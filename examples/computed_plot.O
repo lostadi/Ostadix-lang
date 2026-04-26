@@ -1,0 +1,61 @@
+O^(
+html^(<!DOCTYPE html>
+<html>
+<head>
+  <title>O computed plot</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 780px; margin: 3em auto; }
+    img  { max-width: 100%; border: 1px solid #ddd; border-radius: 8px; }
+    figcaption { color: #666; font-size: 0.9em; margin-top: 0.5em; }
+    code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<h1>An O-lang report with live Python</h1>
+<p>
+  The figure below was produced by Python code embedded in this HTML document.
+  The Python block ran inside env <code>python[0]</code> and returned a matplotlib
+  Figure, which the HTML backend automatically rendered as a <code>&lt;img&gt;</code>
+  data-URL.
+</p>
+<figure>
+python[0]^(
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import math
+
+fig, ax = plt.subplots(figsize=(6.5, 3.6))
+xs = [i / 40 for i in range(-400, 400)]
+ax.plot(xs, [math.sin(x) for x in xs], label="sin x")
+ax.plot(xs, [math.sin(x) * math.exp(-x*x/40) for x in xs], label="sin x . exp(-x^2/40)")
+ax.axhline(0, color="#888", linewidth=0.5)
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_title("Two curves computed at render time")
+ax.legend()
+fig
+)_python[0]
+<figcaption>Figure 1. Computed at render time, embedded via OBlob(mime="image/png").</figcaption>
+</figure>
+<p>
+  The first ten values of a sequence computed in the SAME python[0] environment
+  (note <code>math</code> is still imported from the previous block):
+</p>
+<p>python[0]^([round(math.sin(i/3), 3) for i in range(10)])_python[0]</p>
+<p>
+  And a completely separate env <code>python[1]</code> that doesn't share
+  state with <code>python[0]</code>:
+</p>
+<p>python[1]^(
+    try:
+        math   # should raise NameError -- python[1] never imported math
+        answer = "math is defined"
+    except NameError:
+        answer = "math is NOT defined in python[1]"
+    answer
+)_python[1]</p>
+</body>
+</html>
+)_html
+)_O

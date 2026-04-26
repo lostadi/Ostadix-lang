@@ -1,0 +1,56 @@
+O^(
+markdown^(
+# Quote / Eval: homoiconic .O
+
+This example demonstrates \quote^(...)_quote and `O.eval(expr)`: the pair of
+operators that make .O homoiconic across languages. `quote^` captures its
+body as an unevaluated `OExpr` value; `O.eval` re-enters the evaluator on
+one.
+
+## A quoted expression is a value
+
+python[0]^(
+q = quote^(python^(6 * 7)_python)_quote
+type(q).__name__   # the value the Markdown backend will render
+)_python[0]
+
+The quoted form is opaque until we evaluate it:
+
+python[0]^(
+O.eval(q)          # -> 42
+)_python[0]
+
+## Building O code in Python
+
+Because `quote^` returns a Python-visible `OExpr`, we can collect several of
+them in a list and evaluate them conditionally:
+
+python[0]^(
+variants = [
+  quote^(python^(sum(range(10)))_python)_quote,
+  quote^(python^(len("structural realism"))_python)_quote,
+  quote^(python^(2 ** 10)_python)_quote,
+]
+results = [O.eval(v) for v in variants]
+results
+)_python[0]
+
+## Quote + splicing for metaprogramming
+
+The same machinery works the other way -- Python can CONSTRUCT a .O source
+string and quote it:
+
+python[0]^(
+src = "\python^(111 + 222)_python"     # backslash escapes the inner opener
+O.eval(O.quote(src))
+)_python[0]
+
+## Why this matters
+
+Lisp's power famously derives from code-as-data: a program can produce the
+text of another program and hand it to the same evaluator. .O generalizes
+that across arbitrary target languages. A single expression tree is now a
+fix-point of parse, quote, splice, and eval -- the grammar of programs, not
+the grammar of a particular language.
+)_markdown
+)_O
