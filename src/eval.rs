@@ -223,6 +223,11 @@ impl Evaluator {
             // ── Markdown ─────────────────────────────────────────────────────
             "markdown" | "md" => render_markdown(val),
 
+            // ── Nix family ───────────────────────────────────────────────────
+            // Produce syntactically valid Nix expressions so that O values
+            // from prior blocks can be spliced into Nix code via $var.
+            "nix" | "nix_store" | "nixos_test" => render_nix(val),
+
             // ── Default: use the conservative cross-language representation ──
             _ => val.splice_repr(),
         }
@@ -560,6 +565,59 @@ mod tests {
         let e = Evaluator::new("/tmp".into());
         let v = OValue::int(42);
         assert_eq!(e.render_child("cobol", &v), v.splice_repr());
+    }
+
+    // ── render_child: nix ────────────────────────────────────────────────────
+
+    #[test]
+    fn nix_null_renders_as_null() {
+        let e = Evaluator::new("/tmp".into());
+        assert_eq!(e.render_child("nix", &OValue::Null), "null");
+    }
+
+    #[test]
+    fn nix_bool_renders_correctly() {
+        let e = Evaluator::new("/tmp".into());
+        assert_eq!(e.render_child("nix", &OValue::bool_(true)),  "true");
+        assert_eq!(e.render_child("nix", &OValue::bool_(false)), "false");
+    }
+
+    #[test]
+    fn nix_int_renders_as_integer() {
+        let e = Evaluator::new("/tmp".into());
+        assert_eq!(e.render_child("nix", &OValue::int(42)),  "42");
+        assert_eq!(e.render_child("nix", &OValue::int(-1)), "-1");
+    }
+
+    #[test]
+    fn nix_str_renders_as_double_quoted() {
+        let e = Evaluator::new("/tmp".into());
+        assert_eq!(e.render_child("nix", &OValue::str_("hello")), "\"hello\"");
+    }
+
+    #[test]
+    fn nix_list_renders_with_space_delimiters() {
+        let e = Evaluator::new("/tmp".into());
+        let v = OValue::list(vec![OValue::int(1), OValue::int(2)]);
+        assert_eq!(e.render_child("nix", &v), "[ 1 2 ]");
+    }
+
+    #[test]
+    fn nix_store_path_uses_nix_renderer() {
+        let e = Evaluator::new("/tmp".into());
+        let v = OValue::store_path("/nix/store/abc-hello");
+        // nix and nix_store both dispatch to render_nix
+        let nix_out   = e.render_child("nix",       &v);
+        let store_out = e.render_child("nix_store",  &v);
+        assert_eq!(nix_out, store_out);
+    }
+
+    #[test]
+    fn nixos_test_uses_nix_renderer() {
+        let e = Evaluator::new("/tmp".into());
+        // nixos_test^() should also use render_nix for splicing
+        let v = OValue::int(99);
+        assert_eq!(e.render_child("nixos_test", &v), "99");
     }
 
     // ── eval_document semantics ───────────────────────────────────────────────

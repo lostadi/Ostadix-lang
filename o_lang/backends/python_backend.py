@@ -31,7 +31,7 @@ import textwrap
 from typing import Any, Dict, List
 
 from ..ovalue import (
-    OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull, OStr, OValue,
+    OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull, OStorePath, OStr, OValue,
     from_python, to_python,
 )
 
@@ -70,7 +70,7 @@ class _OHelpers:
         If used as the last expression of a Python block, this fixes the
         expression's OValue explicitly.
         """
-        if isinstance(v, (ONull, OBool, OInt, OFloat, OStr, OList, OMap, OBlob)):
+        if isinstance(v, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob)):
             return v
         return from_python(v)
 
@@ -133,7 +133,7 @@ class _OHelpers:
 
 def _lift_result(x: Any) -> OValue:
     """Convert a Python result to an OValue, recognizing common rich types."""
-    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OList, OMap, OBlob)):
+    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob)):
         return x  # user already wrapped it
 
     # matplotlib.figure.Figure -> PNG blob

@@ -1,0 +1,38 @@
+#!/usr/bin/env O
+# Milestone F — two-machine NixOS test (server + client) inside an O-lang script.
+#
+# Run: cargo run -- examples/nixos_test_two_machine.O
+#
+# The client VM fetches a page from the server VM over the virtual network.
+# Results are rendered as HTML.
+
+let lab = nixos_test^({
+  nodes.server = { pkgs, ... }: {
+    services.nginx.enable = true;
+    networking.firewall.allowedTCPPorts = [ 80 ];
+  };
+
+  nodes.client = { pkgs, ... }: {
+    environment.systemPackages = [ pkgs.curl ];
+  };
+
+  testScript = ''
+    server.start()
+    client.start()
+    server.wait_for_unit("nginx")
+    result = client.succeed("curl -sf http://server")
+    assert "nginx" in result.lower(), f"unexpected page: {result!r}"
+  '';
+})_nixos_test
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>Two-machine NixOS test</h1>
+    <section>
+      $lab
+    </section>
+  </body>
+</html>
+)_html

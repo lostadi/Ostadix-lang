@@ -20,7 +20,7 @@ import json
 from typing import Any
 
 from ..ovalue import (
-    OBlob, OBool, OFloat, OInt, OList, OMap, ONull, OStr, OValue,
+    OBlob, OBool, OFloat, OInt, OList, OMap, ONull, OStorePath, OStr, OValue,
 )
 
 
@@ -43,6 +43,8 @@ class HtmlBackend:
             # If they want escaped text, they can pipe through html.escape
             # explicitly in their Python code.
             return v.value
+        if isinstance(v, OStorePath):
+            return f'<code class="o-store-path">{html.escape(v.path)}</code>'
         if isinstance(v, OBlob):
             b64 = base64.b64encode(v.data).decode("ascii")
             if v.mime.startswith("image/"):
