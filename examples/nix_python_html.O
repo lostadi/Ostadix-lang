@@ -1,0 +1,21 @@
+let nix_data = nix^(
+{
+  answer = 40 + 2;
+  name = "Nix-born value";
+}
+)_nix
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>Nix → Python → HTML</h1>
+
+    python^(
+data = $nix_data
+__oval_result__ = f"{data['name']} says answer={data['answer']}"
+)_python
+
+  </body>
+</html>
+)_html

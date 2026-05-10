@@ -1,0 +1,17 @@
+let answer = python^(
+__oval_result__ = 40 + 2
+)_python
+
+html^(
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>O-lang HTML Test</title>
+  </head>
+  <body>
+    <h1>O-lang is rendering HTML</h1>
+    <p>The answer is $answer.</p>
+  </body>
+</html>
+)_html

@@ -1,0 +1,25 @@
+let name = python^(
+__oval_result__ = "Lee"
+)_python
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>Outer HTML</h1>
+
+    <div>
+      python generated this HTML string:
+      python^(
+inner = html^(
+<section>
+  <strong>Hello, $name.</strong>
+</section>
+)_html
+
+__oval_result__ = inner
+)_python
+    </div>
+  </body>
+</html>
+)_html

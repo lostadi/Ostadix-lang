@@ -1,0 +1,13 @@
+let hello_file = nix_store^(
+builtins.toFile "hello-from-o-lang.txt" "Hello from O-lang + Nix\n"
+)_nix_store
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>O-lang StorePath test</h1>
+    <p>Built file path: $hello_file</p>
+  </body>
+</html>
+)_html

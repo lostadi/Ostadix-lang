@@ -1,0 +1,18 @@
+let hello_file = nix_store^(
+builtins.toFile "hello-from-o-lang.txt" "Hello from O-lang + Nix\n"
+)_nix_store
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>Python reads Nix StorePath</h1>
+
+    <pre>python^(
+path = $hello_file
+with open(path, "r") as f:
+    __oval_result__ = f.read()
+)_python</pre>
+  </body>
+</html>
+)_html

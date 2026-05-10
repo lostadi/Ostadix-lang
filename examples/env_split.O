@@ -1,0 +1,11 @@
+python[0]^(
+x = 100
+)_python[0]
+
+python[1]^(
+x = 5
+)_python[1]
+
+python[0]^(
+__oval_result__ = x
+)_python[0]

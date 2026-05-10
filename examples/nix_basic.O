@@ -1,0 +1,19 @@
+let system_info = nix^(
+{
+  name = "O-lang Nix bridge";
+  answer = 40 + 2;
+  packages = [ "python" "html" "nix" ];
+}
+)_nix
+
+html^(
+<!doctype html>
+<html>
+  <body>
+    <h1>Nix inside O-lang</h1>
+    <section>
+      $system_info
+    </section>
+  </body>
+</html>
+)_html

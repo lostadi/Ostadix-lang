@@ -1,0 +1,4 @@
+#!/usr/bin/env O-lang
+html^(
+<h1>Hello from executable O-lang</h1>
+)_html

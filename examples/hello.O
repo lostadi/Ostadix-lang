@@ -1,13 +1,3 @@
-O^(
-html^(<!DOCTYPE html>
-<html>
-<head><title>O hello</title></head>
-<body>
-<h1>Hello from .O</h1>
-<p>Two plus two in Python is: <strong>python^(2 + 2)_python</strong></p>
-<p>A list computed at runtime: python^([x*x for x in range(6)])_python</p>
-<p>An arbitrary expression: python^(sum(range(100)))_python</p>
-</body>
-</html>
-)_html
-)_O
+python^(
+__oval_result__ = 1 + 1
+)_python

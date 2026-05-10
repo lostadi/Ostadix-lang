@@ -1,0 +1,7 @@
+python^(
+x = 40
+)_python
+
+python^(
+__oval_result__ = x + 2
+)_python

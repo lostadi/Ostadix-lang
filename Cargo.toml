@@ -1,0 +1,42 @@
+[package]
+name        = "o-lang"
+version     = "0.1.0"
+edition     = "2021"
+description = "The O Language — a universal polyglot expression framework"
+authors     = ["Lee Daghlar Ostadi"]
+license     = "MIT"
+
+[[bin]]
+name = "O"
+path = "src/main.rs"
+
+[dependencies]
+# Serialization — OValue wire protocol
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", features = ["preserve_order"] }
+
+# base64 encoding for OBlob wire transport
+base64      = "0.22"
+
+# o.toml manifest parsing
+toml        = "0.8"
+
+# PATH resolution for backend binary checking
+which       = "6"
+
+# semver version checking for backend dependency resolution
+semver      = { version = "1", features = ["serde"] }
+
+# Typed errors with zero boilerplate
+thiserror   = "2"
+anyhow      = "1"
+
+# CLI argument parsing
+clap        = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"     # Fat LTO — maximum cross-crate inlining
+codegen-units = 1         # Single codegen unit — maximum optimization surface
+panic         = "abort"   # No unwinding overhead
+strip         = "symbols" # Strip debug symbols from release binary

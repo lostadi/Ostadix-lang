@@ -1,0 +1,7 @@
+let dangerous = python^(
+__oval_result__ = "<O-lang & friends>"
+)_python
+
+html^(
+<p>$dangerous</p>
+)_html
