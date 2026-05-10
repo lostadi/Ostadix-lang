@@ -128,6 +128,22 @@ class OBlob:
 
 
 @dataclass(frozen=True)
+class OStorePath:
+    """A realized Nix store path (e.g. /nix/store/...).
+
+    Carries a path returned by nix_store^(...)_nix_store. It is typed so
+    that HTML backends can render it as <code>, Python backends can open()
+    it as a real file, and Nix backends can reference it as a store path --
+    without any of them confusing it for an ordinary string.
+    """
+    path: str
+    tag: str = "store_path"
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"tag": "store_path", "path": self.path}
+
+
+@dataclass(frozen=True)
 class OExpr:
     """An unevaluated O expression, carried as a value.
 
@@ -147,7 +163,7 @@ class OExpr:
         return {"tag": "expr", "repr": repr(self.ast)}
 
 
-OValue = Union[ONull, OBool, OInt, OFloat, OStr, OList, OMap, OBlob, OExpr]
+OValue = Union[ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob, OExpr]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +179,7 @@ def from_python(x: Any) -> OValue:
     # Already an OValue? Pass through unchanged so that Python code can
     # build up heterogeneous lists of OInt/OStr/OBlob without us stringifying
     # them on the way out.
-    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OList, OMap, OBlob, OExpr)):
+    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob, OExpr)):
         return x
     if x is None:
         return ONull()
@@ -192,6 +208,8 @@ def to_python(v: OValue) -> Any:
         return None
     if isinstance(v, (OBool, OInt, OFloat, OStr)):
         return v.value
+    if isinstance(v, OStorePath):
+        return v.path
     if isinstance(v, OList):
         return [to_python(item) for item in v.items]
     if isinstance(v, OMap):
@@ -225,6 +243,8 @@ def render_plain(v: OValue) -> str:
         return str(v.value)
     if isinstance(v, OStr):
         return v.value
+    if isinstance(v, OStorePath):
+        return v.path
     if isinstance(v, OList):
         return "[" + ", ".join(render_plain(x) for x in v.items) + "]"
     if isinstance(v, OMap):

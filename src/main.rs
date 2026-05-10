@@ -48,6 +48,7 @@ fn main() -> Result<()> {
         "racket",
         "nix",
         "nix_store",
+        "nixos_test",
     ]
     .into_iter()
     .map(String::from)

@@ -1,14 +1,20 @@
 """End-to-end evaluator tests. Run with: python -m tests.test_evaluator"""
 
+import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from o_lang import (
-    EvalContext, OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull, OStr,
+    EvalContext, OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull,
+    OStorePath, OStr,
     evaluate_document, parse, run,
 )
+
+
+def _nix_available() -> bool:
+    return shutil.which("nix") is not None
 
 
 def test_plain_text_evaluates_to_string():
@@ -245,6 +251,127 @@ def test_lift_preserves_ovalues_inside_python_lists():
     v = run(src)
     assert isinstance(v, OList)
     assert [x.value for x in v.items] == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Nix backends (Milestones A-D)
+# ---------------------------------------------------------------------------
+
+def test_nix_backend_is_registered():
+    # The parser must recognise nix^(...)_nix without crashing.
+    from o_lang.parser import REGISTERED_LANGUAGES
+    assert "nix" in REGISTERED_LANGUAGES
+    assert "nix_store" in REGISTERED_LANGUAGES
+    assert "nixos_test" in REGISTERED_LANGUAGES
+
+
+def test_nix_backend_in_default_registry():
+    from o_lang.backends import default_registry
+    reg = default_registry()
+    assert "nix" in reg
+    assert "nix_store" in reg
+    assert "nixos_test" in reg
+
+
+def test_ostoreppath_in_ovalue_module():
+    from o_lang.ovalue import OStorePath
+    sp = OStorePath("/nix/store/abc-hello")
+    assert sp.path == "/nix/store/abc-hello"
+    assert sp.tag == "store_path"
+    assert sp.to_json() == {"tag": "store_path", "path": "/nix/store/abc-hello"}
+
+
+def test_html_renders_ostoreppath_as_code_tag():
+    # OStorePath spliced into html^() must not render as plain text.
+    from o_lang.backends.html_backend import HtmlBackend
+    from o_lang.ovalue import OStorePath
+    b = HtmlBackend()
+    html = b.render_child(OStorePath("/nix/store/abc-hello"))
+    assert '<code class="o-store-path">' in html
+    assert "/nix/store/abc-hello" in html
+
+
+def test_nix_render_child_produces_nix_syntax():
+    from o_lang.backends.nix_backend import NixBackend
+    from o_lang.ovalue import OBool, OInt, OList, OMap, ONull, OStr
+    b = NixBackend()
+    assert b.render_child(ONull()) == "null"
+    assert b.render_child(OBool(True)) == "true"
+    assert b.render_child(OBool(False)) == "false"
+    assert b.render_child(OInt(42)) == "42"
+    assert b.render_child(OStr("hello")) == '"hello"'
+    lst = b.render_child(OList((OInt(1), OInt(2))))
+    assert lst == "[ 1 2 ]"
+    m = b.render_child(OMap((("x", OInt(1)),)))
+    assert m == "{ x = 1; }"
+
+
+def test_nix_eval_integer(skip_msg="  (skipping nix eval test -- nix not installed)"):
+    if not _nix_available():
+        print(skip_msg)
+        return
+    v = run("nix^(40 + 2)_nix")
+    assert isinstance(v, OInt)
+    assert v.value == 42
+
+
+def test_nix_eval_attrset():
+    if not _nix_available():
+        print("  (skipping nix attrset test -- nix not installed)")
+        return
+    v = run('nix^({ answer = 40 + 2; name = "O-lang"; })_nix')
+    assert isinstance(v, OMap)
+    pairs = dict(v.pairs)
+    assert isinstance(pairs["answer"], OInt) and pairs["answer"].value == 42
+    assert isinstance(pairs["name"], OStr) and pairs["name"].value == "O-lang"
+
+
+def test_nix_to_html():
+    if not _nix_available():
+        print("  (skipping nix->html test -- nix not installed)")
+        return
+    v = run('html^(<p>nix^(40 + 2)_nix</p>)_html')
+    assert isinstance(v, OStr)
+    assert "42" in v.value
+
+
+def test_nix_value_spliced_into_python():
+    if not _nix_available():
+        print("  (skipping nix->python test -- nix not installed)")
+        return
+    src = (
+        "python^("
+        "x = nix^(40 + 2)_nix\n"
+        "x * 2"
+        ")_python"
+    )
+    v = run(src)
+    assert isinstance(v, OInt)
+    assert v.value == 84
+
+
+def test_nix_store_returns_ostoreppath():
+    if not _nix_available():
+        print("  (skipping nix_store test -- nix not installed)")
+        return
+    v = run('nix_store^(builtins.toFile "hello.txt" "hi\n")_nix_store')
+    assert isinstance(v, OStorePath)
+    assert v.path.startswith("/nix/store/")
+
+
+def test_nix_store_path_readable_from_python():
+    if not _nix_available():
+        print("  (skipping nix_store+python test -- nix not installed)")
+        return
+    src = (
+        'python^('
+        'p = nix_store^(builtins.toFile "hello.txt" "hi\\n")_nix_store\n'
+        'with open(p) as fh: __oval_result__ = fh.read().strip()'
+        ')_python'
+    )
+    v = run(src)
+    assert isinstance(v, OStr)
+    assert v.value == "hi"
 
 
 ALL_TESTS = [v for k, v in list(globals().items()) if k.startswith("test_")]

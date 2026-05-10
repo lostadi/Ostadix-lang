@@ -53,6 +53,10 @@ REGISTERED_LANGUAGES = {
     # mirroring Lisp's quote. The companion operator is `O.eval(expr)`
     # available inside Python blocks, which re-evaluates an OExpr.
     "quote",
+    # Nix family: typed evaluator, store-path realizer, OS test runner.
+    "nix",
+    "nix_store",
+    "nixos_test",
 }
 
 # IDENT[N]?^(  -- the opening delimiter
