@@ -273,7 +273,7 @@ def test_nix_backend_in_default_registry():
     assert "nixos_test" in reg
 
 
-def test_ostoreppath_in_ovalue_module():
+def test_ostorepath_in_ovalue_module():
     from o_lang.ovalue import OStorePath
     sp = OStorePath("/nix/store/abc-hello")
     assert sp.path == "/nix/store/abc-hello"
@@ -281,7 +281,7 @@ def test_ostoreppath_in_ovalue_module():
     assert sp.to_json() == {"tag": "store_path", "path": "/nix/store/abc-hello"}
 
 
-def test_html_renders_ostoreppath_as_code_tag():
+def test_html_renders_ostorepath_as_code_tag():
     # OStorePath spliced into html^() must not render as plain text.
     from o_lang.backends.html_backend import HtmlBackend
     from o_lang.ovalue import OStorePath
