@@ -62,10 +62,6 @@ impl Evaluator {
 
         for node in nodes {
             match &node {
-                ONode::RawText(s) if s.trim().is_empty() => {
-                    continue;
-                }
-
                 ONode::LetBinding { name, expr } => {
                     let value = self.eval_node(expr, &scope)?;
                     scope.insert(name.clone(), value.clone());
@@ -279,7 +275,14 @@ fn render_python(val: &OValue) -> String {
         }
 
         OValue::Int { v } => v.to_string(),
-        OValue::Float { v } => v.to_string(),
+        OValue::Float { v } => {
+            let s = v.to_string();
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
 
         OValue::Str { v } => {
             serde_json::to_string(v).unwrap_or_else(|_| "''".to_string())
@@ -337,7 +340,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Int { v } => html_escape(&v.to_string()),
         OValue::Float { v } => html_escape(&v.to_string()),
 
-        OValue::Str { v } => html_escape(v),
+        OValue::Str { v } => v.clone(),
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
@@ -348,10 +351,12 @@ fn render_html(val: &OValue) -> String {
         }
 
         OValue::List { v } => {
-            v.iter()
-                .map(render_html)
+            let items = v
+                .iter()
+                .map(|item| format!("<li>{}</li>", render_html(item)))
                 .collect::<Vec<_>>()
-                .join("")
+                .join("");
+            format!("<ul>{}</ul>", items)
         }
 
         OValue::Map { v } => {
