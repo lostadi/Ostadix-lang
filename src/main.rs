@@ -47,6 +47,7 @@ fn main() -> Result<()> {
         "rust",
         "racket",
         "nix",
+        "nix_expr",
         "nix_store",
         "nixos_test",
     ]

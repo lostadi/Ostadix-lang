@@ -27,6 +27,10 @@ which       = "6"
 # semver version checking for backend dependency resolution
 semver      = { version = "1", features = ["serde"] }
 
+# SHA-256 fingerprinting for ONixExpr cache keys
+sha2        = "0.10"
+hex         = "0.4"
+
 # Typed errors with zero boilerplate
 thiserror   = "2"
 anyhow      = "1"
