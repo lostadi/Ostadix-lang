@@ -51,6 +51,11 @@ fn main() -> Result<()> {
         "nix_expr",
         "nix_store",
         "nixos_test",
+        // NOTE: `lazy` is NOT a language. It's a builtin CALL — `lazy(expr)` —
+        // because there is no source text in any language called "lazy"; the
+        // body is already O-level statements with a different evaluation
+        // policy. Implementing it as a block-shaped construct would be a
+        // category error: blocks are languages, lazy isn't one.
     ]
     .into_iter()
     .map(String::from)

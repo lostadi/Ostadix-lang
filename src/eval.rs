@@ -30,31 +30,78 @@ use crate::process::ProcessRegistry;
 use crate::value::{OValue, RequestKind};
 
 // ═════════════════════════════════════════════════════════════════════════════
+// STEP-3.5: Backend purity table
+//
+// Determines whether the `{lazy}` attribute is valid on a given language.
+// `{lazy}` requires purity because it caches by fingerprint — re-running a
+// thunk with the same input must produce the same result, or the cache lies.
+//
+// "Pure" here means: same body + same deps + same env => same output. No
+// hidden IO, no clock, no random, no mutable global state. The list is
+// conservative — we mark a backend pure only if we're confident.
+//
+// `{defer}` works on any backend (it never caches), so it's the impure-
+// backend escape hatch.
+//
+// STEP4: when more backends are ported to Rust (rust, racket, shell, etc.),
+// they'll need a purity decision here. Shell is impure (anything can happen).
+// Rust the language is pure-ish but compilation has IO. Racket has both
+// pure and impure idioms — we'd default impure and let users opt in.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PURE_BACKENDS: &[&str] = &[
+    "nix",           // Nix is designed to be deterministic
+    "nix_expr",      // already lazy by construction; {lazy}/{defer} are rejected anyway
+    "nix_store",     // returns a content-addressed store path
+    "nixos_test",    // test derivations are content-addressed
+    "html",          // pure templating
+    "markdown",      // pure templating
+    "latex",         // pure templating (compilation is IO but we treat the splice as pure)
+    "text",          // pure templating
+    // python, shell, bash, rust, racket — NOT pure
+];
+
+fn is_pure_backend(lang: &str) -> bool {
+    PURE_BACKENDS.contains(&lang)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Policy — WHEN does a Request execute?
 //
-// Step-2 ships only Eager. Lazy is reserved for STEP3, when the surface
-// syntax for entering a lazy region (block? attribute? directive?) is
-// designed properly.
-//
-// The reason this is an enum and not a bool: STEP3 will add at least
-// `Autonomous` (scheduler-decided), and possibly speculative / goal-driven
-// variants. Making it an enum from the start keeps additions additive.
+// The "when" axis of the two-axis framing (the other is "who decides", which
+// is the Executor). Step-3 ships Eager (default) and Lazy (scoped via lazy^).
+// Autonomous is a placeholder for STEP4 — goal-driven scheduling, where the
+// scheduler decides what to execute (and possibly speculatively pre-executes)
+// based on goals carried alongside requests.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Requests are auto-resolved (executed) at let-binding boundaries and
     /// at the top level. The user sees Derivations/StorePaths, never raw
-    /// Requests. This is the only policy implemented in step 2 and is the
-    /// hardcoded default in eval_document.
+    /// Requests. This is the default policy in eval_document.
     Eager,
 
-    /// STEP3: Requests pass through let-bindings as values. The user must
-    /// explicitly call `now(req)` to perform a request. Not yet wired —
-    /// changing the policy here has no effect because there is no surface
-    /// syntax to enter a Lazy region.
-    #[allow(dead_code)]
+    /// Requests pass through let-bindings as values. The user must explicitly
+    /// call `now(req)` to perform a request. Entered via the `lazy^(...)_lazy`
+    /// block — Policy::Lazy is in effect for the body of that block only,
+    /// then restored to the surrounding policy on exit.
     Lazy,
+
+    /// STEP4 placeholder: scheduler-directed execution.
+    ///
+    /// Under Autonomous, requests are buffered as they're constructed; the
+    /// scheduler decides when (and possibly in what order, with what
+    /// concurrency, with what speculation) to flush them. The trigger for a
+    /// flush is some force point — a splice of a Request-typed value into
+    /// source text, a document boundary, an explicit `now()`, etc.
+    ///
+    /// Not yet wired. Adding this requires designing force points and a
+    /// goal/preference data shape that travels alongside requests. The data
+    /// model is already prepared (Request is a first-class OValue, the
+    /// Executor trait is swappable, RequestKind is extensible).
+    #[allow(dead_code)]
+    Autonomous,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -99,19 +146,35 @@ impl Default for ImmediateExecutor {
     fn default() -> Self { Self::new() }
 }
 
+impl ImmediateExecutor {
+    /// Inject a pre-computed result into the cache. Used in tests to avoid
+    /// shelling out to Nix or spawning real shims for `RequestKind::Eval`.
+    #[cfg(test)]
+    pub fn seed_cache(&mut self, fingerprint: String, value: OValue) {
+        self.cache.insert(fingerprint, value);
+    }
+}
+
 impl Executor for ImmediateExecutor {
     fn execute(&mut self, req: &OValue) -> Result<OValue> {
         let (kind, source, fingerprint) = match req {
             OValue::Request { kind, source, fingerprint } =>
-                (*kind, source.as_ref().clone(), fingerprint.clone()),
+                (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
             other => bail!(
                 "Executor::execute expected a Request, got {}", other.type_name()
             ),
         };
 
-        // Cache hit short-circuits any recursive work.
-        if let Some(hit) = self.cache.get(&fingerprint) {
-            return Ok(hit.clone());
+        // STEP-3.5: for non-cacheable Eval ({defer}) we MUST skip the cache
+        // and re-run on every force. For everything else, cache hits.
+        let consult_cache = match &kind {
+            RequestKind::Eval { cacheable, .. } => *cacheable,
+            _ => true,
+        };
+        if consult_cache {
+            if let Some(hit) = self.cache.get(&fingerprint) {
+                return Ok(hit.clone());
+            }
         }
 
         // If source is itself a Request, recursively perform it first.
@@ -126,9 +189,25 @@ impl Executor for ImmediateExecutor {
         let result = match kind {
             RequestKind::Instantiate => nix_ops::instantiate_nix(&resolved_source)?,
             RequestKind::Realise     => nix_ops::realise_nix(&resolved_source)?,
+            // STEP-3.5: Eval fires the shim through the ProcessRegistry. The
+            // ImmediateExecutor doesn't currently have access to a registry,
+            // so we bail with a clear message. The real wiring is provided by
+            // a custom Executor that does hold a ProcessRegistry — see
+            // RegistryExecutor below, used by the Evaluator.
+            RequestKind::Eval { .. } => bail!(
+                "ImmediateExecutor cannot perform RequestKind::Eval directly — \
+                 it lacks a ProcessRegistry. The Evaluator wires a \
+                 RegistryExecutor for this purpose."
+            ),
         };
 
-        self.cache.insert(fingerprint, result.clone());
+        // STEP-3.5: only cache the result when cacheable (true for {lazy} and
+        // for the Nix family). For {defer}, the !consult_cache check above
+        // already short-circuited the cache lookup; here we also skip insert
+        // so the cache stays clean.
+        if consult_cache {
+            self.cache.insert(fingerprint, result.clone());
+        }
         Ok(result)
     }
 }
@@ -143,13 +222,21 @@ pub struct Evaluator {
     /// Shim path for a language `lang` is `shim_dir/lang`.
     shim_dir: PathBuf,
 
-    /// Current evaluation policy. Step-2: always Eager; STEP3 will allow
-    /// scoped overrides via a lazy region marker.
+    /// Current evaluation policy. Eager by default; lazy(...) installs Lazy
+    /// for the scope of its argument. STEP4: Autonomous joins as a third
+    /// concrete value.
     policy: Policy,
 
-    /// The executor used to perform Requests under the current policy.
-    /// Step-2: ImmediateExecutor; STEP3 swaps in a scheduler.
+    /// The executor used to perform Instantiate/Realise Requests under the
+    /// current policy. STEP4 swaps in a scheduler.
     executor: Box<dyn Executor>,
+
+    /// STEP-3.5: cache for `RequestKind::Eval { cacheable: true }` ({lazy}).
+    /// Keyed by the Request's fingerprint, which composes from the Thunk's
+    /// body + dep identities and the kind metadata (lang, env_id, cacheable).
+    /// Non-cacheable ({defer}) Eval Requests bypass this on both read and
+    /// write — each force re-runs the shim.
+    eval_cache: HashMap<String, OValue>,
 }
 
 impl Evaluator {
@@ -159,6 +246,7 @@ impl Evaluator {
             shim_dir,
             policy: Policy::Eager,
             executor: Box::new(ImmediateExecutor::new()),
+            eval_cache: HashMap::new(),
         }
     }
 
@@ -170,14 +258,134 @@ impl Evaluator {
         self
     }
 
-    /// Auto-resolve a Request under the current policy. Under Eager (the
-    /// only policy in step 2), Requests are executed; under Lazy (STEP3)
-    /// they would pass through unchanged.
+    /// Auto-resolve a Request under the current policy.
+    ///
+    ///   - Eager:      execute the request, return its result
+    ///   - Lazy:       pass through unchanged (the user must call `now()` to perform)
+    ///   - Autonomous: STEP4 — buffer the request for the scheduler. For now,
+    ///                 treated as Lazy (pass-through) so adding the variant
+    ///                 doesn't change behaviour.
     fn auto_resolve(&mut self, v: OValue) -> Result<OValue> {
         match (self.policy, &v) {
-            (Policy::Eager, OValue::Request { .. }) => self.executor.execute(&v),
+            (Policy::Eager, OValue::Request { .. }) => self.force_request(&v),
             _ => Ok(v),
         }
+    }
+
+    /// STEP-3.5: dispatch a Request to the right performer.
+    ///
+    /// `RequestKind::Eval` needs the ProcessRegistry to fire a shim, so it
+    /// has to go through the Evaluator (which owns the registry) rather
+    /// than through the Executor trait (which doesn't). Everything else
+    /// goes through self.executor — that's where the swap point for STEP4's
+    /// scheduler still lives.
+    fn force_request(&mut self, req: &OValue) -> Result<OValue> {
+        let kind = match req {
+            OValue::Request { kind, .. } => kind.clone(),
+            other => bail!("force_request expected a Request, got {}", other.type_name()),
+        };
+        match kind {
+            RequestKind::Eval { .. } => self.exec_eval(req),
+            _ => self.executor.execute(req),
+        }
+    }
+
+    /// Fire the shim invocation captured in a Request[Eval] over a Thunk.
+    ///
+    /// For cacheable Eval ({lazy}), checks/populates an internal cache keyed
+    /// by the Request's fingerprint. For non-cacheable Eval ({defer}), the
+    /// cache is skipped on both read and write — each force re-runs.
+    fn exec_eval(&mut self, req: &OValue) -> Result<OValue> {
+        let (kind, source, fingerprint) = match req {
+            OValue::Request { kind, source, fingerprint } =>
+                (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
+            other => bail!("exec_eval expected Request, got {}", other.type_name()),
+        };
+        let (lang, env_id, cacheable) = match kind {
+            RequestKind::Eval { lang, env_id, cacheable } => (lang, env_id, cacheable),
+            other => bail!(
+                "exec_eval expected RequestKind::Eval, got {:?}", other
+            ),
+        };
+
+        // {lazy} cache: consult before doing work.
+        if cacheable {
+            if let Some(hit) = self.eval_cache.get(&fingerprint) {
+                return Ok(hit.clone());
+            }
+        }
+
+        // The Request's source is a Thunk carrying (body, deps).
+        let body = match &source {
+            OValue::Thunk { body, .. } => body.clone(),
+            other => bail!(
+                "exec_eval's Request source must be a Thunk, got {}",
+                other.type_name()
+            ),
+        };
+
+        // Pick the right shim for the language and fire it through the
+        // ProcessRegistry, exactly as eval_typed_expr would for a normal block.
+        let shim = {
+            let candidates = [
+                self.shim_dir.join(format!("{lang}_shim.py")),
+                self.shim_dir.join(format!("{lang}_shim")),
+                self.shim_dir.join(format!("{lang}.py")),
+                self.shim_dir.join(&lang),
+            ];
+            candidates.into_iter().find(|p| p.exists())
+                .unwrap_or_else(|| self.shim_dir.join(format!("{lang}_shim.py")))
+        };
+        // The shim sees an empty bindings map; deps were already spliced into
+        // the body at capture time. (STEP4: deps could be passed as bindings
+        // instead, for shims that want them as values rather than text.)
+        let result = self.registry.exec(
+            &lang, env_id, &body, HashMap::new(), &shim
+        ).map_err(|e| anyhow::anyhow!("[{}{{eval}}] {}", lang, e))?;
+
+        if env_id == u32::MAX {
+            let _ = self.registry.cleanup_env(&lang, u32::MAX);
+        }
+
+        if cacheable {
+            self.eval_cache.insert(fingerprint, result.clone());
+        }
+        Ok(result)
+    }
+
+    /// STEP-3.5: prepare a value for splicing into source text.
+    ///
+    /// The rule from fork #2:
+    ///   - {lazy} Eval Request → auto-force (cacheable, pure backend, no side
+    ///                                       effects from re-running, splice
+    ///                                       result of the force)
+    ///   - {defer} Eval Request → error (non-cacheable, may have side effects,
+    ///                                   forcing implicitly via splice would
+    ///                                   surprise the user — they must call
+    ///                                   now() explicitly)
+    ///   - any other value → pass through unchanged
+    ///
+    /// Auto-forcing here means: ask the executor to perform the request and
+    /// return its result. The executor's cache makes this idempotent for {lazy}.
+    fn resolve_for_splice(&mut self, v: OValue) -> Result<OValue> {
+        if let OValue::Request { kind, .. } = &v {
+            if let RequestKind::Eval { cacheable, lang, .. } = kind {
+                if *cacheable {
+                    // {lazy}: safe to auto-force.
+                    return self.force_request(&v);
+                } else {
+                    // {defer}: refuse to auto-force.
+                    bail!(
+                        "Cannot splice a {{defer}} thunk (`{}{{defer}}^...`) into \
+                         source text — {{defer}} is non-cacheable and forcing it \
+                         implicitly could re-run side effects unexpectedly. \
+                         Wrap the splice in now(...) to force explicitly.",
+                        lang
+                    );
+                }
+            }
+        }
+        Ok(v)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -193,29 +401,23 @@ impl Evaluator {
         let mut scope = HashMap::new();
         let mut last = OValue::Null;
 
+        // STEP-3 NOTE: auto-resolve is NOT called here. It fires at Request
+        // *construction* time inside eval_call. By the time eval_node returns
+        // a value to this loop, any auto-resolution that the policy at
+        // construction-time demanded has already happened — and any Request
+        // that survived (because it was constructed under lazy(...)) should
+        // NOT be re-executed by binding it to a name.
         for node in nodes {
-            match &node {
+            let value = match &node {
                 ONode::LetBinding { name, expr } => {
-                    // STEP-2: auto-resolve Requests under the Eager policy
-                    // before binding. This is the request/perform boundary
-                    // expressed at the user's let-line.
-                    let raw   = self.eval_node(expr, &scope)?;
-                    let value = self.auto_resolve(raw)?;
+                    let value = self.eval_node(expr, &scope)?;
                     scope.insert(name.clone(), value.clone());
-
-                    if !matches!(value, OValue::Null) {
-                        last = value;
-                    }
+                    value
                 }
-
-                _ => {
-                    let raw   = self.eval_node(&node, &scope)?;
-                    let value = self.auto_resolve(raw)?;
-
-                    if !matches!(value, OValue::Null) {
-                        last = value;
-                    }
-                }
+                _ => self.eval_node(&node, &scope)?,
+            };
+            if !matches!(value, OValue::Null) {
+                last = value;
             }
         }
 
@@ -238,8 +440,8 @@ impl Evaluator {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name)),
 
-            ONode::TypedExpr { lang, env_id, body } => {
-                self.eval_typed_expr(lang, *env_id, body, scope)
+            ONode::TypedExpr { lang, env_id, attr, body } => {
+                self.eval_typed_expr(lang, *env_id, attr.as_deref(), body, scope)
             }
 
             ONode::Call { fn_name, args } => {
@@ -249,19 +451,23 @@ impl Evaluator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Call dispatch — the step-2 built-ins
+    // Call dispatch — the built-in operators
     //
-    // Three built-ins ship in step 2:
-    //   instantiate(expr)   → Request[Instantiate]
-    //   realise(drv)        → Request[Realise]
-    //   now(req)            → executes the request immediately, even under
-    //                         a Lazy policy (which doesn't exist yet, but the
-    //                         operator is here so STEP3 doesn't need to
-    //                         retrofit it)
+    // Step-3 builtins:
+    //   instantiate(expr)  → Request[Instantiate], auto-resolved under Eager
+    //   realise(drv)       → Request[Realise],     auto-resolved under Eager
+    //   now(req)           → executes the request immediately, regardless of policy
+    //   lazy(expr)         → evaluates `expr` under Policy::Lazy, returns its value
     //
-    // STEP3 builtins to add:
-    //   lazy(...)           → enter a Lazy region (or be a block, TBD)
-    //   batch(req, req, ..) → bundle multiple requests for the scheduler
+    // ARCHITECTURAL NOTE: auto-resolve fires INSIDE eval_call at the moment a
+    // Request is constructed, not at let-binding boundaries. This matters
+    // because the policy in effect at construction time is what the user
+    // intended; by the time control returns to a let-binding, lazy(...) has
+    // already restored the outer policy. Auto-resolving at the let-binding
+    // would re-execute Requests that the user explicitly wanted to defer.
+    //
+    // STEP4 builtins to add:
+    //   batch(req, req, ..) → bundle requests for the scheduler
     //   activate(cfg)       → OS-as-participant: switch system to a config
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -271,7 +477,24 @@ impl Evaluator {
         args:    &[ONode],
         scope:   &HashMap<String, OValue>,
     ) -> Result<OValue> {
-        // Evaluate args left-to-right (applicative order, like everywhere else).
+        // STEP-3: `lazy(expr)` is a POLICY-MODIFYING builtin — it must take
+        // control of its argument's evaluation so that the policy switch
+        // applies to the construction of the inner Requests. It cannot go
+        // through the standard "evaluate args first" path; by the time args
+        // are evaluated under that path, the inner Requests would have been
+        // constructed (and auto-resolved) under the wrong policy.
+        if fn_name == "lazy" {
+            if args.len() != 1 {
+                bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
+            }
+            let saved_policy = self.policy;
+            self.policy = Policy::Lazy;
+            let result = self.eval_node(&args[0], scope);
+            self.policy = saved_policy;   // restored even on error path
+            return result;
+        }
+
+        // Standard builtins: evaluate args left-to-right (applicative order).
         let arg_vals: Vec<OValue> = args
             .iter()
             .map(|a| self.eval_node(a, scope))
@@ -282,13 +505,21 @@ impl Evaluator {
                 if arg_vals.len() != 1 {
                     bail!("instantiate(expr) takes exactly 1 argument, got {}", arg_vals.len());
                 }
-                Ok(OValue::request(RequestKind::Instantiate, arg_vals.into_iter().next().unwrap()))
+                let req = OValue::request(
+                    RequestKind::Instantiate,
+                    arg_vals.into_iter().next().unwrap(),
+                );
+                self.auto_resolve(req)
             }
             "realise" => {
                 if arg_vals.len() != 1 {
                     bail!("realise(drv) takes exactly 1 argument, got {}", arg_vals.len());
                 }
-                Ok(OValue::request(RequestKind::Realise, arg_vals.into_iter().next().unwrap()))
+                let req = OValue::request(
+                    RequestKind::Realise,
+                    arg_vals.into_iter().next().unwrap(),
+                );
+                self.auto_resolve(req)
             }
             "now" => {
                 if arg_vals.len() != 1 {
@@ -296,7 +527,7 @@ impl Evaluator {
                 }
                 let req = arg_vals.into_iter().next().unwrap();
                 match &req {
-                    OValue::Request { .. } => self.executor.execute(&req),
+                    OValue::Request { .. } => self.force_request(&req),
                     other => bail!(
                         "now(req) expected a Request, got {}", other.type_name()
                     ),
@@ -314,15 +545,68 @@ impl Evaluator {
         &mut self,
         lang:   &str,
         env_id: u32,
+        attr:   Option<&str>,
         body:   &[ONode],
         scope:  &HashMap<String, OValue>,
     ) -> Result<OValue> {
+        // ─────────────────────────────────────────────────────────────────────
+        // STEP-3.5: validate the optional `{attr}` early so misuses are
+        // caught at the block we're evaluating, not somewhere downstream.
+        //
+        //   {lazy}  — pure backends only; produces a cacheable Eval Request
+        //   {defer} — any backend; produces a non-cacheable Eval Request
+        //
+        // `nix_expr^` is already lazy by construction; attributes on it are
+        // rejected as redundant. STEP4 may add other attributes (trace, etc.).
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(a) = attr {
+            match a {
+                "lazy" => {
+                    if lang == "nix_expr" {
+                        bail!(
+                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ is already \
+                             lazy. Use bare nix_expr^, or use nix{{lazy}}^ if you \
+                             want a generic deferred Nix eval."
+                        );
+                    }
+                    if !is_pure_backend(lang) {
+                        bail!(
+                            "`{lang}{{lazy}}^` is invalid because {lang} is not a \
+                             pure backend; caching a thunk that re-runs with side \
+                             effects would be unsound. Use `{lang}{{defer}}^` instead \
+                             — it captures the same thunk but never caches and \
+                             always re-runs on force.",
+                            lang = lang
+                        );
+                    }
+                }
+                "defer" => {
+                    if lang == "nix_expr" {
+                        bail!(
+                            "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
+                             lazy. If you want a non-cacheable deferred Nix eval, \
+                             write nix{{defer}}^."
+                        );
+                    }
+                    // {defer} works on any backend; nothing else to check.
+                }
+                other => bail!(
+                    "Unknown block attribute `{{{}}}` on {}^. Known attributes: \
+                     lazy, defer.",
+                    other, lang
+                ),
+            }
+        }
+
         // Step 1 — build the fully-spliced source string for the backend.
-        // For `nix_expr` blocks we also collect the evaluated child OValues as
-        // deps (by reference, step-1 decision) so the returned ONixExpr carries
-        // the full dependency tree for later re-traversal.
+        // For `nix_expr` blocks and `{lazy}`/`{defer}` blocks we also collect
+        // the evaluated child OValues as deps so the returned thunk carries
+        // its full dependency tree for fingerprint composition.
         let mut buf  = String::new();
         let mut deps: Vec<OValue> = Vec::new();
+
+        // Whether this block constructs a Thunk (and so should track deps).
+        let constructs_thunk = lang == "nix_expr" || attr.is_some();
 
         for child in body {
             match child {
@@ -336,45 +620,65 @@ impl Evaluator {
                 ONode::VarRef(name) => {
                     let val = scope
                         .get(name)
-                        .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?;
-                    buf.push_str(&self.render_child(lang, val));
-                    if lang == "nix_expr" {
-                        deps.push(val.clone());
+                        .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?
+                        .clone();
+                    // STEP-3.5: auto-force {lazy} thunks before splicing; error
+                    // on {defer} thunks. {lazy} is safe to auto-force because
+                    // pure-backend results don't have side effects.
+                    let resolved = self.resolve_for_splice(val)?;
+                    buf.push_str(&self.render_child(lang, &resolved));
+                    if constructs_thunk {
+                        deps.push(resolved);
                     }
                 }
 
                 ONode::TypedExpr {
                     lang: child_lang,
                     env_id: child_env_id,
+                    attr: child_attr,
                     body: child_body,
                 } => {
                     // Evaluate the nested expression first (leaves-up / applicative order),
                     // then render its value into the parent language's source syntax.
-                    let child_val =
-                        self.eval_typed_expr(child_lang, *child_env_id, child_body, scope)?;
-                    buf.push_str(&self.render_child(lang, &child_val));
-                    if lang == "nix_expr" {
-                        deps.push(child_val);
+                    let child_val = self.eval_typed_expr(
+                        child_lang, *child_env_id, child_attr.as_deref(), child_body, scope,
+                    )?;
+                    let resolved = self.resolve_for_splice(child_val)?;
+                    buf.push_str(&self.render_child(lang, &resolved));
+                    if constructs_thunk {
+                        deps.push(resolved);
                     }
                 }
 
                 ONode::Call { fn_name, args } => {
-                    // STEP-2: the parser does not currently emit a Call inside
-                    // a typed-expr body (the `expected_closer.is_none()` guard
-                    // in parser::parse_until prevents that). This arm exists
-                    // for exhaustiveness — and for forward-compatibility with
-                    // STEP3, when Calls may be allowed inside bodies. The
-                    // semantics mirror nested TypedExpr: evaluate the call,
-                    // auto-resolve any Request under Eager, render the result
-                    // via the parent language's render_child, splice in.
                     let raw = self.eval_call(fn_name, args, scope)?;
-                    let child_val = self.auto_resolve(raw)?;
-                    buf.push_str(&self.render_child(lang, &child_val));
-                    if lang == "nix_expr" {
-                        deps.push(child_val);
+                    let resolved = self.resolve_for_splice(raw)?;
+                    buf.push_str(&self.render_child(lang, &resolved));
+                    if constructs_thunk {
+                        deps.push(resolved);
                     }
                 }
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STEP-3.5: if the block had a `{lazy}` or `{defer}` attribute, wrap
+        // the captured (body, deps) in a Thunk and return a Request[Eval]
+        // over it. The Request does NOT auto-resolve at construction —
+        // syntactic deferral is unconditional. The user forces via now() or
+        // by splicing it (auto-force for {lazy} only).
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(a) = attr {
+            let cacheable = a == "lazy";
+            let thunk = OValue::thunk(buf, deps);
+            return Ok(OValue::request(
+                RequestKind::Eval {
+                    lang:      lang.to_string(),
+                    env_id,
+                    cacheable,
+                },
+                thunk,
+            ));
         }
 
         // Short-circuit for `nix_expr`: return a lazy ONixExpr instead of
@@ -503,13 +807,19 @@ fn render_nix(val: &OValue) -> String {
         // A Request rendered into Nix source is almost certainly a user error —
         // the user spliced a control value into source text. We embed the
         // splice marker; STEP3 can elevate this to a hard error or auto-resolve.
-        OValue::Request { kind, fingerprint, .. } => {
-            let k = match kind {
-                RequestKind::Instantiate => "instantiate",
-                RequestKind::Realise     => "realise",
-            };
-            format!("\"<request:{} fp={}>\"", k, &fingerprint[..8])
+        OValue::Request { fingerprint, .. } => {
+            // STEP-3.5: in a Nix context, an unforced Request is almost
+            // always a user error. We emit a string marker that nix eval
+            // will reject loudly. {lazy} Eval requests should have been
+            // auto-forced before reaching here; {defer} should have errored;
+            // Instantiate/Realise have no sensible Nix-context splice form.
+            format!("\"<request fp={}>\"", &fingerprint[..8])
         }
+        // A Thunk in a Nix context renders as its body, parenthesised. Same
+        // treatment as NixExpr — if the lang matches Nix syntax, this is
+        // safe; otherwise the user composed two different languages and
+        // gets predictable Nix parse errors.
+        OValue::Thunk { body, .. } => format!("({})", body),
     }
 }
 
@@ -600,13 +910,16 @@ fn render_python(val: &OValue) -> String {
             format!("ODerivation({}, outputs=[{}])", drv_lit, outs_lit)
         }
 
-        OValue::Request { kind, fingerprint, .. } => {
-            let k = match kind {
-                RequestKind::Instantiate => "instantiate",
-                RequestKind::Realise     => "realise",
-            };
+        OValue::Request { fingerprint, .. } => {
             let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            format!("ORequest(kind={:?}, fp={})", k, fp_lit)
+            format!("ORequest(fp={})", fp_lit)
+        }
+        OValue::Thunk { body, fingerprint, deps } => {
+            let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
+            let fp_lit   = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
+            let deps_rendered = deps.iter().map(render_python)
+                .collect::<Vec<_>>().join(", ");
+            format!("OThunk({}, fp={}, deps=[{}])", body_lit, fp_lit, deps_rendered)
         }
     }
 }
@@ -671,15 +984,17 @@ fn render_html(val: &OValue) -> String {
             )
         }
 
-        OValue::Request { kind, fingerprint, .. } => {
-            let k = match kind {
-                RequestKind::Instantiate => "instantiate",
-                RequestKind::Realise     => "realise",
-            };
+        OValue::Request { fingerprint, .. } => {
             format!(
-                "<code class=\"o-request\" data-kind=\"{}\" data-fp=\"{}\">&lt;request&gt;</code>",
-                html_escape(k),
+                "<code class=\"o-request\" data-fp=\"{}\">&lt;request&gt;</code>",
                 html_escape(&fingerprint[..8]),
+            )
+        }
+        OValue::Thunk { body, fingerprint, .. } => {
+            format!(
+                "<code class=\"o-thunk\" data-fp=\"{}\">{}</code>",
+                html_escape(&fingerprint[..8]),
+                html_escape(body),
             )
         }
     }
@@ -758,12 +1073,11 @@ fn render_latex(val: &OValue) -> String {
         OValue::Derivation { drv_path, .. } => {
             format!("\\texttt{{{}}}", drv_path.replace("_", "\\_"))
         }
-        OValue::Request { kind, fingerprint, .. } => {
-            let k = match kind {
-                RequestKind::Instantiate => "instantiate",
-                RequestKind::Realise     => "realise",
-            };
-            format!("\\texttt{{<request:{} fp={}>}}", k, &fingerprint[..8])
+        OValue::Request { fingerprint, .. } => {
+            format!("\\texttt{{<request fp={}>}}", &fingerprint[..8])
+        }
+        OValue::Thunk { body, .. } => {
+            format!("\\texttt{{{}}}", body.replace("_", "\\_"))
         }
     }
 }
@@ -794,12 +1108,11 @@ fn render_markdown(val: &OValue) -> String {
         OValue::Blob { mime, .. } => format!("<blob:{}>", mime),
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
-        OValue::Request { kind, fingerprint, .. } => {
-            let k = match kind {
-                RequestKind::Instantiate => "instantiate",
-                RequestKind::Realise     => "realise",
-            };
-            format!("`<request:{} fp={}>`", k, &fingerprint[..8])
+        OValue::Request { fingerprint, .. } => {
+            format!("`<request fp={}>`", &fingerprint[..8])
+        }
+        OValue::Thunk { body, .. } => {
+            format!("`{}`", body)
         }
     }
 }
@@ -1023,6 +1336,7 @@ mod tests {
         let result = e.eval_typed_expr(
             "nix_expr",
             u32::MAX,
+            None,
             &[ONode::RawText("pkgs.hello".to_string())],
             &HashMap::new(),
         ).unwrap();
@@ -1052,7 +1366,7 @@ mod tests {
             ONode::RawText(" suffix".to_string()),
         ];
 
-        let result = e.eval_typed_expr("nix_expr", u32::MAX, &body_nodes, &scope).unwrap();
+        let result = e.eval_typed_expr("nix_expr", u32::MAX, None, &body_nodes, &scope).unwrap();
 
         if let OValue::NixExpr { body, deps, .. } = &result {
             // render_nix for OInt(7) → "7"
@@ -1125,35 +1439,29 @@ mod tests {
         }
     }
 
-    /// `let drv = instantiate($expr)` under Eager policy must bind `drv` to a
-    /// Derivation, not to a Request. The Request is auto-resolved at the
-    /// let-binding boundary.
+    /// Under Eager (the default), `instantiate($expr)` auto-resolves at
+    /// construction time inside eval_call. The caller never sees a Request.
     #[test]
-    fn eager_let_auto_resolves_instantiate_request() {
+    fn eager_call_auto_resolves_at_construction() {
         let mut e = Evaluator::new("/tmp".into())
             .with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
-        // Build the AST directly: let drv = instantiate($expr)
         let call = ONode::Call {
             fn_name: "instantiate".into(),
             args:    vec![ONode::VarRef("expr".into())],
         };
-        let raw = e.eval_node(&call, &scope).unwrap();
-        // Before auto_resolve, the call produces a Request value.
-        assert!(raw.is_request(),
-            "eval_call should return a Request before auto-resolve");
-
-        let resolved = e.auto_resolve(raw).unwrap();
-        assert!(resolved.is_derivation(),
-            "Eager policy should auto-resolve Instantiate to a Derivation");
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert!(result.is_derivation(),
+            "under Eager, eval_call should auto-resolve directly to a Derivation");
     }
 
-    /// `realise(instantiate($expr))` must chain — the outer Request's source
-    /// is the inner Request, and the executor walks the chain.
+    /// `realise(instantiate($expr))` chains under Eager: instantiate auto-
+    /// resolves to a Derivation, then realise auto-resolves to a StorePath.
+    /// No intermediate Request is observable.
     #[test]
-    fn nested_call_produces_chained_request_and_resolves_to_store_path() {
+    fn nested_call_under_eager_resolves_end_to_end() {
         let mut e = Evaluator::new("/tmp".into())
             .with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
@@ -1168,16 +1476,10 @@ mod tests {
             args:    vec![inner],
         };
 
-        let raw = e.eval_node(&outer, &scope).unwrap();
-        if let OValue::Request { kind, source, .. } = &raw {
-            assert_eq!(*kind, RequestKind::Realise);
-            assert!(source.is_request(), "outer request's source must be inner Request");
-        } else { panic!("expected Request, got {:?}", raw); }
-
-        let resolved = e.auto_resolve(raw).unwrap();
-        if let OValue::StorePath { path } = &resolved {
+        let result = e.eval_node(&outer, &scope).unwrap();
+        if let OValue::StorePath { path } = &result {
             assert!(path.starts_with("/nix/store/"));
-        } else { panic!("expected StorePath, got {:?}", resolved); }
+        } else { panic!("expected StorePath under Eager end-to-end, got {:?}", result); }
     }
 
     /// The ImmediateExecutor's cache must hit on identical fingerprints.
@@ -1223,9 +1525,8 @@ mod tests {
     }
 
     /// `now(req)` performs the request immediately and returns its result,
-    /// regardless of policy. (In step 2 the policy is always Eager, so this
-    /// is functionally redundant — but it'll matter in STEP3 when Lazy
-    /// arrives.)
+    /// regardless of policy. In step 3 this matters: inside a lazy^ region,
+    /// `now()` is the explicit-perform escape hatch.
     #[test]
     fn now_call_executes_request_directly() {
         let mut e = Evaluator::new("/tmp".into())
@@ -1242,5 +1543,438 @@ mod tests {
         let result = e.eval_node(&call, &scope).unwrap();
         assert!(result.is_derivation(),
             "now(req) on an Instantiate request should produce a Derivation");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP-3: lazy(expr) builtin call — policy-modifying operator
+    //
+    // Note the structural shape: lazy is a builtin call, not a language. The
+    // block form `lazy^(...)_lazy` was rejected because blocks are languages
+    // and lazy doesn't have a source-text body in any language. These tests
+    // pin down the call form's semantics.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `lazy(instantiate($expr))` returns a Request without executing.
+    /// Under the Lazy policy that lazy() installs, the inner instantiate's
+    /// auto-resolve passes the Request through.
+    #[test]
+    fn lazy_call_returns_unresolved_request() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        let lazy_call = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args:    vec![ONode::VarRef("expr".into())],
+            }],
+        };
+
+        let result = e.eval_node(&lazy_call, &scope).unwrap();
+        assert!(result.is_request(),
+            "lazy(instantiate(...)) must return a Request, got {:?}", result);
+    }
+
+    /// `lazy(realise(instantiate($expr)))` returns a chained Request — outer
+    /// Realise over inner Instantiate, neither executed.
+    #[test]
+    fn lazy_preserves_chained_request_structure() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        let chain = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::Call {
+                fn_name: "realise".into(),
+                args:    vec![ONode::Call {
+                    fn_name: "instantiate".into(),
+                    args:    vec![ONode::VarRef("expr".into())],
+                }],
+            }],
+        };
+
+        let result = e.eval_node(&chain, &scope).unwrap();
+        if let OValue::Request { kind, source, .. } = &result {
+            assert_eq!(*kind, RequestKind::Realise);
+            assert!(source.is_request(),
+                "outer Request's source must be the inner unresolved Instantiate Request");
+        } else { panic!("expected chained Request, got {:?}", result); }
+    }
+
+    /// `now()` inside lazy() forces execution — the explicit escape hatch.
+    #[test]
+    fn now_inside_lazy_executes() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        let nested = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::Call {
+                fn_name: "now".into(),
+                args:    vec![ONode::Call {
+                    fn_name: "instantiate".into(),
+                    args:    vec![ONode::VarRef("expr".into())],
+                }],
+            }],
+        };
+
+        let result = e.eval_node(&nested, &scope).unwrap();
+        assert!(result.is_derivation(),
+            "now() inside lazy() still executes, returning a Derivation");
+    }
+
+    /// Policy is restored after lazy() returns. A subsequent direct call
+    /// should auto-resolve normally — confirming the policy scope is bounded.
+    #[test]
+    fn policy_restored_to_eager_after_lazy_returns() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        // First: lazy(instantiate(...)) returns a Request (Lazy was active).
+        let lazy_call = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args:    vec![ONode::VarRef("expr".into())],
+            }],
+        };
+        assert!(e.eval_node(&lazy_call, &scope).unwrap().is_request());
+
+        // Then: plain instantiate(...) auto-resolves (Eager is back).
+        let plain_call = ONode::Call {
+            fn_name: "instantiate".into(),
+            args:    vec![ONode::VarRef("expr".into())],
+        };
+        let result = e.eval_node(&plain_call, &scope).unwrap();
+        assert!(result.is_derivation(),
+            "after lazy() exits, direct call should auto-resolve to Derivation");
+    }
+
+    /// Nested lazy inside lazy stays lazy. Pinning down the edge case:
+    /// re-entering a lazy region shouldn't accidentally restore an outer
+    /// non-lazy policy.
+    #[test]
+    fn nested_lazy_calls_remain_lazy() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        let nested = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::Call {
+                fn_name: "lazy".into(),
+                args:    vec![ONode::Call {
+                    fn_name: "instantiate".into(),
+                    args:    vec![ONode::VarRef("expr".into())],
+                }],
+            }],
+        };
+        let result = e.eval_node(&nested, &scope).unwrap();
+        assert!(result.is_request(),
+            "lazy nested in lazy must still produce a Request, got {:?}", result);
+    }
+
+    /// Even when lazy()'s argument errors, the policy is restored.
+    /// This is the save/restore guard in the lazy branch of eval_call.
+    #[test]
+    fn policy_restored_even_on_lazy_arg_error() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        let bad = ONode::Call {
+            fn_name: "lazy".into(),
+            args:    vec![ONode::VarRef("missing".into())],   // will error
+        };
+
+        assert_eq!(e.policy, Policy::Eager);
+        let _ = e.eval_node(&bad, &scope);    // expected error
+        assert_eq!(e.policy, Policy::Eager,
+            "policy must be restored to Eager after lazy() errors");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP-3.5: {lazy} / {defer} block attributes
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// {lazy} on an impure backend (python) is rejected at evaluation with a
+    /// message suggesting {defer} as the alternative.
+    #[test]
+    fn lazy_attr_on_impure_backend_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang:   "python".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![ONode::RawText("1 + 1".into())],
+        };
+        let err = e.eval_node(&block, &scope).unwrap_err().to_string();
+        assert!(err.contains("not a pure backend"),
+            "error must explain backend purity, got: {}", err);
+        assert!(err.contains("defer"),
+            "error should suggest {{defer}} as alternative, got: {}", err);
+    }
+
+    /// {lazy} on a pure backend (nix) returns a Request[Eval] without
+    /// invoking the shim. The Thunk inside carries body + deps.
+    #[test]
+    fn lazy_attr_on_pure_backend_produces_eval_request() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang:   "nix".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![ONode::RawText("1 + 2".into())],
+        };
+        let result = e.eval_node(&block, &scope).unwrap();
+        if let OValue::Request { kind, source, .. } = &result {
+            match kind {
+                RequestKind::Eval { lang, env_id: _, cacheable } => {
+                    assert_eq!(lang, "nix");
+                    assert!(*cacheable, "{{lazy}} must produce cacheable=true");
+                }
+                other => panic!("expected RequestKind::Eval, got {:?}", other),
+            }
+            assert!(source.is_thunk(), "Request source must be a Thunk");
+            if let OValue::Thunk { body, .. } = source.as_ref() {
+                assert_eq!(body, "1 + 2");
+            }
+        } else { panic!("expected Request, got {:?}", result); }
+    }
+
+    /// {defer} on an impure backend (python) is allowed and produces a
+    /// non-cacheable Eval Request.
+    #[test]
+    fn defer_attr_on_impure_backend_is_allowed() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang:   "python".into(),
+            env_id: u32::MAX,
+            attr:   Some("defer".into()),
+            body:   vec![ONode::RawText("print('hi')".into())],
+        };
+        let result = e.eval_node(&block, &scope).unwrap();
+        if let OValue::Request { kind, .. } = &result {
+            if let RequestKind::Eval { lang, cacheable, .. } = kind {
+                assert_eq!(lang, "python");
+                assert!(!*cacheable, "{{defer}} must produce cacheable=false");
+            } else { panic!("expected RequestKind::Eval"); }
+        } else { panic!("expected Request"); }
+    }
+
+    /// {lazy} on nix_expr is rejected as redundant.
+    #[test]
+    fn lazy_attr_on_nix_expr_errors_redundant() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang:   "nix_expr".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![],
+        };
+        let err = e.eval_node(&block, &scope).unwrap_err().to_string();
+        assert!(err.contains("redundant"),
+            "error must say nix_expr+{{lazy}} is redundant, got: {}", err);
+    }
+
+    /// Unknown attributes error with a clear message.
+    #[test]
+    fn unknown_attr_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang:   "nix".into(),
+            env_id: u32::MAX,
+            attr:   Some("strict".into()),
+            body:   vec![],
+        };
+        let err = e.eval_node(&block, &scope).unwrap_err().to_string();
+        assert!(err.contains("strict"));
+        assert!(err.contains("Known attributes"));
+    }
+
+    /// now() on a {lazy} Eval request fires the shim. We seed the cache
+    /// directly to verify the cache-hit path without spawning a real shim.
+    #[test]
+    fn now_on_lazy_eval_request_returns_cached_value() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        let block = ONode::TypedExpr {
+            lang:   "nix".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![ONode::RawText("3 + 4".into())],
+        };
+        let req = e.eval_node(&block, &scope).unwrap();
+        let fp = if let OValue::Request { fingerprint, .. } = &req {
+            fingerprint.clone()
+        } else { panic!("expected Request"); };
+
+        // Seed the Evaluator's own eval_cache so force_request hits it
+        // instead of trying to spawn a nix shim.
+        e.eval_cache.insert(fp.clone(), OValue::int(7));
+
+        let forced = e.force_request(&req).unwrap();
+        assert_eq!(forced, OValue::int(7),
+            "now() / force_request must return the cached value");
+    }
+
+    /// {defer} requests bypass the cache on read AND write — re-running on
+    /// every force is their defining property.
+    #[test]
+    fn defer_eval_request_bypasses_cache() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        let block = ONode::TypedExpr {
+            lang:   "python".into(),
+            env_id: u32::MAX,
+            attr:   Some("defer".into()),
+            body:   vec![ONode::RawText("1".into())],
+        };
+        let req = e.eval_node(&block, &scope).unwrap();
+        let fp = if let OValue::Request { fingerprint, .. } = &req {
+            fingerprint.clone()
+        } else { panic!("expected Request"); };
+
+        // Even with a value seeded under the {defer} request's fingerprint,
+        // the executor must not consult the cache for non-cacheable Eval —
+        // it tries to actually spawn the shim, which fails (no shim_dir).
+        e.eval_cache.insert(fp, OValue::str_("hypothetical cached"));
+
+        let err = e.force_request(&req).unwrap_err().to_string();
+        // The shim path doesn't exist; force should attempt to fire it.
+        // (Any error here means we got past the cache lookup. The specific
+        //  error depends on what the registry says.)
+        assert!(
+            !err.contains("hypothetical cached"),
+            "force on {{defer}} must NOT return the seeded cache value, got: {}",
+            err
+        );
+    }
+
+    /// Splicing a {lazy} Eval Request into another block's source text
+    /// auto-forces it (per fork #2). We seed the cache so the auto-force
+    /// returns a known value without spawning a shim.
+    #[test]
+    fn splice_auto_forces_lazy_eval_request() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        // Construct a {lazy} nix block, find its fingerprint, seed the cache.
+        let lazy_block = ONode::TypedExpr {
+            lang:   "nix".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![ONode::RawText("123".into())],
+        };
+        let req = e.eval_node(&lazy_block, &scope).unwrap();
+        let fp = if let OValue::Request { fingerprint, .. } = &req {
+            fingerprint.clone()
+        } else { panic!(); };
+        e.eval_cache.insert(fp, OValue::int(123));
+        scope.insert("lz".into(), req);
+
+        // Now splice the lazy Request into another block via $lz. The splice
+        // path should auto-force, retrieving 123 from the cache and
+        // rendering it. We use markdown^ so we don't need a real shim —
+        // markdown bypasses the registry and renders directly.
+        let md_block = ONode::TypedExpr {
+            lang:   "markdown".into(),
+            env_id: u32::MAX,
+            attr:   None,
+            body:   vec![
+                ONode::RawText("value=".into()),
+                ONode::VarRef("lz".into()),
+            ],
+        };
+        // markdown^ goes through the registry path which tries to spawn a
+        // shim. We just check that resolve_for_splice resolves the request:
+        let resolved = e.resolve_for_splice(scope["lz"].clone()).unwrap();
+        assert_eq!(resolved, OValue::int(123),
+            "splice path must auto-force {{lazy}} to its cached value");
+        // (md_block parsed but not evaluated end-to-end here — the splice
+        // resolution is the unit we're testing.)
+        let _ = md_block;
+    }
+
+    /// Splicing a {defer} Eval Request errors out — the user must now() first.
+    #[test]
+    fn splice_of_defer_request_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        let defer_block = ONode::TypedExpr {
+            lang:   "python".into(),
+            env_id: u32::MAX,
+            attr:   Some("defer".into()),
+            body:   vec![ONode::RawText("1".into())],
+        };
+        let req = e.eval_node(&defer_block, &scope).unwrap();
+        let err = e.resolve_for_splice(req).unwrap_err().to_string();
+        assert!(err.contains("defer"));
+        assert!(err.contains("now"),
+            "error should tell the user to call now() explicitly, got: {}", err);
+    }
+
+    /// Through eval_document: `let pending = lazy(realise(instantiate($expr)))`
+    /// must bind `pending` to a Request, not auto-execute. This was the bug
+    /// the block-form lazy^ had: auto_resolve at let-binding would re-execute.
+    #[test]
+    fn let_binding_preserves_lazy_request_under_eager() {
+        use crate::parser::ONode;
+
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+
+        // We can't put a NixExpr into scope via eval_document's API directly,
+        // so we test this by constructing the nodes for both let-bindings.
+        let nodes = vec![
+            ONode::LetBinding {
+                name: "expr".into(),
+                expr: Box::new(ONode::TypedExpr {
+                    lang:   "nix_expr".into(),
+                    env_id: u32::MAX,
+                    attr:   None,
+                    body:   vec![ONode::RawText("pkgs.hello".into())],
+                }),
+            },
+            ONode::LetBinding {
+                name: "pending".into(),
+                expr: Box::new(ONode::Call {
+                    fn_name: "lazy".into(),
+                    args:    vec![ONode::Call {
+                        fn_name: "realise".into(),
+                        args:    vec![ONode::Call {
+                            fn_name: "instantiate".into(),
+                            args:    vec![ONode::VarRef("expr".into())],
+                        }],
+                    }],
+                }),
+            },
+            // The document's final value: pending. If it's a Request, we got
+            // the right answer; if it's a StorePath, the let-binding
+            // erroneously re-executed.
+            ONode::VarRef("pending".into()),
+        ];
+
+        let last = e.eval_document(nodes).unwrap();
+        assert!(last.is_request(),
+            "let pending = lazy(...) must bind a Request — re-executing at \
+             the let-binding boundary would be the old broken behaviour. \
+             Got {:?}", last);
     }
 }

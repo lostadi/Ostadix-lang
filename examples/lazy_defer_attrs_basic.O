@@ -1,0 +1,36 @@
+#!/usr/bin/env O
+# STEP-3.5: the {lazy} and {defer} block attributes.
+#
+# Both capture a block's body as a thunk instead of firing the shim. They
+# differ on caching:
+#   {lazy}  — pure backends only; cached by fingerprint; auto-forces on splice
+#   {defer} — any backend; never cached; errors on splice (must now() first)
+#
+# Compare with `nix_expr^` which is its own typed lazy rung in the Nix
+# pipeline (returns ONixExpr, feeds into instantiate/realise). The generic
+# {lazy}/{defer} mechanism produces a Request[Eval] whose forced result is
+# whatever the shim returned — an OInt, OList, OStr, etc.
+#
+# This example DOES NOT force anything (no shim subprocess is spawned). It
+# just constructs three thunks and uses the third as the document's final
+# value, which the runtime prints via Debug. On a machine with Nix and
+# Python installed, you can replace the final expression with
+#   now($py_defer)
+# to actually fire the shim.
+
+let nx_lazy = nix{lazy}^( 1 + 2 + 3 )_nix{lazy}
+# nx_lazy : Request[Eval{lang=nix, cacheable=true}]
+# The shim has NOT run; nx_lazy is the unforced thunk.
+
+let md_lazy = markdown{lazy}^( **rendered** later )_markdown{lazy}
+# md_lazy : Request[Eval{lang=markdown, cacheable=true}]
+# markdown is declared pure in PURE_BACKENDS, so {lazy} is valid here.
+
+let py_defer = python{defer}^( import time; time.time() )_python{defer}
+# py_defer : Request[Eval{lang=python, cacheable=false}]
+# python is impure (clock, IO, mutable state), so {defer} is the right
+# attribute — every force re-runs and produces a fresh value.
+
+# The document's last expression is the {defer} request itself, which the
+# runtime prints via Debug. Three Request values constructed, none forced.
+$py_defer

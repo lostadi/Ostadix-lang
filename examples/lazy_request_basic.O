@@ -1,0 +1,22 @@
+#!/usr/bin/env O
+let expr = nix_expr^( (import <nixpkgs> {}).hello )_nix_expr
+
+# Under the default Eager policy, `let drv = instantiate($expr)` would
+# auto-execute and bind a Derivation. Wrapping the whole chain in `lazy(...)`
+# evaluates its argument under Policy::Lazy — Requests are constructed but
+# not performed.
+#
+# lazy is a builtin CALL, not a language block: there is no source text in
+# any language called "lazy"; the argument is already an O-level expression
+# being evaluated under a different policy. Treating it as a block would be
+# a category error.
+let pending = lazy(realise(instantiate($expr)))
+
+# `pending` is now a Request[Realise] over a Request[Instantiate]. No Nix
+# subprocess has been spawned. To force execution: `let path = now($pending)`.
+markdown^(
+# Step-3 lazy region (call form)
+
+- expression: `$expr`
+- pending:    `$pending`   (unresolved Request — no Nix call made)
+)_markdown

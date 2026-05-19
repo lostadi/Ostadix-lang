@@ -1,6 +1,20 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 
+/// Languages whose bodies are SEQUENCED (children are O-level statements)
+/// rather than SPLICED (children are raw source text for a target backend).
+///
+/// Inside a sequencing lang's body, the parser produces ONode::Call for
+/// `name(...)` syntax. Inside any other body, `name(...)` is preserved as
+/// RawText so it reaches the target backend unmodified.
+///
+/// Currently empty: `lazy` was reconsidered and moved to a builtin call
+/// (not a language). When `O^` and `quote^` are ported from the Python
+/// implementation to Rust, they belong here — quote because its body really
+/// IS unevaluated text (the "captured comment" framing), O because it's the
+/// host sequencing language.
+const SEQUENCING_LANGS: &[&str] = &[];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ONode {
     RawText(String),
@@ -10,9 +24,14 @@ pub enum ONode {
         expr: Box<ONode>,
     },
     TypedExpr {
-        lang: String,
+        lang:   String,
         env_id: u32,
-        body: Vec<ONode>,
+        /// STEP-3.5: optional attribute parsed from `{ident}` on the tag.
+        /// `None` for plain `lang^(...)_lang`; `Some("lazy")` for
+        /// `lang{lazy}^(...)_lang{lazy}`; `Some("defer")` for `{defer}`.
+        /// The evaluator dispatches on this when present.
+        attr:   Option<String>,
+        body:   Vec<ONode>,
     },
 
     /// A function call: `name(arg1, arg2, ...)`.
@@ -36,9 +55,17 @@ pub enum ONode {
 
 #[derive(Debug, Clone)]
 struct Tag {
-    lang: String,
+    lang:   String,
     env_id: u32,
-    raw: String,
+    /// STEP-3.5: optional `{ident}` attribute on the language tag.
+    /// e.g. `python{lazy}^(...)_python{lazy}` → attr = Some("lazy").
+    /// Single attribute for now; multi-attribute `{a,b}` is a later parser
+    /// change. The attribute travels with the tag through evaluation.
+    attr:   Option<String>,
+    /// The raw text of the tag — used to construct the closer match string.
+    /// Includes the lang, the optional `[N]` env, and the optional `{attr}`,
+    /// in source order.
+    raw:    String,
 }
 
 pub struct Parser<'a> {
@@ -103,6 +130,7 @@ impl<'a> Parser<'a> {
                 nodes.push(ONode::TypedExpr {
                     lang: tag.lang,
                     env_id: tag.env_id,
+                    attr: tag.attr,
                     body,
                 });
 
@@ -110,11 +138,15 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // STEP-2: try to parse a top-level call like `instantiate($x)` or
-            // `realise(instantiate($x))`. Only attempted at the document top
-            // level (expected_closer.is_none()) so it doesn't eat raw text
-            // inside typed-expr bodies.
-            if expected_closer.is_none() {
+            // STEP-2/3: try to parse a call like `instantiate($x)` or
+            // `realise(instantiate($x))`. Allowed at the document top level
+            // AND inside the bodies of SEQUENCING_LANGS (lazy^, eventually O^
+            // and quote^). Disallowed inside ordinary typed-expr bodies so
+            // that source text destined for a backend isn't reinterpreted.
+            let inside_sequencing = expected_closer
+                .map(|t| SEQUENCING_LANGS.contains(&t.lang.as_str()))
+                .unwrap_or(true);
+            if inside_sequencing {
                 let stmt_start = self.pos;
                 if let Some(call) = self.try_parse_call()? {
                     self.flush_text(&mut nodes, text_start, stmt_start);
@@ -196,6 +228,7 @@ impl<'a> Parser<'a> {
             expr: Box::new(ONode::TypedExpr {
                 lang: tag.lang,
                 env_id: tag.env_id,
+                attr: tag.attr,
                 body,
             }),
         }))
@@ -349,9 +382,34 @@ impl<'a> Parser<'a> {
             raw.push_str(&self.source[env_start..i]);
         }
 
+        // STEP-3.5: optional `{attr}` after the env slot, before `^(`.
+        // Parses a single identifier in braces. Multi-attribute syntax
+        // `{a,b,c}` is left for a later expansion if it becomes useful.
+        let mut attr: Option<String> = None;
+        if i < bytes.len() && bytes[i] == b'{' {
+            let attr_start = i;
+            i += 1;
+
+            let ident_start = i;
+            while i < bytes.len() && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            if ident_start == i {
+                return Ok(None);   // empty {}
+            }
+            if i >= bytes.len() || bytes[i] != b'}' {
+                return Ok(None);
+            }
+
+            attr = Some(self.source[ident_start..i].to_string());
+            i += 1;   // past '}'
+
+            raw.push_str(&self.source[attr_start..i]);
+        }
+
         if i + 2 <= bytes.len() && &self.source[i..i + 2] == "^(" {
             self.pos = i + 2;
-            Ok(Some(Tag { lang, env_id, raw }))
+            Ok(Some(Tag { lang, env_id, attr, raw }))
         } else {
             Ok(None)
         }

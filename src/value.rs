@@ -156,42 +156,80 @@ pub enum OValue {
         deps:     Vec<OValue>,    // child OValues that contributed to this drv (provenance)
     },
 
-    /// A request to climb one rung of the Nix lattice (expr → drv, or drv → path).
+    /// A request to perform a deferred computation.
     ///
     /// Requests are FIRST-CLASS VALUES: they can be bound, passed, composed.
     /// A Request with `source: Box<OValue::Request>` represents a chained climb
     /// (e.g. `realise(instantiate(expr))`); the executor walks the chain.
     ///
-    /// `fingerprint = sha256(kind || source.content_identity())`. This composes:
-    /// two requests with the same kind over sources with the same content identity
-    /// have the same fingerprint, so the executor's cache hits on logical equality
-    /// regardless of how the request was constructed.
+    /// `fingerprint = sha256(kind_tag || source.content_identity())`. This
+    /// composes: two requests with the same kind over sources with the same
+    /// content identity have the same fingerprint, so the executor's cache
+    /// hits on logical equality regardless of how the request was constructed.
     ///
-    /// Under the default Eager policy in eval.rs, requests are auto-executed
-    /// when they would be bound to a let or returned from a top-level statement.
-    /// Under a hypothetical Lazy policy (STEP3) they would pass through as values.
+    /// Auto-resolution fires at Request *construction* time inside eval_call,
+    /// based on the policy in effect AT CONSTRUCTION. Once a Request escapes
+    /// (because it was constructed under Policy::Lazy), no downstream context
+    /// re-fires auto-resolve. The user must explicitly force with `now(...)`.
     #[serde(rename = "request")]
     Request {
         kind:        RequestKind,
         source:      Box<OValue>,
         fingerprint: String,
     },
+
+    /// STEP-3.5: a captured but unevaluated shim invocation.
+    ///
+    /// Produced when a language block carries a `{lazy}` or `{defer}` attribute.
+    /// Holds the same data a normal block evaluation would have built (the
+    /// fully-spliced source body + the dep OValues), but with the shim NOT
+    /// yet fired. The Thunk is wrapped in a Request[Eval { lang, env_id,
+    /// cacheable }] so it can flow through the same orchestration as the
+    /// Nix-family rung climbs.
+    ///
+    /// fingerprint = sha256(body || sorted dep content_identities). The
+    /// lang/env_id/cacheable metadata live on the wrapping Request, not here —
+    /// the Thunk is just the captured payload.
+    #[serde(rename = "thunk")]
+    Thunk {
+        body:        String,
+        deps:        Vec<OValue>,
+        fingerprint: String,
+    },
 }
 
-/// The kind of rung-climb a Request performs.
+/// The kind of computation a Request performs.
 ///
-/// STEP3: additional kinds for OS-as-participant — e.g. `Activate` for switching
+/// STEP4: additional kinds for OS-as-participant — e.g. `Activate` for switching
 /// a NixOS configuration into the running system, `Snapshot` for capturing a
 /// running machine's state, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy`: the `Eval` variant carries owned strings. Cloning is cheap
+/// enough at the construction-and-dispatch frequency we operate at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     /// NixExpr → Derivation. Source must be an OValue::NixExpr (or a Request
     /// whose chained result is a NixExpr).
     Instantiate,
+
     /// Derivation → StorePath. Source must be an OValue::Derivation (or a
     /// Request whose chained result is a Derivation).
     Realise,
+
+    /// STEP-3.5: fire a captured shim invocation. Source must be an
+    /// OValue::Thunk (the captured body + deps).
+    ///
+    /// `lang` selects which backend shim runs (python, nix, html, ...).
+    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral).
+    /// `cacheable` distinguishes {lazy} (true, pure backends only, force-
+    /// caches by fingerprint) from {defer} (false, any backend, re-runs on
+    /// every force, errors on splice).
+    Eval {
+        lang:      String,
+        env_id:    u32,
+        cacheable: bool,
+    },
 }
 
 
@@ -254,16 +292,15 @@ impl OValue {
         }
     }
 
-    /// Construct a Request value that names a rung-climb without performing it.
+    /// Construct a Request value that names a deferred computation without
+    /// performing it.
     ///
-    /// The fingerprint is `sha256(kind || source.content_identity())`. Two
-    /// requests for the same climb over equivalent sources share a fingerprint
-    /// and therefore share the executor's cache slot.
+    /// The fingerprint is `sha256(kind_tag || source.content_identity())`.
+    /// For RequestKind::Eval the kind_tag includes the lang, env_id, and
+    /// cacheable flag so requests differing in any of those (but otherwise
+    /// identical) get distinct cache slots.
     pub fn request(kind: RequestKind, source: OValue) -> Self {
-        let kind_tag = match kind {
-            RequestKind::Instantiate => "instantiate",
-            RequestKind::Realise     => "realise",
-        };
+        let kind_tag = Self::kind_tag(&kind);
         let composed = format!("{}||{}", kind_tag, source.content_identity());
         let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
         OValue::Request {
@@ -273,17 +310,48 @@ impl OValue {
         }
     }
 
+    /// String tag for a RequestKind used in fingerprint composition.
+    /// Includes the data-carrying fields of the Eval variant so distinct
+    /// Eval requests get distinct fingerprints.
+    pub fn kind_tag(kind: &RequestKind) -> String {
+        match kind {
+            RequestKind::Instantiate => "instantiate".to_string(),
+            RequestKind::Realise     => "realise".to_string(),
+            RequestKind::Eval { lang, env_id, cacheable } => {
+                format!("eval|{}|{}|{}", lang, env_id, cacheable)
+            }
+        }
+    }
+
+    /// Construct a Thunk — the captured-but-unevaluated payload of a
+    /// `{lazy}` or `{defer}` block. The Thunk is wrapped in a Request[Eval]
+    /// by the caller; this constructor just builds the data carrier with
+    /// the composed fingerprint.
+    ///
+    /// fingerprint = sha256(body || sorted(dep.content_identity())). Identical
+    /// composition rule to NixExpr — same reason: a thunk that splices the
+    /// same deps must have the same identity for caching to work.
+    pub fn thunk(body: impl Into<String>, deps: Vec<OValue>) -> Self {
+        let body = body.into();
+        let mut identities: Vec<String> = deps.iter().map(|d| d.content_identity()).collect();
+        identities.sort();
+        let composed = format!("{}||{}", body, identities.join("|"));
+        let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
+        OValue::Thunk { body, deps, fingerprint }
+    }
+
     /// The canonical content identity of an OValue.
     ///
     /// Used to compose Request fingerprints and NixExpr fingerprints. Defined
     /// uniformly so any OValue can appear as a dep without special-casing.
     ///
     /// Rules:
-    ///   - NixExpr   → its (already-composite) fingerprint
+    ///   - NixExpr    → its (already-composite) fingerprint
     ///   - Derivation → sha256(drv_path)   (Nix's content-addressing, hashed
     ///                                       so the identity is uniform-width hex)
     ///   - StorePath  → sha256(path)
     ///   - Request    → its fingerprint (recursive, defined at construction)
+    ///   - Thunk      → its (already-composite) fingerprint
     ///   - any other  → sha256(splice_repr())   (a stable projection of the
     ///                                            value's spliced form; not
     ///                                            cryptographically meaningful
@@ -291,6 +359,7 @@ impl OValue {
     pub fn content_identity(&self) -> String {
         match self {
             OValue::NixExpr { fingerprint, .. } => fingerprint.clone(),
+            OValue::Thunk   { fingerprint, .. } => fingerprint.clone(),
             OValue::Derivation { drv_path, .. } => {
                 hex::encode(Sha256::digest(drv_path.as_bytes()))
             }
@@ -352,6 +421,7 @@ impl OValue {
     pub fn is_nix_expr(&self) -> bool { matches!(self, OValue::NixExpr { .. }) }
     pub fn is_derivation(&self) -> bool { matches!(self, OValue::Derivation { .. }) }
     pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
+    pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -370,6 +440,7 @@ impl OValue {
             OValue::NixExpr {..} => "nix_expr",
             OValue::Derivation {..} => "derivation",
             OValue::Request {..} => "request",
+            OValue::Thunk {..} => "thunk",
         }
     }
 }
@@ -484,17 +555,22 @@ impl OValue {
             OValue::Derivation { drv_path, .. } => drv_path.clone(),
 
             // A Request has no natural splice form — it is a control value,
-            // not a data value. We splice its fingerprint as a marker; if a
-            // user is splicing requests directly into source text, they almost
-            // certainly meant to execute the request first.
-            //   STEP3: detect this case in the evaluator and warn / auto-execute.
+            // not a data value. We splice its fingerprint as a marker; the
+            // evaluator's splice loop intercepts {lazy} Eval requests and
+            // auto-forces them BEFORE rendering (per the step-3.5 rule), and
+            // intercepts {defer} Eval requests with an error. If a Request
+            // reaches this point, it's an Instantiate/Realise request being
+            // spliced into source text — almost certainly a user error.
             OValue::Request { kind, fingerprint, .. } => {
-                let k = match kind {
-                    RequestKind::Instantiate => "instantiate",
-                    RequestKind::Realise     => "realise",
-                };
+                let k = Self::kind_tag(kind);
                 format!("<request:{} fp={}>", k, &fingerprint[..8])
             }
+
+            // A Thunk has the same splice shape as a NixExpr: its body is
+            // valid source text in some language and can be parenthesised
+            // inline. The Thunk itself is rarely spliced directly — it
+            // usually flows wrapped in a Request[Eval].
+            OValue::Thunk { body, .. } => body.clone(),
         }
     }
 }
@@ -542,11 +618,11 @@ impl fmt::Display for OValue {
                 write!(f, "<derivation {} outputs=[{}]>", drv_path, outputs.join(","))
             }
             OValue::Request { kind, fingerprint, .. } => {
-                let k = match kind {
-                    RequestKind::Instantiate => "instantiate",
-                    RequestKind::Realise     => "realise",
-                };
+                let k = Self::kind_tag(kind);
                 write!(f, "<request {} fp={}>", k, &fingerprint[..8])
+            }
+            OValue::Thunk { fingerprint, deps, .. } => {
+                write!(f, "<thunk fp={} deps={}>", &fingerprint[..8], deps.len())
             }
         }
     }
