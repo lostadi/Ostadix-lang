@@ -1,0 +1,11 @@
+#!/usr/bin/env O
+let expr = nix_expr^( (import <nixpkgs> {}).hello )_nix_expr
+let drv  = instantiate($expr)
+let path = realise($drv)
+markdown^(
+# Step-2 rung climb
+
+- expression: `$expr`
+- derivation: `$drv`
+- realised:   `$path`
+)_markdown

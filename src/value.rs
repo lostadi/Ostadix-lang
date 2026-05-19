@@ -29,7 +29,6 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hex;
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -123,8 +122,12 @@ pub enum OValue {
     ///   - `deps`:        the child OValues whose rendered forms were spliced into body,
     ///                    carried by reference (step 1 decision — simpler, lets the
     ///                    renderer re-traverse the tree if needed)
-    ///   - `fingerprint`: sha256(body) hex string — cheap cache key (step 1 decision;
-    ///                    upgraded to sha256(body + sorted dep fingerprints) in step 2)
+    ///   - `fingerprint`: STEP-2 SCHEME — sha256(body || "||" || sorted dep content_identities).
+    ///                    Composes with dep identities so two NixExprs that splice the
+    ///                    same children produce the same identity; an NixExpr that
+    ///                    splices a different derivation produces a different identity.
+    ///                    Aligns with Nix's content addressing where deps are
+    ///                    Derivations (uses drv_path) or StorePaths (uses path).
     ///
     /// `nix^(...)_nix` is unchanged — it is the "evaluate immediately to a JSON value"
     /// shortcut that bypasses this rung entirely (step 1 decision, option a).
@@ -134,6 +137,61 @@ pub enum OValue {
         deps:        Vec<OValue>,
         fingerprint: String,
     },
+
+    /// A Nix derivation that has been instantiated but not yet realised.
+    ///
+    /// This is the MIDDLE RUNG — produced by `instantiate(expr)`. The .drv file
+    /// exists in the Nix store; the outputs do not yet. Identity is `drv_path`
+    /// (already content-addressed by Nix itself — we don't re-hash).
+    ///
+    /// Step-2 simplification: only the first output (`out` by default) is exposed
+    /// after realisation. Multi-output realise (returning OMap of {name: store_path})
+    /// is deferred — see eval.rs::realise_to_first_output.
+    ///   STEP3: support `realise(drv, "dev")` for selecting a non-default output,
+    ///   or `realise_all(drv)` returning an OMap of all outputs.
+    #[serde(rename = "derivation")]
+    Derivation {
+        drv_path: String,         // /nix/store/*.drv — canonical identity
+        outputs:  Vec<String>,    // ["out", "dev", ...] (parsed from `nix derivation show`)
+        deps:     Vec<OValue>,    // child OValues that contributed to this drv (provenance)
+    },
+
+    /// A request to climb one rung of the Nix lattice (expr → drv, or drv → path).
+    ///
+    /// Requests are FIRST-CLASS VALUES: they can be bound, passed, composed.
+    /// A Request with `source: Box<OValue::Request>` represents a chained climb
+    /// (e.g. `realise(instantiate(expr))`); the executor walks the chain.
+    ///
+    /// `fingerprint = sha256(kind || source.content_identity())`. This composes:
+    /// two requests with the same kind over sources with the same content identity
+    /// have the same fingerprint, so the executor's cache hits on logical equality
+    /// regardless of how the request was constructed.
+    ///
+    /// Under the default Eager policy in eval.rs, requests are auto-executed
+    /// when they would be bound to a let or returned from a top-level statement.
+    /// Under a hypothetical Lazy policy (STEP3) they would pass through as values.
+    #[serde(rename = "request")]
+    Request {
+        kind:        RequestKind,
+        source:      Box<OValue>,
+        fingerprint: String,
+    },
+}
+
+/// The kind of rung-climb a Request performs.
+///
+/// STEP3: additional kinds for OS-as-participant — e.g. `Activate` for switching
+/// a NixOS configuration into the running system, `Snapshot` for capturing a
+/// running machine's state, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// NixExpr → Derivation. Source must be an OValue::NixExpr (or a Request
+    /// whose chained result is a NixExpr).
+    Instantiate,
+    /// Derivation → StorePath. Source must be an OValue::Derivation (or a
+    /// Request whose chained result is a Derivation).
+    Realise,
 }
 
 
@@ -161,13 +219,90 @@ impl OValue {
     /// `deps` are the child OValues (by reference) whose rendered forms were
     /// spliced into `body`.
     ///
-    /// The fingerprint is computed as `sha256(body)` — the cheap step-1 scheme.
-    /// It will be upgraded to `sha256(body + sorted(dep.fingerprint for dep in deps))`
-    /// in step 2 when `ODerivation` and `Request[Climb]` arrive.
+    /// STEP-2 FINGERPRINT SCHEME (the upgrade promised in step 1's annotation):
+    ///   fingerprint = sha256(body || "||" || sorted(dep.content_identity()))
+    ///
+    /// This composes with dep identities so the cache key stays stable across
+    /// rebuilds. Where deps are Nix-native content-addressed values (Derivation
+    /// has drv_path, StorePath has path), we use those identities directly
+    /// rather than reinventing the hash.
     pub fn nix_expr(body: impl Into<String>, deps: Vec<OValue>) -> Self {
         let body = body.into();
-        let fingerprint = hex::encode(Sha256::digest(body.as_bytes()));
+        let mut identities: Vec<String> = deps.iter().map(|d| d.content_identity()).collect();
+        identities.sort();
+        let composed = format!("{}||{}", body, identities.join("|"));
+        let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
         OValue::NixExpr { body, deps, fingerprint }
+    }
+
+    /// Construct an instantiated derivation value.
+    ///
+    /// `drv_path` is the canonical content identity (assigned by Nix); no
+    /// separate fingerprint is stored on the value. `outputs` enumerates the
+    /// names of buildable outputs (typically just `["out"]`).
+    /// `deps` is provenance — the OValues that were spliced into the source
+    /// expression that produced this derivation.
+    pub fn derivation(
+        drv_path: impl Into<String>,
+        outputs:  Vec<String>,
+        deps:     Vec<OValue>,
+    ) -> Self {
+        OValue::Derivation {
+            drv_path: drv_path.into(),
+            outputs,
+            deps,
+        }
+    }
+
+    /// Construct a Request value that names a rung-climb without performing it.
+    ///
+    /// The fingerprint is `sha256(kind || source.content_identity())`. Two
+    /// requests for the same climb over equivalent sources share a fingerprint
+    /// and therefore share the executor's cache slot.
+    pub fn request(kind: RequestKind, source: OValue) -> Self {
+        let kind_tag = match kind {
+            RequestKind::Instantiate => "instantiate",
+            RequestKind::Realise     => "realise",
+        };
+        let composed = format!("{}||{}", kind_tag, source.content_identity());
+        let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
+        OValue::Request {
+            kind,
+            source: Box::new(source),
+            fingerprint,
+        }
+    }
+
+    /// The canonical content identity of an OValue.
+    ///
+    /// Used to compose Request fingerprints and NixExpr fingerprints. Defined
+    /// uniformly so any OValue can appear as a dep without special-casing.
+    ///
+    /// Rules:
+    ///   - NixExpr   → its (already-composite) fingerprint
+    ///   - Derivation → sha256(drv_path)   (Nix's content-addressing, hashed
+    ///                                       so the identity is uniform-width hex)
+    ///   - StorePath  → sha256(path)
+    ///   - Request    → its fingerprint (recursive, defined at construction)
+    ///   - any other  → sha256(splice_repr())   (a stable projection of the
+    ///                                            value's spliced form; not
+    ///                                            cryptographically meaningful
+    ///                                            for inert values, just stable)
+    pub fn content_identity(&self) -> String {
+        match self {
+            OValue::NixExpr { fingerprint, .. } => fingerprint.clone(),
+            OValue::Derivation { drv_path, .. } => {
+                hex::encode(Sha256::digest(drv_path.as_bytes()))
+            }
+            OValue::StorePath { path } => {
+                hex::encode(Sha256::digest(path.as_bytes()))
+            }
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            other => {
+                let s = other.splice_repr();
+                hex::encode(Sha256::digest(s.as_bytes()))
+            }
+        }
     }
 
     /// Construct an OBlob from raw bytes and a MIME type.
@@ -215,6 +350,8 @@ impl OValue {
     pub fn is_map(&self)   -> bool { matches!(self, OValue::Map   { .. }) }
     pub fn is_blob(&self)  -> bool { matches!(self, OValue::Blob  { .. }) }
     pub fn is_nix_expr(&self) -> bool { matches!(self, OValue::NixExpr { .. }) }
+    pub fn is_derivation(&self) -> bool { matches!(self, OValue::Derivation { .. }) }
+    pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -231,6 +368,8 @@ impl OValue {
             OValue::Map   {..} => "map",
             OValue::Blob  {..} => "blob",
             OValue::NixExpr {..} => "nix_expr",
+            OValue::Derivation {..} => "derivation",
+            OValue::Request {..} => "request",
         }
     }
 }
@@ -338,6 +477,24 @@ impl OValue {
             // ONixExpr splices as the raw Nix body — the expression is already
             // valid Nix source text that can be embedded directly in a Nix context.
             OValue::NixExpr { body, .. } => body.clone(),
+
+            // A Derivation splices as its .drv path. In a Nix context this is
+            // also a valid path expression. In other languages it is just a
+            // string identifier — the receiving backend can decide.
+            OValue::Derivation { drv_path, .. } => drv_path.clone(),
+
+            // A Request has no natural splice form — it is a control value,
+            // not a data value. We splice its fingerprint as a marker; if a
+            // user is splicing requests directly into source text, they almost
+            // certainly meant to execute the request first.
+            //   STEP3: detect this case in the evaluator and warn / auto-execute.
+            OValue::Request { kind, fingerprint, .. } => {
+                let k = match kind {
+                    RequestKind::Instantiate => "instantiate",
+                    RequestKind::Realise     => "realise",
+                };
+                format!("<request:{} fp={}>", k, &fingerprint[..8])
+            }
         }
     }
 }
@@ -381,6 +538,16 @@ impl fmt::Display for OValue {
             OValue::NixExpr { fingerprint, deps, .. } => {
                 write!(f, "<nix_expr fp={} deps={}>", &fingerprint[..8], deps.len())
             },
+            OValue::Derivation { drv_path, outputs, .. } => {
+                write!(f, "<derivation {} outputs=[{}]>", drv_path, outputs.join(","))
+            }
+            OValue::Request { kind, fingerprint, .. } => {
+                let k = match kind {
+                    RequestKind::Instantiate => "instantiate",
+                    RequestKind::Realise     => "realise",
+                };
+                write!(f, "<request {} fp={}>", k, &fingerprint[..8])
+            }
         }
     }
 }
@@ -535,7 +702,7 @@ mod tests {
             bindings,
         };
         let json    = serde_json::to_string(&cmd).unwrap();
-        let decoded: OWireCommand = serde_json::from_str(&json).unwrap();
+        let _decoded: OWireCommand = serde_json::from_str(&json).unwrap();
         // Verify the cmd tag is present and correct
         assert!(json.contains(r#""cmd":"exec""#));
 
@@ -657,5 +824,146 @@ mod tests {
         let body = "pkgs.curl";
         let val  = OValue::nix_expr(body, vec![]);
         assert_eq!(val.splice_repr(), body);
+    }
+
+    // ── STEP-2 FINGERPRINT COMPOSITION ───────────────────────────────────────
+
+    /// The upgraded step-2 fingerprint must change when deps change, even if
+    /// the body text is identical. This is what makes the cache key honest
+    /// when the same Nix source text uses different upstream derivations.
+    #[test]
+    fn nix_expr_fingerprint_depends_on_deps() {
+        let dep_a = OValue::store_path("/nix/store/aaa-foo");
+        let dep_b = OValue::store_path("/nix/store/bbb-bar");
+        let with_a = OValue::nix_expr("pkgs.x", vec![dep_a]);
+        let with_b = OValue::nix_expr("pkgs.x", vec![dep_b]);
+        if let (OValue::NixExpr { fingerprint: fa, .. },
+                OValue::NixExpr { fingerprint: fb, .. }) = (&with_a, &with_b) {
+            assert_ne!(fa, fb,
+                "same body + different deps must produce different fingerprints");
+        }
+    }
+
+    /// Dep order must not affect the fingerprint (we sort identities before hashing).
+    #[test]
+    fn nix_expr_fingerprint_dep_order_invariant() {
+        let a = OValue::store_path("/nix/store/a");
+        let b = OValue::store_path("/nix/store/b");
+        let ab = OValue::nix_expr("x", vec![a.clone(), b.clone()]);
+        let ba = OValue::nix_expr("x", vec![b, a]);
+        if let (OValue::NixExpr { fingerprint: fab, .. },
+                OValue::NixExpr { fingerprint: fba, .. }) = (&ab, &ba) {
+            assert_eq!(fab, fba,
+                "dep order must not affect fingerprint (identities are sorted)");
+        }
+    }
+
+    // ── DERIVATION ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn derivation_constructor_stores_fields() {
+        let d = OValue::derivation(
+            "/nix/store/abc-foo.drv",
+            vec!["out".into(), "dev".into()],
+            vec![],
+        );
+        if let OValue::Derivation { drv_path, outputs, deps } = &d {
+            assert_eq!(drv_path, "/nix/store/abc-foo.drv");
+            assert_eq!(outputs, &vec!["out".to_string(), "dev".to_string()]);
+            assert!(deps.is_empty());
+        } else { panic!("expected Derivation"); }
+    }
+
+    #[test]
+    fn derivation_content_identity_is_hash_of_drv_path() {
+        let d = OValue::derivation("/nix/store/abc.drv", vec!["out".into()], vec![]);
+        let id = d.content_identity();
+        assert_eq!(id.len(), 64);
+        // Same drv_path → same identity
+        let d2 = OValue::derivation("/nix/store/abc.drv", vec![], vec![]);
+        assert_eq!(id, d2.content_identity(),
+            "content_identity depends only on drv_path, not outputs/deps");
+    }
+
+    #[test]
+    fn derivation_type_name_and_round_trip() {
+        let d = OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]);
+        assert_eq!(d.type_name(), "derivation");
+        assert!(d.is_derivation());
+        let json = serde_json::to_string(&d).unwrap();
+        let decoded: OValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, decoded);
+    }
+
+    // ── REQUEST ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn request_construction_carries_kind_and_source() {
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
+        let req  = OValue::request(RequestKind::Instantiate, expr.clone());
+        if let OValue::Request { kind, source, fingerprint } = &req {
+            assert_eq!(*kind, RequestKind::Instantiate);
+            assert_eq!(**source, expr);
+            assert_eq!(fingerprint.len(), 64);
+        } else { panic!("expected Request"); }
+    }
+
+    #[test]
+    fn request_fingerprint_composes_from_source_identity() {
+        let e1 = OValue::nix_expr("pkgs.hello", vec![]);
+        let e2 = OValue::nix_expr("pkgs.hello", vec![]);
+        let r1 = OValue::request(RequestKind::Instantiate, e1);
+        let r2 = OValue::request(RequestKind::Instantiate, e2);
+        if let (OValue::Request { fingerprint: f1, .. },
+                OValue::Request { fingerprint: f2, .. }) = (&r1, &r2) {
+            assert_eq!(f1, f2,
+                "two requests with identical-content sources must share a fingerprint");
+        }
+    }
+
+    #[test]
+    fn request_fingerprint_differs_by_kind() {
+        // Two requests over the same source but different kinds must differ.
+        // (Realise-over-NixExpr is type-incorrect at execution but the
+        //  fingerprint computation doesn't care about that — it's purely
+        //  content-based.)
+        let src = OValue::nix_expr("pkgs.hello", vec![]);
+        let r_inst = OValue::request(RequestKind::Instantiate, src.clone());
+        let r_real = OValue::request(RequestKind::Realise,     src);
+        if let (OValue::Request { fingerprint: fi, .. },
+                OValue::Request { fingerprint: fr, .. }) = (&r_inst, &r_real) {
+            assert_ne!(fi, fr,
+                "requests must be distinguished by kind in their fingerprint");
+        }
+    }
+
+    /// Chained requests (e.g. realise(instantiate(expr))) compose cleanly:
+    /// the outer fingerprint is determined by the inner request's fingerprint,
+    /// not by walking into the inner source.
+    #[test]
+    fn request_chain_fingerprint_is_stable() {
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
+        let inst = OValue::request(RequestKind::Instantiate, expr);
+        let real = OValue::request(RequestKind::Realise, inst.clone());
+
+        if let OValue::Request { fingerprint: outer, .. } = &real {
+            // Recomputing with the same inner produces the same outer fp
+            let real2 = OValue::request(RequestKind::Realise, inst);
+            if let OValue::Request { fingerprint: outer2, .. } = &real2 {
+                assert_eq!(outer, outer2,
+                    "chained request fingerprint must be stable across reconstructions");
+            }
+        }
+    }
+
+    #[test]
+    fn request_type_name_and_round_trip() {
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
+        let req  = OValue::request(RequestKind::Instantiate, expr);
+        assert_eq!(req.type_name(), "request");
+        assert!(req.is_request());
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: OValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
     }
 }

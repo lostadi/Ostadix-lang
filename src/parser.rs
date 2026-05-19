@@ -14,6 +14,24 @@ pub enum ONode {
         env_id: u32,
         body: Vec<ONode>,
     },
+
+    /// A function call: `name(arg1, arg2, ...)`.
+    ///
+    /// Introduced in STEP 2 as the surface syntax for the rung-climb operators
+    /// `instantiate(expr)`, `realise(drv)`, and the explicit performer `now(req)`.
+    /// Each arg is itself an ONode — args can be VarRef, nested Call, or a
+    /// TypedExpr (the latter only at let-binding RHS today).
+    ///
+    /// Parsed at two positions for step 2:
+    ///   1. The RHS of a let-binding:                  `let drv = instantiate($expr)`
+    ///   2. As a top-level statement:                  `realise($drv)`
+    /// Calls are NOT parsed inside typed expression bodies (the body is raw
+    /// source text for the receiving backend; embedding O-level calls there
+    /// would be ambiguous). STEP3 may lift this.
+    Call {
+        fn_name: String,
+        args:    Vec<ONode>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +110,20 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            // STEP-2: try to parse a top-level call like `instantiate($x)` or
+            // `realise(instantiate($x))`. Only attempted at the document top
+            // level (expected_closer.is_none()) so it doesn't eat raw text
+            // inside typed-expr bodies.
+            if expected_closer.is_none() {
+                let stmt_start = self.pos;
+                if let Some(call) = self.try_parse_call()? {
+                    self.flush_text(&mut nodes, text_start, stmt_start);
+                    nodes.push(call);
+                    text_start = self.pos;
+                    continue;
+                }
+            }
+
             self.advance_one_byte();
         }
 
@@ -135,11 +167,22 @@ impl<'a> Parser<'a> {
         self.advance_one_byte();
         self.skip_whitespace();
 
+        // STEP-2: a let RHS may now be a Call (instantiate(...), realise(...))
+        // in addition to a typed expression. Try Call first; on miss, fall
+        // through to the typed-expression path.
+        if let Some(call) = self.try_parse_call()? {
+            return Ok(Some(ONode::LetBinding {
+                name,
+                expr: Box::new(call),
+            }));
+        }
+
         let tag = match self.try_parse_opener()? {
             Some(tag) => tag,
             None => {
                 bail!(
-                    "Line {}: let binding `{}` must be assigned a typed expression",
+                    "Line {}: let binding `{}` must be assigned a typed expression \
+                     or a call",
                     self.line,
                     name
                 );
@@ -156,6 +199,81 @@ impl<'a> Parser<'a> {
                 body,
             }),
         }))
+    }
+
+    /// Try to parse a function call: `name(arg1, arg2, ...)`.
+    ///
+    /// Returns `Ok(Some(call))` on a successful parse, `Ok(None)` if the input
+    /// at the current position isn't a call (so the caller can try other
+    /// productions), and `Err(_)` if it starts to look like a call but is
+    /// malformed mid-parse (we commit to the call path once we've seen
+    /// `name(`).
+    ///
+    /// Arguments are themselves ONodes — currently restricted to VarRef
+    /// (`$name`) and nested Call. STEP3 may extend args to include
+    /// TypedExpr (e.g. `instantiate(nix_expr^(...)_nix_expr)`) once the
+    /// surrounding lifecycle is sorted.
+    fn try_parse_call(&mut self) -> Result<Option<ONode>> {
+        let original_pos = self.pos;
+        let original_line = self.line;
+
+        let name = match self.parse_identifier() {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        // The opener of a TypedExpr is `name(` BUT with `name` being a
+        // registered backend (or `name[N](`). For a call we want plain
+        // `name(` with `name` NOT being a registered backend (otherwise it
+        // would be ambiguous with a typed expression with no body).
+        if self.registered_backends.contains(&name)
+            || self.current_byte() != Some(b'(')
+        {
+            self.pos = original_pos;
+            self.line = original_line;
+            return Ok(None);
+        }
+
+        // Commit: from here on, errors are real errors.
+        self.advance_one_byte(); // consume '('
+        self.skip_whitespace();
+
+        let mut args = Vec::new();
+        loop {
+            if self.current_byte() == Some(b')') {
+                self.advance_one_byte();
+                break;
+            }
+
+            // Each arg is either a VarRef ($name) or a nested Call (name(...)).
+            let arg = if self.current_byte() == Some(b'$') {
+                let var = self.try_parse_var_ref()?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Line {}: expected variable reference after $", self.line
+                    ))?;
+                ONode::VarRef(var)
+            } else if let Some(nested) = self.try_parse_call()? {
+                nested
+            } else {
+                bail!(
+                    "Line {}: in call `{}(...)`, expected $var or nested call",
+                    self.line, name
+                );
+            };
+            args.push(arg);
+
+            self.skip_whitespace();
+            match self.current_byte() {
+                Some(b',') => { self.advance_one_byte(); self.skip_whitespace(); }
+                Some(b')') => { self.advance_one_byte(); break; }
+                _ => bail!(
+                    "Line {}: in call `{}(...)`, expected ',' or ')'",
+                    self.line, name
+                ),
+            }
+        }
+
+        Ok(Some(ONode::Call { fn_name: name, args }))
     }
 
     fn try_parse_var_ref(&mut self) -> Result<Option<String>> {
