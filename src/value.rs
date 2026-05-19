@@ -26,6 +26,8 @@ use std::fmt;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use hex;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -112,6 +114,26 @@ pub enum OValue {
     /// required and neither is "the value" more than the other.
     #[serde(rename = "blob")]
     Blob { v: String, mime: String },   // v = base64-encoded bytes on wire
+
+    /// A lazy Nix expression that has not yet been passed to `nix eval`.
+    ///
+    /// This is the "deferred drv rung" value produced by `nix_expr^(...)_nix_expr`
+    /// blocks. It holds:
+    ///   - `body`:        the fully-spliced Nix source text (ready to hand to nix eval)
+    ///   - `deps`:        the child OValues whose rendered forms were spliced into body,
+    ///                    carried by reference (step 1 decision — simpler, lets the
+    ///                    renderer re-traverse the tree if needed)
+    ///   - `fingerprint`: sha256(body) hex string — cheap cache key (step 1 decision;
+    ///                    upgraded to sha256(body + sorted dep fingerprints) in step 2)
+    ///
+    /// `nix^(...)_nix` is unchanged — it is the "evaluate immediately to a JSON value"
+    /// shortcut that bypasses this rung entirely (step 1 decision, option a).
+    #[serde(rename = "nix_expr")]
+    NixExpr {
+        body:        String,
+        deps:        Vec<OValue>,
+        fingerprint: String,
+    },
 }
 
 
@@ -132,6 +154,21 @@ impl OValue {
     pub fn store_path(path: impl Into<String>) -> Self { OValue::StorePath { path: path.into() } }
     pub fn list(items: Vec<OValue>) -> Self { OValue::List  { v: items } }
     pub fn map(entries: HashMap<String, OValue>) -> Self { OValue::Map { v: entries } }
+
+    /// Construct a lazy Nix expression value.
+    ///
+    /// `body` is the fully-spliced Nix source text.
+    /// `deps` are the child OValues (by reference) whose rendered forms were
+    /// spliced into `body`.
+    ///
+    /// The fingerprint is computed as `sha256(body)` — the cheap step-1 scheme.
+    /// It will be upgraded to `sha256(body + sorted(dep.fingerprint for dep in deps))`
+    /// in step 2 when `ODerivation` and `Request[Climb]` arrive.
+    pub fn nix_expr(body: impl Into<String>, deps: Vec<OValue>) -> Self {
+        let body = body.into();
+        let fingerprint = hex::encode(Sha256::digest(body.as_bytes()));
+        OValue::NixExpr { body, deps, fingerprint }
+    }
 
     /// Construct an OBlob from raw bytes and a MIME type.
     /// The bytes are base64-encoded here; the wire representation stores
@@ -177,6 +214,7 @@ impl OValue {
     pub fn is_list(&self)  -> bool { matches!(self, OValue::List  { .. }) }
     pub fn is_map(&self)   -> bool { matches!(self, OValue::Map   { .. }) }
     pub fn is_blob(&self)  -> bool { matches!(self, OValue::Blob  { .. }) }
+    pub fn is_nix_expr(&self) -> bool { matches!(self, OValue::NixExpr { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -192,6 +230,7 @@ impl OValue {
             OValue::List  {..} => "list",
             OValue::Map   {..} => "map",
             OValue::Blob  {..} => "blob",
+            OValue::NixExpr {..} => "nix_expr",
         }
     }
 }
@@ -296,6 +335,9 @@ impl OValue {
             OValue::Blob  { v, mime } => {
                 format!("data:{};base64,{}", mime, v)
             },
+            // ONixExpr splices as the raw Nix body — the expression is already
+            // valid Nix source text that can be embedded directly in a Nix context.
+            OValue::NixExpr { body, .. } => body.clone(),
         }
     }
 }
@@ -336,6 +378,9 @@ impl fmt::Display for OValue {
             OValue::Html { v } => write!(f, "{}", v),
             OValue::StorePath { path } => write!(f, "{}", path),
             OValue::Blob  { mime, .. } => write!(f, "<blob:{}>", mime),
+            OValue::NixExpr { fingerprint, deps, .. } => {
+                write!(f, "<nix_expr fp={} deps={}>", &fingerprint[..8], deps.len())
+            },
         }
     }
 }
@@ -540,5 +585,77 @@ mod tests {
         assert_eq!(OValue::int(42).splice_repr(),      "42");
         assert_eq!(OValue::float(3.0).splice_repr(),   "3.0");
         assert_eq!(OValue::str_("hi").splice_repr(),   "hi");
+    }
+
+    /// ONixExpr constructor must compute a stable sha256(body) fingerprint,
+    /// store deps by reference, and round-trip through JSON without loss.
+    #[test]
+    fn nix_expr_fingerprint_is_sha256_of_body() {
+        let body  = "pkgs.hello";
+        let val   = OValue::nix_expr(body, vec![]);
+
+        if let OValue::NixExpr { fingerprint, .. } = &val {
+            // sha256("pkgs.hello") = 6b0fc1cf4a0e73a498b0bd6b0d0e6ab91e01bc59…
+            // Just verify it is a 64-hex-character string (256 bits).
+            assert_eq!(fingerprint.len(), 64,
+                "fingerprint should be 64 hex chars (sha256), got {:?}", fingerprint);
+            assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+                "fingerprint must be hex, got {:?}", fingerprint);
+        } else {
+            panic!("expected OValue::NixExpr, got {:?}", val);
+        }
+    }
+
+    #[test]
+    fn nix_expr_same_body_produces_same_fingerprint() {
+        let a = OValue::nix_expr("pkgs.hello", vec![]);
+        let b = OValue::nix_expr("pkgs.hello", vec![]);
+        if let (OValue::NixExpr { fingerprint: fa, .. }, OValue::NixExpr { fingerprint: fb, .. }) = (&a, &b) {
+            assert_eq!(fa, fb, "identical bodies must produce identical fingerprints");
+        }
+    }
+
+    #[test]
+    fn nix_expr_different_body_produces_different_fingerprint() {
+        let a = OValue::nix_expr("pkgs.hello", vec![]);
+        let b = OValue::nix_expr("pkgs.world", vec![]);
+        if let (OValue::NixExpr { fingerprint: fa, .. }, OValue::NixExpr { fingerprint: fb, .. }) = (&a, &b) {
+            assert_ne!(fa, fb, "different bodies must produce different fingerprints");
+        }
+    }
+
+    #[test]
+    fn nix_expr_deps_are_stored_by_reference() {
+        let dep   = OValue::str_("a_dep");
+        let val   = OValue::nix_expr("some expr", vec![dep.clone()]);
+        if let OValue::NixExpr { deps, .. } = &val {
+            assert_eq!(deps.len(), 1);
+            assert_eq!(deps[0], dep);
+        } else {
+            panic!("expected OValue::NixExpr");
+        }
+    }
+
+    #[test]
+    fn nix_expr_round_trips_through_json() {
+        let dep = OValue::int(42);
+        let original = OValue::nix_expr("(builtins.add 1 2)", vec![dep]);
+        let json     = serde_json::to_string(&original).unwrap();
+        let decoded: OValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded, "ONixExpr must round-trip through JSON");
+    }
+
+    #[test]
+    fn nix_expr_type_name_is_nix_expr() {
+        let val = OValue::nix_expr("x", vec![]);
+        assert_eq!(val.type_name(), "nix_expr");
+        assert!(val.is_nix_expr());
+    }
+
+    #[test]
+    fn nix_expr_splice_repr_is_body() {
+        let body = "pkgs.curl";
+        let val  = OValue::nix_expr(body, vec![]);
+        assert_eq!(val.splice_repr(), body);
     }
 }

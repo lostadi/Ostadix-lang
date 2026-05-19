@@ -118,7 +118,11 @@ impl Evaluator {
         scope:  &HashMap<String, OValue>,
     ) -> Result<OValue> {
         // Step 1 — build the fully-spliced source string for the backend.
-        let mut buf = String::new();
+        // For `nix_expr` blocks we also collect the evaluated child OValues as
+        // deps (by reference, step-1 decision) so the returned ONixExpr carries
+        // the full dependency tree for later re-traversal.
+        let mut buf  = String::new();
+        let mut deps: Vec<OValue> = Vec::new();
 
         for child in body {
             match child {
@@ -134,6 +138,9 @@ impl Evaluator {
                         .get(name)
                         .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?;
                     buf.push_str(&self.render_child(lang, val));
+                    if lang == "nix_expr" {
+                        deps.push(val.clone());
+                    }
                 }
 
                 ONode::TypedExpr {
@@ -146,8 +153,19 @@ impl Evaluator {
                     let child_val =
                         self.eval_typed_expr(child_lang, *child_env_id, child_body, scope)?;
                     buf.push_str(&self.render_child(lang, &child_val));
+                    if lang == "nix_expr" {
+                        deps.push(child_val);
+                    }
                 }
             }
+        }
+
+        // Short-circuit for `nix_expr`: return a lazy ONixExpr instead of
+        // calling the Nix shim immediately.  The fingerprint is sha256(body)
+        // — the cheap step-1 scheme.  `nix^` (immediate evaluation) is
+        // unchanged (step-1 decision, option a).
+        if lang == "nix_expr" {
+            return Ok(OValue::nix_expr(buf, deps));
         }
 
         // Step 2 — send the completed splice buffer to the backend.
@@ -259,6 +277,9 @@ fn render_nix(val: &OValue) -> String {
             format!("{{ {} }}", items)
         }
         OValue::Blob { v, .. } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
+        // An ONixExpr spliced into a Nix context is its already-assembled body —
+        // it is a valid Nix expression that can be parenthesised inline.
+        OValue::NixExpr { body, .. } => format!("({})", body),
     }
 }
 
@@ -327,6 +348,17 @@ fn render_python(val: &OValue) -> String {
 
             format!("{{'mime': {}, 'base64': {}}}", mime_lit, data_lit)
         }
+
+        OValue::NixExpr { body, fingerprint, deps } => {
+            let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
+            let fp_lit   = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
+            let deps_rendered = deps
+                .iter()
+                .map(render_python)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ONixExpr({}, fp={}, deps=[{}])", body_lit, fp_lit, deps_rendered)
+        }
     }
 }
 
@@ -373,6 +405,14 @@ fn render_html(val: &OValue) -> String {
         }
 
         OValue::Blob { v, mime } => render_html_blob(v, mime),
+
+        OValue::NixExpr { body, fingerprint, .. } => {
+            format!(
+                "<code class=\"o-nix-expr\" data-fp=\"{}\">{}</code>",
+                html_escape(fingerprint),
+                html_escape(body),
+            )
+        }
     }
 }
 
@@ -445,6 +485,7 @@ fn render_latex(val: &OValue) -> String {
                 .join(", ")
         }
         OValue::Blob { mime, .. } => format!("\\texttt{{<blob:{}>}}", mime),
+        OValue::NixExpr { body, .. } => format!("\\texttt{{{}}}", body.replace("_", "\\_")),
     }
 }
 
@@ -472,6 +513,7 @@ fn render_markdown(val: &OValue) -> String {
                 .join("\n")
         }
         OValue::Blob { mime, .. } => format!("<blob:{}>", mime),
+        OValue::NixExpr { body, .. } => format!("`{}`", body),
     }
 }
 
@@ -682,5 +724,66 @@ mod tests {
             .eval_node(&ONode::VarRef("x".to_string()), &scope)
             .unwrap();
         assert_eq!(result, OValue::int(99));
+    }
+
+    // ── nix_expr backend ─────────────────────────────────────────────────────
+
+    /// `nix_expr^(...)_nix_expr` must return an ONixExpr without calling the
+    /// Nix shim.  No shim process is spawned — the body is captured lazily.
+    #[test]
+    fn nix_expr_block_returns_onixexpr_without_calling_shim() {
+        let mut e = Evaluator::new("/tmp".into());
+        let result = e.eval_typed_expr(
+            "nix_expr",
+            u32::MAX,
+            &[ONode::RawText("pkgs.hello".to_string())],
+            &HashMap::new(),
+        ).unwrap();
+
+        assert!(result.is_nix_expr(), "expected ONixExpr, got {:?}", result);
+
+        if let OValue::NixExpr { body, deps, fingerprint } = &result {
+            assert_eq!(body, "pkgs.hello");
+            assert!(deps.is_empty());
+            assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
+        }
+    }
+
+    /// Child OValues from inner typed expressions should appear in deps
+    /// and their rendered form should be spliced into body.
+    #[test]
+    fn nix_expr_block_collects_deps_from_child_typed_exprs() {
+        let mut e    = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("n".to_string(), OValue::int(7));
+
+        // nix_expr^( prefix $n suffix )_nix_expr
+        // $n is a VarRef that resolves to OValue::Int(7)
+        let body_nodes = vec![
+            ONode::RawText("prefix ".to_string()),
+            ONode::VarRef("n".to_string()),
+            ONode::RawText(" suffix".to_string()),
+        ];
+
+        let result = e.eval_typed_expr("nix_expr", u32::MAX, &body_nodes, &scope).unwrap();
+
+        if let OValue::NixExpr { body, deps, .. } = &result {
+            // render_nix for OInt(7) → "7"
+            assert_eq!(body, "prefix 7 suffix");
+            assert_eq!(deps.len(), 1);
+            assert_eq!(deps[0], OValue::int(7));
+        } else {
+            panic!("expected OValue::NixExpr, got {:?}", result);
+        }
+    }
+
+    /// A NixExpr value spliced into a nix context is parenthesised so it
+    /// composes cleanly as a sub-expression.
+    #[test]
+    fn nix_expr_render_in_nix_context_is_parenthesised() {
+        let e   = Evaluator::new("/tmp".into());
+        let val = OValue::nix_expr("pkgs.hello", vec![]);
+        let rendered = e.render_child("nix", &val);
+        assert_eq!(rendered, "(pkgs.hello)");
     }
 }
