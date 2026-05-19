@@ -1,1 +1,1 @@
-/Users/ustad/O-lang/target/release/O: /Users/ustad/O-lang/src/eval.rs /Users/ustad/O-lang/src/main.rs /Users/ustad/O-lang/src/parser.rs /Users/ustad/O-lang/src/process.rs /Users/ustad/O-lang/src/value.rs
+/Users/ustad/O-lang_rust_edition_from_10-10-2026/target/release/O: /Users/ustad/O-lang_rust_edition_from_10-10-2026/src/eval.rs /Users/ustad/O-lang_rust_edition_from_10-10-2026/src/main.rs /Users/ustad/O-lang_rust_edition_from_10-10-2026/src/parser.rs /Users/ustad/O-lang_rust_edition_from_10-10-2026/src/process.rs /Users/ustad/O-lang_rust_edition_from_10-10-2026/src/value.rs
