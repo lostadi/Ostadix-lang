@@ -57,6 +57,86 @@ __oval_result__ = $answer + 1
 )_python
 ```
 
+### Result from a Python block
+
+In a Python block the return value is (in priority order):
+
+1. `__oval_result__` — set explicitly by the block.
+2. The value of the last expression — a trailing expression (no assignment) is
+   captured automatically, matching Python REPL semantics.
+3. Captured `stdout` — anything printed by `print()` if neither of the above
+   apply.
+
+```
+python^(
+6 * 7          # trailing expression → returns OInt(42)
+)_python
+```
+
+### `O^(...)_O` sequencing block
+
+`O^(...)_O` is the host / sequencing backend. It evaluates its children
+left-to-right in document order. If exactly one non-null value is produced it
+is returned directly; if multiple non-null values are produced they are
+returned as an `OList`; an empty or all-null body returns `ONull`. It is the
+canonical outer wrapper for full `.O` scripts:
+
+```
+O^(
+  python[0]^( x = 10 )_python[0]
+  python[0]^( x * x  )_python[0]
+)_O
+```
+
+### Block aliases
+
+The language tag in an opener/closer can use short aliases that resolve to
+their canonical backend:
+
+| Alias  | Canonical |
+|--------|-----------|
+| `py`   | `python`  |
+| `md`   | `markdown`|
+| `tex`  | `latex`   |
+| `plain`| `text`    |
+| `o`    | `O`       |
+
+### Shebang support
+
+`.O` files can start with a shebang line — the runtime strips it before
+parsing. This requires the `O` binary to be on `PATH` (e.g. via `cargo
+install` or a symlink to the `cargo build` output):
+
+```bash
+#!/usr/bin/env O
+python^( 6 * 7 )_python
+```
+
+### Builtin calls
+
+| Call | Description |
+|------|-------------|
+| `instantiate(expr)` | `ONixExpr` → `ODerivation`. Runs `nix-instantiate`. |
+| `realise(drv)` | `ODerivation` → `OStorePath`. Builds the derivation. |
+| `activate(path)` | `OStorePath` → `OSystem`. Switches to the NixOS configuration (dry-run unless `O_LANG_ALLOW_ACTIVATION=1` is set). |
+| `current_system()` | Returns an `OSystem` for the currently active profile. |
+| `lazy(expr)` | Evaluates `expr` under `Policy::Lazy` — Requests are built but not executed. |
+| `now(req)` | Forces a `Request` or `lazy(...)` expression, performing the deferred computation. |
+
+### `{lazy}` and `{defer}` block attributes
+
+Append `{lazy}` or `{defer}` to any language tag to capture the block as a
+thunk without firing the shim immediately:
+
+```
+let thunk = python{defer}^( import time; time.time() )_python{defer}
+# thunk is a Request[Eval]; no Python subprocess has run yet.
+let result = now($thunk)   # force it here
+```
+
+- `{lazy}` — pure backends only; result is cached by fingerprint.
+- `{defer}` — any backend; never cached; re-runs every time it is forced.
+
 ### Included examples
 
 | File | What it shows |
@@ -64,16 +144,27 @@ __oval_result__ = $answer + 1
 | `examples/hello.O` | Minimal Python arithmetic. |
 | `examples/bindings.O` | `let` binding and `$var` splice. |
 | `examples/nested_splice.O` | A Python block nested inside another Python block. |
+| `examples/html_basic.O` | HTML template with an embedded Python computation. |
 | `examples/html_python_html.O` | HTML root with inner Python that itself generates HTML. |
+| `examples/python_html_python.O` | Python outer ▶ HTML inner ▶ Python innermost. |
 | `examples/html_escape.O` | HTML-escaping of spliced values. |
 | `examples/html_raw_roundtrip.O` | Passthrough of raw HTML fragments via `OHtml`. |
+| `examples/computed_plot.O` | Matplotlib figure returned as `OBlob` and rendered as `<img>` by the HTML backend. |
+| `examples/literate_report.O` | Literate report: Markdown wrapping persistent Python environments. |
 | `examples/nix_basic.O` | Nix expressions evaluated inside O. |
 | `examples/nix_python_html.O` | Nix → Python → HTML value pipeline. |
 | `examples/nix_storepath.O` | Nix-derived store paths rendered as HTML links. |
 | `examples/nix_storepath_python.O` | Python reading a Nix `OStorePath`. |
+| `examples/instantiate_realise_basic.O` | `nix_expr^`, `instantiate()`, and `realise()` rung climb. |
+| `examples/lazy_request_basic.O` | `lazy(...)` call form — constructs `Request` values without executing them. |
+| `examples/lazy_defer_attrs_basic.O` | `{lazy}` and `{defer}` block attributes — thunk creation without immediate shim dispatch. |
+| `examples/os_as_participant_basic.O` | OS-as-participant: `activate()`, `current_system()`, the four-rung Nix lattice. |
+| `examples/nixos_test.O` | Single-machine NixOS VM test inside an O-lang script. |
+| `examples/nixos_test_two_machine.O` | Two-machine NixOS test (server + client). |
 | `examples/persist.O` | Persistent per-`[n]` Python environments across expressions. |
 | `examples/env_split.O` | Two independent Python environments in one document. |
 | `examples/ephemeral.O` | Ephemeral (single-use) environments via `env_id = u32::MAX`. |
+| `examples/trailing_expr.O` | A trailing expression returns its value without `__oval_result__`. |
 | `examples/meta_eval.O` | `quote^` and `O.eval` — homoiconicity across languages. |
 
 ---
@@ -145,7 +236,7 @@ communicates with them over **newline-delimited JSON IPC**:
 Shim resolution order for language tag `<lang>` under `shim_dir`:
 `<lang>_shim.py` → `<lang>_shim` → `<lang>.py` → `<lang>`
 
-**Exception:** `html` is handled entirely inline in `eval.rs` — no subprocess.
+**Exception:** `html`, `O`, and `quote` are handled entirely inline in `eval.rs` — no subprocess.
 
 ### Python reference implementation (`o_lang/`) — used by Python test suite
 
@@ -161,14 +252,20 @@ o_lang/
     ├── html_backend.py
     ├── markdown_backend.py
     ├── latex_backend.py
-    └── text_backend.py
+    ├── text_backend.py
+    ├── nix_backend.py
+    ├── nix_store_backend.py
+    ├── nixos_test_backend.py
+    ├── o_backend.py
+    └── quote_backend.py
 ```
 
 ### Registered backends
 
 | Tag          | Shim / handler          | Notes |
 |--------------|-------------------------|-------|
-| `python`     | `python_shim.py`        | Real `exec`, persistent globals per env. Returns `__oval_result__` or captured stdout. |
+| `O`          | inline (`eval.rs`)      | Sequencing block. Evaluates children left-to-right; returns the last non-null value, or an `OList` if multiple non-null values are produced. |
+| `python`     | `python_shim.py`        | Real `exec`, persistent globals per env. Returns `__oval_result__`, trailing expression, or captured stdout (in that order). |
 | `html`       | inline (`eval.rs`)      | Source passthrough. Blobs → `data:` URL `<img>`. |
 | `markdown`   | shim                    | Source passthrough. |
 | `latex`      | shim                    | Source passthrough. |
@@ -177,9 +274,10 @@ o_lang/
 | `rust`       | shim                    | Rust snippet execution. |
 | `racket`     | shim                    | Racket evaluation. |
 | `nix`        | `nix_shim.py`           | Nix expression evaluation via `nix-instantiate`. |
-| `nix_expr`   | inline (`nix_ops.rs`)   | Nix expression → derivation. |
+| `nix_expr`   | inline (`nix_ops.rs`)   | Nix expression → `ONixExpr` (deferred derivation). |
 | `nix_store`  | `nix_store_shim.py`     | Builds a derivation and returns an `OStorePath`. |
 | `nixos_test` | `nixos_test_shim.py`    | NixOS VM test driver. |
+| `quote`      | inline (`eval.rs`)      | Captures body as `OExpr` without evaluation. Used with `O.eval(q)`. |
 
 Adding a new language (Rust runtime): write `backends/<lang>_shim.py`
 implementing `exec` / `cleanup` / `ping`, add the tag to
@@ -203,7 +301,17 @@ Every value crossing a language boundary is an `OValue`. JSON encoding:
 {"t":"list","v":[...]}
 {"t":"map","v":{"key":{...}}}
 {"t":"blob","v":"<base64>","mime":"image/png"}
+{"t":"expr","src":"<O source text>"}
+{"t":"nix_expr","body":"...","fingerprint":"...","deps":[...]}
+{"t":"derivation","drv_path":"/nix/store/....drv","outputs":["out"],"deps":[...]}
+{"t":"request","kind":{...},"source":{...},"fingerprint":"..."}
+{"t":"thunk","body":"...","fingerprint":"...","deps":[...]}
+{"t":"system","profile_path":"/nix/var/nix/profiles/system"}
 ```
+
+`store_path`, `expr`, `nix_expr`, `derivation`, `request`, `thunk`,
+and `system` are Rust-edition extensions not present in the Python MVP's
+`OValue`. `html` is supported by both runtimes.
 
 ---
 
@@ -245,9 +353,12 @@ olangc examples/hello.O --shim-dir ./backends --keep-build-dir
 ## Status
 
 v0.1.0 — Rust runtime primary, Python reference implementation for
-cross-validation. Twelve registered backends, persistent envs per `[n]`,
-leaves-up eager evaluation, `let` bindings, `lazy^` / `defer^` policy
-blocks, `quote^` + `O.eval` homoiconicity, `olangc` AOT compiler.
+cross-validation. Fourteen registered backends, persistent envs per `[n]`,
+leaves-up eager evaluation, `let` bindings, `{lazy}` / `{defer}` block
+attributes, `lazy()` / `now()` call forms, `quote^` + `O.eval`
+homoiconicity, four-rung Nix lattice (`nix_expr` → `instantiate` →
+`realise` → `activate`), OS-as-participant (`OSystem`), `olangc` AOT
+compiler, shebang support.
 
 See `SPEC.md` for the formal language specification and known limitations.
 
