@@ -259,6 +259,7 @@ mod eval;
 mod process;
 mod nix_ops;
 mod nixos_ops;
+mod scheduler;
 
 use eval::Evaluator;
 use parser::Parser;
