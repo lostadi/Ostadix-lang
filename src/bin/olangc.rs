@@ -10,7 +10,10 @@
 //
 // What it does:
 //   1. Reads the .O source file.
-//   2. Reads all backend shim scripts from --shim-dir (defaults to backends/).
+//   2. Resolves backend shim scripts: starts from shims that are bundled into
+//      olangc itself at olangc's compile time (so olangc works from any cwd
+//      with no adjacent backends/ directory), then optionally overlays files
+//      from --shim-dir if the user passed one.
 //   3. Creates a temporary Cargo project that bundles:
 //        - All O-lang runtime source files (embedded in olangc at its own
 //          compile time via include_str!, so olangc is self-contained).
@@ -59,6 +62,26 @@ const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bundled backend shim scripts — embedded at olangc's own compile time.
+//
+// olangc is the single source of truth for shim contents: every compiled .O
+// binary gets these scripts extracted to its per-invocation temp directory
+// at runtime.  Bundling the shims into olangc itself (rather than re-reading
+// them from a `backends/` directory next to the cwd at every invocation) is
+// what makes `olangc foo.O` work from any directory, including one with no
+// adjacent `backends/`.
+//
+// To replace a shim during development, pass `--shim-dir <path>`; any file
+// in that directory whose name matches a bundled shim overrides it, and any
+// file with a new name is appended to the embedded set.
+const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
+    ("nix_shim.py",        include_bytes!("../../backends/nix_shim.py")),
+    ("nix_store_shim.py",  include_bytes!("../../backends/nix_store_shim.py")),
+    ("nixos_test_shim.py", include_bytes!("../../backends/nixos_test_shim.py")),
+    ("python_shim.py",     include_bytes!("../../backends/python_shim.py")),
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -80,9 +103,12 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Directory containing backend shim scripts (default: backends/)
-    #[arg(long, default_value = "backends")]
-    shim_dir: PathBuf,
+    /// Override or extend the bundled backend shim scripts with files from
+    /// this directory.  Files with names matching a bundled shim replace it;
+    /// files with new names are added.  If omitted, olangc uses only its
+    /// built-in shims, so it works from any working directory.
+    #[arg(long)]
+    shim_dir: Option<PathBuf>,
 
     /// Keep the intermediate build directory after compilation (useful for debugging)
     #[arg(long)]
@@ -111,10 +137,11 @@ fn main() -> Result<()> {
     let source = fs::read_to_string(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
-    let shims = read_shims(&cli.shim_dir)?;
+    let shims = read_shims(cli.shim_dir.as_deref())?;
 
     let build_dir = create_build_dir()?;
     eprintln!("olangc: building in {}", build_dir.display());
+    eprintln!("olangc: embedding {} shim script(s)", shims.len());
 
     let result = assemble_and_compile(&cli.input, &source, &shims, &build_dir, &output);
 
@@ -355,29 +382,49 @@ strip         = "symbols"
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Read all files in `shim_dir` as (filename, bytes) pairs, sorted by name.
-/// If the directory does not exist, returns an empty list (not an error —
-/// some programs don't use any shim-backed backends).
-fn read_shims(shim_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
-    if !shim_dir.exists() {
-        return Ok(Vec::new());
-    }
+/// Resolve the shim set used for a compilation.
+///
+/// Always starts from `BUNDLED_SHIMS` (embedded into olangc at its own
+/// compile time).  If `override_dir` is `Some(path)`, every file in that
+/// directory is read and overlaid on top: a file with the same name as a
+/// bundled shim replaces it; a file with a new name is appended.  Result is
+/// sorted by name (via the BTreeMap).
+///
+/// A missing `override_dir` is an error rather than a silent empty fallback,
+/// because silent fallback is exactly what produced the prior bug where
+/// `olangc foo.O` from a directory without an adjacent `backends/` emitted
+/// a binary with zero shims that died at runtime with a cryptic
+/// `python_shim.py: No such file or directory`.
+fn read_shims(override_dir: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>> {
+    use std::collections::BTreeMap;
 
-    let mut shims = Vec::new();
-    for entry in fs::read_dir(shim_dir)
-        .with_context(|| format!("failed to read shim directory: {}", shim_dir.display()))?
-    {
-        let entry = entry?;
-        let path  = entry.path();
-        if path.is_file() {
-            let name    = path.file_name().unwrap().to_string_lossy().into_owned();
-            let content = fs::read(&path)
-                .with_context(|| format!("failed to read shim: {}", path.display()))?;
-            shims.push((name, content));
+    let mut by_name: BTreeMap<String, Vec<u8>> = BUNDLED_SHIMS
+        .iter()
+        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
+        .collect();
+
+    if let Some(dir) = override_dir {
+        if !dir.exists() {
+            bail!(
+                "shim directory '{}' does not exist (omit --shim-dir to use bundled shims)",
+                dir.display()
+            );
+        }
+        for entry in fs::read_dir(dir)
+            .with_context(|| format!("failed to read shim directory: {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path  = entry.path();
+            if path.is_file() {
+                let name    = path.file_name().unwrap().to_string_lossy().into_owned();
+                let content = fs::read(&path)
+                    .with_context(|| format!("failed to read shim: {}", path.display()))?;
+                by_name.insert(name, content);
+            }
         }
     }
-    shims.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(shims)
+
+    Ok(by_name.into_iter().collect())
 }
 
 /// Create a fresh temporary build directory with a unique name.

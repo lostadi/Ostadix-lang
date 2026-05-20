@@ -1,0 +1,7 @@
+# Verifies the python shim now returns the value of a trailing expression
+# instead of silently producing the empty string.  No __oval_result__ — and
+# the result should still be 42, not "".
+
+python^(
+6 * 7
+)_python

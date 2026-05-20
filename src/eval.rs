@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 use crate::nix_ops;
@@ -348,9 +348,12 @@ impl Evaluator {
         // The shim sees an empty bindings map; deps were already spliced into
         // the body at capture time. (STEP4: deps could be passed as bindings
         // instead, for shims that want them as values rather than text.)
+        // See process.rs for the underlying error chain; using with_context
+        // here preserves the shim's own error message as a "Caused by:" entry
+        // instead of flattening it into the wrapper string.
         let result = self.registry.exec(
             &lang, env_id, &body, HashMap::new(), &shim
-        ).map_err(|e| anyhow::anyhow!("[{}{{eval}}] {}", lang, e))?;
+        ).with_context(|| format!("[{}{{eval}}]", lang))?;
 
         if env_id == u32::MAX {
             let _ = self.registry.cleanup_env(&lang, u32::MAX);
@@ -417,6 +420,19 @@ impl Evaluator {
         // that survived (because it was constructed under lazy(...)) should
         // NOT be re-executed by binding it to a name.
         for node in nodes {
+            // Whitespace-only RawText nodes are document formatting (e.g. the
+            // trailing newline at EOF, blank lines between expressions), not
+            // values.  They MUST NOT overwrite the result of a real expression
+            // — otherwise `python^(...)_python\n` returns OStr("\n") instead
+            // of the python block's value, and the user sees an empty newline
+            // where the answer should be.  The empty-string case is preserved
+            // as a value (see test eval_document_all_null_returns_null) by
+            // requiring at least one character before the whitespace check.
+            let is_pure_whitespace_text = matches!(
+                &node,
+                ONode::RawText(s) if !s.is_empty() && s.chars().all(char::is_whitespace)
+            );
+
             let value = match &node {
                 ONode::LetBinding { name, expr } => {
                     let value = self.eval_node(expr, &scope)?;
@@ -425,7 +441,8 @@ impl Evaluator {
                 }
                 _ => self.eval_node(&node, &scope)?,
             };
-            if !matches!(value, OValue::Null) {
+
+            if !matches!(value, OValue::Null) && !is_pure_whitespace_text {
                 last = value;
             }
         }
@@ -762,14 +779,19 @@ impl Evaluator {
             let _ = self.registry.cleanup_env(lang, u32::MAX);
         }
 
-        result.map_err(|e| {
+        // Attach a `[lang[env_id]]` tag to the existing error CHAIN — using
+        // anyhow::Context preserves the underlying source error (shim stderr,
+        // SyntaxError details, etc.) as a "Caused by:" entry.  Previously this
+        // path used `anyhow!("[{}] {}", env_label, e)`, which formats `e` as a
+        // string and DROPS the source chain — the actual shim error message
+        // was lost, leaving the user with only the wrapper.
+        result.with_context(|| {
             let env_label = if env_id == u32::MAX {
                 format!("{lang}[*ephemeral*]")
             } else {
                 format!("{lang}[{env_id}]")
             };
-
-            anyhow::anyhow!("[{}] {}", env_label, e)
+            format!("[{}]", env_label)
         })
     }
 

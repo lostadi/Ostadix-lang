@@ -2,6 +2,7 @@
 import sys
 import json
 import io
+import ast
 import contextlib
 import base64
 import traceback
@@ -97,13 +98,46 @@ def handle_exec(cmd):
     buf = io.StringIO()
 
     try:
-        with contextlib.redirect_stdout(buf):
-            exec(code, env, env)
+        # Parse the whole code first.  If the last statement is a bare
+        # expression (e.g. `6 * 7`, `type(q).__name__`), split it off so we
+        # can `eval` it and capture its value — exec-mode silently discards
+        # expression-statement values, which made `python^(6 * 7)_python`
+        # return the empty string (the captured-stdout fallback) instead of
+        # 42.  Anything that is genuinely a statement (assignments, defs,
+        # loops, control flow) stays in the exec half and runs as before.
+        module = ast.parse(code, mode="exec")
 
+        trailing_expr = None
+        if module.body and isinstance(module.body[-1], ast.Expr):
+            tail = module.body[-1]
+            module = ast.Module(body=module.body[:-1], type_ignores=[])
+            trailing_expr = ast.Expression(body=tail.value)
+            ast.copy_location(trailing_expr, tail)
+
+        trailing_value = None
+        with contextlib.redirect_stdout(buf):
+            if module.body:
+                exec(compile(module, "<O-python>", "exec"), env, env)
+            if trailing_expr is not None:
+                trailing_value = eval(
+                    compile(trailing_expr, "<O-python>", "eval"), env, env
+                )
+
+        # Result-resolution priority:
+        #   1. An explicit `__oval_result__ = ...` assignment (back-compat
+        #      with every example in the repo that uses it).
+        #   2. The value of a trailing expression — the new affordance.
+        #   3. Captured stdout, for blocks that just `print(...)` for
+        #      side-effect-as-value (preserves the prior fallback).
+        #   4. Otherwise None (also covers a trailing literal `None`).
         if "__oval_result__" in env:
             result = env.pop("__oval_result__")
-        else:
+        elif trailing_value is not None:
+            result = trailing_value
+        elif buf.getvalue():
             result = buf.getvalue()
+        else:
+            result = None
 
         send_ok(result)
 
