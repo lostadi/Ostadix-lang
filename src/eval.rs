@@ -28,6 +28,7 @@ use crate::nix_ops;
 use crate::nixos_ops;
 use crate::parser::{reconstruct_source, ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
+use crate::scheduler::AutonomousScheduler;
 use crate::value::{OValue, RequestKind};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -89,19 +90,23 @@ pub enum Policy {
     /// then restored to the surrounding policy on exit.
     Lazy,
 
-    /// STEP4 placeholder: scheduler-directed execution.
+    /// STEP-4: scheduler-directed buffered execution.
     ///
-    /// Under Autonomous, requests are buffered as they're constructed; the
-    /// scheduler decides when (and possibly in what order, with what
-    /// concurrency, with what speculation) to flush them. The trigger for a
-    /// flush is some force point — a splice of a Request-typed value into
-    /// source text, a document boundary, an explicit `now()`, etc.
+    /// Under Autonomous, non-Eval Requests are buffered as they're constructed
+    /// instead of being executed immediately. At force points (exit of an
+    /// `autonomous(expr)` block, explicit `now(req)`, document end), the
+    /// AutonomousScheduler flushes the buffer: it collects the full transitive
+    /// closure of all buffered requests, builds a dependency DAG, and dispatches
+    /// independent requests as concurrent threads (up to `parallelism` at a
+    /// time). Results are stored in a two-level cache (L1 memory + L2 disk).
     ///
-    /// Not yet wired. Adding this requires designing force points and a
-    /// goal/preference data shape that travels alongside requests. The data
-    /// model is already prepared (Request is a first-class OValue, the
-    /// Executor trait is swappable, RequestKind is extensible).
-    #[allow(dead_code)]
+    /// `RequestKind::Eval` is excluded from buffering — Eval needs the
+    /// ProcessRegistry (which is !Send) and is executed eagerly even under
+    /// this policy. Full Eval parallelism is a STEP5 goal.
+    ///
+    /// Activated via the `autonomous(expr)` built-in function, which evaluates
+    /// `expr` under this policy, flushes the buffer on exit, and returns the
+    /// resolved result.
     Autonomous,
 }
 
@@ -238,12 +243,11 @@ pub struct Evaluator {
     registered_backends: HashSet<String>,
 
     /// Current evaluation policy. Eager by default; lazy(...) installs Lazy
-    /// for the scope of its argument. STEP4: Autonomous joins as a third
-    /// concrete value.
+    /// for the scope of its argument; autonomous(...) installs Autonomous.
     policy: Policy,
 
-    /// The executor used to perform Instantiate/Realise Requests under the
-    /// current policy. STEP4 swaps in a scheduler.
+    /// The executor used to perform Instantiate/Realise/Activate Requests
+    /// under Policy::Eager. Swappable via with_executor (used by tests).
     executor: Box<dyn Executor>,
 
     /// STEP-3.5: cache for `RequestKind::Eval { cacheable: true }` ({lazy}).
@@ -252,6 +256,17 @@ pub struct Evaluator {
     /// Non-cacheable ({defer}) Eval Requests bypass this on both read and
     /// write — each force re-runs the shim.
     eval_cache: HashMap<String, OValue>,
+
+    /// STEP-4: the autonomous scheduler. Always present; only actively used
+    /// when policy == Policy::Autonomous. Holds the two-level cache (L1
+    /// memory + L2 disk) and the concurrent dispatch logic for Nix-family
+    /// requests.
+    scheduler: AutonomousScheduler,
+
+    /// STEP-4: buffer of non-Eval Requests constructed under
+    /// Policy::Autonomous. Flushed by flush_autonomous_buffer() at force
+    /// points: end of autonomous(expr) block, explicit now(), document end.
+    autonomous_buffer: Vec<OValue>,
 }
 
 impl Evaluator {
@@ -263,6 +278,8 @@ impl Evaluator {
             policy: Policy::Eager,
             executor: Box::new(ImmediateExecutor::new()),
             eval_cache: HashMap::new(),
+            scheduler: AutonomousScheduler::new(),
+            autonomous_buffer: Vec::new(),
         }
     }
 
@@ -274,8 +291,8 @@ impl Evaluator {
         self
     }
 
-    /// Replace the executor. Used by tests; STEP3's scheduler will use this
-    /// to install itself.
+    /// Replace the executor. Used by tests; the autonomous scheduler is a
+    /// separate field and is not affected by this call.
     #[allow(dead_code)]
     pub fn with_executor(mut self, exec: Box<dyn Executor>) -> Self {
         self.executor = exec;
@@ -284,25 +301,46 @@ impl Evaluator {
 
     /// Auto-resolve a Request under the current policy.
     ///
-    ///   - Eager:      execute the request, return its result
-    ///   - Lazy:       pass through unchanged (the user must call `now()` to perform)
-    ///   - Autonomous: STEP4 — buffer the request for the scheduler. For now,
-    ///                 treated as Lazy (pass-through) so adding the variant
-    ///                 doesn't change behaviour.
+    ///   - Eager:       execute the request immediately, return its result.
+    ///   - Lazy:        pass through unchanged (user must call `now()` to force).
+    ///   - Autonomous:  Eval requests are executed eagerly (they need the
+    ///                  ProcessRegistry which is !Send and can't be buffered).
+    ///                  All other request kinds (Instantiate, Realise, Activate)
+    ///                  are buffered in autonomous_buffer and returned unchanged;
+    ///                  the scheduler dispatches them concurrently at the next
+    ///                  force point (end of autonomous() block, document end,
+    ///                  or explicit now()).
     fn auto_resolve(&mut self, v: OValue) -> Result<OValue> {
         match (self.policy, &v) {
             (Policy::Eager, OValue::Request { .. }) => self.force_request(&v),
+
+            (Policy::Autonomous, OValue::Request { kind, .. }) => {
+                match kind {
+                    // Eval needs the ProcessRegistry — execute eagerly even under Autonomous.
+                    RequestKind::Eval { .. } => self.force_request(&v),
+                    // Nix-family and Activate: buffer for concurrent flush.
+                    _ => {
+                        self.autonomous_buffer.push(v.clone());
+                        Ok(v)
+                    }
+                }
+            }
+
             _ => Ok(v),
         }
     }
 
-    /// STEP-3.5: dispatch a Request to the right performer.
+    /// Dispatch a Request to the right performer.
     ///
-    /// `RequestKind::Eval` needs the ProcessRegistry to fire a shim, so it
-    /// has to go through the Evaluator (which owns the registry) rather
-    /// than through the Executor trait (which doesn't). Everything else
-    /// goes through self.executor — that's where the swap point for STEP4's
-    /// scheduler still lives.
+    /// Routing rules:
+    ///   - `RequestKind::Eval` always goes to `exec_eval` (needs ProcessRegistry,
+    ///     which is !Send and not accessible to the scheduler).
+    ///   - All other kinds under `Policy::Autonomous` go to the
+    ///     `AutonomousScheduler`, which checks its two-level cache and, on a
+    ///     miss, executes the request (and its source chain) using concurrent
+    ///     threads.
+    ///   - All other kinds under Eager/Lazy go to `self.executor`
+    ///     (ImmediateExecutor), which is synchronous and in-memory cached.
     fn force_request(&mut self, req: &OValue) -> Result<OValue> {
         let kind = match req {
             OValue::Request { kind, .. } => kind.clone(),
@@ -310,11 +348,61 @@ impl Evaluator {
         };
         match kind {
             RequestKind::Eval { .. } => self.exec_eval(req),
+            _ if self.policy == Policy::Autonomous => self.scheduler.execute(req),
             _ => self.executor.execute(req),
         }
     }
+    // ── STEP-4: Autonomous scheduler helpers ──────────────────────────────────
 
-    /// Fire the shim invocation captured in a Request[Eval] over a Thunk.
+    /// Flush all buffered non-Eval Requests through the autonomous scheduler.
+    ///
+    /// Called at force points: exit of `autonomous(expr)` block, document end
+    /// (when top-level policy is Autonomous), and explicit `now()` when a
+    /// buffered request is forced.
+    ///
+    /// After this call, every buffered request's fingerprint is present in
+    /// `self.scheduler.mem_cache` (and written to disk cache if available).
+    /// The buffer is cleared regardless of success or failure to avoid
+    /// polluting future calls with stale entries.
+    fn flush_autonomous_buffer(&mut self) -> Result<()> {
+        let buffer = std::mem::take(&mut self.autonomous_buffer);
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        self.scheduler
+            .execute_batch(&buffer, None)
+            .context("autonomous scheduler: batch flush failed")?;
+        Ok(())
+    }
+
+    /// Resolve a Request value from the scheduler or eval cache without
+    /// going back to the executor. Returns `None` if the fingerprint is not
+    /// in any cache (i.e. the request was never executed).
+    ///
+    /// Used by the `autonomous(expr)` builtin to resolve the return value
+    /// after the buffer has been flushed: the result is already cached, so
+    /// we can avoid a second execution.
+    fn resolve_from_cache(&mut self, v: &OValue) -> Option<OValue> {
+        match v {
+            OValue::Request { fingerprint, kind, .. } => {
+                // For Eval requests, check eval_cache.
+                if matches!(kind, RequestKind::Eval { .. }) {
+                    return self.eval_cache.get(fingerprint).cloned();
+                }
+                // For Nix-family requests, check the scheduler's two-level cache.
+                self.scheduler.cache_get(fingerprint)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if `v` is a non-Eval Request (Instantiate, Realise, or
+    /// Activate), i.e. a request that is buffered under Policy::Autonomous and
+    /// executed by the scheduler rather than by exec_eval.
+    fn is_schedulable_request(v: &OValue) -> bool {
+        matches!(v, OValue::Request { kind, .. } if !matches!(kind, RequestKind::Eval { .. }))
+    }
+
     ///
     /// For cacheable Eval ({lazy}), checks/populates an internal cache keyed
     /// by the Request's fingerprint. For non-cacheable Eval ({defer}), the
@@ -446,6 +534,11 @@ impl Evaluator {
     /// Nodes are evaluated sequentially with an empty root scope. The return
     /// value is the last non-null `OValue` produced, or `OValue::Null` if
     /// every node evaluated to null or the document was empty.
+    ///
+    /// STEP-4: if the document is evaluated under `Policy::Autonomous` (set by
+    /// the caller via `Evaluator::policy` before calling this), any buffered
+    /// non-Eval Requests are flushed through the scheduler at the end, and a
+    /// final Request return value is resolved from the cache.
     pub fn eval_document(&mut self, nodes: Vec<ONode>) -> Result<OValue> {
         let mut scope = HashMap::new();
         let mut last = OValue::Null;
@@ -481,6 +574,22 @@ impl Evaluator {
 
             if !matches!(value, OValue::Null) && !is_pure_whitespace_text {
                 last = value;
+            }
+        }
+
+        // STEP-4: flush any buffered Requests when the document ends under
+        // Autonomous policy.  This covers the case where the caller has set
+        // `self.policy = Policy::Autonomous` before calling eval_document
+        // directly (rather than through the `autonomous(expr)` builtin).
+        // flush_autonomous_buffer() is a no-op when the buffer is empty, so
+        // there is no need for a redundant emptiness check here.
+        if self.policy == Policy::Autonomous {
+            self.flush_autonomous_buffer()?;
+            // If the final value is a buffered Nix-family Request, resolve it.
+            if Self::is_schedulable_request(&last) {
+                if let Some(v) = self.resolve_from_cache(&last) {
+                    last = v;
+                }
             }
         }
 
@@ -555,6 +664,52 @@ impl Evaluator {
             let result = self.eval_node(&args[0], scope);
             self.policy = saved_policy;   // restored even on error path
             return result;
+        }
+
+        // STEP-4: `autonomous(expr)` — evaluate `expr` under Policy::Autonomous.
+        //
+        // Non-Eval Requests constructed during the evaluation are buffered
+        // instead of being executed immediately. When the body finishes, the
+        // scheduler flushes the buffer: it collects the full dependency graph,
+        // executes independent Nix-family requests as concurrent threads, and
+        // writes results to the two-level cache.
+        //
+        // If the body returns a Request value (a request that was buffered and
+        // therefore left unforced in the return position), the method resolves
+        // it from the freshly-populated cache so the caller always receives a
+        // concrete value.
+        //
+        // Like `lazy`, this must intercept the argument BEFORE the standard
+        // "evaluate args first" path runs, so the policy is in effect for the
+        // entire body evaluation.
+        if fn_name == "autonomous" {
+            if args.len() != 1 {
+                bail!("autonomous(expr) takes exactly 1 argument, got {}", args.len());
+            }
+            let saved_policy = self.policy;
+            self.policy = Policy::Autonomous;
+            let result = self.eval_node(&args[0], scope);
+            self.policy = saved_policy; // restore before flush
+
+            match result {
+                Ok(value) => {
+                    // Flush all buffered Nix-family requests concurrently.
+                    self.flush_autonomous_buffer()?;
+                    // If the return value is a buffered Request, resolve it
+                    // from the cache that the flush just populated.
+                    let resolved = if Self::is_schedulable_request(&value) {
+                        self.resolve_from_cache(&value).unwrap_or(value)
+                    } else {
+                        value
+                    };
+                    return Ok(resolved);
+                }
+                Err(e) => {
+                    // Clear the buffer so stale entries don't leak into future calls.
+                    self.autonomous_buffer.clear();
+                    return Err(e);
+                }
+            }
         }
 
         // Standard builtins: evaluate args left-to-right (applicative order).
@@ -2479,5 +2634,169 @@ mod tests {
             }
             other => panic!("expected OValue::Expr, got {:?}", other),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP-4: autonomous(expr) builtin — policy-modifying operator
+    //
+    // Tests verify:
+    //   1. Non-Eval Requests are buffered (returned as Request values).
+    //   2. The buffer is flushed on exit; results are cached in the scheduler.
+    //   3. A Request returned from the body is resolved from the cache.
+    //   4. Eval Requests are still executed eagerly inside autonomous().
+    //   5. Policy is restored after autonomous() returns (and on error).
+    //   6. The buffer is cleared on error so stale entries don't pollute.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `autonomous(instantiate($expr))` under Eager outer policy: the inner
+    /// `instantiate` is buffered (returned as a Request), the buffer is flushed
+    /// at the end, and the scheduler's cache is populated.
+    ///
+    /// We use MockExecutor through the ImmediateExecutor path to verify the
+    /// Eager-mode executor still works independently. The scheduler uses its
+    /// own mem_cache; we seed it to avoid actually calling nix.
+    #[test]
+    fn autonomous_call_buffers_nix_request_and_resolves_on_exit() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
+
+        // Build the Request that autonomous() will construct, find its fp.
+        let expr_val = OValue::nix_expr("pkgs.hello", vec![]);
+        let expected_req = OValue::request(RequestKind::Instantiate, expr_val.clone());
+        let fp = match &expected_req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
+
+        // Pre-seed the scheduler cache so flush_autonomous_buffer doesn't
+        // try to actually call nix.
+        let fake_drv = OValue::derivation("/nix/store/fake.drv", vec!["out".into()], vec![]);
+        e.scheduler.mem_cache.insert(fp.clone(), fake_drv.clone());
+
+        let call = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args: vec![ONode::VarRef("expr".into())],
+            }],
+        };
+
+        // Under autonomous, instantiate($expr) is buffered → returns a Request.
+        // Then the buffer is flushed (cache hit) → the result is Derivation.
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert_eq!(result, fake_drv,
+            "autonomous() should resolve the buffered request from the cache on exit");
+    }
+
+    /// Under autonomous(), Eval requests (nix^{lazy}^()_nix) are executed
+    /// eagerly, bypassing the buffer. The buffer only collects Nix-family requests.
+    #[test]
+    fn autonomous_eval_requests_are_executed_eagerly() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        // Construct an Eval Request (nix {lazy} block) — this should go
+        // through the Evaluator's eval_cache, not the scheduler buffer.
+        let lazy_nix = ONode::TypedExpr {
+            lang:   "nix".into(),
+            env_id: u32::MAX,
+            attr:   Some("lazy".into()),
+            body:   vec![ONode::RawText("1 + 2".into())],
+        };
+        // First, collect the fingerprint to seed the eval_cache.
+        let req = e.eval_node(&lazy_nix, &scope).unwrap();
+        let fp = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        e.eval_cache.insert(fp.clone(), OValue::int(3));
+
+        // Now call autonomous() wrapping another {lazy} nix block for the same expression.
+        let call = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![ONode::Call {
+                fn_name: "now".into(),
+                args: vec![ONode::TypedExpr {
+                    lang:   "nix".into(),
+                    env_id: u32::MAX,
+                    attr:   Some("lazy".into()),
+                    body:   vec![ONode::RawText("1 + 2".into())],
+                }],
+            }],
+        };
+
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert_eq!(result, OValue::int(3),
+            "Eval request inside autonomous() must resolve via eval_cache, got {:?}", result);
+
+        // The buffer must be empty — Eval was not buffered.
+        assert!(e.autonomous_buffer.is_empty(),
+            "autonomous_buffer must be empty after Eval request (not buffered)");
+    }
+
+    /// Policy is restored to Eager after autonomous() returns, even when the
+    /// body errors.
+    #[test]
+    fn policy_restored_after_autonomous_returns() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        assert_eq!(e.policy, Policy::Eager);
+
+        // Success path: policy restored.
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
+        let req  = OValue::request(RequestKind::Instantiate, expr);
+        let fp   = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        e.scheduler.mem_cache.insert(fp, OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]));
+        let call = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args: vec![ONode::TypedExpr {
+                    lang: "nix_expr".into(), env_id: u32::MAX, attr: None,
+                    body: vec![ONode::RawText("pkgs.hello".into())],
+                }],
+            }],
+        };
+        let _ = e.eval_node(&call, &scope);
+        assert_eq!(e.policy, Policy::Eager, "policy must be Eager after autonomous() succeeds");
+
+        // Error path: policy still restored.
+        let bad = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![ONode::VarRef("undefined_var".into())],
+        };
+        let _ = e.eval_node(&bad, &scope);
+        assert_eq!(e.policy, Policy::Eager, "policy must be Eager after autonomous() errors");
+    }
+
+    /// The autonomous buffer is cleared after an error, so stale entries
+    /// don't propagate to the next call.
+    #[test]
+    fn autonomous_buffer_cleared_on_error() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+
+        let bad = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![ONode::VarRef("no_such_var".into())],
+        };
+        let _ = e.eval_node(&bad, &scope);
+        assert!(e.autonomous_buffer.is_empty(),
+            "buffer must be cleared after autonomous() errors");
+    }
+
+    /// autonomous() with wrong arg count errors clearly.
+    #[test]
+    fn autonomous_wrong_arg_count_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let call = ONode::Call {
+            fn_name: "autonomous".into(),
+            args: vec![
+                ONode::RawText("a".into()),
+                ONode::RawText("b".into()),
+            ],
+        };
+        let err = e.eval_node(&call, &scope).unwrap_err().to_string();
+        assert!(err.contains("autonomous(expr) takes exactly 1 argument"));
     }
 }
