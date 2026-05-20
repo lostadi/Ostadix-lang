@@ -396,6 +396,13 @@ impl Evaluator {
         }
     }
 
+    /// Returns `true` if `v` is a non-Eval Request (Instantiate, Realise, or
+    /// Activate), i.e. a request that is buffered under Policy::Autonomous and
+    /// executed by the scheduler rather than by exec_eval.
+    fn is_schedulable_request(v: &OValue) -> bool {
+        matches!(v, OValue::Request { kind, .. } if !matches!(kind, RequestKind::Eval { .. }))
+    }
+
     ///
     /// For cacheable Eval ({lazy}), checks/populates an internal cache keyed
     /// by the Request's fingerprint. For non-cacheable Eval ({defer}), the
@@ -574,12 +581,12 @@ impl Evaluator {
         // Autonomous policy.  This covers the case where the caller has set
         // `self.policy = Policy::Autonomous` before calling eval_document
         // directly (rather than through the `autonomous(expr)` builtin).
-        if self.policy == Policy::Autonomous && !self.autonomous_buffer.is_empty() {
+        // flush_autonomous_buffer() is a no-op when the buffer is empty, so
+        // there is no need for a redundant emptiness check here.
+        if self.policy == Policy::Autonomous {
             self.flush_autonomous_buffer()?;
             // If the final value is a buffered Nix-family Request, resolve it.
-            if matches!(&last, OValue::Request { kind, .. }
-                if !matches!(kind, RequestKind::Eval { .. }))
-            {
+            if Self::is_schedulable_request(&last) {
                 if let Some(v) = self.resolve_from_cache(&last) {
                     last = v;
                 }
@@ -690,9 +697,7 @@ impl Evaluator {
                     self.flush_autonomous_buffer()?;
                     // If the return value is a buffered Request, resolve it
                     // from the cache that the flush just populated.
-                    let resolved = if matches!(&value, OValue::Request { kind, .. }
-                        if !matches!(kind, RequestKind::Eval { .. }))
-                    {
+                    let resolved = if Self::is_schedulable_request(&value) {
                         self.resolve_from_cache(&value).unwrap_or(value)
                     } else {
                         value

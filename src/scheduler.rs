@@ -300,7 +300,7 @@ impl AutonomousScheduler {
     pub fn execute_batch(
         &mut self,
         roots: &[OValue],
-        eval_fn: Option<&mut dyn FnMut(&OValue) -> Result<OValue>>,
+        mut eval_fn: Option<&mut dyn FnMut(&OValue) -> Result<OValue>>,
     ) -> Result<HashMap<String, OValue>> {
         // 1. Collect all unique requests (transitive closure of all roots).
         let mut all: HashMap<String, OValue> = HashMap::new();
@@ -327,13 +327,6 @@ impl AutonomousScheduler {
             .filter(|fp| !resolved.contains_key(*fp))
             .cloned()
             .collect();
-
-        // Re-borrow eval_fn as &mut dyn FnMut for use inside the loop.
-        // We use a raw pointer dance to allow multiple mutable borrows of
-        // separate fields inside the loop without fighting the borrow checker.
-        // Safety: eval_fn is used only in the serial section, never concurrently.
-        let eval_fn_ptr: Option<*mut dyn FnMut(&OValue) -> Result<OValue>> =
-            eval_fn.map(|f| f as *mut _);
 
         while !pending.is_empty() {
             // Find nodes whose deps are all resolved.
@@ -397,7 +390,7 @@ impl AutonomousScheduler {
                             RequestKind::Activate { ref profile, dry_run } => {
                                 nixos_ops::activate_nix(&src, profile, dry_run)
                             }
-                            _ => Err(anyhow!("unexpected kind in concurrent dispatch")),
+                            _ => Err(anyhow!("unexpected kind in concurrent dispatch: {:?}", kind)),
                         };
                         let _ = tx_c.send((fp_c, result));
                     });
@@ -420,21 +413,22 @@ impl AutonomousScheduler {
             // re-evaluate the ready set after each completion — a resolved Eval
             // might unblock threadable nodes that can then run concurrently in
             // the next wave.
+            //
+            // `eval_fn` is an independent mutable reference from the caller and
+            // does not borrow from `self`, so it can be reborrowred here while
+            // `self` is used for cache_put / mem_cache.insert below.
             if let Some(fp) = serial.into_iter().next() {
                 let req = all[&fp].clone();
-                // SAFETY: eval_fn_ptr is only accessed here (serial section),
-                // never while threads are running. The pointer is valid for the
-                // duration of this method call (it came from a &mut reference
-                // that outlives execute_batch).
-                let result = match eval_fn_ptr {
-                    Some(ef) => unsafe { (*ef)(&req) }?,
-                    None => bail!(
+                let result = if let Some(ref mut ef) = eval_fn {
+                    ef(&req)?
+                } else {
+                    bail!(
                         "autonomous scheduler: encountered RequestKind::Eval \
                          but no eval_fn callback was provided (fp: {}). \
                          This is a bug — Eval requests should be excluded from \
                          the autonomous buffer.",
                         &fp[..fp.len().min(8)]
-                    ),
+                    )
                 };
                 // Eval results are stored only in mem_cache (the Evaluator's
                 // eval_cache is the canonical store for {lazy} results; writing
