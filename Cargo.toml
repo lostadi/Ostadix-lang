@@ -10,6 +10,10 @@ license     = "MIT"
 name = "O"
 path = "src/main.rs"
 
+[[bin]]
+name = "olangc"
+path = "src/bin/olangc.rs"
+
 [dependencies]
 # Serialization — OValue wire protocol
 serde       = { version = "1", features = ["derive"] }
