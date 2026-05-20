@@ -178,6 +178,33 @@ pub enum OValue {
         fingerprint: String,
     },
 
+    /// STEP-4: a reference to a running operating system.
+    ///
+    /// This is the FIRST OValue that refers to something IN THE WORLD rather
+    /// than a content-addressed snapshot. The `profile_path` is a symlink in
+    /// the Nix store (typically `/nix/var/nix/profiles/system` for the
+    /// system-wide profile, or `~/.nix-profile` for a user profile). The
+    /// symlink's target — the currently-active generation — can change at
+    /// any time, by:
+    ///   - this runtime (via an Activate request)
+    ///   - other Nix tooling running outside O-lang
+    ///   - the user manually rolling back
+    ///   - automatic rollbacks (boot-time generation selection)
+    ///
+    /// Consequence: equality of two Systems is profile_path equality, NOT
+    /// state equality. A System carries a reference, not a snapshot. Querying
+    /// current state (which generation, which kernel, etc.) requires an
+    /// out-of-band call. This is the structural concession that lets the OS
+    /// participate in the value model without pretending to be pure.
+    ///
+    /// STEP5: extend with `kind` so non-NixOS profiles (Home-Manager, nix-darwin,
+    /// per-user) can be distinguished. Add Snapshot value type for captured
+    /// state at a specific generation. Add Rollback / Update transitions.
+    #[serde(rename = "system")]
+    System {
+        profile_path: String,
+    },
+
     /// STEP-3.5: a captured but unevaluated shim invocation.
     ///
     /// Produced when a language block carries a `{lazy}` or `{defer}` attribute.
@@ -229,6 +256,30 @@ pub enum RequestKind {
         lang:      String,
         env_id:    u32,
         cacheable: bool,
+    },
+
+    /// STEP-4: activate a system closure onto a profile.
+    ///
+    /// Source must resolve (possibly via a chained Request[Realise]) to an
+    /// OValue::StorePath — the path of a built NixOS system closure. The
+    /// activation runs `<store_path>/bin/switch-to-configuration switch`,
+    /// updating the profile symlink and starting/stopping services. The
+    /// returned value is OValue::System pointing at the now-current
+    /// generation of the profile.
+    ///
+    /// `profile` is the symlink path to update (e.g. `/nix/var/nix/profiles/system`).
+    /// `dry_run` defaults to true at construction; the actual real-activation
+    /// is also gated by the O_LANG_ALLOW_ACTIVATION=1 environment variable
+    /// inside nixos_ops::activate_nix. Two layers of opt-in for an operation
+    /// that can reboot a machine.
+    ///
+    /// Activate is NOT cached. The cache invariant ("same fingerprint always
+    /// produces the same result") is meaningless for an operation that
+    /// changes world state, and a stale cached System reference would lie
+    /// about the live state. The executor's cache lookup skips it.
+    Activate {
+        profile: String,
+        dry_run: bool,
     },
 }
 
@@ -320,7 +371,20 @@ impl OValue {
             RequestKind::Eval { lang, env_id, cacheable } => {
                 format!("eval|{}|{}|{}", lang, env_id, cacheable)
             }
+            RequestKind::Activate { profile, dry_run } => {
+                format!("activate|{}|{}", profile, dry_run)
+            }
         }
+    }
+
+    /// Construct a System value pointing at a profile path. STEP-4.
+    ///
+    /// The profile path is the canonical identity — no hashing, no snapshot.
+    /// This is intentional: a System is a reference, and two references to
+    /// the same profile ARE the same System even if the underlying
+    /// generation has changed between observations.
+    pub fn system(profile_path: impl Into<String>) -> Self {
+        OValue::System { profile_path: profile_path.into() }
     }
 
     /// Construct a Thunk — the captured-but-unevaluated payload of a
@@ -365,6 +429,14 @@ impl OValue {
             }
             OValue::StorePath { path } => {
                 hex::encode(Sha256::digest(path.as_bytes()))
+            }
+            // STEP-4: a System's identity is its profile path. Note this is
+            // PURELY REFERENTIAL — the same profile at two different times
+            // is "the same" System for caching purposes, even though its
+            // generation may differ. That's intentional: callers who care
+            // about generation must query the live state explicitly.
+            OValue::System { profile_path } => {
+                hex::encode(Sha256::digest(profile_path.as_bytes()))
             }
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
             other => {
@@ -422,6 +494,7 @@ impl OValue {
     pub fn is_derivation(&self) -> bool { matches!(self, OValue::Derivation { .. }) }
     pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
     pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
+    pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -441,6 +514,7 @@ impl OValue {
             OValue::Derivation {..} => "derivation",
             OValue::Request {..} => "request",
             OValue::Thunk {..} => "thunk",
+            OValue::System {..} => "system",
         }
     }
 }
@@ -571,6 +645,14 @@ impl OValue {
             // inline. The Thunk itself is rarely spliced directly — it
             // usually flows wrapped in a Request[Eval].
             OValue::Thunk { body, .. } => body.clone(),
+
+            // A System splices as its profile path. The receiving context
+            // gets the symlink path as a string — useful for shell scripts
+            // that want to inspect the current generation (`readlink -f $sys`),
+            // less useful for source-text-bearing contexts which probably
+            // shouldn't be embedding a profile path. Document for now;
+            // STEP5 may refine.
+            OValue::System { profile_path } => profile_path.clone(),
         }
     }
 }
@@ -623,6 +705,9 @@ impl fmt::Display for OValue {
             }
             OValue::Thunk { fingerprint, deps, .. } => {
                 write!(f, "<thunk fp={} deps={}>", &fingerprint[..8], deps.len())
+            }
+            OValue::System { profile_path } => {
+                write!(f, "<system {}>", profile_path)
             }
         }
     }
@@ -1041,5 +1126,80 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: OValue = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
+    }
+
+    // ── STEP-4: SYSTEM ───────────────────────────────────────────────────────
+
+    #[test]
+    fn system_constructor_and_predicates() {
+        let s = OValue::system("/nix/var/nix/profiles/system");
+        assert!(s.is_system());
+        assert_eq!(s.type_name(), "system");
+        if let OValue::System { profile_path } = &s {
+            assert_eq!(profile_path, "/nix/var/nix/profiles/system");
+        } else { panic!("expected System"); }
+    }
+
+    #[test]
+    fn system_content_identity_is_referential() {
+        // Two Systems with the same profile path have the same identity,
+        // regardless of any out-of-band state. This is the structural
+        // concession that lets a System participate in the value model
+        // without pretending to be a snapshot.
+        let a = OValue::system("/nix/var/nix/profiles/system");
+        let b = OValue::system("/nix/var/nix/profiles/system");
+        assert_eq!(a.content_identity(), b.content_identity());
+
+        let c = OValue::system("/home/lee/.nix-profile");
+        assert_ne!(a.content_identity(), c.content_identity());
+    }
+
+    #[test]
+    fn system_round_trips_through_json() {
+        let s = OValue::system("/nix/var/nix/profiles/system");
+        let json = serde_json::to_string(&s).unwrap();
+        let decoded: OValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, decoded);
+    }
+
+    // ── STEP-4: ACTIVATE REQUEST ─────────────────────────────────────────────
+
+    #[test]
+    fn activate_request_construction() {
+        let path = OValue::store_path("/nix/store/abc-system");
+        let req  = OValue::request(
+            RequestKind::Activate {
+                profile: "/nix/var/nix/profiles/system".into(),
+                dry_run: true,
+            },
+            path,
+        );
+        if let OValue::Request { kind, source, fingerprint } = &req {
+            if let RequestKind::Activate { profile, dry_run } = kind {
+                assert_eq!(profile, "/nix/var/nix/profiles/system");
+                assert!(*dry_run);
+            } else { panic!("expected Activate kind"); }
+            assert!(matches!(source.as_ref(), OValue::StorePath { .. }));
+            assert_eq!(fingerprint.len(), 64);
+        } else { panic!("expected Request"); }
+    }
+
+    /// Activate fingerprints distinguish dry-run vs. real activation.
+    /// Caching a dry-run result must not satisfy a real-activation request.
+    #[test]
+    fn activate_fingerprint_distinguishes_dry_run() {
+        let path = OValue::store_path("/nix/store/abc");
+        let dry  = OValue::request(
+            RequestKind::Activate { profile: "/p".into(), dry_run: true },
+            path.clone(),
+        );
+        let wet  = OValue::request(
+            RequestKind::Activate { profile: "/p".into(), dry_run: false },
+            path,
+        );
+        if let (OValue::Request { fingerprint: f_dry, .. },
+                OValue::Request { fingerprint: f_wet, .. }) = (&dry, &wet) {
+            assert_ne!(f_dry, f_wet);
+        }
     }
 }

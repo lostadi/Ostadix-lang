@@ -9,6 +9,7 @@ mod parser;
 mod process;
 mod eval;
 mod nix_ops;
+mod nixos_ops;
 
 use eval::Evaluator;
 use parser::Parser;
