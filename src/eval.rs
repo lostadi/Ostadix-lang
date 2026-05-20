@@ -18,7 +18,7 @@
 //     or ONull if no non-null value was produced.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -26,8 +26,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 use crate::nix_ops;
 use crate::nixos_ops;
-use crate::parser::ONode;
-use crate::process::ProcessRegistry;
+use crate::parser::{reconstruct_source, ONode, Parser};
+use crate::process::{ExecStep, ProcessRegistry};
 use crate::value::{OValue, RequestKind};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -231,6 +231,12 @@ pub struct Evaluator {
     /// Shim path for a language `lang` is `shim_dir/lang`.
     shim_dir: PathBuf,
 
+    /// The set of registered backend language tags. Stored here so that
+    /// eval_source (called during O.eval() eval_request callbacks) can
+    /// re-parse a quoted source fragment using the same backend set as the
+    /// top-level document.
+    registered_backends: HashSet<String>,
+
     /// Current evaluation policy. Eager by default; lazy(...) installs Lazy
     /// for the scope of its argument. STEP4: Autonomous joins as a third
     /// concrete value.
@@ -253,10 +259,19 @@ impl Evaluator {
         Evaluator {
             registry: ProcessRegistry::new(),
             shim_dir,
+            registered_backends: HashSet::new(),
             policy: Policy::Eager,
             executor: Box::new(ImmediateExecutor::new()),
             eval_cache: HashMap::new(),
         }
+    }
+
+    /// Install the registered-backends set used by eval_source to re-parse
+    /// quoted fragments in `O.eval(q)` callbacks. Typically called once
+    /// after construction with the same set passed to the Parser.
+    pub fn with_registered_backends(mut self, backends: HashSet<String>) -> Self {
+        self.registered_backends = backends;
+        self
     }
 
     /// Replace the executor. Used by tests; STEP3's scheduler will use this
@@ -398,6 +413,28 @@ impl Evaluator {
             }
         }
         Ok(v)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // eval_source — re-evaluate O source text (for O.eval() callbacks)
+    //
+    // Used when a backend shim sends an `eval_request` response: the shim's
+    // `O.eval(q)` call asks the runtime to evaluate the quoted source fragment
+    // and return the result as an `eval_result` command. This is the recursive
+    // entry point for that path.
+    //
+    // Limitation: eval_source creates a fresh scope (empty let-bindings). Any
+    // top-level `let` bindings defined in the calling document are NOT
+    // accessible. Variables in persistent backend envs (e.g. python[0] globals)
+    // remain accessible because they live in the subprocess, not in the Rust
+    // scope.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn eval_source(&mut self, src: &str) -> Result<OValue> {
+        let nodes = Parser::new(src, &self.registered_backends)
+            .parse()
+            .with_context(|| format!("failed to parse quoted source: {:?}", &src[..src.len().min(80)]))?;
+        self.eval_document(nodes)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -613,6 +650,21 @@ impl Evaluator {
         scope:  &HashMap<String, OValue>,
     ) -> Result<OValue> {
         // ─────────────────────────────────────────────────────────────────────
+        // Short-circuit for `quote^`: capture the body as an unevaluated
+        // OValue::Expr WITHOUT evaluating its children or calling any shim.
+        // Must be first — the body-walking loop below would otherwise start
+        // evaluating nested typed expressions (e.g. python^(6*7)_python inside
+        // a quote body), which would hang waiting for shims.
+        //
+        // reconstruct_source converts the ONode tree back to O source text;
+        // O.eval() in a Python block can then round-trip it through eval_source.
+        // ─────────────────────────────────────────────────────────────────────
+        if lang == "quote" {
+            let src = reconstruct_source(body);
+            return Ok(OValue::Expr { src });
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         // STEP-3.5: validate the optional `{attr}` early so misuses are
         // caught at the block we're evaluating, not somewhere downstream.
         //
@@ -766,11 +818,103 @@ impl Evaluator {
                 .find(|p| p.exists())
                 .unwrap_or_else(|| self.shim_dir.join(format!("{lang}_shim.py")))
         };
+        // `O^(...)_O` sequences its children and returns the last non-null value.
+        // Each child is evaluated in order; whitespace-only text nodes are skipped.
+        // This matches the Python ref impl's OBackend.eval_ast semantics.
+        if lang == "O" {
+            let mut last = OValue::Null;
+            for child in body {
+                match child {
+                    ONode::RawText(s) if s.chars().all(char::is_whitespace) => {}
+                    ONode::RawText(s) => last = OValue::str_(s.clone()),
+                    ONode::VarRef(name) => {
+                        if let Some(v) = scope.get(name) {
+                            last = v.clone();
+                        }
+                    }
+                    ONode::TypedExpr { lang: cl, env_id: ce, attr: ca, body: cb } => {
+                        let v = self.eval_typed_expr(cl, *ce, ca.as_deref(), cb, scope)?;
+                        if !matches!(v, OValue::Null) {
+                            last = v;
+                        }
+                    }
+                    ONode::LetBinding { name, expr } => {
+                        // let inside O^: evaluate and bind, but O-level scope
+                        // is not mutable here. Just evaluate for side effects.
+                        let _ = self.eval_node(expr, scope)?;
+                        let _ = name; // binding discarded inside O^
+                    }
+                    ONode::Call { fn_name, args } => {
+                        let v = self.eval_call(fn_name, args, scope)?;
+                        if !matches!(v, OValue::Null) {
+                            last = v;
+                        }
+                    }
+                }
+            }
+            return Ok(last);
+        }
+
         if lang == "html" {
             return Ok(OValue::html(buf));
         }
 
-        let result = self.registry.exec(lang, env_id, &buf, scope.clone(), &shim);
+        // Markup-only backends: no subprocess needed, just return the body text.
+        // markdown and text return the spliced body as a string value;
+        // latex returns it as a string (compilation to PDF is out-of-scope).
+        if matches!(lang, "markdown" | "md" | "text" | "plain" | "latex" | "tex") {
+            return Ok(OValue::str_(buf));
+        }
+
+        // Send the exec command to the shim, then drive the eval_request loop.
+        //
+        // Normally the shim sends Ok/Err immediately and the loop runs once.
+        // If the shim's user code calls `O.eval(q)`, it sends EvalRequest with
+        // the quoted source; we evaluate it here and send back EvalResult, then
+        // loop to read the next response. The loop terminates on Ok or Err.
+        let env_label = if env_id == u32::MAX {
+            format!("{lang}[*ephemeral*]")
+        } else {
+            format!("{lang}[{env_id}]")
+        };
+
+        self.registry
+            .send_exec(lang, env_id, &buf, scope.clone(), &shim)
+            .with_context(|| format!("[{}]", env_label))?;
+
+        let result: Result<OValue> = loop {
+            let step = self.registry
+                .recv_exec_step(lang, env_id)
+                .with_context(|| format!("[{}]", env_label))?;
+
+            match step {
+                ExecStep::Done(v) => break Ok(v),
+
+                ExecStep::EvalRequest { src } => {
+                    // Evaluate the quoted source. If eval fails, propagate the
+                    // error — the shim's `O.eval(q)` will raise on the Python
+                    // side because the runtime never sends eval_result.
+                    match self.eval_source(&src) {
+                        Ok(result) => {
+                            self.registry
+                                .send_eval_result(lang, env_id, result)
+                                .with_context(|| format!("[{}] send_eval_result", env_label))?;
+                        }
+                        Err(e) => {
+                            // Remove the process from the registry so the
+                            // stuck shim doesn't pollute future calls.
+                            let _ = self.registry.cleanup_env(lang, env_id);
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "[{}] O.eval() failed while evaluating quoted source",
+                                    env_label
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        };
 
         // Step 3 — discard ephemeral envs (env_id == u32::MAX) after every expression,
         // regardless of whether exec succeeded.  This mirrors the Python
@@ -785,14 +929,7 @@ impl Evaluator {
         // path used `anyhow!("[{}] {}", env_label, e)`, which formats `e` as a
         // string and DROPS the source chain — the actual shim error message
         // was lost, leaving the user with only the wrapper.
-        result.with_context(|| {
-            let env_label = if env_id == u32::MAX {
-                format!("{lang}[*ephemeral*]")
-            } else {
-                format!("{lang}[{env_id}]")
-            };
-            format!("[{}]", env_label)
-        })
+        result.with_context(|| format!("[{}]", env_label))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -893,6 +1030,11 @@ fn render_nix(val: &OValue) -> String {
         // literal. Useful for Nix expressions that want to inspect or compare
         // against the live profile location.
         OValue::System { profile_path } => serde_json::to_string(profile_path)
+            .unwrap_or_else(|_| "\"\"".to_string()),
+
+        // An Expr in Nix context renders its quoted source as a Nix string
+        // literal. Rarely useful — the user almost always wants O.eval first.
+        OValue::Expr { src } => serde_json::to_string(src)
             .unwrap_or_else(|_| "\"\"".to_string()),
     }
 }
@@ -999,6 +1141,16 @@ fn render_python(val: &OValue) -> String {
             let lit = serde_json::to_string(profile_path).unwrap_or_else(|_| "''".to_string());
             format!("OSystem({})", lit)
         }
+
+        // An Expr value in Python is available as an OExprValue object (set up
+        // by the Python shim's oval_to_py). Splicing it into source text as a
+        // Python repr would lose the type, so we render it as an OExprValue
+        // constructor that the shim recognises. The shim ensures OExprValue is
+        // always in scope when handling exec bindings.
+        OValue::Expr { src } => {
+            let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "''".to_string());
+            format!("OExprValue({})", src_lit)
+        }
     }
 }
 
@@ -1079,6 +1231,16 @@ fn render_html(val: &OValue) -> String {
             format!(
                 "<code class=\"o-system\">{}</code>",
                 html_escape(profile_path),
+            )
+        }
+
+        OValue::Expr { src } => {
+            // Render an OExpr as a <code> block showing the quoted source.
+            // Users should O.eval() it rather than splice it into HTML, but
+            // we provide a readable fallback so debugging is easier.
+            format!(
+                "<code class=\"o-expr\">{}</code>",
+                html_escape(src),
             )
         }
     }
@@ -1166,6 +1328,9 @@ fn render_latex(val: &OValue) -> String {
         OValue::System { profile_path } => {
             format!("\\texttt{{{}}}", profile_path.replace("_", "\\_"))
         }
+        OValue::Expr { src } => {
+            format!("\\texttt{{{}}}", src.replace("_", "\\_"))
+        }
     }
 }
 
@@ -1203,6 +1368,9 @@ fn render_markdown(val: &OValue) -> String {
         }
         OValue::System { profile_path } => {
             format!("`{}`", profile_path)
+        }
+        OValue::Expr { src } => {
+            format!("`{}`", src)
         }
     }
 }
@@ -1502,7 +1670,7 @@ mod tests {
         fn execute(&mut self, req: &OValue) -> Result<OValue> {
             let (kind, source, fingerprint) = match req {
                 OValue::Request { kind, source, fingerprint } =>
-                    (*kind, source.as_ref().clone(), fingerprint.clone()),
+                    (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
                 _ => panic!("MockExecutor only handles Requests"),
             };
             self.calls.push(fingerprint);
@@ -2135,7 +2303,7 @@ mod tests {
     fn activate_on_bare_nix_expr_errors() {
         let mut e = Evaluator::new("/tmp".into())
             .with_executor(Box::new(MockSystemExecutor::new()));
-        let mut scope = HashMap::new();
+        let mut scope: HashMap<String, OValue> = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("config", vec![]));
 
         // Construct activate($expr) where $expr is a bare NixExpr, not a chain.
@@ -2257,5 +2425,59 @@ mod tests {
             "let pending = lazy(...) must bind a Request — re-executing at \
              the let-binding boundary would be the old broken behaviour. \
              Got {:?}", last);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // quote^ integration tests (in-process, no shim)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// quote^(python^(6*7)_python)_quote should return OValue::Expr with the
+    /// inner source text, NOT start a Python shim or produce 42.
+    #[test]
+    fn quote_block_returns_oexpr_not_evaluated() {
+        let backends: HashSet<String> =
+            ["python", "quote", "O"].iter().map(|s| s.to_string()).collect();
+        let mut e = Evaluator::new("/tmp".into())
+            .with_registered_backends(backends.clone());
+        let scope = HashMap::new();
+
+        let src = r"quote^(python^(6*7)_python)_quote";
+        let nodes = crate::parser::Parser::new(src, &backends)
+            .parse()
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+
+        let result = e.eval_node(&nodes[0], &scope).unwrap();
+        match &result {
+            OValue::Expr { src } => {
+                assert!(src.contains("python^("), "src should contain python^(, got: {:?}", src);
+                assert!(src.contains("6*7"), "src should contain 6*7, got: {:?}", src);
+            }
+            other => panic!("expected OValue::Expr, got {:?}", other),
+        }
+    }
+
+    /// A quoted body with MULTIPLE children should capture the raw source text
+    /// so the outer O.eval round-trip works.
+    #[test]
+    fn quote_multi_child_body_raw_source_preserved() {
+        let backends: HashSet<String> =
+            ["python", "quote", "O"].iter().map(|s| s.to_string()).collect();
+        let mut e = Evaluator::new("/tmp".into())
+            .with_registered_backends(backends.clone());
+        let scope = HashMap::new();
+
+        let src = "quote^(python^(1)_python python^(2)_python)_quote";
+        let nodes = crate::parser::Parser::new(src, &backends)
+            .parse()
+            .unwrap();
+        let result = e.eval_node(&nodes[0], &scope).unwrap();
+        match &result {
+            OValue::Expr { src } => {
+                assert!(src.contains("python^(1)_python"), "missing first block: {:?}", src);
+                assert!(src.contains("python^(2)_python"), "missing second block: {:?}", src);
+            }
+            other => panic!("expected OValue::Expr, got {:?}", other),
+        }
     }
 }

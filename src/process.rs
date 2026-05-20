@@ -6,6 +6,21 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::value::{OValue, OWireCommand, OWireResponse};
 
+/// One step in the exec-reply cycle.
+///
+/// After sending an `Exec` command to a shim, the runtime reads one response.
+/// If the shim is done, it sends `Ok` or `Err`. If the shim's user code called
+/// `O.eval(q)`, the shim sends `EvalRequest` and expects the runtime to
+/// evaluate the quoted source and reply with an `EvalResult` command before
+/// the shim resumes execution and eventually sends `Ok`/`Err`.
+#[derive(Debug)]
+pub enum ExecStep {
+    /// The shim finished executing and returned a value.
+    Done(OValue),
+    /// The shim needs the runtime to evaluate an O source fragment.
+    EvalRequest { src: String },
+}
+
 struct BackendProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
@@ -46,17 +61,16 @@ impl BackendProcess {
         })
     }
 
-    fn send_command(&mut self, command: &OWireCommand) -> Result<OWireResponse> {
+    fn send_command(&mut self, command: &OWireCommand) -> Result<()> {
         let line = serde_json::to_string(command)
             .context("failed to serialize OWireCommand")?;
-
         writeln!(self.stdin, "{line}")
             .context("failed to write command to backend stdin")?;
+        self.stdin.flush().context("failed to flush backend stdin")?;
+        Ok(())
+    }
 
-        self.stdin
-            .flush()
-            .context("failed to flush backend stdin")?;
-
+    fn recv_step(&mut self) -> Result<ExecStep> {
         let mut response_line = String::new();
         let bytes_read = self
             .stdout
@@ -70,32 +84,45 @@ impl BackendProcess {
         let response: OWireResponse = serde_json::from_str(&response_line)
             .with_context(|| format!("failed to parse backend response: {response_line:?}"))?;
 
-        Ok(response)
+        match response {
+            OWireResponse::Ok { value }         => Ok(ExecStep::Done(value)),
+            OWireResponse::Err { message }       => Err(anyhow!("{}", message)),
+            OWireResponse::EvalRequest { src }   => Ok(ExecStep::EvalRequest { src }),
+        }
+    }
+
+    fn send_eval_result(&mut self, value: OValue) -> Result<()> {
+        self.send_command(&OWireCommand::EvalResult { value })
     }
 
     fn exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<OValue> {
-        let response = self.send_command(&OWireCommand::Exec {
-            code: code.to_string(),
-            bindings,
-        })?;
-
-        response.into_result()
+        self.send_command(&OWireCommand::Exec { code: code.to_string(), bindings })?;
+        match self.recv_step()? {
+            ExecStep::Done(v) => Ok(v),
+            ExecStep::EvalRequest { src } => Err(anyhow!(
+                "unexpected eval_request from shim (src: {:?}): \
+                 O.eval is only supported when the evaluator uses the \
+                 exec_with_eval_callback path",
+                &src[..src.len().min(60)]
+            )),
+        }
     }
 
     fn ping(&mut self) -> Result<()> {
-        let response = self.send_command(&OWireCommand::Ping)?;
-        response.into_result().map(|_| ())
+        self.send_command(&OWireCommand::Ping)?;
+        match self.recv_step()? {
+            ExecStep::Done(_) => Ok(()),
+            ExecStep::EvalRequest { src } => Err(anyhow!(
+                "unexpected eval_request during ping (src: {:?})", &src[..src.len().min(40)]
+            )),
+        }
     }
 
     fn cleanup(&mut self) -> Result<()> {
-        let response = self.send_command(&OWireCommand::Cleanup);
+        let send_result = self.send_command(&OWireCommand::Cleanup);
         let _ = self.child.kill();
         let _ = self.child.wait();
-
-        match response {
-            Ok(r) => r.into_result().map(|_| ()),
-            Err(e) => Err(e),
-        }
+        send_result
     }
 }
 
@@ -108,6 +135,55 @@ impl ProcessRegistry {
         Self {
             registry: HashMap::new(),
         }
+    }
+
+    /// Ensure the process for `(lang, env_id)` is running and send the Exec
+    /// command. The caller must then drive the reply cycle with
+    /// `recv_exec_step` / `send_eval_result` until a `Done` step arrives.
+    pub fn send_exec(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        code: &str,
+        bindings: HashMap<String, OValue>,
+        shim_path: &Path,
+    ) -> Result<()> {
+        let key = (lang.to_string(), env_id);
+        if !self.registry.contains_key(&key) {
+            let process = BackendProcess::new(shim_path)
+                .with_context(|| format!("failed to start backend for language `{lang}`"))?;
+            self.registry.insert(key.clone(), process);
+        }
+        self.registry
+            .get_mut(&key)
+            .expect("backend was just inserted but is missing")
+            .send_command(&OWireCommand::Exec { code: code.to_string(), bindings })
+            .with_context(|| format!("failed to send Exec to backend `{lang}`"))
+    }
+
+    /// Read the next step from the shim for `(lang, env_id)`.
+    pub fn recv_exec_step(&mut self, lang: &str, env_id: u32) -> Result<ExecStep> {
+        let key = (lang.to_string(), env_id);
+        let step = self
+            .registry
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("no live backend process for `{lang}[{env_id}]`"))?
+            .recv_step();
+
+        if step.is_err() {
+            self.registry.remove(&key);
+        }
+        step.with_context(|| format!("backend `{lang}[{env_id}]` recv_step failed"))
+    }
+
+    /// Send an eval_result back to the shim so it can resume execution.
+    pub fn send_eval_result(&mut self, lang: &str, env_id: u32, value: OValue) -> Result<()> {
+        let key = (lang.to_string(), env_id);
+        self.registry
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("no live backend process for `{lang}[{env_id}]`"))?
+            .send_eval_result(value)
+            .with_context(|| format!("failed to send eval_result to backend `{lang}`"))
     }
 
     pub fn exec(

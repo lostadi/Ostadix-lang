@@ -1,4 +1,4 @@
-# O-lang Specification (v0.1.0)
+# O-lang Specification (v0.2.0)
 
 O-lang is a meta-language whose syntactic unit — the _typed expression_ — carries
 its own interpreter as part of its syntax. Every expression declares which
@@ -127,15 +127,39 @@ must have.
 
 ```
 OValue  ::= ONull
-          | OBool  { value: bool }
-          | OInt   { value: int }
-          | OFloat { value: float }
-          | OStr   { value: str }
-          | OList  { items: (OValue, …) }
-          | OMap   { pairs: ((str, OValue), …) }
-          | OBlob  { data: bytes, mime: str }
-          | OExpr  { ast: ExpressionNode }    -- homoiconicity at the meta-level
+          | OBool   { value: bool }
+          | OInt    { value: int }
+          | OFloat  { value: float }
+          | OStr    { value: str }
+          | OHtml   { value: str }              -- trusted HTML fragment
+          | OStorePath { path: str }            -- Nix store path
+          | OList   { items: (OValue, …) }
+          | OMap    { pairs: ((str, OValue), …) }
+          | OBlob   { data: bytes, mime: str }
+          | OExpr   { src: str }               -- homoiconicity: quoted O source
+          | ONixExpr { body: str, fingerprint: str, deps: [OValue] }
+          | ODerivation { drv_path: str, outputs: [str] }
+          | ORequest { kind: RequestKind, source: OValue }
+          | OThunk   { body: str, fingerprint: str, deps: [OValue] }
+          | OSystem  { profile_path: str }
 ```
+
+The Rust runtime uses the JSON wire format with a `"t"` discriminant:
+
+| Tag           | Wire form                                    | Notes                                 |
+|---------------|----------------------------------------------|---------------------------------------|
+| `null`        | `{"t":"null"}`                               |                                       |
+| `bool`        | `{"t":"bool","v":true}`                      |                                       |
+| `int`         | `{"t":"int","v":42}`                         |                                       |
+| `float`       | `{"t":"float","v":3.14}`                     |                                       |
+| `str`         | `{"t":"str","v":"hello"}`                    |                                       |
+| `html`        | `{"t":"html","v":"<p>...</p>"}`              | Rust ext; trusted HTML fragment        |
+| `store_path`  | `{"t":"store_path","path":"/nix/store/..."}`  | Rust ext; Nix store path              |
+| `list`        | `{"t":"list","v":[...]}`                     |                                       |
+| `map`         | `{"t":"map","v":{...}}`                      |                                       |
+| `blob`        | `{"t":"blob","v":"<base64>","mime":"..."}`   |                                       |
+| `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
+| `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
 
 Design principles:
 
@@ -145,7 +169,8 @@ Design principles:
   becomes an `<img>` in HTML without either side understanding the other's
   type system — `image/png` is the contract.
 * **`OExpr` gives meta-level homoiconicity.** An O program can produce an
-  O AST as a value and have it evaluated. Lisp's `quote`/`eval` generalized.
+  O AST as a value and have it evaluated. Lisp's `quote`/`eval` generalized
+  across multiple target languages.
 
 ---
 
@@ -209,15 +234,31 @@ output is one rendering of that tree.
 
 ## 6. Currently-registered languages
 
+### Rust runtime (`src/main.rs`)
+
 | Tag          | Aliases | Backend behavior                                              |
 |--------------|---------|---------------------------------------------------------------|
-| `python`     | `py`    | Real execution, persistent globals per env. Returns last expr. |
-| `html`       |         | Source passthrough. `render_child` makes blobs into data URLs. |
-| `markdown`   | `md`    | Source passthrough. Images blob → `![](data:…)`.               |
-| `latex`      | `tex`   | Source passthrough. Image blobs → temp file + `\includegraphics`. |
-| `text`       | `plain` | Source passthrough. `render_child` uses `render_plain`.         |
-| `O`          | `o`     | Host / sequencing backend. Evaluates children in order; returns `OList` (or single value / `ONull`). Canonical root wrapper for full scripts. |
-| `quote`      |         | Captures body as `OExpr` without evaluating. Companion to Python's `O.eval(expr)`. |
+| `python`     | `py`    | Real execution via `backends/python_shim.py`. Persistent globals per env. Returns last expr. Supports `O.eval`/`O.quote`. |
+| `html`       |         | Inline: body returned as `OHtml`. `render_child` makes blobs into data URLs. |
+| `markdown`   | `md`    | Inline: body returned as `OStr`. Markup passthrough with value splicing. |
+| `latex`      | `tex`   | Inline: body returned as `OStr`. Passthrough with value splicing. |
+| `text`       | `plain` | Inline: body returned as `OStr`. Passthrough. |
+| `O`          | `o`     | Inline: sequences children left-to-right; returns last non-null value. |
+| `quote`      |         | Inline: captures body as `OExpr` without evaluating. No subprocess. |
+| `nix`        |         | `backends/nix_shim.py`. Evaluates Nix expressions. |
+| `nix_expr`   |         | Inline: captures body as lazy `ONixExpr` (deferred Nix eval). |
+| `nix_store`  |         | `backends/nix_store_shim.py`. Materialises a store path. |
+| `nixos_test` |         | `backends/nixos_test_shim.py`. NixOS integration test runner. |
+| `bash`       |         | `backends/bash_shim.py` (stub — returns code text). Replace with real executor. |
+| `shell`      |         | `backends/shell_shim.py` (stub). |
+| `rust`       |         | `backends/rust_shim.py` (stub). |
+| `racket`     |         | `backends/racket_shim.py` (stub). |
+
+### Python reference implementation (`o_lang/`)
+
+Same tag set minus `nix_expr`, `nix_store`, `nixos_test`, stubs.  
+`quote` and `O` are structural backends implemented via `eval_ast`.  
+Let-bindings (`let NAME = LANG^(...)`) and `$var` substitution are supported.
 
 Adding a new language: write a Backend subclass, add it to
 `o_lang/backends/__init__.py::default_registry`, and add the tag to
@@ -225,23 +266,37 @@ Adding a new language: write a Backend subclass, add it to
 
 ---
 
-## 7. Known limitations / non-goals (v0.1)
+## 7. Known limitations / current status
 
-* No named sub-expression bindings (`$var` splice referencing a labeled
-  sub-expression). Children are evaluated _inline_ and their rendered value
-  is spliced at their position. Named bindings and DAG evaluation are
-  future work.
-* Eager evaluation only. No laziness, no reactive re-evaluation.
-* No escape mechanism beyond backslash for closer/opener literals.
-* Python is the only language that actually _computes_. HTML/Markdown/LaTeX
-  are source-passthrough with foreign-value splicing — which is still the
-  core demonstration of the thesis.
-* No macro system (yet). `OExpr` gives us the foundation but macros are
-  future work.
+* **`$var` splice** is supported for top-level `let` bindings in both runtimes.
+  Variable references inside nested typed-expression bodies in the Rust runtime
+  work via the `scope` dict passed through `eval_typed_expr`. The Python ref
+  impl similarly threads scope through `_eval_expression`.
+* **Eager evaluation only.** `{lazy}` and `{defer}` attributes create deferred
+  Requests (Thunks) that are auto-forced when spliced or explicitly forced via
+  `now()`. Autonomous scheduling is future work.
+* **`O.eval` scope limitation.** `eval_source` (called on `O.eval`) creates a
+  fresh document scope; top-level `let` bindings from the calling document are
+  NOT visible inside the evaluated fragment. Variables in persistent backend
+  envs (Python subprocess globals) ARE accessible because they live in the
+  subprocess, not the Rust scope.
+* **Stub shims**: `bash`, `shell`, `rust`, `racket` are registered and parse
+  correctly, but their shims return the code text as `OStr` (not executed).
+  Real executor shims are future work.
+* **Python ref impl** (`o_lang/`): maintained as a readable reference and test
+  harness. The Rust runtime is the authoritative implementation.
 
 ---
 
 ## 8. Versioning
 
-This spec is v0.1.0. Breaking changes to OValue or the Backend protocol
+This spec is v0.2.0. The v0.2 bump reflects:
+- `OExpr` wire format and `quote^` / `O.eval` semantics are now implemented
+  (not future work) in both runtimes.
+- `OValue` wire format table expanded with all Rust-runtime types.
+- `let` binding and `$var` substitution work in both runtimes.
+- Registered-language table updated with all registered backends and their
+  implementation status.
+
+Breaking changes to OValue or the Backend protocol
 will bump the minor version until v1.0.

@@ -52,6 +52,11 @@ fn main() -> Result<()> {
         "nix_expr",
         "nix_store",
         "nixos_test",
+        // quote^ captures its body as an unevaluated OValue::Expr without
+        // calling any subprocess shim. O.eval(q) in a Python block sends the
+        // source back to the runtime for evaluation via the eval_request
+        // wire protocol.
+        "quote",
         // NOTE: `lazy` is NOT a language. It's a builtin CALL — `lazy(expr)` —
         // because there is no source text in any language called "lazy"; the
         // body is already O-level statements with a different evaluation
@@ -65,7 +70,8 @@ fn main() -> Result<()> {
     let mut parser = Parser::new(&source, &registered_backends);
     let nodes = parser.parse().context("failed to parse .O source")?;
 
-    let mut evaluator = Evaluator::new(shim_dir);
+    let mut evaluator = Evaluator::new(shim_dir)
+        .with_registered_backends(registered_backends);
     let result = evaluator
         .eval_document(nodes)
         .context("failed to evaluate .O document")?;

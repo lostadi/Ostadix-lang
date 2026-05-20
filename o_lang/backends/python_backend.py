@@ -201,7 +201,7 @@ class PythonBackend:
     def eval_ast(self, node, ctx) -> OValue:
         # Deferred imports avoid circular imports at module load time.
         from ..evaluator import _eval_expression
-        from ..parser import ExpressionNode, TextPart
+        from ..parser import ExpressionNode, TextPart, VarRef
 
         env = ctx.env_for("python", node.env_id)
         # Bind O to a helper that can re-enter the current evaluator.
@@ -214,11 +214,33 @@ class PythonBackend:
         stash_idx = 0
         buf: List[str] = []
 
+        # Retrieve the scope from the outer evaluate_document call.
+        # The scope is passed to eval_ast via the EvalContext or can be
+        # retrieved from the call stack. As a simpler approach, we check
+        # the ctx for a scope dict if it exists, otherwise use an empty dict.
+        scope = getattr(ctx, "_scope", {})
+
         for child in node.body:
             if isinstance(child, TextPart):
                 buf.append(child.text)
+            elif isinstance(child, VarRef):
+                # Substitute variable from the document scope.
+                val = scope.get(child.name) if scope else None
+                if val is not None:
+                    if isinstance(val, OExpr):
+                        name = f"{stash_prefix}{stash_idx}"
+                        stash_idx += 1
+                        stash[name] = val
+                        buf.append(name)
+                    else:
+                        py_val = to_python(val)
+                        buf.append(repr(py_val))
+                else:
+                    # Not in scope — emit as-is so Python's own env can
+                    # resolve it (e.g. a previously assigned python variable).
+                    buf.append(f"${child.name}")
             elif isinstance(child, ExpressionNode):
-                child_value = _eval_expression(child, ctx)
+                child_value = _eval_expression(child, ctx, scope)
                 if isinstance(child_value, OExpr):
                     # Splice OExpr as a live object so user code can do
                     # `O.eval( <spliced> )`.
@@ -296,6 +318,12 @@ class PythonBackend:
             result = env.pop("__O_last__", None)
             if result is not None:
                 return _lift_result(result)
+
+        # Check for an explicit __oval_result__ assignment (back-compat with
+        # the Rust shim convention and with examples like bindings.O that use
+        # `__oval_result__ = value` as the return mechanism).
+        if "__oval_result__" in env:
+            return _lift_result(env.pop("__oval_result__"))
 
         printed = stdout_capture.getvalue()
         if printed:
