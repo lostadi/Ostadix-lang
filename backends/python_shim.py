@@ -7,6 +7,12 @@ import contextlib
 import base64
 import traceback
 
+# Save a reference to the real process stdout (fd 1) before anything can
+# redirect it. O.eval() must write eval_request directly over the IPC pipe
+# even when the shim's handle_exec has temporarily redirected sys.stdout to
+# a StringIO capture buffer for print() capture.
+_real_stdout = sys.stdout
+
 class OHtml(str):
     """Typed trusted HTML fragment passed through O-lang."""
     def __new__(cls, value):
@@ -17,7 +23,87 @@ class OStorePath(str):
     def __new__(cls, value):
         return str.__new__(cls, value)
 
-env = {"OHtml": OHtml, "OStorePath": OStorePath}
+class OExprValue:
+    """A quoted but unevaluated O expression (OValue::Expr on the Rust side).
+
+    Created by ``quote^(...)_quote`` blocks and by ``O.quote(src)``.
+    Evaluated by passing it to ``O.eval(q)``.
+    """
+    def __init__(self, src: str):
+        self.src = src
+
+    def __repr__(self):
+        return f"OExprValue({self.src!r})"
+
+    def __str__(self):
+        return self.src
+
+
+class _OMod:
+    """The ``O`` namespace injected into every Python block.
+
+    Provides ``O.eval(q)`` for evaluating a quoted expression and
+    ``O.quote(src)`` for constructing one from a source string.
+    """
+
+    @staticmethod
+    def eval(q):
+        """Evaluate a quoted expression and return its result.
+
+        Sends an ``eval_request`` back to the Rust runtime, which evaluates
+        the O source fragment and replies with an ``eval_result`` command.
+        The function then returns the result as a Python value.
+
+        Limitation: ``O.eval(q)`` cannot be used if ``q`` contains a
+        reference to the same persistent env that is currently executing
+        (e.g. ``python[0]^(...)_python[0]`` inside another
+        ``python[0]^(...)_python[0]`` block), as this would deadlock the
+        subprocess protocol. Use ephemeral or different-env blocks.
+        """
+        if isinstance(q, OExprValue):
+            src = q.src
+        elif isinstance(q, str):
+            src = q
+        else:
+            raise TypeError(
+                f"O.eval expects an OExprValue (from quote^...) or a str, "
+                f"got {type(q).__name__!r}"
+            )
+        # Write directly to the real process stdout (fd 1) to bypass any
+        # contextlib.redirect_stdout() that the handle_exec caller installs
+        # for capturing print() output.  The IPC protocol must go over the
+        # real pipe — not the StringIO capture buffer.
+        msg = json.dumps({"status": "eval_request", "src": src}) + "\n"
+        _real_stdout.write(msg)
+        _real_stdout.flush()
+        # Block until the runtime replies with eval_result.
+        resp_line = sys.stdin.readline()
+        if not resp_line:
+            raise RuntimeError("O.eval: runtime closed stdin before sending eval_result")
+        resp = json.loads(resp_line)
+        if resp.get("cmd") != "eval_result":
+            raise RuntimeError(
+                f"O.eval: expected eval_result command, got {resp.get('cmd')!r}"
+            )
+        return oval_to_py(resp.get("value", {"t": "null"}))
+
+    @staticmethod
+    def quote(src: str) -> OExprValue:
+        """Construct a quoted O expression from a source string.
+
+        The source is stored verbatim and not evaluated here. Pass the
+        result to ``O.eval(q)`` to evaluate it.
+
+        Note: if the source string contains opener syntax (e.g.
+        ``python^(``) that shouldn't be parsed by the O parser, you must
+        have escaped them with a backslash (``\\python^(``) in the
+        *outer* O source. The backslash is consumed by the O parser and
+        the literal text ``python^(`` reaches the Python code.
+        """
+        if not isinstance(src, str):
+            raise TypeError(f"O.quote expects a str, got {type(src).__name__!r}")
+        return OExprValue(src)
+
 
 def oval_to_py(v):
     t = v.get("t")
@@ -42,6 +128,8 @@ def oval_to_py(v):
         return {k: oval_to_py(x) for k, x in v.get("v", {}).items()}
     if t == "blob":
         return base64.b64decode(v.get("v", ""))
+    if t == "expr":
+        return OExprValue(v.get("src", ""))
 
     raise ValueError(f"unknown OValue type: {t!r}")
 
@@ -64,6 +152,9 @@ def py_to_oval(x):
     if isinstance(x, OStorePath):
         return {"t": "store_path", "path": str(x)}
 
+    if isinstance(x, OExprValue):
+        return {"t": "expr", "src": x.src}
+
     if isinstance(x, str):
         return {"t": "str", "v": x}
 
@@ -83,10 +174,20 @@ def py_to_oval(x):
     return {"t": "str", "v": str(x)}
 
 def send_ok(value=None):
-    print(json.dumps({"status": "ok", "value": py_to_oval(value)}), flush=True)
+    _real_stdout.write(json.dumps({"status": "ok", "value": py_to_oval(value)}) + "\n")
+    _real_stdout.flush()
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    _real_stdout.write(json.dumps({"status": "err", "message": message}) + "\n")
+    _real_stdout.flush()
+
+O = _OMod()
+env = {
+    "OHtml": OHtml,
+    "OStorePath": OStorePath,
+    "OExprValue": OExprValue,
+    "O": O,
+}
 
 def handle_exec(cmd):
     code = cmd.get("code", "")
@@ -148,6 +249,8 @@ def handle_cleanup():
     env.clear()
     env["OHtml"] = OHtml
     env["OStorePath"] = OStorePath
+    env["OExprValue"] = OExprValue
+    env["O"] = O
     send_ok(None)
 
 def handle_ping():

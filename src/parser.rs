@@ -5,15 +5,16 @@ use std::collections::HashSet;
 /// rather than SPLICED (children are raw source text for a target backend).
 ///
 /// Inside a sequencing lang's body, the parser produces ONode::Call for
-/// `name(...)` syntax. Inside any other body, `name(...)` is preserved as
-/// RawText so it reaches the target backend unmodified.
+/// `name(...)` syntax and resolves VarRefs, LetBindings, and nested
+/// TypedExprs as structured ONodes rather than raw text destined for a
+/// foreign backend.
 ///
-/// Currently empty: `lazy` was reconsidered and moved to a builtin call
-/// (not a language). When `O^` and `quote^` are ported from the Python
-/// implementation to Rust, they belong here — quote because its body really
-/// IS unevaluated text (the "captured comment" framing), O because it's the
-/// host sequencing language.
-const SEQUENCING_LANGS: &[&str] = &[];
+/// `quote` is here because its body is the captured AST to wrap as an
+/// OValue::Expr — evaluating its children as O-level statements is correct
+/// (VarRefs and nested blocks need to round-trip through reconstruct_source).
+/// `O` is here for the host-sequencing language (evaluates children
+/// left-to-right as O-level statements).
+const SEQUENCING_LANGS: &[&str] = &["quote", "O"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ONode {
@@ -110,6 +111,55 @@ impl<'a> Parser<'a> {
                     nodes.push(binding);
                     text_start = self.pos;
                     continue;
+                }
+            }
+
+            // Backslash escape: `\IDENT^(` or `\)_IDENT` are emitted as the
+            // literal text of the opener/closer without triggering expression
+            // parsing. This lets O source code contain opener/closer syntax as
+            // raw text — e.g. `python^(src = "\python^(1)_python")_python`
+            // where `\python^(` is a literal Python string, not a nested expr.
+            if self.current_byte() == Some(b'\\') {
+                // Check if a registered opener follows the backslash.
+                let after_bs = self.pos + 1;
+                if after_bs < self.source.len() {
+                    let temp_pos = self.pos;
+                    self.pos = after_bs;
+                    let had_opener = if let Some(tag) = self.try_parse_opener()? {
+                        // Emit the literal opener text (including `^(`) as raw text.
+                        // `tag.raw` is `lang[N]?{attr}?`; we need `lang[N]?{attr}?^(`
+                        let literal = format!("{}^(", tag.raw);
+                        // flush everything up to (not including) the backslash
+                        self.flush_text(&mut nodes, text_start, temp_pos);
+                        // push the literal opener text
+                        if let Some(ONode::RawText(s)) = nodes.last_mut() {
+                            s.push_str(&literal);
+                        } else {
+                            nodes.push(ONode::RawText(literal));
+                        }
+                        text_start = self.pos;
+                        true
+                    } else {
+                        self.pos = temp_pos;
+                        false
+                    };
+                    if had_opener { continue; }
+
+                    // Check if the matching closer follows the backslash.
+                    if let Some(tag) = expected_closer {
+                        let closer = format!(")_{}", tag.raw);
+                        if self.source[after_bs..].starts_with(&closer) {
+                            self.flush_text(&mut nodes, text_start, self.pos);
+                            self.pos = after_bs + closer.len();
+                            if let Some(ONode::RawText(s)) = nodes.last_mut() {
+                                s.push_str(&closer);
+                            } else {
+                                nodes.push(ONode::RawText(closer));
+                            }
+                            text_start = self.pos;
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -525,4 +575,155 @@ fn is_ident_start(b: u8) -> bool {
 
 fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Source reconstruction
+//
+// Converts a slice of ONodes back into O source text. Used by the `quote^`
+// evaluator to capture the body as a re-evaluable `OValue::Expr { src }`.
+//
+// Reconstruction is lossless for all structural information (nesting, envs,
+// attrs, var refs, let bindings) but does NOT preserve formatting whitespace
+// that was between tokens (e.g., blank lines inside a Python body are
+// preserved as RawText, but leading/trailing whitespace that the parser
+// merged into adjacent RawText nodes may differ from the original source).
+// This is sufficient for re-evaluation via `O.eval`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reconstruct O source text from a slice of ONodes.
+///
+/// Used by `quote^(...)_quote` to capture the body as `OValue::Expr { src }`.
+/// The resulting string, when parsed again with the same registered-backends
+/// set, produces an equivalent ONode tree.
+pub fn reconstruct_source(nodes: &[ONode]) -> String {
+    let mut buf = String::new();
+    for node in nodes {
+        reconstruct_node(node, &mut buf);
+    }
+    buf
+}
+
+fn reconstruct_node(node: &ONode, buf: &mut String) {
+    match node {
+        ONode::RawText(s) => buf.push_str(s),
+
+        ONode::VarRef(name) => {
+            buf.push('$');
+            buf.push_str(name);
+        }
+
+        ONode::LetBinding { name, expr } => {
+            buf.push_str("let ");
+            buf.push_str(name);
+            buf.push_str(" = ");
+            reconstruct_node(expr, buf);
+        }
+
+        ONode::TypedExpr { lang, env_id, attr, body } => {
+            // opener: lang[N]?{attr}?^(
+            buf.push_str(lang);
+            if *env_id != u32::MAX {
+                buf.push('[');
+                buf.push_str(&env_id.to_string());
+                buf.push(']');
+            }
+            if let Some(a) = attr {
+                buf.push('{');
+                buf.push_str(a);
+                buf.push('}');
+            }
+            buf.push_str("^(");
+            // body
+            for child in body {
+                reconstruct_node(child, buf);
+            }
+            // closer: )_lang[N]?{attr}?
+            buf.push(')');
+            buf.push('_');
+            buf.push_str(lang);
+            if *env_id != u32::MAX {
+                buf.push('[');
+                buf.push_str(&env_id.to_string());
+                buf.push(']');
+            }
+            if let Some(a) = attr {
+                buf.push('{');
+                buf.push_str(a);
+                buf.push('}');
+            }
+        }
+
+        ONode::Call { fn_name, args } => {
+            buf.push_str(fn_name);
+            buf.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    buf.push_str(", ");
+                }
+                reconstruct_node(arg, buf);
+            }
+            buf.push(')');
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_backends(tags: &[&str]) -> HashSet<String> {
+        tags.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reconstruct_roundtrips_raw_text() {
+        let src = "hello world";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn reconstruct_roundtrips_typed_expr() {
+        let src = "python^(6 * 7)_python";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn reconstruct_roundtrips_var_ref() {
+        // VarRef is only parsed at sequencing-lang or top level
+        let src = "$answer";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn backslash_escapes_opener_as_literal_text() {
+        // \python^( inside a python[0] body should be treated as literal text,
+        // NOT as a nested expression. The outer closer is )_python[0], so
+        // )_python (no env) inside the escaped string doesn't close the block.
+        let src = r#"python[0]^(src = "\python^(1)_python")_python[0]"#;
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        // The outer python[0] block should be a single TypedExpr.
+        assert_eq!(nodes.len(), 1);
+        if let ONode::TypedExpr { body, .. } = &nodes[0] {
+            // Body should be raw text — the backslash was consumed and
+            // `python^(` emitted as literal text. The inner `1)_python`
+            // is also raw text because `)_python` ≠ outer closer `)_python[0]`.
+            let combined: String = body.iter().map(|n| match n {
+                ONode::RawText(s) => s.clone(),
+                _ => "<node>".to_string(),
+            }).collect();
+            assert!(combined.contains("python^(1)_python"),
+                "body should contain literal python^(: {:?}", combined);
+        } else {
+            panic!("expected TypedExpr");
+        }
+    }
 }

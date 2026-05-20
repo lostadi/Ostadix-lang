@@ -87,6 +87,21 @@ pub enum OValue {
     #[serde(rename = "store_path")]
     StorePath { path: String },
 
+    /// A captured but unevaluated O expression — the homoiconicity value.
+    ///
+    /// Produced by `quote^(...)_quote`. The `src` field holds the
+    /// reconstructed O source text of the quoted body (lossless enough
+    /// for re-evaluation via `O.eval`). Nothing inside was executed at
+    /// capture time.
+    ///
+    /// Wire format: `{"t":"expr","src":"<O source text>"}`
+    ///
+    /// In Python shims, an Expr value is bound as an `OExprValue` Python
+    /// object; `O.eval(q)` re-enters the Rust runtime via the eval_request
+    /// callback protocol to evaluate it against the live document context.
+    #[serde(rename = "expr")]
+    Expr { src: String },
+
     /// An ordered, heterogeneous sequence of OValues.
     /// Python lists, Haskell lists, JSON arrays, Racket lists — all map here.
     #[serde(rename = "list")]
@@ -442,8 +457,7 @@ impl OValue {
             other => {
                 let s = other.splice_repr();
                 hex::encode(Sha256::digest(s.as_bytes()))
-            }
-        }
+            }        }
     }
 
     /// Construct an OBlob from raw bytes and a MIME type.
@@ -495,6 +509,7 @@ impl OValue {
     pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
     pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
     pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
+    pub fn is_expr(&self) -> bool { matches!(self, OValue::Expr { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -515,6 +530,7 @@ impl OValue {
             OValue::Request {..} => "request",
             OValue::Thunk {..} => "thunk",
             OValue::System {..} => "system",
+            OValue::Expr {..} => "expr",
         }
     }
 }
@@ -646,6 +662,13 @@ impl OValue {
             // usually flows wrapped in a Request[Eval].
             OValue::Thunk { body, .. } => body.clone(),
 
+            // An Expr splices as its source text. Splicing a quoted expression
+            // into another backend's source text is rarely useful (the user
+            // almost always wants O.eval to run it first), but the conservative
+            // fallback is to embed the O source so at least the content is
+            // visible rather than silently lost.
+            OValue::Expr { src } => src.clone(),
+
             // A System splices as its profile path. The receiving context
             // gets the symlink path as a string — useful for shell scripts
             // that want to inspect the current generation (`readlink -f $sys`),
@@ -709,6 +732,16 @@ impl fmt::Display for OValue {
             OValue::System { profile_path } => {
                 write!(f, "<system {}>", profile_path)
             }
+            OValue::Expr { src } => {
+                // Show a truncated preview of the source — the full text can
+                // be arbitrarily long. 40 chars is enough to identify the quote.
+                let preview: String = src.chars().take(40).collect();
+                if src.len() > 40 {
+                    write!(f, "<expr {:?}…>", preview)
+                } else {
+                    write!(f, "<expr {:?}>", preview)
+                }
+            }
         }
     }
 }
@@ -746,6 +779,15 @@ pub enum OWireCommand {
     /// Verify the backend process is alive and responsive.
     /// Used by the process manager before sending real work.
     Ping,
+
+    /// The result of evaluating an `eval_request` sent by the shim.
+    ///
+    /// Sent by the runtime in response to an `OWireResponse::EvalRequest`
+    /// from the shim. The `value` field carries the evaluated OValue so the
+    /// shim's `O.eval(q)` call can return it to user code and resume
+    /// execution of the current block.
+    #[serde(rename = "eval_result")]
+    EvalResult { value: OValue },
 }
 
 /// A response from a backend subprocess shim to the O runtime.
@@ -759,6 +801,16 @@ pub enum OWireResponse {
     /// (stack trace, compilation error, runtime exception — whatever the
     /// backend's language provides).
     Err { message: String },
+
+    /// The shim is mid-execution and needs the runtime to evaluate an O
+    /// source fragment on its behalf (for `O.eval(q)` in a Python block).
+    ///
+    /// Protocol: after receiving this, the runtime evaluates `src` and
+    /// sends back an `OWireCommand::EvalResult`. The shim then resumes
+    /// execution of the current block. The exec-reply cycle completes
+    /// when the shim finally sends `Ok` or `Err`.
+    #[serde(rename = "eval_request")]
+    EvalRequest { src: String },
 }
 
 impl OWireResponse {
@@ -774,6 +826,12 @@ impl OWireResponse {
         match self {
             OWireResponse::Ok  { value }   => Ok(value),
             OWireResponse::Err { message } => bail!("{}", message),
+            OWireResponse::EvalRequest { src } => bail!(
+                "unexpected eval_request from shim (src: {:?}) — this shim sent \
+                 eval_request outside of an O.eval call or the runtime received it \
+                 through a non-eval-aware path",
+                &src[..src.len().min(60)]
+            ),
         }
     }
 }
@@ -838,6 +896,9 @@ mod tests {
             }),
             OValue::blob(b"\x89PNG\r\n", "image/png"),
             OValue::blob(&[], "application/octet-stream"),
+            // OExpr round-trips its src string.
+            OValue::Expr { src: "python^(6 * 7)_python".to_string() },
+            OValue::Expr { src: String::new() },
         ];
 
         for original in &cases {
@@ -872,6 +933,20 @@ mod tests {
         assert!(json.contains(r#""status":"ok""#));
         let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, OWireResponse::Ok { .. }));
+
+        // EvalRequest/EvalResult round-trip
+        let eval_req = OWireResponse::EvalRequest { src: "python^(42)_python".to_string() };
+        let json = serde_json::to_string(&eval_req).unwrap();
+        assert!(json.contains(r#""status":"eval_request""#));
+        assert!(json.contains(r#""src":"python^(42)_python""#));
+        let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, OWireResponse::EvalRequest { .. }));
+
+        let eval_result = OWireCommand::EvalResult { value: OValue::int(42) };
+        let json = serde_json::to_string(&eval_result).unwrap();
+        assert!(json.contains(r#""cmd":"eval_result""#));
+        let decoded: OWireCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, OWireCommand::EvalResult { .. }));
     }
 
     /// The type_name method must return the exact string used as the
@@ -887,6 +962,7 @@ mod tests {
             (OValue::list(vec![]),    "list"),
             (OValue::map(HashMap::new()), "map"),
             (OValue::blob(&[], ""),   "blob"),
+            (OValue::Expr { src: "x".to_string() }, "expr"),
         ];
         for (val, expected_tag) in cases {
             assert_eq!(val.type_name(), expected_tag);

@@ -62,6 +62,12 @@ REGISTERED_LANGUAGES = {
 # IDENT[N]?^(  -- the opening delimiter
 OPEN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?\^\(")
 
+# let NAME = LANG[N]?^(  -- top-level let binding
+LET_RE = re.compile(r"let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
+
+# $NAME -- variable reference (ASCII ident)
+VAR_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
 
 # ---------------------------------------------------------------------------
 # AST node types
@@ -74,12 +80,29 @@ class TextPart:
 
 
 @dataclass
+class VarRef:
+    """A ``$NAME`` variable reference that substitutes a prior let-binding."""
+    name: str
+
+
+@dataclass
+class LetBinding:
+    """A top-level ``let NAME = LANG^(...)_LANG`` binding.
+
+    After evaluation, ``name`` is bound in the document scope and available
+    via ``$name`` VarRef nodes in subsequent expression bodies.
+    """
+    name: str
+    expr: "ExpressionNode"
+
+
+@dataclass
 class ExpressionNode:
     """A typed expression: LANG[env]^( ... )_LANG[env]."""
     language: str
     env_id: int                # 0 when not explicitly written
     env_explicit: bool         # was [N] written in the source?
-    body: List[Union["TextPart", "ExpressionNode"]] = field(default_factory=list)
+    body: List[Union["TextPart", "ExpressionNode", "VarRef"]] = field(default_factory=list)
 
     @property
     def closing_tag(self) -> str:
@@ -101,7 +124,7 @@ class ExpressionNode:
 @dataclass
 class Document:
     """Top-level parsed .O file."""
-    body: List[Union[TextPart, ExpressionNode]]
+    body: List[Union[TextPart, ExpressionNode, LetBinding]]
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +163,7 @@ class ParseError(Exception):
 def parse(src: str) -> Document:
     """Parse a complete .O source string into a Document AST."""
     p = _ParserState(src)
-    body = p.parse_body(end_tag=None)
+    body = p.parse_body(end_tag=None, top_level=True)
     if p.pos < len(src):
         raise ParseError(p.pos, "trailing content after document body", src)
     return Document(body=body)
@@ -151,9 +174,19 @@ class _ParserState:
         self.src = src
         self.pos = 0
 
-    def parse_body(self, end_tag: Optional[str]) -> List[Union[TextPart, ExpressionNode]]:
-        """Parse text+expressions until end_tag is consumed (or EOF if None)."""
-        out: List[Union[TextPart, ExpressionNode]] = []
+    def parse_body(
+        self,
+        end_tag: Optional[str],
+        top_level: bool = False,
+    ) -> List[Union[TextPart, ExpressionNode, LetBinding, VarRef]]:
+        """Parse text+expressions until end_tag is consumed (or EOF if None).
+
+        When ``top_level`` is True, ``let NAME = LANG^(...)`` patterns are
+        parsed as :class:`LetBinding` nodes.  At all levels, ``$NAME`` tokens
+        that match a known word boundary are emitted as :class:`VarRef` nodes
+        so the evaluator can substitute them with scoped values.
+        """
+        out: List[Union[TextPart, ExpressionNode, LetBinding, VarRef]] = []
         text_buf: List[str] = []
 
         def flush_text() -> None:
@@ -189,6 +222,46 @@ class _ParserState:
                 text_buf.append(c)
                 self.pos += 1
                 continue
+
+            # 2b. Top-level let binding: `let NAME = LANG^(...)`
+            if top_level and self.src.startswith("let ", self.pos):
+                let_m = LET_RE.match(self.src, self.pos)
+                if let_m:
+                    # Peek ahead for a typed-expression opener.
+                    rest_pos = let_m.end()
+                    prev = self.src[rest_pos - 1] if rest_pos > 0 else ""
+                    prev_is_word_here = prev.isalnum() or prev == "_"
+                    open_m = (
+                        None
+                        if prev_is_word_here
+                        else OPEN_RE.match(self.src, rest_pos)
+                    )
+                    if open_m and open_m.group(1) in REGISTERED_LANGUAGES:
+                        flush_text()
+                        binding_name = let_m.group(1)
+                        lang = open_m.group(1)
+                        env_str = open_m.group(2)
+                        env_id = int(env_str) if env_str is not None else 0
+                        env_explicit = env_str is not None
+                        self.pos = open_m.end()
+                        expr_node = ExpressionNode(
+                            language=lang,
+                            env_id=env_id,
+                            env_explicit=env_explicit,
+                            body=[],
+                        )
+                        expr_node.body = self.parse_body(end_tag=expr_node.closing_tag)
+                        out.append(LetBinding(name=binding_name, expr=expr_node))
+                        continue
+
+            # 2c. $NAME variable reference.
+            if c == "$":
+                var_m = VAR_RE.match(self.src, self.pos)
+                if var_m:
+                    flush_text()
+                    out.append(VarRef(name=var_m.group(1)))
+                    self.pos = var_m.end()
+                    continue
 
             # 3. Look for a typed expression opener. But ONLY at a word
             #    boundary -- otherwise `foo^(` would match `o^(` starting
@@ -244,6 +317,10 @@ def pretty(node, indent: int = 0) -> str:
         if len(t) > 60:
             t = t[:60] + "..."
         return f"{pad}TEXT {t!r}"
+    if isinstance(node, VarRef):
+        return f"{pad}VAR ${node.name}"
+    if isinstance(node, LetBinding):
+        return f"{pad}LET {node.name} = {pretty(node.expr, indent)}"
     if isinstance(node, ExpressionNode):
         header = f"{pad}EXPR {node.language}[{node.env_id}]"
         children = "\n".join(pretty(c, indent + 1) for c in node.body)

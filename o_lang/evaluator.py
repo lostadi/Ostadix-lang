@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple, Union
 from .backends import default_registry
 from .backends.base import Backend
 from .ovalue import OStr, OValue
-from .parser import Document, ExpressionNode, TextPart
+from .parser import Document, ExpressionNode, LetBinding, TextPart, VarRef
 
 
 # (canonical_language, env_id) -> persistent env object
@@ -58,6 +58,7 @@ def evaluate_document(doc: Document, ctx: EvalContext = None) -> OValue:
     an implicit text[0] wrapper so that every document has a single root.
     """
     ctx = ctx or EvalContext()
+    scope: Dict[str, OValue] = {}
 
     top_body = doc.body
 
@@ -69,10 +70,31 @@ def evaluate_document(doc: Document, ctx: EvalContext = None) -> OValue:
         if not (isinstance(c, TextPart) and not c.text.strip())
     ]
 
+    # Evaluate let bindings first (they may appear before the main expr).
+    # Collect non-let nodes for the synthesized root.
+    non_let = []
+    for node in top_body:
+        if isinstance(node, LetBinding):
+            # Temporarily stash scope in ctx so backends (like eval_ast) can
+            # access it during recursive evaluation.
+            ctx._scope = scope
+            val = _eval_expression(node.expr, ctx, scope)
+            scope[node.name] = val
+        else:
+            non_let.append(node)
+
+    # Ensure scope is available on ctx throughout the rest of evaluation.
+    ctx._scope = scope
+
+    meaningful_non_let = [
+        c for c in non_let
+        if not (isinstance(c, TextPart) and not c.text.strip())
+    ]
+
     # If the document is exactly one ExpressionNode (ignoring stray
-    # whitespace), that expression IS the root.
-    if len(meaningful) == 1 and isinstance(meaningful[0], ExpressionNode):
-        return _eval_expression(meaningful[0], ctx)
+    # whitespace and let bindings), that expression IS the root.
+    if len(meaningful_non_let) == 1 and isinstance(meaningful_non_let[0], ExpressionNode):
+        return _eval_expression(meaningful_non_let[0], ctx, scope)
 
     # Otherwise synthesize an implicit text root so we always return a single
     # OValue. The text backend renders children using render_plain.
@@ -80,12 +102,16 @@ def evaluate_document(doc: Document, ctx: EvalContext = None) -> OValue:
         language="text",
         env_id=0,
         env_explicit=False,
-        body=top_body,
+        body=non_let,
     )
-    return _eval_expression(synthetic_root, ctx)
+    return _eval_expression(synthetic_root, ctx, scope)
 
 
-def _eval_expression(node: ExpressionNode, ctx: EvalContext) -> OValue:
+def _eval_expression(
+    node: ExpressionNode,
+    ctx: EvalContext,
+    scope: Dict[str, OValue] = None,
+) -> OValue:
     """Evaluate one ExpressionNode.
 
     If the backend implements `eval_ast(node, ctx)`, the backend takes
@@ -98,6 +124,9 @@ def _eval_expression(node: ExpressionNode, ctx: EvalContext) -> OValue:
          with child render_child() results.
       3. Call the backend's evaluate() with the spliced body.
     """
+    if scope is None:
+        scope = {}
+
     backend = ctx.backend_for(node.canonical_language)
 
     eval_ast = getattr(backend, "eval_ast", None)
@@ -110,8 +139,17 @@ def _eval_expression(node: ExpressionNode, ctx: EvalContext) -> OValue:
     for child in node.body:
         if isinstance(child, TextPart):
             buf.append(child.text)
+        elif isinstance(child, VarRef):
+            # Substitute variable reference from scope.
+            val = scope.get(child.name)
+            if val is None:
+                # Emit the raw $name text so it reaches the backend
+                # (might be a Python variable already in the backend env).
+                buf.append(f"${child.name}")
+            else:
+                buf.append(backend.render_child(val))
         elif isinstance(child, ExpressionNode):
-            child_value = _eval_expression(child, ctx)
+            child_value = _eval_expression(child, ctx, scope)
             buf.append(backend.render_child(child_value))
         else:
             raise TypeError(f"Unknown AST child node: {child!r}")
