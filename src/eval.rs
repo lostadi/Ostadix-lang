@@ -807,7 +807,6 @@ impl Evaluator {
             // Supported extensions and their backend mappings:
             //   .py              → python
             //   .sh / .bash      → bash
-            //   .rb              → racket  (placeholder; extend as backends grow)
             //   .rs              → rust
             //   .rkt             → racket
             //   anything else    → error (language cannot be inferred)

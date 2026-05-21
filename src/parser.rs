@@ -381,9 +381,11 @@ impl<'a> Parser<'a> {
 
     /// Parse a double-quoted string literal at the current position.
     ///
-    /// Supports `\"` (literal double-quote) and `\\` (literal backslash) as
-    /// the only escape sequences. All other characters (including multi-byte
-    /// UTF-8) are taken verbatim.
+    /// Recognised escape sequences: `\"` → `"`, `\\` → `\`, `\n` → newline,
+    /// `\t` → tab. Unknown escapes (e.g. `\x`) are kept verbatim with the
+    /// backslash preserved (i.e. `\x` → `\x`), matching the behaviour of
+    /// many template languages where backslash is not a special character
+    /// except in the sequences listed above.
     /// Advances `self.pos` past the closing `"`.
     fn parse_string_literal(&mut self) -> Result<String> {
         // Expect opening '"'

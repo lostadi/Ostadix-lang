@@ -5,8 +5,10 @@ Executes the code body using /bin/sh and returns its captured stdout as an
 OStr. If the shell process exits with a non-zero status, an error is returned
 with the combined stdout+stderr.
 
-This shim is identical to shell_shim.py and is provided so that both
-``sh^(...)_sh`` and ``shell^(...)_shell`` syntax work interchangeably.
+This shim is currently identical to shell_shim.py. Both are kept as separate
+files so that ``sh^(...)_sh`` and ``shell^(...)_shell`` can diverge
+independently in the future (e.g. if ``shell`` is later mapped to a
+user-configurable shell while ``sh`` stays pinned to POSIX /bin/sh).
 """
 import sys
 import json
