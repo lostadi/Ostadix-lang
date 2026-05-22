@@ -15,27 +15,23 @@ cargo run --quiet -- examples/html_raw_roundtrip.O >/tmp/o-html-roundtrip.out 2>
 grep -q '<section>' /tmp/o-html-roundtrip.out
 grep -q '<strong>Hello, Lee.</strong>' /tmp/o-html-roundtrip.out
 
-if command -v nix >/dev/null 2>&1; then
-  cargo run --quiet -- examples/nix_basic.O >/tmp/o-nix-basic.out 2>/tmp/o-nix-basic.err
-  grep -q 'Nix inside O-lang' /tmp/o-nix-basic.out
-  grep -q 'O-lang Nix bridge' /tmp/o-nix-basic.out
-  grep -q '42' /tmp/o-nix-basic.out
+cargo run --quiet -- examples/nix_basic.O >/tmp/o-nix-basic.out 2>/tmp/o-nix-basic.err
+grep -q 'Nix inside O-lang' /tmp/o-nix-basic.out
+grep -q 'O-lang Nix bridge' /tmp/o-nix-basic.out
+grep -q '42' /tmp/o-nix-basic.out
 
-  cargo run --quiet -- examples/nix_python_html.O >/tmp/o-nix-python-html.out 2>/tmp/o-nix-python-html.err
-  grep -q 'Nix → Python → HTML' /tmp/o-nix-python-html.out
-  grep -q 'Nix-born value says answer=42' /tmp/o-nix-python-html.out
+cargo run --quiet -- examples/nix_python_html.O >/tmp/o-nix-python-html.out 2>/tmp/o-nix-python-html.err
+grep -q 'Nix → Python → HTML' /tmp/o-nix-python-html.out
+grep -q 'Nix-born value says answer=42' /tmp/o-nix-python-html.out
 
-  cargo run --quiet -- examples/nix_storepath.O >/tmp/o-nix-storepath.out 2>/tmp/o-nix-storepath.err
-  grep -q 'O-lang StorePath test' /tmp/o-nix-storepath.out
-  grep -q '/nix/store/' /tmp/o-nix-storepath.out
-  grep -q 'hello-from-o-lang.txt' /tmp/o-nix-storepath.out
-  grep -q 'class="o-store-path"' /tmp/o-nix-storepath.out
+cargo run --quiet -- examples/nix_storepath.O >/tmp/o-nix-storepath.out 2>/tmp/o-nix-storepath.err
+grep -q 'O-lang StorePath test' /tmp/o-nix-storepath.out
+grep -q '/nix/store/' /tmp/o-nix-storepath.out
+grep -q 'hello-from-o-lang.txt' /tmp/o-nix-storepath.out
+grep -q 'class="o-store-path"' /tmp/o-nix-storepath.out
 
-  cargo run --quiet -- examples/nix_storepath_python.O >/tmp/o-nix-storepath-python.out 2>/tmp/o-nix-storepath-python.err
-  grep -q 'Python reads Nix StorePath' /tmp/o-nix-storepath-python.out
-  grep -q 'Hello from O-lang + Nix' /tmp/o-nix-storepath-python.out
-else
-  echo "Skipping Nix smoke tests (nix not installed)."
-fi
+cargo run --quiet -- examples/nix_storepath_python.O >/tmp/o-nix-storepath-python.out 2>/tmp/o-nix-storepath-python.err
+grep -q 'Python reads Nix StorePath' /tmp/o-nix-storepath-python.out
+grep -q 'Hello from O-lang + Nix' /tmp/o-nix-storepath-python.out
 
 echo "All O-lang smoke tests passed."

@@ -196,22 +196,6 @@ impl<'a> Parser<'a> {
             let inside_sequencing = expected_closer
                 .map(|t| SEQUENCING_LANGS.contains(&t.lang.as_str()))
                 .unwrap_or(true);
-
-            // O-lang line comment: `#` to end of line. Recognised only in
-            // sequencing contexts (top level and inside `O^`/`quote^`) so that
-            // `#` inside e.g. `python^(# Python comment)_python` passes
-            // through verbatim as part of the backend source.
-            if inside_sequencing && self.current_byte() == Some(b'#') {
-                self.flush_text(&mut nodes, text_start, self.pos);
-                // Skip to end of line (the `\n` is left in place so the
-                // line counter advances normally on the next iteration).
-                while self.pos < self.source.len() && self.current_byte() != Some(b'\n') {
-                    self.pos += 1;
-                }
-                text_start = self.pos;
-                continue;
-            }
-
             if inside_sequencing {
                 let stmt_start = self.pos;
                 if let Some(call) = self.try_parse_call()? {
@@ -308,8 +292,10 @@ impl<'a> Parser<'a> {
     /// malformed mid-parse (we commit to the call path once we've seen
     /// `name(`).
     ///
-    /// Arguments are themselves ONodes — VarRef (`$name`), a string literal
-    /// (`"..."`, including `\"` and `\\` escapes), or a nested Call.
+    /// Arguments are themselves ONodes — currently restricted to VarRef
+    /// (`$name`) and nested Call. STEP3 may extend args to include
+    /// TypedExpr (e.g. `instantiate(nix_expr^(...)_nix_expr)`) once the
+    /// surrounding lifecycle is sorted.
     fn try_parse_call(&mut self) -> Result<Option<ONode>> {
         let original_pos = self.pos;
         let original_line = self.line;
@@ -342,24 +328,18 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Each arg is a VarRef ($name), a string literal ("..."), or a nested Call.
+            // Each arg is either a VarRef ($name) or a nested Call (name(...)).
             let arg = if self.current_byte() == Some(b'$') {
                 let var = self.try_parse_var_ref()?
                     .ok_or_else(|| anyhow::anyhow!(
                         "Line {}: expected variable reference after $", self.line
                     ))?;
                 ONode::VarRef(var)
-            } else if self.current_byte() == Some(b'"') {
-                // String literal: "..." with \" and \\ escape support.
-                let s = self.parse_string_literal().map_err(|e| anyhow::anyhow!(
-                    "Line {}: {}", self.line, e
-                ))?;
-                ONode::RawText(s)
             } else if let Some(nested) = self.try_parse_call()? {
                 nested
             } else {
                 bail!(
-                    "Line {}: in call `{}(...)`, expected $var, \"string\", or nested call",
+                    "Line {}: in call `{}(...)`, expected $var or nested call",
                     self.line, name
                 );
             };
@@ -377,65 +357,6 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Some(ONode::Call { fn_name: name, args }))
-    }
-
-    /// Parse a double-quoted string literal at the current position.
-    ///
-    /// Recognised escape sequences: `\"` → `"`, `\\` → `\`, `\n` → newline,
-    /// `\t` → tab. Unknown escapes (e.g. `\x`) are kept verbatim with the
-    /// backslash preserved (i.e. `\x` → `\x`), matching the behaviour of
-    /// many template languages where backslash is not a special character
-    /// except in the sequences listed above.
-    /// Advances `self.pos` past the closing `"`.
-    fn parse_string_literal(&mut self) -> Result<String> {
-        // Expect opening '"'
-        if self.current_byte() != Some(b'"') {
-            bail!("expected '\"' to start string literal");
-        }
-        self.advance_one_byte(); // consume opening '"'
-
-        let mut result = String::new();
-        loop {
-            // Read the next Unicode character from the current position.
-            let ch = match self.source[self.pos..].chars().next() {
-                Some(c) => c,
-                None => bail!("unterminated string literal"),
-            };
-
-            match ch {
-                '"' => {
-                    self.advance_one_byte(); // consume closing '"'
-                    break;
-                }
-                '\\' => {
-                    self.advance_one_byte(); // consume '\'
-                    let esc = match self.source[self.pos..].chars().next() {
-                        Some(c) => c,
-                        None => bail!("unterminated string literal after '\\'"),
-                    };
-                    match esc {
-                        '"'  => { result.push('"');  self.advance_one_byte(); }
-                        '\\' => { result.push('\\'); self.advance_one_byte(); }
-                        'n'  => { result.push('\n'); self.advance_one_byte(); }
-                        't'  => { result.push('\t'); self.advance_one_byte(); }
-                        other => {
-                            // Unknown escape: keep the backslash and the character.
-                            result.push('\\');
-                            result.push(other);
-                            self.pos += other.len_utf8();
-                            if other == '\n' { self.line += 1; }
-                        }
-                    }
-                }
-                other => {
-                    result.push(other);
-                    // advance_one_byte handles UTF-8 width and line counting.
-                    self.pos += other.len_utf8();
-                    if other == '\n' { self.line += 1; }
-                }
-            }
-        }
-        Ok(result)
     }
 
     fn try_parse_var_ref(&mut self) -> Result<Option<String>> {

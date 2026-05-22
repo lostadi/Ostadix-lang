@@ -20,7 +20,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::fs;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -789,125 +788,6 @@ impl Evaluator {
                 }
                 Ok(OValue::system("/nix/var/nix/profiles/system"))
             }
-
-            // ── Script file utilities ─────────────────────────────────────────
-            //
-            // read_file(path) — reads the contents of a file at `path` and
-            // returns it as an OValue::Str. Useful for loading configuration,
-            // templates, or source files as string values that can be bound to
-            // variables and spliced into backend blocks.
-            //
-            // run_script(path) — reads the file at `path`, detects the target
-            // backend language from the file extension, and executes the file
-            // contents through that backend shim. This lets you write external
-            // scripts in any supported language (Python, Bash, etc.) and invoke
-            // them from O-lang programs by reference rather than by embedding
-            // the entire source inline.
-            //
-            // Supported extensions and their backend mappings:
-            //   .py              → python
-            //   .sh / .bash      → bash
-            //   .rs              → rust
-            //   .rkt             → racket
-            //   anything else    → error (language cannot be inferred)
-            //
-            // Example:
-            //   let path = text^(my_analysis.py)_text
-            //   let result = run_script($path)
-            //
-            // Or with the string literal arg syntax introduced alongside this
-            // builtin:
-            //   let result = run_script("my_analysis.py")
-            "read_file" => {
-                if arg_vals.len() != 1 {
-                    bail!("read_file(path) takes exactly 1 argument, got {}", arg_vals.len());
-                }
-                let path_str = match &arg_vals[0] {
-                    OValue::Str { v } => v.clone(),
-                    other => bail!(
-                        "read_file(path): path must be a string, got {}",
-                        other.type_name()
-                    ),
-                };
-                let contents = fs::read_to_string(&path_str)
-                    .with_context(|| format!("read_file: failed to read {:?}", path_str))?;
-                Ok(OValue::str_(contents))
-            }
-
-            "run_script" => {
-                if arg_vals.len() != 1 {
-                    bail!("run_script(path) takes exactly 1 argument, got {}", arg_vals.len());
-                }
-                let path_str = match &arg_vals[0] {
-                    OValue::Str { v } => v.clone(),
-                    other => bail!(
-                        "run_script(path): path must be a string, got {}",
-                        other.type_name()
-                    ),
-                };
-                // Detect the language from the file extension.
-                let ext = std::path::Path::new(&path_str)
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let lang = match ext.as_str() {
-                    "py"   => "python",
-                    "sh"   => "bash",
-                    "bash" => "bash",
-                    "rs"   => "rust",
-                    "rkt"  => "racket",
-                    other  => bail!(
-                        "run_script: cannot infer backend language from extension \
-                         {other:?} (path: {path_str:?}). Supported extensions: \
-                         .py (python), .sh/.bash (bash), .rs (rust), .rkt (racket)."
-                    ),
-                };
-                let source = fs::read_to_string(&path_str)
-                    .with_context(|| format!("run_script: failed to read {:?}", path_str))?;
-                let shim = {
-                    let candidates = [
-                        self.shim_dir.join(format!("{lang}_shim.py")),
-                        self.shim_dir.join(format!("{lang}_shim")),
-                        self.shim_dir.join(format!("{lang}.py")),
-                        self.shim_dir.join(lang),
-                    ];
-                    candidates.into_iter().find(|p| p.exists())
-                        .unwrap_or_else(|| self.shim_dir.join(format!("{lang}_shim.py")))
-                };
-                // Use an ephemeral env (u32::MAX) so the script runs in a
-                // fresh environment and any state it creates is discarded.
-                let env_id = u32::MAX;
-                self.registry
-                    .send_exec(lang, env_id, &source, HashMap::new(), &shim)
-                    .with_context(|| format!("[run_script:{lang}]"))?;
-
-                let result: Result<OValue> = loop {
-                    let step = self.registry
-                        .recv_exec_step(lang, env_id)
-                        .with_context(|| format!("[run_script:{lang}]"))?;
-                    match step {
-                        ExecStep::Done(v) => break Ok(v),
-                        ExecStep::EvalRequest { src } => {
-                            match self.eval_source(&src) {
-                                Ok(val) => {
-                                    self.registry
-                                        .send_eval_result(lang, env_id, val)
-                                        .with_context(|| format!("[run_script:{lang}] send_eval_result"))?;
-                                }
-                                Err(e) => {
-                                    let _ = self.registry.cleanup_env(lang, env_id);
-                                    return Err(e).with_context(|| {
-                                        format!("[run_script:{lang}] O.eval() failed")
-                                    });
-                                }
-                            }
-                        }
-                    }
-                };
-                let _ = self.registry.cleanup_env(lang, env_id);
-                result.with_context(|| format!("[run_script:{lang}:{path_str}]"))
-            }
             other => bail!("Unknown built-in function: `{}(...)`", other),
         }
     }
@@ -1439,7 +1319,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Int { v } => html_escape(&v.to_string()),
         OValue::Float { v } => html_escape(&v.to_string()),
 
-        OValue::Str { v } => html_escape(v),
+        OValue::Str { v } => v.clone(),
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
@@ -1732,10 +1612,10 @@ mod tests {
     }
 
     #[test]
-    fn html_str_is_escaped() {
+    fn html_str_is_passed_through_unescaped() {
         let e = Evaluator::new("/tmp".into());
         let result = e.render_child("html", &OValue::str_("<b>bold</b>"));
-        assert_eq!(result, "&lt;b&gt;bold&lt;/b&gt;");
+        assert_eq!(result, "<b>bold</b>");
     }
 
     // ── render_child: default fallback ───────────────────────────────────────

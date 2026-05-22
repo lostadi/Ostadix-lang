@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Backend shim for shell^(...)_shell blocks.
+"""Stub backend shim for shell^(...)_shell blocks.
 
-Executes the code body using /bin/sh and returns its captured stdout as an
-OStr. If the shell process exits with a non-zero status, an error is returned
-with the combined stdout+stderr.
+This is a placeholder. It returns the code text as an OStr so that .O
+files containing shell^ blocks at least parse and evaluate without crashing
+the runtime. Replace this with a real shell-execution shim when ready.
 """
 import sys
 import json
-import subprocess
 import traceback
 
 
@@ -26,24 +25,7 @@ for line in sys.stdin:
 
         if tag == "exec":
             code = cmd.get("code", "")
-            try:
-                proc = subprocess.run(
-                    ["/bin/sh", "-c", code],
-                    capture_output=True,
-                    text=True,
-                )
-                if proc.returncode != 0:
-                    combined = proc.stdout + proc.stderr
-                    send_err(
-                        f"sh exited with code {proc.returncode}:\n{combined}"
-                    )
-                else:
-                    out = proc.stdout
-                    if out.endswith("\n"):
-                        out = out[:-1]
-                    send_ok({"t": "str", "v": out})
-            except FileNotFoundError:
-                send_err("/bin/sh not found; ensure a POSIX shell is available")
+            send_ok({"t": "str", "v": code})
         elif tag == "cleanup":
             send_ok({"t": "null"})
         elif tag == "ping":
