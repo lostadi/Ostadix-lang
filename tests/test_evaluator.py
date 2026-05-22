@@ -30,6 +30,11 @@ def _requires_nix(src: str) -> bool:
     return any(token in src for token in tokens)
 
 
+def _requires_rust_only_features(src: str) -> bool:
+    tokens = ("run_script(", "read_file(", "bash^(", "sh^(", "shell^(")
+    return any(token in src for token in tokens)
+
+
 def test_plain_text_evaluates_to_string():
     v = run("just a string")
     assert isinstance(v, OStr)
@@ -167,6 +172,9 @@ def test_example_files_parse_and_eval():
             continue
         if not matplotlib_available and "matplotlib" in src:
             print(f"  (skipping {p.name} -- matplotlib not installed)")
+            continue
+        if _requires_rust_only_features(src):
+            print(f"  (skipping {p.name} -- Rust-only builtins/backends)")
             continue
         v = run(src)
         assert v is not None, f"example {p.name} returned None"
