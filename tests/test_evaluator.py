@@ -12,9 +12,44 @@ from o_lang import (
     evaluate_document, parse, run,
 )
 
+_NIX_FEATURE_TOKENS = (
+    "nix^(",
+    "nix_expr^(",
+    "nix_store^(",
+    "nixos_test^(",
+    "instantiate(",
+    "realise(",
+    "activate(",
+    "current_system(",
+)
+
+_RUST_ONLY_FEATURE_TOKENS = (
+    "run_script(",
+    "read_file(",
+    "bash^(",
+    "sh^(",
+    "shell^(",
+)
+
 
 def _nix_available() -> bool:
     return shutil.which("nix") is not None
+
+
+def _matplotlib_available() -> bool:
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _requires_nix(src: str) -> bool:
+    return any(token in src for token in _NIX_FEATURE_TOKENS)
+
+
+def _requires_rust_only_features(src: str) -> bool:
+    return any(token in src for token in _RUST_ONLY_FEATURE_TOKENS)
 
 
 def test_plain_text_evaluates_to_string():
@@ -143,10 +178,31 @@ def test_backslash_escaped_closer_is_literal_in_python():
     assert v.value == ")_python"
 
 
+def test_requires_nix_detects_nix_tokens():
+    assert _requires_nix("let x = instantiate(nix_expr^(1)_nix_expr)")
+    assert not _requires_nix("python^(1 + 1)_python")
+
+
+def test_requires_rust_only_features_detects_tokens():
+    assert _requires_rust_only_features("let r = run_script(\"examples/script_import.py\")")
+    assert not _requires_rust_only_features("html^(<p>ok</p>)_html")
+
+
 def test_example_files_parse_and_eval():
     root = Path(__file__).resolve().parents[1] / "examples"
+    nix_available = _nix_available()
+    matplotlib_available = _matplotlib_available()
     for p in sorted(root.glob("*.O")):
         src = p.read_text(encoding="utf-8")
+        if not nix_available and _requires_nix(src):
+            print(f"  (skipping {p.name} -- nix not installed)")
+            continue
+        if not matplotlib_available and "matplotlib" in src:
+            print(f"  (skipping {p.name} -- matplotlib not installed)")
+            continue
+        if _requires_rust_only_features(src):
+            print(f"  (skipping {p.name} -- Rust-only builtins/backends)")
+            continue
         v = run(src)
         assert v is not None, f"example {p.name} returned None"
 

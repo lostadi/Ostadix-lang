@@ -1439,7 +1439,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Int { v } => html_escape(&v.to_string()),
         OValue::Float { v } => html_escape(&v.to_string()),
 
-        OValue::Str { v } => v.clone(),
+        OValue::Str { v } => html_escape(v),
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
@@ -1732,10 +1732,10 @@ mod tests {
     }
 
     #[test]
-    fn html_str_is_passed_through_unescaped() {
+    fn html_str_is_escaped() {
         let e = Evaluator::new("/tmp".into());
         let result = e.render_child("html", &OValue::str_("<b>bold</b>"));
-        assert_eq!(result, "<b>bold</b>");
+        assert_eq!(result, "&lt;b&gt;bold&lt;/b&gt;");
     }
 
     // ── render_child: default fallback ───────────────────────────────────────
