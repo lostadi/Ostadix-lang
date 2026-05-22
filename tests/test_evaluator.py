@@ -17,6 +17,19 @@ def _nix_available() -> bool:
     return shutil.which("nix") is not None
 
 
+def _matplotlib_available() -> bool:
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _requires_nix(src: str) -> bool:
+    tokens = ("nix^(", "nix_expr^(", "nix_store^(", "nixos_test^(", "instantiate(", "realise(", "activate(", "current_system(")
+    return any(token in src for token in tokens)
+
+
 def test_plain_text_evaluates_to_string():
     v = run("just a string")
     assert isinstance(v, OStr)
@@ -145,8 +158,16 @@ def test_backslash_escaped_closer_is_literal_in_python():
 
 def test_example_files_parse_and_eval():
     root = Path(__file__).resolve().parents[1] / "examples"
+    nix_available = _nix_available()
+    matplotlib_available = _matplotlib_available()
     for p in sorted(root.glob("*.O")):
         src = p.read_text(encoding="utf-8")
+        if not nix_available and _requires_nix(src):
+            print(f"  (skipping {p.name} -- nix not installed)")
+            continue
+        if not matplotlib_available and "matplotlib" in src:
+            print(f"  (skipping {p.name} -- matplotlib not installed)")
+            continue
         v = run(src)
         assert v is not None, f"example {p.name} returned None"
 
