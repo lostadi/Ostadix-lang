@@ -47,12 +47,19 @@ fn main() -> Result<()> {
         "markdown",
         "bash",
         "shell",
+        "sh",
         "rust",
         "racket",
         "nix",
         "nix_expr",
         "nix_store",
         "nixos_test",
+        // Markup-only (template) backends — no subprocess shim, body is returned
+        // as a string value after variable splicing.
+        "text",
+        "plain",
+        "md",
+        "tex",
         // quote^ captures its body as an unevaluated OValue::Expr without
         // calling any subprocess shim. O.eval(q) in a Python block sends the
         // source back to the runtime for evaluation via the eval_request

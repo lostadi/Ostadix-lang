@@ -1,0 +1,63 @@
+# script_import.O
+#
+# Demonstrates the `run_script` and `read_file` builtins and the
+# `bash^(...)_bash` / `sh^(...)_sh` block syntax.
+#
+# run_script(path) reads the file at `path`, infers the backend language
+# from the file extension, and executes it — so you can author scripts in
+# their own files and invoke them from O-lang without embedding the entire
+# source inline.
+#
+# read_file(path) reads a file and returns its contents as a string, which
+# you can then splice into any backend block.
+#
+# Both builtins accept either a `$variable` holding a path string or an
+# inline double-quoted string literal.
+#
+# ──────────────────────────────────────────────────────────────────────────
+
+# 1. Run an external Python script by path (string literal syntax).
+let py_result = run_script("examples/script_import.py")
+
+# 2. Run an external shell script (.sh → bash backend).
+let sh_result = run_script("examples/script_import.sh")
+
+# 3. Variables can hold the path too; assign via text^ then pass to run_script.
+let py_path = text^(examples/script_import.py)_text
+let py_result2 = run_script($py_path)
+
+# 4. Read a file's raw contents (not execute) — useful for templates or data.
+let raw_source = read_file("examples/script_import.py")
+
+# 5. Inline bash block — now actually executes bash rather than returning
+#    the code text.
+let bash_out = bash^(
+echo "inline bash: 1 + 1 = $((1 + 1))"
+)_bash
+
+# 6. Inline sh block (POSIX shell, same as shell^).
+let sh_out = sh^(
+printf "inline sh: uname = %s\n" "$(uname -s 2>/dev/null || echo unknown)"
+)_sh
+
+# Return a summary produced by Python using the results from all of the above.
+python^(
+lines = [
+    "=== script_import.O results ===",
+    "",
+    "run_script(.py): " + str($py_result),
+    "run_script(.sh):",
+]
+for line in str($sh_result).splitlines():
+    lines.append("  " + line)
+lines += [
+    "",
+    "run_script via " + str($py_path) + ": " + str($py_result2),
+    "",
+    "read_file (first line): " + str($raw_source).splitlines()[0],
+    "",
+    "bash^: " + str($bash_out),
+    "sh^:   " + str($sh_out),
+]
+__oval_result__ = "\n".join(lines)
+)_python

@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Stub backend shim for bash^(...)_bash blocks.
+"""Backend shim for bash^(...)_bash blocks.
 
-This is a placeholder. It returns the code text as an OStr so that .O
-files containing bash^ blocks at least parse and evaluate without crashing
-the runtime. Replace this with a real bash-execution shim when ready.
-
-To implement for real: exec the code in a subprocess bash shell, capture
-stdout as the result.
+Executes the code body in a bash subprocess and returns its captured stdout
+as an OStr. If the bash process exits with a non-zero status, an error is
+returned with the combined stdout+stderr.
 """
 import sys
 import json
+import subprocess
 import traceback
 
 
@@ -27,9 +25,27 @@ for line in sys.stdin:
         tag = cmd.get("cmd")
 
         if tag == "exec":
-            # Stub: return the code text unchanged.
             code = cmd.get("code", "")
-            send_ok({"t": "str", "v": code})
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", code],
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    combined = proc.stdout + proc.stderr
+                    send_err(
+                        f"bash exited with code {proc.returncode}:\n{combined}"
+                    )
+                else:
+                    # Strip a single trailing newline that bash always appends;
+                    # additional trailing newlines are preserved (intentional output).
+                    out = proc.stdout
+                    if out.endswith("\n"):
+                        out = out[:-1]
+                    send_ok({"t": "str", "v": out})
+            except FileNotFoundError:
+                send_err("bash executable not found; ensure bash is installed and on PATH")
         elif tag == "cleanup":
             send_ok({"t": "null"})
         elif tag == "ping":
