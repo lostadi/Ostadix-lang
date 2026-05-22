@@ -12,6 +12,25 @@ from o_lang import (
     evaluate_document, parse, run,
 )
 
+_NIX_FEATURE_TOKENS = (
+    "nix^(",
+    "nix_expr^(",
+    "nix_store^(",
+    "nixos_test^(",
+    "instantiate(",
+    "realise(",
+    "activate(",
+    "current_system(",
+)
+
+_RUST_ONLY_FEATURE_TOKENS = (
+    "run_script(",
+    "read_file(",
+    "bash^(",
+    "sh^(",
+    "shell^(",
+)
+
 
 def _nix_available() -> bool:
     return shutil.which("nix") is not None
@@ -26,13 +45,11 @@ def _matplotlib_available() -> bool:
 
 
 def _requires_nix(src: str) -> bool:
-    tokens = ("nix^(", "nix_expr^(", "nix_store^(", "nixos_test^(", "instantiate(", "realise(", "activate(", "current_system(")
-    return any(token in src for token in tokens)
+    return any(token in src for token in _NIX_FEATURE_TOKENS)
 
 
 def _requires_rust_only_features(src: str) -> bool:
-    tokens = ("run_script(", "read_file(", "bash^(", "sh^(", "shell^(")
-    return any(token in src for token in tokens)
+    return any(token in src for token in _RUST_ONLY_FEATURE_TOKENS)
 
 
 def test_plain_text_evaluates_to_string():
@@ -159,6 +176,16 @@ def test_backslash_escaped_closer_is_literal_in_python():
     v = run(r"python^(s = '\)_python'; s)_python")
     assert isinstance(v, OStr)
     assert v.value == ")_python"
+
+
+def test_requires_nix_detects_nix_tokens():
+    assert _requires_nix("let x = instantiate(nix_expr^(1)_nix_expr)")
+    assert not _requires_nix("python^(1 + 1)_python")
+
+
+def test_requires_rust_only_features_detects_tokens():
+    assert _requires_rust_only_features("let r = run_script(\"examples/script_import.py\")")
+    assert not _requires_rust_only_features("html^(<p>ok</p>)_html")
 
 
 def test_example_files_parse_and_eval():
