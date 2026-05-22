@@ -122,6 +122,7 @@ python^( 6 * 7 )_python
 | `current_system()` | Returns an `OSystem` for the currently active profile. |
 | `lazy(expr)` | Evaluates `expr` under `Policy::Lazy` — Requests are built but not executed. |
 | `now(req)` | Forces a `Request` or `lazy(...)` expression, performing the deferred computation. |
+| `autonomous(expr)` | Evaluates `expr` under `Policy::Autonomous` — Nix-family Requests are buffered and flushed concurrently at force points via `AutonomousScheduler`. Eval requests always execute eagerly. |
 
 ### `{lazy}` and `{defer}` block attributes
 
@@ -220,6 +221,7 @@ src/
 ├── parser.rs     # Typed-paren parser → ONode tree
 ├── eval.rs       # Applicative-order leaves-up evaluator + render_child dispatch
 ├── process.rs    # ProcessRegistry: one subprocess per (lang, env_id) key
+├── scheduler.rs  # AutonomousScheduler: concurrent topological Nix-family dispatch + DiskCache
 ├── nix_ops.rs    # Inline Nix expression evaluation
 ├── nixos_ops.rs  # NixOS test driver integration
 └── bin/
@@ -267,8 +269,9 @@ o_lang/
 | `O`          | inline (`eval.rs`)      | Sequencing block. Evaluates children left-to-right; returns the last non-null value, or an `OList` if multiple non-null values are produced. |
 | `python`     | `python_shim.py`        | Real `exec`, persistent globals per env. Returns `__oval_result__`, trailing expression, or captured stdout (in that order). |
 | `html`       | inline (`eval.rs`)      | Source passthrough. Blobs → `data:` URL `<img>`. |
-| `markdown`   | shim                    | Source passthrough. |
-| `latex`      | shim                    | Source passthrough. |
+| `markdown`   | inline (`eval.rs`)      | Source passthrough; spliced values rendered as plain text / Markdown fragments. |
+| `latex`      | inline (`eval.rs`)      | Source passthrough; spliced values rendered as plain text. |
+| `text`       | inline (`eval.rs`)      | Source passthrough (aliases: `plain`). |
 | `bash`       | shim                    | Shell execution. |
 | `shell`      | shim                    | Shell execution (alias). |
 | `rust`       | shim                    | Rust snippet execution. |
