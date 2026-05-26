@@ -56,6 +56,7 @@ const RUNTIME_EVAL_RS:      &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS:   &str = include_str!("../process.rs");
 const RUNTIME_NIX_OPS_RS:   &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
+const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
@@ -177,6 +178,7 @@ fn assemble_and_compile(
     fs::write(src_dir.join("process.rs"),   RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("nix_ops.rs"),   RUNTIME_NIX_OPS_RS)?;
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
+    fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
 
     // ── Program source ───────────────────────────────────────────────────────
     // Always stored as "program.O" so the generated main.rs can reference it
