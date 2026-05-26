@@ -404,7 +404,6 @@ cargo build
 
 # Run a .O file
 cargo run -- examples/hello.O
-cargo run -- examples/literate_report.O --as markdown
 
 # Compile to a self-contained native binary
 cargo run --bin olangc -- examples/hello.O -o hello
@@ -676,7 +675,7 @@ Backend shims (`backends/`) are subprocess scripts. The Rust runtime
 communicates with them over **newline-delimited JSON IPC**:
 
 ```
-Runtime → shim:  {"cmd":"exec","env_id":0,"body":"...","scope":{...}}
+Runtime → shim:  {"cmd":"exec","code":"...","bindings":{...}}
 Shim → runtime:  {"status":"ok","value":{"t":"int","v":42}}
                  {"status":"err","message":"..."}
 ```
