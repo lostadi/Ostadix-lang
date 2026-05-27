@@ -104,6 +104,22 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Skip `#` line comments at the top level and inside sequencing
+            // langs (quote^, O^).  Inside other typed-expression bodies the
+            // `#` character is valid syntax (e.g. markdown headings, Python
+            // comments) and must NOT be swallowed by the O-lang parser.
+            {
+                let in_seq = expected_closer
+                    .map(|t| SEQUENCING_LANGS.contains(&t.lang.as_str()))
+                    .unwrap_or(true);
+                if in_seq && self.current_byte() == Some(b'#') {
+                    self.flush_text(&mut nodes, text_start, self.pos);
+                    self.skip_to_end_of_line();
+                    text_start = self.pos;
+                    continue;
+                }
+            }
+
             if self.starts_with_let_keyword() {
                 let let_start = self.pos;
                 if let Some(binding) = self.try_parse_let_binding()? {
@@ -523,6 +539,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Advance past everything up to and including the next newline (or EOF).
+    /// Used to skip `#` line comments.
+    fn skip_to_end_of_line(&mut self) {
+        while self.pos < self.source.len() {
+            let b = self.source.as_bytes()[self.pos];
+            self.advance_one_byte();
+            if b == b'\n' {
+                break;
+            }
+        }
+    }
+
     fn flush_text(&self, nodes: &mut Vec<ONode>, start: usize, end: usize) {
         if end > start {
             nodes.push(ONode::RawText(self.source[start..end].to_string()));
@@ -725,5 +753,58 @@ mod tests {
         } else {
             panic!("expected TypedExpr");
         }
+    }
+
+    #[test]
+    fn comments_are_skipped_at_top_level() {
+        // A `#` line at the top level must not be parsed as code.
+        let src = "# activate() is just a comment\nlet x = instantiate($e)";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        // Only the let binding should be present, not a Call for activate().
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], ONode::LetBinding { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn inline_comment_after_let_binding() {
+        // Text after `#` on the same line as a let binding should be ignored.
+        let src = "let x = instantiate($e)  # this is a comment with realise($x)";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        // The let binding is present; the comment is stripped (whitespace
+        // between `)` and `#` may produce a RawText node — that's fine).
+        assert!(nodes.iter().any(|n| matches!(n, ONode::LetBinding { name, .. } if name == "x")));
+        // No Call node for realise should exist.
+        assert!(!nodes.iter().any(|n| matches!(n, ONode::Call { fn_name, .. } if fn_name == "realise")));
+    }
+
+    #[test]
+    fn hash_inside_non_sequencing_body_is_not_a_comment() {
+        // Inside a markdown body, `#` is a heading, not a comment.
+        let src = "markdown^(# Heading\nsome text)_markdown";
+        let backends = make_backends(&["markdown"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(nodes.len(), 1);
+        if let ONode::TypedExpr { body, .. } = &nodes[0] {
+            let combined: String = body.iter().map(|n| match n {
+                ONode::RawText(s) => s.clone(),
+                _ => "<node>".to_string(),
+            }).collect();
+            assert!(combined.contains("# Heading"), "markdown body should keep #: {:?}", combined);
+        } else {
+            panic!("expected TypedExpr");
+        }
+    }
+
+    #[test]
+    fn comment_with_call_syntax_is_ignored() {
+        // Reproduces the bug: `activate()` in a comment must not produce a Call.
+        let src = "# with activate() chains.\nlet here = current_system()";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        // Only the let binding; the comment line is stripped.
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], ONode::LetBinding { name, .. } if name == "here"));
     }
 }
