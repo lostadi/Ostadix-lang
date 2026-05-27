@@ -310,6 +310,7 @@ fn main() -> anyhow::Result<()> {{
     let registered_backends: HashSet<String> = [
         "O", "python", "html", "latex", "markdown", "bash", "shell",
         "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+        "quote",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -327,7 +328,8 @@ fn main() -> anyhow::Result<()> {{
     let mut parser = Parser::new(&source, &registered_backends);
     let nodes = parser.parse().context("failed to parse embedded program")?;
 
-    let mut evaluator = Evaluator::new(shim_dir);
+    let mut evaluator = Evaluator::new(shim_dir)
+        .with_registered_backends(registered_backends);
     let result = evaluator
         .eval_document(nodes)
         .context("failed to evaluate program")?;
