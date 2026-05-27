@@ -4,17 +4,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-mod value;
-mod parser;
-mod process;
-mod eval;
-mod nix_ops;
-mod nixos_ops;
-mod scheduler;
-
-use eval::Evaluator;
-use parser::Parser;
-use value::OValue;
+use o_lang::eval::Evaluator;
+use o_lang::parser::Parser;
+use o_lang::value::OValue;
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);

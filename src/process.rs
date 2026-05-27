@@ -150,8 +150,10 @@ impl ProcessRegistry {
     ) -> Result<()> {
         let key = (lang.to_string(), env_id);
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(shim_path)
+            let mut process = BackendProcess::new(shim_path)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
+            process.ping()
+                .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }
         self.registry
@@ -197,8 +199,10 @@ impl ProcessRegistry {
         let key = (lang.to_string(), env_id);
 
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(shim_path)
+            let mut process = BackendProcess::new(shim_path)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
+            process.ping()
+                .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }
 
