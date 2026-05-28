@@ -541,7 +541,7 @@ impl Evaluator {
     /// final Request return value is resolved from the cache.
     pub fn eval_document(&mut self, nodes: Vec<ONode>) -> Result<OValue> {
         let mut scope = HashMap::new();
-        let mut last = OValue::Null;
+        let mut last = OValue::null();
 
         // STEP-3 NOTE: auto-resolve is NOT called here. It fires at Request
         // *construction* time inside eval_call. By the time eval_node returns
@@ -572,7 +572,7 @@ impl Evaluator {
                 _ => self.eval_node(&node, &scope)?,
             };
 
-            if !matches!(value, OValue::Null) && !is_pure_whitespace_text {
+            if !value.is_null() && !is_pure_whitespace_text {
                 last = value;
             }
         }
@@ -977,7 +977,7 @@ impl Evaluator {
         // Each child is evaluated in order; whitespace-only text nodes are skipped.
         // This matches the Python ref impl's OBackend.eval_ast semantics.
         if lang == "O" {
-            let mut last = OValue::Null;
+            let mut last = OValue::null();
             for child in body {
                 match child {
                     ONode::RawText(s) if s.chars().all(char::is_whitespace) => {}
@@ -989,7 +989,7 @@ impl Evaluator {
                     }
                     ONode::TypedExpr { lang: cl, env_id: ce, attr: ca, body: cb } => {
                         let v = self.eval_typed_expr(cl, *ce, ca.as_deref(), cb, scope)?;
-                        if !matches!(v, OValue::Null) {
+                        if !v.is_null() {
                             last = v;
                         }
                     }
@@ -1001,7 +1001,7 @@ impl Evaluator {
                     }
                     ONode::Call { fn_name, args } => {
                         let v = self.eval_call(fn_name, args, scope)?;
-                        if !matches!(v, OValue::Null) {
+                        if !v.is_null() {
                             last = v;
                         }
                     }
@@ -2364,7 +2364,7 @@ mod tests {
                 }
                 RequestKind::Realise => {
                     // Auto-realise a Derivation source — used in the chain test.
-                    if matches!(&resolved_source, OValue::Derivation { .. }) {
+                    if resolved_source.is_derivation() {
                         Ok(OValue::store_path("/nix/store/mock-system"))
                     } else { panic!("Realise source must be Derivation") }
                 }
