@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Stub backend shim for lisp^(...)_lisp blocks.
+"""Backend shim for lisp^(...)_lisp blocks.
 
-This is a placeholder. It returns the code text as an OStr so that .O
-files containing lisp^ blocks at least parse and evaluate without crashing
-the runtime. Replace this with a real lisp-execution shim when ready.
+Executes code via a Scheme interpreter (Guile, Chicken, or Chez Scheme)
+and captures stdout. For Common Lisp, use common_lisp^ instead.
 """
 import sys
 import json
+import subprocess
+import tempfile
+import os
+import shutil
 import traceback
 
 
@@ -18,14 +21,62 @@ def send_err(message):
     print(json.dumps({"status": "err", "message": message}), flush=True)
 
 
+# Scheme interpreters in order of preference.
+SCHEME_INTERPRETERS = [
+    (["guile", "--no-auto-compile", "-s"], "guile"),
+    (["csi", "-s"], "chicken"),
+    (["chez", "--program"], "chez"),
+    (["scheme", "--program"], "scheme"),
+]
+
+
+def handle_exec(cmd):
+    code = cmd.get("code", "")
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".scm", delete=False
+        ) as f:
+            f.write(code)
+            tmp = f.name
+
+        try:
+            for argv_prefix, name in SCHEME_INTERPRETERS:
+                if shutil.which(argv_prefix[0]):
+                    result = subprocess.run(
+                        argv_prefix + [tmp],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode != 0:
+                        stderr = result.stderr.strip()
+                        send_err(f"{name} exited with code {result.returncode}\n{stderr}")
+                    else:
+                        output = result.stdout
+                        if output.endswith("\n"):
+                            output = output[:-1]
+                        send_ok({"t": "str", "v": output})
+                    return
+
+            send_err(
+                "No Scheme interpreter found. Install Guile, Chicken, or "
+                "Chez Scheme and ensure it is in PATH."
+            )
+        finally:
+            os.unlink(tmp)
+
+    except subprocess.TimeoutExpired:
+        send_err("lisp execution timed out (60s)")
+    except Exception:
+        send_err(traceback.format_exc())
+
+
 for line in sys.stdin:
     try:
         cmd = json.loads(line)
         tag = cmd.get("cmd")
 
         if tag == "exec":
-            code = cmd.get("code", "")
-            send_ok({"t": "str", "v": code})
+            handle_exec(cmd)
         elif tag == "cleanup":
             send_ok({"t": "null"})
         elif tag == "ping":

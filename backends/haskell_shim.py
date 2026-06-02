@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Stub backend shim for haskell^(...)_haskell blocks.
+"""Backend shim for haskell^(...)_haskell blocks.
 
-This is a placeholder. It returns the code text as an OStr so that .O
-files containing haskell^ blocks at least parse and evaluate without crashing
-the runtime. Replace this with a real haskell-execution shim when ready.
+Executes code via runghc (or ghc if runghc is unavailable) and captures stdout.
 """
 import sys
 import json
+import subprocess
+import tempfile
+import os
+import shutil
 import traceback
 
 
@@ -18,14 +20,63 @@ def send_err(message):
     print(json.dumps({"status": "err", "message": message}), flush=True)
 
 
+def handle_exec(cmd):
+    code = cmd.get("code", "")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "Main.hs")
+            with open(src, "w") as f:
+                f.write(code)
+
+            if shutil.which("runghc"):
+                # Interpreted execution
+                result = subprocess.run(
+                    ["runghc", src],
+                    capture_output=True, text=True, timeout=120,
+                )
+            elif shutil.which("ghc"):
+                # Compiled execution
+                binary = os.path.join(tmpdir, "Main")
+                comp = subprocess.run(
+                    ["ghc", "-o", binary, src],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if comp.returncode != 0:
+                    stderr = comp.stderr.strip()
+                    send_err(f"ghc compilation failed\n{stderr}")
+                    return
+
+                result = subprocess.run(
+                    [binary],
+                    capture_output=True, text=True, timeout=60,
+                )
+            else:
+                send_err("Neither runghc nor ghc found in PATH. Install GHC.")
+                return
+
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                send_err(f"Haskell exited with code {result.returncode}\n{stderr}")
+            else:
+                output = result.stdout
+                if output.endswith("\n"):
+                    output = output[:-1]
+                send_ok({"t": "str", "v": output})
+
+    except subprocess.TimeoutExpired:
+        send_err("Haskell execution timed out")
+    except Exception:
+        send_err(traceback.format_exc())
+
+
 for line in sys.stdin:
     try:
         cmd = json.loads(line)
         tag = cmd.get("cmd")
 
         if tag == "exec":
-            code = cmd.get("code", "")
-            send_ok({"t": "str", "v": code})
+            handle_exec(cmd)
         elif tag == "cleanup":
             send_ok({"t": "null"})
         elif tag == "ping":
