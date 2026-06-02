@@ -93,6 +93,7 @@ tagged union that every backend speaks.
 ONull | OBool | OInt | OFloat | OStr
 OHtml | OList | OMap | OBlob(bytes, mime_type)
 OStorePath | OExpr | ONixExpr | ODerivation | OSystem
+ORequest | OThunk
 ```
 
 The critical insight is that **the receiving language decides how to render
@@ -605,7 +606,7 @@ execute eagerly.
 |------|---------------|-------------|
 | `instantiate(expr)` | `ONixExpr` → `ODerivation` | Runs `nix-instantiate`. |
 | `realise(drv)` | `ODerivation` → `OStorePath` | Builds the derivation. |
-| `activate(path)` | `OStorePath` → `OSystem` | Switches system profile (dry-run by default). |
+| `activate(path)` | `OStorePath` → `OSystem` | Switches system profile (dry-run unless `O_LANG_ALLOW_ACTIVATION=1`). |
 | `current_system()` | — → `OSystem` | Returns the currently active profile. |
 | `lazy(expr)` | any → `ORequest` | Wraps in `Policy::Lazy`; deferred until forced. |
 | `now(req)` | `ORequest` → `OValue` | Forces a deferred Request. |
@@ -654,6 +655,7 @@ authoritative.
 
 ```
 src/
+├── lib.rs        # Library crate root — re-exports all modules
 ├── value.rs      # OValue sum type + JSON wire protocol. Pure data layer.
 ├── parser.rs     # Typed-paren parser → ONode tree
 ├── eval.rs       # Applicative-order leaves-up evaluator + render_child dispatch
@@ -661,6 +663,7 @@ src/
 ├── scheduler.rs  # AutonomousScheduler: concurrent topological Nix-family dispatch + DiskCache
 ├── nix_ops.rs    # Inline Nix expression evaluation
 ├── nixos_ops.rs  # NixOS test driver integration
+├── main.rs       # CLI entry point for the `O` interpreter binary
 └── bin/
     └── olangc.rs # AOT compiler: .O source → self-contained native binary
 ```
@@ -721,7 +724,7 @@ o_lang/
 | `html`       | inline (`eval.rs`)      | Body returned as `OHtml`. Blobs → `data:` URL `<img>` tags. |
 | `markdown`   | inline (`eval.rs`)      | Body returned as `OStr`. Markup passthrough with value splicing. |
 | `latex`      | inline (`eval.rs`)      | Body returned as `OStr`. Passthrough with value splicing. |
-| `text`       | inline (`eval.rs`)      | Body returned as `OStr`. Plain passthrough. |
+| `text`       | inline (`eval.rs`)      | Body returned as `OStr`. Plain passthrough. Alias: `plain`. |
 | `quote`      | inline (`eval.rs`)      | Captures body as `OExpr` without evaluating. |
 | `nix`        | `nix_shim.py`           | Evaluates Nix expressions via `nix-instantiate`. |
 | `nix_expr`   | inline (`nix_ops.rs`)   | Captures body as lazy `ONixExpr` (no evaluation yet). |
@@ -762,8 +765,8 @@ Every value that crosses a language boundary is serialized as JSON with a
 ```
 
 `store_path`, `expr`, `nix_expr`, `derivation`, `request`, `thunk`, and
-`system` are Rust-edition extensions not in the Python MVP. `html` is
-supported by both runtimes.
+`system` are Rust-edition extensions. The Python reference implementation
+supports a subset of these types. `html` is supported by both runtimes.
 
 ---
 

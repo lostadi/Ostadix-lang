@@ -45,6 +45,7 @@ fn main() -> Result<()> {
         "nix_expr",
         "nix_store",
         "nixos_test",
+        "text",
         // quote^ captures its body as an unevaluated OValue::Expr without
         // calling any subprocess shim. O.eval(q) in a Python block sends the
         // source back to the runtime for evaluation via the eval_request
