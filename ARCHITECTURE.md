@@ -26,7 +26,7 @@ O-lang/
 ├── examples/         # .O example programs
 ├── c_cpp/            # Complete C17 port (standalone)
 ├── o_lang/           # Legacy Python prototype (reference only)
-├── tests/            # Python-era test suite
+├── tests/            # Python-era test suite (legacy, for o_lang/)
 ├── setup/            # Cross-platform bootstrap scripts
 ├── tools/            # Development utilities (markdown extraction)
 ├── scripts/          # Repository management scripts
