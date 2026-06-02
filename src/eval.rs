@@ -60,7 +60,11 @@ const PURE_BACKENDS: &[&str] = &[
     "markdown",      // pure templating
     "latex",         // pure templating (compilation is IO but we treat the splice as pure)
     "text",          // pure templating
-    // python, shell, bash, rust, racket — NOT pure
+    "sql",           // declarative query language — same query, same result
+    "haskell",       // pure by default (IO is in the type system)
+    "ocaml",         // mostly pure (functional core)
+    "webassembly",   // deterministic computation (no IO in core spec)
+    // python, shell, bash, rust, racket, java, javascript, ruby, etc. — NOT pure
 ];
 
 fn is_pure_backend(lang: &str) -> bool {
