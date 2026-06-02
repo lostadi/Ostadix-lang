@@ -46,6 +46,20 @@ fn main() -> Result<()> {
         "nix_store",
         "nixos_test",
         "text",
+        // Major languages — full subprocess execution via backend shims.
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         // quote^ captures its body as an unevaluated OValue::Expr without
         // calling any subprocess shim. O.eval(q) in a Python block sends the
         // source back to the runtime for evaluation via the eval_request

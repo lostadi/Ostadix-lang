@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Backend shim for rust^(...)_rust blocks.
+"""Backend shim for mathematica^(...)_mathematica blocks.
 
-Compiles code with rustc, runs the resulting binary, and captures stdout.
+Executes code via WolframScript (Wolfram Language / Mathematica CLI)
+and captures stdout as the result.
 """
 import sys
 import json
 import subprocess
 import tempfile
 import os
+import shutil
 import traceback
 
 
@@ -23,41 +25,36 @@ def handle_exec(cmd):
     code = cmd.get("code", "")
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src = os.path.join(tmpdir, "main.rs")
-            binary = os.path.join(tmpdir, "main")
-
-            with open(src, "w") as f:
+        if shutil.which("wolframscript"):
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".wls", delete=False
+            ) as f:
                 f.write(code)
+                tmp = f.name
 
-            # Compile
-            comp = subprocess.run(
-                ["rustc", src, "-o", binary],
-                capture_output=True, text=True, timeout=120,
-            )
-            if comp.returncode != 0:
-                stderr = comp.stderr.strip()
-                send_err(f"rustc compilation failed\n{stderr}")
-                return
+            try:
+                result = subprocess.run(
+                    ["wolframscript", "-file", tmp],
+                    capture_output=True, text=True, timeout=300,
+                )
+            finally:
+                os.unlink(tmp)
 
-            # Run
-            result = subprocess.run(
-                [binary],
-                capture_output=True, text=True, timeout=60,
-            )
             if result.returncode != 0:
                 stderr = result.stderr.strip()
-                send_err(f"rust program exited with code {result.returncode}\n{stderr}")
+                send_err(f"wolframscript exited with code {result.returncode}\n{stderr}")
             else:
                 output = result.stdout
                 if output.endswith("\n"):
                     output = output[:-1]
                 send_ok({"t": "str", "v": output})
-
+        else:
+            send_err(
+                "wolframscript is not installed or not in PATH. "
+                "Install Wolfram Engine (https://www.wolfram.com/engine/)."
+            )
     except subprocess.TimeoutExpired:
-        send_err("rust compilation or execution timed out")
-    except FileNotFoundError:
-        send_err("rustc is not installed or not in PATH")
+        send_err("Mathematica execution timed out")
     except Exception:
         send_err(traceback.format_exc())
 

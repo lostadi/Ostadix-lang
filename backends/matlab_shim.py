@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Backend shim for racket^(...)_racket blocks.
+"""Backend shim for matlab^(...)_matlab blocks.
 
-Executes code via the Racket interpreter and captures stdout.
+Executes code via GNU Octave (MATLAB-compatible open-source alternative)
+or MATLAB if available. Captures stdout as the result.
 """
 import sys
 import json
 import subprocess
 import tempfile
 import os
+import shutil
 import traceback
 
 
@@ -24,31 +26,47 @@ def handle_exec(cmd):
 
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".rkt", delete=False
         ) as f:
             f.write(code)
             tmp = f.name
 
         try:
-            result = subprocess.run(
-                ["racket", tmp],
-                capture_output=True, text=True, timeout=60,
-            )
+            if shutil.which("octave"):
+                result = subprocess.run(
+                    ["octave", "--no-gui", "--norc", "--silent", tmp],
+                    capture_output=True, text=True, timeout=120,
+                )
+            elif shutil.which("matlab"):
+                # MATLAB batch mode
+                script_name = os.path.splitext(os.path.basename(tmp))[0]
+                script_dir = os.path.dirname(tmp)
+                result = subprocess.run(
+                    [
+                        "matlab", "-batch",
+                        f"addpath('{script_dir}'); {script_name}",
+                    ],
+                    capture_output=True, text=True, timeout=300,
+                )
+            else:
+                send_err(
+                    "Neither GNU Octave nor MATLAB found in PATH. "
+                    "Install Octave (https://octave.org) or MATLAB."
+                )
+                return
         finally:
             os.unlink(tmp)
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            send_err(f"racket exited with code {result.returncode}\n{stderr}")
+            send_err(f"MATLAB/Octave exited with code {result.returncode}\n{stderr}")
         else:
             output = result.stdout
             if output.endswith("\n"):
                 output = output[:-1]
             send_ok({"t": "str", "v": output})
+
     except subprocess.TimeoutExpired:
-        send_err("racket execution timed out (60s)")
-    except FileNotFoundError:
-        send_err("racket is not installed or not in PATH")
+        send_err("MATLAB/Octave execution timed out")
     except Exception:
         send_err(traceback.format_exc())
 

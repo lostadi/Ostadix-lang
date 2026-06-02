@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Backend shim for racket^(...)_racket blocks.
+"""Backend shim for javascript^(...)_javascript blocks.
 
-Executes code via the Racket interpreter and captures stdout.
+Executes code via Node.js and captures stdout as the result.
 """
 import sys
 import json
@@ -21,17 +21,38 @@ def send_err(message):
 
 def handle_exec(cmd):
     code = cmd.get("code", "")
+    bindings = cmd.get("bindings", {})
+
+    # Inject bindings as top-level const declarations.
+    preamble = ""
+    for name, oval in bindings.items():
+        t = oval.get("t")
+        v = oval.get("v")
+        if t == "str":
+            preamble += f"const {name} = {json.dumps(v)};\n"
+        elif t in ("int", "float"):
+            preamble += f"const {name} = {v};\n"
+        elif t == "bool":
+            preamble += f"const {name} = {'true' if v else 'false'};\n"
+        elif t == "null":
+            preamble += f"const {name} = null;\n"
+        elif t == "list":
+            preamble += f"const {name} = {json.dumps(v)};\n"
+        elif t == "map":
+            preamble += f"const {name} = {json.dumps(v)};\n"
+
+    full_code = preamble + code
 
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".rkt", delete=False
+            mode="w", suffix=".js", delete=False
         ) as f:
-            f.write(code)
+            f.write(full_code)
             tmp = f.name
 
         try:
             result = subprocess.run(
-                ["racket", tmp],
+                ["node", tmp],
                 capture_output=True, text=True, timeout=60,
             )
         finally:
@@ -39,16 +60,16 @@ def handle_exec(cmd):
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            send_err(f"racket exited with code {result.returncode}\n{stderr}")
+            send_err(f"node exited with code {result.returncode}\n{stderr}")
         else:
             output = result.stdout
             if output.endswith("\n"):
                 output = output[:-1]
             send_ok({"t": "str", "v": output})
     except subprocess.TimeoutExpired:
-        send_err("racket execution timed out (60s)")
+        send_err("javascript execution timed out (60s)")
     except FileNotFoundError:
-        send_err("racket is not installed or not in PATH")
+        send_err("node is not installed or not in PATH")
     except Exception:
         send_err(traceback.format_exc())
 

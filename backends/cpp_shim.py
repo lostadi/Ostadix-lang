@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Backend shim for rust^(...)_rust blocks.
+"""Backend shim for cpp^(...)_cpp blocks.
 
-Compiles code with rustc, runs the resulting binary, and captures stdout.
+Compiles code with g++ (C++17), runs the resulting binary, and captures stdout.
 """
 import sys
 import json
@@ -24,20 +24,20 @@ def handle_exec(cmd):
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            src = os.path.join(tmpdir, "main.rs")
+            src = os.path.join(tmpdir, "main.cpp")
             binary = os.path.join(tmpdir, "main")
 
             with open(src, "w") as f:
                 f.write(code)
 
-            # Compile
+            # Compile with C++17
             comp = subprocess.run(
-                ["rustc", src, "-o", binary],
+                ["g++", "-std=c++17", "-o", binary, src],
                 capture_output=True, text=True, timeout=120,
             )
             if comp.returncode != 0:
                 stderr = comp.stderr.strip()
-                send_err(f"rustc compilation failed\n{stderr}")
+                send_err(f"g++ compilation failed\n{stderr}")
                 return
 
             # Run
@@ -47,7 +47,7 @@ def handle_exec(cmd):
             )
             if result.returncode != 0:
                 stderr = result.stderr.strip()
-                send_err(f"rust program exited with code {result.returncode}\n{stderr}")
+                send_err(f"C++ program exited with code {result.returncode}\n{stderr}")
             else:
                 output = result.stdout
                 if output.endswith("\n"):
@@ -55,9 +55,9 @@ def handle_exec(cmd):
                 send_ok({"t": "str", "v": output})
 
     except subprocess.TimeoutExpired:
-        send_err("rust compilation or execution timed out")
+        send_err("C++ compilation or execution timed out")
     except FileNotFoundError:
-        send_err("rustc is not installed or not in PATH")
+        send_err("g++ is not installed or not in PATH")
     except Exception:
         send_err(traceback.format_exc())
 
