@@ -6,7 +6,6 @@ Executes code in a bash subprocess and captures stdout as the result.
 import sys
 import json
 import subprocess
-import tempfile
 import os
 import traceback
 

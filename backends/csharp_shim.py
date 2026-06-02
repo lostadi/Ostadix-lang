@@ -21,17 +21,6 @@ def send_err(message):
     print(json.dumps({"status": "err", "message": message}), flush=True)
 
 
-def try_dotnet_script(code, tmpdir):
-    """Try running via 'dotnet script' (dotnet-script global tool)."""
-    src = os.path.join(tmpdir, "script.csx")
-    with open(src, "w") as f:
-        f.write(code)
-    return subprocess.run(
-        ["dotnet", "script", src],
-        capture_output=True, text=True, timeout=120,
-    )
-
-
 def try_mono(code, tmpdir):
     """Try compiling with mcs (Mono) and running with mono."""
     src = os.path.join(tmpdir, "Program.cs")

@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         "nix_store",
         "nixos_test",
         "text",
-        // Major languages — stub shims return code as OStr for now.
+        // Major languages — full subprocess execution via backend shims.
         "csharp",
         "cpp",
         "haskell",

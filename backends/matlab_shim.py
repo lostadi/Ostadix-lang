@@ -26,7 +26,6 @@ def handle_exec(cmd):
 
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".m", delete=False, dir=None
         ) as f:
             f.write(code)
             tmp = f.name

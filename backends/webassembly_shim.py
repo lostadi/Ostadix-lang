@@ -58,10 +58,13 @@ def handle_exec(cmd):
                     send_err(f"wat2wasm failed\n{stderr}")
                     return
             else:
-                # Assume raw binary or pre-compiled path
+                # Assume raw WASM binary
                 wasm_path = os.path.join(tmpdir, "module.wasm")
                 with open(wasm_path, "wb") as f:
-                    f.write(code.encode("latin-1") if isinstance(code, str) else code)
+                    if isinstance(code, str):
+                        f.write(code.encode("latin-1"))
+                    else:
+                        f.write(code)
 
             # Run with wasmtime or wasmer
             if shutil.which("wasmtime"):

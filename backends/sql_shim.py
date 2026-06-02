@@ -73,7 +73,11 @@ def handle_exec(cmd):
             send_ok({"t": "str", "v": "\t".join(str(h) for h in headers)})
         else:
             # Non-query statement (INSERT, CREATE, etc.).
-            send_ok({"t": "str", "v": f"{cursor.rowcount} row(s) affected"})
+            affected = cursor.rowcount
+            if affected < 0:
+                send_ok({"t": "str", "v": "Statement executed successfully"})
+            else:
+                send_ok({"t": "str", "v": f"{affected} row(s) affected"})
 
     except Exception:
         send_err(traceback.format_exc())
