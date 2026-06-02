@@ -1,0 +1,6 @@
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/olang_core.dir
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/olang_cpp.dir
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/O.dir
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/olangc.dir
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/edit_cache.dir
+/tmp/workspace/lostadi/O-lang_rust_edition/c_cpp/build/CMakeFiles/rebuild_cache.dir

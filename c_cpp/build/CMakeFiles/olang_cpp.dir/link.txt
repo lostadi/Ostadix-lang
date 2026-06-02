@@ -1,0 +1,2 @@
+/usr/bin/ar qc libolang_cpp.a CMakeFiles/olang_cpp.dir/src/process.cpp.o CMakeFiles/olang_cpp.dir/src/eval.cpp.o CMakeFiles/olang_cpp.dir/src/scheduler.cpp.o CMakeFiles/olang_cpp.dir/src/nix_ops.cpp.o CMakeFiles/olang_cpp.dir/src/nixos_ops.cpp.o
+/usr/bin/ranlib libolang_cpp.a
