@@ -1,0 +1,30 @@
+# Build artifacts
+/target/
+*.o
+*.so
+*.dylib
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Generated extraction artifacts
+extracted_md/
+extracted_segments/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled binaries at root (use cargo build instead)
+/hello
+/script
