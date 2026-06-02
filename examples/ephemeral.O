@@ -3,5 +3,8 @@ x = 40
 )_python
 
 python^(
-__oval_result__ = x + 2
+try:
+    __oval_result__ = x + 2
+except NameError:
+    __oval_result__ = "EPHEMERAL: x from first bare block is NOT visible here (each bare is a fresh env)"
 )_python

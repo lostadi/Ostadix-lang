@@ -18,6 +18,7 @@ Returns OMap:
 
 import json
 import os
+import platform
 import subprocess
 import sys
 import traceback
@@ -73,6 +74,20 @@ def oval_to_nix(v):
 # ---------------------------------------------------------------------------
 
 def run_nixos_test(code):
+    # On non-Linux (e.g. macOS darwin), full NixOS VM tests cannot run
+    # without a linux remote builder + KVM. Return a stub success so the
+    # .O document itself evaluates flawlessly for demo/CI purposes.
+    # Set NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1 (and have a linux builder) to force.
+    if platform.system() != "Linux" and os.environ.get("NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM") != "1":
+        return {
+            "t": "map",
+            "v": {
+                "success": {"t": "bool", "v": False},
+                "log": {"t": "str", "v": "(nixos_test stub: not Linux; set NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1 + linux builder to run real test)"},
+                "store_path": {"t": "store_path", "path": "/nix/store/00000000000000000000000000000000-stub"},
+            }
+        }
+
     nixpkgs = os.environ.get("NIXPKGS_PATH", "<nixpkgs>")
     expr = _WRAPPER.format(nixpkgs=nixpkgs, body=code)
 

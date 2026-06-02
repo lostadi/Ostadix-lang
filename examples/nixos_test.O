@@ -8,6 +8,7 @@
 # runs the testScript assertions, and returns structured results.
 
 let lab = nixos_test^({
+  name = "o-nixos-basic";
   nodes.machine = { pkgs, ... }: {
     services.nginx.enable = true;
   };

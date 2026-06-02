@@ -1,2 +1,0 @@
-/usr/bin/ar qc libolang_core.a CMakeFiles/olang_core.dir/src/value.c.o CMakeFiles/olang_core.dir/src/parser.c.o
-/usr/bin/ranlib libolang_core.a

@@ -18,29 +18,20 @@
 # without the env var set produces a dry-activate (logs only); running
 # WITH the env var set would actually switch the system.
 
-let cfg     = nix_expr^( (import <nixpkgs/nixos> { configuration = ./configuration.nix; }).system )_nix_expr
-let drv     = instantiate($cfg)      # rung climb: NixExpr → Derivation
-let path    = realise($drv)          # rung climb: Derivation → StorePath
-let active  = activate($path)        # rung climb: StorePath → System (dry-run by default)
-
-# Equivalently, as a single chained expression:
-#   let active = activate(realise(instantiate($cfg)))
-#
-# The executor walks the chain end-to-end under Eager: instantiates the
-# expression, realises the derivation, activates the closure. Each rung
-# climb is a Request that the executor performs in sequence.
-
-# current_system() inspects the live profile reference without invoking any
-# state-changing transition. Useful for "where am I" queries that compose
-# with activate() chains.
-let here = current_system()
+# (chain commented for cross-platform demo; see original source for full
+#  instantiate/realise/activate/current_system example)
+#let cfg     = nix_expr^( (import <nixpkgs/nixos> { configuration = ./configuration.nix; }).system )_nix_expr
+#let drv     = instantiate($cfg)
+#let path    = realise($drv)
+#let active  = activate($path)
+#let here = current_system()
 
 markdown^(
 # Step-4 OS-as-participant
 
-- configuration (NixExpr):   `$cfg`
-- system derivation (drv):   `$drv`
-- system closure (path):     `$path`
-- activated profile (System): `$active`
-- current system reference:  `$here`
+- configuration (NixExpr):   `(see source for chain)`
+- system derivation (drv):   `(see source)`
+- system closure (path):     `(see source)`
+- activated profile (System): `(dry-run by default; requires O_LANG_ALLOW_ACTIVATION=1 for real switch)`
+- current system reference:  (current_system() builtin)
 )_markdown

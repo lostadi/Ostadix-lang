@@ -263,7 +263,7 @@ pub enum RequestKind {
     /// OValue::Thunk (the captured body + deps).
     ///
     /// `lang` selects which backend shim runs (python, nix, html, ...).
-    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral).
+    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral for bare `lang^(...)` blocks; explicit [N] for named persistent).
     /// `cacheable` distinguishes {lazy} (true, pure backends only, force-
     /// caches by fingerprint) from {defer} (false, any backend, re-runs on
     /// every force, errors on splice).

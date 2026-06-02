@@ -6,6 +6,7 @@ import ast
 import contextlib
 import base64
 import traceback
+import textwrap
 
 # Save a reference to the real process stdout (fd 1) before anything can
 # redirect it. O.eval() must write eval_request directly over the IPC pipe
@@ -165,6 +166,34 @@ def py_to_oval(x):
             "mime": "application/octet-stream",
         }
 
+    # matplotlib.figure.Figure -> PNG blob (for computed plots etc in HTML)
+    try:
+        import matplotlib.figure
+        if isinstance(x, matplotlib.figure.Figure):
+            buf = io.BytesIO()
+            x.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+            return {
+                "t": "blob",
+                "v": base64.b64encode(buf.getvalue()).decode("ascii"),
+                "mime": "image/png",
+            }
+    except Exception:
+        pass
+
+    # PIL.Image -> PNG blob
+    try:
+        from PIL import Image as _PILImage
+        if isinstance(x, _PILImage.Image):
+            buf = io.BytesIO()
+            x.save(buf, format="PNG")
+            return {
+                "t": "blob",
+                "v": base64.b64encode(buf.getvalue()).decode("ascii"),
+                "mime": "image/png",
+            }
+    except Exception:
+        pass
+
     if isinstance(x, (list, tuple)):
         return {"t": "list", "v": [py_to_oval(i) for i in x]}
 
@@ -206,6 +235,11 @@ def handle_exec(cmd):
         # return the empty string (the captured-stdout fallback) instead of
         # 42.  Anything that is genuinely a statement (assignments, defs,
         # loops, control flow) stays in the exec half and runs as before.
+        # Python bodies inside .O (esp. inside indented HTML/MD literals) often
+        # arrive with common leading whitespace. dedent so top-level Python
+        # parses. Also strip surrounding blank lines (matches py impl).
+        code = textwrap.dedent(code).strip("\n")
+
         module = ast.parse(code, mode="exec")
 
         trailing_expr = None

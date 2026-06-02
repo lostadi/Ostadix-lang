@@ -7,6 +7,7 @@
 # Results are rendered as HTML.
 
 let lab = nixos_test^({
+  name = "o-nixos-two-machine";
   nodes.server = { pkgs, ... }: {
     services.nginx.enable = true;
     networking.firewall.allowedTCPPorts = [ 80 ];

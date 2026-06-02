@@ -11,7 +11,7 @@
 //          VarRef   → look up scope, render via render_child, append
 //          TypedExpr → evaluate recursively first, render via render_child, append
 //     2. Call ProcessRegistry::exec(lang, env_id, buffer, scope, shim)
-//     3. For ephemeral envs (env_id == u32::MAX): call cleanup_env (always, even on err)
+//     3. For ephemeral envs (env_id == u32::MAX, used internally for re-entrancy etc): call cleanup_env (always, even on err)
 //
 //   Root document (eval_document):
 //     Evaluate nodes sequentially; return the last non-null OValue,
@@ -1072,8 +1072,9 @@ impl Evaluator {
         };
 
         // Step 3 — discard ephemeral envs (env_id == u32::MAX) after every expression,
-        // regardless of whether exec succeeded.  This mirrors the Python
-        // evaluator's "unbracketed → env is garbage collected after eval".
+        // regardless of whether exec succeeded.  (MAX is used for certain internal
+        // re-entrant O.eval cases to avoid deadlock on a persistent env; bare
+        // user-level blocks now default to env 0 per the spec.)
         if env_id == u32::MAX {
             let _ = self.registry.cleanup_env(lang, u32::MAX);
         }

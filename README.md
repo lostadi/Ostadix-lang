@@ -397,23 +397,32 @@ pass around.
 
 ## Quickstart
 
+There are two easy ways to build and run O-lang:
+
+**C edition (recommended — only needs a C compiler + make)**
+
 ```bash
-# Clone and build
-git clone https://github.com/lostadi/O-lang_rust_edition
-cd O-lang_rust_edition
+cd c_cpp
+make
+./O ../examples/hello.O ../backends
+./olangc ../examples/hello.O -o /tmp/hello_c && /tmp/hello_c
+```
+
+See [c_cpp/README.md](c_cpp/README.md) for the full easy-build instructions, `make test`, AOT details, etc.
+
+**Rust edition (authoritative reference implementation)**
+
+```bash
 cargo build
-
-# Run a .O file
 cargo run -- examples/hello.O
-
-# Compile to a self-contained native binary
 cargo run --bin olangc -- examples/hello.O -o hello
 ./hello
+```
 
-# Python reference implementation (for cross-checking)
+Python reference (for cross-checking semantics):
+
+```bash
 python -m o_lang examples/hello.O
-python -m o_lang examples/hello.O --dump-ast
-python -m o_lang examples/hello.O --as json
 ```
 
 ---
