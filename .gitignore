@@ -28,3 +28,7 @@ extracted_segments/
 # Compiled binaries at root (use cargo build instead)
 /hello
 /script
+
+# C/C++ build outputs
+c_cpp/O
+c_cpp/olangc
