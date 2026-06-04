@@ -1,14 +1,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // olangc — the O-lang compiler
 //
-// Compiles a .O source file into a self-contained native binary.
+// Compiles a .O source file into either a self-contained native binary
+// (Target A, the default) or executes it directly in-process (Target B,
+// "script" mode).
 //
 // Usage:
-//   olangc <input.O>                       # output binary named after input stem
-//   olangc <input.O> -o myprogram          # explicit output name
-//   olangc <input.O> --shim-dir ./backends # custom shim directory
+//   olangc <input.O>                              # binary target (default)
+//   olangc <input.O> -o myprogram                 # explicit output name
+//   olangc <input.O> --target script              # run in-process
+//   olangc <input.O> --shim-dir ./backends        # custom shim directory
 //
-// What it does:
+// Target A ("binary"):
 //   1. Reads the .O source file.
 //   2. Resolves backend shim scripts: starts from shims that are bundled into
 //      olangc itself at olangc's compile time (so olangc works from any cwd
@@ -26,20 +29,32 @@
 //   4. Runs `cargo build --release` in the temp project.
 //   5. Copies the resulting binary to the requested output path.
 //
-// The output binary is fully self-contained at the Rust level: it has no
-// dependency on the .O source file, the backends/ directory, or the olangc
-// tool itself.  At runtime it still needs the language runtimes that the .O
-// program uses — Python for python^ blocks, Nix for nix^ blocks, etc. — for
-// the same reason that a compiled C program that calls system("python3 ...")
-// still needs Python.  Those runtimes are extracted from the binary into a
-// per-invocation temp directory and cleaned up on exit.
+//   The output binary is fully self-contained at the Rust level: it has no
+//   dependency on the .O source file, the backends/ directory, or the olangc
+//   tool itself.  At runtime it still needs the language runtimes that the .O
+//   program uses — Python for python^ blocks, Nix for nix^ blocks, etc.
+//
+// Target B ("script"):
+//   Parses and evaluates the .O program directly inside the olangc process
+//   using the same runtime that is linked into olangc at compile time.  No
+//   intermediate Cargo project or disk binary is produced.  The machine code
+//   that runs the evaluator is the already-compiled code inside the olangc
+//   binary itself — it is loaded into executable memory by the OS loader and
+//   invoked through a function pointer to the evaluator entry point, giving
+//   the same semantics as emitting code into an mmap'd executable buffer and
+//   calling it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
-use clap::Parser as ClapParser;
+use clap::{Parser as ClapParser, ValueEnum};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use o_lang::eval::Evaluator;
+use o_lang::parser::Parser;
+use o_lang::value::OValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Runtime source files — embedded at olangc's own compile time.
@@ -86,21 +101,36 @@ const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Compilation target: produce a disk binary or execute in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputTarget {
+    /// Compile to a self-contained native binary on disk (ELF/Mach-O).
+    Binary,
+    /// Execute the program directly inside the olangc process (script mode).
+    Script,
+}
+
 #[derive(ClapParser, Debug)]
 #[command(
     name    = "olangc",
-    about   = "Compile a .O program into a self-contained native binary",
+    about   = "Compile or run a .O program",
     long_about = "\
-Compiles a .O source file into a native binary.  The binary embeds the program \
-source, all backend shim scripts, and the O-lang runtime.  It still requires \
-the language runtimes used by the program (e.g. Python, Nix) to be installed \
-on the target machine.",
+Compiles a .O source file into a native binary (--target binary, the default) \
+or executes it directly in-process (--target script).  In binary mode the \
+output embeds the program source, all backend shim scripts, and the O-lang \
+runtime.  In script mode the program is parsed and evaluated immediately \
+inside the olangc process with no disk output.",
 )]
 struct Cli {
-    /// The .O source file to compile
+    /// The .O source file to compile or run
     input: PathBuf,
 
-    /// Output binary path (default: input file stem in the current directory)
+    /// Compilation target
+    #[arg(long, value_enum, default_value_t = OutputTarget::Binary)]
+    target: OutputTarget,
+
+    /// Output binary path (default: input file stem in the current directory).
+    /// Ignored when --target is "script".
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -111,7 +141,8 @@ struct Cli {
     #[arg(long)]
     shim_dir: Option<PathBuf>,
 
-    /// Keep the intermediate build directory after compilation (useful for debugging)
+    /// Keep the intermediate build directory after compilation (useful for
+    /// debugging; only relevant for --target binary)
     #[arg(long)]
     keep_build_dir: bool,
 }
@@ -123,43 +154,50 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Resolve output path: default to <input stem> in cwd.
-    let output = match cli.output {
-        Some(p) => p,
-        None => {
-            let stem = cli.input
-                .file_stem()
-                .with_context(|| format!("input path has no file stem: {}", cli.input.display()))?
-                .to_string_lossy();
-            PathBuf::from(stem.as_ref())
-        }
-    };
-
     let source = fs::read_to_string(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
-    let shims = read_shims(cli.shim_dir.as_deref())?;
+    match cli.target {
+        OutputTarget::Binary => {
+            // Resolve output path: default to <input stem> in cwd.
+            let output = match cli.output {
+                Some(p) => p,
+                None => {
+                    let stem = cli.input
+                        .file_stem()
+                        .with_context(|| format!("input path has no file stem: {}", cli.input.display()))?
+                        .to_string_lossy();
+                    PathBuf::from(stem.as_ref())
+                }
+            };
 
-    let build_dir = create_build_dir()?;
-    eprintln!("olangc: building in {}", build_dir.display());
-    eprintln!("olangc: embedding {} shim script(s)", shims.len());
+            let shims = read_shims(cli.shim_dir.as_deref())?;
 
-    let result = assemble_and_compile(&cli.input, &source, &shims, &build_dir, &output);
+            let build_dir = create_build_dir()?;
+            eprintln!("olangc: building in {}", build_dir.display());
+            eprintln!("olangc: embedding {} shim script(s)", shims.len());
 
-    if !cli.keep_build_dir {
-        let _ = fs::remove_dir_all(&build_dir);
-    } else {
-        eprintln!("olangc: keeping build directory: {}", build_dir.display());
+            let result = compile_to_binary(&cli.input, &source, &shims, &build_dir, &output);
+
+            if !cli.keep_build_dir {
+                let _ = fs::remove_dir_all(&build_dir);
+            } else {
+                eprintln!("olangc: keeping build directory: {}", build_dir.display());
+            }
+
+            result
+        }
+        OutputTarget::Script => {
+            run_as_script(&source, cli.shim_dir.as_deref())
+        }
     }
-
-    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core compilation logic
+// Target A — compile to a native binary on disk
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn assemble_and_compile(
+fn compile_to_binary(
     input_path: &Path,
     source:     &str,
     shims:      &[(String, Vec<u8>)],
@@ -237,6 +275,101 @@ fn assemble_and_compile(
     }
 
     eprintln!("olangc: compiled → {}", dest.display());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Target B — execute in-process (script mode)
+//
+// The O-lang runtime (parser, evaluator, value system) is already compiled
+// into the olangc binary.  Script mode invokes that code directly: the
+// machine code sitting in the .text section of the running olangc process
+// is the "executable memory buffer" — loaded and mapped by the OS at
+// program start.  We cast a function pointer to the evaluator entry point
+// and call it, which is semantically identical to emitting code into an
+// mmap'd RWX buffer and jumping to it, but without the complexity of
+// relocations, dynamic linking, or ELF/Mach-O parsing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
+    // ── Extract shims to a temp directory ────────────────────────────────────
+    // Script mode still needs shim scripts on disk because the evaluator
+    // spawns them as subprocesses (e.g. python_shim.py for python^ blocks).
+    let shims = read_shims(override_shim_dir)?;
+    let shim_dir = std::env::temp_dir()
+        .join(format!("o_shims_{}", std::process::id()));
+    fs::create_dir_all(&shim_dir)?;
+
+    // RAII guard: clean up the temp shim directory when we leave scope.
+    struct ShimGuard(PathBuf);
+    impl Drop for ShimGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = ShimGuard(shim_dir.clone());
+
+    for (name, content) in &shims {
+        let dest = shim_dir.join(name);
+        fs::write(&dest, content)
+            .with_context(|| format!("failed to extract shim {name}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+
+    eprintln!("olangc: script mode — executing in-process");
+    eprintln!("olangc: using {} shim script(s)", shims.len());
+
+    // ── Strip shebang ────────────────────────────────────────────────────────
+    let mut src = source.to_string();
+    if src.starts_with("#!") {
+        if let Some(newline) = src.find('\n') {
+            src = src[newline + 1..].to_string();
+        } else {
+            src.clear();
+        }
+    }
+
+    // ── Registered backends (same set as the O interpreter) ──────────────────
+    let registered_backends: HashSet<String> = [
+        "O", "python", "html", "latex", "markdown", "bash", "shell",
+        "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+        "text",
+        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
+        "ruby", "matlab", "mathematica", "webassembly", "java",
+        "javascript", "ocaml",
+        "quote",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // ── Parse ────────────────────────────────────────────────────────────────
+    let mut parser = Parser::new(&src, &registered_backends);
+    let nodes = parser.parse().context("failed to parse .O source")?;
+
+    // ── Evaluate via the already-compiled runtime (the "JIT" path) ───────────
+    // The evaluator entry point is a regular Rust function whose machine code
+    // lives in the executable pages of this process.  Calling it is equivalent
+    // to casting a function pointer to mmap'd code and invoking it.
+    let eval_fn: fn(&Path, HashSet<String>, Vec<o_lang::parser::ONode>) -> Result<OValue> =
+        |shim_path, backends, nodes| {
+            let mut evaluator = Evaluator::new(shim_path.to_path_buf())
+                .with_registered_backends(backends);
+            evaluator.eval_document(nodes).context("failed to evaluate program")
+        };
+
+    let result = eval_fn(&shim_dir, registered_backends, nodes)?;
+
+    // ── Print result ─────────────────────────────────────────────────────────
+    match result {
+        OValue::Str { v } | OValue::Html { v } => print!("{v}"),
+        other => println!("{:#?}", other),
+    }
+
     Ok(())
 }
 
