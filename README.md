@@ -55,10 +55,14 @@ cd O-lang
 The script supports flags for different levels of setup:
 
 ```bash
-./setup.sh --minimal        # Core only, no prompts for Nix or extras
-./setup.sh --full --verify  # Everything, including Racket, then run verification
+./setup.sh --minimal        # Core only, skip optional Nix and extras
+./setup.sh --full --verify  # Full setup (optional backends like Racket), then run verification
 ./setup.sh --help           # See all options
 ```
+
+**Optional extras:** The `--full` flag also installs Nix (for `nix^(...)_nix`
+examples) and Racket (for the `racket^` backend stub). These are not required
+for core O-lang functionality — most examples only need Python 3.
 
 After it finishes, you can run O-lang programs immediately:
 
@@ -239,6 +243,19 @@ source "$HOME/.cargo/env"
 cd O-lang
 cargo build --release
 cd c_cpp && gmake && cd ..
+```
+
+#### TinyCore Linux
+
+```bash
+tce-load -wi gcc make python3.12 curl git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
 ```
 
 #### Windows
