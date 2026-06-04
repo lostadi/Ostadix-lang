@@ -1,4 +1,4 @@
-# O-lang (Rust edition)
+# O-lang
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
@@ -21,6 +21,336 @@ code fence. It is an *expression*. Its parenthesis shape — `LANG^(` ... `)_LAN
 — is the syntax that says "evaluate this in Python." The result is a value
 that HTML can embed directly, without either side knowing about the other's
 type system.
+
+---
+
+## Getting Started — Full Setup Guide
+
+This section walks you through everything you need to get O-lang's compiler
+and interpreter running on your machine, from scratch. There are three
+implementations you can build: the **C edition** (simplest — just a C compiler
+and make), the **Rust edition** (authoritative reference implementation), and a
+**Python reference** (for cross-checking semantics). You only need one to get
+going.
+
+### Prerequisites
+
+O-lang backends call out to real language runtimes, so you need **Python 3**
+installed for any `.O` program that uses `python^(...)_python` blocks (which
+is most of the examples). Beyond that, the build requirements depend on which
+edition you want.
+
+### Option A: Automatic setup (recommended)
+
+The included `setup.sh` script detects your OS and installs everything —
+system dependencies, Rust, the C build, Python shims, and convenience
+wrappers — in one shot:
+
+```bash
+git clone https://github.com/lostadi/O-lang.git
+cd O-lang
+./setup.sh
+```
+
+The script supports flags for different levels of setup:
+
+```bash
+./setup.sh --minimal        # Core only, skip optional Nix and extras
+./setup.sh --full --verify  # Full setup (optional backends like Racket), then run verification
+./setup.sh --help           # See all options
+```
+
+**Optional extras:** The `--full` flag also installs Nix (for `nix^(...)_nix`
+examples) and Racket (for the `racket^` backend stub). These are not required
+for core O-lang functionality — most examples only need Python 3.
+
+After it finishes, you can run O-lang programs immediately:
+
+```bash
+o examples/hello.O           # Uses the wrapper it installed
+cargo run -- examples/hello.O  # Or call Rust directly
+./c_cpp/O examples/hello.O ./backends  # Or the C edition
+```
+
+### Option B: Manual setup by operating system
+
+If you prefer to set things up yourself, here is what you need on each system.
+
+#### macOS
+
+```bash
+# Install Xcode command line tools (provides a C compiler)
+xcode-select --install
+
+# Install Homebrew if you don't have it, then grab dependencies
+brew install gcc make python@3.12 curl git pkg-config openssl
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build the Rust edition
+cd O-lang
+cargo build --release
+
+# Build the C edition
+cd c_cpp
+make
+cd ..
+
+# Run an example
+cargo run -- examples/hello.O
+./c_cpp/O examples/hello.O ./backends
+```
+
+#### Debian / Ubuntu / Mint / Pop!_OS
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential gcc g++ make python3 python3-pip \
+    python3-venv curl git pkg-config libssl-dev
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build the Rust edition
+cd O-lang
+cargo build --release
+
+# Build the C edition
+cd c_cpp
+make
+cd ..
+
+# Run an example
+cargo run -- examples/hello.O
+./c_cpp/O examples/hello.O ./backends
+```
+
+#### Arch / CachyOS / Manjaro / EndeavourOS
+
+```bash
+sudo pacman -Syu
+sudo pacman -S --needed base-devel gcc make python python-pip curl git pkgconf openssl
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+
+# Run
+cargo run -- examples/hello.O
+```
+
+#### Fedora / RHEL / CentOS / Rocky
+
+```bash
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### Alpine Linux
+
+```bash
+sudo apk update
+sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Build
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### NixOS
+
+```bash
+# Add to environment.systemPackages or use nix-shell:
+nix-shell -p rustup gcc gnumake python3 openssl pkg-config
+
+# Inside the shell
+rustup default stable
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### openSUSE
+
+```bash
+sudo zypper refresh
+sudo zypper install -y gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### Void Linux
+
+```bash
+sudo xbps-install -Suy
+sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### Gentoo
+
+```bash
+sudo emerge --ask=n sys-devel/gcc sys-devel/make dev-lang/python net-misc/curl dev-vcs/git dev-libs/openssl
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### FreeBSD
+
+```bash
+sudo pkg install -y gmake gcc python3 curl git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && gmake && cd ..
+```
+
+#### TinyCore Linux
+
+```bash
+tce-load -wi gcc make python3.12 curl git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+cd O-lang
+cargo build --release
+cd c_cpp && make && cd ..
+```
+
+#### Windows
+
+The recommended approach on Windows is **WSL2** with Ubuntu — follow the
+Debian/Ubuntu instructions above inside your WSL environment.
+
+If you want native Windows:
+
+```powershell
+# Install via winget
+winget install --id Git.Git -e
+winget install --id Python.Python.3.12 -e
+winget install --id Rustlang.Rustup -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
+    --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools"
+
+# Restart your terminal, then:
+cd O-lang
+cargo build --release
+
+# For the C edition, use the Developer Command Prompt or MinGW:
+cd c_cpp
+make
+```
+
+#### Docker (any host)
+
+```bash
+docker run -it -v "$PWD:/ws" -w /ws debian bash -c \
+    "apt-get update && apt-get install -y sudo curl && ./setup.sh --minimal --verify"
+```
+
+### Option C: C edition only (no Rust needed)
+
+If you do not want to install Rust at all, the C edition is a complete
+standalone build. It only requires a C17 compiler (gcc, clang, or cc) and make:
+
+```bash
+cd c_cpp
+make
+./O ../examples/hello.O ../backends
+```
+
+The C edition also includes an AOT compiler that produces self-contained
+native binaries:
+
+```bash
+./olangc ../examples/hello.O -o /tmp/hello
+/tmp/hello
+```
+
+### What gets built
+
+| Binary | Location | What it does |
+|--------|----------|--------------|
+| `O` (Rust) | `target/release/O` | Interpreter — runs `.O` files directly |
+| `olangc` (Rust) | `target/release/olangc` | AOT compiler — compiles `.O` to native binaries |
+| `O` (C) | `c_cpp/O` | C interpreter — same behavior, no Rust dependency |
+| `olangc` (C) | `c_cpp/olangc` | C AOT compiler |
+
+### Verifying the installation
+
+After building, run the smoke tests to confirm everything works:
+
+```bash
+# Rust tests
+cargo test
+
+# C edition smoke tests
+cd c_cpp && make test && cd ..
+
+# Full integration suite
+./test_o_lang_examples.sh
+```
+
+### Per-OS dedicated scripts
+
+For CI or Docker environments, there are also dedicated per-OS scripts in
+`setup/os/` that skip detection and go straight to the right package manager:
+
+```
+setup/os/setup-macos.sh
+setup/os/setup-debian.sh
+setup/os/setup-arch.sh
+setup/os/setup-fedora.sh
+setup/os/setup-alpine.sh
+setup/os/setup-nixos.sh
+setup/os/setup-opensuse.sh
+setup/os/setup-void.sh
+setup/os/setup-gentoo.sh
+setup/os/setup-freebsd.sh
+setup/os/setup-tinycore.sh
+setup/os/setup-windows.sh
+```
 
 ---
 
@@ -841,4 +1171,4 @@ See `SPEC.md` for the formal language specification.
 
 ## License
 
-This is research scaffolding for the .O idea. Use it, extend it, break it.
+MIT License. See [LICENSE](LICENSE) for the full text.
