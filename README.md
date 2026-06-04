@@ -1,4 +1,4 @@
-<img width="832" height="1248" alt="ga6id" src="https://github.com/user-attachments/assets/f7ed9cc1-6391-4191-92ce-0508c75ff696" />
+<img width="500" height="500" alt="ShBrA (1)" src="https://github.com/user-attachments/assets/091029cc-b64a-43bb-9ec0-9d25cf305867" />
 
 
 # O-lang — Ouroboros Language
