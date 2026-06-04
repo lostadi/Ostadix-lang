@@ -101,6 +101,34 @@ cargo test
 bash test_o_lang_examples.sh
 ```
 
+## Compiler Targets (`olangc`)
+
+`olangc` supports two compilation targets, selected via `--target`:
+
+| Target   | Flag              | Output                              |
+|----------|-------------------|-------------------------------------|
+| `binary` | `--target binary` | Native ELF/Mach-O binary on disk    |
+| `script` | `--target script` | In-process execution (no disk file) |
+
+**Target A — Binary** (default): creates a temporary Cargo project that
+bundles the .O source, runtime, and backend shims, then compiles it with
+`cargo build --release`.  The result is a self-contained native binary.
+
+**Target B — Script**: parses and evaluates the .O program directly inside
+the `olangc` process.  The evaluator machine code is already loaded into
+executable memory as part of the running `olangc` binary — calling it is
+semantically equivalent to emitting code into an `mmap`'d executable buffer
+and invoking a function pointer.  No intermediate build step or disk binary
+is produced.
+
+```bash
+# Compile to a binary (Target A)
+cargo run --bin olangc -- examples/hello.O -o hello
+
+# Execute in-process (Target B)
+cargo run --bin olangc -- examples/hello.O --target script
+```
+
 ## Implementations
 
 | Edition | Directory | Status     |
