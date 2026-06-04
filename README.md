@@ -1,8 +1,10 @@
-# O-lang
+# O-lang — Ouroboros Language
+
+*By Lee Daghlar Ostadi*
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
-O-lang is a meta-language built on one radical idea: the language an expression
+O-lang — short for **Ouroboros language** — is a meta-language built on one radical idea: the language an expression
 is written in is a structural part of the expression itself — not a file
 extension, not a global mode switch, not a pragma. You write the language name
 directly around the code, and the runtime dispatches to that language's
