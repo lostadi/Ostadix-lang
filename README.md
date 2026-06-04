@@ -1,4 +1,6 @@
-<img width="500" height="500" alt="ShBrA (1)" src="https://github.com/user-attachments/assets/091029cc-b64a-43bb-9ec0-9d25cf305867" />
+<img width="900" height="297" alt="o_lang_logo" src="https://github.com/user-attachments/assets/182a1832-cf94-453f-98e6-fec8366d8e3d" /><svg viewBox="0 0 560 185" xmlns="http://www.w3.org/2000/svg" role="img" style="">
+
+
 
 
 # O-lang — Ouroboros Language
