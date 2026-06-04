@@ -1,6 +1,4 @@
-<img width="900" height="297" alt="o_lang_logo" src="https://github.com/user-attachments/assets/182a1832-cf94-453f-98e6-fec8366d8e3d" /><svg viewBox="0 0 560 185" xmlns="http://www.w3.org/2000/svg" role="img" style="">
-
-
+<img width="832" height="1248" alt="ga6id" src="https://github.com/user-attachments/assets/864296a5-d913-49ac-a332-80d7688c43f1" />
 
 
 # O-lang — Ouroboros Language
