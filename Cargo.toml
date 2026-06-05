@@ -17,6 +17,14 @@ path = "src/main.rs"
 name = "olangc"
 path = "src/bin/olangc.rs"
 
+[[bin]]
+name = "o-notebook"
+path = "src/bin/o-notebook.rs"
+required-features = ["notebook"]
+
+[features]
+notebook = ["dep:axum", "dep:tokio"]
+
 [dependencies]
 # Serialization — OValue wire protocol
 serde       = { version = "1", features = ["derive"] }
@@ -45,9 +53,17 @@ anyhow      = "1"
 # CLI argument parsing
 clap        = { version = "4", features = ["derive"] }
 
+# REPL line editing — history, arrow keys, Ctrl+A/E, Ctrl+C/D
+rustyline   = "14"
+
+# Notebook server (opt-in via --features notebook)
+axum        = { version = "0.7", optional = true }
+tokio       = { version = "1", features = ["full"], optional = true }
+
 [profile.release]
-opt-level     = 3
-lto           = "fat"     # Fat LTO — maximum cross-crate inlining
-codegen-units = 1         # Single codegen unit — maximum optimization surface
-panic         = "abort"   # No unwinding overhead
-strip         = "symbols" # Strip debug symbols from release binary
+opt-level       = 3
+lto             = "fat"     # Fat LTO — maximum cross-crate inlining
+codegen-units   = 1         # Single codegen unit — maximum optimization surface
+panic           = "abort"   # No unwinding overhead
+strip           = "symbols" # Strip debug symbols from release binary
+overflow-checks = false     # No overflow panics in release (panic=abort anyway)

@@ -127,7 +127,7 @@ pub enum Policy {
 // not now on speculation.
 // ═════════════════════════════════════════════════════════════════════════════
 
-pub trait Executor {
+pub trait Executor: Send {
     /// Perform a Request. Recursively executes nested Requests in the source
     /// chain before doing this request's own work. Cache hits short-circuit.
     fn execute(&mut self, req: &OValue) -> Result<OValue>;
@@ -487,21 +487,19 @@ impl Evaluator {
     /// Auto-forcing here means: ask the executor to perform the request and
     /// return its result. The executor's cache makes this idempotent for {lazy}.
     fn resolve_for_splice(&mut self, v: OValue) -> Result<OValue> {
-        if let OValue::Request { kind, .. } = &v {
-            if let RequestKind::Eval { cacheable, lang, .. } = kind {
-                if *cacheable {
-                    // {lazy}: safe to auto-force.
-                    return self.force_request(&v);
-                } else {
-                    // {defer}: refuse to auto-force.
-                    bail!(
-                        "Cannot splice a {{defer}} thunk (`{}{{defer}}^...`) into \
-                         source text — {{defer}} is non-cacheable and forcing it \
-                         implicitly could re-run side effects unexpectedly. \
-                         Wrap the splice in now(...) to force explicitly.",
-                        lang
-                    );
-                }
+        if let OValue::Request { kind: RequestKind::Eval { cacheable, lang, .. }, .. } = &v {
+            if *cacheable {
+                // {lazy}: safe to auto-force.
+                return self.force_request(&v);
+            } else {
+                // {defer}: refuse to auto-force.
+                bail!(
+                    "Cannot splice a {{defer}} thunk (`{}{{defer}}^...`) into \
+                     source text — {{defer}} is non-cacheable and forcing it \
+                     implicitly could re-run side effects unexpectedly. \
+                     Wrap the splice in now(...) to force explicitly.",
+                    lang
+                );
             }
         }
         Ok(v)
@@ -590,6 +588,49 @@ impl Evaluator {
         if self.policy == Policy::Autonomous {
             self.flush_autonomous_buffer()?;
             // If the final value is a buffered Nix-family Request, resolve it.
+            if Self::is_schedulable_request(&last) {
+                if let Some(v) = self.resolve_from_cache(&last) {
+                    last = v;
+                }
+            }
+        }
+
+        Ok(last)
+    }
+
+    /// Like `eval_document` but operates on a caller-supplied scope instead of
+    /// a fresh one.  Bindings introduced by `let` statements are written back
+    /// into `scope` so they persist across calls.  Used by the notebook server
+    /// to maintain cell-to-cell variable state.
+    pub fn eval_document_with_scope(
+        &mut self,
+        nodes: Vec<ONode>,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let mut last = OValue::null();
+
+        for node in nodes {
+            let is_pure_whitespace_text = matches!(
+                &node,
+                ONode::RawText(s) if !s.is_empty() && s.chars().all(char::is_whitespace)
+            );
+
+            let value = match &node {
+                ONode::LetBinding { name, expr } => {
+                    let value = self.eval_node(expr, scope)?;
+                    scope.insert(name.clone(), value.clone());
+                    value
+                }
+                _ => self.eval_node(&node, scope)?,
+            };
+
+            if !value.is_null() && !is_pure_whitespace_text {
+                last = value;
+            }
+        }
+
+        if self.policy == Policy::Autonomous {
+            self.flush_autonomous_buffer()?;
             if Self::is_schedulable_request(&last) {
                 if let Some(v) = self.resolve_from_cache(&last) {
                     last = v;
@@ -882,17 +923,26 @@ impl Evaluator {
         // Whether this block constructs a Thunk (and so should track deps).
         let constructs_thunk = lang == "nix_expr" || attr.is_some();
 
+        // Own a mutable copy of the scope so that LetBinding nodes inside this
+        // body can extend it for subsequent children. Cloning is cheap compared
+        // to the subprocess dispatch that follows.
+        let mut local_scope = scope.clone();
+
         for child in body {
             match child {
-                ONode::LetBinding { .. } => {
-                    bail!("let bindings are only supported at document top level for now");
-                },
+                ONode::LetBinding { name, expr } => {
+                    // Evaluate the RHS and bind it into the local scope.
+                    // The binding itself produces no text for the backend.
+                    let value = self.eval_node(expr, &local_scope)?;
+                    local_scope.insert(name.clone(), value);
+                }
+
                 ONode::RawText(text) => {
                     buf.push_str(text);
                 }
 
                 ONode::VarRef(name) => {
-                    let val = scope
+                    let val = local_scope
                         .get(name)
                         .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?
                         .clone();
@@ -915,7 +965,7 @@ impl Evaluator {
                     // Evaluate the nested expression first (leaves-up / applicative order),
                     // then render its value into the parent language's source syntax.
                     let child_val = self.eval_typed_expr(
-                        child_lang, *child_env_id, child_attr.as_deref(), child_body, scope,
+                        child_lang, *child_env_id, child_attr.as_deref(), child_body, &local_scope,
                     )?;
                     let resolved = self.resolve_for_splice(child_val)?;
                     buf.push_str(&self.render_child(lang, &resolved));
@@ -925,7 +975,7 @@ impl Evaluator {
                 }
 
                 ONode::Call { fn_name, args } => {
-                    let raw = self.eval_call(fn_name, args, scope)?;
+                    let raw = self.eval_call(fn_name, args, &local_scope)?;
                     let resolved = self.resolve_for_splice(raw)?;
                     buf.push_str(&self.render_child(lang, &resolved));
                     if constructs_thunk {

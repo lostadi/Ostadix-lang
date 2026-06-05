@@ -353,14 +353,13 @@ impl AutonomousScheduler {
             let mut threadable: Vec<String> = Vec::new();
             let mut serial:     Vec<String> = Vec::new();
             for fp in &ready {
-                match all.get(fp) {
-                    Some(OValue::Request { kind, .. }) => match kind {
+                if let Some(OValue::Request { kind, .. }) = all.get(fp) {
+                    match kind {
                         RequestKind::Instantiate |
                         RequestKind::Realise     |
                         RequestKind::Activate { .. } => threadable.push(fp.clone()),
                         _ => serial.push(fp.clone()),
-                    },
-                    _ => {}
+                    }
                 }
             }
 
@@ -460,7 +459,7 @@ impl AutonomousScheduler {
             return Ok(v);
         }
 
-        let results = self.execute_batch(&[req.clone()], None)?;
+        let results = self.execute_batch(std::slice::from_ref(req), None)?;
         results
             .get(&fp)
             .cloned()
