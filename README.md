@@ -1,4 +1,4 @@
-<img width="832" height="1248" alt="ga6id" src="https://github.com/user-attachments/assets/864296a5-d913-49ac-a332-80d7688c43f1" />
+<img width="1200" height="400" alt="svgviewer-png-output" src="https://github.com/user-attachments/assets/46303629-a640-4c8d-8c90-d5981bf4e3ae" />
 
 
 # O-lang — Ouroboros Language
