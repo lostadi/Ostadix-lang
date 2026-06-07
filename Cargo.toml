@@ -4,7 +4,7 @@ version     = "0.1.0"
 edition     = "2021"
 description = "The O Language — a universal polyglot expression framework"
 authors     = ["Lee Daghlar Ostadi"]
-license     = "MIT"
+license     = "Apache-2.0"
 # `cargo run` and the test_o_lang_examples.sh smoke suite invoke the
 # interpreter; default-run pins that so they don't have to spell --bin O.
 default-run = "O"
