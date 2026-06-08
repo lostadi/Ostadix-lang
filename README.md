@@ -1,14 +1,14 @@
 <img width="1200" height="400" alt="svgviewer-png-output" src="https://github.com/user-attachments/assets/46303629-a640-4c8d-8c90-d5981bf4e3ae" />
 
 
-# O-lang — Ouroboros Language
+# O-lang: Ouroboros Language
 
 *By Lee Daghlar Ostadi*
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
-O-lang — short for **Ouroboros language** — is a meta-language built on one radical idea: the language an expression
-is written in is a structural part of the expression itself — not a file
+O-lang, short for **Ouroboros language**, is a meta-language built on one radical idea: the language an expression
+is written in is a structural part of the expression itself, not a file
 extension, not a global mode switch, not a pragma. You write the language name
 directly around the code, and the runtime dispatches to that language's
 evaluator on the spot.
@@ -22,18 +22,17 @@ __oval_result__ = sum(x*x for x in range(10))
 ```
 
 The `python^( ... )_python` block is not a string, not a template, not a
-code fence. It is an *expression*. Its parenthesis shape — `LANG^(` ... `)_LANG`
-— is the syntax that says "evaluate this in Python." The result is a value
+code fence. It is an *expression*. Its parenthesis shape, `LANG^(` ... `)_LANG`, is the syntax that says "evaluate this in Python." The result is a value
 that HTML can embed directly, without either side knowing about the other's
 type system.
 
 ---
 
-## Getting Started — Full Setup Guide
+## Getting Started: Full Setup Guide
 
 This section walks you through everything you need to get O-lang's compiler
 and interpreter running on your machine, from scratch. There are three
-implementations you can build: the **C edition** (simplest — just a C compiler
+implementations you can build: the **C edition** (simplest, just a C compiler
 and make), the **Rust edition** (authoritative reference implementation), and a
 **Python reference** (for cross-checking semantics). You only need one to get
 going.
@@ -47,9 +46,8 @@ edition you want.
 
 ### Option A: Automatic setup (recommended)
 
-The included `setup.sh` script detects your OS and installs everything —
-system dependencies, Rust, the C build, Python shims, and convenience
-wrappers — in one shot:
+The included `setup.sh` script detects your OS and installs everything, system dependencies, Rust, the C build, Python shims, and convenience
+wrappers, in one shot:
 
 ```bash
 git clone https://github.com/lostadi/O-lang.git
@@ -67,7 +65,7 @@ The script supports flags for different levels of setup:
 
 **Optional extras:** The `--full` flag also installs Nix (for `nix^(...)_nix`
 examples) and Racket (for the `racket^` backend stub). These are not required
-for core O-lang functionality — most examples only need Python 3.
+for core O-lang functionality, most examples only need Python 3.
 
 After it finishes, you can run O-lang programs immediately:
 
@@ -265,7 +263,7 @@ cd c_cpp && make && cd ..
 
 #### Windows
 
-The recommended approach on Windows is **WSL2** with Ubuntu — follow the
+The recommended approach on Windows is **WSL2** with Ubuntu, follow the
 Debian/Ubuntu instructions above inside your WSL environment.
 
 If you want native Windows:
@@ -317,9 +315,9 @@ native binaries:
 
 | Binary | Location | What it does |
 |--------|----------|--------------|
-| `O` (Rust) | `target/release/O` | Interpreter — runs `.O` files directly |
-| `olangc` (Rust) | `target/release/olangc` | AOT compiler — compiles `.O` to native binaries |
-| `O` (C) | `c_cpp/O` | C interpreter — same behavior, no Rust dependency |
+| `O` (Rust) | `target/release/O` | Interpreter, runs `.O` files directly |
+| `olangc` (Rust) | `target/release/olangc` | AOT compiler, compiles `.O` to native binaries |
+| `O` (C) | `c_cpp/O` | C interpreter, same behavior, no Rust dependency |
 | `olangc` (C) | `c_cpp/olangc` | C AOT compiler |
 
 ### Verifying the installation
@@ -361,13 +359,13 @@ setup/os/setup-windows.sh
 
 ## Table of Contents
 
-1. [What is new here?](#what-is-new-here) — the novel ideas, explained plainly
-2. [Related work and how O-lang differs](#related-work-and-how-o-lang-differs) — vs. `#lang`, polyglot notebooks, staging
-3. [Gentle introduction](#gentle-introduction) — for readers new to programming languages
-4. [Quickstart](#quickstart) — build and run in three commands
-5. [Language tour](#language-tour) — all features with examples
-6. [Architecture](#architecture) — how the runtime works
-7. [Reference](#reference) — wire format, backends, builtins
+1. [What is new here?](#what-is-new-here), the novel ideas, explained plainly
+2. [Related work and how O-lang differs](#related-work-and-how-o-lang-differs), vs. `#lang`, polyglot notebooks, staging
+3. [Gentle introduction](#gentle-introduction), for readers new to programming languages
+4. [Quickstart](#quickstart), build and run in three commands
+5. [Language tour](#language-tour), all features with examples
+6. [Architecture](#architecture), how the runtime works
+7. [Reference](#reference), wire format, backends, builtins
 8. [Running the tests](#running-the-tests)
 9. [Status and roadmap](#status)
 
@@ -379,7 +377,7 @@ Most languages make one or all of these assumptions:
 
 * A program is written in one language.
 * When you call out to another language you use an FFI (foreign-function
-  interface) — a bridge bolted on the side.
+  interface), a bridge bolted on the side.
 * The "language" a piece of code belongs to is determined by the file it sits
   in, or by a special import/escape mechanism.
 
@@ -422,7 +420,7 @@ completes. **No FFI. No bridge. The nesting is the interface.**
 ### 2. OValue: the universal exchange type
 
 When Python produces `42` and HTML needs to embed it, *something* has to
-cross the boundary. In O-lang that something is always an `OValue` — a
+cross the boundary. In O-lang that something is always an `OValue`, a
 tagged union that every backend speaks.
 
 ```
@@ -448,8 +446,7 @@ Python.render_child(OInt(42))
   → 42  (a Python literal)
 ```
 
-With N languages and this single protocol, interoperability costs O(N) code
-— one `render_child` per language — instead of O(N²) bridges between
+With N languages and this single protocol, interoperability costs O(N) code, one `render_child` per language, instead of O(N²) bridges between
 every pair.
 
 This is a concrete implementation of what formal polyglot theory (the
@@ -472,8 +469,8 @@ python[0]^( x * x  )_python[0]   # sees 10, not 99 → returns 100
 ```
 
 The number in brackets is an *environment index*. Environments survive for
-the life of the document. State — imports, function definitions, variable
-bindings — persists across all expressions that reference the same
+the life of the document. State, imports, function definitions, variable
+bindings, persists across all expressions that reference the same
 `(language, index)` pair.
 
 `python^(...)_python` without brackets defaults to `python[0]`. You can have
@@ -490,12 +487,12 @@ evaluate it. This is how Lisp macros work, and it is a deep source of
 expressive power.
 
 O-lang generalizes homoiconicity across multiple languages. The `quote^`
-backend captures any expression — in any language — as an `OExpr` value
+backend captures any expression, in any language, as an `OExpr` value
 without evaluating it:
 
 ```
 let q = quote^( python^( 6 * 7 )_python )_quote
-# q is now a value of type OExpr — an unevaluated AST
+# q is now a value of type OExpr: an unevaluated AST
 ```
 
 A Python block can receive `q`, inspect it, store it in a list, and evaluate
@@ -518,15 +515,15 @@ python[0]^(
 
 The full quote/eval round-trip works across all registered backends. A
 program can build up an O expression tree in Python, pass it through a
-Nix backend, and evaluate the result — the language boundary is not a
+Nix backend, and evaluate the result, the language boundary is not a
 barrier to metaprogramming.
 
 ---
 
 ## Related work and how O-lang differs
 
-O-lang sits at the intersection of three established traditions — language-oriented
-programming, polyglot execution, and metaprogramming — but combines them in a way
+O-lang sits at the intersection of three established traditions, language-oriented
+programming, polyglot execution, and metaprogramming, but combines them in a way
 none of them individually provide. The one-sentence thesis: **the evaluator is named
 by the delimiter shape, so language choice becomes a structural, compositional
 property of an expression at arbitrary nesting depth, federating multiple
@@ -537,7 +534,7 @@ Here is how that relates to the closest neighbors.
 a program declares its own language and that defining new languages should be cheap.
 The differences are granularity and substrate. Racket's `#lang` is a *module-level*
 declaration, and every surface language ultimately expands into Racket's core and
-runs on the Racket VM — one runtime hosting many front-ends. O-lang places the
+runs on the Racket VM, one runtime hosting many front-ends. O-lang places the
 language tag at the *expression* level (`LANG^( … )_LANG`), nests heterogeneous
 languages inside one another, and dispatches to *separate, real* runtimes (CPython,
 Nix, …) that it federates rather than subsumes. Racket unifies languages by compiling
@@ -551,12 +548,12 @@ blocks are *top-level cells* sequenced linearly, with data passed through a shar
 kernel or named variables; the language is a per-cell mode. In O-lang a block is an
 *expression* that can be nested inside another language's expression, with the inner
 value flowing back into the outer one (`html^( … python^( … )_python … )_html`). The
-language boundary is a node in an AST, not a cell delimiter — which is what makes
+language boundary is a node in an AST, not a cell delimiter, which is what makes
 quote/eval and `OValue` splicing work uniformly at any depth.
 
 **Multi-stage and staged metaprogramming (Lisp quasiquotation, MetaOCaml, Template
 Haskell, Terra).** O-lang's `O.quote`/`O.eval` and the `OExpr` type are
-homoiconicity — code as inspectable data — which these systems also provide. The
+homoiconicity, code as inspectable data, which these systems also provide. The
 generalization is *across languages*: staging systems quote and splice code within a
 single language (or, in Terra's case, two tightly-coupled ones), whereas O-lang's
 quoted `OExpr` can be constructed in Python, threaded through a Nix backend, and
@@ -566,7 +563,7 @@ federation of them.
 **String-embedded DSLs (heredocs, JSX, tagged template literals, SQL-in-host).** The
 common way to mix languages today is to embed foreign syntax as a *string* that some
 library later parses; to the host language those payloads are opaque text. O-lang's
-blocks are not strings — they are parsed by the host grammar, evaluated by the named
+blocks are not strings, they are parsed by the host grammar, evaluated by the named
 backend, and return a typed `OValue` that the surrounding language consumes as a
 first-class atom, with bidirectional flow rather than a one-way opaque payload.
 
@@ -580,8 +577,8 @@ time through a unified metamodel.
 **Honest scope.** O-lang is a research prototype and does not yet match the maturity
 of any system above. Several backends (`bash`, `shell`, `rust`, `racket`) are
 registered but currently parse-only stubs; the executing backends are Python, Nix,
-and inline HTML. The contribution is the *organizing idea* — interpreter-as-syntax
-with value-level federation — together with a working reference implementation in
+and inline HTML. The contribution is the *organizing idea*, interpreter-as-syntax
+with value-level federation, together with a working reference implementation in
 three languages (Rust, C, Python), not a production toolchain.
 
 ---
@@ -601,8 +598,8 @@ those characters and produce the number `4`. That something is an evaluator
 (also called an interpreter or runtime). Every programming language is, at
 bottom, a pair of things:
 
-1. **Syntax** — the rules about what text is a valid program.
-2. **Semantics** — the rules about what a valid program *does*.
+1. **Syntax**, the rules about what text is a valid program.
+2. **Semantics**, the rules about what a valid program *does*.
 
 The evaluator reads syntax and applies semantics to produce a result.
 
@@ -696,7 +693,7 @@ __oval_result__ = $answer + 1
 ```
 
 The `let answer = ...` line runs the Python block and binds its result to
-`$answer`. The second block splices `$answer` in — the runtime substitutes
+`$answer`. The second block splices `$answer` in, the runtime substitutes
 the value `42` before sending the body to Python, so Python sees
 `__oval_result__ = 42 + 1` and returns `43`.
 
@@ -721,7 +718,7 @@ round(sum(samples) / len(samples), 4)
 ```
 
 This makes O-lang documents feel like literate programs or lab notebooks,
-except that the environments are *explicit*, *named*, and *multiple* — you
+except that the environments are *explicit*, *named*, and *multiple*, you
 can have several independent Python namespaces in one document with no
 accidental sharing between them.
 
@@ -744,7 +741,7 @@ The complexity does not grow as you add languages.
 ### Code as data: `quote` and `O.eval`
 
 One of the deepest ideas in programming language theory is
-*homoiconicity* — the ability of a language to treat its own programs as
+*homoiconicity*, the ability of a language to treat its own programs as
 data that can be inspected and modified.
 
 O-lang lets you do this not just within one language but across all of them.
@@ -753,7 +750,7 @@ The `quote^(...)_quote` expression captures its body as an `OExpr` value
 
 ```
 let q = quote^( python^(2 ** 10)_python )_quote
-# q is just data now — nothing has run yet
+# q is just data now: nothing has run yet
 ```
 
 Later, from inside Python, you can evaluate it:
@@ -789,7 +786,7 @@ let sys  = activate($path)     # StorePath → System
 ```
 
 Each step is a pure function from one `OValue` to another. The OS is not
-a side effect of the program — it is a value the program can compute and
+a side effect of the program, it is a value the program can compute and
 pass around.
 
 ---
@@ -798,7 +795,7 @@ pass around.
 
 There are two easy ways to build and run O-lang:
 
-**C edition (recommended — only needs a C compiler + make)**
+**C edition (recommended, only needs a C compiler + make)**
 
 ```bash
 cd c_cpp
@@ -837,7 +834,7 @@ LANG[n]^( body )_LANG[n]    # explicit environment index n
 
 The opener `LANG^(` and closer `)_LANG` must match exactly. `LANG` must be a
 registered language tag (see the backend table below). Every non-language
-identifier — including operators like `2^(x+1)` inside a Python block — is
+identifier, including operators like `2^(x+1)` inside a Python block, is
 left alone by the parser.
 
 #### Aliases
@@ -852,7 +849,7 @@ left alone by the parser.
 
 #### Shebang support
 
-`.O` files can start with `#!/usr/bin/env O` — the runtime strips it before
+`.O` files can start with `#!/usr/bin/env O`, the runtime strips it before
 parsing.
 
 ---
@@ -879,10 +876,10 @@ html^( <p>The answer is $answer.</p> )_html
 
 In a Python block the return value is, in order of priority:
 
-1. `__oval_result__` — set explicitly by the block.
+1. `__oval_result__`, set explicitly by the block.
 2. The value of the last bare expression (no assignment), matching Python REPL
    semantics.
-3. Captured `stdout` — if neither of the above apply, anything written to
+3. Captured `stdout`, if neither of the above apply, anything written to
    `print()` is returned as `OStr`.
 
 ```
@@ -936,10 +933,10 @@ let thunk = python{defer}^( import time; time.time() )_python{defer}
 let result = now($thunk)   # force it here → current timestamp
 ```
 
-- **`{lazy}`** — pure backends only; the result is cached by content
+- **`{lazy}`**, pure backends only; the result is cached by content
   fingerprint. Evaluating the same expression twice returns the cached
   value.
-- **`{defer}`** — any backend; never cached; re-runs every time `now()` is
+- **`{defer}`**, any backend; never cached; re-runs every time `now()` is
   called on it.
 
 The counterpart `lazy(expr)` builtin wraps any expression in a
@@ -961,8 +958,7 @@ O^(
 )_O
 ```
 
-`quote^(...)_quote` captures its body as an unevaluated `OExpr` value —
-nothing runs. `O.eval(expr)` re-enters the evaluator on a live `OExpr`,
+`quote^(...)_quote` captures its body as an unevaluated `OExpr` value, nothing runs. `O.eval(expr)` re-enters the evaluator on a live `OExpr`,
 using the current persistent environments. Python code can also call
 `O.quote(src_string)` to parse a raw source fragment and return it as
 `OExpr`, enabling fully programmatic construction of O expressions.
@@ -1015,7 +1011,7 @@ execute eagerly.
 | `instantiate(expr)` | `ONixExpr` → `ODerivation` | Runs `nix-instantiate`. |
 | `realise(drv)` | `ODerivation` → `OStorePath` | Builds the derivation. |
 | `activate(path)` | `OStorePath` → `OSystem` | Switches system profile (dry-run unless `O_LANG_ALLOW_ACTIVATION=1`). |
-| `current_system()` | — → `OSystem` | Returns the currently active profile. |
+| `current_system()` | none → `OSystem` | Returns the currently active profile. |
 | `lazy(expr)` | any → `ORequest` | Wraps in `Policy::Lazy`; deferred until forced. |
 | `now(req)` | `ORequest` → `OValue` | Forces a deferred Request. |
 | `autonomous(expr)` | any → `OValue` | Buffers Nix Requests; flushes concurrently at force points. |
@@ -1026,12 +1022,12 @@ execute eagerly.
 
 | File | What it demonstrates |
 |------|----------------------|
-| `examples/hello.O` | Minimal Python arithmetic — the smallest runnable program. |
+| `examples/hello.O` | Minimal Python arithmetic, the smallest runnable program. |
 | `examples/bindings.O` | `let` binding and `$var` splice. |
 | `examples/nested_splice.O` | A Python block nested inside another Python block. |
 | `examples/html_basic.O` | HTML template with an embedded Python computation. |
 | `examples/html_python_html.O` | HTML root with inner Python that itself generates HTML. |
-| `examples/python_html_python.O` | Python outer ▶ HTML inner ▶ Python innermost — three languages, two boundaries. |
+| `examples/python_html_python.O` | Python outer ▶ HTML inner ▶ Python innermost, three languages, two boundaries. |
 | `examples/html_escape.O` | HTML-escaping of spliced values. |
 | `examples/html_raw_roundtrip.O` | Passthrough of raw HTML fragments via `OHtml`. |
 | `examples/computed_plot.O` | Matplotlib figure returned as `OBlob` and rendered as `<img>` by HTML. |
@@ -1040,14 +1036,14 @@ execute eagerly.
 | `examples/env_split.O` | Two independent Python environments in one document. |
 | `examples/ephemeral.O` | Ephemeral (single-use) environments. |
 | `examples/trailing_expr.O` | Trailing expression returns value without `__oval_result__`. |
-| `examples/meta_eval.O` | `quote^` and `O.eval` — homoiconicity across languages. |
+| `examples/meta_eval.O` | `quote^` and `O.eval`, homoiconicity across languages. |
 | `examples/nix_basic.O` | Nix expressions evaluated inside O. |
 | `examples/nix_python_html.O` | Nix → Python → HTML value pipeline. |
 | `examples/nix_storepath.O` | Nix-derived store paths rendered as HTML links. |
 | `examples/nix_storepath_python.O` | Python reading a Nix `OStorePath`. |
 | `examples/instantiate_realise_basic.O` | `nix_expr^`, `instantiate()`, and `realise()` rung climb. |
-| `examples/lazy_request_basic.O` | `lazy(...)` — constructs `Request` values without executing them. |
-| `examples/lazy_defer_attrs_basic.O` | `{lazy}` and `{defer}` block attributes — thunk creation. |
+| `examples/lazy_request_basic.O` | `lazy(...)`, constructs `Request` values without executing them. |
+| `examples/lazy_defer_attrs_basic.O` | `{lazy}` and `{defer}` block attributes, thunk creation. |
 | `examples/os_as_participant_basic.O` | OS-as-participant: `activate()`, `current_system()`, the four-rung Nix lattice. |
 | `examples/nixos_test.O` | Single-machine NixOS VM test inside an O-lang script. |
 | `examples/nixos_test_two_machine.O` | Two-machine NixOS test (server + client). |
@@ -1059,11 +1055,11 @@ execute eagerly.
 This repo ships two implementations of the same spec. The Rust runtime is
 authoritative.
 
-### Rust runtime (`src/`) — primary binary
+### Rust runtime (`src/`): primary binary
 
 ```
 src/
-├── lib.rs        # Library crate root — re-exports all modules
+├── lib.rs        # Library crate root, re-exports all modules
 ├── value.rs      # OValue sum type + JSON wire protocol. Pure data layer.
 ├── parser.rs     # Typed-paren parser → ONode tree
 ├── eval.rs       # Applicative-order leaves-up evaluator + render_child dispatch
@@ -1092,12 +1088,12 @@ Shim → runtime:  {"status":"ok","value":{"t":"int","v":42}}
 ```
 
 `html`, `O`, `quote`, and `nix_expr` are handled entirely inline in
-`eval.rs` — no subprocess.
+`eval.rs`, no subprocess.
 
 Shim resolution order for language tag `<lang>` under `shim_dir`:
 `<lang>_shim.py` → `<lang>_shim` → `<lang>.py` → `<lang>`
 
-### Python reference implementation (`o_lang/`) — for cross-validation
+### Python reference implementation (`o_lang/`): for cross-validation
 
 ```
 o_lang/
@@ -1194,7 +1190,7 @@ python -m tests.test_evaluator
 
 ---
 
-## `olangc` — AOT compiler
+## `olangc`: AOT compiler
 
 `olangc` compiles a `.O` file into a self-contained native binary. The
 binary embeds the program source, all backend shim scripts, and the O-lang
@@ -1213,7 +1209,7 @@ olangc examples/hello.O --shim-dir ./backends --keep-build-dir
 
 ## Status
 
-**v0.1.0** — Rust runtime primary, Python reference implementation for
+**v0.1.0**, Rust runtime primary, Python reference implementation for
 cross-validation.
 
 Implemented and working:
