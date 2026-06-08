@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use O-lang in your research, please cite it as below."
+title: "O-lang (Ouroboros Language): interpreter-as-syntax polyglot metaprogramming"
+abstract: >-
+  O-lang (Ouroboros language) is a meta-language in which the evaluator for an
+  expression is named by its delimiter syntax (LANG^( ... )_LANG), making the
+  choice of interpreter a structural, compositional property of the expression
+  rather than a global mode. Heterogeneous language blocks nest to arbitrary
+  depth and exchange values through a single language-neutral value type
+  (OValue), with homoiconic quote/eval generalized across multiple independent
+  real runtimes. The reference implementation includes a Rust runtime, a C
+  edition, and a Python reference interpreter.
+type: software
+authors:
+  - family-names: Ostadi
+    given-names: Lee Daghlar
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add your ORCID if you have one
+version: "0.2.0"
+date-released: "2026-06-08"
+license: Apache-2.0
+repository-code: "https://github.com/lostadi/O-lang"
+url: "https://github.com/lostadi/O-lang"
+keywords:
+  - programming-languages
+  - polyglot
+  - metaprogramming
+  - homoiconicity
+  - language-oriented-programming
+  - interpreters
+  - domain-specific-languages
+# doi: "10.5281/zenodo.XXXXXXX"
+# ^ Uncomment and fill in after minting a DOI via Zenodo (see README "Citing" notes).
+#   Once set, GitHub's "Cite this repository" button will surface this metadata,
+#   and the DOI gives you a permanent, citable, timestamped archive.

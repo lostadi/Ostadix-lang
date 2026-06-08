@@ -362,13 +362,14 @@ setup/os/setup-windows.sh
 ## Table of Contents
 
 1. [What is new here?](#what-is-new-here) — the novel ideas, explained plainly
-2. [Gentle introduction](#gentle-introduction) — for readers new to programming languages
-3. [Quickstart](#quickstart) — build and run in three commands
-4. [Language tour](#language-tour) — all features with examples
-5. [Architecture](#architecture) — how the runtime works
-6. [Reference](#reference) — wire format, backends, builtins
-7. [Running the tests](#running-the-tests)
-8. [Status and roadmap](#status)
+2. [Related work and how O-lang differs](#related-work-and-how-o-lang-differs) — vs. `#lang`, polyglot notebooks, staging
+3. [Gentle introduction](#gentle-introduction) — for readers new to programming languages
+4. [Quickstart](#quickstart) — build and run in three commands
+5. [Language tour](#language-tour) — all features with examples
+6. [Architecture](#architecture) — how the runtime works
+7. [Reference](#reference) — wire format, backends, builtins
+8. [Running the tests](#running-the-tests)
+9. [Status and roadmap](#status)
 
 ---
 
@@ -519,6 +520,69 @@ The full quote/eval round-trip works across all registered backends. A
 program can build up an O expression tree in Python, pass it through a
 Nix backend, and evaluate the result — the language boundary is not a
 barrier to metaprogramming.
+
+---
+
+## Related work and how O-lang differs
+
+O-lang sits at the intersection of three established traditions — language-oriented
+programming, polyglot execution, and metaprogramming — but combines them in a way
+none of them individually provide. The one-sentence thesis: **the evaluator is named
+by the delimiter shape, so language choice becomes a structural, compositional
+property of an expression at arbitrary nesting depth, federating multiple
+independent real runtimes through a single language-neutral value type (`OValue`).**
+Here is how that relates to the closest neighbors.
+
+**Racket `#lang` and language-oriented programming.** Racket pioneered the idea that
+a program declares its own language and that defining new languages should be cheap.
+The differences are granularity and substrate. Racket's `#lang` is a *module-level*
+declaration, and every surface language ultimately expands into Racket's core and
+runs on the Racket VM — one runtime hosting many front-ends. O-lang places the
+language tag at the *expression* level (`LANG^( … )_LANG`), nests heterogeneous
+languages inside one another, and dispatches to *separate, real* runtimes (CPython,
+Nix, …) that it federates rather than subsumes. Racket unifies languages by compiling
+them to a common core; O-lang keeps them as distinct processes and unifies only their
+*values*.
+
+**Polyglot notebooks and literate programming (Jupyter polyglot kernels, .NET
+Interactive, Org-mode Babel).** These let blocks in different languages share data
+inside one document. The difference is compositional structure. Notebook and Babel
+blocks are *top-level cells* sequenced linearly, with data passed through a shared
+kernel or named variables; the language is a per-cell mode. In O-lang a block is an
+*expression* that can be nested inside another language's expression, with the inner
+value flowing back into the outer one (`html^( … python^( … )_python … )_html`). The
+language boundary is a node in an AST, not a cell delimiter — which is what makes
+quote/eval and `OValue` splicing work uniformly at any depth.
+
+**Multi-stage and staged metaprogramming (Lisp quasiquotation, MetaOCaml, Template
+Haskell, Terra).** O-lang's `O.quote`/`O.eval` and the `OExpr` type are
+homoiconicity — code as inspectable data — which these systems also provide. The
+generalization is *across languages*: staging systems quote and splice code within a
+single language (or, in Terra's case, two tightly-coupled ones), whereas O-lang's
+quoted `OExpr` can be constructed in Python, threaded through a Nix backend, and
+evaluated elsewhere. It is Lisp's "code is data" lifted from one language to a
+federation of them.
+
+**String-embedded DSLs (heredocs, JSX, tagged template literals, SQL-in-host).** The
+common way to mix languages today is to embed foreign syntax as a *string* that some
+library later parses; to the host language those payloads are opaque text. O-lang's
+blocks are not strings — they are parsed by the host grammar, evaluated by the named
+backend, and return a typed `OValue` that the surrounding language consumes as a
+first-class atom, with bidirectional flow rather than a one-way opaque payload.
+
+**Language workbenches and projectional editing (JetBrains MPS, Spoofax).** These
+compose languages at the level of grammars and editors, often with projectional
+(non-textual) editing and heavyweight tooling. O-lang is deliberately lightweight and
+textual: a single small grammar (the typed-parenthesis rule) plus a backend registry,
+with composition happening at runtime through subprocess IPC rather than at compile
+time through a unified metamodel.
+
+**Honest scope.** O-lang is a research prototype and does not yet match the maturity
+of any system above. Several backends (`bash`, `shell`, `rust`, `racket`) are
+registered but currently parse-only stubs; the executing backends are Python, Nix,
+and inline HTML. The contribution is the *organizing idea* — interpreter-as-syntax
+with value-level federation — together with a working reference implementation in
+three languages (Rust, C, Python), not a production toolchain.
 
 ---
 
