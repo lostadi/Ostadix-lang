@@ -14,7 +14,7 @@ type: software
 authors:
   - family-names: Ostadi
     given-names: Lee Daghlar
-    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add your ORCID if you have one
+    orcid: "https://orcid.org/0009-0001-6380-9558   # my orchid id
 version: "0.2.0"
 date-released: "2026-06-08"
 license: Apache-2.0
