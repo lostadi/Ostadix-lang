@@ -427,7 +427,7 @@ tagged union that every backend speaks.
 ONull | OBool | OInt | OFloat | OStr
 OHtml | OList | OMap | OBlob(bytes, mime_type)
 OStorePath | OExpr | ONixExpr | ODerivation | OSystem
-ORequest | OThunk
+ORequest | OThunk | OGroup
 ```
 
 The critical insight is that **the receiving language decides how to render
@@ -1004,6 +1004,40 @@ execute eagerly.
 
 ---
 
+### Coordination groups (`batch` / `all` / `any` / `race`)
+
+```
+let bundle = batch($e1, $e2, $e3)   # a Group value — no work performed yet
+let results = now($bundle)          # force it → OList of the three results
+
+let scheduled = autonomous(batch(   # MVP concurrent scheduler integration
+  realise(instantiate($e1)),
+  realise(instantiate($e2))
+))
+```
+
+A **Group** makes the *execution topology* of several computations explicit in
+the value model. Where a Request names one deferred computation, a group names a
+collection of them plus a mode that says how they relate:
+
+- **`batch(a, b, …)`** — run them together for throughput; yields every result.
+- **`all(a, b, …)`** — fan-out where every member must succeed; yields every result.
+- **`any(a, b, …)`** — redundancy/fallback; yields the first member to succeed.
+- **`race(a, b, …)`** — latency competition; yields the first member to settle.
+
+A group performs no work on its own. It is forced by `now(group)`, by
+`autonomous(group)`, or at document end under Autonomous policy. `batch`/`all`
+collect **all** member results into a list (member order preserved); `any`/`race`
+yield a **single** winner. `autonomous(batch(…))` buffers the inner requests and
+lets the scheduler dispatch the independent ones concurrently.
+
+> **MVP note:** the runtime is synchronous (no async, no Tokio, no cancellation),
+> so `any` and `race` both resolve members left-to-right and return the first
+> success. The mode is preserved in the value so a future concurrent scheduler
+> can honour the true topology. See `examples/coordination_groups.O`.
+
+---
+
 ### Builtin call reference
 
 | Call | Input → Output | Description |
@@ -1013,8 +1047,12 @@ execute eagerly.
 | `activate(path)` | `OStorePath` → `OSystem` | Switches system profile (dry-run unless `O_LANG_ALLOW_ACTIVATION=1`). |
 | `current_system()` | none → `OSystem` | Returns the currently active profile. |
 | `lazy(expr)` | any → `ORequest` | Wraps in `Policy::Lazy`; deferred until forced. |
-| `now(req)` | `ORequest` → `OValue` | Forces a deferred Request. |
+| `now(req)` | `ORequest` / `OGroup` → `OValue` | Forces a deferred Request or Group. |
 | `autonomous(expr)` | any → `OValue` | Buffers Nix Requests; flushes concurrently at force points. |
+| `batch(a, …)` | values/Requests → `OGroup` | Throughput bundle; `now`/`autonomous` yields a list of all results. |
+| `all(a, …)` | values/Requests → `OGroup` | Fan-out, all must succeed; yields a list of all results. |
+| `any(a, …)` | values/Requests → `OGroup` | Fallback; yields the first member to succeed. |
+| `race(a, …)` | values/Requests → `OGroup` | First member to settle wins. |
 
 ---
 
@@ -1043,6 +1081,7 @@ execute eagerly.
 | `examples/nix_storepath_python.O` | Python reading a Nix `OStorePath`. |
 | `examples/instantiate_realise_basic.O` | `nix_expr^`, `instantiate()`, and `realise()` rung climb. |
 | `examples/lazy_request_basic.O` | `lazy(...)`, constructs `Request` values without executing them. |
+| `examples/coordination_groups.O` | `batch`/`all`/`any`/`race` coordination groups and `now(group)`. |
 | `examples/lazy_defer_attrs_basic.O` | `{lazy}` and `{defer}` block attributes, thunk creation. |
 | `examples/os_as_participant_basic.O` | OS-as-participant: `activate()`, `current_system()`, the four-rung Nix lattice. |
 | `examples/nixos_test.O` | Single-machine NixOS VM test inside an O-lang script. |
@@ -1166,10 +1205,11 @@ Every value that crosses a language boundary is serialized as JSON with a
 {"t":"request","kind":{...},"source":{...},"fingerprint":"..."}
 {"t":"thunk","body":"...","fingerprint":"...","deps":[...]}
 {"t":"system","profile_path":"/nix/var/nix/profiles/system"}
+{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}
 ```
 
-`store_path`, `expr`, `nix_expr`, `derivation`, `request`, `thunk`, and
-`system` are Rust-edition extensions. The Python reference implementation
+`store_path`, `expr`, `nix_expr`, `derivation`, `request`, `thunk`, `system`,
+and `group` are Rust-edition extensions. The Python reference implementation
 supports a subset of these types. `html` is supported by both runtimes.
 
 ---
@@ -1222,6 +1262,7 @@ Implemented and working:
 - Four-rung Nix lattice: `nix_expr` → `instantiate` → `realise` → `activate`
 - OS-as-participant (`OSystem`, `current_system()`)
 - `autonomous()` scheduler with disk-backed result cache
+- Coordination groups: `batch` / `all` / `any` / `race` and `now(group)`
 - `olangc` AOT compiler (self-contained binary output)
 - Shebang support
 

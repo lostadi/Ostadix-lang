@@ -29,7 +29,7 @@ use crate::nixos_ops;
 use crate::parser::{reconstruct_source, ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{OValue, RequestKind};
+use crate::value::{OValue, RequestKind, GroupMode};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // STEP-3.5: Backend purity table
@@ -400,11 +400,97 @@ impl Evaluator {
         }
     }
 
+    /// Resolve a value returned from an autonomous body AFTER the buffer has
+    /// been flushed through the scheduler.
+    ///
+    /// - A schedulable Request → its cached result (or unchanged on miss).
+    /// - A Group → resolved per its topology mode, reading each member from
+    ///   the freshly-populated cache.
+    /// - Anything else → returned unchanged.
+    fn resolve_after_flush(&mut self, value: OValue) -> Result<OValue> {
+        match &value {
+            OValue::Group { mode, members, .. } => {
+                let (mode, members) = (*mode, members.clone());
+                self.resolve_group(mode, &members, true)
+            }
+            v if Self::is_schedulable_request(v) => {
+                Ok(self.resolve_from_cache(v).unwrap_or(value))
+            }
+            _ => Ok(value),
+        }
+    }
+
     /// Returns `true` if `v` is a non-Eval Request (Instantiate, Realise, or
     /// Activate), i.e. a request that is buffered under Policy::Autonomous and
     /// executed by the scheduler rather than by exec_eval.
     fn is_schedulable_request(v: &OValue) -> bool {
         matches!(v, OValue::Request { kind, .. } if !matches!(kind, RequestKind::Eval { .. }))
+    }
+
+    /// Resolve a single group member to a concrete value.
+    ///
+    /// `from_cache = false` forces the member fresh (via `force_request`, which
+    /// honours the active policy/executor); `from_cache = true` resolves it
+    /// from the scheduler/eval cache populated by a prior buffer flush, falling
+    /// back to the value unchanged on a miss. Nested Groups recurse with the
+    /// same flag. Non-Request, non-Group members are returned as-is.
+    fn resolve_member(&mut self, m: &OValue, from_cache: bool) -> Result<OValue> {
+        match m {
+            OValue::Request { .. } => {
+                if from_cache {
+                    Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone()))
+                } else {
+                    self.force_request(m)
+                }
+            }
+            OValue::Group { mode, members, .. } => {
+                let (mode, members) = (*mode, members.clone());
+                self.resolve_group(mode, &members, from_cache)
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Resolve a Group to a concrete value according to its topology `mode`.
+    ///
+    /// - `Batch` / `All` → an `OList` of every member's resolved result, in
+    ///   member order. Any member failure aborts the whole resolution
+    ///   (all-or-nothing).
+    /// - `Any` / `Race` → the first member that resolves successfully, trying
+    ///   members left-to-right. Fails only if every member fails.
+    ///
+    /// `from_cache` is forwarded to `resolve_member` — `false` forces members,
+    /// `true` reads results that a prior autonomous flush already cached.
+    fn resolve_group(
+        &mut self,
+        mode:       GroupMode,
+        members:    &[OValue],
+        from_cache: bool,
+    ) -> Result<OValue> {
+        if members.is_empty() {
+            bail!("{}(...) group has no members to resolve", mode.name());
+        }
+        if mode.collects_all() {
+            let mut out = Vec::with_capacity(members.len());
+            for m in members {
+                out.push(self.resolve_member(m, from_cache)?);
+            }
+            Ok(OValue::list(out))
+        } else {
+            // Any / Race: first successful member wins.
+            let mut last_err: Option<anyhow::Error> = None;
+            for m in members {
+                match self.resolve_member(m, from_cache) {
+                    Ok(v)  => return Ok(v),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.expect("non-empty group must have produced an error"))
+                .with_context(|| format!(
+                    "{}(...) group: all {} members failed",
+                    mode.name(), members.len()
+                ))
+        }
     }
 
     ///
@@ -587,12 +673,9 @@ impl Evaluator {
         // there is no need for a redundant emptiness check here.
         if self.policy == Policy::Autonomous {
             self.flush_autonomous_buffer()?;
-            // If the final value is a buffered Nix-family Request, resolve it.
-            if Self::is_schedulable_request(&last) {
-                if let Some(v) = self.resolve_from_cache(&last) {
-                    last = v;
-                }
-            }
+            // If the final value is a buffered Request or a Group, resolve it
+            // from the freshly-populated cache.
+            last = self.resolve_after_flush(last)?;
         }
 
         Ok(last)
@@ -631,11 +714,7 @@ impl Evaluator {
 
         if self.policy == Policy::Autonomous {
             self.flush_autonomous_buffer()?;
-            if Self::is_schedulable_request(&last) {
-                if let Some(v) = self.resolve_from_cache(&last) {
-                    last = v;
-                }
-            }
+            last = self.resolve_after_flush(last)?;
         }
 
         Ok(last)
@@ -740,13 +819,10 @@ impl Evaluator {
                 Ok(value) => {
                     // Flush all buffered Nix-family requests concurrently.
                     self.flush_autonomous_buffer()?;
-                    // If the return value is a buffered Request, resolve it
-                    // from the cache that the flush just populated.
-                    let resolved = if Self::is_schedulable_request(&value) {
-                        self.resolve_from_cache(&value).unwrap_or(value)
-                    } else {
-                        value
-                    };
+                    // Resolve the return value (Request or Group) from the
+                    // cache that the flush just populated, so the caller always
+                    // receives concrete values rather than unforced handles.
+                    let resolved = self.resolve_after_flush(value)?;
                     return Ok(resolved);
                 }
                 Err(e) => {
@@ -791,10 +867,36 @@ impl Evaluator {
                 let req = arg_vals.into_iter().next().unwrap();
                 match &req {
                     OValue::Request { .. } => self.force_request(&req),
+                    // now(group): force the whole group per its topology mode,
+                    // resolving each member fresh (from_cache = false).
+                    OValue::Group { mode, members, .. } => {
+                        let (mode, members) = (*mode, members.clone());
+                        self.resolve_group(mode, &members, false)
+                    }
                     other => bail!(
-                        "now(req) expected a Request, got {}", other.type_name()
+                        "now(req) expected a Request or Group, got {}", other.type_name()
                     ),
                 }
+            }
+            // STEP-4: coordination primitives — bundle several computations
+            // into a first-class Group value carrying an explicit execution
+            // topology. The members are the already-evaluated arguments (under
+            // Eager they are resolved values; under Lazy/Autonomous they are
+            // unforced/buffered Requests). The Group itself performs no work —
+            // it is forced by `now(group)`, by `autonomous(...)`, or at
+            // document end under Autonomous policy.
+            "batch" | "all" | "any" | "race" => {
+                let mode = match fn_name {
+                    "batch" => GroupMode::Batch,
+                    "all"   => GroupMode::All,
+                    "any"   => GroupMode::Any,
+                    "race"  => GroupMode::Race,
+                    _       => unreachable!(),
+                };
+                if arg_vals.is_empty() {
+                    bail!("{}(...) takes at least 1 argument, got 0", fn_name);
+                }
+                Ok(OValue::group(mode, arg_vals))
             }
             // STEP-4: OS-as-participant builtins.
             "activate" => {
@@ -1236,6 +1338,13 @@ fn render_nix(val: &OValue) -> String {
         // gets predictable Nix parse errors.
         OValue::Thunk { body, .. } => format!("({})", body),
 
+        // A Group is a control/topology value with no Nix splice form — render
+        // a string marker that nix eval will reject loudly, same treatment as
+        // an unforced Request. Force the group with `now(...)` before splicing.
+        OValue::Group { mode, fingerprint, .. } => {
+            format!("\"<group:{} fp={}>\"", mode.name(), &fingerprint[..8])
+        }
+
         // A System in a Nix context renders as its profile path as a string
         // literal. Useful for Nix expressions that want to inspect or compare
         // against the live profile location.
@@ -1352,6 +1461,14 @@ fn render_python(val: &OValue) -> String {
             format!("OSystem({})", lit)
         }
 
+        // A Group has no Python data form — render an OGroup marker mirroring
+        // the ORequest treatment. The shim does not bind it as a value;
+        // groups are control values forced via `now(...)`, not spliced.
+        OValue::Group { mode, members, fingerprint } => {
+            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
+            format!("OGroup({:?}, n={}, fp={})", mode.name(), members.len(), fp_lit)
+        }
+
         // An Expr value in Python is available as an OExprValue object (set up
         // by the Python shim's oval_to_py). Splicing it into source text as a
         // Python repr would lose the type, so we render it as an OExprValue
@@ -1441,6 +1558,15 @@ fn render_html(val: &OValue) -> String {
             format!(
                 "<code class=\"o-system\">{}</code>",
                 html_escape(profile_path),
+            )
+        }
+
+        OValue::Group { mode, members, fingerprint } => {
+            format!(
+                "<code class=\"o-group\" data-mode=\"{}\" data-fp=\"{}\">&lt;group n={}&gt;</code>",
+                html_escape(mode.name()),
+                html_escape(&fingerprint[..8]),
+                members.len(),
             )
         }
 
@@ -1538,6 +1664,12 @@ fn render_latex(val: &OValue) -> String {
         OValue::System { profile_path } => {
             format!("\\texttt{{{}}}", profile_path.replace("_", "\\_"))
         }
+        OValue::Group { mode, members, fingerprint } => {
+            format!(
+                "\\texttt{{<group:{} n={} fp={}>}}",
+                mode.name(), members.len(), &fingerprint[..8]
+            )
+        }
         OValue::Expr { src } => {
             format!("\\texttt{{{}}}", src.replace("_", "\\_"))
         }
@@ -1578,6 +1710,9 @@ fn render_markdown(val: &OValue) -> String {
         }
         OValue::System { profile_path } => {
             format!("`{}`", profile_path)
+        }
+        OValue::Group { mode, members, fingerprint } => {
+            format!("`<group:{} n={} fp={}>`", mode.name(), members.len(), &fingerprint[..8])
         }
         OValue::Expr { src } => {
             format!("`{}`", src)
@@ -2853,5 +2988,217 @@ mod tests {
         };
         let err = e.eval_node(&call, &scope).unwrap_err().to_string();
         assert!(err.contains("autonomous(expr) takes exactly 1 argument"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP-4: Group coordination primitives (batch / all / any / race / now)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A helper that builds nodes binding `expr` to a NixExpr and returns a
+    /// scope already containing it.
+    fn scope_with_nix_expr() -> HashMap<String, OValue> {
+        let mut scope = HashMap::new();
+        scope.insert("e1".into(), OValue::nix_expr("pkgs.hello", vec![]));
+        scope.insert("e2".into(), OValue::nix_expr("pkgs.world", vec![]));
+        scope
+    }
+
+    /// `batch(...)` constructs an OValue::Group with mode Batch, holding the
+    /// evaluated arguments as members.
+    #[test]
+    fn batch_constructs_group_value() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::int(1));
+        scope.insert("b".into(), OValue::int(2));
+
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        match result {
+            OValue::Group { mode, members, .. } => {
+                assert_eq!(mode, GroupMode::Batch);
+                assert_eq!(members, vec![OValue::int(1), OValue::int(2)]);
+            }
+            other => panic!("expected Group, got {:?}", other),
+        }
+    }
+
+    /// Each builtin maps to its own GroupMode.
+    #[test]
+    fn group_builtins_map_to_modes() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::int(1));
+
+        for (name, expected) in [
+            ("batch", GroupMode::Batch),
+            ("all",   GroupMode::All),
+            ("any",   GroupMode::Any),
+            ("race",  GroupMode::Race),
+        ] {
+            let call = ONode::Call {
+                fn_name: name.into(),
+                args:    vec![ONode::VarRef("a".into())],
+            };
+            let result = e.eval_node(&call, &scope).unwrap();
+            match result {
+                OValue::Group { mode, .. } => assert_eq!(mode, expected, "for {name}"),
+                other => panic!("{name}: expected Group, got {:?}", other),
+            }
+        }
+    }
+
+    /// An empty group builtin errors clearly.
+    #[test]
+    fn group_builtin_empty_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        let call = ONode::Call { fn_name: "batch".into(), args: vec![] };
+        let err = e.eval_node(&call, &scope).unwrap_err().to_string();
+        assert!(err.contains("at least 1 argument"), "got {err}");
+    }
+
+    /// `now(batch(...))` over already-resolved members returns an OList of the
+    /// members in order (Batch/All topology collects everything).
+    #[test]
+    fn now_batch_returns_list_of_members() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::int(10));
+        scope.insert("b".into(), OValue::int(20));
+
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "batch".into(),
+                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert_eq!(result, OValue::list(vec![OValue::int(10), OValue::int(20)]));
+    }
+
+    /// `now(any(...))` over already-resolved members returns the FIRST member
+    /// (Any/Race topology yields a single winner).
+    #[test]
+    fn now_any_returns_first_member() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::str_("first"));
+        scope.insert("b".into(), OValue::str_("second"));
+
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "any".into(),
+                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert_eq!(result, OValue::str_("first"));
+    }
+
+    /// `now(batch(realise(instantiate($e1)), realise(instantiate($e2))))` under
+    /// the default Eager policy: the inner requests are already resolved to
+    /// StorePaths by the time batch runs, so now(group) returns a list of two
+    /// StorePaths. Verifies group force works end-to-end with the executor.
+    #[test]
+    fn now_batch_of_resolved_requests_returns_storepath_list() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let scope = scope_with_nix_expr();
+
+        let mk_chain = |var: &str| ONode::Call {
+            fn_name: "realise".into(),
+            args:    vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args:    vec![ONode::VarRef(var.into())],
+            }],
+        };
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "batch".into(),
+                args:    vec![mk_chain("e1"), mk_chain("e2")],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        match result {
+            OValue::List { v } => {
+                assert_eq!(v.len(), 2);
+                assert!(v.iter().all(|x| x.is_store_path()),
+                    "all members must resolve to StorePaths, got {:?}", v);
+            }
+            other => panic!("expected list, got {:?}", other),
+        }
+    }
+
+    /// `now(x)` where x is neither a Request nor a Group errors with a clear
+    /// message.
+    #[test]
+    fn now_on_non_request_non_group_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::int(1));
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::VarRef("a".into())],
+        };
+        let err = e.eval_node(&call, &scope).unwrap_err().to_string();
+        assert!(err.contains("Request or Group"), "got {err}");
+    }
+
+    /// MVP autonomous(batch(...)) integration: under Autonomous, the inner
+    /// requests are buffered; the flush executes them through the scheduler;
+    /// the returned Group is resolved from the scheduler cache into a list of
+    /// concrete StorePaths. Here we pre-seed the scheduler's mem_cache so the
+    /// flush is a pure cache hit (no real nix subprocess).
+    #[test]
+    fn autonomous_batch_resolves_group_from_cache() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = scope_with_nix_expr();
+
+        // Pre-seed the scheduler cache with results for both realise requests.
+        for var in ["e1", "e2"] {
+            let expr = e.eval_node(&ONode::VarRef(var.into()), &scope).unwrap();
+            let inst = OValue::request(RequestKind::Instantiate, expr);
+            let drv  = OValue::derivation(
+                format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
+            let realise = OValue::request(RequestKind::Realise, inst.clone());
+            let inst_fp = match &inst { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => unreachable!() };
+            let real_fp = match &realise { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => unreachable!() };
+            e.scheduler.mem_cache.insert(inst_fp, drv);
+            e.scheduler.mem_cache.insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
+        }
+
+        let mk_chain = |var: &str| ONode::Call {
+            fn_name: "realise".into(),
+            args:    vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args:    vec![ONode::VarRef(var.into())],
+            }],
+        };
+        let call = ONode::Call {
+            fn_name: "autonomous".into(),
+            args:    vec![ONode::Call {
+                fn_name: "batch".into(),
+                args:    vec![mk_chain("e1"), mk_chain("e2")],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        match result {
+            OValue::List { v } => {
+                assert_eq!(v.len(), 2, "batch must resolve to a 2-element list");
+                assert!(v.iter().all(|x| x.is_store_path()),
+                    "members must resolve to StorePaths, got {:?}", v);
+            }
+            other => panic!("expected list from autonomous(batch(...)), got {:?}", other),
+        }
+        // Policy restored and buffer drained.
+        assert_eq!(e.policy, Policy::Eager);
+        assert!(e.autonomous_buffer.is_empty());
     }
 }
