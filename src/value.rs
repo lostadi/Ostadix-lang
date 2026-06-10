@@ -238,6 +238,88 @@ pub enum OValue {
         deps:        Vec<OValue>,
         fingerprint: String,
     },
+
+    /// A first-class group of computations carrying an explicit execution
+    /// topology.
+    ///
+    /// A Group makes the *shape* of a multi-computation explicit in the value
+    /// model. Where a Request names a single deferred computation, a Group
+    /// names a collection of them together with the `mode` that says HOW they
+    /// relate:
+    ///   - `Batch` — run them all together for throughput; yield every result.
+    ///   - `All`   — fan-out where every member must succeed; yield every result.
+    ///   - `Any`   — redundancy/fallback; yield the first member that succeeds.
+    ///   - `Race`  — latency competition; yield the first member to settle.
+    ///
+    /// Members are arbitrary OValues. They are usually Requests (so the Group
+    /// describes deferred work), but a Group can also hold already-resolved
+    /// values — under `Policy::Eager` the members are resolved before the Group
+    /// is built, so the Group simply records the topology over concrete results.
+    ///
+    /// `fingerprint = sha256("group" || mode || ordered member content identities)`.
+    /// Member order is preserved (NOT sorted) because order is semantically
+    /// significant: it determines the result list order for Batch/All and the
+    /// preference order for Any/Race.
+    ///
+    /// Wire format: `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}`
+    #[serde(rename = "group")]
+    Group {
+        mode:        GroupMode,
+        members:     Vec<OValue>,
+        fingerprint: String,
+    },
+}
+
+/// The execution topology of an `OValue::Group`.
+///
+/// This is the "shape" axis of coordination: given several computations, the
+/// mode says how their execution relates and which results survive into the
+/// resolved value. The synchronous MVP resolves members left-to-right; the
+/// mode is preserved in the value so a future concurrent scheduler can honour
+/// the true topology (parallel fan-out, first-to-finish racing, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMode {
+    /// Run every member together for throughput. Resolves to an `OList` of all
+    /// member results, in member order. Under `Policy::Autonomous` a Batch is
+    /// the unit the scheduler dispatches concurrently.
+    Batch,
+
+    /// Fan-out where every member must succeed. Resolves to an `OList` of all
+    /// member results, in member order; if any member fails, the whole group
+    /// fails. Behaviourally identical to Batch in the MVP — the distinction is
+    /// intent (a hard all-or-nothing barrier vs. a throughput bundle).
+    All,
+
+    /// Redundancy / fallback. Resolves to the first member that succeeds,
+    /// trying members left-to-right; only fails if every member fails.
+    Any,
+
+    /// Latency competition — first member to settle wins. In the synchronous
+    /// MVP "first to settle" is the first member in declaration order that
+    /// resolves successfully, so Race coincides with Any here; the distinction
+    /// is intent (competing for lowest latency vs. tolerating failures).
+    Race,
+}
+
+impl GroupMode {
+    /// The builtin function name / wire tag that constructs this mode
+    /// (`batch`, `all`, `any`, `race`). Used in fingerprint composition,
+    /// error messages, and Display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            GroupMode::Batch => "batch",
+            GroupMode::All   => "all",
+            GroupMode::Any   => "any",
+            GroupMode::Race  => "race",
+        }
+    }
+
+    /// Whether this mode yields ALL member results (`Batch`/`All`) as opposed
+    /// to a single winning member (`Any`/`Race`).
+    pub fn collects_all(&self) -> bool {
+        matches!(self, GroupMode::Batch | GroupMode::All)
+    }
 }
 
 /// The kind of computation a Request performs.
@@ -419,6 +501,24 @@ impl OValue {
         OValue::Thunk { body, deps, fingerprint }
     }
 
+    /// Construct a Group — a first-class collection of computations carrying an
+    /// explicit execution topology (`mode`).
+    ///
+    /// `members` are the (already-evaluated) OValues that make up the group,
+    /// typically Requests. Member order is preserved verbatim because it is
+    /// semantically significant (result ordering for Batch/All, preference
+    /// ordering for Any/Race).
+    ///
+    /// fingerprint = sha256("group" || mode || ordered(member.content_identity())).
+    /// Unlike NixExpr/Thunk, member identities are NOT sorted — two groups that
+    /// differ only in member order are genuinely different computations.
+    pub fn group(mode: GroupMode, members: Vec<OValue>) -> Self {
+        let identities: Vec<String> = members.iter().map(|m| m.content_identity()).collect();
+        let composed = format!("group|{}|{}", mode.name(), identities.join("|"));
+        let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
+        OValue::Group { mode, members, fingerprint }
+    }
+
     /// The canonical content identity of an OValue.
     ///
     /// Used to compose Request fingerprints and NixExpr fingerprints. Defined
@@ -454,6 +554,7 @@ impl OValue {
                 hex::encode(Sha256::digest(profile_path.as_bytes()))
             }
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            OValue::Group   { fingerprint, .. } => fingerprint.clone(),
             other => {
                 let s = other.splice_repr();
                 hex::encode(Sha256::digest(s.as_bytes()))
@@ -508,6 +609,7 @@ impl OValue {
     pub fn is_derivation(&self) -> bool { matches!(self, OValue::Derivation { .. }) }
     pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
     pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
+    pub fn is_group(&self) -> bool { matches!(self, OValue::Group { .. }) }
     pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
     pub fn is_expr(&self) -> bool { matches!(self, OValue::Expr { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
@@ -529,6 +631,7 @@ impl OValue {
             OValue::Derivation {..} => "derivation",
             OValue::Request {..} => "request",
             OValue::Thunk {..} => "thunk",
+            OValue::Group {..} => "group",
             OValue::System {..} => "system",
             OValue::Expr {..} => "expr",
         }
@@ -662,6 +765,15 @@ impl OValue {
             // usually flows wrapped in a Request[Eval].
             OValue::Thunk { body, .. } => body.clone(),
 
+            // A Group is a control/topology value, not a data value — like a
+            // Request, it has no natural splice form. We splice a marker so a
+            // Group accidentally embedded in source text is visible rather than
+            // silently rendered as a misleading list. Users who want member
+            // values spliced should force the group first with `now(...)`.
+            OValue::Group { mode, members, fingerprint } => {
+                format!("<group:{} n={} fp={}>", mode.name(), members.len(), &fingerprint[..8])
+            }
+
             // An Expr splices as its source text. Splicing a quoted expression
             // into another backend's source text is rarely useful (the user
             // almost always wants O.eval to run it first), but the conservative
@@ -728,6 +840,9 @@ impl fmt::Display for OValue {
             }
             OValue::Thunk { fingerprint, deps, .. } => {
                 write!(f, "<thunk fp={} deps={}>", &fingerprint[..8], deps.len())
+            }
+            OValue::Group { mode, members, fingerprint } => {
+                write!(f, "<group {} n={} fp={}>", mode.name(), members.len(), &fingerprint[..8])
             }
             OValue::System { profile_path } => {
                 write!(f, "<system {}>", profile_path)
@@ -899,6 +1014,9 @@ mod tests {
             // OExpr round-trips its src string.
             OValue::Expr { src: "python^(6 * 7)_python".to_string() },
             OValue::Expr { src: String::new() },
+            // Group round-trips mode + members + fingerprint.
+            OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]),
+            OValue::group(GroupMode::Race,  vec![OValue::str_("a")]),
         ];
 
         for original in &cases {
@@ -963,6 +1081,7 @@ mod tests {
             (OValue::map(HashMap::new()), "map"),
             (OValue::blob(&[], ""),   "blob"),
             (OValue::Expr { src: "x".to_string() }, "expr"),
+            (OValue::group(GroupMode::Batch, vec![OValue::int(1)]), "group"),
         ];
         for (val, expected_tag) in cases {
             assert_eq!(val.type_name(), expected_tag);
@@ -1277,5 +1396,93 @@ mod tests {
                 OValue::Request { fingerprint: f_wet, .. }) = (&dry, &wet) {
             assert_ne!(f_dry, f_wet);
         }
+    }
+
+    // ── STEP-4 GROUP COORDINATION PRIMITIVES ─────────────────────────────────
+
+    #[test]
+    fn group_constructor_preserves_mode_and_members() {
+        let members = vec![OValue::int(1), OValue::int(2), OValue::int(3)];
+        let g = OValue::group(GroupMode::Batch, members.clone());
+        if let OValue::Group { mode, members: m, fingerprint } = &g {
+            assert_eq!(*mode, GroupMode::Batch);
+            assert_eq!(m, &members);
+            assert_eq!(fingerprint.len(), 64, "group fingerprint must be sha256 hex");
+            assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        } else {
+            panic!("expected OValue::Group, got {:?}", g);
+        }
+        assert_eq!(g.type_name(), "group");
+        assert!(g.is_group());
+    }
+
+    #[test]
+    fn group_mode_changes_fingerprint() {
+        let members = vec![OValue::int(1), OValue::int(2)];
+        let batch = OValue::group(GroupMode::Batch, members.clone());
+        let all   = OValue::group(GroupMode::All,   members.clone());
+        let any   = OValue::group(GroupMode::Any,   members.clone());
+        let race  = OValue::group(GroupMode::Race,  members);
+        let fps: Vec<String> = [batch, all, any, race].iter()
+            .map(|g| g.content_identity())
+            .collect();
+        // All four modes over the same members must have distinct identities.
+        for i in 0..fps.len() {
+            for j in (i + 1)..fps.len() {
+                assert_ne!(fps[i], fps[j], "mode {i} vs {j} must differ");
+            }
+        }
+    }
+
+    #[test]
+    fn group_member_order_is_significant() {
+        let a = OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]);
+        let b = OValue::group(GroupMode::Batch, vec![OValue::int(2), OValue::int(1)]);
+        assert_ne!(a.content_identity(), b.content_identity(),
+            "member order must change the group fingerprint (order is semantic)");
+    }
+
+    #[test]
+    fn group_same_inputs_produce_same_fingerprint() {
+        let a = OValue::group(GroupMode::All, vec![OValue::str_("x"), OValue::str_("y")]);
+        let b = OValue::group(GroupMode::All, vec![OValue::str_("x"), OValue::str_("y")]);
+        assert_eq!(a.content_identity(), b.content_identity());
+    }
+
+    #[test]
+    fn group_round_trips_through_json() {
+        let original = OValue::group(
+            GroupMode::Race,
+            vec![OValue::int(1), OValue::str_("two"), OValue::bool_(true)],
+        );
+        let json    = serde_json::to_string(&original).unwrap();
+        let decoded: OValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded, "Group must round-trip through JSON");
+    }
+
+    #[test]
+    fn group_mode_serializes_snake_case() {
+        let json = serde_json::to_string(&OValue::group(GroupMode::Batch, vec![OValue::int(1)])).unwrap();
+        assert!(json.contains("\"mode\":\"batch\""), "got {json}");
+        assert!(json.contains("\"t\":\"group\""), "got {json}");
+    }
+
+    #[test]
+    fn group_mode_name_and_collects_all() {
+        assert_eq!(GroupMode::Batch.name(), "batch");
+        assert_eq!(GroupMode::All.name(),   "all");
+        assert_eq!(GroupMode::Any.name(),   "any");
+        assert_eq!(GroupMode::Race.name(),  "race");
+        assert!(GroupMode::Batch.collects_all());
+        assert!(GroupMode::All.collects_all());
+        assert!(!GroupMode::Any.collects_all());
+        assert!(!GroupMode::Race.collects_all());
+    }
+
+    #[test]
+    fn group_splice_repr_is_a_marker() {
+        let g = OValue::group(GroupMode::Batch, vec![OValue::int(1)]);
+        let s = g.splice_repr();
+        assert!(s.starts_with("<group:batch"), "group splice marker, got {s}");
     }
 }

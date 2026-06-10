@@ -142,7 +142,11 @@ OValue  ::= ONull
           | ORequest { kind: RequestKind, source: OValue }
           | OThunk   { body: str, fingerprint: str, deps: [OValue] }
           | OSystem  { profile_path: str }
+          | OGroup   { mode: GroupMode, members: [OValue], fingerprint: str }
 ```
+
+`GroupMode` is one of `batch`, `all`, `any`, `race` — the execution topology
+of an `OGroup` (see §3.1).
 
 The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 
@@ -160,6 +164,39 @@ The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 | `blob`        | `{"t":"blob","v":"<base64>","mime":"..."}`   |                                       |
 | `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
 | `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
+| `group`       | `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}` | Rust ext; coordination group |
+
+### 3.1 Coordination groups
+
+An `OGroup` makes the **execution topology** of several computations explicit
+in the value model. Where an `ORequest` names a single deferred computation, a
+group names a collection of them plus a `mode` that says how they relate:
+
+| Builtin            | Mode    | Resolution                                                |
+|--------------------|---------|-----------------------------------------------------------|
+| `batch(a, b, …)`   | `batch` | Run all for throughput; yields an `OList` of every result |
+| `all(a, b, …)`     | `all`   | Fan-out, every member must succeed; yields every result   |
+| `any(a, b, …)`     | `any`   | Redundancy/fallback; yields the first member to succeed   |
+| `race(a, b, …)`    | `race`  | Latency competition; yields the first member to settle    |
+
+A group performs no work on its own — it is a control value. It is forced by
+`now(group)`, by `autonomous(group)`, or at document end under Autonomous
+policy. `batch`/`all` collect **all** member results into a list (member order
+preserved); `any`/`race` yield a **single** winning member.
+
+Members may be already-resolved values, deferred `ORequest`s (when built under
+`lazy(…)`), or nested groups. The group's `fingerprint` composes from the mode
+and the **ordered** member content identities — member order is semantically
+significant, so it is never sorted.
+
+`autonomous(batch(…))` is the MVP scheduler integration: the inner requests are
+buffered, the scheduler dispatches the independent ones concurrently when the
+block exits, and the batch resolves into a list of results from the cache.
+
+> **MVP note.** The runtime is synchronous (no async, no Tokio, no Eval-request
+> parallelism, no cancellation). `any` and `race` therefore both resolve members
+> left-to-right and return the first success; the mode is preserved in the value
+> so a future concurrent scheduler can honour the true topology.
 
 Design principles:
 
@@ -274,7 +311,12 @@ Adding a new language: write a Backend subclass, add it to
   impl similarly threads scope through `_eval_expression`.
 * **Eager evaluation only.** `{lazy}` and `{defer}` attributes create deferred
   Requests (Thunks) that are auto-forced when spliced or explicitly forced via
-  `now()`. Autonomous scheduling is future work.
+  `now()`. `lazy(…)` and `autonomous(…)` switch the policy for their argument;
+  `autonomous(batch(…))` dispatches independent Nix-family requests concurrently
+  through the scheduler. Coordination groups (`batch`/`all`/`any`/`race`, see
+  §3.1) make execution topology explicit, but the runtime is still synchronous —
+  full async scheduling, `any`/`race` parallelism, and cancellation are future
+  work.
 * **`O.eval` scope limitation.** `eval_source` (called on `O.eval`) creates a
   fresh document scope; top-level `let` bindings from the calling document are
   NOT visible inside the evaluated fragment. Variables in persistent backend

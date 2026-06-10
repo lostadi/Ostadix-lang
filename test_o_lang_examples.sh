@@ -34,4 +34,9 @@ cargo run --quiet -- examples/nix_storepath_python.O >/tmp/o-nix-storepath-pytho
 grep -q 'Python reads Nix StorePath' /tmp/o-nix-storepath-python.out
 grep -q 'Hello from O-lang + Nix' /tmp/o-nix-storepath-python.out
 
+cargo run --quiet -- examples/coordination_groups.O >/tmp/o-coordination.out 2>/tmp/o-coordination.err
+grep -q 'Step-4 coordination primitives' /tmp/o-coordination.out
+grep -q '<group:batch n=3' /tmp/o-coordination.out
+grep -q 'pkgs.hello' /tmp/o-coordination.out
+
 echo "All O-lang smoke tests passed."
