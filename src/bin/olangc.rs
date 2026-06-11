@@ -9,6 +9,7 @@
 //   olangc <input.O>                              # binary target (default)
 //   olangc <input.O> -o myprogram                 # explicit output name
 //   olangc <input.O> --target script              # run in-process
+//   olangc <input.O> --target ir                  # dump the lowered OIR
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
 //
 // Target A ("binary"):
@@ -43,6 +44,11 @@
 //   invoked through a function pointer to the evaluator entry point, giving
 //   the same semantics as emitting code into an mmap'd executable buffer and
 //   calling it.
+//
+// Target C ("ir"):
+//   Parses the .O program, lowers the ONode forest to the OIR intermediate
+//   representation (src/ir.rs), and prints the lowered program to stdout.
+//   A debugging/inspection target — no execution, no disk output.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use o_lang::eval::Evaluator;
+use o_lang::ir::OIrProgram;
 use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
@@ -67,6 +74,7 @@ use o_lang::value::OValue;
 
 const RUNTIME_VALUE_RS:     &str = include_str!("../value.rs");
 const RUNTIME_PARSER_RS:    &str = include_str!("../parser.rs");
+const RUNTIME_IR_RS:        &str = include_str!("../ir.rs");
 const RUNTIME_EVAL_RS:      &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS:   &str = include_str!("../process.rs");
 const RUNTIME_NIX_OPS_RS:   &str = include_str!("../nix_ops.rs");
@@ -101,13 +109,19 @@ const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compilation target: produce a disk binary or execute in-process.
+/// Compilation target: the small internal CompileTarget abstraction.
+/// Each variant selects one end-to-end pipeline over the shared front end
+/// (read source → parse → …): native codegen via Cargo, in-process
+/// evaluation, or an OIR dump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum OutputTarget {
+enum CompileTarget {
     /// Compile to a self-contained native binary on disk (ELF/Mach-O).
     Binary,
     /// Execute the program directly inside the olangc process (script mode).
     Script,
+    /// Lower the parsed program to the OIR intermediate representation and
+    /// print it to stdout (debug/inspection; no execution).
+    Ir,
 }
 
 #[derive(ClapParser, Debug)]
@@ -119,18 +133,19 @@ Compiles a .O source file into a native binary (--target binary, the default) \
 or executes it directly in-process (--target script).  In binary mode the \
 output embeds the program source, all backend shim scripts, and the O-lang \
 runtime.  In script mode the program is parsed and evaluated immediately \
-inside the olangc process with no disk output.",
+inside the olangc process with no disk output.  In ir mode the program is \
+parsed, lowered to the OIR intermediate representation, and printed.",
 )]
 struct Cli {
     /// The .O source file to compile or run
     input: PathBuf,
 
     /// Compilation target
-    #[arg(long, value_enum, default_value_t = OutputTarget::Binary)]
-    target: OutputTarget,
+    #[arg(long, value_enum, default_value_t = CompileTarget::Binary)]
+    target: CompileTarget,
 
     /// Output binary path (default: input file stem in the current directory).
-    /// Ignored when --target is "script".
+    /// Ignored when --target is "script" or "ir".
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -158,7 +173,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
     match cli.target {
-        OutputTarget::Binary => {
+        CompileTarget::Binary => {
             // Resolve output path: default to <input stem> in cwd.
             let output = match cli.output {
                 Some(p) => p,
@@ -187,8 +202,11 @@ fn main() -> Result<()> {
 
             result
         }
-        OutputTarget::Script => {
+        CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref())
+        }
+        CompileTarget::Ir => {
+            dump_ir(&source)
         }
     }
 }
@@ -212,6 +230,7 @@ fn compile_to_binary(
     // ── Runtime source files ─────────────────────────────────────────────────
     fs::write(src_dir.join("value.rs"),     RUNTIME_VALUE_RS)?;
     fs::write(src_dir.join("parser.rs"),    RUNTIME_PARSER_RS)?;
+    fs::write(src_dir.join("ir.rs"),        RUNTIME_IR_RS)?;
     fs::write(src_dir.join("eval.rs"),      RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"),   RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("nix_ops.rs"),   RUNTIME_NIX_OPS_RS)?;
@@ -324,28 +343,10 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
     eprintln!("olangc: using {} shim script(s)", shims.len());
 
     // ── Strip shebang ────────────────────────────────────────────────────────
-    let mut src = source.to_string();
-    if src.starts_with("#!") {
-        if let Some(newline) = src.find('\n') {
-            src = src[newline + 1..].to_string();
-        } else {
-            src.clear();
-        }
-    }
+    let src = strip_shebang(source);
 
     // ── Registered backends (same set as the O interpreter) ──────────────────
-    let registered_backends: HashSet<String> = [
-        "O", "python", "html", "latex", "markdown", "bash", "shell",
-        "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
-        "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
-        "ruby", "matlab", "mathematica", "webassembly", "java",
-        "javascript", "ocaml",
-        "quote",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let registered_backends = registered_backends();
 
     // ── Parse ────────────────────────────────────────────────────────────────
     let mut parser = Parser::new(&src, &registered_backends);
@@ -374,6 +375,59 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Target C — dump the OIR intermediate representation
+//
+// Parses the program with the same front end as the other targets, lowers
+// the ONode forest to OIR (see src/ir.rs), and prints the lowered program.
+// Purely an inspection/debugging surface: nothing is executed and no output
+// file is produced.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dump_ir(source: &str) -> Result<()> {
+    let src = strip_shebang(source);
+    let registered_backends = registered_backends();
+
+    let mut parser = Parser::new(&src, &registered_backends);
+    let nodes = parser.parse().context("failed to parse .O source")?;
+
+    let program = OIrProgram::lower(&nodes);
+    print!("{}", program.to_text());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared front-end helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The backend names accepted in language tags — same set as the O interpreter.
+fn registered_backends() -> HashSet<String> {
+    [
+        "O", "python", "html", "latex", "markdown", "bash", "shell",
+        "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+        "text",
+        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
+        "ruby", "matlab", "mathematica", "webassembly", "java",
+        "javascript", "ocaml",
+        "quote",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Drop a leading `#!...` shebang line, if present.
+fn strip_shebang(source: &str) -> String {
+    if source.starts_with("#!") {
+        match source.find('\n') {
+            Some(newline) => source[newline + 1..].to_string(),
+            None => String::new(),
+        }
+    } else {
+        source.to_string()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Code generation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -387,6 +441,7 @@ fn generate_lib_rs() -> String {
 
 pub mod value;
 pub mod parser;
+pub mod ir;
 pub mod eval;
 pub mod process;
 pub mod nix_ops;

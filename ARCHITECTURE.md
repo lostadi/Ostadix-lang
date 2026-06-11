@@ -15,6 +15,7 @@ O-lang/
 │   ├── main.rs       #   CLI entry point
 │   ├── lib.rs        #   Library crate root
 │   ├── parser.rs     #   Tokenizer & expression parser
+│   ├── ir.rs         #   OIR intermediate representation & backend registry
 │   ├── eval.rs       #   Recursive evaluator
 │   ├── value.rs      #   OValue universal type system
 │   ├── process.rs    #   Subprocess management for backends
@@ -53,6 +54,27 @@ O-lang processes code through a 5-stage pipeline:
 
 5. **Cache** — Memoize expensive operations (especially Nix
    instantiate/realise) to avoid redundant work.
+
+## Intermediate Representation (OIR)
+
+`src/ir.rs` provides a thin IR/backend interface layer — a stable seam
+between syntax (`ONode`), execution planning (`OIr`), runtime values
+(`OValue`), and backend capabilities (`BackendSpec`):
+
+- **`OIr` / `OIrProgram`** — a lowered, backend-neutral form of a parsed
+  program. Lowering (`OIrProgram::lower`) is a 1:1 structural mapping of
+  the `ONode` forest: `RawText → Text`, `VarRef → Load`,
+  `LetBinding → Store`, `Call → Invoke`, `TypedExpr → Exec`.
+- **`BackendSpec` / `BackendRegistry`** — centralized backend metadata:
+  purity (whether `{lazy}` may cache results), the splice-rendering
+  strategy used by `render_child`, and shim path resolution
+  (`<dir>/<lang>_shim.py`, `<dir>/<lang>_shim`, `<dir>/<lang>.py`,
+  `<dir>/<lang>`, in that order).
+
+The evaluator still walks `ONode` directly; OIR is currently a
+debug/inspection surface (`olangc --target ir`) and the designated home for
+future execution planning. There is deliberately no native codegen,
+optimizer, SSA, or VM at this layer.
 
 ## Universal Value System (OValue)
 
@@ -103,12 +125,13 @@ bash test_o_lang_examples.sh
 
 ## Compiler Targets (`olangc`)
 
-`olangc` supports two compilation targets, selected via `--target`:
+`olangc` supports three compilation targets, selected via `--target`:
 
 | Target   | Flag              | Output                              |
 |----------|-------------------|-------------------------------------|
 | `binary` | `--target binary` | Native ELF/Mach-O binary on disk    |
 | `script` | `--target script` | In-process execution (no disk file) |
+| `ir`     | `--target ir`     | Lowered OIR dump on stdout          |
 
 **Target A — Binary** (default): creates a temporary Cargo project that
 bundles the .O source, runtime, and backend shims, then compiles it with
@@ -121,12 +144,20 @@ semantically equivalent to emitting code into an `mmap`'d executable buffer
 and invoking a function pointer.  No intermediate build step or disk binary
 is produced.
 
+**Target C — IR**: parses the program with the same front end, lowers the
+`ONode` forest to OIR (`src/ir.rs`), and prints the lowered program to
+stdout.  A debugging/inspection target — nothing is executed and no output
+file is produced.
+
 ```bash
 # Compile to a binary (Target A)
 cargo run --bin olangc -- examples/hello.O -o hello
 
 # Execute in-process (Target B)
 cargo run --bin olangc -- examples/hello.O --target script
+
+# Dump the lowered OIR (Target C)
+cargo run --bin olangc -- examples/hello.O --target ir
 ```
 
 ## Implementations
