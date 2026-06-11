@@ -10,6 +10,7 @@
 
 pub mod value;
 pub mod parser;
+pub mod ir;
 pub mod eval;
 pub mod process;
 pub mod nix_ops;

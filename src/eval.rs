@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
+use crate::ir::{BackendRegistry, SpliceRenderer};
 use crate::nix_ops;
 use crate::nixos_ops;
 use crate::parser::{reconstruct_source, ONode, Parser};
@@ -32,43 +33,27 @@ use crate::scheduler::AutonomousScheduler;
 use crate::value::{OValue, RequestKind, GroupMode};
 
 // ═════════════════════════════════════════════════════════════════════════════
-// STEP-3.5: Backend purity table
+// STEP-3.5: Backend purity
 //
 // Determines whether the `{lazy}` attribute is valid on a given language.
 // `{lazy}` requires purity because it caches by fingerprint — re-running a
 // thunk with the same input must produce the same result, or the cache lies.
 //
-// "Pure" here means: same body + same deps + same env => same output. No
-// hidden IO, no clock, no random, no mutable global state. The list is
-// conservative — we mark a backend pure only if we're confident.
+// The purity table itself now lives in the centralized backend metadata
+// (ir.rs: BACKEND_SPECS / BackendRegistry); this is a thin delegation so the
+// evaluator keeps a single local entry point for the purity question.
 //
 // `{defer}` works on any backend (it never caches), so it's the impure-
 // backend escape hatch.
 //
 // STEP4: when more backends are ported to Rust (rust, racket, shell, etc.),
-// they'll need a purity decision here. Shell is impure (anything can happen).
-// Rust the language is pure-ish but compilation has IO. Racket has both
-// pure and impure idioms — we'd default impure and let users opt in.
+// they'll need a purity decision in the registry. Shell is impure (anything
+// can happen). Rust the language is pure-ish but compilation has IO. Racket
+// has both pure and impure idioms — we'd default impure and let users opt in.
 // ═════════════════════════════════════════════════════════════════════════════
 
-const PURE_BACKENDS: &[&str] = &[
-    "nix",           // Nix is designed to be deterministic
-    "nix_expr",      // already lazy by construction; {lazy}/{defer} are rejected anyway
-    "nix_store",     // returns a content-addressed store path
-    "nixos_test",    // test derivations are content-addressed
-    "html",          // pure templating
-    "markdown",      // pure templating
-    "latex",         // pure templating (compilation is IO but we treat the splice as pure)
-    "text",          // pure templating
-    "sql",           // declarative query language — same query, same result
-    "haskell",       // pure by default (IO is in the type system)
-    "ocaml",         // mostly pure (functional core)
-    "webassembly",   // deterministic computation (no IO in core spec)
-    // python, shell, bash, rust, racket, java, javascript, ruby, etc. — NOT pure
-];
-
 fn is_pure_backend(lang: &str) -> bool {
-    PURE_BACKENDS.contains(&lang)
+    BackendRegistry::global().is_pure(lang)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -528,16 +513,8 @@ impl Evaluator {
 
         // Pick the right shim for the language and fire it through the
         // ProcessRegistry, exactly as eval_typed_expr would for a normal block.
-        let shim = {
-            let candidates = [
-                self.shim_dir.join(format!("{lang}_shim.py")),
-                self.shim_dir.join(format!("{lang}_shim")),
-                self.shim_dir.join(format!("{lang}.py")),
-                self.shim_dir.join(&lang),
-            ];
-            candidates.into_iter().find(|p| p.exists())
-                .unwrap_or_else(|| self.shim_dir.join(format!("{lang}_shim.py")))
-        };
+        // Shim path resolution is centralized in the BackendRegistry.
+        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, &lang);
         // The shim sees an empty bindings map; deps were already spliced into
         // the body at capture time. (STEP4: deps could be passed as bindings
         // instead, for shims that want them as values rather than text.)
@@ -1116,19 +1093,8 @@ impl Evaluator {
         }
 
         // Step 2 — send the completed splice buffer to the backend.
-        let shim = {
-            let candidates = [
-                self.shim_dir.join(format!("{lang}_shim.py")),
-                self.shim_dir.join(format!("{lang}_shim")),
-                self.shim_dir.join(format!("{lang}.py")),
-                self.shim_dir.join(lang),
-            ];
-
-            candidates
-                .into_iter()
-                .find(|p| p.exists())
-                .unwrap_or_else(|| self.shim_dir.join(format!("{lang}_shim.py")))
-        };
+        // Shim path resolution is centralized in the BackendRegistry.
+        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, lang);
         // `O^(...)_O` sequences its children and returns the last non-null value.
         // Each child is evaluated in order; whitespace-only text nodes are skipped.
         // This matches the Python ref impl's OBackend.eval_ast semantics.
@@ -1257,31 +1223,36 @@ impl Evaluator {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn render_child(&self, lang: &str, val: &OValue) -> String {
-        match lang {
+        // The lang → strategy decision is centralized in the BackendRegistry
+        // (ir.rs); the value-level renderers stay here because they need
+        // OValue. Unrecognised languages get SpliceRenderer::Default, which
+        // is OValue::splice_repr() — a conservative representation that is
+        // valid in the widest range of languages.
+        match BackendRegistry::global().renderer_for(lang) {
             // ── Python ──────────────────────────────────────────────────────
             // Produce a valid Python literal so the spliced code compiles
             // without the user having to quote things manually.
-            "python" | "py" => render_python(val),
+            SpliceRenderer::Python => render_python(val),
 
             // ── HTML ─────────────────────────────────────────────────────────
             // Produce embeddable HTML markup.  OBlob images become data-URI
             // <img> tags; everything else falls back to splice_repr or
             // direct string embedding.
-            "html" => render_html(val),
+            SpliceRenderer::Html => render_html(val),
 
             // ── LaTeX ────────────────────────────────────────────────────────
-            "latex" | "tex" => render_latex(val),
+            SpliceRenderer::Latex => render_latex(val),
 
             // ── Markdown ─────────────────────────────────────────────────────
-            "markdown" | "md" => render_markdown(val),
+            SpliceRenderer::Markdown => render_markdown(val),
 
             // ── Nix family ───────────────────────────────────────────────────
             // Produce syntactically valid Nix expressions so that O values
             // from prior blocks can be spliced into Nix code via $var.
-            "nix" | "nix_store" | "nixos_test" => render_nix(val),
+            SpliceRenderer::Nix => render_nix(val),
 
             // ── Default: use the conservative cross-language representation ──
-            _ => val.splice_repr(),
+            SpliceRenderer::Default => val.splice_repr(),
         }
     }
 }
