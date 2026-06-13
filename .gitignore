@@ -32,3 +32,4 @@ extracted_segments/
 # C/C++ build outputs
 c_cpp/O
 c_cpp/olangc
+*.wasm

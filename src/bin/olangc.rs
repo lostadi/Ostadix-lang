@@ -117,6 +117,8 @@ const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
 enum CompileTarget {
     /// Compile to a self-contained native binary on disk (ELF/Mach-O).
     Binary,
+    /// Compile to a WebAssembly (WASI) binary on disk.
+    Wasm,
     /// Execute the program directly inside the olangc process (script mode).
     Script,
     /// Lower the parsed program to the OIR intermediate representation and
@@ -173,9 +175,9 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
     match cli.target {
-        CompileTarget::Binary => {
+        CompileTarget::Binary | CompileTarget::Wasm => {
             // Resolve output path: default to <input stem> in cwd.
-            let output = match cli.output {
+            let mut output = match cli.output {
                 Some(p) => p,
                 None => {
                     let stem = cli.input
@@ -185,6 +187,10 @@ fn main() -> Result<()> {
                     PathBuf::from(stem.as_ref())
                 }
             };
+            
+            if cli.target == CompileTarget::Wasm {
+                output.set_extension("wasm");
+            }
 
             let shims = read_shims(cli.shim_dir.as_deref())?;
 
@@ -192,7 +198,7 @@ fn main() -> Result<()> {
             eprintln!("olangc: building in {}", build_dir.display());
             eprintln!("olangc: embedding {} shim script(s)", shims.len());
 
-            let result = compile_to_binary(&cli.input, &source, &shims, &build_dir, &output);
+            let result = compile_to_binary(&cli.input, &source, &shims, &build_dir, &output, cli.target == CompileTarget::Wasm);
 
             if !cli.keep_build_dir {
                 let _ = fs::remove_dir_all(&build_dir);
@@ -221,6 +227,7 @@ fn compile_to_binary(
     shims:      &[(String, Vec<u8>)],
     build_dir:  &Path,
     output:     &Path,
+    is_wasm:    bool,
 ) -> Result<()> {
     let bin_name = derive_bin_name(output);
     let src_dir  = build_dir.join("src");
@@ -268,9 +275,17 @@ fn compile_to_binary(
     fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
 
     // ── Build ────────────────────────────────────────────────────────────────
-    eprintln!("olangc: running cargo build --release ...");
+    let mut cargo_args = vec!["build", "--release"];
+    if is_wasm {
+        cargo_args.push("--target");
+        cargo_args.push("wasm32-wasip1");
+        eprintln!("olangc: running cargo build --release --target wasm32-wasip1 ...");
+    } else {
+        eprintln!("olangc: running cargo build --release ...");
+    }
+    
     let status = Command::new("cargo")
-        .args(["build", "--release"])
+        .args(&cargo_args)
         .current_dir(build_dir)
         .status()
         .context("failed to spawn cargo — is Rust/Cargo installed?")?;
@@ -280,7 +295,7 @@ fn compile_to_binary(
     }
 
     // ── Copy binary to output ────────────────────────────────────────────────
-    let built = built_binary_path(build_dir, &bin_name);
+    let built = built_binary_path(build_dir, &bin_name, is_wasm);
     let dest  = canonicalize_output(output)?;
 
     fs::copy(&built, &dest)
@@ -288,7 +303,7 @@ fn compile_to_binary(
 
     // Make the output binary executable on Unix.
     #[cfg(unix)]
-    {
+    if !is_wasm {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
     }
@@ -475,14 +490,17 @@ use std::collections::HashSet;
 /// The compiled .O program source, embedded at compile time.
 const PROGRAM_SOURCE: &str = include_str!({program_filename:?});
 
+#[cfg(not(target_family = "wasm"))]
 /// Backend shim scripts, embedded as raw bytes at compile time.
 /// Extracted to a per-invocation temp directory at startup and cleaned up on exit.
 const EMBEDDED_SHIMS: &[(&str, &[u8])] = &[
 {shim_entries}
 ];
 
+#[cfg(not(target_family = "wasm"))]
 struct ShimGuard(std::path::PathBuf);
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for ShimGuard {{
     fn drop(&mut self) {{
         let _ = std::fs::remove_dir_all(&self.0);
@@ -492,22 +510,31 @@ impl Drop for ShimGuard {{
 fn main() -> anyhow::Result<()> {{
     use anyhow::Context as _;
 
-    // Extract embedded shims to a private temp directory for this invocation.
-    let shim_dir = std::env::temp_dir()
-        .join(format!("o_shims_{{}}", std::process::id()));
-    std::fs::create_dir_all(&shim_dir)?;
-    let _guard = ShimGuard(shim_dir.clone());
+    #[cfg(not(target_family = "wasm"))]
+    let shim_dir = {{
+        // Extract embedded shims to a private temp directory for this invocation.
+        let dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(format!(".o_shims_{{}}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
 
-    for (name, content) in EMBEDDED_SHIMS {{
-        let dest = shim_dir.join(name);
-        std::fs::write(&dest, content)
-            .with_context(|| format!("failed to extract shim {{name}}"))?;
-        #[cfg(unix)]
-        {{
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+        for (name, content) in EMBEDDED_SHIMS {{
+            let dest = dir.join(name);
+            std::fs::write(&dest, content)
+                .with_context(|| format!("failed to extract shim {{name}}"))?;
+            #[cfg(unix)]
+            {{
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+            }}
         }}
-    }}
+        dir
+    }};
+    #[cfg(target_family = "wasm")]
+    let shim_dir = std::path::PathBuf::from(".");
+
+    #[cfg(not(target_family = "wasm"))]
+    let _guard = ShimGuard(shim_dir.clone());
 
     let registered_backends: HashSet<String> = [
         "O", "python", "html", "latex", "markdown", "bash", "shell",
@@ -706,13 +733,17 @@ fn sanitize_program_filename(input_path: &Path) -> String {
 }
 
 /// Platform-aware path to the binary produced by `cargo build --release`.
-fn built_binary_path(build_dir: &Path, bin_name: &str) -> PathBuf {
-    let name = if cfg!(windows) {
-        format!("{bin_name}.exe")
+fn built_binary_path(build_dir: &Path, bin_name: &str, is_wasm: bool) -> PathBuf {
+    if is_wasm {
+        build_dir.join("target").join("wasm32-wasip1").join("release").join(format!("{}.wasm", bin_name))
     } else {
-        bin_name.to_string()
-    };
-    build_dir.join("target").join("release").join(name)
+        let name = if cfg!(windows) {
+            format!("{bin_name}.exe")
+        } else {
+            bin_name.to_string()
+        };
+        build_dir.join("target").join("release").join(name)
+    }
 }
 
 /// Resolve the output path to an absolute path in the current directory.

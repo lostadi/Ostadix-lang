@@ -276,6 +276,17 @@ def handle_exec(cmd):
 
         send_ok(result)
 
+    except SystemExit as e:
+        # SystemExit inherits BaseException, not Exception, so it would slip
+        # past the generic handler and terminate the shim process, causing
+        # "backend closed stdout unexpectedly" on the Rust side.
+        # Treat exit(0) as a clean null result; any other code as an error.
+        code = e.code if e.code is not None else 0
+        if code == 0:
+            send_ok(None)
+        else:
+            send_err(f"SystemExit({code})")
+
     except Exception:
         send_err(traceback.format_exc())
 

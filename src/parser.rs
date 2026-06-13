@@ -178,6 +178,24 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+
+                    // Check for \$IDENT — emit as literal `$IDENT` text.
+                    // Without this, shell variables like $PATH in bash blocks
+                    // would have to be written \$PATH to avoid being parsed as
+                    // O-lang binding references (VarRefs).
+                    self.pos = after_bs;
+                    if let Some(name) = self.try_parse_var_ref()? {
+                        let literal = format!("${}", name);
+                        self.flush_text(&mut nodes, text_start, temp_pos);
+                        if let Some(ONode::RawText(s)) = nodes.last_mut() {
+                            s.push_str(&literal);
+                        } else {
+                            nodes.push(ONode::RawText(literal));
+                        }
+                        text_start = self.pos;
+                        continue;
+                    }
+                    self.pos = temp_pos;
                 }
             }
 
@@ -778,6 +796,42 @@ mod tests {
         } else {
             panic!("expected TypedExpr");
         }
+    }
+
+    #[test]
+    fn backslash_escapes_dollar_as_literal_text() {
+        // \$PATH inside a bash block should emit the literal text "$PATH",
+        // NOT parse as a VarRef (which would fail with "Undefined variable: $PATH").
+        // This is essential for writing real shell code in bash^(...)_bash blocks.
+        let src = r#"bash^(echo \$PATH)_bash"#;
+        let backends = make_backends(&["bash"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(nodes.len(), 1);
+        if let ONode::TypedExpr { body, .. } = &nodes[0] {
+            let combined: String = body.iter().map(|n| match n {
+                ONode::RawText(s) => s.clone(),
+                ONode::VarRef(n)  => format!("<VarRef:{n}>"),
+                _                 => "<node>".to_string(),
+            }).collect();
+            assert!(
+                combined.contains("$PATH") && !combined.contains("<VarRef:PATH>"),
+                "bash body should contain literal $PATH, not a VarRef: {:?}", combined
+            );
+        } else {
+            panic!("expected TypedExpr");
+        }
+    }
+
+    #[test]
+    fn dollar_without_backslash_is_still_a_varref() {
+        // $answer at the top level (unescaped) must still parse as a VarRef.
+        let src = "$answer";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert!(
+            nodes.iter().any(|n| matches!(n, ONode::VarRef(name) if name == "answer")),
+            "unescaped $answer should still be a VarRef: {:?}", nodes
+        );
     }
 
     #[test]

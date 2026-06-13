@@ -26,7 +26,14 @@ text         ::= (any char | backslash-escape)+     -- everything not OPENER/CLO
 backslash-escape
              ::= "\" OPENER          -- literal opener, no expression
                | "\" CLOSER          -- literal closer, not a termination
+               | "\" "$" IDENT       -- literal $IDENT, not a VarRef splice
 ```
+
+The `\$IDENT` escape is important when writing real target-language code inside block
+bodies. O-lang parses `$IDENT` everywhere (including inside `bash^`, `python^`, etc.)
+as a binding reference (VarRef). To write a bare shell variable like `$PATH` in a
+`bash^(...)_bash` block without triggering a "Undefined variable" error, write `\$PATH`.
+O-lang strips the backslash and passes `$PATH` verbatim to the bash backend.
 
 An `IDENT` that is **not in the registered-language set** is NOT treated as an
 opener, even if followed by `^(`. This keeps inner-language code safe —
