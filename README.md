@@ -837,10 +837,35 @@ cargo run -- program.O                  # run the combined file
 
 cargo run --bin o-link -- src/ -o project.O          # link a whole codebase
 cargo run --bin o-link -- notes.txt --lang txt=markdown --stdout
+
+cargo run --bin o-link -- calc.py --run              # link, then execute in-process
+cargo run --bin o-link -- src/ -o app.O --shebang    # emit `#!/usr/bin/env o`,
+./app.O                                              # chmod +x — directly runnable
 ```
 
 The combined output is re-parsed before it is written, so `o-link` never
-emits a `.O` file the runtime cannot read.
+emits a `.O` file the runtime cannot read. Directory walks skip binary /
+non-UTF-8 files with a warning, follow symlinked directories at most once
+(no infinite loops), dedupe files reachable through overlapping inputs, and
+never pick up the output file itself — so re-linking a directory that
+already contains a previous `combined.O` is safe.
+
+**Docker image (zero local toolchain)**
+
+The repository ships a multi-stage `Dockerfile` that builds the full Rust
+toolchain (`O`, `olangc`, `o-link`) and packages it with Python 3 and the
+backend shims, so you can run, link, and compile `.O` programs with nothing
+but Docker installed:
+
+```bash
+docker build -t o-lang .
+
+docker run --rm -v "$PWD:/work" o-lang my_program.O      # run a program
+docker run --rm -it o-lang --repl                        # interactive REPL
+docker run --rm -v "$PWD:/work" --entrypoint o-link \
+    o-lang src/ -o app.O                                 # link a codebase
+docker run --rm -v "$PWD:/work" o-lang app.O             # run the result
+```
 
 ---
 

@@ -1,0 +1,13 @@
+target/
+c_cpp/*.o
+c_cpp/O
+c_cpp/olangc
+.git/
+docs/
+examples/
+setup/
+tools/
+tests/
+o_lang/__pycache__/
+*.md
+!README.md

@@ -25,9 +25,17 @@
 //   o-link src/ -o project.O                  # link a whole codebase
 //   o-link a.py --lang txt=markdown -o out.O  # extra extension mapping
 //   o-link a.py --stdout                      # write to stdout instead
+//   o-link a.py b.sh --run                    # link, then execute in-process
+//   o-link src/ -o app.O --shebang            # emit `#!/usr/bin/env o`, chmod +x
 //
-// The combined output is re-parsed with the O-lang parser before it is
-// written, so o-link never emits a .O file that the runtime cannot read.
+// Robustness guarantees:
+//   * The combined output is re-parsed with the O-lang parser before it is
+//     written, so o-link never emits a .O file that the runtime cannot read.
+//   * Directory walks skip binary / non-UTF-8 files (with a warning), follow
+//     symlinked directories at most once (no infinite loops), and never pick
+//     up the output file itself.
+//   * The same file given twice (directly or via overlapping directories) is
+//     linked only once.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -36,7 +44,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use o_lang::eval::Evaluator;
 use o_lang::parser::Parser;
+use o_lang::value::OValue;
 
 /// o-link — link multiple scripts or codebases into a single .O file.
 #[derive(Debug, ClapParser)]
@@ -65,6 +75,19 @@ struct Cli {
     /// Skip the parse-validation pass on the combined output.
     #[arg(long = "no-validate")]
     no_validate: bool,
+
+    /// Execute the combined program in-process after linking.
+    #[arg(long = "run")]
+    run: bool,
+
+    /// Shim directory used by --run (defaults to ./backends).
+    #[arg(long = "shim-dir", default_value = "backends")]
+    shim_dir: PathBuf,
+
+    /// Prepend `#!/usr/bin/env o` and mark the output executable, so the
+    /// combined .O file can be run directly (`./program.O`).
+    #[arg(long = "shebang", conflicts_with = "to_stdout")]
+    shebang: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,12 +109,20 @@ fn main() -> Result<()> {
         ext_map.insert(ext.trim_start_matches('.').to_string(), backend.to_string());
     }
 
-    let files = collect_files(&cli.inputs, &ext_map)?;
+    // Never let the output file get linked into itself when a directory walk
+    // would otherwise reach it (e.g. `o-link . -o ./combined.O` run twice).
+    let exclude = if cli.to_stdout {
+        None
+    } else {
+        cli.output.canonicalize().ok()
+    };
+
+    let files = collect_files(&cli.inputs, &ext_map, exclude.as_deref())?;
     if files.is_empty() {
         bail!("no linkable files found in the given inputs");
     }
 
-    let combined = link_files(&files, &ext_map, &backends)?;
+    let mut combined = link_files(&files, &ext_map, &backends)?;
 
     if !cli.no_validate {
         let mut parser = Parser::new(&combined, &backends);
@@ -100,11 +131,25 @@ fn main() -> Result<()> {
             .context("internal error: combined output does not parse as .O source")?;
     }
 
+    if cli.shebang {
+        combined.insert_str(0, "#!/usr/bin/env o\n");
+    }
+
     if cli.to_stdout {
         print!("{}", combined);
     } else {
         fs::write(&cli.output, &combined)
             .with_context(|| format!("failed to write {}", cli.output.display()))?;
+        if cli.shebang {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&cli.output, fs::Permissions::from_mode(0o755))
+                    .with_context(|| {
+                        format!("failed to mark {} executable", cli.output.display())
+                    })?;
+            }
+        }
         eprintln!(
             "linked {} file(s) into {}",
             files.len(),
@@ -112,6 +157,36 @@ fn main() -> Result<()> {
         );
     }
 
+    if cli.run {
+        run_combined(&combined, cli.shim_dir, backends)?;
+    }
+
+    Ok(())
+}
+
+/// Execute the combined program in-process, the same way the `O` interpreter
+/// would: strip the shebang (if any), parse, evaluate, print the result.
+fn run_combined(source: &str, shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
+    let body = if source.starts_with("#!") {
+        source.find('\n').map(|nl| &source[nl + 1..]).unwrap_or("")
+    } else {
+        source
+    };
+
+    let mut parser = Parser::new(body, &backends);
+    let nodes = parser
+        .parse()
+        .context("failed to parse combined .O source")?;
+
+    let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
+    let result = evaluator
+        .eval_document(nodes)
+        .context("failed to evaluate combined .O program")?;
+
+    match result {
+        OValue::Str { v } | OValue::Html { v } => println!("{}", v),
+        other => println!("{}", other),
+    }
     Ok(())
 }
 
@@ -121,12 +196,21 @@ fn main() -> Result<()> {
 
 /// Expand the input list: files are taken as-is (and must be mappable),
 /// directories are walked recursively in sorted order, keeping only files
-/// whose extension maps to a backend.
-fn collect_files(inputs: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Result<Vec<PathBuf>> {
+/// whose extension maps to a backend. Duplicate files (the same file given
+/// twice, or reachable via overlapping directory inputs) are linked once,
+/// and `exclude` (the output file) is never picked up.
+fn collect_files(
+    inputs: &[PathBuf],
+    ext_map: &BTreeMap<String, String>,
+    exclude: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
+    let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+
     for input in inputs {
         if input.is_dir() {
-            walk_dir(input, ext_map, &mut files)?;
+            walk_dir(input, ext_map, exclude, &mut seen_files, &mut seen_dirs, &mut files)?;
         } else if input.is_file() {
             if file_backend(input, ext_map).is_none() {
                 bail!(
@@ -134,7 +218,13 @@ fn collect_files(inputs: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Resu
                     input.display()
                 );
             }
-            files.push(input.clone());
+            if push_unique(input, exclude, &mut seen_files, &mut files) {
+                // Explicitly-listed files must be readable text: fail loudly
+                // here instead of skipping silently like directory walks do.
+                fs::read_to_string(input).with_context(|| {
+                    format!("{}: not readable as UTF-8 text", input.display())
+                })?;
+            }
         } else {
             bail!("{}: no such file or directory", input.display());
         }
@@ -142,9 +232,44 @@ fn collect_files(inputs: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Resu
     Ok(files)
 }
 
+/// Push `path` onto `files` unless it is the excluded output file or has
+/// already been collected (compared by canonical path, so symlinks and
+/// `./a.py` vs `a.py` spellings dedupe correctly). Returns true if pushed.
+fn push_unique(
+    path: &Path,
+    exclude: Option<&Path>,
+    seen: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if exclude.is_some_and(|e| e == canonical) {
+        return false;
+    }
+    if !seen.insert(canonical) {
+        return false;
+    }
+    files.push(path.to_path_buf());
+    true
+}
+
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".git"];
 
-fn walk_dir(dir: &Path, ext_map: &BTreeMap<String, String>, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_dir(
+    dir: &Path,
+    ext_map: &BTreeMap<String, String>,
+    exclude: Option<&Path>,
+    seen_files: &mut HashSet<PathBuf>,
+    seen_dirs: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    // Symlink-loop protection: visit each real directory at most once.
+    let canonical = dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve directory {}", dir.display()))?;
+    if !seen_dirs.insert(canonical) {
+        return Ok(());
+    }
+
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -163,9 +288,24 @@ fn walk_dir(dir: &Path, ext_map: &BTreeMap<String, String>, out: &mut Vec<PathBu
             if SKIP_DIRS.contains(&name) {
                 continue;
             }
-            walk_dir(&entry, ext_map, out)?;
+            walk_dir(&entry, ext_map, exclude, seen_files, seen_dirs, out)?;
         } else if entry.is_file() && file_backend(&entry, ext_map).is_some() {
-            out.push(entry);
+            // Directory walks skip binary / non-UTF-8 files with a warning
+            // rather than aborting the whole link.
+            match fs::read(&entry) {
+                Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {
+                    push_unique(&entry, exclude, seen_files, out);
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "warning: {}: skipped (not UTF-8 text)",
+                        entry.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("warning: {}: skipped ({})", entry.display(), err);
+                }
+            }
         }
     }
     Ok(())
@@ -485,5 +625,65 @@ mod tests {
         assert_eq!(map.get("sh").unwrap(), "bash");
         assert_eq!(map.get("html").unwrap(), "html");
         assert_eq!(map.get("md").unwrap(), "markdown");
+    }
+
+    /// Build a unique scratch directory for filesystem-backed tests.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "olink_test_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn collect_dedupes_overlapping_inputs() {
+        let dir = scratch("dedupe");
+        let file = dir.join("a.py");
+        fs::write(&file, "x = 1\n").unwrap();
+
+        let map = default_extension_map();
+        // Same file via the directory AND explicitly: linked once.
+        let files = collect_files(&[dir.clone(), file.clone()], &map, None).unwrap();
+        assert_eq!(files.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_excludes_output_and_binary_files() {
+        let dir = scratch("exclude");
+        fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("out.O"), "stale combined output\n").unwrap();
+        fs::write(dir.join("blob.py"), [0xff_u8, 0xfe, 0x00]).unwrap();
+
+        let map = default_extension_map();
+        let exclude = dir.join("out.O").canonicalize().unwrap();
+        let files = collect_files(&[dir.clone()], &map, Some(&exclude)).unwrap();
+
+        // Only a.py: out.O is the excluded output, blob.py is not UTF-8.
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("a.py"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_survives_symlink_loops() {
+        let dir = scratch("symloop");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.py"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(&dir, sub.join("loop")).unwrap();
+
+        let map = default_extension_map();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        assert_eq!(files.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
