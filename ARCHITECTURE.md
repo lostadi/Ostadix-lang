@@ -23,7 +23,7 @@ O-lang/
 │   ├── nixos_ops.rs  #   NixOS-specific operations
 │   ├── scheduler.rs  #   Parallel evaluation scheduler
 │   └── bin/          #   Additional binary targets
-├── backends/         # Language shims (Python, Bash, Nix, Racket, Rust, Shell)
+├── backends/         # Language shims (Python, Bash, Nix, Racket, Rust, … — see README backend table)
 ├── examples/         # .O example programs
 ├── c_cpp/            # Complete C17 port (standalone)
 ├── o_lang/           # Legacy Python prototype (reference only)
@@ -105,7 +105,13 @@ Each supported language has a shim script in `backends/` that:
 - Evaluates the expression in the target language
 - Writes JSON output to stdout
 
-Currently supported: Python, Bash, Nix, Racket, Rust, Shell.
+Shims exist for: Python, Bash, Shell, Nix, `nix_store`, `nixos_test`, Racket,
+Rust, C#, C++, Haskell, Lisp, Common Lisp, SQL, Ruby, MATLAB, Mathematica,
+WebAssembly, Java, JavaScript, and OCaml. The fully executing backends are
+Python and the Nix family; `html`, `markdown`, `latex`, `text`, `quote`,
+`nix_expr`, and `O` are handled inline by the evaluator (no subprocess), and
+the remaining shims are parse-only stubs. See the backend table in README.md
+for per-backend status.
 
 ## Building & Testing
 

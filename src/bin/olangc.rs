@@ -409,6 +409,8 @@ fn registered_backends() -> HashSet<String> {
         "ruby", "matlab", "mathematica", "webassembly", "java",
         "javascript", "ocaml",
         "quote",
+        // Aliases (canonicalized by the parser via the BackendRegistry).
+        "py", "md", "tex", "plain", "o",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -510,7 +512,13 @@ fn main() -> anyhow::Result<()> {{
     let registered_backends: HashSet<String> = [
         "O", "python", "html", "latex", "markdown", "bash", "shell",
         "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+        "text",
+        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
+        "ruby", "matlab", "mathematica", "webassembly", "java",
+        "javascript", "ocaml",
         "quote",
+        // Aliases (canonicalized by the parser via the BackendRegistry).
+        "py", "md", "tex", "plain", "o",
     ]
     .iter()
     .map(|s| s.to_string())

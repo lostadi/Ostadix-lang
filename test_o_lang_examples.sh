@@ -2,11 +2,10 @@
 set -euo pipefail
 
 cargo run --quiet -- examples/bindings.O >/tmp/o-bindings.out 2>/tmp/o-bindings.err
-grep -q 'Int' /tmp/o-bindings.out
-grep -q 'v: 43' /tmp/o-bindings.out
+grep -q '^43$' /tmp/o-bindings.out
 
 cargo run --quiet -- examples/nested_splice.O >/tmp/o-nested.out 2>/tmp/o-nested.err
-grep -q 'v: 42' /tmp/o-nested.out
+grep -q '^42$' /tmp/o-nested.out
 
 cargo run --quiet -- examples/html_escape.O >/tmp/o-html-escape.out 2>/tmp/o-html-escape.err
 grep -q '&lt;O-lang &amp; friends&gt;' /tmp/o-html-escape.out

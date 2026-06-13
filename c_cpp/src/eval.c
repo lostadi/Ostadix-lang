@@ -107,10 +107,22 @@ static char *render_python(OValue *v) {
         case OVAL_BOOL: return strdup(v->data.bool_val ? "True" : "False");
         case OVAL_INT: { char b[32]; snprintf(b,32,"%lld", (long long)v->data.int_val); return strdup(b); }
         case OVAL_FLOAT: { char b[64]; snprintf(b,64,"%.17g", v->data.float_val); return strdup(b); }
-        case OVAL_STR: case OVAL_HTML: case OVAL_STORE_PATH: case OVAL_SYSTEM: {
+        case OVAL_STR: case OVAL_SYSTEM: {
             char *q = json_quote(v->data.str_val ? v->data.str_val : "");
             /* python str */
             SB sb; sb_init(&sb); sb_append(&sb, q); free(q); return sb_take(&sb);
+        }
+        case OVAL_HTML: {
+            /* Preserve the trusted-HTML type across the splice (matches the
+               Rust runtime's render_python; the shim defines OHtml). */
+            char *q = json_quote(v->data.str_val ? v->data.str_val : "");
+            SB sb; sb_init(&sb); sb_append(&sb, "OHtml("); sb_append(&sb, q);
+            sb_append(&sb, ")"); free(q); return sb_take(&sb);
+        }
+        case OVAL_STORE_PATH: {
+            char *q = json_quote(v->data.str_val ? v->data.str_val : "");
+            SB sb; sb_init(&sb); sb_append(&sb, "OStorePath("); sb_append(&sb, q);
+            sb_append(&sb, ")"); free(q); return sb_take(&sb);
         }
         case OVAL_LIST: {
             SB sb; sb_init(&sb); sb_append(&sb, "[");
@@ -193,7 +205,10 @@ static char *html_escape_c(const char *s) {
 static char *render_html(OValue *v) {
     if (!v) return strdup("");
     switch (v->tag) {
-        case OVAL_HTML: case OVAL_STR: case OVAL_STORE_PATH:
+        case OVAL_STR:
+            /* Untrusted text — escape. Trusted raw HTML must be OVAL_HTML. */
+            return html_escape_c(v->data.str_val ? v->data.str_val : "");
+        case OVAL_HTML: case OVAL_STORE_PATH:
             return strdup(v->data.str_val ? v->data.str_val : "");
         case OVAL_BLOB: {
             const char *d = v->data.blob.data ? v->data.blob.data : "";

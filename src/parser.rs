@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 
+use crate::ir::BackendRegistry;
+
 /// Languages whose bodies are SEQUENCED (children are O-level statements)
 /// rather than SPLICED (children are raw source text for a target backend).
 ///
@@ -475,6 +477,11 @@ impl<'a> Parser<'a> {
 
         if i + 2 <= bytes.len() && &self.source[i..i + 2] == "^(" {
             self.pos = i + 2;
+            // Canonicalize alias tags (`py` → `python`, `md` → `markdown`,
+            // …) so the AST, evaluator env keys, and shim resolution all see
+            // the canonical name. `raw` keeps the source spelling so the
+            // closer `)_py` still matches its opener.
+            let lang = BackendRegistry::global().canonical(&lang).to_string();
             Ok(Some(Tag { lang, env_id, attr, raw }))
         } else {
             Ok(None)
@@ -719,6 +726,24 @@ mod tests {
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn alias_tags_are_canonicalized() {
+        // `py^(...)_py` parses and the AST carries the canonical name.
+        let backends = make_backends(&["py", "md", "plain", "o"]);
+        for (src, canonical) in [
+            ("py^(6 * 7)_py", "python"),
+            ("md^(# hi)_md", "markdown"),
+            ("plain^(hi)_plain", "text"),
+            ("o^(x)_o", "O"),
+        ] {
+            let nodes = Parser::new(src, &backends).parse().unwrap();
+            match &nodes[0] {
+                ONode::TypedExpr { lang, .. } => assert_eq!(lang, canonical),
+                other => panic!("expected TypedExpr for {src}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

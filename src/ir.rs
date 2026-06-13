@@ -205,7 +205,7 @@ impl BackendSpec {
 /// `BackendRegistry::DEFAULT_SPEC` (impure, default renderer).
 const BACKEND_SPECS: &[BackendSpec] = &[
     // Sequencing / host languages.
-    BackendSpec::new("O",     &[], false, SpliceRenderer::Default),
+    BackendSpec::new("O",     &["o"], false, SpliceRenderer::Default),
     BackendSpec::new("quote", &[], false, SpliceRenderer::Default),
 
     // Nix family — deterministic by design.
@@ -221,7 +221,7 @@ const BACKEND_SPECS: &[BackendSpec] = &[
     BackendSpec::new("html",     &[],     true, SpliceRenderer::Html),
     BackendSpec::new("markdown", &["md"], true, SpliceRenderer::Markdown),
     BackendSpec::new("latex",    &["tex"], true, SpliceRenderer::Latex),
-    BackendSpec::new("text",     &[],     true, SpliceRenderer::Default),
+    BackendSpec::new("text",     &["plain"], true, SpliceRenderer::Default),
 
     // Declarative / pure-by-default languages.
     BackendSpec::new("sql",         &[], true, SpliceRenderer::Default),
@@ -269,6 +269,12 @@ impl BackendRegistry {
     /// Look up a backend by canonical name or alias.
     pub fn get(&self, lang: &str) -> Option<&BackendSpec> {
         self.specs.iter().find(|s| s.matches(lang))
+    }
+
+    /// Resolve a language tag (canonical name or alias) to its canonical
+    /// name. Unknown tags are returned unchanged.
+    pub fn canonical<'a>(&self, lang: &'a str) -> &'a str {
+        self.get(lang).map_or(lang, |s| s.name)
     }
 
     /// Whether `{lazy}` may cache results from this backend.
