@@ -1,0 +1,8 @@
+javascript^(
+function double(x) {
+  return x * 2;
+}
+
+const value = double(21);
+console.log(value)
+)_javascript

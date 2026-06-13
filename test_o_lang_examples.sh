@@ -1,41 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cargo run --quiet -- examples/bindings.O >/tmp/o-bindings.out 2>/tmp/o-bindings.err
-grep -q '^43$' /tmp/o-bindings.out
+run_example() {
+  local example="$1"
+  local output
 
-cargo run --quiet -- examples/nested_splice.O >/tmp/o-nested.out 2>/tmp/o-nested.err
-grep -q '^42$' /tmp/o-nested.out
+  if ! output="$(./target/release/O "examples/${example}.O" backends/ 2>&1)"; then
+    printf 'Example %s failed:\n%s\n' "$example" "$output" >&2
+    return 1
+  fi
 
-cargo run --quiet -- examples/html_escape.O >/tmp/o-html-escape.out 2>/tmp/o-html-escape.err
-grep -q '&lt;O-lang &amp; friends&gt;' /tmp/o-html-escape.out
+  printf '%s\n' "$output"
+}
 
-cargo run --quiet -- examples/html_raw_roundtrip.O >/tmp/o-html-roundtrip.out 2>/tmp/o-html-roundtrip.err
-grep -q '<section>' /tmp/o-html-roundtrip.out
-grep -q '<strong>Hello, Lee.</strong>' /tmp/o-html-roundtrip.out
+assert_example_matches() {
+  local example="$1"
+  local pattern="$2"
+  local output
 
-cargo run --quiet -- examples/nix_basic.O >/tmp/o-nix-basic.out 2>/tmp/o-nix-basic.err
-grep -q 'Nix inside O-lang' /tmp/o-nix-basic.out
-grep -q 'O-lang Nix bridge' /tmp/o-nix-basic.out
-grep -q '42' /tmp/o-nix-basic.out
+  output="$(run_example "$example")"
+  grep -q -- "$pattern" <<<"$output"
+}
 
-cargo run --quiet -- examples/nix_python_html.O >/tmp/o-nix-python-html.out 2>/tmp/o-nix-python-html.err
-grep -q 'Nix → Python → HTML' /tmp/o-nix-python-html.out
-grep -q 'Nix-born value says answer=42' /tmp/o-nix-python-html.out
+assert_example_matches bindings '^43$'
+assert_example_matches nested_splice '^42$'
+assert_example_matches html_escape '&lt;O-lang &amp; friends&gt;'
 
-cargo run --quiet -- examples/nix_storepath.O >/tmp/o-nix-storepath.out 2>/tmp/o-nix-storepath.err
-grep -q 'O-lang StorePath test' /tmp/o-nix-storepath.out
-grep -q '/nix/store/' /tmp/o-nix-storepath.out
-grep -q 'hello-from-o-lang.txt' /tmp/o-nix-storepath.out
-grep -q 'class="o-store-path"' /tmp/o-nix-storepath.out
+html_roundtrip_output="$(run_example html_raw_roundtrip)"
+grep -q '<section>' <<<"$html_roundtrip_output"
+grep -q '<strong>Hello, Lee.</strong>' <<<"$html_roundtrip_output"
 
-cargo run --quiet -- examples/nix_storepath_python.O >/tmp/o-nix-storepath-python.out 2>/tmp/o-nix-storepath-python.err
-grep -q 'Python reads Nix StorePath' /tmp/o-nix-storepath-python.out
-grep -q 'Hello from O-lang + Nix' /tmp/o-nix-storepath-python.out
+if command -v nix >/dev/null 2>&1; then
+  nix_basic_output="$(run_example nix_basic)"
+  grep -q 'Nix inside O-lang' <<<"$nix_basic_output"
+  grep -q 'O-lang Nix bridge' <<<"$nix_basic_output"
+  grep -q '42' <<<"$nix_basic_output"
 
-cargo run --quiet -- examples/coordination_groups.O >/tmp/o-coordination.out 2>/tmp/o-coordination.err
-grep -q 'Step-4 coordination primitives' /tmp/o-coordination.out
-grep -q '<group:batch n=3' /tmp/o-coordination.out
-grep -q 'pkgs.hello' /tmp/o-coordination.out
+  nix_python_html_output="$(run_example nix_python_html)"
+  grep -q 'Nix → Python → HTML' <<<"$nix_python_html_output"
+  grep -q 'Nix-born value says answer=42' <<<"$nix_python_html_output"
+
+  nix_storepath_output="$(run_example nix_storepath)"
+  grep -q 'O-lang StorePath test' <<<"$nix_storepath_output"
+  grep -q '/nix/store/' <<<"$nix_storepath_output"
+  grep -q 'hello-from-o-lang.txt' <<<"$nix_storepath_output"
+  grep -q 'class="o-store-path"' <<<"$nix_storepath_output"
+
+  nix_storepath_python_output="$(run_example nix_storepath_python)"
+  grep -q 'Python reads Nix StorePath' <<<"$nix_storepath_python_output"
+  grep -q 'Hello from O-lang + Nix' <<<"$nix_storepath_python_output"
+
+  coordination_output="$(run_example coordination_groups)"
+  grep -q 'Step-4 coordination primitives' <<<"$coordination_output"
+  grep -q '<group:batch n=3' <<<"$coordination_output"
+  grep -q 'pkgs.hello' <<<"$coordination_output"
+else
+  echo "(skipping nix-backed examples -- nix not installed)"
+fi
+
+assert_example_matches js_hello 'hello from js'
+assert_example_matches js_binding '^42$'
+assert_example_matches js_json '{"x":1,"y":2}'
+assert_example_matches js_multiline '^42$'
 
 echo "All O-lang smoke tests passed."
