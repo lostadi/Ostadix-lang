@@ -254,3 +254,85 @@ impl Drop for ProcessRegistry {
         self.cleanup_all();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn python_shim_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/python_shim.py")
+    }
+
+    fn spawn_python_shim() -> Result<BackendProcess> {
+        BackendProcess::new(&python_shim_path())
+    }
+
+    fn expect_done(step: ExecStep) -> OValue {
+        match step {
+            ExecStep::Done(value) => value,
+            ExecStep::EvalRequest { src } => {
+                panic!("expected Done step from shim, got EvalRequest({src:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn ping_round_trip_returns_null() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        process.send_command(&OWireCommand::Ping)?;
+        let value = expect_done(process.recv_step()?);
+
+        assert_eq!(value, OValue::Null);
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_without_bindings_returns_int_result() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        let value = process.exec("__oval_result__ = 42", HashMap::new())?;
+
+        assert_eq!(value, OValue::int(42));
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_with_string_binding_round_trips_through_shim() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+        let bindings = HashMap::from([("msg".to_string(), OValue::str_("hello"))]);
+
+        let value = process.exec("__oval_result__ = msg.upper()", bindings)?;
+
+        assert_eq!(value, OValue::str_("HELLO"));
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_reports_backend_errors_without_panicking() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        let err = process
+            .exec("raise RuntimeError('boom from shim')", HashMap::new())
+            .unwrap_err();
+
+        assert!(err.to_string().contains("boom from shim"));
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_command_returns_ok_null() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        process.send_command(&OWireCommand::Cleanup)?;
+        let value = expect_done(process.recv_step()?);
+
+        assert_eq!(value, OValue::Null);
+        process.cleanup()?;
+        Ok(())
+    }
+}
