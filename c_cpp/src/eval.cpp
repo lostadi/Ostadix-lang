@@ -328,6 +328,8 @@ std::string render_html(const OValue *val) {
     case OVAL_FLOAT:
         return html_escape(format_float(val->data.float_val));
     case OVAL_STR:
+        // Untrusted text — escape. Trusted raw HTML must be OVAL_HTML.
+        return html_escape(maybe(val->data.str_val));
     case OVAL_HTML:
         return maybe(val->data.str_val);
     case OVAL_STORE_PATH:

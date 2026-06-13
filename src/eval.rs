@@ -1462,7 +1462,10 @@ fn render_html(val: &OValue) -> String {
         OValue::Int { v } => html_escape(&v.to_string()),
         OValue::Float { v } => html_escape(&v.to_string()),
 
-        OValue::Str { v } => v.clone(),
+        // Plain strings are untrusted text — escape them. Trusted raw HTML
+        // must arrive as OValue::Html (the "trusted HTML fragment" type per
+        // SPEC.md), e.g. produced by an inner html^(...)_html block.
+        OValue::Str { v } => html_escape(v),
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
@@ -1773,10 +1776,12 @@ mod tests {
     }
 
     #[test]
-    fn html_str_is_passed_through_unescaped() {
+    fn html_str_is_escaped_html_is_raw() {
         let e = Evaluator::new("/tmp".into());
         let result = e.render_child("html", &OValue::str_("<b>bold</b>"));
-        assert_eq!(result, "<b>bold</b>");
+        assert_eq!(result, "&lt;b&gt;bold&lt;/b&gt;");
+        let raw = e.render_child("html", &OValue::html("<b>bold</b>"));
+        assert_eq!(raw, "<b>bold</b>");
     }
 
     // ── render_child: default fallback ───────────────────────────────────────

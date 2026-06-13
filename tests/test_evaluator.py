@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from o_lang import (
-    EvalContext, OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull,
+    EvalContext, OBlob, OBool, OExpr, OFloat, OHtml, OInt, OList, OMap, ONull,
     OStorePath, OStr,
     evaluate_document, parse, run,
 )
@@ -60,7 +60,7 @@ def test_python_dict_to_omap():
 
 def test_html_embeds_python_number():
     v = run("html^(<p>python^(3 + 4)_python</p>)_html")
-    assert isinstance(v, OStr)
+    assert isinstance(v, OHtml)
     assert v.value == "<p>7</p>"
 
 

@@ -578,7 +578,7 @@ time through a unified metamodel.
 **Honest scope.** O-lang is a research prototype and does not yet match the maturity
 of any system above. Several backends (`bash`, `shell`, `rust`, `racket`) are
 registered but currently parse-only stubs; the executing backends are Python, Nix,
-and inline HTML. The contribution is the *organizing idea*, interpreter-as-syntax
+and the inline templating backends (HTML, Markdown, LaTeX, text). The contribution is the *organizing idea*, interpreter-as-syntax
 with value-level federation, together with a working reference implementation in
 three languages (Rust, C, Python), not a production toolchain.
 
@@ -1295,7 +1295,7 @@ olangc examples/hello.O --shim-dir ./backends --keep-build-dir
 
 ## Status
 
-**v0.1.0**, Rust runtime primary, Python reference implementation for
+**v0.2.0**, Rust runtime primary, Python reference implementation for
 cross-validation.
 
 Implemented and working:

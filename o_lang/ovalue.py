@@ -82,6 +82,17 @@ class OStr:
 
 
 @dataclass(frozen=True)
+class OHtml:
+    """Trusted HTML fragment — spliced into html^(...)_html bodies raw,
+    unlike OStr which is escaped (see SPEC.md OValue wire format)."""
+    value: str
+    tag: str = "html"
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"tag": "html", "value": self.value}
+
+
+@dataclass(frozen=True)
 class OList:
     items: Tuple["OValue", ...]
     tag: str = "list"
@@ -163,7 +174,7 @@ class OExpr:
         return {"tag": "expr", "repr": repr(self.ast)}
 
 
-OValue = Union[ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob, OExpr]
+OValue = Union[ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap, OBlob, OExpr]
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +190,7 @@ def from_python(x: Any) -> OValue:
     # Already an OValue? Pass through unchanged so that Python code can
     # build up heterogeneous lists of OInt/OStr/OBlob without us stringifying
     # them on the way out.
-    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob, OExpr)):
+    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap, OBlob, OExpr)):
         return x
     if x is None:
         return ONull()
@@ -206,7 +217,7 @@ def to_python(v: OValue) -> Any:
     """Lower an OValue back into a Python native value."""
     if isinstance(v, ONull):
         return None
-    if isinstance(v, (OBool, OInt, OFloat, OStr)):
+    if isinstance(v, (OBool, OInt, OFloat, OStr, OHtml)):
         return v.value
     if isinstance(v, OStorePath):
         return v.path
@@ -241,7 +252,7 @@ def render_plain(v: OValue) -> str:
         return ""
     if isinstance(v, (OBool, OInt, OFloat)):
         return str(v.value)
-    if isinstance(v, OStr):
+    if isinstance(v, (OStr, OHtml)):
         return v.value
     if isinstance(v, OStorePath):
         return v.path
