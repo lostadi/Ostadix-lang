@@ -199,6 +199,8 @@ fn registered_backends() -> HashSet<String> {
         "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
         "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
         "quote",
+        // Aliases (canonicalized by the parser via the BackendRegistry).
+        "py", "md", "tex", "plain", "o",
     ]
     .into_iter()
     .map(String::from)
