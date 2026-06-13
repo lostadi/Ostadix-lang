@@ -18,6 +18,10 @@ name = "olangc"
 path = "src/bin/olangc.rs"
 
 [[bin]]
+name = "o-link"
+path = "src/bin/olink.rs"
+
+[[bin]]
 name = "o-notebook"
 path = "src/bin/o-notebook.rs"
 required-features = ["notebook"]
