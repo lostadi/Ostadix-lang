@@ -1,0 +1,5 @@
+#!/usr/bin/env O
+
+bash^(
+echo "hello from bash"
+)_bash

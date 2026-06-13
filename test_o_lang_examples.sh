@@ -79,4 +79,15 @@ assert_example_matches js_binding '^42$'
 assert_example_matches js_json '{"x":1,"y":2}'
 assert_example_matches js_multiline '^42$'
 
+assert_example_matches bash_hello '^hello from bash$'
+echo 'PASS: bash_hello'
+assert_example_matches bash_binding '^hello world$'
+echo 'PASS: bash_binding'
+assert_example_matches bash_multiline '^10 + 20 = 30$'
+echo 'PASS: bash_multiline'
+assert_example_matches shell_hello '^hello from sh$'
+echo 'PASS: shell_hello'
+assert_example_matches bash_exit_code '^ok$'
+echo 'PASS: bash_exit_code'
+
 echo "All O-lang smoke tests passed."

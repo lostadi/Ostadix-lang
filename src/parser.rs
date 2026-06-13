@@ -179,23 +179,21 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // Check for \$IDENT — emit as literal `$IDENT` text.
-                    // Without this, shell variables like $PATH in bash blocks
-                    // would have to be written \$PATH to avoid being parsed as
-                    // O-lang binding references (VarRefs).
-                    self.pos = after_bs;
-                    if let Some(name) = self.try_parse_var_ref()? {
-                        let literal = format!("${}", name);
+                    // Check for \$ — emit a literal `$` and continue parsing the
+                    // following source as raw text. This covers shell variables
+                    // like \$PATH and shell arithmetic like \$((x + y)) inside
+                    // bash^(...)_bash / shell^(...)_shell blocks.
+                    if self.source.as_bytes()[after_bs] == b'$' {
                         self.flush_text(&mut nodes, text_start, temp_pos);
                         if let Some(ONode::RawText(s)) = nodes.last_mut() {
-                            s.push_str(&literal);
+                            s.push('$');
                         } else {
-                            nodes.push(ONode::RawText(literal));
+                            nodes.push(ONode::RawText("$".to_string()));
                         }
+                        self.pos = after_bs + 1;
                         text_start = self.pos;
                         continue;
                     }
-                    self.pos = temp_pos;
                 }
             }
 
@@ -816,6 +814,29 @@ mod tests {
             assert!(
                 combined.contains("$PATH") && !combined.contains("<VarRef:PATH>"),
                 "bash body should contain literal $PATH, not a VarRef: {:?}", combined
+            );
+        } else {
+            panic!("expected TypedExpr");
+        }
+    }
+
+    #[test]
+    fn backslash_escapes_dollar_paren_as_literal_text() {
+        // \$((...)) inside a bash block should emit literal shell arithmetic
+        // syntax, not leave the backslash in place or try to parse an O splice.
+        let src = r#"bash^(echo \$((1 + 2)))_bash"#;
+        let backends = make_backends(&["bash"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(nodes.len(), 1);
+        if let ONode::TypedExpr { body, .. } = &nodes[0] {
+            let combined: String = body.iter().map(|n| match n {
+                ONode::RawText(s) => s.clone(),
+                _                 => "<node>".to_string(),
+            }).collect();
+            assert!(
+                combined.contains("$((1 + 2))"),
+                "bash body should contain literal $((...)) arithmetic syntax: {:?}",
+                combined
             );
         } else {
             panic!("expected TypedExpr");

@@ -1,0 +1,5 @@
+#!/usr/bin/env O
+
+shell^(
+echo "hello from sh"
+)_shell

@@ -1,0 +1,9 @@
+#!/usr/bin/env O
+
+let greeting = python^(
+__oval_result__ = "world"
+)_python
+
+bash^(
+echo "hello \$greeting"
+)_bash
