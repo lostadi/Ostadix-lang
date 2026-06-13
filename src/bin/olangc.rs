@@ -383,7 +383,7 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
     // ── Print result ─────────────────────────────────────────────────────────
     match result {
         OValue::Str { v } | OValue::Html { v } => print!("{v}"),
-        other => println!("{:#?}", other),
+        other => println!("{other}"),
     }
 
     Ok(())
@@ -571,7 +571,7 @@ fn main() -> anyhow::Result<()> {{
 
     match result {{
         OValue::Str {{ v }} | OValue::Html {{ v }} => print!("{{v}}"),
-        other => println!("{{:#?}}", other),
+        other => println!("{{other}}"),
     }}
 
     Ok(())

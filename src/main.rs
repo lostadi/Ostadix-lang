@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -15,12 +15,29 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1).peekable();
     let backends = registered_backends();
 
-    // No args, or explicit --repl / -i → interactive REPL
+    // No args in an interactive terminal → REPL.
+    // In non-interactive contexts, missing args is a usage error so shell tests
+    // and scripts do not silently enter and exit the REPL.
     match args.peek().map(String::as_str) {
-        None | Some("--repl") | Some("-i") => {
-            if args.peek().is_some() { args.next(); }
+        Some("--help") | Some("-h") => {
+            print_usage(&mut io::stdout())?;
+            return Ok(());
+        }
+        None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+            return run_repl(PathBuf::from("backends"), backends);
+        }
+        None => {
+            print_usage(&mut io::stderr())?;
+            bail!("missing input file (pass a .O file or use --repl)");
+        }
+        Some("--repl") | Some("-i") => {
+            args.next();
             let shim_dir = args.next().map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("backends"));
+            if let Some(extra) = args.next() {
+                print_usage(&mut io::stderr())?;
+                bail!("unexpected extra argument after --repl: {}", extra);
+            }
             return run_repl(shim_dir, backends);
         }
         _ => {}
@@ -29,6 +46,10 @@ fn main() -> Result<()> {
     let input_path = args.next().unwrap();
     let shim_dir = args.next().map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("backends"));
+    if let Some(extra) = args.next() {
+        print_usage(&mut io::stderr())?;
+        bail!("unexpected extra argument: {}", extra);
+    }
 
     let mut source = fs::read_to_string(&input_path)
         .with_context(|| format!("failed to read input file: {}", input_path))?;
@@ -57,6 +78,17 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_usage(out: &mut impl Write) -> io::Result<()> {
+    writeln!(out, "Usage:")?;
+    writeln!(out, "  O <input.O> [backends_dir]")?;
+    writeln!(out, "  O --repl [backends_dir]")?;
+    writeln!(out, "  O --help")?;
+    writeln!(out)?;
+    writeln!(out, "Runs a .O file or starts the interactive REPL.")?;
+    writeln!(out, "With no arguments in an interactive terminal, O starts the REPL.")?;
     Ok(())
 }
 
