@@ -30,6 +30,22 @@ html_roundtrip_output="$(run_example html_raw_roundtrip)"
 grep -q '<section>' <<<"$html_roundtrip_output"
 grep -q '<strong>Hello, Lee.</strong>' <<<"$html_roundtrip_output"
 
+sql_select_output="$(run_example sql_select)"
+grep -q '^result$' <<<"$sql_select_output"
+grep -q '^2$' <<<"$sql_select_output"
+
+sql_create_insert_select_output="$(run_example sql_create_insert_select)"
+grep -q '^name[[:space:]]age$' <<<"$sql_create_insert_select_output"
+grep -q '^Ollie[[:space:]]3$' <<<"$sql_create_insert_select_output"
+
+sql_python_sql_output="$(run_example sql_python_sql)"
+grep -q '^doubled$' <<<"$sql_python_sql_output"
+grep -q '^200$' <<<"$sql_python_sql_output"
+
+sql_aggregation_output="$(run_example sql_aggregation)"
+grep -q '^total_rows[[:space:]]total_points$' <<<"$sql_aggregation_output"
+grep -q '^3[[:space:]]60$' <<<"$sql_aggregation_output"
+
 if command -v nix >/dev/null 2>&1; then
   nix_basic_output="$(run_example nix_basic)"
   grep -q 'Nix inside O-lang' <<<"$nix_basic_output"

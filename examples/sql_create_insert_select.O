@@ -1,0 +1,5 @@
+sql^(
+CREATE TABLE pets (name TEXT, age INTEGER);
+INSERT INTO pets (name, age) VALUES ('Ollie', 3);
+SELECT name, age FROM pets;
+)_sql

@@ -1,0 +1,11 @@
+sql[0]^(
+CREATE TABLE scores (points INTEGER)
+)_sql[0]
+
+sql[0]^(
+INSERT INTO scores (points) VALUES (10), (20), (30)
+)_sql[0]
+
+sql[0]^(
+SELECT COUNT(*) AS total_rows, SUM(points) AS total_points FROM scores
+)_sql[0]

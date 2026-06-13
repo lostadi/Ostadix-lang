@@ -1,6 +1,10 @@
 # Build artifacts
 /target/
 *.o
+!examples/sql_select.O
+!examples/sql_create_insert_select.O
+!examples/sql_python_sql.O
+!examples/sql_aggregation.O
 *.so
 *.dylib
 
