@@ -1,0 +1,489 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// o-link — the O-lang linker / combiner compiler
+//
+// Accepts a list of scripts, source files, or whole codebases (directories)
+// and links them into a single .O file. Each input file is wrapped in the
+// typed-expression block of the backend that matches its extension:
+//
+//   hello.py    →  python^( ...file contents... )_python
+//   build.sh    →  bash^( ...file contents... )_bash
+//   index.html  →  html^( ...file contents... )_html
+//   notes.md    →  markdown^( ... )_markdown
+//   prog.O      →  inlined verbatim (it is already O-lang source)
+//
+// Directories are walked recursively; every file with a recognized extension
+// is included, in sorted order, so the output is deterministic.
+//
+// Any text inside a wrapped file that would collide with O-lang syntax —
+// a registered opener like `python^(` or the wrapping block's own closer
+// like `)_python` — is backslash-escaped (`\python^(`, `\)_python`), which
+// the O-lang parser turns back into the literal text at evaluation time, so
+// file contents survive the round trip byte-for-byte.
+//
+// Usage:
+//   o-link a.py b.sh c.html -o program.O      # link three scripts
+//   o-link src/ -o project.O                  # link a whole codebase
+//   o-link a.py --lang txt=markdown -o out.O  # extra extension mapping
+//   o-link a.py --stdout                      # write to stdout instead
+//
+// The combined output is re-parsed with the O-lang parser before it is
+// written, so o-link never emits a .O file that the runtime cannot read.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use anyhow::{bail, Context, Result};
+use clap::Parser as ClapParser;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use o_lang::parser::Parser;
+
+/// o-link — link multiple scripts or codebases into a single .O file.
+#[derive(Debug, ClapParser)]
+#[command(
+    name = "o-link",
+    about = "Link scripts and codebases into a single .O file"
+)]
+struct Cli {
+    /// Input files and/or directories to link, in order.
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Output path for the combined .O file.
+    #[arg(short = 'o', long = "output", default_value = "combined.O")]
+    output: PathBuf,
+
+    /// Write the combined source to stdout instead of a file.
+    #[arg(long = "stdout", conflicts_with = "output")]
+    to_stdout: bool,
+
+    /// Extra extension→backend mappings, e.g. --lang txt=markdown.
+    /// May be given multiple times; overrides the built-in mapping.
+    #[arg(long = "lang", value_name = "EXT=BACKEND")]
+    lang: Vec<String>,
+
+    /// Skip the parse-validation pass on the combined output.
+    #[arg(long = "no-validate")]
+    no_validate: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let backends = registered_backends();
+
+    let mut ext_map = default_extension_map();
+    for spec in &cli.lang {
+        let (ext, backend) = spec
+            .split_once('=')
+            .with_context(|| format!("--lang expects EXT=BACKEND, got `{}`", spec))?;
+        if !backends.contains(backend) {
+            bail!(
+                "--lang {}: `{}` is not a registered backend",
+                spec,
+                backend
+            );
+        }
+        ext_map.insert(ext.trim_start_matches('.').to_string(), backend.to_string());
+    }
+
+    let files = collect_files(&cli.inputs, &ext_map)?;
+    if files.is_empty() {
+        bail!("no linkable files found in the given inputs");
+    }
+
+    let combined = link_files(&files, &ext_map, &backends)?;
+
+    if !cli.no_validate {
+        let mut parser = Parser::new(&combined, &backends);
+        parser
+            .parse()
+            .context("internal error: combined output does not parse as .O source")?;
+    }
+
+    if cli.to_stdout {
+        print!("{}", combined);
+    } else {
+        fs::write(&cli.output, &combined)
+            .with_context(|| format!("failed to write {}", cli.output.display()))?;
+        eprintln!(
+            "linked {} file(s) into {}",
+            files.len(),
+            cli.output.display()
+        );
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Input collection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Expand the input list: files are taken as-is (and must be mappable),
+/// directories are walked recursively in sorted order, keeping only files
+/// whose extension maps to a backend.
+fn collect_files(inputs: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for input in inputs {
+        if input.is_dir() {
+            walk_dir(input, ext_map, &mut files)?;
+        } else if input.is_file() {
+            if file_backend(input, ext_map).is_none() {
+                bail!(
+                    "{}: unrecognized extension — use --lang EXT=BACKEND to map it",
+                    input.display()
+                );
+            }
+            files.push(input.clone());
+        } else {
+            bail!("{}: no such file or directory", input.display());
+        }
+    }
+    Ok(files)
+}
+
+const SKIP_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".git"];
+
+fn walk_dir(dir: &Path, ext_map: &BTreeMap<String, String>, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.starts_with('.') {
+            continue;
+        }
+        if entry.is_dir() {
+            if SKIP_DIRS.contains(&name) {
+                continue;
+            }
+            walk_dir(&entry, ext_map, out)?;
+        } else if entry.is_file() && file_backend(&entry, ext_map).is_some() {
+            out.push(entry);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a file path to its backend language, or None if the extension is
+/// unknown. `.O` files map to the pseudo-backend "" (inline).
+fn file_backend(path: &Path, ext_map: &BTreeMap<String, String>) -> Option<String> {
+    let ext = path.extension()?.to_str()?;
+    if ext == "O" {
+        return Some(String::new());
+    }
+    ext_map.get(&ext.to_ascii_lowercase()).cloned()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linking
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn link_files(
+    files: &[PathBuf],
+    ext_map: &BTreeMap<String, String>,
+    backends: &HashSet<String>,
+) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("# Linked by o-link — single-file .O program\n");
+
+    for path in files {
+        let backend = file_backend(path, ext_map)
+            .with_context(|| format!("{}: unrecognized extension", path.display()))?;
+        let mut content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        out.push('\n');
+        out.push_str(&format!("# ── {} ──\n", path.display()));
+
+        if backend.is_empty() {
+            // .O source: strip a shebang line and inline verbatim.
+            if content.starts_with("#!") {
+                content = content
+                    .find('\n')
+                    .map(|nl| content[nl + 1..].to_string())
+                    .unwrap_or_default();
+            }
+            out.push_str(&content);
+            if !content.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            warn_on_splices(path, &content);
+            let escaped = escape_body(&content, &backend, backends);
+            out.push_str(&backend);
+            out.push_str("^(\n");
+            out.push_str(&escaped);
+            if !escaped.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(")_");
+            out.push_str(&backend);
+            out.push('\n');
+        }
+    }
+
+    Ok(out)
+}
+
+/// Backslash-escape any text in `body` that the O-lang parser would otherwise
+/// treat as syntax inside a `wrapper^( ... )_wrapper` block:
+///
+///   * any registered opener `IDENT[N]?{attr}?^(`  →  `\IDENT...^(`
+///   * the wrapping block's own closer `)_wrapper`  →  `\)_wrapper`
+///
+/// The parser consumes the backslash and emits the literal text, so the
+/// backend receives the file contents unchanged.
+fn escape_body(body: &str, wrapper: &str, backends: &HashSet<String>) -> String {
+    let closer = format!(")_{}", wrapper);
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if body[i..].starts_with(&closer) {
+            out.push('\\');
+            out.push_str(&closer);
+            i += closer.len();
+            continue;
+        }
+        if let Some(len) = opener_len(&body[i..], backends) {
+            out.push('\\');
+            out.push_str(&body[i..i + len]);
+            i += len;
+            continue;
+        }
+        // Advance one full UTF-8 character.
+        let ch = body[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// If `s` begins with a registered opener (`IDENT [N]? {attr}? ^(`), return
+/// the byte length of the opener text including the trailing `^(`.
+fn opener_len(s: &str, backends: &HashSet<String>) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if !backends.contains(&s[..i]) {
+        return None;
+    }
+    // Optional `[digits]` env marker.
+    if i < bytes.len() && bytes[i] == b'[' {
+        let mut j = i + 1;
+        let digits_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > digits_start && j < bytes.len() && bytes[j] == b']' {
+            i = j + 1;
+        }
+    }
+    // Optional `{attr}` marker.
+    if i < bytes.len() && bytes[i] == b'{' {
+        let mut j = i + 1;
+        let ident_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if j > ident_start && j < bytes.len() && bytes[j] == b'}' {
+            i = j + 1;
+        }
+    }
+    if s[i..].starts_with("^(") {
+        Some(i + 2)
+    } else {
+        None
+    }
+}
+
+/// `$ident` inside a typed-expression body is an O-lang splice and cannot be
+/// backslash-escaped by the grammar. Warn when a linked file contains text
+/// that the runtime will treat as a splice, so the user can rename or bind
+/// the variable rather than getting a confusing eval-time error.
+fn warn_on_splices(path: &Path, content: &str) {
+    let bytes = content.as_bytes();
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let name = &content[i..j];
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if !names.is_empty() {
+        eprintln!(
+            "warning: {}: `{}` will be treated as O-lang splice(s); \
+             bind them with `let` or rename them if that is not intended",
+            path.display(),
+            names.join("`, `")
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tables
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Built-in extension → backend mapping. Keys are lowercase extensions
+/// without the leading dot. `.O` is handled separately (inline).
+fn default_extension_map() -> BTreeMap<String, String> {
+    [
+        ("py", "python"),
+        ("sh", "bash"),
+        ("bash", "bash"),
+        ("html", "html"),
+        ("htm", "html"),
+        ("tex", "latex"),
+        ("md", "markdown"),
+        ("markdown", "markdown"),
+        ("rs", "rust"),
+        ("rkt", "racket"),
+        ("nix", "nix"),
+        ("txt", "text"),
+        ("cs", "csharp"),
+        ("c", "cpp"),
+        ("cc", "cpp"),
+        ("cpp", "cpp"),
+        ("cxx", "cpp"),
+        ("h", "cpp"),
+        ("hpp", "cpp"),
+        ("hs", "haskell"),
+        ("lisp", "lisp"),
+        ("cl", "common_lisp"),
+        ("sql", "sql"),
+        ("rb", "ruby"),
+        ("m", "matlab"),
+        ("wl", "mathematica"),
+        ("wat", "webassembly"),
+        ("java", "java"),
+        ("js", "javascript"),
+        ("mjs", "javascript"),
+        ("cjs", "javascript"),
+        ("ml", "ocaml"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// The registered backend set — must stay in sync with `registered_backends`
+/// in src/main.rs so o-link escapes exactly the openers the runtime parses.
+fn registered_backends() -> HashSet<String> {
+    [
+        "O", "python", "html", "latex", "markdown", "bash", "shell", "rust",
+        "racket", "nix", "nix_expr", "nix_store", "nixos_test", "text",
+        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
+        "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
+        "quote",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use o_lang::parser::{reconstruct_source, ONode, Parser};
+
+    fn parse(src: &str) -> Vec<ONode> {
+        let backends = registered_backends();
+        Parser::new(src, &backends).parse().unwrap()
+    }
+
+    /// Concatenate all raw text inside the body of the first TypedExpr.
+    fn first_block_text(nodes: &[ONode]) -> String {
+        for node in nodes {
+            if let ONode::TypedExpr { body, .. } = node {
+                return reconstruct_source(body);
+            }
+        }
+        panic!("no TypedExpr in parsed output");
+    }
+
+    #[test]
+    fn escape_is_identity_for_plain_code() {
+        let backends = registered_backends();
+        let src = "x = 1 + 2\nprint(x)\n";
+        assert_eq!(escape_body(src, "python", &backends), src);
+    }
+
+    #[test]
+    fn escapes_opener_and_closer_collisions() {
+        let backends = registered_backends();
+        let src = "s = \"python^(1)_python\"";
+        let escaped = escape_body(src, "python", &backends);
+        assert_eq!(escaped, "s = \"\\python^(1\\)_python\"");
+    }
+
+    #[test]
+    fn escaped_body_round_trips_through_parser() {
+        let backends = registered_backends();
+        let inner = "doc = \"use python^( ... )_python blocks\"\nx = 2 ^ (3 + 1)\n";
+        let escaped = escape_body(inner, "python", &backends);
+        let combined = format!("python^(\n{})_python\n", escaped);
+        let nodes = parse(&combined);
+        let body = first_block_text(&nodes);
+        assert_eq!(body.trim_start_matches('\n'), inner);
+    }
+
+    #[test]
+    fn foreign_closers_are_left_alone() {
+        let backends = registered_backends();
+        let src = "html closer: )_html stays literal";
+        assert_eq!(escape_body(src, "python", &backends), src);
+    }
+
+    #[test]
+    fn env_and_attr_openers_are_escaped() {
+        let backends = registered_backends();
+        let src = "python[3]^(x)_python[3] and python{lazy}^(y)_python{lazy}";
+        let escaped = escape_body(src, "bash", &backends);
+        assert!(escaped.contains("\\python[3]^("));
+        assert!(escaped.contains("\\python{lazy}^("));
+    }
+
+    #[test]
+    fn unregistered_idents_are_not_escaped() {
+        let backends = registered_backends();
+        let src = "result = pow2^(n) if weird else 2 ^ (x+1)";
+        assert_eq!(escape_body(src, "python", &backends), src);
+    }
+
+    #[test]
+    fn default_map_covers_common_scripts() {
+        let map = default_extension_map();
+        assert_eq!(map.get("py").unwrap(), "python");
+        assert_eq!(map.get("sh").unwrap(), "bash");
+        assert_eq!(map.get("html").unwrap(), "html");
+        assert_eq!(map.get("md").unwrap(), "markdown");
+    }
+}

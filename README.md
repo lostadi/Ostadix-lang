@@ -317,6 +317,7 @@ native binaries:
 |--------|----------|--------------|
 | `O` (Rust) | `target/release/O` | Interpreter, runs `.O` files directly |
 | `olangc` (Rust) | `target/release/olangc` | AOT compiler, compiles `.O` to native binaries |
+| `o-link` (Rust) | `target/release/o-link` | Linker, combines scripts/codebases into one `.O` file |
 | `O` (C) | `c_cpp/O` | C interpreter, same behavior, no Rust dependency |
 | `olangc` (C) | `c_cpp/olangc` | C AOT compiler |
 
@@ -820,6 +821,26 @@ Python reference (for cross-checking semantics):
 ```bash
 python -m o_lang examples/hello.O
 ```
+
+**Linking existing scripts into one `.O` file**
+
+The `o-link` linker (combiner compiler) takes a list of scripts, source
+files, or whole directories and links them into a single `.O` program. Each
+file is wrapped in the typed-expression block matching its extension
+(`.py` → `python^(...)_python`, `.sh` → `bash^(...)_bash`,
+`.html` → `html^(...)_html`, …), `.O` files are inlined verbatim, and any
+text that collides with O-lang syntax is backslash-escaped automatically:
+
+```bash
+cargo run --bin o-link -- calc.py page.html app.O -o program.O
+cargo run -- program.O                  # run the combined file
+
+cargo run --bin o-link -- src/ -o project.O          # link a whole codebase
+cargo run --bin o-link -- notes.txt --lang txt=markdown --stdout
+```
+
+The combined output is re-parsed before it is written, so `o-link` never
+emits a `.O` file the runtime cannot read.
 
 ---
 
