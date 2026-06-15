@@ -15,10 +15,11 @@
 // is included, in sorted order, so the output is deterministic.
 //
 // Any text inside a wrapped file that would collide with O-lang syntax —
-// a registered opener like `python^(` or the wrapping block's own closer
-// like `)_python` — is backslash-escaped (`\python^(`, `\)_python`), which
-// the O-lang parser turns back into the literal text at evaluation time, so
-// file contents survive the round trip byte-for-byte.
+// a registered opener like `python^(`, the wrapping block's own closer
+// like `)_python`, or a splice like `$HOME` — is backslash-escaped
+// (`\python^(`, `\)_python`, `\$HOME`), which the O-lang parser turns
+// back into the literal text at evaluation time, so file contents survive
+// the round trip byte-for-byte.
 //
 // Usage:
 //   o-link a.py b.sh c.html -o program.O      # link three scripts
@@ -355,7 +356,6 @@ fn link_files(
                 out.push('\n');
             }
         } else {
-            warn_on_splices(path, &content);
             let escaped = escape_body(&content, &backend, backends);
             out.push_str(&backend);
             out.push_str("^(\n");
@@ -377,6 +377,7 @@ fn link_files(
 ///
 ///   * any registered opener `IDENT[N]?{attr}?^(`  →  `\IDENT...^(`
 ///   * the wrapping block's own closer `)_wrapper`  →  `\)_wrapper`
+///   * any splice `$IDENT`                          →  `\$IDENT`
 ///
 /// The parser consumes the backslash and emits the literal text, so the
 /// backend receives the file contents unchanged.
@@ -397,6 +398,21 @@ fn escape_body(body: &str, wrapper: &str, backends: &HashSet<String>) -> String 
             out.push('\\');
             out.push_str(&body[i..i + len]);
             i += len;
+            continue;
+        }
+        // Escape `$IDENT` — the O-lang parser treats `$name` as a splice
+        // (variable reference). Backslash-escaping it (`\$name`) makes the
+        // parser emit the literal text `$name`, so the backend receives the
+        // original file contents unchanged. This is critical for shell
+        // scripts (`$HOME`, `$PATH`, …) and any language that uses `$`
+        // followed by an identifier-shaped name.
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+        {
+            out.push('\\');
+            out.push('$');
+            i += 1;
             continue;
         }
         // Advance one full UTF-8 character.
@@ -448,39 +464,6 @@ fn opener_len(s: &str, backends: &HashSet<String>) -> Option<usize> {
         Some(i + 2)
     } else {
         None
-    }
-}
-
-/// `$ident` inside a typed-expression body is an O-lang splice and cannot be
-/// backslash-escaped by the grammar. Warn when a linked file contains text
-/// that the runtime will treat as a splice, so the user can rename or bind
-/// the variable rather than getting a confusing eval-time error.
-fn warn_on_splices(path: &Path, content: &str) {
-    let bytes = content.as_bytes();
-    let mut names: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'$' && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
-            let mut j = i + 1;
-            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                j += 1;
-            }
-            let name = &content[i..j];
-            if !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    if !names.is_empty() {
-        eprintln!(
-            "warning: {}: `{}` will be treated as O-lang splice(s); \
-             bind them with `let` or rename them if that is not intended",
-            path.display(),
-            names.join("`, `")
-        );
     }
 }
 
@@ -618,6 +601,35 @@ mod tests {
         let backends = registered_backends();
         let src = "result = pow2^(n) if weird else 2 ^ (x+1)";
         assert_eq!(escape_body(src, "python", &backends), src);
+    }
+
+    #[test]
+    fn dollar_ident_splices_are_escaped() {
+        let backends = registered_backends();
+        let src = "echo $HOME and $PATH";
+        let escaped = escape_body(src, "bash", &backends);
+        assert_eq!(escaped, "echo \\$HOME and \\$PATH");
+    }
+
+    #[test]
+    fn dollar_non_ident_is_left_alone() {
+        let backends = registered_backends();
+        // $1, $@, $? — the parser does not treat these as splices, so no escaping.
+        let src = "echo $1 $@ $? $$";
+        assert_eq!(escape_body(src, "bash", &backends), src);
+    }
+
+    #[test]
+    fn dollar_ident_round_trips_through_parser() {
+        let backends = registered_backends();
+        let inner = "echo $HOME\ncd $PATH/bin\n";
+        let escaped = escape_body(inner, "bash", &backends);
+        assert!(escaped.contains("\\$HOME"));
+        assert!(escaped.contains("\\$PATH"));
+        let combined = format!("bash^(\n{})_bash\n", escaped);
+        let nodes = parse(&combined);
+        let body = first_block_text(&nodes);
+        assert_eq!(body.trim_start_matches('\n'), inner);
     }
 
     #[test]
