@@ -393,7 +393,7 @@ In every language you have ever used, parentheses are anonymous. `(x + y)`
 is just grouping; nothing about the parentheses tells you what evaluator will
 handle the contents.
 
-O-lang gives parentheses a *type*: the identifier before `^(` names the
+Olang gives parentheses a *type*: the identifier before `^(` names the
 evaluator, and the matching `)_IDENT` closes it.
 
 ```
@@ -487,7 +487,7 @@ shape, so a program can treat another program as data, transform it, and
 evaluate it. This is how Lisp macros work, and it is a deep source of
 expressive power.
 
-O-lang generalizes homoiconicity across multiple languages. The `quote^`
+Olang generalizes homoiconicity across multiple languages. The `quote^`
 backend captures any expression, in any language, as an `OExpr` value
 without evaluating it:
 
