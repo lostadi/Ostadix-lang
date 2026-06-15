@@ -5,11 +5,21 @@
 // and links them into a single .O file. Each input file is wrapped in the
 // typed-expression block of the backend that matches its extension:
 //
-//   hello.py    →  python^( ...file contents... )_python
-//   build.sh    →  bash^( ...file contents... )_bash
-//   index.html  →  html^( ...file contents... )_html
-//   notes.md    →  markdown^( ... )_markdown
+//   hello.py    →  python[N]^( ...file contents... )_python[N]
+//   build.sh    →  bash[N]^( ...file contents... )_bash[N]
+//   index.html  →  html[N]^( ...file contents... )_html[N]
+//   notes.md    →  markdown[N]^( ... )_markdown[N]
 //   prog.O      →  inlined verbatim (it is already O-lang source)
+//
+// Every wrapped file receives a unique `[N]` environment index within its
+// language group (python[0], python[1], …), so each file runs in its own
+// isolated backend environment and their state cannot leak into one another.
+//
+// Files of the same language are ordered by their import-dependency graph
+// before being assigned environment indices: if `b.py` imports from `a.py`,
+// `a.py` will appear as python[0] and `b.py` as python[1], regardless of
+// their alphabetical order.  For languages without import scanning support,
+// files keep the sorted order from the directory walk.
 //
 // Directories are walked recursively; every file with a recognized extension
 // is included, in sorted order, so the output is deterministic.
@@ -41,7 +51,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser as ClapParser;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -331,10 +341,20 @@ fn link_files(
     ext_map: &BTreeMap<String, String>,
     backends: &HashSet<String>,
 ) -> Result<String> {
+    // Reorder same-language files according to their import-graph so that
+    // files depended on by others always appear first.  Files of different
+    // languages keep their relative order from the input list.
+    let ordered = order_by_deps(files, ext_map);
+
     let mut out = String::new();
     out.push_str("# Linked by o-link — single-file .O program\n");
 
-    for path in files {
+    // Track how many files of each language we have seen so far so we can
+    // give every wrapped file its own isolated `[N]` environment slot.
+    // `.O` files are inlined verbatim and do not get an env slot.
+    let mut lang_counters: HashMap<String, u32> = HashMap::new();
+
+    for path in &ordered {
         let backend = file_backend(path, ext_map)
             .with_context(|| format!("{}: unrecognized extension", path.display()))?;
         let mut content = fs::read_to_string(path)
@@ -356,20 +376,237 @@ fn link_files(
                 out.push('\n');
             }
         } else {
+            // Assign a unique per-language environment index so that every
+            // wrapped file runs in its own isolated backend environment.
+            // `python[0]^(...)_python[0]`, `python[1]^(...)_python[1]`, …
+            let env_id = lang_counters.entry(backend.clone()).or_insert(0);
+            let n = *env_id;
+            *env_id += 1;
+
             let escaped = escape_body(&content, &backend, backends);
             out.push_str(&backend);
-            out.push_str("^(\n");
+            out.push('[');
+            out.push_str(&n.to_string());
+            out.push_str("]^(\n");
             out.push_str(&escaped);
             if !escaped.ends_with('\n') {
                 out.push('\n');
             }
             out.push_str(")_");
             out.push_str(&backend);
-            out.push('\n');
+            out.push('[');
+            out.push_str(&n.to_string());
+            out.push_str("]\n");
         }
     }
 
     Ok(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dependency ordering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reorder `files` so that within each language group, files that are imported
+/// by others appear before the files that import them.  The relative order of
+/// files from different language groups is preserved, and within a language
+/// group the original (alphabetical) order is preserved for files that have
+/// no dependency relationship with each other.
+///
+/// Cycles are broken conservatively: any file that participates in a cycle
+/// keeps its original position relative to the other cycle members.
+pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    // Group files by backend language, preserving original indices so we can
+    // interleave the sorted groups back correctly.
+    let mut groups: HashMap<String, Vec<(usize, &PathBuf)>> = HashMap::new();
+    for (i, path) in files.iter().enumerate() {
+        if let Some(backend) = file_backend(path, ext_map) {
+            groups.entry(backend).or_default().push((i, path));
+        }
+    }
+
+    // Sort each group by import-graph dependencies, then reassemble the full
+    // list in original index order (preserving cross-language ordering).
+    let mut sorted_entries: Vec<(usize, PathBuf)> = Vec::with_capacity(files.len());
+
+    for (_lang, group) in &groups {
+        let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+        let paths: Vec<&PathBuf> = group.iter().map(|(_, p)| *p).collect();
+        let sorted_paths = topo_sort_group(&paths, ext_map);
+        // Zip the topo-sorted paths back with the original indices so the
+        // interleave step uses the slot each file occupied in the input list.
+        for (orig_i, path) in orig_indices.iter().zip(sorted_paths) {
+            sorted_entries.push((*orig_i, path.clone()));
+        }
+    }
+
+    sorted_entries.sort_by_key(|(i, _)| *i);
+    sorted_entries.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Topological sort of a single-language file group.
+///
+/// Builds a directed dependency graph among the files in `paths` using
+/// language-specific import scanning, then emits files in an order where
+/// every dependency precedes the files that depend on it.  Files that have
+/// no dependency relationship keep their original relative order.  Cycles
+/// are detected and broken by removing one back-edge (the cycle members keep
+/// their original order).
+fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    if paths.len() <= 1 {
+        return paths.iter().map(|p| (*p).clone()).collect();
+    }
+
+    // Build a stem→index map so we can resolve import names to file indices.
+    // For `src/utils.py` the stem is `utils`; for `pkg/sub/helper.py` we also
+    // register `sub.helper` and `pkg.sub.helper` (dotted module paths).
+    let mut stem_to_idx: HashMap<String, usize> = HashMap::new();
+    for (i, path) in paths.iter().enumerate() {
+        let stems = module_stems(path);
+        for s in stems {
+            stem_to_idx.entry(s).or_insert(i);
+        }
+    }
+
+    // For each file, collect the set of file indices it depends on.
+    let mut deps: Vec<HashSet<usize>> = vec![HashSet::new(); paths.len()];
+    for (i, path) in paths.iter().enumerate() {
+        if let Ok(src) = fs::read_to_string(path) {
+            for imp in imported_modules(&src, ext_map, path) {
+                if let Some(&j) = stem_to_idx.get(&imp) {
+                    if j != i {
+                        deps[i].insert(j);
+                    }
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm for topological sort.
+    let n = paths.len();
+    let mut in_degree = vec![0u32; n];
+    // adjacency: rev_adj[j] = files that depend on j (j must come before them)
+    let mut rev_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, dep_set) in deps.iter().enumerate() {
+        for &j in dep_set {
+            in_degree[i] += 1;
+            rev_adj[j].push(i);
+        }
+    }
+
+    // Use a stable queue (preserve original order among equal-priority nodes).
+    let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut result: Vec<PathBuf> = Vec::with_capacity(n);
+
+    while !queue.is_empty() {
+        // Pick the smallest original index among ready nodes to preserve order.
+        let pos = queue.iter().enumerate().min_by_key(|(_, &i)| i).map(|(p, _)| p).unwrap();
+        let node = queue.remove(pos);
+        result.push(paths[node].clone());
+        for &dependent in &rev_adj[node].clone() {
+            in_degree[dependent] -= 1;
+            if in_degree[dependent] == 0 {
+                queue.push(dependent);
+            }
+        }
+    }
+
+    // If there are cycles, some nodes were never enqueued.  Append them in
+    // original order (conservative: keep what the user gave us).
+    if result.len() < n {
+        let emitted: HashSet<usize> = (0..result.len())
+            .filter_map(|k| {
+                paths.iter().position(|p| *p == &result[k])
+            })
+            .collect();
+        for i in 0..n {
+            if !emitted.contains(&i) {
+                result.push(paths[i].clone());
+            }
+        }
+    }
+
+    result
+}
+
+/// Return the set of module-name stems that `path` could be imported as.
+///
+/// For `/some/src/pkg/utils.py`, we return `["utils", "pkg.utils"]`.
+/// We stop at directory components named `src`, `lib`, or `source` since
+/// those are common source roots that are not part of the import path.
+fn module_stems(path: &Path) -> Vec<String> {
+    let mut stems = Vec::new();
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) if s != "__init__" => s.to_string(),
+        _ => return stems,
+    };
+
+    stems.push(stem.clone());
+
+    // Build dotted-path variants by walking parent components.
+    let mut parts: Vec<String> = vec![stem];
+    let root_markers = ["src", "lib", "source", "tests"];
+    for component in path.parent().map(|p| p.components()).into_iter().flatten().rev() {
+        let name = match component {
+            std::path::Component::Normal(n) => n.to_str().unwrap_or("").to_string(),
+            _ => break,
+        };
+        if root_markers.contains(&name.as_str()) || name.starts_with('.') {
+            break;
+        }
+        parts.insert(0, name.clone());
+        stems.push(parts.join("."));
+    }
+
+    stems
+}
+
+/// Extract the module names imported by the source text of a file.
+///
+/// Currently handles Python (`import X`, `from X import …`).
+/// Returns module stems suitable for lookup in `stem_to_idx`.
+fn imported_modules(src: &str, ext_map: &BTreeMap<String, String>, path: &Path) -> Vec<String> {
+    let lang = file_backend(path, ext_map).unwrap_or_default();
+    let mut mods = Vec::new();
+
+    match lang.as_str() {
+        "python" => {
+            for line in src.lines() {
+                let line = line.trim();
+                // `import X`, `import X as Y`, `import X, Y`
+                if let Some(rest) = line.strip_prefix("import ") {
+                    for part in rest.split(',') {
+                        let module = part.trim().split_whitespace().next().unwrap_or("").trim();
+                        if !module.is_empty() {
+                            // Use only the top-level component for relative matching.
+                            let top = module.split('.').next().unwrap_or(module);
+                            mods.push(top.to_string());
+                            // Also push the full dotted path for sub-module matching.
+                            if module.contains('.') {
+                                mods.push(module.to_string());
+                            }
+                        }
+                    }
+                }
+                // `from X import Y` — the module being depended on is X.
+                if let Some(rest) = line.strip_prefix("from ") {
+                    let module = rest.split_whitespace().next().unwrap_or("").trim();
+                    // Relative imports (`from . import X`) are skipped.
+                    if !module.starts_with('.') && !module.is_empty() {
+                        let top = module.split('.').next().unwrap_or(module);
+                        mods.push(top.to_string());
+                        if module.contains('.') {
+                            mods.push(module.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Additional languages can be added here following the same pattern.
+        _ => {}
+    }
+
+    mods
 }
 
 /// Backslash-escape any text in `body` that the O-lang parser would otherwise
@@ -626,7 +863,8 @@ mod tests {
         let escaped = escape_body(inner, "bash", &backends);
         assert!(escaped.contains("\\$HOME"));
         assert!(escaped.contains("\\$PATH"));
-        let combined = format!("bash^(\n{})_bash\n", escaped);
+        // Use [0] env_id syntax since link_files now emits `bash[0]^(...)_bash[0]`.
+        let combined = format!("bash[0]^(\n{})_bash[0]\n", escaped);
         let nodes = parse(&combined);
         let body = first_block_text(&nodes);
         assert_eq!(body.trim_start_matches('\n'), inner);
@@ -697,6 +935,141 @@ mod tests {
         let map = default_extension_map();
         let files = collect_files(&[dir.clone()], &map, None).unwrap();
         assert_eq!(files.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── env_id isolation tests ───────────────────────────────────────────────
+
+    #[test]
+    fn link_files_assigns_unique_env_ids_per_language() {
+        let dir = scratch("env_ids");
+        fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("b.py"), "y = 2\n").unwrap();
+        fs::write(dir.join("c.sh"), "echo hi\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        let combined = link_files(&files, &map, &backends).unwrap();
+
+        // Both Python files must appear with distinct [N] tags.
+        assert!(combined.contains("python[0]^("), "expected python[0]^(, got:\n{}", combined);
+        assert!(combined.contains("python[1]^("), "expected python[1]^(, got:\n{}", combined);
+        assert!(combined.contains(")_python[0]"), "expected )_python[0], got:\n{}", combined);
+        assert!(combined.contains(")_python[1]"), "expected )_python[1], got:\n{}", combined);
+        // The shell file is the only file of its language so it gets [0].
+        assert!(combined.contains("bash[0]^("), "expected bash[0]^(, got:\n{}", combined);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_files_env_ids_parse_cleanly() {
+        let dir = scratch("env_parse");
+        fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("b.py"), "y = 2\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        let combined = link_files(&files, &map, &backends).unwrap();
+
+        // The combined output must parse without errors.
+        let mut parser = o_lang::parser::Parser::new(&combined, &backends);
+        parser.parse().expect("combined output with env_ids should parse");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── dependency ordering tests ────────────────────────────────────────────
+
+    #[test]
+    fn python_files_ordered_by_import_dependency() {
+        let dir = scratch("pydeps");
+        // b.py imports from a, so a.py should come first.
+        fs::write(dir.join("a.py"), "def helper(): pass\n").unwrap();
+        fs::write(dir.join("b.py"), "from a import helper\nhelper()\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        let combined = link_files(&files, &map, &backends).unwrap();
+
+        // a.py (the dependency) must appear before b.py in the output.
+        let pos_a = combined.find("python[0]^(").expect("python[0] not found");
+        let pos_b = combined.find("python[1]^(").expect("python[1] not found");
+        assert!(
+            pos_a < pos_b,
+            "a.py (dependency) should be python[0] but positions are a={} b={}",
+            pos_a, pos_b
+        );
+        // Verify a.py body is in python[0] slot.
+        let slot0_start = combined.find("python[0]^(").unwrap();
+        let slot0_end   = combined.find(")_python[0]").unwrap();
+        let slot0_body  = &combined[slot0_start..slot0_end];
+        assert!(slot0_body.contains("def helper"), "python[0] should contain a.py");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_import_ordering_import_statement() {
+        let dir = scratch("pydeps_import");
+        // c.py imports from b, b imports from a.
+        fs::write(dir.join("c.py"), "import b\n").unwrap();
+        fs::write(dir.join("b.py"), "import a\n").unwrap();
+        fs::write(dir.join("a.py"), "VALUE = 42\n").unwrap();
+
+        let map = default_extension_map();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        let ordered = order_by_deps(&files, &map);
+
+        // The expected order after topo-sort: a.py, b.py, c.py.
+        let names: Vec<&str> = ordered
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert_eq!(names, ["a.py", "b.py", "c.py"], "expected topo order a<b<c, got {:?}", names);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dependency_ordering_does_not_reorder_different_languages() {
+        let dir = scratch("crosslang");
+        fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("b.sh"), "echo hi\n").unwrap();
+        fs::write(dir.join("c.py"), "import a\n").unwrap();
+
+        let map = default_extension_map();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        let ordered = order_by_deps(&files, &map);
+
+        // a.py and c.py are Python; b.sh is bash.
+        // After ordering: a.py (py dep) before c.py; b.sh keeps its position.
+        let names: Vec<&str> = ordered
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        let pos_a = names.iter().position(|&n| n == "a.py").unwrap();
+        let pos_c = names.iter().position(|&n| n == "c.py").unwrap();
+        assert!(pos_a < pos_c, "a.py must come before c.py, got {:?}", names);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cyclic_deps_do_not_panic() {
+        let dir = scratch("cycle");
+        fs::write(dir.join("a.py"), "import b\n").unwrap();
+        fs::write(dir.join("b.py"), "import a\n").unwrap();
+
+        let map = default_extension_map();
+        let files = collect_files(&[dir.clone()], &map, None).unwrap();
+        // Should not panic; result has both files.
+        let ordered = order_by_deps(&files, &map);
+        assert_eq!(ordered.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -22,6 +22,10 @@ name = "o-link"
 path = "src/bin/olink.rs"
 
 [[bin]]
+name = "o-unlink"
+path = "src/bin/ounlink.rs"
+
+[[bin]]
 name = "o-notebook"
 path = "src/bin/o-notebook.rs"
 required-features = ["notebook"]
