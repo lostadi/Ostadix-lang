@@ -35,7 +35,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser as ClapParser;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use o_lang::parser::{reconstruct_source, ONode, Parser};
 
@@ -73,6 +73,16 @@ fn main() -> Result<()> {
     }
 
     for (path, content) in &entries {
+        // Refuse unsafe paths: absolute paths or any `..` component would
+        // allow writing outside `output_dir` (path traversal).
+        if path.is_absolute()
+            || path.components().any(|c| c == Component::ParentDir)
+        {
+            bail!(
+                "unsafe path in marker (absolute or contains '..'): {}",
+                path.display()
+            );
+        }
         let dest = cli.output_dir.join(path);
         if cli.dry_run {
             println!("{}", dest.display());
@@ -157,16 +167,21 @@ pub fn unlink_source(source: &str) -> Result<Vec<(PathBuf, String)>> {
 
         let section = &source[*content_start..content_end];
 
-        if let Some(content) = extract_block_content(section, &backends)? {
-            results.push((path.clone(), content));
-        }
-        // If no TypedExpr block is found in the section, the file was a `.O`
-        // inline.  We gather the raw text (minus comment lines) as the content.
-        else {
-            let raw = raw_o_content(section);
-            if !raw.trim().is_empty() {
-                results.push((path.clone(), raw));
+        // Only attempt typed-block extraction for non-`.O` marker paths.
+        // Inline `.O` files can legitimately contain typed-expression blocks
+        // (e.g. `python[0]^(`); for them only the header line is stripped.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "O" {
+            if let Some(content) = extract_block_content(section, &backends)? {
+                results.push((path.clone(), content));
+                continue;
             }
+        }
+        // For `.O` marker paths, or when no TypedExpr block was found in a
+        // non-`.O` section, gather the raw text (minus comment lines).
+        let raw = raw_o_content(section);
+        if !raw.trim().is_empty() {
+            results.push((path.clone(), raw));
         }
     }
 
@@ -233,15 +248,19 @@ fn find_typed_opener(text: &str, backends: &HashSet<String>) -> Option<usize> {
             }
             let name = &text[start..i];
             if backends.contains(name) {
-                // Accept optional `[N]` then `^(`
+                // Accept optional `[N]` (N must be at least one digit) then `^(`
                 let mut j = i;
                 if j < bytes.len() && bytes[j] == b'[' {
+                    let j_bracket = j;
                     j += 1;
+                    let digits_start = j;
                     while j < bytes.len() && bytes[j].is_ascii_digit() {
                         j += 1;
                     }
-                    if j < bytes.len() && bytes[j] == b']' {
-                        j += 1;
+                    if j > digits_start && j < bytes.len() && bytes[j] == b']' {
+                        j += 1; // consumed valid `[N]`
+                    } else {
+                        j = j_bracket; // not a valid `[N]`, don't consume
                     }
                 }
                 if j + 1 < bytes.len() && bytes[j] == b'^' && bytes[j + 1] == b'(' {

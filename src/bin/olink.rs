@@ -418,10 +418,15 @@ fn link_files(
 pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
     // Group files by backend language, preserving original indices so we can
     // interleave the sorted groups back correctly.
+    // Files whose extension is not recognised are kept as-is in their original
+    // positions so callers can decide how to handle them.
     let mut groups: HashMap<String, Vec<(usize, &PathBuf)>> = HashMap::new();
+    let mut unknowns: Vec<(usize, &PathBuf)> = Vec::new();
     for (i, path) in files.iter().enumerate() {
         if let Some(backend) = file_backend(path, ext_map) {
             groups.entry(backend).or_default().push((i, path));
+        } else {
+            unknowns.push((i, path));
         }
     }
 
@@ -438,6 +443,11 @@ pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> V
         for (orig_i, path) in orig_indices.iter().zip(sorted_paths) {
             sorted_entries.push((*orig_i, path.clone()));
         }
+    }
+
+    // Preserve unknown-extension inputs in their original positions.
+    for (i, path) in unknowns {
+        sorted_entries.push((i, (*path).clone()));
     }
 
     sorted_entries.sort_by_key(|(i, _)| *i);
@@ -503,7 +513,7 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
         let pos = queue.iter().enumerate().min_by_key(|(_, &i)| i).map(|(p, _)| p).unwrap();
         let node = queue.remove(pos);
         result.push(paths[node].clone());
-        for &dependent in &rev_adj[node].clone() {
+        for &dependent in &rev_adj[node] {
             in_degree[dependent] -= 1;
             if in_degree[dependent] == 0 {
                 queue.push(dependent);
