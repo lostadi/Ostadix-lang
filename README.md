@@ -1,7 +1,7 @@
 <img width="1200" height="400" alt="svgviewer-png-output" src="https://github.com/user-attachments/assets/46303629-a640-4c8d-8c90-d5981bf4e3ae" />
 
 
-# O-lang: Ouroboros Language
+# Olang: Ouroboros Language
 
 *By Lee Daghlar Ostadi*
 
