@@ -7,7 +7,7 @@
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
-O-lang, short for **Ouroboros language**, is a meta-language built on one radical idea: the language an expression
+Olang, short for **Ouroboros language**, is a meta-language built on one radical idea: the language an expression
 is written in is a structural part of the expression itself, not a file
 extension, not a global mode switch, not a pragma. You write the language name
 directly around the code, and the runtime dispatches to that language's
@@ -30,7 +30,7 @@ type system.
 
 ## Getting Started: Full Setup Guide
 
-This section walks you through everything you need to get O-lang's compiler
+This section walks you through everything you need to get Olang's compiler
 and interpreter running on your machine, from scratch. There are three
 implementations you can build: the **C edition** (simplest, just a C compiler
 and make), the **Rust edition** (authoritative reference implementation), and a
@@ -39,7 +39,7 @@ going.
 
 ### Prerequisites
 
-O-lang backends call out to real language runtimes, so you need **Python 3**
+Olang backends call out to real language runtimes, so you need **Python 3**
 installed for any `.O` program that uses `python^(...)_python` blocks (which
 is most of the examples). Beyond that, the build requirements depend on which
 edition you want.
@@ -50,8 +50,8 @@ The included `setup.sh` script detects your OS and installs everything, system d
 wrappers, in one shot:
 
 ```bash
-git clone https://github.com/lostadi/O-lang.git
-cd O-lang
+git clone https://github.com/lostadi/Olang.git
+cd Olang
 ./setup.sh
 ```
 
@@ -65,9 +65,9 @@ The script supports flags for different levels of setup:
 
 **Optional extras:** The `--full` flag also installs Nix (for `nix^(...)_nix`
 examples) and Racket (for the `racket^` backend stub). These are not required
-for core O-lang functionality, most examples only need Python 3.
+for core Olang functionality, most examples only need Python 3.
 
-After it finishes, you can run O-lang programs immediately:
+After it finishes, you can run Olang programs immediately:
 
 ```bash
 o examples/hello.O           # Uses the wrapper it installed
@@ -521,9 +521,9 @@ barrier to metaprogramming.
 
 ---
 
-## Related work and how O-lang differs
+## Related work and how Olang differs
 
-O-lang sits at the intersection of three established traditions, language-oriented
+Olang sits at the intersection of three established traditions, language-oriented
 programming, polyglot execution, and metaprogramming, but combines them in a way
 none of them individually provide. The one-sentence thesis: **the evaluator is named
 by the delimiter shape, so language choice becomes a structural, compositional
@@ -609,7 +609,7 @@ The evaluator is fixed for the whole file.
 
 ---
 
-### The problem O-lang is solving
+### The problem Olang is solving
 
 Imagine you are writing a web page. The page is HTML. But the page needs
 a number computed in Python. And the number comes from a database query
@@ -620,14 +620,14 @@ Today you would write four separate programs in four separate files, wire
 them together with shell scripts, and spend a lot of time making sure the
 data types line up at each boundary. The language boundaries are friction.
 
-O-lang's answer is: **let the expression carry its evaluator**. Instead of
+Olang's answer is: **let the expression carry its evaluator**. Instead of
 choosing one language for the file, write each piece of the program in the
 language that fits it, right where it belongs, nested inside the other
 pieces.
 
 ---
 
-### Your first O-lang program
+### Your first Olang program
 
 The smallest possible program:
 
@@ -718,7 +718,7 @@ round(sum(samples) / len(samples), 4)
 )_python[0]
 ```
 
-This makes O-lang documents feel like literate programs or lab notebooks,
+This makes Olang documents feel like literate programs or lab notebooks,
 except that the environments are *explicit*, *named*, and *multiple*, you
 can have several independent Python namespaces in one document with no
 accidental sharing between them.
@@ -727,7 +727,7 @@ accidental sharing between them.
 
 ### The universal value type
 
-Every O-lang expression returns an `OValue`. Think of `OValue` as the
+Every Olang expression returns an `OValue`. Think of `OValue` as the
 common currency that all languages in a document share. When a Python
 block returns a list, it becomes `OList`. When it returns a number, it
 becomes `OInt`. When an HTML block needs to embed that value, it looks at
@@ -745,7 +745,7 @@ One of the deepest ideas in programming language theory is
 *homoiconicity*, the ability of a language to treat its own programs as
 data that can be inspected and modified.
 
-O-lang lets you do this not just within one language but across all of them.
+Olang lets you do this not just within one language but across all of them.
 The `quote^(...)_quote` expression captures its body as an `OExpr` value
 (an unevaluated program fragment) rather than running it:
 
@@ -762,7 +762,7 @@ O.eval(q)    # → 1024
 )_python[0]
 ```
 
-You can also build O-lang source code programmatically in Python and then
+You can also build Olang source code programmatically in Python and then
 evaluate it. This is the same power that makes Lisp famously expressive,
 now available in a multi-language system.
 
@@ -770,7 +770,7 @@ now available in a multi-language system.
 
 ### The Nix dimension
 
-For readers familiar with NixOS or Nix package manager: O-lang treats the
+For readers familiar with NixOS or Nix package manager: Olang treats the
 operating system as a participant in the value model. A Nix expression is
 an `OValue`. A derivation (a package build specification) is an `OValue`.
 A built store path is an `OValue`. An active system configuration is an
@@ -794,7 +794,7 @@ pass around.
 
 ## Quickstart
 
-There are two easy ways to build and run O-lang:
+There are two easy ways to build and run Olang:
 
 **C edition (recommended, only needs a C compiler + make)**
 
@@ -829,7 +829,7 @@ files, or whole directories and links them into a single `.O` program. Each
 file is wrapped in the typed-expression block matching its extension
 (`.py` → `python^(...)_python`, `.sh` → `bash^(...)_bash`,
 `.html` → `html^(...)_html`, …), `.O` files are inlined verbatim, and any
-text that collides with O-lang syntax is backslash-escaped automatically:
+text that collides with Olang syntax is backslash-escaped automatically:
 
 ```bash
 cargo run --bin o-link -- calc.py page.html app.O -o program.O
@@ -1013,7 +1013,7 @@ using the current persistent environments. Python code can also call
 
 ### The Nix lattice (four-rung pipeline)
 
-O-lang models the full Nix build pipeline as a typed value chain:
+Olang models the full Nix build pipeline as a typed value chain:
 
 ```
 nix_expr^(...)_nix_expr   →   ONixExpr
