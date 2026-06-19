@@ -203,9 +203,6 @@ significant, so it is never sorted.
 buffered, then resolved when the block exits, and the batch resolves into a
 list of results from the cache.
 
-> **Current implementation note:** `any(...)`, `race(...)`, and `autonomous(batch(...))` currently evaluate/select members synchronously in left-to-right order at the evaluator level. `any`/`race` therefore return the first successful member in source order, and true concurrency/cancellation semantics are not yet implemented.
-> This is a known limitation — full async semantics are planned.
-
 Design principles:
 
 * **Structurally rich, semantically minimal.** Values carry data and
@@ -317,13 +314,14 @@ Adding a new language: write a Backend subclass, add it to
   Variable references inside nested typed-expression bodies in the Rust runtime
   work via the `scope` dict passed through `eval_typed_expr`. The Python ref
   impl similarly threads scope through `_eval_expression`.
-* **Async coordination limitation.** `{lazy}` and `{defer}` attributes create
+* **Async coordination.** `{lazy}` and `{defer}` attributes create
   deferred Requests (Thunks) that are auto-forced when spliced or explicitly
   forced via `now()`. `lazy(…)` and `autonomous(…)` switch the policy for their
-  argument, but `any(...)`, `race(...)`, and `autonomous(batch(...))` still
-  evaluate/select members synchronously in left-to-right order at the evaluator
-  level. Full async scheduling, true concurrency, and cancellation are future
-  work.
+  argument. When `now(group)` is called, Nix-family Request members
+  (`Instantiate`, `Realise`, `Activate`) are dispatched as concurrent threads;
+  `any(…)` returns the first success, `race(…)` returns the first result
+  (success or failure). Eval Requests and nested plain values resolve serially.
+  Full cancellation and async I/O are future work.
 * **`O.eval` scope limitation.** `eval_source` (called on `O.eval`) creates a
   fresh document scope; top-level `let` bindings from the calling document are
   NOT visible inside the evaluated fragment. Variables in persistent backend
