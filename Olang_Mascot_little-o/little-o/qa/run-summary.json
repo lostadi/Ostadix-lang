@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "run_dir": "/Users/ustad/Avesta-unstable/output/hatch-pet/little-o",
+  "spritesheet": "/Users/ustad/Avesta-unstable/output/hatch-pet/little-o/final/spritesheet.webp",
+  "validation": "/Users/ustad/Avesta-unstable/output/hatch-pet/little-o/final/validation.json",
+  "contact_sheet": "/Users/ustad/Avesta-unstable/output/hatch-pet/little-o/qa/contact-sheet.png",
+  "review": "/Users/ustad/Avesta-unstable/output/hatch-pet/little-o/qa/review.json",
+  "package": "/Users/ustad/.codex/pets/little-o"
+}
