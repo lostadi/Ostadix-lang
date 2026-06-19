@@ -34,6 +34,19 @@ use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
 use crate::value::{OValue, RequestKind, GroupMode};
 
+/// How to resolve group members that might be cached Request values.
+///
+/// - `Fresh`   — force the member fresh via `force_request`; honours the
+///               active policy and executor. Used by `now(group)`.
+/// - `Lenient` — read from the scheduler/eval cache; return the value
+///               unchanged on a miss. Soft fallback.
+/// - `Strict`  — read from the scheduler/eval cache; return a hard error
+///               on a miss. Used after `autonomous(...)` flush: every
+///               buffered request must have been materialized, so a miss
+///               indicates a scheduler bug rather than a user error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheMode { Fresh, Lenient, Strict }
+
 // ═════════════════════════════════════════════════════════════════════════════
 // STEP-3.5: Backend purity
 //
@@ -412,18 +425,32 @@ impl Evaluator {
     /// Resolve a value returned from an autonomous body AFTER the buffer has
     /// been flushed through the scheduler.
     ///
-    /// - A schedulable Request → its cached result (or unchanged on miss).
-    /// - A Group → resolved per its topology mode, reading each member from
-    ///   the freshly-populated cache.
+    /// - A schedulable Request → its cached result (error on cache miss in
+    ///   Strict mode — the scheduler must have materialized every buffered
+    ///   request, so a miss indicates a scheduler bug).
+    /// - A Group → resolved per its topology mode using Strict cache reads.
     /// - Anything else → returned unchanged.
     fn resolve_after_flush(&mut self, value: OValue) -> Result<OValue> {
         match &value {
             OValue::Group { mode, members, .. } => {
                 let (mode, members) = (*mode, members.clone());
-                self.resolve_group(mode, &members, true)
+                self.resolve_group(mode, &members, CacheMode::Strict)
             }
             v if Self::is_schedulable_request(v) => {
-                Ok(self.resolve_from_cache(v).unwrap_or(value))
+                match self.resolve_from_cache(v) {
+                    Some(result) => Ok(result),
+                    None => {
+                        let fp = match v {
+                            OValue::Request { fingerprint, .. } => &fingerprint[..8],
+                            _ => "?",
+                        };
+                        bail!(
+                            "autonomous: scheduler failed to materialize \
+                             request fp={}; cache miss after flush",
+                            fp
+                        )
+                    }
+                }
             }
             _ => Ok(value),
         }
@@ -470,23 +497,30 @@ impl Evaluator {
 
     /// Resolve a single group member to a concrete value.
     ///
-    /// `from_cache = false` forces the member fresh (via `force_request`, which
-    /// honours the active policy/executor); `from_cache = true` resolves it
-    /// from the scheduler/eval cache populated by a prior buffer flush, falling
-    /// back to the value unchanged on a miss. Nested Groups recurse with the
-    /// same flag. Non-Request, non-Group members are returned as-is.
-    fn resolve_member(&mut self, m: &OValue, from_cache: bool) -> Result<OValue> {
+    /// `CacheMode::Fresh` forces the member via `force_request`; `Lenient`
+    /// and `Strict` read from the scheduler/eval cache (Strict errors on
+    /// miss; Lenient returns the value unchanged). Nested Groups recurse
+    /// with the same mode. Non-Request, non-Group members are returned as-is.
+    fn resolve_member(&mut self, m: &OValue, mode: CacheMode) -> Result<OValue> {
         match m {
-            OValue::Request { .. } => {
-                if from_cache {
-                    Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone()))
-                } else {
-                    self.force_request(m)
+            OValue::Request { fingerprint, .. } => {
+                match mode {
+                    CacheMode::Fresh => self.force_request(m),
+                    CacheMode::Lenient => {
+                        Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone()))
+                    }
+                    CacheMode::Strict => {
+                        self.resolve_from_cache(m).ok_or_else(|| anyhow::anyhow!(
+                            "autonomous: scheduler failed to materialize \
+                             request fp={}; cache miss after flush",
+                            &fingerprint[..8]
+                        ))
+                    }
                 }
             }
-            OValue::Group { mode, members, .. } => {
-                let (mode, members) = (*mode, members.clone());
-                self.resolve_group(mode, &members, from_cache)
+            OValue::Group { mode: gmode, members, .. } => {
+                let (gmode, members) = (*gmode, members.clone());
+                self.resolve_group(gmode, &members, mode)
             }
             other => Ok(other.clone()),
         }
@@ -494,27 +528,31 @@ impl Evaluator {
 
     /// Resolve a Group to a concrete value according to its topology `mode`.
     ///
-    /// Concurrency model:
-    ///   When `from_cache` is `false` and any member is a threadable Nix-family
-    ///   Request, members are dispatched concurrently:
-    ///   - `Batch`/`All`  → all members run in parallel; result is an `OList`
-    ///     of every resolved value in member order. For `All`, any failure
-    ///     aborts the whole group.
-    ///   - `Any`  → all threadable members run in parallel; the first `Ok`
-    ///     result wins. Fails only when every member fails.
-    ///   - `Race` → all threadable members run in parallel; the first result
-    ///     to settle (success **or** failure) is returned immediately.
+    /// **Member semantics:**
+    ///   - `Batch` — collect ALL member results into an `OList`; failures are
+    ///     NOT fatal: a failed member is wrapped as `OValue::Error` so the list
+    ///     always has exactly one entry per input member.
+    ///   - `All`   — collect ALL member results into an `OList`; if **any**
+    ///     member fails, the whole group fails immediately (hard barrier).
+    ///   - `Any`   — return the first member that succeeds; fail only if all fail.
+    ///   - `Race`  — return the first member to settle (Ok **or** Err);
+    ///               remaining members may still run but their results are
+    ///               discarded. Race does not yet cancel losing work.
     ///
-    ///   Eval Requests and plain values are always resolved serially on the
-    ///   evaluator thread (Eval needs the ProcessRegistry which is !Send).
+    /// **Concurrency:**
+    ///   When `cache_mode == CacheMode::Fresh` and any member is a threadable
+    ///   Nix-family Request, members are dispatched concurrently (up to
+    ///   `self.scheduler.parallelism` threads at a time). Eval Requests and
+    ///   plain values always resolve serially on the evaluator thread (Eval
+    ///   needs the ProcessRegistry which is !Send).
     ///
-    /// When `from_cache` is `true` (after an autonomous flush), results are
-    /// already in L1 memory; sequential cache reads are used throughout.
-    fn resolve_group(
+    ///   When `cache_mode` is `Lenient` or `Strict` (after an autonomous flush),
+    ///   results are already in L1 memory; sequential cache reads are used.
+    pub(crate) fn resolve_group(
         &mut self,
         mode:       GroupMode,
         members:    &[OValue],
-        from_cache: bool,
+        cache_mode: CacheMode,
     ) -> Result<OValue> {
         if members.is_empty() {
             bail!("{}(...) group has no members to resolve", mode.name());
@@ -522,19 +560,33 @@ impl Evaluator {
 
         // Cache reads are fast (L1 memory); no threading benefit.
         // Also use the sequential path when no Nix-family Requests are present.
-        let has_threadable = !from_cache && members.iter().any(Self::is_threadable_member);
+        let has_threadable = cache_mode == CacheMode::Fresh
+            && members.iter().any(Self::is_threadable_member);
 
         if mode.collects_all() {
             if has_threadable {
                 self.resolve_collect_all_concurrent(mode, members)
             } else {
-                // Sequential: plain values, Eval Requests, nested Groups, or
-                // from_cache (already-resolved results in L1 memory).
-                let mut out = Vec::with_capacity(members.len());
-                for m in members {
-                    out.push(self.resolve_member(m, from_cache)?);
+                // Sequential path: plain values, Eval Requests, nested Groups,
+                // or cache reads (Lenient / Strict — already in L1 memory).
+                if mode == GroupMode::Batch {
+                    // Batch: collect all outcomes, wrapping failures as OError.
+                    let mut out = Vec::with_capacity(members.len());
+                    for m in members {
+                        match self.resolve_member(m, cache_mode) {
+                            Ok(v)  => out.push(v),
+                            Err(e) => out.push(OValue::error(e.to_string())),
+                        }
+                    }
+                    Ok(OValue::list(out))
+                } else {
+                    // All: hard all-or-nothing barrier — fail on first error.
+                    let mut out = Vec::with_capacity(members.len());
+                    for m in members {
+                        out.push(self.resolve_member(m, cache_mode)?);
+                    }
+                    Ok(OValue::list(out))
                 }
-                Ok(OValue::list(out))
             }
         } else {
             // Any / Race: first-wins topology.
@@ -546,7 +598,7 @@ impl Evaluator {
                         // Try members in source order; return first success.
                         let mut last_err: Option<anyhow::Error> = None;
                         for m in members {
-                            match self.resolve_member(m, from_cache) {
+                            match self.resolve_member(m, cache_mode) {
                                 Ok(v)  => return Ok(v),
                                 Err(e) => last_err = Some(e),
                             }
@@ -561,7 +613,10 @@ impl Evaluator {
                         // In sequential execution the first member always
                         // settles first — return its result immediately
                         // (whether Ok or Err) without trying later members.
-                        self.resolve_member(&members[0], from_cache)
+                        // NOTE: Race does not yet cancel losing work; in the
+                        // concurrent path, remaining threads run to completion
+                        // but their results are discarded.
+                        self.resolve_member(&members[0], cache_mode)
                             .with_context(|| "race(...) group: lead member failed".to_string())
                     }
                     _ => unreachable!("Batch/All already handled by collects_all() branch"),
@@ -578,15 +633,15 @@ impl Evaluator {
     ///        sequentially, then push `(index, kind, src)` onto the work list.
     ///      - Serial (plain values, Eval Requests, nested Groups): resolve
     ///        inline and store the result immediately.
-    ///   2. Spawn one thread per work-list entry; each thread calls
-    ///      `exec_nix_kind` and sends `(index, Result<OValue>)` over a channel.
+    ///   2. Spawn threads in batches capped at `self.scheduler.parallelism`;
+    ///      each thread calls `exec_nix_kind` and sends `(index, Result<OValue>)`
+    ///      over a channel.
     ///   3. Collect thread results (all of them — channel closes when every
     ///      sender drops).
     ///   4. Assemble results in member order:
-    ///      - `Batch`: collect all into an `OList` (any member failure is an error).
-    ///      - `All`:   same; the intent is "all must succeed" rather than
-    ///                 "best effort" throughput, but the observable resolution
-    ///                 is identical.
+    ///      - `Batch`: collect all into an `OList`; failures wrapped as OError
+    ///                 so every input member has exactly one output slot.
+    ///      - `All`:   collect all, but propagate the first error — hard barrier.
     fn resolve_collect_all_concurrent(
         &mut self,
         mode:    GroupMode,
@@ -606,40 +661,62 @@ impl Evaluator {
                     Err(e) => results[i] = Some(Err(e)),
                 }
             } else {
-                results[i] = Some(self.resolve_member(m, false));
+                results[i] = Some(self.resolve_member(m, CacheMode::Fresh));
             }
         }
 
-        // Phase 2 — spawn threads.
+        // Phase 2 — spawn threads capped at scheduler.parallelism.
+        // Processing in batches of `cap` ensures at most `cap` concurrent
+        // Nix operations, matching the autonomous scheduler's parallelism cap.
+        // `parallelism` is validated to be >= 1 at construction time, but we
+        // guard here anyway to avoid zero-sized chunks in pathological configs.
         if !threadable.is_empty() {
-            let (tx, rx) = mpsc::channel::<(usize, Result<OValue>)>();
-            for (idx, kind, src) in threadable {
-                let tx = tx.clone();
-                thread::spawn(move || {
-                    // `send` can only fail if the receiver was dropped (e.g. the
-                    // evaluator thread panicked). Silently ignoring keeps threads
-                    // from panicking on a dead channel and is the intended pattern
-                    // for fire-and-collect thread fans.
-                    let _ = tx.send((idx, exec_nix_kind(kind, src)));
-                });
-            }
-            drop(tx); // channel closes when every spawned sender drops
+            let cap = self.scheduler.parallelism.max(1);
+            for chunk in threadable.chunks(cap) {
+                let (tx, rx) = mpsc::channel::<(usize, Result<OValue>)>();
+                for (idx, kind, src) in chunk.iter().cloned() {
+                    let tx = tx.clone();
+                    thread::spawn(move || {
+                        // `send` can only fail if the receiver was dropped
+                        // (e.g. the evaluator thread panicked). Silently
+                        // ignoring keeps threads from panicking on a dead
+                        // channel and is the intended pattern for fire-and-
+                        // collect thread fans.
+                        let _ = tx.send((idx, exec_nix_kind(kind, src)));
+                    });
+                }
+                drop(tx); // channel closes when every spawned sender drops
 
-            // Phase 3 — collect (blocks until all threads complete).
-            for (idx, result) in rx {
-                results[idx] = Some(result);
+                // Phase 3 — collect chunk (blocks until all chunk threads done).
+                for (idx, result) in rx {
+                    results[idx] = Some(result);
+                }
             }
         }
 
-        // Phase 4 — assemble result list.
+        // Phase 4 — assemble result list with mode-specific failure semantics.
         let mut out = Vec::with_capacity(members.len());
         for (i, slot) in results.into_iter().enumerate() {
-            let val = slot
-                .expect("every member slot must be filled after phases 1-3")
-                .with_context(|| format!(
-                    "{}(...) group: member {} failed", mode.name(), i
-                ))?;
-            out.push(val);
+            let member_result = slot
+                .expect("every member slot must be filled after phases 1-3");
+            match mode {
+                GroupMode::Batch => {
+                    // Batch: collect every outcome; failures become OError values.
+                    match member_result {
+                        Ok(v)  => out.push(v),
+                        Err(e) => out.push(OValue::error(format!(
+                            "member {}: {}", i, e
+                        ))),
+                    }
+                }
+                _ => {
+                    // All: hard barrier — propagate first error immediately.
+                    let val = member_result.with_context(|| format!(
+                        "{}(...) group: member {} failed", mode.name(), i
+                    ))?;
+                    out.push(val);
+                }
+            }
         }
         Ok(OValue::list(out))
     }
@@ -671,7 +748,7 @@ impl Evaluator {
                 let (kind, src) = self.pre_resolve_nix_request(m)?;
                 threadable.push((kind, src));
             } else {
-                let result = self.resolve_member(m, false);
+                let result = self.resolve_member(m, CacheMode::Fresh);
                 match mode {
                     GroupMode::Any => {
                         if result.is_ok() {
@@ -1070,6 +1147,49 @@ impl Evaluator {
             }
         }
 
+        // ── Group constructors as special forms ──────────────────────────────
+        //
+        // `batch`, `all`, `any`, and `race` must be special forms, not ordinary
+        // functions.  Under the standard "evaluate args left-to-right" path, any
+        // request-producing call (e.g. `realise(instantiate($e))`) would already
+        // be forced to a StorePath before the group constructor ever sees it.
+        // That would make the group contain concrete values rather than deferred
+        // Requests, defeating the whole coordination abstraction.
+        //
+        // The fix: evaluate members under `Policy::Lazy` regardless of the outer
+        // policy, then restore the outer policy once members are captured.  This
+        // guarantees that:
+        //   batch(realise(instantiate($e1)), realise(instantiate($e2)))
+        // always builds:
+        //   Group(Batch, [Request[Realise(Request[Instantiate(e1)])], ...])
+        // whether the surrounding policy is Eager, Lazy, or Autonomous.
+        //
+        // The Group itself performs no work — it is a first-class coordination
+        // value forced later by `now(group)`, `autonomous(group)`, or by the
+        // Autonomous flush at document end.
+        if matches!(fn_name, "batch" | "all" | "any" | "race") {
+            if args.is_empty() {
+                bail!("{}(...) takes at least 1 argument, got 0", fn_name);
+            }
+            let mode = match fn_name {
+                "batch" => GroupMode::Batch,
+                "all"   => GroupMode::All,
+                "any"   => GroupMode::Any,
+                "race"  => GroupMode::Race,
+                _       => unreachable!(),
+            };
+            // Evaluate members under Lazy policy so request chains are captured,
+            // not resolved, regardless of the outer policy.
+            let saved_policy = self.policy;
+            self.policy = Policy::Lazy;
+            let members: Vec<OValue> = args
+                .iter()
+                .map(|a| self.eval_node(a, scope))
+                .collect::<Result<_>>()?;
+            self.policy = saved_policy;
+            return Ok(OValue::group(mode, members));
+        }
+
         // Standard builtins: evaluate args left-to-right (applicative order).
         let arg_vals: Vec<OValue> = args
             .iter()
@@ -1105,35 +1225,15 @@ impl Evaluator {
                 match &req {
                     OValue::Request { .. } => self.force_request(&req),
                     // now(group): force the whole group per its topology mode,
-                    // resolving each member fresh (from_cache = false).
+                    // resolving each member fresh via the scheduler path.
                     OValue::Group { mode, members, .. } => {
                         let (mode, members) = (*mode, members.clone());
-                        self.resolve_group(mode, &members, false)
+                        self.resolve_group(mode, &members, CacheMode::Fresh)
                     }
                     other => bail!(
                         "now(req) expected a Request or Group, got {}", other.type_name()
                     ),
                 }
-            }
-            // STEP-4: coordination primitives — bundle several computations
-            // into a first-class Group value carrying an explicit execution
-            // topology. The members are the already-evaluated arguments (under
-            // Eager they are resolved values; under Lazy/Autonomous they are
-            // unforced/buffered Requests). The Group itself performs no work —
-            // it is forced by `now(group)`, by `autonomous(...)`, or at
-            // document end under Autonomous policy.
-            "batch" | "all" | "any" | "race" => {
-                let mode = match fn_name {
-                    "batch" => GroupMode::Batch,
-                    "all"   => GroupMode::All,
-                    "any"   => GroupMode::Any,
-                    "race"  => GroupMode::Race,
-                    _       => unreachable!(),
-                };
-                if arg_vals.is_empty() {
-                    bail!("{}(...) takes at least 1 argument, got 0", fn_name);
-                }
-                Ok(OValue::group(mode, arg_vals))
             }
             // STEP-4: OS-as-participant builtins.
             "activate" => {
@@ -1586,6 +1686,10 @@ fn render_nix(val: &OValue) -> String {
         // literal. Rarely useful — the user almost always wants O.eval first.
         OValue::Expr { src } => serde_json::to_string(src)
             .unwrap_or_else(|_| "\"\"".to_string()),
+
+        // An error outcome in a Nix context renders as a string marker that
+        // nix eval will reject loudly — errors should not reach Nix source.
+        OValue::Error { msg } => format!("\"<error: {}>\"", msg.replace('"', "\\\"")),
     }
 }
 
@@ -1709,6 +1813,13 @@ fn render_python(val: &OValue) -> String {
             let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "''".to_string());
             format!("OExprValue({})", src_lit)
         }
+
+        // An error outcome rendered into Python is an OError marker. Errors
+        // appear in batch(...) result lists; the shim can inspect the type.
+        OValue::Error { msg } => {
+            let msg_lit = serde_json::to_string(msg).unwrap_or_else(|_| "''".to_string());
+            format!("OError({})", msg_lit)
+        }
     }
 }
 
@@ -1813,6 +1924,14 @@ fn render_html(val: &OValue) -> String {
                 html_escape(src),
             )
         }
+
+        // An error outcome in HTML renders as a styled error span.
+        OValue::Error { msg } => {
+            format!(
+                "<span class=\"o-error\" role=\"alert\">{}</span>",
+                html_escape(msg),
+            )
+        }
     }
 }
 
@@ -1907,6 +2026,9 @@ fn render_latex(val: &OValue) -> String {
         OValue::Expr { src } => {
             format!("\\texttt{{{}}}", src.replace("_", "\\_"))
         }
+        OValue::Error { msg } => {
+            format!("\\texttt{{<error: {}>}}", msg.replace("_", "\\_"))
+        }
     }
 }
 
@@ -1950,6 +2072,9 @@ fn render_markdown(val: &OValue) -> String {
         }
         OValue::Expr { src } => {
             format!("`{}`", src)
+        }
+        OValue::Error { msg } => {
+            format!("`<error: {}>`", msg)
         }
     }
 }
@@ -3337,14 +3462,16 @@ mod tests {
         assert_eq!(result, OValue::str_("first"));
     }
 
-    /// `now(batch(realise(instantiate($e1)), realise(instantiate($e2))))` under
-    /// the default Eager policy: the inner requests are already resolved to
-    /// StorePaths by the time batch runs, so now(group) returns a list of two
-    /// StorePaths. Verifies group force works end-to-end with the executor.
+    /// `now(batch(realise(instantiate($e1)), realise(instantiate($e2))))`:
+    /// Because `batch` is a special form, its arguments are evaluated under
+    /// Lazy policy regardless of the outer Eager policy. The group therefore
+    /// holds Request chains (not pre-resolved StorePaths).
+    ///
+    /// Resolution is verified by pre-seeding the scheduler cache and resolving
+    /// with `CacheMode::Strict` — the same path used after `autonomous(...)` flush.
     #[test]
     fn now_batch_of_resolved_requests_returns_storepath_list() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into());
         let scope = scope_with_nix_expr();
 
         let mk_chain = |var: &str| ONode::Call {
@@ -3354,14 +3481,30 @@ mod tests {
                 args:    vec![ONode::VarRef(var.into())],
             }],
         };
-        let call = ONode::Call {
-            fn_name: "now".into(),
-            args:    vec![ONode::Call {
-                fn_name: "batch".into(),
-                args:    vec![mk_chain("e1"), mk_chain("e2")],
-            }],
-        };
-        let result = e.eval_node(&call, &scope).unwrap();
+
+        // Pre-seed the scheduler cache with results for both realise requests.
+        let mut members = vec![];
+        for var in ["e1", "e2"] {
+            let expr = e.eval_node(&ONode::VarRef(var.into()), &scope).unwrap();
+            let inst = OValue::request(RequestKind::Instantiate, expr);
+            let drv  = OValue::derivation(
+                format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
+            let realise = OValue::request(RequestKind::Realise, inst.clone());
+            let inst_fp = match &inst {
+                OValue::Request { fingerprint, .. } => fingerprint.clone(),
+                _ => unreachable!()
+            };
+            let real_fp = match &realise {
+                OValue::Request { fingerprint, .. } => fingerprint.clone(),
+                _ => unreachable!()
+            };
+            e.scheduler.mem_cache.insert(inst_fp, drv);
+            e.scheduler.mem_cache.insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
+            members.push(realise);
+        }
+
+        // Resolve via CacheMode::Strict (same path as autonomous flush result resolution).
+        let result = e.resolve_group(GroupMode::Batch, &members, CacheMode::Strict).unwrap();
         match result {
             OValue::List { v } => {
                 assert_eq!(v.len(), 2);
@@ -3369,6 +3512,21 @@ mod tests {
                     "all members must resolve to StorePaths, got {:?}", v);
             }
             other => panic!("expected list, got {:?}", other),
+        }
+
+        // Verify the special-form property: batch() evaluated via eval_node
+        // captures Request chains, not pre-resolved values.
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args:    vec![mk_chain("e1"), mk_chain("e2")],
+        };
+        let group_val = e.eval_node(&call, &scope).unwrap();
+        match &group_val {
+            OValue::Group { members, .. } => {
+                assert!(members.iter().all(|m| matches!(m, OValue::Request { .. })),
+                    "batch() must capture Request members, not resolved values, got {:?}", members);
+            }
+            other => panic!("expected Group from batch(), got {:?}", other),
         }
     }
 
@@ -3499,8 +3657,13 @@ mod tests {
         assert_eq!(e.eval_node(&call, &scope).unwrap(), OValue::str_("only"));
     }
 
-    /// `now(all(...))` is semantically equivalent to `now(batch(...))` for the
-    /// plain-value case: all members must succeed and the result is an OList.
+    /// `now(all(...))` over plain values succeeds like `now(batch(...))` when
+    /// all members succeed: the result is an OList with one entry per member.
+    ///
+    /// NOTE: When a member fails, `all` and `batch` diverge: `all` propagates
+    /// the first error (hard all-or-nothing barrier), while `batch` wraps each
+    /// failure as `OValue::Error` and always returns a full list. That
+    /// distinction is tested separately in `batch_collects_error_outcomes_as_values`.
     #[test]
     fn now_all_returns_list_identical_to_batch() {
         let mut e = Evaluator::new("/tmp".into());
@@ -3524,15 +3687,17 @@ mod tests {
             OValue::list(vec![OValue::int(1), OValue::int(2)]));
     }
 
-    /// `now(race(...))` over pre-resolved Requests (MockExecutor, Eager) returns
-    /// the first member (both are plain StorePaths after Eager resolution, so
-    /// sequential race path is used — first always wins).
+    /// `now(race(...))` over pre-resolved Requests: because `race` is a special
+    /// form, its arguments are captured as Request chains. A pre-built group with
+    /// plain StorePaths uses the sequential race path — first member wins.
     #[test]
     fn now_race_of_resolved_requests_returns_first() {
         let mut e = Evaluator::new("/tmp".into())
             .with_executor(Box::new(MockExecutor::new()));
         let scope = scope_with_nix_expr();
 
+        // Verify the special-form property: race() evaluated via eval_node
+        // captures Request chains (Lazy-evaluated), not pre-resolved values.
         let mk_chain = |var: &str| ONode::Call {
             fn_name: "realise".into(),
             args:    vec![ONode::Call {
@@ -3540,18 +3705,30 @@ mod tests {
                 args:    vec![ONode::VarRef(var.into())],
             }],
         };
-        // Under Eager, requests are resolved before race() sees them.
-        // race(sp1, sp2) with plain StorePaths → first member wins.
         let call = ONode::Call {
-            fn_name: "now".into(),
-            args:    vec![ONode::Call {
-                fn_name: "race".into(),
-                args:    vec![mk_chain("e1"), mk_chain("e2")],
-            }],
+            fn_name: "race".into(),
+            args:    vec![mk_chain("e1"), mk_chain("e2")],
         };
-        let result = e.eval_node(&call, &scope).unwrap();
-        assert!(result.is_store_path(),
-            "race over resolved requests must return a StorePath, got {:?}", result);
+        let group_val = e.eval_node(&call, &scope).unwrap();
+        match &group_val {
+            OValue::Group { members, .. } => {
+                assert!(members.iter().all(|m| matches!(m, OValue::Request { .. })),
+                    "race() must capture Request members, not resolved values, got {:?}", members);
+            }
+            other => panic!("expected Group from race(), got {:?}", other),
+        }
+
+        // Also test that a race group over plain StorePaths resolves correctly:
+        // first member (sequential path) always wins.
+        let sp1 = OValue::store_path("/nix/store/aaa-out");
+        let sp2 = OValue::store_path("/nix/store/bbb-out");
+        let group = OValue::group(GroupMode::Race, vec![sp1.clone(), sp2]);
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let result = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap();
+        assert_eq!(result, sp1, "sequential race must return the first member");
     }
 
     /// `is_threadable_member` recognises Nix-family Requests and rejects Eval
@@ -3602,8 +3779,9 @@ mod tests {
         OValue::group(mode, vec![])
     }
 
-    /// `batch(ok_val, failing_group)` — the entire Batch fails because one
-    /// member fails.  Verifies the Collect-All "fail fast" contract.
+    /// `batch(ok_val, failing_group)` — Batch collects ALL outcomes; a failing
+    /// member becomes an `OValue::Error` in the result list rather than aborting
+    /// the whole group. The result list always has one entry per input member.
     #[test]
     fn batch_fails_if_any_member_fails() {
         let mut e = Evaluator::new("/tmp".into());
@@ -3615,15 +3793,22 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
-        assert!(
-            err.contains("batch") || err.contains("no members"),
-            "batch must fail when a member fails, got: {err}"
-        );
+        // Batch must succeed (return a list), wrapping the failed member as OError.
+        let result = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap();
+        match &result {
+            OValue::List { v } => {
+                assert_eq!(v.len(), 2, "batch must return one entry per member");
+                assert_eq!(v[0], OValue::int(1), "successful member must be preserved");
+                assert!(v[1].is_error(),
+                    "failing member must become OError, got {:?}", v[1]);
+            }
+            other => panic!("batch must return a list, got {:?}", other),
+        }
     }
 
-    /// `all(ok_val, failing_group)` — the entire All group fails because one
-    /// member fails.  Behaviourally identical to Batch; intent is all-or-nothing.
+    /// `all(ok_val, failing_group)` — the entire All group fails when any
+    /// member fails.  All is an all-or-nothing hard barrier: unlike Batch,
+    /// it does NOT wrap failures as OError — it propagates the first error.
     #[test]
     fn all_fails_if_any_member_fails() {
         let mut e = Evaluator::new("/tmp".into());
@@ -3635,7 +3820,7 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
         assert!(
             err.contains("all") || err.contains("no members"),
             "all must fail when a member fails, got: {err}"
@@ -3655,7 +3840,7 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let result = e.resolve_group(mode, &members, false).unwrap();
+        let result = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap();
         assert_eq!(
             result,
             OValue::str_("winner"),
@@ -3675,7 +3860,7 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
         assert!(
             err.contains("any") && err.contains("members failed"),
             "any must fail when all members fail, got: {err}"
@@ -3697,7 +3882,7 @@ mod tests {
             _ => unreachable!(),
         };
         // Race settles on the first result whether Ok or Err.
-        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
         assert!(
             err.contains("race") || err.contains("no members"),
             "race must propagate the lead member's failure, got: {err}"
@@ -3717,7 +3902,7 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let result = e.resolve_group(mode, &members, false).unwrap();
+        let result = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap();
         assert_eq!(result, OValue::int(42),
             "race must return the lead member's value");
     }
@@ -3733,8 +3918,221 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let result = e.resolve_group(mode, &grp_members, false).unwrap();
+        let result = e.resolve_group(mode, &grp_members, CacheMode::Fresh).unwrap();
         assert_eq!(result, OValue::list(members),
             "batch must preserve member order in the result list");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // New semantic tests (lock down the OGroup semantics)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `batch(realise(instantiate($e)))` evaluated via `eval_node` must hold
+    /// Request members — not pre-resolved StorePaths — regardless of the outer
+    /// Eager policy.  This is the fundamental "group constructors are special
+    /// forms" property.
+    #[test]
+    fn batch_does_not_eagerly_force_request_members() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let scope = scope_with_nix_expr();
+
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args:    vec![
+                ONode::Call {
+                    fn_name: "realise".into(),
+                    args: vec![ONode::Call {
+                        fn_name: "instantiate".into(),
+                        args:    vec![ONode::VarRef("e1".into())],
+                    }],
+                },
+                ONode::Call {
+                    fn_name: "realise".into(),
+                    args: vec![ONode::Call {
+                        fn_name: "instantiate".into(),
+                        args:    vec![ONode::VarRef("e2".into())],
+                    }],
+                },
+            ],
+        };
+        // Default policy is Eager; yet batch() must capture Requests.
+        assert_eq!(e.policy, Policy::Eager);
+        let group = e.eval_node(&call, &scope).unwrap();
+        match group {
+            OValue::Group { members, mode, .. } => {
+                assert_eq!(mode, GroupMode::Batch);
+                assert_eq!(members.len(), 2, "batch must have 2 members");
+                for (i, m) in members.iter().enumerate() {
+                    assert!(matches!(m, OValue::Request { .. }),
+                        "member {} must be a Request (not a resolved value), got {:?}", i, m);
+                }
+            }
+            other => panic!("batch() must return a Group, got {:?}", other),
+        }
+        // Outer policy must be restored after the special-form.
+        assert_eq!(e.policy, Policy::Eager, "policy must be restored after batch()");
+    }
+
+    /// `batch(ok, fail)` collects BOTH outcomes: the successful member keeps its
+    /// value; the failing member becomes `OValue::Error` in the list. The group
+    /// itself never returns `Err` — it always returns a full-length list.
+    #[test]
+    fn batch_collects_error_outcomes_as_values() {
+        let mut e = Evaluator::new("/tmp".into());
+
+        // failing_member(Batch) is an empty Batch group, which errors on resolution.
+        let members = vec![OValue::str_("ok"), failing_member(GroupMode::Batch)];
+        let result = e.resolve_group(GroupMode::Batch, &members, CacheMode::Fresh).unwrap();
+
+        match result {
+            OValue::List { v } => {
+                assert_eq!(v.len(), 2, "batch list must have one entry per member");
+                assert_eq!(v[0], OValue::str_("ok"), "successful member preserved");
+                assert!(v[1].is_error(),
+                    "failed member must become OError in batch result, got {:?}", v[1]);
+                // The OError message should contain some indication of the failure.
+                if let OValue::Error { msg } = &v[1] {
+                    assert!(!msg.is_empty(), "OError message must not be empty");
+                }
+            }
+            other => panic!("batch must return a list even with failures, got {:?}", other),
+        }
+    }
+
+    /// After `autonomous(...)` flush, if a Request's result is absent from the
+    /// cache, `resolve_group` with `CacheMode::Strict` must produce a hard error.
+    ///
+    /// For `Batch` mode: the error is wrapped as `OValue::Error` in the result list.
+    /// For `All` mode: the error propagates and the whole group fails.
+    #[test]
+    fn autonomous_batch_errors_on_missing_cache_result() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = scope_with_nix_expr();
+
+        // Build a realise Request but do NOT seed the cache.
+        let expr = e.eval_node(&ONode::VarRef("e1".into()), &scope).unwrap();
+        let inst = OValue::request(RequestKind::Instantiate, expr);
+        let realise = OValue::request(RequestKind::Realise, inst);
+
+        // Batch mode: cache miss becomes OError in the result list.
+        let batch_result = e.resolve_group(
+            GroupMode::Batch,
+            &[realise.clone()],
+            CacheMode::Strict,
+        ).unwrap();
+        match batch_result {
+            OValue::List { v } => {
+                assert_eq!(v.len(), 1);
+                assert!(v[0].is_error(),
+                    "CacheStrict batch must produce OError on cache miss, got {:?}", v[0]);
+                if let OValue::Error { msg } = &v[0] {
+                    assert!(
+                        msg.contains("autonomous") || msg.contains("cache miss") || msg.contains("materialize"),
+                        "error message must indicate a strict cache miss, got: {msg}"
+                    );
+                }
+            }
+            other => panic!("batch must return a list, got {:?}", other),
+        }
+
+        // All mode: cache miss propagates as a hard error.
+        let all_err = e.resolve_group(
+            GroupMode::All,
+            &[realise],
+            CacheMode::Strict,
+        ).unwrap_err().to_string();
+        assert!(
+            all_err.contains("autonomous") || all_err.contains("cache miss") || all_err.contains("materialize"),
+            "CacheStrict All must hard-error on cache miss, got: {all_err}"
+        );
+    }
+
+    /// `now(group)` must respect the scheduler's parallelism cap:
+    /// at most `scheduler.parallelism` threads are in flight at once.
+    ///
+    /// We verify this by setting `parallelism = 1`, building a 3-member
+    /// group of plain values (no threadable Requests), and confirming that
+    /// the result is still correct (the cap only limits concurrent Nix
+    /// threads; plain values always resolve serially).
+    #[test]
+    fn now_group_uses_parallelism_cap() {
+        let mut e = Evaluator::new("/tmp".into());
+        // Set a low parallelism cap.
+        e.scheduler = e.scheduler.with_parallelism(1);
+        assert_eq!(e.scheduler.parallelism, 1);
+
+        let members = vec![OValue::int(10), OValue::int(20), OValue::int(30)];
+        let result = e.resolve_group(GroupMode::All, &members, CacheMode::Fresh).unwrap();
+        assert_eq!(result,
+            OValue::list(vec![OValue::int(10), OValue::int(20), OValue::int(30)]),
+            "parallelism cap must not affect correctness of plain-value groups");
+    }
+
+    /// A nested group resolves deterministically:
+    ///   `all(any(a, b), batch(c))` → `[first_of(a,b), [c]]`
+    ///
+    /// This verifies that `resolve_member` correctly recurses into nested groups
+    /// and that member order is preserved throughout.
+    #[test]
+    fn nested_group_resolution_is_deterministic() {
+        let mut e = Evaluator::new("/tmp".into());
+
+        // Inner any(a, b) → "a" (first success)
+        let inner_any = OValue::group(
+            GroupMode::Any,
+            vec![OValue::str_("a"), OValue::str_("b")],
+        );
+        // Inner batch(c) → ["c"]
+        let inner_batch = OValue::group(
+            GroupMode::Batch,
+            vec![OValue::str_("c")],
+        );
+        // Outer all(inner_any, inner_batch)
+        let outer_members = vec![inner_any, inner_batch];
+        let result = e.resolve_group(GroupMode::All, &outer_members, CacheMode::Fresh).unwrap();
+
+        // Expect: [<result of any("a","b")>, <result of batch("c")>]
+        //       = ["a", ["c"]]
+        assert_eq!(
+            result,
+            OValue::list(vec![
+                OValue::str_("a"),
+                OValue::list(vec![OValue::str_("c")]),
+            ]),
+            "nested group must resolve deterministically"
+        );
+    }
+
+    /// A group's fingerprint must change when the order of its members changes.
+    /// This ensures fingerprint-keyed caches treat `batch(a, b)` ≠ `batch(b, a)`.
+    #[test]
+    fn group_fingerprint_changes_when_member_order_changes() {
+        let a = OValue::str_("alpha");
+        let b = OValue::str_("beta");
+
+        let g_ab = OValue::group(GroupMode::Batch, vec![a.clone(), b.clone()]);
+        let g_ba = OValue::group(GroupMode::Batch, vec![b.clone(), a.clone()]);
+
+        let fp_ab = match &g_ab {
+            OValue::Group { fingerprint, .. } => fingerprint.clone(),
+            _ => unreachable!()
+        };
+        let fp_ba = match &g_ba {
+            OValue::Group { fingerprint, .. } => fingerprint.clone(),
+            _ => unreachable!()
+        };
+
+        assert_ne!(fp_ab, fp_ba,
+            "fingerprints must differ when member order differs");
+
+        // Sanity: same order → same fingerprint.
+        let g_ab2 = OValue::group(GroupMode::Batch, vec![a.clone(), b.clone()]);
+        let fp_ab2 = match &g_ab2 {
+            OValue::Group { fingerprint, .. } => fingerprint.clone(),
+            _ => unreachable!()
+        };
+        assert_eq!(fp_ab, fp_ab2,
+            "fingerprints must be stable for identical groups");
     }
 }

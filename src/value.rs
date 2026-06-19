@@ -246,15 +246,19 @@ pub enum OValue {
     /// model. Where a Request names a single deferred computation, a Group
     /// names a collection of them together with the `mode` that says HOW they
     /// relate:
-    ///   - `Batch` — run them all together for throughput; yield every result.
-    ///   - `All`   — fan-out where every member must succeed; yield every result.
+    ///   - `Batch` — run all for throughput; yields every result, including
+    ///              failures wrapped as `OValue::Error` values.
+    ///   - `All`   — fan-out where every member must succeed; if any member
+    ///              fails the whole group fails (hard all-or-nothing barrier).
     ///   - `Any`   — redundancy/fallback; yield the first member that succeeds.
-    ///   - `Race`  — latency competition; yield the first member to settle.
+    ///   - `Race`  — latency competition; yield the first member to settle
+    ///              (success **or** failure). Does not yet cancel losers.
     ///
-    /// Members are arbitrary OValues. They are usually Requests (so the Group
-    /// describes deferred work), but a Group can also hold already-resolved
-    /// values — under `Policy::Eager` the members are resolved before the Group
-    /// is built, so the Group simply records the topology over concrete results.
+    /// `batch` and `all` group constructors are **special forms**: their
+    /// arguments are captured as-is (deferred Requests) rather than being
+    /// eagerly resolved before the group is built. This means
+    /// `batch(realise(instantiate($e)))` always captures a Request chain —
+    /// never a pre-resolved StorePath.
     ///
     /// `fingerprint = sha256("group" || mode || ordered member content identities)`.
     /// Member order is preserved (NOT sorted) because order is semantically
@@ -268,37 +272,54 @@ pub enum OValue {
         members:     Vec<OValue>,
         fingerprint: String,
     },
+
+    /// A captured error outcome — produced by `batch(...)` when a member
+    /// fails. Where `all(...)` aborts the whole group on first failure,
+    /// `batch(...)` continues and wraps each failure as an `OError` so the
+    /// result list has exactly one entry per input member regardless of
+    /// how many succeeded or failed.
+    ///
+    /// `msg` is the human-readable error message from the failed computation.
+    ///
+    /// Wire format: `{"t":"error","msg":"..."}`
+    #[serde(rename = "error")]
+    Error {
+        msg: String,
+    },
 }
 
 /// The execution topology of an `OValue::Group`.
 ///
 /// This is the "shape" axis of coordination: given several computations, the
 /// mode says how their execution relates and which results survive into the
-/// resolved value. The synchronous MVP resolves members left-to-right; the
-/// mode is preserved in the value so a future concurrent scheduler can honour
-/// the true topology (parallel fan-out, first-to-finish racing, etc.).
+/// resolved value. Members are dispatched concurrently for Nix-family
+/// Requests; Eval Requests and plain values always resolve serially.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupMode {
-    /// Run every member together for throughput. Resolves to an `OList` of all
-    /// member results, in member order. Under `Policy::Autonomous` a Batch is
-    /// the unit the scheduler dispatches concurrently.
+    /// Run every member for throughput. Resolves to an `OList` of all member
+    /// results in member order. **Failures are not fatal**: a failed member is
+    /// represented as an `OValue::Error` in the result list so the list always
+    /// has exactly one entry per input member. Under `Policy::Autonomous` a
+    /// Batch is the unit the scheduler dispatches concurrently.
     Batch,
 
     /// Fan-out where every member must succeed. Resolves to an `OList` of all
-    /// member results, in member order; if any member fails, the whole group
-    /// fails. Behaviourally identical to Batch in the MVP — the distinction is
-    /// intent (a hard all-or-nothing barrier vs. a throughput bundle).
+    /// member results in member order; if **any** member fails the whole group
+    /// fails immediately (hard all-or-nothing barrier). Distinguished from
+    /// `Batch` by intent and by failure semantics: `all` aborts on the first
+    /// error while `batch` collects every outcome.
     All,
 
     /// Redundancy / fallback. Resolves to the first member that succeeds,
     /// trying members left-to-right; only fails if every member fails.
     Any,
 
-    /// Latency competition — first member to settle wins. In the synchronous
-    /// MVP "first to settle" is the first member in declaration order that
-    /// resolves successfully, so Race coincides with Any here; the distinction
-    /// is intent (competing for lowest latency vs. tolerating failures).
+    /// Latency competition — first member to **settle** (success or failure)
+    /// wins. Remaining members may still run but their results are discarded.
+    ///
+    /// **Note:** Race does not yet cancel losing work. Full cancellation
+    /// support (cooperative tokens or subprocess kill) is a future goal.
     Race,
 }
 
@@ -519,6 +540,15 @@ impl OValue {
         OValue::Group { mode, members, fingerprint }
     }
 
+    /// Construct an error outcome value.
+    ///
+    /// Used by `batch(...)` to represent a failed member as a first-class
+    /// value in the result list rather than aborting the whole group.
+    /// `msg` is the human-readable error message from the failed computation.
+    pub fn error(msg: impl Into<String>) -> Self {
+        OValue::Error { msg: msg.into() }
+    }
+
     /// The canonical content identity of an OValue.
     ///
     /// Used to compose Request fingerprints and NixExpr fingerprints. Defined
@@ -612,6 +642,7 @@ impl OValue {
     pub fn is_group(&self) -> bool { matches!(self, OValue::Group { .. }) }
     pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
     pub fn is_expr(&self) -> bool { matches!(self, OValue::Expr { .. }) }
+    pub fn is_error(&self) -> bool { matches!(self, OValue::Error { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -634,6 +665,7 @@ impl OValue {
             OValue::Group {..} => "group",
             OValue::System {..} => "system",
             OValue::Expr {..} => "expr",
+            OValue::Error {..} => "error",
         }
     }
 }
@@ -788,6 +820,11 @@ impl OValue {
             // shouldn't be embedding a profile path. Document for now;
             // STEP5 may refine.
             OValue::System { profile_path } => profile_path.clone(),
+
+            // An Error value splices as a human-readable marker — the raw
+            // error text surrounded by brackets. Splicing an error into source
+            // code is almost always a bug; the marker makes it visible.
+            OValue::Error { msg } => format!("<error: {}>", msg),
         }
     }
 }
@@ -857,6 +894,7 @@ impl fmt::Display for OValue {
                     write!(f, "<expr {:?}>", preview)
                 }
             }
+            OValue::Error { msg } => write!(f, "<error: {}>", msg),
         }
     }
 }

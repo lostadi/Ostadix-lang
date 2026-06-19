@@ -6,18 +6,25 @@
 # Group names a collection of them together with a mode that says HOW they
 # relate:
 #
-#   batch(a, b, ...)  — run them together for throughput; yields every result
-#   all(a, b, ...)    — fan-out, every member must succeed; yields every result
+#   batch(a, b, ...)  — run all members; collect every outcome including failures
+#                       (failures are wrapped as OError values, not propagated)
+#   all(a, b, ...)    — all must succeed; any failure aborts the whole group
 #   any(a, b, ...)    — redundancy/fallback; yields the first member to succeed
-#   race(a, b, ...)   — latency competition; yields the first member to settle
+#   race(a, b, ...)   — latency competition; yields the first result to settle
+#                       (NOTE: does not yet cancel losing work)
 #
 # A Group performs no work on its own. It is forced by `now(group)`, by
 # `autonomous(group)`, or at document end under Autonomous policy.
 #
-# MVP NOTE: the runtime is synchronous (no async, no Tokio, no cancellation),
-# so `any` and `race` both resolve members left-to-right and return the first
-# success. The mode is preserved in the value so a future concurrent scheduler
-# can honour the true topology.
+# IMPORTANT: batch/all/any/race are SPECIAL FORMS — their arguments are
+# evaluated under Lazy policy regardless of the surrounding evaluation policy.
+# This means:
+#
+#   batch(realise(instantiate($e1)), realise(instantiate($e2)))
+#
+# always captures Request chains, never pre-resolved values. You do NOT need
+# to wrap in lazy(...) to get meaningful group coordination — the group
+# constructor handles deferral automatically.
 
 # ── Group over plain values (runs without Nix) ───────────────────────────────
 # nix_expr^ produces a NixExpr value WITHOUT invoking Nix, so this section is
@@ -33,24 +40,39 @@ let bundle = batch($e1, $e2, $e3)
 # result is an OList of the three values, in order.
 let collected = now($bundle)
 
-# any(...) yields the FIRST member (single winner), not a list.
+# any(...) yields the FIRST successful member (single winner), not a list.
+# If the first member fails, any() tries the next, and so on.
 let first = now(any($e1, $e2, $e3))
 
+# race(...) yields the FIRST result to settle, whether success or failure.
+# In sequential mode the first member always settles first.
+# NOTE: Race does not yet cancel remaining work — in concurrent mode other
+# threads run to completion but their results are discarded.
+let winner = now(race($e1, $e2, $e3))
+
 # ── Group over deferred Requests (needs a working Nix; commented) ─────────────
-# Under lazy(...) the inner instantiate/realise Requests are constructed but
-# NOT performed, so the batch holds three unforced Request chains. now($builds)
-# then forces them all and returns a list of StorePaths.
+# Because batch() is a special form, you can write this directly:
+#
+#let builds = batch(
+#    realise(instantiate($e1)),
+#    realise(instantiate($e2)),
+#    realise(instantiate($e3))
+#)
+#let paths = now($builds)
+#
+# The `lazy(batch(...))` wrapper is NO LONGER NEEDED — batch() already captures
+# its arguments lazily. The above is equivalent to the old:
 #
 #let builds = lazy(batch(
 #    realise(instantiate($e1)),
 #    realise(instantiate($e2)),
 #    realise(instantiate($e3))
 #))
-#let paths = now($builds)
 #
-# autonomous(batch(...)) is the MVP scheduler integration: the inner Requests
-# are buffered, the scheduler dispatches the independent ones concurrently at
-# the end of the block, and the batch is resolved into a list of results.
+# autonomous(batch(...)) is the scheduler integration: the inner Requests are
+# buffered, the scheduler dispatches them concurrently (up to parallelism cap),
+# and the batch resolves into a list of StorePaths from the cache.
+# On cache miss after flush, a hard error is returned (CacheMode::Strict).
 #
 #let scheduled = autonomous(batch(
 #    realise(instantiate($e1)),
@@ -64,8 +86,14 @@ markdown^(
 - batch group (unforced): `$bundle`
 - batch forced (collects all): $collected
 - any group (first winner): `$first`
+- race group (first to settle): `$winner`
 
 A `Group` is a control value: spliced raw it renders as a marker (above), and
-forced with `now(...)` it resolves per its topology mode — `batch`/`all`
-collect every result into a list, while `any`/`race` yield a single winner.
+forced with `now(...)` it resolves per its topology mode.
+
+**Mode semantics:**
+- `batch`: collects ALL outcomes; failures become `OError` values in the list
+- `all`: hard barrier — any failure aborts the entire group
+- `any`: returns the first SUCCESS; tries members in order; fails only if all fail
+- `race`: returns the first SETTLEMENT (Ok or Err); does not cancel losing work
 )_markdown
