@@ -1,4 +1,5 @@
-<img width="1200" height="400" alt="svgviewer-png-output" src="https://github.com/user-attachments/assets/46303629-a640-4c8d-8c90-d5981bf4e3ae" />
+<img width="632" height="176" alt="Screenshot 2026-06-19 at 7 16 34 PM" src="https://github.com/user-attachments/assets/ef509d0d-1b90-45be-bcdf-94142849fcc5" />
+
 
 
 # Olang: Ouroboros Language
