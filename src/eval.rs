@@ -3582,4 +3582,159 @@ mod tests {
         assert!(!Evaluator::is_threadable_member(&OValue::str_("hello")),
             "string must NOT be threadable");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Group resolution: failure-semantic contract tests
+    //
+    // These tests verify the Resolution Algebra from the OValue::Group spec:
+    //   - Collect-All (Batch/All): entire group fails if ANY member fails.
+    //   - Winner-Take-All (Any):   skips failed members; fails only when ALL fail.
+    //   - Winner-Take-All (Race):  first member's result (Ok or Err) wins
+    //                               immediately; later members are ignored.
+    //
+    // An empty group (constructed directly via OValue::group with no members)
+    // is used as the "always-failing" member: resolve_group bails on it with
+    // "no members to resolve".
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn failing_member(mode: GroupMode) -> OValue {
+        // An empty group always fails when resolved (no members to resolve).
+        OValue::group(mode, vec![])
+    }
+
+    /// `batch(ok_val, failing_group)` — the entire Batch fails because one
+    /// member fails.  Verifies the Collect-All "fail fast" contract.
+    #[test]
+    fn batch_fails_if_any_member_fails() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::Batch,
+            vec![OValue::int(1), failing_member(GroupMode::Batch)],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        assert!(
+            err.contains("batch") || err.contains("no members"),
+            "batch must fail when a member fails, got: {err}"
+        );
+    }
+
+    /// `all(ok_val, failing_group)` — the entire All group fails because one
+    /// member fails.  Behaviourally identical to Batch; intent is all-or-nothing.
+    #[test]
+    fn all_fails_if_any_member_fails() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::All,
+            vec![OValue::str_("ok"), failing_member(GroupMode::All)],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        assert!(
+            err.contains("all") || err.contains("no members"),
+            "all must fail when a member fails, got: {err}"
+        );
+    }
+
+    /// `any(failing_group, ok_val)` — Any skips the first (failing) member and
+    /// returns the second (successful) member.  Verifies fallback semantics.
+    #[test]
+    fn any_skips_failed_member_and_returns_first_success() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::Any,
+            vec![failing_member(GroupMode::Any), OValue::str_("winner")],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let result = e.resolve_group(mode, &members, false).unwrap();
+        assert_eq!(
+            result,
+            OValue::str_("winner"),
+            "any must skip the failed first member and return the second"
+        );
+    }
+
+    /// `any(fail1, fail2)` — Any fails only when EVERY member fails.
+    #[test]
+    fn any_fails_only_when_all_members_fail() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::Any,
+            vec![failing_member(GroupMode::Any), failing_member(GroupMode::Any)],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        assert!(
+            err.contains("any") && err.contains("members failed"),
+            "any must fail when all members fail, got: {err}"
+        );
+    }
+
+    /// `race(failing_group, ok_val)` — sequential Race returns the first member's
+    /// result immediately, even when it is a failure.  The second member is
+    /// never attempted.
+    #[test]
+    fn race_returns_lead_member_failure_immediately() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::Race,
+            vec![failing_member(GroupMode::Race), OValue::str_("never_reached")],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        // Race settles on the first result whether Ok or Err.
+        let err = e.resolve_group(mode, &members, false).unwrap_err().to_string();
+        assert!(
+            err.contains("race") || err.contains("no members"),
+            "race must propagate the lead member's failure, got: {err}"
+        );
+    }
+
+    /// `race(ok_val, ...)` — Race returns the first member's successful result;
+    /// later members are not consulted.
+    #[test]
+    fn race_returns_lead_member_success_immediately() {
+        let mut e = Evaluator::new("/tmp".into());
+        let group = OValue::group(
+            GroupMode::Race,
+            vec![OValue::int(42), OValue::int(99)],
+        );
+        let (mode, members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let result = e.resolve_group(mode, &members, false).unwrap();
+        assert_eq!(result, OValue::int(42),
+            "race must return the lead member's value");
+    }
+
+    /// Member order is preserved in Collect-All results.  `batch(a, b, c)` must
+    /// return `[a, b, c]` in declaration order regardless of resolution timing.
+    #[test]
+    fn batch_result_preserves_member_order() {
+        let mut e = Evaluator::new("/tmp".into());
+        let members = vec![OValue::str_("first"), OValue::str_("second"), OValue::str_("third")];
+        let group = OValue::group(GroupMode::Batch, members.clone());
+        let (mode, grp_members) = match &group {
+            OValue::Group { mode, members, .. } => (*mode, members.clone()),
+            _ => unreachable!(),
+        };
+        let result = e.resolve_group(mode, &grp_members, false).unwrap();
+        assert_eq!(result, OValue::list(members),
+            "batch must preserve member order in the result list");
+    }
 }
