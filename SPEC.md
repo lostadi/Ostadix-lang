@@ -175,6 +175,7 @@ The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 | `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
 | `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
 | `group`       | `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}` | Rust ext; coordination group |
+| `error`       | `{"t":"error","msg":"..."}` | Rust ext; error outcome value (used in Batch results) |
 
 ### 3.1 Coordination groups
 
@@ -184,24 +185,125 @@ group names a collection of them plus a `mode` that says how they relate:
 
 | Builtin            | Mode    | Resolution                                                |
 |--------------------|---------|-----------------------------------------------------------|
-| `batch(a, b, …)`   | `batch` | Run all for throughput; yields an `OList` of every result |
-| `all(a, b, …)`     | `all`   | Fan-out, every member must succeed; yields every result   |
+| `batch(a, b, …)`   | `batch` | Run all members; collect every outcome including failures |
+| `all(a, b, …)`     | `all`   | Every member must succeed; any failure aborts the group   |
 | `any(a, b, …)`     | `any`   | Redundancy/fallback; yields the first member to succeed   |
 | `race(a, b, …)`    | `race`  | Latency competition; yields the first member to settle    |
 
 A group performs no work on its own — it is a control value. It is forced by
 `now(group)`, by `autonomous(group)`, or at document end under Autonomous
-policy. `batch`/`all` collect **all** member results into a list (member order
-preserved); `any`/`race` yield a **single** winning member.
+policy.
 
-Members may be already-resolved values, deferred `ORequest`s (when built under
-`lazy(…)`), or nested groups. The group's `fingerprint` composes from the mode
-and the **ordered** member content identities — member order is semantically
-significant, so it is never sorted.
+### 3.2 Group Semantics
 
-`autonomous(batch(…))` is the MVP scheduler integration: the inner requests are
-buffered, then resolved when the block exits, and the batch resolves into a
-list of results from the cache.
+#### Construction
+
+`batch`, `all`, `any`, and `race` are **special forms**, not ordinary
+functions. Their arguments are evaluated under `Policy::Lazy` regardless of the
+surrounding policy. This means that:
+
+```
+batch(realise(instantiate($e1)), realise(instantiate($e2)))
+```
+
+always builds:
+
+```
+Group(Batch, [Request[Realise(Request[Instantiate(e1)])], ...])
+```
+
+even when the surrounding policy is Eager. Members are captured as deferred
+`ORequest` chains, not pre-resolved values.
+
+#### Member evaluation policy
+
+Group members may be already-resolved values, deferred `ORequest`s (under any
+policy — the group constructor always captures lazily), or nested groups. The
+group's `fingerprint` composes from the mode and the **ordered** member content
+identities — member order is semantically significant and is never sorted.
+
+#### Empty group behavior
+
+A group with no members is rejected at construction time; calling
+`batch()`/`all()`/`any()`/`race()` with zero arguments is a hard error.
+
+#### Batch result shape
+
+`batch(a, b, …)` always returns an `OList` with exactly one element per input
+member, in declaration order.  Failures are NOT fatal: a member that fails is
+wrapped as an `OValue::Error` in the list so every input slot has a
+corresponding output slot. Callers can distinguish success from failure by
+testing `is_error()` on each element.
+
+#### All failure behavior
+
+`all(a, b, …)` is a hard all-or-nothing barrier. If **any** member fails, the
+entire group fails immediately and propagates the first error. Unlike `batch`,
+there is no error wrapping — `all` either returns a full `OList` of successes,
+or returns an error.
+
+#### Any failure behavior
+
+`any(a, b, …)` returns the **first member to succeed**. Members are tried in
+source order; a failing member is skipped and the next is tried. `any` fails
+only when every member has failed, in which case the last error is propagated
+with an aggregate message noting how many members failed.
+
+#### Race settlement behavior
+
+`race(a, b, …)` returns the **first result to settle**, whether it is a success
+or a failure. In sequential mode, the first member always settles first;
+remaining members are not consulted. In concurrent mode (when members are
+threadable Nix-family Requests), the first channel message wins and remaining
+threads run to completion but their results are discarded.
+
+> **Note:** Race does not yet cancel remaining work. After the winner is
+> selected, other threads continue executing and are silently dropped. Full
+> cancellation (via cooperative tokens or subprocess kill) is a future feature.
+
+#### Nested group behavior
+
+Group members may themselves be groups. `resolve_member` recurses into nested
+groups with the same `CacheMode`, so:
+
+```
+all(any(a, b), batch(c))
+```
+
+resolves as `[first_success_of(a,b), [c]]` — inner topologies are respected.
+
+#### Cancellation status
+
+Race does not cancel losers. Any and Race over concurrent members may leave
+background threads running after the winner is selected. Cooperative
+cancellation is planned for a future release.
+
+#### Cache behavior
+
+Two resolution modes are used internally:
+
+- `CacheMode::Fresh` — force each member via the active executor; used by
+  `now(group)`. This is the standard "resolve right now" path.
+- `CacheMode::Strict` — read each member from the scheduler/eval cache; a
+  cache miss is a hard error. Used after `autonomous(...)` flush to verify the
+  scheduler materialized every buffered request.
+
+A `CacheMode::Lenient` fallback (return unchanged on miss) exists for
+inspection/debugging but is not used in production resolution paths.
+
+#### Scheduler guarantees
+
+Under `autonomous(batch(…))`:
+
+1. The inner requests are buffered (not executed) while evaluating the body.
+2. At block exit, the autonomous scheduler flushes the buffer concurrently,
+   up to `scheduler.parallelism` threads at a time.
+3. Results are written to the L1 memory cache and the L2 disk cache.
+4. The batch group is resolved from the cache using `CacheMode::Strict` — a
+   cache miss after flush is a hard error, not a silent fallback.
+
+`now(group)` uses the same `resolve_group` path but with `CacheMode::Fresh`,
+dispatching threadable members in batches capped at `scheduler.parallelism`.
 
 Design principles:
 

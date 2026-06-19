@@ -213,7 +213,7 @@ pub struct AutonomousScheduler {
     /// directory, etc.).
     disk_cache: Option<DiskCache>,
     /// Maximum number of concurrent threads per dispatch wave.
-    parallelism: usize,
+    pub(crate) parallelism: usize,
 }
 
 impl AutonomousScheduler {
