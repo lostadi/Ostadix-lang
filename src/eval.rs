@@ -20,6 +20,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -54,6 +56,28 @@ use crate::value::{OValue, RequestKind, GroupMode};
 
 fn is_pure_backend(lang: &str) -> bool {
     BackendRegistry::global().is_pure(lang)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// exec_nix_kind — thread-safe Nix-family dispatcher
+//
+// Executes a single Nix-family RequestKind against an already-resolved source
+// value. Called inside group-resolution threads; takes no `self` reference so
+// it can be safely moved into `thread::spawn` closures.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn exec_nix_kind(kind: RequestKind, src: OValue) -> Result<OValue> {
+    match kind {
+        RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
+        RequestKind::Realise     => nix_ops::realise_nix(&src),
+        RequestKind::Activate { profile, dry_run } => {
+            nixos_ops::activate_nix(&src, &profile, dry_run)
+        }
+        RequestKind::Eval { .. } => bail!(
+            "exec_nix_kind: RequestKind::Eval must not appear in concurrent \
+             group dispatch (Eval requests are always executed serially)"
+        ),
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -412,6 +436,38 @@ impl Evaluator {
         matches!(v, OValue::Request { kind, .. } if !matches!(kind, RequestKind::Eval { .. }))
     }
 
+    /// Returns `true` if `m` is a Nix-family Request (Instantiate, Realise, or
+    /// Activate) that can be dispatched to a background thread during concurrent
+    /// group resolution. Eval Requests are excluded because they require the
+    /// ProcessRegistry (which is !Send) and must stay on the evaluator thread.
+    fn is_threadable_member(m: &OValue) -> bool {
+        Self::is_schedulable_request(m)
+    }
+
+    /// Pre-resolve the source chain of a Nix-family Request, returning
+    /// `(kind, resolved_source)` ready for hand-off to a worker thread.
+    ///
+    /// If the Request's source is itself a Request (e.g. the `drv` inside
+    /// `realise(instantiate(expr))`), it is executed via `force_request` on
+    /// the evaluator thread before the outer operation is dispatched to a
+    /// worker. Source chains are therefore resolved sequentially per member,
+    /// but independent members can still execute their outer operations
+    /// concurrently.
+    fn pre_resolve_nix_request(&mut self, req: &OValue) -> Result<(RequestKind, OValue)> {
+        let (kind, source) = match req {
+            OValue::Request { kind, source, .. } => (kind.clone(), source.as_ref().clone()),
+            other => bail!(
+                "pre_resolve_nix_request: expected a Nix-family Request, got {}",
+                other.type_name()
+            ),
+        };
+        let resolved_source = match source {
+            OValue::Request { .. } => self.force_request(&source)?,
+            concrete => concrete,
+        };
+        Ok((kind, resolved_source))
+    }
+
     /// Resolve a single group member to a concrete value.
     ///
     /// `from_cache = false` forces the member fresh (via `force_request`, which
@@ -438,14 +494,22 @@ impl Evaluator {
 
     /// Resolve a Group to a concrete value according to its topology `mode`.
     ///
-    /// - `Batch` / `All` → an `OList` of every member's resolved result, in
-    ///   member order. Any member failure aborts the whole resolution
-    ///   (all-or-nothing).
-    /// - `Any` / `Race` → the first member that resolves successfully, trying
-    ///   members left-to-right. Fails only if every member fails.
+    /// Concurrency model:
+    ///   When `from_cache` is `false` and any member is a threadable Nix-family
+    ///   Request, members are dispatched concurrently:
+    ///   - `Batch`/`All`  → all members run in parallel; result is an `OList`
+    ///     of every resolved value in member order. For `All`, any failure
+    ///     aborts the whole group.
+    ///   - `Any`  → all threadable members run in parallel; the first `Ok`
+    ///     result wins. Fails only when every member fails.
+    ///   - `Race` → all threadable members run in parallel; the first result
+    ///     to settle (success **or** failure) is returned immediately.
     ///
-    /// `from_cache` is forwarded to `resolve_member` — `false` forces members,
-    /// `true` reads results that a prior autonomous flush already cached.
+    ///   Eval Requests and plain values are always resolved serially on the
+    ///   evaluator thread (Eval needs the ProcessRegistry which is !Send).
+    ///
+    /// When `from_cache` is `true` (after an autonomous flush), results are
+    /// already in L1 memory; sequential cache reads are used throughout.
     fn resolve_group(
         &mut self,
         mode:       GroupMode,
@@ -455,26 +519,222 @@ impl Evaluator {
         if members.is_empty() {
             bail!("{}(...) group has no members to resolve", mode.name());
         }
+
+        // Cache reads are fast (L1 memory); no threading benefit.
+        // Also use the sequential path when no Nix-family Requests are present.
+        let has_threadable = !from_cache && members.iter().any(Self::is_threadable_member);
+
         if mode.collects_all() {
-            let mut out = Vec::with_capacity(members.len());
-            for m in members {
-                out.push(self.resolve_member(m, from_cache)?);
+            if has_threadable {
+                self.resolve_collect_all_concurrent(mode, members)
+            } else {
+                // Sequential: plain values, Eval Requests, nested Groups, or
+                // from_cache (already-resolved results in L1 memory).
+                let mut out = Vec::with_capacity(members.len());
+                for m in members {
+                    out.push(self.resolve_member(m, from_cache)?);
+                }
+                Ok(OValue::list(out))
             }
-            Ok(OValue::list(out))
         } else {
-            // Any / Race: first successful member wins.
-            let mut last_err: Option<anyhow::Error> = None;
-            for m in members {
-                match self.resolve_member(m, from_cache) {
-                    Ok(v)  => return Ok(v),
-                    Err(e) => last_err = Some(e),
+            // Any / Race: first-wins topology.
+            if has_threadable {
+                self.resolve_first_wins_concurrent(mode, members)
+            } else {
+                match mode {
+                    GroupMode::Any => {
+                        // Try members in source order; return first success.
+                        let mut last_err: Option<anyhow::Error> = None;
+                        for m in members {
+                            match self.resolve_member(m, from_cache) {
+                                Ok(v)  => return Ok(v),
+                                Err(e) => last_err = Some(e),
+                            }
+                        }
+                        Err(last_err.expect("non-empty group must have produced an error"))
+                            .with_context(|| format!(
+                                "any(...) group: all {} members failed", members.len()
+                            ))
+                    }
+                    GroupMode::Race => {
+                        // Sequential race: first member to settle wins.
+                        // In sequential execution the first member always
+                        // settles first — return its result immediately
+                        // (whether Ok or Err) without trying later members.
+                        self.resolve_member(&members[0], from_cache)
+                            .with_context(|| "race(...) group: lead member failed".to_string())
+                    }
+                    _ => unreachable!("Batch/All already handled by collects_all() branch"),
                 }
             }
-            Err(last_err.expect("non-empty group must have produced an error"))
+        }
+    }
+
+    /// Concurrent resolution for `Batch`/`All` groups.
+    ///
+    /// Algorithm:
+    ///   1. Walk members in source order.
+    ///      - Threadable (Nix-family Requests): pre-resolve source chains
+    ///        sequentially, then push `(index, kind, src)` onto the work list.
+    ///      - Serial (plain values, Eval Requests, nested Groups): resolve
+    ///        inline and store the result immediately.
+    ///   2. Spawn one thread per work-list entry; each thread calls
+    ///      `exec_nix_kind` and sends `(index, Result<OValue>)` over a channel.
+    ///   3. Collect thread results (all of them — channel closes when every
+    ///      sender drops).
+    ///   4. Assemble results in member order:
+    ///      - `Batch`: collect all into an `OList` (any member failure is an error).
+    ///      - `All`:   same; the intent is "all must succeed" rather than
+    ///                 "best effort" throughput, but the observable resolution
+    ///                 is identical.
+    fn resolve_collect_all_concurrent(
+        &mut self,
+        mode:    GroupMode,
+        members: &[OValue],
+    ) -> Result<OValue> {
+        // results[i] holds the resolved value (or error) for members[i].
+        // We use the iterator form rather than `vec![None; N]` because
+        // `Result<OValue, anyhow::Error>` does not implement `Clone`.
+        let mut results: Vec<Option<Result<OValue>>> = (0..members.len()).map(|_| None).collect();
+        let mut threadable: Vec<(usize, RequestKind, OValue)> = Vec::new();
+
+        // Phase 1 — classify and pre-resolve.
+        for (i, m) in members.iter().enumerate() {
+            if Self::is_threadable_member(m) {
+                match self.pre_resolve_nix_request(m) {
+                    Ok((kind, src)) => threadable.push((i, kind, src)),
+                    Err(e) => results[i] = Some(Err(e)),
+                }
+            } else {
+                results[i] = Some(self.resolve_member(m, false));
+            }
+        }
+
+        // Phase 2 — spawn threads.
+        if !threadable.is_empty() {
+            let (tx, rx) = mpsc::channel::<(usize, Result<OValue>)>();
+            for (idx, kind, src) in threadable {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    // `send` can only fail if the receiver was dropped (e.g. the
+                    // evaluator thread panicked). Silently ignoring keeps threads
+                    // from panicking on a dead channel and is the intended pattern
+                    // for fire-and-collect thread fans.
+                    let _ = tx.send((idx, exec_nix_kind(kind, src)));
+                });
+            }
+            drop(tx); // channel closes when every spawned sender drops
+
+            // Phase 3 — collect (blocks until all threads complete).
+            for (idx, result) in rx {
+                results[idx] = Some(result);
+            }
+        }
+
+        // Phase 4 — assemble result list.
+        let mut out = Vec::with_capacity(members.len());
+        for (i, slot) in results.into_iter().enumerate() {
+            let val = slot
+                .expect("every member slot must be filled after phases 1-3")
                 .with_context(|| format!(
-                    "{}(...) group: all {} members failed",
-                    mode.name(), members.len()
-                ))
+                    "{}(...) group: member {} failed", mode.name(), i
+                ))?;
+            out.push(val);
+        }
+        Ok(OValue::list(out))
+    }
+
+    /// Concurrent resolution for `Any`/`Race` groups.
+    ///
+    /// Serial (non-threadable) members are evaluated first, in source order.
+    /// For `Any`, a serial success ends resolution immediately; for `Race`, the
+    /// first serial member's result (Ok or Err) ends resolution immediately.
+    ///
+    /// If no serial member wins, all threadable members are dispatched as
+    /// concurrent threads over a shared channel:
+    ///   - `Any`  → blocks on the channel until the first `Ok` arrives; if the
+    ///              channel closes without any success, returns the last error.
+    ///   - `Race` → returns the very first message from the channel, whether
+    ///              it is `Ok` or `Err`; remaining threads run to completion
+    ///              but their results are discarded.
+    fn resolve_first_wins_concurrent(
+        &mut self,
+        mode:    GroupMode,
+        members: &[OValue],
+    ) -> Result<OValue> {
+        let mut threadable: Vec<(RequestKind, OValue)> = Vec::new();
+
+        // Phase 1 — serial members first; they may resolve immediately.
+        for m in members {
+            if Self::is_threadable_member(m) {
+                // Pre-resolve source chain before enqueueing for a thread.
+                let (kind, src) = self.pre_resolve_nix_request(m)?;
+                threadable.push((kind, src));
+            } else {
+                let result = self.resolve_member(m, false);
+                match mode {
+                    GroupMode::Any => {
+                        if result.is_ok() {
+                            return result; // first success wins
+                        }
+                        // Serial member failed — continue to next member.
+                    }
+                    GroupMode::Race => {
+                        // First to settle wins (Ok or Err).
+                        return result.with_context(|| "race(...) group: lead member failed");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        if threadable.is_empty() {
+            // All members were serial and none won (Any: all failed).
+            bail!("{}(...) group: all {} members failed", mode.name(), members.len());
+        }
+
+        // Phase 2 — concurrent dispatch for threadable members.
+        let (tx, rx) = mpsc::channel::<Result<OValue>>();
+        for (kind, src) in threadable {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                // `send` can only fail if the receiver is dropped (evaluator
+                // returned early, e.g. after the first `any` success or the
+                // first `race` settler). Silently ignoring is intentional:
+                // the thread still runs to completion, but its result is simply
+                // discarded by the already-returned caller.
+                let _ = tx.send(exec_nix_kind(kind, src));
+            });
+        }
+        drop(tx);
+
+        match mode {
+            GroupMode::Any => {
+                // Return first Ok; accumulate errors in case all threads fail.
+                let mut last_err: Option<anyhow::Error> = None;
+                for result in rx {
+                    match result {
+                        Ok(v)  => return Ok(v),   // drops rx; remaining threads ignored
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(last_err.expect(
+                        "threadable is non-empty so at least one thread must have sent an error"
+                    ))
+                    .with_context(|| format!(
+                        "any(...) group: all {} members failed", members.len()
+                    ))
+            }
+            GroupMode::Race => {
+                // Return the very first result that settles (Ok or Err).
+                // Dropping `rx` after the first message causes remaining
+                // thread sends to fail silently (we use `let _ = tx.send`).
+                rx.into_iter()
+                    .next()
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("race(...) group: no results received")))
+                    .with_context(|| "race(...) group: winner")
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -3176,5 +3436,150 @@ mod tests {
         // Policy restored and buffer drained.
         assert_eq!(e.policy, Policy::Eager);
         assert!(e.autonomous_buffer.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Concurrent group resolution — new semantics tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `now(race(...))` over plain-value members returns the FIRST member's
+    /// result immediately — race settles on the first value regardless of
+    /// whether it is a success or failure.  With plain values (no threads)
+    /// the sequential path is used; the first value always settles first.
+    #[test]
+    fn now_race_returns_first_member_result() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("a".into(), OValue::str_("first"));
+        scope.insert("b".into(), OValue::str_("second"));
+
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "race".into(),
+                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        // Race returns the first member to settle — always "first" here.
+        assert_eq!(result, OValue::str_("first"));
+    }
+
+    /// `now(race(single_member))` works with exactly one member.
+    #[test]
+    fn now_race_single_member() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("v".into(), OValue::int(42));
+
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "race".into(),
+                args:    vec![ONode::VarRef("v".into())],
+            }],
+        };
+        assert_eq!(e.eval_node(&call, &scope).unwrap(), OValue::int(42));
+    }
+
+    /// `now(any(single_member))` works with exactly one member.
+    #[test]
+    fn now_any_single_member() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("v".into(), OValue::str_("only"));
+
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "any".into(),
+                args:    vec![ONode::VarRef("v".into())],
+            }],
+        };
+        assert_eq!(e.eval_node(&call, &scope).unwrap(), OValue::str_("only"));
+    }
+
+    /// `now(all(...))` is semantically equivalent to `now(batch(...))` for the
+    /// plain-value case: all members must succeed and the result is an OList.
+    #[test]
+    fn now_all_returns_list_identical_to_batch() {
+        let mut e = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert("x".into(), OValue::int(1));
+        scope.insert("y".into(), OValue::int(2));
+
+        let make_call = |fn_name: &str| ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: fn_name.to_string(),
+                args:    vec![ONode::VarRef("x".into()), ONode::VarRef("y".into())],
+            }],
+        };
+
+        let batch_result = e.eval_node(&make_call("batch"), &scope).unwrap();
+        let all_result   = e.eval_node(&make_call("all"),   &scope).unwrap();
+        assert_eq!(batch_result, all_result,
+            "batch and all must produce identical results for plain values");
+        assert_eq!(batch_result,
+            OValue::list(vec![OValue::int(1), OValue::int(2)]));
+    }
+
+    /// `now(race(...))` over pre-resolved Requests (MockExecutor, Eager) returns
+    /// the first member (both are plain StorePaths after Eager resolution, so
+    /// sequential race path is used — first always wins).
+    #[test]
+    fn now_race_of_resolved_requests_returns_first() {
+        let mut e = Evaluator::new("/tmp".into())
+            .with_executor(Box::new(MockExecutor::new()));
+        let scope = scope_with_nix_expr();
+
+        let mk_chain = |var: &str| ONode::Call {
+            fn_name: "realise".into(),
+            args:    vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args:    vec![ONode::VarRef(var.into())],
+            }],
+        };
+        // Under Eager, requests are resolved before race() sees them.
+        // race(sp1, sp2) with plain StorePaths → first member wins.
+        let call = ONode::Call {
+            fn_name: "now".into(),
+            args:    vec![ONode::Call {
+                fn_name: "race".into(),
+                args:    vec![mk_chain("e1"), mk_chain("e2")],
+            }],
+        };
+        let result = e.eval_node(&call, &scope).unwrap();
+        assert!(result.is_store_path(),
+            "race over resolved requests must return a StorePath, got {:?}", result);
+    }
+
+    /// `is_threadable_member` recognises Nix-family Requests and rejects Eval
+    /// Requests and plain values.
+    #[test]
+    fn is_threadable_member_classification() {
+        let nix_expr = OValue::nix_expr("pkgs.hello", vec![]);
+
+        let inst = OValue::request(RequestKind::Instantiate, nix_expr.clone());
+        assert!(Evaluator::is_threadable_member(&inst),
+            "Instantiate Request must be threadable");
+
+        let drv  = OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]);
+        let real = OValue::request(RequestKind::Realise, drv);
+        assert!(Evaluator::is_threadable_member(&real),
+            "Realise Request must be threadable");
+
+        let thunk = OValue::thunk("1+1", vec![]);
+        let eval  = OValue::request(
+            RequestKind::Eval { lang: "python".into(), env_id: 0, cacheable: false },
+            thunk,
+        );
+        assert!(!Evaluator::is_threadable_member(&eval),
+            "Eval Request must NOT be threadable");
+
+        assert!(!Evaluator::is_threadable_member(&OValue::int(1)),
+            "plain value must NOT be threadable");
+        assert!(!Evaluator::is_threadable_member(&OValue::str_("hello")),
+            "string must NOT be threadable");
     }
 }

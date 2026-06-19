@@ -1077,10 +1077,12 @@ collect **all** member results into a list (member order preserved); `any`/`race
 yield a **single** winner. `autonomous(batch(…))` buffers the inner requests and
 lets the scheduler dispatch the independent ones concurrently.
 
-> **MVP note:** the runtime is synchronous (no async, no Tokio, no cancellation),
-> so `any` and `race` both resolve members left-to-right and return the first
-> success. The mode is preserved in the value so a future concurrent scheduler
-> can honour the true topology. See `examples/coordination_groups.O`.
+When `now(group)` is called, Nix-family Request members (`Instantiate`, `Realise`,
+`Activate`) are dispatched as concurrent threads — independent operations run in
+parallel. `any(…)` returns the first `Ok` result; `race(…)` returns the very
+first result that settles, whether success or failure. Eval Requests and plain
+values are always resolved serially on the evaluator thread (Eval needs the
+ProcessRegistry which is `!Send`). Full async I/O and cancellation are future work.
 
 ---
 
