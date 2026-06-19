@@ -668,11 +668,13 @@ impl Evaluator {
         // Phase 2 — spawn threads capped at scheduler.parallelism.
         // Processing in batches of `cap` ensures at most `cap` concurrent
         // Nix operations, matching the autonomous scheduler's parallelism cap.
+        // `parallelism` is validated to be >= 1 at construction time, but we
+        // guard here anyway to avoid zero-sized chunks in pathological configs.
         if !threadable.is_empty() {
             let cap = self.scheduler.parallelism.max(1);
             for chunk in threadable.chunks(cap) {
                 let (tx, rx) = mpsc::channel::<(usize, Result<OValue>)>();
-                for (idx, kind, src) in chunk.to_vec() {
+                for (idx, kind, src) in chunk.iter().cloned() {
                     let tx = tx.clone();
                     thread::spawn(move || {
                         // `send` can only fail if the receiver was dropped
@@ -1687,10 +1689,7 @@ fn render_nix(val: &OValue) -> String {
 
         // An error outcome in a Nix context renders as a string marker that
         // nix eval will reject loudly — errors should not reach Nix source.
-        OValue::Error { msg } => {
-            let msg_lit = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string());
-            format!("\"<error: {}>\"", msg_lit)
-        }
+        OValue::Error { msg } => format!("\"<error: {}>\"", msg.replace('"', "\\\"")),
     }
 }
 
