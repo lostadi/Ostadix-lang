@@ -27,14 +27,14 @@ pub enum ONode {
         expr: Box<ONode>,
     },
     TypedExpr {
-        lang:   String,
+        lang: String,
         env_id: u32,
         /// STEP-3.5: optional attribute parsed from `{ident}` on the tag.
         /// `None` for plain `lang^(...)_lang`; `Some("lazy")` for
         /// `lang{lazy}^(...)_lang{lazy}`; `Some("defer")` for `{defer}`.
         /// The evaluator dispatches on this when present.
-        attr:   Option<String>,
-        body:   Vec<ONode>,
+        attr: Option<String>,
+        body: Vec<ONode>,
     },
 
     /// A function call: `name(arg1, arg2, ...)`.
@@ -52,23 +52,23 @@ pub enum ONode {
     /// would be ambiguous). STEP3 may lift this.
     Call {
         fn_name: String,
-        args:    Vec<ONode>,
+        args: Vec<ONode>,
     },
 }
 
 #[derive(Debug, Clone)]
 struct Tag {
-    lang:   String,
+    lang: String,
     env_id: u32,
     /// STEP-3.5: optional `{ident}` attribute on the language tag.
     /// e.g. `python{lazy}^(...)_python{lazy}` → attr = Some("lazy").
     /// Single attribute for now; multi-attribute `{a,b}` is a later parser
     /// change. The attribute travels with the tag through evaluation.
-    attr:   Option<String>,
+    attr: Option<String>,
     /// The raw text of the tag — used to construct the closer match string.
     /// Includes the lang, the optional `[N]` env, and the optional `{attr}`,
     /// in source order.
-    raw:    String,
+    raw: String,
 }
 
 pub struct Parser<'a> {
@@ -161,7 +161,9 @@ impl<'a> Parser<'a> {
                         self.pos = temp_pos;
                         false
                     };
-                    if had_opener { continue; }
+                    if had_opener {
+                        continue;
+                    }
 
                     // Check if the matching closer follows the backslash.
                     if let Some(tag) = expected_closer {
@@ -343,9 +345,7 @@ impl<'a> Parser<'a> {
         // registered backend (or `name[N](`). For a call we want plain
         // `name(` with `name` NOT being a registered backend (otherwise it
         // would be ambiguous with a typed expression with no body).
-        if self.registered_backends.contains(&name)
-            || self.current_byte() != Some(b'(')
-        {
+        if self.registered_backends.contains(&name) || self.current_byte() != Some(b'(') {
             self.pos = original_pos;
             self.line = original_line;
             return Ok(None);
@@ -364,33 +364,43 @@ impl<'a> Parser<'a> {
 
             // Each arg is either a VarRef ($name) or a nested Call (name(...)).
             let arg = if self.current_byte() == Some(b'$') {
-                let var = self.try_parse_var_ref()?
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "Line {}: expected variable reference after $", self.line
-                    ))?;
+                let var = self.try_parse_var_ref()?.ok_or_else(|| {
+                    anyhow::anyhow!("Line {}: expected variable reference after $", self.line)
+                })?;
                 ONode::VarRef(var)
             } else if let Some(nested) = self.try_parse_call()? {
                 nested
             } else {
                 bail!(
                     "Line {}: in call `{}(...)`, expected $var or nested call",
-                    self.line, name
+                    self.line,
+                    name
                 );
             };
             args.push(arg);
 
             self.skip_whitespace();
             match self.current_byte() {
-                Some(b',') => { self.advance_one_byte(); self.skip_whitespace(); }
-                Some(b')') => { self.advance_one_byte(); break; }
+                Some(b',') => {
+                    self.advance_one_byte();
+                    self.skip_whitespace();
+                }
+                Some(b')') => {
+                    self.advance_one_byte();
+                    break;
+                }
                 _ => bail!(
                     "Line {}: in call `{}(...)`, expected ',' or ')'",
-                    self.line, name
+                    self.line,
+                    name
                 ),
             }
         }
 
-        Ok(Some(ONode::Call { fn_name: name, args }))
+        Ok(Some(ONode::Call {
+            fn_name: name,
+            args,
+        }))
     }
 
     fn try_parse_var_ref(&mut self) -> Result<Option<String>> {
@@ -479,14 +489,14 @@ impl<'a> Parser<'a> {
                 i += 1;
             }
             if ident_start == i {
-                return Ok(None);   // empty {}
+                return Ok(None); // empty {}
             }
             if i >= bytes.len() || bytes[i] != b'}' {
                 return Ok(None);
             }
 
             attr = Some(self.source[ident_start..i].to_string());
-            i += 1;   // past '}'
+            i += 1; // past '}'
 
             raw.push_str(&self.source[attr_start..i]);
         }
@@ -498,7 +508,12 @@ impl<'a> Parser<'a> {
             // the canonical name. `raw` keeps the source spelling so the
             // closer `)_py` still matches its opener.
             let lang = BackendRegistry::global().canonical(&lang).to_string();
-            Ok(Some(Tag { lang, env_id, attr, raw }))
+            Ok(Some(Tag {
+                lang,
+                env_id,
+                attr,
+                raw,
+            }))
         } else {
             Ok(None)
         }
@@ -628,7 +643,6 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Source reconstruction
 //
@@ -672,7 +686,12 @@ fn reconstruct_node(node: &ONode, buf: &mut String) {
             reconstruct_node(expr, buf);
         }
 
-        ONode::TypedExpr { lang, env_id, attr, body } => {
+        ONode::TypedExpr {
+            lang,
+            env_id,
+            attr,
+            body,
+        } => {
             // opener: lang[N]?{attr}?^(
             buf.push_str(lang);
             if *env_id != u32::MAX {
@@ -785,12 +804,18 @@ mod tests {
             // Body should be raw text — the backslash was consumed and
             // `python^(` emitted as literal text. The inner `1)_python`
             // is also raw text because `)_python` ≠ outer closer `)_python[0]`.
-            let combined: String = body.iter().map(|n| match n {
-                ONode::RawText(s) => s.clone(),
-                _ => "<node>".to_string(),
-            }).collect();
-            assert!(combined.contains("python^(1)_python"),
-                "body should contain literal python^(: {:?}", combined);
+            let combined: String = body
+                .iter()
+                .map(|n| match n {
+                    ONode::RawText(s) => s.clone(),
+                    _ => "<node>".to_string(),
+                })
+                .collect();
+            assert!(
+                combined.contains("python^(1)_python"),
+                "body should contain literal python^(: {:?}",
+                combined
+            );
         } else {
             panic!("expected TypedExpr");
         }
@@ -806,14 +831,18 @@ mod tests {
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(nodes.len(), 1);
         if let ONode::TypedExpr { body, .. } = &nodes[0] {
-            let combined: String = body.iter().map(|n| match n {
-                ONode::RawText(s) => s.clone(),
-                ONode::VarRef(n)  => format!("<VarRef:{n}>"),
-                _                 => "<node>".to_string(),
-            }).collect();
+            let combined: String = body
+                .iter()
+                .map(|n| match n {
+                    ONode::RawText(s) => s.clone(),
+                    ONode::VarRef(n) => format!("<VarRef:{n}>"),
+                    _ => "<node>".to_string(),
+                })
+                .collect();
             assert!(
                 combined.contains("$PATH") && !combined.contains("<VarRef:PATH>"),
-                "bash body should contain literal $PATH, not a VarRef: {:?}", combined
+                "bash body should contain literal $PATH, not a VarRef: {:?}",
+                combined
             );
         } else {
             panic!("expected TypedExpr");
@@ -829,10 +858,13 @@ mod tests {
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(nodes.len(), 1);
         if let ONode::TypedExpr { body, .. } = &nodes[0] {
-            let combined: String = body.iter().map(|n| match n {
-                ONode::RawText(s) => s.clone(),
-                _                 => "<node>".to_string(),
-            }).collect();
+            let combined: String = body
+                .iter()
+                .map(|n| match n {
+                    ONode::RawText(s) => s.clone(),
+                    _ => "<node>".to_string(),
+                })
+                .collect();
             assert!(
                 combined.contains("$((1 + 2))"),
                 "bash body should contain literal $((...)) arithmetic syntax: {:?}",
@@ -850,8 +882,11 @@ mod tests {
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert!(
-            nodes.iter().any(|n| matches!(n, ONode::VarRef(name) if name == "answer")),
-            "unescaped $answer should still be a VarRef: {:?}", nodes
+            nodes
+                .iter()
+                .any(|n| matches!(n, ONode::VarRef(name) if name == "answer")),
+            "unescaped $answer should still be a VarRef: {:?}",
+            nodes
         );
     }
 
@@ -874,9 +909,13 @@ mod tests {
         let nodes = Parser::new(src, &backends).parse().unwrap();
         // The let binding is present; the comment is stripped (whitespace
         // between `)` and `#` may produce a RawText node — that's fine).
-        assert!(nodes.iter().any(|n| matches!(n, ONode::LetBinding { name, .. } if name == "x")));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n, ONode::LetBinding { name, .. } if name == "x")));
         // No Call node for realise should exist.
-        assert!(!nodes.iter().any(|n| matches!(n, ONode::Call { fn_name, .. } if fn_name == "realise")));
+        assert!(!nodes
+            .iter()
+            .any(|n| matches!(n, ONode::Call { fn_name, .. } if fn_name == "realise")));
     }
 
     #[test]
@@ -887,11 +926,18 @@ mod tests {
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(nodes.len(), 1);
         if let ONode::TypedExpr { body, .. } = &nodes[0] {
-            let combined: String = body.iter().map(|n| match n {
-                ONode::RawText(s) => s.clone(),
-                _ => "<node>".to_string(),
-            }).collect();
-            assert!(combined.contains("# Heading"), "markdown body should keep #: {:?}", combined);
+            let combined: String = body
+                .iter()
+                .map(|n| match n {
+                    ONode::RawText(s) => s.clone(),
+                    _ => "<node>".to_string(),
+                })
+                .collect();
+            assert!(
+                combined.contains("# Heading"),
+                "markdown body should keep #: {:?}",
+                combined
+            );
         } else {
             panic!("expected TypedExpr");
         }

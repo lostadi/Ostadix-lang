@@ -31,14 +31,14 @@ use o_lang::value::OValue;
 /// subprocess registry) and the accumulated O-level variable scope.
 struct Session {
     evaluator: Evaluator,
-    scope:     HashMap<String, OValue>,
+    scope: HashMap<String, OValue>,
 }
 
 impl Session {
     fn new(shim_dir: PathBuf, backends: HashSet<String>) -> Self {
         Session {
             evaluator: Evaluator::new(shim_dir).with_registered_backends(backends),
-            scope:     HashMap::new(),
+            scope: HashMap::new(),
         }
     }
 }
@@ -47,7 +47,7 @@ impl Session {
 
 #[derive(Clone)]
 struct AppState {
-    session:  Arc<Mutex<Session>>,
+    session: Arc<Mutex<Session>>,
     shim_dir: Arc<PathBuf>,
     backends: Arc<HashSet<String>>,
 }
@@ -69,20 +69,20 @@ struct EvalRequest {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum EvalOutput {
-    Text  { display: String },
-    Html  { html: String },
+    Text { display: String },
+    Html { html: String },
     Image { mime: String, data: String },
     Null,
 }
 
 #[derive(Serialize)]
 struct EvalResponse {
-    ok:         bool,
+    ok: bool,
     value_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result:     Option<EvalOutput>,
+    result: Option<EvalOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error:      Option<String>,
+    error: Option<String>,
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -91,18 +91,17 @@ async fn root() -> Html<&'static str> {
     Html(NOTEBOOK_HTML)
 }
 
-async fn eval(
-    State(state): State<AppState>,
-    Json(req): Json<EvalRequest>,
-) -> Json<EvalResponse> {
+async fn eval(State(state): State<AppState>, Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
     let session = state.session.clone();
     let backends = state.backends.clone();
-    let code    = req.code.trim().to_string();
+    let code = req.code.trim().to_string();
 
     if code.is_empty() {
         return Json(EvalResponse {
-            ok: true, value_type: "null".into(),
-            result: Some(EvalOutput::Null), error: None,
+            ok: true,
+            value_type: "null".into(),
+            result: Some(EvalOutput::Null),
+            error: None,
         });
     }
 
@@ -115,7 +114,10 @@ async fn eval(
         // Destructure to split the borrow: the compiler cannot prove that
         // `guard.evaluator` and `guard.scope` are disjoint through `guard`
         // alone, but a single destructure makes both sub-borrows visible.
-        let Session { ref mut evaluator, ref mut scope } = *guard;
+        let Session {
+            ref mut evaluator,
+            ref mut scope,
+        } = *guard;
         evaluator.eval_document_with_scope(nodes, scope)
     })
     .await;
@@ -126,19 +128,31 @@ async fn eval(
             let output = match &value {
                 OValue::Null => EvalOutput::Null,
                 OValue::Html { v } => EvalOutput::Html { html: v.clone() },
-                OValue::Blob { v, mime } if mime.starts_with("image/") => {
-                    EvalOutput::Image { mime: mime.clone(), data: v.clone() }
-                }
-                other => EvalOutput::Text { display: format!("{other}") },
+                OValue::Blob { v, mime } if mime.starts_with("image/") => EvalOutput::Image {
+                    mime: mime.clone(),
+                    data: v.clone(),
+                },
+                other => EvalOutput::Text {
+                    display: format!("{other}"),
+                },
             };
-            Json(EvalResponse { ok: true, value_type, result: Some(output), error: None })
+            Json(EvalResponse {
+                ok: true,
+                value_type,
+                result: Some(output),
+                error: None,
+            })
         }
         Ok(Err(e)) => Json(EvalResponse {
-            ok: false, value_type: "error".into(), result: None,
+            ok: false,
+            value_type: "error".into(),
+            result: None,
             error: Some(e.to_string()),
         }),
         Err(e) => Json(EvalResponse {
-            ok: false, value_type: "error".into(), result: None,
+            ok: false,
+            value_type: "error".into(),
+            result: None,
             error: Some(format!("internal: {e}")),
         }),
     }
@@ -177,16 +191,20 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8888));
-    let url  = format!("http://{addr}");
+    let url = format!("http://{addr}");
     let listener = TcpListener::bind(addr).await?;
 
     eprintln!("\x1b[1m\x1b[34m  O ◦ Notebook\x1b[0m");
     eprintln!("  \x1b[2mListening on \x1b[0m\x1b[4m{url}\x1b[0m");
     eprintln!("  \x1b[2mShift+Enter to run a cell · Ctrl+C to stop\x1b[0m\n");
 
-    let _ = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
-        .arg(&url)
-        .spawn();
+    let _ = std::process::Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    })
+    .arg(&url)
+    .spawn();
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -194,13 +212,40 @@ async fn main() -> Result<()> {
 
 fn registered_backends() -> HashSet<String> {
     [
-        "O", "python", "html", "latex", "markdown", "bash", "shell", "rust",
-        "racket", "nix", "nix_expr", "nix_store", "nixos_test", "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
-        "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
+        "O",
+        "python",
+        "html",
+        "latex",
+        "markdown",
+        "bash",
+        "shell",
+        "rust",
+        "racket",
+        "nix",
+        "nix_expr",
+        "nix_store",
+        "nixos_test",
+        "text",
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         "quote",
         // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py", "md", "tex", "plain", "o",
+        "py",
+        "md",
+        "tex",
+        "plain",
+        "o",
     ]
     .into_iter()
     .map(String::from)

@@ -58,7 +58,8 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
 
     let out = Command::new("nix")
         .args([
-            "--extra-experimental-features", "nix-command",
+            "--extra-experimental-features",
+            "nix-command",
             "eval",
             "--raw",
             "--impure",
@@ -99,7 +100,8 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
     // dict's keys (the output names like "out", "dev", "lib").
     let show = Command::new("nix")
         .args([
-            "--extra-experimental-features", "nix-command",
+            "--extra-experimental-features",
+            "nix-command",
             "derivation",
             "show",
             &drv_path,
@@ -129,13 +131,19 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
 ///
 /// We return the keys of the inner `outputs` map.
 fn parse_outputs_from_show(json_bytes: &[u8], drv_path: &str) -> Result<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_slice(json_bytes)
-        .context("nix derivation show produced invalid JSON")?;
+    let v: serde_json::Value =
+        serde_json::from_slice(json_bytes).context("nix derivation show produced invalid JSON")?;
 
-    let outputs_obj = v.get(drv_path)
+    let outputs_obj = v
+        .get(drv_path)
         .and_then(|d| d.get("outputs"))
         .and_then(|o| o.as_object())
-        .ok_or_else(|| anyhow!("nix derivation show JSON missing outputs map for {}", drv_path))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "nix derivation show JSON missing outputs map for {}",
+                drv_path
+            )
+        })?;
 
     Ok(outputs_obj.keys().cloned().collect())
 }
@@ -168,7 +176,8 @@ pub fn realise_nix(source: &OValue) -> Result<OValue> {
 
     let out = Command::new("nix")
         .args([
-            "--extra-experimental-features", "nix-command",
+            "--extra-experimental-features",
+            "nix-command",
             "build",
             &target,
             "--no-link",
@@ -184,7 +193,9 @@ pub fn realise_nix(source: &OValue) -> Result<OValue> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
             "nix build failed while realising {} (exit {:?}):\nSTDERR:\n{}",
-            drv_path, out.status.code(), stderr
+            drv_path,
+            out.status.code(),
+            stderr
         );
     }
 
@@ -225,7 +236,10 @@ mod tests {
         let expr = OValue::nix_expr(body, vec![]);
         let drv = instantiate_nix(&expr).expect("instantiation should succeed");
         assert!(drv.is_derivation());
-        if let OValue::Derivation { drv_path, outputs, .. } = drv {
+        if let OValue::Derivation {
+            drv_path, outputs, ..
+        } = drv
+        {
             assert!(drv_path.starts_with("/nix/store/"));
             assert!(drv_path.ends_with(".drv"));
             assert!(outputs.contains(&"out".to_string()));
@@ -237,12 +251,17 @@ mod tests {
     fn realise_after_instantiate_returns_store_path() {
         let body = "(import <nixpkgs> {}).hello";
         let expr = OValue::nix_expr(body, vec![]);
-        let drv  = instantiate_nix(&expr).expect("instantiation should succeed");
+        let drv = instantiate_nix(&expr).expect("instantiation should succeed");
         let path = realise_nix(&drv).expect("realisation should succeed");
         if let OValue::StorePath { path } = path {
             assert!(path.starts_with("/nix/store/"));
-            assert!(!path.ends_with(".drv"), "realised path should not be a .drv");
-        } else { panic!("expected StorePath"); }
+            assert!(
+                !path.ends_with(".drv"),
+                "realised path should not be a .drv"
+            );
+        } else {
+            panic!("expected StorePath");
+        }
     }
 
     #[test]

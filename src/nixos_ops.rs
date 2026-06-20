@@ -46,11 +46,7 @@ const ACTIVATION_GATE_ENV: &str = "O_LANG_ALLOW_ACTIVATION";
 /// `switch-to-configuration dry-activate`, which logs what would happen
 /// without applying. When false AND the env-var gate is set, we pass
 /// `switch-to-configuration switch`, the real thing.
-pub fn activate_nix(
-    source:  &OValue,
-    profile: &str,
-    dry_run: bool,
-) -> Result<OValue> {
+pub fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OValue> {
     // ── Type check: only StorePath sources are accepted ──────────────────────
     let store_path = match source {
         OValue::StorePath { path } => path.clone(),
@@ -63,9 +59,7 @@ pub fn activate_nix(
             "activate() expected a StorePath, got a NixExpr. The full chain is \
              activate(realise(instantiate($expr)))."
         ),
-        other => bail!(
-            "activate() expected a StorePath, got {}", other.type_name()
-        ),
+        other => bail!("activate() expected a StorePath, got {}", other.type_name()),
     };
 
     // ── Sanity check: the closure must have a switch-to-configuration ────────
@@ -118,7 +112,8 @@ pub fn activate_nix(
     if !out.success() {
         bail!(
             "switch-to-configuration {} exited with status {:?}",
-            effective_action, out.code()
+            effective_action,
+            out.code()
         );
     }
 
@@ -143,15 +138,15 @@ mod tests {
 
     #[test]
     fn activate_rejects_derivation_with_helpful_message() {
-        let drv = OValue::derivation(
-            "/nix/store/abc-system.drv",
-            vec!["out".into()],
-            vec![],
-        );
+        let drv = OValue::derivation("/nix/store/abc-system.drv", vec!["out".into()], vec![]);
         let err = activate_nix(&drv, "/nix/var/nix/profiles/system", true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("realise"), "error should suggest realise(), got: {}", err);
+        assert!(
+            err.contains("realise"),
+            "error should suggest realise(), got: {}",
+            err
+        );
     }
 
     #[test]
@@ -160,8 +155,11 @@ mod tests {
         let err = activate_nix(&expr, "/nix/var/nix/profiles/system", true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("activate(realise(instantiate"),
-            "error should show the full chain, got: {}", err);
+        assert!(
+            err.contains("activate(realise(instantiate"),
+            "error should show the full chain, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -171,8 +169,11 @@ mod tests {
         let err = activate_nix(&bogus, "/nix/var/nix/profiles/system", true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("switch-to-configuration"),
-            "error should mention the missing switch-to-configuration, got: {}", err);
+        assert!(
+            err.contains("switch-to-configuration"),
+            "error should mention the missing switch-to-configuration, got: {}",
+            err
+        );
     }
 
     #[test]

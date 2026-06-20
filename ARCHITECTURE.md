@@ -57,24 +57,31 @@ O-lang processes code through a 5-stage pipeline:
 
 ## Intermediate Representation (OIR)
 
-`src/ir.rs` provides a thin IR/backend interface layer — a stable seam
-between syntax (`ONode`), execution planning (`OIr`), runtime values
-(`OValue`), and backend capabilities (`BackendSpec`):
+`src/ir.rs` now provides the canonical execution-planning surface — a stable
+seam between syntax (`ONode`), lowered instructions (`OIr`), dependency-graph
+planning (`ExecutionPlan`), runtime values (`OValue`), and typed backend
+interfaces (`BackendSpec` / `BackendInterface`):
 
 - **`OIr` / `OIrProgram`** — a lowered, backend-neutral form of a parsed
   program. Lowering (`OIrProgram::lower`) is a 1:1 structural mapping of
   the `ONode` forest: `RawText → Text`, `VarRef → Load`,
   `LetBinding → Store`, `Call → Invoke`, `TypedExpr → Exec`.
+- **`ExecutionPlan`** — the dependency graph built from OIR. Structural
+  edges encode child → parent evaluation dependencies, sequence edges preserve
+  left-to-right order, and data edges connect `load $x` to the latest visible
+  `store $x`. This is the designated home for batching, scheduling, purity-
+  aware reordering, and future code generation.
 - **`BackendSpec` / `BackendRegistry`** — centralized backend metadata:
   purity (whether `{lazy}` may cache results), the splice-rendering
-  strategy used by `render_child`, and shim path resolution
+  strategy used by `render_child`, typed dispatch mode (`inline_ast`,
+  `inline_value`, `shim`), and shim path resolution
   (`<dir>/<lang>_shim.py`, `<dir>/<lang>_shim`, `<dir>/<lang>.py`,
   `<dir>/<lang>`, in that order).
 
-The evaluator still walks `ONode` directly; OIR is currently a
-debug/inspection surface (`olangc --target ir`) and the designated home for
-future execution planning. There is deliberately no native codegen,
-optimizer, SSA, or VM at this layer.
+The evaluator still walks `ONode` directly today, but OIR plus
+`ExecutionPlan` is the contract future schedulers, compilers, and OS-facing
+runtimes must target. There is deliberately no SSA or optimizer yet; the value
+of the layer is that planning decisions are now explicit rather than implicit.
 
 ## Universal Value System (OValue)
 
@@ -95,8 +102,19 @@ Every value crossing language boundaries is represented as one of these types:
 | `ODerivation`  | Nix derivation                       |
 | `OBlob`        | Binary data                          |
 | `OExpr`        | Unevaluated O expression             |
-| `ORequest`     | HTTP/system request                  |
+| `ORequest`     | Deferred computation / control value |
 | `OThunk`       | Deferred computation                 |
+| `OGroup`       | Explicit execution topology          |
+| `OSystem`      | Live OS/profile reference            |
+| `OCapability`  | Authority-bearing resource handle    |
+| `OSnapshot`    | Persistable captured world state     |
+
+The runtime boundary is intentionally split:
+
+- **Pure values** can be cached, replayed, and persisted.
+- **Referential values** identify live world entities by handle, not snapshot.
+- **Effectful values** carry authority or orchestration meaning and must be
+  handled explicitly by schedulers and persistence layers.
 
 ## Backend Shims
 

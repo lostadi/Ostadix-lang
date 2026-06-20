@@ -32,7 +32,9 @@ fn main() -> Result<()> {
         }
         Some("--repl") | Some("-i") => {
             args.next();
-            let shim_dir = args.next().map(PathBuf::from)
+            let shim_dir = args
+                .next()
+                .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("backends"));
             if let Some(extra) = args.next() {
                 print_usage(&mut io::stderr())?;
@@ -44,7 +46,9 @@ fn main() -> Result<()> {
     }
 
     let input_path = args.next().unwrap();
-    let shim_dir = args.next().map(PathBuf::from)
+    let shim_dir = args
+        .next()
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("backends"));
     if let Some(extra) = args.next() {
         print_usage(&mut io::stderr())?;
@@ -55,7 +59,8 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read input file: {}", input_path))?;
 
     if source.starts_with("#!") {
-        source = source.find('\n')
+        source = source
+            .find('\n')
             .map(|nl| source[nl + 1..].to_string())
             .unwrap_or_default();
     }
@@ -65,7 +70,9 @@ fn main() -> Result<()> {
     let nodes = parser.parse().context("failed to parse .O source")?;
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
-    let result = evaluator.eval_document(nodes).context("failed to evaluate .O document")?;
+    let result = evaluator
+        .eval_document(nodes)
+        .context("failed to evaluate .O document")?;
 
     let elapsed = start.elapsed();
     print_result(&result);
@@ -88,7 +95,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  O --help")?;
     writeln!(out)?;
     writeln!(out, "Runs a .O file or starts the interactive REPL.")?;
-    writeln!(out, "With no arguments in an interactive terminal, O starts the REPL.")?;
+    writeln!(
+        out,
+        "With no arguments in an interactive terminal, O starts the REPL."
+    )?;
     Ok(())
 }
 
@@ -111,14 +121,15 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
 
     // Set up rustyline editor with history
     let mut rl = DefaultEditor::new()?;
-    let history_path = std::env::var("HOME").ok()
+    let history_path = std::env::var("HOME")
+        .ok()
         .map(|h| PathBuf::from(h).join(".o_history"));
     if let Some(ref p) = history_path {
         let _ = rl.load_history(p);
     }
 
-    let mut buf  = String::new(); // accumulated multi-line input
-    let mut cont = false;         // in a continuation (unclosed expression)
+    let mut buf = String::new(); // accumulated multi-line input
+    let mut cont = false; // in a continuation (unclosed expression)
 
     loop {
         let prompt = if cont { "  ... " } else { "O> " };
@@ -126,7 +137,8 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
         match rl.readline(prompt) {
             Err(ReadlineError::Interrupted) => {
                 // Ctrl+C — cancel current input, return to fresh prompt
-                buf.clear(); cont = false;
+                buf.clear();
+                cont = false;
                 continue;
             }
             Err(ReadlineError::Eof) => break, // Ctrl+D
@@ -141,9 +153,14 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
 
                         ":r" | ":reset" => {
                             scope.clear();
-                            eprintln!("{}", if color {
-                                "\x1b[90m  [scope cleared]\x1b[0m"
-                            } else { "  [scope cleared]" });
+                            eprintln!(
+                                "{}",
+                                if color {
+                                    "\x1b[90m  [scope cleared]\x1b[0m"
+                                } else {
+                                    "  [scope cleared]"
+                                }
+                            );
                             continue;
                         }
 
@@ -152,22 +169,32 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
                             continue;
                         }
 
-                        ":?" | ":help" => { print_repl_help(color); continue; }
+                        ":?" | ":help" => {
+                            print_repl_help(color);
+                            continue;
+                        }
 
                         "" => continue,
                         _ => {}
                     }
                 }
 
-                if !buf.is_empty() { buf.push('\n'); }
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
                 buf.push_str(trimmed);
 
-                if buf.trim().is_empty() { buf.clear(); cont = false; continue; }
+                if buf.trim().is_empty() {
+                    buf.clear();
+                    cont = false;
+                    continue;
+                }
 
                 let mut parser = Parser::new(&buf, &backends);
                 match parser.parse() {
                     Ok(nodes) if nodes.is_empty() => {
-                        buf.clear(); cont = false;
+                        buf.clear();
+                        cont = false;
                     }
                     Ok(nodes) => {
                         // Add the complete (possibly multi-line) expression to history
@@ -188,7 +215,8 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
                             }
                             Err(e) => eprintln!("{}", fmt_err(&e.to_string(), color)),
                         }
-                        buf.clear(); cont = false;
+                        buf.clear();
+                        cont = false;
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -199,7 +227,8 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
                             cont = true;
                         } else {
                             eprintln!("{}", fmt_err(&msg, color));
-                            buf.clear(); cont = false;
+                            buf.clear();
+                            cont = false;
                         }
                     }
                 }
@@ -211,36 +240,67 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
         let _ = rl.save_history(p);
     }
 
-    eprintln!("{}", if color { "\x1b[90m  bye\x1b[0m" } else { "  bye" });
+    eprintln!(
+        "{}",
+        if color {
+            "\x1b[90m  bye\x1b[0m"
+        } else {
+            "  bye"
+        }
+    );
     Ok(())
 }
 
 fn print_scope(scope: &HashMap<String, OValue>, color: bool) {
     if scope.is_empty() {
-        eprintln!("{}", if color { "\x1b[90m  (no bindings)\x1b[0m" } else { "  (no bindings)" });
+        eprintln!(
+            "{}",
+            if color {
+                "\x1b[90m  (no bindings)\x1b[0m"
+            } else {
+                "  (no bindings)"
+            }
+        );
         return;
     }
     let mut names: Vec<_> = scope.keys().collect();
     names.sort();
-    if color { eprintln!("\x1b[2m  {} binding{}:\x1b[0m", names.len(), if names.len() == 1 { "" } else { "s" }); }
+    if color {
+        eprintln!(
+            "\x1b[2m  {} binding{}:\x1b[0m",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" }
+        );
+    }
     for name in names {
         let val = &scope[name];
         let preview = preview_value(val, color);
-        let badge   = if color { format!("\x1b[90m[{}]\x1b[0m", val.type_name()) }
-                      else     { format!("[{}]", val.type_name()) };
-        if color { eprintln!("  \x1b[35m${name}\x1b[0m = {preview}  {badge}"); }
-        else     { eprintln!("  ${name} = {preview}  {badge}"); }
+        let badge = if color {
+            format!("\x1b[90m[{}]\x1b[0m", val.type_name())
+        } else {
+            format!("[{}]", val.type_name())
+        };
+        if color {
+            eprintln!("  \x1b[35m${name}\x1b[0m = {preview}  {badge}");
+        } else {
+            eprintln!("  ${name} = {preview}  {badge}");
+        }
     }
 }
 
 fn preview_value(val: &OValue, color: bool) -> String {
     let full = format_value(val, color, 0);
     // Flatten newlines and cap at 60 chars for inline display
-    let flat: String = full.chars()
+    let flat: String = full
+        .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
         .take(60)
         .collect();
-    if full.len() > 60 { format!("{flat}…") } else { flat }
+    if full.len() > 60 {
+        format!("{flat}…")
+    } else {
+        flat
+    }
 }
 
 fn print_repl_help(color: bool) {
@@ -277,35 +337,46 @@ fn print_result(value: &OValue) {
     let color = io::stdout().is_terminal();
 
     match value {
-        OValue::Str  { v } => print!("{v}"),
+        OValue::Str { v } => print!("{v}"),
         OValue::Html { v } => print!("{v}"),
         OValue::Null => {
             println!("{}", if color { "\x1b[2mnull\x1b[0m" } else { "null" });
         }
-        OValue::Bool  { v } => println!("{}", colored(v, "\x1b[33m", color)),
-        OValue::Int   { v } => println!("{}", colored(v, "\x1b[36m", color)),
+        OValue::Bool { v } => println!("{}", colored(v, "\x1b[33m", color)),
+        OValue::Int { v } => println!("{}", colored(v, "\x1b[36m", color)),
         OValue::Float { v } => println!("{}", colored(v, "\x1b[36m", color)),
-        OValue::List  { v } => println!("{}", format_list(v, color, 0)),
-        OValue::Map   { v } => println!("{}", format_map(v, color, 0)),
+        OValue::List { v } => println!("{}", format_list(v, color, 0)),
+        OValue::Map { v } => println!("{}", format_map(v, color, 0)),
         other => {
             let t = other.type_name();
             let d = format!("{other}");
-            if color { println!("\x1b[90m[{t}]\x1b[0m {d}") }
-            else     { println!("[{t}] {d}") }
+            if color {
+                println!("\x1b[90m[{t}]\x1b[0m {d}")
+            } else {
+                println!("[{t}] {d}")
+            }
         }
     }
 }
 
 fn colored(v: &dyn std::fmt::Display, code: &str, color: bool) -> String {
-    if color { format!("{code}{v}\x1b[0m") } else { v.to_string() }
+    if color {
+        format!("{code}{v}\x1b[0m")
+    } else {
+        v.to_string()
+    }
 }
 
 fn format_list(items: &[OValue], color: bool, depth: usize) -> String {
     if items.is_empty() {
-        return if color { "\x1b[90m[]\x1b[0m".into() } else { "[]".into() };
+        return if color {
+            "\x1b[90m[]\x1b[0m".into()
+        } else {
+            "[]".into()
+        };
     }
     let indent = "  ".repeat(depth + 1);
-    let close  = "  ".repeat(depth);
+    let close = "  ".repeat(depth);
     let (open_b, close_b) = if color {
         ("\x1b[90m[\x1b[0m", "\x1b[90m]\x1b[0m")
     } else {
@@ -324,10 +395,14 @@ fn format_list(items: &[OValue], color: bool, depth: usize) -> String {
 
 fn format_map(map: &HashMap<String, OValue>, color: bool, depth: usize) -> String {
     if map.is_empty() {
-        return if color { "\x1b[90m{}\x1b[0m".into() } else { "{}".into() };
+        return if color {
+            "\x1b[90m{}\x1b[0m".into()
+        } else {
+            "{}".into()
+        };
     }
     let indent = "  ".repeat(depth + 1);
-    let close  = "  ".repeat(depth);
+    let close = "  ".repeat(depth);
     let (open_b, close_b) = if color {
         ("\x1b[90m{\x1b[0m", "\x1b[90m}\x1b[0m")
     } else {
@@ -338,8 +413,11 @@ fn format_map(map: &HashMap<String, OValue>, color: bool, depth: usize) -> Strin
     let mut out = format!("{open_b}\n");
     for (k, v) in pairs {
         out.push_str(&indent);
-        if color { out.push_str(&format!("\x1b[35m\"{k}\"\x1b[0m: ")) }
-        else     { out.push_str(&format!("{k:?}: ")) }
+        if color {
+            out.push_str(&format!("\x1b[35m\"{k}\"\x1b[0m: "))
+        } else {
+            out.push_str(&format!("{k:?}: "))
+        }
         out.push_str(&format_value(v, color, depth + 1));
         out.push_str(",\n");
     }
@@ -350,18 +428,40 @@ fn format_map(map: &HashMap<String, OValue>, color: bool, depth: usize) -> Strin
 
 fn format_value(v: &OValue, color: bool, depth: usize) -> String {
     match v {
-        OValue::Null        => if color { "\x1b[2mnull\x1b[0m".into() } else { "null".into() },
-        OValue::Bool  { v } => colored(v, "\x1b[33m", color),
-        OValue::Int   { v } => colored(v, "\x1b[36m", color),
+        OValue::Null => {
+            if color {
+                "\x1b[2mnull\x1b[0m".into()
+            } else {
+                "null".into()
+            }
+        }
+        OValue::Bool { v } => colored(v, "\x1b[33m", color),
+        OValue::Int { v } => colored(v, "\x1b[36m", color),
         OValue::Float { v } => colored(v, "\x1b[36m", color),
-        OValue::Str   { v } => if color { format!("\x1b[32m{v:?}\x1b[0m") } else { format!("{v:?}") },
-        OValue::Html  { v } => if color { format!("\x1b[32m{v:?}\x1b[0m") } else { format!("{v:?}") },
-        OValue::List  { v } => format_list(v, color, depth),
-        OValue::Map   { v } => format_map(v, color, depth),
+        OValue::Str { v } => {
+            if color {
+                format!("\x1b[32m{v:?}\x1b[0m")
+            } else {
+                format!("{v:?}")
+            }
+        }
+        OValue::Html { v } => {
+            if color {
+                format!("\x1b[32m{v:?}\x1b[0m")
+            } else {
+                format!("{v:?}")
+            }
+        }
+        OValue::List { v } => format_list(v, color, depth),
+        OValue::Map { v } => format_map(v, color, depth),
         other => {
             let t = other.type_name();
             let d = format!("{other}");
-            if color { format!("\x1b[90m[{t}]\x1b[0m {d}") } else { format!("[{t}] {d}") }
+            if color {
+                format!("\x1b[90m[{t}]\x1b[0m {d}")
+            } else {
+                format!("[{t}] {d}")
+            }
         }
     }
 }
@@ -370,13 +470,40 @@ fn format_value(v: &OValue, color: bool, depth: usize) -> String {
 
 fn registered_backends() -> HashSet<String> {
     [
-        "O", "python", "html", "latex", "markdown", "bash", "shell", "rust",
-        "racket", "nix", "nix_expr", "nix_store", "nixos_test", "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
-        "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
+        "O",
+        "python",
+        "html",
+        "latex",
+        "markdown",
+        "bash",
+        "shell",
+        "rust",
+        "racket",
+        "nix",
+        "nix_expr",
+        "nix_store",
+        "nixos_test",
+        "text",
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         "quote",
         // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py", "md", "tex", "plain", "o",
+        "py",
+        "md",
+        "tex",
+        "plain",
+        "o",
     ]
     .into_iter()
     .map(String::from)
