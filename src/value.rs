@@ -27,9 +27,8 @@ use std::fmt;
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hex;
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
-
+use sha2::{Digest, Sha256};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 1: The OValue Sum Type
@@ -83,7 +82,7 @@ pub enum OValue {
     #[serde(rename = "str")]
     Str { v: String },
     #[serde(rename = "html")]
-    Html  { v: String },
+    Html { v: String },
     #[serde(rename = "store_path")]
     StorePath { path: String },
 
@@ -127,7 +126,7 @@ pub enum OValue {
     /// string; `mime` is a separate field (not inside `v`) because both are
     /// required and neither is "the value" more than the other.
     #[serde(rename = "blob")]
-    Blob { v: String, mime: String },   // v = base64-encoded bytes on wire
+    Blob { v: String, mime: String }, // v = base64-encoded bytes on wire
 
     /// A lazy Nix expression that has not yet been passed to `nix eval`.
     ///
@@ -148,8 +147,8 @@ pub enum OValue {
     /// shortcut that bypasses this rung entirely (step 1 decision, option a).
     #[serde(rename = "nix_expr")]
     NixExpr {
-        body:        String,
-        deps:        Vec<OValue>,
+        body: String,
+        deps: Vec<OValue>,
         fingerprint: String,
     },
 
@@ -166,9 +165,9 @@ pub enum OValue {
     ///   or `realise_all(drv)` returning an OMap of all outputs.
     #[serde(rename = "derivation")]
     Derivation {
-        drv_path: String,         // /nix/store/*.drv — canonical identity
-        outputs:  Vec<String>,    // ["out", "dev", ...] (parsed from `nix derivation show`)
-        deps:     Vec<OValue>,    // child OValues that contributed to this drv (provenance)
+        drv_path: String,     // /nix/store/*.drv — canonical identity
+        outputs: Vec<String>, // ["out", "dev", ...] (parsed from `nix derivation show`)
+        deps: Vec<OValue>,    // child OValues that contributed to this drv (provenance)
     },
 
     /// A request to perform a deferred computation.
@@ -188,8 +187,8 @@ pub enum OValue {
     /// re-fires auto-resolve. The user must explicitly force with `now(...)`.
     #[serde(rename = "request")]
     Request {
-        kind:        RequestKind,
-        source:      Box<OValue>,
+        kind: RequestKind,
+        source: Box<OValue>,
         fingerprint: String,
     },
 
@@ -216,9 +215,7 @@ pub enum OValue {
     /// per-user) can be distinguished. Add Snapshot value type for captured
     /// state at a specific generation. Add Rollback / Update transitions.
     #[serde(rename = "system")]
-    System {
-        profile_path: String,
-    },
+    System { profile_path: String },
 
     /// A capability-scoped reference to a privileged system resource.
     ///
@@ -266,8 +263,8 @@ pub enum OValue {
     /// the Thunk is just the captured payload.
     #[serde(rename = "thunk")]
     Thunk {
-        body:        String,
-        deps:        Vec<OValue>,
+        body: String,
+        deps: Vec<OValue>,
         fingerprint: String,
     },
 
@@ -300,8 +297,8 @@ pub enum OValue {
     /// Wire format: `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}`
     #[serde(rename = "group")]
     Group {
-        mode:        GroupMode,
-        members:     Vec<OValue>,
+        mode: GroupMode,
+        members: Vec<OValue>,
         fingerprint: String,
     },
 
@@ -315,9 +312,7 @@ pub enum OValue {
     ///
     /// Wire format: `{"t":"error","msg":"..."}`
     #[serde(rename = "error")]
-    Error {
-        msg: String,
-    },
+    Error { msg: String },
 }
 
 /// The execution topology of an `OValue::Group`.
@@ -422,9 +417,9 @@ impl GroupMode {
     pub fn name(&self) -> &'static str {
         match self {
             GroupMode::Batch => "batch",
-            GroupMode::All   => "all",
-            GroupMode::Any   => "any",
-            GroupMode::Race  => "race",
+            GroupMode::All => "all",
+            GroupMode::Any => "any",
+            GroupMode::Race => "race",
         }
     }
 
@@ -463,8 +458,8 @@ pub enum RequestKind {
     /// caches by fingerprint) from {defer} (false, any backend, re-runs on
     /// every force, errors on splice).
     Eval {
-        lang:      String,
-        env_id:    u32,
+        lang: String,
+        env_id: u32,
         cacheable: bool,
     },
 
@@ -487,12 +482,8 @@ pub enum RequestKind {
     /// produces the same result") is meaningless for an operation that
     /// changes world state, and a stale cached System reference would lie
     /// about the live state. The executor's cache lookup skips it.
-    Activate {
-        profile: String,
-        dry_run: bool,
-    },
+    Activate { profile: String, dry_run: bool },
 }
-
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 2: Constructors
@@ -502,15 +493,33 @@ pub enum RequestKind {
 // ═════════════════════════════════════════════════════════════════════════════
 
 impl OValue {
-    pub fn null()                   -> Self { OValue::Null }
-    pub fn bool_(b: bool)           -> Self { OValue::Bool  { v: b } }
-    pub fn int(n: i64)              -> Self { OValue::Int   { v: n } }
-    pub fn float(f: f64)            -> Self { OValue::Float { v: f } }
-    pub fn str_(s: impl Into<String>) -> Self { OValue::Str { v: s.into() } }
-    pub fn html(s: impl Into<String>) -> Self { OValue::Html { v: s.into() } }
-    pub fn store_path(path: impl Into<String>) -> Self { OValue::StorePath { path: path.into() } }
-    pub fn list(items: Vec<OValue>) -> Self { OValue::List  { v: items } }
-    pub fn map(entries: HashMap<String, OValue>) -> Self { OValue::Map { v: entries } }
+    pub fn null() -> Self {
+        OValue::Null
+    }
+    pub fn bool_(b: bool) -> Self {
+        OValue::Bool { v: b }
+    }
+    pub fn int(n: i64) -> Self {
+        OValue::Int { v: n }
+    }
+    pub fn float(f: f64) -> Self {
+        OValue::Float { v: f }
+    }
+    pub fn str_(s: impl Into<String>) -> Self {
+        OValue::Str { v: s.into() }
+    }
+    pub fn html(s: impl Into<String>) -> Self {
+        OValue::Html { v: s.into() }
+    }
+    pub fn store_path(path: impl Into<String>) -> Self {
+        OValue::StorePath { path: path.into() }
+    }
+    pub fn list(items: Vec<OValue>) -> Self {
+        OValue::List { v: items }
+    }
+    pub fn map(entries: HashMap<String, OValue>) -> Self {
+        OValue::Map { v: entries }
+    }
 
     /// Construct a lazy Nix expression value.
     ///
@@ -531,7 +540,11 @@ impl OValue {
         identities.sort();
         let composed = format!("{}||{}", body, identities.join("|"));
         let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
-        OValue::NixExpr { body, deps, fingerprint }
+        OValue::NixExpr {
+            body,
+            deps,
+            fingerprint,
+        }
     }
 
     /// Construct an instantiated derivation value.
@@ -543,8 +556,8 @@ impl OValue {
     /// expression that produced this derivation.
     pub fn derivation(
         drv_path: impl Into<String>,
-        outputs:  Vec<String>,
-        deps:     Vec<OValue>,
+        outputs: Vec<String>,
+        deps: Vec<OValue>,
     ) -> Self {
         OValue::Derivation {
             drv_path: drv_path.into(),
@@ -577,8 +590,12 @@ impl OValue {
     pub fn kind_tag(kind: &RequestKind) -> String {
         match kind {
             RequestKind::Instantiate => "instantiate".to_string(),
-            RequestKind::Realise     => "realise".to_string(),
-            RequestKind::Eval { lang, env_id, cacheable } => {
+            RequestKind::Realise => "realise".to_string(),
+            RequestKind::Eval {
+                lang,
+                env_id,
+                cacheable,
+            } => {
                 format!("eval|{}|{}|{}", lang, env_id, cacheable)
             }
             RequestKind::Activate { profile, dry_run } => {
@@ -594,7 +611,9 @@ impl OValue {
     /// the same profile ARE the same System even if the underlying
     /// generation has changed between observations.
     pub fn system(profile_path: impl Into<String>) -> Self {
-        OValue::System { profile_path: profile_path.into() }
+        OValue::System {
+            profile_path: profile_path.into(),
+        }
     }
 
     /// Construct a capability-scoped system resource handle.
@@ -637,7 +656,11 @@ impl OValue {
         identities.sort();
         let composed = format!("{}||{}", body, identities.join("|"));
         let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
-        OValue::Thunk { body, deps, fingerprint }
+        OValue::Thunk {
+            body,
+            deps,
+            fingerprint,
+        }
     }
 
     /// Construct a Group — a first-class collection of computations carrying an
@@ -655,7 +678,11 @@ impl OValue {
         let identities: Vec<String> = members.iter().map(|m| m.content_identity()).collect();
         let composed = format!("group|{}|{}", mode.name(), identities.join("|"));
         let fingerprint = hex::encode(Sha256::digest(composed.as_bytes()));
-        OValue::Group { mode, members, fingerprint }
+        OValue::Group {
+            mode,
+            members,
+            fingerprint,
+        }
     }
 
     /// Construct an error outcome value.
@@ -686,21 +713,15 @@ impl OValue {
     pub fn content_identity(&self) -> String {
         match self {
             OValue::NixExpr { fingerprint, .. } => fingerprint.clone(),
-            OValue::Thunk   { fingerprint, .. } => fingerprint.clone(),
-            OValue::Derivation { drv_path, .. } => {
-                hex::encode(Sha256::digest(drv_path.as_bytes()))
-            }
-            OValue::StorePath { path } => {
-                hex::encode(Sha256::digest(path.as_bytes()))
-            }
+            OValue::Thunk { fingerprint, .. } => fingerprint.clone(),
+            OValue::Derivation { drv_path, .. } => hex::encode(Sha256::digest(drv_path.as_bytes())),
+            OValue::StorePath { path } => hex::encode(Sha256::digest(path.as_bytes())),
             // STEP-4: a System's identity is its profile path. Note this is
             // PURELY REFERENTIAL — the same profile at two different times
             // is "the same" System for caching purposes, even though its
             // generation may differ. That's intentional: callers who care
             // about generation must query the live state explicitly.
-            OValue::System { profile_path } => {
-                hex::encode(Sha256::digest(profile_path.as_bytes()))
-            }
+            OValue::System { profile_path } => hex::encode(Sha256::digest(profile_path.as_bytes())),
             OValue::Capability { kind, identity, .. } => {
                 let composed = format!("capability|{}|{}", kind.name(), identity);
                 hex::encode(Sha256::digest(composed.as_bytes()))
@@ -710,11 +731,12 @@ impl OValue {
                 hex::encode(Sha256::digest(composed.as_bytes()))
             }
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
-            OValue::Group   { fingerprint, .. } => fingerprint.clone(),
+            OValue::Group { fingerprint, .. } => fingerprint.clone(),
             other => {
                 let s = other.splice_repr();
                 hex::encode(Sha256::digest(s.as_bytes()))
-            }        }
+            }
+        }
     }
 
     /// Construct an OBlob from raw bytes and a MIME type.
@@ -722,7 +744,7 @@ impl OValue {
     /// the base64 string, not the raw bytes.
     pub fn blob(data: &[u8], mime: impl Into<String>) -> Self {
         OValue::Blob {
-            v:    B64.encode(data),
+            v: B64.encode(data),
             mime: mime.into(),
         }
     }
@@ -732,7 +754,7 @@ impl OValue {
     pub fn blob_bytes(&self) -> Option<Vec<u8>> {
         match self {
             OValue::Blob { v, .. } => B64.decode(v).ok(),
-            _                      => None,
+            _ => None,
         }
     }
 
@@ -740,62 +762,103 @@ impl OValue {
     pub fn blob_mime(&self) -> Option<&str> {
         match self {
             OValue::Blob { mime, .. } => Some(mime.as_str()),
-            _                         => None,
+            _ => None,
         }
     }
 }
-
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 3: Type predicates
 // ═════════════════════════════════════════════════════════════════════════════
 
 impl OValue {
-    pub fn is_null(&self)  -> bool { matches!(self, OValue::Null) }
-    pub fn is_bool(&self)  -> bool { matches!(self, OValue::Bool  { .. }) }
-    pub fn is_int(&self)   -> bool { matches!(self, OValue::Int   { .. }) }
-    pub fn is_float(&self) -> bool { matches!(self, OValue::Float { .. }) }
-    pub fn is_str(&self)   -> bool { matches!(self, OValue::Str   { .. }) }
-    pub fn is_html(&self) -> bool { matches!(self, OValue::Html { .. }) }
-    pub fn is_store_path(&self) -> bool { matches!(self, OValue::StorePath { .. }) }
-    pub fn is_list(&self)  -> bool { matches!(self, OValue::List  { .. }) }
-    pub fn is_map(&self)   -> bool { matches!(self, OValue::Map   { .. }) }
-    pub fn is_blob(&self)  -> bool { matches!(self, OValue::Blob  { .. }) }
-    pub fn is_nix_expr(&self) -> bool { matches!(self, OValue::NixExpr { .. }) }
-    pub fn is_derivation(&self) -> bool { matches!(self, OValue::Derivation { .. }) }
-    pub fn is_request(&self) -> bool { matches!(self, OValue::Request { .. }) }
-    pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
-    pub fn is_group(&self) -> bool { matches!(self, OValue::Group { .. }) }
-    pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
-    pub fn is_capability(&self) -> bool { matches!(self, OValue::Capability { .. }) }
-    pub fn is_snapshot(&self) -> bool { matches!(self, OValue::Snapshot { .. }) }
-    pub fn is_expr(&self) -> bool { matches!(self, OValue::Expr { .. }) }
-    pub fn is_error(&self) -> bool { matches!(self, OValue::Error { .. }) }
-    pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
+    pub fn is_null(&self) -> bool {
+        matches!(self, OValue::Null)
+    }
+    pub fn is_bool(&self) -> bool {
+        matches!(self, OValue::Bool { .. })
+    }
+    pub fn is_int(&self) -> bool {
+        matches!(self, OValue::Int { .. })
+    }
+    pub fn is_float(&self) -> bool {
+        matches!(self, OValue::Float { .. })
+    }
+    pub fn is_str(&self) -> bool {
+        matches!(self, OValue::Str { .. })
+    }
+    pub fn is_html(&self) -> bool {
+        matches!(self, OValue::Html { .. })
+    }
+    pub fn is_store_path(&self) -> bool {
+        matches!(self, OValue::StorePath { .. })
+    }
+    pub fn is_list(&self) -> bool {
+        matches!(self, OValue::List { .. })
+    }
+    pub fn is_map(&self) -> bool {
+        matches!(self, OValue::Map { .. })
+    }
+    pub fn is_blob(&self) -> bool {
+        matches!(self, OValue::Blob { .. })
+    }
+    pub fn is_nix_expr(&self) -> bool {
+        matches!(self, OValue::NixExpr { .. })
+    }
+    pub fn is_derivation(&self) -> bool {
+        matches!(self, OValue::Derivation { .. })
+    }
+    pub fn is_request(&self) -> bool {
+        matches!(self, OValue::Request { .. })
+    }
+    pub fn is_thunk(&self) -> bool {
+        matches!(self, OValue::Thunk { .. })
+    }
+    pub fn is_group(&self) -> bool {
+        matches!(self, OValue::Group { .. })
+    }
+    pub fn is_system(&self) -> bool {
+        matches!(self, OValue::System { .. })
+    }
+    pub fn is_capability(&self) -> bool {
+        matches!(self, OValue::Capability { .. })
+    }
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, OValue::Snapshot { .. })
+    }
+    pub fn is_expr(&self) -> bool {
+        matches!(self, OValue::Expr { .. })
+    }
+    pub fn is_error(&self) -> bool {
+        matches!(self, OValue::Error { .. })
+    }
+    pub fn is_numeric(&self) -> bool {
+        self.is_int() || self.is_float()
+    }
 
     /// The type name as it appears in the wire protocol `t` field.
     pub fn type_name(&self) -> &'static str {
         match self {
-            OValue::Null      => "null",
-            OValue::Bool  {..} => "bool",
-            OValue::Int   {..} => "int",
-            OValue::Float {..} => "float",
-            OValue::Str   {..} => "str",
-            OValue::Html  { .. } => "html",
+            OValue::Null => "null",
+            OValue::Bool { .. } => "bool",
+            OValue::Int { .. } => "int",
+            OValue::Float { .. } => "float",
+            OValue::Str { .. } => "str",
+            OValue::Html { .. } => "html",
             OValue::StorePath { .. } => "store_path",
-            OValue::List  {..} => "list",
-            OValue::Map   {..} => "map",
-            OValue::Blob  {..} => "blob",
-            OValue::NixExpr {..} => "nix_expr",
-            OValue::Derivation {..} => "derivation",
-            OValue::Request {..} => "request",
-            OValue::Thunk {..} => "thunk",
-            OValue::Group {..} => "group",
-            OValue::System {..} => "system",
+            OValue::List { .. } => "list",
+            OValue::Map { .. } => "map",
+            OValue::Blob { .. } => "blob",
+            OValue::NixExpr { .. } => "nix_expr",
+            OValue::Derivation { .. } => "derivation",
+            OValue::Request { .. } => "request",
+            OValue::Thunk { .. } => "thunk",
+            OValue::Group { .. } => "group",
+            OValue::System { .. } => "system",
             OValue::Capability { .. } => "capability",
             OValue::Snapshot { .. } => "snapshot",
-            OValue::Expr {..} => "expr",
-            OValue::Error {..} => "error",
+            OValue::Expr { .. } => "expr",
+            OValue::Error { .. } => "error",
         }
     }
 
@@ -803,10 +866,10 @@ impl OValue {
     pub fn runtime_boundary(&self) -> RuntimeBoundary {
         match self {
             OValue::System { .. } => RuntimeBoundary::Referential,
-            OValue::Capability { .. } |
-            OValue::Request { .. } |
-            OValue::Group { .. } |
-            OValue::Error { .. } => RuntimeBoundary::Effectful,
+            OValue::Capability { .. }
+            | OValue::Request { .. }
+            | OValue::Group { .. }
+            | OValue::Error { .. } => RuntimeBoundary::Effectful,
             _ => RuntimeBoundary::Pure,
         }
     }
@@ -843,18 +906,17 @@ impl OValue {
 
     /// Whether this value is safe to persist across boots as an inert artifact.
     pub fn is_boot_persistable(&self) -> bool {
-        match self {
-            OValue::System { .. } |
-            OValue::Capability { .. } |
-            OValue::Request {
-                kind: RequestKind::Activate { .. },
-                ..
-            } => false,
-            _ => true,
-        }
+        !matches!(
+            self,
+            OValue::System { .. }
+                | OValue::Capability { .. }
+                | OValue::Request {
+                    kind: RequestKind::Activate { .. },
+                    ..
+                }
+        )
     }
 }
-
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 4: Coercions
@@ -883,7 +945,7 @@ impl OValue {
         match self {
             OValue::Float { v } => Ok(*v),
             // Implicit int → float widening, because this is always safe
-            OValue::Int   { v } => Ok(*v as f64),
+            OValue::Int { v } => Ok(*v as f64),
             other => bail!("Expected float, got {}", other.type_name()),
         }
     }
@@ -910,7 +972,6 @@ impl OValue {
     }
 }
 
-
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 5: Splice representation
 //
@@ -931,30 +992,34 @@ impl OValue {
     /// into the surrounding expression's code string.
     pub fn splice_repr(&self) -> String {
         match self {
-            OValue::Null          => "null".to_string(),
-            OValue::Bool  { v }   => v.to_string(),
-            OValue::Int   { v }   => v.to_string(),
-            OValue::Float { v }   => {
+            OValue::Null => "null".to_string(),
+            OValue::Bool { v } => v.to_string(),
+            OValue::Int { v } => v.to_string(),
+            OValue::Float { v } => {
                 // Always include decimal point — "3" vs "3.0" matters in some langs
-                if v.fract() == 0.0 { format!("{:.1}", v) }
-                else                 { v.to_string() }
-            },
-            OValue::Str   { v }   => v.clone(),
+                if v.fract() == 0.0 {
+                    format!("{:.1}", v)
+                } else {
+                    v.to_string()
+                }
+            }
+            OValue::Str { v } => v.clone(),
             OValue::Html { v } => v.clone(),
             OValue::StorePath { path } => path.clone(),
-            OValue::List  { v }   => {
+            OValue::List { v } => {
                 let items: Vec<String> = v.iter().map(|i| i.splice_repr()).collect();
                 format!("[{}]", items.join(", "))
-            },
-            OValue::Map   { v }   => {
-                let pairs: Vec<String> = v.iter()
+            }
+            OValue::Map { v } => {
+                let pairs: Vec<String> = v
+                    .iter()
                     .map(|(k, val)| format!("{:?}: {}", k, val.splice_repr()))
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
-            },
-            OValue::Blob  { v, mime } => {
+            }
+            OValue::Blob { v, mime } => {
                 format!("data:{};base64,{}", mime, v)
-            },
+            }
             // ONixExpr splices as the raw Nix body — the expression is already
             // valid Nix source text that can be embedded directly in a Nix context.
             OValue::NixExpr { body, .. } => body.clone(),
@@ -971,7 +1036,9 @@ impl OValue {
             // intercepts {defer} Eval requests with an error. If a Request
             // reaches this point, it's an Instantiate/Realise request being
             // spliced into source text — almost certainly a user error.
-            OValue::Request { kind, fingerprint, .. } => {
+            OValue::Request {
+                kind, fingerprint, ..
+            } => {
                 let k = Self::kind_tag(kind);
                 format!("<request:{} fp={}>", k, &fingerprint[..8])
             }
@@ -987,8 +1054,17 @@ impl OValue {
             // Group accidentally embedded in source text is visible rather than
             // silently rendered as a misleading list. Users who want member
             // values spliced should force the group first with `now(...)`.
-            OValue::Group { mode, members, fingerprint } => {
-                format!("<group:{} n={} fp={}>", mode.name(), members.len(), &fingerprint[..8])
+            OValue::Group {
+                mode,
+                members,
+                fingerprint,
+            } => {
+                format!(
+                    "<group:{} n={} fp={}>",
+                    mode.name(),
+                    members.len(),
+                    &fingerprint[..8]
+                )
             }
 
             // An Expr splices as its source text. Splicing a quoted expression
@@ -1022,7 +1098,6 @@ impl OValue {
     }
 }
 
-
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 6: Display
 //
@@ -1034,50 +1109,81 @@ impl OValue {
 impl fmt::Display for OValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OValue::Null          => write!(f, "null"),
-            OValue::Bool  { v }   => write!(f, "{}", v),
-            OValue::Int   { v }   => write!(f, "{}", v),
-            OValue::Float { v }   => write!(f, "{}", v),
-            OValue::Str   { v }   => write!(f, "{:?}", v),
-            OValue::List  { v }   => {
+            OValue::Null => write!(f, "null"),
+            OValue::Bool { v } => write!(f, "{}", v),
+            OValue::Int { v } => write!(f, "{}", v),
+            OValue::Float { v } => write!(f, "{}", v),
+            OValue::Str { v } => write!(f, "{:?}", v),
+            OValue::List { v } => {
                 write!(f, "[")?;
                 for (i, item) in v.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", item)?;
                 }
                 write!(f, "]")
-            },
-            OValue::Map   { v }   => {
+            }
+            OValue::Map { v } => {
                 write!(f, "{{")?;
                 for (i, (k, val)) in v.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{:?}: {}", k, val)?;
                 }
                 write!(f, "}}")
-            },
+            }
             OValue::Html { v } => write!(f, "{}", v),
             OValue::StorePath { path } => write!(f, "{}", path),
-            OValue::Blob  { mime, .. } => write!(f, "<blob:{}>", mime),
-            OValue::NixExpr { fingerprint, deps, .. } => {
+            OValue::Blob { mime, .. } => write!(f, "<blob:{}>", mime),
+            OValue::NixExpr {
+                fingerprint, deps, ..
+            } => {
                 write!(f, "<nix_expr fp={} deps={}>", &fingerprint[..8], deps.len())
-            },
-            OValue::Derivation { drv_path, outputs, .. } => {
-                write!(f, "<derivation {} outputs=[{}]>", drv_path, outputs.join(","))
             }
-            OValue::Request { kind, fingerprint, .. } => {
+            OValue::Derivation {
+                drv_path, outputs, ..
+            } => {
+                write!(
+                    f,
+                    "<derivation {} outputs=[{}]>",
+                    drv_path,
+                    outputs.join(",")
+                )
+            }
+            OValue::Request {
+                kind, fingerprint, ..
+            } => {
                 let k = Self::kind_tag(kind);
                 write!(f, "<request {} fp={}>", k, &fingerprint[..8])
             }
-            OValue::Thunk { fingerprint, deps, .. } => {
+            OValue::Thunk {
+                fingerprint, deps, ..
+            } => {
                 write!(f, "<thunk fp={} deps={}>", &fingerprint[..8], deps.len())
             }
-            OValue::Group { mode, members, fingerprint } => {
-                write!(f, "<group {} n={} fp={}>", mode.name(), members.len(), &fingerprint[..8])
+            OValue::Group {
+                mode,
+                members,
+                fingerprint,
+            } => {
+                write!(
+                    f,
+                    "<group {} n={} fp={}>",
+                    mode.name(),
+                    members.len(),
+                    &fingerprint[..8]
+                )
             }
             OValue::System { profile_path } => {
                 write!(f, "<system {}>", profile_path)
             }
-            OValue::Capability { kind, identity, metadata } => {
+            OValue::Capability {
+                kind,
+                identity,
+                metadata,
+            } => {
                 write!(
                     f,
                     "<capability {} {} meta={}>",
@@ -1086,7 +1192,11 @@ impl fmt::Display for OValue {
                     metadata.len()
                 )
             }
-            OValue::Snapshot { kind, identity, state } => {
+            OValue::Snapshot {
+                kind,
+                identity,
+                state,
+            } => {
                 write!(
                     f,
                     "<snapshot {} {} fields={}>",
@@ -1110,7 +1220,6 @@ impl fmt::Display for OValue {
     }
 }
 
-
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 7: Wire protocol message types
 //
@@ -1132,7 +1241,7 @@ pub enum OWireCommand {
     /// `bindings` are variables to inject before execution — the resolved
     /// values of any `$var` references that appeared in the expression body.
     Exec {
-        code:     String,
+        code: String,
         bindings: HashMap<String, OValue>,
     },
 
@@ -1183,12 +1292,14 @@ impl OWireResponse {
     }
 
     pub fn err(message: impl Into<String>) -> Self {
-        OWireResponse::Err { message: message.into() }
+        OWireResponse::Err {
+            message: message.into(),
+        }
     }
 
     pub fn into_result(self) -> Result<OValue> {
         match self {
-            OWireResponse::Ok  { value }   => Ok(value),
+            OWireResponse::Ok { value } => Ok(value),
             OWireResponse::Err { message } => bail!("{}", message),
             OWireResponse::EvalRequest { src } => bail!(
                 "unexpected eval_request from shim (src: {:?}) — this shim sent \
@@ -1200,7 +1311,6 @@ impl OWireResponse {
     }
 }
 
-
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 8: Error types
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1208,7 +1318,10 @@ impl OWireResponse {
 #[derive(thiserror::Error, Debug)]
 pub enum OValueError {
     #[error("Type mismatch: expected {expected}, got {actual}")]
-    TypeMismatch { expected: &'static str, actual: String },
+    TypeMismatch {
+        expected: &'static str,
+        actual: String,
+    },
 
     #[error("Base64 decode failed for OBlob: {0}")]
     Base64Error(#[from] base64::DecodeError),
@@ -1216,7 +1329,6 @@ pub enum OValueError {
     #[error("JSON serialization error: {0}")]
     JsonError(#[from] serde_json::Error),
 }
-
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 9: Tests
@@ -1261,7 +1373,9 @@ mod tests {
             OValue::blob(b"\x89PNG\r\n", "image/png"),
             OValue::blob(&[], "application/octet-stream"),
             // OExpr round-trips its src string.
-            OValue::Expr { src: "python^(6 * 7)_python".to_string() },
+            OValue::Expr {
+                src: "python^(6 * 7)_python".to_string(),
+            },
             OValue::Expr { src: String::new() },
             OValue::capability(
                 CapabilityKind::Service,
@@ -1275,16 +1389,19 @@ mod tests {
             ),
             // Group round-trips mode + members + fingerprint.
             OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]),
-            OValue::group(GroupMode::Race,  vec![OValue::str_("a")]),
+            OValue::group(GroupMode::Race, vec![OValue::str_("a")]),
         ];
 
         for original in &cases {
-            let json    = serde_json::to_string(original)
+            let json = serde_json::to_string(original)
                 .unwrap_or_else(|e| panic!("Serialize failed for {:?}: {}", original, e));
             let decoded: OValue = serde_json::from_str(&json)
                 .unwrap_or_else(|e| panic!("Deserialize failed for {}: {}", json, e));
-            assert_eq!(*original, decoded,
-                "Round-trip failed: {:?} → {} → {:?}", original, json, decoded);
+            assert_eq!(
+                *original, decoded,
+                "Round-trip failed: {:?} → {} → {:?}",
+                original, json, decoded
+            );
         }
     }
 
@@ -1300,7 +1417,7 @@ mod tests {
             code: "print(a + 1)".to_string(),
             bindings,
         };
-        let json    = serde_json::to_string(&cmd).unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
         let _decoded: OWireCommand = serde_json::from_str(&json).unwrap();
         // Verify the cmd tag is present and correct
         assert!(json.contains(r#""cmd":"exec""#));
@@ -1312,14 +1429,18 @@ mod tests {
         assert!(matches!(decoded, OWireResponse::Ok { .. }));
 
         // EvalRequest/EvalResult round-trip
-        let eval_req = OWireResponse::EvalRequest { src: "python^(42)_python".to_string() };
+        let eval_req = OWireResponse::EvalRequest {
+            src: "python^(42)_python".to_string(),
+        };
         let json = serde_json::to_string(&eval_req).unwrap();
         assert!(json.contains(r#""status":"eval_request""#));
         assert!(json.contains(r#""src":"python^(42)_python""#));
         let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, OWireResponse::EvalRequest { .. }));
 
-        let eval_result = OWireCommand::EvalResult { value: OValue::int(42) };
+        let eval_result = OWireCommand::EvalResult {
+            value: OValue::int(42),
+        };
         let json = serde_json::to_string(&eval_result).unwrap();
         assert!(json.contains(r#""cmd":"eval_result""#));
         let decoded: OWireCommand = serde_json::from_str(&json).unwrap();
@@ -1331,26 +1452,43 @@ mod tests {
     #[test]
     fn type_names_match_wire_tags() {
         let cases = vec![
-            (OValue::null(),          "null"),
-            (OValue::bool_(true),     "bool"),
-            (OValue::int(0),          "int"),
-            (OValue::float(0.0),      "float"),
-            (OValue::str_(""),        "str"),
-            (OValue::list(vec![]),    "list"),
+            (OValue::null(), "null"),
+            (OValue::bool_(true), "bool"),
+            (OValue::int(0), "int"),
+            (OValue::float(0.0), "float"),
+            (OValue::str_(""), "str"),
+            (OValue::list(vec![]), "list"),
             (OValue::map(HashMap::new()), "map"),
-            (OValue::blob(&[], ""),   "blob"),
-            (OValue::Expr { src: "x".to_string() }, "expr"),
-            (OValue::capability(CapabilityKind::File, "/etc/hosts", HashMap::new()), "capability"),
-            (OValue::snapshot(SnapshotKind::Service, "svc:sshd", HashMap::new()), "snapshot"),
-            (OValue::group(GroupMode::Batch, vec![OValue::int(1)]), "group"),
+            (OValue::blob(&[], ""), "blob"),
+            (
+                OValue::Expr {
+                    src: "x".to_string(),
+                },
+                "expr",
+            ),
+            (
+                OValue::capability(CapabilityKind::File, "/etc/hosts", HashMap::new()),
+                "capability",
+            ),
+            (
+                OValue::snapshot(SnapshotKind::Service, "svc:sshd", HashMap::new()),
+                "snapshot",
+            ),
+            (
+                OValue::group(GroupMode::Batch, vec![OValue::int(1)]),
+                "group",
+            ),
         ];
         for (val, expected_tag) in cases {
             assert_eq!(val.type_name(), expected_tag);
-            let json: serde_json::Value = serde_json::from_str(
-                &serde_json::to_string(&val).unwrap()
-            ).unwrap();
-            assert_eq!(json["t"].as_str().unwrap(), expected_tag,
-                "Wire tag mismatch for {}", expected_tag);
+            let json: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&val).unwrap()).unwrap();
+            assert_eq!(
+                json["t"].as_str().unwrap(),
+                expected_tag,
+                "Wire tag mismatch for {}",
+                expected_tag
+            );
         }
     }
 
@@ -1364,11 +1502,11 @@ mod tests {
 
     #[test]
     fn splice_repr_produces_expected_strings() {
-        assert_eq!(OValue::null().splice_repr(),       "null");
-        assert_eq!(OValue::bool_(true).splice_repr(),  "true");
-        assert_eq!(OValue::int(42).splice_repr(),      "42");
-        assert_eq!(OValue::float(3.0).splice_repr(),   "3.0");
-        assert_eq!(OValue::str_("hi").splice_repr(),   "hi");
+        assert_eq!(OValue::null().splice_repr(), "null");
+        assert_eq!(OValue::bool_(true).splice_repr(), "true");
+        assert_eq!(OValue::int(42).splice_repr(), "42");
+        assert_eq!(OValue::float(3.0).splice_repr(), "3.0");
+        assert_eq!(OValue::str_("hi").splice_repr(), "hi");
     }
 
     #[test]
@@ -1415,16 +1553,23 @@ mod tests {
     /// store deps by reference, and round-trip through JSON without loss.
     #[test]
     fn nix_expr_fingerprint_is_sha256_of_body() {
-        let body  = "pkgs.hello";
-        let val   = OValue::nix_expr(body, vec![]);
+        let body = "pkgs.hello";
+        let val = OValue::nix_expr(body, vec![]);
 
         if let OValue::NixExpr { fingerprint, .. } = &val {
             // sha256("pkgs.hello") = 6b0fc1cf4a0e73a498b0bd6b0d0e6ab91e01bc59…
             // Just verify it is a 64-hex-character string (256 bits).
-            assert_eq!(fingerprint.len(), 64,
-                "fingerprint should be 64 hex chars (sha256), got {:?}", fingerprint);
-            assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
-                "fingerprint must be hex, got {:?}", fingerprint);
+            assert_eq!(
+                fingerprint.len(),
+                64,
+                "fingerprint should be 64 hex chars (sha256), got {:?}",
+                fingerprint
+            );
+            assert!(
+                fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+                "fingerprint must be hex, got {:?}",
+                fingerprint
+            );
         } else {
             panic!("expected OValue::NixExpr, got {:?}", val);
         }
@@ -1434,8 +1579,19 @@ mod tests {
     fn nix_expr_same_body_produces_same_fingerprint() {
         let a = OValue::nix_expr("pkgs.hello", vec![]);
         let b = OValue::nix_expr("pkgs.hello", vec![]);
-        if let (OValue::NixExpr { fingerprint: fa, .. }, OValue::NixExpr { fingerprint: fb, .. }) = (&a, &b) {
-            assert_eq!(fa, fb, "identical bodies must produce identical fingerprints");
+        if let (
+            OValue::NixExpr {
+                fingerprint: fa, ..
+            },
+            OValue::NixExpr {
+                fingerprint: fb, ..
+            },
+        ) = (&a, &b)
+        {
+            assert_eq!(
+                fa, fb,
+                "identical bodies must produce identical fingerprints"
+            );
         }
     }
 
@@ -1443,15 +1599,26 @@ mod tests {
     fn nix_expr_different_body_produces_different_fingerprint() {
         let a = OValue::nix_expr("pkgs.hello", vec![]);
         let b = OValue::nix_expr("pkgs.world", vec![]);
-        if let (OValue::NixExpr { fingerprint: fa, .. }, OValue::NixExpr { fingerprint: fb, .. }) = (&a, &b) {
-            assert_ne!(fa, fb, "different bodies must produce different fingerprints");
+        if let (
+            OValue::NixExpr {
+                fingerprint: fa, ..
+            },
+            OValue::NixExpr {
+                fingerprint: fb, ..
+            },
+        ) = (&a, &b)
+        {
+            assert_ne!(
+                fa, fb,
+                "different bodies must produce different fingerprints"
+            );
         }
     }
 
     #[test]
     fn nix_expr_deps_are_stored_by_reference() {
-        let dep   = OValue::str_("a_dep");
-        let val   = OValue::nix_expr("some expr", vec![dep.clone()]);
+        let dep = OValue::str_("a_dep");
+        let val = OValue::nix_expr("some expr", vec![dep.clone()]);
         if let OValue::NixExpr { deps, .. } = &val {
             assert_eq!(deps.len(), 1);
             assert_eq!(deps[0], dep);
@@ -1464,7 +1631,7 @@ mod tests {
     fn nix_expr_round_trips_through_json() {
         let dep = OValue::int(42);
         let original = OValue::nix_expr("(builtins.add 1 2)", vec![dep]);
-        let json     = serde_json::to_string(&original).unwrap();
+        let json = serde_json::to_string(&original).unwrap();
         let decoded: OValue = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded, "ONixExpr must round-trip through JSON");
     }
@@ -1479,7 +1646,7 @@ mod tests {
     #[test]
     fn nix_expr_splice_repr_is_body() {
         let body = "pkgs.curl";
-        let val  = OValue::nix_expr(body, vec![]);
+        let val = OValue::nix_expr(body, vec![]);
         assert_eq!(val.splice_repr(), body);
     }
 
@@ -1494,10 +1661,19 @@ mod tests {
         let dep_b = OValue::store_path("/nix/store/bbb-bar");
         let with_a = OValue::nix_expr("pkgs.x", vec![dep_a]);
         let with_b = OValue::nix_expr("pkgs.x", vec![dep_b]);
-        if let (OValue::NixExpr { fingerprint: fa, .. },
-                OValue::NixExpr { fingerprint: fb, .. }) = (&with_a, &with_b) {
-            assert_ne!(fa, fb,
-                "same body + different deps must produce different fingerprints");
+        if let (
+            OValue::NixExpr {
+                fingerprint: fa, ..
+            },
+            OValue::NixExpr {
+                fingerprint: fb, ..
+            },
+        ) = (&with_a, &with_b)
+        {
+            assert_ne!(
+                fa, fb,
+                "same body + different deps must produce different fingerprints"
+            );
         }
     }
 
@@ -1508,10 +1684,19 @@ mod tests {
         let b = OValue::store_path("/nix/store/b");
         let ab = OValue::nix_expr("x", vec![a.clone(), b.clone()]);
         let ba = OValue::nix_expr("x", vec![b, a]);
-        if let (OValue::NixExpr { fingerprint: fab, .. },
-                OValue::NixExpr { fingerprint: fba, .. }) = (&ab, &ba) {
-            assert_eq!(fab, fba,
-                "dep order must not affect fingerprint (identities are sorted)");
+        if let (
+            OValue::NixExpr {
+                fingerprint: fab, ..
+            },
+            OValue::NixExpr {
+                fingerprint: fba, ..
+            },
+        ) = (&ab, &ba)
+        {
+            assert_eq!(
+                fab, fba,
+                "dep order must not affect fingerprint (identities are sorted)"
+            );
         }
     }
 
@@ -1524,11 +1709,18 @@ mod tests {
             vec!["out".into(), "dev".into()],
             vec![],
         );
-        if let OValue::Derivation { drv_path, outputs, deps } = &d {
+        if let OValue::Derivation {
+            drv_path,
+            outputs,
+            deps,
+        } = &d
+        {
             assert_eq!(drv_path, "/nix/store/abc-foo.drv");
             assert_eq!(outputs, &vec!["out".to_string(), "dev".to_string()]);
             assert!(deps.is_empty());
-        } else { panic!("expected Derivation"); }
+        } else {
+            panic!("expected Derivation");
+        }
     }
 
     #[test]
@@ -1538,8 +1730,11 @@ mod tests {
         assert_eq!(id.len(), 64);
         // Same drv_path → same identity
         let d2 = OValue::derivation("/nix/store/abc.drv", vec![], vec![]);
-        assert_eq!(id, d2.content_identity(),
-            "content_identity depends only on drv_path, not outputs/deps");
+        assert_eq!(
+            id,
+            d2.content_identity(),
+            "content_identity depends only on drv_path, not outputs/deps"
+        );
     }
 
     #[test]
@@ -1557,12 +1752,19 @@ mod tests {
     #[test]
     fn request_construction_carries_kind_and_source() {
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr.clone());
-        if let OValue::Request { kind, source, fingerprint } = &req {
+        let req = OValue::request(RequestKind::Instantiate, expr.clone());
+        if let OValue::Request {
+            kind,
+            source,
+            fingerprint,
+        } = &req
+        {
             assert_eq!(*kind, RequestKind::Instantiate);
             assert_eq!(**source, expr);
             assert_eq!(fingerprint.len(), 64);
-        } else { panic!("expected Request"); }
+        } else {
+            panic!("expected Request");
+        }
     }
 
     #[test]
@@ -1571,10 +1773,19 @@ mod tests {
         let e2 = OValue::nix_expr("pkgs.hello", vec![]);
         let r1 = OValue::request(RequestKind::Instantiate, e1);
         let r2 = OValue::request(RequestKind::Instantiate, e2);
-        if let (OValue::Request { fingerprint: f1, .. },
-                OValue::Request { fingerprint: f2, .. }) = (&r1, &r2) {
-            assert_eq!(f1, f2,
-                "two requests with identical-content sources must share a fingerprint");
+        if let (
+            OValue::Request {
+                fingerprint: f1, ..
+            },
+            OValue::Request {
+                fingerprint: f2, ..
+            },
+        ) = (&r1, &r2)
+        {
+            assert_eq!(
+                f1, f2,
+                "two requests with identical-content sources must share a fingerprint"
+            );
         }
     }
 
@@ -1586,11 +1797,20 @@ mod tests {
         //  content-based.)
         let src = OValue::nix_expr("pkgs.hello", vec![]);
         let r_inst = OValue::request(RequestKind::Instantiate, src.clone());
-        let r_real = OValue::request(RequestKind::Realise,     src);
-        if let (OValue::Request { fingerprint: fi, .. },
-                OValue::Request { fingerprint: fr, .. }) = (&r_inst, &r_real) {
-            assert_ne!(fi, fr,
-                "requests must be distinguished by kind in their fingerprint");
+        let r_real = OValue::request(RequestKind::Realise, src);
+        if let (
+            OValue::Request {
+                fingerprint: fi, ..
+            },
+            OValue::Request {
+                fingerprint: fr, ..
+            },
+        ) = (&r_inst, &r_real)
+        {
+            assert_ne!(
+                fi, fr,
+                "requests must be distinguished by kind in their fingerprint"
+            );
         }
     }
 
@@ -1603,12 +1823,21 @@ mod tests {
         let inst = OValue::request(RequestKind::Instantiate, expr);
         let real = OValue::request(RequestKind::Realise, inst.clone());
 
-        if let OValue::Request { fingerprint: outer, .. } = &real {
+        if let OValue::Request {
+            fingerprint: outer, ..
+        } = &real
+        {
             // Recomputing with the same inner produces the same outer fp
             let real2 = OValue::request(RequestKind::Realise, inst);
-            if let OValue::Request { fingerprint: outer2, .. } = &real2 {
-                assert_eq!(outer, outer2,
-                    "chained request fingerprint must be stable across reconstructions");
+            if let OValue::Request {
+                fingerprint: outer2,
+                ..
+            } = &real2
+            {
+                assert_eq!(
+                    outer, outer2,
+                    "chained request fingerprint must be stable across reconstructions"
+                );
             }
         }
     }
@@ -1616,7 +1845,7 @@ mod tests {
     #[test]
     fn request_type_name_and_round_trip() {
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
+        let req = OValue::request(RequestKind::Instantiate, expr);
         assert_eq!(req.type_name(), "request");
         assert!(req.is_request());
         let json = serde_json::to_string(&req).unwrap();
@@ -1633,7 +1862,9 @@ mod tests {
         assert_eq!(s.type_name(), "system");
         if let OValue::System { profile_path } = &s {
             assert_eq!(profile_path, "/nix/var/nix/profiles/system");
-        } else { panic!("expected System"); }
+        } else {
+            panic!("expected System");
+        }
     }
 
     #[test]
@@ -1663,21 +1894,30 @@ mod tests {
     #[test]
     fn activate_request_construction() {
         let path = OValue::store_path("/nix/store/abc-system");
-        let req  = OValue::request(
+        let req = OValue::request(
             RequestKind::Activate {
                 profile: "/nix/var/nix/profiles/system".into(),
                 dry_run: true,
             },
             path,
         );
-        if let OValue::Request { kind, source, fingerprint } = &req {
+        if let OValue::Request {
+            kind,
+            source,
+            fingerprint,
+        } = &req
+        {
             if let RequestKind::Activate { profile, dry_run } = kind {
                 assert_eq!(profile, "/nix/var/nix/profiles/system");
                 assert!(*dry_run);
-            } else { panic!("expected Activate kind"); }
+            } else {
+                panic!("expected Activate kind");
+            }
             assert!(matches!(source.as_ref(), OValue::StorePath { .. }));
             assert_eq!(fingerprint.len(), 64);
-        } else { panic!("expected Request"); }
+        } else {
+            panic!("expected Request");
+        }
     }
 
     /// Activate fingerprints distinguish dry-run vs. real activation.
@@ -1685,16 +1925,29 @@ mod tests {
     #[test]
     fn activate_fingerprint_distinguishes_dry_run() {
         let path = OValue::store_path("/nix/store/abc");
-        let dry  = OValue::request(
-            RequestKind::Activate { profile: "/p".into(), dry_run: true },
+        let dry = OValue::request(
+            RequestKind::Activate {
+                profile: "/p".into(),
+                dry_run: true,
+            },
             path.clone(),
         );
-        let wet  = OValue::request(
-            RequestKind::Activate { profile: "/p".into(), dry_run: false },
+        let wet = OValue::request(
+            RequestKind::Activate {
+                profile: "/p".into(),
+                dry_run: false,
+            },
             path,
         );
-        if let (OValue::Request { fingerprint: f_dry, .. },
-                OValue::Request { fingerprint: f_wet, .. }) = (&dry, &wet) {
+        if let (
+            OValue::Request {
+                fingerprint: f_dry, ..
+            },
+            OValue::Request {
+                fingerprint: f_wet, ..
+            },
+        ) = (&dry, &wet)
+        {
             assert_ne!(f_dry, f_wet);
         }
     }
@@ -1705,10 +1958,19 @@ mod tests {
     fn group_constructor_preserves_mode_and_members() {
         let members = vec![OValue::int(1), OValue::int(2), OValue::int(3)];
         let g = OValue::group(GroupMode::Batch, members.clone());
-        if let OValue::Group { mode, members: m, fingerprint } = &g {
+        if let OValue::Group {
+            mode,
+            members: m,
+            fingerprint,
+        } = &g
+        {
             assert_eq!(*mode, GroupMode::Batch);
             assert_eq!(m, &members);
-            assert_eq!(fingerprint.len(), 64, "group fingerprint must be sha256 hex");
+            assert_eq!(
+                fingerprint.len(),
+                64,
+                "group fingerprint must be sha256 hex"
+            );
             assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
         } else {
             panic!("expected OValue::Group, got {:?}", g);
@@ -1721,10 +1983,11 @@ mod tests {
     fn group_mode_changes_fingerprint() {
         let members = vec![OValue::int(1), OValue::int(2)];
         let batch = OValue::group(GroupMode::Batch, members.clone());
-        let all   = OValue::group(GroupMode::All,   members.clone());
-        let any   = OValue::group(GroupMode::Any,   members.clone());
-        let race  = OValue::group(GroupMode::Race,  members);
-        let fps: Vec<String> = [batch, all, any, race].iter()
+        let all = OValue::group(GroupMode::All, members.clone());
+        let any = OValue::group(GroupMode::Any, members.clone());
+        let race = OValue::group(GroupMode::Race, members);
+        let fps: Vec<String> = [batch, all, any, race]
+            .iter()
             .map(|g| g.content_identity())
             .collect();
         // All four modes over the same members must have distinct identities.
@@ -1739,8 +2002,11 @@ mod tests {
     fn group_member_order_is_significant() {
         let a = OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]);
         let b = OValue::group(GroupMode::Batch, vec![OValue::int(2), OValue::int(1)]);
-        assert_ne!(a.content_identity(), b.content_identity(),
-            "member order must change the group fingerprint (order is semantic)");
+        assert_ne!(
+            a.content_identity(),
+            b.content_identity(),
+            "member order must change the group fingerprint (order is semantic)"
+        );
     }
 
     #[test]
@@ -1756,14 +2022,15 @@ mod tests {
             GroupMode::Race,
             vec![OValue::int(1), OValue::str_("two"), OValue::bool_(true)],
         );
-        let json    = serde_json::to_string(&original).unwrap();
+        let json = serde_json::to_string(&original).unwrap();
         let decoded: OValue = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded, "Group must round-trip through JSON");
     }
 
     #[test]
     fn group_mode_serializes_snake_case() {
-        let json = serde_json::to_string(&OValue::group(GroupMode::Batch, vec![OValue::int(1)])).unwrap();
+        let json =
+            serde_json::to_string(&OValue::group(GroupMode::Batch, vec![OValue::int(1)])).unwrap();
         assert!(json.contains("\"mode\":\"batch\""), "got {json}");
         assert!(json.contains("\"t\":\"group\""), "got {json}");
     }
@@ -1771,9 +2038,9 @@ mod tests {
     #[test]
     fn group_mode_name_and_collects_all() {
         assert_eq!(GroupMode::Batch.name(), "batch");
-        assert_eq!(GroupMode::All.name(),   "all");
-        assert_eq!(GroupMode::Any.name(),   "any");
-        assert_eq!(GroupMode::Race.name(),  "race");
+        assert_eq!(GroupMode::All.name(), "all");
+        assert_eq!(GroupMode::Any.name(), "any");
+        assert_eq!(GroupMode::Race.name(), "race");
         assert!(GroupMode::Batch.collects_all());
         assert!(GroupMode::All.collects_all());
         assert!(!GroupMode::Any.collects_all());
@@ -1784,6 +2051,9 @@ mod tests {
     fn group_splice_repr_is_a_marker() {
         let g = OValue::group(GroupMode::Batch, vec![OValue::int(1)]);
         let s = g.splice_repr();
-        assert!(s.starts_with("<group:batch"), "group splice marker, got {s}");
+        assert!(
+            s.starts_with("<group:batch"),
+            "group splice marker, got {s}"
+        );
     }
 }

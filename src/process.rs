@@ -62,11 +62,11 @@ impl BackendProcess {
     }
 
     fn send_command(&mut self, command: &OWireCommand) -> Result<()> {
-        let line = serde_json::to_string(command)
-            .context("failed to serialize OWireCommand")?;
-        writeln!(self.stdin, "{line}")
-            .context("failed to write command to backend stdin")?;
-        self.stdin.flush().context("failed to flush backend stdin")?;
+        let line = serde_json::to_string(command).context("failed to serialize OWireCommand")?;
+        writeln!(self.stdin, "{line}").context("failed to write command to backend stdin")?;
+        self.stdin
+            .flush()
+            .context("failed to flush backend stdin")?;
         Ok(())
     }
 
@@ -85,9 +85,9 @@ impl BackendProcess {
             .with_context(|| format!("failed to parse backend response: {response_line:?}"))?;
 
         match response {
-            OWireResponse::Ok { value }         => Ok(ExecStep::Done(value)),
-            OWireResponse::Err { message }       => Err(anyhow!("{}", message)),
-            OWireResponse::EvalRequest { src }   => Ok(ExecStep::EvalRequest { src }),
+            OWireResponse::Ok { value } => Ok(ExecStep::Done(value)),
+            OWireResponse::Err { message } => Err(anyhow!("{}", message)),
+            OWireResponse::EvalRequest { src } => Ok(ExecStep::EvalRequest { src }),
         }
     }
 
@@ -96,7 +96,10 @@ impl BackendProcess {
     }
 
     fn exec(&mut self, code: &str, bindings: HashMap<String, OValue>) -> Result<OValue> {
-        self.send_command(&OWireCommand::Exec { code: code.to_string(), bindings })?;
+        self.send_command(&OWireCommand::Exec {
+            code: code.to_string(),
+            bindings,
+        })?;
         match self.recv_step()? {
             ExecStep::Done(v) => Ok(v),
             ExecStep::EvalRequest { src } => Err(anyhow!(
@@ -113,7 +116,8 @@ impl BackendProcess {
         match self.recv_step()? {
             ExecStep::Done(_) => Ok(()),
             ExecStep::EvalRequest { src } => Err(anyhow!(
-                "unexpected eval_request during ping (src: {:?})", &src[..src.len().min(40)]
+                "unexpected eval_request during ping (src: {:?})",
+                &src[..src.len().min(40)]
             )),
         }
     }
@@ -152,14 +156,18 @@ impl ProcessRegistry {
         if !self.registry.contains_key(&key) {
             let mut process = BackendProcess::new(shim_path)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
-            process.ping()
+            process
+                .ping()
                 .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }
         self.registry
             .get_mut(&key)
             .expect("backend was just inserted but is missing")
-            .send_command(&OWireCommand::Exec { code: code.to_string(), bindings })
+            .send_command(&OWireCommand::Exec {
+                code: code.to_string(),
+                bindings,
+            })
             .with_context(|| format!("failed to send Exec to backend `{lang}`"))
     }
 
@@ -201,7 +209,8 @@ impl ProcessRegistry {
         if !self.registry.contains_key(&key) {
             let mut process = BackendProcess::new(shim_path)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
-            process.ping()
+            process
+                .ping()
                 .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }

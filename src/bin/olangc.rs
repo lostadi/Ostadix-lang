@@ -73,12 +73,12 @@ use o_lang::value::OValue;
 // .O programs.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const RUNTIME_VALUE_RS:     &str = include_str!("../value.rs");
-const RUNTIME_PARSER_RS:    &str = include_str!("../parser.rs");
-const RUNTIME_IR_RS:        &str = include_str!("../ir.rs");
-const RUNTIME_EVAL_RS:      &str = include_str!("../eval.rs");
-const RUNTIME_PROCESS_RS:   &str = include_str!("../process.rs");
-const RUNTIME_NIX_OPS_RS:   &str = include_str!("../nix_ops.rs");
+const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
+const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
+const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
+const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
+const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
+const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 
@@ -100,10 +100,19 @@ const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
 // in that directory whose name matches a bundled shim overrides it, and any
 // file with a new name is appended to the embedded set.
 const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
-    ("nix_shim.py",        include_bytes!("../../backends/nix_shim.py")),
-    ("nix_store_shim.py",  include_bytes!("../../backends/nix_store_shim.py")),
-    ("nixos_test_shim.py", include_bytes!("../../backends/nixos_test_shim.py")),
-    ("python_shim.py",     include_bytes!("../../backends/python_shim.py")),
+    ("nix_shim.py", include_bytes!("../../backends/nix_shim.py")),
+    (
+        "nix_store_shim.py",
+        include_bytes!("../../backends/nix_store_shim.py"),
+    ),
+    (
+        "nixos_test_shim.py",
+        include_bytes!("../../backends/nixos_test_shim.py"),
+    ),
+    (
+        "python_shim.py",
+        include_bytes!("../../backends/python_shim.py"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,15 +138,15 @@ enum CompileTarget {
 
 #[derive(ClapParser, Debug)]
 #[command(
-    name    = "olangc",
-    about   = "Compile or run a .O program",
+    name = "olangc",
+    about = "Compile or run a .O program",
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default) \
 or executes it directly in-process (--target script).  In binary mode the \
 output embeds the program source, all backend shim scripts, and the O-lang \
 runtime.  In script mode the program is parsed and evaluated immediately \
 inside the olangc process with no disk output.  In ir mode the program is \
-parsed, lowered to OIR, planned as an ExecutionPlan, and printed.",
+parsed, lowered to OIR, planned as an ExecutionPlan, and printed."
 )]
 struct Cli {
     /// The .O source file to compile or run
@@ -181,14 +190,17 @@ fn main() -> Result<()> {
             let mut output = match cli.output {
                 Some(p) => p,
                 None => {
-                    let stem = cli.input
+                    let stem = cli
+                        .input
                         .file_stem()
-                        .with_context(|| format!("input path has no file stem: {}", cli.input.display()))?
+                        .with_context(|| {
+                            format!("input path has no file stem: {}", cli.input.display())
+                        })?
                         .to_string_lossy();
                     PathBuf::from(stem.as_ref())
                 }
             };
-            
+
             if cli.target == CompileTarget::Wasm {
                 output.set_extension("wasm");
             }
@@ -199,7 +211,14 @@ fn main() -> Result<()> {
             eprintln!("olangc: building in {}", build_dir.display());
             eprintln!("olangc: embedding {} shim script(s)", shims.len());
 
-            let result = compile_to_binary(&cli.input, &source, &shims, &build_dir, &output, cli.target == CompileTarget::Wasm);
+            let result = compile_to_binary(
+                &cli.input,
+                &source,
+                &shims,
+                &build_dir,
+                &output,
+                cli.target == CompileTarget::Wasm,
+            );
 
             if !cli.keep_build_dir {
                 let _ = fs::remove_dir_all(&build_dir);
@@ -209,12 +228,8 @@ fn main() -> Result<()> {
 
             result
         }
-        CompileTarget::Script => {
-            run_as_script(&source, cli.shim_dir.as_deref())
-        }
-        CompileTarget::Ir => {
-            dump_ir(&source)
-        }
+        CompileTarget::Script => run_as_script(&source, cli.shim_dir.as_deref()),
+        CompileTarget::Ir => dump_ir(&source),
     }
 }
 
@@ -224,24 +239,24 @@ fn main() -> Result<()> {
 
 fn compile_to_binary(
     input_path: &Path,
-    source:     &str,
-    shims:      &[(String, Vec<u8>)],
-    build_dir:  &Path,
-    output:     &Path,
-    is_wasm:    bool,
+    source: &str,
+    shims: &[(String, Vec<u8>)],
+    build_dir: &Path,
+    output: &Path,
+    is_wasm: bool,
 ) -> Result<()> {
     let bin_name = derive_bin_name(output);
-    let src_dir  = build_dir.join("src");
+    let src_dir = build_dir.join("src");
     let shim_dir = src_dir.join("shims");
     fs::create_dir_all(&shim_dir)?;
 
     // ── Runtime source files ─────────────────────────────────────────────────
-    fs::write(src_dir.join("value.rs"),     RUNTIME_VALUE_RS)?;
-    fs::write(src_dir.join("parser.rs"),    RUNTIME_PARSER_RS)?;
-    fs::write(src_dir.join("ir.rs"),        RUNTIME_IR_RS)?;
-    fs::write(src_dir.join("eval.rs"),      RUNTIME_EVAL_RS)?;
-    fs::write(src_dir.join("process.rs"),   RUNTIME_PROCESS_RS)?;
-    fs::write(src_dir.join("nix_ops.rs"),   RUNTIME_NIX_OPS_RS)?;
+    fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
+    fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
+    fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
+    fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
+    fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
+    fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
 
@@ -284,7 +299,7 @@ fn compile_to_binary(
     } else {
         eprintln!("olangc: running cargo build --release ...");
     }
-    
+
     let status = Command::new("cargo")
         .args(&cargo_args)
         .current_dir(build_dir)
@@ -297,7 +312,7 @@ fn compile_to_binary(
 
     // ── Copy binary to output ────────────────────────────────────────────────
     let built = built_binary_path(build_dir, &bin_name, is_wasm);
-    let dest  = canonicalize_output(output)?;
+    let dest = canonicalize_output(output)?;
 
     fs::copy(&built, &dest)
         .with_context(|| format!("failed to copy {} → {}", built.display(), dest.display()))?;
@@ -331,8 +346,7 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
     // Script mode still needs shim scripts on disk because the evaluator
     // spawns them as subprocesses (e.g. python_shim.py for python^ blocks).
     let shims = read_shims(override_shim_dir)?;
-    let shim_dir = std::env::temp_dir()
-        .join(format!("o_shims_{}", std::process::id()));
+    let shim_dir = std::env::temp_dir().join(format!("o_shims_{}", std::process::id()));
     fs::create_dir_all(&shim_dir)?;
 
     // RAII guard: clean up the temp shim directory when we leave scope.
@@ -346,8 +360,7 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
 
     for (name, content) in &shims {
         let dest = shim_dir.join(name);
-        fs::write(&dest, content)
-            .with_context(|| format!("failed to extract shim {name}"))?;
+        fs::write(&dest, content).with_context(|| format!("failed to extract shim {name}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -374,9 +387,11 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
     // to casting a function pointer to mmap'd code and invoking it.
     let eval_fn: fn(&Path, HashSet<String>, Vec<o_lang::parser::ONode>) -> Result<OValue> =
         |shim_path, backends, nodes| {
-            let mut evaluator = Evaluator::new(shim_path.to_path_buf())
-                .with_registered_backends(backends);
-            evaluator.eval_document(nodes).context("failed to evaluate program")
+            let mut evaluator =
+                Evaluator::new(shim_path.to_path_buf()).with_registered_backends(backends);
+            evaluator
+                .eval_document(nodes)
+                .context("failed to evaluate program")
         };
 
     let result = eval_fn(&shim_dir, registered_backends, nodes)?;
@@ -418,15 +433,40 @@ fn dump_ir(source: &str) -> Result<()> {
 /// The backend names accepted in language tags — same set as the O interpreter.
 fn registered_backends() -> HashSet<String> {
     [
-        "O", "python", "html", "latex", "markdown", "bash", "shell",
-        "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+        "O",
+        "python",
+        "html",
+        "latex",
+        "markdown",
+        "bash",
+        "shell",
+        "rust",
+        "racket",
+        "nix",
+        "nix_expr",
+        "nix_store",
+        "nixos_test",
         "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
-        "ruby", "matlab", "mathematica", "webassembly", "java",
-        "javascript", "ocaml",
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         "quote",
         // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py", "md", "tex", "plain", "o",
+        "py",
+        "md",
+        "tex",
+        "plain",
+        "o",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -469,7 +509,11 @@ pub mod scheduler;
     .to_string()
 }
 
-fn generate_main_rs(bin_name: &str, program_filename: &str, shim_include_lines: &[String]) -> String {
+fn generate_main_rs(
+    bin_name: &str,
+    program_filename: &str,
+    shim_include_lines: &[String],
+) -> String {
     let shim_entries = if shim_include_lines.is_empty() {
         "    // no shims bundled".to_string()
     } else {
@@ -578,9 +622,9 @@ fn main() -> anyhow::Result<()> {{
     Ok(())
 }}
 "###,
-        bin_name         = bin_name,
+        bin_name = bin_name,
         program_filename = program_filename,
-        shim_entries     = shim_entries,
+        shim_entries = shim_entries,
     )
 }
 
@@ -663,9 +707,9 @@ fn read_shims(override_dir: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>> {
             .with_context(|| format!("failed to read shim directory: {}", dir.display()))?
         {
             let entry = entry?;
-            let path  = entry.path();
+            let path = entry.path();
             if path.is_file() {
-                let name    = path.file_name().unwrap().to_string_lossy().into_owned();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 let content = fs::read(&path)
                     .with_context(|| format!("failed to read shim: {}", path.display()))?;
                 by_name.insert(name, content);
@@ -683,8 +727,7 @@ fn create_build_dir() -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir()
-        .join(format!("olang_build_{}_{}", std::process::id(), ts));
+    let dir = std::env::temp_dir().join(format!("olang_build_{}_{}", std::process::id(), ts));
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -736,7 +779,11 @@ fn sanitize_program_filename(input_path: &Path) -> String {
 /// Platform-aware path to the binary produced by `cargo build --release`.
 fn built_binary_path(build_dir: &Path, bin_name: &str, is_wasm: bool) -> PathBuf {
     if is_wasm {
-        build_dir.join("target").join("wasm32-wasip1").join("release").join(format!("{}.wasm", bin_name))
+        build_dir
+            .join("target")
+            .join("wasm32-wasip1")
+            .join("release")
+            .join(format!("{}.wasm", bin_name))
     } else {
         let name = if cfg!(windows) {
             format!("{bin_name}.exe")

@@ -65,8 +65,8 @@ fn main() -> Result<()> {
     let source = fs::read_to_string(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
-    let entries = unlink_source(&source)
-        .context("failed to extract files from combined .O source")?;
+    let entries =
+        unlink_source(&source).context("failed to extract files from combined .O source")?;
 
     if entries.is_empty() {
         bail!("no linkable file sections found in {}", cli.input.display());
@@ -75,9 +75,7 @@ fn main() -> Result<()> {
     for (path, content) in &entries {
         // Refuse unsafe paths: absolute paths or any `..` component would
         // allow writing outside `output_dir` (path traversal).
-        if path.is_absolute()
-            || path.components().any(|c| c == Component::ParentDir)
-        {
+        if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
             bail!(
                 "unsafe path in marker (absolute or contains '..'): {}",
                 path.display()
@@ -145,7 +143,10 @@ pub fn unlink_source(source: &str) -> Result<Vec<(PathBuf, String)>> {
     {
         let mut pos = 0;
         while pos < source.len() {
-            let line_end = source[pos..].find('\n').map(|n| pos + n + 1).unwrap_or(source.len());
+            let line_end = source[pos..]
+                .find('\n')
+                .map(|n| pos + n + 1)
+                .unwrap_or(source.len());
             let line = source[pos..line_end].trim_end_matches('\n');
             if let Some(path) = parse_path_marker(line) {
                 markers.push((line_end, path));
@@ -356,13 +357,40 @@ fn strip_dash_suffix(s: &str) -> &str {
 
 fn registered_backends() -> HashSet<String> {
     [
-        "O", "python", "html", "latex", "markdown", "bash", "shell", "rust",
-        "racket", "nix", "nix_expr", "nix_store", "nixos_test", "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
-        "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
+        "O",
+        "python",
+        "html",
+        "latex",
+        "markdown",
+        "bash",
+        "shell",
+        "rust",
+        "racket",
+        "nix",
+        "nix_expr",
+        "nix_store",
+        "nixos_test",
+        "text",
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         "quote",
         // Aliases
-        "py", "md", "tex", "plain", "o",
+        "py",
+        "md",
+        "tex",
+        "plain",
+        "o",
     ]
     .into_iter()
     .map(String::from)
@@ -399,7 +427,11 @@ mod tests {
         let idx = find_path_marker(text).unwrap();
         // `# ── ` is 9 bytes: '#', ' ', then two U+2500 box-drawing chars
         // (3 bytes each), then ' '.
-        assert!(text[idx..].starts_with("# ── "), "expected marker at idx {}", idx);
+        assert!(
+            text[idx..].starts_with("# ── "),
+            "expected marker at idx {}",
+            idx
+        );
         // Verify the text before the marker is what we expect.
         assert_eq!(&text[..idx], "some text\n");
     }
@@ -413,11 +445,8 @@ mod tests {
     // ── integration: round-trip through o-link then o-unlink ────────────────
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ounlink_test_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ounlink_test_{}_{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -456,8 +485,16 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let (_, content) = &entries[0];
         // The escaped \$HOME in the source should be decoded to literal $HOME.
-        assert!(content.contains("$HOME"), "\\$HOME should decode to $HOME; got: {:?}", content);
-        assert!(!content.contains("\\$"), "no backslash should remain; got: {:?}", content);
+        assert!(
+            content.contains("$HOME"),
+            "\\$HOME should decode to $HOME; got: {:?}",
+            content
+        );
+        assert!(
+            !content.contains("\\$"),
+            "no backslash should remain; got: {:?}",
+            content
+        );
     }
 
     #[test]
@@ -508,11 +545,13 @@ mod tests {
         let (_, content) = &entries[0];
         assert!(
             content.contains("python^("),
-            "opener escape should resolve; got: {:?}", content
+            "opener escape should resolve; got: {:?}",
+            content
         );
         assert!(
             content.contains(")_python"),
-            "closer escape should resolve; got: {:?}", content
+            "closer escape should resolve; got: {:?}",
+            content
         );
     }
 
@@ -547,9 +586,9 @@ mod tests {
                 "{sh_body}",
                 ")_bash[0]\n",
             ),
-            py     = dir.join("greet.py").display(),
+            py = dir.join("greet.py").display(),
             py_body = py_content,
-            sh     = dir.join("run.sh").display(),
+            sh = dir.join("run.sh").display(),
             sh_body = sh_content.replace("$HOME", "\\$HOME"),
         );
 

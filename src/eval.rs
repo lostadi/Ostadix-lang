@@ -32,7 +32,7 @@ use crate::nixos_ops;
 use crate::parser::{reconstruct_source, ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{OValue, RequestKind, GroupMode};
+use crate::value::{GroupMode, OValue, RequestKind};
 
 /// How to resolve group members that might be cached Request values.
 ///
@@ -45,7 +45,11 @@ use crate::value::{OValue, RequestKind, GroupMode};
 ///               buffered request must have been materialized, so a miss
 ///               indicates a scheduler bug rather than a user error.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheMode { Fresh, Lenient, Strict }
+pub(crate) enum CacheMode {
+    Fresh,
+    Lenient,
+    Strict,
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // STEP-3.5: Backend purity
@@ -82,7 +86,7 @@ fn is_pure_backend(lang: &str) -> bool {
 fn exec_nix_kind(kind: RequestKind, src: OValue) -> Result<OValue> {
     match kind {
         RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
-        RequestKind::Realise     => nix_ops::realise_nix(&src),
+        RequestKind::Realise => nix_ops::realise_nix(&src),
         RequestKind::Activate { profile, dry_run } => {
             nixos_ops::activate_nix(&src, &profile, dry_run)
         }
@@ -170,12 +174,16 @@ pub struct ImmediateExecutor {
 
 impl ImmediateExecutor {
     pub fn new() -> Self {
-        Self { cache: HashMap::new() }
+        Self {
+            cache: HashMap::new(),
+        }
     }
 }
 
 impl Default for ImmediateExecutor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ImmediateExecutor {
@@ -190,10 +198,14 @@ impl ImmediateExecutor {
 impl Executor for ImmediateExecutor {
     fn execute(&mut self, req: &OValue) -> Result<OValue> {
         let (kind, source, fingerprint) = match req {
-            OValue::Request { kind, source, fingerprint } =>
-                (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
+            OValue::Request {
+                kind,
+                source,
+                fingerprint,
+            } => (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
             other => bail!(
-                "Executor::execute expected a Request, got {}", other.type_name()
+                "Executor::execute expected a Request, got {}",
+                other.type_name()
             ),
         };
 
@@ -224,7 +236,7 @@ impl Executor for ImmediateExecutor {
 
         let result = match kind {
             RequestKind::Instantiate => nix_ops::instantiate_nix(&resolved_source)?,
-            RequestKind::Realise     => nix_ops::realise_nix(&resolved_source)?,
+            RequestKind::Realise => nix_ops::realise_nix(&resolved_source)?,
             // STEP-3.5: Eval fires the shim through the ProcessRegistry. The
             // ImmediateExecutor doesn't currently have access to a registry,
             // so we bail with a clear message. The real wiring is provided
@@ -370,7 +382,10 @@ impl Evaluator {
     fn force_request(&mut self, req: &OValue) -> Result<OValue> {
         let kind = match req {
             OValue::Request { kind, .. } => kind.clone(),
-            other => bail!("force_request expected a Request, got {}", other.type_name()),
+            other => bail!(
+                "force_request expected a Request, got {}",
+                other.type_name()
+            ),
         };
         match kind {
             RequestKind::Eval { .. } => self.exec_eval(req),
@@ -410,7 +425,9 @@ impl Evaluator {
     /// we can avoid a second execution.
     fn resolve_from_cache(&mut self, v: &OValue) -> Option<OValue> {
         match v {
-            OValue::Request { fingerprint, kind, .. } => {
+            OValue::Request {
+                fingerprint, kind, ..
+            } => {
                 // For Eval requests, check eval_cache.
                 if matches!(kind, RequestKind::Eval { .. }) {
                     return self.eval_cache.get(fingerprint).cloned();
@@ -436,22 +453,20 @@ impl Evaluator {
                 let (mode, members) = (*mode, members.clone());
                 self.resolve_group(mode, &members, CacheMode::Strict)
             }
-            v if Self::is_schedulable_request(v) => {
-                match self.resolve_from_cache(v) {
-                    Some(result) => Ok(result),
-                    None => {
-                        let fp = match v {
-                            OValue::Request { fingerprint, .. } => &fingerprint[..8],
-                            _ => "?",
-                        };
-                        bail!(
-                            "autonomous: scheduler failed to materialize \
+            v if Self::is_schedulable_request(v) => match self.resolve_from_cache(v) {
+                Some(result) => Ok(result),
+                None => {
+                    let fp = match v {
+                        OValue::Request { fingerprint, .. } => &fingerprint[..8],
+                        _ => "?",
+                    };
+                    bail!(
+                        "autonomous: scheduler failed to materialize \
                              request fp={}; cache miss after flush",
-                            fp
-                        )
-                    }
+                        fp
+                    )
                 }
-            }
+            },
             _ => Ok(value),
         }
     }
@@ -503,22 +518,22 @@ impl Evaluator {
     /// with the same mode. Non-Request, non-Group members are returned as-is.
     fn resolve_member(&mut self, m: &OValue, mode: CacheMode) -> Result<OValue> {
         match m {
-            OValue::Request { fingerprint, .. } => {
-                match mode {
-                    CacheMode::Fresh => self.force_request(m),
-                    CacheMode::Lenient => {
-                        Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone()))
-                    }
-                    CacheMode::Strict => {
-                        self.resolve_from_cache(m).ok_or_else(|| anyhow::anyhow!(
-                            "autonomous: scheduler failed to materialize \
+            OValue::Request { fingerprint, .. } => match mode {
+                CacheMode::Fresh => self.force_request(m),
+                CacheMode::Lenient => Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone())),
+                CacheMode::Strict => self.resolve_from_cache(m).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "autonomous: scheduler failed to materialize \
                              request fp={}; cache miss after flush",
-                            &fingerprint[..8]
-                        ))
-                    }
-                }
-            }
-            OValue::Group { mode: gmode, members, .. } => {
+                        &fingerprint[..8]
+                    )
+                }),
+            },
+            OValue::Group {
+                mode: gmode,
+                members,
+                ..
+            } => {
                 let (gmode, members) = (*gmode, members.clone());
                 self.resolve_group(gmode, &members, mode)
             }
@@ -550,8 +565,8 @@ impl Evaluator {
     ///   results are already in L1 memory; sequential cache reads are used.
     pub(crate) fn resolve_group(
         &mut self,
-        mode:       GroupMode,
-        members:    &[OValue],
+        mode: GroupMode,
+        members: &[OValue],
         cache_mode: CacheMode,
     ) -> Result<OValue> {
         if members.is_empty() {
@@ -560,8 +575,8 @@ impl Evaluator {
 
         // Cache reads are fast (L1 memory); no threading benefit.
         // Also use the sequential path when no Nix-family Requests are present.
-        let has_threadable = cache_mode == CacheMode::Fresh
-            && members.iter().any(Self::is_threadable_member);
+        let has_threadable =
+            cache_mode == CacheMode::Fresh && members.iter().any(Self::is_threadable_member);
 
         if mode.collects_all() {
             if has_threadable {
@@ -574,7 +589,7 @@ impl Evaluator {
                     let mut out = Vec::with_capacity(members.len());
                     for m in members {
                         match self.resolve_member(m, cache_mode) {
-                            Ok(v)  => out.push(v),
+                            Ok(v) => out.push(v),
                             Err(e) => out.push(OValue::error(e.to_string())),
                         }
                     }
@@ -599,14 +614,14 @@ impl Evaluator {
                         let mut last_err: Option<anyhow::Error> = None;
                         for m in members {
                             match self.resolve_member(m, cache_mode) {
-                                Ok(v)  => return Ok(v),
+                                Ok(v) => return Ok(v),
                                 Err(e) => last_err = Some(e),
                             }
                         }
                         Err(last_err.expect("non-empty group must have produced an error"))
-                            .with_context(|| format!(
-                                "any(...) group: all {} members failed", members.len()
-                            ))
+                            .with_context(|| {
+                                format!("any(...) group: all {} members failed", members.len())
+                            })
                     }
                     GroupMode::Race => {
                         // Sequential race: first member to settle wins.
@@ -644,7 +659,7 @@ impl Evaluator {
     ///      - `All`:   collect all, but propagate the first error — hard barrier.
     fn resolve_collect_all_concurrent(
         &mut self,
-        mode:    GroupMode,
+        mode: GroupMode,
         members: &[OValue],
     ) -> Result<OValue> {
         // results[i] holds the resolved value (or error) for members[i].
@@ -697,23 +712,20 @@ impl Evaluator {
         // Phase 4 — assemble result list with mode-specific failure semantics.
         let mut out = Vec::with_capacity(members.len());
         for (i, slot) in results.into_iter().enumerate() {
-            let member_result = slot
-                .expect("every member slot must be filled after phases 1-3");
+            let member_result = slot.expect("every member slot must be filled after phases 1-3");
             match mode {
                 GroupMode::Batch => {
                     // Batch: collect every outcome; failures become OError values.
                     match member_result {
-                        Ok(v)  => out.push(v),
-                        Err(e) => out.push(OValue::error(format!(
-                            "member {}: {}", i, e
-                        ))),
+                        Ok(v) => out.push(v),
+                        Err(e) => out.push(OValue::error(format!("member {}: {}", i, e))),
                     }
                 }
                 _ => {
                     // All: hard barrier — propagate first error immediately.
-                    let val = member_result.with_context(|| format!(
-                        "{}(...) group: member {} failed", mode.name(), i
-                    ))?;
+                    let val = member_result.with_context(|| {
+                        format!("{}(...) group: member {} failed", mode.name(), i)
+                    })?;
                     out.push(val);
                 }
             }
@@ -736,7 +748,7 @@ impl Evaluator {
     ///              but their results are discarded.
     fn resolve_first_wins_concurrent(
         &mut self,
-        mode:    GroupMode,
+        mode: GroupMode,
         members: &[OValue],
     ) -> Result<OValue> {
         let mut threadable: Vec<(RequestKind, OValue)> = Vec::new();
@@ -767,7 +779,11 @@ impl Evaluator {
 
         if threadable.is_empty() {
             // All members were serial and none won (Any: all failed).
-            bail!("{}(...) group: all {} members failed", mode.name(), members.len());
+            bail!(
+                "{}(...) group: all {} members failed",
+                mode.name(),
+                members.len()
+            );
         }
 
         // Phase 2 — concurrent dispatch for threadable members.
@@ -791,16 +807,14 @@ impl Evaluator {
                 let mut last_err: Option<anyhow::Error> = None;
                 for result in rx {
                     match result {
-                        Ok(v)  => return Ok(v),   // drops rx; remaining threads ignored
+                        Ok(v) => return Ok(v), // drops rx; remaining threads ignored
                         Err(e) => last_err = Some(e),
                     }
                 }
                 Err(last_err.expect(
-                        "threadable is non-empty so at least one thread must have sent an error"
-                    ))
-                    .with_context(|| format!(
-                        "any(...) group: all {} members failed", members.len()
-                    ))
+                    "threadable is non-empty so at least one thread must have sent an error",
+                ))
+                .with_context(|| format!("any(...) group: all {} members failed", members.len()))
             }
             GroupMode::Race => {
                 // Return the very first result that settles (Ok or Err).
@@ -821,15 +835,20 @@ impl Evaluator {
     /// cache is skipped on both read and write — each force re-runs.
     fn exec_eval(&mut self, req: &OValue) -> Result<OValue> {
         let (kind, source, fingerprint) = match req {
-            OValue::Request { kind, source, fingerprint } =>
-                (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
+            OValue::Request {
+                kind,
+                source,
+                fingerprint,
+            } => (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
             other => bail!("exec_eval expected Request, got {}", other.type_name()),
         };
         let (lang, env_id, cacheable) = match kind {
-            RequestKind::Eval { lang, env_id, cacheable } => (lang, env_id, cacheable),
-            other => bail!(
-                "exec_eval expected RequestKind::Eval, got {:?}", other
-            ),
+            RequestKind::Eval {
+                lang,
+                env_id,
+                cacheable,
+            } => (lang, env_id, cacheable),
+            other => bail!("exec_eval expected RequestKind::Eval, got {:?}", other),
         };
 
         // {lazy} cache: consult before doing work.
@@ -858,9 +877,10 @@ impl Evaluator {
         // See process.rs for the underlying error chain; using with_context
         // here preserves the shim's own error message as a "Caused by:" entry
         // instead of flattening it into the wrapper string.
-        let result = self.registry.exec(
-            &lang, env_id, &body, HashMap::new(), &shim
-        ).with_context(|| format!("[{}{{eval}}]", lang))?;
+        let result = self
+            .registry
+            .exec(&lang, env_id, &body, HashMap::new(), &shim)
+            .with_context(|| format!("[{}{{eval}}]", lang))?;
 
         if env_id == u32::MAX {
             let _ = self.registry.cleanup_env(&lang, u32::MAX);
@@ -887,7 +907,13 @@ impl Evaluator {
     /// Auto-forcing here means: ask the executor to perform the request and
     /// return its result. The executor's cache makes this idempotent for {lazy}.
     fn resolve_for_splice(&mut self, v: OValue) -> Result<OValue> {
-        if let OValue::Request { kind: RequestKind::Eval { cacheable, lang, .. }, .. } = &v {
+        if let OValue::Request {
+            kind: RequestKind::Eval {
+                cacheable, lang, ..
+            },
+            ..
+        } = &v
+        {
             if *cacheable {
                 // {lazy}: safe to auto-force.
                 return self.force_request(&v);
@@ -923,7 +949,12 @@ impl Evaluator {
     fn eval_source(&mut self, src: &str) -> Result<OValue> {
         let nodes = Parser::new(src, &self.registered_backends)
             .parse()
-            .with_context(|| format!("failed to parse quoted source: {:?}", &src[..src.len().min(80)]))?;
+            .with_context(|| {
+                format!(
+                    "failed to parse quoted source: {:?}",
+                    &src[..src.len().min(80)]
+                )
+            })?;
         self.eval_document(nodes)
     }
 
@@ -1040,9 +1071,7 @@ impl Evaluator {
 
     fn eval_node(&mut self, node: &ONode, scope: &HashMap<String, OValue>) -> Result<OValue> {
         match node {
-            ONode::LetBinding { expr, .. } => {
-                self.eval_node(expr, scope)
-            },
+            ONode::LetBinding { expr, .. } => self.eval_node(expr, scope),
             ONode::RawText(text) => Ok(OValue::str_(text.clone())),
 
             ONode::VarRef(name) => scope
@@ -1050,13 +1079,14 @@ impl Evaluator {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name)),
 
-            ONode::TypedExpr { lang, env_id, attr, body } => {
-                self.eval_typed_expr(lang, *env_id, attr.as_deref(), body, scope)
-            }
+            ONode::TypedExpr {
+                lang,
+                env_id,
+                attr,
+                body,
+            } => self.eval_typed_expr(lang, *env_id, attr.as_deref(), body, scope),
 
-            ONode::Call { fn_name, args } => {
-                self.eval_call(fn_name, args, scope)
-            }
+            ONode::Call { fn_name, args } => self.eval_call(fn_name, args, scope),
         }
     }
 
@@ -1084,8 +1114,8 @@ impl Evaluator {
     fn eval_call(
         &mut self,
         fn_name: &str,
-        args:    &[ONode],
-        scope:   &HashMap<String, OValue>,
+        args: &[ONode],
+        scope: &HashMap<String, OValue>,
     ) -> Result<OValue> {
         // STEP-3: `lazy(expr)` is a POLICY-MODIFYING builtin — it must take
         // control of its argument's evaluation so that the policy switch
@@ -1100,7 +1130,7 @@ impl Evaluator {
             let saved_policy = self.policy;
             self.policy = Policy::Lazy;
             let result = self.eval_node(&args[0], scope);
-            self.policy = saved_policy;   // restored even on error path
+            self.policy = saved_policy; // restored even on error path
             return result;
         }
 
@@ -1122,7 +1152,10 @@ impl Evaluator {
         // entire body evaluation.
         if fn_name == "autonomous" {
             if args.len() != 1 {
-                bail!("autonomous(expr) takes exactly 1 argument, got {}", args.len());
+                bail!(
+                    "autonomous(expr) takes exactly 1 argument, got {}",
+                    args.len()
+                );
             }
             let saved_policy = self.policy;
             self.policy = Policy::Autonomous;
@@ -1173,10 +1206,10 @@ impl Evaluator {
             }
             let mode = match fn_name {
                 "batch" => GroupMode::Batch,
-                "all"   => GroupMode::All,
-                "any"   => GroupMode::Any,
-                "race"  => GroupMode::Race,
-                _       => unreachable!(),
+                "all" => GroupMode::All,
+                "any" => GroupMode::Any,
+                "race" => GroupMode::Race,
+                _ => unreachable!(),
             };
             // Evaluate members under Lazy policy so request chains are captured,
             // not resolved, regardless of the outer policy.
@@ -1199,7 +1232,10 @@ impl Evaluator {
         match fn_name {
             "instantiate" => {
                 if arg_vals.len() != 1 {
-                    bail!("instantiate(expr) takes exactly 1 argument, got {}", arg_vals.len());
+                    bail!(
+                        "instantiate(expr) takes exactly 1 argument, got {}",
+                        arg_vals.len()
+                    );
                 }
                 let req = OValue::request(
                     RequestKind::Instantiate,
@@ -1209,12 +1245,13 @@ impl Evaluator {
             }
             "realise" => {
                 if arg_vals.len() != 1 {
-                    bail!("realise(drv) takes exactly 1 argument, got {}", arg_vals.len());
+                    bail!(
+                        "realise(drv) takes exactly 1 argument, got {}",
+                        arg_vals.len()
+                    );
                 }
-                let req = OValue::request(
-                    RequestKind::Realise,
-                    arg_vals.into_iter().next().unwrap(),
-                );
+                let req =
+                    OValue::request(RequestKind::Realise, arg_vals.into_iter().next().unwrap());
                 self.auto_resolve(req)
             }
             "now" => {
@@ -1231,7 +1268,8 @@ impl Evaluator {
                         self.resolve_group(mode, &members, CacheMode::Fresh)
                     }
                     other => bail!(
-                        "now(req) expected a Request or Group, got {}", other.type_name()
+                        "now(req) expected a Request or Group, got {}",
+                        other.type_name()
                     ),
                 }
             }
@@ -1240,17 +1278,19 @@ impl Evaluator {
                 if arg_vals.is_empty() || arg_vals.len() > 2 {
                     bail!(
                         "activate(path) or activate(path, profile) — takes 1 \
-                         or 2 args, got {}", arg_vals.len()
+                         or 2 args, got {}",
+                        arg_vals.len()
                     );
                 }
                 let mut iter = arg_vals.into_iter();
-                let target  = iter.next().unwrap();
+                let target = iter.next().unwrap();
                 let profile = match iter.next() {
                     Some(OValue::Str { v }) => v,
                     Some(OValue::System { profile_path }) => profile_path,
                     Some(other) => bail!(
                         "activate's second arg must be a string profile path \
-                         or a System value, got {}", other.type_name()
+                         or a System value, got {}",
+                        other.type_name()
                     ),
                     None => "/nix/var/nix/profiles/system".to_string(),
                 };
@@ -1258,7 +1298,10 @@ impl Evaluator {
                 // subprocess argument is further gated by an env var in
                 // nixos_ops. Two layers of opt-in.
                 let req = OValue::request(
-                    RequestKind::Activate { profile, dry_run: true },
+                    RequestKind::Activate {
+                        profile,
+                        dry_run: true,
+                    },
                     target,
                 );
                 self.auto_resolve(req)
@@ -1268,7 +1311,10 @@ impl Evaluator {
                 // Request — this is a pure inspection, not a deferred
                 // computation. The result is an OValue::System reference.
                 if !arg_vals.is_empty() {
-                    bail!("current_system() takes no arguments, got {}", arg_vals.len());
+                    bail!(
+                        "current_system() takes no arguments, got {}",
+                        arg_vals.len()
+                    );
                 }
                 Ok(OValue::system("/nix/var/nix/profiles/system"))
             }
@@ -1282,11 +1328,11 @@ impl Evaluator {
 
     fn eval_typed_expr(
         &mut self,
-        lang:   &str,
+        lang: &str,
         env_id: u32,
-        attr:   Option<&str>,
-        body:   &[ONode],
-        scope:  &HashMap<String, OValue>,
+        attr: Option<&str>,
+        body: &[ONode],
+        scope: &HashMap<String, OValue>,
     ) -> Result<OValue> {
         // ─────────────────────────────────────────────────────────────────────
         // Short-circuit for `quote^`: capture the body as an unevaluated
@@ -1347,7 +1393,8 @@ impl Evaluator {
                 other => bail!(
                     "Unknown block attribute `{{{}}}` on {}^. Known attributes: \
                      lazy, defer.",
-                    other, lang
+                    other,
+                    lang
                 ),
             }
         }
@@ -1356,7 +1403,7 @@ impl Evaluator {
         // For `nix_expr` blocks and `{lazy}`/`{defer}` blocks we also collect
         // the evaluated child OValues as deps so the returned thunk carries
         // its full dependency tree for fingerprint composition.
-        let mut buf  = String::new();
+        let mut buf = String::new();
         let mut deps: Vec<OValue> = Vec::new();
 
         // Whether this block constructs a Thunk (and so should track deps).
@@ -1404,7 +1451,11 @@ impl Evaluator {
                     // Evaluate the nested expression first (leaves-up / applicative order),
                     // then render its value into the parent language's source syntax.
                     let child_val = self.eval_typed_expr(
-                        child_lang, *child_env_id, child_attr.as_deref(), child_body, &local_scope,
+                        child_lang,
+                        *child_env_id,
+                        child_attr.as_deref(),
+                        child_body,
+                        &local_scope,
                     )?;
                     let resolved = self.resolve_for_splice(child_val)?;
                     buf.push_str(&self.render_child(lang, &resolved));
@@ -1436,7 +1487,7 @@ impl Evaluator {
             let thunk = OValue::thunk(buf, deps);
             return Ok(OValue::request(
                 RequestKind::Eval {
-                    lang:      lang.to_string(),
+                    lang: lang.to_string(),
                     env_id,
                     cacheable,
                 },
@@ -1469,7 +1520,12 @@ impl Evaluator {
                             last = v.clone();
                         }
                     }
-                    ONode::TypedExpr { lang: cl, env_id: ce, attr: ca, body: cb } => {
+                    ONode::TypedExpr {
+                        lang: cl,
+                        env_id: ce,
+                        attr: ca,
+                        body: cb,
+                    } => {
                         let v = self.eval_typed_expr(cl, *ce, ca.as_deref(), cb, scope)?;
                         if !v.is_null() {
                             last = v;
@@ -1520,7 +1576,8 @@ impl Evaluator {
             .with_context(|| format!("[{}]", env_label))?;
 
         let result: Result<OValue> = loop {
-            let step = self.registry
+            let step = self
+                .registry
                 .recv_exec_step(lang, env_id)
                 .with_context(|| format!("[{}]", env_label))?;
 
@@ -1627,19 +1684,26 @@ fn render_nix(val: &OValue) -> String {
     match val {
         OValue::Null => "null".to_string(),
         OValue::Bool { v } => {
-            if *v { "true".to_string() } else { "false".to_string() }
+            if *v {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
         }
         OValue::Int { v } => v.to_string(),
         OValue::Float { v } => v.to_string(),
         OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
         OValue::Html { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
-        OValue::StorePath { path } => serde_json::to_string(path).unwrap_or_else(|_| "\"".to_string()),
+        OValue::StorePath { path } => {
+            serde_json::to_string(path).unwrap_or_else(|_| "\"".to_string())
+        }
         OValue::List { v } => {
             let items = v.iter().map(render_nix).collect::<Vec<_>>().join(" ");
             format!("[ {} ]", items)
         }
         OValue::Map { v } => {
-            let items = v.iter()
+            let items = v
+                .iter()
                 .map(|(k, val)| format!("{} = {};", k, render_nix(val)))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1650,8 +1714,9 @@ fn render_nix(val: &OValue) -> String {
         // it is a valid Nix expression that can be parenthesised inline.
         OValue::NixExpr { body, .. } => format!("({})", body),
         // A Derivation in a Nix context is its .drv path literal.
-        OValue::Derivation { drv_path, .. } => serde_json::to_string(drv_path)
-            .unwrap_or_else(|_| "\"".to_string()),
+        OValue::Derivation { drv_path, .. } => {
+            serde_json::to_string(drv_path).unwrap_or_else(|_| "\"".to_string())
+        }
         // A Request rendered into Nix source is almost certainly a user error —
         // the user spliced a control value into source text. We embed the
         // splice marker; STEP3 can elevate this to a hard error or auto-resolve.
@@ -1672,20 +1737,32 @@ fn render_nix(val: &OValue) -> String {
         // A Group is a control/topology value with no Nix splice form — render
         // a string marker that nix eval will reject loudly, same treatment as
         // an unforced Request. Force the group with `now(...)` before splicing.
-        OValue::Group { mode, fingerprint, .. } => {
+        OValue::Group {
+            mode, fingerprint, ..
+        } => {
             format!("\"<group:{} fp={}>\"", mode.name(), &fingerprint[..8])
         }
 
         // A System in a Nix context renders as its profile path as a string
         // literal. Useful for Nix expressions that want to inspect or compare
         // against the live profile location.
-        OValue::System { profile_path } => serde_json::to_string(profile_path)
-            .unwrap_or_else(|_| "\"\"".to_string()),
+        OValue::System { profile_path } => {
+            serde_json::to_string(profile_path).unwrap_or_else(|_| "\"\"".to_string())
+        }
+
+        OValue::Capability { kind, identity, .. } => {
+            serde_json::to_string(&format!("<capability:{} {}>", kind.name(), identity))
+                .unwrap_or_else(|_| "\"\"".to_string())
+        }
+
+        OValue::Snapshot { kind, identity, .. } => {
+            serde_json::to_string(&format!("<snapshot:{} {}>", kind.name(), identity))
+                .unwrap_or_else(|_| "\"\"".to_string())
+        }
 
         // An Expr in Nix context renders its quoted source as a Nix string
         // literal. Rarely useful — the user almost always wants O.eval first.
-        OValue::Expr { src } => serde_json::to_string(src)
-            .unwrap_or_else(|_| "\"\"".to_string()),
+        OValue::Expr { src } => serde_json::to_string(src).unwrap_or_else(|_| "\"\"".to_string()),
 
         // An error outcome in a Nix context renders as a string marker that
         // nix eval will reject loudly — errors should not reach Nix source.
@@ -1715,9 +1792,7 @@ fn render_python(val: &OValue) -> String {
             }
         }
 
-        OValue::Str { v } => {
-            serde_json::to_string(v).unwrap_or_else(|_| "''".to_string())
-        }
+        OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "''".to_string()),
 
         OValue::Html { v } => {
             let lit = serde_json::to_string(v).unwrap_or_else(|_| "''".to_string());
@@ -1730,11 +1805,7 @@ fn render_python(val: &OValue) -> String {
         }
 
         OValue::List { v } => {
-            let items = v
-                .iter()
-                .map(render_python)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let items = v.iter().map(render_python).collect::<Vec<_>>().join(", ");
 
             format!("[{}]", items)
         }
@@ -1759,18 +1830,27 @@ fn render_python(val: &OValue) -> String {
             format!("{{'mime': {}, 'base64': {}}}", mime_lit, data_lit)
         }
 
-        OValue::NixExpr { body, fingerprint, deps } => {
+        OValue::NixExpr {
+            body,
+            fingerprint,
+            deps,
+        } => {
             let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
-            let fp_lit   = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
+            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
             let deps_rendered = deps
                 .iter()
                 .map(render_python)
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("ONixExpr({}, fp={}, deps=[{}])", body_lit, fp_lit, deps_rendered)
+            format!(
+                "ONixExpr({}, fp={}, deps=[{}])",
+                body_lit, fp_lit, deps_rendered
+            )
         }
 
-        OValue::Derivation { drv_path, outputs, .. } => {
+        OValue::Derivation {
+            drv_path, outputs, ..
+        } => {
             let drv_lit = serde_json::to_string(drv_path).unwrap_or_else(|_| "''".to_string());
             let outs_lit = outputs
                 .iter()
@@ -1784,24 +1864,69 @@ fn render_python(val: &OValue) -> String {
             let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
             format!("ORequest(fp={})", fp_lit)
         }
-        OValue::Thunk { body, fingerprint, deps } => {
+        OValue::Thunk {
+            body,
+            fingerprint,
+            deps,
+        } => {
             let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
-            let fp_lit   = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            let deps_rendered = deps.iter().map(render_python)
-                .collect::<Vec<_>>().join(", ");
-            format!("OThunk({}, fp={}, deps=[{}])", body_lit, fp_lit, deps_rendered)
+            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
+            let deps_rendered = deps
+                .iter()
+                .map(render_python)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "OThunk({}, fp={}, deps=[{}])",
+                body_lit, fp_lit, deps_rendered
+            )
         }
         OValue::System { profile_path } => {
             let lit = serde_json::to_string(profile_path).unwrap_or_else(|_| "''".to_string());
             format!("OSystem({})", lit)
         }
+        OValue::Capability {
+            kind,
+            identity,
+            metadata,
+        } => {
+            let id_lit = serde_json::to_string(identity).unwrap_or_else(|_| "''".to_string());
+            format!(
+                "OCapability({:?}, {}, meta={})",
+                kind.name(),
+                id_lit,
+                metadata.len()
+            )
+        }
+        OValue::Snapshot {
+            kind,
+            identity,
+            state,
+        } => {
+            let id_lit = serde_json::to_string(identity).unwrap_or_else(|_| "''".to_string());
+            format!(
+                "OSnapshot({:?}, {}, fields={})",
+                kind.name(),
+                id_lit,
+                state.len()
+            )
+        }
 
         // A Group has no Python data form — render an OGroup marker mirroring
         // the ORequest treatment. The shim does not bind it as a value;
         // groups are control values forced via `now(...)`, not spliced.
-        OValue::Group { mode, members, fingerprint } => {
+        OValue::Group {
+            mode,
+            members,
+            fingerprint,
+        } => {
             let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            format!("OGroup({:?}, n={}, fp={})", mode.name(), members.len(), fp_lit)
+            format!(
+                "OGroup({:?}, n={}, fp={})",
+                mode.name(),
+                members.len(),
+                fp_lit
+            )
         }
 
         // An Expr value in Python is available as an OExprValue object (set up
@@ -1840,10 +1965,7 @@ fn render_html(val: &OValue) -> String {
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
-            format!(
-                "<code class=\"o-store-path\">{}</code>",
-                html_escape(path)
-            )
+            format!("<code class=\"o-store-path\">{}</code>", html_escape(path))
         }
 
         OValue::List { v } => {
@@ -1855,22 +1977,23 @@ fn render_html(val: &OValue) -> String {
             format!("<ul>{}</ul>", items)
         }
 
-        OValue::Map { v } => {
-            v.iter()
-                .map(|(k, val)| {
-                    format!(
-                        "<div data-o-key=\"{}\">{}</div>",
-                        html_escape(k),
-                        render_html(val)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        }
+        OValue::Map { v } => v
+            .iter()
+            .map(|(k, val)| {
+                format!(
+                    "<div data-o-key=\"{}\">{}</div>",
+                    html_escape(k),
+                    render_html(val)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(""),
 
         OValue::Blob { v, mime } => render_html_blob(v, mime),
 
-        OValue::NixExpr { body, fingerprint, .. } => {
+        OValue::NixExpr {
+            body, fingerprint, ..
+        } => {
             format!(
                 "<code class=\"o-nix-expr\" data-fp=\"{}\">{}</code>",
                 html_escape(fingerprint),
@@ -1878,7 +2001,9 @@ fn render_html(val: &OValue) -> String {
             )
         }
 
-        OValue::Derivation { drv_path, outputs, .. } => {
+        OValue::Derivation {
+            drv_path, outputs, ..
+        } => {
             format!(
                 "<code class=\"o-derivation\" data-outputs=\"{}\">{}</code>",
                 html_escape(&outputs.join(",")),
@@ -1892,7 +2017,9 @@ fn render_html(val: &OValue) -> String {
                 html_escape(&fingerprint[..8]),
             )
         }
-        OValue::Thunk { body, fingerprint, .. } => {
+        OValue::Thunk {
+            body, fingerprint, ..
+        } => {
             format!(
                 "<code class=\"o-thunk\" data-fp=\"{}\">{}</code>",
                 html_escape(&fingerprint[..8]),
@@ -1905,8 +2032,36 @@ fn render_html(val: &OValue) -> String {
                 html_escape(profile_path),
             )
         }
+        OValue::Capability {
+            kind,
+            identity,
+            metadata,
+        } => {
+            format!(
+                "<code class=\"o-capability\" data-kind=\"{}\" data-meta=\"{}\">{}</code>",
+                html_escape(kind.name()),
+                metadata.len(),
+                html_escape(identity),
+            )
+        }
+        OValue::Snapshot {
+            kind,
+            identity,
+            state,
+        } => {
+            format!(
+                "<code class=\"o-snapshot\" data-kind=\"{}\" data-fields=\"{}\">{}</code>",
+                html_escape(kind.name()),
+                state.len(),
+                html_escape(identity),
+            )
+        }
 
-        OValue::Group { mode, members, fingerprint } => {
+        OValue::Group {
+            mode,
+            members,
+            fingerprint,
+        } => {
             format!(
                 "<code class=\"o-group\" data-mode=\"{}\" data-fp=\"{}\">&lt;group n={}&gt;</code>",
                 html_escape(mode.name()),
@@ -1919,10 +2074,7 @@ fn render_html(val: &OValue) -> String {
             // Render an OExpr as a <code> block showing the quoted source.
             // Users should O.eval() it rather than splice it into HTML, but
             // we provide a readable fallback so debugging is easier.
-            format!(
-                "<code class=\"o-expr\">{}</code>",
-                html_escape(src),
-            )
+            format!("<code class=\"o-expr\">{}</code>", html_escape(src),)
         }
 
         // An error outcome in HTML renders as a styled error span.
@@ -1967,7 +2119,7 @@ fn render_html_blob(b64: &str, mime: &str) -> String {
         mime,
         b64,
         mime,
-        b64.len() * 3 / 4,  // approximate decoded byte count
+        b64.len() * 3 / 4, // approximate decoded byte count
     )
 }
 
@@ -1991,18 +2143,12 @@ fn render_latex(val: &OValue) -> String {
         OValue::StorePath { path } => {
             format!("\\texttt{{{}}}", path.replace("_", "\\_"))
         }
-        OValue::List { v } => {
-            v.iter()
-                .map(render_latex)
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-        OValue::Map { v } => {
-            v.iter()
-                .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
+        OValue::List { v } => v.iter().map(render_latex).collect::<Vec<_>>().join(", "),
+        OValue::Map { v } => v
+            .iter()
+            .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
+            .collect::<Vec<_>>()
+            .join(", "),
         OValue::Blob { mime, .. } => format!("\\texttt{{<blob:{}>}}", mime),
         OValue::NixExpr { body, .. } => format!("\\texttt{{{}}}", body.replace("_", "\\_")),
         OValue::Derivation { drv_path, .. } => {
@@ -2017,10 +2163,30 @@ fn render_latex(val: &OValue) -> String {
         OValue::System { profile_path } => {
             format!("\\texttt{{{}}}", profile_path.replace("_", "\\_"))
         }
-        OValue::Group { mode, members, fingerprint } => {
+        OValue::Capability { kind, identity, .. } => {
+            format!(
+                "\\texttt{{<capability:{} {}>}}",
+                kind.name(),
+                identity.replace("_", "\\_")
+            )
+        }
+        OValue::Snapshot { kind, identity, .. } => {
+            format!(
+                "\\texttt{{<snapshot:{} {}>}}",
+                kind.name(),
+                identity.replace("_", "\\_")
+            )
+        }
+        OValue::Group {
+            mode,
+            members,
+            fingerprint,
+        } => {
             format!(
                 "\\texttt{{<group:{} n={} fp={}>}}",
-                mode.name(), members.len(), &fingerprint[..8]
+                mode.name(),
+                members.len(),
+                &fingerprint[..8]
             )
         }
         OValue::Expr { src } => {
@@ -2043,18 +2209,12 @@ fn render_markdown(val: &OValue) -> String {
         OValue::Str { v } => v.clone(),
         OValue::Html { v } => v.clone(),
         OValue::StorePath { path } => format!("`{}`", path),
-        OValue::List { v } => {
-            v.iter()
-                .map(render_markdown)
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        OValue::Map { v } => {
-            v.iter()
-                .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        OValue::List { v } => v.iter().map(render_markdown).collect::<Vec<_>>().join("\n"),
+        OValue::Map { v } => v
+            .iter()
+            .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
+            .collect::<Vec<_>>()
+            .join("\n"),
         OValue::Blob { mime, .. } => format!("<blob:{}>", mime),
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
@@ -2067,8 +2227,23 @@ fn render_markdown(val: &OValue) -> String {
         OValue::System { profile_path } => {
             format!("`{}`", profile_path)
         }
-        OValue::Group { mode, members, fingerprint } => {
-            format!("`<group:{} n={} fp={}>`", mode.name(), members.len(), &fingerprint[..8])
+        OValue::Capability { kind, identity, .. } => {
+            format!("`<capability:{} {}>`", kind.name(), identity)
+        }
+        OValue::Snapshot { kind, identity, .. } => {
+            format!("`<snapshot:{} {}>`", kind.name(), identity)
+        }
+        OValue::Group {
+            mode,
+            members,
+            fingerprint,
+        } => {
+            format!(
+                "`<group:{} n={} fp={}>`",
+                mode.name(),
+                members.len(),
+                &fingerprint[..8]
+            )
         }
         OValue::Expr { src } => {
             format!("`{}`", src)
@@ -2098,7 +2273,7 @@ mod tests {
     #[test]
     fn python_bool_true_renders_as_title_case() {
         let e = Evaluator::new("/tmp".into());
-        assert_eq!(e.render_child("python", &OValue::bool_(true)),  "True");
+        assert_eq!(e.render_child("python", &OValue::bool_(true)), "True");
         assert_eq!(e.render_child("python", &OValue::bool_(false)), "False");
     }
 
@@ -2189,14 +2364,14 @@ mod tests {
     #[test]
     fn nix_bool_renders_correctly() {
         let e = Evaluator::new("/tmp".into());
-        assert_eq!(e.render_child("nix", &OValue::bool_(true)),  "true");
+        assert_eq!(e.render_child("nix", &OValue::bool_(true)), "true");
         assert_eq!(e.render_child("nix", &OValue::bool_(false)), "false");
     }
 
     #[test]
     fn nix_int_renders_as_integer() {
         let e = Evaluator::new("/tmp".into());
-        assert_eq!(e.render_child("nix", &OValue::int(42)),  "42");
+        assert_eq!(e.render_child("nix", &OValue::int(42)), "42");
         assert_eq!(e.render_child("nix", &OValue::int(-1)), "-1");
     }
 
@@ -2218,8 +2393,8 @@ mod tests {
         let e = Evaluator::new("/tmp".into());
         let v = OValue::store_path("/nix/store/abc-hello");
         // nix and nix_store both dispatch to render_nix
-        let nix_out   = e.render_child("nix",       &v);
-        let store_out = e.render_child("nix_store",  &v);
+        let nix_out = e.render_child("nix", &v);
+        let store_out = e.render_child("nix_store", &v);
         assert_eq!(nix_out, store_out);
     }
 
@@ -2252,7 +2427,9 @@ mod tests {
     #[test]
     fn eval_document_all_null_returns_null() {
         let mut e = Evaluator::new("/tmp".into());
-        let result = e.eval_document(vec![ONode::RawText(String::new())]).unwrap();
+        let result = e
+            .eval_document(vec![ONode::RawText(String::new())])
+            .unwrap();
         // OStr("") is not null — empty string is a valid value
         assert!(!result.is_null());
     }
@@ -2297,17 +2474,24 @@ mod tests {
     #[test]
     fn nix_expr_block_returns_onixexpr_without_calling_shim() {
         let mut e = Evaluator::new("/tmp".into());
-        let result = e.eval_typed_expr(
-            "nix_expr",
-            u32::MAX,
-            None,
-            &[ONode::RawText("pkgs.hello".to_string())],
-            &HashMap::new(),
-        ).unwrap();
+        let result = e
+            .eval_typed_expr(
+                "nix_expr",
+                u32::MAX,
+                None,
+                &[ONode::RawText("pkgs.hello".to_string())],
+                &HashMap::new(),
+            )
+            .unwrap();
 
         assert!(result.is_nix_expr(), "expected ONixExpr, got {:?}", result);
 
-        if let OValue::NixExpr { body, deps, fingerprint } = &result {
+        if let OValue::NixExpr {
+            body,
+            deps,
+            fingerprint,
+        } = &result
+        {
             assert_eq!(body, "pkgs.hello");
             assert!(deps.is_empty());
             assert_eq!(fingerprint.len(), 64, "fingerprint must be 64 hex chars");
@@ -2318,7 +2502,7 @@ mod tests {
     /// and their rendered form should be spliced into body.
     #[test]
     fn nix_expr_block_collects_deps_from_child_typed_exprs() {
-        let mut e    = Evaluator::new("/tmp".into());
+        let mut e = Evaluator::new("/tmp".into());
         let mut scope = HashMap::new();
         scope.insert("n".to_string(), OValue::int(7));
 
@@ -2330,7 +2514,9 @@ mod tests {
             ONode::RawText(" suffix".to_string()),
         ];
 
-        let result = e.eval_typed_expr("nix_expr", u32::MAX, None, &body_nodes, &scope).unwrap();
+        let result = e
+            .eval_typed_expr("nix_expr", u32::MAX, None, &body_nodes, &scope)
+            .unwrap();
 
         if let OValue::NixExpr { body, deps, .. } = &result {
             // render_nix for OInt(7) → "7"
@@ -2346,7 +2532,7 @@ mod tests {
     /// composes cleanly as a sub-expression.
     #[test]
     fn nix_expr_render_in_nix_context_is_parenthesised() {
-        let e   = Evaluator::new("/tmp".into());
+        let e = Evaluator::new("/tmp".into());
         let val = OValue::nix_expr("pkgs.hello", vec![]);
         let rendered = e.render_child("nix", &val);
         assert_eq!(rendered, "(pkgs.hello)");
@@ -2369,14 +2555,19 @@ mod tests {
     }
 
     impl MockExecutor {
-        fn new() -> Self { Self { calls: vec![] } }
+        fn new() -> Self {
+            Self { calls: vec![] }
+        }
     }
 
     impl Executor for MockExecutor {
         fn execute(&mut self, req: &OValue) -> Result<OValue> {
             let (kind, source, fingerprint) = match req {
-                OValue::Request { kind, source, fingerprint } =>
-                    (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
+                OValue::Request {
+                    kind,
+                    source,
+                    fingerprint,
+                } => (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
                 _ => panic!("MockExecutor only handles Requests"),
             };
             self.calls.push(fingerprint);
@@ -2388,13 +2579,11 @@ mod tests {
             };
 
             match (kind, &resolved) {
-                (RequestKind::Instantiate, OValue::NixExpr { .. }) => {
-                    Ok(OValue::derivation(
-                        "/nix/store/mockhash-foo.drv",
-                        vec!["out".into()],
-                        vec![],
-                    ))
-                }
+                (RequestKind::Instantiate, OValue::NixExpr { .. }) => Ok(OValue::derivation(
+                    "/nix/store/mockhash-foo.drv",
+                    vec!["out".into()],
+                    vec![],
+                )),
                 (RequestKind::Realise, OValue::Derivation { .. }) => {
                     Ok(OValue::store_path("/nix/store/mockhash-foo"))
                 }
@@ -2407,18 +2596,19 @@ mod tests {
     /// construction time inside eval_call. The caller never sees a Request.
     #[test]
     fn eager_call_auto_resolves_at_construction() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let call = ONode::Call {
             fn_name: "instantiate".into(),
-            args:    vec![ONode::VarRef("expr".into())],
+            args: vec![ONode::VarRef("expr".into())],
         };
         let result = e.eval_node(&call, &scope).unwrap();
-        assert!(result.is_derivation(),
-            "under Eager, eval_call should auto-resolve directly to a Derivation");
+        assert!(
+            result.is_derivation(),
+            "under Eager, eval_call should auto-resolve directly to a Derivation"
+        );
     }
 
     /// `realise(instantiate($expr))` chains under Eager: instantiate auto-
@@ -2426,24 +2616,28 @@ mod tests {
     /// No intermediate Request is observable.
     #[test]
     fn nested_call_under_eager_resolves_end_to_end() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let inner = ONode::Call {
             fn_name: "instantiate".into(),
-            args:    vec![ONode::VarRef("expr".into())],
+            args: vec![ONode::VarRef("expr".into())],
         };
         let outer = ONode::Call {
             fn_name: "realise".into(),
-            args:    vec![inner],
+            args: vec![inner],
         };
 
         let result = e.eval_node(&outer, &scope).unwrap();
         if let OValue::StorePath { path } = &result {
             assert!(path.starts_with("/nix/store/"));
-        } else { panic!("expected StorePath under Eager end-to-end, got {:?}", result); }
+        } else {
+            panic!(
+                "expected StorePath under Eager end-to-end, got {:?}",
+                result
+            );
+        }
     }
 
     /// The ImmediateExecutor's cache must hit on identical fingerprints.
@@ -2468,11 +2662,14 @@ mod tests {
         let r1 = exec.execute(&req1).expect("cached execute should succeed");
         let r2 = exec.execute(&req2).expect("cached execute should succeed");
         // Same identity → same cached result on both calls.
-        if let (OValue::Derivation { drv_path: d1, .. },
-                OValue::Derivation { drv_path: d2, .. }) = (&r1, &r2) {
+        if let (OValue::Derivation { drv_path: d1, .. }, OValue::Derivation { drv_path: d2, .. }) =
+            (&r1, &r2)
+        {
             assert_eq!(d1, d2);
             assert_eq!(d1, "/nix/store/seeded.drv");
-        } else { panic!("expected Derivation results"); }
+        } else {
+            panic!("expected Derivation results");
+        }
     }
 
     /// Unknown call names must error cleanly rather than silently no-op.
@@ -2482,10 +2679,13 @@ mod tests {
         let scope = HashMap::new();
         let call = ONode::Call {
             fn_name: "frobnicate".into(),
-            args:    vec![],
+            args: vec![],
         };
         let err = e.eval_node(&call, &scope).unwrap_err().to_string();
-        assert!(err.contains("frobnicate"), "error must name the unknown function");
+        assert!(
+            err.contains("frobnicate"),
+            "error must name the unknown function"
+        );
     }
 
     /// `now(req)` performs the request immediately and returns its result,
@@ -2493,20 +2693,21 @@ mod tests {
     /// `now()` is the explicit-perform escape hatch.
     #[test]
     fn now_call_executes_request_directly() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
+        let req = OValue::request(RequestKind::Instantiate, expr);
         scope.insert("req".into(), req);
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::VarRef("req".into())],
+            args: vec![ONode::VarRef("req".into())],
         };
         let result = e.eval_node(&call, &scope).unwrap();
-        assert!(result.is_derivation(),
-            "now(req) on an Instantiate request should produce a Derivation");
+        assert!(
+            result.is_derivation(),
+            "now(req) on an Instantiate request should produce a Derivation"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2523,40 +2724,41 @@ mod tests {
     /// auto-resolve passes the Request through.
     #[test]
     fn lazy_call_returns_unresolved_request() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let lazy_call = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
-                args:    vec![ONode::VarRef("expr".into())],
+                args: vec![ONode::VarRef("expr".into())],
             }],
         };
 
         let result = e.eval_node(&lazy_call, &scope).unwrap();
-        assert!(result.is_request(),
-            "lazy(instantiate(...)) must return a Request, got {:?}", result);
+        assert!(
+            result.is_request(),
+            "lazy(instantiate(...)) must return a Request, got {:?}",
+            result
+        );
     }
 
     /// `lazy(realise(instantiate($expr)))` returns a chained Request — outer
     /// Realise over inner Instantiate, neither executed.
     #[test]
     fn lazy_preserves_chained_request_structure() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let chain = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "realise".into(),
-                args:    vec![ONode::Call {
+                args: vec![ONode::Call {
                     fn_name: "instantiate".into(),
-                    args:    vec![ONode::VarRef("expr".into())],
+                    args: vec![ONode::VarRef("expr".into())],
                 }],
             }],
         };
@@ -2564,50 +2766,54 @@ mod tests {
         let result = e.eval_node(&chain, &scope).unwrap();
         if let OValue::Request { kind, source, .. } = &result {
             assert_eq!(*kind, RequestKind::Realise);
-            assert!(source.is_request(),
-                "outer Request's source must be the inner unresolved Instantiate Request");
-        } else { panic!("expected chained Request, got {:?}", result); }
+            assert!(
+                source.is_request(),
+                "outer Request's source must be the inner unresolved Instantiate Request"
+            );
+        } else {
+            panic!("expected chained Request, got {:?}", result);
+        }
     }
 
     /// `now()` inside lazy() forces execution — the explicit escape hatch.
     #[test]
     fn now_inside_lazy_executes() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let nested = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "now".into(),
-                args:    vec![ONode::Call {
+                args: vec![ONode::Call {
                     fn_name: "instantiate".into(),
-                    args:    vec![ONode::VarRef("expr".into())],
+                    args: vec![ONode::VarRef("expr".into())],
                 }],
             }],
         };
 
         let result = e.eval_node(&nested, &scope).unwrap();
-        assert!(result.is_derivation(),
-            "now() inside lazy() still executes, returning a Derivation");
+        assert!(
+            result.is_derivation(),
+            "now() inside lazy() still executes, returning a Derivation"
+        );
     }
 
     /// Policy is restored after lazy() returns. A subsequent direct call
     /// should auto-resolve normally — confirming the policy scope is bounded.
     #[test]
     fn policy_restored_to_eager_after_lazy_returns() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         // First: lazy(instantiate(...)) returns a Request (Lazy was active).
         let lazy_call = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
-                args:    vec![ONode::VarRef("expr".into())],
+                args: vec![ONode::VarRef("expr".into())],
             }],
         };
         assert!(e.eval_node(&lazy_call, &scope).unwrap().is_request());
@@ -2615,11 +2821,13 @@ mod tests {
         // Then: plain instantiate(...) auto-resolves (Eager is back).
         let plain_call = ONode::Call {
             fn_name: "instantiate".into(),
-            args:    vec![ONode::VarRef("expr".into())],
+            args: vec![ONode::VarRef("expr".into())],
         };
         let result = e.eval_node(&plain_call, &scope).unwrap();
-        assert!(result.is_derivation(),
-            "after lazy() exits, direct call should auto-resolve to Derivation");
+        assert!(
+            result.is_derivation(),
+            "after lazy() exits, direct call should auto-resolve to Derivation"
+        );
     }
 
     /// Nested lazy inside lazy stays lazy. Pinning down the edge case:
@@ -2627,24 +2835,26 @@ mod tests {
     /// non-lazy policy.
     #[test]
     fn nested_lazy_calls_remain_lazy() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("pkgs.hello", vec![]));
 
         let nested = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "lazy".into(),
-                args:    vec![ONode::Call {
+                args: vec![ONode::Call {
                     fn_name: "instantiate".into(),
-                    args:    vec![ONode::VarRef("expr".into())],
+                    args: vec![ONode::VarRef("expr".into())],
                 }],
             }],
         };
         let result = e.eval_node(&nested, &scope).unwrap();
-        assert!(result.is_request(),
-            "lazy nested in lazy must still produce a Request, got {:?}", result);
+        assert!(
+            result.is_request(),
+            "lazy nested in lazy must still produce a Request, got {:?}",
+            result
+        );
     }
 
     /// Even when lazy()'s argument errors, the policy is restored.
@@ -2656,13 +2866,16 @@ mod tests {
 
         let bad = ONode::Call {
             fn_name: "lazy".into(),
-            args:    vec![ONode::VarRef("missing".into())],   // will error
+            args: vec![ONode::VarRef("missing".into())], // will error
         };
 
         assert_eq!(e.policy, Policy::Eager);
-        let _ = e.eval_node(&bad, &scope);    // expected error
-        assert_eq!(e.policy, Policy::Eager,
-            "policy must be restored to Eager after lazy() errors");
+        let _ = e.eval_node(&bad, &scope); // expected error
+        assert_eq!(
+            e.policy,
+            Policy::Eager,
+            "policy must be restored to Eager after lazy() errors"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2676,16 +2889,22 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang:   "python".into(),
+            lang: "python".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![ONode::RawText("1 + 1".into())],
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("1 + 1".into())],
         };
         let err = e.eval_node(&block, &scope).unwrap_err().to_string();
-        assert!(err.contains("not a pure backend"),
-            "error must explain backend purity, got: {}", err);
-        assert!(err.contains("defer"),
-            "error should suggest {{defer}} as alternative, got: {}", err);
+        assert!(
+            err.contains("not a pure backend"),
+            "error must explain backend purity, got: {}",
+            err
+        );
+        assert!(
+            err.contains("defer"),
+            "error should suggest {{defer}} as alternative, got: {}",
+            err
+        );
     }
 
     /// {lazy} on a pure backend (nix) returns a Request[Eval] without
@@ -2695,15 +2914,19 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang:   "nix".into(),
+            lang: "nix".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![ONode::RawText("1 + 2".into())],
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("1 + 2".into())],
         };
         let result = e.eval_node(&block, &scope).unwrap();
         if let OValue::Request { kind, source, .. } = &result {
             match kind {
-                RequestKind::Eval { lang, env_id: _, cacheable } => {
+                RequestKind::Eval {
+                    lang,
+                    env_id: _,
+                    cacheable,
+                } => {
                     assert_eq!(lang, "nix");
                     assert!(*cacheable, "{{lazy}} must produce cacheable=true");
                 }
@@ -2713,7 +2936,9 @@ mod tests {
             if let OValue::Thunk { body, .. } = source.as_ref() {
                 assert_eq!(body, "1 + 2");
             }
-        } else { panic!("expected Request, got {:?}", result); }
+        } else {
+            panic!("expected Request, got {:?}", result);
+        }
     }
 
     /// {defer} on an impure backend (python) is allowed and produces a
@@ -2723,18 +2948,25 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang:   "python".into(),
+            lang: "python".into(),
             env_id: u32::MAX,
-            attr:   Some("defer".into()),
-            body:   vec![ONode::RawText("print('hi')".into())],
+            attr: Some("defer".into()),
+            body: vec![ONode::RawText("print('hi')".into())],
         };
         let result = e.eval_node(&block, &scope).unwrap();
         if let OValue::Request { kind, .. } = &result {
-            if let RequestKind::Eval { lang, cacheable, .. } = kind {
+            if let RequestKind::Eval {
+                lang, cacheable, ..
+            } = kind
+            {
                 assert_eq!(lang, "python");
                 assert!(!*cacheable, "{{defer}} must produce cacheable=false");
-            } else { panic!("expected RequestKind::Eval"); }
-        } else { panic!("expected Request"); }
+            } else {
+                panic!("expected RequestKind::Eval");
+            }
+        } else {
+            panic!("expected Request");
+        }
     }
 
     /// {lazy} on nix_expr is rejected as redundant.
@@ -2743,14 +2975,17 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang:   "nix_expr".into(),
+            lang: "nix_expr".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![],
+            attr: Some("lazy".into()),
+            body: vec![],
         };
         let err = e.eval_node(&block, &scope).unwrap_err().to_string();
-        assert!(err.contains("redundant"),
-            "error must say nix_expr+{{lazy}} is redundant, got: {}", err);
+        assert!(
+            err.contains("redundant"),
+            "error must say nix_expr+{{lazy}} is redundant, got: {}",
+            err
+        );
     }
 
     /// Unknown attributes error with a clear message.
@@ -2759,10 +2994,10 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang:   "nix".into(),
+            lang: "nix".into(),
             env_id: u32::MAX,
-            attr:   Some("strict".into()),
-            body:   vec![],
+            attr: Some("strict".into()),
+            body: vec![],
         };
         let err = e.eval_node(&block, &scope).unwrap_err().to_string();
         assert!(err.contains("strict"));
@@ -2777,23 +3012,28 @@ mod tests {
         let scope = HashMap::new();
 
         let block = ONode::TypedExpr {
-            lang:   "nix".into(),
+            lang: "nix".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![ONode::RawText("3 + 4".into())],
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("3 + 4".into())],
         };
         let req = e.eval_node(&block, &scope).unwrap();
         let fp = if let OValue::Request { fingerprint, .. } = &req {
             fingerprint.clone()
-        } else { panic!("expected Request"); };
+        } else {
+            panic!("expected Request");
+        };
 
         // Seed the Evaluator's own eval_cache so force_request hits it
         // instead of trying to spawn a nix shim.
         e.eval_cache.insert(fp.clone(), OValue::int(7));
 
         let forced = e.force_request(&req).unwrap();
-        assert_eq!(forced, OValue::int(7),
-            "now() / force_request must return the cached value");
+        assert_eq!(
+            forced,
+            OValue::int(7),
+            "now() / force_request must return the cached value"
+        );
     }
 
     /// {defer} requests bypass the cache on read AND write — re-running on
@@ -2804,15 +3044,17 @@ mod tests {
         let scope = HashMap::new();
 
         let block = ONode::TypedExpr {
-            lang:   "python".into(),
+            lang: "python".into(),
             env_id: u32::MAX,
-            attr:   Some("defer".into()),
-            body:   vec![ONode::RawText("1".into())],
+            attr: Some("defer".into()),
+            body: vec![ONode::RawText("1".into())],
         };
         let req = e.eval_node(&block, &scope).unwrap();
         let fp = if let OValue::Request { fingerprint, .. } = &req {
             fingerprint.clone()
-        } else { panic!("expected Request"); };
+        } else {
+            panic!("expected Request");
+        };
 
         // Even with a value seeded under the {defer} request's fingerprint,
         // the executor must not consult the cache for non-cacheable Eval —
@@ -2840,15 +3082,17 @@ mod tests {
 
         // Construct a {lazy} nix block, find its fingerprint, seed the cache.
         let lazy_block = ONode::TypedExpr {
-            lang:   "nix".into(),
+            lang: "nix".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![ONode::RawText("123".into())],
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("123".into())],
         };
         let req = e.eval_node(&lazy_block, &scope).unwrap();
         let fp = if let OValue::Request { fingerprint, .. } = &req {
             fingerprint.clone()
-        } else { panic!(); };
+        } else {
+            panic!();
+        };
         e.eval_cache.insert(fp, OValue::int(123));
         scope.insert("lz".into(), req);
 
@@ -2857,19 +3101,19 @@ mod tests {
         // rendering it. We use markdown^ so we don't need a real shim —
         // markdown bypasses the registry and renders directly.
         let md_block = ONode::TypedExpr {
-            lang:   "markdown".into(),
+            lang: "markdown".into(),
             env_id: u32::MAX,
-            attr:   None,
-            body:   vec![
-                ONode::RawText("value=".into()),
-                ONode::VarRef("lz".into()),
-            ],
+            attr: None,
+            body: vec![ONode::RawText("value=".into()), ONode::VarRef("lz".into())],
         };
         // markdown^ goes through the registry path which tries to spawn a
         // shim. We just check that resolve_for_splice resolves the request:
         let resolved = e.resolve_for_splice(scope["lz"].clone()).unwrap();
-        assert_eq!(resolved, OValue::int(123),
-            "splice path must auto-force {{lazy}} to its cached value");
+        assert_eq!(
+            resolved,
+            OValue::int(123),
+            "splice path must auto-force {{lazy}} to its cached value"
+        );
         // (md_block parsed but not evaluated end-to-end here — the splice
         // resolution is the unit we're testing.)
         let _ = md_block;
@@ -2888,11 +3132,15 @@ mod tests {
     /// without actually shelling out to switch-to-configuration. Used to
     /// verify the orchestration without touching the real OS.
     struct MockSystemExecutor {
-        activate_calls: Vec<(String, bool)>,    // (profile, dry_run)
+        activate_calls: Vec<(String, bool)>, // (profile, dry_run)
     }
 
     impl MockSystemExecutor {
-        fn new() -> Self { Self { activate_calls: vec![] } }
+        fn new() -> Self {
+            Self {
+                activate_calls: vec![],
+            }
+        }
     }
 
     impl Executor for MockSystemExecutor {
@@ -2917,15 +3165,15 @@ mod tests {
                     // Auto-realise a Derivation source — used in the chain test.
                     if resolved_source.is_derivation() {
                         Ok(OValue::store_path("/nix/store/mock-system"))
-                    } else { panic!("Realise source must be Derivation") }
+                    } else {
+                        panic!("Realise source must be Derivation")
+                    }
                 }
-                RequestKind::Instantiate => {
-                    Ok(OValue::derivation(
-                        "/nix/store/mockhash-system.drv",
-                        vec!["out".into()],
-                        vec![],
-                    ))
-                }
+                RequestKind::Instantiate => Ok(OValue::derivation(
+                    "/nix/store/mockhash-system.drv",
+                    vec!["out".into()],
+                    vec![],
+                )),
                 other => panic!("MockSystemExecutor: unhandled kind {:?}", other),
             }
         }
@@ -2935,36 +3183,41 @@ mod tests {
     /// auto-resolves it. The mock executor returns a System value.
     #[test]
     fn activate_call_builds_request_and_resolves_to_system() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockSystemExecutor::new()));
+        let mut e =
+            Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("path".into(), OValue::store_path("/nix/store/abc-system"));
 
         let call = ONode::Call {
             fn_name: "activate".into(),
-            args:    vec![ONode::VarRef("path".into())],
+            args: vec![ONode::VarRef("path".into())],
         };
         let result = e.eval_node(&call, &scope).unwrap();
-        assert!(result.is_system(),
-            "activate($path) under Eager should auto-resolve to a System, got {:?}", result);
+        assert!(
+            result.is_system(),
+            "activate($path) under Eager should auto-resolve to a System, got {:?}",
+            result
+        );
         if let OValue::System { profile_path } = &result {
-            assert_eq!(profile_path, "/nix/var/nix/profiles/system",
-                "default profile should be the system-wide one");
+            assert_eq!(
+                profile_path, "/nix/var/nix/profiles/system",
+                "default profile should be the system-wide one"
+            );
         }
     }
 
     /// `activate($path, $profile)` uses the user-supplied profile.
     #[test]
     fn activate_with_explicit_profile_uses_it() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockSystemExecutor::new()));
+        let mut e =
+            Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("path".into(), OValue::store_path("/nix/store/abc-system"));
         scope.insert("profile".into(), OValue::str_("/home/lee/.nix-profile"));
 
         let call = ONode::Call {
             fn_name: "activate".into(),
-            args:    vec![
+            args: vec![
                 ONode::VarRef("path".into()),
                 ONode::VarRef("profile".into()),
             ],
@@ -2972,7 +3225,9 @@ mod tests {
         let result = e.eval_node(&call, &scope).unwrap();
         if let OValue::System { profile_path } = &result {
             assert_eq!(profile_path, "/home/lee/.nix-profile");
-        } else { panic!("expected System"); }
+        } else {
+            panic!("expected System");
+        }
     }
 
     /// The full four-rung chain — `activate(realise(instantiate($expr)))` —
@@ -2980,10 +3235,13 @@ mod tests {
     /// and the executor walks the chain end-to-end under Eager.
     #[test]
     fn full_chain_instantiate_realise_activate() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockSystemExecutor::new()));
+        let mut e =
+            Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
-        scope.insert("expr".into(), OValue::nix_expr("nixos.config.system", vec![]));
+        scope.insert(
+            "expr".into(),
+            OValue::nix_expr("nixos.config.system", vec![]),
+        );
 
         let activate_call = ONode::Call {
             fn_name: "activate".into(),
@@ -2996,8 +3254,10 @@ mod tests {
             }],
         };
         let result = e.eval_node(&activate_call, &scope).unwrap();
-        assert!(result.is_system(),
-            "instantiate→realise→activate chain must resolve to a System");
+        assert!(
+            result.is_system(),
+            "instantiate→realise→activate chain must resolve to a System"
+        );
     }
 
     /// activate() with a NixExpr (not yet instantiated) is NOT auto-realised.
@@ -3007,8 +3267,8 @@ mod tests {
     /// auto-lifted.)
     #[test]
     fn activate_on_bare_nix_expr_errors() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockSystemExecutor::new()));
+        let mut e =
+            Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope: HashMap<String, OValue> = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("config", vec![]));
 
@@ -3029,13 +3289,20 @@ mod tests {
     fn current_system_returns_default_profile_reference() {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
-        let result = e.eval_node(
-            &ONode::Call { fn_name: "current_system".into(), args: vec![] },
-            &scope,
-        ).unwrap();
+        let result = e
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "current_system".into(),
+                    args: vec![],
+                },
+                &scope,
+            )
+            .unwrap();
         if let OValue::System { profile_path } = &result {
             assert_eq!(profile_path, "/nix/var/nix/profiles/system");
-        } else { panic!("expected System"); }
+        } else {
+            panic!("expected System");
+        }
     }
 
     /// Activate requests must NEVER hit the executor cache. A stale System
@@ -3045,13 +3312,18 @@ mod tests {
     fn activate_bypasses_cache_in_executor() {
         let mut exec = ImmediateExecutor::new();
         let path = OValue::store_path("/nix/store/abc-system");
-        let req  = OValue::request(
-            RequestKind::Activate { profile: "/p".into(), dry_run: true },
+        let req = OValue::request(
+            RequestKind::Activate {
+                profile: "/p".into(),
+                dry_run: true,
+            },
             path,
         );
         let fp = if let OValue::Request { fingerprint, .. } = &req {
             fingerprint.clone()
-        } else { panic!() };
+        } else {
+            panic!()
+        };
         exec.seed_cache(fp, OValue::system("/cached"));
         // The cache would return /cached IF cache were consulted. The real
         // path would try to spawn switch-to-configuration on a bogus store
@@ -3073,16 +3345,19 @@ mod tests {
         let scope = HashMap::new();
 
         let defer_block = ONode::TypedExpr {
-            lang:   "python".into(),
+            lang: "python".into(),
             env_id: u32::MAX,
-            attr:   Some("defer".into()),
-            body:   vec![ONode::RawText("1".into())],
+            attr: Some("defer".into()),
+            body: vec![ONode::RawText("1".into())],
         };
         let req = e.eval_node(&defer_block, &scope).unwrap();
         let err = e.resolve_for_splice(req).unwrap_err().to_string();
         assert!(err.contains("defer"));
-        assert!(err.contains("now"),
-            "error should tell the user to call now() explicitly, got: {}", err);
+        assert!(
+            err.contains("now"),
+            "error should tell the user to call now() explicitly, got: {}",
+            err
+        );
     }
 
     /// Through eval_document: `let pending = lazy(realise(instantiate($expr)))`
@@ -3092,8 +3367,7 @@ mod tests {
     fn let_binding_preserves_lazy_request_under_eager() {
         use crate::parser::ONode;
 
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
 
         // We can't put a NixExpr into scope via eval_document's API directly,
         // so we test this by constructing the nodes for both let-bindings.
@@ -3101,21 +3375,21 @@ mod tests {
             ONode::LetBinding {
                 name: "expr".into(),
                 expr: Box::new(ONode::TypedExpr {
-                    lang:   "nix_expr".into(),
+                    lang: "nix_expr".into(),
                     env_id: u32::MAX,
-                    attr:   None,
-                    body:   vec![ONode::RawText("pkgs.hello".into())],
+                    attr: None,
+                    body: vec![ONode::RawText("pkgs.hello".into())],
                 }),
             },
             ONode::LetBinding {
                 name: "pending".into(),
                 expr: Box::new(ONode::Call {
                     fn_name: "lazy".into(),
-                    args:    vec![ONode::Call {
+                    args: vec![ONode::Call {
                         fn_name: "realise".into(),
-                        args:    vec![ONode::Call {
+                        args: vec![ONode::Call {
                             fn_name: "instantiate".into(),
-                            args:    vec![ONode::VarRef("expr".into())],
+                            args: vec![ONode::VarRef("expr".into())],
                         }],
                     }],
                 }),
@@ -3127,10 +3401,13 @@ mod tests {
         ];
 
         let last = e.eval_document(nodes).unwrap();
-        assert!(last.is_request(),
+        assert!(
+            last.is_request(),
             "let pending = lazy(...) must bind a Request — re-executing at \
              the let-binding boundary would be the old broken behaviour. \
-             Got {:?}", last);
+             Got {:?}",
+            last
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3141,23 +3418,30 @@ mod tests {
     /// inner source text, NOT start a Python shim or produce 42.
     #[test]
     fn quote_block_returns_oexpr_not_evaluated() {
-        let backends: HashSet<String> =
-            ["python", "quote", "O"].iter().map(|s| s.to_string()).collect();
-        let mut e = Evaluator::new("/tmp".into())
-            .with_registered_backends(backends.clone());
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut e = Evaluator::new("/tmp".into()).with_registered_backends(backends.clone());
         let scope = HashMap::new();
 
         let src = r"quote^(python^(6*7)_python)_quote";
-        let nodes = crate::parser::Parser::new(src, &backends)
-            .parse()
-            .unwrap();
+        let nodes = crate::parser::Parser::new(src, &backends).parse().unwrap();
         assert_eq!(nodes.len(), 1);
 
         let result = e.eval_node(&nodes[0], &scope).unwrap();
         match &result {
             OValue::Expr { src } => {
-                assert!(src.contains("python^("), "src should contain python^(, got: {:?}", src);
-                assert!(src.contains("6*7"), "src should contain 6*7, got: {:?}", src);
+                assert!(
+                    src.contains("python^("),
+                    "src should contain python^(, got: {:?}",
+                    src
+                );
+                assert!(
+                    src.contains("6*7"),
+                    "src should contain 6*7, got: {:?}",
+                    src
+                );
             }
             other => panic!("expected OValue::Expr, got {:?}", other),
         }
@@ -3167,21 +3451,28 @@ mod tests {
     /// so the outer O.eval round-trip works.
     #[test]
     fn quote_multi_child_body_raw_source_preserved() {
-        let backends: HashSet<String> =
-            ["python", "quote", "O"].iter().map(|s| s.to_string()).collect();
-        let mut e = Evaluator::new("/tmp".into())
-            .with_registered_backends(backends.clone());
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut e = Evaluator::new("/tmp".into()).with_registered_backends(backends.clone());
         let scope = HashMap::new();
 
         let src = "quote^(python^(1)_python python^(2)_python)_quote";
-        let nodes = crate::parser::Parser::new(src, &backends)
-            .parse()
-            .unwrap();
+        let nodes = crate::parser::Parser::new(src, &backends).parse().unwrap();
         let result = e.eval_node(&nodes[0], &scope).unwrap();
         match &result {
             OValue::Expr { src } => {
-                assert!(src.contains("python^(1)_python"), "missing first block: {:?}", src);
-                assert!(src.contains("python^(2)_python"), "missing second block: {:?}", src);
+                assert!(
+                    src.contains("python^(1)_python"),
+                    "missing first block: {:?}",
+                    src
+                );
+                assert!(
+                    src.contains("python^(2)_python"),
+                    "missing second block: {:?}",
+                    src
+                );
             }
             other => panic!("expected OValue::Expr, got {:?}", other),
         }
@@ -3236,8 +3527,10 @@ mod tests {
         // Under autonomous, instantiate($expr) is buffered → returns a Request.
         // Then the buffer is flushed (cache hit) → the result is Derivation.
         let result = e.eval_node(&call, &scope).unwrap();
-        assert_eq!(result, fake_drv,
-            "autonomous() should resolve the buffered request from the cache on exit");
+        assert_eq!(
+            result, fake_drv,
+            "autonomous() should resolve the buffered request from the cache on exit"
+        );
     }
 
     /// Under autonomous(), Eval requests (nix^{lazy}^()_nix) are executed
@@ -3250,14 +3543,17 @@ mod tests {
         // Construct an Eval Request (nix {lazy} block) — this should go
         // through the Evaluator's eval_cache, not the scheduler buffer.
         let lazy_nix = ONode::TypedExpr {
-            lang:   "nix".into(),
+            lang: "nix".into(),
             env_id: u32::MAX,
-            attr:   Some("lazy".into()),
-            body:   vec![ONode::RawText("1 + 2".into())],
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("1 + 2".into())],
         };
         // First, collect the fingerprint to seed the eval_cache.
         let req = e.eval_node(&lazy_nix, &scope).unwrap();
-        let fp = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
         e.eval_cache.insert(fp.clone(), OValue::int(3));
 
         // Now call autonomous() wrapping another {lazy} nix block for the same expression.
@@ -3266,21 +3562,27 @@ mod tests {
             args: vec![ONode::Call {
                 fn_name: "now".into(),
                 args: vec![ONode::TypedExpr {
-                    lang:   "nix".into(),
+                    lang: "nix".into(),
                     env_id: u32::MAX,
-                    attr:   Some("lazy".into()),
-                    body:   vec![ONode::RawText("1 + 2".into())],
+                    attr: Some("lazy".into()),
+                    body: vec![ONode::RawText("1 + 2".into())],
                 }],
             }],
         };
 
         let result = e.eval_node(&call, &scope).unwrap();
-        assert_eq!(result, OValue::int(3),
-            "Eval request inside autonomous() must resolve via eval_cache, got {:?}", result);
+        assert_eq!(
+            result,
+            OValue::int(3),
+            "Eval request inside autonomous() must resolve via eval_cache, got {:?}",
+            result
+        );
 
         // The buffer must be empty — Eval was not buffered.
-        assert!(e.autonomous_buffer.is_empty(),
-            "autonomous_buffer must be empty after Eval request (not buffered)");
+        assert!(
+            e.autonomous_buffer.is_empty(),
+            "autonomous_buffer must be empty after Eval request (not buffered)"
+        );
     }
 
     /// Policy is restored to Eager after autonomous() returns, even when the
@@ -3294,21 +3596,33 @@ mod tests {
 
         // Success path: policy restored.
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
-        let fp   = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
-        e.scheduler.mem_cache.insert(fp, OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]));
+        let req = OValue::request(RequestKind::Instantiate, expr);
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
+        e.scheduler.mem_cache.insert(
+            fp,
+            OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]),
+        );
         let call = ONode::Call {
             fn_name: "autonomous".into(),
             args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
                 args: vec![ONode::TypedExpr {
-                    lang: "nix_expr".into(), env_id: u32::MAX, attr: None,
+                    lang: "nix_expr".into(),
+                    env_id: u32::MAX,
+                    attr: None,
                     body: vec![ONode::RawText("pkgs.hello".into())],
                 }],
             }],
         };
         let _ = e.eval_node(&call, &scope);
-        assert_eq!(e.policy, Policy::Eager, "policy must be Eager after autonomous() succeeds");
+        assert_eq!(
+            e.policy,
+            Policy::Eager,
+            "policy must be Eager after autonomous() succeeds"
+        );
 
         // Error path: policy still restored.
         let bad = ONode::Call {
@@ -3316,7 +3630,11 @@ mod tests {
             args: vec![ONode::VarRef("undefined_var".into())],
         };
         let _ = e.eval_node(&bad, &scope);
-        assert_eq!(e.policy, Policy::Eager, "policy must be Eager after autonomous() errors");
+        assert_eq!(
+            e.policy,
+            Policy::Eager,
+            "policy must be Eager after autonomous() errors"
+        );
     }
 
     /// The autonomous buffer is cleared after an error, so stale entries
@@ -3331,8 +3649,10 @@ mod tests {
             args: vec![ONode::VarRef("no_such_var".into())],
         };
         let _ = e.eval_node(&bad, &scope);
-        assert!(e.autonomous_buffer.is_empty(),
-            "buffer must be cleared after autonomous() errors");
+        assert!(
+            e.autonomous_buffer.is_empty(),
+            "buffer must be cleared after autonomous() errors"
+        );
     }
 
     /// autonomous() with wrong arg count errors clearly.
@@ -3342,10 +3662,7 @@ mod tests {
         let scope = HashMap::new();
         let call = ONode::Call {
             fn_name: "autonomous".into(),
-            args: vec![
-                ONode::RawText("a".into()),
-                ONode::RawText("b".into()),
-            ],
+            args: vec![ONode::RawText("a".into()), ONode::RawText("b".into())],
         };
         let err = e.eval_node(&call, &scope).unwrap_err().to_string();
         assert!(err.contains("autonomous(expr) takes exactly 1 argument"));
@@ -3375,7 +3692,7 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "batch".into(),
-            args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+            args: vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
         };
         let result = e.eval_node(&call, &scope).unwrap();
         match result {
@@ -3396,13 +3713,13 @@ mod tests {
 
         for (name, expected) in [
             ("batch", GroupMode::Batch),
-            ("all",   GroupMode::All),
-            ("any",   GroupMode::Any),
-            ("race",  GroupMode::Race),
+            ("all", GroupMode::All),
+            ("any", GroupMode::Any),
+            ("race", GroupMode::Race),
         ] {
             let call = ONode::Call {
                 fn_name: name.into(),
-                args:    vec![ONode::VarRef("a".into())],
+                args: vec![ONode::VarRef("a".into())],
             };
             let result = e.eval_node(&call, &scope).unwrap();
             match result {
@@ -3417,7 +3734,10 @@ mod tests {
     fn group_builtin_empty_errors() {
         let mut e = Evaluator::new("/tmp".into());
         let scope = HashMap::new();
-        let call = ONode::Call { fn_name: "batch".into(), args: vec![] };
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args: vec![],
+        };
         let err = e.eval_node(&call, &scope).unwrap_err().to_string();
         assert!(err.contains("at least 1 argument"), "got {err}");
     }
@@ -3433,9 +3753,9 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "batch".into(),
-                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+                args: vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
             }],
         };
         let result = e.eval_node(&call, &scope).unwrap();
@@ -3453,9 +3773,9 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "any".into(),
-                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+                args: vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
             }],
         };
         let result = e.eval_node(&call, &scope).unwrap();
@@ -3476,9 +3796,9 @@ mod tests {
 
         let mk_chain = |var: &str| ONode::Call {
             fn_name: "realise".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
-                args:    vec![ONode::VarRef(var.into())],
+                args: vec![ONode::VarRef(var.into())],
             }],
         };
 
@@ -3487,29 +3807,36 @@ mod tests {
         for var in ["e1", "e2"] {
             let expr = e.eval_node(&ONode::VarRef(var.into()), &scope).unwrap();
             let inst = OValue::request(RequestKind::Instantiate, expr);
-            let drv  = OValue::derivation(
-                format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
+            let drv =
+                OValue::derivation(format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
             let realise = OValue::request(RequestKind::Realise, inst.clone());
             let inst_fp = match &inst {
                 OValue::Request { fingerprint, .. } => fingerprint.clone(),
-                _ => unreachable!()
+                _ => unreachable!(),
             };
             let real_fp = match &realise {
                 OValue::Request { fingerprint, .. } => fingerprint.clone(),
-                _ => unreachable!()
+                _ => unreachable!(),
             };
             e.scheduler.mem_cache.insert(inst_fp, drv);
-            e.scheduler.mem_cache.insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
+            e.scheduler
+                .mem_cache
+                .insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
             members.push(realise);
         }
 
         // Resolve via CacheMode::Strict (same path as autonomous flush result resolution).
-        let result = e.resolve_group(GroupMode::Batch, &members, CacheMode::Strict).unwrap();
+        let result = e
+            .resolve_group(GroupMode::Batch, &members, CacheMode::Strict)
+            .unwrap();
         match result {
             OValue::List { v } => {
                 assert_eq!(v.len(), 2);
-                assert!(v.iter().all(|x| x.is_store_path()),
-                    "all members must resolve to StorePaths, got {:?}", v);
+                assert!(
+                    v.iter().all(|x| x.is_store_path()),
+                    "all members must resolve to StorePaths, got {:?}",
+                    v
+                );
             }
             other => panic!("expected list, got {:?}", other),
         }
@@ -3518,13 +3845,16 @@ mod tests {
         // captures Request chains, not pre-resolved values.
         let call = ONode::Call {
             fn_name: "batch".into(),
-            args:    vec![mk_chain("e1"), mk_chain("e2")],
+            args: vec![mk_chain("e1"), mk_chain("e2")],
         };
         let group_val = e.eval_node(&call, &scope).unwrap();
         match &group_val {
             OValue::Group { members, .. } => {
-                assert!(members.iter().all(|m| matches!(m, OValue::Request { .. })),
-                    "batch() must capture Request members, not resolved values, got {:?}", members);
+                assert!(
+                    members.iter().all(|m| matches!(m, OValue::Request { .. })),
+                    "batch() must capture Request members, not resolved values, got {:?}",
+                    members
+                );
             }
             other => panic!("expected Group from batch(), got {:?}", other),
         }
@@ -3539,7 +3869,7 @@ mod tests {
         scope.insert("a".into(), OValue::int(1));
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::VarRef("a".into())],
+            args: vec![ONode::VarRef("a".into())],
         };
         let err = e.eval_node(&call, &scope).unwrap_err().to_string();
         assert!(err.contains("Request or Group"), "got {err}");
@@ -3559,35 +3889,46 @@ mod tests {
         for var in ["e1", "e2"] {
             let expr = e.eval_node(&ONode::VarRef(var.into()), &scope).unwrap();
             let inst = OValue::request(RequestKind::Instantiate, expr);
-            let drv  = OValue::derivation(
-                format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
+            let drv =
+                OValue::derivation(format!("/nix/store/{var}.drv"), vec!["out".into()], vec![]);
             let realise = OValue::request(RequestKind::Realise, inst.clone());
-            let inst_fp = match &inst { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => unreachable!() };
-            let real_fp = match &realise { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => unreachable!() };
+            let inst_fp = match &inst {
+                OValue::Request { fingerprint, .. } => fingerprint.clone(),
+                _ => unreachable!(),
+            };
+            let real_fp = match &realise {
+                OValue::Request { fingerprint, .. } => fingerprint.clone(),
+                _ => unreachable!(),
+            };
             e.scheduler.mem_cache.insert(inst_fp, drv);
-            e.scheduler.mem_cache.insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
+            e.scheduler
+                .mem_cache
+                .insert(real_fp, OValue::store_path(format!("/nix/store/{var}-out")));
         }
 
         let mk_chain = |var: &str| ONode::Call {
             fn_name: "realise".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
-                args:    vec![ONode::VarRef(var.into())],
+                args: vec![ONode::VarRef(var.into())],
             }],
         };
         let call = ONode::Call {
             fn_name: "autonomous".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "batch".into(),
-                args:    vec![mk_chain("e1"), mk_chain("e2")],
+                args: vec![mk_chain("e1"), mk_chain("e2")],
             }],
         };
         let result = e.eval_node(&call, &scope).unwrap();
         match result {
             OValue::List { v } => {
                 assert_eq!(v.len(), 2, "batch must resolve to a 2-element list");
-                assert!(v.iter().all(|x| x.is_store_path()),
-                    "members must resolve to StorePaths, got {:?}", v);
+                assert!(
+                    v.iter().all(|x| x.is_store_path()),
+                    "members must resolve to StorePaths, got {:?}",
+                    v
+                );
             }
             other => panic!("expected list from autonomous(batch(...)), got {:?}", other),
         }
@@ -3613,9 +3954,9 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "race".into(),
-                args:    vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
+                args: vec![ONode::VarRef("a".into()), ONode::VarRef("b".into())],
             }],
         };
         let result = e.eval_node(&call, &scope).unwrap();
@@ -3632,9 +3973,9 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "race".into(),
-                args:    vec![ONode::VarRef("v".into())],
+                args: vec![ONode::VarRef("v".into())],
             }],
         };
         assert_eq!(e.eval_node(&call, &scope).unwrap(), OValue::int(42));
@@ -3649,9 +3990,9 @@ mod tests {
 
         let call = ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "any".into(),
-                args:    vec![ONode::VarRef("v".into())],
+                args: vec![ONode::VarRef("v".into())],
             }],
         };
         assert_eq!(e.eval_node(&call, &scope).unwrap(), OValue::str_("only"));
@@ -3673,18 +4014,22 @@ mod tests {
 
         let make_call = |fn_name: &str| ONode::Call {
             fn_name: "now".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: fn_name.to_string(),
-                args:    vec![ONode::VarRef("x".into()), ONode::VarRef("y".into())],
+                args: vec![ONode::VarRef("x".into()), ONode::VarRef("y".into())],
             }],
         };
 
         let batch_result = e.eval_node(&make_call("batch"), &scope).unwrap();
-        let all_result   = e.eval_node(&make_call("all"),   &scope).unwrap();
-        assert_eq!(batch_result, all_result,
-            "batch and all must produce identical results for plain values");
-        assert_eq!(batch_result,
-            OValue::list(vec![OValue::int(1), OValue::int(2)]));
+        let all_result = e.eval_node(&make_call("all"), &scope).unwrap();
+        assert_eq!(
+            batch_result, all_result,
+            "batch and all must produce identical results for plain values"
+        );
+        assert_eq!(
+            batch_result,
+            OValue::list(vec![OValue::int(1), OValue::int(2)])
+        );
     }
 
     /// `now(race(...))` over pre-resolved Requests: because `race` is a special
@@ -3692,28 +4037,30 @@ mod tests {
     /// plain StorePaths uses the sequential race path — first member wins.
     #[test]
     fn now_race_of_resolved_requests_returns_first() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let scope = scope_with_nix_expr();
 
         // Verify the special-form property: race() evaluated via eval_node
         // captures Request chains (Lazy-evaluated), not pre-resolved values.
         let mk_chain = |var: &str| ONode::Call {
             fn_name: "realise".into(),
-            args:    vec![ONode::Call {
+            args: vec![ONode::Call {
                 fn_name: "instantiate".into(),
-                args:    vec![ONode::VarRef(var.into())],
+                args: vec![ONode::VarRef(var.into())],
             }],
         };
         let call = ONode::Call {
             fn_name: "race".into(),
-            args:    vec![mk_chain("e1"), mk_chain("e2")],
+            args: vec![mk_chain("e1"), mk_chain("e2")],
         };
         let group_val = e.eval_node(&call, &scope).unwrap();
         match &group_val {
             OValue::Group { members, .. } => {
-                assert!(members.iter().all(|m| matches!(m, OValue::Request { .. })),
-                    "race() must capture Request members, not resolved values, got {:?}", members);
+                assert!(
+                    members.iter().all(|m| matches!(m, OValue::Request { .. })),
+                    "race() must capture Request members, not resolved values, got {:?}",
+                    members
+                );
             }
             other => panic!("expected Group from race(), got {:?}", other),
         }
@@ -3738,26 +4085,40 @@ mod tests {
         let nix_expr = OValue::nix_expr("pkgs.hello", vec![]);
 
         let inst = OValue::request(RequestKind::Instantiate, nix_expr.clone());
-        assert!(Evaluator::is_threadable_member(&inst),
-            "Instantiate Request must be threadable");
+        assert!(
+            Evaluator::is_threadable_member(&inst),
+            "Instantiate Request must be threadable"
+        );
 
-        let drv  = OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]);
+        let drv = OValue::derivation("/nix/store/x.drv", vec!["out".into()], vec![]);
         let real = OValue::request(RequestKind::Realise, drv);
-        assert!(Evaluator::is_threadable_member(&real),
-            "Realise Request must be threadable");
+        assert!(
+            Evaluator::is_threadable_member(&real),
+            "Realise Request must be threadable"
+        );
 
         let thunk = OValue::thunk("1+1", vec![]);
-        let eval  = OValue::request(
-            RequestKind::Eval { lang: "python".into(), env_id: 0, cacheable: false },
+        let eval = OValue::request(
+            RequestKind::Eval {
+                lang: "python".into(),
+                env_id: 0,
+                cacheable: false,
+            },
             thunk,
         );
-        assert!(!Evaluator::is_threadable_member(&eval),
-            "Eval Request must NOT be threadable");
+        assert!(
+            !Evaluator::is_threadable_member(&eval),
+            "Eval Request must NOT be threadable"
+        );
 
-        assert!(!Evaluator::is_threadable_member(&OValue::int(1)),
-            "plain value must NOT be threadable");
-        assert!(!Evaluator::is_threadable_member(&OValue::str_("hello")),
-            "string must NOT be threadable");
+        assert!(
+            !Evaluator::is_threadable_member(&OValue::int(1)),
+            "plain value must NOT be threadable"
+        );
+        assert!(
+            !Evaluator::is_threadable_member(&OValue::str_("hello")),
+            "string must NOT be threadable"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3799,8 +4160,11 @@ mod tests {
             OValue::List { v } => {
                 assert_eq!(v.len(), 2, "batch must return one entry per member");
                 assert_eq!(v[0], OValue::int(1), "successful member must be preserved");
-                assert!(v[1].is_error(),
-                    "failing member must become OError, got {:?}", v[1]);
+                assert!(
+                    v[1].is_error(),
+                    "failing member must become OError, got {:?}",
+                    v[1]
+                );
             }
             other => panic!("batch must return a list, got {:?}", other),
         }
@@ -3820,7 +4184,10 @@ mod tests {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
+        let err = e
+            .resolve_group(mode, &members, CacheMode::Fresh)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("all") || err.contains("no members"),
             "all must fail when a member fails, got: {err}"
@@ -3854,13 +4221,19 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let group = OValue::group(
             GroupMode::Any,
-            vec![failing_member(GroupMode::Any), failing_member(GroupMode::Any)],
+            vec![
+                failing_member(GroupMode::Any),
+                failing_member(GroupMode::Any),
+            ],
         );
         let (mode, members) = match &group {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
+        let err = e
+            .resolve_group(mode, &members, CacheMode::Fresh)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("any") && err.contains("members failed"),
             "any must fail when all members fail, got: {err}"
@@ -3875,14 +4248,20 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
         let group = OValue::group(
             GroupMode::Race,
-            vec![failing_member(GroupMode::Race), OValue::str_("never_reached")],
+            vec![
+                failing_member(GroupMode::Race),
+                OValue::str_("never_reached"),
+            ],
         );
         let (mode, members) = match &group {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
         // Race settles on the first result whether Ok or Err.
-        let err = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap_err().to_string();
+        let err = e
+            .resolve_group(mode, &members, CacheMode::Fresh)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("race") || err.contains("no members"),
             "race must propagate the lead member's failure, got: {err}"
@@ -3894,17 +4273,17 @@ mod tests {
     #[test]
     fn race_returns_lead_member_success_immediately() {
         let mut e = Evaluator::new("/tmp".into());
-        let group = OValue::group(
-            GroupMode::Race,
-            vec![OValue::int(42), OValue::int(99)],
-        );
+        let group = OValue::group(GroupMode::Race, vec![OValue::int(42), OValue::int(99)]);
         let (mode, members) = match &group {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
         let result = e.resolve_group(mode, &members, CacheMode::Fresh).unwrap();
-        assert_eq!(result, OValue::int(42),
-            "race must return the lead member's value");
+        assert_eq!(
+            result,
+            OValue::int(42),
+            "race must return the lead member's value"
+        );
     }
 
     /// Member order is preserved in Collect-All results.  `batch(a, b, c)` must
@@ -3912,15 +4291,24 @@ mod tests {
     #[test]
     fn batch_result_preserves_member_order() {
         let mut e = Evaluator::new("/tmp".into());
-        let members = vec![OValue::str_("first"), OValue::str_("second"), OValue::str_("third")];
+        let members = vec![
+            OValue::str_("first"),
+            OValue::str_("second"),
+            OValue::str_("third"),
+        ];
         let group = OValue::group(GroupMode::Batch, members.clone());
         let (mode, grp_members) = match &group {
             OValue::Group { mode, members, .. } => (*mode, members.clone()),
             _ => unreachable!(),
         };
-        let result = e.resolve_group(mode, &grp_members, CacheMode::Fresh).unwrap();
-        assert_eq!(result, OValue::list(members),
-            "batch must preserve member order in the result list");
+        let result = e
+            .resolve_group(mode, &grp_members, CacheMode::Fresh)
+            .unwrap();
+        assert_eq!(
+            result,
+            OValue::list(members),
+            "batch must preserve member order in the result list"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3933,25 +4321,24 @@ mod tests {
     /// forms" property.
     #[test]
     fn batch_does_not_eagerly_force_request_members() {
-        let mut e = Evaluator::new("/tmp".into())
-            .with_executor(Box::new(MockExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into()).with_executor(Box::new(MockExecutor::new()));
         let scope = scope_with_nix_expr();
 
         let call = ONode::Call {
             fn_name: "batch".into(),
-            args:    vec![
+            args: vec![
                 ONode::Call {
                     fn_name: "realise".into(),
                     args: vec![ONode::Call {
                         fn_name: "instantiate".into(),
-                        args:    vec![ONode::VarRef("e1".into())],
+                        args: vec![ONode::VarRef("e1".into())],
                     }],
                 },
                 ONode::Call {
                     fn_name: "realise".into(),
                     args: vec![ONode::Call {
                         fn_name: "instantiate".into(),
-                        args:    vec![ONode::VarRef("e2".into())],
+                        args: vec![ONode::VarRef("e2".into())],
                     }],
                 },
             ],
@@ -3964,14 +4351,22 @@ mod tests {
                 assert_eq!(mode, GroupMode::Batch);
                 assert_eq!(members.len(), 2, "batch must have 2 members");
                 for (i, m) in members.iter().enumerate() {
-                    assert!(matches!(m, OValue::Request { .. }),
-                        "member {} must be a Request (not a resolved value), got {:?}", i, m);
+                    assert!(
+                        matches!(m, OValue::Request { .. }),
+                        "member {} must be a Request (not a resolved value), got {:?}",
+                        i,
+                        m
+                    );
                 }
             }
             other => panic!("batch() must return a Group, got {:?}", other),
         }
         // Outer policy must be restored after the special-form.
-        assert_eq!(e.policy, Policy::Eager, "policy must be restored after batch()");
+        assert_eq!(
+            e.policy,
+            Policy::Eager,
+            "policy must be restored after batch()"
+        );
     }
 
     /// `batch(ok, fail)` collects BOTH outcomes: the successful member keeps its
@@ -3983,20 +4378,28 @@ mod tests {
 
         // failing_member(Batch) is an empty Batch group, which errors on resolution.
         let members = vec![OValue::str_("ok"), failing_member(GroupMode::Batch)];
-        let result = e.resolve_group(GroupMode::Batch, &members, CacheMode::Fresh).unwrap();
+        let result = e
+            .resolve_group(GroupMode::Batch, &members, CacheMode::Fresh)
+            .unwrap();
 
         match result {
             OValue::List { v } => {
                 assert_eq!(v.len(), 2, "batch list must have one entry per member");
                 assert_eq!(v[0], OValue::str_("ok"), "successful member preserved");
-                assert!(v[1].is_error(),
-                    "failed member must become OError in batch result, got {:?}", v[1]);
+                assert!(
+                    v[1].is_error(),
+                    "failed member must become OError in batch result, got {:?}",
+                    v[1]
+                );
                 // The OError message should contain some indication of the failure.
                 if let OValue::Error { msg } = &v[1] {
                     assert!(!msg.is_empty(), "OError message must not be empty");
                 }
             }
-            other => panic!("batch must return a list even with failures, got {:?}", other),
+            other => panic!(
+                "batch must return a list even with failures, got {:?}",
+                other
+            ),
         }
     }
 
@@ -4016,19 +4419,22 @@ mod tests {
         let realise = OValue::request(RequestKind::Realise, inst);
 
         // Batch mode: cache miss becomes OError in the result list.
-        let batch_result = e.resolve_group(
-            GroupMode::Batch,
-            &[realise.clone()],
-            CacheMode::Strict,
-        ).unwrap();
+        let batch_result = e
+            .resolve_group(GroupMode::Batch, &[realise.clone()], CacheMode::Strict)
+            .unwrap();
         match batch_result {
             OValue::List { v } => {
                 assert_eq!(v.len(), 1);
-                assert!(v[0].is_error(),
-                    "CacheStrict batch must produce OError on cache miss, got {:?}", v[0]);
+                assert!(
+                    v[0].is_error(),
+                    "CacheStrict batch must produce OError on cache miss, got {:?}",
+                    v[0]
+                );
                 if let OValue::Error { msg } = &v[0] {
                     assert!(
-                        msg.contains("autonomous") || msg.contains("cache miss") || msg.contains("materialize"),
+                        msg.contains("autonomous")
+                            || msg.contains("cache miss")
+                            || msg.contains("materialize"),
                         "error message must indicate a strict cache miss, got: {msg}"
                     );
                 }
@@ -4037,13 +4443,14 @@ mod tests {
         }
 
         // All mode: cache miss propagates as a hard error.
-        let all_err = e.resolve_group(
-            GroupMode::All,
-            &[realise],
-            CacheMode::Strict,
-        ).unwrap_err().to_string();
+        let all_err = e
+            .resolve_group(GroupMode::All, &[realise], CacheMode::Strict)
+            .unwrap_err()
+            .to_string();
         assert!(
-            all_err.contains("autonomous") || all_err.contains("cache miss") || all_err.contains("materialize"),
+            all_err.contains("autonomous")
+                || all_err.contains("cache miss")
+                || all_err.contains("materialize"),
             "CacheStrict All must hard-error on cache miss, got: {all_err}"
         );
     }
@@ -4063,10 +4470,14 @@ mod tests {
         assert_eq!(e.scheduler.parallelism, 1);
 
         let members = vec![OValue::int(10), OValue::int(20), OValue::int(30)];
-        let result = e.resolve_group(GroupMode::All, &members, CacheMode::Fresh).unwrap();
-        assert_eq!(result,
+        let result = e
+            .resolve_group(GroupMode::All, &members, CacheMode::Fresh)
+            .unwrap();
+        assert_eq!(
+            result,
             OValue::list(vec![OValue::int(10), OValue::int(20), OValue::int(30)]),
-            "parallelism cap must not affect correctness of plain-value groups");
+            "parallelism cap must not affect correctness of plain-value groups"
+        );
     }
 
     /// A nested group resolves deterministically:
@@ -4079,18 +4490,14 @@ mod tests {
         let mut e = Evaluator::new("/tmp".into());
 
         // Inner any(a, b) → "a" (first success)
-        let inner_any = OValue::group(
-            GroupMode::Any,
-            vec![OValue::str_("a"), OValue::str_("b")],
-        );
+        let inner_any = OValue::group(GroupMode::Any, vec![OValue::str_("a"), OValue::str_("b")]);
         // Inner batch(c) → ["c"]
-        let inner_batch = OValue::group(
-            GroupMode::Batch,
-            vec![OValue::str_("c")],
-        );
+        let inner_batch = OValue::group(GroupMode::Batch, vec![OValue::str_("c")]);
         // Outer all(inner_any, inner_batch)
         let outer_members = vec![inner_any, inner_batch];
-        let result = e.resolve_group(GroupMode::All, &outer_members, CacheMode::Fresh).unwrap();
+        let result = e
+            .resolve_group(GroupMode::All, &outer_members, CacheMode::Fresh)
+            .unwrap();
 
         // Expect: [<result of any("a","b")>, <result of batch("c")>]
         //       = ["a", ["c"]]
@@ -4116,23 +4523,27 @@ mod tests {
 
         let fp_ab = match &g_ab {
             OValue::Group { fingerprint, .. } => fingerprint.clone(),
-            _ => unreachable!()
+            _ => unreachable!(),
         };
         let fp_ba = match &g_ba {
             OValue::Group { fingerprint, .. } => fingerprint.clone(),
-            _ => unreachable!()
+            _ => unreachable!(),
         };
 
-        assert_ne!(fp_ab, fp_ba,
-            "fingerprints must differ when member order differs");
+        assert_ne!(
+            fp_ab, fp_ba,
+            "fingerprints must differ when member order differs"
+        );
 
         // Sanity: same order → same fingerprint.
         let g_ab2 = OValue::group(GroupMode::Batch, vec![a.clone(), b.clone()]);
         let fp_ab2 = match &g_ab2 {
             OValue::Group { fingerprint, .. } => fingerprint.clone(),
-            _ => unreachable!()
+            _ => unreachable!(),
         };
-        assert_eq!(fp_ab, fp_ab2,
-            "fingerprints must be stable for identical groups");
+        assert_eq!(
+            fp_ab, fp_ab2,
+            "fingerprints must be stable for identical groups"
+        );
     }
 }

@@ -111,11 +111,7 @@ fn main() -> Result<()> {
             .split_once('=')
             .with_context(|| format!("--lang expects EXT=BACKEND, got `{}`", spec))?;
         if !backends.contains(backend) {
-            bail!(
-                "--lang {}: `{}` is not a registered backend",
-                spec,
-                backend
-            );
+            bail!("--lang {}: `{}` is not a registered backend", spec, backend);
         }
         ext_map.insert(ext.trim_start_matches('.').to_string(), backend.to_string());
     }
@@ -155,10 +151,9 @@ fn main() -> Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&cli.output, fs::Permissions::from_mode(0o755))
-                    .with_context(|| {
-                        format!("failed to mark {} executable", cli.output.display())
-                    })?;
+                fs::set_permissions(&cli.output, fs::Permissions::from_mode(0o755)).with_context(
+                    || format!("failed to mark {} executable", cli.output.display()),
+                )?;
             }
         }
         eprintln!(
@@ -221,7 +216,14 @@ fn collect_files(
 
     for input in inputs {
         if input.is_dir() {
-            walk_dir(input, ext_map, exclude, &mut seen_files, &mut seen_dirs, &mut files)?;
+            walk_dir(
+                input,
+                ext_map,
+                exclude,
+                &mut seen_files,
+                &mut seen_dirs,
+                &mut files,
+            )?;
         } else if input.is_file() {
             if file_backend(input, ext_map).is_none() {
                 bail!(
@@ -232,9 +234,8 @@ fn collect_files(
             if push_unique(input, exclude, &mut seen_files, &mut files) {
                 // Explicitly-listed files must be readable text: fail loudly
                 // here instead of skipping silently like directory walks do.
-                fs::read_to_string(input).with_context(|| {
-                    format!("{}: not readable as UTF-8 text", input.display())
-                })?;
+                fs::read_to_string(input)
+                    .with_context(|| format!("{}: not readable as UTF-8 text", input.display()))?;
             }
         } else {
             bail!("{}: no such file or directory", input.display());
@@ -308,10 +309,7 @@ fn walk_dir(
                     push_unique(&entry, exclude, seen_files, out);
                 }
                 Ok(_) => {
-                    eprintln!(
-                        "warning: {}: skipped (not UTF-8 text)",
-                        entry.display()
-                    );
+                    eprintln!("warning: {}: skipped (not UTF-8 text)", entry.display());
                 }
                 Err(err) => {
                     eprintln!("warning: {}: skipped ({})", entry.display(), err);
@@ -510,7 +508,12 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
 
     while !queue.is_empty() {
         // Pick the smallest original index among ready nodes to preserve order.
-        let pos = queue.iter().enumerate().min_by_key(|(_, &i)| i).map(|(p, _)| p).unwrap();
+        let pos = queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &i)| i)
+            .map(|(p, _)| p)
+            .unwrap();
         let node = queue.remove(pos);
         result.push(paths[node].clone());
         for &dependent in &rev_adj[node] {
@@ -525,9 +528,7 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
     // original order (conservative: keep what the user gave us).
     if result.len() < n {
         let emitted: HashSet<usize> = (0..result.len())
-            .filter_map(|k| {
-                paths.iter().position(|p| *p == &result[k])
-            })
+            .filter_map(|k| paths.iter().position(|p| *p == &result[k]))
             .collect();
         for i in 0..n {
             if !emitted.contains(&i) {
@@ -556,7 +557,13 @@ fn module_stems(path: &Path) -> Vec<String> {
     // Build dotted-path variants by walking parent components.
     let mut parts: Vec<String> = vec![stem];
     let root_markers = ["src", "lib", "source", "tests"];
-    for component in path.parent().map(|p| p.components()).into_iter().flatten().rev() {
+    for component in path
+        .parent()
+        .map(|p| p.components())
+        .into_iter()
+        .flatten()
+        .rev()
+    {
         let name = match component {
             std::path::Component::Normal(n) => n.to_str().unwrap_or("").to_string(),
             _ => break,
@@ -764,13 +771,40 @@ fn default_extension_map() -> BTreeMap<String, String> {
 /// in src/main.rs so o-link escapes exactly the openers the runtime parses.
 fn registered_backends() -> HashSet<String> {
     [
-        "O", "python", "html", "latex", "markdown", "bash", "shell", "rust",
-        "racket", "nix", "nix_expr", "nix_store", "nixos_test", "text",
-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql", "ruby",
-        "matlab", "mathematica", "webassembly", "java", "javascript", "ocaml",
+        "O",
+        "python",
+        "html",
+        "latex",
+        "markdown",
+        "bash",
+        "shell",
+        "rust",
+        "racket",
+        "nix",
+        "nix_expr",
+        "nix_store",
+        "nixos_test",
+        "text",
+        "csharp",
+        "cpp",
+        "haskell",
+        "lisp",
+        "common_lisp",
+        "sql",
+        "ruby",
+        "matlab",
+        "mathematica",
+        "webassembly",
+        "java",
+        "javascript",
+        "ocaml",
         "quote",
         // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py", "md", "tex", "plain", "o",
+        "py",
+        "md",
+        "tex",
+        "plain",
+        "o",
     ]
     .into_iter()
     .map(String::from)
@@ -891,11 +925,7 @@ mod tests {
 
     /// Build a unique scratch directory for filesystem-backed tests.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "olink_test_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("olink_test_{}_{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -964,12 +994,32 @@ mod tests {
         let combined = link_files(&files, &map, &backends).unwrap();
 
         // Both Python files must appear with distinct [N] tags.
-        assert!(combined.contains("python[0]^("), "expected python[0]^(, got:\n{}", combined);
-        assert!(combined.contains("python[1]^("), "expected python[1]^(, got:\n{}", combined);
-        assert!(combined.contains(")_python[0]"), "expected )_python[0], got:\n{}", combined);
-        assert!(combined.contains(")_python[1]"), "expected )_python[1], got:\n{}", combined);
+        assert!(
+            combined.contains("python[0]^("),
+            "expected python[0]^(, got:\n{}",
+            combined
+        );
+        assert!(
+            combined.contains("python[1]^("),
+            "expected python[1]^(, got:\n{}",
+            combined
+        );
+        assert!(
+            combined.contains(")_python[0]"),
+            "expected )_python[0], got:\n{}",
+            combined
+        );
+        assert!(
+            combined.contains(")_python[1]"),
+            "expected )_python[1], got:\n{}",
+            combined
+        );
         // The shell file is the only file of its language so it gets [0].
-        assert!(combined.contains("bash[0]^("), "expected bash[0]^(, got:\n{}", combined);
+        assert!(
+            combined.contains("bash[0]^("),
+            "expected bash[0]^(, got:\n{}",
+            combined
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -987,7 +1037,9 @@ mod tests {
 
         // The combined output must parse without errors.
         let mut parser = o_lang::parser::Parser::new(&combined, &backends);
-        parser.parse().expect("combined output with env_ids should parse");
+        parser
+            .parse()
+            .expect("combined output with env_ids should parse");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1012,13 +1064,17 @@ mod tests {
         assert!(
             pos_a < pos_b,
             "a.py (dependency) should be python[0] but positions are a={} b={}",
-            pos_a, pos_b
+            pos_a,
+            pos_b
         );
         // Verify a.py body is in python[0] slot.
         let slot0_start = combined.find("python[0]^(").unwrap();
-        let slot0_end   = combined.find(")_python[0]").unwrap();
-        let slot0_body  = &combined[slot0_start..slot0_end];
-        assert!(slot0_body.contains("def helper"), "python[0] should contain a.py");
+        let slot0_end = combined.find(")_python[0]").unwrap();
+        let slot0_body = &combined[slot0_start..slot0_end];
+        assert!(
+            slot0_body.contains("def helper"),
+            "python[0] should contain a.py"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1040,7 +1096,12 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
-        assert_eq!(names, ["a.py", "b.py", "c.py"], "expected topo order a<b<c, got {:?}", names);
+        assert_eq!(
+            names,
+            ["a.py", "b.py", "c.py"],
+            "expected topo order a<b<c, got {:?}",
+            names
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

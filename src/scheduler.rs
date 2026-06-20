@@ -84,7 +84,10 @@ impl DiskCache {
             return PathBuf::from(xdg).join("o-lang").join("sched");
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".cache").join("o-lang").join("sched");
+            return PathBuf::from(home)
+                .join(".cache")
+                .join("o-lang")
+                .join("sched");
         }
         std::env::temp_dir().join("o-lang-cache").join("sched")
     }
@@ -103,7 +106,7 @@ impl DiskCache {
     pub fn put(&self, fingerprint: &str, value: &OValue) {
         let fp_short = &fingerprint[..fingerprint.len().min(8)];
         let path = self.dir.join(format!("{fingerprint}.json"));
-        let tmp  = self.dir.join(format!("{fingerprint}.json.tmp"));
+        let tmp = self.dir.join(format!("{fingerprint}.json.tmp"));
 
         match serde_json::to_vec(value) {
             Err(e) => {
@@ -133,7 +136,12 @@ impl DiskCache {
 ///
 /// Terminates when the source is not a Request (NixExpr, Derivation, etc.).
 pub fn collect_transitive_requests(req: &OValue, out: &mut HashMap<String, OValue>) {
-    if let OValue::Request { fingerprint, source, .. } = req {
+    if let OValue::Request {
+        fingerprint,
+        source,
+        ..
+    } = req
+    {
         if out.contains_key(fingerprint) {
             return; // already visited
         }
@@ -152,7 +160,11 @@ fn build_dep_graph(all: &HashMap<String, OValue>) -> HashMap<String, Vec<String>
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for (fp, req) in all {
         if let OValue::Request { source, .. } = req {
-            let dep = if let OValue::Request { fingerprint: dep_fp, .. } = source.as_ref() {
+            let dep = if let OValue::Request {
+                fingerprint: dep_fp,
+                ..
+            } = source.as_ref()
+            {
                 // Only add the dep if it is in our batch (it might be a
                 // pre-existing request that's already cached; we don't need
                 // to track it as a pending dep in that case).
@@ -179,16 +191,18 @@ fn build_dep_graph(all: &HashMap<String, OValue>) -> HashMap<String, Vec<String>
 fn resolve_source(req: &OValue, resolved: &HashMap<String, OValue>) -> Result<OValue> {
     match req {
         OValue::Request { source, .. } => match source.as_ref() {
-            OValue::Request { fingerprint, .. } => resolved
-                .get(fingerprint)
-                .cloned()
-                .ok_or_else(|| {
+            OValue::Request { fingerprint, .. } => {
+                resolved.get(fingerprint).cloned().ok_or_else(|| {
                     let short = &fingerprint[..fingerprint.len().min(8)];
                     anyhow!("scheduler: dep {short} not yet resolved (BUG: should be ready)")
-                }),
+                })
+            }
             other => Ok(other.clone()),
         },
-        other => bail!("resolve_source expected a Request, got {}", other.type_name()),
+        other => bail!(
+            "resolve_source expected a Request, got {}",
+            other.type_name()
+        ),
     }
 }
 
@@ -224,7 +238,11 @@ impl AutonomousScheduler {
             .map(|n| n.get().min(8))
             .unwrap_or(4);
         let disk_cache = DiskCache::new(DiskCache::default_dir()).ok();
-        Self { mem_cache: HashMap::new(), disk_cache, parallelism }
+        Self {
+            mem_cache: HashMap::new(),
+            disk_cache,
+            parallelism,
+        }
     }
 
     /// Create a scheduler that writes its disk cache to a specific directory.
@@ -250,7 +268,11 @@ impl AutonomousScheduler {
     /// Create a scheduler with no disk cache. For tests and ephemeral runs.
     #[cfg(test)]
     pub fn no_disk() -> Self {
-        Self { mem_cache: HashMap::new(), disk_cache: None, parallelism: 2 }
+        Self {
+            mem_cache: HashMap::new(),
+            disk_cache: None,
+            parallelism: 2,
+        }
     }
 
     // ── Cache access ──────────────────────────────────────────────────────────
@@ -323,14 +345,16 @@ impl AutonomousScheduler {
         let dep_graph = build_dep_graph(&all);
 
         // 4. Topological dispatch loop.
-        let mut pending: HashSet<String> = all.keys()
+        let mut pending: HashSet<String> = all
+            .keys()
             .filter(|fp| !resolved.contains_key(*fp))
             .cloned()
             .collect();
 
         while !pending.is_empty() {
             // Find nodes whose deps are all resolved.
-            let ready: Vec<String> = pending.iter()
+            let ready: Vec<String> = pending
+                .iter()
                 .filter(|fp| {
                     dep_graph
                         .get(*fp)
@@ -351,13 +375,13 @@ impl AutonomousScheduler {
 
             // Classify ready nodes into thread-dispatchable vs serial.
             let mut threadable: Vec<String> = Vec::new();
-            let mut serial:     Vec<String> = Vec::new();
+            let mut serial: Vec<String> = Vec::new();
             for fp in &ready {
                 if let Some(OValue::Request { kind, .. }) = all.get(fp) {
                     match kind {
-                        RequestKind::Instantiate |
-                        RequestKind::Realise     |
-                        RequestKind::Activate { .. } => threadable.push(fp.clone()),
+                        RequestKind::Instantiate
+                        | RequestKind::Realise
+                        | RequestKind::Activate { .. } => threadable.push(fp.clone()),
                         _ => serial.push(fp.clone()),
                     }
                 }
@@ -373,23 +397,27 @@ impl AutonomousScheduler {
                 let (tx, rx) = mpsc::channel::<(String, Result<OValue>)>();
 
                 for fp in &wave {
-                    let req  = all[fp].clone();
-                    let src  = resolve_source(&req, &resolved)?;
+                    let req = all[fp].clone();
+                    let src = resolve_source(&req, &resolved)?;
                     let kind = match &req {
                         OValue::Request { kind, .. } => kind.clone(),
                         _ => unreachable!(),
                     };
-                    let fp_c  = fp.clone();
-                    let tx_c  = tx.clone();
+                    let fp_c = fp.clone();
+                    let tx_c = tx.clone();
 
                     thread::spawn(move || {
                         let result = match kind {
                             RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
-                            RequestKind::Realise     => nix_ops::realise_nix(&src),
-                            RequestKind::Activate { ref profile, dry_run } => {
-                                nixos_ops::activate_nix(&src, profile, dry_run)
-                            }
-                            _ => Err(anyhow!("unexpected kind in concurrent dispatch: {:?}", kind)),
+                            RequestKind::Realise => nix_ops::realise_nix(&src),
+                            RequestKind::Activate {
+                                ref profile,
+                                dry_run,
+                            } => nixos_ops::activate_nix(&src, profile, dry_run),
+                            _ => Err(anyhow!(
+                                "unexpected kind in concurrent dispatch: {:?}",
+                                kind
+                            )),
                         };
                         let _ = tx_c.send((fp_c, result));
                     });
@@ -398,7 +426,10 @@ impl AutonomousScheduler {
 
                 for (fp, result) in rx {
                     let value = result.with_context(|| {
-                        format!("autonomous scheduler: request {} failed", &fp[..fp.len().min(8)])
+                        format!(
+                            "autonomous scheduler: request {} failed",
+                            &fp[..fp.len().min(8)]
+                        )
                     })?;
                     self.cache_put(&fp, value.clone());
                     resolved.insert(fp.clone(), value);
@@ -460,15 +491,19 @@ impl AutonomousScheduler {
         }
 
         let results = self.execute_batch(std::slice::from_ref(req), None)?;
-        results
-            .get(&fp)
-            .cloned()
-            .ok_or_else(|| anyhow!("scheduler: root request {} not in results", &fp[..fp.len().min(8)]))
+        results.get(&fp).cloned().ok_or_else(|| {
+            anyhow!(
+                "scheduler: root request {} not in results",
+                &fp[..fp.len().min(8)]
+            )
+        })
     }
 }
 
 impl Default for AutonomousScheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -491,16 +526,16 @@ mod tests {
 
     #[test]
     fn disk_cache_miss_returns_none() {
-        let dir   = tmp_cache_dir("miss");
+        let dir = tmp_cache_dir("miss");
         let cache = DiskCache::new(dir).unwrap();
         assert!(cache.get("nonexistent_fingerprint").is_none());
     }
 
     #[test]
     fn disk_cache_put_then_get_roundtrips_ovalue() {
-        let dir   = tmp_cache_dir("put-get");
+        let dir = tmp_cache_dir("put-get");
         let cache = DiskCache::new(dir).unwrap();
-        let val   = OValue::str_("hello from cache");
+        let val = OValue::str_("hello from cache");
         cache.put("abc123", &val);
         let got = cache.get("abc123").expect("cache should have hit");
         assert_eq!(got, val);
@@ -508,7 +543,7 @@ mod tests {
 
     #[test]
     fn disk_cache_int_roundtrip() {
-        let dir   = tmp_cache_dir("int");
+        let dir = tmp_cache_dir("int");
         let cache = DiskCache::new(dir).unwrap();
         cache.put("fp_int", &OValue::int(42));
         assert_eq!(cache.get("fp_int").unwrap(), OValue::int(42));
@@ -517,7 +552,7 @@ mod tests {
     #[test]
     fn disk_cache_put_is_idempotent() {
         // Writing twice: second write wins, no corruption.
-        let dir   = tmp_cache_dir("idempotent");
+        let dir = tmp_cache_dir("idempotent");
         let cache = DiskCache::new(dir).unwrap();
         cache.put("fp", &OValue::int(1));
         cache.put("fp", &OValue::int(2));
@@ -526,9 +561,9 @@ mod tests {
 
     #[test]
     fn disk_cache_store_path_roundtrip() {
-        let dir   = tmp_cache_dir("store-path");
+        let dir = tmp_cache_dir("store-path");
         let cache = DiskCache::new(dir).unwrap();
-        let sp    = OValue::store_path("/nix/store/abc-hello");
+        let sp = OValue::store_path("/nix/store/abc-hello");
         cache.put("sp_fp", &sp);
         assert_eq!(cache.get("sp_fp").unwrap(), sp);
     }
@@ -538,7 +573,7 @@ mod tests {
     #[test]
     fn collect_single_request_no_chain() {
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
+        let req = OValue::request(RequestKind::Instantiate, expr);
         let mut all = HashMap::new();
         collect_transitive_requests(&req, &mut all);
         assert_eq!(all.len(), 1);
@@ -551,7 +586,7 @@ mod tests {
 
     #[test]
     fn collect_two_level_chain() {
-        let expr     = OValue::nix_expr("pkgs.hello", vec![]);
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
         let inst_req = OValue::request(RequestKind::Instantiate, expr);
         let real_req = OValue::request(RequestKind::Realise, inst_req.clone());
 
@@ -564,7 +599,7 @@ mod tests {
     #[test]
     fn collect_is_idempotent_on_duplicate_roots() {
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
+        let req = OValue::request(RequestKind::Instantiate, expr);
         let mut all = HashMap::new();
         collect_transitive_requests(&req, &mut all);
         collect_transitive_requests(&req, &mut all); // second call is a no-op
@@ -576,8 +611,11 @@ mod tests {
     #[test]
     fn dep_graph_single_request_has_no_deps() {
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
-        let fp   = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let req = OValue::request(RequestKind::Instantiate, expr);
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
         let mut all = HashMap::new();
         all.insert(fp.clone(), req);
         let graph = build_dep_graph(&all);
@@ -586,12 +624,18 @@ mod tests {
 
     #[test]
     fn dep_graph_realise_depends_on_instantiate() {
-        let expr     = OValue::nix_expr("pkgs.hello", vec![]);
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
         let inst_req = OValue::request(RequestKind::Instantiate, expr);
         let real_req = OValue::request(RequestKind::Realise, inst_req.clone());
 
-        let inst_fp = match &inst_req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
-        let real_fp = match &real_req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let inst_fp = match &inst_req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
+        let real_fp = match &real_req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
 
         let mut all = HashMap::new();
         all.insert(inst_fp.clone(), inst_req);
@@ -599,7 +643,11 @@ mod tests {
 
         let graph = build_dep_graph(&all);
         assert!(graph[&inst_fp].is_empty(), "Instantiate has no Request dep");
-        assert_eq!(graph[&real_fp], vec![inst_fp], "Realise depends on Instantiate");
+        assert_eq!(
+            graph[&real_fp],
+            vec![inst_fp],
+            "Realise depends on Instantiate"
+        );
     }
 
     // ── AutonomousScheduler: cache lookup ─────────────────────────────────────
@@ -608,11 +656,16 @@ mod tests {
     fn scheduler_mem_cache_hit_bypasses_execution() {
         let mut sched = AutonomousScheduler::no_disk();
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
-        let fp   = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let req = OValue::request(RequestKind::Instantiate, expr);
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
 
         // Seed the in-memory cache with a fake result.
-        sched.mem_cache.insert(fp.clone(), OValue::store_path("/nix/store/fake-cached"));
+        sched
+            .mem_cache
+            .insert(fp.clone(), OValue::store_path("/nix/store/fake-cached"));
 
         // execute() should return the cached value without calling nix.
         let got = sched.execute(&req).unwrap();
@@ -621,11 +674,14 @@ mod tests {
 
     #[test]
     fn scheduler_disk_cache_hit_bypasses_execution() {
-        let dir  = tmp_cache_dir("sched-disk-hit");
+        let dir = tmp_cache_dir("sched-disk-hit");
         let mut sched = AutonomousScheduler::with_cache_dir(dir).unwrap();
         let expr = OValue::nix_expr("pkgs.hello", vec![]);
-        let req  = OValue::request(RequestKind::Instantiate, expr);
-        let fp   = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let req = OValue::request(RequestKind::Instantiate, expr);
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
 
         // Write result to disk cache.
         let cached_val = OValue::store_path("/nix/store/disk-cached-hello");
@@ -641,10 +697,14 @@ mod tests {
 
     #[test]
     fn scheduler_disk_cache_promoted_to_mem_cache() {
-        let dir  = tmp_cache_dir("sched-promote");
+        let dir = tmp_cache_dir("sched-promote");
         let mut sched = AutonomousScheduler::with_cache_dir(dir).unwrap();
         let fp = "aaaa1111".to_string();
-        sched.disk_cache.as_ref().unwrap().put(&fp, &OValue::int(99));
+        sched
+            .disk_cache
+            .as_ref()
+            .unwrap()
+            .put(&fp, &OValue::int(99));
 
         // First cache_get: L2 hit → promotes to L1.
         let v1 = sched.cache_get(&fp).unwrap();
@@ -663,11 +723,18 @@ mod tests {
         let mut sched = AutonomousScheduler::no_disk();
 
         let thunk = OValue::thunk("x = 1 + 1", vec![]);
-        let req   = OValue::request(
-            RequestKind::Eval { lang: "python".to_string(), env_id: u32::MAX, cacheable: false },
+        let req = OValue::request(
+            RequestKind::Eval {
+                lang: "python".to_string(),
+                env_id: u32::MAX,
+                cacheable: false,
+            },
             thunk,
         );
-        let fp = match &req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let fp = match &req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
 
         let called = Arc::new(Mutex::new(false));
         let called_c = called.clone();
@@ -685,8 +752,12 @@ mod tests {
     fn execute_batch_errors_on_eval_without_callback() {
         let mut sched = AutonomousScheduler::no_disk();
         let thunk = OValue::thunk("x = 1", vec![]);
-        let req   = OValue::request(
-            RequestKind::Eval { lang: "python".to_string(), env_id: 0, cacheable: false },
+        let req = OValue::request(
+            RequestKind::Eval {
+                lang: "python".to_string(),
+                env_id: 0,
+                cacheable: false,
+            },
             thunk,
         );
         let err = sched.execute_batch(&[req], None).unwrap_err();
@@ -706,15 +777,21 @@ mod tests {
     fn execute_batch_skips_cached_requests() {
         let mut sched = AutonomousScheduler::no_disk();
 
-        let expr     = OValue::nix_expr("pkgs.hello", vec![]);
+        let expr = OValue::nix_expr("pkgs.hello", vec![]);
         let inst_req = OValue::request(RequestKind::Instantiate, expr);
         let real_req = OValue::request(RequestKind::Realise, inst_req.clone());
 
-        let inst_fp = match &inst_req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
-        let real_fp = match &real_req { OValue::Request { fingerprint, .. } => fingerprint.clone(), _ => panic!() };
+        let inst_fp = match &inst_req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
+        let real_fp = match &real_req {
+            OValue::Request { fingerprint, .. } => fingerprint.clone(),
+            _ => panic!(),
+        };
 
         // Pre-populate both cache slots. execute_batch should NOT try to call nix.
-        let fake_drv  = OValue::derivation("/nix/store/fake.drv", vec!["out".into()], vec![]);
+        let fake_drv = OValue::derivation("/nix/store/fake.drv", vec!["out".into()], vec![]);
         let fake_path = OValue::store_path("/nix/store/fake-hello-out");
         sched.mem_cache.insert(inst_fp.clone(), fake_drv);
         sched.mem_cache.insert(real_fp.clone(), fake_path.clone());

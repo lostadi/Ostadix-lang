@@ -8,11 +8,11 @@
 // without suppression attributes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub mod value;
-pub mod parser;
-pub mod ir;
 pub mod eval;
-pub mod process;
+pub mod ir;
 pub mod nix_ops;
 pub mod nixos_ops;
+pub mod parser;
+pub mod process;
 pub mod scheduler;
+pub mod value;
