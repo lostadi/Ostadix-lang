@@ -126,6 +126,22 @@ programmatically and eval it.
 > **Current implementation note:** `O.eval(...)` evaluates the quoted fragment in a fresh document scope and does not inherit top-level `let` bindings from the enclosing document at the time of the call.
 > This is a known limitation — full scope semantics are planned.
 
+### 2.4 Environment lifetime and forcing contract
+
+Environment lifetime and request forcing are part of the stable language core:
+
+- A persistent environment is keyed by `(language, env_id)` and lives until the
+  evaluator drops it or explicitly cleans it up.
+- Bare `lang^(...)_lang` blocks use the default persistent env for that
+  language unless the evaluator intentionally chooses an internal ephemeral env.
+- `now(request)` forces exactly the named deferred computation.
+- `now(group)` resolves the group according to its `GroupMode`.
+- Under `Policy::Autonomous`, non-`Eval` requests are buffered first and forced
+  at explicit force points (`now(...)`, `autonomous(...)` exit, document end).
+- A backend counts as **pure** only when the runtime may safely reuse a cached
+  result for identical `(body, deps, env)` input. Unknown backends are
+  conservatively impure.
+
 ---
 
 ## 3. OValue: the canonical intermediate value
@@ -158,6 +174,20 @@ OValue  ::= ONull
 `GroupMode` is one of `batch`, `all`, `any`, `race` — the execution topology
 of an `OGroup` (see §3.1).
 
+Two additional system-facing forms freeze the runtime boundary:
+
+```
+         | OCapability { kind: CapabilityKind, identity: str, metadata: {str: OValue} }
+         | OSnapshot   { kind: SnapshotKind, identity: str, state: {str: OValue} }
+```
+
+- `OCapability` is an authority-bearing handle to a privileged resource (file,
+  memory region, device, clock, network endpoint, process, service). It is a
+  live token of access, not inert data.
+- `OSnapshot` is an inert observation of world state captured at a boundary
+  (for example a system generation, service state, or filesystem view). It is
+  the persistable counterpart to live references such as `OSystem`.
+
 The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 
 | Tag           | Wire form                                    | Notes                                 |
@@ -175,7 +205,32 @@ The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 | `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
 | `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
 | `group`       | `{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}` | Rust ext; coordination group |
+| `capability`  | `{"t":"capability","kind":"service","identity":"...","metadata":{...}}` | Authority-bearing system handle |
+| `snapshot`    | `{"t":"snapshot","kind":"system","identity":"...","state":{...}}` | Persistable captured state |
 | `error`       | `{"t":"error","msg":"..."}` | Rust ext; error outcome value (used in Batch results) |
+
+### 3.0 Runtime-boundary contract
+
+The language/runtime contract distinguishes three classes of values:
+
+- **Pure values** — inert data that is serializable, replayable, and safe to
+  persist across boots (`ONull`, numbers, strings, lists, maps, blobs,
+  `OExpr`, `ONixExpr`, `ODerivation`, `OThunk`, `OSnapshot`, most `ORequest`s).
+- **Referential values** — live handles into the world whose identity is stable
+  as a reference but whose observed state may change (`OSystem`).
+- **Effectful values** — authority-bearing or orchestration values whose meaning
+  depends on execution context (`OCapability`, `OGroup`, `OError`, and effectful
+  `ORequest`s such as `activate`).
+
+The runtime MUST preserve these invariants:
+
+1. Every `OValue` is wire-serializable.
+2. Only pure values are assumed replay-safe across time.
+3. Referential values are hashable by handle identity, not by live state.
+4. Values that encode authority or world mutation MUST NOT be treated as
+   boot-persistable system facts merely because they serialize.
+5. A future OS/runtime layer may add richer kinds, but must classify them into
+   this same boundary model.
 
 ### 3.1 Coordination groups
 

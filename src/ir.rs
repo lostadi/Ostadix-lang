@@ -78,7 +78,33 @@ impl OIrProgram {
         for node in &self.nodes {
             dump_node(node, 0, &mut out);
         }
+        out.push('\n');
+        out.push_str(&self.plan().to_text());
         out
+    }
+
+    /// Build the canonical execution plan for this program.
+    ///
+    /// The plan is a dependency graph over OIR nodes:
+    ///   - structural edges capture child → parent evaluation dependencies
+    ///   - sequence edges preserve left-to-right source order
+    ///   - data edges connect `load $x` to the latest dominating `store $x`
+    ///
+    /// This is the designated planning surface for scheduling, batching, purity-
+    /// aware reordering, backend dispatch policy, and future code generation.
+    pub fn plan(&self) -> ExecutionPlan {
+        let mut builder = PlanBuilder::new();
+        let mut scope_stack = vec![std::collections::HashMap::new()];
+        let mut previous_sibling = None;
+        let mut roots = Vec::new();
+
+        for node in &self.nodes {
+            let id = builder.add_node(node, &mut scope_stack, None, previous_sibling);
+            roots.push(id);
+            previous_sibling = Some(id);
+        }
+
+        builder.finish(roots)
     }
 }
 
@@ -121,6 +147,248 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
             out.push_str(&format!("{indent}invoke {fn_name}/{}\n", args.len()));
             for arg in args {
                 dump_node(arg, depth + 1, out);
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════════════════════
+        // ExecutionPlan — canonical dependency graph over OIR
+        // ═════════════════════════════════════════════════════════════════════════════
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct PlanNodeId(pub usize);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PlanEdgeKind {
+            Structural,
+            Sequence,
+            Data,
+        }
+
+        impl PlanEdgeKind {
+            fn label(self) -> &'static str {
+                match self {
+                    PlanEdgeKind::Structural => "structural",
+                    PlanEdgeKind::Sequence => "sequence",
+                    PlanEdgeKind::Data => "data",
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct PlanEdge {
+            pub from: PlanNodeId,
+            pub to: PlanNodeId,
+            pub kind: PlanEdgeKind,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ExecutionMode {
+            InlineAst,
+            InlineValue,
+            Shim,
+        }
+
+        impl ExecutionMode {
+            fn label(self) -> &'static str {
+                match self {
+                    ExecutionMode::InlineAst => "inline_ast",
+                    ExecutionMode::InlineValue => "inline_value",
+                    ExecutionMode::Shim => "shim",
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct BackendInterface {
+            pub canonical: String,
+            pub pure: bool,
+            pub renderer: SpliceRenderer,
+            pub execution: ExecutionMode,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum PlanNodeKind {
+            Text,
+            Load { name: String },
+            Store { name: String },
+            Invoke { fn_name: String, arg_count: usize },
+            Exec {
+                lang: String,
+                env_id: u32,
+                attr: Option<String>,
+                backend: BackendInterface,
+            },
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct PlanNode {
+            pub id: PlanNodeId,
+            pub kind: PlanNodeKind,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct ExecutionPlan {
+            pub roots: Vec<PlanNodeId>,
+            pub nodes: Vec<PlanNode>,
+            pub edges: Vec<PlanEdge>,
+        }
+
+        impl ExecutionPlan {
+            pub fn to_text(&self) -> String {
+                let mut out = String::new();
+                out.push_str("; ExecutionPlan\n");
+                if !self.roots.is_empty() {
+                    let roots = self
+                        .roots
+                        .iter()
+                        .map(|id| id.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("roots [{roots}]\n"));
+                }
+                for node in &self.nodes {
+                    out.push_str(&format!("node {} {}\n", node.id.0, node.kind.describe()));
+                }
+                for edge in &self.edges {
+                    out.push_str(&format!(
+                        "edge {} -> {} {}\n",
+                        edge.from.0,
+                        edge.to.0,
+                        edge.kind.label()
+                    ));
+                }
+                out
+            }
+        }
+
+        impl PlanNodeKind {
+            fn describe(&self) -> String {
+                match self {
+                    PlanNodeKind::Text => "text".to_string(),
+                    PlanNodeKind::Load { name } => format!("load ${name}"),
+                    PlanNodeKind::Store { name } => format!("store ${name}"),
+                    PlanNodeKind::Invoke { fn_name, arg_count } => {
+                        format!("invoke {fn_name}/{arg_count}")
+                    }
+                    PlanNodeKind::Exec { lang, env_id, attr, backend } => {
+                        let attr_s = attr
+                            .as_deref()
+                            .map(|a| format!(" {{{a}}}"))
+                            .unwrap_or_default();
+                        format!(
+                            "exec {} [env {}]{} backend={} pure={} renderer={:?} execution={}",
+                            lang,
+                            env_id,
+                            attr_s,
+                            backend.canonical,
+                            backend.pure,
+                            backend.renderer,
+                            backend.execution.label()
+                        )
+                    }
+                }
+            }
+        }
+
+        struct PlanBuilder {
+            nodes: Vec<PlanNode>,
+            edges: Vec<PlanEdge>,
+        }
+
+        impl PlanBuilder {
+            fn new() -> Self {
+                Self {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                }
+            }
+
+            fn finish(self, roots: Vec<PlanNodeId>) -> ExecutionPlan {
+                ExecutionPlan {
+                    roots,
+                    nodes: self.nodes,
+                    edges: self.edges,
+                }
+            }
+
+            fn add_edge(&mut self, from: PlanNodeId, to: PlanNodeId, kind: PlanEdgeKind) {
+                self.edges.push(PlanEdge { from, to, kind });
+            }
+
+            fn add_node(
+                &mut self,
+                node: &OIr,
+                scope_stack: &mut Vec<std::collections::HashMap<String, PlanNodeId>>,
+                parent: Option<PlanNodeId>,
+                previous_sibling: Option<PlanNodeId>,
+            ) -> PlanNodeId {
+                let id = PlanNodeId(self.nodes.len());
+                let kind = self.plan_kind(node);
+                self.nodes.push(PlanNode { id, kind });
+
+                if let Some(parent_id) = parent {
+                    self.add_edge(id, parent_id, PlanEdgeKind::Structural);
+                }
+                if let Some(prev) = previous_sibling {
+                    self.add_edge(prev, id, PlanEdgeKind::Sequence);
+                }
+
+                match node {
+                    OIr::Text(_) => {}
+                    OIr::Load(name) => {
+                        if let Some(source) = scope_stack.iter().rev().find_map(|scope| scope.get(name)) {
+                            self.add_edge(*source, id, PlanEdgeKind::Data);
+                        }
+                    }
+                    OIr::Store { name, expr } => {
+                        scope_stack.push(std::collections::HashMap::new());
+                        self.add_node(expr, scope_stack, Some(id), None);
+                        scope_stack.pop();
+                        scope_stack
+                            .last_mut()
+                            .expect("scope stack always has a root scope")
+                            .insert(name.clone(), id);
+                    }
+                    OIr::Invoke { args, .. } => {
+                        scope_stack.push(std::collections::HashMap::new());
+                        let mut prev = None;
+                        for arg in args {
+                            prev = Some(self.add_node(arg, scope_stack, Some(id), prev));
+                        }
+                        scope_stack.pop();
+                    }
+                    OIr::Exec { body, .. } => {
+                        scope_stack.push(std::collections::HashMap::new());
+                        let mut prev = None;
+                        for child in body {
+                            prev = Some(self.add_node(child, scope_stack, Some(id), prev));
+                        }
+                        scope_stack.pop();
+                    }
+                }
+
+                id
+            }
+
+            fn plan_kind(&self, node: &OIr) -> PlanNodeKind {
+                match node {
+                    OIr::Text(_) => PlanNodeKind::Text,
+                    OIr::Load(name) => PlanNodeKind::Load { name: name.clone() },
+                    OIr::Store { name, .. } => PlanNodeKind::Store { name: name.clone() },
+                    OIr::Invoke { fn_name, args } => PlanNodeKind::Invoke {
+                        fn_name: fn_name.clone(),
+                        arg_count: args.len(),
+                    },
+                    OIr::Exec { lang, env_id, attr, .. } => {
+                        let backend = BackendRegistry::global().interface_for(lang);
+                        PlanNodeKind::Exec {
+                            lang: lang.clone(),
+                            env_id: *env_id,
+                            attr: attr.clone(),
+                            backend,
+                        }
+                    }
+                }
             }
         }
         OIr::Exec { lang, env_id, attr, body } => {
@@ -182,6 +450,8 @@ pub struct BackendSpec {
     pub pure: bool,
     /// Which splice-rendering strategy `render_child` should use.
     pub renderer: SpliceRenderer,
+    /// How the evaluator dispatches this backend.
+    pub execution: ExecutionMode,
 }
 
 impl BackendSpec {
@@ -190,8 +460,9 @@ impl BackendSpec {
         aliases: &'static [&'static str],
         pure: bool,
         renderer: SpliceRenderer,
+        execution: ExecutionMode,
     ) -> Self {
-        Self { name, aliases, pure, renderer }
+        Self { name, aliases, pure, renderer, execution }
     }
 
     fn matches(&self, lang: &str) -> bool {
@@ -205,45 +476,45 @@ impl BackendSpec {
 /// `BackendRegistry::DEFAULT_SPEC` (impure, default renderer).
 const BACKEND_SPECS: &[BackendSpec] = &[
     // Sequencing / host languages.
-    BackendSpec::new("O",     &["o"], false, SpliceRenderer::Default),
-    BackendSpec::new("quote", &[], false, SpliceRenderer::Default),
+    BackendSpec::new("O",     &["o"], false, SpliceRenderer::Default, ExecutionMode::InlineAst),
+    BackendSpec::new("quote", &[], false, SpliceRenderer::Default, ExecutionMode::InlineAst),
 
     // Nix family — deterministic by design.
-    BackendSpec::new("nix",        &[], true, SpliceRenderer::Nix),
+    BackendSpec::new("nix",        &[], true, SpliceRenderer::Nix, ExecutionMode::Shim),
     // nix_expr is already lazy by construction; {lazy}/{defer} are rejected
     // anyway. It splices via the default representation (its body is
     // assembled before any Nix evaluation happens).
-    BackendSpec::new("nix_expr",   &[], true, SpliceRenderer::Default),
-    BackendSpec::new("nix_store",  &[], true, SpliceRenderer::Nix),
-    BackendSpec::new("nixos_test", &[], true, SpliceRenderer::Nix),
+    BackendSpec::new("nix_expr",   &[], true, SpliceRenderer::Default, ExecutionMode::InlineValue),
+    BackendSpec::new("nix_store",  &[], true, SpliceRenderer::Nix, ExecutionMode::Shim),
+    BackendSpec::new("nixos_test", &[], true, SpliceRenderer::Nix, ExecutionMode::Shim),
 
     // Pure templating.
-    BackendSpec::new("html",     &[],     true, SpliceRenderer::Html),
-    BackendSpec::new("markdown", &["md"], true, SpliceRenderer::Markdown),
-    BackendSpec::new("latex",    &["tex"], true, SpliceRenderer::Latex),
-    BackendSpec::new("text",     &["plain"], true, SpliceRenderer::Default),
+    BackendSpec::new("html",     &[],     true, SpliceRenderer::Html, ExecutionMode::InlineValue),
+    BackendSpec::new("markdown", &["md"], true, SpliceRenderer::Markdown, ExecutionMode::InlineValue),
+    BackendSpec::new("latex",    &["tex"], true, SpliceRenderer::Latex, ExecutionMode::InlineValue),
+    BackendSpec::new("text",     &["plain"], true, SpliceRenderer::Default, ExecutionMode::InlineValue),
 
     // Declarative / pure-by-default languages.
-    BackendSpec::new("sql",         &[], true, SpliceRenderer::Default),
-    BackendSpec::new("haskell",     &[], true, SpliceRenderer::Default),
-    BackendSpec::new("ocaml",       &[], true, SpliceRenderer::Default),
-    BackendSpec::new("webassembly", &[], true, SpliceRenderer::Default),
+    BackendSpec::new("sql",         &[], true, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("haskell",     &[], true, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("ocaml",       &[], true, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("webassembly", &[], true, SpliceRenderer::Default, ExecutionMode::Shim),
 
     // General-purpose, impure backends.
-    BackendSpec::new("python",      &["py"], false, SpliceRenderer::Python),
-    BackendSpec::new("bash",        &[], false, SpliceRenderer::Default),
-    BackendSpec::new("shell",       &[], false, SpliceRenderer::Default),
-    BackendSpec::new("rust",        &[], false, SpliceRenderer::Default),
-    BackendSpec::new("racket",      &[], false, SpliceRenderer::Default),
-    BackendSpec::new("csharp",      &[], false, SpliceRenderer::Default),
-    BackendSpec::new("cpp",         &[], false, SpliceRenderer::Default),
-    BackendSpec::new("lisp",        &[], false, SpliceRenderer::Default),
-    BackendSpec::new("common_lisp", &[], false, SpliceRenderer::Default),
-    BackendSpec::new("ruby",        &[], false, SpliceRenderer::Default),
-    BackendSpec::new("matlab",      &[], false, SpliceRenderer::Default),
-    BackendSpec::new("mathematica", &[], false, SpliceRenderer::Default),
-    BackendSpec::new("java",        &[], false, SpliceRenderer::Default),
-    BackendSpec::new("javascript",  &[], false, SpliceRenderer::Default),
+    BackendSpec::new("python",      &["py"], false, SpliceRenderer::Python, ExecutionMode::Shim),
+    BackendSpec::new("bash",        &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("shell",       &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("rust",        &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("racket",      &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("csharp",      &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("cpp",         &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("lisp",        &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("common_lisp", &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("ruby",        &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("matlab",      &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("mathematica", &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("java",        &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
+    BackendSpec::new("javascript",  &[], false, SpliceRenderer::Default, ExecutionMode::Shim),
 ];
 
 /// Lookup table over `BackendSpec`s plus the centralized shim path
@@ -258,7 +529,7 @@ impl BackendRegistry {
     /// Fallback metadata for backends with no entry in the table:
     /// impure, conservative cross-language splice representation.
     const DEFAULT_SPEC: BackendSpec =
-        BackendSpec::new("", &[], false, SpliceRenderer::Default);
+        BackendSpec::new("", &[], false, SpliceRenderer::Default, ExecutionMode::Shim);
 
     /// The process-wide registry over the static spec table.
     pub fn global() -> &'static BackendRegistry {
@@ -280,13 +551,25 @@ impl BackendRegistry {
     /// Whether `{lazy}` may cache results from this backend.
     /// Unknown backends are conservatively impure.
     pub fn is_pure(&self, lang: &str) -> bool {
-        self.get(lang).map_or(false, |s| s.pure)
+        self.get(lang).is_some_and(|s| s.pure)
     }
 
     /// Which splice-rendering strategy `render_child` should use for `lang`.
     /// Unknown backends use the conservative default representation.
     pub fn renderer_for(&self, lang: &str) -> SpliceRenderer {
         self.get(lang).map_or(Self::DEFAULT_SPEC.renderer, |s| s.renderer)
+    }
+
+    /// Typed backend interface metadata used by planning and dispatch policy.
+    pub fn interface_for(&self, lang: &str) -> BackendInterface {
+        let canonical = self.canonical(lang).to_string();
+        let spec = self.get(lang).copied().unwrap_or(Self::DEFAULT_SPEC);
+        BackendInterface {
+            canonical,
+            pure: spec.pure,
+            renderer: spec.renderer,
+            execution: spec.execution,
+        }
     }
 
     /// Centralized shim path resolution.
@@ -382,7 +665,20 @@ mod tests {
     fn ir_dump_is_stable() {
         let nodes = vec![typed("python", vec![ONode::RawText("1 + 1".into())])];
         let prog = OIrProgram::lower(&nodes);
-        assert_eq!(prog.to_text(), "; OIrProgram\nexec python\n  text \"1 + 1\"\n");
+        assert_eq!(
+            prog.to_text(),
+            concat!(
+                "; OIrProgram\n",
+                "exec python\n",
+                "  text \"1 + 1\"\n",
+                "\n",
+                "; ExecutionPlan\n",
+                "roots [0]\n",
+                "node 0 exec python [env 0] backend=python pure=false renderer=Python execution=shim\n",
+                "node 1 text\n",
+                "edge 1 -> 0 structural\n",
+            )
+        );
     }
 
     #[test]
@@ -428,5 +724,46 @@ mod tests {
             reg.resolve_shim_path(dir, "python"),
             dir.join("python_shim.py")
         );
+    }
+
+    #[test]
+    fn plan_builds_data_and_sequence_edges() {
+        let prog = OIrProgram::lower(&[
+            ONode::LetBinding {
+                name: "x".into(),
+                expr: Box::new(ONode::Call {
+                    fn_name: "instantiate".into(),
+                    args: vec![ONode::VarRef("expr".into())],
+                }),
+            },
+            ONode::TypedExpr {
+                lang: "python".into(),
+                env_id: 0,
+                attr: None,
+                body: vec![ONode::VarRef("x".into())],
+            },
+        ]);
+
+        let plan = prog.plan();
+        assert_eq!(plan.roots, vec![PlanNodeId(0), PlanNodeId(3)]);
+        assert!(plan.edges.iter().any(|e| {
+            e.from == PlanNodeId(0) && e.to == PlanNodeId(3) && e.kind == PlanEdgeKind::Sequence
+        }));
+        assert!(plan.edges.iter().any(|e| {
+            e.from == PlanNodeId(0) && e.to == PlanNodeId(4) && e.kind == PlanEdgeKind::Data
+        }));
+    }
+
+    #[test]
+    fn registry_exposes_typed_backend_interface() {
+        let reg = BackendRegistry::global();
+        let python = reg.interface_for("py");
+        let html = reg.interface_for("html");
+        let quote = reg.interface_for("quote");
+
+        assert_eq!(python.canonical, "python");
+        assert_eq!(python.execution, ExecutionMode::Shim);
+        assert_eq!(html.execution, ExecutionMode::InlineValue);
+        assert_eq!(quote.execution, ExecutionMode::InlineAst);
     }
 }

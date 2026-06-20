@@ -47,8 +47,9 @@
 //
 // Target C ("ir"):
 //   Parses the .O program, lowers the ONode forest to the OIR intermediate
-//   representation (src/ir.rs), and prints the lowered program to stdout.
-//   A debugging/inspection target — no execution, no disk output.
+//   representation (src/ir.rs), builds the canonical ExecutionPlan dependency
+//   graph from that OIR, and prints both to stdout. A debugging/inspection
+//   target — no execution, no disk output.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -121,8 +122,8 @@ enum CompileTarget {
     Wasm,
     /// Execute the program directly inside the olangc process (script mode).
     Script,
-    /// Lower the parsed program to the OIR intermediate representation and
-    /// print it to stdout (debug/inspection; no execution).
+    /// Lower the parsed program to OIR, build its ExecutionPlan, and print
+    /// both to stdout (debug/inspection; no execution).
     Ir,
 }
 
@@ -136,7 +137,7 @@ or executes it directly in-process (--target script).  In binary mode the \
 output embeds the program source, all backend shim scripts, and the O-lang \
 runtime.  In script mode the program is parsed and evaluated immediately \
 inside the olangc process with no disk output.  In ir mode the program is \
-parsed, lowered to the OIR intermediate representation, and printed.",
+parsed, lowered to OIR, planned as an ExecutionPlan, and printed.",
 )]
 struct Cli {
     /// The .O source file to compile or run

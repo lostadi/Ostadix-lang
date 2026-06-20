@@ -220,6 +220,38 @@ pub enum OValue {
         profile_path: String,
     },
 
+    /// A capability-scoped reference to a privileged system resource.
+    ///
+    /// Capabilities are the runtime's explicit representation of authority:
+    /// instead of assuming ambient access to files, devices, clocks, network
+    /// sockets, or services, O can pass a first-class value that says WHAT
+    /// resource is being authorized and which descriptive metadata travels with
+    /// it.
+    ///
+    /// `kind` identifies the resource class, `identity` is the stable handle
+    /// within that class, and `metadata` carries machine-readable annotations
+    /// such as mount points, driver names, access modes, or labels.
+    #[serde(rename = "capability")]
+    Capability {
+        kind: CapabilityKind,
+        identity: String,
+        metadata: HashMap<String, OValue>,
+    },
+
+    /// A persisted snapshot of world state captured at a specific observation
+    /// boundary.
+    ///
+    /// Unlike `System`, which is a live reference to a moving profile path, a
+    /// Snapshot is inert data: it names a captured state (`identity`) and
+    /// stores the observed facts in `state`. This is the value form intended
+    /// for persistence, replay, rollback planning, and cross-boot comparison.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        kind: SnapshotKind,
+        identity: String,
+        state: HashMap<String, OValue>,
+    },
+
     /// STEP-3.5: a captured but unevaluated shim invocation.
     ///
     /// Produced when a language block carries a `{lazy}` or `{defer}` attribute.
@@ -321,6 +353,66 @@ pub enum GroupMode {
     /// **Note:** Race does not yet cancel losing work. Full cancellation
     /// support (cooperative tokens or subprocess kill) is a future goal.
     Race,
+}
+
+/// The broad class of authority carried by an `OValue::Capability`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    File,
+    MemoryRegion,
+    Device,
+    Clock,
+    NetworkEndpoint,
+    Process,
+    Service,
+}
+
+impl CapabilityKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            CapabilityKind::File => "file",
+            CapabilityKind::MemoryRegion => "memory_region",
+            CapabilityKind::Device => "device",
+            CapabilityKind::Clock => "clock",
+            CapabilityKind::NetworkEndpoint => "network_endpoint",
+            CapabilityKind::Process => "process",
+            CapabilityKind::Service => "service",
+        }
+    }
+}
+
+/// The domain of state captured by an `OValue::Snapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKind {
+    System,
+    Service,
+    Filesystem,
+    Device,
+}
+
+impl SnapshotKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SnapshotKind::System => "system",
+            SnapshotKind::Service => "service",
+            SnapshotKind::Filesystem => "filesystem",
+            SnapshotKind::Device => "device",
+        }
+    }
+}
+
+/// Runtime boundary classification for an O value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBoundary {
+    /// Pure data: serializable, replayable, and safe to persist across boots.
+    Pure,
+    /// A live reference into the world; stable as a handle, but not a snapshot.
+    Referential,
+    /// Authority-bearing or effectful control values that must be handled with
+    /// extra care by schedulers, caches, and persistence layers.
+    Effectful,
 }
 
 impl GroupMode {
@@ -505,6 +597,32 @@ impl OValue {
         OValue::System { profile_path: profile_path.into() }
     }
 
+    /// Construct a capability-scoped system resource handle.
+    pub fn capability(
+        kind: CapabilityKind,
+        identity: impl Into<String>,
+        metadata: HashMap<String, OValue>,
+    ) -> Self {
+        OValue::Capability {
+            kind,
+            identity: identity.into(),
+            metadata,
+        }
+    }
+
+    /// Construct an inert snapshot of observed world state.
+    pub fn snapshot(
+        kind: SnapshotKind,
+        identity: impl Into<String>,
+        state: HashMap<String, OValue>,
+    ) -> Self {
+        OValue::Snapshot {
+            kind,
+            identity: identity.into(),
+            state,
+        }
+    }
+
     /// Construct a Thunk — the captured-but-unevaluated payload of a
     /// `{lazy}` or `{defer}` block. The Thunk is wrapped in a Request[Eval]
     /// by the caller; this constructor just builds the data carrier with
@@ -583,6 +701,14 @@ impl OValue {
             OValue::System { profile_path } => {
                 hex::encode(Sha256::digest(profile_path.as_bytes()))
             }
+            OValue::Capability { kind, identity, .. } => {
+                let composed = format!("capability|{}|{}", kind.name(), identity);
+                hex::encode(Sha256::digest(composed.as_bytes()))
+            }
+            OValue::Snapshot { kind, identity, .. } => {
+                let composed = format!("snapshot|{}|{}", kind.name(), identity);
+                hex::encode(Sha256::digest(composed.as_bytes()))
+            }
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
             OValue::Group   { fingerprint, .. } => fingerprint.clone(),
             other => {
@@ -641,6 +767,8 @@ impl OValue {
     pub fn is_thunk(&self) -> bool { matches!(self, OValue::Thunk { .. }) }
     pub fn is_group(&self) -> bool { matches!(self, OValue::Group { .. }) }
     pub fn is_system(&self) -> bool { matches!(self, OValue::System { .. }) }
+    pub fn is_capability(&self) -> bool { matches!(self, OValue::Capability { .. }) }
+    pub fn is_snapshot(&self) -> bool { matches!(self, OValue::Snapshot { .. }) }
     pub fn is_expr(&self) -> bool { matches!(self, OValue::Expr { .. }) }
     pub fn is_error(&self) -> bool { matches!(self, OValue::Error { .. }) }
     pub fn is_numeric(&self) -> bool { self.is_int() || self.is_float() }
@@ -664,8 +792,65 @@ impl OValue {
             OValue::Thunk {..} => "thunk",
             OValue::Group {..} => "group",
             OValue::System {..} => "system",
+            OValue::Capability { .. } => "capability",
+            OValue::Snapshot { .. } => "snapshot",
             OValue::Expr {..} => "expr",
             OValue::Error {..} => "error",
+        }
+    }
+
+    /// How this value crosses the runtime / world boundary.
+    pub fn runtime_boundary(&self) -> RuntimeBoundary {
+        match self {
+            OValue::System { .. } => RuntimeBoundary::Referential,
+            OValue::Capability { .. } |
+            OValue::Request { .. } |
+            OValue::Group { .. } |
+            OValue::Error { .. } => RuntimeBoundary::Effectful,
+            _ => RuntimeBoundary::Pure,
+        }
+    }
+
+    /// Whether this value can be encoded and shipped across process boundaries.
+    ///
+    /// Today every `OValue` is serializable via the JSON wire format.
+    pub fn is_serializable(&self) -> bool {
+        true
+    }
+
+    /// Whether this value is safe to reuse from a cache without consulting the
+    /// live world again.
+    pub fn is_cache_safe(&self) -> bool {
+        match self {
+            OValue::System { .. } | OValue::Capability { .. } => false,
+            OValue::Request {
+                kind: RequestKind::Activate { .. },
+                ..
+            } => false,
+            OValue::Request {
+                kind: RequestKind::Eval { cacheable, .. },
+                ..
+            } => *cacheable,
+            OValue::Error { .. } => false,
+            _ => true,
+        }
+    }
+
+    /// Whether replaying this value across time preserves its meaning.
+    pub fn is_replay_safe(&self) -> bool {
+        !matches!(self, OValue::System { .. } | OValue::Capability { .. })
+    }
+
+    /// Whether this value is safe to persist across boots as an inert artifact.
+    pub fn is_boot_persistable(&self) -> bool {
+        match self {
+            OValue::System { .. } |
+            OValue::Capability { .. } |
+            OValue::Request {
+                kind: RequestKind::Activate { .. },
+                ..
+            } => false,
+            _ => true,
         }
     }
 }
@@ -821,6 +1006,14 @@ impl OValue {
             // STEP5 may refine.
             OValue::System { profile_path } => profile_path.clone(),
 
+            OValue::Capability { kind, identity, .. } => {
+                format!("<capability:{} {}>", kind.name(), identity)
+            }
+
+            OValue::Snapshot { kind, identity, .. } => {
+                format!("<snapshot:{} {}>", kind.name(), identity)
+            }
+
             // An Error value splices as a human-readable marker — the raw
             // error text surrounded by brackets. Splicing an error into source
             // code is almost always a bug; the marker makes it visible.
@@ -883,6 +1076,24 @@ impl fmt::Display for OValue {
             }
             OValue::System { profile_path } => {
                 write!(f, "<system {}>", profile_path)
+            }
+            OValue::Capability { kind, identity, metadata } => {
+                write!(
+                    f,
+                    "<capability {} {} meta={}>",
+                    kind.name(),
+                    identity,
+                    metadata.len()
+                )
+            }
+            OValue::Snapshot { kind, identity, state } => {
+                write!(
+                    f,
+                    "<snapshot {} {} fields={}>",
+                    kind.name(),
+                    identity,
+                    state.len()
+                )
             }
             OValue::Expr { src } => {
                 // Show a truncated preview of the source — the full text can
@@ -1052,6 +1263,16 @@ mod tests {
             // OExpr round-trips its src string.
             OValue::Expr { src: "python^(6 * 7)_python".to_string() },
             OValue::Expr { src: String::new() },
+            OValue::capability(
+                CapabilityKind::Service,
+                "svc:boot",
+                HashMap::from([("restart".to_string(), OValue::bool_(true))]),
+            ),
+            OValue::snapshot(
+                SnapshotKind::System,
+                "generation-42",
+                HashMap::from([("kernel".to_string(), OValue::str_("6.9.0"))]),
+            ),
             // Group round-trips mode + members + fingerprint.
             OValue::group(GroupMode::Batch, vec![OValue::int(1), OValue::int(2)]),
             OValue::group(GroupMode::Race,  vec![OValue::str_("a")]),
@@ -1119,6 +1340,8 @@ mod tests {
             (OValue::map(HashMap::new()), "map"),
             (OValue::blob(&[], ""),   "blob"),
             (OValue::Expr { src: "x".to_string() }, "expr"),
+            (OValue::capability(CapabilityKind::File, "/etc/hosts", HashMap::new()), "capability"),
+            (OValue::snapshot(SnapshotKind::Service, "svc:sshd", HashMap::new()), "snapshot"),
             (OValue::group(GroupMode::Batch, vec![OValue::int(1)]), "group"),
         ];
         for (val, expected_tag) in cases {
@@ -1146,6 +1369,46 @@ mod tests {
         assert_eq!(OValue::int(42).splice_repr(),      "42");
         assert_eq!(OValue::float(3.0).splice_repr(),   "3.0");
         assert_eq!(OValue::str_("hi").splice_repr(),   "hi");
+    }
+
+    #[test]
+    fn runtime_boundary_classifies_live_world_values() {
+        let pure = OValue::snapshot(SnapshotKind::System, "gen-1", HashMap::new());
+        let referential = OValue::system("/nix/var/nix/profiles/system");
+        let effectful = OValue::capability(CapabilityKind::Device, "pci:00:1f.2", HashMap::new());
+
+        assert_eq!(pure.runtime_boundary(), RuntimeBoundary::Pure);
+        assert_eq!(referential.runtime_boundary(), RuntimeBoundary::Referential);
+        assert_eq!(effectful.runtime_boundary(), RuntimeBoundary::Effectful);
+    }
+
+    #[test]
+    fn persistence_and_cache_flags_match_runtime_contract() {
+        let lazy_req = OValue::request(
+            RequestKind::Eval {
+                lang: "python".to_string(),
+                env_id: 0,
+                cacheable: true,
+            },
+            OValue::thunk("41 + 1", vec![]),
+        );
+        let activate_req = OValue::request(
+            RequestKind::Activate {
+                profile: "/nix/var/nix/profiles/system".to_string(),
+                dry_run: true,
+            },
+            OValue::store_path("/nix/store/demo-system"),
+        );
+        let system = OValue::system("/nix/var/nix/profiles/system");
+        let snapshot = OValue::snapshot(SnapshotKind::System, "gen-42", HashMap::new());
+
+        assert!(lazy_req.is_cache_safe());
+        assert!(!activate_req.is_cache_safe());
+        assert!(!system.is_cache_safe());
+        assert!(snapshot.is_boot_persistable());
+        assert!(!system.is_boot_persistable());
+        assert!(!system.is_replay_safe());
+        assert!(snapshot.is_replay_safe());
     }
 
     /// ONixExpr constructor must compute a stable sha256(body) fingerprint,
