@@ -12,6 +12,7 @@ pub mod eval;
 pub mod ir;
 pub mod nix_ops;
 pub mod nixos_ops;
+pub mod ocore;
 pub mod parser;
 pub mod process;
 pub mod scheduler;

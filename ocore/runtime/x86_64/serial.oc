@@ -1,0 +1,28 @@
+module runtime::serial;
+
+const COM1: u16 = 0x3f8;
+
+pub unsafe fn init() -> void {
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x80);
+    outb(COM1 + 0, 0x03);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xc7);
+    outb(COM1 + 4, 0x0b);
+}
+
+pub unsafe fn write_byte(byte: u8) -> void {
+    while (inb(COM1 + 5) & 0x20) == 0 {
+        asm!("pause", options(nomem, nostack));
+    }
+    outb(COM1, byte);
+}
+
+pub unsafe fn write(data: *const u8, len: usize) -> void {
+    let mut index: usize = 0;
+    while index < len {
+        write_byte(*(data + index));
+        index += 1;
+    }
+}

@@ -23,6 +23,7 @@ O-lang/
 │   ├── nixos_ops.rs  #   NixOS-specific operations
 │   ├── scheduler.rs  #   Parallel evaluation scheduler
 │   └── bin/          #   Additional binary targets
+├── ocore/            # Native systems runtime and bootable x86_64 kernel proof
 ├── backends/         # Language shims (Python, Bash, Nix, Racket, Rust, … — see README backend table)
 ├── examples/         # .O example programs
 ├── c_cpp/            # Complete C17 port (standalone)
@@ -82,6 +83,11 @@ The evaluator still walks `ONode` directly today, but OIR plus
 `ExecutionPlan` is the contract future schedulers, compilers, and OS-facing
 runtimes must target. There is deliberately no SSA or optimizer yet; the value
 of the layer is that planning decisions are now explicit rather than implicit.
+
+O-core does not lower into this representation. Native `.oc` files use the
+separate `AST -> typed HIR -> SSA MIR -> object` pipeline under `src/ocore/`.
+This separation prevents machine-level mutation, layout, and control-flow
+semantics from being conflated with OIR's backend dependency graph.
 
 ## Universal Value System (OValue)
 

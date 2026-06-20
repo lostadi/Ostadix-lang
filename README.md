@@ -1296,6 +1296,38 @@ olangc examples/hello.O --shim-dir ./backends --keep-build-dir
 
 ---
 
+## O-core: native systems language
+
+O-core is the freestanding, statically typed systems-programming layer. It is
+compiled by `ocorec` through a pipeline separate from orchestration OIR:
+
+```text
+.oc source -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
+```
+
+It includes modules, functions, static types, structs/enums, arrays, raw
+pointers, explicit `unsafe`, deterministic ABI/layout, volatile and atomic
+operations, inline assembly, interrupt functions, and linker-section
+attributes. Foreign blocks such as `python^` remain hosted `.O` facilities and
+are not part of a freestanding artifact.
+
+```bash
+cargo build --bin ocorec
+target/debug/ocorec kernel.oc --emit obj --keep-asm -o kernel.o
+
+# Build and boot the included x86_64 kernel proof
+./ocore/kernel/build.sh
+./ocore/kernel/smoke-qemu.sh
+```
+
+The QEMU proof boots into 64-bit mode, writes through COM1, allocates a page,
+installs a generation-tagged capability, configures an IDT/PIC/PIT, receives
+IRQ0, performs an atomic tick increment, and returns with `iretq`. See
+[`docs/OCORE.md`](docs/OCORE.md) for the normative language and ABI contract and
+[`ocore/README.md`](ocore/README.md) for commands.
+
+---
+
 ## Status
 
 **v0.2.0**, Rust runtime primary, Python reference implementation for
@@ -1313,6 +1345,8 @@ Implemented and working:
 - `autonomous()` scheduler with disk-backed result cache
 - Coordination groups: `batch` / `all` / `any` / `race` and `now(group)`
 - `olangc` AOT compiler (self-contained binary output)
+- `ocorec` native compiler with typed HIR, SSA MIR, and x86_64 ELF objects
+- Freestanding O-core kernel proof: serial, page allocation, IRQ0, capabilities
 - Shebang support
 
 Known limitations (see `SPEC.md` for full details):

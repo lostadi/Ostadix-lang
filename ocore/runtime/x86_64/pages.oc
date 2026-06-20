@@ -1,0 +1,24 @@
+module runtime::pages;
+
+const PAGE_SIZE: usize = 4096;
+static mut NEXT_FRAME: usize = 0x00400000;
+static mut FRAME_LIMIT: usize = 0x04000000;
+
+pub unsafe fn init(start: usize, end: usize) -> void {
+    NEXT_FRAME = start;
+    FRAME_LIMIT = end;
+}
+
+pub unsafe fn alloc_page() -> *mut u8 {
+    let frame: usize = NEXT_FRAME;
+    let next: usize = frame + PAGE_SIZE;
+    if next > FRAME_LIMIT {
+        return 0 as *mut u8;
+    }
+    NEXT_FRAME = next;
+    return frame as *mut u8;
+}
+
+pub unsafe fn allocated_bytes() -> usize {
+    return NEXT_FRAME - 0x00400000;
+}

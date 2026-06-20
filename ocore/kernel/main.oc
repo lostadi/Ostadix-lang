@@ -1,0 +1,38 @@
+module kernel::main;
+
+use runtime::capability::install;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::interrupts::init as interrupts_init;
+use runtime::pages::alloc_page;
+use runtime::pages::init as pages_init;
+use runtime::serial::init as serial_init;
+use runtime::serial::write;
+
+static START_MESSAGE: [u8; 29] = b"O-core kernel: serial online\n";
+static PAGE_MESSAGE: [u8; 23] = b"page allocator: online\n";
+static CAP_MESSAGE: [u8; 19] = b"capability: online\n";
+
+@export
+@no_mangle
+@link_section(".text.kernel")
+pub unsafe fn kernel_main(multiboot_info: usize) -> never {
+    serial_init();
+    write((&START_MESSAGE[0]), 29);
+
+    pages_init(0x00400000, 0x04000000);
+    let first_page: *mut u8 = alloc_page();
+    if (first_page as usize) == 0x00400000 {
+        write((&PAGE_MESSAGE[0]), 23);
+    }
+
+    let debug_capability: u64 = install(1, 1, RIGHT_DEBUG_WRITE);
+    if debug_capability != 0 {
+        write((&CAP_MESSAGE[0]), 19);
+    }
+
+    interrupts_init();
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}

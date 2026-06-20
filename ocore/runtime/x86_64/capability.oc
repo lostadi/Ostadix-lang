@@ -1,0 +1,59 @@
+module runtime::capability;
+
+const TABLE_SIZE: usize = 64;
+pub const RIGHT_DEBUG_WRITE: u64 = 1;
+pub const RIGHT_PAGE_ALLOC: u64 = 2;
+pub const RIGHT_TRANSFER: u64 = 4;
+
+// A handle is (generation << 32) | slot. Kernel pointers never cross this ABI.
+static mut OBJECT_IDS: [u64; 64] = [0; 64];
+static mut RIGHTS: [u64; 64] = [0; 64];
+static mut GENERATIONS: [u32; 64] = [1; 64];
+static mut OCCUPIED: [u8; 64] = [0; 64];
+
+pub unsafe fn install(slot: usize, object_id: u64, rights: u64) -> u64 {
+    if slot >= TABLE_SIZE {
+        return 0;
+    }
+    OBJECT_IDS[slot] = object_id;
+    RIGHTS[slot] = rights;
+    OCCUPIED[slot] = 1;
+    return ((GENERATIONS[slot] as u64) << 32) | (slot as u64);
+}
+
+pub unsafe fn validate(handle: u64, required_rights: u64) -> u64 {
+    let slot: usize = (handle & 0xffff_ffff) as usize;
+    let generation: u32 = (handle >> 32) as u32;
+    if slot >= TABLE_SIZE {
+        return 0;
+    }
+    if OCCUPIED[slot] == 0 {
+        return 0;
+    }
+    if GENERATIONS[slot] != generation {
+        return 0;
+    }
+    if (RIGHTS[slot] & required_rights) != required_rights {
+        return 0;
+    }
+    return OBJECT_IDS[slot];
+}
+
+pub unsafe fn close(handle: u64) -> u64 {
+    let slot: usize = (handle & 0xffff_ffff) as usize;
+    let generation: u32 = (handle >> 32) as u32;
+    if slot >= TABLE_SIZE {
+        return 0;
+    }
+    if OCCUPIED[slot] == 0 {
+        return 0;
+    }
+    if GENERATIONS[slot] != generation {
+        return 0;
+    }
+    OCCUPIED[slot] = 0;
+    OBJECT_IDS[slot] = 0;
+    RIGHTS[slot] = 0;
+    GENERATIONS[slot] += 1;
+    return 1;
+}

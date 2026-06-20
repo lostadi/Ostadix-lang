@@ -18,6 +18,10 @@ name = "olangc"
 path = "src/bin/olangc.rs"
 
 [[bin]]
+name = "ocorec"
+path = "src/bin/ocorec.rs"
+
+[[bin]]
 name = "o-link"
 path = "src/bin/olink.rs"
 
