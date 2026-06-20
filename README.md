@@ -1,4 +1,4 @@
-<img width="632" height="176" alt="Screenshot 2026-06-19 at 7 16 34 PM" src="https://github.com/user-attachments/assets/ef509d0d-1b90-45be-bcdf-94142849fcc5" />
+<img width="632" height="176" alt="Screenshot 2026-06-19 at 7 16 34 PM" src="https://github.com/user-attachments/assets/ef509d0d-1b90-45be-bcdf-94142849fcc5" />
 
 
 
@@ -8,13 +8,13 @@
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
-Olang, short for **Ouroboros language**, is a meta-language built on one radical idea: the language an expression
-is written in is a structural part of the expression itself, not a file
-extension, not a global mode switch, not a pragma. You write the language name
-directly around the code, and the runtime dispatches to that language's
-evaluator on the spot.
+Olang, short for **Ouroboros language**, is a language system built on one
+radical idea: the language an expression is written in is a structural part
+of the expression itself, not a file extension, not a global mode switch, not
+a pragma. You write the language name directly around the code, and the
+runtime dispatches to that language's evaluator on the spot.
 
-```
+```O
 html^(
   <p>The answer is python^(
 __oval_result__ = sum(x*x for x in range(10))
@@ -22,33 +22,77 @@ __oval_result__ = sum(x*x for x in range(10))
 )_html
 ```
 
-The `python^( ... )_python` block is not a string, not a template, not a
-code fence. It is an *expression*. Its parenthesis shape, `LANG^(` ... `)_LANG`, is the syntax that says "evaluate this in Python." The result is a value
-that HTML can embed directly, without either side knowing about the other's
-type system.
+The `python^( ... )_python` block is not a string, not a template, not a code
+fence. It is an *expression*. Its parenthesis shape, `LANG^(` ... `)_LANG`, is
+the syntax that says "evaluate this in Python." The result is an OValue that
+HTML can embed directly, without either side knowing about the other's type
+system.
+
+Olang now has two computation layers that share one project but do different
+jobs:
+
+1. **O orchestration**, written in `.O` files, composes real hosted languages,
+   persistent environments, deferred computations, Nix operations, and
+   operating-system values through typed parentheses and OValue.
+2. **O-core**, written in `.oc` files, is the statically typed native systems
+   language. It compiles through typed HIR and SSA MIR into freestanding
+   x86_64 ELF object files and is capable of building a kernel without Python,
+   JSON, subprocesses, a filesystem, libc, or Rust `std` in the target image.
+
+This separation is deliberate. OIR describes orchestration between language
+runtimes. O-core MIR describes machine computation, control flow, memory, and
+hardware. Hosted blocks such as `python^`, `rust^`, `nix^`, and `sql^` remain
+available in user space without becoming kernel dependencies.
 
 ---
 
 ## Getting Started: Full Setup Guide
 
-This section walks you through everything you need to get Olang's compiler
-and interpreter running on your machine, from scratch. There are three
-implementations you can build: the **C edition** (simplest, just a C compiler
-and make), the **Rust edition** (authoritative reference implementation), and a
-**Python reference** (for cross-checking semantics). You only need one to get
-going.
+There are three implementations of the hosted `.O` language and one native
+compiler path in this repository:
+
+- The **Rust edition** is the authoritative hosted runtime and contains the
+  interpreter, REPL, OIR, scheduler, linker tools, notebook, `olangc`, and
+  `ocorec`.
+- The **C17 edition** is the small standalone hosted runtime and AOT compiler.
+- The **Python edition** is the readable reference implementation used for
+  semantic cross-checking.
+- **O-core** is compiled by the Rust `ocorec` binary, but the code it produces
+  is freestanding and has no Rust runtime dependency.
+
+You only need the Rust edition for the full current feature set. The C17 and
+Python editions remain useful when you want a smaller substrate or a direct
+comparison of the evaluator semantics.
 
 ### Prerequisites
 
-Olang backends call out to real language runtimes, so you need **Python 3**
-installed for any `.O` program that uses `python^(...)_python` blocks (which
-is most of the examples). Beyond that, the build requirements depend on which
-edition you want.
+The base Rust build needs:
 
-### Option A: Automatic setup (recommended)
+- Rust and Cargo
+- A C compiler and system linker
+- Python 3 for `python^` blocks and the shared Python shim protocol
+- Git and standard POSIX command-line tools
 
-The included `setup.sh` script detects your OS and installs everything, system dependencies, Rust, the C build, Python shims, and convenience
-wrappers, in one shot:
+Each hosted backend uses the real local runtime named in the backend table.
+You only install the runtimes your `.O` program actually uses. Nix is needed
+for the Nix lattice and NixOS tests. Node.js is needed for `javascript^`.
+Racket is needed for `racket^`. Rust is needed for `rust^`. The same rule
+applies to the other language shims.
+
+The bootable O-core proof additionally needs:
+
+- Clang with the `x86_64-unknown-none-elf` assembler target
+- `rust-lld`, supplied by the active Rust toolchain
+- QEMU for boot verification
+
+Python is used by the four-second QEMU smoke-test harness. It is not linked
+into the kernel and is not used after the machine starts executing O-core.
+
+### Option A: Automatic setup
+
+The included `setup.sh` script detects the host, installs the ordinary hosted
+runtime dependencies, builds the Rust and C17 editions, prepares the Python
+reference, and creates convenience wrappers:
 
 ```bash
 git clone https://github.com/lostadi/Olang.git
@@ -56,320 +100,217 @@ cd Olang
 ./setup.sh
 ```
 
-The script supports flags for different levels of setup:
+The script supports several levels of setup:
 
 ```bash
-./setup.sh --minimal        # Core only, skip optional Nix and extras
-./setup.sh --full --verify  # Full setup (optional backends like Racket), then run verification
-./setup.sh --help           # See all options
+./setup.sh --minimal
+./setup.sh --full --verify
+./setup.sh --full --yes
+./setup.sh --no-wrappers
+./setup.sh --dry-run
+./setup.sh --help
 ```
 
-**Optional extras:** The `--full` flag also installs Nix (for `nix^(...)_nix`
-examples) and Racket (for the `racket^` backend stub). These are not required
-for core Olang functionality, most examples only need Python 3.
+`--minimal` skips optional Nix, matplotlib, and extra backend tools. `--full`
+adds optional runtimes such as Racket when the operating system package
+manager provides them. `--verify` runs the hosted implementations after the
+build. The generated wrappers are placed in `~/.local/bin`.
 
-After it finishes, you can run Olang programs immediately:
+After setup:
 
 ```bash
-o examples/hello.O           # Uses the wrapper it installed
-cargo run -- examples/hello.O  # Or call Rust directly
-./c_cpp/O examples/hello.O ./backends  # Or the C edition
+o examples/hello.O
+cargo run -- examples/hello.O
+./c_cpp/O examples/hello.O ./backends
+python3 -m o_lang examples/hello.O
 ```
 
-### Option B: Manual setup by operating system
+### Option B: Manual Rust setup
 
-If you prefer to set things up yourself, here is what you need on each system.
+```bash
+git clone https://github.com/lostadi/Olang.git
+cd Olang
+cargo build --release
+
+./target/release/O examples/hello.O backends
+./target/release/olangc examples/hello.O -o hello
+./hello
+```
+
+The usual package-manager prerequisites are:
 
 #### macOS
 
 ```bash
-# Install Xcode command line tools (provides a C compiler)
 xcode-select --install
-
-# Install Homebrew if you don't have it, then grab dependencies
-brew install gcc make python@3.12 curl git pkg-config openssl
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build the Rust edition
-cd O-lang
+brew install rust python qemu
 cargo build --release
-
-# Build the C edition
-cd c_cpp
-make
-cd ..
-
-# Run an example
-cargo run -- examples/hello.O
-./c_cpp/O examples/hello.O ./backends
 ```
 
-#### Debian / Ubuntu / Mint / Pop!_OS
+#### Debian, Ubuntu, Mint, and Pop!_OS
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential gcc g++ make python3 python3-pip \
-    python3-venv curl git pkg-config libssl-dev
-
-# Install Rust
+sudo apt-get install -y build-essential clang lld python3 python3-pip \
+    curl git pkg-config libssl-dev qemu-system-x86
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-
-# Build the Rust edition
-cd O-lang
 cargo build --release
-
-# Build the C edition
-cd c_cpp
-make
-cd ..
-
-# Run an example
-cargo run -- examples/hello.O
-./c_cpp/O examples/hello.O ./backends
 ```
 
-#### Arch / CachyOS / Manjaro / EndeavourOS
+#### Arch, CachyOS, Manjaro, and EndeavourOS
 
 ```bash
 sudo pacman -Syu
-sudo pacman -S --needed base-devel gcc make python python-pip curl git pkgconf openssl
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Build
-cd O-lang
+sudo pacman -S --needed base-devel clang lld python rustup qemu-full git
+rustup default stable
 cargo build --release
-cd c_cpp && make && cd ..
-
-# Run
-cargo run -- examples/hello.O
 ```
 
-#### Fedora / RHEL / CentOS / Rocky
+#### Fedora, RHEL, Rocky, and related systems
 
 ```bash
 sudo dnf groupinstall -y "Development Tools"
-sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Build
-cd O-lang
+sudo dnf install -y clang lld python3 rustup qemu-system-x86 git openssl-devel pkgconfig
+rustup default stable
 cargo build --release
-cd c_cpp && make && cd ..
-```
-
-#### Alpine Linux
-
-```bash
-sudo apk update
-sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# Build
-cd O-lang
-cargo build --release
-cd c_cpp && make && cd ..
 ```
 
 #### NixOS
 
 ```bash
-# Add to environment.systemPackages or use nix-shell:
-nix-shell -p rustup gcc gnumake python3 openssl pkg-config
-
-# Inside the shell
+nix-shell -p rustup clang lld python3 qemu
 rustup default stable
-cd O-lang
 cargo build --release
-cd c_cpp && make && cd ..
 ```
 
-#### openSUSE
+#### Other systems
 
-```bash
-sudo zypper refresh
-sudo zypper install -y gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config
+Dedicated setup scripts are provided for Alpine, openSUSE, Void, Gentoo,
+FreeBSD, TinyCore, Windows, macOS, Debian, Arch, Fedora, and NixOS under
+`setup/os/`. Windows development is best done through WSL2 when the program
+needs POSIX backends or the QEMU kernel proof.
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+### Option C: C17 edition only
 
-cd O-lang
-cargo build --release
-cd c_cpp && make && cd ..
-```
-
-#### Void Linux
-
-```bash
-sudo xbps-install -Suy
-sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-cd O-lang
-cargo build --release
-cd c_cpp && make && cd ..
-```
-
-#### Gentoo
-
-```bash
-sudo emerge --ask=n sys-devel/gcc sys-devel/make dev-lang/python net-misc/curl dev-vcs/git dev-libs/openssl
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-cd O-lang
-cargo build --release
-cd c_cpp && make && cd ..
-```
-
-#### FreeBSD
-
-```bash
-sudo pkg install -y gmake gcc python3 curl git
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-cd O-lang
-cargo build --release
-cd c_cpp && gmake && cd ..
-```
-
-#### TinyCore Linux
-
-```bash
-tce-load -wi gcc make python3.12 curl git
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-cd O-lang
-cargo build --release
-cd c_cpp && make && cd ..
-```
-
-#### Windows
-
-The recommended approach on Windows is **WSL2** with Ubuntu, follow the
-Debian/Ubuntu instructions above inside your WSL environment.
-
-If you want native Windows:
-
-```powershell
-# Install via winget
-winget install --id Git.Git -e
-winget install --id Python.Python.3.12 -e
-winget install --id Rustlang.Rustup -e
-winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
-    --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools"
-
-# Restart your terminal, then:
-cd O-lang
-cargo build --release
-
-# For the C edition, use the Developer Command Prompt or MinGW:
-cd c_cpp
-make
-```
-
-#### Docker (any host)
-
-```bash
-docker run -it -v "$PWD:/ws" -w /ws debian bash -c \
-    "apt-get update && apt-get install -y sudo curl && ./setup.sh --minimal --verify"
-```
-
-### Option C: C edition only (no Rust needed)
-
-If you do not want to install Rust at all, the C edition is a complete
-standalone build. It only requires a C17 compiler (gcc, clang, or cc) and make:
+The C17 edition requires only a C17 compiler, make, and whatever hosted
+language runtimes the program calls:
 
 ```bash
 cd c_cpp
 make
 ./O ../examples/hello.O ../backends
+
+./olangc ../examples/hello.O -o /tmp/hello-c
+/tmp/hello-c
 ```
 
-The C edition also includes an AOT compiler that produces self-contained
-native binaries:
+The C17 port implements the core typed-parenthesis evaluator, structural
+backends, Python execution, the Nix value ladder, lazy and deferred requests,
+shebang handling, and AOT packaging. The Rust edition remains authoritative
+for OIR planning, coordination-group concurrency, the full backend registry,
+the notebook, and O-core.
+
+### Option D: Build and boot O-core
 
 ```bash
-./olangc ../examples/hello.O -o /tmp/hello
-/tmp/hello
+cargo build --bin ocorec
+
+# Compile one or more O-core modules to an ELF relocatable object.
+target/debug/ocorec module.oc --emit obj -o module.o
+
+# Build the included freestanding kernel.
+./ocore/kernel/build.sh
+
+# Boot interactively or run the asserted smoke test.
+./ocore/kernel/run-qemu.sh
+./ocore/kernel/smoke-qemu.sh
 ```
+
+The asserted serial output is:
+
+```text
+O-core kernel: serial online
+page allocator: online
+capability: online
+T
+QEMU smoke: PASS
+```
+
+The `T` is emitted by the actual IRQ0 timer handler after the IDT, PIC, and
+PIT are installed. It is not printed by the host harness.
+
+### Docker
+
+The Dockerfile builds the hosted `O`, `olangc`, and `o-link` binaries and
+packages Python 3 with the core shims. The native O-core compiler and
+`o-unlink` remain part of the direct Cargo build:
+
+```bash
+docker build -t o-lang .
+
+docker run --rm -v "$PWD:/work" o-lang examples/hello.O
+docker run --rm -it o-lang --repl
+docker run --rm -v "$PWD:/work" --entrypoint o-link \
+    o-lang src/ -o app.O
+```
+
+The O-core QEMU proof is intended to run directly on the host because it
+needs QEMU and the local Rust linker toolchain.
 
 ### What gets built
 
 | Binary | Location | What it does |
 |--------|----------|--------------|
-| `O` (Rust) | `target/release/O` | Interpreter, runs `.O` files directly |
-| `olangc` (Rust) | `target/release/olangc` | AOT compiler, compiles `.O` to native binaries |
-| `o-link` (Rust) | `target/release/o-link` | Linker, combines scripts/codebases into one `.O` file |
-| `O` (C) | `c_cpp/O` | C interpreter, same behavior, no Rust dependency |
-| `olangc` (C) | `c_cpp/olangc` | C AOT compiler |
+| `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
+| `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, or OIR dumps. |
+| `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to x86_64 ELF objects. |
+| `o-link` | `target/release/o-link` | Combines scripts, source trees, and `.O` files into one validated `.O` program. |
+| `o-unlink` | `target/release/o-unlink` | Restores the source files embedded by `o-link`. |
+| `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
+| `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
+| `olangc` | `c_cpp/olangc` | Produces a hosted native executable through the C17 edition. |
 
 ### Verifying the installation
 
-After building, run the smoke tests to confirm everything works:
-
 ```bash
-# Rust tests
-cargo test
+# Rust unit and binary-target tests
+cargo test --all-targets
 
-# C edition smoke tests
-cd c_cpp && make test && cd ..
+# Release CLI contract, including olangc and ocorec object emission
+cargo build --release
+bash tests/test_cli.sh
 
-# Full integration suite
-./test_o_lang_examples.sh
-```
+# Hosted example suite
+bash test_o_lang_examples.sh
 
-### Per-OS dedicated scripts
+# C17 edition
+make -C c_cpp test
 
-For CI or Docker environments, there are also dedicated per-OS scripts in
-`setup/os/` that skip detection and go straight to the right package manager:
+# Python reference
+python3 -m tests.test_parser
+python3 -m tests.test_evaluator
 
-```
-setup/os/setup-macos.sh
-setup/os/setup-debian.sh
-setup/os/setup-arch.sh
-setup/os/setup-fedora.sh
-setup/os/setup-alpine.sh
-setup/os/setup-nixos.sh
-setup/os/setup-opensuse.sh
-setup/os/setup-void.sh
-setup/os/setup-gentoo.sh
-setup/os/setup-freebsd.sh
-setup/os/setup-tinycore.sh
-setup/os/setup-windows.sh
+# Native boot proof
+./ocore/kernel/smoke-qemu.sh
 ```
 
 ---
 
 ## Table of Contents
 
-1. [What is new here?](#what-is-new-here), the novel ideas, explained plainly
-2. [Related work and how O-lang differs](#related-work-and-how-o-lang-differs), vs. `#lang`, polyglot notebooks, staging
-3. [Gentle introduction](#gentle-introduction), for readers new to programming languages
-4. [Quickstart](#quickstart), build and run in three commands
-5. [Language tour](#language-tour), all features with examples
-6. [Architecture](#architecture), how the runtime works
-7. [Reference](#reference), wire format, backends, builtins
-8. [Running the tests](#running-the-tests)
-9. [Status and roadmap](#status)
+1. [What is new here?](#what-is-new-here)
+2. [Related work and how Olang differs](#related-work-and-how-olang-differs)
+3. [Gentle introduction](#gentle-introduction)
+4. [Quickstart](#quickstart)
+5. [Hosted language tour](#hosted-language-tour)
+6. [OValue and the runtime boundary](#ovalue-and-the-runtime-boundary)
+7. [Hosted backends](#hosted-backends)
+8. [Compiler and composition tools](#compiler-and-composition-tools)
+9. [Architecture](#architecture)
+10. [O-core native systems language](#o-core-native-systems-language)
+11. [Running the tests](#running-the-tests)
+12. [Status](#status)
 
 ---
 
@@ -378,335 +319,292 @@ setup/os/setup-windows.sh
 Most languages make one or all of these assumptions:
 
 * A program is written in one language.
-* When you call out to another language you use an FFI (foreign-function
-  interface), a bridge bolted on the side.
-* The "language" a piece of code belongs to is determined by the file it sits
-  in, or by a special import/escape mechanism.
+* When you call another language you use an FFI, a bridge bolted on the side.
+* The language a piece of code belongs to is determined by the file it sits
+  in, or by a special import or escape mechanism.
+* Native systems code and orchestration code must share one intermediate
+  representation even though they have different semantics.
 
-O-lang breaks all three assumptions. Here are the four ideas that make it
+Olang breaks all four assumptions. Here are the five ideas that make it
 different.
-
----
 
 ### 1. Typed parentheses: the language is in the syntax
 
-In every language you have ever used, parentheses are anonymous. `(x + y)`
-is just grouping; nothing about the parentheses tells you what evaluator will
-handle the contents.
+In every ordinary language, parentheses are anonymous. `(x + y)` is grouping;
+nothing about the parentheses tells you what evaluator will handle the
+contents.
 
 Olang gives parentheses a *type*: the identifier before `^(` names the
 evaluator, and the matching `)_IDENT` closes it.
 
-```
-python^( 6 * 7 )_python          # evaluated by the Python runtime → 42
-html^( <b>hello</b> )_html       # rendered as an HTML fragment
-markdown^( **bold** )_markdown   # rendered as Markdown
-nix^( builtins.nixVersion )_nix  # evaluated by the Nix expression language
+```O
+python^( 6 * 7 )_python
+html^( <b>hello</b> )_html
+markdown^( **bold** )_markdown
+nix^( builtins.nixVersion )_nix
+sql^( SELECT 40 + 2 AS answer; )_sql
 ```
 
 These are not escape sequences inside another language. They are first-class
-expressions in their own right, and they nest freely:
+expressions, and they nest freely:
 
-```
+```O
 html^(
   <p>Count: python^( sum(range(10)) )_python</p>
 )_html
 ```
 
-The Python expression is evaluated first (inner-to-outer), its result
-is converted to something HTML can embed, and then the HTML expression
-completes. **No FFI. No bridge. The nesting is the interface.**
-
----
+The Python expression is evaluated first, its result is converted to
+something HTML can embed, and then the HTML expression completes. **No
+pairwise FFI. No template bridge. The nesting is the interface.**
 
 ### 2. OValue: the universal exchange type
 
-When Python produces `42` and HTML needs to embed it, *something* has to
-cross the boundary. In O-lang that something is always an `OValue`, a
-tagged union that every backend speaks.
+When Python produces `42` and HTML needs to embed it, something has to cross
+the boundary. In Olang that something is always an `OValue`, a tagged union
+that every backend speaks.
 
-```
-ONull | OBool | OInt | OFloat | OStr
-OHtml | OList | OMap | OBlob(bytes, mime_type)
-OStorePath | OExpr | ONixExpr | ODerivation | OSystem
-ORequest | OThunk | OGroup
+```text
+ONull | OBool | OInt | OFloat | OStr | OHtml
+OList | OMap | OBlob | OExpr
+ONixExpr | ODerivation | OStorePath | OSystem
+ORequest | OThunk | OGroup | OError
+OCapability | OSnapshot
 ```
 
-The critical insight is that **the receiving language decides how to render
-a foreign value, not the sending language**. This is the `render_child`
-method: each backend knows how to turn any `OValue` into its own source
-syntax.
+The critical insight is that **the receiving language decides how to render a
+foreign value, not the sending language**. This is the `render_child`
+operation: each backend knows how to turn OValue into its own source syntax.
 
-```
+```text
 HTML.render_child(OBlob(png, "image/png"))
-  → <img src="data:image/png;base64,…">
+  -> <img src="data:image/png;base64,...">
 
 HTML.render_child(OList([OStr("a"), OStr("b")]))
-  → <ul><li>a</li><li>b</li></ul>
+  -> <ul><li>a</li><li>b</li></ul>
 
 Python.render_child(OInt(42))
-  → 42  (a Python literal)
+  -> 42
 ```
 
-With N languages and this single protocol, interoperability costs O(N) code, one `render_child` per language, instead of O(N²) bridges between
-every pair.
+With N languages and this single protocol, interoperability costs O(N) code,
+one renderer per language, instead of O(N squared) bridges between every
+pair. The canonical exchange form is explicit and inspectable rather than
+hidden in a compiler pass.
 
-This is a concrete implementation of what formal polyglot theory (the
-Transcompiler Composite Framework's T3 theorem) predicts must exist in any
-*lossless* polyglot system: a canonical intermediate representation that all
-parties route through. In O-lang it is visible to the programmer rather than
-hidden in a compiler.
+### 3. Explicit persistent environments
 
----
+Bare hosted expressions are ephemeral. They receive a fresh environment for
+that expression and are cleaned up afterward:
 
-### 3. Persistent, named environments
-
-In a Jupyter notebook, all Python cells share one implicit global namespace.
-In O-lang, environments are explicit and multiple:
-
-```
-python[0]^( x = 10 )_python[0]   # sets x in environment 0
-python[1]^( x = 99 )_python[1]   # sets x in a completely separate environment 1
-python[0]^( x * x  )_python[0]   # sees 10, not 99 → returns 100
+```O
+python^( x = 10 )_python
+python^( x )_python             # x is not retained
 ```
 
-The number in brackets is an *environment index*. Environments survive for
-the life of the document. State, imports, function definitions, variable
-bindings, persists across all expressions that reference the same
-`(language, index)` pair.
+Persistence is explicit through the environment index:
 
-`python^(...)_python` without brackets defaults to `python[0]`. You can have
-as many independent Python (or Nix, or Racket, …) environments as you need,
-all live at once in the same document.
+```O
+python[0]^( x = 10 )_python[0]
+python[1]^( x = 99 )_python[1]
+python[0]^( x * x  )_python[0]  # 100
+```
 
----
+The number in brackets is an environment index. State, imports, functions,
+and backend-owned resources survive for the life of the evaluator for every
+expression that names the same `(language, index)` pair. Different indices
+are isolated from one another.
+
+This gives Olang notebook-like state without making the notebook's one global
+namespace an invisible part of the language.
 
 ### 4. Homoiconicity across languages
 
-Lisp is famous for *homoiconicity*: in Lisp, code and data have the same
-shape, so a program can treat another program as data, transform it, and
-evaluate it. This is how Lisp macros work, and it is a deep source of
-expressive power.
+Lisp is famous for homoiconicity: code and data have the same shape, so a
+program can inspect another program, transform it, and evaluate it. Olang
+generalizes that idea across multiple languages.
 
-Olang generalizes homoiconicity across multiple languages. The `quote^`
-backend captures any expression, in any language, as an `OExpr` value
-without evaluating it:
+The `quote^` backend captures an O expression as `OExpr` without evaluating
+it:
 
-```
+```O
 let q = quote^( python^( 6 * 7 )_python )_quote
-# q is now a value of type OExpr: an unevaluated AST
 ```
 
-A Python block can receive `q`, inspect it, store it in a list, and evaluate
-it on demand with `O.eval(q)`:
+Python can receive `q` as a live `OExprValue` and evaluate it through the
+current O evaluator:
 
-```
+```O
 python[0]^(
-  result = O.eval(q)   # fires the Python evaluator on the quoted expression → 42
+result = O.eval(q)
 )_python[0]
 ```
 
-Python code can also *construct* O source programmatically and quote it:
+Python can also construct O source and parse it back into an expression:
 
-```
+```O
 python[0]^(
-  src = "python^(2 ** 10)_python"
-  O.eval(O.quote(src))            # → 1024
+src = "python^(2 ** 10)_python"
+result = O.eval(O.quote(src))
 )_python[0]
 ```
 
-The full quote/eval round-trip works across all registered backends. A
-program can build up an O expression tree in Python, pass it through a
-Nix backend, and evaluate the result, the language boundary is not a
-barrier to metaprogramming.
+The language boundary is not a barrier to metaprogramming. An O expression
+can be constructed in one language, moved as data through another, and
+evaluated by its named backend later.
+
+### 5. Orchestration and machine computation have different IRs
+
+Olang does not force every kind of computation into the same abstraction.
+
+Hosted `.O` programs lower into OIR. OIR names text, loads, stores, builtin
+calls, backend execution, structural dependencies, sequencing dependencies,
+and data dependencies. It is the correct representation for scheduling
+polyglot work.
+
+Native `.oc` programs lower into typed HIR and then SSA MIR. MIR has typed
+values, mutable places, basic blocks, phi nodes, calls, branches, memory
+operations, intrinsics, and assembly. It is the correct representation for
+machine code.
+
+```text
+.O  -> ONode -> OIR -> ExecutionPlan -> hosted evaluators
+.oc -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
+```
+
+This is the point where Olang becomes both a polyglot meta-language and a
+systems programming language without pretending those are the same problem.
 
 ---
 
 ## Related work and how Olang differs
 
-Olang sits at the intersection of three established traditions, language-oriented
-programming, polyglot execution, and metaprogramming, but combines them in a way
-none of them individually provide. The one-sentence thesis: **the evaluator is named
-by the delimiter shape, so language choice becomes a structural, compositional
-property of an expression at arbitrary nesting depth, federating multiple
-independent real runtimes through a single language-neutral value type (`OValue`).**
-Here is how that relates to the closest neighbors.
+Olang sits at the intersection of language-oriented programming, polyglot
+execution, metaprogramming, workflow systems, and native systems languages.
+The one-sentence thesis is: **the evaluator is named by the delimiter shape,
+so language choice becomes a structural property of an expression at any
+nesting depth, and distinct runtimes exchange values through OValue while
+native computation remains in a separate typed compiler pipeline.**
 
-**Racket `#lang` and language-oriented programming.** Racket pioneered the idea that
-a program declares its own language and that defining new languages should be cheap.
-The differences are granularity and substrate. Racket's `#lang` is a *module-level*
-declaration, and every surface language ultimately expands into Racket's core and
-runs on the Racket VM, one runtime hosting many front-ends. O-lang places the
-language tag at the *expression* level (`LANG^( … )_LANG`), nests heterogeneous
-languages inside one another, and dispatches to *separate, real* runtimes (CPython,
-Nix, …) that it federates rather than subsumes. Racket unifies languages by compiling
-them to a common core; O-lang keeps them as distinct processes and unifies only their
-*values*.
+**Racket `#lang` and language-oriented programming.** Racket pioneered the
+idea that a program declares its own language and that defining new languages
+should be cheap. The differences are granularity and substrate. `#lang` is a
+module-level declaration, and its languages ultimately run through Racket.
+Olang places the language tag at expression level and dispatches to separate,
+real runtimes such as CPython, Nix, Node.js, Rust, SQLite, Racket, and others.
+Racket unifies languages through a common host. Olang keeps the evaluators
+distinct and unifies the values that cross between them.
 
-**Polyglot notebooks and literate programming (Jupyter polyglot kernels, .NET
-Interactive, Org-mode Babel).** These let blocks in different languages share data
-inside one document. The difference is compositional structure. Notebook and Babel
-blocks are *top-level cells* sequenced linearly, with data passed through a shared
-kernel or named variables; the language is a per-cell mode. In O-lang a block is an
-*expression* that can be nested inside another language's expression, with the inner
-value flowing back into the outer one (`html^( … python^( … )_python … )_html`). The
-language boundary is a node in an AST, not a cell delimiter, which is what makes
-quote/eval and `OValue` splicing work uniformly at any depth.
+**Polyglot notebooks and literate programming.** Jupyter, .NET Interactive,
+and Org-mode Babel let top-level cells use different languages. Olang makes a
+language block an expression inside the AST. A Python expression can occur
+inside HTML which occurs inside another Python expression. The boundary is a
+composable node, not only a cell delimiter. The local O notebook is one UI
+over this evaluator, not the definition of the language.
 
-**Multi-stage and staged metaprogramming (Lisp quasiquotation, MetaOCaml, Template
-Haskell, Terra).** O-lang's `O.quote`/`O.eval` and the `OExpr` type are
-homoiconicity, code as inspectable data, which these systems also provide. The
-generalization is *across languages*: staging systems quote and splice code within a
-single language (or, in Terra's case, two tightly-coupled ones), whereas O-lang's
-quoted `OExpr` can be constructed in Python, threaded through a Nix backend, and
-evaluated elsewhere. It is Lisp's "code is data" lifted from one language to a
-federation of them.
+**Staged metaprogramming.** Lisp quotation, MetaOCaml, Template Haskell, and
+Terra all make code available as data. Olang's generalization is across
+backend languages. `OExpr` carries O syntax, `quote^` captures it, and
+`O.eval` re-enters the active evaluator.
 
-**String-embedded DSLs (heredocs, JSX, tagged template literals, SQL-in-host).** The
-common way to mix languages today is to embed foreign syntax as a *string* that some
-library later parses; to the host language those payloads are opaque text. O-lang's
-blocks are not strings, they are parsed by the host grammar, evaluated by the named
-backend, and return a typed `OValue` that the surrounding language consumes as a
-first-class atom, with bidirectional flow rather than a one-way opaque payload.
+**String-embedded DSLs.** Heredocs, JSX, tagged templates, and SQL strings
+usually leave the embedded language opaque to the host. Olang parses the
+typed-expression boundary into its AST, evaluates the named backend, and
+returns an OValue that the surrounding expression consumes as a first-class
+atom.
 
-**Language workbenches and projectional editing (JetBrains MPS, Spoofax).** These
-compose languages at the level of grammars and editors, often with projectional
-(non-textual) editing and heavyweight tooling. O-lang is deliberately lightweight and
-textual: a single small grammar (the typed-parenthesis rule) plus a backend registry,
-with composition happening at runtime through subprocess IPC rather than at compile
-time through a unified metamodel.
+**Workflow engines.** Deferred requests, content fingerprints, execution
+plans, groups, and autonomous scheduling make Olang capable of expressing
+workflow topology. The difference is that these control values live in the
+same value system as the language results. `batch`, `all`, `any`, and `race`
+are not external scheduler configuration; they are O expressions.
 
-**Honest scope.** O-lang is a research prototype and does not yet match the maturity
-of any system above. Several backends (`bash`, `shell`, `rust`, `racket`) are
-registered but currently parse-only stubs; the executing backends are Python, Nix,
-and the inline templating backends (HTML, Markdown, LaTeX, text). The contribution is the *organizing idea*, interpreter-as-syntax
-with value-level federation, together with a working reference implementation in
-three languages (Rust, C, Python), not a production toolchain.
+**Systems languages.** C, Rust, Zig, and freestanding subsets of other
+languages already compile kernels. O-core's distinct point is its placement
+inside Olang's two-level model. Hosted O can generate, compose, build, boot,
+and inspect native O-core while O-core itself stays free of the hosted runtime
+and its dependencies.
+
+Olang is now an implemented toolchain rather than only an organizing idea.
+The repository contains the parser, evaluator, OValue protocol, persistent
+process registry, OIR and execution planner, scheduler and disk cache, real
+backend shims, native and WASI packaging, linker and unlinker, notebook,
+static O-core front end, SSA lowering, x86_64 object generation, freestanding
+runtime, and an asserted QEMU boot. The current boundaries are documented at
+the end of this README as concrete engineering scope, not as placeholders for
+features that already exist.
 
 ---
 
 ## Gentle introduction
 
-*This section is for readers who are new to the idea of programming
-languages as objects of study. You do not need prior experience with
-compilers, interpreters, or language theory. You need only curiosity.*
-
----
+*This section is for readers who are new to programming languages as objects
+of study. You do not need prior experience with compilers, interpreters, or
+kernel development. You need only curiosity.*
 
 ### What is a programming language, really?
 
-When you write `2 + 2` in Python and run it, something has to *interpret*
-those characters and produce the number `4`. That something is an evaluator
-(also called an interpreter or runtime). Every programming language is, at
-bottom, a pair of things:
+When you write `2 + 2` in Python and run it, something has to interpret those
+characters and produce the number `4`. That something is an evaluator. Every
+programming language is, at bottom, a pair of things:
 
 1. **Syntax**, the rules about what text is a valid program.
-2. **Semantics**, the rules about what a valid program *does*.
+2. **Semantics**, the rules about what a valid program does.
 
-The evaluator reads syntax and applies semantics to produce a result.
+Most of the time, you pick one language and use its evaluator for the whole
+file.
 
-Most of the time, you pick a language and then write your whole program in it.
-The evaluator is fixed for the whole file.
+Olang changes the unit at which that choice is made. The evaluator belongs to
+the expression:
 
----
-
-### The problem Olang is solving
-
-Imagine you are writing a web page. The page is HTML. But the page needs
-a number computed in Python. And the number comes from a database query
-written in SQL. And the SQL is generated from a Nix configuration that
-manages your database server.
-
-Today you would write four separate programs in four separate files, wire
-them together with shell scripts, and spend a lot of time making sure the
-data types line up at each boundary. The language boundaries are friction.
-
-Olang's answer is: **let the expression carry its evaluator**. Instead of
-choosing one language for the file, write each piece of the program in the
-language that fits it, right where it belongs, nested inside the other
-pieces.
-
----
-
-### Your first Olang program
-
-The smallest possible program:
-
-```
+```O
 python^(
-__oval_result__ = 1 + 1
+1 + 1
 )_python
 ```
 
-Read it as: "evaluate this body in Python." The `python^(` opener and
-`)_python` closer are a matched pair. Everything between them is Python code.
-The special variable `__oval_result__` is how a Python block says "this is my
-return value." (You can also just write a bare expression on the last line,
-like a Python REPL.)
-
-Run it:
-
-```bash
-cargo run -- examples/hello.O
-```
-
-Output: `2`
-
----
+Read this as: "evaluate this body in Python." The opener and closer are a
+matched pair. Everything between them is Python source.
 
 ### Nested expressions
 
-Now nest a Python block inside an HTML block:
+Now place a Python block inside HTML:
 
-```
+```O
 html^(
   <h1>The answer is python^(
-__oval_result__ = 6 * 7
+6 * 7
 )_python!</h1>
 )_html
 ```
 
-The evaluator works *inside-out* (leaves before roots, like arithmetic).
-First the Python block runs and produces `42`. Then the HTML block sees
-`42` where the Python block used to be. The HTML backend turns `42` into
-the string `"42"` and embeds it, producing:
+The evaluator works inside-out, leaves before roots, like arithmetic. Python
+produces `42`. The HTML backend receives the value, renders it as HTML-safe
+content, and produces:
 
 ```html
 <h1>The answer is 42!</h1>
 ```
 
-No string interpolation library. No template engine. The nesting *is* the
-template.
+No string interpolation library is needed. The nesting is the template.
 
----
+### Naming values
 
-### Naming values with `let`
-
-You can give a name to the result of any expression:
-
-```
-let answer = python^(
-__oval_result__ = 40 + 2
-)_python
+```O
+let answer = python^( 40 + 2 )_python
 
 python^(
-__oval_result__ = $answer + 1
+$answer + 1
 )_python
 ```
 
-The `let answer = ...` line runs the Python block and binds its result to
-`$answer`. The second block splices `$answer` in, the runtime substitutes
-the value `42` before sending the body to Python, so Python sees
-`__oval_result__ = 42 + 1` and returns `43`.
+The first expression binds an OInt to `$answer`. The receiving Python backend
+renders that OInt as the Python literal `42`, so the second block evaluates
+`42 + 1`.
 
----
+### Persistent state when you ask for it
 
-### Persistent state across blocks
-
-One of the most practical features: state persists across blocks that share
-the same environment index.
-
-```
+```O
 python[0]^(
 import random
 random.seed(42)
@@ -714,647 +612,1094 @@ samples = [random.gauss(0, 1) for _ in range(500)]
 )_python[0]
 
 python[0]^(
-# `samples` is still here from the block above
 round(sum(samples) / len(samples), 4)
 )_python[0]
 ```
 
-This makes Olang documents feel like literate programs or lab notebooks,
-except that the environments are *explicit*, *named*, and *multiple*, you
-can have several independent Python namespaces in one document with no
-accidental sharing between them.
+The `[0]` is what makes the Python process persistent. A bare Python block is
+single-use. This distinction keeps state visible in the source.
 
----
+### Native computation
 
-### The universal value type
+The hosted language is about composing evaluators. O-core is what you use
+when the computation itself must become freestanding machine code:
 
-Every Olang expression returns an `OValue`. Think of `OValue` as the
-common currency that all languages in a document share. When a Python
-block returns a list, it becomes `OList`. When it returns a number, it
-becomes `OInt`. When an HTML block needs to embed that value, it looks at
-the type tag and decides how to render it.
+```ocore
+module example;
 
-The remarkable thing is that *you do not have to teach Python about HTML or
-HTML about Python*. You only have to teach each language about `OValue`.
-The complexity does not grow as you add languages.
+struct Point {
+    x: i64,
+    y: i64,
+}
 
----
-
-### Code as data: `quote` and `O.eval`
-
-One of the deepest ideas in programming language theory is
-*homoiconicity*, the ability of a language to treat its own programs as
-data that can be inspected and modified.
-
-Olang lets you do this not just within one language but across all of them.
-The `quote^(...)_quote` expression captures its body as an `OExpr` value
-(an unevaluated program fragment) rather than running it:
-
-```
-let q = quote^( python^(2 ** 10)_python )_quote
-# q is just data now: nothing has run yet
+fn sum(point: *const Point) -> i64 {
+    unsafe {
+        return (*point).x + (*point).y;
+    }
+}
 ```
 
-Later, from inside Python, you can evaluate it:
-
-```
-python[0]^(
-O.eval(q)    # → 1024
-)_python[0]
-```
-
-You can also build Olang source code programmatically in Python and then
-evaluate it. This is the same power that makes Lisp famously expressive,
-now available in a multi-language system.
-
----
-
-### The Nix dimension
-
-For readers familiar with NixOS or Nix package manager: Olang treats the
-operating system as a participant in the value model. A Nix expression is
-an `OValue`. A derivation (a package build specification) is an `OValue`.
-A built store path is an `OValue`. An active system configuration is an
-`OValue`.
-
-These values flow through the same typed-expression mechanism as everything
-else:
-
-```
-let cfg  = nix_expr^( (import <nixpkgs/nixos> { configuration = ./conf.nix; }).system )_nix_expr
-let drv  = instantiate($cfg)   # NixExpr → Derivation
-let path = realise($drv)       # Derivation → StorePath
-let sys  = activate($path)     # StorePath → System
-```
-
-Each step is a pure function from one `OValue` to another. The OS is not
-a side effect of the program, it is a value the program can compute and
-pass around.
+The source is parsed, resolved, statically checked, lowered through typed HIR
+and SSA MIR, and emitted as an ELF object. There is no backend interpreter in
+the resulting target code.
 
 ---
 
 ## Quickstart
 
-There are two easy ways to build and run Olang:
-
-**C edition (recommended, only needs a C compiler + make)**
-
-```bash
-cd c_cpp
-make
-./O ../examples/hello.O ../backends
-./olangc ../examples/hello.O -o /tmp/hello_c && /tmp/hello_c
-```
-
-See [c_cpp/README.md](c_cpp/README.md) for the full easy-build instructions, `make test`, AOT details, etc.
-
-**Rust edition (authoritative reference implementation)**
+### Run a hosted O program
 
 ```bash
 cargo build
 cargo run -- examples/hello.O
-cargo run --bin olangc -- examples/hello.O -o hello
-./hello
 ```
 
-Python reference (for cross-checking semantics):
+### Use the REPL
 
 ```bash
-python -m o_lang examples/hello.O
+cargo run -- --repl backends
 ```
 
-**Linking existing scripts into one `.O` file**
+The REPL keeps O-level `let` bindings and explicit backend environments alive
+between entries. It supports multiline typed expressions, history, scope
+inspection, reset, and terminal-aware output.
 
-The `o-link` linker (combiner compiler) takes a list of scripts, source
-files, or whole directories and links them into a single `.O` program. Each
-file is wrapped in the typed-expression block matching its extension
-(`.py` → `python^(...)_python`, `.sh` → `bash^(...)_bash`,
-`.html` → `html^(...)_html`, …), `.O` files are inlined verbatim, and any
-text that collides with Olang syntax is backslash-escaped automatically:
+### Use the local notebook
+
+```bash
+cargo run --features notebook --bin o-notebook -- backends
+```
+
+The notebook listens on `127.0.0.1:8888`, opens a local browser, and keeps one
+evaluator session across cells. It renders HTML and image OValues directly,
+supports cell reordering and run-all, saves and loads notebook JSON, and can
+restart the evaluator state.
+
+### Compile hosted O
+
+```bash
+cargo run --bin olangc -- examples/hello.O -o hello
+./hello
+
+cargo run --bin olangc -- examples/hello.O --target script
+cargo run --bin olangc -- examples/hello.O --target ir
+```
+
+### Compile O-core
+
+```bash
+cargo run --bin ocorec -- kernel.oc --emit hir -o -
+cargo run --bin ocorec -- kernel.oc --emit mir -o -
+cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o kernel.o
+```
+
+### Link a source tree into one O document
 
 ```bash
 cargo run --bin o-link -- calc.py page.html app.O -o program.O
-cargo run -- program.O                  # run the combined file
+cargo run -- program.O
 
-cargo run --bin o-link -- src/ -o project.O          # link a whole codebase
-cargo run --bin o-link -- notes.txt --lang txt=markdown --stdout
-
-cargo run --bin o-link -- calc.py --run              # link, then execute in-process
-cargo run --bin o-link -- src/ -o app.O --shebang    # emit `#!/usr/bin/env o`,
-./app.O                                              # chmod +x — directly runnable
-```
-
-The combined output is re-parsed before it is written, so `o-link` never
-emits a `.O` file the runtime cannot read. Directory walks skip binary /
-non-UTF-8 files with a warning, follow symlinked directories at most once
-(no infinite loops), dedupe files reachable through overlapping inputs, and
-never pick up the output file itself — so re-linking a directory that
-already contains a previous `combined.O` is safe.
-
-**Docker image (zero local toolchain)**
-
-The repository ships a multi-stage `Dockerfile` that builds the full Rust
-toolchain (`O`, `olangc`, `o-link`) and packages it with Python 3 and the
-backend shims, so you can run, link, and compile `.O` programs with nothing
-but Docker installed:
-
-```bash
-docker build -t o-lang .
-
-docker run --rm -v "$PWD:/work" o-lang my_program.O      # run a program
-docker run --rm -it o-lang --repl                        # interactive REPL
-docker run --rm -v "$PWD:/work" --entrypoint o-link \
-    o-lang src/ -o app.O                                 # link a codebase
-docker run --rm -v "$PWD:/work" o-lang app.O             # run the result
+cargo run --bin o-unlink -- program.O -o restored/
 ```
 
 ---
 
-## Language tour
+## Hosted language tour
 
 ### Typed expression syntax
 
-```
+```text
 LANG^( body )_LANG
-LANG[n]^( body )_LANG[n]    # explicit environment index n
+LANG[n]^( body )_LANG[n]
+LANG{lazy}^( body )_LANG{lazy}
+LANG[n]{defer}^( body )_LANG[n]{defer}
 ```
 
-The opener `LANG^(` and closer `)_LANG` must match exactly. `LANG` must be a
-registered language tag (see the backend table below). Every non-language
-identifier, including operators like `2^(x+1)` inside a Python block, is
-left alone by the parser.
+The opener and closer must match exactly as written. The language name must be
+registered. An identifier that is not a registered language remains ordinary
+text even when followed by `^(`, which prevents inner-language operators from
+being mistaken for O syntax.
+
+The parser recognizes backslash escapes for literal O openers, closers, and
+splices. Inside a Bash block, write `\$PATH` when you want the backend to
+receive the literal shell expression `$PATH` rather than an O-level splice.
 
 #### Aliases
 
-| Alias   | Canonical  |
-|---------|------------|
-| `py`    | `python`   |
-| `md`    | `markdown` |
-| `tex`   | `latex`    |
-| `plain` | `text`     |
-| `o`     | `O`        |
+| Alias | Canonical language |
+|-------|--------------------|
+| `py` | `python` |
+| `md` | `markdown` |
+| `tex` | `latex` |
+| `plain` | `text` |
+| `o` | `O` |
+
+Aliases retain their source spelling in the closer but resolve to the same
+backend and environment namespace.
 
 #### Shebang support
 
-`.O` files can start with `#!/usr/bin/env O`, the runtime strips it before
-parsing.
+Executable O documents may begin with:
 
----
+```text
+#!/usr/bin/env o
+```
+
+The interpreter, compiler, linker, and unlinker handle the shebang as part of
+the source-file workflow.
 
 ### `let` bindings and `$var` splicing
 
-```
+```O
 let name = LANG^( ... )_LANG
 ```
 
-Runs the expression and binds its `OValue` result to `$name`. Any subsequent
-expression that contains `$name` in its body has the value substituted before
-the body is sent to the backend.
+The expression is evaluated and its OValue is stored in the O-level scope.
+When `$name` appears inside another expression, the receiving backend renders
+that OValue in its own syntax.
 
-```
-let answer = python^( __oval_result__ = 40 + 2 )_python
-
+```O
+let answer = python^( 40 + 2 )_python
 html^( <p>The answer is $answer.</p> )_html
 ```
 
----
+### Python result rules
 
-### Result from a Python block
+A Python block chooses its result in this order:
 
-In a Python block the return value is, in order of priority:
+1. The value assigned to `__oval_result__`.
+2. The value of the final bare expression.
+3. Captured stdout when neither of the first two produces a value.
 
-1. `__oval_result__`, set explicitly by the block.
-2. The value of the last bare expression (no assignment), matching Python REPL
-   semantics.
-3. Captured `stdout`, if neither of the above apply, anything written to
-   `print()` is returned as `OStr`.
-
-```
-python^( 6 * 7 )_python             # → OInt(42), trailing-expression form
-python^( print("hi") )_python       # → OStr("hi\n"), stdout capture
-python^( __oval_result__ = 99 )_python  # → OInt(99), explicit form
+```O
+python^( 6 * 7 )_python
+python^( print("hi") )_python
+python^( __oval_result__ = 99 )_python
 ```
 
----
+Python values are converted recursively into OValue, including booleans,
+integers, floats, strings, lists, maps, bytes, HTML, store paths, expressions,
+and image blobs.
 
-### `O^(...)_O` sequencing block
+### `O^(...)_O` sequencing
 
-The `O` backend is the document host. It evaluates its children
-left-to-right and collects their results. One non-null child → returns
-it directly. Multiple non-null children → returns them as `OList`. All
-null → returns `ONull`.
+The `O` backend is the structural document host. It evaluates children from
+left to right and returns the last non-null value:
 
-```
+```O
 O^(
   python[0]^( x = 10 )_python[0]
   python[0]^( x * x  )_python[0]
 )_O
 ```
 
-This is the canonical outer wrapper for full `.O` documents.
+Because `O` controls child evaluation directly, it is implemented as an
+inline AST backend rather than as a subprocess shim.
 
----
+### Environment lifetime
 
-### Persistent environments
+```O
+python^( x = 40 )_python
+python^( x + 2 )_python        # fresh environment, x is absent
 
-```
 python[0]^( x = 40 )_python[0]
-python[0]^( x + 2  )_python[0]   # → 42, x is still in scope
-python[1]^( x      )_python[1]   # NameError: x not defined in env 1
+python[0]^( x + 2 )_python[0] # 42
+python[1]^( x )_python[1]     # isolated environment
 ```
 
-Each unique `(language, index)` pair has its own isolated subprocess. State
-inside it survives until the process exits. There is no accidental sharing
-between different indices.
-
----
+The Rust runtime uses an internal ephemeral environment identifier for bare
+blocks and destroys that backend process after the expression. An explicit
+numeric identifier names a persistent `(language, environment)` process.
 
 ### Lazy and deferred blocks
 
-Append `{lazy}` or `{defer}` to a language tag to capture the block as a
-thunk without immediately running the backend:
+`{lazy}` and `{defer}` capture backend evaluation as a first-class Request:
 
-```
-let thunk = python{defer}^( import time; time.time() )_python{defer}
-# No Python subprocess has run yet. thunk is a Request[Eval] value.
-let result = now($thunk)   # force it here → current timestamp
-```
+```O
+let cached = html{lazy}^(<p>stable</p>)_html{lazy}
+let effect = python{defer}^(import time; time.time())_python{defer}
 
-- **`{lazy}`**, pure backends only; the result is cached by content
-  fingerprint. Evaluating the same expression twice returns the cached
-  value.
-- **`{defer}`**, any backend; never cached; re-runs every time `now()` is
-  called on it.
-
-The counterpart `lazy(expr)` builtin wraps any expression in a
-`Policy::Lazy` context without block-level syntax, and `now(req)` forces
-any `Request` value.
-
----
-
-### Homoiconicity: `quote^` and `O.eval`
-
-```
-O^(
-  python[0]^(
-    q = quote^( python^(6 * 7)_python )_quote   # q : OExpr
-  )_python[0]
-  python[0]^(
-    O.eval(q)                                    # → 42
-  )_python[0]
-)_O
+let a = now($cached)
+let b = now($effect)
 ```
 
-`quote^(...)_quote` captures its body as an unevaluated `OExpr` value, nothing runs. `O.eval(expr)` re-enters the evaluator on a live `OExpr`,
-using the current persistent environments. Python code can also call
-`O.quote(src_string)` to parse a raw source fragment and return it as
-`OExpr`, enabling fully programmatic construction of O expressions.
+- `{lazy}` is accepted only for backends marked pure. Its forced result is
+  cached by the request fingerprint.
+- `{defer}` is accepted for any backend. It is never result-cached and runs
+  again each time it is forced.
+- `lazy(expr)` evaluates its argument under the lazy policy.
+- `now(value)` forces a Request or coordination Group.
+- Splicing a `{lazy}` Request forces it before rendering. Splicing a `{defer}`
+  Request is rejected because an implicit splice must not silently repeat an
+  effect; use `now()` when that force is intentional.
 
----
+Purity is centralized in the backend registry rather than inferred from the
+language name at every call site.
 
-### The Nix lattice (four-rung pipeline)
+### `quote^` and `O.eval`
 
-Olang models the full Nix build pipeline as a typed value chain:
+```O
+let q = quote^(
+  python^(6 * 7)_python
+)_quote
 
+python[0]^(
+O.eval(q)
+)_python[0]
 ```
-nix_expr^(...)_nix_expr   →   ONixExpr
-instantiate($expr)         →   ODerivation
-realise($drv)              →   OStorePath
-activate($path)            →   OSystem
+
+`quote^` is a structural backend. It reconstructs the enclosed O source into
+an OExpr without evaluating its children. The Python shim represents OExpr as
+a live `OExprValue`; `O.eval` sends an evaluator callback over the same IPC
+channel and receives the resulting OValue.
+
+### The Nix lattice
+
+Olang models the Nix and NixOS path as a value chain:
+
+```text
+nix_expr^(...)_nix_expr -> ONixExpr
+instantiate($expr)       -> ODerivation
+realise($drv)            -> OStorePath
+activate($path)          -> OSystem
 ```
 
-Each builtin takes an `OValue` of the expected type and returns the next
-rung. `current_system()` returns an `OSystem` for the currently active
-profile without performing any transition.
+`nix^` remains the immediate evaluation form. `nix_expr^` captures Nix source
+and its dependencies without evaluating it. `instantiate` uses `nix eval` to
+obtain a derivation, `realise` uses `nix build`, and `activate` invokes the
+closure's `switch-to-configuration` entry point.
 
-`activate()` defaults to dry-run unless `O_LANG_ALLOW_ACTIVATION=1` is set.
-
----
+Real activation is guarded by `O_LANG_ALLOW_ACTIVATION=1`. Without that gate,
+the runtime forces `dry-activate`. `current_system()` returns the current
+profile as a referential OSystem value.
 
 ### Autonomous scheduling
 
-```
-autonomous(
-  O^(
-    let a = nix_expr^( ... )_nix_expr
-    let b = nix_expr^( ... )_nix_expr
-    ...
-  )_O
+Inside `autonomous(...)`, non-Eval requests are buffered. At a force point,
+the scheduler constructs their dependency graph, executes ready Nix-family
+work concurrently up to its parallelism limit, and writes results to memory
+and disk caches.
+
+```O
+let result = autonomous(
+  batch(
+    realise(instantiate($one)),
+    realise(instantiate($two))
+  )
 )
 ```
 
-Inside `autonomous(...)`, Nix-family Requests (instantiate, realise) are
-buffered rather than executed eagerly. When a *force point* is reached, the
-`AutonomousScheduler` flushes the buffer by executing all pending Requests
-concurrently in topological order. Eval requests (Python, bash, etc.) still
-execute eagerly.
+Eval requests remain on the evaluator thread because the live process
+registry is not Send. This preserves persistent backend state while still
+parallelizing the Nix operations that can safely run on worker threads.
 
----
+### Coordination groups
 
-### Coordination groups (`batch` / `all` / `any` / `race`)
+Groups make execution topology part of the value model:
 
-```
-let bundle = batch($e1, $e2, $e3)   # a Group value — no work performed yet
-let results = now($bundle)          # force it → OList of the three results
+```O
+let bundle = batch($a, $b, $c)
+let results = now($bundle)
 
-let scheduled = autonomous(batch(   # MVP concurrent scheduler integration
-  realise(instantiate($e1)),
-  realise(instantiate($e2))
-))
+let required = all($a, $b)
+let fallback = any($primary, $secondary)
+let fastest = race($left, $right)
 ```
 
-A **Group** makes the *execution topology* of several computations explicit in
-the value model. Where a Request names one deferred computation, a group names a
-collection of them plus a mode that says how they relate:
+| Form | Meaning | Result |
+|------|---------|--------|
+| `batch(a, b, ...)` | Run every member for throughput. | OList containing every result; failures become OError values. |
+| `all(a, b, ...)` | Require every member to succeed. | OList on success; the group fails on the first error. |
+| `any(a, b, ...)` | Try members as fallbacks. | The first successful value; fails only when all members fail. |
+| `race(a, b, ...)` | Take the first member to settle. | The first success or failure. |
 
-- **`batch(a, b, …)`** — run them together for throughput; yields every result.
-- **`all(a, b, …)`** — fan-out where every member must succeed; yields every result.
-- **`any(a, b, …)`** — redundancy/fallback; yields the first member to succeed.
-- **`race(a, b, …)`** — latency competition; yields the first member to settle.
-
-A group performs no work on its own. It is forced by `now(group)`, by
-`autonomous(group)`, or at document end under Autonomous policy. `batch`/`all`
-collect **all** member results into a list (member order preserved); `any`/`race`
-yield a **single** winner. `autonomous(batch(…))` buffers the inner requests and
-lets the scheduler dispatch the independent ones concurrently.
-
-When `now(group)` is called, Nix-family Request members (`Instantiate`, `Realise`,
-`Activate`) are dispatched as concurrent threads — independent operations run in
-parallel. `any(…)` returns the first `Ok` result; `race(…)` returns the very
-first result that settles, whether success or failure. Eval Requests and plain
-values are always resolved serially on the evaluator thread (Eval needs the
-ProcessRegistry which is `!Send`). Full async I/O and cancellation are future work.
-
----
+Group construction is lazy by definition. Nested request chains remain
+deferred inside the group instead of being resolved before the topology is
+built. Member order is significant and is part of the group fingerprint.
 
 ### Builtin call reference
 
-| Call | Input → Output | Description |
-|------|---------------|-------------|
-| `instantiate(expr)` | `ONixExpr` → `ODerivation` | Runs `nix-instantiate`. |
-| `realise(drv)` | `ODerivation` → `OStorePath` | Builds the derivation. |
-| `activate(path)` | `OStorePath` → `OSystem` | Switches system profile (dry-run unless `O_LANG_ALLOW_ACTIVATION=1`). |
-| `current_system()` | none → `OSystem` | Returns the currently active profile. |
-| `lazy(expr)` | any → `ORequest` | Wraps in `Policy::Lazy`; deferred until forced. |
-| `now(req)` | `ORequest` / `OGroup` → `OValue` | Forces a deferred Request or Group. |
-| `autonomous(expr)` | any → `OValue` | Buffers Nix Requests; flushes concurrently at force points. |
-| `batch(a, …)` | values/Requests → `OGroup` | Throughput bundle; `now`/`autonomous` yields a list of all results. |
-| `all(a, …)` | values/Requests → `OGroup` | Fan-out, all must succeed; yields a list of all results. |
-| `any(a, …)` | values/Requests → `OGroup` | Fallback; yields the first member to succeed. |
-| `race(a, …)` | values/Requests → `OGroup` | First member to settle wins. |
+| Call | Input to output | Description |
+|------|-----------------|-------------|
+| `instantiate(expr)` | ONixExpr to ODerivation | Instantiates a Nix derivation. |
+| `realise(drv)` | ODerivation to OStorePath | Builds the default derivation output. |
+| `activate(path)` | OStorePath to OSystem | Dry-activates or switches a NixOS closure through the safety gate. |
+| `current_system()` | none to OSystem | Returns the current system profile reference. |
+| `lazy(expr)` | any to ORequest or value | Evaluates under the lazy policy. |
+| `now(req)` | ORequest or OGroup to OValue | Forces deferred work. |
+| `autonomous(expr)` | any to OValue | Buffers and schedules non-Eval requests. |
+| `batch(...)` | values or Requests to OGroup | Captures throughput topology. |
+| `all(...)` | values or Requests to OGroup | Captures an all-success barrier. |
+| `any(...)` | values or Requests to OGroup | Captures ordered fallback topology. |
+| `race(...)` | values or Requests to OGroup | Captures first-settlement topology. |
 
 ---
 
-### Included examples
+## OValue and the runtime boundary
 
-| File | What it demonstrates |
-|------|----------------------|
-| `examples/hello.O` | Minimal Python arithmetic, the smallest runnable program. |
-| `examples/bindings.O` | `let` binding and `$var` splice. |
-| `examples/nested_splice.O` | A Python block nested inside another Python block. |
-| `examples/html_basic.O` | HTML template with an embedded Python computation. |
-| `examples/html_python_html.O` | HTML root with inner Python that itself generates HTML. |
-| `examples/python_html_python.O` | Python outer ▶ HTML inner ▶ Python innermost, three languages, two boundaries. |
-| `examples/html_escape.O` | HTML-escaping of spliced values. |
-| `examples/html_raw_roundtrip.O` | Passthrough of raw HTML fragments via `OHtml`. |
-| `examples/computed_plot.O` | Matplotlib figure returned as `OBlob` and rendered as `<img>` by HTML. |
-| `examples/literate_report.O` | Literate report: Markdown wrapping persistent Python environments. |
-| `examples/persist.O` | Persistent per-`[n]` Python environments across expressions. |
-| `examples/env_split.O` | Two independent Python environments in one document. |
-| `examples/ephemeral.O` | Ephemeral (single-use) environments. |
-| `examples/trailing_expr.O` | Trailing expression returns value without `__oval_result__`. |
-| `examples/meta_eval.O` | `quote^` and `O.eval`, homoiconicity across languages. |
-| `examples/nix_basic.O` | Nix expressions evaluated inside O. |
-| `examples/nix_python_html.O` | Nix → Python → HTML value pipeline. |
-| `examples/nix_storepath.O` | Nix-derived store paths rendered as HTML links. |
-| `examples/nix_storepath_python.O` | Python reading a Nix `OStorePath`. |
-| `examples/instantiate_realise_basic.O` | `nix_expr^`, `instantiate()`, and `realise()` rung climb. |
-| `examples/lazy_request_basic.O` | `lazy(...)`, constructs `Request` values without executing them. |
-| `examples/coordination_groups.O` | `batch`/`all`/`any`/`race` coordination groups and `now(group)`. |
-| `examples/lazy_defer_attrs_basic.O` | `{lazy}` and `{defer}` block attributes, thunk creation. |
-| `examples/os_as_participant_basic.O` | OS-as-participant: `activate()`, `current_system()`, the four-rung Nix lattice. |
-| `examples/nixos_test.O` | Single-machine NixOS VM test inside an O-lang script. |
-| `examples/nixos_test_two_machine.O` | Two-machine NixOS test (server + client). |
+OValue is both the inter-language exchange type and the boundary between pure
+data, live references, and authority-bearing values.
+
+| OValue | Meaning |
+|--------|---------|
+| ONull | Absence of a result. |
+| OBool, OInt, OFloat | Primitive scalar values. OInt is a signed 64-bit integer. |
+| OStr | UTF-8 text. |
+| OHtml | Trusted HTML fragment, kept distinct from escaped text. |
+| OList, OMap | Recursive heterogeneous containers. Map keys are strings. |
+| OBlob | Base64 wire data with a MIME type. |
+| OExpr | Unevaluated O source captured by `quote^`. |
+| ONixExpr | Unevaluated Nix source plus dependencies and a fingerprint. |
+| ODerivation | Instantiated Nix derivation and output metadata. |
+| OStorePath | Realized Nix store path. |
+| ORequest | Deferred computation with a compositional fingerprint. |
+| OThunk | Captured backend body and dependencies for Eval requests. |
+| OGroup | Explicit batch, all, any, or race topology. |
+| OError | Captured failed outcome used by batch results. |
+| OSystem | Live reference to a system profile. |
+| OCapability | Authority-bearing reference to a resource. |
+| OSnapshot | Inert captured world state suitable for persistence. |
+
+The runtime classifies values into three groups:
+
+- **Pure values** are serializable, replayable, cacheable when their contents
+  are cache-safe, and suitable for persistence.
+- **Referential values** name live world objects whose state can change.
+  OSystem identity is the profile reference, not a frozen system state.
+- **Effectful values** carry authority or orchestration semantics. Requests,
+  groups, errors, and capabilities require explicit treatment by caches,
+  schedulers, and persistence layers.
+
+Every OValue has a JSON wire form for hosted IPC. That fact does not make
+every OValue safe to replay. `is_cache_safe`, `is_replay_safe`, and
+`is_boot_persistable` enforce the distinction in the Rust value layer.
+
+Representative wire values are:
+
+```json
+{"t":"null"}
+{"t":"int","v":42}
+{"t":"str","v":"hello"}
+{"t":"blob","v":"<base64>","mime":"image/png"}
+{"t":"expr","src":"python^(6 * 7)_python"}
+{"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."}
+{"t":"request","kind":"instantiate","source":{"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."},"fingerprint":"..."}
+{"t":"group","mode":"batch","members":[],"fingerprint":"..."}
+{"t":"capability","kind":"service","identity":"ocore-live:...","metadata":{}}
+{"t":"snapshot","kind":"system","identity":"generation-42","state":{}}
+{"t":"error","msg":"member failed"}
+```
+
+OCapability is descriptive on the ordinary hosted wire. A serialized identity
+does not become kernel authority by being parsed. The O-core capability bridge
+requires that identity to already be bound inside a live authenticated kernel
+session before it can resolve to a generation-tagged kernel handle.
+
+---
+
+## Hosted backends
+
+The Rust runtime currently registers the following languages. Inline backends
+run inside the evaluator. Shim backends execute through newline-delimited JSON
+IPC and require their local runtime to be installed.
+
+| Tag | Runtime or handler | Behavior |
+|-----|--------------------|----------|
+| `O` | inline AST | Sequences child expressions from left to right. Alias: `o`. |
+| `quote` | inline AST | Captures child source as OExpr without evaluating it. |
+| `html` | inline value | Returns OHtml and renders image blobs as data URL images. |
+| `markdown` | inline value | Returns spliced Markdown text. Alias: `md`. |
+| `latex` | inline value | Returns spliced LaTeX text. Alias: `tex`. |
+| `text` | inline value | Returns plain spliced text. Alias: `plain`. |
+| `nix_expr` | inline value | Captures deferred Nix source and dependencies as ONixExpr. |
+| `python` | CPython shim | Executes Python, preserves explicit environments, converts native values, and supports `O.quote` and `O.eval`. Alias: `py`. |
+| `nix` | Nix shim | Evaluates Nix expressions and converts JSON results to OValue. |
+| `nix_store` | Nix shim | Realizes derivations and returns OStorePath. |
+| `nixos_test` | Nix test-driver shim | Runs NixOS VM test expressions. |
+| `bash` | Bash shim | Executes Bash with scalar O bindings exported as environment variables. |
+| `shell` | POSIX `sh` shim | Executes portable shell source with scalar bindings. |
+| `rust` | `rustc` shim | Compiles a temporary Rust program, runs it, and returns stdout. |
+| `racket` | Racket shim | Executes a temporary Racket module and returns stdout. |
+| `cpp` | `g++` shim | Compiles C++17 source, runs it, and returns stdout. |
+| `csharp` | .NET or Mono shim | Builds and runs C# with the locally available toolchain. |
+| `haskell` | `runghc` or `ghc` shim | Interprets or compiles Haskell and returns stdout. |
+| `lisp` | Guile, Chicken, or Chez shim | Executes Scheme-family Lisp source. |
+| `common_lisp` | SBCL, ECL, CLISP, or CCL shim | Executes Common Lisp source. |
+| `sql` | Python SQLite shim | Executes SQL against a persistent in-memory database per environment. |
+| `ruby` | Ruby shim | Executes Ruby with scalar O bindings rendered as local values. |
+| `matlab` | Octave or MATLAB shim | Executes MATLAB-compatible source and returns stdout. |
+| `mathematica` | WolframScript shim | Executes Wolfram Language source and returns stdout. |
+| `webassembly` | WABT plus Wasmtime or Wasmer | Compiles WAT when needed and executes the resulting WebAssembly module. |
+| `java` | `javac` and `java` shim | Compiles and runs a Java class. |
+| `javascript` | Node.js shim | Executes JavaScript with O bindings injected as constants. |
+| `ocaml` | OCaml toolchain shim | Interprets or compiles OCaml and returns stdout. |
+
+These are executing shims, not parse-only registrations. A missing target
+runtime produces an explicit backend error. The default example suite
+exercises Python, Bash, POSIX shell, JavaScript, SQL, HTML, Nix-independent
+orchestration, and the structural backends. Backends requiring optional local
+toolchains are available when those toolchains are installed.
+
+Shim resolution for a language `<lang>` searches:
+
+```text
+<shim-dir>/<lang>_shim.py
+<shim-dir>/<lang>_shim
+<shim-dir>/<lang>.py
+<shim-dir>/<lang>
+```
+
+Adding another hosted language requires a shim that implements `ping`, `exec`,
+and `cleanup`, a backend registry entry describing purity and rendering, and a
+registered parser tag. A language with structural evaluation semantics can
+instead use an inline AST handler like `O` and `quote`.
+
+---
+
+## Compiler and composition tools
+
+### `O`: interpreter and REPL
+
+```bash
+O program.O [backends_dir]
+O --repl [backends_dir]
+```
+
+With a file, `O` strips an optional shebang, parses the document, evaluates it,
+and prints the final OValue. With `--repl`, it keeps O-level scope and backend
+processes alive across entries. With no arguments in an interactive terminal,
+it enters the REPL automatically.
+
+### `olangc`: hosted AOT, WASI, script, and OIR
+
+`olangc` shares the parser, evaluator, OValue model, and OIR implementation
+with `O`.
+
+| Target | Command | Result |
+|--------|---------|--------|
+| `binary` | `olangc app.O -o app` | Builds a native hosted executable containing the program and Rust O runtime. |
+| `wasm` | `olangc app.O --target wasm -o app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
+| `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
+| `ir` | `olangc app.O --target ir` | Prints lowered OIR and its ExecutionPlan without executing the program. |
+
+Native hosted binaries contain the `.O` source, runtime modules, lockfile
+dependency versions, and bundled core shims. Python, Nix, and other language
+runtimes remain explicit host dependencies. `--shim-dir` overlays or adds
+shim files before packaging. `--keep-build-dir` retains the generated Cargo
+project for inspection.
+
+### `o-link`: one O document from a codebase
+
+`o-link` accepts files and directories, maps extensions to backends, wraps
+each source file in a typed expression, and emits one validated `.O` file.
+
+```bash
+o-link calc.py page.html app.O -o program.O
+o-link src/ -o project.O
+o-link notes.txt --lang txt=markdown --stdout
+o-link calc.py --run
+o-link src/ -o app.O --shebang
+```
+
+It provides several correctness properties:
+
+- Recursive directory walks are deterministic.
+- Hidden directories, `target`, `node_modules`, `__pycache__`, and `.git` are
+  skipped.
+- Symlinked directories are visited at most once.
+- Duplicate files and the output file itself are excluded.
+- Binary and non-UTF-8 files found during directory walks are skipped with a
+  warning.
+- O openers, matching closers, and `$name` sequences inside source files are
+  escaped and round-trip as literal source.
+- Python files are ordered by their import dependencies before wrapping.
+- Every wrapped file receives an isolated explicit environment number.
+- The combined source is parsed again before it is written unless
+  `--no-validate` is requested.
+
+The built-in extension map includes Python, shell, HTML, LaTeX, Markdown,
+Rust, Racket, Nix, text, C and C++, C#, Haskell, Scheme, Common Lisp, SQL,
+Ruby, MATLAB, Wolfram Language, WAT, Java, JavaScript, and OCaml.
+
+### `o-unlink`: restore the linked source tree
+
+`o-unlink` reads the source-path markers written by `o-link`, reconstructs the
+escaped body of each typed expression, and writes the original files under an
+output directory:
+
+```bash
+o-unlink combined.O -o restored/
+o-unlink combined.O --dry-run
+```
+
+The output path is checked before writing so a linked document cannot escape
+the selected directory through `..` components. For supported textual source
+trees, `o-link` followed by `o-unlink` is designed to round-trip the contents.
+
+### `o-notebook`: local interactive documents
+
+The optional notebook feature embeds its HTML, CSS, and JavaScript UI in the
+Rust binary. It exposes only a local evaluator endpoint and reset endpoint,
+keeps one O scope per server process, and renders text, trusted HTML, and image
+blobs as distinct output forms.
+
+```bash
+cargo run --features notebook --bin o-notebook -- backends
+```
 
 ---
 
 ## Architecture
 
-This repo ships two implementations of the same spec. The Rust runtime is
-authoritative.
+Olang has two compiler and execution pipelines with a deliberate boundary
+between them.
 
-### Rust runtime (`src/`): primary binary
+```text
+Hosted orchestration
+====================
+.O source
+    -> ONode parser tree
+    -> OIR and ExecutionPlan
+    -> Evaluator
+    -> inline handlers or persistent backend shims
+    -> OValue
 
-```
-src/
-├── lib.rs        # Library crate root, re-exports all modules
-├── value.rs      # OValue sum type + JSON wire protocol. Pure data layer.
-├── parser.rs     # Typed-paren parser → ONode tree
-├── eval.rs       # Applicative-order leaves-up evaluator + render_child dispatch
-├── process.rs    # ProcessRegistry: one subprocess per (lang, env_id) key
-├── scheduler.rs  # AutonomousScheduler: concurrent topological Nix-family dispatch + DiskCache
-├── nix_ops.rs    # Inline Nix expression evaluation
-├── nixos_ops.rs  # NixOS test driver integration
-├── main.rs       # CLI entry point for the `O` interpreter binary
-└── bin/
-    └── olangc.rs # AOT compiler: .O source → self-contained native binary
-```
-
-The evaluator is **applicative order, leaves-up**: inner expressions are
-evaluated before the outer expression that contains them, exactly like
-normal arithmetic evaluation. A backend that needs to control its own
-child evaluation (like `O^` and `quote^`) implements the optional
-`eval_ast` hook to take over.
-
-Backend shims (`backends/`) are subprocess scripts. The Rust runtime
-communicates with them over **newline-delimited JSON IPC**:
-
-```
-Runtime → shim:  {"cmd":"exec","code":"...","bindings":{...}}
-Shim → runtime:  {"status":"ok","value":{"t":"int","v":42}}
-                 {"status":"err","message":"..."}
+Native computation
+==================
+.oc modules
+    -> AST
+    -> resolved and typed HIR
+    -> SSA MIR
+    -> x86_64 assembly
+    -> ELF relocatable object
 ```
 
-`html`, `O`, `quote`, and `nix_expr` are handled entirely inline in
-`eval.rs`, no subprocess.
+### Repository layout
 
-Shim resolution order for language tag `<lang>` under `shim_dir`:
-`<lang>_shim.py` → `<lang>_shim` → `<lang>.py` → `<lang>`
-
-### Python reference implementation (`o_lang/`): for cross-validation
-
+```text
+Olang/
+├── src/
+│   ├── main.rs                 # O interpreter and REPL
+│   ├── parser.rs               # hosted typed-parenthesis parser
+│   ├── value.rs                # OValue and hosted wire protocol
+│   ├── ir.rs                   # OIR, ExecutionPlan, backend registry
+│   ├── eval.rs                 # evaluator and rendering semantics
+│   ├── process.rs              # persistent shim IPC
+│   ├── scheduler.rs            # dependency scheduling and caches
+│   ├── nix_ops.rs              # instantiate and realise
+│   ├── nixos_ops.rs            # activation and system references
+│   ├── ocore/                  # native front end, IRs, codegen, capability bridge
+│   └── bin/                    # olangc, ocorec, o-link, o-unlink, notebook
+├── backends/                   # executing hosted-language shims
+├── ocore/                      # freestanding runtime and kernel proof
+├── c_cpp/                      # standalone C17 hosted implementation
+├── o_lang/                     # Python reference implementation
+├── examples/                   # runnable hosted examples
+├── docs/OCORE.md               # O-core language and ABI contract
+├── SPEC.md                     # hosted language specification
+└── ARCHITECTURE.md             # implementation architecture
 ```
-o_lang/
-├── ovalue.py              # OValue tagged union
-├── parser.py              # Typed-paren parser
-├── evaluator.py           # Leaves-up tree evaluator + env registry
-├── cli.py                 # python -m o_lang entry point
-└── backends/
-    ├── base.py            # Backend base class
-    ├── python_backend.py
-    ├── html_backend.py
-    ├── markdown_backend.py
-    ├── latex_backend.py
-    ├── text_backend.py
-    ├── nix_backend.py
-    ├── nix_store_backend.py
-    ├── nixos_test_backend.py
-    ├── o_backend.py
-    └── quote_backend.py
+
+### Hosted evaluation
+
+The hosted evaluator runs five conceptual stages:
+
+1. Parse source into typed expression nodes.
+2. Evaluate child expressions before their receiving parent unless a
+   structural backend takes control.
+3. Render each child OValue into the parent language's source syntax.
+4. Dispatch the completed source to an inline handler or backend shim.
+5. Cache only values and requests whose runtime-boundary classification
+   permits reuse.
+
+Backend shims communicate with the Rust runtime through newline-delimited
+JSON:
+
+```text
+Runtime -> shim: {"cmd":"exec","code":"...","bindings":{...}}
+Shim -> runtime: {"status":"ok","value":{"t":"int","v":42}}
+Shim -> runtime: {"status":"eval_request","src":"..."}
+Runtime -> shim: {"cmd":"eval_result","value":{...}}
 ```
+
+The callback forms are what allow Python's `O.eval` to re-enter the O
+evaluator without starting a second unrelated document process.
+
+### OIR and ExecutionPlan
+
+OIR is a backend-neutral lowering of hosted syntax:
+
+```text
+RawText      -> Text
+VarRef       -> Load
+LetBinding   -> Store
+Call         -> Invoke
+TypedExpr    -> Exec
+```
+
+The ExecutionPlan adds three kinds of graph edge:
+
+- Structural edges connect child expressions to the expressions receiving
+  their values.
+- Sequence edges preserve left-to-right document semantics.
+- Data edges connect `$name` loads to the latest visible `let name` store.
+
+BackendInterface records canonical names, aliases, purity, splice rendering,
+execution mode, and shim resolution. `olangc --target ir` prints the lowered
+program and plan so the orchestration layer can be inspected independently of
+evaluation.
+
+OIR is not SSA and does not model native pointer mutation. Those semantics
+belong to O-core MIR.
 
 ---
 
-## Reference
+## O-core native systems language
 
-### Registered backends
+O-core is the statically typed, ahead-of-time systems member of Olang. Its
+first target is `x86_64-unknown-none`, using ELF64, the LP64 data model, and
+the System V AMD64 calling convention.
 
-| Tag          | Shim / handler          | Notes |
-|--------------|-------------------------|-------|
-| `O`          | inline (`eval.rs`)      | Sequencing block. Evaluates children left-to-right; returns single value, `OList`, or `ONull`. |
-| `python`     | `python_shim.py`        | Real `exec()`, persistent globals per env. Returns `__oval_result__`, trailing expr, or captured stdout. Supports `O.eval`/`O.quote`. |
-| `html`       | inline (`eval.rs`)      | Body returned as `OHtml`. Blobs → `data:` URL `<img>` tags. |
-| `markdown`   | inline (`eval.rs`)      | Body returned as `OStr`. Markup passthrough with value splicing. |
-| `latex`      | inline (`eval.rs`)      | Body returned as `OStr`. Passthrough with value splicing. |
-| `text`       | inline (`eval.rs`)      | Body returned as `OStr`. Plain passthrough. Alias: `plain`. |
-| `quote`      | inline (`eval.rs`)      | Captures body as `OExpr` without evaluating. |
-| `nix`        | `nix_shim.py`           | Evaluates Nix expressions via `nix-instantiate`. |
-| `nix_expr`   | inline (`nix_ops.rs`)   | Captures body as lazy `ONixExpr` (no evaluation yet). |
-| `nix_store`  | `nix_store_shim.py`     | Materialises a Nix derivation, returns `OStorePath`. |
-| `nixos_test` | `nixos_test_shim.py`    | NixOS VM test driver. |
-| `bash`       | shim (stub)             | Returns code text as `OStr`. Real executor is future work. |
-| `shell`      | shim (stub)             | Alias for `bash`. |
-| `rust`       | shim (stub)             | Returns code text. Real executor is future work. |
-| `racket`     | shim (stub)             | Returns code text. Real executor is future work. |
+### Modules, items, and control flow
 
-**Adding a new language (Rust runtime):** write `backends/<lang>_shim.py`
-implementing `exec` / `cleanup` / `ping`; add the tag to
-`registered_backends` in `src/main.rs`; add a `render_child` branch in
-`eval.rs` if the language needs non-default value embedding.
+Every source file declares a module. One `ocorec` invocation may compile
+multiple modules as one unit:
 
-### OValue wire format
+```ocore
+module kernel::serial;
+use kernel::ports::write_byte;
 
-Every value that crosses a language boundary is serialized as JSON with a
-`"t"` discriminant:
+const COM1: u16 = 0x3f8;
+static mut BYTES_WRITTEN: u64 = 0;
 
-```json
-{"t":"null"}
-{"t":"bool","v":true}
-{"t":"int","v":42}
-{"t":"float","v":3.14}
-{"t":"str","v":"hello"}
-{"t":"html","v":"<p>...</p>"}
-{"t":"store_path","path":"/nix/store/..."}
-{"t":"list","v":[...]}
-{"t":"map","v":{"key":{...}}}
-{"t":"blob","v":"<base64>","mime":"image/png"}
-{"t":"expr","src":"<O source text>"}
-{"t":"nix_expr","body":"...","fingerprint":"...","deps":[...]}
-{"t":"derivation","drv_path":"/nix/store/....drv","outputs":["out"],"deps":[...]}
-{"t":"request","kind":{...},"source":{...},"fingerprint":"..."}
-{"t":"thunk","body":"...","fingerprint":"...","deps":[...]}
-{"t":"system","profile_path":"/nix/var/nix/profiles/system"}
-{"t":"group","mode":"batch","members":[...],"fingerprint":"..."}
+pub unsafe fn write(data: *const u8, len: usize) -> void {
+    let mut index: usize = 0;
+    while index < len {
+        write_byte(*(data + index));
+        index += 1;
+    }
+}
 ```
 
-`store_path`, `expr`, `nix_expr`, `derivation`, `request`, `thunk`, `system`,
-and `group` are Rust-edition extensions. The Python reference implementation
-supports a subset of these types. `html` is supported by both runtimes.
+Implemented items include functions, extern functions, structs, enums,
+constants, and immutable or mutable statics. Implemented control flow includes
+lexical blocks, `let`, assignment, `if` and `else`, `while`, `loop`, `break`,
+`continue`, and `return`.
+
+Name resolution covers locals, current-module items, explicit imports, and
+predeclared hardware intrinsics. Cross-module functions receive deterministic
+mangled symbols unless their attributes specify an exported symbol.
+
+### Static types and aggregates
+
+Primitive types are:
+
+```text
+bool
+u8 u16 u32 u64 usize
+i8 i16 i32 i64 isize
+f32 f64
+void never
+```
+
+Compound types include:
+
+```text
+[T; N]                 fixed-size array
+*const T               immutable raw pointer
+*mut T                 mutable raw pointer
+struct Name { ... }    declaration-ordered product type
+enum Name { ... }      tagged union
+fn(T, U) -> R          function-pointer type
+```
+
+The type checker resolves all module items before checking bodies, computes
+deterministic layouts, validates assignments and returns, checks direct-call
+arguments, applies expected integer types to literals, validates casts, and
+rejects unsafe operations outside an unsafe function or block.
+
+Structs support construction, field access, locals, statics, and aggregate
+copying. Arrays support literals, repeated initializers, indexing, locals,
+statics, and pointer decay through explicit address operations. Enums support
+unit and payload variants with a computed tag and payload layout.
+
+### Layout and ABI
+
+The x86_64 layout contract is fixed:
+
+| Type | Size | Alignment |
+|------|-----:|----------:|
+| `bool`, `u8`, `i8` | 1 | 1 |
+| `u16`, `i16` | 2 | 2 |
+| `u32`, `i32`, `f32` | 4 | 4 |
+| `u64`, `i64`, `usize`, `isize`, `f64`, pointers | 8 | 8 |
+| `void`, `never` | 0 | 1 |
+
+Struct fields retain declaration order and receive natural padding.
+`@packed` removes inter-field padding and gives the struct alignment 1.
+`@align(N)` can increase alignment to a power of two.
+
+Enums use the smallest `u8`, `u16`, or `u32` tag capable of representing all
+variants. The payload is aligned after the tag, and the final enum size is
+rounded to its maximum required alignment.
+
+System V scalar arguments use RDI, RSI, RDX, RCX, R8, and R9, with additional
+arguments on the stack. Scalar results use RAX. The stack is 16-byte aligned
+at calls. Interrupt functions use the compiler's `@interrupt` convention and
+return with `iretq`.
+
+### Explicit unsafe
+
+O-core makes operations that can violate memory or machine invariants visible
+in the source:
+
+```ocore
+unsafe {
+    let status: u32 = volatile_load(status_register);
+    volatile_store(device_register, command);
+    outb(0x3f8, byte);
+    invalidate_page(address);
+}
+```
+
+Raw dereference, raw pointer arithmetic, pointer and integer casts, mutable
+static access, inline assembly, port I/O, interrupt control, page invalidation,
+halt, syscall instructions, volatile memory, and atomic memory operations are
+checked as unsafe.
+
+### Volatile and atomic operations
+
+The compiler recognizes:
+
+```text
+volatile_load
+volatile_store
+atomic_load
+atomic_store
+atomic_exchange
+atomic_compare_exchange
+atomic_fetch_add
+```
+
+Atomic orders are `relaxed`, `acquire`, `release`, `acq_rel`, and `seq_cst`.
+The type checker rejects invalid load-release and store-acquire combinations,
+requires pointer and value widths to agree, and requires mutable pointers for
+mutating atomic operations. The x86_64 backend emits the corresponding locked
+or ordered instructions.
+
+### Hardware intrinsics and assembly
+
+O-core directly supports:
+
+```text
+inb inw inl
+outb outw outl
+enable_interrupts disable_interrupts halt
+invalidate_page
+syscall0 through syscall6
+asm!
+```
+
+Inline assembly uses Intel syntax with explicit register operands and options
+such as `nomem`, `readonly`, and `nostack`. Register constraints are checked
+against the backend's safe calling convention assumptions.
+
+### Linkage and sections
+
+The implemented item attributes are:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `@export` | Make the symbol externally visible. |
+| `@no_mangle` | Use the source identifier as the symbol name. |
+| `@link_section("name")` | Emit an item into a named ELF section. |
+| `@align(N)` | Increase item or type alignment. |
+| `@used` | Retain a static item. |
+| `@packed` | Use packed struct layout. |
+| `@interrupt` | Generate an x86_64 interrupt entry and `iretq` return. |
+| `@naked` | Restrict the body to assembly without an ordinary frame. |
+
+### Compiler pipeline
+
+`ocorec` exposes every major stage:
+
+```bash
+ocorec a.oc b.oc --emit ast -o -
+ocorec a.oc b.oc --emit hir -o -
+ocorec a.oc b.oc --emit mir -o -
+ocorec a.oc b.oc --emit asm -o program.s
+ocorec a.oc b.oc --emit obj -o program.o
+```
+
+The front end creates source spans and diagnostics, parses modules and items,
+resolves types and imports, computes aggregate layouts, and emits typed HIR.
+MIR lowering creates explicit basic blocks, SSA values, phi nodes, places,
+loads, stores, aggregate copies, branches, calls, intrinsics, assembly, and
+terminators.
+
+The x86_64 backend emits GNU Intel-syntax assembly and uses local Clang only as
+the hosted assembler for object production. The resulting file is an ELF64
+x86_64 relocatable object suitable for a freestanding link. The target object
+contains no O interpreter, Python runtime, JSON protocol, filesystem runtime,
+libc, or Rust standard library.
+
+### Freestanding kernel proof
+
+The included kernel proves the native path end to end:
+
+```text
+Multiboot2 or Xen PVH entry
+    -> 32-bit bootstrap
+    -> identity page tables
+    -> long mode
+    -> O-core kernel_main
+    -> COM1 serial initialization
+    -> physical page allocation
+    -> kernel capability installation
+    -> IDT, PIC, and PIT setup
+    -> IRQ0 timer handler
+    -> atomic tick increment
+    -> iretq
+```
+
+The bootstrap assembly builds the initial P4, P3, and P2 page tables, enables
+PAE and long mode, loads a 64-bit GDT, aligns the stack, and calls the O-core
+`kernel_main`. The linker script places the Multiboot header, Xen note, text,
+read-only data, writable data, and BSS into a static ELF image beginning at
+1 MiB.
+
+The runtime modules provide:
+
+- COM1 initialization and polled serial writes.
+- A 4 KiB physical-frame bump allocator with an explicit range.
+- A packed 256-entry IDT and IDTR.
+- 8259 PIC remapping and IRQ masks.
+- 8253/8254 PIT programming.
+- A compiler-generated interrupt handler that atomically increments ticks,
+  acknowledges the PIC, and returns with `iretq`.
+- A generation-tagged kernel capability table.
+- A checked syscall dispatch function.
+
+### Capabilities and syscall ABI
+
+Kernel authority is represented by a 64-bit handle:
+
+```text
+handle = (generation << 32) | slot
+```
+
+The table stores object identifiers, rights, generations, and occupancy in
+kernel-owned arrays. Validation checks the slot bounds, occupied bit,
+generation, and required rights. Closing a capability clears the slot and
+increments its generation, so stale handles cannot silently regain authority
+after reuse. Kernel pointers never cross this ABI.
+
+The initial syscall number contract is:
+
+| Number | Operation |
+|-------:|-----------|
+| 0 | `debug_write(cap, ptr, len)` |
+| 1 | `cap_close(cap)` |
+| 2 | `cap_copy(dst_process, cap, rights)` |
+| 3 | `page_alloc(memory_cap, count, flags)` |
+| 4 | `yield()` |
+
+The exported `kernel_syscall_dispatch` implements checked debug output today.
+It validates the generation-tagged handle and `RIGHT_DEBUG_WRITE` before
+touching the serial object.
+
+On the hosted side, `CapabilityBroker<T>` binds an unpredictable per-session
+OCapability identity to a kernel-issued handle, capability kind, and rights.
+Before invoking its `KernelSyscallTransport`, the broker verifies that the
+identity belongs to the live session and that the kind and rights match. A
+deserialized, forged, revoked, or cross-session identity never becomes a
+kernel handle.
+
+This is the bridge between OValue's authority-bearing hosted form and the
+kernel's actual capability table. The transport can be implemented by a
+native syscall, VM socket, shared memory channel, or monitor connection
+without changing the authority rule.
+
+### The freestanding boundary
+
+Hosted O may use Python, Rust, Nix, JSON, subprocesses, files, and QEMU to
+construct and test a system. Freestanding O-core may not assume any of them.
+The build tools run on the host. The emitted object and kernel image depend
+only on their target ABI and explicitly linked runtime symbols.
+
+That distinction lets this remain valid:
+
+```O
+python^(
+# Generate or inspect O-core source here.
+)_python
+```
+
+without making Python part of this:
+
+```ocore
+unsafe fn kernel_main(info: usize) -> never {
+    loop { halt(); }
+}
+```
+
+The complete normative language, layout, ABI, unsafe, intrinsic, section, and
+capability contract is in [docs/OCORE.md](docs/OCORE.md).
+
+---
+
+## Included examples
+
+| File | What it demonstrates |
+|------|----------------------|
+| `examples/hello.O` | Smallest Python-backed O program. |
+| `examples/bindings.O` | `let` and `$var` splicing. |
+| `examples/nested_splice.O` | Nested Python expressions. |
+| `examples/html_basic.O` | HTML with an embedded computation. |
+| `examples/html_python_html.O` | HTML receiving an OHtml fragment produced through Python. |
+| `examples/python_html_python.O` | Three nested language levels. |
+| `examples/html_escape.O` | Escaped strings versus trusted OHtml. |
+| `examples/computed_plot.O` | Matplotlib image blob rendered as an HTML image. |
+| `examples/literate_report.O` | Markdown report with persistent Python state. |
+| `examples/persist.O` | Explicit persistent environment. |
+| `examples/env_split.O` | Independent environment indices. |
+| `examples/ephemeral.O` | Fresh state for bare blocks. |
+| `examples/meta_eval.O` | `quote^`, OExpr, `O.quote`, and `O.eval`. |
+| `examples/bash_hello.O` | Executing Bash backend. |
+| `examples/shell_hello.O` | Executing POSIX shell backend. |
+| `examples/js_hello.O` | Executing JavaScript backend. |
+| `examples/sql_create_insert_select.O` | Persistent in-memory SQLite state. |
+| `examples/sql_python_sql.O` | SQL to Python to SQL value flow. |
+| `examples/nix_basic.O` | Immediate Nix evaluation. |
+| `examples/nix_python_html.O` | Nix to Python to HTML. |
+| `examples/instantiate_realise_basic.O` | ONixExpr to derivation to store path. |
+| `examples/lazy_defer_attrs_basic.O` | Lazy and deferred Eval requests. |
+| `examples/coordination_groups.O` | Batch, all, any, and race values. |
+| `examples/os_as_participant_basic.O` | OSystem and activation boundary. |
+| `examples/nixos_test.O` | Single-machine NixOS VM test. |
+| `examples/nixos_test_two_machine.O` | Two-machine NixOS VM test. |
 
 ---
 
 ## Running the tests
 
-```bash
-# Rust unit tests
-cargo test
-
-# Python reference implementation tests
-python -m tests.test_parser
-python -m tests.test_evaluator
-
-# Integration smoke tests (requires cargo build first)
-./test_o_lang_examples.sh
-```
-
----
-
-## `olangc`: AOT compiler
-
-`olangc` compiles a `.O` file into a self-contained native binary. The
-binary embeds the program source, all backend shim scripts, and the O-lang
-runtime. The language runtimes the program *uses* (Python, Nix, etc.) must
-still be installed on the target machine.
+The primary verification command is:
 
 ```bash
-cargo build --bin olangc
-
-olangc examples/hello.O                              # output: ./hello
-olangc examples/hello.O -o mybin                     # explicit output name
-olangc examples/hello.O --shim-dir ./backends --keep-build-dir
+cargo test --all-targets
 ```
 
----
-
-## O-core: native systems language
-
-O-core is the freestanding, statically typed systems-programming layer. It is
-compiled by `ocorec` through a pipeline separate from orchestration OIR:
-
-```text
-.oc source -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
-```
-
-It includes modules, functions, static types, structs/enums, arrays, raw
-pointers, explicit `unsafe`, deterministic ABI/layout, volatile and atomic
-operations, inline assembly, interrupt functions, and linker-section
-attributes. Foreign blocks such as `python^` remain hosted `.O` facilities and
-are not part of a freestanding artifact.
+The release CLI suite checks interpreter errors, successful execution,
+`olangc` native output, `ocorec` ELF object output, and linker help contracts:
 
 ```bash
-cargo build --bin ocorec
-target/debug/ocorec kernel.oc --emit obj --keep-asm -o kernel.o
+cargo build --release
+bash tests/test_cli.sh
+```
 
-# Build and boot the included x86_64 kernel proof
-./ocore/kernel/build.sh
+The example suite executes every `.O` example with an explicit expected
+output. Nix examples are skipped when Nix is not part of the local test
+environment:
+
+```bash
+bash test_o_lang_examples.sh
+```
+
+The native boot test compiles every O-core runtime module, assembles the boot
+entry, links the kernel, boots it in QEMU, captures serial output, and asserts
+serial initialization, page allocation, capability initialization, and the
+timer interrupt:
+
+```bash
 ./ocore/kernel/smoke-qemu.sh
 ```
 
-The QEMU proof boots into 64-bit mode, writes through COM1, allocates a page,
-installs a generation-tagged capability, configures an IDT/PIC/PIT, receives
-IRQ0, performs an atomic tick increment, and returns with `iretq`. See
-[`docs/OCORE.md`](docs/OCORE.md) for the normative language and ABI contract and
-[`ocore/README.md`](ocore/README.md) for commands.
+Additional implementation checks are:
+
+```bash
+make -C c_cpp test
+python3 -m tests.test_parser
+python3 -m tests.test_evaluator
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
+```
 
 ---
 
 ## Status
 
-**v0.2.0**, Rust runtime primary, Python reference implementation for
-cross-validation.
+**v0.2.0**, with the Rust hosted runtime authoritative, the C17 edition as the
+standalone native port, the Python edition as the semantic reference, and
+O-core as the freestanding systems language.
 
-Implemented and working:
-- Typed-paren parser; all registered backends
-- Applicative-order leaves-up evaluator with `render_child` dispatch
-- Persistent environments per `(language, index)` pair
-- `let` bindings and `$var` splicing
-- `{lazy}` / `{defer}` block attributes; `lazy()` / `now()` builtins
-- `quote^` + `O.eval` homoiconicity across languages
-- Four-rung Nix lattice: `nix_expr` → `instantiate` → `realise` → `activate`
-- OS-as-participant (`OSystem`, `current_system()`)
-- `autonomous()` scheduler with disk-backed result cache
-- Coordination groups: `batch` / `all` / `any` / `race` and `now(group)`
-- `olangc` AOT compiler (self-contained binary output)
-- `ocorec` native compiler with typed HIR, SSA MIR, and x86_64 ELF objects
-- Freestanding O-core kernel proof: serial, page allocation, IRQ0, capabilities
-- Shebang support
+### Implemented
 
-Known limitations (see `SPEC.md` for full details):
-- `bash`, `shell`, `rust`, `racket` backends are stubs (parse, do not execute)
-- `O.eval` scope does not see top-level `let` bindings from the calling document
-- Autonomous scheduling is implemented; cross-document dependency tracking is future work
+- Typed-parenthesis parsing with exact openers, closers, aliases, environment
+  indices, block attributes, and literal escapes.
+- Applicative-order nested evaluation with inline structural backends and
+  receiving-language rendering.
+- Ephemeral bare blocks and explicit persistent backend environments.
+- O-level `let` bindings and `$var` splicing.
+- The complete current OValue sum type, JSON wire protocol, content identity,
+  runtime-boundary classification, and persistence checks.
+- `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
+- Lazy and deferred Eval requests with purity validation and caching rules.
+- The ONixExpr, ODerivation, OStorePath, and OSystem lattice.
+- Autonomous dependency scheduling with memory and disk caches.
+- Batch, all, any, and race coordination groups with distinct failure
+  semantics and nested groups.
+- OIR lowering, backend interfaces, and ExecutionPlan graph construction.
+- Real hosted shims for the registered backend table.
+- Interpreter, REPL, local notebook, native and WASI `olangc` targets,
+  script execution, OIR dumps, `o-link`, and `o-unlink`.
+- C17 interpreter and C17 hosted AOT compiler.
+- O-core modules, functions, control flow, static checking, arrays, pointers,
+  structs, enums, unsafe, volatile and atomic operations, assembly, hardware
+  intrinsics, ABI layout, linker attributes, typed HIR, SSA MIR, x86_64
+  assembly, and ELF relocatable objects.
+- Freestanding Multiboot2 and Xen PVH kernel image with long-mode bootstrap,
+  serial output, physical page allocation, IDT, PIC, PIT, timer interrupt,
+  atomic tick, and `iretq`.
+- Generation-tagged kernel capabilities, rights validation, checked syscall
+  dispatch, and hosted OCapability broker binding.
 
-See `SPEC.md` for the formal language specification.
+### Current boundaries
+
+These are the boundaries of the current implementation, not descriptions of
+features that are already present:
+
+- `O.eval` reuses live backend environments but evaluates quoted source with a
+  fresh O-level `let` scope. Persistent Python globals remain visible;
+  top-level O bindings from the caller do not.
+- Concurrent group dispatch currently applies to threadable Nix-family
+  requests. Eval requests preserve the single evaluator thread. Race selects
+  a winner but does not cancel already-running loser work.
+- The evaluator executes ONode directly. OIR and ExecutionPlan are implemented
+  and inspectable, but OIR is not yet the evaluator's execution engine.
+- `olangc` bundles the core Python and Nix shims by default. Programs using
+  additional hosted shims should compile with `--shim-dir backends` so those
+  shims are embedded as well.
+- The C17 and Python editions implement their documented subsets and are not
+  feature-identical to the authoritative Rust runtime.
+- O-core currently targets x86_64 only and uses a stack-spill backend without
+  optimization or register allocation.
+- O-core direct calls are implemented. Function-pointer types are represented,
+  while indirect calls are not yet lowered.
+- O-core aggregates support deterministic layout, construction, indexing,
+  fields, locals, statics, and copying. Aggregate parameters and returns use
+  pointers in the current ABI slice. Enum construction is implemented;
+  pattern matching is not yet part of the surface language.
+- Floating-point types have specified x86_64 layouts, while floating-point
+  arithmetic code generation is not yet implemented.
+- The kernel uses an identity-mapped bootstrap address space and a physical
+  bump allocator. It allocates frames but does not reclaim them.
+- The kernel exports a checked syscall dispatcher and the hosted capability
+  bridge is real. Ring-3 entry setup and an architectural syscall entry stub
+  are the next layer above that dispatcher.
+
+See [SPEC.md](SPEC.md) for the hosted language contract,
+[ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
+[docs/OCORE.md](docs/OCORE.md) for the native language and ABI contract.
 
 ---
 
