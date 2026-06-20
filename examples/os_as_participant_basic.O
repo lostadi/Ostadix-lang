@@ -12,18 +12,18 @@
 # path, not by current generation. Querying its state requires an
 # out-of-band call.
 #
-# SAFETY: activate() defaults to dry_run=true at the language level, AND
-# the actual subprocess (`switch-to-configuration switch`) is gated by the
-# environment variable O_LANG_ALLOW_ACTIVATION=1. Running this example
-# without the env var set produces a dry-activate (logs only); running
-# WITH the env var set would actually switch the system.
+# SAFETY: activate($path) always performs dry-activate. A real switch uses
+# activate($authority, $path), where the host has explicitly inserted a live,
+# profile-scoped system_activation capability into the O scope. No environment
+# variable grants that authority.
 
 # (chain commented for cross-platform demo; see original source for full
 #  instantiate/realise/activate/current_system example)
 #let cfg     = nix_expr^( (import <nixpkgs/nixos> { configuration = ./configuration.nix; }).system )_nix_expr
 #let drv     = instantiate($cfg)
 #let path    = realise($drv)
-#let active  = activate($path)
+#let active  = activate($path) # dry activation
+#let switched = activate($authority, $path) # real, host-injected authority
 #let here = current_system()
 
 markdown^(
@@ -32,6 +32,6 @@ markdown^(
 - configuration (NixExpr):   `(see source for chain)`
 - system derivation (drv):   `(see source)`
 - system closure (path):     `(see source)`
-- activated profile (System): `(dry-run by default; requires O_LANG_ALLOW_ACTIVATION=1 for real switch)`
+- activated profile (System): `(dry activation is unprivileged; real switch requires a live capability)`
 - current system reference:  (current_system() builtin)
 )_markdown

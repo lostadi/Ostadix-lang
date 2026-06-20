@@ -168,7 +168,7 @@ run_registered_test() {
     os_as_participant_basic)
       run_test "$name" "$file" \
         '# Step-4 OS-as-participant' \
-        'requires O_LANG_ALLOW_ACTIVATION=1 for real switch' \
+        'real switch requires a live capability' \
         'current system reference:  (current_system() builtin)'
       ;;
     persist)

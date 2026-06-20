@@ -225,9 +225,9 @@ pub enum OValue {
     /// resource is being authorized and which descriptive metadata travels with
     /// it.
     ///
-    /// `kind` identifies the resource class, `identity` is the stable handle
-    /// within that class, and `metadata` carries machine-readable annotations
-    /// such as mount points, driver names, access modes, or labels.
+    /// `kind` identifies the resource class. For live capabilities, `identity`
+    /// is an opaque session bearer resolved only through a private authority
+    /// table. `metadata` is descriptive and never grants authority.
     #[serde(rename = "capability")]
     Capability {
         kind: CapabilityKind,
@@ -361,6 +361,7 @@ pub enum CapabilityKind {
     NetworkEndpoint,
     Process,
     Service,
+    SystemActivation,
 }
 
 impl CapabilityKind {
@@ -373,6 +374,7 @@ impl CapabilityKind {
             CapabilityKind::NetworkEndpoint => "network_endpoint",
             CapabilityKind::Process => "process",
             CapabilityKind::Service => "service",
+            CapabilityKind::SystemActivation => "system_activation",
         }
     }
 }
@@ -473,16 +475,20 @@ pub enum RequestKind {
     /// generation of the profile.
     ///
     /// `profile` is the symlink path to update (e.g. `/nix/var/nix/profiles/system`).
-    /// `dry_run` defaults to true at construction; the actual real-activation
-    /// is also gated by the O_LANG_ALLOW_ACTIVATION=1 environment variable
-    /// inside nixos_ops::activate_nix. Two layers of opt-in for an operation
-    /// that can reboot a machine.
+    /// `dry_run` defaults to true at construction. A real activation carries
+    /// the opaque identity of a live, profile-scoped SystemActivation
+    /// capability. The evaluator resolves that identity through its private
+    /// authority table before the operation can reach the perform boundary.
     ///
     /// Activate is NOT cached. The cache invariant ("same fingerprint always
     /// produces the same result") is meaningless for an operation that
     /// changes world state, and a stale cached System reference would lie
     /// about the live state. The executor's cache lookup skips it.
-    Activate { profile: String, dry_run: bool },
+    Activate {
+        profile: String,
+        dry_run: bool,
+        authority: Option<String>,
+    },
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -598,8 +604,17 @@ impl OValue {
             } => {
                 format!("eval|{}|{}|{}", lang, env_id, cacheable)
             }
-            RequestKind::Activate { profile, dry_run } => {
-                format!("activate|{}|{}", profile, dry_run)
+            RequestKind::Activate {
+                profile,
+                dry_run,
+                authority,
+            } => {
+                format!(
+                    "activate|{}|{}|{}",
+                    profile,
+                    dry_run,
+                    authority.as_deref().unwrap_or("none")
+                )
             }
         }
     }
@@ -901,7 +916,15 @@ impl OValue {
 
     /// Whether replaying this value across time preserves its meaning.
     pub fn is_replay_safe(&self) -> bool {
-        !matches!(self, OValue::System { .. } | OValue::Capability { .. })
+        !matches!(
+            self,
+            OValue::System { .. }
+                | OValue::Capability { .. }
+                | OValue::Request {
+                    kind: RequestKind::Activate { .. },
+                    ..
+                }
+        )
     }
 
     /// Whether this value is safe to persist across boots as an inert artifact.
@@ -1350,7 +1373,7 @@ mod tests {
             OValue::int(-9_999_999_999_999),
             OValue::int(i64::MAX),
             OValue::int(i64::MIN),
-            OValue::float(3.14159),
+            OValue::float(std::f64::consts::PI),
             OValue::float(-0.0),
             // NOTE: f64::INFINITY excluded — JSON RFC 8259 has no infinity repr.
             // serde_json serializes it as null. Custom serializer needed (tracked).
@@ -1534,6 +1557,7 @@ mod tests {
             RequestKind::Activate {
                 profile: "/nix/var/nix/profiles/system".to_string(),
                 dry_run: true,
+                authority: None,
             },
             OValue::store_path("/nix/store/demo-system"),
         );
@@ -1542,6 +1566,7 @@ mod tests {
 
         assert!(lazy_req.is_cache_safe());
         assert!(!activate_req.is_cache_safe());
+        assert!(!activate_req.is_replay_safe());
         assert!(!system.is_cache_safe());
         assert!(snapshot.is_boot_persistable());
         assert!(!system.is_boot_persistable());
@@ -1898,6 +1923,7 @@ mod tests {
             RequestKind::Activate {
                 profile: "/nix/var/nix/profiles/system".into(),
                 dry_run: true,
+                authority: None,
             },
             path,
         );
@@ -1907,7 +1933,10 @@ mod tests {
             fingerprint,
         } = &req
         {
-            if let RequestKind::Activate { profile, dry_run } = kind {
+            if let RequestKind::Activate {
+                profile, dry_run, ..
+            } = kind
+            {
                 assert_eq!(profile, "/nix/var/nix/profiles/system");
                 assert!(*dry_run);
             } else {
@@ -1929,6 +1958,7 @@ mod tests {
             RequestKind::Activate {
                 profile: "/p".into(),
                 dry_run: true,
+                authority: None,
             },
             path.clone(),
         );
@@ -1936,6 +1966,7 @@ mod tests {
             RequestKind::Activate {
                 profile: "/p".into(),
                 dry_run: false,
+                authority: Some("o-activate-live:test".into()),
             },
             path,
         );

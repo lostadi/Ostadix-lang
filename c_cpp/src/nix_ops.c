@@ -124,21 +124,15 @@ OValue *olang_activate_nix(OValue *source, const char *profile, bool dry_run) {
     if (!path) path = "/nix/store/fake-system";
 
     const char *prof = profile ? profile : "/nix/var/nix/profiles/system";
-    if (dry_run || getenv("O_LANG_ALLOW_ACTIVATION") == NULL) {
-        fprintf(stderr, "activate: (dry-run) would switch to %s using %s\n", path, prof);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "dry-activate -> %s", path);
-        return oval_system(msg);
+    if (!dry_run) {
+        fprintf(stderr,
+                "activate: real switching requires the Rust runtime's live "
+                "system_activation capability; forcing dry-run in C17\n");
     }
-    /* real attempt (dangerous, gated) */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "%s/bin/switch-to-configuration switch 2>&1 | cat", path);
-    char *out = run_command_capture(cmd);
-    if (out) {
-        /* ignore output */
-        free(out);
-    }
-    return oval_system(prof);
+    fprintf(stderr, "activate: (dry-run) would switch to %s using %s\n", path, prof);
+    char msg[256];
+    snprintf(msg, sizeof(msg), "dry-activate -> %s", path);
+    return oval_system(msg);
 }
 
 OValue *olang_current_system(void) {

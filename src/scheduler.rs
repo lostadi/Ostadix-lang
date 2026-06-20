@@ -47,7 +47,6 @@ use std::thread;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::nix_ops;
-use crate::nixos_ops;
 use crate::value::{OValue, RequestKind};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -212,9 +211,9 @@ fn resolve_source(req: &OValue, resolved: &HashMap<String, OValue>) -> Result<OV
 
 /// STEP-4 autonomous scheduler for concurrent, disk-cached Request dispatch.
 ///
-/// Handles `RequestKind::Instantiate`, `Realise`, and `Activate`. Eval requests
-/// are not handled here (they need the Evaluator's ProcessRegistry and are
-/// excluded from the buffer). See `src/eval.rs::auto_resolve` for the split.
+/// Handles `RequestKind::Instantiate`, `Realise`, and unprivileged dry
+/// activation. Eval and real activation requests are not handled here because
+/// they need evaluator-local process or authority state.
 ///
 /// Call `execute_batch` at force points (end of an `autonomous(...)` block,
 /// explicit `now()`, document end) to flush all buffered roots.
@@ -308,10 +307,10 @@ impl AutonomousScheduler {
     ///   3. Build a DAG (fingerprint → dep_fingerprints).
     ///   4. Loop until all requests are resolved:
     ///      a. Find "ready" nodes (all deps already resolved).
-    ///      b. Dispatch Instantiate/Realise/Activate as concurrent threads,
-    ///         up to `self.parallelism` threads per wave.
-    ///      c. Execute any Eval requests via the `eval_fn` callback (one at a
-    ///         time — Eval needs the ProcessRegistry which is !Send).
+    ///      b. Dispatch Instantiate, Realise, and dry Activate concurrently,
+    ///         capped at `self.parallelism` threads per wave.
+    ///      c. Execute Eval through `eval_fn`, one at a time because Eval needs
+    ///         the ProcessRegistry, which is not Send.
     ///      d. Collect thread/callback results, update cache.
     ///
     /// Returns a fingerprint → OValue map covering every request in the closure.
@@ -379,9 +378,14 @@ impl AutonomousScheduler {
             for fp in &ready {
                 if let Some(OValue::Request { kind, .. }) = all.get(fp) {
                     match kind {
-                        RequestKind::Instantiate
-                        | RequestKind::Realise
-                        | RequestKind::Activate { .. } => threadable.push(fp.clone()),
+                        RequestKind::Instantiate | RequestKind::Realise => {
+                            threadable.push(fp.clone())
+                        }
+                        RequestKind::Activate {
+                            dry_run: true,
+                            authority: None,
+                            ..
+                        } => threadable.push(fp.clone()),
                         _ => serial.push(fp.clone()),
                     }
                 }
@@ -412,8 +416,9 @@ impl AutonomousScheduler {
                             RequestKind::Realise => nix_ops::realise_nix(&src),
                             RequestKind::Activate {
                                 ref profile,
-                                dry_run,
-                            } => nixos_ops::activate_nix(&src, profile, dry_run),
+                                dry_run: true,
+                                authority: None,
+                            } => crate::nixos_ops::activate_nix(&src, profile, true),
                             _ => Err(anyhow!(
                                 "unexpected kind in concurrent dispatch: {:?}",
                                 kind

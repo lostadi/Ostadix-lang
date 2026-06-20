@@ -8,6 +8,7 @@
 // without suppression attributes.
 // ─────────────────────────────────────────────────────────────────────────────
 
+mod capability;
 pub mod eval;
 pub mod ir;
 pub mod nix_ops;

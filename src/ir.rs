@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// ir.rs — the O-lang intermediate representation and backend interface layer.
+// ir.rs — the executable O-lang intermediate representation.
 //
-// This module is a thin, stable seam between four concerns that were
-// previously fused inside parser.rs / eval.rs / olangc.rs:
+// This module is the stable seam between four concerns that were previously
+// fused inside parser.rs / eval.rs / olangc.rs:
 //
 //   1. Syntax            — ONode, produced by the parser.
 //   2. Execution plan    — OIr / OIrProgram, a lowered, backend-neutral form
@@ -14,28 +14,64 @@
 // Non-goals (deliberately out of scope for this layer):
 //   - no native codegen from OIR
 //   - no optimizer, no SSA, no LLVM, no VM
-//   - no behavior changes — lowering is a 1:1 structural mapping of ONode,
-//     and the registry reproduces the exact metadata the evaluator used
-//     to hard-code.
 //
-// The evaluator continues to walk ONode directly; OIr is currently a
-// debug/inspection surface (`olangc --target ir`) and the designated place
-// where future execution planning will live.
+// ONode is syntax only. Every hosted execution lowers to OIR, builds and
+// validates an ExecutionPlan, and interprets OIR. Backend execution mode,
+// purity, and splice rendering are frozen into each Exec instruction during
+// lowering so analysis and runtime dispatch cannot silently diverge.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::parser::ONode;
+use crate::value::GroupMode;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // OIr — the lowered instruction forms
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// One lowered IR node. Structurally mirrors `ONode` 1:1 today — the value of
-/// the layer is the *seam*, not a transformation. Future passes (constant
-/// splice folding, purity-driven reordering, request batching) operate here
-/// without touching parser or evaluator.
+/// Evaluation policy carried by an Invoke instruction. Special-form behavior
+/// is fixed during lowering instead of being rediscovered from a string by the
+/// evaluator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokeMode {
+    Eager,
+    Lazy,
+    Autonomous,
+    Group(GroupMode),
+}
+
+impl InvokeMode {
+    fn for_name(name: &str) -> Self {
+        match name {
+            "lazy" => Self::Lazy,
+            "autonomous" => Self::Autonomous,
+            "batch" => Self::Group(GroupMode::Batch),
+            "all" => Self::Group(GroupMode::All),
+            "any" => Self::Group(GroupMode::Any),
+            "race" => Self::Group(GroupMode::Race),
+            _ => Self::Eager,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Lazy => "lazy",
+            Self::Autonomous => "autonomous",
+            Self::Group(GroupMode::Batch) => "group:batch",
+            Self::Group(GroupMode::All) => "group:all",
+            Self::Group(GroupMode::Any) => "group:any",
+            Self::Group(GroupMode::Race) => "group:race",
+        }
+    }
+}
+
+/// One executable OIR instruction. The tree shape preserves lexical and
+/// structural evaluation regions while `ExecutionPlan` makes dependencies
+/// and legal scheduling order explicit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OIr {
     /// Verbatim text destined for a backend splice buffer.
@@ -48,13 +84,18 @@ pub enum OIr {
     Store { name: String, expr: Box<OIr> },
 
     /// Invoke a built-in O-level function (`instantiate(...)`, `now(...)`, …).
-    Invoke { fn_name: String, args: Vec<OIr> },
+    Invoke {
+        fn_name: String,
+        mode: InvokeMode,
+        args: Vec<OIr>,
+    },
 
     /// Execute a typed-expression block on backend `lang`.
     Exec {
         lang: String,
         env_id: u32,
         attr: Option<String>,
+        backend: BackendInterface,
         body: Vec<OIr>,
     },
 }
@@ -92,8 +133,9 @@ impl OIrProgram {
     ///   - sequence edges preserve left-to-right source order
     ///   - data edges connect `load $x` to the latest dominating `store $x`
     ///
-    /// This is the designated planning surface for scheduling, batching, purity-
-    /// aware reordering, backend dispatch policy, and future code generation.
+    /// This is the planning surface used by the evaluator. It is also the
+    /// designated home for scheduling, batching, purity-aware reordering, and
+    /// future code generation.
     pub fn plan(&self) -> ExecutionPlan {
         let mut builder = PlanBuilder::new();
         let mut scope_stack = vec![std::collections::HashMap::new()];
@@ -121,6 +163,7 @@ pub fn lower_node(node: &ONode) -> OIr {
         },
         ONode::Call { fn_name, args } => OIr::Invoke {
             fn_name: fn_name.clone(),
+            mode: InvokeMode::for_name(fn_name),
             args: args.iter().map(lower_node).collect(),
         },
         ONode::TypedExpr {
@@ -132,8 +175,81 @@ pub fn lower_node(node: &ONode) -> OIr {
             lang: lang.clone(),
             env_id: *env_id,
             attr: attr.clone(),
+            backend: BackendRegistry::global().interface_for(lang),
             body: body.iter().map(lower_node).collect(),
         },
+    }
+}
+
+/// Reconstruct executable OIR as parseable O source. This is used by the
+/// `quote` instruction, so quotation no longer reaches back into ONode.
+pub fn reconstruct_source(nodes: &[OIr]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        reconstruct_node(node, &mut out);
+    }
+    out
+}
+
+fn reconstruct_node(node: &OIr, out: &mut String) {
+    match node {
+        OIr::Text(text) => out.push_str(text),
+        OIr::Load(name) => {
+            out.push('$');
+            out.push_str(name);
+        }
+        OIr::Store { name, expr } => {
+            out.push_str("let ");
+            out.push_str(name);
+            out.push_str(" = ");
+            reconstruct_node(expr, out);
+        }
+        OIr::Invoke { fn_name, args, .. } => {
+            out.push_str(fn_name);
+            out.push('(');
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                reconstruct_node(arg, out);
+            }
+            out.push(')');
+        }
+        OIr::Exec {
+            lang,
+            env_id,
+            attr,
+            body,
+            ..
+        } => {
+            out.push_str(lang);
+            if *env_id != u32::MAX {
+                out.push('[');
+                out.push_str(&env_id.to_string());
+                out.push(']');
+            }
+            if let Some(attr) = attr {
+                out.push('{');
+                out.push_str(attr);
+                out.push('}');
+            }
+            out.push_str("^(");
+            for child in body {
+                reconstruct_node(child, out);
+            }
+            out.push_str(")_");
+            out.push_str(lang);
+            if *env_id != u32::MAX {
+                out.push('[');
+                out.push_str(&env_id.to_string());
+                out.push(']');
+            }
+            if let Some(attr) = attr {
+                out.push('{');
+                out.push_str(attr);
+                out.push('}');
+            }
+        }
     }
 }
 
@@ -150,8 +266,16 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
             out.push_str(&format!("{indent}store ${name} =\n"));
             dump_node(expr, depth + 1, out);
         }
-        OIr::Invoke { fn_name, args } => {
-            out.push_str(&format!("{indent}invoke {fn_name}/{}\n", args.len()));
+        OIr::Invoke {
+            fn_name,
+            mode,
+            args,
+        } => {
+            out.push_str(&format!(
+                "{indent}invoke {fn_name}/{} [{}]\n",
+                args.len(),
+                mode.label()
+            ));
             for arg in args {
                 dump_node(arg, depth + 1, out);
             }
@@ -161,12 +285,13 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
             env_id,
             attr,
             body,
+            ..
         } => {
             let attr_s = attr
                 .as_deref()
                 .map(|a| format!(" {{{a}}}"))
                 .unwrap_or_default();
-            let env_s = if *env_id == 0 {
+            let env_s = if *env_id == u32::MAX {
                 String::new()
             } else {
                 format!(" [env {env_id}]")
@@ -183,7 +308,7 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
 // ExecutionPlan — canonical dependency graph over OIR
 // ═════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlanNodeId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +371,7 @@ pub enum PlanNodeKind {
     },
     Invoke {
         fn_name: String,
+        mode: InvokeMode,
         arg_count: usize,
     },
     Exec {
@@ -295,6 +421,124 @@ impl ExecutionPlan {
         }
         out
     }
+
+    /// Validate plan identity, edge bounds, acyclicity, and root coverage.
+    /// Runtime execution calls this before evaluating any instruction.
+    pub fn validate(&self, root_count: usize) -> Result<(), String> {
+        if self.roots.len() != root_count {
+            return Err(format!(
+                "execution plan has {} roots for {root_count} OIR instructions",
+                self.roots.len()
+            ));
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.id != PlanNodeId(index) {
+                return Err(format!(
+                    "execution plan node identity mismatch at {index}: got {}",
+                    node.id.0
+                ));
+            }
+        }
+        let mut roots = BTreeSet::new();
+        for root in &self.roots {
+            if root.0 >= self.nodes.len() {
+                return Err(format!("execution plan root {} is out of bounds", root.0));
+            }
+            if !roots.insert(root.0) {
+                return Err(format!("execution plan root {} is duplicated", root.0));
+            }
+        }
+        for edge in &self.edges {
+            if edge.from.0 >= self.nodes.len() || edge.to.0 >= self.nodes.len() {
+                return Err(format!(
+                    "execution plan edge {} -> {} is out of bounds",
+                    edge.from.0, edge.to.0
+                ));
+            }
+        }
+        self.topological_order()?;
+        self.root_schedule()?;
+        Ok(())
+    }
+
+    /// Stable topological order over every planned instruction. Lower node
+    /// identifiers win ties so source order remains deterministic whenever
+    /// the dependency graph permits more than one schedule.
+    pub fn topological_order(&self) -> Result<Vec<PlanNodeId>, String> {
+        let mut indegree = vec![0usize; self.nodes.len()];
+        let mut successors = vec![Vec::new(); self.nodes.len()];
+        for edge in &self.edges {
+            indegree[edge.to.0] += 1;
+            successors[edge.from.0].push(edge.to.0);
+        }
+
+        let mut ready: BTreeSet<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(id))
+            .collect();
+        let mut order = Vec::with_capacity(self.nodes.len());
+        while let Some(id) = ready.iter().next().copied() {
+            ready.remove(&id);
+            order.push(PlanNodeId(id));
+            for successor in &successors[id] {
+                indegree[*successor] -= 1;
+                if indegree[*successor] == 0 {
+                    ready.insert(*successor);
+                }
+            }
+        }
+        if order.len() != self.nodes.len() {
+            return Err("execution plan dependency graph contains a cycle".to_string());
+        }
+        Ok(order)
+    }
+
+    /// Return top-level OIR indices in their executable dependency order.
+    /// The evaluator uses this schedule instead of walking parser nodes.
+    pub fn root_schedule(&self) -> Result<Vec<usize>, String> {
+        let positions: HashMap<PlanNodeId, usize> = self
+            .roots
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, id)| (id, position))
+            .collect();
+        let schedule: Vec<usize> = self
+            .topological_order()?
+            .into_iter()
+            .filter_map(|id| positions.get(&id).copied())
+            .collect();
+        if schedule.len() != self.roots.len() {
+            return Err("execution plan did not schedule every root".to_string());
+        }
+        Ok(schedule)
+    }
+
+    /// Return the direct structural children of `parent` in executable plan
+    /// order. Recursive OIR evaluation uses this for every Store, Invoke, and
+    /// Exec region rather than assuming vector order independently of the
+    /// dependency graph.
+    pub fn child_schedule(&self, parent: PlanNodeId) -> Result<Vec<PlanNodeId>, String> {
+        if parent.0 >= self.nodes.len() {
+            return Err(format!(
+                "execution plan parent {} is out of bounds",
+                parent.0
+            ));
+        }
+        let children: BTreeSet<PlanNodeId> = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                (edge.kind == PlanEdgeKind::Structural && edge.to == parent).then_some(edge.from)
+            })
+            .collect();
+        Ok(self
+            .topological_order()?
+            .into_iter()
+            .filter(|id| children.contains(id))
+            .collect())
+    }
 }
 
 impl PlanNodeKind {
@@ -303,8 +547,12 @@ impl PlanNodeKind {
             PlanNodeKind::Text => "text".to_string(),
             PlanNodeKind::Load { name } => format!("load ${name}"),
             PlanNodeKind::Store { name } => format!("store ${name}"),
-            PlanNodeKind::Invoke { fn_name, arg_count } => {
-                format!("invoke {fn_name}/{arg_count}")
+            PlanNodeKind::Invoke {
+                fn_name,
+                mode,
+                arg_count,
+            } => {
+                format!("invoke {fn_name}/{arg_count} [{}]", mode.label())
             }
             PlanNodeKind::Exec {
                 lang,
@@ -316,10 +564,15 @@ impl PlanNodeKind {
                     .as_deref()
                     .map(|a| format!(" {{{a}}}"))
                     .unwrap_or_default();
+                let env = if *env_id == u32::MAX {
+                    "ephemeral".to_string()
+                } else {
+                    env_id.to_string()
+                };
                 format!(
                     "exec {} [env {}]{} backend={} pure={} renderer={:?} execution={}",
                     lang,
-                    env_id,
+                    env,
                     attr_s,
                     backend.canonical,
                     backend.pure,
@@ -416,21 +669,27 @@ impl PlanBuilder {
             OIr::Text(_) => PlanNodeKind::Text,
             OIr::Load(name) => PlanNodeKind::Load { name: name.clone() },
             OIr::Store { name, .. } => PlanNodeKind::Store { name: name.clone() },
-            OIr::Invoke { fn_name, args } => PlanNodeKind::Invoke {
+            OIr::Invoke {
+                fn_name,
+                mode,
+                args,
+            } => PlanNodeKind::Invoke {
                 fn_name: fn_name.clone(),
+                mode: *mode,
                 arg_count: args.len(),
             },
             OIr::Exec {
-                lang, env_id, attr, ..
-            } => {
-                let backend = BackendRegistry::global().interface_for(lang);
-                PlanNodeKind::Exec {
-                    lang: lang.clone(),
-                    env_id: *env_id,
-                    attr: attr.clone(),
-                    backend,
-                }
-            }
+                lang,
+                env_id,
+                attr,
+                backend,
+                ..
+            } => PlanNodeKind::Exec {
+                lang: lang.clone(),
+                env_id: *env_id,
+                attr: attr.clone(),
+                backend: backend.clone(),
+            },
         }
     }
 }
@@ -827,12 +1086,14 @@ mod tests {
                 lang: "html".into(),
                 env_id: 0,
                 attr: None,
+                backend: BackendRegistry::global().interface_for("html"),
                 body: vec![
                     OIr::Text("<p>".into()),
                     OIr::Exec {
                         lang: "python".into(),
                         env_id: 0,
                         attr: None,
+                        backend: BackendRegistry::global().interface_for("python"),
                         body: vec![OIr::Text("2 + 2".into())],
                     },
                     OIr::Load("x".into()),
@@ -858,10 +1119,33 @@ mod tests {
                 name: "drv".into(),
                 expr: Box::new(OIr::Invoke {
                     fn_name: "instantiate".into(),
+                    mode: InvokeMode::Eager,
                     args: vec![OIr::Load("expr".into())],
                 }),
             }]
         );
+    }
+
+    #[test]
+    fn lowering_types_policy_changing_invocations() {
+        for (name, expected) in [
+            ("lazy", InvokeMode::Lazy),
+            ("autonomous", InvokeMode::Autonomous),
+            ("batch", InvokeMode::Group(GroupMode::Batch)),
+            ("all", InvokeMode::Group(GroupMode::All)),
+            ("any", InvokeMode::Group(GroupMode::Any)),
+            ("race", InvokeMode::Group(GroupMode::Race)),
+            ("now", InvokeMode::Eager),
+        ] {
+            let program = OIrProgram::lower(&[ONode::Call {
+                fn_name: name.into(),
+                args: vec![ONode::RawText("x".into())],
+            }]);
+            assert!(matches!(
+                &program.nodes[0],
+                OIr::Invoke { mode, .. } if *mode == expected
+            ));
+        }
     }
 
     #[test]
@@ -872,7 +1156,7 @@ mod tests {
             prog.to_text(),
             concat!(
                 "; OIrProgram\n",
-                "exec python\n",
+                "exec python [env 0]\n",
                 "  text \"1 + 1\"\n",
                 "\n",
                 "; ExecutionPlan\n",
@@ -974,6 +1258,58 @@ mod tests {
         assert!(plan.edges.iter().any(|e| {
             e.from == PlanNodeId(0) && e.to == PlanNodeId(4) && e.kind == PlanEdgeKind::Data
         }));
+    }
+
+    #[test]
+    fn executable_plan_validates_and_schedules_roots() {
+        let program = OIrProgram::lower(&[
+            ONode::LetBinding {
+                name: "x".into(),
+                expr: Box::new(ONode::RawText("value".into())),
+            },
+            ONode::VarRef("x".into()),
+            typed("html", vec![ONode::VarRef("x".into())]),
+        ]);
+        let plan = program.plan();
+        plan.validate(program.nodes.len()).unwrap();
+        assert_eq!(plan.root_schedule().unwrap(), vec![0, 1, 2]);
+        assert_eq!(
+            plan.child_schedule(plan.roots[0]).unwrap(),
+            vec![PlanNodeId(1)]
+        );
+        assert_eq!(
+            plan.child_schedule(plan.roots[2]).unwrap(),
+            vec![PlanNodeId(4)]
+        );
+        assert_eq!(plan.topological_order().unwrap().len(), plan.nodes.len());
+    }
+
+    #[test]
+    fn executable_plan_rejects_dependency_cycles() {
+        let mut plan = OIrProgram::lower(&[ONode::RawText("a".into())]).plan();
+        plan.edges.push(PlanEdge {
+            from: PlanNodeId(0),
+            to: PlanNodeId(0),
+            kind: PlanEdgeKind::Sequence,
+        });
+        assert!(plan.validate(1).unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn executable_oir_reconstructs_quoted_source() {
+        let nodes = vec![typed(
+            "html",
+            vec![
+                ONode::RawText("<p>".into()),
+                ONode::VarRef("answer".into()),
+                ONode::RawText("</p>".into()),
+            ],
+        )];
+        let program = OIrProgram::lower(&nodes);
+        assert_eq!(
+            reconstruct_source(&program.nodes),
+            "html[0]^(<p>$answer</p>)_html[0]"
+        );
     }
 
     #[test]

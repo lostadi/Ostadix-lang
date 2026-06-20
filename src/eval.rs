@@ -1,21 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // eval.rs
 //
-// The O-language evaluator — applicative order, leaves-up.
+// The O-language OIR evaluator — applicative order, leaves-up.
 //
 // Evaluation semantics (mirrors o_lang/evaluator.py):
 //
-//   TypedExpr { lang, env_id, body }:
+//   OIr::Exec { lang, env_id, backend, body }:
 //     1. Walk body children left-to-right, building a splice buffer:
-//          RawText  → append verbatim
-//          VarRef   → look up scope, render via render_child, append
-//          TypedExpr → evaluate recursively first, render via render_child, append
+//          Text  → append verbatim
+//          Load  → look up scope, render through the OIR backend interface
+//          Exec  → evaluate recursively first, then render into the parent
 //     2. Call ProcessRegistry::exec(lang, env_id, buffer, scope, shim)
 //     3. For ephemeral envs (env_id == u32::MAX, used internally for re-entrancy etc): call cleanup_env (always, even on err)
 //
 //   Root document (eval_document):
-//     Evaluate nodes sequentially; return the last non-null OValue,
-//     or ONull if no non-null value was produced.
+//     Lower ONode syntax to OIR, build and validate ExecutionPlan, execute its
+//     root schedule, and return the last non-null OValue.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::collections::{HashMap, HashSet};
@@ -26,20 +26,24 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
-use crate::ir::{BackendRegistry, SpliceRenderer};
+use crate::capability::fresh_bearer_identity;
+#[cfg(test)]
+use crate::ir::lower_node;
+use crate::ir::{
+    reconstruct_source as reconstruct_ir_source, BackendInterface, BackendRegistry, ExecutionMode,
+    ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanNodeId, SpliceRenderer,
+};
 use crate::nix_ops;
 use crate::nixos_ops;
-use crate::parser::{reconstruct_source, ONode, Parser};
+use crate::parser::{ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{GroupMode, OValue, RequestKind};
+use crate::value::{CapabilityKind, GroupMode, OValue, RequestKind};
 
 /// How to resolve group members that might be cached Request values.
 ///
 /// - `Fresh`   — force the member fresh via `force_request`; honours the
 ///               active policy and executor. Used by `now(group)`.
-/// - `Lenient` — read from the scheduler/eval cache; return the value
-///               unchanged on a miss. Soft fallback.
 /// - `Strict`  — read from the scheduler/eval cache; return a hard error
 ///               on a miss. Used after `autonomous(...)` flush: every
 ///               buffered request must have been materialized, so a miss
@@ -47,32 +51,7 @@ use crate::value::{GroupMode, OValue, RequestKind};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheMode {
     Fresh,
-    Lenient,
     Strict,
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// STEP-3.5: Backend purity
-//
-// Determines whether the `{lazy}` attribute is valid on a given language.
-// `{lazy}` requires purity because it caches by fingerprint — re-running a
-// thunk with the same input must produce the same result, or the cache lies.
-//
-// The purity table itself now lives in the centralized backend metadata
-// (ir.rs: BACKEND_SPECS / BackendRegistry); this is a thin delegation so the
-// evaluator keeps a single local entry point for the purity question.
-//
-// `{defer}` works on any backend (it never caches), so it's the impure-
-// backend escape hatch.
-//
-// STEP4: when more backends are ported to Rust (rust, racket, shell, etc.),
-// they'll need a purity decision in the registry. Shell is impure (anything
-// can happen). Rust the language is pure-ish but compilation has IO. Racket
-// has both pure and impure idioms — we'd default impure and let users opt in.
-// ═════════════════════════════════════════════════════════════════════════════
-
-fn is_pure_backend(lang: &str) -> bool {
-    BackendRegistry::global().is_pure(lang)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,8 +66,13 @@ fn exec_nix_kind(kind: RequestKind, src: OValue) -> Result<OValue> {
     match kind {
         RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
         RequestKind::Realise => nix_ops::realise_nix(&src),
-        RequestKind::Activate { profile, dry_run } => {
-            nixos_ops::activate_nix(&src, &profile, dry_run)
+        RequestKind::Activate {
+            profile,
+            dry_run: true,
+            authority: None,
+        } => nixos_ops::activate_nix(&src, &profile, true),
+        RequestKind::Activate { .. } => {
+            bail!("real activation requires the evaluator's live authority table")
         }
         RequestKind::Eval { .. } => bail!(
             "exec_nix_kind: RequestKind::Eval must not appear in concurrent \
@@ -248,9 +232,15 @@ impl Executor for ImmediateExecutor {
                  via force_request → exec_eval."
             ),
             // STEP-4: Activate is dispatched to nixos_ops::activate_nix.
-            RequestKind::Activate { profile, dry_run } => {
-                nixos_ops::activate_nix(&resolved_source, &profile, dry_run)?
-            }
+            RequestKind::Activate {
+                profile,
+                dry_run: true,
+                authority: None,
+            } => nixos_ops::activate_nix(&resolved_source, &profile, true)?,
+            RequestKind::Activate { .. } => bail!(
+                "ImmediateExecutor cannot perform real activation directly; \
+                 the Evaluator must validate a live SystemActivation capability"
+            ),
         };
 
         // STEP-3.5: only cache the result when cacheable (true for {lazy} and
@@ -275,7 +265,7 @@ pub struct Evaluator {
     shim_dir: PathBuf,
 
     /// The set of registered backend language tags. Stored here so that
-    /// eval_source (called during O.eval() eval_request callbacks) can
+    /// eval_source_with_scope (called during O.eval() callbacks) can
     /// re-parse a quoted source fragment using the same backend set as the
     /// top-level document.
     registered_backends: HashSet<String>,
@@ -284,8 +274,9 @@ pub struct Evaluator {
     /// for the scope of its argument; autonomous(...) installs Autonomous.
     policy: Policy,
 
-    /// The executor used to perform Instantiate/Realise/Activate Requests
-    /// under Policy::Eager. Swappable via with_executor (used by tests).
+    /// The executor used to perform Instantiate, Realise, and dry Activate
+    /// Requests under Policy::Eager. Real activation stays in Evaluator so its
+    /// live authority can be checked. Swappable via with_executor for tests.
     executor: Box<dyn Executor>,
 
     /// STEP-3.5: cache for `RequestKind::Eval { cacheable: true }` ({lazy}).
@@ -305,6 +296,25 @@ pub struct Evaluator {
     /// Policy::Autonomous. Flushed by flush_autonomous_buffer() at force
     /// points: end of autonomous(expr) block, explicit now(), document end.
     autonomous_buffer: Vec<OValue>,
+
+    /// The validated plan used by the most recent document execution.
+    last_execution_plan: Option<ExecutionPlan>,
+
+    /// Live, process-local authority for mutating system activation.
+    ///
+    /// Keyed by an opaque 256-bit bearer identity. The value is the only
+    /// profile that bearer may activate. Neither serialized capability
+    /// metadata nor an environment variable can populate this table.
+    activation_authorities: HashMap<String, String>,
+}
+
+struct IrExecRegion<'a> {
+    lang: &'a str,
+    env_id: u32,
+    attr: Option<&'a str>,
+    backend: &'a BackendInterface,
+    body: &'a [OIr],
+    node_id: PlanNodeId,
 }
 
 impl Evaluator {
@@ -318,10 +328,12 @@ impl Evaluator {
             eval_cache: HashMap::new(),
             scheduler: AutonomousScheduler::new(),
             autonomous_buffer: Vec::new(),
+            last_execution_plan: None,
+            activation_authorities: HashMap::new(),
         }
     }
 
-    /// Install the registered-backends set used by eval_source to re-parse
+    /// Install the registered-backends set used by O.eval to re-parse
     /// quoted fragments in `O.eval(q)` callbacks. Typically called once
     /// after construction with the same set passed to the Parser.
     pub fn with_registered_backends(mut self, backends: HashSet<String>) -> Self {
@@ -337,26 +349,78 @@ impl Evaluator {
         self
     }
 
+    /// The dependency plan that mediated the most recent document execution.
+    pub fn last_execution_plan(&self) -> Option<&ExecutionPlan> {
+        self.last_execution_plan.as_ref()
+    }
+
+    /// Mint a live capability that authorizes real activation of one profile.
+    ///
+    /// Hosts must inject the returned OValue into an O scope explicitly. Its
+    /// serialized metadata is descriptive only; the private table entry is the
+    /// authority and disappears when this Evaluator is dropped.
+    pub fn issue_system_activation_capability(
+        &mut self,
+        profile: impl Into<String>,
+    ) -> Result<OValue> {
+        let profile = profile.into();
+        if profile.is_empty() {
+            bail!("system activation capability requires a non-empty profile path");
+        }
+        let identity = loop {
+            let candidate = fresh_bearer_identity("o-activate-live")?;
+            if !self.activation_authorities.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.activation_authorities
+            .insert(identity.clone(), profile.clone());
+        let mut metadata = HashMap::new();
+        metadata.insert("live".into(), OValue::bool_(true));
+        metadata.insert("profile".into(), OValue::str_(profile));
+        Ok(OValue::capability(
+            CapabilityKind::SystemActivation,
+            identity,
+            metadata,
+        ))
+    }
+
+    /// Revoke a previously issued system activation capability immediately.
+    pub fn revoke_system_activation_capability(&mut self, capability: &OValue) -> Result<()> {
+        let OValue::Capability { kind, identity, .. } = capability else {
+            bail!("expected OCapability, got {}", capability.type_name());
+        };
+        if *kind != CapabilityKind::SystemActivation {
+            bail!(
+                "expected a system_activation capability, got {}",
+                kind.name()
+            );
+        }
+        self.activation_authorities
+            .remove(identity)
+            .ok_or_else(|| anyhow::anyhow!("system activation capability is forged or revoked"))?;
+        Ok(())
+    }
+
     /// Auto-resolve a Request under the current policy.
     ///
-    ///   - Eager:       execute the request immediately, return its result.
-    ///   - Lazy:        pass through unchanged (user must call `now()` to force).
-    ///   - Autonomous:  Eval requests are executed eagerly (they need the
-    ///                  ProcessRegistry which is !Send and can't be buffered).
-    ///                  All other request kinds (Instantiate, Realise, Activate)
-    ///                  are buffered in autonomous_buffer and returned unchanged;
-    ///                  the scheduler dispatches them concurrently at the next
-    ///                  force point (end of autonomous() block, document end,
-    ///                  or explicit now()).
+    /// - Eager executes the request immediately and returns its result.
+    /// - Lazy passes it through unchanged so the user must call `now()`.
+    /// - Autonomous keeps Eval and real Activate on the evaluator thread because
+    ///   they need live local state. Instantiate, Realise, and dry Activate are
+    ///   buffered and dispatched by the scheduler at the next force point.
     fn auto_resolve(&mut self, v: OValue) -> Result<OValue> {
         match (self.policy, &v) {
             (Policy::Eager, OValue::Request { .. }) => self.force_request(&v),
 
             (Policy::Autonomous, OValue::Request { kind, .. }) => {
                 match kind {
-                    // Eval needs the ProcessRegistry — execute eagerly even under Autonomous.
-                    RequestKind::Eval { .. } => self.force_request(&v),
-                    // Nix-family and Activate: buffer for concurrent flush.
+                    // Eval needs the ProcessRegistry. Real activation needs the
+                    // evaluator's live authority table. Keep both on this thread.
+                    RequestKind::Eval { .. } | RequestKind::Activate { dry_run: false, .. } => {
+                        self.force_request(&v)
+                    }
+                    // Pure Nix requests and dry activation can be scheduled.
                     _ => {
                         self.autonomous_buffer.push(v.clone());
                         Ok(v)
@@ -389,9 +453,57 @@ impl Evaluator {
         };
         match kind {
             RequestKind::Eval { .. } => self.exec_eval(req),
+            RequestKind::Activate { dry_run: false, .. } => self.exec_activate(req),
             _ if self.policy == Policy::Autonomous => self.scheduler.execute(req),
             _ => self.executor.execute(req),
         }
+    }
+
+    /// Perform a real activation only after resolving its live bearer through
+    /// this evaluator's private, profile-scoped authority table.
+    fn exec_activate(&mut self, req: &OValue) -> Result<OValue> {
+        let (profile, authority, source) = match req {
+            OValue::Request {
+                kind:
+                    RequestKind::Activate {
+                        profile,
+                        dry_run: false,
+                        authority,
+                    },
+                source,
+                ..
+            } => (profile.clone(), authority.clone(), source.as_ref().clone()),
+            OValue::Request {
+                kind: RequestKind::Activate { dry_run: true, .. },
+                ..
+            } => bail!("exec_activate is only for real activation requests"),
+            other => bail!(
+                "exec_activate expected a real Activate request, got {}",
+                other.type_name()
+            ),
+        };
+
+        let identity = authority.ok_or_else(|| {
+            anyhow::anyhow!("real activation requires a live system_activation capability")
+        })?;
+        let authorized_profile = self.activation_authorities.get(&identity).ok_or_else(|| {
+            anyhow::anyhow!(
+                "system activation capability is forged, revoked, or from another evaluator"
+            )
+        })?;
+        if authorized_profile != &profile {
+            bail!(
+                "system activation capability is scoped to profile {}, not {}",
+                authorized_profile,
+                profile
+            );
+        }
+
+        let resolved_source = match source {
+            OValue::Request { .. } => self.force_request(&source)?,
+            concrete => concrete,
+        };
+        nixos_ops::activate_nix(&resolved_source, &profile, false)
     }
     // ── STEP-4: Autonomous scheduler helpers ──────────────────────────────────
 
@@ -471,11 +583,24 @@ impl Evaluator {
         }
     }
 
-    /// Returns `true` if `v` is a non-Eval Request (Instantiate, Realise, or
-    /// Activate), i.e. a request that is buffered under Policy::Autonomous and
-    /// executed by the scheduler rather than by exec_eval.
+    /// Returns `true` if `v` is a request that can be buffered under
+    /// Policy::Autonomous. Real activation is excluded because it must resolve
+    /// authority through the evaluator's private live table.
     fn is_schedulable_request(v: &OValue) -> bool {
-        matches!(v, OValue::Request { kind, .. } if !matches!(kind, RequestKind::Eval { .. }))
+        matches!(
+            v,
+            OValue::Request {
+                kind: RequestKind::Instantiate | RequestKind::Realise,
+                ..
+            } | OValue::Request {
+                kind: RequestKind::Activate {
+                    dry_run: true,
+                    authority: None,
+                    ..
+                },
+                ..
+            }
+        )
     }
 
     /// Returns `true` if `m` is a Nix-family Request (Instantiate, Realise, or
@@ -512,15 +637,13 @@ impl Evaluator {
 
     /// Resolve a single group member to a concrete value.
     ///
-    /// `CacheMode::Fresh` forces the member via `force_request`; `Lenient`
-    /// and `Strict` read from the scheduler/eval cache (Strict errors on
-    /// miss; Lenient returns the value unchanged). Nested Groups recurse
-    /// with the same mode. Non-Request, non-Group members are returned as-is.
+    /// `CacheMode::Fresh` forces the member via `force_request`; `Strict`
+    /// reads from the scheduler/eval cache and errors on a miss. Nested Groups
+    /// recurse with the same mode. Other values are returned as-is.
     fn resolve_member(&mut self, m: &OValue, mode: CacheMode) -> Result<OValue> {
         match m {
             OValue::Request { fingerprint, .. } => match mode {
                 CacheMode::Fresh => self.force_request(m),
-                CacheMode::Lenient => Ok(self.resolve_from_cache(m).unwrap_or_else(|| m.clone())),
                 CacheMode::Strict => self.resolve_from_cache(m).ok_or_else(|| {
                     anyhow::anyhow!(
                         "autonomous: scheduler failed to materialize \
@@ -561,8 +684,8 @@ impl Evaluator {
     ///   plain values always resolve serially on the evaluator thread (Eval
     ///   needs the ProcessRegistry which is !Send).
     ///
-    ///   When `cache_mode` is `Lenient` or `Strict` (after an autonomous flush),
-    ///   results are already in L1 memory; sequential cache reads are used.
+    ///   Under `Strict` after an autonomous flush, results are already in L1
+    ///   memory and sequential cache reads are used.
     pub(crate) fn resolve_group(
         &mut self,
         mode: GroupMode,
@@ -583,7 +706,7 @@ impl Evaluator {
                 self.resolve_collect_all_concurrent(mode, members)
             } else {
                 // Sequential path: plain values, Eval Requests, nested Groups,
-                // or cache reads (Lenient / Strict — already in L1 memory).
+                // or strict cache reads already in L1 memory.
                 if mode == GroupMode::Batch {
                     // Batch: collect all outcomes, wrapping failures as OError.
                     let mut out = Vec::with_capacity(members.len());
@@ -867,24 +990,33 @@ impl Evaluator {
             ),
         };
 
-        // Pick the right shim for the language and fire it through the
-        // ProcessRegistry, exactly as eval_typed_expr would for a normal block.
-        // Shim path resolution is centralized in the BackendRegistry.
-        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, &lang);
-        // The shim sees an empty bindings map; deps were already spliced into
-        // the body at capture time. (STEP4: deps could be passed as bindings
-        // instead, for shims that want them as values rather than text.)
-        // See process.rs for the underlying error chain; using with_context
-        // here preserves the shim's own error message as a "Caused by:" entry
-        // instead of flattening it into the wrapper string.
-        let result = self
-            .registry
-            .exec(&lang, env_id, &body, HashMap::new(), &shim)
-            .with_context(|| format!("[{}{{eval}}]", lang))?;
-
-        if env_id == u32::MAX {
-            let _ = self.registry.cleanup_env(&lang, u32::MAX);
-        }
+        let backend = BackendRegistry::global().interface_for(&lang);
+        let result = match backend.execution {
+            ExecutionMode::InlineValue => match backend.canonical.as_str() {
+                "html" => OValue::html(body),
+                "markdown" | "text" | "latex" => OValue::str_(body),
+                other => bail!("inline OIR backend `{other}` cannot execute an Eval request"),
+            },
+            ExecutionMode::Shim => {
+                let runtime_lang = backend.canonical.as_str();
+                let shim =
+                    BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
+                // Dependencies were rendered into the thunk body at capture
+                // time, so the forced shim receives an empty binding map.
+                let result = self
+                    .registry
+                    .exec(runtime_lang, env_id, &body, HashMap::new(), &shim)
+                    .with_context(|| format!("[{}{{eval}}]", runtime_lang))?;
+                if env_id == u32::MAX {
+                    let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
+                }
+                result
+            }
+            ExecutionMode::InlineAst => bail!(
+                "structural OIR backend `{}` cannot be captured as an Eval request",
+                backend.canonical
+            ),
+        };
 
         if cacheable {
             self.eval_cache.insert(fingerprint, result.clone());
@@ -932,21 +1064,24 @@ impl Evaluator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // eval_source — re-evaluate O source text (for O.eval() callbacks)
+    // eval_source_with_scope — re-evaluate O source text for O.eval callbacks
     //
     // Used when a backend shim sends an `eval_request` response: the shim's
     // `O.eval(q)` call asks the runtime to evaluate the quoted source fragment
     // and return the result as an `eval_result` command. This is the recursive
     // entry point for that path.
     //
-    // Limitation: eval_source creates a fresh scope (empty let-bindings). Any
-    // top-level `let` bindings defined in the calling document are NOT
-    // accessible. Variables in persistent backend envs (e.g. python[0] globals)
-    // remain accessible because they live in the subprocess, not in the Rust
-    // scope.
+    // Scope rule: O.eval receives a lexical snapshot of the O bindings visible
+    // at the backend call site. The fragment can read those bindings and can
+    // create local bindings of its own, but those local writes do not mutate the
+    // caller. Persistent backend environments remain live independently.
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_source(&mut self, src: &str) -> Result<OValue> {
+    fn eval_source_with_scope(
+        &mut self,
+        src: &str,
+        caller_scope: &HashMap<String, OValue>,
+    ) -> Result<OValue> {
         let nodes = Parser::new(src, &self.registered_backends)
             .parse()
             .with_context(|| {
@@ -955,101 +1090,74 @@ impl Evaluator {
                     &src[..src.len().min(80)]
                 )
             })?;
-        self.eval_document(nodes)
+        let program = OIrProgram::lower(&nodes);
+        let mut snapshot = caller_scope.clone();
+        self.eval_ir_program_with_scope(&program, &mut snapshot)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Public API
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Evaluate a parsed O document.
-    ///
-    /// Nodes are evaluated sequentially with an empty root scope. The return
-    /// value is the last non-null `OValue` produced, or `OValue::Null` if
-    /// every node evaluated to null or the document was empty.
-    ///
-    /// STEP-4: if the document is evaluated under `Policy::Autonomous` (set by
-    /// the caller via `Evaluator::policy` before calling this), any buffered
-    /// non-Eval Requests are flushed through the scheduler at the end, and a
-    /// final Request return value is resolved from the cache.
+    /// Lower a parsed document to executable OIR, validate its dependency
+    /// plan, and execute the plan with a fresh root scope.
     pub fn eval_document(&mut self, nodes: Vec<ONode>) -> Result<OValue> {
+        let program = OIrProgram::lower(&nodes);
         let mut scope = HashMap::new();
-        let mut last = OValue::null();
-
-        // STEP-3 NOTE: auto-resolve is NOT called here. It fires at Request
-        // *construction* time inside eval_call. By the time eval_node returns
-        // a value to this loop, any auto-resolution that the policy at
-        // construction-time demanded has already happened — and any Request
-        // that survived (because it was constructed under lazy(...)) should
-        // NOT be re-executed by binding it to a name.
-        for node in nodes {
-            // Whitespace-only RawText nodes are document formatting (e.g. the
-            // trailing newline at EOF, blank lines between expressions), not
-            // values.  They MUST NOT overwrite the result of a real expression
-            // — otherwise `python^(...)_python\n` returns OStr("\n") instead
-            // of the python block's value, and the user sees an empty newline
-            // where the answer should be.  The empty-string case is preserved
-            // as a value (see test eval_document_all_null_returns_null) by
-            // requiring at least one character before the whitespace check.
-            let is_pure_whitespace_text = matches!(
-                &node,
-                ONode::RawText(s) if !s.is_empty() && s.chars().all(char::is_whitespace)
-            );
-
-            let value = match &node {
-                ONode::LetBinding { name, expr } => {
-                    let value = self.eval_node(expr, &scope)?;
-                    scope.insert(name.clone(), value.clone());
-                    value
-                }
-                _ => self.eval_node(&node, &scope)?,
-            };
-
-            if !value.is_null() && !is_pure_whitespace_text {
-                last = value;
-            }
-        }
-
-        // STEP-4: flush any buffered Requests when the document ends under
-        // Autonomous policy.  This covers the case where the caller has set
-        // `self.policy = Policy::Autonomous` before calling eval_document
-        // directly (rather than through the `autonomous(expr)` builtin).
-        // flush_autonomous_buffer() is a no-op when the buffer is empty, so
-        // there is no need for a redundant emptiness check here.
-        if self.policy == Policy::Autonomous {
-            self.flush_autonomous_buffer()?;
-            // If the final value is a buffered Request or a Group, resolve it
-            // from the freshly-populated cache.
-            last = self.resolve_after_flush(last)?;
-        }
-
-        Ok(last)
+        self.eval_ir_program_with_scope(&program, &mut scope)
     }
 
-    /// Like `eval_document` but operates on a caller-supplied scope instead of
-    /// a fresh one.  Bindings introduced by `let` statements are written back
-    /// into `scope` so they persist across calls.  Used by the notebook server
-    /// to maintain cell-to-cell variable state.
+    /// Lower and execute with a caller-owned scope. Notebook and REPL bindings
+    /// therefore persist while execution still goes through OIR.
     pub fn eval_document_with_scope(
         &mut self,
         nodes: Vec<ONode>,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
-        let mut last = OValue::null();
+        let program = OIrProgram::lower(&nodes);
+        self.eval_ir_program_with_scope(&program, scope)
+    }
 
-        for node in nodes {
+    /// Execute a lowered program through its validated ExecutionPlan.
+    pub fn eval_ir_program(&mut self, program: &OIrProgram) -> Result<OValue> {
+        let mut scope = HashMap::new();
+        self.eval_ir_program_with_scope(program, &mut scope)
+    }
+
+    fn eval_ir_program_with_scope(
+        &mut self,
+        program: &OIrProgram,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let plan = program.plan();
+        plan.validate(program.nodes.len())
+            .map_err(anyhow::Error::msg)
+            .context("invalid OIR execution plan")?;
+        let schedule = plan
+            .root_schedule()
+            .map_err(anyhow::Error::msg)
+            .context("failed to schedule OIR roots")?;
+        self.last_execution_plan = Some(plan.clone());
+
+        let mut last = OValue::null();
+        for root_index in schedule {
+            let node = &program.nodes[root_index];
+            let node_id = plan.roots[root_index];
             let is_pure_whitespace_text = matches!(
-                &node,
-                ONode::RawText(s) if !s.is_empty() && s.chars().all(char::is_whitespace)
+                node,
+                OIr::Text(text) if !text.is_empty() && text.chars().all(char::is_whitespace)
             );
 
-            let value = match &node {
-                ONode::LetBinding { name, expr } => {
-                    let value = self.eval_node(expr, scope)?;
+            let value = match node {
+                OIr::Store { name, expr } => {
+                    let children =
+                        planned_children(&plan, node_id, std::slice::from_ref(expr.as_ref()))?;
+                    let (expr_id, _) = children[0];
+                    let value = self.eval_ir_node(expr, expr_id, &plan, scope)?;
                     scope.insert(name.clone(), value.clone());
                     value
                 }
-                _ => self.eval_node(&node, scope)?,
+                _ => self.eval_ir_node(node, node_id, &plan, scope)?,
             };
 
             if !value.is_null() && !is_pure_whitespace_text {
@@ -1066,28 +1174,89 @@ impl Evaluator {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Node dispatch
+    // Executable OIR dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_node(&mut self, node: &ONode, scope: &HashMap<String, OValue>) -> Result<OValue> {
+    fn eval_ir_node(
+        &mut self,
+        node: &OIr,
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+        scope: &HashMap<String, OValue>,
+    ) -> Result<OValue> {
         match node {
-            ONode::LetBinding { expr, .. } => self.eval_node(expr, scope),
-            ONode::RawText(text) => Ok(OValue::str_(text.clone())),
+            OIr::Store { expr, .. } => {
+                let children =
+                    planned_children(plan, node_id, std::slice::from_ref(expr.as_ref()))?;
+                let (expr_id, _) = children[0];
+                self.eval_ir_node(expr, expr_id, plan, scope)
+            }
+            OIr::Text(text) => Ok(OValue::str_(text.clone())),
 
-            ONode::VarRef(name) => scope
+            OIr::Load(name) => scope
                 .get(name)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name)),
 
-            ONode::TypedExpr {
+            OIr::Exec {
                 lang,
                 env_id,
                 attr,
+                backend,
                 body,
-            } => self.eval_typed_expr(lang, *env_id, attr.as_deref(), body, scope),
+            } => self.eval_ir_exec(
+                IrExecRegion {
+                    lang,
+                    env_id: *env_id,
+                    attr: attr.as_deref(),
+                    backend,
+                    body,
+                    node_id,
+                },
+                plan,
+                scope,
+            ),
 
-            ONode::Call { fn_name, args } => self.eval_call(fn_name, args, scope),
+            OIr::Invoke {
+                fn_name,
+                mode,
+                args,
+            } => self.eval_ir_invoke(fn_name, *mode, args, node_id, plan, scope),
         }
+    }
+
+    /// Test-only compatibility entry point. It proves individual legacy test
+    /// fixtures are lowered before execution instead of maintaining a second
+    /// ONode interpreter.
+    #[cfg(test)]
+    fn eval_node(&mut self, node: &ONode, scope: &HashMap<String, OValue>) -> Result<OValue> {
+        let program = OIrProgram {
+            nodes: vec![lower_node(node)],
+        };
+        let mut scope = scope.clone();
+        self.eval_ir_program_with_scope(&program, &mut scope)
+    }
+
+    #[cfg(test)]
+    fn eval_typed_expr(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        attr: Option<&str>,
+        body: &[ONode],
+        scope: &HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: lang.to_string(),
+                env_id,
+                attr: attr.map(str::to_string),
+                backend: BackendRegistry::global().interface_for(lang),
+                body: body.iter().map(lower_node).collect(),
+            }],
+        };
+        let mut scope = scope.clone();
+        self.eval_ir_program_with_scope(&program, &mut scope)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1111,25 +1280,30 @@ impl Evaluator {
     //   activate(cfg)       → OS-as-participant: switch system to a config
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_call(
+    fn eval_ir_invoke(
         &mut self,
         fn_name: &str,
-        args: &[ONode],
+        invoke_mode: InvokeMode,
+        args: &[OIr],
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
         scope: &HashMap<String, OValue>,
     ) -> Result<OValue> {
+        let planned_args = planned_children(plan, node_id, args)?;
         // STEP-3: `lazy(expr)` is a POLICY-MODIFYING builtin — it must take
         // control of its argument's evaluation so that the policy switch
         // applies to the construction of the inner Requests. It cannot go
         // through the standard "evaluate args first" path; by the time args
         // are evaluated under that path, the inner Requests would have been
         // constructed (and auto-resolved) under the wrong policy.
-        if fn_name == "lazy" {
+        if invoke_mode == InvokeMode::Lazy {
             if args.len() != 1 {
                 bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
             }
             let saved_policy = self.policy;
             self.policy = Policy::Lazy;
-            let result = self.eval_node(&args[0], scope);
+            let (arg_id, arg) = planned_args[0];
+            let result = self.eval_ir_node(arg, arg_id, plan, scope);
             self.policy = saved_policy; // restored even on error path
             return result;
         }
@@ -1150,7 +1324,7 @@ impl Evaluator {
         // Like `lazy`, this must intercept the argument BEFORE the standard
         // "evaluate args first" path runs, so the policy is in effect for the
         // entire body evaluation.
-        if fn_name == "autonomous" {
+        if invoke_mode == InvokeMode::Autonomous {
             if args.len() != 1 {
                 bail!(
                     "autonomous(expr) takes exactly 1 argument, got {}",
@@ -1159,7 +1333,8 @@ impl Evaluator {
             }
             let saved_policy = self.policy;
             self.policy = Policy::Autonomous;
-            let result = self.eval_node(&args[0], scope);
+            let (arg_id, arg) = planned_args[0];
+            let result = self.eval_ir_node(arg, arg_id, plan, scope);
             self.policy = saved_policy; // restore before flush
 
             match result {
@@ -1200,33 +1375,26 @@ impl Evaluator {
         // The Group itself performs no work — it is a first-class coordination
         // value forced later by `now(group)`, `autonomous(group)`, or by the
         // Autonomous flush at document end.
-        if matches!(fn_name, "batch" | "all" | "any" | "race") {
+        if let InvokeMode::Group(mode) = invoke_mode {
             if args.is_empty() {
                 bail!("{}(...) takes at least 1 argument, got 0", fn_name);
             }
-            let mode = match fn_name {
-                "batch" => GroupMode::Batch,
-                "all" => GroupMode::All,
-                "any" => GroupMode::Any,
-                "race" => GroupMode::Race,
-                _ => unreachable!(),
-            };
             // Evaluate members under Lazy policy so request chains are captured,
             // not resolved, regardless of the outer policy.
             let saved_policy = self.policy;
             self.policy = Policy::Lazy;
-            let members: Vec<OValue> = args
+            let members: Vec<OValue> = planned_args
                 .iter()
-                .map(|a| self.eval_node(a, scope))
+                .map(|(id, arg)| self.eval_ir_node(arg, *id, plan, scope))
                 .collect::<Result<_>>()?;
             self.policy = saved_policy;
             return Ok(OValue::group(mode, members));
         }
 
         // Standard builtins: evaluate args left-to-right (applicative order).
-        let arg_vals: Vec<OValue> = args
+        let arg_vals: Vec<OValue> = planned_args
             .iter()
-            .map(|a| self.eval_node(a, scope))
+            .map(|(id, arg)| self.eval_ir_node(arg, *id, plan, scope))
             .collect::<Result<_>>()?;
 
         match fn_name {
@@ -1275,32 +1443,82 @@ impl Evaluator {
             }
             // STEP-4: OS-as-participant builtins.
             "activate" => {
-                if arg_vals.is_empty() || arg_vals.len() > 2 {
+                if arg_vals.is_empty() || arg_vals.len() > 3 {
                     bail!(
-                        "activate(path) or activate(path, profile) — takes 1 \
-                         or 2 args, got {}",
+                        "activate(path[, profile]) dry-runs; \
+                         activate(capability, path[, profile]) performs a real \
+                         switch; got {} args",
                         arg_vals.len()
                     );
                 }
-                let mut iter = arg_vals.into_iter();
-                let target = iter.next().unwrap();
-                let profile = match iter.next() {
-                    Some(OValue::Str { v }) => v,
-                    Some(OValue::System { profile_path }) => profile_path,
-                    Some(other) => bail!(
-                        "activate's second arg must be a string profile path \
-                         or a System value, got {}",
-                        other.type_name()
-                    ),
-                    None => "/nix/var/nix/profiles/system".to_string(),
+
+                let has_authority = matches!(arg_vals.first(), Some(OValue::Capability { .. }));
+                let (authority, target, profile, dry_run) = if has_authority {
+                    if arg_vals.len() < 2 {
+                        bail!("activate(capability, path) requires a target StorePath");
+                    }
+                    let capability = &arg_vals[0];
+                    let OValue::Capability { kind, identity, .. } = capability else {
+                        unreachable!()
+                    };
+                    if *kind != CapabilityKind::SystemActivation {
+                        bail!(
+                            "activate requires a system_activation capability, got {}",
+                            kind.name()
+                        );
+                    }
+                    let authorized_profile = self
+                        .activation_authorities
+                        .get(identity)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "system activation capability is forged, revoked, or from another evaluator"
+                            )
+                        })?;
+                    let requested_profile = match arg_vals.get(2) {
+                        Some(OValue::Str { v }) => v.clone(),
+                        Some(OValue::System { profile_path }) => profile_path.clone(),
+                        Some(other) => bail!(
+                            "activate's profile must be a string path or System, got {}",
+                            other.type_name()
+                        ),
+                        None => authorized_profile.clone(),
+                    };
+                    if requested_profile != authorized_profile {
+                        bail!(
+                            "system activation capability is scoped to profile {}, not {}",
+                            authorized_profile,
+                            requested_profile
+                        );
+                    }
+                    (
+                        Some(identity.clone()),
+                        arg_vals[1].clone(),
+                        requested_profile,
+                        false,
+                    )
+                } else {
+                    if arg_vals.len() > 2 {
+                        bail!("dry activate accepts only path and optional profile");
+                    }
+                    let profile = match arg_vals.get(1) {
+                        Some(OValue::Str { v }) => v.clone(),
+                        Some(OValue::System { profile_path }) => profile_path.clone(),
+                        Some(other) => bail!(
+                            "activate's profile must be a string path or System, got {}",
+                            other.type_name()
+                        ),
+                        None => "/nix/var/nix/profiles/system".to_string(),
+                    };
+                    (None, arg_vals[0].clone(), profile, true)
                 };
-                // dry_run defaults to true at the language level. The actual
-                // subprocess argument is further gated by an env var in
-                // nixos_ops. Two layers of opt-in.
+
                 let req = OValue::request(
                     RequestKind::Activate {
                         profile,
-                        dry_run: true,
+                        dry_run,
+                        authority,
                     },
                     target,
                 );
@@ -1326,14 +1544,21 @@ impl Evaluator {
     // Core evaluation: build splice buffer then dispatch to backend
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_typed_expr(
+    fn eval_ir_exec(
         &mut self,
-        lang: &str,
-        env_id: u32,
-        attr: Option<&str>,
-        body: &[ONode],
+        region: IrExecRegion<'_>,
+        plan: &ExecutionPlan,
         scope: &HashMap<String, OValue>,
     ) -> Result<OValue> {
+        let IrExecRegion {
+            lang,
+            env_id,
+            attr,
+            backend,
+            body,
+            node_id,
+        } = region;
+        let planned_body = planned_children(plan, node_id, body)?;
         // ─────────────────────────────────────────────────────────────────────
         // Short-circuit for `quote^`: capture the body as an unevaluated
         // OValue::Expr WITHOUT evaluating its children or calling any shim.
@@ -1344,9 +1569,52 @@ impl Evaluator {
         // reconstruct_source converts the ONode tree back to O source text;
         // O.eval() in a Python block can then round-trip it through eval_source.
         // ─────────────────────────────────────────────────────────────────────
-        if lang == "quote" {
-            let src = reconstruct_source(body);
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `quote` backend");
+            }
+            let src = reconstruct_ir_source(body);
             return Ok(OValue::Expr { src });
+        }
+
+        // `O` is an executable structural region. It sequences its OIR
+        // children exactly once with a lexical child scope; it never builds a
+        // backend splice buffer and never re-walks parser nodes.
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `O` backend");
+            }
+            let mut local_scope = scope.clone();
+            let mut last = OValue::null();
+            for (child_id, child) in &planned_body {
+                let is_whitespace = matches!(
+                    *child,
+                    OIr::Text(text)
+                        if !text.is_empty() && text.chars().all(char::is_whitespace)
+                );
+                let value = match *child {
+                    OIr::Store { name, expr } => {
+                        let children =
+                            planned_children(plan, *child_id, std::slice::from_ref(expr.as_ref()))?;
+                        let (expr_id, _) = children[0];
+                        let value = self.eval_ir_node(expr, expr_id, plan, &local_scope)?;
+                        local_scope.insert(name.clone(), value.clone());
+                        value
+                    }
+                    _ => self.eval_ir_node(child, *child_id, plan, &local_scope)?,
+                };
+                if !value.is_null() && !is_whitespace {
+                    last = value;
+                }
+            }
+            return Ok(last);
+        }
+
+        if backend.execution == ExecutionMode::InlineAst {
+            bail!(
+                "OIR backend `{}` declares inline_ast execution without an executor",
+                backend.canonical
+            );
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1369,7 +1637,7 @@ impl Evaluator {
                              want a generic deferred Nix eval."
                         );
                     }
-                    if !is_pure_backend(lang) {
+                    if !backend.pure {
                         bail!(
                             "`{lang}{{lazy}}^` is invalid because {lang} is not a \
                              pure backend; caching a thunk that re-runs with side \
@@ -1407,27 +1675,30 @@ impl Evaluator {
         let mut deps: Vec<OValue> = Vec::new();
 
         // Whether this block constructs a Thunk (and so should track deps).
-        let constructs_thunk = lang == "nix_expr" || attr.is_some();
+        let constructs_thunk = backend.canonical == "nix_expr" || attr.is_some();
 
         // Own a mutable copy of the scope so that LetBinding nodes inside this
         // body can extend it for subsequent children. Cloning is cheap compared
         // to the subprocess dispatch that follows.
         let mut local_scope = scope.clone();
 
-        for child in body {
-            match child {
-                ONode::LetBinding { name, expr } => {
+        for (child_id, child) in &planned_body {
+            match *child {
+                OIr::Store { name, expr } => {
                     // Evaluate the RHS and bind it into the local scope.
                     // The binding itself produces no text for the backend.
-                    let value = self.eval_node(expr, &local_scope)?;
+                    let children =
+                        planned_children(plan, *child_id, std::slice::from_ref(expr.as_ref()))?;
+                    let (expr_id, _) = children[0];
+                    let value = self.eval_ir_node(expr, expr_id, plan, &local_scope)?;
                     local_scope.insert(name.clone(), value);
                 }
 
-                ONode::RawText(text) => {
+                OIr::Text(text) => {
                     buf.push_str(text);
                 }
 
-                ONode::VarRef(name) => {
+                OIr::Load(name) => {
                     let val = local_scope
                         .get(name)
                         .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?
@@ -1436,38 +1707,49 @@ impl Evaluator {
                     // on {defer} thunks. {lazy} is safe to auto-force because
                     // pure-backend results don't have side effects.
                     let resolved = self.resolve_for_splice(val)?;
-                    buf.push_str(&self.render_child(lang, &resolved));
+                    buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
                         deps.push(resolved);
                     }
                 }
 
-                ONode::TypedExpr {
+                OIr::Exec {
                     lang: child_lang,
                     env_id: child_env_id,
                     attr: child_attr,
+                    backend: child_backend,
                     body: child_body,
                 } => {
                     // Evaluate the nested expression first (leaves-up / applicative order),
                     // then render its value into the parent language's source syntax.
-                    let child_val = self.eval_typed_expr(
-                        child_lang,
-                        *child_env_id,
-                        child_attr.as_deref(),
-                        child_body,
+                    let child_val = self.eval_ir_exec(
+                        IrExecRegion {
+                            lang: child_lang,
+                            env_id: *child_env_id,
+                            attr: child_attr.as_deref(),
+                            backend: child_backend,
+                            body: child_body,
+                            node_id: *child_id,
+                        },
+                        plan,
                         &local_scope,
                     )?;
                     let resolved = self.resolve_for_splice(child_val)?;
-                    buf.push_str(&self.render_child(lang, &resolved));
+                    buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
                         deps.push(resolved);
                     }
                 }
 
-                ONode::Call { fn_name, args } => {
-                    let raw = self.eval_call(fn_name, args, &local_scope)?;
+                OIr::Invoke {
+                    fn_name,
+                    mode,
+                    args,
+                } => {
+                    let raw =
+                        self.eval_ir_invoke(fn_name, *mode, args, *child_id, plan, &local_scope)?;
                     let resolved = self.resolve_for_splice(raw)?;
-                    buf.push_str(&self.render_child(lang, &resolved));
+                    buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
                         deps.push(resolved);
                     }
@@ -1499,65 +1781,22 @@ impl Evaluator {
         // calling the Nix shim immediately.  The fingerprint is sha256(body)
         // — the cheap step-1 scheme.  `nix^` (immediate evaluation) is
         // unchanged (step-1 decision, option a).
-        if lang == "nix_expr" {
+        if backend.canonical == "nix_expr" {
             return Ok(OValue::nix_expr(buf, deps));
         }
 
-        // Step 2 — send the completed splice buffer to the backend.
-        // Shim path resolution is centralized in the BackendRegistry.
-        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, lang);
-        // `O^(...)_O` sequences its children and returns the last non-null value.
-        // Each child is evaluated in order; whitespace-only text nodes are skipped.
-        // This matches the Python ref impl's OBackend.eval_ast semantics.
-        if lang == "O" {
-            let mut last = OValue::null();
-            for child in body {
-                match child {
-                    ONode::RawText(s) if s.chars().all(char::is_whitespace) => {}
-                    ONode::RawText(s) => last = OValue::str_(s.clone()),
-                    ONode::VarRef(name) => {
-                        if let Some(v) = scope.get(name) {
-                            last = v.clone();
-                        }
-                    }
-                    ONode::TypedExpr {
-                        lang: cl,
-                        env_id: ce,
-                        attr: ca,
-                        body: cb,
-                    } => {
-                        let v = self.eval_typed_expr(cl, *ce, ca.as_deref(), cb, scope)?;
-                        if !v.is_null() {
-                            last = v;
-                        }
-                    }
-                    ONode::LetBinding { name, expr } => {
-                        // let inside O^: evaluate and bind, but O-level scope
-                        // is not mutable here. Just evaluate for side effects.
-                        let _ = self.eval_node(expr, scope)?;
-                        let _ = name; // binding discarded inside O^
-                    }
-                    ONode::Call { fn_name, args } => {
-                        let v = self.eval_call(fn_name, args, scope)?;
-                        if !v.is_null() {
-                            last = v;
-                        }
-                    }
-                }
-            }
-            return Ok(last);
+        // Dispatch is an OIR property frozen at lowering time.
+        if backend.execution == ExecutionMode::InlineValue {
+            return match backend.canonical.as_str() {
+                "html" => Ok(OValue::html(buf)),
+                "markdown" | "text" | "latex" => Ok(OValue::str_(buf)),
+                other => bail!("inline OIR backend `{other}` has no value executor"),
+            };
         }
 
-        if lang == "html" {
-            return Ok(OValue::html(buf));
-        }
-
-        // Markup-only backends: no subprocess needed, just return the body text.
-        // markdown and text return the spliced body as a string value;
-        // latex returns it as a string (compilation to PDF is out-of-scope).
-        if matches!(lang, "markdown" | "md" | "text" | "plain" | "latex" | "tex") {
-            return Ok(OValue::str_(buf));
-        }
+        debug_assert_eq!(backend.execution, ExecutionMode::Shim);
+        let runtime_lang = backend.canonical.as_str();
+        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
 
         // Send the exec command to the shim, then drive the eval_request loop.
         //
@@ -1566,19 +1805,19 @@ impl Evaluator {
         // the quoted source; we evaluate it here and send back EvalResult, then
         // loop to read the next response. The loop terminates on Ok or Err.
         let env_label = if env_id == u32::MAX {
-            format!("{lang}[*ephemeral*]")
+            format!("{runtime_lang}[*ephemeral*]")
         } else {
-            format!("{lang}[{env_id}]")
+            format!("{runtime_lang}[{env_id}]")
         };
 
         self.registry
-            .send_exec(lang, env_id, &buf, scope.clone(), &shim)
+            .send_exec(runtime_lang, env_id, &buf, local_scope.clone(), &shim)
             .with_context(|| format!("[{}]", env_label))?;
 
         let result: Result<OValue> = loop {
             let step = self
                 .registry
-                .recv_exec_step(lang, env_id)
+                .recv_exec_step(runtime_lang, env_id)
                 .with_context(|| format!("[{}]", env_label))?;
 
             match step {
@@ -1588,16 +1827,16 @@ impl Evaluator {
                     // Evaluate the quoted source. If eval fails, propagate the
                     // error — the shim's `O.eval(q)` will raise on the Python
                     // side because the runtime never sends eval_result.
-                    match self.eval_source(&src) {
+                    match self.eval_source_with_scope(&src, &local_scope) {
                         Ok(result) => {
                             self.registry
-                                .send_eval_result(lang, env_id, result)
+                                .send_eval_result(runtime_lang, env_id, result)
                                 .with_context(|| format!("[{}] send_eval_result", env_label))?;
                         }
                         Err(e) => {
                             // Remove the process from the registry so the
                             // stuck shim doesn't pollute future calls.
-                            let _ = self.registry.cleanup_env(lang, env_id);
+                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
                             return Err(e).with_context(|| {
                                 format!(
                                     "[{}] O.eval() failed while evaluating quoted source",
@@ -1615,7 +1854,7 @@ impl Evaluator {
         // re-entrant O.eval cases to avoid deadlock on a persistent env; bare
         // user-level blocks now default to env 0 per the spec.)
         if env_id == u32::MAX {
-            let _ = self.registry.cleanup_env(lang, u32::MAX);
+            let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
         }
 
         // Attach a `[lang[env_id]]` tag to the existing error CHAIN — using
@@ -1639,38 +1878,54 @@ impl Evaluator {
     // that is valid in the widest range of languages.
     // ─────────────────────────────────────────────────────────────────────────
 
+    #[cfg(test)]
     fn render_child(&self, lang: &str, val: &OValue) -> String {
-        // The lang → strategy decision is centralized in the BackendRegistry
-        // (ir.rs); the value-level renderers stay here because they need
-        // OValue. Unrecognised languages get SpliceRenderer::Default, which
-        // is OValue::splice_repr() — a conservative representation that is
-        // valid in the widest range of languages.
-        match BackendRegistry::global().renderer_for(lang) {
-            // ── Python ──────────────────────────────────────────────────────
-            // Produce a valid Python literal so the spliced code compiles
-            // without the user having to quote things manually.
-            SpliceRenderer::Python => render_python(val),
+        render_with(BackendRegistry::global().renderer_for(lang), val)
+    }
+}
 
-            // ── HTML ─────────────────────────────────────────────────────────
-            // Produce embeddable HTML markup.  OBlob images become data-URI
-            // <img> tags; everything else falls back to splice_repr or
-            // direct string embedding.
-            SpliceRenderer::Html => render_html(val),
+/// Pair direct OIR children with the identities and order selected by the
+/// execution plan. Plan node identifiers are allocated in source order, so a
+/// sorted copy provides the stable mapping back to the child payloads while
+/// `child_schedule` remains free to reorder independent work later.
+fn planned_children<'a>(
+    plan: &ExecutionPlan,
+    parent: PlanNodeId,
+    children: &'a [OIr],
+) -> Result<Vec<(PlanNodeId, &'a OIr)>> {
+    let scheduled = plan.child_schedule(parent).map_err(anyhow::Error::msg)?;
+    if scheduled.len() != children.len() {
+        bail!(
+            "OIR plan node {} schedules {} children for {} instructions",
+            parent.0,
+            scheduled.len(),
+            children.len()
+        );
+    }
+    let mut source_ids = scheduled.clone();
+    source_ids.sort_by_key(|id| id.0);
+    scheduled
+        .into_iter()
+        .map(|id| {
+            let source_index = source_ids
+                .binary_search_by_key(&id.0, |candidate| candidate.0)
+                .expect("scheduled child must be present in source child map");
+            Ok((id, &children[source_index]))
+        })
+        .collect()
+}
 
-            // ── LaTeX ────────────────────────────────────────────────────────
-            SpliceRenderer::Latex => render_latex(val),
-
-            // ── Markdown ─────────────────────────────────────────────────────
-            SpliceRenderer::Markdown => render_markdown(val),
-
-            // ── Nix family ───────────────────────────────────────────────────
-            // Produce syntactically valid Nix expressions so that O values
-            // from prior blocks can be spliced into Nix code via $var.
-            SpliceRenderer::Nix => render_nix(val),
-
-            // ── Default: use the conservative cross-language representation ──
-            SpliceRenderer::Default => val.splice_repr(),
-        }
+/// Render using the strategy frozen into executable OIR. Keeping this as a
+/// value-level function lets tests exercise renderers directly while runtime
+/// execution never has to rediscover backend policy from a language string.
+fn render_with(renderer: SpliceRenderer, val: &OValue) -> String {
+    match renderer {
+        SpliceRenderer::Python => render_python(val),
+        SpliceRenderer::Html => render_html(val),
+        SpliceRenderer::Latex => render_latex(val),
+        SpliceRenderer::Markdown => render_markdown(val),
+        SpliceRenderer::Nix => render_nix(val),
+        SpliceRenderer::Default => val.splice_repr(),
     }
 }
 
@@ -2448,6 +2703,74 @@ mod tests {
     }
 
     #[test]
+    fn document_execution_is_mediated_by_oir_plan() {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let result = evaluator
+            .eval_document(vec![
+                ONode::LetBinding {
+                    name: "x".into(),
+                    expr: Box::new(ONode::RawText("planned".into())),
+                },
+                ONode::VarRef("x".into()),
+            ])
+            .unwrap();
+        assert_eq!(result, OValue::str_("planned"));
+
+        let plan = evaluator
+            .last_execution_plan()
+            .expect("document execution must install an OIR plan");
+        assert_eq!(plan.roots.len(), 2);
+        assert!(plan.edges.iter().any(|edge| {
+            edge.kind == crate::ir::PlanEdgeKind::Data
+                && matches!(
+                    &plan.nodes[edge.to.0].kind,
+                    crate::ir::PlanNodeKind::Load { name } if name == "x"
+                )
+        }));
+    }
+
+    #[test]
+    fn lowered_oir_is_a_public_execution_input() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "html".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("html"),
+                body: vec![OIr::Text("<p>executed from OIR</p>".into())],
+            }],
+        };
+        let mut evaluator = Evaluator::new("/tmp".into());
+        assert_eq!(
+            evaluator.eval_ir_program(&program).unwrap(),
+            OValue::html("<p>executed from OIR</p>")
+        );
+        assert!(evaluator.last_execution_plan().is_some());
+    }
+
+    #[test]
+    fn lazy_inline_backend_is_forced_by_oir_dispatch() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "now".into(),
+                mode: InvokeMode::Eager,
+                args: vec![OIr::Exec {
+                    lang: "html".into(),
+                    env_id: u32::MAX,
+                    attr: Some("lazy".into()),
+                    backend: BackendRegistry::global().interface_for("html"),
+                    body: vec![OIr::Text("<p>cached inline</p>".into())],
+                }],
+            }],
+        };
+        let mut evaluator = Evaluator::new("/tmp".into());
+        assert_eq!(
+            evaluator.eval_ir_program(&program).unwrap(),
+            OValue::html("<p>cached inline</p>")
+        );
+    }
+
+    #[test]
     fn eval_node_varref_undefined_is_error() {
         let mut e = Evaluator::new("/tmp".into());
         let result = e.eval_node(&ONode::VarRef("missing".to_string()), &HashMap::new());
@@ -2590,6 +2913,67 @@ mod tests {
                 (k, s) => panic!("MockExecutor: unexpected ({:?}, {})", k, s.type_name()),
             }
         }
+    }
+
+    #[test]
+    fn structural_o_region_executes_each_oir_child_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingExecutor {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Executor for CountingExecutor {
+            fn execute(&mut self, request: &OValue) -> Result<OValue> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match request {
+                    OValue::Request {
+                        kind: RequestKind::Instantiate,
+                        ..
+                    } => Ok(OValue::derivation(
+                        "/nix/store/oir-once.drv",
+                        vec!["out".into()],
+                        vec![],
+                    )),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut evaluator =
+            Evaluator::new("/tmp".into()).with_executor(Box::new(CountingExecutor {
+                calls: calls.clone(),
+            }));
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Store {
+                    name: "expr".into(),
+                    expr: Box::new(OIr::Exec {
+                        lang: "nix_expr".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: BackendRegistry::global().interface_for("nix_expr"),
+                        body: vec![OIr::Text("pkgs.hello".into())],
+                    }),
+                },
+                OIr::Exec {
+                    lang: "O".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: BackendRegistry::global().interface_for("O"),
+                    body: vec![OIr::Invoke {
+                        fn_name: "instantiate".into(),
+                        mode: InvokeMode::Eager,
+                        args: vec![OIr::Load("expr".into())],
+                    }],
+                },
+            ],
+        };
+
+        assert!(evaluator.eval_ir_program(&program).unwrap().is_derivation());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Under Eager (the default), `instantiate($expr)` auto-resolves at
@@ -3122,10 +3506,10 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // STEP-4: OS-as-participant
     //
-    // The activate() builtin constructs a Request[Activate] over a StorePath
-    // (or auto-realises a chained Derivation Request first). The default
-    // dry_run flag is true at the Request level, AND the actual subprocess
-    // is gated by an env var in nixos_ops — two layers of opt-in.
+    // The unprivileged activate(path[, profile]) form constructs a dry-run
+    // Request[Activate]. A real switch requires
+    // activate(system_activation_capability, path[, profile]); the capability
+    // is checked at construction and again at force time.
     // ─────────────────────────────────────────────────────────────────────────
 
     /// MockSystemExecutor returns canned System values for Activate requests
@@ -3157,7 +3541,9 @@ mod tests {
             };
 
             match kind {
-                RequestKind::Activate { profile, dry_run } => {
+                RequestKind::Activate {
+                    profile, dry_run, ..
+                } => {
                     self.activate_calls.push((profile.clone(), dry_run));
                     Ok(OValue::system(profile))
                 }
@@ -3228,6 +3614,127 @@ mod tests {
         } else {
             panic!("expected System");
         }
+    }
+
+    #[test]
+    fn real_activation_request_captures_live_profile_scoped_authority() {
+        let profile = "/nix/var/nix/profiles/system";
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let capability = evaluator
+            .issue_system_activation_capability(profile)
+            .unwrap();
+        let mut scope = HashMap::new();
+        scope.insert("authority".into(), capability);
+        scope.insert("path".into(), OValue::store_path("/nix/store/abc-system"));
+        evaluator.policy = Policy::Lazy;
+
+        let request = evaluator
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![
+                        ONode::VarRef("authority".into()),
+                        ONode::VarRef("path".into()),
+                    ],
+                },
+                &scope,
+            )
+            .unwrap();
+
+        let OValue::Request {
+            kind:
+                RequestKind::Activate {
+                    profile: actual_profile,
+                    dry_run,
+                    authority,
+                },
+            ..
+        } = request
+        else {
+            panic!("expected an Activate request")
+        };
+        assert_eq!(actual_profile, profile);
+        assert!(!dry_run);
+        assert!(authority
+            .as_deref()
+            .is_some_and(|id| id.starts_with("o-activate-live:")));
+    }
+
+    #[test]
+    fn forged_or_revoked_activation_authority_is_rejected_before_io() {
+        let profile = "/nix/var/nix/profiles/system";
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let capability = evaluator
+            .issue_system_activation_capability(profile)
+            .unwrap();
+        let identity = match &capability {
+            OValue::Capability { identity, .. } => identity.clone(),
+            _ => unreachable!(),
+        };
+        evaluator
+            .revoke_system_activation_capability(&capability)
+            .unwrap();
+
+        let request = OValue::request(
+            RequestKind::Activate {
+                profile: profile.into(),
+                dry_run: false,
+                authority: Some(identity),
+            },
+            OValue::store_path("/tmp/does-not-need-to-exist"),
+        );
+        let err = evaluator.force_request(&request).unwrap_err().to_string();
+        assert!(err.contains("forged, revoked"));
+
+        let forged = OValue::capability(
+            CapabilityKind::SystemActivation,
+            "o-activate-live:forged",
+            HashMap::new(),
+        );
+        let mut scope = HashMap::new();
+        scope.insert("authority".into(), forged);
+        scope.insert("path".into(), OValue::store_path("/tmp/unused"));
+        let err = evaluator
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![
+                        ONode::VarRef("authority".into()),
+                        ONode::VarRef("path".into()),
+                    ],
+                },
+                &scope,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("forged, revoked"));
+    }
+
+    #[test]
+    fn activation_capability_cannot_escape_its_profile() {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let capability = evaluator
+            .issue_system_activation_capability("/nix/var/nix/profiles/system")
+            .unwrap();
+        let mut scope = HashMap::new();
+        scope.insert("authority".into(), capability);
+        scope.insert("path".into(), OValue::store_path("/tmp/unused"));
+        scope.insert("other".into(), OValue::str_("/home/lee/.nix-profile"));
+        let err = evaluator
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![
+                        ONode::VarRef("authority".into()),
+                        ONode::VarRef("path".into()),
+                        ONode::VarRef("other".into()),
+                    ],
+                },
+                &scope,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scoped to profile"));
     }
 
     /// The full four-rung chain — `activate(realise(instantiate($expr)))` —
@@ -3316,6 +3823,7 @@ mod tests {
             RequestKind::Activate {
                 profile: "/p".into(),
                 dry_run: true,
+                authority: None,
             },
             path,
         );
@@ -3476,6 +3984,41 @@ mod tests {
             }
             other => panic!("expected OValue::Expr, got {:?}", other),
         }
+    }
+
+    /// O.eval reads the O bindings visible where the calling backend block was
+    /// entered. The callback receives a cloned lexical scope, so bindings made
+    /// inside the fragment cannot leak back into the document scope.
+    #[test]
+    fn o_eval_uses_a_lexical_scope_snapshot() {
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let source = r#"
+let answer = python[2]^(41)_python[2]
+let q = quote^(
+    let callback_only = python[3]^(1)_python[3]
+    python[1]^($answer + $callback_only)_python[1]
+)_quote
+python[0]^(O.eval($q))_python[0]
+"#;
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+        let mut scope = HashMap::new();
+
+        let result = evaluator
+            .eval_document_with_scope(nodes, &mut scope)
+            .unwrap();
+
+        assert_eq!(result, OValue::int(42));
+        assert_eq!(scope.get("answer"), Some(&OValue::int(41)));
+        assert!(scope.contains_key("q"));
+        assert!(
+            !scope.contains_key("callback_only"),
+            "O.eval bindings must not mutate the caller's lexical scope"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4420,7 +4963,11 @@ mod tests {
 
         // Batch mode: cache miss becomes OError in the result list.
         let batch_result = e
-            .resolve_group(GroupMode::Batch, &[realise.clone()], CacheMode::Strict)
+            .resolve_group(
+                GroupMode::Batch,
+                std::slice::from_ref(&realise),
+                CacheMode::Strict,
+            )
             .unwrap();
         match batch_result {
             OValue::List { v } => {

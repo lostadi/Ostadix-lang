@@ -317,21 +317,11 @@ OValue *activate_nix(OValue *source, const std::string &profile, bool dry_run) {
             "Path " + store_path + " does not contain bin/switch-to-configuration. This doesn't look like a NixOS system closure.");
     }
 
-    const char *gate = std::getenv("O_LANG_ALLOW_ACTIVATION");
-    const bool gate_set = gate != nullptr &&
-        (std::strcmp(gate, "1") == 0 || std::strcmp(gate, "true") == 0 || std::strcmp(gate, "TRUE") == 0);
-
-    std::string action;
-    if (dry_run) {
-        action = "dry-activate";
-    } else if (!gate_set) {
-        std::cerr << "warning: activate() was called with dry_run=false, but the safety gate "
-                  << "O_LANG_ALLOW_ACTIVATION=1 is NOT set. Forcing dry-activate. "
-                  << "To actually switch the system, run with O_LANG_ALLOW_ACTIVATION=1.\n";
-        action = "dry-activate";
-    } else {
-        action = "switch";
+    if (!dry_run) {
+        std::cerr << "activate: real switching requires the Rust runtime's live "
+                  << "system_activation capability; forcing dry-activate in the C++ port\n";
     }
+    const std::string action = "dry-activate";
 
     std::cerr << "activate: profile=" << profile
               << " closure=" << store_path

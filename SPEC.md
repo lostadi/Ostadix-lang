@@ -49,55 +49,55 @@ persistent environments** for the same language. State (imports, bindings,
 function definitions) lives inside the env and survives across every
 expression that references that env in the document.
 
-`python^(...)_python` without brackets is shorthand for `python[0]^(...)_python` —
-they share the same default env. BUT: the parser requires the opener and
-closer to match _textually_. If you opened with `python^(` you must close with
-`)_python`; if you opened with `python[0]^(` you must close with `)_python[0]`.
+`python^(...)_python` without brackets is ephemeral. It receives a fresh
+backend process for that expression and is cleaned up afterward. Persistent
+state is always explicit through `[n]`. The parser also requires the opener
+and closer to match textually. If you opened with `python^(` you must close
+with `)_python`; if you opened with `python[0]^(` you must close with
+`)_python[0]`.
 
 ---
 
 ## 2. Evaluation semantics
 
 The evaluator is **applicative order, leaves-up** (standard Lisp eval order).
+`ONode` is syntax only. Before any document executes, the Rust runtime lowers
+the parsed forest to executable OIR and builds a validated `ExecutionPlan`.
 
 ### 2.1 Default flow (splice + evaluate)
 
-For each ExpressionNode `E` with language `L[n]` and body `B = [c₁, c₂, …]`:
+For each OIR `Exec` instruction `E` with language `L[n]`, embedded
+`BackendInterface`, and body `B = [c₁, c₂, …]`:
 
 1. For each child `cᵢ`:
     * if `cᵢ` is text, emit `cᵢ` verbatim into a splice buffer.
     * if `cᵢ` is an ExpressionNode, recursively evaluate it to get OValue `vᵢ`,
-      then emit `backend(L).render_child(vᵢ)` into the splice buffer.
+      then emit `E.backend.renderer(vᵢ)` into the splice buffer.
 2. Concatenate the splice buffer → final source string `B*`.
 3. Return `backend(L).evaluate(B*, env(L, n))`.
 
-Persistent environments: `env(L, n)` is created exactly once via
-`backend(L).make_env()` and memoized in the `EvalContext`. Subsequent
-references to the same `(L, n)` pair reuse the same env object.
+Persistent environments: `env(L, n)` is created exactly once for an explicit
+environment marker and memoized in the process registry. Subsequent references
+to the same `(L, n)` pair reuse the same process. A bare expression uses the
+ephemeral environment identifier and is destroyed after dispatch.
 
 ### 2.2 Structural backends (`eval_ast` hook)
 
-Some backends need control over how their children are evaluated — the
-default splice-then-evaluate flow is wrong for them. A backend can
-optionally implement `eval_ast(node, ctx) -> OValue` to take over. The
-evaluator checks for this method and, if present, hands over control
-entirely. Otherwise it falls back to the default flow.
+Some backends need control over how their children are evaluated because the
+default splice-then-evaluate flow is wrong for them. Their OIR
+`BackendInterface` uses `inline_ast`, and the OIR evaluator hands the entire
+region to its structural executor.
 
 Two backends currently use this:
 
-* **`O^(...)_O`** — the *host / sequencing* backend. Evaluates its
-  children left-to-right in source order, returning the children's
-  OValues as an `OList` (or a single value if the list has length 1, or
-  `ONull` if empty). Whitespace-only text between children is treated
-  as formatting and dropped; non-whitespace text is preserved as
-  `OStr`. This is the canonical wrapper for full .O scripts; it lets
-  side-effects in `python[0]^(...)_python[0]` blocks flow naturally
-  down the page.
+* **`O^(...)_O`** is the host and sequencing backend. It evaluates each OIR
+  child exactly once in planned source order and returns the last non-null
+  value. Whitespace-only text between children is formatting and does not
+  replace the result. `let` bindings inside the region extend its lexical
+  child scope.
 
-* **`quote^(...)_quote`** — captures its body as an `OExpr` *without
-  evaluating it*. If the body is exactly one ExpressionNode, the
-  quoted AST is that node; otherwise the body is wrapped in a
-  synthetic O-node. The companion operator is `O.eval(expr)` available
+* **`quote^(...)_quote`** captures its OIR body as parseable O source without
+  evaluating any child. The resulting OExpr can be passed to `O.eval(expr)`
   inside Python blocks.
 
 ### 2.3 Homoiconicity: `quote^` + `O.eval`
@@ -123,8 +123,11 @@ current state. `O.quote(src_str)` parses a source fragment and returns
 it as an unevaluated `OExpr`, so Python code can build up O source
 programmatically and eval it.
 
-> **Current implementation note:** `O.eval(...)` evaluates the quoted fragment in a fresh document scope and does not inherit top-level `let` bindings from the enclosing document at the time of the call.
-> This is a known limitation — full scope semantics are planned.
+`O.eval(...)` receives a lexical snapshot of the O scope visible at the
+backend call site. The fragment can read caller `let` bindings, including
+bindings established earlier in the current typed expression. The fragment
+evaluates through OIR with a cloned root scope, so `let` bindings created by
+the callback do not mutate the caller.
 
 ### 2.4 Environment lifetime and forcing contract
 
@@ -132,15 +135,43 @@ Environment lifetime and request forcing are part of the stable language core:
 
 - A persistent environment is keyed by `(language, env_id)` and lives until the
   evaluator drops it or explicitly cleans it up.
-- Bare `lang^(...)_lang` blocks use the default persistent env for that
-  language unless the evaluator intentionally chooses an internal ephemeral env.
+- Bare `lang^(...)_lang` blocks are ephemeral. Explicit `lang[n]` blocks are
+  persistent.
 - `now(request)` forces exactly the named deferred computation.
 - `now(group)` resolves the group according to its `GroupMode`.
-- Under `Policy::Autonomous`, non-`Eval` requests are buffered first and forced
-  at explicit force points (`now(...)`, `autonomous(...)` exit, document end).
+- Under `Policy::Autonomous`, schedulable Nix requests and dry activation are
+  buffered first and forced at explicit force points (`now(...)`,
+  `autonomous(...)` exit, document end). Eval and real activation stay on the
+  evaluator thread because they require live process or authority state.
 - A backend counts as **pure** only when the runtime may safely reuse a cached
   result for identical `(body, deps, env)` input. Unknown backends are
   conservatively impure.
+
+### 2.5 Executable OIR and plan contract
+
+Every authoritative Rust execution entry point follows this path:
+
+```text
+.O source -> ONode -> OIrProgram -> validated ExecutionPlan -> OIR evaluator
+```
+
+This includes the `O` interpreter, REPL entries, notebook cells,
+`olangc --target script`, `o-link --run`, compiled hosted binaries, and source
+fragments received through `O.eval`.
+
+OIR instructions are `Text`, `Load`, `Store`, `Invoke`, and `Exec`. Each Exec
+owns a `BackendInterface` containing its canonical backend name, purity,
+splice renderer, and execution mode. Each Invoke owns an `InvokeMode` that is
+eager, lazy, autonomous, or one of the four group modes. Runtime dispatch,
+policy regions, and `{lazy}` cache validation use this embedded metadata rather
+than reconstructing policy from independent name tables after lowering.
+
+ExecutionPlan contains structural, sequence, and data edges. Before execution
+it MUST validate node identities, edge bounds, root coverage, root uniqueness,
+and graph acyclicity. The evaluator MUST obtain both top-level and direct-child
+execution order from the plan. Policy-changing Invoke instructions such as
+`lazy`, `autonomous`, `batch`, `all`, `any`, and `race` retain control over how
+their planned child regions are evaluated.
 
 ---
 
@@ -182,8 +213,9 @@ Two additional system-facing forms freeze the runtime boundary:
 ```
 
 - `OCapability` is an authority-bearing handle to a privileged resource (file,
-  memory region, device, clock, network endpoint, process, service). It is a
-  live token of access, not inert data.
+  memory region, device, clock, network endpoint, process, service, or system
+  activation). A live capability identity is an opaque bearer resolved through
+  a private session table. Metadata is descriptive and grants no authority.
 - `OSnapshot` is an inert observation of world state captured at a boundary
   (for example a system generation, service state, or filesystem view). It is
   the persistable counterpart to live references such as `OSystem`.
@@ -231,6 +263,23 @@ The runtime MUST preserve these invariants:
    boot-persistable system facts merely because they serialize.
 5. A future OS/runtime layer may add richer kinds, but must classify them into
    this same boundary model.
+
+### 3.0.1 System activation authority
+
+System activation has separate dry and mutating forms:
+
+```
+activate(store_path [, profile])
+activate(system_activation_capability, store_path [, profile])
+```
+
+The first form always runs `switch-to-configuration dry-activate`. The second
+form requests a real switch and MUST carry a live `system_activation`
+capability issued by the current Evaluator for the selected profile. The
+evaluator checks the private authority table when constructing the request and
+again when forcing it. A serialized, forged, revoked, cross-evaluator, or
+wrong-profile capability MUST be rejected before the perform boundary. Ambient
+environment variables MUST NOT grant activation authority.
 
 ### 3.1 Coordination groups
 
@@ -343,9 +392,6 @@ Two resolution modes are used internally:
   cache miss is a hard error. Used after `autonomous(...)` flush to verify the
   scheduler materialized every buffered request.
 
-A `CacheMode::Lenient` fallback (return unchanged on miss) exists for
-inspection/debugging but is not used in production resolution paths.
-
 #### Scheduler guarantees
 
 Under `autonomous(batch(…))`:
@@ -448,15 +494,28 @@ output is one rendering of that tree.
 | `nix_expr`   |         | Inline: captures body as lazy `ONixExpr` (deferred Nix eval). |
 | `nix_store`  |         | `backends/nix_store_shim.py`. Materialises a store path. |
 | `nixos_test` |         | `backends/nixos_test_shim.py`. NixOS integration test runner. |
-| `bash`       |         | `backends/bash_shim.py` (stub — returns code text). Replace with real executor. |
-| `shell`      |         | `backends/shell_shim.py` (stub). |
-| `rust`       |         | `backends/rust_shim.py` (stub). |
-| `racket`     |         | `backends/racket_shim.py` (stub). |
+| `bash`       |         | `backends/bash_shim.py`. Executes Bash and returns stdout. |
+| `shell`      |         | `backends/shell_shim.py`. Executes POSIX sh and returns stdout. |
+| `rust`       |         | `backends/rust_shim.py`. Compiles with rustc, runs, and returns stdout. |
+| `racket`     |         | `backends/racket_shim.py`. Executes Racket and returns stdout. |
+| `cpp`        |         | Compiles C++17 with g++, runs, and returns stdout. |
+| `csharp`     |         | Compiles and runs through .NET or Mono. |
+| `haskell`    |         | Executes through runghc or ghc. |
+| `lisp`       |         | Executes through Guile, Chicken, or Chez Scheme. |
+| `common_lisp`|         | Executes through SBCL, ECL, CLISP, or CCL. |
+| `sql`        |         | Executes against persistent in-memory SQLite per environment. |
+| `ruby`       |         | Executes with Ruby. |
+| `matlab`     |         | Executes with Octave or MATLAB. |
+| `mathematica`|         | Executes with WolframScript. |
+| `webassembly`|         | Converts WAT when needed and runs with Wasmtime or Wasmer. |
+| `java`       |         | Compiles with javac and runs with java. |
+| `javascript` |         | Executes with Node.js. |
+| `ocaml`      |         | Interprets or compiles with the OCaml toolchain. |
 
 ### Python reference implementation (`o_lang/`)
 
-Same tag set minus `nix_expr`, `nix_store`, `nixos_test`, stubs.  
-`quote` and `O` are structural backends implemented via `eval_ast`.  
+Same core tag set minus Rust-only orchestration extensions.
+`quote` and `O` are structural backends implemented via `eval_ast`.
 Let-bindings (`let NAME = LANG^(...)`) and `$var` substitution are supported.
 
 Adding a new language: write a Backend subclass, add it to
@@ -469,24 +528,24 @@ Adding a new language: write a Backend subclass, add it to
 
 * **`$var` splice** is supported for top-level `let` bindings in both runtimes.
   Variable references inside nested typed-expression bodies in the Rust runtime
-  work via the `scope` dict passed through `eval_typed_expr`. The Python ref
-  impl similarly threads scope through `_eval_expression`.
+  work through lexical scope passed into OIR `Exec`. The Python ref impl
+  similarly threads scope through `_eval_expression`.
 * **Async coordination.** `{lazy}` and `{defer}` attributes create
-  deferred Requests (Thunks) that are auto-forced when spliced or explicitly
-  forced via `now()`. `lazy(…)` and `autonomous(…)` switch the policy for their
-  argument. When `now(group)` is called, Nix-family Request members
-  (`Instantiate`, `Realise`, `Activate`) are dispatched as concurrent threads;
+  deferred Requests (Thunks). Lazy requests can be auto-forced by a splice;
+  deferred requests require explicit `now()`. `lazy(…)` and `autonomous(…)`
+  switch policy for their planned child region. When `now(group)` is called,
+  Nix-family Request members (`Instantiate`, `Realise`) and dry activation are
+  dispatched as concurrent threads; real activation remains evaluator-local;
   `any(…)` returns the first success, `race(…)` returns the first result
   (success or failure). Eval Requests and nested plain values resolve serially.
   Full cancellation and async I/O are future work.
-* **`O.eval` scope limitation.** `eval_source` (called on `O.eval`) creates a
-  fresh document scope; top-level `let` bindings from the calling document are
-  NOT visible inside the evaluated fragment. Variables in persistent backend
-  envs (Python subprocess globals) ARE accessible because they live in the
-  subprocess, not the Rust scope.
-* **Stub shims**: `bash`, `shell`, `rust`, `racket` are registered and parse
-  correctly, but their shims return the code text as `OStr` (not executed).
-  Real executor shims are future work.
+* **`O.eval` same-environment recursion.** The callback inherits a lexical
+  snapshot of caller O bindings and keeps callback writes local. A callback
+  cannot execute the same persistent backend environment that is currently
+  waiting for the callback result; nested backend work must use another
+  environment index.
+* **Optional runtime dependencies.** Executing shims report an explicit error
+  when their target interpreter or compiler is not installed locally.
 * **Python ref impl** (`o_lang/`): maintained as a readable reference and test
   harness. The Rust runtime is the authoritative implementation.
 

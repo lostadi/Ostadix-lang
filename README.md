@@ -453,6 +453,11 @@ The language boundary is not a barrier to metaprogramming. An O expression
 can be constructed in one language, moved as data through another, and
 evaluated by its named backend later.
 
+`O.eval` uses a lexical snapshot of the O scope visible at the backend call
+site. A quoted fragment can read caller `let` bindings, including bindings
+created earlier inside the current typed expression. New `let` bindings inside
+the fragment remain local to that callback and do not mutate the caller.
+
 ### 5. Orchestration and machine computation have different IRs
 
 Olang does not force every kind of computation into the same abstraction.
@@ -861,7 +866,8 @@ Olang models the Nix and NixOS path as a value chain:
 nix_expr^(...)_nix_expr -> ONixExpr
 instantiate($expr)       -> ODerivation
 realise($drv)            -> OStorePath
-activate($path)          -> OSystem
+activate($path)           -> OSystem by dry activation
+activate($cap, $path)     -> OSystem by real activation
 ```
 
 `nix^` remains the immediate evaluation form. `nix_expr^` captures Nix source
@@ -869,16 +875,23 @@ and its dependencies without evaluating it. `instantiate` uses `nix eval` to
 obtain a derivation, `realise` uses `nix build`, and `activate` invokes the
 closure's `switch-to-configuration` entry point.
 
-Real activation is guarded by `O_LANG_ALLOW_ACTIVATION=1`. Without that gate,
-the runtime forces `dry-activate`. `current_system()` returns the current
-profile as a referential OSystem value.
+`activate(path[, profile])` always uses `dry-activate`. A real switch requires
+`activate(capability, path[, profile])`, where the first value is a live
+`system_activation` OCapability issued by
+`Evaluator::issue_system_activation_capability(profile)` and explicitly placed
+in the program scope by the host. The capability is bound to one profile,
+checked when the request is built, checked again when it is forced, and can be
+revoked. No environment variable grants activation authority.
+
+`current_system()` returns the current profile as a referential OSystem value.
 
 ### Autonomous scheduling
 
-Inside `autonomous(...)`, non-Eval requests are buffered. At a force point,
-the scheduler constructs their dependency graph, executes ready Nix-family
-work concurrently up to its parallelism limit, and writes results to memory
-and disk caches.
+Inside `autonomous(...)`, schedulable Nix requests and dry activations are
+buffered. At a force point, the scheduler constructs their dependency graph,
+executes ready work concurrently up to its parallelism limit, and writes safe
+results to memory and disk caches. Eval requests and real activation stay on
+the evaluator thread because they require live process or authority state.
 
 ```O
 let result = autonomous(
@@ -923,11 +936,12 @@ built. Member order is significant and is part of the group fingerprint.
 |------|-----------------|-------------|
 | `instantiate(expr)` | ONixExpr to ODerivation | Instantiates a Nix derivation. |
 | `realise(drv)` | ODerivation to OStorePath | Builds the default derivation output. |
-| `activate(path)` | OStorePath to OSystem | Dry-activates or switches a NixOS closure through the safety gate. |
+| `activate(path[, profile])` | OStorePath to OSystem | Runs `dry-activate` without privileged authority. |
+| `activate(capability, path[, profile])` | OCapability and OStorePath to OSystem | Performs a real switch after validating a live profile-scoped capability. |
 | `current_system()` | none to OSystem | Returns the current system profile reference. |
 | `lazy(expr)` | any to ORequest or value | Evaluates under the lazy policy. |
 | `now(req)` | ORequest or OGroup to OValue | Forces deferred work. |
-| `autonomous(expr)` | any to OValue | Buffers and schedules non-Eval requests. |
+| `autonomous(expr)` | any to OValue | Buffers and schedules requests that do not require evaluator-local state. |
 | `batch(...)` | values or Requests to OGroup | Captures throughput topology. |
 | `all(...)` | values or Requests to OGroup | Captures an all-success barrier. |
 | `any(...)` | values or Requests to OGroup | Captures ordered fallback topology. |
@@ -1182,6 +1196,7 @@ Olang/
 │   ├── main.rs                 # O interpreter and REPL
 │   ├── parser.rs               # hosted typed-parenthesis parser
 │   ├── value.rs                # OValue and hosted wire protocol
+│   ├── capability.rs           # live bearer identity generation
 │   ├── ir.rs                   # OIR, ExecutionPlan, backend registry
 │   ├── eval.rs                 # evaluator and rendering semantics
 │   ├── process.rs              # persistent shim IPC
@@ -1223,7 +1238,10 @@ Runtime -> shim: {"cmd":"eval_result","value":{...}}
 ```
 
 The callback forms are what allow Python's `O.eval` to re-enter the O
-evaluator without starting a second unrelated document process.
+evaluator without starting a second unrelated document process. Each callback
+receives a snapshot of the O bindings visible at the call site. The snapshot is
+used as the callback's lexical root, so reads see caller bindings while new
+callback bindings do not leak into the caller.
 
 ### OIR and ExecutionPlan
 
@@ -1237,6 +1255,11 @@ Call         -> Invoke
 TypedExpr    -> Exec
 ```
 
+Every public hosted execution path lowers to OIR before it runs. `O`, the
+REPL, notebook cells, `olangc --target script`, linked programs, and recursive
+`O.eval` callbacks all enter the same OIR evaluator. There is no production
+ONode interpreter beside it.
+
 The ExecutionPlan adds three kinds of graph edge:
 
 - Structural edges connect child expressions to the expressions receiving
@@ -1244,10 +1267,21 @@ The ExecutionPlan adds three kinds of graph edge:
 - Sequence edges preserve left-to-right document semantics.
 - Data edges connect `$name` loads to the latest visible `let name` store.
 
-BackendInterface records canonical names, aliases, purity, splice rendering,
-execution mode, and shim resolution. `olangc --target ir` prints the lowered
-program and plan so the orchestration layer can be inspected independently of
-evaluation.
+BackendRegistry records aliases and shim resolution. BackendInterface freezes
+the canonical name, purity, splice renderer, and execution mode into each OIR
+`Exec` instruction. Before execution, the plan validates node identities, root
+coverage, edge bounds, and acyclicity, then produces the stable
+topological root schedule and direct-child schedules used by every `Store`,
+`Invoke`, and `Exec`. The most recent runtime plan is available through
+`Evaluator::last_execution_plan()`.
+
+`Invoke` is also typed during lowering as eager, lazy, autonomous, or a
+specific coordination-group mode. The evaluator does not rediscover special
+form policy from an unrelated name table after planning.
+
+`olangc --target ir` prints the same executable program and plan used by the
+runtime. It is an inspection target for the execution engine, not a parallel
+analysis representation.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.
@@ -1508,12 +1542,21 @@ The exported `kernel_syscall_dispatch` implements checked debug output today.
 It validates the generation-tagged handle and `RIGHT_DEBUG_WRITE` before
 touching the serial object.
 
-On the hosted side, `CapabilityBroker<T>` binds an unpredictable per-session
-OCapability identity to a kernel-issued handle, capability kind, and rights.
-Before invoking its `KernelSyscallTransport`, the broker verifies that the
-identity belongs to the live session and that the kind and rights match. A
-deserialized, forged, revoked, or cross-session identity never becomes a
-kernel handle.
+On the hosted side, `CapabilityBroker<T>` binds a 256-bit per-session bearer
+identity from the operating system CSPRNG to a kernel-issued handle,
+capability kind, and rights. Before invoking its `KernelSyscallTransport`, the
+broker verifies that the identity belongs to the live session and that the
+kind and rights match. A guessed, deserialized, forged, revoked, or
+cross-session identity never becomes a kernel handle. Serialized metadata is
+descriptive and cannot add rights or choose a kernel slot.
+
+The threat boundary is explicit. The broker prevents identity guessing,
+metadata-based escalation, stale token use, revocation bypass, and
+cross-session replay. It does not protect against theft of a still-live bearer
+inside the same broker session, compromise of the broker process, or
+compromise of the authenticated kernel transport. Possession of a live bearer
+is delegation, so callers must keep the token inside the intended trust domain
+and revoke it when that delegation ends.
 
 This is the bridge between OValue's authority-bearing hosted form and the
 kernel's actual capability table. The transport can be implemented by a
@@ -1643,12 +1686,16 @@ O-core as the freestanding systems language.
 - The complete current OValue sum type, JSON wire protocol, content identity,
   runtime-boundary classification, and persistence checks.
 - `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
+- Lexical scope snapshots for `O.eval`, including caller binding visibility
+  without callback writes leaking into the caller.
 - Lazy and deferred Eval requests with purity validation and caching rules.
 - The ONixExpr, ODerivation, OStorePath, and OSystem lattice.
 - Autonomous dependency scheduling with memory and disk caches.
 - Batch, all, any, and race coordination groups with distinct failure
   semantics and nested groups.
-- OIR lowering, backend interfaces, and ExecutionPlan graph construction.
+- OIR as the hosted execution engine, with embedded backend interfaces,
+  typed invocation policy, validated ExecutionPlan graphs, planned root and
+  child scheduling, structural regions, and runtime plan inspection.
 - Real hosted shims for the registered backend table.
 - Interpreter, REPL, local notebook, native and WASI `olangc` targets,
   script execution, OIR dumps, `o-link`, and `o-unlink`.
@@ -1661,26 +1708,31 @@ O-core as the freestanding systems language.
   serial output, physical page allocation, IDT, PIC, PIT, timer interrupt,
   atomic tick, and `iretq`.
 - Generation-tagged kernel capabilities, rights validation, checked syscall
-  dispatch, and hosted OCapability broker binding.
+  dispatch, 256-bit live bearer identities, and hosted OCapability broker
+  binding.
+- Revocable, profile-scoped `system_activation` capabilities for real NixOS
+  activation, with dry activation remaining unprivileged.
 
 ### Current boundaries
 
 These are the boundaries of the current implementation, not descriptions of
 features that are already present:
 
-- `O.eval` reuses live backend environments but evaluates quoted source with a
-  fresh O-level `let` scope. Persistent Python globals remain visible;
-  top-level O bindings from the caller do not.
+- `O.eval` uses a lexical snapshot of caller O bindings and reuses live backend
+  environments. A callback cannot recursively execute the same persistent
+  backend environment that is currently waiting for its result; use a
+  different environment index for that nested block.
 - Concurrent group dispatch currently applies to threadable Nix-family
-  requests. Eval requests preserve the single evaluator thread. Race selects
-  a winner but does not cancel already-running loser work.
-- The evaluator executes ONode directly. OIR and ExecutionPlan are implemented
-  and inspectable, but OIR is not yet the evaluator's execution engine.
+  requests and dry activation. Eval requests and real activation preserve the
+  single evaluator thread. Race selects a winner but does not cancel
+  already-running loser work.
 - `olangc` bundles the core Python and Nix shims by default. Programs using
   additional hosted shims should compile with `--shim-dir backends` so those
   shims are embedded as well.
 - The C17 and Python editions implement their documented subsets and are not
-  feature-identical to the authoritative Rust runtime.
+  feature-identical to the authoritative Rust runtime. The C17 native port
+  keeps activation dry-only; live `system_activation` authority is implemented
+  in the Rust evaluator.
 - O-core currently targets x86_64 only and uses a stack-spill backend without
   optimization or register allocation.
 - O-core direct calls are implemented. Function-pointer types are represented,

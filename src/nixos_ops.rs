@@ -8,12 +8,11 @@
 // implements the StorePath → System transition: applying a built NixOS
 // system closure to a profile and switching the live system to it.
 //
-// SAFETY POSTURE: dry-run is the default. The Activate Request constructed
-// from an `activate(...)` call in O-lang carries `dry_run: true` unless the
-// caller explicitly sets it false. AND the actual subprocess invocation is
-// further gated by the environment variable `O_LANG_ALLOW_ACTIVATION=1`.
-// Two layers of opt-in for an operation that can reboot the user's machine
-// or take it offline.
+// SAFETY POSTURE: dry-run is the unprivileged default. A real switch can reach
+// this boundary only through Evaluator::exec_activate after a live,
+// profile-scoped SystemActivation capability has been resolved through the
+// evaluator's private authority table. This module does not read ambient
+// environment variables as authority.
 //
 // STEP5 additions (each with its own safety surface):
 //   - rollback to a prior generation
@@ -23,15 +22,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
-use std::env;
 use std::process::{Command, Stdio};
 
 use crate::value::OValue;
-
-/// The env var that gates real (non-dry-run) activation, even when the
-/// Activate Request itself asks for `dry_run: false`. If unset, every
-/// activation is forced to dry-run mode with a printed warning.
-const ACTIVATION_GATE_ENV: &str = "O_LANG_ALLOW_ACTIVATION";
 
 /// Apply a system closure to a profile.
 ///
@@ -44,9 +37,10 @@ const ACTIVATION_GATE_ENV: &str = "O_LANG_ALLOW_ACTIVATION";
 ///
 /// `dry_run` controls the subprocess argument: when true, we pass
 /// `switch-to-configuration dry-activate`, which logs what would happen
-/// without applying. When false AND the env-var gate is set, we pass
-/// `switch-to-configuration switch`, the real thing.
-pub fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OValue> {
+/// without applying. When false, we pass `switch-to-configuration switch`.
+/// The caller is responsible for validating live authority before invoking
+/// the real path; this function is crate-private to keep that boundary narrow.
+pub(crate) fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OValue> {
     // ── Type check: only StorePath sources are accepted ──────────────────────
     let store_path = match source {
         OValue::StorePath { path } => path.clone(),
@@ -74,25 +68,7 @@ pub fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OVa
         );
     }
 
-    // ── Decide effective action based on gate env var ────────────────────────
-    let gate_set = env::var(ACTIVATION_GATE_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let effective_action = if dry_run {
-        "dry-activate"
-    } else if !gate_set {
-        // Caller asked for real activation but the env-var gate is unset.
-        // Force dry-run with a loud warning.
-        eprintln!(
-            "warning: activate() was called with dry_run=false, but the safety \
-             gate {ACTIVATION_GATE_ENV}=1 is NOT set. Forcing dry-activate. \
-             To actually switch the system, run with {ACTIVATION_GATE_ENV}=1."
-        );
-        "dry-activate"
-    } else {
-        "switch"
-    };
+    let effective_action = if dry_run { "dry-activate" } else { "switch" };
 
     // ── Invoke switch-to-configuration ───────────────────────────────────────
     eprintln!(
@@ -127,9 +103,8 @@ pub fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OVa
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 //
-// Real-activation tests are #[ignore]'d — they require a NixOS system AND
-// O_LANG_ALLOW_ACTIVATION=1. The unit tests cover the type-check and gate
-// logic without spawning subprocesses.
+// The integration smoke test is ignored because it requires a NixOS system.
+// Unit tests cover the type boundary without spawning subprocesses.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -177,10 +152,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a NixOS system AND O_LANG_ALLOW_ACTIVATION=1"]
-    fn activate_actually_switches_when_gate_is_set() {
-        // To run: O_LANG_ALLOW_ACTIVATION=1 cargo test --ignored \
-        //         activate_actually_switches_when_gate_is_set
+    #[ignore = "requires a NixOS system"]
+    fn dry_activation_smoke_test_on_nixos() {
         //
         // This is the smoke test for the real path. It assumes the current
         // system's profile is already valid and asks for a dry-run, so it's

@@ -4,12 +4,19 @@
 //! or kernel handle. A process-local broker resolves an unpredictable bearer
 //! token through its private binding table and sends only the bound u64 handle
 //! over an authenticated transport for the corresponding kernel session.
+//!
+//! Threat boundary:
+//! - Prevented: guessed identities, serialized forgeries, metadata-based rights
+//!   escalation, stale or revoked tokens, and cross-session token replay.
+//! - Not prevented: theft of a still-live bearer inside the same broker
+//!   session, compromise of the broker process, or compromise of the
+//!   authenticated kernel transport. Bearer possession is delegation.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 
 use anyhow::{bail, Result};
 
+use crate::capability::fresh_bearer_identity;
 use crate::value::{CapabilityKind, OValue};
 
 pub const RIGHT_DEBUG_WRITE: u64 = 1 << 0;
@@ -41,8 +48,6 @@ struct Binding {
 pub struct CapabilityBroker<T> {
     transport: T,
     bindings: HashMap<String, Binding>,
-    random: std::collections::hash_map::RandomState,
-    next_ticket: u64,
 }
 
 impl<T: KernelSyscallTransport> CapabilityBroker<T> {
@@ -50,8 +55,6 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
         Self {
             transport,
             bindings: HashMap::new(),
-            random: std::collections::hash_map::RandomState::new(),
-            next_ticket: 1,
         }
     }
 
@@ -63,14 +66,9 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
         handle: u64,
         rights: u64,
         mut metadata: HashMap<String, OValue>,
-    ) -> OValue {
+    ) -> Result<OValue> {
         let identity = loop {
-            let ticket = self.next_ticket;
-            self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
-            let mut hasher = self.random.build_hasher();
-            hasher.write_u64(ticket);
-            hasher.write_u64(handle);
-            let identity = format!("ocore-live:{:016x}", hasher.finish());
+            let identity = fresh_bearer_identity("ocore-live")?;
             if !self.bindings.contains_key(&identity) {
                 break identity;
             }
@@ -84,7 +82,7 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
                 rights,
             },
         );
-        OValue::capability(kind, identity, metadata)
+        Ok(OValue::capability(kind, identity, metadata))
     }
 
     pub fn invoke(
@@ -152,12 +150,14 @@ mod tests {
     #[test]
     fn bound_ocapability_resolves_to_kernel_handle() {
         let mut broker = CapabilityBroker::new(RecordingTransport::default());
-        let capability = broker.bind(
-            CapabilityKind::Service,
-            (3u64 << 32) | 9,
-            RIGHT_DEBUG_WRITE,
-            HashMap::new(),
-        );
+        let capability = broker
+            .bind(
+                CapabilityKind::Service,
+                (3u64 << 32) | 9,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
         let result = broker
             .invoke(
                 &capability,
@@ -193,12 +193,14 @@ mod tests {
     #[test]
     fn rights_are_checked_before_transport() {
         let mut broker = CapabilityBroker::new(RecordingTransport::default());
-        let capability = broker.bind(
-            CapabilityKind::MemoryRegion,
-            (1u64 << 32) | 2,
-            RIGHT_PAGE_ALLOC,
-            HashMap::new(),
-        );
+        let capability = broker
+            .bind(
+                CapabilityKind::MemoryRegion,
+                (1u64 << 32) | 2,
+                RIGHT_PAGE_ALLOC,
+                HashMap::new(),
+            )
+            .unwrap();
         assert!(broker
             .invoke(
                 &capability,
@@ -209,5 +211,37 @@ mod tests {
             )
             .is_err());
         assert!(broker.transport().calls.is_empty());
+    }
+
+    #[test]
+    fn live_identity_has_256_bits_and_is_session_local() {
+        let mut first = CapabilityBroker::new(RecordingTransport::default());
+        let capability = first
+            .bind(
+                CapabilityKind::Service,
+                (2u64 << 32) | 4,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
+        let OValue::Capability { identity, .. } = &capability else {
+            panic!("bind must return a capability")
+        };
+        assert!(identity.starts_with("ocore-live:"));
+        assert_eq!(identity.len(), "ocore-live:".len() + 64);
+
+        let mut second = CapabilityBroker::new(RecordingTransport::default());
+        let err = second
+            .invoke(
+                &capability,
+                CapabilityKind::Service,
+                RIGHT_DEBUG_WRITE,
+                SYS_DEBUG_WRITE,
+                [0; 5],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another session"));
+        assert!(second.transport().calls.is_empty());
     }
 }

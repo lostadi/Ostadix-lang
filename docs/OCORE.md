@@ -188,9 +188,10 @@ separate interrupt-safe allocator exists.
 
 ## 9. Capabilities and syscalls
 
-`OCapability` on the hosted side is a description, not authority. Authority is
-represented in the kernel by an unforgeable `(slot, generation)` handle tied
-to a per-process capability table:
+A generic or deserialized `OCapability` is not kernel authority. An
+`OCapability` emitted by a live hosted broker is a bearer for a private session
+binding. Kernel authority itself is represented by an unforgeable
+`(slot, generation)` handle tied to a per-process capability table:
 
 ```text
 CapabilityEntry = { object_id, object_type, rights, generation, occupied }
@@ -215,11 +216,19 @@ The hosted `OCapability` wire value may refer to a live kernel capability only
 through an authenticated transport endpoint. Its string `identity` is never
 accepted directly as a kernel handle.
 
-The hosted `CapabilityBroker` implements this boundary. It keeps a private
-per-session token-to-handle table, verifies capability kind and rights before
-transport, and forwards only the bound generation-tagged u64 handle to a
+The hosted `CapabilityBroker` implements this boundary. It generates 256-bit
+bearer identities from operating-system entropy, keeps a private per-session
+token-to-handle table, verifies capability kind and rights before transport,
+and forwards only the bound generation-tagged u64 handle to a
 `KernelSyscallTransport`. Deserialized identities not already bound in that
-live broker session are rejected as forged or stale.
+live broker session are rejected as forged or stale. Metadata cannot select a
+slot or add rights.
+
+This prevents guessing, serialized forgery, metadata-based escalation, stale
+or revoked token use, and cross-session replay. It does not prevent theft of a
+still-live bearer inside the same broker session, broker-process compromise,
+or authenticated-transport compromise. Possession of a live bearer is an
+explicit delegation of its bounded authority.
 
 ## 10. Hosted foreign-language boundary
 

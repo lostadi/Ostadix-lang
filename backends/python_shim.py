@@ -55,7 +55,11 @@ class _OMod:
         the O source fragment and replies with an ``eval_result`` command.
         The function then returns the result as a Python value.
 
-        Limitation: ``O.eval(q)`` cannot be used if ``q`` contains a
+        The O fragment sees a lexical snapshot of the O bindings visible at
+        this backend call site. Bindings created by the fragment remain local
+        to that evaluation.
+
+        ``O.eval(q)`` cannot be used if ``q`` contains a
         reference to the same persistent env that is currently executing
         (e.g. ``python[0]^(...)_python[0]`` inside another
         ``python[0]^(...)_python[0]`` block), as this would deadlock the

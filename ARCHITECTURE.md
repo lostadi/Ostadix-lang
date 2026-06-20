@@ -39,50 +39,71 @@ O-lang/
 
 ## Evaluation Pipeline
 
-O-lang processes code through a 5-stage pipeline:
+O-lang processes hosted code through a 6-stage pipeline:
 
 1. **Parse** — Tokenize source into typed expression trees. Each expression
    carries a language tag (e.g., `python`, `html`, `nix`).
 
-2. **Evaluate** — Recursively evaluate inner expressions first (applicative
-   order). Child results become available to parent expressions.
+2. **Lower** — Convert the syntax-only `ONode` forest to executable OIR.
+   Every `Exec` instruction freezes the backend's canonical identity, purity,
+   splice renderer, and dispatch mode.
 
-3. **Render** — Convert child `OValue` results into the parent language's
-   native syntax for interpolation.
+3. **Plan** — Build and validate `ExecutionPlan`. Structural edges connect
+   children to parents, sequence edges preserve source order, and data edges
+   connect loads to their visible stores.
 
-4. **Dispatch** — Send the rendered source to the appropriate backend shim
-   as a subprocess, communicating via JSON over stdin/stdout.
+4. **Execute** — Interpret OIR through the plan's stable topological root
+   schedule. Structural OIR regions implement `O` and `quote`; ordinary
+   execution regions build splice buffers from child OValues.
 
-5. **Cache** — Memoize expensive operations (especially Nix
-   instantiate/realise) to avoid redundant work.
+5. **Render and dispatch** — Convert child values with the renderer embedded
+   in OIR, then run an inline value handler or send source to a backend shim.
+
+6. **Schedule and cache** — Request values created by OIR carry compositional
+   fingerprints. The eager executor and autonomous scheduler apply the cache
+   and dependency semantics selected by the OIR operation.
 
 ## Intermediate Representation (OIR)
 
-`src/ir.rs` now provides the canonical execution-planning surface — a stable
-seam between syntax (`ONode`), lowered instructions (`OIr`), dependency-graph
-planning (`ExecutionPlan`), runtime values (`OValue`), and typed backend
-interfaces (`BackendSpec` / `BackendInterface`):
+`src/ir.rs` is the canonical hosted execution surface. It is the seam between
+syntax (`ONode`), executable instructions (`OIr`), dependency planning
+(`ExecutionPlan`), runtime values (`OValue`), and typed backend interfaces
+(`BackendSpec` / `BackendInterface`):
 
-- **`OIr` / `OIrProgram`** — a lowered, backend-neutral form of a parsed
-  program. Lowering (`OIrProgram::lower`) is a 1:1 structural mapping of
-  the `ONode` forest: `RawText → Text`, `VarRef → Load`,
-  `LetBinding → Store`, `Call → Invoke`, `TypedExpr → Exec`.
-- **`ExecutionPlan`** — the dependency graph built from OIR. Structural
-  edges encode child → parent evaluation dependencies, sequence edges preserve
+- **`OIr` / `OIrProgram`** is the executable form of a parsed program.
+  Lowering maps `RawText` to `Text`, `VarRef` to `Load`, `LetBinding` to
+  `Store`, `Call` to `Invoke`, and `TypedExpr` to `Exec`. `Exec` also owns a
+  `BackendInterface`, so runtime dispatch cannot drift from OIR analysis.
+  `Invoke` owns an `InvokeMode`, so eager, lazy, autonomous, and group policy
+  is decided during lowering rather than rediscovered by the evaluator.
+- **`ExecutionPlan`** is the validated dependency graph built from OIR.
+  Structural edges encode child to parent dependencies, sequence edges preserve
   left-to-right order, and data edges connect `load $x` to the latest visible
-  `store $x`. This is the designated home for batching, scheduling, purity-
-  aware reordering, and future code generation.
-- **`BackendSpec` / `BackendRegistry`** — centralized backend metadata:
+  `store $x`. It rejects invalid identities, out-of-bounds edges, duplicated
+  roots, and cycles, then provides the stable topological root schedule and
+  direct-child schedules used by the evaluator.
+- **`BackendSpec` / `BackendRegistry`** provides centralized backend metadata:
   purity (whether `{lazy}` may cache results), the splice-rendering
   strategy used by `render_child`, typed dispatch mode (`inline_ast`,
   `inline_value`, `shim`), and shim path resolution
   (`<dir>/<lang>_shim.py`, `<dir>/<lang>_shim`, `<dir>/<lang>.py`,
   `<dir>/<lang>`, in that order).
 
-The evaluator still walks `ONode` directly today, but OIR plus
-`ExecutionPlan` is the contract future schedulers, compilers, and OS-facing
-runtimes must target. There is deliberately no SSA or optimizer yet; the value
-of the layer is that planning decisions are now explicit rather than implicit.
+`Evaluator::eval_document` and `eval_document_with_scope` lower immediately to
+OIR and call the same OIR engine used by `eval_ir_program`. No production path
+interprets `ONode`. `O.eval` callbacks re-enter through the parser, lower to a
+new OIR program, validate its plan, and execute it through the same engine. The
+callback root scope is a clone of the O bindings visible at the backend call
+site. Reads therefore have lexical visibility, while callback `let` bindings
+cannot mutate the caller. The evaluator retains the most recent validated plan
+through `last_execution_plan()` for inspection and tests.
+
+OIR remains intentionally distinct from SSA. Recursive OIR regions preserve
+lexical scope and policy-changing special forms such as `lazy`, `autonomous`,
+and coordination groups. Every `Store`, `Invoke`, and `Exec` maps its direct
+OIR children to plan identities before execution. The plan expresses legal
+dependency order, while runtime Request values carry fingerprints into the
+eager executor or autonomous scheduler.
 
 O-core does not lower into this representation. Native `.oc` files use the
 separate `AST -> typed HIR -> SSA MIR -> object` pipeline under `src/ocore/`.
@@ -122,6 +143,19 @@ The runtime boundary is intentionally split:
 - **Effectful values** carry authority or orchestration meaning and must be
   handled explicitly by schedulers and persistence layers.
 
+Live OCapabilities are not validated from their serialized fields. The hosted
+O-core `CapabilityBroker` maps a 256-bit operating-system-random bearer to a
+kernel generation-tagged handle in a private session table, then checks kind
+and rights before transport. The evaluator uses the same rule for hosted
+system activation: a private table maps a live bearer to one authorized
+profile. Capability metadata is descriptive only.
+
+Unprivileged `activate(path[, profile])` constructs a dry activation request.
+Mutating `activate(capability, path[, profile])` requires a live
+`system_activation` bearer and is checked both at construction and at force
+time. Real activation stays on the evaluator thread rather than entering the
+autonomous disk-cached scheduler.
+
 ## Backend Shims
 
 Each supported language has a shim script in `backends/` that:
@@ -129,13 +163,12 @@ Each supported language has a shim script in `backends/` that:
 - Evaluates the expression in the target language
 - Writes JSON output to stdout
 
-Shims exist for: Python, Bash, Shell, Nix, `nix_store`, `nixos_test`, Racket,
+Shims exist for Python, Bash, Shell, Nix, `nix_store`, `nixos_test`, Racket,
 Rust, C#, C++, Haskell, Lisp, Common Lisp, SQL, Ruby, MATLAB, Mathematica,
-WebAssembly, Java, JavaScript, and OCaml. The fully executing backends are
-Python and the Nix family; `html`, `markdown`, `latex`, `text`, `quote`,
-`nix_expr`, and `O` are handled inline by the evaluator (no subprocess), and
-the remaining shims are parse-only stubs. See the backend table in README.md
-for per-backend status.
+WebAssembly, Java, JavaScript, and OCaml. These are executing adapters for
+their local runtimes. `html`, `markdown`, `latex`, `text`, `quote`,
+`nix_expr`, and `O` are handled inline without a subprocess. See the backend
+table in README.md for runtime requirements.
 
 ## Building & Testing
 
@@ -155,11 +188,12 @@ bash test_o_lang_examples.sh
 
 ## Compiler Targets (`olangc`)
 
-`olangc` supports three compilation targets, selected via `--target`:
+`olangc` supports four compilation targets, selected via `--target`:
 
 | Target   | Flag              | Output                              |
 |----------|-------------------|-------------------------------------|
 | `binary` | `--target binary` | Native ELF/Mach-O binary on disk    |
+| `wasm`   | `--target wasm`   | `wasm32-wasip1` module on disk     |
 | `script` | `--target script` | In-process execution (no disk file) |
 | `ir`     | `--target ir`     | Lowered OIR dump on stdout          |
 
@@ -167,14 +201,18 @@ bash test_o_lang_examples.sh
 bundles the .O source, runtime, and backend shims, then compiles it with
 `cargo build --release`.  The result is a self-contained native binary.
 
-**Target B — Script**: parses and evaluates the .O program directly inside
+**Target B — WASI**: generates the same hosted runtime project for
+`wasm32-wasip1`. Programs remain subject to the subprocess facilities exposed
+by their WASI host.
+
+**Target C — Script**: parses and evaluates the .O program directly inside
 the `olangc` process.  The evaluator machine code is already loaded into
 executable memory as part of the running `olangc` binary — calling it is
 semantically equivalent to emitting code into an `mmap`'d executable buffer
 and invoking a function pointer.  No intermediate build step or disk binary
 is produced.
 
-**Target C — IR**: parses the program with the same front end, lowers the
+**Target D — IR**: parses the program with the same front end, lowers the
 `ONode` forest to OIR (`src/ir.rs`), and prints the lowered program to
 stdout.  A debugging/inspection target — nothing is executed and no output
 file is produced.
@@ -183,10 +221,13 @@ file is produced.
 # Compile to a binary (Target A)
 cargo run --bin olangc -- examples/hello.O -o hello
 
-# Execute in-process (Target B)
+# Compile to WASI (Target B)
+cargo run --bin olangc -- examples/hello.O --target wasm -o hello.wasm
+
+# Execute in-process (Target C)
 cargo run --bin olangc -- examples/hello.O --target script
 
-# Dump the lowered OIR (Target C)
+# Dump the lowered OIR (Target D)
 cargo run --bin olangc -- examples/hello.O --target ir
 ```
 

@@ -58,6 +58,9 @@ semver      = { version = "1", features = ["serde"] }
 sha2        = "0.10"
 hex         = "0.4"
 
+# Operating-system entropy for live bearer capability identities
+getrandom   = "0.4.3"
+
 # Typed errors with zero boilerplate
 thiserror   = "2"
 anyhow      = "1"

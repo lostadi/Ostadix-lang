@@ -1,13 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // olangc — the O-lang compiler
 //
-// Compiles a .O source file into either a self-contained native binary
-// (Target A, the default) or executes it directly in-process (Target B,
-// "script" mode).
+// Compiles a .O source file to a hosted native or WASI binary, executes its
+// OIR directly in-process, or prints that same executable OIR and plan.
 //
 // Usage:
 //   olangc <input.O>                              # binary target (default)
 //   olangc <input.O> -o myprogram                 # explicit output name
+//   olangc <input.O> --target wasm                # wasm32-wasip1
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
@@ -35,21 +35,19 @@
 //   tool itself.  At runtime it still needs the language runtimes that the .O
 //   program uses — Python for python^ blocks, Nix for nix^ blocks, etc.
 //
-// Target B ("script"):
-//   Parses and evaluates the .O program directly inside the olangc process
-//   using the same runtime that is linked into olangc at compile time.  No
-//   intermediate Cargo project or disk binary is produced.  The machine code
-//   that runs the evaluator is the already-compiled code inside the olangc
-//   binary itself — it is loaded into executable memory by the OS loader and
-//   invoked through a function pointer to the evaluator entry point, giving
-//   the same semantics as emitting code into an mmap'd executable buffer and
-//   calling it.
+// Target B ("wasm"):
+//   Generates the same hosted runtime project for wasm32-wasip1.
 //
-// Target C ("ir"):
+// Target C ("script"):
+//   Parses, lowers to OIR, validates ExecutionPlan, and executes the plan
+//   directly inside the olangc process. No intermediate project or output
+//   binary is produced.
+//
+// Target D ("ir"):
 //   Parses the .O program, lowers the ONode forest to the OIR intermediate
 //   representation (src/ir.rs), builds the canonical ExecutionPlan dependency
-//   graph from that OIR, and prints both to stdout. A debugging/inspection
-//   target — no execution, no disk output.
+//   graph from that OIR, and prints both to stdout. This is the same OIR the
+//   script and generated-binary runtimes execute.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -74,6 +72,7 @@ use o_lang::value::OValue;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
+const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
 const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
@@ -121,18 +120,18 @@ const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
 
 /// Compilation target: the small internal CompileTarget abstraction.
 /// Each variant selects one end-to-end pipeline over the shared front end
-/// (read source → parse → …): native codegen via Cargo, in-process
-/// evaluation, or an OIR dump.
+/// (read source → parse → OIR): native codegen via Cargo, in-process OIR
+/// execution, or an executable OIR dump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CompileTarget {
     /// Compile to a self-contained native binary on disk (ELF/Mach-O).
     Binary,
     /// Compile to a WebAssembly (WASI) binary on disk.
     Wasm,
-    /// Execute the program directly inside the olangc process (script mode).
+    /// Execute the lowered and planned OIR inside the olangc process.
     Script,
     /// Lower the parsed program to OIR, build its ExecutionPlan, and print
-    /// both to stdout (debug/inspection; no execution).
+    /// both to stdout without executing them.
     Ir,
 }
 
@@ -141,12 +140,11 @@ enum CompileTarget {
     name = "olangc",
     about = "Compile or run a .O program",
     long_about = "\
-Compiles a .O source file into a native binary (--target binary, the default) \
-or executes it directly in-process (--target script).  In binary mode the \
-output embeds the program source, all backend shim scripts, and the O-lang \
-runtime.  In script mode the program is parsed and evaluated immediately \
-inside the olangc process with no disk output.  In ir mode the program is \
-parsed, lowered to OIR, planned as an ExecutionPlan, and printed."
+Compiles a .O source file into a native binary (--target binary, the default), \
+a wasm32-wasip1 module (--target wasm), or executes executable OIR in-process \
+(--target script). Binary outputs embed the program source, backend shims, and \
+the O-lang runtime. In ir mode the same OIR and ExecutionPlan used at runtime \
+are printed without execution."
 )]
 struct Cli {
     /// The .O source file to compile or run
@@ -169,7 +167,7 @@ struct Cli {
     shim_dir: Option<PathBuf>,
 
     /// Keep the intermediate build directory after compilation (useful for
-    /// debugging; only relevant for --target binary)
+    /// debugging; relevant for binary and wasm targets)
     #[arg(long)]
     keep_build_dir: bool,
 }
@@ -252,6 +250,7 @@ fn compile_to_binary(
 
     // ── Runtime source files ─────────────────────────────────────────────────
     fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
+    fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
     fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
     fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
@@ -498,6 +497,7 @@ fn generate_lib_rs() -> String {
 // calls them directly.
 
 pub mod value;
+mod capability;
 pub mod parser;
 pub mod ir;
 pub mod eval;
@@ -655,6 +655,7 @@ which      = "6"
 semver     = {{ version = "1", features = ["serde"] }}
 sha2       = "0.10"
 hex        = "0.4"
+getrandom  = "0.4.3"
 thiserror  = "2"
 anyhow     = "1"
 clap       = {{ version = "4", features = ["derive"] }}
