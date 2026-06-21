@@ -1293,13 +1293,18 @@ impl<'a> BodyChecker<'a> {
                 let mut operands = Vec::new();
                 for operand in &asm.operands {
                     operands.push(match operand {
-                        ast::AsmOperand::In { register, value } => HirAsmOperand::In {
-                            register: register.clone(),
-                            value: self.check_expr(value, None)?,
-                        },
+                        ast::AsmOperand::In { register, value } => {
+                            let value = self.check_expr(value, None)?;
+                            self.require_asm_operand_type(value.ty, value.span)?;
+                            HirAsmOperand::In {
+                                register: register.clone(),
+                                value,
+                            }
+                        }
                         ast::AsmOperand::Out { register, target } => {
                             let target = self.check_expr(target, None)?;
                             self.ensure_place(&target, true)?;
+                            self.require_asm_operand_type(target.ty, target.span)?;
                             HirAsmOperand::Out {
                                 register: register.clone(),
                                 target,
@@ -1314,6 +1319,8 @@ impl<'a> BodyChecker<'a> {
                             let output = self.check_expr(output, Some(input.ty))?;
                             self.ensure_place(&output, true)?;
                             self.expect_assignable(output.ty, input.ty, output.span)?;
+                            self.require_asm_operand_type(input.ty, input.span)?;
+                            self.require_asm_operand_type(output.ty, output.span)?;
                             HirAsmOperand::InOut {
                                 register: register.clone(),
                                 input,
@@ -1341,6 +1348,16 @@ impl<'a> BodyChecker<'a> {
             ty,
             span: expr.span,
         })
+    }
+
+    fn require_asm_operand_type(&self, ty: TypeId, span: Span) -> TcResult<()> {
+        if !self.program.types.is_scalar(ty) || self.program.types.is_float(ty) {
+            return Err(self.error(
+                span,
+                "inline assembly operands require non-floating scalar types",
+            ));
+        }
+        Ok(())
     }
 
     fn check_path(&mut self, span: Span, path: &[String]) -> TcResult<HirExpr> {
@@ -1464,6 +1481,9 @@ impl<'a> BodyChecker<'a> {
             return Err(self.error(span, "v0.1 supports direct function calls only"));
         };
         let function = self.program.functions[function_id].clone();
+        if function.abi == ast::Abi::Interrupt {
+            return Err(self.error(span, "interrupt handlers cannot be called directly"));
+        }
         if function.unsafe_ {
             self.require_unsafe(
                 span,
@@ -1531,6 +1551,12 @@ impl<'a> BodyChecker<'a> {
                 let Type::Pointer { pointee, .. } = self.program.types.types[arg.ty] else {
                     return Err(self.error(arg.span, "volatile_load requires a pointer"));
                 };
+                if !self.program.types.is_scalar(pointee) {
+                    return Err(self.error(
+                        arg.span,
+                        "volatile_load currently requires a scalar pointee",
+                    ));
+                }
                 return Ok(HirExpr {
                     kind: HirExprKind::Intrinsic {
                         intrinsic,
@@ -1552,6 +1578,12 @@ impl<'a> BodyChecker<'a> {
                 else {
                     return Err(self.error(ptr.span, "volatile_store requires a mutable pointer"));
                 };
+                if !self.program.types.is_scalar(pointee) {
+                    return Err(self.error(
+                        ptr.span,
+                        "volatile_store currently requires a scalar pointee",
+                    ));
+                }
                 let value = self.check_expr(&args[1], Some(pointee))?;
                 self.expect_assignable(value.ty, pointee, value.span)?;
                 return Ok(HirExpr {
@@ -1960,15 +1992,15 @@ fn validate_function_attrs(
             "floating-point values are forbidden across the v0.1 sysv64 ABI",
         ));
     }
-    if *function.abi == ast::Abi::SysV64
+    if *function.abi != ast::Abi::Interrupt
         && (function.params.iter().any(|ty| !types.is_scalar(*ty))
-            || !matches!(types.types[function.result], Type::Void | Type::Never)
-                && !types.is_scalar(function.result))
+            || (!matches!(types.types[function.result], Type::Void | Type::Never)
+                && !types.is_scalar(function.result)))
     {
         return Err(diag(
             file,
             span,
-            "aggregate values are forbidden across the v0.1 sysv64 ABI; pass pointers",
+            "aggregate values are forbidden across the current call ABI; pass pointers",
         ));
     }
     Ok(())
@@ -1991,7 +2023,7 @@ fn validate_asm_options(options: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_memory_order(intrinsic: Intrinsic, order: u8) -> Result<(), &'static str> {
+pub(super) fn validate_memory_order(intrinsic: Intrinsic, order: u8) -> Result<(), &'static str> {
     if order > MemoryOrder::SeqCst as u8 {
         return Err("invalid memory ordering");
     }
@@ -2251,5 +2283,50 @@ fn equal_pointer(lhs: *const u8, rhs: *const u8) -> bool { return lhs == rhs; }
 "#,
         );
         assert_eq!(program.functions.len(), 4);
+    }
+
+    #[test]
+    fn rejects_types_that_the_machine_backend_cannot_encode() {
+        let aggregate_abi_error = rejected(
+            r#"
+module guards;
+struct Pair { left: u64, right: u64 }
+fn bad_parameter(value: Pair) -> void {}
+"#,
+        );
+        assert!(aggregate_abi_error.message.contains("current call ABI"));
+
+        let asm_error = rejected(
+            r#"
+module guards;
+unsafe fn bad_asm(value: f64) -> void {
+    asm!("nop", in("rax") value);
+}
+"#,
+        );
+        assert!(asm_error.message.contains("non-floating scalar"));
+
+        let volatile_error = rejected(
+            r#"
+module guards;
+struct Pair { left: u64, right: u64 }
+unsafe fn bad_volatile(pointer: *const Pair) -> void {
+    let value: Pair = volatile_load(pointer);
+}
+"#,
+        );
+        assert!(volatile_error.message.contains("scalar pointee"));
+
+        let interrupt_error = rejected(
+            r#"
+module guards;
+@interrupt @no_mangle
+unsafe fn irq() -> void {}
+unsafe fn bad_call() -> void { irq(); }
+"#,
+        );
+        assert!(interrupt_error
+            .message
+            .contains("cannot be called directly"));
     }
 }

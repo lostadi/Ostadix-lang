@@ -2,7 +2,7 @@
 name        = "o-lang"
 version     = "0.2.0"
 edition     = "2021"
-description = "The O Language — a universal polyglot expression framework"
+description = "The O Language: a universal polyglot expression framework"
 authors     = ["Lee Daghlar Ostadi"]
 license     = "Apache-2.0"
 # `cargo run` and the test_o_lang_examples.sh smoke suite invoke the
@@ -38,7 +38,7 @@ required-features = ["notebook"]
 notebook = ["dep:axum", "dep:tokio"]
 
 [dependencies]
-# Serialization — OValue wire protocol
+# Serialization: OValue wire protocol
 serde       = { version = "1", features = ["derive"] }
 serde_json  = { version = "1", features = ["preserve_order"] }
 
@@ -68,17 +68,24 @@ anyhow      = "1"
 # CLI argument parsing
 clap        = { version = "4", features = ["derive"] }
 
-# REPL line editing — history, arrow keys, Ctrl+A/E, Ctrl+C/D
+# Git-compatible .gitignore and .olinkignore matching for o-link
+ignore      = "0.4"
+
+# REPL line editing: history, arrow keys, Ctrl+A/E, Ctrl+C/D
 rustyline   = "14"
 
 # Notebook server (opt-in via --features notebook)
 axum        = { version = "0.7", optional = true }
 tokio       = { version = "1", features = ["full"], optional = true }
 
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
 [profile.release]
 opt-level       = 3
-lto             = "fat"     # Fat LTO — maximum cross-crate inlining
-codegen-units   = 1         # Single codegen unit — maximum optimization surface
+lto             = "fat"     # Fat LTO with maximum cross-crate inlining
+codegen-units   = 1         # Single codegen unit for maximum optimization surface
 panic           = "abort"   # No unwinding overhead
 strip           = "symbols" # Strip debug symbols from release binary
 overflow-checks = false     # No overflow panics in release (panic=abort anyway)

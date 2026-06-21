@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// o-unlink — the inverse of o-link
+// o-unlink: the inverse of o-link
 //
 // Reads a combined `.O` file produced by `o-link` and writes each original
 // source file back to an output directory, reconstructing the pre-link layout.
@@ -39,7 +39,9 @@ use std::path::{Component, PathBuf};
 
 use o_lang::parser::{reconstruct_source, ONode, Parser};
 
-/// o-unlink — restore per-language files from a combined .O file.
+const SECTION_LENGTH_PREFIX: &str = "# o-link-section-bytes: ";
+
+/// o-unlink restores per-language files from a combined .O file.
 #[derive(Debug, ClapParser)]
 #[command(
     name = "o-unlink",
@@ -113,7 +115,7 @@ fn main() -> Result<()> {
 /// pairs for every file section that `o-link` embedded.
 ///
 /// Two kinds of sections are handled:
-///   1. Wrapped files: `LANG[N]^(...)_LANG[N]` — the body is reconstructed
+///   1. Wrapped files: `LANG[N]^(...)_LANG[N]`. The body is reconstructed
 ///      through the parser so that escape sequences (`\$HOME`, `\python^(`, …)
 ///      are unwound back to their literal forms.
 ///   2. Inlined `.O` files: their source is emitted verbatim between the path
@@ -136,6 +138,85 @@ pub fn unlink_source(source: &str) -> Result<Vec<(PathBuf, String)>> {
         source
     };
 
+    if source
+        .lines()
+        .any(|line| line.starts_with(SECTION_LENGTH_PREFIX))
+    {
+        return unlink_length_prefixed(source, &backends);
+    }
+
+    unlink_legacy_source(source, &backends)
+}
+
+fn unlink_length_prefixed(
+    source: &str,
+    backends: &HashSet<String>,
+) -> Result<Vec<(PathBuf, String)>> {
+    let mut results = Vec::new();
+    let mut position = 0;
+
+    while let Some((marker_end, path)) = next_path_marker(source, position) {
+        let metadata_end = source[marker_end..]
+            .find('\n')
+            .map(|offset| marker_end + offset + 1)
+            .unwrap_or(source.len());
+        let metadata = source[marker_end..metadata_end].trim_end_matches('\n');
+        let length = metadata
+            .strip_prefix(SECTION_LENGTH_PREFIX)
+            .with_context(|| format!("{}: missing section length", path.display()))?
+            .parse::<usize>()
+            .with_context(|| format!("{}: invalid section length", path.display()))?;
+        let section_start = metadata_end;
+        let section_end = section_start
+            .checked_add(length)
+            .context("section length overflow")?;
+        let section = source.get(section_start..section_end).with_context(|| {
+            format!(
+                "{}: section length extends beyond combined source",
+                path.display()
+            )
+        })?;
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some("O") {
+            results.push((path, section.to_string()));
+        } else if let Some(content) = extract_block_content(section, backends)? {
+            results.push((path, content));
+        } else {
+            bail!(
+                "{}: length-prefixed section has no typed block",
+                path.display()
+            );
+        }
+        position = section_end;
+    }
+
+    Ok(results)
+}
+
+fn next_path_marker(source: &str, start: usize) -> Option<(usize, PathBuf)> {
+    let mut position = start;
+    while position < source.len() {
+        let line_end = source[position..]
+            .find('\n')
+            .map(|offset| position + offset + 1)
+            .unwrap_or(source.len());
+        let line = source[position..line_end].trim_end_matches('\n');
+        if let Some(path) = parse_path_marker(line) {
+            return Some((line_end, path));
+        }
+        if line_end == position {
+            position += 1;
+        } else {
+            position = line_end;
+        }
+    }
+    None
+}
+
+fn unlink_legacy_source(
+    source: &str,
+    backends: &HashSet<String>,
+) -> Result<Vec<(PathBuf, String)>> {
     // Collect the byte offsets of every `# ── path ──` marker line plus the
     // path it encodes.  Each entry is (content_start, path) where
     // `content_start` is the byte just after the marker's newline.
@@ -173,7 +254,7 @@ pub fn unlink_source(source: &str) -> Result<Vec<(PathBuf, String)>> {
         // (e.g. `python[0]^(`); for them only the header line is stripped.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext != "O" {
-            if let Some(content) = extract_block_content(section, &backends)? {
+            if let Some(content) = extract_block_content(section, backends)? {
                 results.push((path.clone(), content));
                 continue;
             }
@@ -226,7 +307,7 @@ fn extract_block_content(section: &str, backends: &HashSet<String>) -> Result<Op
         if let ONode::TypedExpr { body, .. } = node {
             let content = reconstruct_source(body);
             // o-link writes `LANG[N]^(\n<content>`, so the parser body starts
-            // with a newline — strip exactly that one leading newline.
+            // with a newline. Strip exactly that one leading newline.
             let content = content.strip_prefix('\n').unwrap_or(&content);
             return Ok(Some(content.to_string()));
         }
@@ -312,7 +393,7 @@ fn find_path_marker(text: &str) -> Option<usize> {
 
 /// Parse a `# ── <path> ──` line and return the embedded path.
 ///
-/// The line MUST start with `# ──` (em-dash) or `# --` (ASCII dash) — this
+/// The line MUST start with `# ──` (box drawing) or `# --` (ASCII dash). This
 /// prevents the o-link header comment (`# Linked by o-link…`) from being
 /// mistaken for a path marker.
 fn parse_path_marker(line: &str) -> Option<PathBuf> {
@@ -342,17 +423,17 @@ fn parse_path_marker(line: &str) -> Option<PathBuf> {
 }
 
 fn strip_dash_suffix(s: &str) -> &str {
-    if s.ends_with("──") {
-        s[..s.len() - "──".len()].trim_end_matches(' ')
-    } else if s.ends_with("--") {
-        s[..s.len() - "--".len()].trim_end_matches(' ')
+    if let Some(stripped) = s.strip_suffix("──") {
+        stripped.trim_end_matches(' ')
+    } else if let Some(stripped) = s.strip_suffix("--") {
+        stripped.trim_end_matches(' ')
     } else {
         s
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Backend registry — must stay in sync with olink.rs
+// Backend registry must stay in sync with olink.rs
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn registered_backends() -> HashSet<String> {
@@ -459,7 +540,7 @@ mod tests {
     fn roundtrip_python_file_with_dollar_vars() {
         // o-link escapes $HOME → \$HOME in the wrapped body.
         // We construct the combined string with the escaped form directly.
-        let combined = "# Linked by o-link — single-file .O program\n\
+        let combined = "# Linked by o-link: single-file .O program\n\
                         \n\
                         # ── script.py ──\n\
                         python[0]^(\n\
@@ -500,7 +581,7 @@ mod tests {
     #[test]
     fn roundtrip_multiple_languages() {
         let combined = concat!(
-            "# Linked by o-link — single-file .O program\n",
+            "# Linked by o-link: single-file .O program\n",
             "\n",
             "# ── app.py ──\n",
             "python[0]^(\n",
@@ -574,7 +655,7 @@ mod tests {
         // format o-link uses.
         let combined = format!(
             concat!(
-                "# Linked by o-link — single-file .O program\n",
+                "# Linked by o-link: single-file .O program\n",
                 "\n",
                 "# ── {py} ──\n",
                 "python[0]^(\n",
@@ -607,8 +688,21 @@ mod tests {
 
     #[test]
     fn empty_combined_returns_empty_vec() {
-        let combined = "# Linked by o-link — single-file .O program\n";
+        let combined = "# Linked by o-link: single-file .O program\n";
         let entries = unlink_source(combined).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn length_prefixed_inline_o_source_preserves_final_newline_state() {
+        for content in ["python^(1)_python", "python^(1)_python\n"] {
+            let combined = format!(
+                "# Linked by o-link\n\n# ── exact.O ──\n{SECTION_LENGTH_PREFIX}{}\n{}\n",
+                content.len(),
+                content
+            );
+            let entries = unlink_source(&combined).unwrap();
+            assert_eq!(entries, vec![(PathBuf::from("exact.O"), content.into())]);
+        }
     }
 }

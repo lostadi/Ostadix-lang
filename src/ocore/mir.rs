@@ -943,4 +943,46 @@ fn max(a: u64, b: u64) -> u64 {
         assert!(text.contains("branch"));
         assert!(text.contains("return"));
     }
+
+    #[test]
+    fn enum_payload_lowering_uses_aligned_variant_offsets() {
+        let ast = parser::parse(
+            "test.oc",
+            r#"
+module mir;
+enum Mixed { empty, payload(u8, u64, u16) }
+fn construct() -> u64 {
+    let state: Mixed = Mixed::payload(1, 2, 3);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let hir = typeck::check(&[("test.oc".into(), ast)]).unwrap();
+        let mir = lower(&hir).unwrap();
+        let enum_def = &hir.types.enums[0];
+        assert_eq!(enum_def.payload_offset, 8);
+        assert_eq!(enum_def.layout, Layout { size: 32, align: 8 });
+
+        let offsets = mir.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|instruction| {
+                let Instruction::Store { place, .. } = instruction else {
+                    return None;
+                };
+                Some(
+                    place
+                        .projections
+                        .iter()
+                        .filter_map(|projection| match projection {
+                            Projection::Field { offset } => Some(*offset),
+                            Projection::Index { .. } => None,
+                        })
+                        .sum::<u64>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![0, 8, 16, 24]);
+    }
 }

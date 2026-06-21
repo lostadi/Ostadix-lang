@@ -125,8 +125,9 @@ after the tag; total size is rounded to maximum tag/payload alignment.
 
 `extern "sysv64"` uses System V AMD64. Integer and pointer arguments use RDI,
 RSI, RDX, RCX, R8, R9, with further arguments on the stack. Scalar results use
-RAX. Aggregate ABI passing is initially forbidden across extern boundaries;
-callers pass pointers instead. The stack is 16-byte aligned before `call`.
+RAX. Aggregate ABI passing is currently forbidden across both direct and
+extern call boundaries; callers pass pointers instead. The stack is 16-byte
+aligned before `call`.
 
 `extern "ocore"` is versioned with the compiler and is not a stable foreign
 ABI. Interrupt entries use `@interrupt`; they have no ordinary arguments or
@@ -158,11 +159,15 @@ Memory order values are `relaxed`, `acquire`, `release`, `acq_rel`, and
 `seq_cst`. Invalid load/release and store/acquire combinations are compile-time
 errors. Volatile operations prevent compiler elision and reordering relative
 to other volatile operations; they do not provide inter-core synchronization.
+The current volatile lowering accepts scalar pointees. Atomic pointees must be
+1, 2, 4, or 8-byte integers, and the backend rechecks the pointer, value,
+result, and ordering types before emitting x86_64 instructions.
 
 Inline assembly templates use Intel syntax. Input/output registers are
 explicit, implicit clobbers are forbidden, and `options(nostack)` asserts that
-RSP is unchanged. Assembly is unsafe even when it contains no privileged
-instruction.
+RSP is unchanged. Assembly operands must be non-floating scalar values because
+the current interface exposes general-purpose registers. Assembly is unsafe
+even when it contains no privileged instruction.
 
 ## 7. Linkage attributes
 
@@ -254,7 +259,10 @@ indexing, locals, statics, and copies, while aggregate parameters and returns
 must currently be passed through pointers. Enum construction is supported;
 pattern matching is not. Floating-point types reserve their storage layouts,
 while operations, conversions, and `sysv64` ABI crossings are rejected before
-MIR lowering.
+MIR lowering. Code generation also validates the MIR type contracts for
+operations, calls, control flow, indexed places, atomics, volatile access, and
+assembly. This is a second boundary against malformed or future lowering paths
+silently selecting integer instructions.
 
 The kernel proof uses a physical-page bump allocator and an identity-mapped
 bootstrap address space. It demonstrates a checked kernel syscall dispatcher

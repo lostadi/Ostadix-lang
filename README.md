@@ -1160,15 +1160,27 @@ o-link src/ -o app.O --shebang
 It provides several correctness properties:
 
 - Recursive directory walks are deterministic.
-- Hidden directories, `target`, `node_modules`, `__pycache__`, and `.git` are
-  skipped.
+- Source markers are always relative to one common root computed across every
+  input. Absolute invocation paths never leak into the linked document, and
+  multiple input trees retain the directory components below their common
+  root.
+- `.gitignore` and `.olinkignore` rules are loaded at each walked directory.
+  Git-compatible negation rules are honored.
+- Hidden paths, `target`, `node_modules`, `__pycache__`, and `.git` are skipped.
+  Every excluded path receives a warning, including files with no extension,
+  unknown extensions, unreadable entries, binary data, duplicates, symlink
+  aliases, ignored files, and the output file itself. A final scan summary
+  reports the selected and skipped counts.
 - Symlinked directories are visited at most once.
-- Duplicate files and the output file itself are excluded.
-- Binary and non-UTF-8 files found during directory walks are skipped with a
-  warning.
 - O openers, matching closers, and `$name` sequences inside source files are
   escaped and round-trip as literal source.
-- Python files are ordered by their import dependencies before wrapping.
+- Each section records its exact byte length. Embedded source-path markers,
+  opener text, closer text, final-newline differences, and other source text
+  cannot be mistaken for section boundaries by `o-unlink`.
+- Static imports are dependency ordered for Python, JavaScript, Rust, C and
+  C++, Java, Haskell, Ruby, OCaml, Racket and Lisp, shell, Nix, C#, MATLAB,
+  and Wolfram Language inputs. Files without a recognized dependency remain
+  in stable walk order.
 - Every wrapped file receives an isolated explicit environment number.
 - The combined source is parsed again before it is written unless
   `--no-validate` is requested.
@@ -1190,7 +1202,12 @@ o-unlink combined.O --dry-run
 
 The output path is checked before writing so a linked document cannot escape
 the selected directory through `..` components. For supported textual source
-trees, `o-link` followed by `o-unlink` is designed to round-trip the contents.
+trees, `o-link` followed by `o-unlink` round-trips the selected contents. The
+test suite proves this over generated small trees with nested directories,
+multiple extensions, dollar variables, embedded opener and closer text,
+Unicode, final-newline variations, file aliases, and directory symlink loops.
+Each generated case runs both binaries and requires `diff -r` to report an
+empty difference.
 
 ### `o-notebook`: local interactive documents
 
@@ -1461,8 +1478,10 @@ atomic_fetch_add
 Atomic orders are `relaxed`, `acquire`, `release`, `acq_rel`, and `seq_cst`.
 The type checker rejects invalid load-release and store-acquire combinations,
 requires pointer and value widths to agree, and requires mutable pointers for
-mutating atomic operations. The x86_64 backend emits the corresponding locked
-or ordered instructions.
+mutating atomic operations. Volatile operations currently require scalar
+pointees. The x86_64 backend emits the corresponding locked or ordered
+instructions and independently checks the atomic pointee, value, result, and
+ordering types before selecting an instruction width.
 
 ### Hardware intrinsics and assembly
 
@@ -1479,7 +1498,9 @@ asm!
 
 Inline assembly uses Intel syntax with explicit register operands and options
 such as `nomem`, `readonly`, and `nostack`. Register constraints are checked
-against the backend's safe calling convention assumptions.
+against the backend's safe calling convention assumptions. Operands are
+limited to non-floating scalar values because the current register interface
+names general-purpose registers only.
 
 ### Linkage and sections
 
@@ -1786,6 +1807,10 @@ features that are already present:
   fields, locals, statics, and copying. Aggregate parameters and returns use
   pointers in the current ABI slice. Enum construction is implemented;
   pattern matching is not yet part of the surface language.
+- The x86_64 backend rechecks MIR contracts for unary and binary operations,
+  casts, calls, returns, branches, phi inputs, indexed places, atomics,
+  volatile scalar access, and assembly operands. A malformed MIR program is
+  rejected instead of being interpreted as an integer-shaped machine value.
 - Floating-point types have specified x86_64 storage layouts. Float literals,
   arithmetic, comparisons, casts, and `sysv64` float parameters and returns are
   rejected until SSE lowering and the floating-point ABI are implemented.

@@ -70,4 +70,7 @@ reclaiming page allocator remain follow-on work. Float operations, casts, and
 `sysv64` float crossings are rejected during type checking, so the layout-only
 float types cannot reach integer machine operations. The implemented subset is
 enough to compile a freestanding ELF kernel, enter long mode, service IRQ0,
-allocate page frames, and enforce generation-tagged capability rights.
+allocate page frames, and enforce generation-tagged capability rights. The
+x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
+volatile, and assembly contracts so unsupported type shapes fail instead of
+falling through to integer-shaped instructions.

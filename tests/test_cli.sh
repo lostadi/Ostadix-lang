@@ -29,8 +29,9 @@ if [ -x ./target/release/olink ]; then
 else
     OLINK_BIN="./target/release/o-link"
 fi
+OUNLINK_BIN="./target/release/o-unlink"
 
-for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OLINK_BIN"; do
+for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
     if [ ! -x "$bin" ]; then
         echo "Missing executable: $bin" >&2
         exit 1
@@ -187,6 +188,49 @@ check_olangc_compile_and_run() {
     fi
 }
 
+check_olink_hardened_round_trip() {
+    local source="$ARTIFACT_DIR/link-source"
+    local expected="$ARTIFACT_DIR/link-expected"
+    local restored="$ARTIFACT_DIR/link-restored"
+    local combined="$ARTIFACT_DIR/linked.O"
+
+    mkdir -p "$source/src" "$expected/src"
+    printf '%s' 'value = "$HOME )_python[0] python^("' >"$source/src/main.py"
+    cp "$source/src/main.py" "$expected/src/main.py"
+    printf '%s\n' 'ignored.py' >"$source/.olinkignore"
+    printf '%s\n' 'ignored = true' >"$source/ignored.py"
+    printf '%s\n' 'extensionless' >"$source/README"
+    printf '\377\376\000' >"$source/binary.py"
+
+    run_command "$OLINK_BIN" "$source" -o "$combined"
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "o-link hardening round-trip" "(o-link failed with exit $RUN_EXIT)"
+        return
+    fi
+    if ! grep -Eq 'warning: skipped .*ignored.py.*\.olinkignore' "$STDERR_FILE" \
+        || ! grep -Eq 'warning: skipped .*README.*no extension' "$STDERR_FILE" \
+        || ! grep -Eq 'warning: skipped .*binary.py.*not UTF-8 text' "$STDERR_FILE" \
+        || ! grep -Eq 'o-link scan: 1 selected, [0-9]+ skipped' "$STDERR_FILE"; then
+        fail "o-link hardening round-trip" "(skip warnings or summary are incomplete)"
+        return
+    fi
+    if grep -Fq "$source" "$combined"; then
+        fail "o-link hardening round-trip" "(combined markers contain an absolute source path)"
+        return
+    fi
+
+    run_command "$OUNLINK_BIN" "$combined" -o "$restored"
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "o-link hardening round-trip" "(o-unlink failed with exit $RUN_EXIT)"
+        return
+    fi
+    if diff -r "$expected" "$restored" >"$STDOUT_FILE" 2>"$STDERR_FILE"; then
+        pass "o-link hardening round-trip"
+    else
+        fail "o-link hardening round-trip" "(restored tree differs from selected input tree)"
+    fi
+}
+
 # --- Test inputs --- #
 
 INVALID_SOURCE="$ARTIFACT_DIR/invalid.O"
@@ -215,6 +259,7 @@ check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
 check_stdout_contains "olink help shows usage" 0 'Usage: (olink|o-link)' "$OLINK_BIN" --help
+check_olink_hardened_round_trip
 check_nonzero_stderr_contains "O invalid syntax exits with an error" 'failed to parse \.O source|error:' "$O_BIN" "$INVALID_SOURCE" backends/
 
 echo ""

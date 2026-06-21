@@ -55,13 +55,22 @@ fn emit_const(
     out: &mut String,
 ) -> Result<(), Diagnostic> {
     match (value, &hir.types.types[ty]) {
-        (HirConstValue::Integer(value), _) => {
+        (HirConstValue::Integer(value), Type::Int { .. } | Type::Usize | Type::Isize) => {
             emit_integer(hir.types.layout(ty).size, *value, out)?;
         }
-        (HirConstValue::Bool(value), _) => {
+        (HirConstValue::Bool(value), Type::Bool) => {
             emit_integer(hir.types.layout(ty).size, u64::from(*value), out)?;
         }
-        (HirConstValue::Bytes(bytes), Type::Array { .. }) => {
+        (HirConstValue::Bytes(bytes), Type::Array { element, len })
+            if bytes.len() as u64 == *len
+                && matches!(
+                    hir.types.types[*element],
+                    Type::Int {
+                        signed: false,
+                        bits: 8
+                    }
+                ) =>
+        {
             if bytes.is_empty() {
                 out.push_str(".zero 0\n");
             } else {
@@ -75,17 +84,21 @@ fn emit_const(
                 out.push('\n');
             }
         }
-        (HirConstValue::Array(values), Type::Array { element, .. }) => {
+        (HirConstValue::Array(values), Type::Array { element, len })
+            if values.len() as u64 == *len =>
+        {
             for value in values {
                 emit_const(hir, *element, value, out)?;
             }
         }
-        (HirConstValue::Repeat(value, count), Type::Array { element, .. }) => {
+        (HirConstValue::Repeat(value, count), Type::Array { element, len }) if count == len => {
             for _ in 0..*count {
                 emit_const(hir, *element, value, out)?;
             }
         }
-        (HirConstValue::Struct(id, values), Type::Struct(expected)) if id == expected => {
+        (HirConstValue::Struct(id, values), Type::Struct(expected))
+            if id == expected && values.len() == hir.types.structs[*id].fields.len() =>
+        {
             let def = &hir.types.structs[*id];
             let mut cursor = 0u64;
             for (field, value) in def.fields.iter().zip(values) {
@@ -99,7 +112,13 @@ fn emit_const(
                 writeln!(out, ".zero {}", def.layout.size - cursor).unwrap();
             }
         }
-        (HirConstValue::Enum(id, variant, payload), Type::Enum(expected)) if id == expected => {
+        (HirConstValue::Enum(id, variant, payload), Type::Enum(expected))
+            if id == expected
+                && hir.types.enums[*id]
+                    .variants
+                    .get(*variant)
+                    .is_some_and(|definition| definition.payload.len() == payload.len()) =>
+        {
             let def = &hir.types.enums[*id];
             emit_integer(def.tag_size, *variant as u64, out)?;
             if def.payload_offset > def.tag_size {
@@ -280,6 +299,11 @@ impl<'a> FunctionCodegen<'a> {
             if !self.hir.types.is_scalar(ty) {
                 return Err(codegen_error("aggregate parameters are not implemented"));
             }
+            if self.source.abi == Abi::SysV64 && self.hir.types.is_float(ty) {
+                return Err(codegen_error(
+                    "floating-point parameter escaped sysv64 ABI checking",
+                ));
+            }
             let offset = self.frame.locals[*local];
             if index < registers.len() {
                 self.store_reg_to_frame(registers[index], offset, ty, out)?;
@@ -299,10 +323,16 @@ impl<'a> FunctionCodegen<'a> {
     ) -> Result<(), Diagnostic> {
         match instruction {
             Instruction::Const { dst, value } => {
+                if self.hir.types.is_float(self.mir.values[*dst]) {
+                    return Err(codegen_error(
+                        "floating-point constant escaped O-core type checking",
+                    ));
+                }
                 writeln!(out, "  mov rax, {value}").unwrap();
                 self.store_value(*dst, "rax", out);
             }
             Instruction::FunctionAddress { dst, function } => {
+                self.validate_function_address(*dst, *function)?;
                 writeln!(
                     out,
                     "  lea rax, [rip+{}]",
@@ -312,15 +342,26 @@ impl<'a> FunctionCodegen<'a> {
                 self.store_value(*dst, "rax", out);
             }
             Instruction::AddressOf { dst, place } => {
+                let Type::Pointer { pointee, .. } = self.hir.types.types[self.mir.values[*dst]]
+                else {
+                    return Err(codegen_error("address result is not a pointer"));
+                };
+                if pointee != place.ty {
+                    return Err(codegen_error("address result pointee type mismatch"));
+                }
                 self.place_address(place, "r11", out)?;
                 self.store_value(*dst, "r11", out);
             }
             Instruction::Load { dst, place, .. } => {
+                self.require_same_type(self.mir.values[*dst], place.ty, "load result")?;
+                self.require_scalar_type(place.ty, "load")?;
                 self.place_address(place, "r11", out)?;
                 self.load_memory("rax", "r11", place.ty, out)?;
                 self.store_value(*dst, "rax", out);
             }
             Instruction::Store { place, value, .. } => {
+                self.require_same_type(self.mir.values[*value], place.ty, "store value")?;
+                self.require_scalar_type(place.ty, "store")?;
                 self.load_value(*value, "rax", out);
                 self.place_address(place, "r11", out)?;
                 self.store_memory("rax", "r11", place.ty, out)?;
@@ -330,12 +371,18 @@ impl<'a> FunctionCodegen<'a> {
                 source,
                 size,
             } => {
+                if destination.ty != source.ty
+                    || *size != self.hir.types.layout(destination.ty).size
+                {
+                    return Err(codegen_error("aggregate copy type or size mismatch"));
+                }
                 self.place_address(destination, "rdi", out)?;
                 self.place_address(source, "rsi", out)?;
                 writeln!(out, "  mov rcx, {size}").unwrap();
                 out.push_str("  rep movsb\n");
             }
             Instruction::Unary { dst, op, operand } => {
+                self.validate_unary(*dst, *op, *operand)?;
                 self.load_value(*operand, "rax", out);
                 match op {
                     UnaryOp::Neg => out.push_str("  neg rax\n"),
@@ -356,6 +403,10 @@ impl<'a> FunctionCodegen<'a> {
                 from,
                 to,
             } => {
+                self.require_same_type(self.mir.values[*value], *from, "cast source")?;
+                self.require_same_type(self.mir.values[*dst], *to, "cast result")?;
+                self.require_scalar_type(*from, "cast source")?;
+                self.require_scalar_type(*to, "cast result")?;
                 if self.hir.types.is_float(*from) || self.hir.types.is_float(*to) {
                     return Err(codegen_error(
                         "floating-point cast escaped O-core type checking",
@@ -384,6 +435,276 @@ impl<'a> FunctionCodegen<'a> {
         Ok(())
     }
 
+    fn validate_function_address(
+        &self,
+        dst: ValueId,
+        function: FunctionId,
+    ) -> Result<(), Diagnostic> {
+        let target = &self.hir.functions[function];
+        let expected_params = target
+            .params
+            .iter()
+            .map(|local| target.locals[*local].ty)
+            .collect::<Vec<_>>();
+        match &self.hir.types.types[self.mir.values[dst]] {
+            Type::Function {
+                params,
+                result,
+                abi,
+            } if params == &expected_params && *result == target.result && *abi == target.abi => {
+                Ok(())
+            }
+            _ => Err(codegen_error("function address type mismatch")),
+        }
+    }
+
+    fn validate_unary(
+        &self,
+        dst: ValueId,
+        op: UnaryOp,
+        operand: ValueId,
+    ) -> Result<(), Diagnostic> {
+        let operand_ty = self.mir.values[operand];
+        let dst_ty = self.mir.values[dst];
+        match op {
+            UnaryOp::Neg | UnaryOp::BitNot => {
+                self.require_integer_type(operand_ty, "unary operand")?;
+                self.require_same_type(dst_ty, operand_ty, "unary result")
+            }
+            UnaryOp::Not => {
+                let bool_ty = self.hir.types.primitive("bool").unwrap();
+                self.require_same_type(operand_ty, bool_ty, "logical-not operand")?;
+                self.require_same_type(dst_ty, bool_ty, "logical-not result")
+            }
+            UnaryOp::Deref | UnaryOp::AddressOf { .. } => {
+                Err(codegen_error("place unary operation escaped MIR lowering"))
+            }
+        }
+    }
+
+    fn validate_binary(
+        &self,
+        dst: ValueId,
+        op: BinaryOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Result<(), Diagnostic> {
+        let lhs_ty = self.mir.values[lhs];
+        let rhs_ty = self.mir.values[rhs];
+        let dst_ty = self.mir.values[dst];
+        if self.hir.types.is_float(lhs_ty) || self.hir.types.is_float(rhs_ty) {
+            return Err(codegen_error(
+                "floating-point binary operation escaped O-core type checking",
+            ));
+        }
+        match op {
+            BinaryOp::Add | BinaryOp::Sub
+                if matches!(self.hir.types.types[lhs_ty], Type::Pointer { .. }) =>
+            {
+                self.require_integer_type(rhs_ty, "pointer offset")?;
+                self.require_same_type(dst_ty, lhs_ty, "pointer arithmetic result")
+            }
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight => {
+                self.require_integer_type(lhs_ty, "binary left operand")?;
+                self.require_same_type(rhs_ty, lhs_ty, "binary right operand")?;
+                self.require_same_type(dst_ty, lhs_ty, "binary result")
+            }
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Less
+            | BinaryOp::LessEq
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEq => {
+                self.require_scalar_type(lhs_ty, "comparison operand")?;
+                self.require_same_type(rhs_ty, lhs_ty, "comparison right operand")?;
+                let bool_ty = self.hir.types.primitive("bool").unwrap();
+                self.require_same_type(dst_ty, bool_ty, "comparison result")
+            }
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => Err(codegen_error(
+                "logical operator escaped short-circuit lowering",
+            )),
+        }
+    }
+
+    fn validate_call(
+        &self,
+        dst: Option<ValueId>,
+        function: FunctionId,
+        args: &[ValueId],
+    ) -> Result<(), Diagnostic> {
+        let target = &self.hir.functions[function];
+        if target.abi == Abi::Interrupt {
+            return Err(codegen_error(
+                "interrupt handler reached direct-call lowering",
+            ));
+        }
+        if args.len() != target.params.len() {
+            return Err(codegen_error("direct call argument count mismatch"));
+        }
+        for (arg, local) in args.iter().zip(&target.params) {
+            let expected = target.locals[*local].ty;
+            self.require_scalar_type(expected, "direct call argument")?;
+            self.require_same_type(self.mir.values[*arg], expected, "direct call argument")?;
+            if target.abi == Abi::SysV64 && self.hir.types.is_float(expected) {
+                return Err(codegen_error(
+                    "floating-point argument escaped sysv64 ABI checking",
+                ));
+            }
+        }
+        let no_result = matches!(
+            self.hir.types.types[target.result],
+            Type::Void | Type::Never
+        );
+        match (dst, no_result) {
+            (None, true) => Ok(()),
+            (Some(dst), false) => {
+                self.require_scalar_type(target.result, "direct call result")?;
+                self.require_same_type(self.mir.values[dst], target.result, "direct call result")?;
+                if target.abi == Abi::SysV64 && self.hir.types.is_float(target.result) {
+                    return Err(codegen_error(
+                        "floating-point result escaped sysv64 ABI checking",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(codegen_error("direct call result shape mismatch")),
+        }
+    }
+
+    fn validate_intrinsic(
+        &self,
+        dst: Option<ValueId>,
+        intrinsic: Intrinsic,
+        args: &[ValueId],
+    ) -> Result<(), Diagnostic> {
+        let u8_ty = self.hir.types.primitive("u8").unwrap();
+        let u16_ty = self.hir.types.primitive("u16").unwrap();
+        let u32_ty = self.hir.types.primitive("u32").unwrap();
+        let u64_ty = self.hir.types.primitive("u64").unwrap();
+        let usize_ty = self.hir.types.primitive("usize").unwrap();
+        let signature = match intrinsic {
+            Intrinsic::In8 => Some((vec![u16_ty], Some(u8_ty))),
+            Intrinsic::In16 => Some((vec![u16_ty], Some(u16_ty))),
+            Intrinsic::In32 => Some((vec![u16_ty], Some(u32_ty))),
+            Intrinsic::Out8 => Some((vec![u16_ty, u8_ty], None)),
+            Intrinsic::Out16 => Some((vec![u16_ty, u16_ty], None)),
+            Intrinsic::Out32 => Some((vec![u16_ty, u32_ty], None)),
+            Intrinsic::EnableInterrupts | Intrinsic::DisableInterrupts | Intrinsic::Halt => {
+                Some((vec![], None))
+            }
+            Intrinsic::InvalidatePage => Some((vec![usize_ty], None)),
+            Intrinsic::Syscall(count) => Some((vec![u64_ty; count as usize + 1], Some(u64_ty))),
+            Intrinsic::VolatileLoad | Intrinsic::VolatileStore => {
+                return Err(codegen_error(
+                    "volatile intrinsic escaped MIR memory lowering",
+                ))
+            }
+            Intrinsic::AtomicLoad
+            | Intrinsic::AtomicStore
+            | Intrinsic::AtomicExchange
+            | Intrinsic::AtomicCompareExchange
+            | Intrinsic::AtomicFetchAdd => None,
+        };
+        if let Some((expected_args, expected_result)) = signature {
+            if args.len() != expected_args.len() {
+                return Err(codegen_error("intrinsic argument count mismatch"));
+            }
+            for (arg, expected) in args.iter().zip(expected_args) {
+                self.require_same_type(self.mir.values[*arg], expected, "intrinsic argument")?;
+            }
+            return self.require_optional_result(dst, expected_result, "intrinsic result");
+        }
+
+        let (value_count, order_count) = match intrinsic {
+            Intrinsic::AtomicLoad => (0, 1),
+            Intrinsic::AtomicStore | Intrinsic::AtomicExchange | Intrinsic::AtomicFetchAdd => {
+                (1, 1)
+            }
+            Intrinsic::AtomicCompareExchange => (2, 2),
+            _ => unreachable!(),
+        };
+        if args.len() != 1 + value_count + order_count {
+            return Err(codegen_error("atomic intrinsic argument count mismatch"));
+        }
+        let pointer_ty = self.mir.values[args[0]];
+        let Type::Pointer { mutable, pointee } = self.hir.types.types[pointer_ty] else {
+            return Err(codegen_error("atomic intrinsic requires a pointer"));
+        };
+        self.require_integer_type(pointee, "atomic pointee")?;
+        if !matches!(self.hir.types.layout(pointee).size, 1 | 2 | 4 | 8) {
+            return Err(codegen_error(
+                "atomic pointee must be a 1/2/4/8-byte integer",
+            ));
+        }
+        if !mutable && intrinsic != Intrinsic::AtomicLoad {
+            return Err(codegen_error("mutating atomic intrinsic requires *mut"));
+        }
+        for value in &args[1..1 + value_count] {
+            self.require_same_type(self.mir.values[*value], pointee, "atomic value")?;
+        }
+        for order in &args[1 + value_count..] {
+            self.require_same_type(self.mir.values[*order], u8_ty, "atomic ordering")?;
+            let order = self
+                .const_from_value(*order)
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| codegen_error("atomic ordering must be constant in MIR"))?;
+            super::typeck::validate_memory_order(intrinsic, order).map_err(codegen_error)?;
+        }
+        let result = (intrinsic != Intrinsic::AtomicStore).then_some(pointee);
+        self.require_optional_result(dst, result, "atomic result")
+    }
+
+    fn require_optional_result(
+        &self,
+        actual: Option<ValueId>,
+        expected: Option<TypeId>,
+        context: &str,
+    ) -> Result<(), Diagnostic> {
+        match (actual, expected) {
+            (None, None) => Ok(()),
+            (Some(value), Some(ty)) => self.require_same_type(self.mir.values[value], ty, context),
+            _ => Err(codegen_error(format!("{context} shape mismatch"))),
+        }
+    }
+
+    fn require_same_type(
+        &self,
+        actual: TypeId,
+        expected: TypeId,
+        context: &str,
+    ) -> Result<(), Diagnostic> {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(codegen_error(format!("{context} type mismatch")))
+        }
+    }
+
+    fn require_scalar_type(&self, ty: TypeId, context: &str) -> Result<(), Diagnostic> {
+        if self.hir.types.is_scalar(ty) {
+            Ok(())
+        } else {
+            Err(codegen_error(format!("{context} requires a scalar type")))
+        }
+    }
+
+    fn require_integer_type(&self, ty: TypeId, context: &str) -> Result<(), Diagnostic> {
+        if self.hir.types.is_integer(ty) {
+            Ok(())
+        } else {
+            Err(codegen_error(format!("{context} requires an integer type")))
+        }
+    }
+
     fn emit_binary(
         &self,
         dst: ValueId,
@@ -392,13 +713,7 @@ impl<'a> FunctionCodegen<'a> {
         rhs: ValueId,
         out: &mut String,
     ) -> Result<(), Diagnostic> {
-        if self.hir.types.is_float(self.mir.values[lhs])
-            || self.hir.types.is_float(self.mir.values[rhs])
-        {
-            return Err(codegen_error(
-                "floating-point binary operation escaped O-core type checking",
-            ));
-        }
+        self.validate_binary(dst, op, lhs, rhs)?;
         self.load_value(lhs, "rax", out);
         self.load_value(rhs, "rcx", out);
         let signed = is_signed(&self.hir.types.types[self.mir.values[lhs]]);
@@ -479,6 +794,7 @@ impl<'a> FunctionCodegen<'a> {
         args: &[ValueId],
         out: &mut String,
     ) -> Result<(), Diagnostic> {
+        self.validate_call(dst, function, args)?;
         let registers = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         let stack_count = args.len().saturating_sub(registers.len());
         let pad = stack_count % 2;
@@ -510,6 +826,7 @@ impl<'a> FunctionCodegen<'a> {
         args: &[ValueId],
         out: &mut String,
     ) -> Result<(), Diagnostic> {
+        self.validate_intrinsic(dst, intrinsic, args)?;
         match intrinsic {
             Intrinsic::In8 | Intrinsic::In16 | Intrinsic::In32 => {
                 self.load_value(args[0], "rdx", out);
@@ -647,10 +964,12 @@ impl<'a> FunctionCodegen<'a> {
             match operand {
                 MirAsmOperand::In { register, value } => {
                     validate_register(register)?;
+                    self.require_asm_value(self.mir.values[*value])?;
                     self.load_value(*value, register, out);
                 }
                 MirAsmOperand::Out { register, target } => {
                     validate_register(register)?;
+                    self.require_asm_value(target.ty)?;
                     outputs.push((register.as_str(), target));
                 }
                 MirAsmOperand::InOut {
@@ -659,6 +978,13 @@ impl<'a> FunctionCodegen<'a> {
                     output,
                 } => {
                     validate_register(register)?;
+                    self.require_asm_value(self.mir.values[*input])?;
+                    self.require_asm_value(output.ty)?;
+                    self.require_same_type(
+                        self.mir.values[*input],
+                        output.ty,
+                        "assembly inout operand",
+                    )?;
                     self.load_value(*input, register, out);
                     outputs.push((register.as_str(), output));
                 }
@@ -675,6 +1001,16 @@ impl<'a> FunctionCodegen<'a> {
         Ok(())
     }
 
+    fn require_asm_value(&self, ty: TypeId) -> Result<(), Diagnostic> {
+        self.require_scalar_type(ty, "inline assembly operand")?;
+        if self.hir.types.is_float(ty) {
+            return Err(codegen_error(
+                "floating-point inline assembly operand escaped type checking",
+            ));
+        }
+        Ok(())
+    }
+
     fn emit_terminator(
         &self,
         block_id: BlockId,
@@ -685,13 +1021,34 @@ impl<'a> FunctionCodegen<'a> {
             Terminator::Pending => return Err(codegen_error("MIR block has no terminator")),
             Terminator::Unreachable => out.push_str("  ud2\n"),
             Terminator::Return(value) => {
-                if let Some(value) = value {
-                    self.load_value(*value, "rax", out);
+                let no_result = matches!(
+                    self.hir.types.types[self.source.result],
+                    Type::Void | Type::Never
+                );
+                match (value, no_result) {
+                    (Some(value), false) => {
+                        self.require_scalar_type(self.source.result, "return value")?;
+                        self.require_same_type(
+                            self.mir.values[*value],
+                            self.source.result,
+                            "return value",
+                        )?;
+                        if self.source.abi == Abi::SysV64
+                            && self.hir.types.is_float(self.source.result)
+                        {
+                            return Err(codegen_error(
+                                "floating-point result escaped sysv64 ABI checking",
+                            ));
+                        }
+                        self.load_value(*value, "rax", out);
+                    }
+                    (None, true) => {}
+                    _ => return Err(codegen_error("return value shape mismatch")),
                 }
                 self.emit_epilogue(out);
             }
             Terminator::Jump(target) => {
-                self.emit_phi_moves(block_id, *target, out);
+                self.emit_phi_moves(block_id, *target, out)?;
                 writeln!(out, "  jmp {}_bb{target}", self.label_prefix).unwrap();
             }
             Terminator::Branch {
@@ -699,30 +1056,43 @@ impl<'a> FunctionCodegen<'a> {
                 then_block,
                 else_block,
             } => {
+                let bool_ty = self.hir.types.primitive("bool").unwrap();
+                self.require_same_type(self.mir.values[*condition], bool_ty, "branch condition")?;
                 let then_edge = format!("{}_bb{}_then_edge", self.label_prefix, block_id);
                 self.load_value(*condition, "rax", out);
                 out.push_str("  test rax, rax\n");
                 writeln!(out, "  jne {then_edge}").unwrap();
-                self.emit_phi_moves(block_id, *else_block, out);
+                self.emit_phi_moves(block_id, *else_block, out)?;
                 writeln!(out, "  jmp {}_bb{else_block}", self.label_prefix).unwrap();
                 writeln!(out, "{then_edge}:").unwrap();
-                self.emit_phi_moves(block_id, *then_block, out);
+                self.emit_phi_moves(block_id, *then_block, out)?;
                 writeln!(out, "  jmp {}_bb{then_block}", self.label_prefix).unwrap();
             }
         }
         Ok(())
     }
 
-    fn emit_phi_moves(&self, from: BlockId, to: BlockId, out: &mut String) {
+    fn emit_phi_moves(
+        &self,
+        from: BlockId,
+        to: BlockId,
+        out: &mut String,
+    ) -> Result<(), Diagnostic> {
         for instruction in &self.mir.blocks[to].instructions {
             let Instruction::Phi { dst, incoming } = instruction else {
                 continue;
             };
             if let Some((_, value)) = incoming.iter().find(|(block, _)| *block == from) {
+                self.require_same_type(
+                    self.mir.values[*value],
+                    self.mir.values[*dst],
+                    "phi incoming value",
+                )?;
                 self.load_value(*value, "rax", out);
                 self.store_value(*dst, "rax", out);
             }
         }
+        Ok(())
     }
 
     fn emit_epilogue(&self, out: &mut String) {
@@ -765,7 +1135,15 @@ impl<'a> FunctionCodegen<'a> {
                 )
                 .unwrap();
             }
-            PlaceBase::Pointer(value) => self.load_value(value, register, out),
+            PlaceBase::Pointer(value) => {
+                if !matches!(
+                    self.hir.types.types[self.mir.values[value]],
+                    Type::Pointer { .. }
+                ) {
+                    return Err(codegen_error("place base is not a pointer"));
+                }
+                self.load_value(value, register, out);
+            }
         }
         for projection in &place.projections {
             match projection {
@@ -778,6 +1156,7 @@ impl<'a> FunctionCodegen<'a> {
                     index,
                     element_size,
                 } => {
+                    self.require_integer_type(self.mir.values[*index], "place index")?;
                     let scratch = if register == "r10" { "r11" } else { "r10" };
                     self.load_value(*index, scratch, out);
                     if *element_size != 1 {
@@ -1061,5 +1440,111 @@ fn identity(value: f64) -> f64 { return value; }
             });
         let cast_error = emit_assembly(&hir, &cast_mir).unwrap_err();
         assert!(cast_error.message.contains("floating-point cast"));
+    }
+
+    #[test]
+    fn rejects_other_mir_type_contract_violations() {
+        let ast = parser::parse(
+            "test.oc",
+            r#"
+module guards;
+fn choose(flag: bool, count: u64) -> u64 {
+    if flag { return count + 1; }
+    return count;
+}
+"#,
+        )
+        .unwrap();
+        let hir = typeck::check(&[("test.oc".into(), ast)]).unwrap();
+        let mir = mir::lower(&hir).unwrap();
+        let bool_ty = hir.types.primitive("bool").unwrap();
+        let u8_ty = hir.types.primitive("u8").unwrap();
+        let u64_ty = hir.types.primitive("u64").unwrap();
+        let bool_value = mir.functions[0]
+            .values
+            .iter()
+            .position(|ty| *ty == bool_ty)
+            .unwrap();
+        let integer_value = mir.functions[0]
+            .values
+            .iter()
+            .position(|ty| *ty == u64_ty)
+            .unwrap();
+
+        let mut unary_mir = mir.clone();
+        let unary_dst = unary_mir.functions[0].values.len();
+        unary_mir.functions[0].values.push(bool_ty);
+        unary_mir.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Unary {
+                dst: unary_dst,
+                op: UnaryOp::Neg,
+                operand: bool_value,
+            });
+        let unary_error = emit_assembly(&hir, &unary_mir).unwrap_err();
+        assert!(unary_error.message.contains("requires an integer type"));
+
+        let mut branch_mir = mir.clone();
+        let branch = branch_mir.functions[0]
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.terminator {
+                Terminator::Branch { condition, .. } => Some(condition),
+                _ => None,
+            })
+            .unwrap();
+        *branch = integer_value;
+        let branch_error = emit_assembly(&hir, &branch_mir).unwrap_err();
+        assert!(branch_error
+            .message
+            .contains("branch condition type mismatch"));
+
+        let mut atomic_mir = mir;
+        let order = atomic_mir.functions[0].values.len();
+        atomic_mir.functions[0].values.push(u8_ty);
+        let result = atomic_mir.functions[0].values.len();
+        atomic_mir.functions[0].values.push(u64_ty);
+        atomic_mir.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Const {
+                dst: order,
+                value: MemoryOrder::Relaxed as u64,
+            });
+        atomic_mir.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dst: Some(result),
+                intrinsic: Intrinsic::AtomicLoad,
+                args: vec![integer_value, order],
+            });
+        let atomic_error = emit_assembly(&hir, &atomic_mir).unwrap_err();
+        assert!(atomic_error.message.contains("requires a pointer"));
+
+        let atomic_ast = parser::parse(
+            "atomic.oc",
+            r#"
+module guards;
+unsafe fn load(pointer: *const u64) -> u64 {
+    return atomic_load(pointer, relaxed);
+}
+"#,
+        )
+        .unwrap();
+        let atomic_hir = typeck::check(&[("atomic.oc".into(), atomic_ast)]).unwrap();
+        let mut invalid_order_mir = mir::lower(&atomic_hir).unwrap();
+        let order = invalid_order_mir.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                Instruction::Const { value, .. } if *value == MemoryOrder::Relaxed as u64 => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .unwrap();
+        *order = 255;
+        let order_error = emit_assembly(&atomic_hir, &invalid_order_mir).unwrap_err();
+        assert!(order_error.message.contains("invalid memory ordering"));
     }
 }
