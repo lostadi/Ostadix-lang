@@ -458,6 +458,20 @@ site. A quoted fragment can read caller `let` bindings, including bindings
 created earlier inside the current typed expression. New `let` bindings inside
 the fragment remain local to that callback and do not mutate the caller.
 
+Scope capture can also be explicit. `scope()` returns a detached OScope value,
+and the two-argument form chooses it instead of the callback-site scope:
+
+```O
+let answer = python[2]^(41)_python[2]
+let captured = scope()
+let answer = python[2]^(99)_python[2]
+let q = quote^(python[1]^($answer + 1)_python[1])_quote
+python[0]^(O.eval($q, $captured))_python[0]  # 42
+```
+
+Python can also call `O.scope()` to capture the current O bindings or
+`O.scope({"name": value})` to construct a restricted scope explicitly.
+
 ### 5. Orchestration and machine computation have different IRs
 
 Olang does not force every kind of computation into the same abstraction.
@@ -856,7 +870,9 @@ O.eval(q)
 `quote^` is a structural backend. It reconstructs the enclosed O source into
 an OExpr without evaluating its children. The Python shim represents OExpr as
 a live `OExprValue`; `O.eval` sends an evaluator callback over the same IPC
-channel and receives the resulting OValue.
+channel and receives the resulting OValue. `O.eval(q)` uses the call-site
+snapshot. `O.eval(q, snapshot)` requires an OScope and uses that explicit
+lexical root.
 
 ### The Nix lattice
 
@@ -939,6 +955,7 @@ built. Member order is significant and is part of the group fingerprint.
 | `activate(path[, profile])` | OStorePath to OSystem | Runs `dry-activate` without privileged authority. |
 | `activate(capability, path[, profile])` | OCapability and OStorePath to OSystem | Performs a real switch after validating a live profile-scoped capability. |
 | `current_system()` | none to OSystem | Returns the current system profile reference. |
+| `scope()` | current O bindings to OScope | Captures a detached lexical snapshot for explicit evaluation. |
 | `lazy(expr)` | any to ORequest or value | Evaluates under the lazy policy. |
 | `now(req)` | ORequest or OGroup to OValue | Forces deferred work. |
 | `autonomous(expr)` | any to OValue | Buffers and schedules requests that do not require evaluator-local state. |
@@ -961,6 +978,7 @@ data, live references, and authority-bearing values.
 | OStr | UTF-8 text. |
 | OHtml | Trusted HTML fragment, kept distinct from escaped text. |
 | OList, OMap | Recursive heterogeneous containers. Map keys are strings. |
+| OScope | Detached O-level lexical bindings for `O.eval(expr, scope)`. |
 | OBlob | Base64 wire data with a MIME type. |
 | OExpr | Unevaluated O source captured by `quote^`. |
 | ONixExpr | Unevaluated Nix source plus dependencies and a fingerprint. |
@@ -980,8 +998,8 @@ The runtime classifies values into three groups:
   are cache-safe, and suitable for persistence.
 - **Referential values** name live world objects whose state can change.
   OSystem identity is the profile reference, not a frozen system state.
-- **Effectful values** carry authority or orchestration semantics. Requests,
-  groups, errors, and capabilities require explicit treatment by caches,
+- **Effectful values** carry authority, scope, or orchestration semantics.
+  Requests, groups, errors, scopes, and capabilities require explicit treatment by caches,
   schedulers, and persistence layers.
 
 Every OValue has a JSON wire form for hosted IPC. That fact does not make
@@ -996,6 +1014,7 @@ Representative wire values are:
 {"t":"str","v":"hello"}
 {"t":"blob","v":"<base64>","mime":"image/png"}
 {"t":"expr","src":"python^(6 * 7)_python"}
+{"t":"scope","bindings":{"answer":{"t":"int","v":42}}}
 {"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."}
 {"t":"request","kind":"instantiate","source":{"t":"nix_expr","body":"...","deps":[],"fingerprint":"..."},"fingerprint":"..."}
 {"t":"group","mode":"batch","members":[],"fingerprint":"..."}
@@ -1003,6 +1022,29 @@ Representative wire values are:
 {"t":"snapshot","kind":"system","identity":"generation-42","state":{}}
 {"t":"error","msg":"member failed"}
 ```
+
+### OValue and the TCF terminal object
+
+The TCF connection is now stated precisely. Fix a behavior space `Beh` and
+form the representation category `Set/Beh`. An object is a carrier together
+with a map into `Beh`. Its terminal object is `(Beh, id)`, because every
+representation has exactly one behavior-preserving map into behavior itself.
+
+OValue realizes that terminal object relative to the observation theory used
+at an O boundary. For the supported fragment in which two closed, terminating
+computations are equivalent exactly when they return the same OValue, take
+`Beh_O = OValue`. Each backend's OValue lifting map is then its unique arrow to
+the terminal carrier.
+
+This is deliberately not a claim that ordinary OValue equality is already
+fully abstract for every observable fact about a program. OExpr preserves
+source, OCapability preserves authority, OScope preserves a namespace, and an
+ordinary returned value does not encode divergence, timing, or a complete
+effect trace. Extending the result to full O semantics requires an observation
+carrier that includes effects and divergence, followed by a proof that its
+equality is exactly the intended behavioral equivalence. The OValue enum has a
+finite set of registered variants, but its carrier is not finite because
+strings, blobs, lists, maps, expressions, and scopes are unbounded.
 
 OCapability is descriptive on the ordinary hosted wire. A serialized identity
 does not become kernel authority by being parsed. The O-core capability bridge
@@ -1233,7 +1275,7 @@ JSON:
 ```text
 Runtime -> shim: {"cmd":"exec","code":"...","bindings":{...}}
 Shim -> runtime: {"status":"ok","value":{"t":"int","v":42}}
-Shim -> runtime: {"status":"eval_request","src":"..."}
+Shim -> runtime: {"status":"eval_request","src":"...","scope":{"t":"scope","bindings":{...}}}
 Runtime -> shim: {"cmd":"eval_result","value":{...}}
 ```
 
@@ -1241,7 +1283,8 @@ The callback forms are what allow Python's `O.eval` to re-enter the O
 evaluator without starting a second unrelated document process. Each callback
 receives a snapshot of the O bindings visible at the call site. The snapshot is
 used as the callback's lexical root, so reads see caller bindings while new
-callback bindings do not leak into the caller.
+callback bindings do not leak into the caller. When the request carries an
+explicit OScope, that value replaces the implicit call-site snapshot.
 
 ### OIR and ExecutionPlan
 
@@ -1688,6 +1731,8 @@ O-core as the freestanding systems language.
 - `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
 - Lexical scope snapshots for `O.eval`, including caller binding visibility
   without callback writes leaking into the caller.
+- First-class OScope values, `scope()`, `O.scope()`, and explicit
+  `O.eval(expr, scope_snapshot)` evaluation.
 - Lazy and deferred Eval requests with purity validation and caching rules.
 - The ONixExpr, ODerivation, OStorePath, and OSystem lattice.
 - Autonomous dependency scheduling with memory and disk caches.
@@ -1718,8 +1763,8 @@ O-core as the freestanding systems language.
 These are the boundaries of the current implementation, not descriptions of
 features that are already present:
 
-- `O.eval` uses a lexical snapshot of caller O bindings and reuses live backend
-  environments. A callback cannot recursively execute the same persistent
+- `O.eval` uses either the caller snapshot or an explicit OScope and reuses live
+  backend environments. A callback cannot recursively execute the same persistent
   backend environment that is currently waiting for its result; use a
   different environment index for that nested block.
 - Concurrent group dispatch currently applies to threadable Nix-family

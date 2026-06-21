@@ -31,7 +31,8 @@ import textwrap
 from typing import Any, Dict, List
 
 from ..ovalue import (
-    OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull, OStorePath, OStr, OValue,
+    OBlob, OBool, OExpr, OFloat, OInt, OList, OMap, ONull, OScope, OStorePath,
+    OStr, OValue,
     from_python, to_python,
 )
 
@@ -48,12 +49,13 @@ class _OHelpers:
     EvalContext so `O.eval(expr)` can walk back into the evaluator.
     """
 
-    def __init__(self, ctx=None):
+    def __init__(self, ctx=None, scope=None):
         # ctx is the live EvalContext, so we can re-enter the evaluator
         # when the user calls O.eval(expr). It's optional for back-compat
         # (e.g., someone manually calling PythonBackend.evaluate without
         # threading a ctx through).
         self._ctx = ctx
+        self._scope = dict(scope or {})
 
     @staticmethod
     def blob(data: bytes, mime: str = "application/octet-stream") -> OBlob:
@@ -70,13 +72,13 @@ class _OHelpers:
         If used as the last expression of a Python block, this fixes the
         expression's OValue explicitly.
         """
-        if isinstance(v, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob)):
+        if isinstance(v, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OScope, OBlob)):
             return v
         return from_python(v)
 
     # ---- Meta-programming bridge -----------------------------------------
 
-    def eval(self, expr: Any) -> OValue:
+    def eval(self, expr: Any, scope_snapshot: Any = None) -> OValue:
         """Evaluate an OExpr (or an AST node) against the live EvalContext.
 
         The expr argument is typically produced by `quote^(...)_quote`.
@@ -102,7 +104,32 @@ class _OHelpers:
             raise TypeError(
                 f"O.eval expected OExpr or ExpressionNode, got {type(expr).__name__}"
             )
-        return _eval_expression(node, self._ctx)
+        if scope_snapshot is None:
+            selected_scope = dict(self._scope)
+        elif isinstance(scope_snapshot, OScope):
+            selected_scope = scope_snapshot.as_dict()
+        else:
+            raise TypeError(
+                "O.eval explicit scope must be an OScope from O.scope(), "
+                f"got {type(scope_snapshot).__name__}"
+            )
+
+        previous_scope = getattr(self._ctx, "_scope", {})
+        self._ctx._scope = selected_scope
+        try:
+            return _eval_expression(node, self._ctx, selected_scope)
+        finally:
+            self._ctx._scope = previous_scope
+
+    def scope(self, bindings: Any = None) -> OScope:
+        """Capture current O bindings or construct a detached explicit scope."""
+        if bindings is None:
+            return OScope(tuple(self._scope.items()))
+        if isinstance(bindings, OScope):
+            return bindings
+        if not isinstance(bindings, dict):
+            raise TypeError(f"O.scope expects a dict, got {type(bindings).__name__}")
+        return OScope(tuple((str(k), from_python(v)) for k, v in bindings.items()))
 
     @staticmethod
     def quote(src: str) -> OExpr:
@@ -133,7 +160,7 @@ class _OHelpers:
 
 def _lift_result(x: Any) -> OValue:
     """Convert a Python result to an OValue, recognizing common rich types."""
-    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OBlob)):
+    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OStorePath, OList, OMap, OScope, OBlob)):
         return x  # user already wrapped it
 
     # matplotlib.figure.Figure -> PNG blob
@@ -205,8 +232,6 @@ class PythonBackend:
 
         env = ctx.env_for("python", node.env_id)
         # Bind O to a helper that can re-enter the current evaluator.
-        env["O"] = _OHelpers(ctx)
-
         # A scratch namespace for child-value stashes keeps the user's
         # env clean of our generated names.
         stash_prefix = "__O_child_"
@@ -219,6 +244,7 @@ class PythonBackend:
         # retrieved from the call stack. As a simpler approach, we check
         # the ctx for a scope dict if it exists, otherwise use an empty dict.
         scope = getattr(ctx, "_scope", {})
+        env["O"] = _OHelpers(ctx, scope)
 
         for child in node.body:
             if isinstance(child, TextPart):
@@ -272,7 +298,7 @@ class PythonBackend:
     def evaluate(self, body: str, env: Dict[str, Any], ctx=None) -> OValue:
         if ctx is not None:
             # Refresh the O helper so O.eval works even through this path.
-            env["O"] = _OHelpers(ctx)
+            env["O"] = _OHelpers(ctx, getattr(ctx, "_scope", {}))
         return self._exec(body, env)
 
     def _exec(self, body: str, env: Dict[str, Any]) -> OValue:

@@ -98,6 +98,13 @@ site. Reads therefore have lexical visibility, while callback `let` bindings
 cannot mutate the caller. The evaluator retains the most recent validated plan
 through `last_execution_plan()` for inspection and tests.
 
+`scope()` materializes those bindings as a first-class OScope. The Python shim
+can send OScope in an `eval_request`, so `O.eval(expr, scope_snapshot)` replaces
+implicit capture with an explicit lexical root. OScope is distinct from OMap:
+it carries namespace intent and is conservatively non-cacheable,
+non-replayable, and non-persistable because its bindings may delegate live
+capabilities or references.
+
 OIR remains intentionally distinct from SSA. Recursive OIR regions preserve
 lexical scope and policy-changing special forms such as `lazy`, `autonomous`,
 and coordination groups. Every `Store`, `Invoke`, and `Exec` maps its direct
@@ -123,6 +130,7 @@ Every value crossing language boundaries is represented as one of these types:
 | `OStr`         | Text string                          |
 | `OList`        | Ordered collection                   |
 | `OMap`         | Key-value mapping                    |
+| `OScope`       | Detached lexical binding snapshot    |
 | `OHtml`        | HTML fragment                        |
 | `OStorePath`   | Nix store path                       |
 | `ONixExpr`     | Unevaluated Nix expression           |

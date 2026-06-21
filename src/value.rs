@@ -113,6 +113,18 @@ pub enum OValue {
     #[serde(rename = "map")]
     Map { v: HashMap<String, OValue> },
 
+    /// A first-class snapshot of an O-level lexical scope.
+    ///
+    /// A Scope is not a plain Map. It records that its entries are bindings to
+    /// use as the lexical root of a later evaluation, most notably
+    /// `O.eval(expr, scope)`. The snapshot is detached: evaluation may read and
+    /// shadow its bindings, but cannot mutate the scope from which it was made.
+    ///
+    /// Scope snapshots may contain capabilities and live references, so they
+    /// are conservatively non-cacheable, non-replayable, and non-persistable.
+    #[serde(rename = "scope")]
+    Scope { bindings: HashMap<String, OValue> },
+
     /// Raw binary data with a MIME type hint for the receiving backend.
     ///
     /// This is the escape hatch for rich values: matplotlib figures,
@@ -526,6 +538,9 @@ impl OValue {
     pub fn map(entries: HashMap<String, OValue>) -> Self {
         OValue::Map { v: entries }
     }
+    pub fn scope(bindings: HashMap<String, OValue>) -> Self {
+        OValue::Scope { bindings }
+    }
 
     /// Construct a lazy Nix expression value.
     ///
@@ -741,6 +756,15 @@ impl OValue {
                 let composed = format!("capability|{}|{}", kind.name(), identity);
                 hex::encode(Sha256::digest(composed.as_bytes()))
             }
+            OValue::Scope { bindings } => {
+                let mut entries = bindings
+                    .iter()
+                    .map(|(name, value)| format!("{}={}", name, value.content_identity()))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                let composed = format!("scope|{}", entries.join("|"));
+                hex::encode(Sha256::digest(composed.as_bytes()))
+            }
             OValue::Snapshot { kind, identity, .. } => {
                 let composed = format!("snapshot|{}|{}", kind.name(), identity);
                 hex::encode(Sha256::digest(composed.as_bytes()))
@@ -814,6 +838,9 @@ impl OValue {
     pub fn is_map(&self) -> bool {
         matches!(self, OValue::Map { .. })
     }
+    pub fn is_scope(&self) -> bool {
+        matches!(self, OValue::Scope { .. })
+    }
     pub fn is_blob(&self) -> bool {
         matches!(self, OValue::Blob { .. })
     }
@@ -863,6 +890,7 @@ impl OValue {
             OValue::StorePath { .. } => "store_path",
             OValue::List { .. } => "list",
             OValue::Map { .. } => "map",
+            OValue::Scope { .. } => "scope",
             OValue::Blob { .. } => "blob",
             OValue::NixExpr { .. } => "nix_expr",
             OValue::Derivation { .. } => "derivation",
@@ -882,6 +910,7 @@ impl OValue {
         match self {
             OValue::System { .. } => RuntimeBoundary::Referential,
             OValue::Capability { .. }
+            | OValue::Scope { .. }
             | OValue::Request { .. }
             | OValue::Group { .. }
             | OValue::Error { .. } => RuntimeBoundary::Effectful,
@@ -900,7 +929,7 @@ impl OValue {
     /// live world again.
     pub fn is_cache_safe(&self) -> bool {
         match self {
-            OValue::System { .. } | OValue::Capability { .. } => false,
+            OValue::System { .. } | OValue::Capability { .. } | OValue::Scope { .. } => false,
             OValue::Request {
                 kind: RequestKind::Activate { .. },
                 ..
@@ -920,6 +949,7 @@ impl OValue {
             self,
             OValue::System { .. }
                 | OValue::Capability { .. }
+                | OValue::Scope { .. }
                 | OValue::Request {
                     kind: RequestKind::Activate { .. },
                     ..
@@ -933,6 +963,7 @@ impl OValue {
             self,
             OValue::System { .. }
                 | OValue::Capability { .. }
+                | OValue::Scope { .. }
                 | OValue::Request {
                     kind: RequestKind::Activate { .. },
                     ..
@@ -1040,6 +1071,7 @@ impl OValue {
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
             }
+            OValue::Scope { bindings } => format!("<scope bindings={}>", bindings.len()),
             OValue::Blob { v, mime } => {
                 format!("data:{};base64,{}", mime, v)
             }
@@ -1157,6 +1189,7 @@ impl fmt::Display for OValue {
                 }
                 write!(f, "}}")
             }
+            OValue::Scope { bindings } => write!(f, "<scope bindings={}>", bindings.len()),
             OValue::Html { v } => write!(f, "{}", v),
             OValue::StorePath { path } => write!(f, "{}", path),
             OValue::Blob { mime, .. } => write!(f, "<blob:{}>", mime),
@@ -1301,12 +1334,17 @@ pub enum OWireResponse {
     /// The shim is mid-execution and needs the runtime to evaluate an O
     /// source fragment on its behalf (for `O.eval(q)` in a Python block).
     ///
-    /// Protocol: after receiving this, the runtime evaluates `src` and
-    /// sends back an `OWireCommand::EvalResult`. The shim then resumes
-    /// execution of the current block. The exec-reply cycle completes
-    /// when the shim finally sends `Ok` or `Err`.
+    /// Protocol: after receiving this, the runtime evaluates `src` against the
+    /// explicit Scope when one is supplied, otherwise against the backend call
+    /// site's lexical snapshot, and sends back an `OWireCommand::EvalResult`.
+    /// The shim then resumes execution of the current block. The exec-reply
+    /// cycle completes when the shim finally sends `Ok` or `Err`.
     #[serde(rename = "eval_request")]
-    EvalRequest { src: String },
+    EvalRequest {
+        src: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<OValue>,
+    },
 }
 
 impl OWireResponse {
@@ -1324,7 +1362,7 @@ impl OWireResponse {
         match self {
             OWireResponse::Ok { value } => Ok(value),
             OWireResponse::Err { message } => bail!("{}", message),
-            OWireResponse::EvalRequest { src } => bail!(
+            OWireResponse::EvalRequest { src, .. } => bail!(
                 "unexpected eval_request from shim (src: {:?}) — this shim sent \
                  eval_request outside of an O.eval call or the runtime received it \
                  through a non-eval-aware path",
@@ -1393,6 +1431,7 @@ mod tests {
                 m.insert("nested".to_string(), OValue::list(vec![OValue::null()]));
                 m
             }),
+            OValue::scope(HashMap::from([("answer".to_string(), OValue::int(42))])),
             OValue::blob(b"\x89PNG\r\n", "image/png"),
             OValue::blob(&[], "application/octet-stream"),
             // OExpr round-trips its src string.
@@ -1454,10 +1493,15 @@ mod tests {
         // EvalRequest/EvalResult round-trip
         let eval_req = OWireResponse::EvalRequest {
             src: "python^(42)_python".to_string(),
+            scope: Some(OValue::scope(HashMap::from([(
+                "answer".to_string(),
+                OValue::int(42),
+            )]))),
         };
         let json = serde_json::to_string(&eval_req).unwrap();
         assert!(json.contains(r#""status":"eval_request""#));
         assert!(json.contains(r#""src":"python^(42)_python""#));
+        assert!(json.contains(r#""scope":{"t":"scope""#));
         let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, OWireResponse::EvalRequest { .. }));
 
@@ -1482,6 +1526,7 @@ mod tests {
             (OValue::str_(""), "str"),
             (OValue::list(vec![]), "list"),
             (OValue::map(HashMap::new()), "map"),
+            (OValue::scope(HashMap::new()), "scope"),
             (OValue::blob(&[], ""), "blob"),
             (
                 OValue::Expr {
@@ -1537,10 +1582,15 @@ mod tests {
         let pure = OValue::snapshot(SnapshotKind::System, "gen-1", HashMap::new());
         let referential = OValue::system("/nix/var/nix/profiles/system");
         let effectful = OValue::capability(CapabilityKind::Device, "pci:00:1f.2", HashMap::new());
+        let scope = OValue::scope(HashMap::from([("cap".to_string(), effectful.clone())]));
 
         assert_eq!(pure.runtime_boundary(), RuntimeBoundary::Pure);
         assert_eq!(referential.runtime_boundary(), RuntimeBoundary::Referential);
         assert_eq!(effectful.runtime_boundary(), RuntimeBoundary::Effectful);
+        assert_eq!(scope.runtime_boundary(), RuntimeBoundary::Effectful);
+        assert!(!scope.is_cache_safe());
+        assert!(!scope.is_replay_safe());
+        assert!(!scope.is_boot_persistable());
     }
 
     #[test]

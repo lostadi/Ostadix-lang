@@ -13,6 +13,8 @@ import textwrap
 # even when the shim's handle_exec has temporarily redirected sys.stdout to
 # a StringIO capture buffer for print() capture.
 _real_stdout = sys.stdout
+_current_o_scope = {}
+_current_o_scope_wire = {}
 
 class OHtml(str):
     """Typed trusted HTML fragment passed through O-lang."""
@@ -40,6 +42,41 @@ class OExprValue:
         return self.src
 
 
+class OOpaqueValue:
+    """A lossless Python handle for an OValue without a native Python form."""
+
+    def __init__(self, wire_value):
+        if not isinstance(wire_value, dict) or "t" not in wire_value:
+            raise TypeError("OOpaqueValue requires a tagged OValue object")
+        self.wire_value = dict(wire_value)
+
+    def __repr__(self):
+        return f"OOpaqueValue({self.wire_value.get('t')!r})"
+
+
+class OScopeValue:
+    """A detached snapshot of O-level lexical bindings."""
+
+    def __init__(self, bindings, wire_bindings=None):
+        if not isinstance(bindings, dict):
+            raise TypeError("OScopeValue bindings must be a dict")
+        self.bindings = dict(bindings)
+        self.wire_bindings = (
+            dict(wire_bindings) if wire_bindings is not None else None
+        )
+
+    def __repr__(self):
+        return f"OScopeValue({self.bindings!r})"
+
+    @classmethod
+    def from_wire_json(cls, encoded):
+        """Rebuild a scope literal without erasing opaque nested OValues."""
+        value = oval_to_py(json.loads(encoded))
+        if not isinstance(value, cls):
+            raise TypeError("OScopeValue wire literal did not contain a scope")
+        return value
+
+
 class _OMod:
     """The ``O`` namespace injected into every Python block.
 
@@ -48,16 +85,17 @@ class _OMod:
     """
 
     @staticmethod
-    def eval(q):
+    def eval(q, scope_snapshot=None):
         """Evaluate a quoted expression and return its result.
 
         Sends an ``eval_request`` back to the Rust runtime, which evaluates
         the O source fragment and replies with an ``eval_result`` command.
         The function then returns the result as a Python value.
 
-        The O fragment sees a lexical snapshot of the O bindings visible at
-        this backend call site. Bindings created by the fragment remain local
-        to that evaluation.
+        With one argument, the O fragment sees the lexical snapshot visible at
+        this backend call site. With ``O.eval(q, scope_snapshot)``, it instead
+        uses the supplied ``OScopeValue``. Bindings created by the fragment
+        remain local to that evaluation in both forms.
 
         ``O.eval(q)`` cannot be used if ``q`` contains a
         reference to the same persistent env that is currently executing
@@ -78,7 +116,15 @@ class _OMod:
         # contextlib.redirect_stdout() that the handle_exec caller installs
         # for capturing print() output.  The IPC protocol must go over the
         # real pipe — not the StringIO capture buffer.
-        msg = json.dumps({"status": "eval_request", "src": src}) + "\n"
+        msg = {"status": "eval_request", "src": src}
+        if scope_snapshot is not None:
+            if not isinstance(scope_snapshot, OScopeValue):
+                raise TypeError(
+                    "O.eval explicit scope must be an OScopeValue from "
+                    f"scope() or O.scope(), got {type(scope_snapshot).__name__!r}"
+                )
+            msg["scope"] = py_to_oval(scope_snapshot)
+        msg = json.dumps(msg) + "\n"
         _real_stdout.write(msg)
         _real_stdout.flush()
         # Block until the runtime replies with eval_result.
@@ -109,6 +155,15 @@ class _OMod:
             raise TypeError(f"O.quote expects a str, got {type(src).__name__!r}")
         return OExprValue(src)
 
+    @staticmethod
+    def scope(bindings=None) -> OScopeValue:
+        """Capture the current O lexical bindings or build an explicit scope."""
+        if bindings is None:
+            return OScopeValue(_current_o_scope, _current_o_scope_wire)
+        if not isinstance(bindings, dict):
+            raise TypeError(f"O.scope expects a dict, got {type(bindings).__name__!r}")
+        return OScopeValue(bindings)
+
 
 def oval_to_py(v):
     t = v.get("t")
@@ -131,12 +186,18 @@ def oval_to_py(v):
         return [oval_to_py(x) for x in v.get("v", [])]
     if t == "map":
         return {k: oval_to_py(x) for k, x in v.get("v", {}).items()}
+    if t == "scope":
+        wire_bindings = v.get("bindings", {})
+        return OScopeValue(
+            {k: oval_to_py(x) for k, x in wire_bindings.items()},
+            wire_bindings,
+        )
     if t == "blob":
         return base64.b64decode(v.get("v", ""))
     if t == "expr":
         return OExprValue(v.get("src", ""))
 
-    raise ValueError(f"unknown OValue type: {t!r}")
+    return OOpaqueValue(v)
 
 def py_to_oval(x):
     if x is None:
@@ -159,6 +220,19 @@ def py_to_oval(x):
 
     if isinstance(x, OExprValue):
         return {"t": "expr", "src": x.src}
+
+    if isinstance(x, OOpaqueValue):
+        return dict(x.wire_value)
+
+    if isinstance(x, OScopeValue):
+        return {
+            "t": "scope",
+            "bindings": (
+                dict(x.wire_bindings)
+                if x.wire_bindings is not None
+                else {k: py_to_oval(v) for k, v in x.bindings.items()}
+            ),
+        }
 
     if isinstance(x, str):
         return {"t": "str", "v": x}
@@ -219,13 +293,18 @@ env = {
     "OHtml": OHtml,
     "OStorePath": OStorePath,
     "OExprValue": OExprValue,
+    "OOpaqueValue": OOpaqueValue,
+    "OScopeValue": OScopeValue,
     "O": O,
 }
 
 def handle_exec(cmd):
+    global _current_o_scope, _current_o_scope_wire
     code = cmd.get("code", "")
     bindings = cmd.get("bindings", {})
 
+    _current_o_scope_wire = dict(bindings)
+    _current_o_scope = {name: oval_to_py(oval) for name, oval in bindings.items()}
     for name, oval in bindings.items():
         env[name] = oval_to_py(oval)
 
@@ -295,10 +374,15 @@ def handle_exec(cmd):
         send_err(traceback.format_exc())
 
 def handle_cleanup():
+    global _current_o_scope, _current_o_scope_wire
+    _current_o_scope = {}
+    _current_o_scope_wire = {}
     env.clear()
     env["OHtml"] = OHtml
     env["OStorePath"] = OStorePath
     env["OExprValue"] = OExprValue
+    env["OOpaqueValue"] = OOpaqueValue
+    env["OScopeValue"] = OScopeValue
     env["O"] = O
     send_ok(None)
 

@@ -118,6 +118,19 @@ class OMap:
 
 
 @dataclass(frozen=True)
+class OScope:
+    """A detached snapshot of O-level lexical bindings."""
+    pairs: Tuple[Tuple[str, "OValue"], ...]
+    tag: str = "scope"
+
+    def as_dict(self) -> Dict[str, "OValue"]:
+        return dict(self.pairs)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"tag": "scope", "bindings": [[k, v.to_json()] for k, v in self.pairs]}
+
+
+@dataclass(frozen=True)
 class OBlob:
     """Opaque binary payload with a mime-type tag.
 
@@ -174,7 +187,10 @@ class OExpr:
         return {"tag": "expr", "repr": repr(self.ast)}
 
 
-OValue = Union[ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap, OBlob, OExpr]
+OValue = Union[
+    ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap,
+    OScope, OBlob, OExpr,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +206,7 @@ def from_python(x: Any) -> OValue:
     # Already an OValue? Pass through unchanged so that Python code can
     # build up heterogeneous lists of OInt/OStr/OBlob without us stringifying
     # them on the way out.
-    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap, OBlob, OExpr)):
+    if isinstance(x, (ONull, OBool, OInt, OFloat, OStr, OHtml, OStorePath, OList, OMap, OScope, OBlob, OExpr)):
         return x
     if x is None:
         return ONull()
@@ -224,6 +240,8 @@ def to_python(v: OValue) -> Any:
     if isinstance(v, OList):
         return [to_python(item) for item in v.items]
     if isinstance(v, OMap):
+        return {k: to_python(val) for k, val in v.pairs}
+    if isinstance(v, OScope):
         return {k: to_python(val) for k, val in v.pairs}
     if isinstance(v, OBlob):
         return v.data
@@ -260,6 +278,8 @@ def render_plain(v: OValue) -> str:
         return "[" + ", ".join(render_plain(x) for x in v.items) + "]"
     if isinstance(v, OMap):
         return "{" + ", ".join(f"{k}: {render_plain(x)}" for k, x in v.pairs) + "}"
+    if isinstance(v, OScope):
+        return f"<scope bindings={len(v.pairs)}>"
     if isinstance(v, OBlob):
         return f"<blob mime={v.mime} bytes={len(v.data)}>"
     if isinstance(v, OExpr):

@@ -643,7 +643,27 @@ impl PlanBuilder {
                     .expect("scope stack always has a root scope")
                     .insert(name.clone(), id);
             }
-            OIr::Invoke { args, .. } => {
+            OIr::Invoke { fn_name, args, .. } => {
+                // scope() reads every currently visible lexical binding even
+                // though it has no syntactic arguments. Record those implicit
+                // reads as data dependencies so the plan describes the same
+                // semantics the evaluator executes. Inner bindings shadow
+                // outer bindings with the same name.
+                if fn_name == "scope" {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut sources = Vec::new();
+                    for lexical_scope in scope_stack.iter().rev() {
+                        for (name, source) in lexical_scope {
+                            if seen.insert(name.clone()) {
+                                sources.push(*source);
+                            }
+                        }
+                    }
+                    sources.sort_by_key(|source| source.0);
+                    for source in sources {
+                        self.add_edge(source, id, PlanEdgeKind::Data);
+                    }
+                }
                 scope_stack.push(std::collections::HashMap::new());
                 let mut prev = None;
                 for arg in args {
@@ -1258,6 +1278,50 @@ mod tests {
         assert!(plan.edges.iter().any(|e| {
             e.from == PlanNodeId(0) && e.to == PlanNodeId(4) && e.kind == PlanEdgeKind::Data
         }));
+    }
+
+    #[test]
+    fn scope_capture_depends_on_every_visible_store() {
+        let program = OIrProgram::lower(&[
+            ONode::LetBinding {
+                name: "x".into(),
+                expr: Box::new(ONode::RawText("one".into())),
+            },
+            ONode::LetBinding {
+                name: "y".into(),
+                expr: Box::new(ONode::RawText("two".into())),
+            },
+            ONode::LetBinding {
+                name: "captured".into(),
+                expr: Box::new(ONode::Call {
+                    fn_name: "scope".into(),
+                    args: vec![],
+                }),
+            },
+        ]);
+        let plan = program.plan();
+        let capture = plan
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    PlanNodeKind::Invoke { fn_name, .. } if fn_name == "scope"
+                )
+            })
+            .unwrap()
+            .id;
+        let visible_stores = plan
+            .edges
+            .iter()
+            .filter(|edge| edge.to == capture && edge.kind == PlanEdgeKind::Data)
+            .map(|edge| edge.from)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            visible_stores,
+            BTreeSet::from([PlanNodeId(0), PlanNodeId(2)])
+        );
     }
 
     #[test]

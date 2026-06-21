@@ -129,6 +129,20 @@ bindings established earlier in the current typed expression. The fragment
 evaluates through OIR with a cloned root scope, so `let` bindings created by
 the callback do not mutate the caller.
 
+The explicit form is:
+
+```
+let snapshot = scope()
+python^(O.eval(expr, $snapshot))_python
+```
+
+`scope()` returns an `OScope` containing a detached copy of the current O-level
+bindings. `O.eval(expr, snapshot)` MUST reject values that are not OScope and
+MUST use the supplied bindings instead of the callback-site snapshot. Python's
+`O.scope()` captures the current O bindings; `O.scope(dict)` constructs a
+restricted OScope from the supplied entries. Scope writes during evaluation
+never mutate either the snapshot or its source scope.
+
 ### 2.4 Environment lifetime and forcing contract
 
 Environment lifetime and request forcing are part of the stable language core:
@@ -192,6 +206,7 @@ OValue  ::= ONull
           | OStorePath { path: str }            -- Nix store path
           | OList   { items: (OValue, …) }
           | OMap    { pairs: ((str, OValue), …) }
+          | OScope  { bindings: {str: OValue} } -- detached lexical snapshot
           | OBlob   { data: bytes, mime: str }
           | OExpr   { src: str }               -- homoiconicity: quoted O source
           | ONixExpr { body: str, fingerprint: str, deps: [OValue] }
@@ -233,6 +248,7 @@ The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 | `store_path`  | `{"t":"store_path","path":"/nix/store/..."}`  | Rust ext; Nix store path              |
 | `list`        | `{"t":"list","v":[...]}`                     |                                       |
 | `map`         | `{"t":"map","v":{...}}`                      |                                       |
+| `scope`       | `{"t":"scope","bindings":{...}}`             | Explicit lexical root for O.eval      |
 | `blob`        | `{"t":"blob","v":"<base64>","mime":"..."}`   |                                       |
 | `expr`        | `{"t":"expr","src":"<O source text>"}`       | Quoted O expression; send to O.eval   |
 | `nix_expr`    | `{"t":"nix_expr","body":"...","fp":"..."}`   | Rust ext; lazy Nix expression         |
@@ -250,8 +266,8 @@ The language/runtime contract distinguishes three classes of values:
   `OExpr`, `ONixExpr`, `ODerivation`, `OThunk`, `OSnapshot`, most `ORequest`s).
 - **Referential values** — live handles into the world whose identity is stable
   as a reference but whose observed state may change (`OSystem`).
-- **Effectful values** — authority-bearing or orchestration values whose meaning
-  depends on execution context (`OCapability`, `OGroup`, `OError`, and effectful
+- **Effectful values** — authority-bearing, scope, or orchestration values whose meaning
+  depends on execution context (`OCapability`, `OScope`, `OGroup`, `OError`, and effectful
   `ORequest`s such as `activate`).
 
 The runtime MUST preserve these invariants:
@@ -539,8 +555,8 @@ Adding a new language: write a Backend subclass, add it to
   `any(…)` returns the first success, `race(…)` returns the first result
   (success or failure). Eval Requests and nested plain values resolve serially.
   Full cancellation and async I/O are future work.
-* **`O.eval` same-environment recursion.** The callback inherits a lexical
-  snapshot of caller O bindings and keeps callback writes local. A callback
+* **`O.eval` same-environment recursion.** The callback uses a caller snapshot
+  or explicit OScope and keeps callback writes local. A callback
   cannot execute the same persistent backend environment that is currently
   waiting for the callback result; nested backend work must use another
   environment index.

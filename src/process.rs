@@ -17,8 +17,9 @@ use crate::value::{OValue, OWireCommand, OWireResponse};
 pub enum ExecStep {
     /// The shim finished executing and returned a value.
     Done(OValue),
-    /// The shim needs the runtime to evaluate an O source fragment.
-    EvalRequest { src: String },
+    /// The shim needs the runtime to evaluate an O source fragment. `scope` is
+    /// an optional explicit OValue::Scope supplied by user code.
+    EvalRequest { src: String, scope: Option<OValue> },
 }
 
 struct BackendProcess {
@@ -87,7 +88,7 @@ impl BackendProcess {
         match response {
             OWireResponse::Ok { value } => Ok(ExecStep::Done(value)),
             OWireResponse::Err { message } => Err(anyhow!("{}", message)),
-            OWireResponse::EvalRequest { src } => Ok(ExecStep::EvalRequest { src }),
+            OWireResponse::EvalRequest { src, scope } => Ok(ExecStep::EvalRequest { src, scope }),
         }
     }
 
@@ -102,7 +103,7 @@ impl BackendProcess {
         })?;
         match self.recv_step()? {
             ExecStep::Done(v) => Ok(v),
-            ExecStep::EvalRequest { src } => Err(anyhow!(
+            ExecStep::EvalRequest { src, .. } => Err(anyhow!(
                 "unexpected eval_request from shim (src: {:?}): \
                  O.eval is only supported when the evaluator uses the \
                  exec_with_eval_callback path",
@@ -115,7 +116,7 @@ impl BackendProcess {
         self.send_command(&OWireCommand::Ping)?;
         match self.recv_step()? {
             ExecStep::Done(_) => Ok(()),
-            ExecStep::EvalRequest { src } => Err(anyhow!(
+            ExecStep::EvalRequest { src, .. } => Err(anyhow!(
                 "unexpected eval_request during ping (src: {:?})",
                 &src[..src.len().min(40)]
             )),
@@ -279,7 +280,7 @@ mod tests {
     fn expect_done(step: ExecStep) -> OValue {
         match step {
             ExecStep::Done(value) => value,
-            ExecStep::EvalRequest { src } => {
+            ExecStep::EvalRequest { src, .. } => {
                 panic!("expected Done step from shim, got EvalRequest({src:?})")
             }
         }

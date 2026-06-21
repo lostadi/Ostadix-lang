@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from o_lang import (
     EvalContext, OBlob, OBool, OExpr, OFloat, OHtml, OInt, OList, OMap, ONull,
-    OStorePath, OStr,
+    OScope, OStorePath, OStr,
     evaluate_document, parse, run,
 )
 
@@ -146,6 +146,8 @@ def test_backslash_escaped_closer_is_literal_in_python():
 def test_example_files_parse_and_eval():
     root = Path(__file__).resolve().parents[1] / "examples"
     for p in sorted(root.glob("*.O")):
+        if not _nix_available() and p.name.startswith(("nix_", "nixos_")):
+            continue
         src = p.read_text(encoding="utf-8")
         v = run(src)
         assert v is not None, f"example {p.name} returned None"
@@ -236,6 +238,21 @@ def test_o_quote_from_python_source_string():
     )
     v = run(src)
     assert isinstance(v, OInt) and v.value == 333
+
+
+def test_o_eval_with_explicit_scope_snapshot():
+    src = (
+        "python[0]^(\n"
+        "snapshot = O.scope({'answer': 41})\n"
+        "q = quote^(python[1]^($answer + 1)_python[1])_quote\n"
+        "O.eval(q, snapshot)\n"
+        ")_python[0]"
+    )
+    v = run(src)
+    assert isinstance(v, OInt) and v.value == 42
+
+    scope = OScope((("answer", OInt(41)),))
+    assert scope.as_dict()["answer"] == OInt(41)
 
 
 def test_lift_preserves_ovalues_inside_python_lists():

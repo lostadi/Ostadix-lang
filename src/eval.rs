@@ -1536,6 +1536,12 @@ impl Evaluator {
                 }
                 Ok(OValue::system("/nix/var/nix/profiles/system"))
             }
+            "scope" => {
+                if !arg_vals.is_empty() {
+                    bail!("scope() takes no arguments, got {}", arg_vals.len());
+                }
+                Ok(OValue::scope(scope.clone()))
+            }
             other => bail!("Unknown built-in function: `{}(...)`", other),
         }
     }
@@ -1823,11 +1829,26 @@ impl Evaluator {
             match step {
                 ExecStep::Done(v) => break Ok(v),
 
-                ExecStep::EvalRequest { src } => {
+                ExecStep::EvalRequest {
+                    src,
+                    scope: explicit_scope,
+                } => {
                     // Evaluate the quoted source. If eval fails, propagate the
                     // error — the shim's `O.eval(q)` will raise on the Python
                     // side because the runtime never sends eval_result.
-                    match self.eval_source_with_scope(&src, &local_scope) {
+                    let callback_scope = match explicit_scope {
+                        None => local_scope.clone(),
+                        Some(OValue::Scope { bindings }) => bindings,
+                        Some(other) => {
+                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
+                            bail!(
+                                "[{}] O.eval explicit scope must be an OScope, got {}",
+                                env_label,
+                                other.type_name()
+                            );
+                        }
+                    };
+                    match self.eval_source_with_scope(&src, &callback_scope) {
                         Ok(result) => {
                             self.registry
                                 .send_eval_result(runtime_lang, env_id, result)
@@ -1964,6 +1985,9 @@ fn render_nix(val: &OValue) -> String {
                 .join(" ");
             format!("{{ {} }}", items)
         }
+        OValue::Scope { bindings } => {
+            format!("\"<scope bindings={}>\"", bindings.len())
+        }
         OValue::Blob { v, .. } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
         // An ONixExpr spliced into a Nix context is its already-assembled body —
         // it is a valid Nix expression that can be parenthesised inline.
@@ -2076,6 +2100,15 @@ fn render_python(val: &OValue) -> String {
                 .join(", ");
 
             format!("{{{}}}", items)
+        }
+
+        OValue::Scope { bindings } => {
+            let wire = serde_json::to_string(&OValue::Scope {
+                bindings: bindings.clone(),
+            })
+            .expect("OValue::Scope must serialize");
+            let encoded = serde_json::to_string(&wire).expect("scope JSON string must serialize");
+            format!("OScopeValue.from_wire_json({encoded})")
         }
 
         OValue::Blob { v, mime } => {
@@ -2244,6 +2277,13 @@ fn render_html(val: &OValue) -> String {
             .collect::<Vec<_>>()
             .join(""),
 
+        OValue::Scope { bindings } => {
+            format!(
+                "<code class=\"o-scope\" data-bindings=\"{}\">&lt;scope&gt;</code>",
+                bindings.len()
+            )
+        }
+
         OValue::Blob { v, mime } => render_html_blob(v, mime),
 
         OValue::NixExpr {
@@ -2404,6 +2444,9 @@ fn render_latex(val: &OValue) -> String {
             .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
             .collect::<Vec<_>>()
             .join(", "),
+        OValue::Scope { bindings } => {
+            format!("\\texttt{{<scope bindings={}>}}", bindings.len())
+        }
         OValue::Blob { mime, .. } => format!("\\texttt{{<blob:{}>}}", mime),
         OValue::NixExpr { body, .. } => format!("\\texttt{{{}}}", body.replace("_", "\\_")),
         OValue::Derivation { drv_path, .. } => {
@@ -2470,6 +2513,7 @@ fn render_markdown(val: &OValue) -> String {
             .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
             .collect::<Vec<_>>()
             .join("\n"),
+        OValue::Scope { bindings } => format!("`<scope bindings={}>`", bindings.len()),
         OValue::Blob { mime, .. } => format!("<blob:{}>", mime),
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
@@ -4019,6 +4063,44 @@ python[0]^(O.eval($q))_python[0]
             !scope.contains_key("callback_only"),
             "O.eval bindings must not mutate the caller's lexical scope"
         );
+    }
+
+    /// The explicit two-argument form evaluates against the supplied OScope,
+    /// not the lexical scope at the callback site. This makes time-of-capture
+    /// visible and lets metaprograms choose which O namespace they evaluate in.
+    #[test]
+    fn o_eval_accepts_an_explicit_first_class_scope_snapshot() {
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let source = r#"
+let answer = python[2]^(41)_python[2]
+let captured = scope()
+let answer = python[2]^(99)_python[2]
+let q = quote^(python[1]^($answer + (1 if isinstance(authority, OOpaqueValue) else 1000))_python[1])_quote
+python[0]^(O.eval($q, $captured))_python[0]
+"#;
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+        let mut scope = HashMap::new();
+        let authority = evaluator
+            .issue_system_activation_capability("/nix/var/nix/profiles/system")
+            .unwrap();
+        scope.insert("authority".into(), authority.clone());
+
+        let result = evaluator
+            .eval_document_with_scope(nodes, &mut scope)
+            .unwrap();
+
+        assert_eq!(result, OValue::int(42));
+        assert_eq!(scope.get("answer"), Some(&OValue::int(99)));
+        let Some(OValue::Scope { bindings }) = scope.get("captured") else {
+            panic!("scope() must produce an OScope value")
+        };
+        assert_eq!(bindings.get("answer"), Some(&OValue::int(41)));
+        assert_eq!(bindings.get("authority"), Some(&authority));
     }
 
     // ─────────────────────────────────────────────────────────────────────────

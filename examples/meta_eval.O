@@ -45,6 +45,17 @@ src = "\python^(111 + 222)_python"     # backslash escapes the inner opener
 O.eval(O.quote(src))
 )_python[0]
 
+## Explicit lexical scope
+
+The one-argument form captures the scope at the callback site. The two-argument
+form accepts an OScope value, so the chosen namespace is explicit:
+
+python[0]^(
+captured = O.scope({"answer": 41})
+scoped = quote^(python[1]^($answer + 1)_python[1])_quote
+O.eval(scoped, captured)  # -> 42
+)_python[0]
+
 ## Why this matters
 
 Lisp's power famously derives from code-as-data: a program can produce the
