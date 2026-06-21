@@ -1829,3 +1829,21 @@ See [SPEC.md](SPEC.md) for the hosted language contract,
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+
+## Citation and authorship
+
+O-lang / ^Olang_ -- the Ouroboros Language -- was created by Lee Daghlar Ostadi.
+
+If you use, fork, compare, derive from, or discuss this project, cite the
+canonical repository:
+
+    Lee Daghlar Ostadi. O-lang / ^Olang_: the Ouroboros Language.
+    https://github.com/lostadi/Olang
+
+Core contribution:
+
+    Typed expression boundaries: LANG^( body )_LANG
+
+Canonical phrase:
+
+    The nesting is the interface.

@@ -1,0 +1,17 @@
+O-lang / ^Olang_: the Ouroboros Language
+Copyright 2026 Lee Daghlar Ostadi
+
+Original public implementation:
+https://github.com/lostadi/Olang
+
+Core contribution:
+Typed expression boundaries, where the evaluator of an expression is part of
+the expression syntax:
+
+    LANG^( body )_LANG
+
+Associated project terms:
+O-lang, ^Olang_, Ouroboros Language, OValue, OIR, O-core, typed parentheses,
+evaluator-as-syntax, language-boundary calculus, "the nesting is the interface."
+
+This project and its documentation originate with Lee Daghlar Ostadi.
