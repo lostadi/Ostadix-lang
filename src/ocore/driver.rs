@@ -279,4 +279,40 @@ unsafe fn kernel_main() -> never {
         assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 62); // EM_X86_64
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn rejects_float_miscompilation_before_object_emission() {
+        let dir =
+            std::env::temp_dir().join(format!("ocore-float-regression-test-{}", monotonic_nonce()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("float.oc");
+        let object = dir.join("float.o");
+        fs::write(
+            &source,
+            r#"
+module floats;
+fn compare() -> bool {
+    let x: f64 = 1 as f64;
+    let y: f64 = 2 as f64;
+    return x < y;
+}
+"#,
+        )
+        .unwrap();
+
+        let error = compile(
+            &[source],
+            &CompileOptions {
+                target: Target::X86_64UnknownNone,
+                emit: EmitKind::Object,
+                output: object.clone(),
+                keep_assembly: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("floating-point cast"));
+        assert!(!object.exists(), "invalid float program emitted an object");
+        let _ = fs::remove_dir_all(dir);
+    }
 }

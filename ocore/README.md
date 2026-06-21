@@ -66,6 +66,8 @@ This is the first vertical slice, not yet a self-hosting general-purpose
 compiler. It is x86_64-only, uses a stack-spill backend, and currently requires
 aggregate arguments/returns to travel through pointers. Indirect function
 calls, enum pattern matching, floating-point computation, ring-3 entry, and a
-reclaiming page allocator remain follow-on work. The implemented subset is
+reclaiming page allocator remain follow-on work. Float operations, casts, and
+`sysv64` float crossings are rejected during type checking, so the layout-only
+float types cannot reach integer machine operations. The implemented subset is
 enough to compile a freestanding ELF kernel, enter long mode, service IRQ0,
 allocate page frames, and enforce generation-tagged capability rights.

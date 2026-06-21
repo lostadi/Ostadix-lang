@@ -1786,8 +1786,9 @@ features that are already present:
   fields, locals, statics, and copying. Aggregate parameters and returns use
   pointers in the current ABI slice. Enum construction is implemented;
   pattern matching is not yet part of the surface language.
-- Floating-point types have specified x86_64 layouts, while floating-point
-  arithmetic code generation is not yet implemented.
+- Floating-point types have specified x86_64 storage layouts. Float literals,
+  arithmetic, comparisons, casts, and `sysv64` float parameters and returns are
+  rejected until SSE lowering and the floating-point ABI are implemented.
 - The kernel uses an identity-mapped bootstrap address space and a physical
   bump allocator. It allocates frames but does not reclaim them.
 - The kernel exports a checked syscall dispatcher and the hosted capability

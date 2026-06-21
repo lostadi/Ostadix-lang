@@ -356,6 +356,11 @@ impl<'a> FunctionCodegen<'a> {
                 from,
                 to,
             } => {
+                if self.hir.types.is_float(*from) || self.hir.types.is_float(*to) {
+                    return Err(codegen_error(
+                        "floating-point cast escaped O-core type checking",
+                    ));
+                }
                 self.load_value(*value, "rax", out);
                 self.normalize_scalar("rax", *from, out)?;
                 self.normalize_scalar("rax", *to, out)?;
@@ -387,6 +392,13 @@ impl<'a> FunctionCodegen<'a> {
         rhs: ValueId,
         out: &mut String,
     ) -> Result<(), Diagnostic> {
+        if self.hir.types.is_float(self.mir.values[lhs])
+            || self.hir.types.is_float(self.mir.values[rhs])
+        {
+            return Err(codegen_error(
+                "floating-point binary operation escaped O-core type checking",
+            ));
+        }
         self.load_value(lhs, "rax", out);
         self.load_value(rhs, "rcx", out);
         let signed = is_signed(&self.hir.types.types[self.mir.values[lhs]]);
@@ -1003,5 +1015,51 @@ fn use_aggregates() -> u64 {
         assert!(text.contains("copy 16 bytes"));
         let asm = emit_assembly(&hir, &mir).unwrap();
         assert!(asm.contains("rep movsb"));
+    }
+
+    #[test]
+    fn rejects_float_mir_if_type_checking_is_bypassed() {
+        let ast = parser::parse(
+            "test.oc",
+            r#"
+module floats;
+fn identity(value: f64) -> f64 { return value; }
+"#,
+        )
+        .unwrap();
+        let hir = typeck::check(&[("test.oc".into(), ast)]).unwrap();
+        let mir = mir::lower(&hir).unwrap();
+        let float_value = 0;
+        assert!(hir.types.is_float(mir.functions[0].values[float_value]));
+
+        let mut binary_mir = mir.clone();
+        let bool_ty = hir.types.primitive("bool").unwrap();
+        let binary_dst = binary_mir.functions[0].values.len();
+        binary_mir.functions[0].values.push(bool_ty);
+        binary_mir.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Binary {
+                dst: binary_dst,
+                op: BinaryOp::Less,
+                lhs: float_value,
+                rhs: float_value,
+            });
+        let binary_error = emit_assembly(&hir, &binary_mir).unwrap_err();
+        assert!(binary_error.message.contains("floating-point binary"));
+
+        let mut cast_mir = mir;
+        let u64_ty = hir.types.primitive("u64").unwrap();
+        let cast_dst = cast_mir.functions[0].values.len();
+        cast_mir.functions[0].values.push(u64_ty);
+        cast_mir.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Cast {
+                dst: cast_dst,
+                value: float_value,
+                from: hir.types.primitive("f64").unwrap(),
+                to: u64_ty,
+            });
+        let cast_error = emit_assembly(&hir, &cast_mir).unwrap_err();
+        assert!(cast_error.message.contains("floating-point cast"));
     }
 }

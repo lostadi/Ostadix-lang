@@ -92,6 +92,12 @@ use `as`. Pointer-to-integer, integer-to-pointer, pointer arithmetic, pointer
 dereference, mutable static access, inline assembly, and privileged intrinsics
 require an unsafe context.
 
+Floating-point types currently provide storage layout and bit-preserving
+transport only. Float literals, arithmetic, comparisons, casts, and `sysv64`
+float parameters and returns are compile-time errors until SSE lowering and the
+floating-point calling convention are implemented. This boundary is enforced
+in type checking and defended again in machine code generation.
+
 O-core v0.1 has no garbage collector and no implicit heap allocation. Values
 have deterministic destruction-free storage. A later ownership layer may add
 checked owning pointers, but it must lower to this explicit storage model.
@@ -246,8 +252,9 @@ are supported; function-pointer types are representable, but indirect calls
 are not yet lowered. Aggregates support layout, construction, fields,
 indexing, locals, statics, and copies, while aggregate parameters and returns
 must currently be passed through pointers. Enum construction is supported;
-pattern matching is not. Floating-point types reserve their ABI layouts but
-floating-point computation is not implemented.
+pattern matching is not. Floating-point types reserve their storage layouts,
+while operations, conversions, and `sysv64` ABI crossings are rejected before
+MIR lowering.
 
 The kernel proof uses a physical-page bump allocator and an identity-mapped
 bootstrap address space. It demonstrates a checked kernel syscall dispatcher

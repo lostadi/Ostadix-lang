@@ -231,6 +231,10 @@ impl TypeContext {
         matches!(self.types[ty], Type::Int { .. } | Type::Usize | Type::Isize)
     }
 
+    pub fn is_float(&self, ty: TypeId) -> bool {
+        matches!(self.types[ty], Type::Float { .. })
+    }
+
     pub fn is_scalar(&self, ty: TypeId) -> bool {
         matches!(
             self.types[ty],

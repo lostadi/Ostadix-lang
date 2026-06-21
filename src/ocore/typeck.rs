@@ -1148,6 +1148,14 @@ impl<'a> BodyChecker<'a> {
                     | ast::BinaryOp::Greater
                     | ast::BinaryOp::GreaterEq => {
                         self.expect_assignable(rhs.ty, lhs.ty, rhs.span)?;
+                        if self.program.types.is_float(lhs.ty)
+                            || self.program.types.is_float(rhs.ty)
+                        {
+                            return Err(self.error(
+                                expr.span,
+                                "floating-point comparison code generation is not implemented",
+                            ));
+                        }
                         if !self.program.types.is_scalar(lhs.ty) {
                             return Err(
                                 self.error(expr.span, "comparison requires scalar operands")
@@ -1257,6 +1265,12 @@ impl<'a> BodyChecker<'a> {
             ast::ExprKind::Cast { value, ty } => {
                 let value = self.check_expr(value, None)?;
                 let to = self.resolve_type(ty)?;
+                if self.program.types.is_float(value.ty) || self.program.types.is_float(to) {
+                    return Err(self.error(
+                        expr.span,
+                        "floating-point cast code generation is not implemented",
+                    ));
+                }
                 if !self.program.types.is_scalar(value.ty) || !self.program.types.is_scalar(to) {
                     return Err(self.error(expr.span, "casts are limited to scalar types"));
                 }
@@ -1938,6 +1952,15 @@ fn validate_function_attrs(
         }
     }
     if *function.abi == ast::Abi::SysV64
+        && (function.params.iter().any(|ty| types.is_float(*ty)) || types.is_float(function.result))
+    {
+        return Err(diag(
+            file,
+            span,
+            "floating-point values are forbidden across the v0.1 sysv64 ABI",
+        ));
+    }
+    if *function.abi == ast::Abi::SysV64
         && (function.params.iter().any(|ty| !types.is_scalar(*ty))
             || !matches!(types.types[function.result], Type::Void | Type::Never)
                 && !types.is_scalar(function.result))
@@ -2113,6 +2136,11 @@ mod tests {
         check(&[("test.oc".into(), ast)]).unwrap()
     }
 
+    fn rejected(source: &str) -> Diagnostic {
+        let ast = parser::parse("test.oc", source).unwrap();
+        check(&[("test.oc".into(), ast)]).unwrap_err()
+    }
+
     #[test]
     fn computes_struct_and_enum_layouts() {
         let program = checked(
@@ -2163,5 +2191,65 @@ fn sum(n: u64) -> u64 {
         );
         assert_eq!(program.functions.len(), 2);
         assert_eq!(program.functions[1].locals.len(), 3);
+    }
+
+    #[test]
+    fn rejects_every_floating_point_comparison() {
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            let source = format!(
+                r#"
+module floats;
+fn compare(lhs: f64, rhs: f64) -> bool {{ return lhs {op} rhs; }}
+"#
+            );
+            let error = rejected(&source);
+            assert!(
+                error.message.contains("floating-point comparison"),
+                "operator {op} produced: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_casts_to_and_from_floating_point_types() {
+        for function in [
+            "fn bad(value: u64) -> f64 { return value as f64; }",
+            "fn bad(value: f64) -> u64 { return value as u64; }",
+            "fn bad(value: f32) -> f64 { return value as f64; }",
+        ] {
+            let source = format!("module floats;\n{function}\n");
+            let error = rejected(&source);
+            assert!(
+                error.message.contains("floating-point cast"),
+                "{function} produced: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_floats_at_the_sysv64_abi_boundary() {
+        let error = rejected(
+            r#"
+module floats;
+extern "sysv64" fn foreign(value: f64) -> f64;
+"#,
+        );
+        assert!(error.message.contains("v0.1 sysv64 ABI"));
+    }
+
+    #[test]
+    fn retains_supported_non_float_scalar_operations() {
+        let program = checked(
+            r#"
+module scalar;
+fn equal_bool(lhs: bool, rhs: bool) -> bool { return lhs == rhs; }
+fn less_integer(lhs: i64, rhs: i64) -> bool { return lhs < rhs; }
+fn widen(value: u8) -> u64 { return value as u64; }
+fn equal_pointer(lhs: *const u8, rhs: *const u8) -> bool { return lhs == rhs; }
+"#,
+        );
+        assert_eq!(program.functions.len(), 4);
     }
 }
