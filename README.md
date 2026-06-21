@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./Olang_Mascot_little-o/little-o/references/canonical-base.png" alt="O-lang logo" width="320" />
+  <img src="./assets/olang-logo.png" alt="O-lang, Ouroboros Language" width="900" />
 </p>
 
 # O-lang: Ouroboros Language
