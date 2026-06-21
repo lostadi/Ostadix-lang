@@ -1,6 +1,6 @@
 # O-lang Specification (v0.2.0)
 
-O-lang is a meta-language whose syntactic unit — the _typed expression_ — carries
+O-lang is a meta-language whose syntactic unit ( the _typed expression_ ) carries
 its own interpreter as part of its syntax. Every expression declares which
 language it is written in; the runtime dispatches evaluation to a backend for
 that language; the resulting value is a language-neutral `OValue` that can be
@@ -36,7 +36,7 @@ as a binding reference (VarRef). To write a bare shell variable like `$PATH` in 
 O-lang strips the backslash and passes `$PATH` verbatim to the bash backend.
 
 An `IDENT` that is **not in the registered-language set** is NOT treated as an
-opener, even if followed by `^(`. This keeps inner-language code safe —
+opener, even if followed by `^(`. This keeps inner-language code safe -
 `2 ^ (x+1)` in a Python body does not parse as a `2^(…)_2` expression.
 
 Aliases: `py → python`, `md → markdown`, `tex → latex`, `plain → text`, `o → O`.
@@ -118,7 +118,7 @@ O^(
 
 An `OExpr` value spliced into a Python body is bound as a live object
 (not `repr()`'d), so user code can `O.eval(expr)` against the *live*
-`EvalContext` — any env bindings the quoted expression references see
+`EvalContext` - any env bindings the quoted expression references see
 current state. `O.quote(src_str)` parses a source fragment and returns
 it as an unevaluated `OExpr`, so Python code can build up O source
 programmatically and eval it.
@@ -192,7 +192,7 @@ their planned child regions are evaluated.
 ## 3. OValue: the canonical intermediate value
 
 OValue is a tagged union. Every typed expression evaluates to one. All
-inter-language data passing goes through this type — it is the runtime
+inter-language data passing goes through this type - it is the runtime
 embodiment of the canonical intermediate form any lossless polyglot system
 must have.
 
@@ -217,7 +217,7 @@ OValue  ::= ONull
           | OGroup   { mode: GroupMode, members: [OValue], fingerprint: str }
 ```
 
-`GroupMode` is one of `batch`, `all`, `any`, `race` — the execution topology
+`GroupMode` is one of `batch`, `all`, `any`, `race` - the execution topology
 of an `OGroup` (see §3.1).
 
 Two additional system-facing forms freeze the runtime boundary:
@@ -261,12 +261,12 @@ The Rust runtime uses the JSON wire format with a `"t"` discriminant:
 
 The language/runtime contract distinguishes three classes of values:
 
-- **Pure values** — inert data that is serializable, replayable, and safe to
+- **Pure values** - inert data that is serializable, replayable, and safe to
   persist across boots (`ONull`, numbers, strings, lists, maps, blobs,
   `OExpr`, `ONixExpr`, `ODerivation`, `OThunk`, `OSnapshot`, most `ORequest`s).
-- **Referential values** — live handles into the world whose identity is stable
+- **Referential values** - live handles into the world whose identity is stable
   as a reference but whose observed state may change (`OSystem`).
-- **Effectful values** — authority-bearing, scope, or orchestration values whose meaning
+- **Effectful values** - authority-bearing, scope, or orchestration values whose meaning
   depends on execution context (`OCapability`, `OScope`, `OGroup`, `OError`, and effectful
   `ORequest`s such as `activate`).
 
@@ -310,7 +310,7 @@ group names a collection of them plus a `mode` that says how they relate:
 | `any(a, b, …)`     | `any`   | Redundancy/fallback; yields the first member to succeed   |
 | `race(a, b, …)`    | `race`  | Latency competition; yields the first member to settle    |
 
-A group performs no work on its own — it is a control value. It is forced by
+A group performs no work on its own - it is a control value. It is forced by
 `now(group)`, by `autonomous(group)`, or at document end under Autonomous
 policy.
 
@@ -338,9 +338,9 @@ even when the surrounding policy is Eager. Members are captured as deferred
 #### Member evaluation policy
 
 Group members may be already-resolved values, deferred `ORequest`s (under any
-policy — the group constructor always captures lazily), or nested groups. The
+policy - the group constructor always captures lazily), or nested groups. The
 group's `fingerprint` composes from the mode and the **ordered** member content
-identities — member order is semantically significant and is never sorted.
+identities - member order is semantically significant and is never sorted.
 
 #### Empty group behavior
 
@@ -359,7 +359,7 @@ testing `is_error()` on each element.
 
 `all(a, b, …)` is a hard all-or-nothing barrier. If **any** member fails, the
 entire group fails immediately and propagates the first error. Unlike `batch`,
-there is no error wrapping — `all` either returns a full `OList` of successes,
+there is no error wrapping - `all` either returns a full `OList` of successes,
 or returns an error.
 
 #### Any failure behavior
@@ -390,7 +390,7 @@ groups with the same `CacheMode`, so:
 all(any(a, b), batch(c))
 ```
 
-resolves as `[first_success_of(a,b), [c]]` — inner topologies are respected.
+resolves as `[first_success_of(a,b), [c]]` - inner topologies are respected.
 
 #### Cancellation status
 
@@ -402,9 +402,9 @@ cancellation is planned for a future release.
 
 Two resolution modes are used internally:
 
-- `CacheMode::Fresh` — force each member via the active executor; used by
+- `CacheMode::Fresh` - force each member via the active executor; used by
   `now(group)`. This is the standard "resolve right now" path.
-- `CacheMode::Strict` — read each member from the scheduler/eval cache; a
+- `CacheMode::Strict` - read each member from the scheduler/eval cache; a
   cache miss is a hard error. Used after `autonomous(...)` flush to verify the
   scheduler materialized every buffered request.
 
@@ -416,7 +416,7 @@ Under `autonomous(batch(…))`:
 2. At block exit, the autonomous scheduler flushes the buffer concurrently,
    up to `scheduler.parallelism` threads at a time.
 3. Results are written to the L1 memory cache and the L2 disk cache.
-4. The batch group is resolved from the cache using `CacheMode::Strict` — a
+4. The batch group is resolved from the cache using `CacheMode::Strict` - a
    cache miss after flush is a hard error, not a silent fallback.
 
 `now(group)` uses the same `resolve_group` path but with `CacheMode::Fresh`,
@@ -428,7 +428,7 @@ Design principles:
   self-description (the tag), but no methods and no behavior.
 * **`OBlob` carries its own mime type.** This is how a matplotlib figure
   becomes an `<img>` in HTML without either side understanding the other's
-  type system — `image/png` is the contract.
+  type system - `image/png` is the contract.
 * **`OExpr` gives meta-level homoiconicity.** An O program can produce an
   O AST as a value and have it evaluated. Lisp's `quote`/`eval` generalized
   across multiple target languages.
@@ -457,7 +457,7 @@ class Backend:
 * `evaluate(body, env, ctx=None)`: run / render / transform the body string
   into an OValue. The optional `ctx` parameter gives access to the live
   `EvalContext` (env registry, backend lookup) for backends that need to
-  re-enter the evaluator at runtime — e.g. Python uses it to power
+  re-enter the evaluator at runtime - e.g. Python uses it to power
   `O.eval(expr)`.
 * `eval_ast(node, ctx)` _(optional)_: take full control of child
   evaluation, skipping the default splice flow. Required for `O` (which
@@ -471,12 +471,12 @@ An O document evaluates to a single root OValue. The CLI's final rendering
 step converts that OValue to the user-requested target format:
 
 * `--as auto` (default): target format is determined by the root expression's
-  own language — an `html^(…)_html` root prints HTML, a `markdown^(…)_markdown`
+  own language - an `html^(…)_html` root prints HTML, a `markdown^(…)_markdown`
   root prints Markdown. When the root is `O^(...)_O`, the format is
   inherited from the **first substantive inner expression**.
 * `--as html | markdown | latex | text`: force that backend's `render_child` as
   the final rendering step, regardless of root language.
-* `--as json`: dump the OValue JSON — useful for debugging.
+* `--as json`: dump the OValue JSON - useful for debugging.
 
 ### 5.1 `O^` root: sequence rendering
 
@@ -570,8 +570,7 @@ Adding a new language: write a Backend subclass, add it to
 ## 8. Versioning
 
 This spec is v0.2.0. The v0.2 bump reflects:
-- `OExpr` wire format and `quote^` / `O.eval` semantics are now implemented
-  (not future work) in both runtimes.
+- `OExpr` wire format and `quote^` / `O.eval` semantics are now implemented in both runtimes.
 - `OValue` wire format table expanded with all Rust-runtime types.
 - `let` binding and `$var` substitution work in both runtimes.
 - Registered-language table updated with all registered backends and their
@@ -579,3 +578,5 @@ This spec is v0.2.0. The v0.2 bump reflects:
 
 Breaking changes to OValue or the Backend protocol
 will bump the minor version until v1.0.
+
+Author: Lee Ostadi
