@@ -26,7 +26,7 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
-use crate::capability::fresh_bearer_identity;
+use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
@@ -38,16 +38,15 @@ use crate::nixos_ops;
 use crate::parser::{ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{CapabilityKind, GroupMode, OValue, RequestKind};
+use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind};
 
 /// How to resolve group members that might be cached Request values.
 ///
-/// - `Fresh`   — force the member fresh via `force_request`; honours the
-///               active policy and executor. Used by `now(group)`.
-/// - `Strict`  — read from the scheduler/eval cache; return a hard error
-///               on a miss. Used after `autonomous(...)` flush: every
-///               buffered request must have been materialized, so a miss
-///               indicates a scheduler bug rather than a user error.
+/// - `Fresh`: force the member via `force_request` under the active policy and
+///   executor. Used by `now(group)`.
+/// - `Strict`: read from the scheduler or eval cache and return a hard error on
+///   a miss. Used after `autonomous(...)` flush, where every buffered request
+///   must already have been materialized.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheMode {
     Fresh,
@@ -306,6 +305,9 @@ pub struct Evaluator {
     /// profile that bearer may activate. Neither serialized capability
     /// metadata nor an environment variable can populate this table.
     activation_authorities: HashMap<String, String>,
+
+    /// Live bearer bindings for authority requested by hosted backend blocks.
+    backend_authorities: BackendAuthorityBroker,
 }
 
 struct IrExecRegion<'a> {
@@ -315,6 +317,61 @@ struct IrExecRegion<'a> {
     backend: &'a BackendInterface,
     body: &'a [OIr],
     node_id: PlanNodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockEvalPolicy {
+    Lazy,
+    Defer,
+}
+
+#[derive(Debug, Default)]
+struct BlockOptions {
+    policy: Option<BlockEvalPolicy>,
+    capability_binding: Option<String>,
+    permissions: Vec<BackendAuthority>,
+}
+
+impl BlockOptions {
+    fn parse(attr: Option<&str>, lang: &str) -> Result<Self> {
+        let mut options = Self::default();
+        let mut seen = HashSet::new();
+        for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
+            let entry = entry.trim();
+            if !seen.insert(entry.to_string()) {
+                bail!("duplicate block attribute `{{{entry}}}` on {lang}^");
+            }
+            match entry {
+                "lazy" => {
+                    if options.policy.replace(BlockEvalPolicy::Lazy).is_some() {
+                        bail!("a block cannot combine `lazy` and `defer`");
+                    }
+                }
+                "defer" => {
+                    if options.policy.replace(BlockEvalPolicy::Defer).is_some() {
+                        bail!("a block cannot combine `lazy` and `defer`");
+                    }
+                }
+                _ if entry.starts_with("cap=") => {
+                    let name = entry.trim_start_matches("cap=");
+                    if name.is_empty() || options.capability_binding.replace(name.into()).is_some()
+                    {
+                        bail!("a block must name exactly one backend capability binding");
+                    }
+                }
+                _ => {
+                    let permission = BackendAuthority::parse(entry).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown block attribute `{{{entry}}}` on {lang}^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process"
+                        )
+                    })?;
+                    options.permissions.push(permission);
+                }
+            }
+        }
+        options.permissions.sort();
+        Ok(options)
+    }
 }
 
 impl Evaluator {
@@ -330,6 +387,7 @@ impl Evaluator {
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             activation_authorities: HashMap::new(),
+            backend_authorities: BackendAuthorityBroker::default(),
         }
     }
 
@@ -400,6 +458,103 @@ impl Evaluator {
             .remove(identity)
             .ok_or_else(|| anyhow::anyhow!("system activation capability is forged or revoked"))?;
         Ok(())
+    }
+
+    /// Mint a live capability for explicitly declared backend authority.
+    ///
+    /// The language may be a canonical backend name or `*`. Metadata is only
+    /// descriptive; dispatch checks the private broker binding before both
+    /// direct execution and deferred forcing.
+    pub fn issue_backend_execution_capability(
+        &mut self,
+        language: impl Into<String>,
+        permissions: impl IntoIterator<Item = BackendAuthority>,
+    ) -> Result<OValue> {
+        let language = language.into();
+        let language = if language == "*" {
+            language
+        } else {
+            BackendRegistry::global().canonical(&language).to_string()
+        };
+        self.backend_authorities.issue(language, permissions)
+    }
+
+    /// Revoke a backend execution capability immediately.
+    pub fn revoke_backend_execution_capability(&mut self, capability: &OValue) -> Result<()> {
+        self.backend_authorities.revoke(capability)
+    }
+
+    /// Parse `NAME=LANG[:RIGHT,RIGHT]`, mint a live backend capability, and
+    /// install it into an O scope under `NAME`.
+    pub fn install_backend_grant(
+        &mut self,
+        spec: &str,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<()> {
+        let (name, grant) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("backend grant must be NAME=LANG[:RIGHT,...], got `{spec}`")
+        })?;
+        if name.is_empty()
+            || !name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            bail!("backend grant binding `{name}` is not an O identifier");
+        }
+        let (language, permissions) = grant.split_once(':').unwrap_or((grant, ""));
+        if language.is_empty() {
+            bail!("backend grant `{spec}` has no language");
+        }
+        let mut parsed = Vec::new();
+        for permission in permissions
+            .split(',')
+            .map(str::trim)
+            .filter(|permission| !permission.is_empty())
+        {
+            parsed.push(BackendAuthority::parse(permission).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown backend authority `{permission}`; expected fs_read, fs_write, network, or process"
+                )
+            })?);
+        }
+        parsed.sort();
+        parsed.dedup();
+        let capability = self.issue_backend_execution_capability(language, parsed)?;
+        scope.insert(name.to_string(), capability);
+        Ok(())
+    }
+
+    fn resolve_backend_authority(
+        &self,
+        language: &str,
+        options: &BlockOptions,
+        permissions: &[BackendAuthority],
+        scope: &HashMap<String, OValue>,
+    ) -> Result<Option<String>> {
+        let Some(binding) = options.capability_binding.as_deref() else {
+            if permissions.is_empty() {
+                return Ok(None);
+            }
+            bail!(
+                "backend `{language}` requests {} but names no live capability; add `cap=name` to the block attributes",
+                permissions
+                    .iter()
+                    .map(|permission| permission.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        let capability = scope.get(binding).ok_or_else(|| {
+            anyhow::anyhow!("backend `{language}` names undefined capability binding `${binding}`")
+        })?;
+        self.backend_authorities
+            .authorize(capability, language, permissions)
+            .with_context(|| format!("backend `{language}` authority check failed"))
+            .map(Some)
     }
 
     /// Auto-resolve a Request under the current policy.
@@ -667,15 +822,14 @@ impl Evaluator {
     /// Resolve a Group to a concrete value according to its topology `mode`.
     ///
     /// **Member semantics:**
-    ///   - `Batch` — collect ALL member results into an `OList`; failures are
-    ///     NOT fatal: a failed member is wrapped as `OValue::Error` so the list
-    ///     always has exactly one entry per input member.
-    ///   - `All`   — collect ALL member results into an `OList`; if **any**
-    ///     member fails, the whole group fails immediately (hard barrier).
-    ///   - `Any`   — return the first member that succeeds; fail only if all fail.
-    ///   - `Race`  — return the first member to settle (Ok **or** Err);
-    ///               remaining members may still run but their results are
-    ///               discarded. Race does not yet cancel losing work.
+    ///
+    /// - `Batch`: collect every member result into an `OList`. A failed member
+    ///   becomes `OValue::Error`, preserving one output slot per input.
+    /// - `All`: collect every member result, but fail the group if any member
+    ///   fails.
+    /// - `Any`: return the first member that succeeds and fail only if all fail.
+    /// - `Race`: return the first member to settle. Remaining members may still
+    ///   run, but their results are discarded.
     ///
     /// **Concurrency:**
     ///   When `cache_mode == CacheMode::Fresh` and any member is a threadable
@@ -776,10 +930,8 @@ impl Evaluator {
     ///      over a channel.
     ///   3. Collect thread results (all of them — channel closes when every
     ///      sender drops).
-    ///   4. Assemble results in member order:
-    ///      - `Batch`: collect all into an `OList`; failures wrapped as OError
-    ///                 so every input member has exactly one output slot.
-    ///      - `All`:   collect all, but propagate the first error — hard barrier.
+    ///   4. Assemble results in member order. `Batch` wraps failures as OError
+    ///      so every input has one output. `All` propagates the first error.
     fn resolve_collect_all_concurrent(
         &mut self,
         mode: GroupMode,
@@ -864,11 +1016,11 @@ impl Evaluator {
     ///
     /// If no serial member wins, all threadable members are dispatched as
     /// concurrent threads over a shared channel:
-    ///   - `Any`  → blocks on the channel until the first `Ok` arrives; if the
-    ///              channel closes without any success, returns the last error.
-    ///   - `Race` → returns the very first message from the channel, whether
-    ///              it is `Ok` or `Err`; remaining threads run to completion
-    ///              but their results are discarded.
+    ///
+    /// - `Any` blocks until the first `Ok`, or returns the last error if no
+    ///   member succeeds.
+    /// - `Race` returns the first message, whether `Ok` or `Err`. Other threads
+    ///   run to completion, but their results are discarded.
     fn resolve_first_wins_concurrent(
         &mut self,
         mode: GroupMode,
@@ -965,14 +1117,33 @@ impl Evaluator {
             } => (kind.clone(), source.as_ref().clone(), fingerprint.clone()),
             other => bail!("exec_eval expected Request, got {}", other.type_name()),
         };
-        let (lang, env_id, cacheable) = match kind {
+        let (lang, env_id, cacheable, authority, permissions) = match kind {
             RequestKind::Eval {
                 lang,
                 env_id,
                 cacheable,
-            } => (lang, env_id, cacheable),
+                authority,
+                permissions,
+            } => (lang, env_id, cacheable, authority, permissions),
             other => bail!("exec_eval expected RequestKind::Eval, got {:?}", other),
         };
+
+        let backend = BackendRegistry::global().interface_for(&lang);
+        let sandbox = BackendSandboxPolicy::new(
+            backend
+                .required_authorities
+                .iter()
+                .copied()
+                .chain(permissions),
+        );
+        match authority.as_deref() {
+            Some(identity) => self
+                .backend_authorities
+                .authorize_identity(identity, &backend.canonical, sandbox.permissions())
+                .context("deferred backend authority check failed")?,
+            None if sandbox.permissions().is_empty() => {}
+            None => bail!("deferred backend request lost its live authority bearer"),
+        }
 
         // {lazy} cache: consult before doing work.
         if cacheable {
@@ -990,7 +1161,6 @@ impl Evaluator {
             ),
         };
 
-        let backend = BackendRegistry::global().interface_for(&lang);
         let result = match backend.execution {
             ExecutionMode::InlineValue => match backend.canonical.as_str() {
                 "html" => OValue::html(body),
@@ -1005,7 +1175,7 @@ impl Evaluator {
                 // time, so the forced shim receives an empty binding map.
                 let result = self
                     .registry
-                    .exec(runtime_lang, env_id, &body, HashMap::new(), &shim)
+                    .exec(runtime_lang, env_id, &body, HashMap::new(), &shim, &sandbox)
                     .with_context(|| format!("[{}{{eval}}]", runtime_lang))?;
                 if env_id == u32::MAX {
                     let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
@@ -1027,14 +1197,11 @@ impl Evaluator {
     /// STEP-3.5: prepare a value for splicing into source text.
     ///
     /// The rule from fork #2:
-    ///   - {lazy} Eval Request → auto-force (cacheable, pure backend, no side
-    ///                                       effects from re-running, splice
-    ///                                       result of the force)
-    ///   - {defer} Eval Request → error (non-cacheable, may have side effects,
-    ///                                   forcing implicitly via splice would
-    ///                                   surprise the user — they must call
-    ///                                   now() explicitly)
-    ///   - any other value → pass through unchanged
+    ///
+    /// - A `{lazy}` Eval Request is auto-forced and its cached result is spliced.
+    /// - A `{defer}` Eval Request is rejected because an implicit force could
+    ///   repeat effects. The user must call `now()` explicitly.
+    /// - Any other value passes through unchanged.
     ///
     /// Auto-forcing here means: ask the executor to perform the request and
     /// return its result. The executor's cache makes this idempotent for {lazy}.
@@ -1564,6 +1731,12 @@ impl Evaluator {
             body,
             node_id,
         } = region;
+        let registered_backend = BackendRegistry::global().interface_for(lang);
+        if backend != &registered_backend {
+            bail!(
+                "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
+            );
+        }
         let planned_body = planned_children(plan, node_id, body)?;
         // ─────────────────────────────────────────────────────────────────────
         // Short-circuit for `quote^`: capture the body as an unevaluated
@@ -1624,7 +1797,7 @@ impl Evaluator {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // STEP-3.5: validate the optional `{attr}` early so misuses are
+        // Validate block policy and authority declarations early so misuses are
         // caught at the block we're evaluating, not somewhere downstream.
         //
         //   {lazy}  — pure backends only; produces a cacheable Eval Request
@@ -1633,9 +1806,10 @@ impl Evaluator {
         // `nix_expr^` is already lazy by construction; attributes on it are
         // rejected as redundant. STEP4 may add other attributes (trace, etc.).
         // ─────────────────────────────────────────────────────────────────────
-        if let Some(a) = attr {
-            match a {
-                "lazy" => {
+        let options = BlockOptions::parse(attr, lang)?;
+        if let Some(policy) = options.policy {
+            match policy {
+                BlockEvalPolicy::Lazy => {
                     if lang == "nix_expr" {
                         bail!(
                             "`nix_expr{{lazy}}^` is redundant — nix_expr^ is already \
@@ -1654,7 +1828,7 @@ impl Evaluator {
                         );
                     }
                 }
-                "defer" => {
+                BlockEvalPolicy::Defer => {
                     if lang == "nix_expr" {
                         bail!(
                             "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
@@ -1664,14 +1838,21 @@ impl Evaluator {
                     }
                     // {defer} works on any backend; nothing else to check.
                 }
-                other => bail!(
-                    "Unknown block attribute `{{{}}}` on {}^. Known attributes: \
-                     lazy, defer.",
-                    other,
-                    lang
-                ),
             }
         }
+        let sandbox = BackendSandboxPolicy::new(
+            backend
+                .required_authorities
+                .iter()
+                .copied()
+                .chain(options.permissions.iter().copied()),
+        );
+        let authority_identity = self.resolve_backend_authority(
+            backend.canonical.as_str(),
+            &options,
+            sandbox.permissions(),
+            scope,
+        )?;
 
         // Step 1 — build the fully-spliced source string for the backend.
         // For `nix_expr` blocks and `{lazy}`/`{defer}` blocks we also collect
@@ -1681,7 +1862,7 @@ impl Evaluator {
         let mut deps: Vec<OValue> = Vec::new();
 
         // Whether this block constructs a Thunk (and so should track deps).
-        let constructs_thunk = backend.canonical == "nix_expr" || attr.is_some();
+        let constructs_thunk = backend.canonical == "nix_expr" || options.policy.is_some();
 
         // Own a mutable copy of the scope so that LetBinding nodes inside this
         // body can extend it for subsequent children. Cloning is cheap compared
@@ -1770,14 +1951,16 @@ impl Evaluator {
         // syntactic deferral is unconditional. The user forces via now() or
         // by splicing it (auto-force for {lazy} only).
         // ─────────────────────────────────────────────────────────────────────
-        if let Some(a) = attr {
-            let cacheable = a == "lazy";
+        if let Some(policy) = options.policy {
+            let cacheable = policy == BlockEvalPolicy::Lazy;
             let thunk = OValue::thunk(buf, deps);
             return Ok(OValue::request(
                 RequestKind::Eval {
                     lang: lang.to_string(),
                     env_id,
                     cacheable,
+                    authority: authority_identity,
+                    permissions: sandbox.permissions().to_vec(),
                 },
                 thunk,
             ));
@@ -1803,7 +1986,6 @@ impl Evaluator {
         debug_assert_eq!(backend.execution, ExecutionMode::Shim);
         let runtime_lang = backend.canonical.as_str();
         let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
-
         // Send the exec command to the shim, then drive the eval_request loop.
         //
         // Normally the shim sends Ok/Err immediately and the loop runs once.
@@ -1817,13 +1999,20 @@ impl Evaluator {
         };
 
         self.registry
-            .send_exec(runtime_lang, env_id, &buf, local_scope.clone(), &shim)
+            .send_exec(
+                runtime_lang,
+                env_id,
+                &buf,
+                local_scope.clone(),
+                &shim,
+                &sandbox,
+            )
             .with_context(|| format!("[{}]", env_label))?;
 
         let result: Result<OValue> = loop {
             let step = self
                 .registry
-                .recv_exec_step(runtime_lang, env_id)
+                .recv_exec_step(runtime_lang, env_id, &sandbox)
                 .with_context(|| format!("[{}]", env_label))?;
 
             match step {
@@ -1851,7 +2040,7 @@ impl Evaluator {
                     match self.eval_source_with_scope(&src, &callback_scope) {
                         Ok(result) => {
                             self.registry
-                                .send_eval_result(runtime_lang, env_id, result)
+                                .send_eval_result(runtime_lang, env_id, result, &sandbox)
                                 .with_context(|| format!("[{}] send_eval_result", env_label))?;
                         }
                         Err(e) => {
@@ -1950,6 +2139,141 @@ fn render_with(renderer: SpliceRenderer, val: &OValue) -> String {
     }
 }
 
+/// How much OValue information survives a source-splice rendering.
+///
+/// This classification is deliberately separate from OValue's wire lifting.
+/// Wire lifting preserves the tagged OValue. A splice renderer projects that
+/// value into a consumer language and may erase tags or retain only a readable
+/// marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderFidelity {
+    /// The consumer syntax retains the value and its O-level type.
+    Typed,
+    /// The payload is retained, but one or more O-level type tags are erased.
+    Structural,
+    /// The renderer intentionally produces a human-facing presentation.
+    Presentation,
+    /// Only an identifying marker or summary survives.
+    Opaque,
+}
+
+fn container_fidelity<'a>(
+    renderer: SpliceRenderer,
+    children: impl IntoIterator<Item = &'a OValue>,
+    base: RenderFidelity,
+) -> RenderFidelity {
+    children
+        .into_iter()
+        .map(|child| render_fidelity(renderer, child))
+        .fold(base, |current, child| match (current, child) {
+            (RenderFidelity::Opaque, _) | (_, RenderFidelity::Opaque) => RenderFidelity::Opaque,
+            (RenderFidelity::Presentation, _) | (_, RenderFidelity::Presentation) => {
+                RenderFidelity::Presentation
+            }
+            (RenderFidelity::Structural, _) | (_, RenderFidelity::Structural) => {
+                RenderFidelity::Structural
+            }
+            _ => RenderFidelity::Typed,
+        })
+}
+
+pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity {
+    use OValue::*;
+    use RenderFidelity::*;
+
+    match renderer {
+        SpliceRenderer::Python => match val {
+            Null
+            | Bool { .. }
+            | Int { .. }
+            | Float { .. }
+            | Str { .. }
+            | Html { .. }
+            | StorePath { .. }
+            | Expr { .. }
+            | Scope { .. }
+            | NixExpr { .. }
+            | Derivation { .. }
+            | Request { .. }
+            | System { .. }
+            | Capability { .. }
+            | Snapshot { .. }
+            | Thunk { .. }
+            | Group { .. }
+            | Error { .. } => Typed,
+            List { v } => container_fidelity(renderer, v, Typed),
+            Map { v } => container_fidelity(renderer, v.values(), Typed),
+            Blob { .. } => Structural,
+        },
+        SpliceRenderer::Nix => match val {
+            Null | Bool { .. } | Int { .. } | Float { .. } | Str { .. } | NixExpr { .. } => Typed,
+            List { v } => container_fidelity(renderer, v, Typed),
+            Map { v } => container_fidelity(renderer, v.values(), Typed),
+            Html { .. }
+            | StorePath { .. }
+            | Blob { .. }
+            | Derivation { .. }
+            | System { .. }
+            | Expr { .. } => Structural,
+            Scope { .. }
+            | Request { .. }
+            | Capability { .. }
+            | Snapshot { .. }
+            | Thunk { .. }
+            | Group { .. }
+            | Error { .. } => Opaque,
+        },
+        SpliceRenderer::Html | SpliceRenderer::Latex | SpliceRenderer::Markdown => match val {
+            Null
+            | Bool { .. }
+            | Int { .. }
+            | Float { .. }
+            | Str { .. }
+            | Html { .. }
+            | StorePath { .. }
+            | Blob { .. }
+            | NixExpr { .. }
+            | Derivation { .. }
+            | System { .. }
+            | Expr { .. }
+            | Error { .. } => Presentation,
+            List { v } => container_fidelity(renderer, v, Presentation),
+            Map { v } => container_fidelity(renderer, v.values(), Presentation),
+            Scope { .. }
+            | Request { .. }
+            | Capability { .. }
+            | Snapshot { .. }
+            | Thunk { .. }
+            | Group { .. } => Opaque,
+        },
+        SpliceRenderer::Default => match val {
+            Null | Bool { .. } | Int { .. } | Float { .. } | Str { .. } => Structural,
+            List { v } => container_fidelity(renderer, v, Structural),
+            Map { v } => container_fidelity(renderer, v.values(), Structural),
+            Html { .. }
+            | StorePath { .. }
+            | Expr { .. }
+            | Scope { .. }
+            | Blob { .. }
+            | NixExpr { .. }
+            | Derivation { .. }
+            | Request { .. }
+            | System { .. }
+            | Capability { .. }
+            | Snapshot { .. }
+            | Thunk { .. }
+            | Group { .. }
+            | Error { .. } => Opaque,
+        },
+    }
+}
+
+fn sorted_map_entries(values: &HashMap<String, OValue>) -> Vec<(&String, &OValue)> {
+    let mut entries = values.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Language-specific renderers
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1978,9 +2302,12 @@ fn render_nix(val: &OValue) -> String {
             format!("[ {} ]", items)
         }
         OValue::Map { v } => {
-            let items = v
-                .iter()
-                .map(|(k, val)| format!("{} = {};", k, render_nix(val)))
+            let items = sorted_map_entries(v)
+                .into_iter()
+                .map(|(k, val)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
+                    format!("{} = {};", key, render_nix(val))
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             format!("{{ {} }}", items)
@@ -2090,8 +2417,8 @@ fn render_python(val: &OValue) -> String {
         }
 
         OValue::Map { v } => {
-            let items = v
-                .iter()
+            let items = sorted_map_entries(v)
+                .into_iter()
                 .map(|(k, val)| {
                     let key = serde_json::to_string(k).unwrap_or_else(|_| "''".to_string());
                     format!("{}: {}", key, render_python(val))
@@ -2118,104 +2445,15 @@ fn render_python(val: &OValue) -> String {
             format!("{{'mime': {}, 'base64': {}}}", mime_lit, data_lit)
         }
 
-        OValue::NixExpr {
-            body,
-            fingerprint,
-            deps,
-        } => {
-            let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
-            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            let deps_rendered = deps
-                .iter()
-                .map(render_python)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "ONixExpr({}, fp={}, deps=[{}])",
-                body_lit, fp_lit, deps_rendered
-            )
-        }
-
-        OValue::Derivation {
-            drv_path, outputs, ..
-        } => {
-            let drv_lit = serde_json::to_string(drv_path).unwrap_or_else(|_| "''".to_string());
-            let outs_lit = outputs
-                .iter()
-                .map(|o| serde_json::to_string(o).unwrap_or_else(|_| "''".to_string()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("ODerivation({}, outputs=[{}])", drv_lit, outs_lit)
-        }
-
-        OValue::Request { fingerprint, .. } => {
-            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            format!("ORequest(fp={})", fp_lit)
-        }
-        OValue::Thunk {
-            body,
-            fingerprint,
-            deps,
-        } => {
-            let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "''".to_string());
-            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            let deps_rendered = deps
-                .iter()
-                .map(render_python)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "OThunk({}, fp={}, deps=[{}])",
-                body_lit, fp_lit, deps_rendered
-            )
-        }
-        OValue::System { profile_path } => {
-            let lit = serde_json::to_string(profile_path).unwrap_or_else(|_| "''".to_string());
-            format!("OSystem({})", lit)
-        }
-        OValue::Capability {
-            kind,
-            identity,
-            metadata,
-        } => {
-            let id_lit = serde_json::to_string(identity).unwrap_or_else(|_| "''".to_string());
-            format!(
-                "OCapability({:?}, {}, meta={})",
-                kind.name(),
-                id_lit,
-                metadata.len()
-            )
-        }
-        OValue::Snapshot {
-            kind,
-            identity,
-            state,
-        } => {
-            let id_lit = serde_json::to_string(identity).unwrap_or_else(|_| "''".to_string());
-            format!(
-                "OSnapshot({:?}, {}, fields={})",
-                kind.name(),
-                id_lit,
-                state.len()
-            )
-        }
-
-        // A Group has no Python data form — render an OGroup marker mirroring
-        // the ORequest treatment. The shim does not bind it as a value;
-        // groups are control values forced via `now(...)`, not spliced.
-        OValue::Group {
-            mode,
-            members,
-            fingerprint,
-        } => {
-            let fp_lit = serde_json::to_string(fingerprint).unwrap_or_else(|_| "''".to_string());
-            format!(
-                "OGroup({:?}, n={}, fp={})",
-                mode.name(),
-                members.len(),
-                fp_lit
-            )
-        }
+        OValue::NixExpr { .. }
+        | OValue::Derivation { .. }
+        | OValue::Request { .. }
+        | OValue::Thunk { .. }
+        | OValue::System { .. }
+        | OValue::Capability { .. }
+        | OValue::Snapshot { .. }
+        | OValue::Group { .. }
+        | OValue::Error { .. } => render_python_opaque(val),
 
         // An Expr value in Python is available as an OExprValue object (set up
         // by the Python shim's oval_to_py). Splicing it into source text as a
@@ -2226,14 +2464,13 @@ fn render_python(val: &OValue) -> String {
             let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "''".to_string());
             format!("OExprValue({})", src_lit)
         }
-
-        // An error outcome rendered into Python is an OError marker. Errors
-        // appear in batch(...) result lists; the shim can inspect the type.
-        OValue::Error { msg } => {
-            let msg_lit = serde_json::to_string(msg).unwrap_or_else(|_| "''".to_string());
-            format!("OError({})", msg_lit)
-        }
     }
+}
+
+fn render_python_opaque(val: &OValue) -> String {
+    let wire = serde_json::to_string(val).expect("OValue must serialize for Python rendering");
+    let encoded = serde_json::to_string(&wire).expect("OValue JSON string must serialize");
+    format!("OOpaqueValue.from_wire_json({encoded})")
 }
 
 // ── HTML ─────────────────────────────────────────────────────────────────────
@@ -2265,8 +2502,8 @@ fn render_html(val: &OValue) -> String {
             format!("<ul>{}</ul>", items)
         }
 
-        OValue::Map { v } => v
-            .iter()
+        OValue::Map { v } => sorted_map_entries(v)
+            .into_iter()
             .map(|(k, val)| {
                 format!(
                     "<div data-o-key=\"{}\">{}</div>",
@@ -2439,8 +2676,8 @@ fn render_latex(val: &OValue) -> String {
             format!("\\texttt{{{}}}", path.replace("_", "\\_"))
         }
         OValue::List { v } => v.iter().map(render_latex).collect::<Vec<_>>().join(", "),
-        OValue::Map { v } => v
-            .iter()
+        OValue::Map { v } => sorted_map_entries(v)
+            .into_iter()
             .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
             .collect::<Vec<_>>()
             .join(", "),
@@ -2508,8 +2745,8 @@ fn render_markdown(val: &OValue) -> String {
         OValue::Html { v } => v.clone(),
         OValue::StorePath { path } => format!("`{}`", path),
         OValue::List { v } => v.iter().map(render_markdown).collect::<Vec<_>>().join("\n"),
-        OValue::Map { v } => v
-            .iter()
+        OValue::Map { v } => sorted_map_entries(v)
+            .into_iter()
             .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
             .collect::<Vec<_>>()
             .join("\n"),
@@ -2604,6 +2841,130 @@ mod tests {
         let e = Evaluator::new("/tmp".into());
         let v = OValue::list(vec![OValue::int(1), OValue::int(2), OValue::int(3)]);
         assert_eq!(e.render_child("python", &v), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn rendering_fidelity_matrix_covers_every_ovalue_variant() {
+        use crate::value::SnapshotKind;
+
+        let values = vec![
+            OValue::Null,
+            OValue::bool_(true),
+            OValue::int(1),
+            OValue::float(1.5),
+            OValue::str_("text"),
+            OValue::html("<b>text</b>"),
+            OValue::store_path("/nix/store/example"),
+            OValue::Expr { src: "42".into() },
+            OValue::list(vec![OValue::int(1)]),
+            OValue::map(HashMap::from([("key".into(), OValue::int(1))])),
+            OValue::scope(HashMap::from([("x".into(), OValue::int(1))])),
+            OValue::blob(b"data", "application/octet-stream"),
+            OValue::nix_expr("1 + 1", vec![]),
+            OValue::derivation("/nix/store/example.drv", vec!["out".into()], vec![]),
+            OValue::request(RequestKind::Instantiate, OValue::nix_expr("1", vec![])),
+            OValue::system("/nix/var/nix/profiles/system"),
+            OValue::capability(CapabilityKind::Service, "opaque", HashMap::new()),
+            OValue::snapshot(SnapshotKind::System, "generation", HashMap::new()),
+            OValue::thunk("42", vec![]),
+            OValue::group(GroupMode::Batch, vec![]),
+            OValue::error("failed"),
+        ];
+        let renderers = [
+            SpliceRenderer::Python,
+            SpliceRenderer::Nix,
+            SpliceRenderer::Html,
+            SpliceRenderer::Latex,
+            SpliceRenderer::Markdown,
+            SpliceRenderer::Default,
+        ];
+
+        assert_eq!(values.len(), 21, "update the matrix when OValue grows");
+        for renderer in renderers {
+            for value in &values {
+                let rendered = render_with(renderer, value);
+                let _classification = render_fidelity(renderer, value);
+                assert!(
+                    !rendered.is_empty() || matches!(value, OValue::Null),
+                    "{renderer:?} silently erased {}",
+                    value.type_name()
+                );
+            }
+        }
+
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Python, &OValue::int(1)),
+            RenderFidelity::Typed
+        );
+        assert_eq!(
+            render_fidelity(
+                SpliceRenderer::Python,
+                &OValue::capability(CapabilityKind::Service, "opaque", HashMap::new())
+            ),
+            RenderFidelity::Typed
+        );
+        assert_eq!(
+            render_fidelity(SpliceRenderer::Html, &OValue::int(1)),
+            RenderFidelity::Presentation
+        );
+        assert_eq!(
+            render_fidelity(
+                SpliceRenderer::Python,
+                &OValue::list(vec![OValue::blob(b"data", "application/octet-stream")])
+            ),
+            RenderFidelity::Structural,
+            "container fidelity must be bounded by its least faithful child"
+        );
+    }
+
+    #[test]
+    fn map_rendering_is_independent_of_hashmap_insertion_order() {
+        let first = OValue::map(HashMap::from([
+            ("z".into(), OValue::int(1)),
+            ("a key".into(), OValue::int(2)),
+        ]));
+        let second = OValue::map(HashMap::from([
+            ("a key".into(), OValue::int(2)),
+            ("z".into(), OValue::int(1)),
+        ]));
+
+        for renderer in [
+            SpliceRenderer::Python,
+            SpliceRenderer::Nix,
+            SpliceRenderer::Html,
+            SpliceRenderer::Latex,
+            SpliceRenderer::Markdown,
+            SpliceRenderer::Default,
+        ] {
+            assert_eq!(
+                render_with(renderer, &first),
+                render_with(renderer, &second)
+            );
+        }
+        assert_eq!(
+            render_with(SpliceRenderer::Nix, &first),
+            "{ \"a key\" = 2; \"z\" = 1; }"
+        );
+    }
+
+    #[test]
+    fn python_opaque_handle_round_trips_the_complete_tagged_value() {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir);
+        let capability = OValue::capability(
+            CapabilityKind::Service,
+            "descriptive-test-identity",
+            HashMap::from([("service".into(), OValue::str_("serial"))]),
+        );
+        let scope = HashMap::from([("value".into(), capability.clone())]);
+        let block = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            body: vec![ONode::VarRef("value".into())],
+        };
+
+        assert_eq!(evaluator.eval_node(&block, &scope).unwrap(), capability);
     }
 
     // ── render_child: HTML ────────────────────────────────────────────────────
@@ -2790,6 +3151,25 @@ mod tests {
             OValue::html("<p>executed from OIR</p>")
         );
         assert!(evaluator.last_execution_plan().is_some());
+    }
+
+    #[test]
+    fn public_oir_cannot_weaken_registered_backend_authority() {
+        let mut weakened = BackendRegistry::global().interface_for("bash");
+        weakened.required_authorities.clear();
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "bash".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: weakened,
+                body: vec![OIr::Text("printf forbidden".into())],
+            }],
+        };
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let error = evaluator.eval_ir_program(&program).unwrap_err().to_string();
+        assert!(error.contains("does not match the registered execution and authority policy"));
+        assert!(!error.contains("failed to spawn backend shim"));
     }
 
     #[test]
@@ -3340,11 +3720,14 @@ mod tests {
     #[test]
     fn lazy_attr_on_pure_backend_produces_eval_request() {
         let mut e = Evaluator::new("/tmp".into());
-        let scope = HashMap::new();
+        let capability = e
+            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
+            .unwrap();
+        let scope = HashMap::from([("runner".into(), capability)]);
         let block = ONode::TypedExpr {
             lang: "nix".into(),
             env_id: u32::MAX,
-            attr: Some("lazy".into()),
+            attr: Some("lazy,cap=runner".into()),
             body: vec![ONode::RawText("1 + 2".into())],
         };
         let result = e.eval_node(&block, &scope).unwrap();
@@ -3354,6 +3737,7 @@ mod tests {
                     lang,
                     env_id: _,
                     cacheable,
+                    ..
                 } => {
                     assert_eq!(lang, "nix");
                     assert!(*cacheable, "{{lazy}} must produce cacheable=true");
@@ -3397,6 +3781,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backend_authority_is_checked_before_shim_dispatch() {
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: Some("fs_read".into()),
+            body: vec![ONode::RawText("__oval_result__ = 1".into())],
+        };
+        let error = evaluator.eval_node(&block, &scope).unwrap_err().to_string();
+        assert!(error.contains("names no live capability"));
+        assert!(!error.contains("failed to spawn backend shim"));
+    }
+
+    #[test]
+    fn adapter_required_authority_is_checked_before_shim_dispatch() {
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let block = ONode::TypedExpr {
+            lang: "bash".into(),
+            env_id: u32::MAX,
+            attr: None,
+            body: vec![ONode::RawText("printf forbidden".into())],
+        };
+        let error = evaluator
+            .eval_node(&block, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requests process"));
+        assert!(error.contains("names no live capability"));
+        assert!(!error.contains("failed to spawn backend shim"));
+    }
+
+    #[test]
+    fn backend_capability_allows_only_its_language_and_rights() {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir);
+        let capability = evaluator
+            .issue_backend_execution_capability("python", [BackendAuthority::Process])
+            .unwrap();
+        let scope = HashMap::from([("runner".into(), capability)]);
+        let allowed = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: Some("cap=runner,process".into()),
+            body: vec![ONode::RawText(
+                "import os\n__oval_result__ = os.system('true')".into(),
+            )],
+        };
+        assert_eq!(
+            evaluator.eval_node(&allowed, &scope).unwrap(),
+            OValue::int(0)
+        );
+
+        let denied = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: Some("cap=runner,network".into()),
+            body: vec![ONode::RawText("__oval_result__ = 1".into())],
+        };
+        let error = format!("{:#}", evaluator.eval_node(&denied, &scope).unwrap_err());
+        assert!(error.contains("lacks `network` authority"));
+    }
+
+    #[test]
+    fn plain_python_blocks_cannot_spawn_processes() {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir);
+        let block = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            body: vec![ONode::RawText(
+                "import os\n__oval_result__ = os.system('echo forbidden')".into(),
+            )],
+        };
+        let error = format!(
+            "{:#}",
+            evaluator.eval_node(&block, &HashMap::new()).unwrap_err()
+        );
+        assert!(error.contains("denies process spawn"));
+    }
+
+    #[test]
+    fn deferred_backend_authority_is_rechecked_when_forced() {
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let capability = evaluator
+            .issue_backend_execution_capability("python", [BackendAuthority::Process])
+            .unwrap();
+        let scope = HashMap::from([("runner".into(), capability.clone())]);
+        let block = ONode::TypedExpr {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: Some("defer,cap=runner,process".into()),
+            body: vec![ONode::RawText("__oval_result__ = 1".into())],
+        };
+        let request = evaluator.eval_node(&block, &scope).unwrap();
+        evaluator
+            .revoke_backend_execution_capability(&capability)
+            .unwrap();
+        let error = format!("{:#}", evaluator.force_request(&request).unwrap_err());
+        assert!(error.contains("forged, revoked, or from another evaluator"));
+    }
+
+    #[test]
+    fn forged_deferred_request_cannot_omit_adapter_required_rights() {
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let capability = evaluator
+            .issue_backend_execution_capability("bash", [])
+            .unwrap();
+        let identity = match capability {
+            OValue::Capability { identity, .. } => identity,
+            _ => unreachable!(),
+        };
+        let request = OValue::request(
+            RequestKind::Eval {
+                lang: "bash".into(),
+                env_id: u32::MAX,
+                cacheable: false,
+                authority: Some(identity),
+                permissions: vec![],
+            },
+            OValue::thunk("printf forbidden", vec![]),
+        );
+
+        let error = format!("{:#}", evaluator.force_request(&request).unwrap_err());
+        assert!(error.contains("lacks `process` authority"));
+        assert!(!error.contains("failed to spawn backend shim"));
+    }
+
     /// {lazy} on nix_expr is rejected as redundant.
     #[test]
     fn lazy_attr_on_nix_expr_errors_redundant() {
@@ -3437,12 +3951,15 @@ mod tests {
     #[test]
     fn now_on_lazy_eval_request_returns_cached_value() {
         let mut e = Evaluator::new("/tmp".into());
-        let scope = HashMap::new();
+        let capability = e
+            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
+            .unwrap();
+        let scope = HashMap::from([("runner".into(), capability)]);
 
         let block = ONode::TypedExpr {
             lang: "nix".into(),
             env_id: u32::MAX,
-            attr: Some("lazy".into()),
+            attr: Some("lazy,cap=runner".into()),
             body: vec![ONode::RawText("3 + 4".into())],
         };
         let req = e.eval_node(&block, &scope).unwrap();
@@ -3506,13 +4023,16 @@ mod tests {
     #[test]
     fn splice_auto_forces_lazy_eval_request() {
         let mut e = Evaluator::new("/tmp".into());
-        let mut scope = HashMap::new();
+        let capability = e
+            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
+            .unwrap();
+        let mut scope = HashMap::from([("runner".into(), capability)]);
 
         // Construct a {lazy} nix block, find its fingerprint, seed the cache.
         let lazy_block = ONode::TypedExpr {
             lang: "nix".into(),
             env_id: u32::MAX,
-            attr: Some("lazy".into()),
+            attr: Some("lazy,cap=runner".into()),
             body: vec![ONode::RawText("123".into())],
         };
         let req = e.eval_node(&lazy_block, &scope).unwrap();
@@ -4163,14 +4683,17 @@ python[0]^(O.eval($q, $captured))_python[0]
     #[test]
     fn autonomous_eval_requests_are_executed_eagerly() {
         let mut e = Evaluator::new("/tmp".into());
-        let scope = HashMap::new();
+        let capability = e
+            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
+            .unwrap();
+        let scope = HashMap::from([("runner".into(), capability)]);
 
         // Construct an Eval Request (nix {lazy} block) — this should go
         // through the Evaluator's eval_cache, not the scheduler buffer.
         let lazy_nix = ONode::TypedExpr {
             lang: "nix".into(),
             env_id: u32::MAX,
-            attr: Some("lazy".into()),
+            attr: Some("lazy,cap=runner".into()),
             body: vec![ONode::RawText("1 + 2".into())],
         };
         // First, collect the fingerprint to seed the eval_cache.
@@ -4189,7 +4712,7 @@ python[0]^(O.eval($q, $captured))_python[0]
                 args: vec![ONode::TypedExpr {
                     lang: "nix".into(),
                     env_id: u32::MAX,
-                    attr: Some("lazy".into()),
+                    attr: Some("lazy,cap=runner".into()),
                     body: vec![ONode::RawText("1 + 2".into())],
                 }],
             }],
@@ -4728,6 +5251,8 @@ python[0]^(O.eval($q, $captured))_python[0]
                 lang: "python".into(),
                 env_id: 0,
                 cacheable: false,
+                authority: None,
+                permissions: vec![],
             },
             thunk,
         );

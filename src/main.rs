@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use rustyline::{error::ReadlineError, DefaultEditor};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -12,45 +12,53 @@ use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1).peekable();
+    let mut args = env::args().skip(1).collect::<VecDeque<_>>();
     let backends = registered_backends();
+    let mut backend_grants = Vec::new();
+    while args.front().is_some_and(|arg| arg == "--backend-grant") {
+        args.pop_front();
+        backend_grants.push(
+            args.pop_front()
+                .context("--backend-grant requires NAME=LANG[:RIGHT,...]")?,
+        );
+    }
 
     // No args in an interactive terminal → REPL.
     // In non-interactive contexts, missing args is a usage error so shell tests
     // and scripts do not silently enter and exit the REPL.
-    match args.peek().map(String::as_str) {
+    match args.front().map(String::as_str) {
         Some("--help") | Some("-h") => {
             print_usage(&mut io::stdout())?;
             return Ok(());
         }
         None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
-            return run_repl(PathBuf::from("backends"), backends);
+            return run_repl(PathBuf::from("backends"), backends, &backend_grants);
         }
         None => {
             print_usage(&mut io::stderr())?;
             bail!("missing input file (pass a .O file or use --repl)");
         }
         Some("--repl") | Some("-i") => {
-            args.next();
+            args.pop_front();
             let shim_dir = args
-                .next()
+                .pop_front()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("backends"));
-            if let Some(extra) = args.next() {
+            if let Some(extra) = args.pop_front() {
                 print_usage(&mut io::stderr())?;
                 bail!("unexpected extra argument after --repl: {}", extra);
             }
-            return run_repl(shim_dir, backends);
+            return run_repl(shim_dir, backends, &backend_grants);
         }
         _ => {}
     }
 
-    let input_path = args.next().unwrap();
+    let input_path = args.pop_front().unwrap();
     let shim_dir = args
-        .next()
+        .pop_front()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("backends"));
-    if let Some(extra) = args.next() {
+    if let Some(extra) = args.pop_front() {
         print_usage(&mut io::stderr())?;
         bail!("unexpected extra argument: {}", extra);
     }
@@ -70,8 +78,12 @@ fn main() -> Result<()> {
     let nodes = parser.parse().context("failed to parse .O source")?;
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
+    let mut scope = HashMap::new();
+    for grant in &backend_grants {
+        evaluator.install_backend_grant(grant, &mut scope)?;
+    }
     let result = evaluator
-        .eval_document(nodes)
+        .eval_document_with_scope(nodes, &mut scope)
         .context("failed to evaluate .O document")?;
 
     let elapsed = start.elapsed();
@@ -92,6 +104,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(out, "  O <input.O> [backends_dir]")?;
     writeln!(out, "  O --repl [backends_dir]")?;
+    writeln!(
+        out,
+        "  O --backend-grant NAME=LANG[:RIGHT,...] <input.O> [backends_dir]"
+    )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;
     writeln!(out, "Runs a .O file or starts the interactive REPL.")?;
@@ -104,10 +120,14 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
 
 // ─── REPL ─────────────────────────────────────────────────────────────────────
 
-fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
+fn run_repl(shim_dir: PathBuf, backends: HashSet<String>, backend_grants: &[String]) -> Result<()> {
     let color = io::stderr().is_terminal();
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
     let mut scope: HashMap<String, OValue> = HashMap::new();
+    for grant in backend_grants {
+        evaluator.install_backend_grant(grant, &mut scope)?;
+    }
+    let host_scope = scope.clone();
 
     if color {
         eprintln!(
@@ -152,7 +172,7 @@ fn run_repl(shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
                         ":q" | ":quit" | "exit" | "quit" => break,
 
                         ":r" | ":reset" => {
-                            scope.clear();
+                            scope = host_scope.clone();
                             eprintln!(
                                 "{}",
                                 if color {

@@ -1,4 +1,4 @@
-javascript^(
+javascript{cap=backend}^(
 const obj = {x: 1, y: 2};
 console.log(JSON.stringify(obj))
-)_javascript
+)_javascript{cap=backend}

@@ -22,7 +22,13 @@ o_bin, example, backends, timeout_s = sys.argv[1], sys.argv[2], sys.argv[3], flo
 
 try:
     result = subprocess.run(
-        [o_bin, example, backends],
+        [
+            o_bin,
+            "--backend-grant",
+            "backend=*:fs_read,fs_write,network,process",
+            example,
+            backends,
+        ],
         capture_output=True,
         text=True,
         timeout=timeout_s,

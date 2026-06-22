@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
-    branches: [main]
+    branches: [master, main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,13 +30,19 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --all-targets --all-features --verbose
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --all-targets --all-features --verbose
+
+      - name: Verify byte-reproducible O-core objects
+        run: cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+
+      - name: Check parser fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml
 
       - name: Check formatting
         run: cargo fmt -- --check
 
       - name: Clippy lints
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings

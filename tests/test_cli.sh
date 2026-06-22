@@ -188,6 +188,24 @@ check_olangc_compile_and_run() {
     fi
 }
 
+check_olangc_capability_compile_and_run() {
+    local desc="$1"
+    local output_bin="$ARTIFACT_DIR/capability_compiled"
+
+    run_command "$OLANGC_BIN" "$CAPABILITY_SOURCE" \
+        --backend-grant runner=python:process -o "$output_bin"
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(olangc capability compilation failed with exit $RUN_EXIT)"
+        return
+    fi
+    run_command "$output_bin"
+    if [ "$RUN_EXIT" -eq 0 ] && grep -Eq '^0$' "$STDOUT_FILE"; then
+        pass "$desc"
+    else
+        fail "$desc" "(compiled capability program did not print 0)"
+    fi
+}
+
 check_olink_hardened_round_trip() {
     local source="$ARTIFACT_DIR/link-source"
     local expected="$ARTIFACT_DIR/link-expected"
@@ -239,6 +257,22 @@ python^(
 __oval_result__ = 2
 EOF
 
+CAPABILITY_SOURCE="$ARTIFACT_DIR/capability.O"
+cat >"$CAPABILITY_SOURCE" <<'EOF'
+python{cap=runner,process}^(
+import os
+__oval_result__ = os.system("true")
+)_python{cap=runner,process}
+EOF
+
+AMBIENT_AUTHORITY_SOURCE="$ARTIFACT_DIR/ambient-authority.O"
+cat >"$AMBIENT_AUTHORITY_SOURCE" <<'EOF'
+python^(
+import os
+__oval_result__ = os.system("true")
+)_python
+EOF
+
 cat >"$ARTIFACT_DIR/smoke.oc" <<'EOF'
 module smoke;
 @export @no_mangle
@@ -253,9 +287,13 @@ EOF
 check_stderr_contains "O with no args shows usage error" 1 'Usage:|missing input file' "$O_BIN"
 check_nonzero_stderr_contains "O missing file errors" 'failed to read input file|No such file' "$O_BIN" nonexistent.O backends/
 check_stdout_contains "O runs hello.O" 0 '^2$' "$O_BIN" examples/hello.O backends/
+check_nonzero_stderr_contains "backend authority must name a live capability" 'undefined capability binding.*runner' "$O_BIN" "$CAPABILITY_SOURCE" backends/
+check_stdout_contains "live backend capability authorizes declared process access" 0 '^0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
+check_nonzero_stderr_contains "plain Python has no ambient process authority" 'denies process spawn' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
+check_olangc_capability_compile_and_run "olangc preserves live backend grants in compiled binaries"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
 check_stdout_contains "olink help shows usage" 0 'Usage: (olink|o-link)' "$OLINK_BIN" --help

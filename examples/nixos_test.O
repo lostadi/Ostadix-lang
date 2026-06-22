@@ -7,7 +7,7 @@
 # The nixos_test^(...)_nixos_test block builds a real NixOS VM, boots it,
 # runs the testScript assertions, and returns structured results.
 
-let lab = nixos_test^({
+let lab = nixos_test{cap=backend}^({
   name = "o-nixos-basic";
   nodes.machine = { pkgs, ... }: {
     services.nginx.enable = true;
@@ -18,7 +18,7 @@ let lab = nixos_test^({
     machine.wait_for_unit("nginx")
     machine.succeed("curl -sf http://localhost | grep -i nginx")
   '';
-})_nixos_test
+})_nixos_test{cap=backend}
 
 html^(
 <!doctype html>

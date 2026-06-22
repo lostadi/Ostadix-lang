@@ -53,6 +53,10 @@ class OOpaqueValue:
     def __repr__(self):
         return f"OOpaqueValue({self.wire_value.get('t')!r})"
 
+    @classmethod
+    def from_wire_json(cls, encoded):
+        return cls(json.loads(encoded))
+
 
 class OScopeValue:
     """A detached snapshot of O-level lexical bindings."""

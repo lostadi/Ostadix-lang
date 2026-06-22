@@ -49,6 +49,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::nix_ops;
 use crate::value::{OValue, RequestKind};
 
+type EvalRequestCallback<'a> = dyn FnMut(&OValue) -> Result<OValue> + 'a;
+
 // ═════════════════════════════════════════════════════════════════════════════
 // DiskCache
 // ═════════════════════════════════════════════════════════════════════════════
@@ -307,10 +309,8 @@ impl AutonomousScheduler {
     ///   3. Build a DAG (fingerprint → dep_fingerprints).
     ///   4. Loop until all requests are resolved:
     ///      a. Find "ready" nodes (all deps already resolved).
-    ///      b. Dispatch Instantiate, Realise, and dry Activate concurrently,
-    ///         capped at `self.parallelism` threads per wave.
-    ///      c. Execute Eval through `eval_fn`, one at a time because Eval needs
-    ///         the ProcessRegistry, which is not Send.
+    ///      b. Dispatch Instantiate, Realise, and dry Activate concurrently.
+    ///      c. Execute Eval through `eval_fn` one at a time.
     ///      d. Collect thread/callback results, update cache.
     ///
     /// Returns a fingerprint → OValue map covering every request in the closure.
@@ -321,7 +321,7 @@ impl AutonomousScheduler {
     pub fn execute_batch(
         &mut self,
         roots: &[OValue],
-        mut eval_fn: Option<&mut dyn FnMut(&OValue) -> Result<OValue>>,
+        mut eval_fn: Option<&mut EvalRequestCallback<'_>>,
     ) -> Result<HashMap<String, OValue>> {
         // 1. Collect all unique requests (transitive closure of all roots).
         let mut all: HashMap<String, OValue> = HashMap::new();
@@ -733,6 +733,8 @@ mod tests {
                 lang: "python".to_string(),
                 env_id: u32::MAX,
                 cacheable: false,
+                authority: None,
+                permissions: vec![],
             },
             thunk,
         );
@@ -762,6 +764,8 @@ mod tests {
                 lang: "python".to_string(),
                 env_id: 0,
                 cacheable: false,
+                authority: None,
+                permissions: vec![],
             },
             thunk,
         );

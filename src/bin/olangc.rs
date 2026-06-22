@@ -170,6 +170,11 @@ struct Cli {
     /// debugging; relevant for binary and wasm targets)
     #[arg(long)]
     keep_build_dir: bool,
+
+    /// Mint a live backend capability at startup and bind it in O scope.
+    /// Format: NAME=LANG[:fs_read,fs_write,network,process].
+    #[arg(long = "backend-grant")]
+    backend_grants: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +221,7 @@ fn main() -> Result<()> {
                 &build_dir,
                 &output,
                 cli.target == CompileTarget::Wasm,
+                &cli.backend_grants,
             );
 
             if !cli.keep_build_dir {
@@ -226,7 +232,9 @@ fn main() -> Result<()> {
 
             result
         }
-        CompileTarget::Script => run_as_script(&source, cli.shim_dir.as_deref()),
+        CompileTarget::Script => {
+            run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
+        }
         CompileTarget::Ir => dump_ir(&source),
     }
 }
@@ -242,6 +250,7 @@ fn compile_to_binary(
     build_dir: &Path,
     output: &Path,
     is_wasm: bool,
+    backend_grants: &[String],
 ) -> Result<()> {
     let bin_name = derive_bin_name(output);
     let src_dir = build_dir.join("src");
@@ -280,7 +289,12 @@ fn compile_to_binary(
     // ── Generated lib.rs and main.rs ────────────────────────────────────────
     let lib_rs = generate_lib_rs();
     fs::write(src_dir.join("lib.rs"), &lib_rs)?;
-    let main_rs = generate_main_rs(&bin_name, &program_filename, &shim_include_lines);
+    let main_rs = generate_main_rs(
+        &bin_name,
+        &program_filename,
+        &shim_include_lines,
+        backend_grants,
+    );
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
     // ── Cargo.toml ───────────────────────────────────────────────────────────
@@ -340,7 +354,11 @@ fn compile_to_binary(
 // relocations, dynamic linking, or ELF/Mach-O parsing.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
+fn run_as_script(
+    source: &str,
+    override_shim_dir: Option<&Path>,
+    backend_grants: &[String],
+) -> Result<()> {
     // ── Extract shims to a temp directory ────────────────────────────────────
     // Script mode still needs shim scripts on disk because the evaluator
     // spawns them as subprocesses (e.g. python_shim.py for python^ blocks).
@@ -384,16 +402,23 @@ fn run_as_script(source: &str, override_shim_dir: Option<&Path>) -> Result<()> {
     // The evaluator entry point is a regular Rust function whose machine code
     // lives in the executable pages of this process.  Calling it is equivalent
     // to casting a function pointer to mmap'd code and invoking it.
-    let eval_fn: fn(&Path, HashSet<String>, Vec<o_lang::parser::ONode>) -> Result<OValue> =
-        |shim_path, backends, nodes| {
-            let mut evaluator =
-                Evaluator::new(shim_path.to_path_buf()).with_registered_backends(backends);
-            evaluator
-                .eval_document(nodes)
-                .context("failed to evaluate program")
-        };
+    let eval_fn = |shim_path: &Path,
+                   backends: HashSet<String>,
+                   nodes: Vec<o_lang::parser::ONode>,
+                   grants: &[String]|
+     -> Result<OValue> {
+        let mut evaluator =
+            Evaluator::new(shim_path.to_path_buf()).with_registered_backends(backends);
+        let mut scope = std::collections::HashMap::new();
+        for grant in grants {
+            evaluator.install_backend_grant(grant, &mut scope)?;
+        }
+        evaluator
+            .eval_document_with_scope(nodes, &mut scope)
+            .context("failed to evaluate program")
+    };
 
-    let result = eval_fn(&shim_dir, registered_backends, nodes)?;
+    let result = eval_fn(&shim_dir, registered_backends, nodes, backend_grants)?;
 
     // ── Print result ─────────────────────────────────────────────────────────
     match result {
@@ -513,12 +538,18 @@ fn generate_main_rs(
     bin_name: &str,
     program_filename: &str,
     shim_include_lines: &[String],
+    backend_grants: &[String],
 ) -> String {
     let shim_entries = if shim_include_lines.is_empty() {
         "    // no shims bundled".to_string()
     } else {
         shim_include_lines.join("\n")
     };
+    let backend_grants = backend_grants
+        .iter()
+        .map(|grant| format!("    {grant:?},"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // NOTE: `{{` / `}}` are literal `{` / `}` in a format! string.
     // We use r###"..."### (three hashes) so that `"#` sequences inside the
@@ -534,6 +565,9 @@ use std::collections::HashSet;
 
 /// The compiled .O program source, embedded at compile time.
 const PROGRAM_SOURCE: &str = include_str!({program_filename:?});
+const BACKEND_GRANTS: &[&str] = &[
+{backend_grants}
+];
 
 #[cfg(not(target_family = "wasm"))]
 /// Backend shim scripts, embedded as raw bytes at compile time.
@@ -610,8 +644,12 @@ fn main() -> anyhow::Result<()> {{
 
     let mut evaluator = Evaluator::new(shim_dir)
         .with_registered_backends(registered_backends);
+    let mut scope = std::collections::HashMap::new();
+    for grant in BACKEND_GRANTS {{
+        evaluator.install_backend_grant(grant, &mut scope)?;
+    }}
     let result = evaluator
-        .eval_document(nodes)
+        .eval_document_with_scope(nodes, &mut scope)
         .context("failed to evaluate program")?;
 
     match result {{
@@ -625,6 +663,7 @@ fn main() -> anyhow::Result<()> {{
         bin_name = bin_name,
         program_filename = program_filename,
         shim_entries = shim_entries,
+        backend_grants = backend_grants,
     )
 }
 

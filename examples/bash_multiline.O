@@ -1,7 +1,7 @@
 #!/usr/bin/env O
 
-bash^(
+bash{cap=backend}^(
 x=10
 y=20
 echo "\$x + \$y = \$((x + y))"
-)_bash
+)_bash{cap=backend}

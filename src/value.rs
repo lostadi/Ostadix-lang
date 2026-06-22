@@ -144,16 +144,11 @@ pub enum OValue {
     ///
     /// This is the "deferred drv rung" value produced by `nix_expr^(...)_nix_expr`
     /// blocks. It holds:
-    ///   - `body`:        the fully-spliced Nix source text (ready to hand to nix eval)
-    ///   - `deps`:        the child OValues whose rendered forms were spliced into body,
-    ///                    carried by reference (step 1 decision — simpler, lets the
-    ///                    renderer re-traverse the tree if needed)
-    ///   - `fingerprint`: STEP-2 SCHEME — sha256(body || "||" || sorted dep content_identities).
-    ///                    Composes with dep identities so two NixExprs that splice the
-    ///                    same children produce the same identity; an NixExpr that
-    ///                    splices a different derivation produces a different identity.
-    ///                    Aligns with Nix's content addressing where deps are
-    ///                    Derivations (uses drv_path) or StorePaths (uses path).
+    /// - `body`: fully spliced Nix source ready for `nix eval`.
+    /// - `deps`: child OValues whose rendered forms were spliced into the body.
+    /// - `fingerprint`: SHA-256 over the body and sorted dependency identities.
+    ///   This composes with Nix content identities and remains independent of
+    ///   dependency traversal order.
     ///
     /// `nix^(...)_nix` is unchanged — it is the "evaluate immediately to a JSON value"
     /// shortcut that bypasses this rung entirely (step 1 decision, option a).
@@ -287,13 +282,10 @@ pub enum OValue {
     /// model. Where a Request names a single deferred computation, a Group
     /// names a collection of them together with the `mode` that says HOW they
     /// relate:
-    ///   - `Batch` — run all for throughput; yields every result, including
-    ///              failures wrapped as `OValue::Error` values.
-    ///   - `All`   — fan-out where every member must succeed; if any member
-    ///              fails the whole group fails (hard all-or-nothing barrier).
-    ///   - `Any`   — redundancy/fallback; yield the first member that succeeds.
-    ///   - `Race`  — latency competition; yield the first member to settle
-    ///              (success **or** failure). Does not yet cancel losers.
+    /// - `Batch`: run all for throughput and wrap failures as `OValue::Error`.
+    /// - `All`: require every member to succeed.
+    /// - `Any`: yield the first member that succeeds.
+    /// - `Race`: yield the first member to settle. Losers are not yet canceled.
     ///
     /// `batch` and `all` group constructors are **special forms**: their
     /// arguments are captured as-is (deferred Requests) rather than being
@@ -374,6 +366,7 @@ pub enum CapabilityKind {
     Process,
     Service,
     SystemActivation,
+    BackendExecution,
 }
 
 impl CapabilityKind {
@@ -387,7 +380,50 @@ impl CapabilityKind {
             CapabilityKind::Process => "process",
             CapabilityKind::Service => "service",
             CapabilityKind::SystemActivation => "system_activation",
+            CapabilityKind::BackendExecution => "backend_execution",
         }
+    }
+}
+
+/// Ambient host authority that a backend block may request explicitly.
+///
+/// These rights are separate from the trusted runtime's ability to start the
+/// backend interpreter itself. They describe what evaluated foreign source is
+/// allowed to do after the shim has started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendAuthority {
+    FileRead,
+    FileWrite,
+    Network,
+    Process,
+}
+
+impl BackendAuthority {
+    pub const ALL: [Self; 4] = [
+        Self::FileRead,
+        Self::FileWrite,
+        Self::Network,
+        Self::Process,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FileRead => "fs_read",
+            Self::FileWrite => "fs_write",
+            Self::Network => "network",
+            Self::Process => "process",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "fs_read" => Self::FileRead,
+            "fs_write" => Self::FileWrite,
+            "network" => Self::Network,
+            "process" => Self::Process,
+            _ => return None,
+        })
     }
 }
 
@@ -475,6 +511,8 @@ pub enum RequestKind {
         lang: String,
         env_id: u32,
         cacheable: bool,
+        authority: Option<String>,
+        permissions: Vec<BackendAuthority>,
     },
 
     /// STEP-4: activate a system closure onto a profile.
@@ -616,8 +654,22 @@ impl OValue {
                 lang,
                 env_id,
                 cacheable,
+                authority,
+                permissions,
             } => {
-                format!("eval|{}|{}|{}", lang, env_id, cacheable)
+                let permissions = permissions
+                    .iter()
+                    .map(|permission| permission.name())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "eval|{}|{}|{}|{}|{}",
+                    lang,
+                    env_id,
+                    cacheable,
+                    authority.as_deref().unwrap_or("none"),
+                    permissions
+                )
             }
             RequestKind::Activate {
                 profile,
@@ -730,16 +782,11 @@ impl OValue {
     /// uniformly so any OValue can appear as a dep without special-casing.
     ///
     /// Rules:
-    ///   - NixExpr    → its (already-composite) fingerprint
-    ///   - Derivation → sha256(drv_path)   (Nix's content-addressing, hashed
-    ///                                       so the identity is uniform-width hex)
-    ///   - StorePath  → sha256(path)
-    ///   - Request    → its fingerprint (recursive, defined at construction)
-    ///   - Thunk      → its (already-composite) fingerprint
-    ///   - any other  → sha256(splice_repr())   (a stable projection of the
-    ///                                            value's spliced form; not
-    ///                                            cryptographically meaningful
-    ///                                            for inert values, just stable)
+    /// - NixExpr uses its already composed fingerprint.
+    /// - Derivation uses SHA-256 of its Nix content-addressed path.
+    /// - StorePath uses SHA-256 of its path.
+    /// - Request and Thunk use their construction-time fingerprints.
+    /// - Other values use SHA-256 of their stable splice representation.
     pub fn content_identity(&self) -> String {
         match self {
             OValue::NixExpr { fingerprint, .. } => fingerprint.clone(),
@@ -935,9 +982,15 @@ impl OValue {
                 ..
             } => false,
             OValue::Request {
-                kind: RequestKind::Eval { cacheable, .. },
+                kind:
+                    RequestKind::Eval {
+                        cacheable,
+                        authority,
+                        permissions,
+                        ..
+                    },
                 ..
-            } => *cacheable,
+            } => *cacheable && authority.is_none() && permissions.is_empty(),
             OValue::Error { .. } => false,
             _ => true,
         }
@@ -945,30 +998,48 @@ impl OValue {
 
     /// Whether replaying this value across time preserves its meaning.
     pub fn is_replay_safe(&self) -> bool {
-        !matches!(
-            self,
+        match self {
             OValue::System { .. }
-                | OValue::Capability { .. }
-                | OValue::Scope { .. }
-                | OValue::Request {
-                    kind: RequestKind::Activate { .. },
-                    ..
-                }
-        )
+            | OValue::Capability { .. }
+            | OValue::Scope { .. }
+            | OValue::Request {
+                kind: RequestKind::Activate { .. },
+                ..
+            } => false,
+            OValue::Request {
+                kind:
+                    RequestKind::Eval {
+                        authority,
+                        permissions,
+                        ..
+                    },
+                ..
+            } => authority.is_none() && permissions.is_empty(),
+            _ => true,
+        }
     }
 
     /// Whether this value is safe to persist across boots as an inert artifact.
     pub fn is_boot_persistable(&self) -> bool {
-        !matches!(
-            self,
+        match self {
             OValue::System { .. }
-                | OValue::Capability { .. }
-                | OValue::Scope { .. }
-                | OValue::Request {
-                    kind: RequestKind::Activate { .. },
-                    ..
-                }
-        )
+            | OValue::Capability { .. }
+            | OValue::Scope { .. }
+            | OValue::Request {
+                kind: RequestKind::Activate { .. },
+                ..
+            } => false,
+            OValue::Request {
+                kind:
+                    RequestKind::Eval {
+                        authority,
+                        permissions,
+                        ..
+                    },
+                ..
+            } => authority.is_none() && permissions.is_empty(),
+            _ => true,
+        }
     }
 }
 
@@ -1065,8 +1136,10 @@ impl OValue {
                 format!("[{}]", items.join(", "))
             }
             OValue::Map { v } => {
-                let pairs: Vec<String> = v
-                    .iter()
+                let mut entries = v.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                let pairs: Vec<String> = entries
+                    .into_iter()
                     .map(|(k, val)| format!("{:?}: {}", k, val.splice_repr()))
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
@@ -1181,7 +1254,9 @@ impl fmt::Display for OValue {
             }
             OValue::Map { v } => {
                 write!(f, "{{")?;
-                for (i, (k, val)) in v.iter().enumerate() {
+                let mut entries = v.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                for (i, (k, val)) in entries.into_iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
@@ -1600,6 +1675,8 @@ mod tests {
                 lang: "python".to_string(),
                 env_id: 0,
                 cacheable: true,
+                authority: None,
+                permissions: vec![],
             },
             OValue::thunk("41 + 1", vec![]),
         );
@@ -1611,12 +1688,25 @@ mod tests {
             },
             OValue::store_path("/nix/store/demo-system"),
         );
+        let authority_req = OValue::request(
+            RequestKind::Eval {
+                lang: "python".to_string(),
+                env_id: 0,
+                cacheable: true,
+                authority: Some("o-backend-live:test".to_string()),
+                permissions: vec![BackendAuthority::Process],
+            },
+            OValue::thunk("41 + 1", vec![]),
+        );
         let system = OValue::system("/nix/var/nix/profiles/system");
         let snapshot = OValue::snapshot(SnapshotKind::System, "gen-42", HashMap::new());
 
         assert!(lazy_req.is_cache_safe());
         assert!(!activate_req.is_cache_safe());
         assert!(!activate_req.is_replay_safe());
+        assert!(!authority_req.is_cache_safe());
+        assert!(!authority_req.is_replay_safe());
+        assert!(!authority_req.is_boot_persistable());
         assert!(!system.is_cache_safe());
         assert!(snapshot.is_boot_persistable());
         assert!(!system.is_boot_persistable());

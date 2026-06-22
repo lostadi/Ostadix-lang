@@ -2,6 +2,6 @@
 
 # Non-zero exit codes surface as runtime errors (for example, `bash^(exit 1)_bash`),
 # so this example stays on the success path for the smoke test.
-bash^(
+bash{cap=backend}^(
 echo "ok"
-)_bash
+)_bash{cap=backend}

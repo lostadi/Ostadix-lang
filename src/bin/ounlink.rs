@@ -345,6 +345,18 @@ fn find_typed_opener(text: &str, backends: &HashSet<String>) -> Option<usize> {
                         j = j_bracket; // not a valid `[N]`, don't consume
                     }
                 }
+                if j < bytes.len() && bytes[j] == b'{' {
+                    let brace = j;
+                    j += 1;
+                    while j < bytes.len() && bytes[j] != b'}' {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'}' && j > brace + 1 {
+                        j += 1;
+                    } else {
+                        j = brace;
+                    }
+                }
                 if j + 1 < bytes.len() && bytes[j] == b'^' && bytes[j + 1] == b'(' {
                     return Some(start);
                 }

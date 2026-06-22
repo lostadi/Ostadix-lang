@@ -1,11 +1,11 @@
 O^(
-let system_info = nix^(
+let system_info = nix{cap=backend}^(
 {
   name = "O-lang Nix bridge";
   answer = 40 + 2;
   packages = [ "python" "html" "nix" ];
 }
-)_nix
+)_nix{cap=backend}
 
 html^(
 <!doctype html>

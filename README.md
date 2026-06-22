@@ -275,7 +275,7 @@ needs QEMU and the local Rust linker toolchain.
 
 ```bash
 # Rust unit and binary-target tests
-cargo test --all-targets
+cargo test --all-targets --all-features
 
 # Release CLI contract, including olangc and ocorec object emission
 cargo build --release
@@ -341,7 +341,7 @@ evaluator, and the matching `)_IDENT` closes it.
 python^( 6 * 7 )_python
 html^( <b>hello</b> )_html
 markdown^( **bold** )_markdown
-nix^( builtins.nixVersion )_nix
+nix{cap=backend}^( builtins.nixVersion )_nix{cap=backend}
 sql^( SELECT 40 + 2 AS answer; )_sql
 ```
 
@@ -855,6 +855,50 @@ let b = now($effect)
 Purity is centralized in the backend registry rather than inferred from the
 language name at every call site.
 
+### Backend authority is explicit
+
+Hosted source does not inherit filesystem, network, or process authority just
+because its interpreter has that authority. A block declares the rights it
+needs and names a live capability from the O scope:
+
+```O
+python{cap=runner,process}^(
+import os
+os.system("printf capability-checked")
+)_python{cap=runner,process}
+```
+
+The host mints that capability when it launches the program:
+
+```bash
+O --backend-grant runner=python:process program.O backends
+olangc program.O --backend-grant runner=python:process -o program
+```
+
+The four block rights are `fs_read`, `fs_write`, `network`, and `process`.
+Capabilities are language-scoped unless the host explicitly uses `*`. The
+evaluator resolves the scope binding through a private `BackendAuthorityBroker`
+before direct dispatch and again before a deferred request is forced. A copied
+wire value, forged identity, capability for another language, missing right,
+or revoked bearer is rejected before the shim runs.
+
+Plain Python blocks start with no source authority. Python audit hooks reject
+undeclared file writes, reads outside runtime dependencies, sockets,
+subprocesses, and restricted native-library loading. On macOS the runtime also
+wraps the shim in an operating-system sandbox profile. Persistent process
+identity includes the complete authority policy, so a privileged environment
+is never reused by a less privileged block.
+
+Some adapters must invoke a target runtime or compiler to implement the block
+at all. Those required rights are part of the backend interface embedded in
+OIR. Bash and shell require `process`; compiled-language adapters require
+`fs_write` and `process`; Nix execution requires all four rights. Such a block
+must still name a live capability. `olangc --target ir` prints the required
+authority set so it is inspectable before execution.
+Unregistered shim interfaces default to all four required rights, and public
+OIR execution rejects an embedded backend interface that weakens the registry
+policy.
+
 ### `quote^` and `O.eval`
 
 ```O
@@ -1036,6 +1080,39 @@ computations are equivalent exactly when they return the same OValue, take
 `Beh_O = OValue`. Each backend's OValue lifting map is then its unique arrow to
 the terminal carrier.
 
+The terminal-object statement applies to backend-to-OValue lifting, not to
+every `render_child` projection back into source. Rendering is deliberately
+consumer-specific and some consumers only have a presentation or marker for a
+value. The implemented matrix is:
+
+| OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
+|---------------|--------|-----|------|-------|----------|---------|
+| Null, bool, int, float, string | T | T | P | P | P | S |
+| HTML, store path | T | S | P | P | P | O |
+| List, map | T | T | P | P | P | S |
+| Scope | T | O | O | O | O | O |
+| Blob | S | S | P | P | P | O |
+| Expr | T | S | P | P | P | O |
+| NixExpr | T | T | P | P | P | O |
+| Derivation, system | T | S | P | P | P | O |
+| Thunk | T | O | O | O | O | O |
+| Error | T | O | P | P | P | O |
+| Request, capability, snapshot, group | T | O | O | O | O | O |
+
+`T` means the consumer syntax preserves the O-level type, `S` means the
+payload or structure survives but its O tag does not, `P` means an intentional
+human-facing presentation, and `O` means an opaque marker or summary. Container
+fidelity is bounded by the least faithfully rendered child. The Rust
+`RenderFidelity` match and its exhaustive matrix test cover every current
+OValue variant and every renderer. Adding a value or renderer requires the
+classification to be updated.
+
+Python closes its non-native cells with `OOpaqueValue`, a lossless handle over
+the complete tagged wire value. It can pass requests, capabilities, snapshots,
+groups, and other O-specific values back across the boundary without reducing
+them to display strings. The handle does not mint authority; a capability
+identity still has to resolve in the evaluator's private live table.
+
 This is deliberately not a claim that ordinary OValue equality is already
 fully abstract for every observable fact about a program. OExpr preserves
 source, OCapability preserves authority, OScope preserves a namespace, and an
@@ -1126,6 +1203,10 @@ and prints the final OValue. With `--repl`, it keeps O-level scope and backend
 processes alive across entries. With no arguments in an interactive terminal,
 it enters the REPL automatically.
 
+`--backend-grant NAME=LANG[:RIGHT,...]` may be repeated before the input path.
+Each occurrence creates a fresh live bearer in that evaluator and installs it
+under `NAME` in the initial O scope.
+
 ### `olangc`: hosted AOT, WASI, script, and OIR
 
 `olangc` shares the parser, evaluator, OValue model, and OIR implementation
@@ -1142,7 +1223,9 @@ Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language
 runtimes remain explicit host dependencies. `--shim-dir` overlays or adds
 shim files before packaging. `--keep-build-dir` retains the generated Cargo
-project for inspection.
+project for inspection. `--backend-grant` may be repeated for script mode and
+native hosted binaries. Compiled binaries mint fresh process-local bearers at
+startup instead of embedding serialized authority.
 
 ### `o-link`: one O document from a codebase
 
@@ -1182,6 +1265,10 @@ It provides several correctness properties:
   and Wolfram Language inputs. Files without a recognized dependency remain
   in stable walk order.
 - Every wrapped file receives an isolated explicit environment number.
+- Wrapped backends with required runtime authority name the conventional
+  `backend` capability. Running such output requires a matching host grant,
+  for example `O --backend-grant backend=*:fs_read,fs_write,network,process
+  combined.O backends`.
 - The combined source is parsed again before it is written unless
   `--no-validate` is requested.
 
@@ -1693,7 +1780,7 @@ capability contract is in [docs/OCORE.md](docs/OCORE.md).
 The primary verification command is:
 
 ```bash
-cargo test --all-targets
+cargo test --all-targets --all-features
 ```
 
 The release CLI suite checks interpreter errors, successful execution,
@@ -1728,8 +1815,21 @@ make -C c_cpp test
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Parser properties in the ordinary test suite
+cargo test --test parser_proptest
+
+# Continuous raw-byte parser fuzzing
+cargo install cargo-fuzz
+rustup toolchain install nightly
+cargo +nightly fuzz run parser
 ```
+
+The CI workflow runs all Cargo targets, the parser property tests, a build
+check for the fuzz target, and a named reproducibility test. That test compiles
+the same O-core module from two different source directories and asserts that
+the emitted x86_64 ELF object bytes are identical.
 
 ---
 
@@ -1778,6 +1878,17 @@ O-core as the freestanding systems language.
   binding.
 - Revocable, profile-scoped `system_activation` capabilities for real NixOS
   activation, with dry activation remaining unprivileged.
+- Revocable, language-scoped backend execution capabilities with explicit
+  filesystem, network, and process rights checked before direct and deferred
+  shim dispatch.
+- Policy-keyed hosted processes with Python audit enforcement and a macOS
+  operating-system sandbox layer.
+- Exhaustive producer-to-consumer rendering fidelity classification for every
+  OValue variant and renderer.
+- Byte-reproducible O-core object emission for identical modules across source
+  directories, enforced by a named test and CI.
+- Raw-byte and structured adversarial parser properties plus a cargo-fuzz
+  target.
 
 ### Current boundaries
 
@@ -1795,6 +1906,16 @@ features that are already present:
 - `olangc` bundles the core Python and Nix shims by default. Programs using
   additional hosted shims should compile with `--shim-dir backends` so those
   shims are embedded as well.
+- Hosted backend isolation has two enforcement layers on macOS: Python audit
+  hooks and `sandbox-exec`. Other hosts currently enforce Python-level audit
+  events but do not yet install a kernel sandbox for non-Python target
+  runtimes. Backend capabilities prevent undeclared dispatch through O-lang;
+  they are not a containment claim after a permitted native runtime is fully
+  compromised.
+- Reproducibility is currently asserted for O-core assembly and ELF relocatable
+  objects under the same compiler, assembler, and target contract. Hosted
+  `olangc` executables are not claimed byte-identical across different host
+  linkers or toolchain versions.
 - The C17 and Python editions implement their documented subsets and are not
   feature-identical to the authoritative Rust runtime. The C17 native port
   keeps activation dry-only; live `system_activation` authority is implemented

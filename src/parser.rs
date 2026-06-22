@@ -29,7 +29,7 @@ pub enum ONode {
     TypedExpr {
         lang: String,
         env_id: u32,
-        /// STEP-3.5: optional attribute parsed from `{ident}` on the tag.
+        /// Optional comma-separated attributes parsed from `{...}` on the tag.
         /// `None` for plain `lang^(...)_lang`; `Some("lazy")` for
         /// `lang{lazy}^(...)_lang{lazy}`; `Some("defer")` for `{defer}`.
         /// The evaluator dispatches on this when present.
@@ -47,6 +47,7 @@ pub enum ONode {
     /// Parsed at two positions for step 2:
     ///   1. The RHS of a let-binding:                  `let drv = instantiate($expr)`
     ///   2. As a top-level statement:                  `realise($drv)`
+    ///
     /// Calls are NOT parsed inside typed expression bodies (the body is raw
     /// source text for the receiving backend; embedding O-level calls there
     /// would be ambiguous). STEP3 may lift this.
@@ -60,10 +61,8 @@ pub enum ONode {
 struct Tag {
     lang: String,
     env_id: u32,
-    /// STEP-3.5: optional `{ident}` attribute on the language tag.
-    /// e.g. `python{lazy}^(...)_python{lazy}` → attr = Some("lazy").
-    /// Single attribute for now; multi-attribute `{a,b}` is a later parser
-    /// change. The attribute travels with the tag through evaluation.
+    /// Optional attribute list on the language tag. The normalized string is
+    /// carried through OIR while `raw` preserves the exact closer spelling.
     attr: Option<String>,
     /// The raw text of the tag — used to construct the closer match string.
     /// Includes the lang, the optional `[N]` env, and the optional `{attr}`,
@@ -476,32 +475,75 @@ impl<'a> Parser<'a> {
             raw.push_str(&self.source[env_start..i]);
         }
 
-        // STEP-3.5: optional `{attr}` after the env slot, before `^(`.
-        // Parses a single identifier in braces. Multi-attribute syntax
-        // `{a,b,c}` is left for a later expansion if it becomes useful.
+        // Optional comma-separated `{attr}` list after the env slot. Entries
+        // are identifiers or `cap=scope_name`; whitespace around entries is
+        // ignored. The exact source spelling remains part of `raw` so closer
+        // matching stays literal.
         let mut attr: Option<String> = None;
         if i < bytes.len() && bytes[i] == b'{' {
             let attr_start = i;
             i += 1;
 
-            let ident_start = i;
-            while i < bytes.len() && is_ident_continue(bytes[i]) {
+            let content_start = i;
+            while i < bytes.len() && bytes[i] != b'}' {
+                let byte = bytes[i];
+                if !(is_ident_continue(byte) || matches!(byte, b',' | b'=' | b' ' | b'\t')) {
+                    if attribute_suffix_closes_as_opener(bytes, i) {
+                        bail!(
+                            "Invalid character in block attribute list at line {}",
+                            self.line
+                        );
+                    }
+                    return Ok(None);
+                }
                 i += 1;
-            }
-            if ident_start == i {
-                return Ok(None); // empty {}
             }
             if i >= bytes.len() || bytes[i] != b'}' {
                 return Ok(None);
             }
+            let entries = self.source[content_start..i]
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            if entries.is_empty() || entries.iter().any(|entry| entry.is_empty()) {
+                if attribute_suffix_closes_as_opener(bytes, i) {
+                    bail!("Empty block attribute at line {}", self.line);
+                }
+                return Ok(None);
+            }
+            for entry in &entries {
+                let mut parts = entry.split('=');
+                let name = parts.next().unwrap();
+                let value = parts.next();
+                if parts.next().is_some()
+                    || !name
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| is_ident_start(*byte))
+                    || !name.as_bytes().iter().copied().all(is_ident_continue)
+                    || value.is_some_and(|value| {
+                        value.is_empty()
+                            || !value
+                                .as_bytes()
+                                .first()
+                                .is_some_and(|byte| is_ident_start(*byte))
+                            || !value.as_bytes().iter().copied().all(is_ident_continue)
+                    })
+                {
+                    if attribute_suffix_closes_as_opener(bytes, i) {
+                        bail!("Malformed block attribute at line {}", self.line);
+                    }
+                    return Ok(None);
+                }
+            }
 
-            attr = Some(self.source[ident_start..i].to_string());
+            attr = Some(entries.join(","));
             i += 1; // past '}'
 
             raw.push_str(&self.source[attr_start..i]);
         }
 
-        if i + 2 <= bytes.len() && &self.source[i..i + 2] == "^(" {
+        if bytes.get(i..i + 2) == Some(b"^(") {
             self.pos = i + 2;
             // Canonicalize alias tags (`py` → `python`, `md` → `markdown`,
             // …) so the AST, evaluator env keys, and shim resolution all see
@@ -643,6 +685,20 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn attribute_suffix_closes_as_opener(bytes: &[u8], start: usize) -> bool {
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        match byte {
+            b'\n' | b'\r' => return false,
+            b'}' => {
+                let close = start + offset;
+                return bytes.get(close + 1..close + 3) == Some(b"^(");
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source reconstruction
 //
@@ -764,6 +820,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_normalizes_backend_authority_attributes() {
+        let src = "python{ defer, cap=runner, process, fs_read }^(1)_python{ defer, cap=runner, process, fs_read }";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        let ONode::TypedExpr { attr, .. } = &nodes[0] else {
+            panic!("expected typed expression")
+        };
+        assert_eq!(attr.as_deref(), Some("defer,cap=runner,process,fs_read"));
+        assert_eq!(
+            reconstruct_source(&nodes),
+            "python{defer,cap=runner,process,fs_read}^(1)_python{defer,cap=runner,process,fs_read}"
+        );
+    }
+
+    #[test]
     fn alias_tags_are_canonicalized() {
         // `py^(...)_py` parses and the AST carries the canonical name.
         let backends = make_backends(&["py", "md", "plain", "o"]);
@@ -788,6 +859,42 @@ mod tests {
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn registered_name_followed_by_ordinary_braces_remains_raw_text() {
+        let src = "O{'not an opener'}";
+        let backends = make_backends(&["O"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(nodes, vec![ONode::RawText(src.into())]);
+    }
+
+    #[test]
+    fn malformed_attribute_on_an_actual_opener_is_an_error() {
+        let src = "python{cap=,network}^(1)_python{cap=,network}";
+        let backends = make_backends(&["python"]);
+        let error = Parser::new(src, &backends).parse().unwrap_err().to_string();
+        assert!(error.contains("Malformed block attribute"));
+    }
+
+    #[test]
+    fn incomplete_raw_attribute_does_not_scan_into_the_next_line() {
+        let src = concat!(
+            "python[0]^(\n",
+            ")_python{\n",
+            ")_python[0]\n",
+            "cpp[0]{cap=backend}^(\n",
+            ")_cpp[0]{cap=backend}\n",
+        );
+        let backends = make_backends(&["python", "cpp"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, ONode::TypedExpr { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@
 #   now($py_defer)
 # to actually fire the shim.
 
-let nx_lazy = nix{lazy}^( 1 + 2 + 3 )_nix{lazy}
+let nx_lazy = nix{lazy,cap=backend}^( 1 + 2 + 3 )_nix{lazy,cap=backend}
 # nx_lazy : Request[Eval{lang=nix, cacheable=true}]
 # The shim has NOT run; nx_lazy is the unforced thunk.
 

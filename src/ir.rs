@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::parser::ONode;
-use crate::value::GroupMode;
+use crate::value::{BackendAuthority, GroupMode};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // OIr — the lowered instruction forms
@@ -358,6 +358,9 @@ pub struct BackendInterface {
     pub pure: bool,
     pub renderer: SpliceRenderer,
     pub execution: ExecutionMode,
+    /// Authority required by the backend adapter itself, before any
+    /// additional rights declared by a source block.
+    pub required_authorities: Vec<BackendAuthority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,15 +572,22 @@ impl PlanNodeKind {
                 } else {
                     env_id.to_string()
                 };
+                let required = backend
+                    .required_authorities
+                    .iter()
+                    .map(|authority| authority.name())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 format!(
-                    "exec {} [env {}]{} backend={} pure={} renderer={:?} execution={}",
+                    "exec {} [env {}]{} backend={} pure={} renderer={:?} execution={} required=[{}]",
                     lang,
                     env,
                     attr_s,
                     backend.canonical,
                     backend.pure,
                     backend.renderer,
-                    backend.execution.label()
+                    backend.execution.label(),
+                    required
                 )
             }
         }
@@ -758,6 +768,10 @@ pub struct BackendSpec {
     pub renderer: SpliceRenderer,
     /// How the evaluator dispatches this backend.
     pub execution: ExecutionMode,
+    /// Rights needed to implement this backend. For example,
+    /// the Bash adapter must start `bash`, while Python evaluation itself does
+    /// not require a child process.
+    pub required_authorities: &'static [BackendAuthority],
 }
 
 impl BackendSpec {
@@ -774,6 +788,25 @@ impl BackendSpec {
             pure,
             renderer,
             execution,
+            required_authorities: &[],
+        }
+    }
+
+    const fn with_authority(
+        name: &'static str,
+        aliases: &'static [&'static str],
+        pure: bool,
+        renderer: SpliceRenderer,
+        execution: ExecutionMode,
+        required_authorities: &'static [BackendAuthority],
+    ) -> Self {
+        Self {
+            name,
+            aliases,
+            pure,
+            renderer,
+            execution,
+            required_authorities,
         }
     }
 
@@ -803,7 +836,19 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         ExecutionMode::InlineAst,
     ),
     // Nix family — deterministic by design.
-    BackendSpec::new("nix", &[], true, SpliceRenderer::Nix, ExecutionMode::Shim),
+    BackendSpec::with_authority(
+        "nix",
+        &[],
+        true,
+        SpliceRenderer::Nix,
+        ExecutionMode::Shim,
+        &[
+            BackendAuthority::FileRead,
+            BackendAuthority::FileWrite,
+            BackendAuthority::Network,
+            BackendAuthority::Process,
+        ],
+    ),
     // nix_expr is already lazy by construction; {lazy}/{defer} are rejected
     // anyway. It splices via the default representation (its body is
     // assembled before any Nix evaluation happens).
@@ -814,19 +859,31 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Default,
         ExecutionMode::InlineValue,
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "nix_store",
         &[],
         true,
         SpliceRenderer::Nix,
         ExecutionMode::Shim,
+        &[
+            BackendAuthority::FileRead,
+            BackendAuthority::FileWrite,
+            BackendAuthority::Network,
+            BackendAuthority::Process,
+        ],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "nixos_test",
         &[],
         true,
         SpliceRenderer::Nix,
         ExecutionMode::Shim,
+        &[
+            BackendAuthority::FileRead,
+            BackendAuthority::FileWrite,
+            BackendAuthority::Network,
+            BackendAuthority::Process,
+        ],
     ),
     // Pure templating.
     BackendSpec::new(
@@ -865,26 +922,29 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Default,
         ExecutionMode::Shim,
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "haskell",
         &[],
         true,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "ocaml",
         &[],
         true,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "webassembly",
         &[],
         true,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
     // General-purpose, impure backends.
     BackendSpec::new(
@@ -894,96 +954,109 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Python,
         ExecutionMode::Shim,
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "bash",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "shell",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "rust",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "racket",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "csharp",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "cpp",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "lisp",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "common_lisp",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "ruby",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "matlab",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "mathematica",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "java",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
-    BackendSpec::new(
+    BackendSpec::with_authority(
         "javascript",
         &[],
         false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
 ];
 
@@ -998,8 +1071,19 @@ pub struct BackendRegistry {
 impl BackendRegistry {
     /// Fallback metadata for backends with no entry in the table:
     /// impure, conservative cross-language splice representation.
-    const DEFAULT_SPEC: BackendSpec =
-        BackendSpec::new("", &[], false, SpliceRenderer::Default, ExecutionMode::Shim);
+    const DEFAULT_SPEC: BackendSpec = BackendSpec::with_authority(
+        "",
+        &[],
+        false,
+        SpliceRenderer::Default,
+        ExecutionMode::Shim,
+        &[
+            BackendAuthority::FileRead,
+            BackendAuthority::FileWrite,
+            BackendAuthority::Network,
+            BackendAuthority::Process,
+        ],
+    );
 
     /// The process-wide registry over the static spec table.
     pub fn global() -> &'static BackendRegistry {
@@ -1042,6 +1126,7 @@ impl BackendRegistry {
             pure: spec.pure,
             renderer: spec.renderer,
             execution: spec.execution,
+            required_authorities: spec.required_authorities.to_vec(),
         }
     }
 
@@ -1181,7 +1266,7 @@ mod tests {
                 "\n",
                 "; ExecutionPlan\n",
                 "roots [0]\n",
-                "node 0 exec python [env 0] backend=python pure=false renderer=Python execution=shim\n",
+                "node 0 exec python [env 0] backend=python pure=false renderer=Python execution=shim required=[]\n",
                 "node 1 text\n",
                 "edge 1 -> 0 structural\n",
             )
@@ -1240,6 +1325,26 @@ mod tests {
         // nix_expr splices via the default representation (legacy behavior).
         assert_eq!(reg.renderer_for("nix_expr"), SpliceRenderer::Default);
         assert_eq!(reg.renderer_for("cobol"), SpliceRenderer::Default);
+    }
+
+    #[test]
+    fn registry_exposes_adapter_required_authority_in_oir() {
+        let reg = BackendRegistry::global();
+        assert!(reg.interface_for("python").required_authorities.is_empty());
+        assert_eq!(
+            reg.interface_for("bash").required_authorities,
+            vec![BackendAuthority::Process]
+        );
+        assert_eq!(
+            reg.interface_for("nix").required_authorities,
+            BackendAuthority::ALL
+        );
+        assert_eq!(
+            reg.interface_for("unregistered_backend")
+                .required_authorities,
+            BackendAuthority::ALL,
+            "unknown shims must default to the conservative authority envelope"
+        );
     }
 
     #[test]

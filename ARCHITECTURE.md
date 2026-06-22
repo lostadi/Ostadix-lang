@@ -56,8 +56,10 @@ O-lang processes hosted code through a 6-stage pipeline:
    schedule. Structural OIR regions implement `O` and `quote`; ordinary
    execution regions build splice buffers from child OValues.
 
-5. **Render and dispatch** — Convert child values with the renderer embedded
-   in OIR, then run an inline value handler or send source to a backend shim.
+5. **Render, authorize, and dispatch** - Convert child values with the renderer
+   embedded in OIR, resolve the block's live backend capability against the
+   adapter's required rights, then run an inline value handler or send source
+   to a policy-keyed backend shim.
 
 6. **Schedule and cache** — Request values created by OIR carry compositional
    fingerprints. The eager executor and autonomous scheduler apply the cache
@@ -151,12 +153,27 @@ The runtime boundary is intentionally split:
 - **Effectful values** carry authority or orchestration meaning and must be
   handled explicitly by schedulers and persistence layers.
 
+OValue lifting and source rendering are distinct boundaries. Lifting maps a
+backend result into the tagged OValue carrier. `render_child` projects that
+carrier into one consumer language and can be typed, structural, presentational,
+or opaque. The exhaustive fidelity matrix is specified in [SPEC.md](SPEC.md)
+and implemented by `RenderFidelity`; opaque control and authority values emit
+visible markers instead of silently falling through.
+
 Live OCapabilities are not validated from their serialized fields. The hosted
 O-core `CapabilityBroker` maps a 256-bit operating-system-random bearer to a
 kernel generation-tagged handle in a private session table, then checks kind
 and rights before transport. The evaluator uses the same rule for hosted
 system activation: a private table maps a live bearer to one authorized
 profile. Capability metadata is descriptive only.
+
+Hosted backend effects follow the same rule. `BackendAuthorityBroker` binds a
+live bearer to one backend language and a subset of `fs_read`, `fs_write`,
+`network`, and `process`. Required adapter rights are embedded in
+`BackendInterface`, additional source rights are block attributes, and the
+evaluator validates their union before dispatch and before deferred force.
+The process registry key includes the full sandbox policy, which prevents a
+wider persistent environment from serving a narrower block.
 
 Unprivileged `activate(path[, profile])` constructs a dry activation request.
 Mutating `activate(capability, path[, profile])` requires a live
@@ -170,6 +187,12 @@ Each supported language has a shim script in `backends/` that:
 - Reads JSON input from stdin
 - Evaluates the expression in the target language
 - Writes JSON output to stdout
+
+Python shims run under an audit policy derived from the validated capability.
+On macOS the shim also runs under an operating-system sandbox profile. Bash,
+compiled-language, and Nix adapters declare the rights inherent in invoking
+their target tool, so those blocks require an explicit host capability even
+when the source lists no additional right.
 
 Shims exist for Python, Bash, Shell, Nix, `nix_store`, `nixos_test`, Racket,
 Rust, C#, C++, Haskell, Lisp, Common Lisp, SQL, Ruby, MATLAB, Mathematica,

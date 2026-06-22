@@ -32,7 +32,8 @@ backslash-escape
 The `\$IDENT` escape is important when writing real target-language code inside block
 bodies. O-lang parses `$IDENT` everywhere (including inside `bash^`, `python^`, etc.)
 as a binding reference (VarRef). To write a bare shell variable like `$PATH` in a
-`bash^(...)_bash` block without triggering a "Undefined variable" error, write `\$PATH`.
+`bash{cap=runner}^(...)_bash{cap=runner}` block without triggering an
+"Undefined variable" error, write `\$PATH`.
 O-lang strips the backslash and passes `$PATH` verbatim to the bash backend.
 
 An `IDENT` that is **not in the registered-language set** is NOT treated as an
@@ -297,6 +298,45 @@ again when forcing it. A serialized, forged, revoked, cross-evaluator, or
 wrong-profile capability MUST be rejected before the perform boundary. Ambient
 environment variables MUST NOT grant activation authority.
 
+### 3.0.2 Hosted backend authority
+
+Hosted backend effects use the same live-bearer rule as system activation.
+The source form is:
+
+```
+LANG{cap=NAME,RIGHT,...}^(body)_LANG{cap=NAME,RIGHT,...}
+```
+
+`RIGHT` is one of `fs_read`, `fs_write`, `network`, or `process`. `NAME`
+resolves through the current O scope to an `OCapability` of kind
+`backend_execution`. The private broker binding records a canonical backend
+language and a set of rights. Serialized metadata MUST NOT create or extend
+that binding.
+
+The evaluator MUST compute the union of rights declared by the block and
+rights required by the selected backend adapter. It MUST validate a live
+capability for that union before starting a shim. Deferred Eval requests MUST
+carry the bearer identity and right set and MUST revalidate them immediately
+before force. Revocation between construction and force MUST prevent dispatch.
+
+A persistent backend process MUST be keyed by its complete authority policy in
+addition to language and environment number. A process created under a wider
+policy MUST NOT serve a later block with a narrower policy.
+
+Python has no adapter-required source authority. Bash and shell require
+`process`. Adapters that compile or launch a target program require
+`fs_write` and `process`. Nix evaluators require `fs_read`, `fs_write`,
+`network`, and `process`. These requirements are part of `BackendInterface`
+and therefore part of executable OIR rather than an evaluator-side name table.
+An unregistered shim MUST default to the full authority set. A public or
+deserialized OIR program MUST NOT weaken registered adapter requirements;
+execution MUST reject an embedded interface that differs from registry policy.
+
+The Rust runtime enforces Python operations with an audit hook. On macOS it
+also installs an operating-system sandbox profile around shim processes. A
+host without a kernel sandbox MUST describe that boundary honestly; broker
+validation alone does not contain a permitted native runtime after dispatch.
+
 ### 3.1 Coordination groups
 
 An `OGroup` makes the **execution topology** of several computations explicit
@@ -462,6 +502,34 @@ class Backend:
 * `eval_ast(node, ctx)` _(optional)_: take full control of child
   evaluation, skipping the default splice flow. Required for `O` (which
   sequences) and `quote` (which captures without evaluating).
+
+`render_child` is a consumer projection, not the OValue lifting map. Its
+fidelity is classified as typed (`T`), structural with an erased O tag (`S`),
+human presentation (`P`), or opaque marker (`O`):
+
+| OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
+|---------------|--------|-----|------|-------|----------|---------|
+| Null, bool, int, float, string | T | T | P | P | P | S |
+| HTML, store path | T | S | P | P | P | O |
+| List, map | T | T | P | P | P | S |
+| Scope | T | O | O | O | O | O |
+| Blob | S | S | P | P | P | O |
+| Expr | T | S | P | P | P | O |
+| NixExpr | T | T | P | P | P | O |
+| Derivation, system | T | S | P | P | P | O |
+| Thunk | T | O | O | O | O | O |
+| Error | T | O | P | P | P | O |
+| Request, capability, snapshot, group | T | O | O | O | O | O |
+
+Container fidelity MUST be no stronger than the least faithful child.
+Implementations MUST classify every OValue variant for every registered
+renderer. An opaque value MUST render an identifying marker rather than
+silently disappearing.
+
+The Python renderer uses `OOpaqueValue` for O-specific tagged values with no
+native Python form. That handle MUST retain the complete wire object and MUST
+round-trip it unchanged. Deserializing such a handle MUST NOT create a private
+capability broker binding.
 
 ---
 

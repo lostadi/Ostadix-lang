@@ -57,6 +57,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use o_lang::eval::Evaluator;
+use o_lang::ir::BackendRegistry;
 use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
@@ -144,6 +145,11 @@ struct Cli {
     #[arg(long = "shim-dir", default_value = "backends")]
     shim_dir: PathBuf,
 
+    /// Mint a live backend capability for --run. Format:
+    /// NAME=LANG[:fs_read,fs_write,network,process].
+    #[arg(long = "backend-grant", requires = "run")]
+    backend_grants: Vec<String>,
+
     /// Prepend `#!/usr/bin/env o` and mark the output executable, so the
     /// combined .O file can be run directly (`./program.O`).
     #[arg(long = "shebang", conflicts_with = "to_stdout")]
@@ -217,7 +223,7 @@ fn main() -> Result<()> {
     }
 
     if cli.run {
-        run_combined(&combined, cli.shim_dir, backends)?;
+        run_combined(&combined, cli.shim_dir, backends, &cli.backend_grants)?;
     }
 
     Ok(())
@@ -225,7 +231,12 @@ fn main() -> Result<()> {
 
 /// Execute the combined program in-process, the same way the `O` interpreter
 /// would: strip the shebang (if any), parse, evaluate, print the result.
-fn run_combined(source: &str, shim_dir: PathBuf, backends: HashSet<String>) -> Result<()> {
+fn run_combined(
+    source: &str,
+    shim_dir: PathBuf,
+    backends: HashSet<String>,
+    backend_grants: &[String],
+) -> Result<()> {
     let body = if source.starts_with("#!") {
         source.find('\n').map(|nl| &source[nl + 1..]).unwrap_or("")
     } else {
@@ -238,8 +249,12 @@ fn run_combined(source: &str, shim_dir: PathBuf, backends: HashSet<String>) -> R
         .context("failed to parse combined .O source")?;
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
+    let mut scope = HashMap::new();
+    for grant in backend_grants {
+        evaluator.install_backend_grant(grant, &mut scope)?;
+    }
     let result = evaluator
-        .eval_document(nodes)
+        .eval_document_with_scope(nodes, &mut scope)
         .context("failed to evaluate combined .O program")?;
 
     match result {
@@ -675,18 +690,20 @@ fn link_files(
             let n = *env_id;
             *env_id += 1;
 
-            let closer = format!(")_{backend}[{n}]");
+            let interface = BackendRegistry::global().interface_for(&backend);
+            let authority_attr = if interface.required_authorities.is_empty() {
+                ""
+            } else {
+                "{cap=backend}"
+            };
+            let tag = format!("{backend}[{n}]{authority_attr}");
+            let closer = format!(")_{tag}");
             let escaped = escape_body(&content, &closer, backends);
-            section.push_str(&backend);
-            section.push('[');
-            section.push_str(&n.to_string());
-            section.push_str("]^(\n");
+            section.push_str(&tag);
+            section.push_str("^(\n");
             section.push_str(&escaped);
-            section.push_str(")_");
-            section.push_str(&backend);
-            section.push('[');
-            section.push_str(&n.to_string());
-            section.push_str("]\n");
+            section.push_str(&closer);
+            section.push('\n');
         }
 
         out.push_str(SECTION_LENGTH_PREFIX);
@@ -1155,11 +1172,10 @@ fn opener_len(s: &str, backends: &HashSet<String>) -> Option<usize> {
     // Optional `{attr}` marker.
     if i < bytes.len() && bytes[i] == b'{' {
         let mut j = i + 1;
-        let ident_start = j;
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        while j < bytes.len() && bytes[j] != b'}' {
             j += 1;
         }
-        if j > ident_start && j < bytes.len() && bytes[j] == b'}' {
+        if j > i + 1 && j < bytes.len() && bytes[j] == b'}' {
             i = j + 1;
         }
     }
@@ -1369,7 +1385,7 @@ mod tests {
         let escaped = escape_body(inner, ")_bash[0]", &backends);
         assert!(escaped.contains("\\$HOME"));
         assert!(escaped.contains("\\$PATH"));
-        // Use [0] env_id syntax since link_files now emits `bash[0]^(...)_bash[0]`.
+        // Use [0] env_id syntax to exercise the same delimiter shape as link_files.
         let combined = format!("bash[0]^(\n{})_bash[0]\n", escaped);
         let nodes = parse(&combined);
         let body = first_block_text(&nodes);
@@ -1585,8 +1601,8 @@ mod tests {
         );
         // The shell file is the only file of its language so it gets [0].
         assert!(
-            combined.contains("bash[0]^("),
-            "expected bash[0]^(, got:\n{}",
+            combined.contains("bash[0]{cap=backend}^("),
+            "expected authority-scoped bash block, got:\n{}",
             combined
         );
 

@@ -281,6 +281,52 @@ unsafe fn kernel_main() -> never {
     }
 
     #[test]
+    fn ocore_object_is_byte_reproducible_across_source_directories() {
+        let dir = std::env::temp_dir().join(format!("ocore-repro-test-{}", monotonic_nonce()));
+        let first_dir = dir.join("first-root");
+        let second_dir = dir.join("second-root");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let source_text = r#"
+module reproducible;
+static ANSWER: u64 = 42;
+@export @no_mangle
+fn answer() -> u64 {
+    return ANSWER;
+}
+"#;
+        let first_source = first_dir.join("input.oc");
+        let second_source = second_dir.join("renamed.oc");
+        let first_object = first_dir.join("first.o");
+        let second_object = second_dir.join("second.o");
+        fs::write(&first_source, source_text).unwrap();
+        fs::write(&second_source, source_text).unwrap();
+
+        for (source, output) in [
+            (first_source, first_object.clone()),
+            (second_source, second_object.clone()),
+        ] {
+            compile(
+                &[source],
+                &CompileOptions {
+                    target: Target::X86_64UnknownNone,
+                    emit: EmitKind::Object,
+                    output,
+                    keep_assembly: false,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            fs::read(first_object).unwrap(),
+            fs::read(second_object).unwrap(),
+            "identical O-core modules emitted different object bytes"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn rejects_float_miscompilation_before_object_emission() {
         let dir =
             std::env::temp_dir().join(format!("ocore-float-regression-test-{}", monotonic_nonce()));
