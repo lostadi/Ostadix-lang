@@ -136,8 +136,8 @@ cd Olang
 cargo build --release
 
 ./target/release/O examples/hello.O backends
-./target/release/olangc examples/hello.O -o hello
-./hello
+./target/release/olangc examples/hello.O -o target/hello
+./target/hello
 ```
 
 The usual package-manager prerequisites are:
@@ -220,7 +220,7 @@ the notebook, and O-core.
 cargo build --bin ocorec
 
 # Compile one or more O-core modules to an ELF relocatable object.
-target/debug/ocorec module.oc --emit obj -o module.o
+target/debug/ocorec module.oc --emit obj -o target/module.o
 
 # Build the included freestanding kernel.
 ./ocore/kernel/build.sh
@@ -273,6 +273,48 @@ needs QEMU and the local Rust linker toolchain.
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
 | `olangc` | `c_cpp/olangc` | Produces a hosted native executable through the C17 edition. |
+
+### Build artifacts and source-only checkout
+
+The repository tracks source, specifications, tests, examples, the O-lang
+logo, and the intentional mascot assets. It does not track compiled programs,
+object files, Python bytecode, fuzz crashes, coverage output, virtual
+environments, or compiler caches.
+
+Cargo places Rust products under `target/`. The C17 edition writes `c_cpp/O`,
+`c_cpp/olangc`, and `c_cpp/src/*.o`. O-core kernel objects and the linked kernel
+also live under `target/ocore-kernel`. The commands in this README place direct
+`olangc` and `ocorec` output under `target/` for the same reason. All of these
+locations are ignored by Git.
+
+The ignore rules cover:
+
+- Cargo, cargo-fuzz, C, C++, CMake, linker, profiler, and WebAssembly output.
+- Root-level generated O-lang command binaries and the C17 binaries.
+- Python `__pycache__`, bytecode, virtual environments, test caches, type-check
+  caches, lint caches, and coverage output.
+- Default `o-link` output, generated extraction directories, editor state, and
+  operating-system metadata.
+
+Uppercase `.O` files are O-lang source and remain trackable. Lowercase `.o`
+files are native objects. On case-folding macOS filesystems Git can treat those
+patterns as equivalent, so object rules are scoped to real build directories
+instead of using a global `*.o` rule.
+
+To remove local build products without touching source:
+
+```bash
+cargo clean
+make -C c_cpp clean
+rm -rf fuzz/target fuzz/artifacts fuzz/coverage
+```
+
+To audit what Git is excluding:
+
+```bash
+git status --short --ignored
+git check-ignore -v target/release/O c_cpp/O fuzz/artifacts/parser/crash
+```
 
 ### Verifying the installation
 
@@ -700,8 +742,8 @@ restart the evaluator state.
 ### Compile hosted O
 
 ```bash
-cargo run --bin olangc -- examples/hello.O -o hello
-./hello
+cargo run --bin olangc -- examples/hello.O -o target/hello
+./target/hello
 
 cargo run --bin olangc -- examples/hello.O --target script
 cargo run --bin olangc -- examples/hello.O --target ir
@@ -712,16 +754,16 @@ cargo run --bin olangc -- examples/hello.O --target ir
 ```bash
 cargo run --bin ocorec -- kernel.oc --emit hir -o -
 cargo run --bin ocorec -- kernel.oc --emit mir -o -
-cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o kernel.o
+cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o target/kernel.o
 ```
 
 ### Link a source tree into one O document
 
 ```bash
-cargo run --bin o-link -- calc.py page.html app.O -o program.O
-cargo run -- program.O
+cargo run --bin o-link -- calc.py page.html app.O -o target/program.O
+cargo run -- target/program.O
 
-cargo run --bin o-unlink -- program.O -o restored/
+cargo run --bin o-unlink -- target/program.O -o target/restored/
 ```
 
 ---
@@ -875,7 +917,7 @@ The host mints that capability when it launches the program:
 
 ```bash
 O --backend-grant runner=python:process program.O backends
-olangc program.O --backend-grant runner=python:process -o program
+olangc program.O --backend-grant runner=python:process -o target/program
 ```
 
 The four block rights are `fs_read`, `fs_write`, `network`, and `process`.
@@ -1217,8 +1259,8 @@ with `O`.
 
 | Target | Command | Result |
 |--------|---------|--------|
-| `binary` | `olangc app.O -o app` | Builds a native hosted executable containing the program and Rust O runtime. |
-| `wasm` | `olangc app.O --target wasm -o app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
+| `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
+| `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
 | `ir` | `olangc app.O --target ir` | Prints lowered OIR and its ExecutionPlan without executing the program. |
 
@@ -1367,6 +1409,7 @@ Olang/
 ├── c_cpp/                      # standalone C17 hosted implementation
 ├── o_lang/                     # Python reference implementation
 ├── examples/                   # runnable hosted examples
+├── .gitignore                  # source-only checkout and artifact boundaries
 ├── docs/OCORE.md               # O-core language and ABI contract
 ├── SPEC.md                     # hosted language specification
 └── ARCHITECTURE.md             # implementation architecture
@@ -1623,8 +1666,8 @@ The implemented item attributes are:
 ocorec a.oc b.oc --emit ast -o -
 ocorec a.oc b.oc --emit hir -o -
 ocorec a.oc b.oc --emit mir -o -
-ocorec a.oc b.oc --emit asm -o program.s
-ocorec a.oc b.oc --emit obj -o program.o
+ocorec a.oc b.oc --emit asm -o target/program.s
+ocorec a.oc b.oc --emit obj -o target/program.o
 ```
 
 The front end creates source spans and diagnostics, parses modules and items,
@@ -1907,6 +1950,9 @@ O-core as the freestanding systems language.
   directories, enforced by a named test and CI.
 - Raw-byte and structured adversarial parser properties plus a cargo-fuzz
   target.
+- Source-only Git tracking with Rust, native, Python, fuzzing, coverage, and
+  local compiler products excluded while `.O` source and intentional visual
+  assets remain tracked.
 
 ### Current boundaries
 
