@@ -1,26 +1,84 @@
-# Build artifacts
+# Rust and Cargo build artifacts
 /target/
-*.o
-!examples/sql_select.O
-!examples/sql_create_insert_select.O
-!examples/sql_python_sql.O
-!examples/sql_aggregation.O
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+*.rlib
+*.rmeta
+*.d
+
+# Native compiler and linker artifacts
+# Keep object rules scoped because macOS case folding makes *.o match .O source.
+/c_cpp/**/*.o
+/ocore/kernel/*.o
+*.obj
+*.a
+*.lib
 *.so
+*.so.*
 *.dylib
+*.dll
+*.exe
+*.pdb
+*.dSYM/
+*.wasm
+*.profraw
+*.profdata
+
+# Other build systems
+/build/
+/dist/
+/out/
+/cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/.ninja_deps
+**/.ninja_log
+
+# Generated binaries
+/O
+/o-link
+/o-unlink
+/o-notebook
+/olangc
+/ocorec
+/hello
+/script
+/program
+/app
+/examples/meta_eval
+/examples/nix_basic
+/c_cpp/O
+/c_cpp/olangc
+
+# Generated linker and extraction output
+/combined.O
+/extracted_md/
+/extracted_segments/
 
 # OS metadata
 .DS_Store
 Thumbs.db
 
-# Python
+# Python bytecode, environments, and tool caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.egg-info/
-
-# Generated extraction artifacts
-extracted_md/
-extracted_segments/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
 
 # Editor / IDE
 .vscode/
@@ -28,12 +86,3 @@ extracted_segments/
 *.swp
 *.swo
 *~
-
-# Compiled binaries at root (use cargo build instead)
-/hello
-/script
-
-# C/C++ build outputs
-c_cpp/O
-c_cpp/olangc
-*.wasm
