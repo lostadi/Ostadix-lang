@@ -6,6 +6,9 @@
 
 *By Lee Daghlar Ostadi*
 
+[![CI](https://github.com/lostadi/Olang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/Olang/actions/workflows/ci.yml)
+[![Parser fuzz campaign](https://github.com/lostadi/Olang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/Olang/actions/workflows/fuzz.yml)
+
 > **Every expression carries its own interpreter as part of its syntax.**
 
 O-lang, short for **Ouroboros language**, is a language system built on one
@@ -1826,10 +1829,17 @@ rustup toolchain install nightly
 cargo +nightly fuzz run parser
 ```
 
-The CI workflow runs all Cargo targets, the parser property tests, a build
-check for the fuzz target, and a named reproducibility test. That test compiles
-the same O-core module from two different source directories and asserts that
-the emitted x86_64 ELF object bytes are identical.
+The per-commit CI workflow runs all Cargo targets, names the deterministic
+parser properties as their own gate, checks that the libFuzzer harness builds,
+and runs a named reproducibility test. That test compiles the same O-core module
+from two different source directories and asserts that the emitted x86_64 ELF
+object bytes are identical.
+
+The separate `Parser fuzz campaign` workflow runs the seeded libFuzzer target
+for five minutes every Monday and whenever it is manually dispatched. This
+keeps fast, deterministic property coverage on every change while making the
+sanitizer-instrumented adversarial campaign an executing CI job rather than
+type-checked scaffolding.
 
 ---
 

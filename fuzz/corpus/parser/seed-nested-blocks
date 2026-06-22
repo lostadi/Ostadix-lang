@@ -1,0 +1,4 @@
+O^(
+let runner = quote^(python{defer,cap=worker,process}^(40 + 2)_python{defer,cap=worker,process})_quote
+html^(<p>python[3]^(6 * 7)_python[3]</p>)_html
+)_O

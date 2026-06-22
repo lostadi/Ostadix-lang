@@ -35,6 +35,9 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
 
+      - name: Run deterministic parser properties
+        run: cargo test --test parser_proptest
+
       - name: Verify byte-reproducible O-core objects
         run: cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 
