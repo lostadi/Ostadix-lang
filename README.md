@@ -1241,6 +1241,7 @@ o-link src/ -o project.O
 o-link notes.txt --lang txt=markdown --stdout
 o-link calc.py --run
 o-link src/ -o app.O --shebang
+o-link src/ -o app.O --verbose-skips
 ```
 
 It provides several correctness properties:
@@ -1252,11 +1253,15 @@ It provides several correctness properties:
   root.
 - `.gitignore` and `.olinkignore` rules are loaded at each walked directory.
   Git-compatible negation rules are honored.
-- Hidden paths, `target`, `node_modules`, `__pycache__`, and `.git` are skipped.
-  Every excluded path receives a warning, including files with no extension,
-  unknown extensions, unreadable entries, binary data, duplicates, symlink
-  aliases, ignored files, and the output file itself. A final scan summary
-  reports the selected and skipped counts.
+- Every readable UTF-8 file is selected. Known extensions use their registered
+  backend, while unknown extensions and extensionless files use the inert
+  `text` backend and remain byte-for-byte recoverable through `o-unlink`.
+- Hidden paths, `target`, `node_modules`, `__pycache__`, `.git`, ignored paths,
+  unreadable entries, binary data, duplicates, symlink aliases, and the output
+  file itself are skipped. Default warnings are grouped by reason so a large
+  ignored tree cannot flood the terminal. `--verbose-skips` prints one warning
+  for every skipped path. A final scan summary always reports the selected and
+  skipped counts.
 - Symlinked directories are visited at most once.
 - O openers, matching closers, and `$name` sequences inside source files are
   escaped and round-trip as literal source.
@@ -1278,6 +1283,8 @@ It provides several correctness properties:
 The built-in extension map includes Python, shell, HTML, LaTeX, Markdown,
 Rust, Racket, Nix, text, C and C++, C#, Haskell, Scheme, Common Lisp, SQL,
 Ruby, MATLAB, Wolfram Language, WAT, Java, JavaScript, and OCaml.
+Extensions outside this map are preserved with the `text` backend unless an
+explicit `--lang EXT=BACKEND` mapping selects another registered backend.
 
 ### `o-unlink`: restore the linked source tree
 
@@ -1291,11 +1298,12 @@ o-unlink combined.O --dry-run
 ```
 
 The output path is checked before writing so a linked document cannot escape
-the selected directory through `..` components. For supported textual source
+the selected directory through `..` components. For UTF-8 textual source
 trees, `o-link` followed by `o-unlink` round-trips the selected contents. The
 test suite proves this over generated small trees with nested directories,
-multiple extensions, dollar variables, embedded opener and closer text,
-Unicode, final-newline variations, file aliases, and directory symlink loops.
+registered, unknown, and missing extensions, dollar variables, embedded opener
+and closer text, Unicode, final-newline variations, file aliases, and directory
+symlink loops.
 Each generated case runs both binaries and requires `diff -r` to report an
 empty difference.
 

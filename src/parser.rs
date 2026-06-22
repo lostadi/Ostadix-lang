@@ -7,9 +7,10 @@ use crate::ir::BackendRegistry;
 /// rather than SPLICED (children are raw source text for a target backend).
 ///
 /// Inside a sequencing lang's body, the parser produces ONode::Call for
-/// `name(...)` syntax and resolves VarRefs, LetBindings, and nested
-/// TypedExprs as structured ONodes rather than raw text destined for a
-/// foreign backend.
+/// `name(...)` syntax and resolves LetBindings and nested TypedExprs as
+/// structured ONodes rather than raw text destined for a foreign backend.
+/// VarRefs remain meaningful in every backend because they are the splice
+/// syntax used to pass OValues across evaluator boundaries.
 ///
 /// `quote` is here because its body is the captured AST to wrap as an
 /// OValue::Expr — evaluating its children as O-level statements is correct
@@ -94,6 +95,9 @@ impl<'a> Parser<'a> {
     fn parse_until(&mut self, expected_closer: Option<&Tag>) -> Result<Vec<ONode>> {
         let mut nodes = Vec::new();
         let mut text_start = self.pos;
+        let inside_sequencing = expected_closer
+            .map(|tag| SEQUENCING_LANGS.contains(&tag.lang.as_str()))
+            .unwrap_or(true);
 
         while self.pos < self.source.len() {
             if let Some(tag) = expected_closer {
@@ -109,19 +113,17 @@ impl<'a> Parser<'a> {
             // langs (quote^, O^).  Inside other typed-expression bodies the
             // `#` character is valid syntax (e.g. markdown headings, Python
             // comments) and must NOT be swallowed by the O-lang parser.
-            {
-                let in_seq = expected_closer
-                    .map(|t| SEQUENCING_LANGS.contains(&t.lang.as_str()))
-                    .unwrap_or(true);
-                if in_seq && self.current_byte() == Some(b'#') {
-                    self.flush_text(&mut nodes, text_start, self.pos);
-                    self.skip_to_end_of_line();
-                    text_start = self.pos;
-                    continue;
-                }
+            if inside_sequencing && self.current_byte() == Some(b'#') {
+                self.flush_text(&mut nodes, text_start, self.pos);
+                self.skip_to_end_of_line();
+                text_start = self.pos;
+                continue;
             }
 
-            if self.starts_with_let_keyword() {
+            // A foreign backend owns ordinary `let name = ...` syntax in its
+            // body. Only the O document and sequencing backends may turn it
+            // into an ONode::LetBinding.
+            if inside_sequencing && self.starts_with_let_keyword() {
                 let let_start = self.pos;
                 if let Some(binding) = self.try_parse_let_binding()? {
                     self.flush_text(&mut nodes, text_start, let_start);
@@ -228,9 +230,6 @@ impl<'a> Parser<'a> {
             // AND inside the bodies of SEQUENCING_LANGS (lazy^, eventually O^
             // and quote^). Disallowed inside ordinary typed-expr bodies so
             // that source text destined for a backend isn't reinterpreted.
-            let inside_sequencing = expected_closer
-                .map(|t| SEQUENCING_LANGS.contains(&t.lang.as_str()))
-                .unwrap_or(true);
             if inside_sequencing {
                 let stmt_start = self.pos;
                 if let Some(call) = self.try_parse_call()? {
@@ -1048,6 +1047,29 @@ mod tests {
         } else {
             panic!("expected TypedExpr");
         }
+    }
+
+    #[test]
+    fn let_syntax_inside_non_sequencing_body_remains_backend_source() {
+        let src = concat!(
+            "markdown^(Swift package example:\n",
+            "let package = Package(\n",
+            "    name: \"MyLlamaPackage\"\n",
+            "))_markdown"
+        );
+        let backends = make_backends(&["markdown"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(nodes.len(), 1);
+        let ONode::TypedExpr { body, .. } = &nodes[0] else {
+            panic!("expected TypedExpr")
+        };
+        assert_eq!(
+            body,
+            &[ONode::RawText(
+                "Swift package example:\nlet package = Package(\n    name: \"MyLlamaPackage\"\n)"
+                    .into()
+            )]
+        );
     }
 
     #[test]

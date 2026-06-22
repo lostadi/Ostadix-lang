@@ -218,6 +218,7 @@ check_olink_hardened_round_trip() {
     printf '%s\n' 'ignored.py' >"$source/.olinkignore"
     printf '%s\n' 'ignored = true' >"$source/ignored.py"
     printf '%s\n' 'extensionless' >"$source/README"
+    cp "$source/README" "$expected/README"
     printf '\377\376\000' >"$source/binary.py"
 
     run_command "$OLINK_BIN" "$source" -o "$combined"
@@ -225,10 +226,9 @@ check_olink_hardened_round_trip() {
         fail "o-link hardening round-trip" "(o-link failed with exit $RUN_EXIT)"
         return
     fi
-    if ! grep -Eq 'warning: skipped .*ignored.py.*\.olinkignore' "$STDERR_FILE" \
-        || ! grep -Eq 'warning: skipped .*README.*no extension' "$STDERR_FILE" \
-        || ! grep -Eq 'warning: skipped .*binary.py.*not UTF-8 text' "$STDERR_FILE" \
-        || ! grep -Eq 'o-link scan: 1 selected, [0-9]+ skipped' "$STDERR_FILE"; then
+    if ! grep -Eq 'warning: skipped [0-9]+ path[s]? .*\.olinkignore' "$STDERR_FILE" \
+        || ! grep -Eq 'warning: skipped [0-9]+ path[s]? \(not UTF-8 text\)' "$STDERR_FILE" \
+        || ! grep -Eq 'o-link scan: 2 selected, [0-9]+ skipped' "$STDERR_FILE"; then
         fail "o-link hardening round-trip" "(skip warnings or summary are incomplete)"
         return
     fi

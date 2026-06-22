@@ -21,8 +21,9 @@
 // their alphabetical order.  For languages without import scanning support,
 // files keep the sorted order from the directory walk.
 //
-// Directories are walked recursively; every file with a recognized extension
-// is included, in sorted order, so the output is deterministic.
+// Directories are walked recursively; every UTF-8 text file is included in
+// sorted order so the output is deterministic. Unknown and extensionless
+// files use the inert text backend unless --lang selects another backend.
 //
 // Any text inside a wrapped file that would collide with O-lang syntax:
 // a registered opener like `python^(`, the wrapping block's own closer
@@ -38,13 +39,14 @@
 //   o-link a.py --stdout                      # write to stdout instead
 //   o-link a.py b.sh --run                    # link, then execute in-process
 //   o-link src/ -o app.O --shebang            # emit `#!/usr/bin/env o`, chmod +x
+//   o-link src/ -o app.O --verbose-skips      # report every excluded path
 //
 // Robustness guarantees:
 //   * The combined output is re-parsed with the O-lang parser before it is
 //     written, so o-link never emits a .O file that the runtime cannot read.
-//   * Directory walks skip binary / non-UTF-8 files (with a warning), follow
-//     symlinked directories at most once (no infinite loops), and never pick
-//     up the output file itself.
+//   * Directory walks skip binary / non-UTF-8 files, group warnings by reason,
+//     follow symlinked directories at most once (no infinite loops), and never
+//     pick up the output file itself. --verbose-skips reports every path.
 //   * The same file given twice (directly or via overlapping directories) is
 //     linked only once.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,19 +79,38 @@ struct CollectedFiles {
 }
 
 impl CollectedFiles {
-    fn report(&self) {
-        for skipped in &self.skipped {
-            eprintln!(
-                "warning: skipped {} ({})",
-                skipped.path.display(),
-                skipped.reason
-            );
+    fn report_lines(&self, verbose_skips: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        if verbose_skips {
+            lines.extend(self.skipped.iter().map(|skipped| {
+                format!(
+                    "warning: skipped {} ({})",
+                    skipped.path.display(),
+                    skipped.reason
+                )
+            }));
+        } else {
+            let mut counts = BTreeMap::<&str, usize>::new();
+            for skipped in &self.skipped {
+                *counts.entry(&skipped.reason).or_default() += 1;
+            }
+            lines.extend(counts.into_iter().map(|(reason, count)| {
+                let noun = if count == 1 { "path" } else { "paths" };
+                format!("warning: skipped {count} {noun} ({reason})")
+            }));
         }
-        eprintln!(
+        lines.push(format!(
             "o-link scan: {} selected, {} skipped",
             self.files.len(),
             self.skipped.len()
-        );
+        ));
+        lines
+    }
+
+    fn report(&self, verbose_skips: bool) {
+        for line in self.report_lines(verbose_skips) {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -100,7 +121,6 @@ struct IgnoreRules {
 }
 
 struct WalkState<'a> {
-    ext_map: &'a BTreeMap<String, String>,
     exclude: Option<&'a Path>,
     seen_files: &'a mut HashSet<PathBuf>,
     seen_dirs: &'a mut HashSet<PathBuf>,
@@ -132,6 +152,10 @@ struct Cli {
     /// May be given multiple times; overrides the built-in mapping.
     #[arg(long = "lang", value_name = "EXT=BACKEND")]
     lang: Vec<String>,
+
+    /// Print one warning for every skipped path instead of grouping by reason.
+    #[arg(long)]
+    verbose_skips: bool,
 
     /// Skip the parse-validation pass on the combined output.
     #[arg(long = "no-validate")]
@@ -178,7 +202,7 @@ fn main() -> Result<()> {
         .transpose()?;
 
     let collected = collect_files(&cli.inputs, &ext_map, exclude.as_deref())?;
-    collected.report();
+    collected.report(cli.verbose_skips);
     if collected.files.is_empty() {
         bail!("no linkable files found in the given inputs");
     }
@@ -273,7 +297,7 @@ fn run_combined(
 /// skipped path so callers can report exclusions uniformly.
 fn collect_files(
     inputs: &[PathBuf],
-    ext_map: &BTreeMap<String, String>,
+    _ext_map: &BTreeMap<String, String>,
     exclude: Option<&Path>,
 ) -> Result<CollectedFiles> {
     let mut files = Vec::new();
@@ -286,7 +310,6 @@ fn collect_files(
         if input.is_dir() {
             let mut ignore_rules = Vec::new();
             let mut state = WalkState {
-                ext_map,
                 exclude,
                 seen_files: &mut seen_files,
                 seen_dirs: &mut seen_dirs,
@@ -296,12 +319,6 @@ fn collect_files(
             };
             walk_dir(&input, &mut state)?;
         } else if input.is_file() {
-            if file_backend(&input, ext_map).is_none() {
-                bail!(
-                    "{}: unrecognized extension; use --lang EXT=BACKEND to map it",
-                    input.display()
-                );
-            }
             if push_unique(&input, exclude, &mut seen_files, &mut files, &mut skipped)? {
                 // Explicitly-listed files must be readable text: fail loudly
                 // here instead of skipping silently like directory walks do.
@@ -417,18 +434,6 @@ fn walk_dir(dir: &Path, state: &mut WalkState<'_>) -> Result<()> {
             state.skipped.push(SkippedPath {
                 path: entry,
                 reason: "unsupported filesystem entry".into(),
-            });
-            continue;
-        }
-
-        if file_backend(&entry, state.ext_map).is_none() {
-            let reason = match entry.extension().and_then(|ext| ext.to_str()) {
-                None => "no extension".to_string(),
-                Some(ext) => format!("unrecognized extension .{ext}"),
-            };
-            state.skipped.push(SkippedPath {
-                path: entry,
-                reason,
             });
             continue;
         }
@@ -628,14 +633,20 @@ fn marker_path(path: &Path, marker_root: &Path) -> Result<PathBuf> {
     Ok(relative.to_path_buf())
 }
 
-/// Resolve a file path to its backend language, or None if the extension is
-/// unknown. `.O` files map to the pseudo-backend "" (inline).
-fn file_backend(path: &Path, ext_map: &BTreeMap<String, String>) -> Option<String> {
-    let ext = path.extension()?.to_str()?;
+/// Resolve a file path to its backend language. Unknown and extensionless
+/// UTF-8 files use the inert `text` backend so arbitrary textual source trees
+/// remain lossless. `.O` files map to the pseudo-backend "" (inline).
+fn file_backend(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return "text".to_string();
+    };
     if ext == "O" {
-        return Some(String::new());
+        return String::new();
     }
-    ext_map.get(&ext.to_ascii_lowercase()).cloned()
+    ext_map
+        .get(&ext.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_else(|| "text".to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -662,8 +673,7 @@ fn link_files(
     let mut lang_counters: HashMap<String, u32> = HashMap::new();
 
     for path in &ordered {
-        let backend = file_backend(path, ext_map)
-            .with_context(|| format!("{}: unrecognized extension", path.display()))?;
+        let backend = file_backend(path, ext_map);
         let mut content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let marker = marker_path(path, marker_root)?;
@@ -733,16 +743,12 @@ fn link_files(
 pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
     // Group files by backend language, preserving original indices so we can
     // interleave the sorted groups back correctly.
-    // Files whose extension is not recognised are kept as-is in their original
-    // positions so callers can decide how to handle them.
     let mut groups: HashMap<String, Vec<(usize, &PathBuf)>> = HashMap::new();
-    let mut unknowns: Vec<(usize, &PathBuf)> = Vec::new();
     for (i, path) in files.iter().enumerate() {
-        if let Some(backend) = file_backend(path, ext_map) {
-            groups.entry(backend).or_default().push((i, path));
-        } else {
-            unknowns.push((i, path));
-        }
+        groups
+            .entry(file_backend(path, ext_map))
+            .or_default()
+            .push((i, path));
     }
 
     // Sort each group by import-graph dependencies, then reassemble the full
@@ -758,11 +764,6 @@ pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> V
         for (orig_i, path) in orig_indices.iter().zip(sorted_paths) {
             sorted_entries.push((*orig_i, path.clone()));
         }
-    }
-
-    // Preserve unknown-extension inputs in their original positions.
-    for (i, path) in unknowns {
-        sorted_entries.push((i, (*path).clone()));
     }
 
     sorted_entries.sort_by_key(|(i, _)| *i);
@@ -900,7 +901,7 @@ fn module_stems(path: &Path) -> Vec<String> {
 /// ordinary static import forms of each hosted language and returns module
 /// stems suitable for lookup in `stem_to_idx`.
 fn imported_modules(src: &str, ext_map: &BTreeMap<String, String>, path: &Path) -> Vec<String> {
-    let lang = file_backend(path, ext_map).unwrap_or_default();
+    let lang = file_backend(path, ext_map);
     let mut mods = Vec::new();
 
     for line in src.lines() {
@@ -1401,6 +1402,51 @@ mod tests {
         assert_eq!(map.get("md").unwrap(), "markdown");
     }
 
+    #[test]
+    fn unknown_and_extensionless_text_use_inert_text_backend() {
+        let map = default_extension_map();
+        assert_eq!(file_backend(Path::new("component.svelte"), &map), "text");
+        assert_eq!(file_backend(Path::new("module.ts"), &map), "text");
+        assert_eq!(file_backend(Path::new("README"), &map), "text");
+        assert_eq!(file_backend(Path::new("program.O"), &map), "");
+    }
+
+    #[test]
+    fn skip_report_is_aggregated_unless_verbose() {
+        let collection = CollectedFiles {
+            files: vec![PathBuf::from("selected.py")],
+            marker_root: PathBuf::from("."),
+            skipped: vec![
+                SkippedPath {
+                    path: PathBuf::from("one.bin"),
+                    reason: "not UTF-8 text".into(),
+                },
+                SkippedPath {
+                    path: PathBuf::from("two.bin"),
+                    reason: "not UTF-8 text".into(),
+                },
+                SkippedPath {
+                    path: PathBuf::from(".hidden"),
+                    reason: "hidden path".into(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            collection.report_lines(false),
+            vec![
+                "warning: skipped 1 path (hidden path)",
+                "warning: skipped 2 paths (not UTF-8 text)",
+                "o-link scan: 1 selected, 3 skipped",
+            ]
+        );
+        let verbose = collection.report_lines(true);
+        assert_eq!(verbose.len(), 4);
+        assert!(verbose[0].contains("one.bin"));
+        assert!(verbose[1].contains("two.bin"));
+        assert!(verbose[2].contains(".hidden"));
+    }
+
     /// Build a unique scratch directory for filesystem-backed tests.
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("olink_test_{}_{}", name, std::process::id()));
@@ -1485,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_walk_records_every_kind_of_skip() {
+    fn directory_walk_keeps_unknown_text_and_records_real_skips() {
         let dir = scratch("skip_report");
         fs::create_dir_all(dir.join("cache")).unwrap();
         fs::write(dir.join(".gitignore"), "*.py\n!keep.py\ncache/\n").unwrap();
@@ -1501,8 +1547,16 @@ mod tests {
 
         let map = default_extension_map();
         let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
-        assert_eq!(collection.files.len(), 1);
-        assert!(collection.files[0].ends_with("keep.py"));
+        assert_eq!(collection.files.len(), 3);
+        assert!(collection
+            .files
+            .iter()
+            .any(|path| path.ends_with("keep.py")));
+        assert!(collection.files.iter().any(|path| path.ends_with("README")));
+        assert!(collection
+            .files
+            .iter()
+            .any(|path| path.ends_with("unknown.xyz")));
 
         let reasons = collection
             .skipped
@@ -1511,10 +1565,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(reasons.iter().any(|reason| reason.contains(".gitignore")));
         assert!(reasons.iter().any(|reason| reason.contains(".olinkignore")));
-        assert!(reasons.contains(&"no extension"));
-        assert!(reasons
-            .iter()
-            .any(|reason| reason.contains("unrecognized extension")));
         assert!(reasons.contains(&"not UTF-8 text"));
         assert!(reasons.contains(&"hidden path"));
         assert!(collection

@@ -13,19 +13,23 @@ fn relative_path_strategy() -> impl Strategy<Value = String> {
         prop::collection::vec("[a-z]{1,5}", 0..3),
         "[a-z]{1,7}",
         prop_oneof![
-            Just("py"),
-            Just("sh"),
-            Just("rs"),
-            Just("js"),
-            Just("rb"),
-            Just("java"),
-            Just("ml"),
-            Just("md"),
-            Just("txt"),
-            Just("c"),
-            Just("hs"),
-            Just("rkt"),
-            Just("sql"),
+            Just(Some("py")),
+            Just(Some("sh")),
+            Just(Some("rs")),
+            Just(Some("js")),
+            Just(Some("rb")),
+            Just(Some("java")),
+            Just(Some("ml")),
+            Just(Some("md")),
+            Just(Some("txt")),
+            Just(Some("c")),
+            Just(Some("hs")),
+            Just(Some("rkt")),
+            Just(Some("sql")),
+            Just(Some("ts")),
+            Just(Some("svelte")),
+            Just(Some("toml")),
+            Just(None),
         ],
     )
         .prop_map(|(directories, name, extension)| {
@@ -34,8 +38,10 @@ fn relative_path_strategy() -> impl Strategy<Value = String> {
                 path.push('/');
             }
             path.push_str(&name);
-            path.push('.');
-            path.push_str(extension);
+            if let Some(extension) = extension {
+                path.push('.');
+                path.push_str(extension);
+            }
             path
         })
 }
@@ -94,15 +100,12 @@ fn setup(files: &BTreeMap<String, String>, symlink_mode: u8) -> (TempDir, PathBu
     }
     if symlink_mode & 2 != 0 {
         let target = files.keys().next().unwrap();
-        let extension = Path::new(target)
+        let alias = Path::new(target)
             .extension()
             .and_then(|extension| extension.to_str())
-            .unwrap();
-        std::os::unix::fs::symlink(
-            source.join(target),
-            source.join(format!("zzzzzzzzzzzz-alias.{extension}")),
-        )
-        .unwrap();
+            .map(|extension| format!("zzzzzzzzzzzz-alias.{extension}"))
+            .unwrap_or_else(|| "zzzzzzzzzzzz-alias".to_string());
+        std::os::unix::fs::symlink(source.join(target), source.join(alias)).unwrap();
     }
     (temp, source, expected)
 }
