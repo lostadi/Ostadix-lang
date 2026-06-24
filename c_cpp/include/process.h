@@ -41,8 +41,6 @@ void olang_backend_process_send_eval_result(OBackendProcess *p, OValue *value);
 
 /* High-level: send exec, get final value (or NULL on err). Handles basic case. */
 OValue *olang_backend_process_exec(OBackendProcess *p, const char *code, OValueMap *bindings);
-
-void olang_backend_process_ping(OBackendProcess *p);
 void olang_backend_process_cleanup(OBackendProcess *p);
 
 /* ── ProcessRegistry: owns the (lang,env_id) -> process map ────────────── */

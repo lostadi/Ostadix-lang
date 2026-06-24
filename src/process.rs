@@ -197,6 +197,10 @@ fn sandbox_quote(path: &Path) -> String {
 
 impl BackendProcess {
     fn new(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Self> {
+        if !shim_path.exists() {
+            return Err(anyhow!("backend shim not found: {}", shim_path.display()));
+        }
+
         let mut command = if shim_path.extension().and_then(|s| s.to_str()) == Some("py") {
             python_shim_command(shim_path, sandbox)?
         } else {
@@ -277,17 +281,6 @@ impl BackendProcess {
         }
     }
 
-    fn ping(&mut self) -> Result<()> {
-        self.send_command(&OWireCommand::Ping)?;
-        match self.recv_step()? {
-            ExecStep::Done(_) => Ok(()),
-            ExecStep::EvalRequest { src, .. } => Err(anyhow!(
-                "unexpected eval_request during ping (src: {:?})",
-                &src[..src.len().min(40)]
-            )),
-        }
-    }
-
     fn cleanup(&mut self) -> Result<()> {
         let send_result = self.send_command(&OWireCommand::Cleanup);
         let _ = self.child.kill();
@@ -327,11 +320,8 @@ impl ProcessRegistry {
     ) -> Result<()> {
         let key = (lang.to_string(), env_id, sandbox.clone());
         if !self.registry.contains_key(&key) {
-            let mut process = BackendProcess::new(shim_path, sandbox)
+            let process = BackendProcess::new(shim_path, sandbox)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
-            process
-                .ping()
-                .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }
         self.registry
@@ -392,11 +382,8 @@ impl ProcessRegistry {
         let key = (lang.to_string(), env_id, sandbox.clone());
 
         if !self.registry.contains_key(&key) {
-            let mut process = BackendProcess::new(shim_path, sandbox)
+            let process = BackendProcess::new(shim_path, sandbox)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
-            process
-                .ping()
-                .with_context(|| format!("backend `{lang}` did not respond to health check"))?;
             self.registry.insert(key.clone(), process);
         }
 

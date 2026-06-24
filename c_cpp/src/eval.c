@@ -86,6 +86,69 @@ static bool is_pure_backend(const char *lang) {
     return false;
 }
 
+typedef struct {
+    bool lazy;
+    bool defer;
+} BlockOptions;
+
+static char *trim_in_place(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) *--end = '\0';
+    return s;
+}
+
+static bool is_backend_authority_attr(const char *entry) {
+    return strcmp(entry, "fs_read") == 0 ||
+           strcmp(entry, "fs_write") == 0 ||
+           strcmp(entry, "network") == 0 ||
+           strcmp(entry, "process") == 0;
+}
+
+static bool parse_block_options(const char *attr, const char *lang, BlockOptions *out) {
+    out->lazy = false;
+    out->defer = false;
+    if (!attr) return true;
+
+    char *copy = dup_cstr(attr);
+    if (!copy) return false;
+
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *entry = trim_in_place(tok);
+        if (strcmp(entry, "lazy") == 0) {
+            if (out->defer) {
+                fprintf(stderr, "a block cannot combine lazy and defer\n");
+                free(copy);
+                return false;
+            }
+            out->lazy = true;
+        } else if (strcmp(entry, "defer") == 0) {
+            if (out->lazy) {
+                fprintf(stderr, "a block cannot combine lazy and defer\n");
+                free(copy);
+                return false;
+            }
+            out->defer = true;
+        } else if (strncmp(entry, "cap=", 4) == 0) {
+            if (entry[4] == '\0') {
+                fprintf(stderr, "empty backend capability binding on %s^\n", lang ? lang : "<unknown>");
+                free(copy);
+                return false;
+            }
+        } else if (!is_backend_authority_attr(entry)) {
+            fprintf(stderr,
+                    "unknown block attribute {%s} on %s^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process\n",
+                    entry, lang ? lang : "<unknown>");
+            free(copy);
+            return false;
+        }
+    }
+
+    free(copy);
+    return true;
+}
+
 /* ── render helpers (C ports of render_python/html etc) ────────────────── */
 static char *json_quote(const char *s) {
     if (!s) return strdup("\"\"");
@@ -435,7 +498,7 @@ static OValue *eval_call(OEvaluator *ev, const char *fn, ONode **args, size_t na
         oval_release(req);
         return out;
     }
-    if (strcmp(fn, "activate") == 0) {
+    if (strcmp(fn, "activate") == 0 || strcmp(fn, "dry_activate") == 0) {
         if (nargs < 1 || nargs > 2) { *err=true; return NULL; }
         OValue *a0 = eval_node(ev, args[0], err);
         if (*err) { oval_release(a0); return NULL; }
@@ -446,7 +509,8 @@ static OValue *eval_call(OEvaluator *ev, const char *fn, ONode **args, size_t na
                 prof = a1->data.str_val;
             oval_release(a1);
         }
-        OValue *req = oval_request((RequestKind){REQ_ACTIVATE, NULL, 0, false, dup_cstr(prof), true}, a0);
+        bool dry_run = strcmp(fn, "dry_activate") == 0;
+        OValue *req = oval_request((RequestKind){REQ_ACTIVATE, NULL, 0, false, dup_cstr(prof), dry_run}, a0);
         oval_release(a0);
         OValue *out = olang_scheduler_execute(ev->scheduler, req);
         oval_release(req);
@@ -469,8 +533,13 @@ static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id
         return v;
     }
 
-    if (attr) {
-        if (strcmp(attr, "lazy") == 0 || strcmp(attr, "defer") == 0) {
+    BlockOptions options;
+    if (!parse_block_options(attr, lang, &options)) {
+        *err = true;
+        return NULL;
+    }
+
+    if (options.lazy || options.defer) {
             /* build thunk + request */
             SB buf; sb_init(&buf);
             for (size_t i=0; i<body_len; ++i) {
@@ -481,12 +550,11 @@ static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id
             char *b = sb_take(&buf);
             OValue *th = oval_thunk(b, NULL, 0);
             free(b);
-            bool cache = (strcmp(attr, "lazy") == 0) && is_pure_backend(lang);
+            bool cache = options.lazy && is_pure_backend(lang);
             RequestKind k = {REQ_EVAL, dup_cstr(lang), env_id, cache, NULL, false};
             OValue *req = oval_request(k, th);
             oval_release(th);
             return req;
-        }
     }
 
     if (strcmp(lang, "O") == 0) {

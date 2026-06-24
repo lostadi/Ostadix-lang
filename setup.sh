@@ -29,8 +29,8 @@ INSTALL_WRAPPERS=true
 DRY_RUN=false
 
 RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
-RUST_STALE_BINARIES=(O olangc ocorec o-link olink o-unlink)
-WRAPPER_TARGETS=(o olangc o-c olangc-c)
+RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink)
+WRAPPER_TARGETS=(O o olangc o-c olangc-c)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
 # --- Arg parsing ---
@@ -172,6 +172,7 @@ refresh_cargo_bin_binaries() {
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
+    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O"
     return
   fi
 
@@ -189,6 +190,18 @@ refresh_cargo_bin_binaries() {
     cp "$src" "$dst"
     chmod +x "$dst"
   done
+  cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
+  chmod +x "$CARGO_BIN_DIR/o"
+}
+
+create_rust_alias_binaries() {
+  echo ">>> Recreating Rust alias binaries..."
+  if $DRY_RUN; then
+    echo "[DRY] replace $PROJECT_ROOT/target/release/o from $PROJECT_ROOT/target/release/O"
+    return
+  fi
+  cp "$PROJECT_ROOT/target/release/O" "$PROJECT_ROOT/target/release/o"
+  chmod +x "$PROJECT_ROOT/target/release/o"
 }
 
 # --- Install system dependencies (extended) ---
@@ -352,6 +365,7 @@ build_rust() {
     cargo_args+=(--bin "$bin")
   done
   run_cmd cargo "${cargo_args[@]}"
+  create_rust_alias_binaries
   refresh_cargo_bin_binaries
   echo "Rust build done → target/release/"
 }
@@ -429,11 +443,14 @@ create_wrappers() {
   done
 
   # Rust runner (prefers release)
-  cat > "$BIN_DIR/o" <<WRAP
+  for runner in O o; do
+    cat > "$BIN_DIR/$runner" <<WRAP
 #!/usr/bin/env bash
+export O_BACKENDS_DIR="\${O_BACKENDS_DIR:-$PROJECT_ROOT/backends}"
 exec "$PROJECT_ROOT/target/release/O" "\$@"
 WRAP
-  chmod +x "$BIN_DIR/o"
+    chmod +x "$BIN_DIR/$runner"
+  done
 
   cat > "$BIN_DIR/olangc" <<WRAP
 #!/usr/bin/env bash

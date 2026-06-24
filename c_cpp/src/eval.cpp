@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -49,6 +50,73 @@ bool whitespace_only(const char *text) {
         }
     }
     return true;
+}
+
+std::string trim_copy(const std::string &s) {
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1U);
+}
+
+struct BlockOptions {
+    bool lazy = false;
+    bool defer = false;
+    bool has_capability_binding = false;
+};
+
+bool is_backend_authority_attr(const std::string &entry) {
+    return entry == "fs_read" || entry == "fs_write" ||
+           entry == "network" || entry == "process";
+}
+
+BlockOptions parse_block_options(const char *attr, const std::string &lang) {
+    BlockOptions options;
+    if (attr == nullptr) {
+        return options;
+    }
+
+    std::set<std::string> seen;
+    const std::string attrs = attr;
+    std::size_t start = 0U;
+    while (start <= attrs.size()) {
+        const std::size_t comma = attrs.find(',', start);
+        const std::size_t end = comma == std::string::npos ? attrs.size() : comma;
+        const std::string entry = trim_copy(attrs.substr(start, end - start));
+        if (!seen.insert(entry).second) {
+            throw std::runtime_error("duplicate block attribute `{" + entry + "}` on " + lang + "^");
+        }
+
+        if (entry == "lazy") {
+            if (options.defer) {
+                throw std::runtime_error("a block cannot combine `lazy` and `defer`");
+            }
+            options.lazy = true;
+        } else if (entry == "defer") {
+            if (options.lazy) {
+                throw std::runtime_error("a block cannot combine `lazy` and `defer`");
+            }
+            options.defer = true;
+        } else if (entry.rfind("cap=", 0) == 0) {
+            const std::string name = entry.substr(4);
+            if (name.empty() || options.has_capability_binding) {
+                throw std::runtime_error("a block must name exactly one backend capability binding");
+            }
+            options.has_capability_binding = true;
+        } else if (!is_backend_authority_attr(entry)) {
+            throw std::runtime_error(
+                "Unknown block attribute `{" + entry + "}` on " + lang +
+                "^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process.");
+        }
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1U;
+    }
+    return options;
 }
 
 std::string json_quote(const std::string &s) {
@@ -552,7 +620,17 @@ bool Evaluator::is_pure_backend(const std::string &lang) {
 }
 
 bool Evaluator::is_schedulable_request(OValue *v) {
-    return oval_is_request(v) && v->data.request.kind.tag != REQ_EVAL;
+    if (!oval_is_request(v)) {
+        return false;
+    }
+    const RequestKind &kind = v->data.request.kind;
+    if (kind.tag == REQ_EVAL) {
+        return false;
+    }
+    if (kind.tag == REQ_ACTIVATE && !kind.dry_run) {
+        return false;
+    }
+    return true;
 }
 
 OValue *Evaluator::auto_resolve(OValue *v) {
@@ -565,7 +643,8 @@ OValue *Evaluator::auto_resolve(OValue *v) {
         return out;
     }
     if (policy_ == Policy::Autonomous) {
-        if (v->data.request.kind.tag == REQ_EVAL) {
+        const RequestKind &kind = v->data.request.kind;
+        if (kind.tag == REQ_EVAL || (kind.tag == REQ_ACTIVATE && !kind.dry_run)) {
             OValue *out = force_request(v);
             oval_release(v);
             return out;
@@ -582,6 +661,9 @@ OValue *Evaluator::force_request(OValue *req) {
     }
     if (req->data.request.kind.tag == REQ_EVAL) {
         return exec_eval(req);
+    }
+    if (req->data.request.kind.tag == REQ_ACTIVATE && !req->data.request.kind.dry_run) {
+        return executor_->execute(req);
     }
     if (policy_ == Policy::Autonomous) {
         return scheduler_.execute(req);
@@ -852,19 +934,20 @@ OValue *Evaluator::eval_call(const std::string &fn_name, ONode **args, size_t ar
             for (OValue *arg : arg_vals) oval_release(arg);
             return out;
         }
-        if (fn_name == "activate") {
+        if (fn_name == "activate" || fn_name == "dry_activate") {
             if (arg_vals.empty() || arg_vals.size() > 2U) {
-                throw std::runtime_error("activate(path) or activate(path, profile) — takes 1 or 2 args, got " + std::to_string(arg_vals.size()));
+                throw std::runtime_error(fn_name + "(path) or " + fn_name + "(path, profile) — takes 1 or 2 args, got " + std::to_string(arg_vals.size()));
             }
             std::string profile = kDefaultSystemProfile;
             if (arg_vals.size() == 2U) {
                 if (arg_vals[1]->tag == OVAL_STR || arg_vals[1]->tag == OVAL_SYSTEM) {
                     profile = maybe(arg_vals[1]->data.str_val);
                 } else {
-                    throw std::runtime_error(std::string("activate's second arg must be a string profile path or a System value, got ") + type_name(arg_vals[1]));
+                    throw std::runtime_error(fn_name + "'s second arg must be a string profile path or a System value, got " + type_name(arg_vals[1]));
                 }
             }
-            OValue *req = oval_request(make_activate_kind(profile, true), arg_vals[0]);
+            const bool dry_run = fn_name == "dry_activate";
+            OValue *req = oval_request(make_activate_kind(profile, dry_run), arg_vals[0]);
             OValue *out = auto_resolve(req);
             for (OValue *arg : arg_vals) oval_release(arg);
             return out;
@@ -890,21 +973,19 @@ OValue *Evaluator::eval_typed_expr(const std::string &lang, uint32_t env_id,
         return oval_expr(to_owned(::reconstruct_source(body, body_len)).c_str());
     }
 
-    if (attr != nullptr) {
-        const std::string a = attr;
-        if (a == "lazy") {
+    const BlockOptions options = parse_block_options(attr, lang);
+    if (options.lazy || options.defer) {
+        if (options.lazy) {
             if (lang == "nix_expr") {
                 throw std::runtime_error("`nix_expr{lazy}^` is redundant — nix_expr^ is already lazy. Use bare nix_expr^, or use nix{lazy}^ if you want a generic deferred Nix eval.");
             }
             if (!is_pure_backend(lang)) {
                 throw std::runtime_error("`" + lang + "{lazy}^` is invalid because " + lang + " is not a pure backend; caching a thunk that re-runs with side effects would be unsound. Use `" + lang + "{defer}^` instead — it captures the same thunk but never caches and always re-runs on force.");
             }
-        } else if (a == "defer") {
+        } else if (options.defer) {
             if (lang == "nix_expr") {
                 throw std::runtime_error("`nix_expr{defer}^` is redundant — nix_expr^ is already lazy. If you want a non-cacheable deferred Nix eval, write nix{defer}^.");
             }
-        } else {
-            throw std::runtime_error("Unknown block attribute `{" + a + "}` on " + lang + "^. Known attributes: lazy, defer.");
         }
     }
 
@@ -952,7 +1033,7 @@ OValue *Evaluator::eval_typed_expr(const std::string &lang, uint32_t env_id,
 
     std::string buf;
     std::vector<OValue *> deps;
-    const bool constructs_thunk = lang == "nix_expr" || attr != nullptr;
+    const bool constructs_thunk = lang == "nix_expr" || options.lazy || options.defer;
 
     try {
         for (std::size_t i = 0; i < body_len; ++i) {
@@ -994,10 +1075,10 @@ OValue *Evaluator::eval_typed_expr(const std::string &lang, uint32_t env_id,
             }
         }
 
-        if (attr != nullptr) {
+        if (options.lazy || options.defer) {
             std::vector<OValue *> dep_copy = deps;
             OValue *thunk = oval_thunk(buf.c_str(), dep_copy.data(), dep_copy.size());
-            OValue *req = oval_request(make_eval_kind(lang, env_id, std::string(attr) == "lazy"), thunk);
+            OValue *req = oval_request(make_eval_kind(lang, env_id, options.lazy), thunk);
             oval_release(thunk);
             for (OValue *dep : deps) oval_release(dep);
             return req;

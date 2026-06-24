@@ -3875,8 +3875,8 @@ mod tests {
         let error = format!("{:#}", evaluator.eval_node(&block, &scope).unwrap_err());
         assert!(
             error.contains("failed to spawn backend shim")
+                || error.contains("backend shim not found")
                 || error.contains("No such file or directory")
-                || error.contains("did not respond to health check")
                 || error.contains("backend process closed stdout"),
             "default backend authority should allow dispatch to reach the shim layer, got: {error}"
         );
@@ -3898,8 +3898,8 @@ mod tests {
         );
         assert!(
             error.contains("failed to spawn backend shim")
+                || error.contains("backend shim not found")
                 || error.contains("No such file or directory")
-                || error.contains("did not respond to health check")
                 || error.contains("backend process closed stdout"),
             "default backend authority should allow bash dispatch to reach the shim layer, got: {error}"
         );

@@ -30,6 +30,10 @@ static bool has_python_suffix(const char *path) {
     return len >= 3 && strcmp(path + len - 3, ".py") == 0;
 }
 
+static void install_full_backend_authority_env(void) {
+    setenv("O_BACKEND_AUTHORITIES", "[\"fs_read\",\"fs_write\",\"network\",\"process\"]", 1);
+}
+
 static void close_fd(int *fd) {
     if (fd && *fd >= 0) {
         close(*fd);
@@ -104,7 +108,9 @@ OBackendProcess *olang_backend_process_new(const char *shim_path) {
         close(stdin_pipe[0]); close(stdin_pipe[1]);
         close(stdout_pipe[0]); close(stdout_pipe[1]);
 
+        install_full_backend_authority_env();
         if (has_python_suffix(shim_path)) {
+            setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
             char *argv[] = { (char*)"python3", (char*)shim_path, NULL };
             execvp("python3", argv);
         } else {
@@ -272,19 +278,6 @@ OValue *olang_backend_process_exec(OBackendProcess *bp, const char *code, OValue
     return NULL;
 }
 
-void olang_backend_process_ping(OBackendProcess *bp) {
-    BackendProcessImpl *p = (BackendProcessImpl *)bp;
-    if (!p || !p->alive) return;
-    OWireCommand cmd = {0};
-    cmd.tag = WIRE_CMD_PING;
-    olang_backend_process_send_command(bp, &cmd);
-    OExecStep step = olang_backend_process_recv_step(bp);
-    if (step.kind != EXEC_STEP_DONE) {
-        fprintf(stderr, "process: unexpected eval_request during ping\n");
-    }
-    oexec_step_free(&step);
-}
-
 void olang_backend_process_cleanup(OBackendProcess *bp) {
     BackendProcessImpl *p = (BackendProcessImpl *)bp;
     if (!p || !p->alive) return;
@@ -375,7 +368,6 @@ void olang_process_registry_send_exec(OProcessRegistry *reg,
             fprintf(stderr, "process: failed to start shim for %s\n", lang);
             return;
         }
-        olang_backend_process_ping(proc);
         registry_add(reg, lang, env_id, proc);
         registry_find(reg, lang, env_id, &idx);
     }
@@ -417,7 +409,6 @@ OValue *olang_process_registry_exec(OProcessRegistry *reg,
     if (!registry_find(reg, lang, env_id, &idx)) {
         OBackendProcess *proc = olang_backend_process_new(shim_path);
         if (!proc) return NULL;
-        olang_backend_process_ping(proc);
         registry_add(reg, lang, env_id, proc);
         registry_find(reg, lang, env_id, &idx);
     }

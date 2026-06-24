@@ -809,14 +809,14 @@ static Tag *try_parse_opener(OParser *p) {
 
     if (i < p->source_len && p->source[i] == '{') {
         size_t attr_start = i;
-        size_t ident_start;
+        size_t attr_body_start;
 
         i += 1;
-        ident_start = i;
-        while (i < p->source_len && is_ident_continue((unsigned char)p->source[i])) {
+        attr_body_start = i;
+        while (i < p->source_len && p->source[i] != '}') {
             i += 1;
         }
-        if (ident_start == i) {
+        if (attr_body_start == i) {
             free(lang);
             free(raw);
             return NULL;
@@ -827,7 +827,7 @@ static Tag *try_parse_opener(OParser *p) {
             return NULL;
         }
 
-        attr = dup_range(p->source + ident_start, i - ident_start);
+        attr = dup_range(p->source + attr_body_start, i - attr_body_start);
         if (attr == NULL) {
             free(lang);
             free(raw);

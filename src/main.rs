@@ -32,7 +32,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
-            return run_repl(PathBuf::from("backends"), backends, &backend_grants);
+            return run_repl(default_shim_dir(), backends, &backend_grants);
         }
         None => {
             print_usage(&mut io::stderr())?;
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
             let shim_dir = args
                 .pop_front()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("backends"));
+                .unwrap_or_else(default_shim_dir);
             if let Some(extra) = args.pop_front() {
                 print_usage(&mut io::stderr())?;
                 bail!("unexpected extra argument after --repl: {}", extra);
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     let shim_dir = args
         .pop_front()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("backends"));
+        .unwrap_or_else(default_shim_dir);
     if let Some(extra) = args.pop_front() {
         print_usage(&mut io::stderr())?;
         bail!("unexpected extra argument: {}", extra);
@@ -116,6 +116,24 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
         "With no arguments in an interactive terminal, O starts the REPL. Backend grants are optional compatibility hooks; shim backends have default host authority."
     )?;
     Ok(())
+}
+
+fn default_shim_dir() -> PathBuf {
+    if let Ok(path) = env::var("O_BACKENDS_DIR").or_else(|_| env::var("BACKENDS_DIR")) {
+        return PathBuf::from(path);
+    }
+
+    let cwd_backends = PathBuf::from("backends");
+    if cwd_backends.exists() {
+        return cwd_backends;
+    }
+
+    let source_backends = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+    if source_backends.exists() {
+        return source_backends;
+    }
+
+    cwd_backends
 }
 
 // ─── REPL ─────────────────────────────────────────────────────────────────────

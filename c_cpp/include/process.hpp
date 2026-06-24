@@ -38,7 +38,6 @@ public:
     ExecStep recv_step();
     void send_eval_result(OValue *value);
     OValue *exec(const std::string &code, OValueMap *bindings);
-    void ping();
     void cleanup();
 
 private:

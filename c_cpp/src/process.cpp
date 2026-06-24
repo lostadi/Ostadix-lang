@@ -29,6 +29,10 @@ bool has_python_suffix(const std::string &path) {
     return path.size() >= 3 && path.compare(path.size() - 3, 3, ".py") == 0;
 }
 
+void install_full_backend_authority_env() {
+    setenv("O_BACKEND_AUTHORITIES", "[\"fs_read\",\"fs_write\",\"network\",\"process\"]", 1);
+}
+
 std::string env_label(uint32_t env_id) {
     return env_id == std::numeric_limits<uint32_t>::max()
              ? std::string("*ephemeral*")
@@ -40,15 +44,6 @@ OWireCommand make_exec_command(const std::string &code, OValueMap *bindings) {
     cmd.tag = WIRE_CMD_EXEC;
     cmd.code = const_cast<char *>(code.c_str());
     cmd.bindings = bindings;
-    cmd.value = nullptr;
-    return cmd;
-}
-
-OWireCommand make_ping_command() {
-    OWireCommand cmd{};
-    cmd.tag = WIRE_CMD_PING;
-    cmd.code = nullptr;
-    cmd.bindings = nullptr;
     cmd.value = nullptr;
     return cmd;
 }
@@ -116,7 +111,9 @@ BackendProcess::BackendProcess(const std::string &shim_path)
         close(stdout_pipe[0]);
         close(stdout_pipe[1]);
 
+        install_full_backend_authority_env();
         if (has_python_suffix(shim_path)) {
+            setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
             char *argv[] = {
                 const_cast<char *>("python3"),
                 const_cast<char *>(shim_path.c_str()),
@@ -277,18 +274,6 @@ OValue *BackendProcess::exec(const std::string &code, OValueMap *bindings) {
         "\"): O.eval is only supported when the evaluator uses the exec_with_eval_callback path");
 }
 
-void BackendProcess::ping() {
-    const OWireCommand cmd = make_ping_command();
-    send_command(cmd);
-    const ExecStep step = recv_step();
-    if (step.kind == ExecStepKind::Done) {
-        return;
-    }
-
-    throw std::runtime_error(
-        "unexpected eval_request during ping (src: \"" + truncate_for_error(step.src, 40) + "\")");
-}
-
 void BackendProcess::cleanup() {
     if (!alive_) {
         return;
@@ -352,11 +337,6 @@ void ProcessRegistry::send_exec(const std::string &lang, uint32_t env_id,
     if (it == registry_.end()) {
         try {
             auto process = std::make_unique<BackendProcess>(shim_path);
-            try {
-                process->ping();
-            } catch (const std::exception &error) {
-                throw_with_context("backend `" + lang + "` did not respond to health check", error);
-            }
             it = registry_.emplace(key, std::move(process)).first;
         } catch (const std::exception &error) {
             throw_with_context("failed to start backend for language `" + lang + "`", error);
@@ -409,11 +389,6 @@ OValue *ProcessRegistry::exec(const std::string &lang, uint32_t env_id,
     if (it == registry_.end()) {
         try {
             auto process = std::make_unique<BackendProcess>(shim_path);
-            try {
-                process->ping();
-            } catch (const std::exception &error) {
-                throw_with_context("backend `" + lang + "` did not respond to health check", error);
-            }
             it = registry_.emplace(key, std::move(process)).first;
         } catch (const std::exception &error) {
             throw_with_context("failed to start backend for language `" + lang + "`", error);
