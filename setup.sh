@@ -29,6 +29,7 @@ INSTALL_WRAPPERS=true
 DRY_RUN=false
 
 RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
+RUST_STALE_BINARIES=(O olangc ocorec o-link olink o-unlink)
 WRAPPER_TARGETS=(o olangc o-c olangc-c)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
@@ -155,7 +156,7 @@ remove_managed_file() {
 
 clean_rust_release_binaries() {
   echo ">>> Removing stale Rust release binaries..."
-  for bin in "${RUST_BIN_TARGETS[@]}"; do
+  for bin in "${RUST_STALE_BINARIES[@]}"; do
     remove_managed_file "$PROJECT_ROOT/target/release/$bin"
     remove_managed_file "$PROJECT_ROOT/target/release/$bin.d"
   done
@@ -165,6 +166,9 @@ refresh_cargo_bin_binaries() {
   echo ">>> Refreshing installed Rust binaries in $CARGO_BIN_DIR..."
   if $DRY_RUN; then
     run_cmd mkdir -p "$CARGO_BIN_DIR"
+    for bin in "${RUST_STALE_BINARIES[@]}"; do
+      echo "[DRY] remove stale $CARGO_BIN_DIR/$bin"
+    done
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
@@ -172,6 +176,9 @@ refresh_cargo_bin_binaries() {
   fi
 
   mkdir -p "$CARGO_BIN_DIR"
+  for bin in "${RUST_STALE_BINARIES[@]}"; do
+    remove_managed_file "$CARGO_BIN_DIR/$bin"
+  done
   for bin in "${RUST_BIN_TARGETS[@]}"; do
     local src="$PROJECT_ROOT/target/release/$bin"
     local dst="$CARGO_BIN_DIR/$bin"
@@ -179,7 +186,6 @@ refresh_cargo_bin_binaries() {
       echo "Expected freshly built binary missing: $src" >&2
       exit 1
     fi
-    remove_managed_file "$dst"
     cp "$src" "$dst"
     chmod +x "$dst"
   done

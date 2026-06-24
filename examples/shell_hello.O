@@ -1,5 +1,5 @@
 #!/usr/bin/env O
 
-shell{cap=backend}^(
+shell^(
 echo "hello from sh"
-)_shell{cap=backend}
+)_shell

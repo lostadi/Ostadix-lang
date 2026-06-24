@@ -157,7 +157,8 @@ Environment lifetime and request forcing are part of the stable language core:
 - Under `Policy::Autonomous`, schedulable Nix requests and dry activation are
   buffered first and forced at explicit force points (`now(...)`,
   `autonomous(...)` exit, document end). Eval and real activation stay on the
-  evaluator thread because they require live process or authority state.
+  evaluator thread because they require live process state or mutate the host
+  profile.
 - A backend counts as **pure** only when the runtime may safely reuse a cached
   result for identical `(body, deps, env)` input. Unknown backends are
   conservatively impure.
@@ -283,45 +284,47 @@ The runtime MUST preserve these invariants:
 
 ### 3.0.1 System activation authority
 
-System activation has separate dry and mutating forms:
+System activation has separate mutating and dry forms:
 
 ```
 activate(store_path [, profile])
+dry_activate(store_path [, profile])
 activate(system_activation_capability, store_path [, profile])
 ```
 
-The first form always runs `switch-to-configuration dry-activate`. The second
-form requests a real switch and MUST carry a live `system_activation`
-capability issued by the current Evaluator for the selected profile. The
-evaluator checks the private authority table when constructing the request and
-again when forcing it. A serialized, forged, revoked, cross-evaluator, or
-wrong-profile capability MUST be rejected before the perform boundary. Ambient
-environment variables MUST NOT grant activation authority.
+`activate(path[, profile])` requests a real switch and uses the ambient host
+authority of the current process, matching what the same user could do from
+Bash. `dry_activate(path[, profile])` runs `switch-to-configuration
+dry-activate`. If the first argument is a live `system_activation` capability
+issued by the current Evaluator, it is an embedding-specific profile guard. The
+evaluator checks that private authority table when constructing the guarded
+request and again when forcing it. A serialized, forged, revoked,
+cross-evaluator, or wrong-profile explicit capability MUST be rejected before
+the perform boundary.
 
 ### 3.0.2 Hosted backend authority
 
-Hosted backend effects use the same live-bearer rule as system activation.
-The source form is:
+Hosted backend effects are ambient host-language effects by default. The source
+form is:
 
 ```
-LANG{cap=NAME,RIGHT,...}^(body)_LANG{cap=NAME,RIGHT,...}
+LANG^(body)_LANG
 ```
 
-`RIGHT` is one of `fs_read`, `fs_write`, `network`, or `process`. `NAME`
-resolves through the current O scope to an `OCapability` of kind
-`backend_execution`. The private broker binding records a canonical backend
-language and a set of rights. Serialized metadata MUST NOT create or extend
-that binding.
+The evaluator MUST make all grantable backend rights available to shim
+backends: `fs_read`, `fs_write`, `network`, and `process`. This is the normal
+O-lang execution substrate, not a privilege exception. The older
+`LANG{cap=NAME,RIGHT,...}^` spelling remains accepted for compatibility and
+embedding experiments, but ordinary source MUST NOT require a host-injected
+backend grant to access backend capacities.
 
-The evaluator MUST compute the union of rights declared by the block and
-rights required by the selected backend adapter. It MUST validate a live
-capability for that union before starting a shim. Deferred Eval requests MUST
-carry the bearer identity and right set and MUST revalidate them immediately
-before force. Revocation between construction and force MUST prevent dispatch.
+Deferred Eval requests MUST carry a backend authority identity and right set
+and MUST revalidate them immediately before force. In the default evaluator that
+identity is the process-local wildcard authority minted at Evaluator startup.
 
 A persistent backend process MUST be keyed by its complete authority policy in
-addition to language and environment number. A process created under a wider
-policy MUST NOT serve a later block with a narrower policy.
+addition to language and environment number. Process reuse MUST NOT cross
+authority policies.
 
 Python has no adapter-required source authority. Bash and shell require
 `process`. Adapters that compile or launch a target program require
@@ -332,10 +335,10 @@ An unregistered shim MUST default to the full authority set. A public or
 deserialized OIR program MUST NOT weaken registered adapter requirements;
 execution MUST reject an embedded interface that differs from registry policy.
 
-The Rust runtime enforces Python operations with an audit hook. On macOS it
-also installs an operating-system sandbox profile around shim processes. A
-host without a kernel sandbox MUST describe that boundary honestly; broker
-validation alone does not contain a permitted native runtime after dispatch.
+The Rust runtime applies backend policy through Python audit hooks. On macOS it
+also installs an operating-system sandbox profile around shim processes. The
+default policy is intentionally permissive; these layers are policy plumbing,
+not a claim that ordinary O execution contains host-language effects.
 
 ### 3.1 Coordination groups
 

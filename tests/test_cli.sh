@@ -192,8 +192,7 @@ check_olangc_capability_compile_and_run() {
     local desc="$1"
     local output_bin="$ARTIFACT_DIR/capability_compiled"
 
-    run_command "$OLANGC_BIN" "$CAPABILITY_SOURCE" \
-        --backend-grant runner=python:process -o "$output_bin"
+    run_command "$OLANGC_BIN" "$CAPABILITY_SOURCE" -o "$output_bin"
     if [ "$RUN_EXIT" -ne 0 ]; then
         fail "$desc" "(olangc capability compilation failed with exit $RUN_EXIT)"
         return
@@ -287,13 +286,13 @@ EOF
 check_stderr_contains "O with no args shows usage error" 1 'Usage:|missing input file' "$O_BIN"
 check_nonzero_stderr_contains "O missing file errors" 'failed to read input file|No such file' "$O_BIN" nonexistent.O backends/
 check_stdout_contains "O runs hello.O" 0 '^2$' "$O_BIN" examples/hello.O backends/
-check_nonzero_stderr_contains "backend authority must name a live capability" 'undefined capability binding.*runner' "$O_BIN" "$CAPABILITY_SOURCE" backends/
-check_stdout_contains "live backend capability authorizes declared process access" 0 '^0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
-check_nonzero_stderr_contains "plain Python has no ambient process authority" 'denies process spawn' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
+check_stdout_contains "legacy backend cap attrs run without a host grant" 0 '^0$' "$O_BIN" "$CAPABILITY_SOURCE" backends/
+check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
+check_stdout_contains "plain Python has ambient process authority" 0 '^0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
-check_olangc_capability_compile_and_run "olangc preserves live backend grants in compiled binaries"
+check_olangc_capability_compile_and_run "olangc compiles legacy backend cap attrs without a host grant"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
 check_stdout_contains "olink help shows usage" 0 'Usage: (olink|o-link)' "$OLINK_BIN" --help

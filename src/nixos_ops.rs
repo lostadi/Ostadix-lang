@@ -8,11 +8,11 @@
 // implements the StorePath → System transition: applying a built NixOS
 // system closure to a profile and switching the live system to it.
 //
-// SAFETY POSTURE: dry-run is the unprivileged default. A real switch can reach
-// this boundary only through Evaluator::exec_activate after a live,
-// profile-scoped SystemActivation capability has been resolved through the
-// evaluator's private authority table. This module does not read ambient
-// environment variables as authority.
+// SAFETY POSTURE: O-lang is a host language, not a sandbox around the host.
+// A real switch can reach this boundary through Evaluator::exec_activate using
+// the same ambient authority available to Bash in this process environment.
+// Optional profile-scoped SystemActivation capabilities are embedding guards,
+// not the default path for ordinary O programs.
 //
 // STEP5 additions (each with its own safety surface):
 //   - rollback to a prior generation
@@ -38,8 +38,9 @@ use crate::value::OValue;
 /// `dry_run` controls the subprocess argument: when true, we pass
 /// `switch-to-configuration dry-activate`, which logs what would happen
 /// without applying. When false, we pass `switch-to-configuration switch`.
-/// The caller is responsible for validating live authority before invoking
-/// the real path; this function is crate-private to keep that boundary narrow.
+/// The caller is responsible for deciding whether an embedding-specific
+/// guard applies before invoking the real path; this function is
+/// crate-private to keep that boundary narrow.
 pub(crate) fn activate_nix(source: &OValue, profile: &str, dry_run: bool) -> Result<OValue> {
     // ── Type check: only StorePath sources are accepted ──────────────────────
     let store_path = match source {

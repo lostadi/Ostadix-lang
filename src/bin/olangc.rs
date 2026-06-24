@@ -171,7 +171,8 @@ struct Cli {
     #[arg(long)]
     keep_build_dir: bool,
 
-    /// Mint a live backend capability at startup and bind it in O scope.
+    /// Compatibility hook: mint a live backend capability at startup and bind
+    /// it in O scope. Normal shim backends already have default host authority.
     /// Format: NAME=LANG[:fs_read,fs_write,network,process].
     #[arg(long = "backend-grant")]
     backend_grants: Vec<String>,

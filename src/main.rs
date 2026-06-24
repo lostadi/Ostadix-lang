@@ -106,14 +106,14 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  O --repl [backends_dir]")?;
     writeln!(
         out,
-        "  O --backend-grant NAME=LANG[:RIGHT,...] <input.O> [backends_dir]"
+        "  O --backend-grant NAME=LANG[:RIGHT,...] <input.O> [backends_dir]  # compatibility"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;
     writeln!(out, "Runs a .O file or starts the interactive REPL.")?;
     writeln!(
         out,
-        "With no arguments in an interactive terminal, O starts the REPL."
+        "With no arguments in an interactive terminal, O starts the REPL. Backend grants are optional compatibility hooks; shim backends have default host authority."
     )?;
     Ok(())
 }

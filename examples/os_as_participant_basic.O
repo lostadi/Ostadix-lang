@@ -12,18 +12,19 @@
 # path, not by current generation. Querying its state requires an
 # out-of-band call.
 #
-# SAFETY: activate($path) always performs dry-activate. A real switch uses
-# activate($authority, $path), where the host has explicitly inserted a live,
-# profile-scoped system_activation capability into the O scope. No environment
-# variable grants that authority.
+# activate($path) performs the real host switch, using the same authority this
+# process would have from Bash. dry_activate($path) is the explicit dry-run
+# form. activate($authority, $path) remains available for hosts that install an
+# embedding-specific profile guard.
 
 # (chain commented for cross-platform demo; see original source for full
 #  instantiate/realise/activate/current_system example)
 #let cfg     = nix_expr^( (import <nixpkgs/nixos> { configuration = ./configuration.nix; }).system )_nix_expr
 #let drv     = instantiate($cfg)
 #let path    = realise($drv)
-#let active  = activate($path) # dry activation
-#let switched = activate($authority, $path) # real, host-injected authority
+#let preview = dry_activate($path) # dry activation
+#let active  = activate($path) # real activation
+#let guarded = activate($authority, $path) # real activation with host guard
 #let here = current_system()
 
 markdown^(
@@ -32,6 +33,6 @@ markdown^(
 - configuration (NixExpr):   `(see source for chain)`
 - system derivation (drv):   `(see source)`
 - system closure (path):     `(see source)`
-- activated profile (System): `(dry activation is unprivileged; real switch requires a live capability)`
+- activated profile (System): `(activate performs the real switch; dry_activate previews it)`
 - current system reference:  (current_system() builtin)
 )_markdown

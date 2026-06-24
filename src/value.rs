@@ -530,10 +530,11 @@ pub enum RequestKind {
     /// generation of the profile.
     ///
     /// `profile` is the symlink path to update (e.g. `/nix/var/nix/profiles/system`).
-    /// `dry_run` defaults to true at construction. A real activation carries
-    /// the opaque identity of a live, profile-scoped SystemActivation
-    /// capability. The evaluator resolves that identity through its private
-    /// authority table before the operation can reach the perform boundary.
+    /// `dry_run` selects `dry-activate` instead of `switch`. Real activation is
+    /// ambient host authority by default, matching what the same user could do
+    /// from a shell. If `authority` is present, the evaluator treats it as an
+    /// embedding-specific profile guard and validates it before the operation
+    /// reaches the perform boundary.
     ///
     /// Activate is NOT cached. The cache invariant ("same fingerprint always
     /// produces the same result") is meaningless for an operation that

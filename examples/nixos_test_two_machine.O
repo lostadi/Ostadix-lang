@@ -6,7 +6,7 @@
 # The client VM fetches a page from the server VM over the virtual network.
 # Results are rendered as HTML.
 
-let lab = nixos_test{cap=backend}^({
+let lab = nixos_test^({
   name = "o-nixos-two-machine";
   nodes.server = { pkgs, ... }: {
     services.nginx.enable = true;
@@ -24,7 +24,7 @@ let lab = nixos_test{cap=backend}^({
     result = client.succeed("curl -sf http://server")
     assert "nginx" in result.lower(), f"unexpected page: {result!r}"
   '';
-})_nixos_test{cap=backend}
+})_nixos_test
 
 html^(
 <!doctype html>

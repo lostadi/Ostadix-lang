@@ -4,6 +4,6 @@ let greeting = python^(
 __oval_result__ = "world"
 )_python
 
-bash{cap=backend}^(
+bash^(
 echo "hello \$greeting"
-)_bash{cap=backend}
+)_bash

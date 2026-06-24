@@ -1,6 +1,6 @@
-let hello_file = nix_store{cap=backend}^(
+let hello_file = nix_store^(
 builtins.toFile "hello-from-o-lang.txt" "Hello from O-lang + Nix\n"
-)_nix_store{cap=backend}
+)_nix_store
 
 html^(
 <!doctype html>

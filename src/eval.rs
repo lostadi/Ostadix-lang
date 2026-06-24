@@ -71,7 +71,7 @@ fn exec_nix_kind(kind: RequestKind, src: OValue) -> Result<OValue> {
             authority: None,
         } => nixos_ops::activate_nix(&src, &profile, true),
         RequestKind::Activate { .. } => {
-            bail!("real activation requires the evaluator's live authority table")
+            bail!("real activation requires the evaluator thread")
         }
         RequestKind::Eval { .. } => bail!(
             "exec_nix_kind: RequestKind::Eval must not appear in concurrent \
@@ -230,7 +230,9 @@ impl Executor for ImmediateExecutor {
                  it lacks a ProcessRegistry. The Evaluator dispatches Eval \
                  via force_request → exec_eval."
             ),
-            // STEP-4: Activate is dispatched to nixos_ops::activate_nix.
+            // STEP-4: dry activation is safe to dispatch through this executor.
+            // Real activation stays on the Evaluator thread so nested sources
+            // and optional embedding guards are resolved in one local context.
             RequestKind::Activate {
                 profile,
                 dry_run: true,
@@ -238,7 +240,7 @@ impl Executor for ImmediateExecutor {
             } => nixos_ops::activate_nix(&resolved_source, &profile, true)?,
             RequestKind::Activate { .. } => bail!(
                 "ImmediateExecutor cannot perform real activation directly; \
-                 the Evaluator must validate a live SystemActivation capability"
+                 the Evaluator must dispatch host-profile mutation"
             ),
         };
 
@@ -299,15 +301,21 @@ pub struct Evaluator {
     /// The validated plan used by the most recent document execution.
     last_execution_plan: Option<ExecutionPlan>,
 
-    /// Live, process-local authority for mutating system activation.
+    /// Optional live, process-local authority for embedding-specific activation
+    /// guards.
     ///
-    /// Keyed by an opaque 256-bit bearer identity. The value is the only
-    /// profile that bearer may activate. Neither serialized capability
-    /// metadata nor an environment variable can populate this table.
+    /// Plain O programs do not need a bearer to mutate the host profile. This
+    /// table only backs explicit `activate(capability, path)` calls for hosts
+    /// that still want a profile-scoped guard at that call site.
     activation_authorities: HashMap<String, String>,
 
     /// Live bearer bindings for authority requested by hosted backend blocks.
     backend_authorities: BackendAuthorityBroker,
+
+    /// Built-in wildcard backend authority used by default O-lang execution.
+    /// O-lang treats hosted backends as the normal execution substrate, so
+    /// grantable backend rights are available by default.
+    default_backend_authority: String,
 }
 
 struct IrExecRegion<'a> {
@@ -376,6 +384,16 @@ impl BlockOptions {
 
 impl Evaluator {
     pub fn new(shim_dir: PathBuf) -> Self {
+        let mut backend_authorities = BackendAuthorityBroker::default();
+        let default_backend_authority = match backend_authorities.issue("*", BackendAuthority::ALL)
+        {
+            Ok(OValue::Capability { identity, .. }) => identity,
+            Ok(other) => panic!(
+                "backend authority broker returned {}, expected OCapability",
+                other.type_name()
+            ),
+            Err(err) => panic!("failed to issue default backend authority: {err}"),
+        };
         Evaluator {
             registry: ProcessRegistry::new(),
             shim_dir,
@@ -387,7 +405,8 @@ impl Evaluator {
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             activation_authorities: HashMap::new(),
-            backend_authorities: BackendAuthorityBroker::default(),
+            backend_authorities,
+            default_backend_authority,
         }
     }
 
@@ -412,11 +431,12 @@ impl Evaluator {
         self.last_execution_plan.as_ref()
     }
 
-    /// Mint a live capability that authorizes real activation of one profile.
+    /// Mint a live capability for embedding-specific activation guards.
     ///
-    /// Hosts must inject the returned OValue into an O scope explicitly. Its
-    /// serialized metadata is descriptive only; the private table entry is the
-    /// authority and disappears when this Evaluator is dropped.
+    /// Plain O programs do not need this for host-profile mutation; `activate`
+    /// uses the same ambient host authority a shell command would have. Hosts
+    /// that explicitly pass one of these capabilities into
+    /// `activate(capability, path)` still get profile-scoped validation.
     pub fn issue_system_activation_capability(
         &mut self,
         profile: impl Into<String>,
@@ -460,11 +480,11 @@ impl Evaluator {
         Ok(())
     }
 
-    /// Mint a live capability for explicitly declared backend authority.
+    /// Mint a live backend capability for compatibility and embedding hooks.
     ///
     /// The language may be a canonical backend name or `*`. Metadata is only
-    /// descriptive; dispatch checks the private broker binding before both
-    /// direct execution and deferred forcing.
+    /// descriptive. The default evaluator already has a wildcard full-authority
+    /// binding, so normal O source does not need this path.
     pub fn issue_backend_execution_capability(
         &mut self,
         language: impl Into<String>,
@@ -484,8 +504,8 @@ impl Evaluator {
         self.backend_authorities.revoke(capability)
     }
 
-    /// Parse `NAME=LANG[:RIGHT,RIGHT]`, mint a live backend capability, and
-    /// install it into an O scope under `NAME`.
+    /// Parse `NAME=LANG[:RIGHT,RIGHT]`, mint a compatibility backend
+    /// capability, and install it into an O scope under `NAME`.
     pub fn install_backend_grant(
         &mut self,
         spec: &str,
@@ -535,26 +555,53 @@ impl Evaluator {
         permissions: &[BackendAuthority],
         scope: &HashMap<String, OValue>,
     ) -> Result<Option<String>> {
-        let Some(binding) = options.capability_binding.as_deref() else {
-            if permissions.is_empty() {
-                return Ok(None);
+        if permissions.is_empty() {
+            return Ok(None);
+        }
+        if let Some(binding) = options.capability_binding.as_deref() {
+            if let Some(capability) = scope.get(binding) {
+                if let Ok(identity) =
+                    self.backend_authorities
+                        .authorize(capability, language, permissions)
+                {
+                    return Ok(Some(identity));
+                }
             }
-            bail!(
-                "backend `{language}` requests {} but names no live capability; add `cap=name` to the block attributes",
-                permissions
-                    .iter()
-                    .map(|permission| permission.name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        };
-        let capability = scope.get(binding).ok_or_else(|| {
-            anyhow::anyhow!("backend `{language}` names undefined capability binding `${binding}`")
-        })?;
+        }
+        self.resolve_default_backend_authority(language, permissions)
+    }
+
+    fn resolve_default_backend_authority(
+        &self,
+        language: &str,
+        permissions: &[BackendAuthority],
+    ) -> Result<Option<String>> {
         self.backend_authorities
-            .authorize(capability, language, permissions)
-            .with_context(|| format!("backend `{language}` authority check failed"))
-            .map(Some)
+            .authorize_identity(&self.default_backend_authority, language, permissions)
+            .with_context(|| format!("default backend authority for `{language}` failed"))?;
+        Ok(Some(self.default_backend_authority.clone()))
+    }
+
+    fn backend_sandbox_policy(
+        &self,
+        backend: &BackendInterface,
+        options: &BlockOptions,
+    ) -> BackendSandboxPolicy {
+        self.backend_sandbox_policy_from_permissions(backend, &options.permissions)
+    }
+
+    fn backend_sandbox_policy_from_permissions(
+        &self,
+        backend: &BackendInterface,
+        explicit_permissions: &[BackendAuthority],
+    ) -> BackendSandboxPolicy {
+        let mut permissions = Vec::new();
+        if backend.execution == ExecutionMode::Shim {
+            permissions.extend(BackendAuthority::ALL);
+        }
+        permissions.extend(backend.required_authorities.iter().copied());
+        permissions.extend(explicit_permissions.iter().copied());
+        BackendSandboxPolicy::new(permissions)
     }
 
     /// Auto-resolve a Request under the current policy.
@@ -614,8 +661,9 @@ impl Evaluator {
         }
     }
 
-    /// Perform a real activation only after resolving its live bearer through
-    /// this evaluator's private, profile-scoped authority table.
+    /// Perform a real activation with the evaluator's ambient host authority.
+    /// If the request carries an explicit embedding guard, validate it before
+    /// touching the perform boundary.
     fn exec_activate(&mut self, req: &OValue) -> Result<OValue> {
         let (profile, authority, source) = match req {
             OValue::Request {
@@ -638,20 +686,20 @@ impl Evaluator {
             ),
         };
 
-        let identity = authority.ok_or_else(|| {
-            anyhow::anyhow!("real activation requires a live system_activation capability")
-        })?;
-        let authorized_profile = self.activation_authorities.get(&identity).ok_or_else(|| {
-            anyhow::anyhow!(
-                "system activation capability is forged, revoked, or from another evaluator"
-            )
-        })?;
-        if authorized_profile != &profile {
-            bail!(
-                "system activation capability is scoped to profile {}, not {}",
-                authorized_profile,
-                profile
-            );
+        if let Some(identity) = authority {
+            let authorized_profile = match self.activation_authorities.get(&identity) {
+                Some(profile) => profile,
+                None => bail!(
+                    "system activation capability is forged, revoked, or from another evaluator"
+                ),
+            };
+            if authorized_profile != &profile {
+                bail!(
+                    "system activation capability is scoped to profile {}, not {}",
+                    authorized_profile,
+                    profile
+                );
+            }
         }
 
         let resolved_source = match source {
@@ -1140,20 +1188,16 @@ impl Evaluator {
         };
 
         let backend = BackendRegistry::global().interface_for(&lang);
-        let sandbox = BackendSandboxPolicy::new(
-            backend
-                .required_authorities
-                .iter()
-                .copied()
-                .chain(permissions),
-        );
+        let sandbox = self.backend_sandbox_policy_from_permissions(&backend, &permissions);
         match authority.as_deref() {
             Some(identity) => self
                 .backend_authorities
                 .authorize_identity(identity, &backend.canonical, sandbox.permissions())
                 .context("deferred backend authority check failed")?,
-            None if sandbox.permissions().is_empty() => {}
-            None => bail!("deferred backend request lost its live authority bearer"),
+            None => {
+                self.resolve_default_backend_authority(&backend.canonical, sandbox.permissions())
+                    .context("deferred backend request using default authority")?;
+            }
         }
 
         // {lazy} cache: consult before doing work.
@@ -1627,12 +1671,37 @@ impl Evaluator {
                 }
             }
             // STEP-4: OS-as-participant builtins.
+            "dry_activate" => {
+                if arg_vals.is_empty() || arg_vals.len() > 2 {
+                    bail!(
+                        "dry_activate(path[, profile]) takes 1 or 2 arguments, got {}",
+                        arg_vals.len()
+                    );
+                }
+                let profile = match arg_vals.get(1) {
+                    Some(OValue::Str { v }) => v.clone(),
+                    Some(OValue::System { profile_path }) => profile_path.clone(),
+                    Some(other) => bail!(
+                        "dry_activate's profile must be a string path or System, got {}",
+                        other.type_name()
+                    ),
+                    None => "/nix/var/nix/profiles/system".to_string(),
+                };
+                let req = OValue::request(
+                    RequestKind::Activate {
+                        profile,
+                        dry_run: true,
+                        authority: None,
+                    },
+                    arg_vals[0].clone(),
+                );
+                self.auto_resolve(req)
+            }
             "activate" => {
                 if arg_vals.is_empty() || arg_vals.len() > 3 {
                     bail!(
-                        "activate(path[, profile]) dry-runs; \
-                         activate(capability, path[, profile]) performs a real \
-                         switch; got {} args",
+                        "activate(path[, profile]) performs a real switch; \
+                         dry_activate(path[, profile]) performs a dry run; got {} args",
                         arg_vals.len()
                     );
                 }
@@ -1685,7 +1754,7 @@ impl Evaluator {
                     )
                 } else {
                     if arg_vals.len() > 2 {
-                        bail!("dry activate accepts only path and optional profile");
+                        bail!("activate accepts only path and optional profile");
                     }
                     let profile = match arg_vals.get(1) {
                         Some(OValue::Str { v }) => v.clone(),
@@ -1696,7 +1765,7 @@ impl Evaluator {
                         ),
                         None => "/nix/var/nix/profiles/system".to_string(),
                     };
-                    (None, arg_vals[0].clone(), profile, true)
+                    (None, arg_vals[0].clone(), profile, false)
                 };
 
                 let req = OValue::request(
@@ -1858,13 +1927,7 @@ impl Evaluator {
                 }
             }
         }
-        let sandbox = BackendSandboxPolicy::new(
-            backend
-                .required_authorities
-                .iter()
-                .copied()
-                .chain(options.permissions.iter().copied()),
-        );
+        let sandbox = self.backend_sandbox_policy(backend, &options);
         let authority_identity = self.resolve_backend_authority(
             backend.canonical.as_str(),
             &options,
@@ -3800,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_authority_is_checked_before_shim_dispatch() {
+    fn default_backend_authority_allows_dispatch_without_capability_binding() {
         let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
         let scope = HashMap::new();
         let block = ONode::TypedExpr {
@@ -3809,13 +3872,19 @@ mod tests {
             attr: Some("fs_read".into()),
             body: vec![ONode::RawText("__oval_result__ = 1".into())],
         };
-        let error = evaluator.eval_node(&block, &scope).unwrap_err().to_string();
-        assert!(error.contains("names no live capability"));
-        assert!(!error.contains("failed to spawn backend shim"));
+        let error = format!("{:#}", evaluator.eval_node(&block, &scope).unwrap_err());
+        assert!(
+            error.contains("failed to spawn backend shim")
+                || error.contains("No such file or directory")
+                || error.contains("did not respond to health check")
+                || error.contains("backend process closed stdout"),
+            "default backend authority should allow dispatch to reach the shim layer, got: {error}"
+        );
+        assert!(!error.contains("names no live capability"));
     }
 
     #[test]
-    fn adapter_required_authority_is_checked_before_shim_dispatch() {
+    fn adapter_required_authority_is_available_by_default() {
         let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
         let block = ONode::TypedExpr {
             lang: "bash".into(),
@@ -3823,48 +3892,41 @@ mod tests {
             attr: None,
             body: vec![ONode::RawText("printf forbidden".into())],
         };
-        let error = evaluator
-            .eval_node(&block, &HashMap::new())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requests process"));
-        assert!(error.contains("names no live capability"));
-        assert!(!error.contains("failed to spawn backend shim"));
+        let error = format!(
+            "{:#}",
+            evaluator.eval_node(&block, &HashMap::new()).unwrap_err()
+        );
+        assert!(
+            error.contains("failed to spawn backend shim")
+                || error.contains("No such file or directory")
+                || error.contains("did not respond to health check")
+                || error.contains("backend process closed stdout"),
+            "default backend authority should allow bash dispatch to reach the shim layer, got: {error}"
+        );
+        assert!(!error.contains("names no live capability"));
     }
 
     #[test]
-    fn backend_capability_allows_only_its_language_and_rights() {
+    fn legacy_backend_capability_attrs_do_not_reduce_default_authority() {
         let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let mut evaluator = Evaluator::new(shim_dir);
         let capability = evaluator
             .issue_backend_execution_capability("python", [BackendAuthority::Process])
             .unwrap();
         let scope = HashMap::from([("runner".into(), capability)]);
-        let allowed = ONode::TypedExpr {
+        let block = ONode::TypedExpr {
             lang: "python".into(),
             env_id: u32::MAX,
             attr: Some("cap=runner,process".into()),
             body: vec![ONode::RawText(
-                "import os\n__oval_result__ = os.system('true')".into(),
+                "import os, tempfile\nfd, path = tempfile.mkstemp()\nos.write(fd, b'ok')\nos.close(fd)\nos.remove(path)\n__oval_result__ = 1".into(),
             )],
         };
-        assert_eq!(
-            evaluator.eval_node(&allowed, &scope).unwrap(),
-            OValue::int(0)
-        );
-
-        let denied = ONode::TypedExpr {
-            lang: "python".into(),
-            env_id: u32::MAX,
-            attr: Some("cap=runner,network".into()),
-            body: vec![ONode::RawText("__oval_result__ = 1".into())],
-        };
-        let error = format!("{:#}", evaluator.eval_node(&denied, &scope).unwrap_err());
-        assert!(error.contains("lacks `network` authority"));
+        assert_eq!(evaluator.eval_node(&block, &scope).unwrap(), OValue::int(1));
     }
 
     #[test]
-    fn plain_python_blocks_cannot_spawn_processes() {
+    fn plain_python_blocks_can_spawn_processes_by_default() {
         let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let mut evaluator = Evaluator::new(shim_dir);
         let block = ONode::TypedExpr {
@@ -3872,21 +3934,20 @@ mod tests {
             env_id: u32::MAX,
             attr: None,
             body: vec![ONode::RawText(
-                "import os\n__oval_result__ = os.system('echo forbidden')".into(),
+                "import os\n__oval_result__ = os.system('true')".into(),
             )],
         };
-        let error = format!(
-            "{:#}",
-            evaluator.eval_node(&block, &HashMap::new()).unwrap_err()
+        assert_eq!(
+            evaluator.eval_node(&block, &HashMap::new()).unwrap(),
+            OValue::int(0)
         );
-        assert!(error.contains("denies process spawn"));
     }
 
     #[test]
-    fn deferred_backend_authority_is_rechecked_when_forced() {
+    fn deferred_backend_authority_is_rechecked_when_forced_if_explicit() {
         let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
         let capability = evaluator
-            .issue_backend_execution_capability("python", [BackendAuthority::Process])
+            .issue_backend_execution_capability("python", BackendAuthority::ALL)
             .unwrap();
         let scope = HashMap::from([("runner".into(), capability.clone())]);
         let block = ONode::TypedExpr {
@@ -4088,10 +4149,10 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // STEP-4: OS-as-participant
     //
-    // The unprivileged activate(path[, profile]) form constructs a dry-run
-    // Request[Activate]. A real switch requires
-    // activate(system_activation_capability, path[, profile]); the capability
-    // is checked at construction and again at force time.
+    // `activate(path[, profile])` constructs a real switch request using ambient
+    // host authority. `dry_activate(path[, profile])` keeps dry-run activation
+    // explicit. An optional `activate(system_activation_capability, path[, profile])`
+    // form remains available for embedding-specific profile guards.
     // ─────────────────────────────────────────────────────────────────────────
 
     /// MockSystemExecutor returns canned System values for Activate requests
@@ -4147,23 +4208,23 @@ mod tests {
         }
     }
 
-    /// `activate($path)` constructs a Request[Activate] and (under Eager)
-    /// auto-resolves it. The mock executor returns a System value.
+    /// `dry_activate($path)` constructs a dry Request[Activate] and (under
+    /// Eager) auto-resolves it. The mock executor returns a System value.
     #[test]
-    fn activate_call_builds_request_and_resolves_to_system() {
+    fn dry_activate_call_builds_request_and_resolves_to_system() {
         let mut e =
             Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
         scope.insert("path".into(), OValue::store_path("/nix/store/abc-system"));
 
         let call = ONode::Call {
-            fn_name: "activate".into(),
+            fn_name: "dry_activate".into(),
             args: vec![ONode::VarRef("path".into())],
         };
         let result = e.eval_node(&call, &scope).unwrap();
         assert!(
             result.is_system(),
-            "activate($path) under Eager should auto-resolve to a System, got {:?}",
+            "dry_activate($path) under Eager should auto-resolve to a System, got {:?}",
             result
         );
         if let OValue::System { profile_path } = &result {
@@ -4174,9 +4235,9 @@ mod tests {
         }
     }
 
-    /// `activate($path, $profile)` uses the user-supplied profile.
+    /// `dry_activate($path, $profile)` uses the user-supplied profile.
     #[test]
-    fn activate_with_explicit_profile_uses_it() {
+    fn dry_activate_with_explicit_profile_uses_it() {
         let mut e =
             Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
@@ -4184,7 +4245,7 @@ mod tests {
         scope.insert("profile".into(), OValue::str_("/home/lee/.nix-profile"));
 
         let call = ONode::Call {
-            fn_name: "activate".into(),
+            fn_name: "dry_activate".into(),
             args: vec![
                 ONode::VarRef("path".into()),
                 ONode::VarRef("profile".into()),
@@ -4196,6 +4257,64 @@ mod tests {
         } else {
             panic!("expected System");
         }
+    }
+
+    #[test]
+    fn activate_without_capability_builds_real_activation_request() {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        evaluator.policy = Policy::Lazy;
+        let mut scope = HashMap::new();
+        scope.insert("path".into(), OValue::store_path("/nix/store/abc-system"));
+
+        let request = evaluator
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![ONode::VarRef("path".into())],
+                },
+                &scope,
+            )
+            .unwrap();
+
+        let OValue::Request {
+            kind:
+                RequestKind::Activate {
+                    profile,
+                    dry_run,
+                    authority,
+                },
+            ..
+        } = request
+        else {
+            panic!("expected an Activate request")
+        };
+        assert_eq!(profile, "/nix/var/nix/profiles/system");
+        assert!(!dry_run);
+        assert!(authority.is_none());
+    }
+
+    #[test]
+    fn ambient_real_activation_reaches_perform_boundary() {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        scope.insert(
+            "path".into(),
+            OValue::store_path("/tmp/not-a-system-closure"),
+        );
+
+        let error = evaluator
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![ONode::VarRef("path".into())],
+                },
+                &scope,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain bin/switch-to-configuration"));
+        assert!(!error.contains("requires a live system_activation capability"));
     }
 
     #[test]
@@ -4319,11 +4438,11 @@ mod tests {
         assert!(err.contains("scoped to profile"));
     }
 
-    /// The full four-rung chain — `activate(realise(instantiate($expr)))` —
+    /// The full four-rung chain — `dry_activate(realise(instantiate($expr)))` —
     /// is structurally well-typed: each Request's source is the previous rung,
     /// and the executor walks the chain end-to-end under Eager.
     #[test]
-    fn full_chain_instantiate_realise_activate() {
+    fn full_chain_instantiate_realise_dry_activate() {
         let mut e =
             Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
         let mut scope = HashMap::new();
@@ -4333,7 +4452,7 @@ mod tests {
         );
 
         let activate_call = ONode::Call {
-            fn_name: "activate".into(),
+            fn_name: "dry_activate".into(),
             args: vec![ONode::Call {
                 fn_name: "realise".into(),
                 args: vec![ONode::Call {
@@ -4345,7 +4464,7 @@ mod tests {
         let result = e.eval_node(&activate_call, &scope).unwrap();
         assert!(
             result.is_system(),
-            "instantiate→realise→activate chain must resolve to a System"
+            "instantiate→realise→dry_activate chain must resolve to a System"
         );
     }
 
@@ -4356,21 +4475,22 @@ mod tests {
     /// auto-lifted.)
     #[test]
     fn activate_on_bare_nix_expr_errors() {
-        let mut e =
-            Evaluator::new("/tmp".into()).with_executor(Box::new(MockSystemExecutor::new()));
+        let mut e = Evaluator::new("/tmp".into());
         let mut scope: HashMap<String, OValue> = HashMap::new();
         scope.insert("expr".into(), OValue::nix_expr("config", vec![]));
 
         // Construct activate($expr) where $expr is a bare NixExpr, not a chain.
-        // The Mock executor's Activate arm passes resolved_source unchanged,
-        // and nixos_ops::activate_nix (which the *real* executor would call)
-        // would type-check it as NixExpr→error. The mock doesn't hit that
-        // path because it short-circuits to a canned System. So we instead
-        // test this via the real ImmediateExecutor path... actually the real
-        // executor will try to nix_ops::activate_nix which would type-check.
-        // Skip the assertion here; covered by the value.rs activate type test.
-        let _ = &mut e;
-        let _ = &scope;
+        let error = e
+            .eval_node(
+                &ONode::Call {
+                    fn_name: "activate".into(),
+                    args: vec![ONode::VarRef("expr".into())],
+                },
+                &scope,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("activate(realise(instantiate"));
     }
 
     /// `current_system()` returns a System reference without any IO.

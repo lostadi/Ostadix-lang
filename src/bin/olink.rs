@@ -60,7 +60,6 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use o_lang::eval::Evaluator;
-use o_lang::ir::BackendRegistry;
 use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
@@ -172,7 +171,8 @@ struct Cli {
     #[arg(long = "shim-dir", default_value = "backends")]
     shim_dir: PathBuf,
 
-    /// Mint a live backend capability for --run. Format:
+    /// Compatibility hook for --run; normal shim backends already have default
+    /// host authority. Format:
     /// NAME=LANG[:fs_read,fs_write,network,process].
     #[arg(long = "backend-grant", requires = "run")]
     backend_grants: Vec<String>,
@@ -748,13 +748,7 @@ fn link_files(
             let n = *env_id;
             *env_id += 1;
 
-            let interface = BackendRegistry::global().interface_for(&backend);
-            let authority_attr = if interface.required_authorities.is_empty() {
-                ""
-            } else {
-                "{cap=backend}"
-            };
-            let tag = format!("{backend}[{n}]{authority_attr}");
+            let tag = format!("{backend}[{n}]");
             let closer = format!(")_{tag}");
             let escaped = escape_body(&content, &closer, backends);
             section.push_str(&tag);
@@ -1785,8 +1779,8 @@ mod tests {
         );
         // The shell file is the only file of its language so it gets [0].
         assert!(
-            combined.contains("bash[0]{cap=backend}^("),
-            "expected authority-scoped bash block, got:\n{}",
+            combined.contains("bash[0]^("),
+            "expected plain bash block, got:\n{}",
             combined
         );
 

@@ -1,9 +1,9 @@
-let nix_data = nix{cap=backend}^(
+let nix_data = nix^(
 {
   answer = 40 + 2;
   name = "Nix-born value";
 }
-)_nix{cap=backend}
+)_nix
 
 html^(
 <!doctype html>

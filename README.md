@@ -392,7 +392,7 @@ evaluator, and the matching `)_IDENT` closes it.
 python^( 6 * 7 )_python
 html^( <b>hello</b> )_html
 markdown^( **bold** )_markdown
-nix{cap=backend}^( builtins.nixVersion )_nix{cap=backend}
+nix^( builtins.nixVersion )_nix
 sql^( SELECT 40 + 2 AS answer; )_sql
 ```
 
@@ -906,46 +906,35 @@ let b = now($effect)
 Purity is centralized in the backend registry rather than inferred from the
 language name at every call site.
 
-### Backend authority is explicit
+### Backend authority is ambient by default
 
-Hosted source does not inherit filesystem, network, or process authority just
-because its interpreter has that authority. A block declares the rights it
-needs and names a live capability from the O scope:
+Hosted source runs as normal O-lang execution, so shim backends receive every
+grantable backend right by default: `fs_read`, `fs_write`, `network`, and
+`process`. A plain block can use the host as directly as the same user could
+from Python, Bash, Nix, or another supported language:
 
 ```O
-python{cap=runner,process}^(
+python^(
 import os
-os.system("printf capability-checked")
-)_python{cap=runner,process}
+__oval_result__ = os.system("printf host-accessible")
+)_python
 ```
 
-The host mints that capability when it launches the program:
+The older `cap=...` and per-right block attributes are still parsed for
+compatibility with existing source and for embedding-specific experiments, but
+ordinary O programs do not need host-launched backend grants. `--backend-grant`
+remains accepted by `O` and `olangc`; it is no longer the happy path for backend
+access.
 
-```bash
-O --backend-grant runner=python:process program.O backends
-olangc program.O --backend-grant runner=python:process -o target/program
-```
-
-The four block rights are `fs_read`, `fs_write`, `network`, and `process`.
-Capabilities are language-scoped unless the host explicitly uses `*`. The
-evaluator resolves the scope binding through a private `BackendAuthorityBroker`
-before direct dispatch and again before a deferred request is forced. A copied
-wire value, forged identity, capability for another language, missing right,
-or revoked bearer is rejected before the shim runs.
-
-Plain Python blocks start with no source authority. Python audit hooks reject
-undeclared file writes, reads outside runtime dependencies, sockets,
-subprocesses, and restricted native-library loading. On macOS the runtime also
-wraps the shim in an operating-system sandbox profile. Persistent process
-identity includes the complete authority policy, so a privileged environment
-is never reused by a less privileged block.
+Persistent process identity includes the complete authority policy, so process
+reuse cannot cross policies.
 
 Some adapters must invoke a target runtime or compiler to implement the block
 at all. Those required rights are part of the backend interface embedded in
 OIR. Bash and shell require `process`; compiled-language adapters require
-`fs_write` and `process`; Nix execution requires all four rights. Such a block
-must still name a live capability. `olangc --target ir` prints the required
-authority set so it is inspectable before execution.
+`fs_write` and `process`; Nix execution requires all four rights. These rights
+are available through the default backend authority. `olangc --target ir` prints
+the required authority set so it is inspectable before execution.
 Unregistered shim interfaces default to all four required rights, and public
 OIR execution rejects an embedded backend interface that weakens the registry
 policy.
@@ -977,22 +966,22 @@ O-lang models the Nix and NixOS path as a value chain:
 nix_expr^(...)_nix_expr -> ONixExpr
 instantiate($expr)       -> ODerivation
 realise($drv)            -> OStorePath
-activate($path)           -> OSystem by dry activation
-activate($cap, $path)     -> OSystem by real activation
+activate($path)           -> OSystem by real activation
+dry_activate($path)       -> OSystem by dry activation
+activate($cap, $path)     -> OSystem by real activation with an embedding guard
 ```
 
 `nix^` remains the immediate evaluation form. `nix_expr^` captures Nix source
 and its dependencies without evaluating it. `instantiate` uses `nix eval` to
 obtain a derivation, `realise` uses `nix build`, and `activate` invokes the
-closure's `switch-to-configuration` entry point.
+closure's `switch-to-configuration switch` entry point.
 
-`activate(path[, profile])` always uses `dry-activate`. A real switch requires
-`activate(capability, path[, profile])`, where the first value is a live
-`system_activation` OCapability issued by
-`Evaluator::issue_system_activation_capability(profile)` and explicitly placed
-in the program scope by the host. The capability is bound to one profile,
-checked when the request is built, checked again when it is forced, and can be
-revoked. No environment variable grants activation authority.
+`activate(path[, profile])` performs a real host switch using the same ambient
+authority available to this process from a shell. `dry_activate(path[, profile])`
+uses `switch-to-configuration dry-activate`. If a host passes a live
+`system_activation` OCapability as the first argument, O treats it as an
+embedding guard: the capability is bound to one profile, checked when the
+request is built, checked again when it is forced, and can be revoked.
 
 `current_system()` returns the current profile as a referential OSystem value.
 
@@ -1002,7 +991,8 @@ Inside `autonomous(...)`, schedulable Nix requests and dry activations are
 buffered. At a force point, the scheduler constructs their dependency graph,
 executes ready work concurrently up to its parallelism limit, and writes safe
 results to memory and disk caches. Eval requests and real activation stay on
-the evaluator thread because they require live process or authority state.
+the evaluator thread because they require live process state or mutate the host
+profile.
 
 ```O
 let result = autonomous(
@@ -1055,8 +1045,9 @@ failures are the ones represented as OError values.
 |------|-----------------|-------------|
 | `instantiate(expr)` | ONixExpr to ODerivation | Instantiates a Nix derivation. |
 | `realise(drv)` | ODerivation to OStorePath | Builds the default derivation output. |
-| `activate(path[, profile])` | OStorePath to OSystem | Runs `dry-activate` without privileged authority. |
-| `activate(capability, path[, profile])` | OCapability and OStorePath to OSystem | Performs a real switch after validating a live profile-scoped capability. |
+| `activate(path[, profile])` | OStorePath to OSystem | Performs a real host switch. |
+| `dry_activate(path[, profile])` | OStorePath to OSystem | Runs `dry-activate` without switching. |
+| `activate(capability, path[, profile])` | OCapability and OStorePath to OSystem | Performs a real switch after validating an embedding-specific profile guard. |
 | `current_system()` | none to OSystem | Returns the current system profile reference. |
 | `scope()` | current O bindings to OScope | Captures a detached lexical snapshot for explicit evaluation. |
 | `lazy(expr)` | any to ORequest or value | Evaluates under the lazy policy. |
@@ -1262,9 +1253,10 @@ and prints the final OValue. With `--repl`, it keeps O-level scope and backend
 processes alive across entries. With no arguments in an interactive terminal,
 it enters the REPL automatically.
 
-`--backend-grant NAME=LANG[:RIGHT,...]` may be repeated before the input path.
-Each occurrence creates a fresh live bearer in that evaluator and installs it
-under `NAME` in the initial O scope.
+`--backend-grant NAME=LANG[:RIGHT,...]` may be repeated before the input path
+for compatibility with older sources or embedding experiments. Ordinary backend
+blocks do not need grants; the default evaluator gives shim backends full
+grantable host authority.
 
 ### `olangc`: hosted AOT, WASI, script, and OIR
 
@@ -1283,8 +1275,9 @@ dependency versions, and bundled core shims. Python, Nix, and other language
 runtimes remain explicit host dependencies. `--shim-dir` overlays or adds
 shim files before packaging. `--keep-build-dir` retains the generated Cargo
 project for inspection. `--backend-grant` may be repeated for script mode and
-native hosted binaries. Compiled binaries mint fresh process-local bearers at
-startup instead of embedding serialized authority.
+native hosted binaries as a compatibility hook. Compiled binaries mint fresh
+process-local default backend authority at startup instead of embedding
+serialized authority.
 
 ### `o-link`: one O document from a codebase
 
@@ -1334,10 +1327,8 @@ It provides several correctness properties:
   and Wolfram Language inputs. Files without a recognized dependency remain
   in stable walk order.
 - Every wrapped file receives an isolated explicit environment number.
-- Wrapped backends with required runtime authority name the conventional
-  `backend` capability. Running such output requires a matching host grant,
-  for example `O --backend-grant backend=*:fs_read,fs_write,network,process
-  combined.O backends`.
+- Wrapped backends are emitted as plain typed blocks; running linked output uses
+  the default full backend authority.
 - The combined source is parsed again before it is written unless
   `--no-validate` is requested.
 
@@ -1956,11 +1947,10 @@ O-core as the freestanding systems language.
 - Generation-tagged kernel capabilities, rights validation, checked syscall
   dispatch, 256-bit live bearer identities, and hosted OCapability broker
   binding.
-- Revocable, profile-scoped `system_activation` capabilities for real NixOS
-  activation, with dry activation remaining unprivileged.
-- Revocable, language-scoped backend execution capabilities with explicit
-  filesystem, network, and process rights checked before direct and deferred
-  shim dispatch.
+- Ambient real NixOS activation through `activate(path[, profile])`, plus
+  explicit `dry_activate` and optional profile-scoped embedding guards.
+- Default full backend authority for shim execution, with legacy
+  `--backend-grant` and `cap=...` syntax still accepted for compatibility.
 - Policy-keyed hosted processes with Python audit enforcement and a macOS
   operating-system sandbox layer.
 - Exhaustive producer-to-consumer rendering fidelity classification for every
@@ -1989,20 +1979,17 @@ features that are already present:
 - `olangc` bundles the core Python and Nix shims by default. Programs using
   additional hosted shims should compile with `--shim-dir backends` so those
   shims are embedded as well.
-- Hosted backend isolation has two enforcement layers on macOS: Python audit
-  hooks and `sandbox-exec`. Other hosts currently enforce Python-level audit
-  events but do not yet install a kernel sandbox for non-Python target
-  runtimes. Backend capabilities prevent undeclared dispatch through O-lang;
-  they are not a containment claim after a permitted native runtime is fully
-  compromised.
+- Hosted backend policy still flows through Python audit hooks and
+  `sandbox-exec` on macOS, but the default policy is intentionally permissive:
+  O-lang gives shim code the host access available to the current process.
 - Reproducibility is currently asserted for O-core assembly and ELF relocatable
   objects under the same compiler, assembler, and target contract. Hosted
   `olangc` executables are not claimed byte-identical across different host
   linkers or toolchain versions.
 - The C17 and Python editions implement their documented subsets and are not
   feature-identical to the authoritative Rust runtime. The C17 native port
-  keeps activation dry-only; live `system_activation` authority is implemented
-  in the Rust evaluator.
+  keeps activation dry-only; ambient real activation is implemented in the Rust
+  evaluator.
 - O-core currently targets x86_64 only and uses a stack-spill backend without
   optimization or register allocation.
 - O-core direct calls are implemented. Function-pointer types are represented,

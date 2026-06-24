@@ -1,3 +1,3 @@
-javascript{cap=backend}^(
+javascript^(
 console.log("hello from js")
-)_javascript{cap=backend}
+)_javascript
