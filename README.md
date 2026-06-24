@@ -1299,15 +1299,20 @@ It provides several correctness properties:
   root.
 - `.gitignore` and `.olinkignore` rules are loaded at each walked directory.
   Git-compatible negation rules are honored.
+- A linked tree is literal. If you run the resulting `.O` file, every selected
+  executable backend block runs. Use `.olinkignore` to leave out test harnesses,
+  setup scripts, old bundles, generated outputs, and other files that are
+  useful to preserve but not meant to execute as part of the program.
 - Every readable UTF-8 file is selected. Known extensions use their registered
   backend, while unknown extensions and extensionless files use the inert
   `text` backend and remain byte-for-byte recoverable through `o-unlink`.
 - Hidden paths, `target`, `node_modules`, `__pycache__`, `.git`, ignored paths,
-  unreadable entries, binary data, duplicates, symlink aliases, and the output
-  file itself are skipped. Default warnings are grouped by reason so a large
-  ignored tree cannot flood the terminal. `--verbose-skips` prints one warning
-  for every skipped path. A final scan summary always reports the selected and
-  skipped counts.
+  generated `o-link` outputs, unreadable entries, binary data, duplicates,
+  symlink aliases, and the output file itself are skipped. Default warnings are
+  grouped by reason so a large ignored tree cannot flood the terminal or force
+  a full walk of generated children. `--verbose-skips` descends into excluded
+  trees and prints one warning for every skipped path. A final scan summary
+  always reports the selected and skipped counts.
 - Symlinked directories are visited at most once.
 - O openers, matching closers, and `$name` sequences inside source files are
   escaped and round-trip as literal source.

@@ -45,8 +45,9 @@
 //   * The combined output is re-parsed with the O-lang parser before it is
 //     written, so o-link never emits a .O file that the runtime cannot read.
 //   * Directory walks skip binary / non-UTF-8 files, group warnings by reason,
+//     do not descend into excluded subtrees unless --verbose-skips is set,
 //     follow symlinked directories at most once (no infinite loops), and never
-//     pick up the output file itself. --verbose-skips reports every path.
+//     pick up the output file itself.
 //   * The same file given twice (directly or via overlapping directories) is
 //     linked only once.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
 const SECTION_LENGTH_PREFIX: &str = "# o-link-section-bytes: ";
+const O_LINK_GENERATED_HEADER: &str = "# Linked by o-link";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkippedPath {
@@ -127,6 +129,7 @@ struct WalkState<'a> {
     files: &'a mut Vec<PathBuf>,
     skipped: &'a mut Vec<SkippedPath>,
     ignore_rules: &'a mut Vec<IgnoreRules>,
+    enumerate_excluded_trees: bool,
 }
 
 /// o-link links multiple scripts or codebases into a single .O file.
@@ -201,7 +204,8 @@ fn main() -> Result<()> {
         .then(|| path_identity(&cli.output))
         .transpose()?;
 
-    let collected = collect_files(&cli.inputs, &ext_map, exclude.as_deref())?;
+    let collected =
+        collect_files_with_skip_mode(&cli.inputs, &ext_map, exclude.as_deref(), cli.verbose_skips)?;
     collected.report(cli.verbose_skips);
     if collected.files.is_empty() {
         bail!("no linkable files found in the given inputs");
@@ -295,10 +299,20 @@ fn run_combined(
 /// Expand the input list and compute the root against which marker paths are
 /// written. Explicit files fail on invalid input. Directory walks record every
 /// skipped path so callers can report exclusions uniformly.
+#[cfg(test)]
 fn collect_files(
     inputs: &[PathBuf],
     _ext_map: &BTreeMap<String, String>,
     exclude: Option<&Path>,
+) -> Result<CollectedFiles> {
+    collect_files_with_skip_mode(inputs, _ext_map, exclude, false)
+}
+
+fn collect_files_with_skip_mode(
+    inputs: &[PathBuf],
+    _ext_map: &BTreeMap<String, String>,
+    exclude: Option<&Path>,
+    enumerate_excluded_trees: bool,
 ) -> Result<CollectedFiles> {
     let mut files = Vec::new();
     let mut skipped = Vec::new();
@@ -316,6 +330,7 @@ fn collect_files(
                 files: &mut files,
                 skipped: &mut skipped,
                 ignore_rules: &mut ignore_rules,
+                enumerate_excluded_trees,
             };
             walk_dir(&input, &mut state)?;
         } else if input.is_file() {
@@ -412,18 +427,29 @@ fn walk_dir(dir: &Path, state: &mut WalkState<'_>) -> Result<()> {
                 &entry,
                 &format!("ignored by {}", source.display()),
                 state.skipped,
+                state.enumerate_excluded_trees,
             );
             continue;
         }
 
         if name.starts_with('.') {
-            record_excluded_tree(&entry, "hidden path", state.skipped);
+            record_excluded_tree(
+                &entry,
+                "hidden path",
+                state.skipped,
+                state.enumerate_excluded_trees,
+            );
             continue;
         }
 
         if is_dir {
             if SKIP_DIRS.contains(&name.as_ref()) {
-                record_excluded_tree(&entry, "built-in excluded directory", state.skipped);
+                record_excluded_tree(
+                    &entry,
+                    "built-in excluded directory",
+                    state.skipped,
+                    state.enumerate_excluded_trees,
+                );
                 continue;
             }
             walk_dir(&entry, state)?;
@@ -439,19 +465,28 @@ fn walk_dir(dir: &Path, state: &mut WalkState<'_>) -> Result<()> {
         }
 
         match fs::read(&entry) {
-            Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {
-                let _ = push_unique(
-                    &entry,
-                    state.exclude,
-                    state.seen_files,
-                    state.files,
-                    state.skipped,
-                )?;
-            }
-            Ok(_) => state.skipped.push(SkippedPath {
-                path: entry,
-                reason: "not UTF-8 text".into(),
-            }),
+            Ok(bytes) => match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    if is_generated_olink_output(text) {
+                        state.skipped.push(SkippedPath {
+                            path: entry,
+                            reason: "generated o-link output".into(),
+                        });
+                        continue;
+                    }
+                    let _ = push_unique(
+                        &entry,
+                        state.exclude,
+                        state.seen_files,
+                        state.files,
+                        state.skipped,
+                    )?;
+                }
+                Err(_) => state.skipped.push(SkippedPath {
+                    path: entry,
+                    reason: "not UTF-8 text".into(),
+                }),
+            },
             Err(error) => state.skipped.push(SkippedPath {
                 path: entry,
                 reason: format!("read error: {error}"),
@@ -463,11 +498,24 @@ fn walk_dir(dir: &Path, state: &mut WalkState<'_>) -> Result<()> {
     Ok(())
 }
 
-fn record_excluded_tree(path: &Path, reason: &str, skipped: &mut Vec<SkippedPath>) {
+fn is_generated_olink_output(text: &str) -> bool {
+    text.starts_with(O_LINK_GENERATED_HEADER)
+}
+
+fn record_excluded_tree(
+    path: &Path,
+    reason: &str,
+    skipped: &mut Vec<SkippedPath>,
+    enumerate_children: bool,
+) {
     skipped.push(SkippedPath {
         path: path.to_path_buf(),
         reason: reason.to_string(),
     });
+
+    if !enumerate_children {
+        return;
+    }
 
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
@@ -499,7 +547,7 @@ fn record_excluded_tree(path: &Path, reason: &str, skipped: &mut Vec<SkippedPath
     let mut entries = paths;
     entries.sort();
     for entry in entries {
-        record_excluded_tree(&entry, reason, skipped);
+        record_excluded_tree(&entry, reason, skipped, enumerate_children);
     }
 }
 
@@ -1488,6 +1536,39 @@ mod tests {
     }
 
     #[test]
+    fn directory_walk_skips_generated_olink_outputs() {
+        let dir = scratch("skip_generated_olink");
+        fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("ordinary.O"), "python^(1)_python\n").unwrap();
+        fs::write(
+            dir.join("combined.O"),
+            "# Linked by o-link: single-file .O program\npython^(2)_python\n",
+        )
+        .unwrap();
+
+        let map = default_extension_map();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+
+        assert_eq!(collection.files.len(), 2);
+        assert!(collection.files.iter().any(|path| path.ends_with("a.py")));
+        assert!(collection
+            .files
+            .iter()
+            .any(|path| path.ends_with("ordinary.O")));
+        assert!(!collection
+            .files
+            .iter()
+            .any(|path| path.ends_with("combined.O")));
+        assert!(collection
+            .skipped
+            .iter()
+            .any(|skip| skip.path.ends_with("combined.O")
+                && skip.reason == "generated o-link output"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn marker_paths_are_relative_to_the_input_root() {
         let dir = scratch("relative_markers");
         let project = dir.join("project");
@@ -1546,7 +1627,8 @@ mod tests {
         fs::write(dir.join("cache/generated.py"), "cached\n").unwrap();
 
         let map = default_extension_map();
-        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let collection =
+            collect_files_with_skip_mode(std::slice::from_ref(&dir), &map, None, true).unwrap();
         assert_eq!(collection.files.len(), 3);
         assert!(collection
             .files
@@ -1571,6 +1653,58 @@ mod tests {
             .skipped
             .iter()
             .any(|skip| skip.path.ends_with("cache/generated.py")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_walk_records_excluded_subtrees_without_descending() {
+        let dir = scratch("bounded_skips");
+        fs::create_dir_all(dir.join(".hidden/deep")).unwrap();
+        fs::create_dir_all(dir.join("cache/deep")).unwrap();
+        fs::write(dir.join(".gitignore"), "cache/\n").unwrap();
+        fs::write(dir.join("keep.py"), "print('keep')\n").unwrap();
+        fs::write(dir.join(".hidden/deep/a.py"), "print('hidden')\n").unwrap();
+        fs::write(dir.join("cache/deep/generated.py"), "print('cache')\n").unwrap();
+
+        let map = default_extension_map();
+        let default_collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        assert_eq!(default_collection.files.len(), 1);
+        assert_eq!(
+            default_collection
+                .skipped
+                .iter()
+                .filter(|skip| skip.path.ends_with(".hidden"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            default_collection
+                .skipped
+                .iter()
+                .filter(|skip| skip.reason.contains(".gitignore"))
+                .count(),
+            1
+        );
+        assert!(!default_collection
+            .skipped
+            .iter()
+            .any(|skip| skip.path.ends_with(".hidden/deep/a.py")));
+        assert!(!default_collection
+            .skipped
+            .iter()
+            .any(|skip| skip.path.ends_with("cache/deep/generated.py")));
+
+        let verbose_collection =
+            collect_files_with_skip_mode(std::slice::from_ref(&dir), &map, None, true).unwrap();
+        assert!(verbose_collection
+            .skipped
+            .iter()
+            .any(|skip| skip.path.ends_with(".hidden/deep/a.py")));
+        assert!(verbose_collection
+            .skipped
+            .iter()
+            .any(|skip| skip.path.ends_with("cache/deep/generated.py")));
 
         let _ = fs::remove_dir_all(&dir);
     }

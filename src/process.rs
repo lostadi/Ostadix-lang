@@ -13,12 +13,25 @@ _o_permissions = frozenset(json.loads(os.environ.pop("O_BACKEND_AUTHORITIES", "[
 _o_runtime_candidates = json.loads(os.environ.pop("O_BACKEND_RUNTIME_ROOTS", "[]"))
 _o_runtime_candidates.extend(path for path in sys.path if path)
 _o_runtime_candidates.extend((sys.prefix, sys.base_prefix, os.path.dirname(sys.executable)))
-_o_runtime_roots = tuple(sorted({os.path.realpath(path) for path in _o_runtime_candidates if path}))
+
+def _o_realpath_or_none(path):
+    try:
+        return os.path.realpath(os.fspath(path))
+    except (TypeError, ValueError, OSError):
+        return None
+
+_o_runtime_roots = tuple(sorted({
+    real
+    for path in _o_runtime_candidates
+    if path
+    for real in [_o_realpath_or_none(path)]
+    if real
+}))
 
 def _o_under(path, roots):
     try:
         real = os.path.realpath(os.fspath(path))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError):
         return False
     return any(real == root or real.startswith(root + os.sep) for root in roots)
 
@@ -612,6 +625,48 @@ mod tests {
         )?;
         assert_eq!(value, OValue::int(0));
         process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_bootstrap_skips_runtime_candidates_that_cannot_be_resolved() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let probe = temp.path().join("probe.py");
+        std::fs::write(&probe, "print('bootstrap-ok')\n")?;
+
+        let denied_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new("/Users"))
+            .to_path_buf();
+
+        let python = which::which("python3").context("python3 is required for backend shims")?;
+
+        #[cfg(target_os = "macos")]
+        let mut command =
+            macos_sandbox_command(&python, &BackendSandboxPolicy::none(), temp.path())?;
+
+        #[cfg(not(target_os = "macos"))]
+        let mut command = Command::new(&python);
+
+        let output = command
+            .arg("-c")
+            .arg(PYTHON_POLICY_BOOTSTRAP)
+            .arg(&probe)
+            .env("O_BACKEND_AUTHORITIES", "[]")
+            .env(
+                "O_BACKEND_RUNTIME_ROOTS",
+                serde_json::to_string(&[temp.path(), &denied_candidate])?,
+            )
+            .output()
+            .context("failed to run Python policy bootstrap probe")?;
+
+        assert!(
+            output.status.success(),
+            "bootstrap failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("bootstrap-ok"));
         Ok(())
     }
 }
