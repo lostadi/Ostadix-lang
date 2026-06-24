@@ -28,6 +28,10 @@ VERIFY=false
 INSTALL_WRAPPERS=true
 DRY_RUN=false
 
+RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
+WRAPPER_TARGETS=(o olangc o-c olangc-c)
+CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+
 # --- Arg parsing ---
 usage() {
   cat <<EOF
@@ -71,7 +75,7 @@ fi
 echo "=== O-lang cross-platform setup ==="
 echo "Project root: $PROJECT_ROOT"
 echo "Host: $(uname -a)"
-echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY wrappers=$INSTALL_WRAPPERS"
+echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY wrappers=$INSTALL_WRAPPERS dry_run=$DRY_RUN"
 echo
 
 # --- OS / Distro Detection ---
@@ -134,6 +138,51 @@ run_cmd() {
   else
     "$@"
   fi
+}
+
+remove_managed_file() {
+  local path="$1"
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    echo "  Skipping directory at managed file path: $path"
+    return
+  fi
+  if [[ -e "$path" || -L "$path" ]]; then
+    run_cmd rm -f "$path"
+  elif $DRY_RUN; then
+    echo "[DRY] rm -f $path"
+  fi
+}
+
+clean_rust_release_binaries() {
+  echo ">>> Removing stale Rust release binaries..."
+  for bin in "${RUST_BIN_TARGETS[@]}"; do
+    remove_managed_file "$PROJECT_ROOT/target/release/$bin"
+    remove_managed_file "$PROJECT_ROOT/target/release/$bin.d"
+  done
+}
+
+refresh_cargo_bin_binaries() {
+  echo ">>> Refreshing installed Rust binaries in $CARGO_BIN_DIR..."
+  if $DRY_RUN; then
+    run_cmd mkdir -p "$CARGO_BIN_DIR"
+    for bin in "${RUST_BIN_TARGETS[@]}"; do
+      echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
+    done
+    return
+  fi
+
+  mkdir -p "$CARGO_BIN_DIR"
+  for bin in "${RUST_BIN_TARGETS[@]}"; do
+    local src="$PROJECT_ROOT/target/release/$bin"
+    local dst="$CARGO_BIN_DIR/$bin"
+    if [[ ! -x "$src" ]]; then
+      echo "Expected freshly built binary missing: $src" >&2
+      exit 1
+    fi
+    remove_managed_file "$dst"
+    cp "$src" "$dst"
+    chmod +x "$dst"
+  done
 }
 
 # --- Install system dependencies (extended) ---
@@ -254,6 +303,10 @@ install_system_deps() {
 }
 
 install_rust() {
+  if $DRY_RUN; then
+    echo "[DRY] Would ensure Rust/Cargo is installed"
+    return
+  fi
   if has_cmd cargo; then
     echo "Rust/Cargo already present."
     if has_cmd rustup; then rustup update stable || true; fi
@@ -287,13 +340,25 @@ install_nix() {
 
 build_rust() {
   echo ">>> Building Rust edition (--release)..."
-  cargo build --release
+  clean_rust_release_binaries
+  local cargo_args=(build --release)
+  for bin in "${RUST_BIN_TARGETS[@]}"; do
+    cargo_args+=(--bin "$bin")
+  done
+  run_cmd cargo "${cargo_args[@]}"
+  refresh_cargo_bin_binaries
   echo "Rust build done → target/release/"
 }
 
 build_c() {
   echo ">>> Building C/C++ edition..."
   if [[ -d c_cpp ]]; then
+    remove_managed_file "$PROJECT_ROOT/c_cpp/O"
+    remove_managed_file "$PROJECT_ROOT/c_cpp/olangc"
+    if $DRY_RUN; then
+      echo "[DRY] Would build C/C++ edition in $PROJECT_ROOT/c_cpp"
+      return
+    fi
     (cd c_cpp && make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" || make)
     echo "C edition done → ./c_cpp/O and ./c_cpp/olangc"
   fi
@@ -301,6 +366,10 @@ build_c() {
 
 setup_python() {
   echo ">>> Setting up Python shims / edition..."
+  if $DRY_RUN; then
+    echo "[DRY] Would install Python shim dependencies and editable Python package"
+    return
+  fi
   if has_cmd python3; then
     python3 -m pip install --user --upgrade pip setuptools wheel 2>/dev/null || true
     if ! $MINIMAL; then
@@ -336,8 +405,22 @@ install_extras() {
 create_wrappers() {
   if ! $INSTALL_WRAPPERS; then return; fi
   echo ">>> Creating convenience wrappers in ~/.local/bin (for runnable form)..."
-  mkdir -p "$HOME/.local/bin"
   local BIN_DIR="$HOME/.local/bin"
+
+  if $DRY_RUN; then
+    echo "[DRY] mkdir -p $BIN_DIR"
+    for wrapper in "${WRAPPER_TARGETS[@]}"; do
+      remove_managed_file "$BIN_DIR/$wrapper"
+      echo "[DRY] recreate wrapper $BIN_DIR/$wrapper"
+    done
+    return
+  fi
+
+  mkdir -p "$BIN_DIR"
+
+  for wrapper in "${WRAPPER_TARGETS[@]}"; do
+    remove_managed_file "$BIN_DIR/$wrapper"
+  done
 
   # Rust runner (prefers release)
   cat > "$BIN_DIR/o" <<WRAP
@@ -416,7 +499,11 @@ create_wrappers
 verify_runnable
 
 echo
-echo "=== All done! O-lang is set up and runnable on this machine. ==="
+if $DRY_RUN; then
+  echo "=== Dry run complete. No changes were made. ==="
+else
+  echo "=== All done! O-lang is set up and runnable on this machine. ==="
+fi
 echo
 echo "Quick starts:"
 echo "  o examples/hello.O                    # Rust (if wrapper installed)"

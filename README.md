@@ -121,7 +121,9 @@ The script supports several levels of setup:
 `--minimal` skips optional Nix, matplotlib, and extra backend tools. `--full`
 adds optional runtimes such as Racket when the operating system package
 manager provides them. `--verify` runs the hosted implementations after the
-build. The generated wrappers are placed in `~/.local/bin`.
+build. Each setup run removes stale generated O-lang binaries before rebuilding
+them, refreshes installed Rust copies in `~/.cargo/bin`, and recreates wrappers
+in `~/.local/bin`.
 
 After setup:
 
