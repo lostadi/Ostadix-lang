@@ -1030,14 +1030,22 @@ let fastest = race($left, $right)
 
 | Form | Meaning | Result |
 |------|---------|--------|
-| `batch(a, b, ...)` | Run every member for throughput. | OList containing every result; failures become OError values. |
+| `batch(a, b, ...)` | Run every member for throughput. | OList containing every result; ordinary failures become OError values. |
 | `all(a, b, ...)` | Require every member to succeed. | OList on success; the group fails on the first error. |
 | `any(a, b, ...)` | Try members as fallbacks. | The first successful value; fails only when all members fail. |
 | `race(a, b, ...)` | Take the first member to settle. | The first success or failure. |
 
-Group construction is lazy by definition. Nested request chains remain
-deferred inside the group instead of being resolved before the topology is
-built. Member order is significant and is part of the group fingerprint.
+Group construction is capture-oriented by definition. Under eager evaluation,
+nested request chains are captured lazily inside the group instead of being
+resolved before the topology is built. Inside `autonomous(...)`, the constructor
+preserves Autonomous policy, so captured request chains are also buffered for
+the scheduler. Member order is significant and is part of the group
+fingerprint.
+
+After an autonomous scheduler flush, group members resolve through strict cache
+reads. A strict cache miss means the scheduler failed to materialize buffered
+work and remains a hard error, even for `batch`; normal Fresh-mode member
+failures are the ones represented as OError values.
 
 ### Builtin call reference
 

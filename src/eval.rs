@@ -823,8 +823,10 @@ impl Evaluator {
     ///
     /// **Member semantics:**
     ///
-    /// - `Batch`: collect every member result into an `OList`. A failed member
-    ///   becomes `OValue::Error`, preserving one output slot per input.
+    /// - `Batch`: collect every member result into an `OList`. In Fresh mode, a
+    ///   failed member becomes `OValue::Error`, preserving one output slot per
+    ///   input. In Strict mode, cache misses remain hard scheduler invariant
+    ///   errors.
     /// - `All`: collect every member result, but fail the group if any member
     ///   fails.
     /// - `Any`: return the first member that succeeds and fail only if all fail.
@@ -862,12 +864,21 @@ impl Evaluator {
                 // Sequential path: plain values, Eval Requests, nested Groups,
                 // or strict cache reads already in L1 memory.
                 if mode == GroupMode::Batch {
-                    // Batch: collect all outcomes, wrapping failures as OError.
+                    // Batch: collect ordinary member failures as OError values
+                    // only in Fresh mode. In Strict mode, a miss means the
+                    // autonomous scheduler failed to materialize a buffered
+                    // request, so it remains a hard invariant error.
                     let mut out = Vec::with_capacity(members.len());
                     for m in members {
                         match self.resolve_member(m, cache_mode) {
                             Ok(v) => out.push(v),
-                            Err(e) => out.push(OValue::error(e.to_string())),
+                            Err(e) if cache_mode == CacheMode::Fresh => {
+                                out.push(OValue::error(e.to_string()))
+                            }
+                            Err(e) => {
+                                return Err(e)
+                                    .with_context(|| "batch(...) strict cache resolution failed");
+                            }
                         }
                     }
                     Ok(OValue::list(out))
@@ -1531,13 +1542,16 @@ impl Evaluator {
         // That would make the group contain concrete values rather than deferred
         // Requests, defeating the whole coordination abstraction.
         //
-        // The fix: evaluate members under `Policy::Lazy` regardless of the outer
-        // policy, then restore the outer policy once members are captured.  This
-        // guarantees that:
+        // The fix: evaluate members under a capture policy, then restore the
+        // outer policy once members are captured. Eager evaluation is lowered to
+        // Lazy so request chains are captured instead of forced. Autonomous is
+        // preserved so those captured requests are also buffered for the
+        // autonomous scheduler. This guarantees that:
         //   batch(realise(instantiate($e1)), realise(instantiate($e2)))
         // always builds:
         //   Group(Batch, [Request[Realise(Request[Instantiate(e1)])], ...])
-        // whether the surrounding policy is Eager, Lazy, or Autonomous.
+        // whether the surrounding policy is Eager, Lazy, or Autonomous, while
+        // autonomous(batch(...)) still records the inner requests for flushing.
         //
         // The Group itself performs no work — it is a first-class coordination
         // value forced later by `now(group)`, `autonomous(group)`, or by the
@@ -1546,15 +1560,19 @@ impl Evaluator {
             if args.is_empty() {
                 bail!("{}(...) takes at least 1 argument, got 0", fn_name);
             }
-            // Evaluate members under Lazy policy so request chains are captured,
-            // not resolved, regardless of the outer policy.
             let saved_policy = self.policy;
-            self.policy = Policy::Lazy;
-            let members: Vec<OValue> = planned_args
+            let capture_policy = match saved_policy {
+                Policy::Autonomous => Policy::Autonomous,
+                Policy::Lazy => Policy::Lazy,
+                Policy::Eager => Policy::Lazy,
+            };
+            self.policy = capture_policy;
+            let result: Result<Vec<OValue>> = planned_args
                 .iter()
                 .map(|(id, arg)| self.eval_ir_node(arg, *id, plan, scope))
-                .collect::<Result<_>>()?;
+                .collect();
             self.policy = saved_policy;
+            let members = result?;
             return Ok(OValue::group(mode, members));
         }
 
@@ -4931,9 +4949,9 @@ python[0]^(O.eval($q, $captured))_python[0]
     }
 
     /// `now(batch(realise(instantiate($e1)), realise(instantiate($e2))))`:
-    /// Because `batch` is a special form, its arguments are evaluated under
-    /// Lazy policy regardless of the outer Eager policy. The group therefore
-    /// holds Request chains (not pre-resolved StorePaths).
+    /// Because `batch` is a special form, the outer Eager policy is lowered to
+    /// Lazy capture for group members. The group therefore holds Request chains
+    /// (not pre-resolved StorePaths).
     ///
     /// Resolution is verified by pre-seeding the scheduler cache and resolving
     /// with `CacheMode::Strict` — the same path used after `autonomous(...)` flush.
@@ -5275,7 +5293,8 @@ python[0]^(O.eval($q, $captured))_python[0]
     // Group resolution: failure-semantic contract tests
     //
     // These tests verify the Resolution Algebra from the OValue::Group spec:
-    //   - Collect-All (Batch/All): entire group fails if ANY member fails.
+    //   - Collect-All (Batch): collect every outcome; failures become OError.
+    //   - Collect-All (All):   entire group fails if ANY member fails.
     //   - Winner-Take-All (Any):   skips failed members; fails only when ALL fail.
     //   - Winner-Take-All (Race):  first member's result (Ok or Err) wins
     //                               immediately; later members are ignored.
@@ -5519,6 +5538,104 @@ python[0]^(O.eval($q, $captured))_python[0]
         );
     }
 
+    /// Under Policy::Autonomous, group constructors still capture Request
+    /// members, but they must not downgrade policy to Lazy. The inner Nix-family
+    /// requests must also be buffered for the autonomous scheduler.
+    #[test]
+    fn batch_under_autonomous_buffers_captured_request_chains() {
+        let mut e = Evaluator::new("/tmp".into());
+        e.scheduler = AutonomousScheduler::no_disk();
+        e.policy = Policy::Autonomous;
+        let scope = scope_with_nix_expr();
+
+        let mk_chain = |var: &str| ONode::Call {
+            fn_name: "realise".into(),
+            args: vec![ONode::Call {
+                fn_name: "instantiate".into(),
+                args: vec![ONode::VarRef(var.into())],
+            }],
+        };
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args: vec![mk_chain("e1"), mk_chain("e2")],
+        };
+
+        let program = OIrProgram {
+            nodes: vec![lower_node(&call)],
+        };
+        let plan = program.plan();
+        plan.validate(program.nodes.len()).unwrap();
+        let root_id = plan.roots[0];
+        let group = e
+            .eval_ir_node(&program.nodes[0], root_id, &plan, &scope)
+            .unwrap();
+        match group {
+            OValue::Group { mode, members, .. } => {
+                assert_eq!(mode, GroupMode::Batch);
+                assert_eq!(members.len(), 2);
+                assert!(
+                    members.iter().all(|m| matches!(
+                        m,
+                        OValue::Request {
+                            kind: RequestKind::Realise,
+                            ..
+                        }
+                    )),
+                    "batch members must be captured Realise requests, got {:?}",
+                    members
+                );
+            }
+            other => panic!("batch() must return a Group, got {:?}", other),
+        }
+
+        let kinds: Vec<RequestKind> = e
+            .autonomous_buffer
+            .iter()
+            .map(|v| match v {
+                OValue::Request { kind, .. } => kind.clone(),
+                other => panic!("autonomous_buffer must contain only Requests, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                RequestKind::Instantiate,
+                RequestKind::Realise,
+                RequestKind::Instantiate,
+                RequestKind::Realise,
+            ],
+            "autonomous batch capture must buffer every inner request in source order"
+        );
+        assert_eq!(
+            e.policy,
+            Policy::Autonomous,
+            "group construction must restore the surrounding Autonomous policy"
+        );
+    }
+
+    /// If a member expression fails while a group constructor is capturing
+    /// members, the saved policy must still be restored before the error is
+    /// returned.
+    #[test]
+    fn group_constructor_restores_policy_when_member_eval_errors() {
+        let mut e = Evaluator::new("/tmp".into());
+        let scope = HashMap::new();
+        assert_eq!(e.policy, Policy::Eager);
+
+        let call = ONode::Call {
+            fn_name: "batch".into(),
+            args: vec![ONode::VarRef("missing".into())],
+        };
+        let err = e.eval_node(&call, &scope).unwrap_err().to_string();
+
+        assert!(err.contains("missing"), "got {err}");
+        assert_eq!(
+            e.policy,
+            Policy::Eager,
+            "policy must be restored after group-construction failure"
+        );
+    }
+
     /// `batch(ok, fail)` collects BOTH outcomes: the successful member keeps its
     /// value; the failing member becomes `OValue::Error` in the list. The group
     /// itself never returns `Err` — it always returns a full-length list.
@@ -5555,9 +5672,8 @@ python[0]^(O.eval($q, $captured))_python[0]
 
     /// After `autonomous(...)` flush, if a Request's result is absent from the
     /// cache, `resolve_group` with `CacheMode::Strict` must produce a hard error.
-    ///
-    /// For `Batch` mode: the error is wrapped as `OValue::Error` in the result list.
-    /// For `All` mode: the error propagates and the whole group fails.
+    /// This is a scheduler invariant failure, not an ordinary member failure for
+    /// `batch` to wrap.
     #[test]
     fn autonomous_batch_errors_on_missing_cache_result() {
         let mut e = Evaluator::new("/tmp".into());
@@ -5568,33 +5684,21 @@ python[0]^(O.eval($q, $captured))_python[0]
         let inst = OValue::request(RequestKind::Instantiate, expr);
         let realise = OValue::request(RequestKind::Realise, inst);
 
-        // Batch mode: cache miss becomes OError in the result list.
-        let batch_result = e
+        // Batch mode: strict cache miss is a hard scheduler invariant error.
+        let batch_err = e
             .resolve_group(
                 GroupMode::Batch,
                 std::slice::from_ref(&realise),
                 CacheMode::Strict,
             )
-            .unwrap();
-        match batch_result {
-            OValue::List { v } => {
-                assert_eq!(v.len(), 1);
-                assert!(
-                    v[0].is_error(),
-                    "CacheStrict batch must produce OError on cache miss, got {:?}",
-                    v[0]
-                );
-                if let OValue::Error { msg } = &v[0] {
-                    assert!(
-                        msg.contains("autonomous")
-                            || msg.contains("cache miss")
-                            || msg.contains("materialize"),
-                        "error message must indicate a strict cache miss, got: {msg}"
-                    );
-                }
-            }
-            other => panic!("batch must return a list, got {:?}", other),
-        }
+            .unwrap_err();
+        let batch_err = format!("{batch_err:#}");
+        assert!(
+            batch_err.contains("autonomous")
+                || batch_err.contains("cache miss")
+                || batch_err.contains("materialize"),
+            "CacheStrict Batch must hard-error on cache miss, got: {batch_err}"
+        );
 
         // All mode: cache miss propagates as a hard error.
         let all_err = e

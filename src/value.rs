@@ -287,9 +287,11 @@ pub enum OValue {
     /// - `Any`: yield the first member that succeeds.
     /// - `Race`: yield the first member to settle. Losers are not yet canceled.
     ///
-    /// `batch` and `all` group constructors are **special forms**: their
-    /// arguments are captured as-is (deferred Requests) rather than being
-    /// eagerly resolved before the group is built. This means
+    /// `batch`, `all`, `any`, and `race` group constructors are **special
+    /// forms**: their arguments are captured as deferred Requests rather than
+    /// being eagerly resolved before the group is built. Under
+    /// `Policy::Autonomous`, capture preserves Autonomous policy so those
+    /// deferred Requests are also buffered for the scheduler. This means
     /// `batch(realise(instantiate($e)))` always captures a Request chain —
     /// never a pre-resolved StorePath.
     ///
@@ -306,11 +308,12 @@ pub enum OValue {
         fingerprint: String,
     },
 
-    /// A captured error outcome — produced by `batch(...)` when a member
-    /// fails. Where `all(...)` aborts the whole group on first failure,
-    /// `batch(...)` continues and wraps each failure as an `OError` so the
-    /// result list has exactly one entry per input member regardless of
-    /// how many succeeded or failed.
+    /// A captured error outcome — produced by `batch(...)` when a member fails
+    /// during normal Fresh resolution. Where `all(...)` aborts the whole group
+    /// on first failure, `batch(...)` continues and wraps each ordinary failure
+    /// as an `OError` so the result list has exactly one entry per input member
+    /// regardless of how many succeeded or failed. Strict cache misses after an
+    /// autonomous flush remain hard scheduler invariant errors.
     ///
     /// `msg` is the human-readable error message from the failed computation.
     ///
@@ -329,10 +332,12 @@ pub enum OValue {
 #[serde(rename_all = "snake_case")]
 pub enum GroupMode {
     /// Run every member for throughput. Resolves to an `OList` of all member
-    /// results in member order. **Failures are not fatal**: a failed member is
-    /// represented as an `OValue::Error` in the result list so the list always
-    /// has exactly one entry per input member. Under `Policy::Autonomous` a
-    /// Batch is the unit the scheduler dispatches concurrently.
+    /// results in member order. **Ordinary Fresh-mode failures are not fatal**:
+    /// a failed member is represented as an `OValue::Error` in the result list
+    /// so the list always has exactly one entry per input member. Under
+    /// `Policy::Autonomous`, captured Batch members are buffered and dispatched
+    /// by the scheduler; a Strict-mode cache miss after flush is a hard
+    /// scheduler invariant error, not an `OValue::Error`.
     Batch,
 
     /// Fan-out where every member must succeed. Resolves to an `OList` of all
@@ -769,8 +774,9 @@ impl OValue {
 
     /// Construct an error outcome value.
     ///
-    /// Used by `batch(...)` to represent a failed member as a first-class
-    /// value in the result list rather than aborting the whole group.
+    /// Used by `batch(...)` to represent an ordinary Fresh-mode failed member as
+    /// a first-class value in the result list rather than aborting the whole
+    /// group. Strict cache misses after autonomous scheduling are not wrapped.
     /// `msg` is the human-readable error message from the failed computation.
     pub fn error(msg: impl Into<String>) -> Self {
         OValue::Error { msg: msg.into() }

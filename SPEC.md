@@ -359,8 +359,15 @@ policy.
 #### Construction
 
 `batch`, `all`, `any`, and `race` are **special forms**, not ordinary
-functions. Their arguments are evaluated under `Policy::Lazy` regardless of the
-surrounding policy. This means that:
+functions. Their arguments are evaluated under a capture policy:
+
+- under `Policy::Eager`, members are evaluated as `Policy::Lazy` so request
+  chains are captured instead of forced;
+- under `Policy::Lazy`, members remain lazy;
+- under `Policy::Autonomous`, members remain autonomous, so request chains are
+  captured and buffered for the scheduler.
+
+This means that:
 
 ```
 batch(realise(instantiate($e1)), realise(instantiate($e2)))
@@ -372,14 +379,15 @@ always builds:
 Group(Batch, [Request[Realise(Request[Instantiate(e1)])], ...])
 ```
 
-even when the surrounding policy is Eager. Members are captured as deferred
-`ORequest` chains, not pre-resolved values.
+even when the surrounding policy is Eager. Inside `autonomous(...)`, the same
+captured `ORequest` chains are also recorded in the autonomous buffer before
+the scheduler flushes.
 
 #### Member evaluation policy
 
-Group members may be already-resolved values, deferred `ORequest`s (under any
-policy - the group constructor always captures lazily), or nested groups. The
-group's `fingerprint` composes from the mode and the **ordered** member content
+Group members may be already-resolved values, deferred `ORequest`s captured
+under the constructor's active capture policy, or nested groups. The group's
+`fingerprint` composes from the mode and the **ordered** member content
 identities - member order is semantically significant and is never sorted.
 
 #### Empty group behavior
@@ -389,11 +397,15 @@ A group with no members is rejected at construction time; calling
 
 #### Batch result shape
 
-`batch(a, b, …)` always returns an `OList` with exactly one element per input
-member, in declaration order.  Failures are NOT fatal: a member that fails is
-wrapped as an `OValue::Error` in the list so every input slot has a
-corresponding output slot. Callers can distinguish success from failure by
-testing `is_error()` on each element.
+`batch(a, b, …)` returns an `OList` with exactly one element per input member,
+in declaration order, for ordinary Fresh-mode resolution. Failures are NOT
+fatal in that path: a member that fails is wrapped as an `OValue::Error` in the
+list so every input slot has a corresponding output slot. Callers can
+distinguish success from failure by testing `is_error()` on each element.
+
+Under `CacheMode::Strict`, used after an autonomous scheduler flush, a cache
+miss is not an ordinary member failure. It is a scheduler invariant failure and
+remains a hard error even for `batch`.
 
 #### All failure behavior
 

@@ -16,14 +16,15 @@
 # A Group performs no work on its own. It is forced by `now(group)`, by
 # `autonomous(group)`, or at document end under Autonomous policy.
 #
-# IMPORTANT: batch/all/any/race are SPECIAL FORMS — their arguments are
-# evaluated under Lazy policy regardless of the surrounding evaluation policy.
+# IMPORTANT: batch/all/any/race are SPECIAL FORMS. Under eager evaluation, their
+# arguments are captured lazily. Under autonomous evaluation, Autonomous policy
+# is preserved so captured request chains are also buffered for the scheduler.
 # This means:
 #
 #   batch(realise(instantiate($e1)), realise(instantiate($e2)))
 #
 # always captures Request chains, never pre-resolved values. You do NOT need
-# to wrap in lazy(...) to get meaningful group coordination — the group
+# to wrap in lazy(...) to get meaningful group coordination - the group
 # constructor handles deferral automatically.
 
 # ── Group over plain values (runs without Nix) ───────────────────────────────
@@ -46,7 +47,7 @@ let first = now(any($e1, $e2, $e3))
 
 # race(...) yields the FIRST result to settle, whether success or failure.
 # In sequential mode the first member always settles first.
-# NOTE: Race does not yet cancel remaining work — in concurrent mode other
+# NOTE: Race does not yet cancel remaining work - in concurrent mode other
 # threads run to completion but their results are discarded.
 let winner = now(race($e1, $e2, $e3))
 
@@ -60,7 +61,7 @@ let winner = now(race($e1, $e2, $e3))
 #)
 #let paths = now($builds)
 #
-# The `lazy(batch(...))` wrapper is NO LONGER NEEDED — batch() already captures
+# The `lazy(batch(...))` wrapper is NO LONGER NEEDED - batch() already captures
 # its arguments lazily. The above is equivalent to the old:
 #
 #let builds = lazy(batch(
@@ -93,7 +94,7 @@ forced with `now(...)` it resolves per its topology mode.
 
 **Mode semantics:**
 - `batch`: collects ALL outcomes; failures become `OError` values in the list
-- `all`: hard barrier — any failure aborts the entire group
+- `all`: hard barrier - any failure aborts the entire group
 - `any`: returns the first SUCCESS; tries members in order; fails only if all fail
 - `race`: returns the first SETTLEMENT (Ok or Err); does not cancel losing work
 )_markdown
