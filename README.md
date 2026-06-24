@@ -85,8 +85,12 @@ applies to the other language shims.
 The bootable O-core proof additionally needs:
 
 - Clang with the `x86_64-unknown-none-elf` assembler target
-- `rust-lld`, supplied by the active Rust toolchain
+- An LLD-compatible linker, either `rust-lld`, `ld.lld`, or Homebrew `lld`
 - QEMU for boot verification
+
+The kernel build probes the active Rust toolchain, `PATH`, and common Homebrew
+LLD prefixes. If your linker lives somewhere custom, set
+`OCORE_LLD=/absolute/path/to/rust-lld-or-ld.lld`.
 
 Python is used by the four-second QEMU smoke-test harness. It is not linked
 into the kernel and is not used after the machine starts executing O-core.
@@ -220,7 +224,7 @@ the notebook, and O-core.
 cargo build --bin ocorec
 
 # Compile one or more O-core modules to an ELF relocatable object.
-target/debug/ocorec module.oc --emit obj -o target/module.o
+target/debug/ocorec ocore/examples/minimal.oc --emit obj -o target/minimal.o
 
 # Build the included freestanding kernel.
 ./ocore/kernel/build.sh

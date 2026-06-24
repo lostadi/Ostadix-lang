@@ -16,13 +16,13 @@ capability contracts are in [`docs/OCORE.md`](../docs/OCORE.md).
 cargo build --bin ocorec
 
 # Inspect typed layout and name resolution
-target/debug/ocorec module.oc --emit hir -o -
+target/debug/ocorec ocore/examples/minimal.oc --emit hir -o -
 
 # Inspect SSA MIR
-target/debug/ocorec module.oc --emit mir -o -
+target/debug/ocorec ocore/examples/minimal.oc --emit mir -o -
 
 # Emit freestanding x86_64 ELF object and retain assembly
-target/debug/ocorec module.oc --emit obj --keep-asm -o module.o
+target/debug/ocorec ocore/examples/minimal.oc --emit obj --keep-asm -o target/minimal.o
 ```
 
 Multiple input files form one compilation unit. Each starts with a unique
@@ -33,6 +33,10 @@ Multiple input files form one compilation unit. Each starts with a unique
 The kernel example contains no Python, JSON, subprocess, filesystem, libc, or
 Rust runtime dependency. Those tools are used only by the hosted compiler and
 test harness.
+
+The build script accepts `rust-lld`, `ld.lld`, or Homebrew `lld`. Set
+`OCORE_LLD=/absolute/path/to/rust-lld-or-ld.lld` if your linker is installed
+outside the normal Rust, `PATH`, or Homebrew locations.
 
 ```bash
 ./ocore/kernel/build.sh       # build target/ocore-kernel/kernel.elf
