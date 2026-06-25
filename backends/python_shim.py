@@ -8,6 +8,7 @@ import base64
 import decimal
 import fractions
 import math
+import os
 import struct
 import traceback
 import textwrap
@@ -24,6 +25,19 @@ _current_o_scope = {}
 _current_o_scope_wire = {}
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
+
+def dump_generated_python(source):
+    try:
+        override = os.environ.get("O_PYTHON_DUMP_FILE")
+        path = (
+            Path(override)
+            if override
+            else Path(os.environ.get("TMPDIR", "/tmp")) / f"O-python-failing-{os.getpid()}.py"
+        )
+        path.write_text(source, encoding="utf-8")
+        return str(path)
+    except Exception as exc:
+        return f"<failed to write generated Python source: {exc}>"
 
 class OHtml(str):
     """Typed trusted HTML fragment passed through O-lang."""
@@ -504,7 +518,10 @@ def handle_exec(cmd):
             send_err(f"SystemExit({code})")
 
     except Exception:
-        send_err(traceback.format_exc())
+        message = traceback.format_exc()
+        dump_path = dump_generated_python(code if isinstance(code, str) else "")
+        message += f"\nGenerated Python source: {dump_path}\n"
+        send_err(message)
 
 def handle_cleanup():
     global _current_o_scope, _current_o_scope_wire
