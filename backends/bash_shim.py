@@ -8,6 +8,7 @@ import json
 import subprocess
 import os
 import traceback
+from o_shim_common import stdout_result
 
 
 def send_ok(value):
@@ -37,10 +38,7 @@ def handle_exec(cmd):
             stderr = result.stderr.strip()
             send_err(f"bash exited with code {result.returncode}\n{stderr}")
         else:
-            output = result.stdout
-            if output.endswith("\n"):
-                output = output[:-1]
-            send_ok({"t": "str", "v": output})
+            send_ok(stdout_result(result.stdout))
     except subprocess.TimeoutExpired:
         send_err("bash execution timed out (60s)")
     except FileNotFoundError:

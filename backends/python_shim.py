@@ -5,6 +5,10 @@ import io
 import ast
 import contextlib
 import base64
+import decimal
+import fractions
+import math
+import struct
 import traceback
 import textwrap
 
@@ -15,6 +19,8 @@ import textwrap
 _real_stdout = sys.stdout
 _current_o_scope = {}
 _current_o_scope_wire = {}
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
 
 class OHtml(str):
     """Typed trusted HTML fragment passed through O-lang."""
@@ -180,8 +186,16 @@ def oval_to_py(v):
         return int(v.get("v"))
     if t == "float":
         return float(v.get("v"))
+    if t == "number":
+        return oval_number_to_py(v.get("v", {}))
     if t == "str":
         return str(v.get("v"))
+    if t == "text":
+        return str(v.get("v", {}).get("utf8", ""))
+    if t == "bytes":
+        return bytes(v.get("v", {}).get("bytes", []))
+    if t == "char":
+        return str(v.get("scalar", ""))
     if t == "html":
         return OHtml(v.get("v", ""))
     if t == "store_path":
@@ -190,6 +204,29 @@ def oval_to_py(v):
         return [oval_to_py(x) for x in v.get("v", [])]
     if t == "map":
         return {k: oval_to_py(x) for k, x in v.get("v", {}).items()}
+    if t == "seq":
+        items = [oval_to_py(x) for x in v.get("items", [])]
+        return tuple(items) if v.get("kind") == "tuple" else items
+    if t == "object":
+        return {k: oval_to_py(x) for k, x in v.get("fields", {}).items()}
+    if t == "entries_map":
+        return [(oval_to_py(k), oval_to_py(val)) for k, val in v.get("entries", [])]
+    if t == "set":
+        items = [oval_to_py(x) for x in v.get("items", [])]
+        try:
+            return set(items)
+        except TypeError:
+            return items
+    if t == "symbol":
+        sym = v.get("v", {})
+        ns = sym.get("namespace")
+        name = sym.get("name", "")
+        return f"{ns}/{name}" if ns else name
+    if t == "keyword":
+        kw = v.get("v", {})
+        ns = kw.get("namespace")
+        name = kw.get("name", "")
+        return f":{ns}/{name}" if ns else f":{name}"
     if t == "scope":
         wire_bindings = v.get("bindings", {})
         return OScopeValue(
@@ -203,6 +240,83 @@ def oval_to_py(v):
 
     return OOpaqueValue(v)
 
+
+def oval_number_to_py(n):
+    kind = n.get("kind")
+    if kind == "int":
+        return int(n.get("v", "0"))
+    if kind == "rational":
+        return fractions.Fraction(int(n.get("num", "0")), int(n.get("den", "1")))
+    if kind == "decimal":
+        special = n.get("special")
+        if special == "nan":
+            return decimal.Decimal("NaN")
+        if special == "pos_inf":
+            return decimal.Decimal("Infinity")
+        if special == "neg_inf":
+            return decimal.Decimal("-Infinity")
+        if special == "pos_zero":
+            return decimal.Decimal("0")
+        if special == "neg_zero":
+            return decimal.Decimal("-0")
+        return decimal.Decimal(int(n.get("coeff", "0"))).scaleb(int(n.get("exp10", 0)))
+    if kind == "binary_float":
+        bits = bytes(n.get("bits", []))
+        if n.get("format") == "f32":
+            return struct.unpack(">f", bits)[0]
+        return struct.unpack(">d", bits)[0]
+    if kind == "complex":
+        return complex(
+            oval_number_to_py(n.get("re", {"kind": "int", "v": "0"})),
+            oval_number_to_py(n.get("im", {"kind": "int", "v": "0"})),
+        )
+    return OOpaqueValue({"t": "number", "v": n})
+
+
+def py_number_to_oval_payload(x):
+    if isinstance(x, int):
+        return {"kind": "int", "v": str(x)}
+
+    if isinstance(x, fractions.Fraction):
+        return {"kind": "rational", "num": str(x.numerator), "den": str(x.denominator)}
+
+    if isinstance(x, decimal.Decimal):
+        if x.is_nan():
+            return {"kind": "decimal", "coeff": "0", "exp10": 0, "special": "nan"}
+        if x == decimal.Decimal("Infinity"):
+            return {"kind": "decimal", "coeff": "0", "exp10": 0, "special": "pos_inf"}
+        if x == decimal.Decimal("-Infinity"):
+            return {"kind": "decimal", "coeff": "0", "exp10": 0, "special": "neg_inf"}
+        if x.is_zero():
+            return {
+                "kind": "decimal",
+                "coeff": "0",
+                "exp10": 0,
+                "special": "neg_zero" if x.is_signed() else "pos_zero",
+            }
+        sign, digits, exponent = x.as_tuple()
+        coeff = int("".join(str(digit) for digit in digits) or "0")
+        if sign:
+            coeff = -coeff
+        return {"kind": "decimal", "coeff": str(coeff), "exp10": int(exponent), "special": None}
+
+    if isinstance(x, float):
+        return {
+            "kind": "binary_float",
+            "format": "f64",
+            "bits": list(struct.pack(">d", x)),
+        }
+
+    if isinstance(x, complex):
+        return {
+            "kind": "complex",
+            "re": py_number_to_oval_payload(float(x.real)),
+            "im": py_number_to_oval_payload(float(x.imag)),
+        }
+
+    raise TypeError(f"not a supported numeric value: {type(x).__name__}")
+
+
 def py_to_oval(x):
     if x is None:
         return {"t": "null"}
@@ -211,10 +325,17 @@ def py_to_oval(x):
         return {"t": "bool", "v": x}
 
     if isinstance(x, int):
-        return {"t": "int", "v": x}
+        if _INT64_MIN <= x <= _INT64_MAX:
+            return {"t": "int", "v": x}
+        return {"t": "number", "v": py_number_to_oval_payload(x)}
+
+    if isinstance(x, (fractions.Fraction, decimal.Decimal, complex)):
+        return {"t": "number", "v": py_number_to_oval_payload(x)}
 
     if isinstance(x, float):
-        return {"t": "float", "v": x}
+        if math.isfinite(x):
+            return {"t": "float", "v": x}
+        return {"t": "number", "v": py_number_to_oval_payload(x)}
 
     if isinstance(x, OHtml):
         return {"t": "html", "v": str(x)}
@@ -241,11 +362,13 @@ def py_to_oval(x):
     if isinstance(x, str):
         return {"t": "str", "v": x}
 
-    if isinstance(x, bytes):
+    if isinstance(x, (bytes, bytearray, memoryview)):
         return {
-            "t": "blob",
-            "v": base64.b64encode(x).decode("ascii"),
-            "mime": "application/octet-stream",
+            "t": "bytes",
+            "v": {
+                "bytes": list(bytes(x)),
+                "media_type": "application/octet-stream",
+            },
         }
 
     # matplotlib.figure.Figure -> PNG blob (for computed plots etc in HTML)
@@ -276,11 +399,19 @@ def py_to_oval(x):
     except Exception:
         pass
 
-    if isinstance(x, (list, tuple)):
+    if isinstance(x, tuple):
+        return {"t": "seq", "kind": "tuple", "items": [py_to_oval(i) for i in x]}
+
+    if isinstance(x, list):
         return {"t": "list", "v": [py_to_oval(i) for i in x]}
 
     if isinstance(x, dict):
-        return {"t": "map", "v": {str(k): py_to_oval(v) for k, v in x.items()}}
+        if all(isinstance(k, str) for k in x):
+            return {"t": "map", "v": {k: py_to_oval(v) for k, v in x.items()}}
+        return {
+            "t": "entries_map",
+            "entries": [[py_to_oval(k), py_to_oval(v)] for k, v in x.items()],
+        }
 
     return {"t": "str", "v": str(x)}
 

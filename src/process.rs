@@ -11,6 +11,7 @@ const PYTHON_POLICY_BOOTSTRAP: &str = r#"
 import json, os, runpy, sys
 _o_permissions = frozenset(json.loads(os.environ.pop("O_BACKEND_AUTHORITIES", "[]")))
 _o_runtime_candidates = json.loads(os.environ.pop("O_BACKEND_RUNTIME_ROOTS", "[]"))
+_o_import_roots = list(_o_runtime_candidates)
 _o_runtime_candidates.extend(path for path in sys.path if path)
 _o_runtime_candidates.extend((sys.prefix, sys.base_prefix, os.path.dirname(sys.executable)))
 
@@ -34,6 +35,11 @@ def _o_under(path, roots):
     except (TypeError, ValueError, OSError):
         return False
     return any(real == root or real.startswith(root + os.sep) for root in roots)
+
+for _o_root in reversed(_o_import_roots):
+    _o_real_root = _o_realpath_or_none(_o_root)
+    if _o_real_root and _o_real_root not in sys.path:
+        sys.path.insert(0, _o_real_root)
 
 def _o_audit(event, args):
     if event == "open" and args:
@@ -489,6 +495,44 @@ mod tests {
         let value = process.exec("__oval_result__ = 42", HashMap::new())?;
 
         assert_eq!(value, OValue::int(42));
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_python_big_int_result_uses_number_ovalue() -> Result<()> {
+        use crate::value::ONumber;
+
+        let mut process = spawn_python_shim()?;
+
+        let value = process.exec("__oval_result__ = 2 ** 100", HashMap::new())?;
+
+        match value {
+            OValue::Number {
+                v: ONumber::Int { v },
+            } => {
+                let expected = num_bigint::BigInt::from(1_u8) << 100_u32;
+                assert_eq!(v, expected);
+            }
+            other => panic!("expected number/int OValue, got {other:?}"),
+        }
+        process.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_python_bytes_result_uses_structural_bytes() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        let value = process.exec("__oval_result__ = bytes([0, 1, 255])", HashMap::new())?;
+
+        match value {
+            OValue::Bytes { v } => {
+                assert_eq!(v.bytes, vec![0, 1, 255]);
+                assert_eq!(v.media_type.as_deref(), Some("application/octet-stream"));
+            }
+            other => panic!("expected bytes OValue, got {other:?}"),
+        }
         process.cleanup()?;
         Ok(())
     }

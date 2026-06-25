@@ -12,6 +12,7 @@ import sys
 import json
 import sqlite3
 import traceback
+from o_shim_common import float_to_oval, int_to_oval
 
 
 def send_ok(value):
@@ -20,6 +21,26 @@ def send_ok(value):
 
 def send_err(message):
     print(json.dumps({"status": "err", "message": message}), flush=True)
+
+
+def sqlite_value_to_oval(value):
+    if value is None:
+        return {"t": "null"}
+    if isinstance(value, bool):
+        return {"t": "bool", "v": value}
+    if isinstance(value, int):
+        return int_to_oval(value)
+    if isinstance(value, float):
+        return float_to_oval(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {
+            "t": "bytes",
+            "v": {
+                "bytes": list(bytes(value)),
+                "media_type": "application/octet-stream",
+            },
+        }
+    return {"t": "str", "v": str(value)}
 
 
 # Map from env_id to persistent sqlite3 connection.
@@ -61,16 +82,25 @@ def handle_exec(cmd):
         conn.commit()
 
         if description and rows:
-            # Format as tab-separated table with header.
             headers = [d[0] for d in description]
-            lines = ["\t".join(str(h) for h in headers)]
-            for row in rows:
-                lines.append("\t".join(str(v) if v is not None else "NULL" for v in row))
-            send_ok({"t": "str", "v": "\n".join(lines)})
+            if len(headers) == 1 and len(rows) == 1:
+                send_ok(sqlite_value_to_oval(rows[0][0]))
+            else:
+                send_ok({
+                    "t": "list",
+                    "v": [
+                        {
+                            "t": "map",
+                            "v": {
+                                str(header): sqlite_value_to_oval(value)
+                                for header, value in zip(headers, row)
+                            },
+                        }
+                        for row in rows
+                    ],
+                })
         elif description:
-            # Query returned no rows.
-            headers = [d[0] for d in description]
-            send_ok({"t": "str", "v": "\t".join(str(h) for h in headers)})
+            send_ok({"t": "list", "v": []})
         else:
             # Non-query statement (INSERT, CREATE, etc.).
             affected = cursor.rowcount

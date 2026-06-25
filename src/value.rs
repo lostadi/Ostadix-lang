@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -24,6 +25,63 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod bigint_json {
+    use super::*;
+    use serde::de::{self, Visitor};
+
+    pub fn serialize<S>(value: &BigInt, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BigInt, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BigIntVisitor;
+
+        impl Visitor<'_> for BigIntVisitor {
+            type Value = BigInt;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a decimal integer string or JSON integer")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                BigInt::from_str(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BigInt::from(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BigInt::from(value))
+            }
+        }
+
+        deserializer.deserialize_any(BigIntVisitor)
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 1: The OValue Sum Type
@@ -34,13 +92,17 @@ use sha2::{Digest, Sha256};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ONumber {
     Int {
+        #[serde(with = "bigint_json")]
         v: BigInt,
     },
     Rational {
+        #[serde(with = "bigint_json")]
         num: BigInt,
+        #[serde(with = "bigint_json")]
         den: BigInt,
     },
     Decimal {
+        #[serde(with = "bigint_json")]
         coeff: BigInt,
         exp10: i64,
         special: Option<DecimalSpecial>,
@@ -50,6 +112,7 @@ pub enum ONumber {
         bits: Vec<u8>,
     },
     BigFloat {
+        #[serde(with = "bigint_json")]
         mantissa: BigInt,
         exp2: i64,
         precision: Option<u64>,
@@ -2608,8 +2671,8 @@ pub enum OWireCommand {
     /// Sent when a persistent env [n] is garbage collected, or on shutdown.
     Cleanup,
 
-    /// Verify the backend process is alive and responsive.
-    /// Used by the process manager before sending real work.
+    /// Optional protocol probe for diagnostics and direct tests.
+    /// Backend startup sends real work directly; there is no health-check gate.
     Ping,
 
     /// The result of evaluating an `eval_request` sent by the shim.

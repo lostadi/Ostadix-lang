@@ -99,6 +99,10 @@ const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
 // in that directory whose name matches a bundled shim overrides it, and any
 // file with a new name is appended to the embedded set.
 const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
+    (
+        "o_shim_common.py",
+        include_bytes!("../../backends/o_shim_common.py"),
+    ),
     ("nix_shim.py", include_bytes!("../../backends/nix_shim.py")),
     (
         "nix_store_shim.py",
