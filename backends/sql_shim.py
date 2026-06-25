@@ -12,6 +12,8 @@ import sys
 import json
 import sqlite3
 import traceback
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from o_shim_common import read_wire_message, write_wire_message
 from o_shim_common import float_to_oval, int_to_oval
 

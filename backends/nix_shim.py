@@ -3,6 +3,8 @@ import sys
 import json
 import subprocess
 import traceback
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from o_shim_common import read_wire_message, write_wire_message
 from o_shim_common import json_value_to_oval
 

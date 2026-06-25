@@ -11,6 +11,8 @@ import math
 import struct
 import traceback
 import textwrap
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from o_shim_common import read_wire_message, write_wire_message
 
 # Save a reference to the real process stdout (fd 1) before anything can

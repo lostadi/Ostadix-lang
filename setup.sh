@@ -517,6 +517,9 @@ verify_runnable() {
   echo -n "Rust release interpreter: "
   if target/release/O examples/hello.O 2>/dev/null | grep -qE "(2|Int)"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
 
+  echo -n "Installed O on PATH: "
+  if has_cmd O && "$(command -v O)" examples/bindings.O 2>/dev/null | grep -q "43"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
   echo -n "Rust-native Bash without shim dir: "
   if target/release/O examples/bash_hello.O "$missing_shims" 2>/dev/null | grep -q "hello from bash"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
 
