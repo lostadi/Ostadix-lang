@@ -3,21 +3,22 @@ import sys
 import json
 import subprocess
 import traceback
+from o_shim_common import read_wire_message, write_wire_message
 
 def send_ok_store_path(path):
-    print(json.dumps({
+    write_wire_message({
         "status": "ok",
         "value": {"t": "store_path", "path": path}
-    }), flush=True)
+    })
 
 def send_ok_null():
-    print(json.dumps({
+    write_wire_message({
         "status": "ok",
         "value": {"t": "null"}
-    }), flush=True)
+    })
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    write_wire_message({"status": "err", "message": message})
 
 def eval_store_path(code):
     cmd = [
@@ -62,9 +63,11 @@ def handle_exec(cmd):
     except Exception:
         send_err(traceback.format_exc())
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message()
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

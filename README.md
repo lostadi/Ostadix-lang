@@ -1096,9 +1096,10 @@ The runtime classifies values into three groups:
   Requests, groups, errors, scopes, and capabilities require explicit treatment by caches,
   schedulers, and persistence layers.
 
-Every OValue has a JSON wire form for hosted IPC. That fact does not make
-every OValue safe to replay. `is_cache_safe`, `is_replay_safe`, and
-`is_boot_persistable` enforce the distinction in the Rust value layer.
+Every OValue has a tagged schema that can be serialized for hosted IPC. The
+backend transport is length-prefixed canonical CBOR, not JSON text. That fact
+does not make every OValue safe to replay. `is_cache_safe`, `is_replay_safe`,
+and `is_boot_persistable` enforce the distinction in the Rust value layer.
 
 Representative wire values are:
 
@@ -1183,8 +1184,8 @@ session before it can resolve to a generation-tagged kernel handle.
 ## Hosted backends
 
 The Rust runtime currently registers the following languages. Inline backends
-run inside the evaluator. Shim backends execute through newline-delimited JSON
-IPC and require their local runtime to be installed.
+run inside the evaluator. Shim backends execute through length-prefixed
+canonical CBOR IPC and require their local runtime to be installed.
 
 | Tag | Runtime or handler | Behavior |
 |-----|--------------------|----------|
@@ -1437,14 +1438,15 @@ The hosted evaluator runs five conceptual stages:
 5. Cache only values and requests whose runtime-boundary classification
    permits reuse.
 
-Backend shims communicate with the Rust runtime through newline-delimited
-JSON:
+Backend shims communicate with the Rust runtime through length-prefixed
+canonical CBOR frames. The frame body carries the same tagged command/response
+schema:
 
 ```text
-Runtime -> shim: {"cmd":"exec","code":"...","bindings":{...}}
-Shim -> runtime: {"status":"ok","value":{"t":"int","v":42}}
-Shim -> runtime: {"status":"eval_request","src":"...","scope":{"t":"scope","bindings":{...}}}
-Runtime -> shim: {"cmd":"eval_result","value":{...}}
+Runtime -> shim: u32be_len || cbor({"cmd":"exec","code":"...","bindings":{...}})
+Shim -> runtime: u32be_len || cbor({"status":"ok","value":{"t":"int","v":42}})
+Shim -> runtime: u32be_len || cbor({"status":"eval_request","src":"...","scope":{...}})
+Runtime -> shim: u32be_len || cbor({"cmd":"eval_result","value":{...}})
 ```
 
 The callback forms are what allow Python's `O.eval` to re-enter the O
@@ -1918,8 +1920,8 @@ O-core as the freestanding systems language.
   receiving-language rendering.
 - Ephemeral bare blocks and explicit persistent backend environments.
 - O-level `let` bindings and `$var` splicing.
-- The complete current OValue sum type, JSON wire protocol, content identity,
-  runtime-boundary classification, and persistence checks.
+- The complete current OValue sum type, canonical CBOR backend wire protocol,
+  content identity, runtime-boundary classification, and persistence checks.
 - `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
 - Lexical scope snapshots for `O.eval`, including caller binding visibility
   without callback writes leaking into the caller.

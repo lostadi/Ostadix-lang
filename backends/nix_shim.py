@@ -3,14 +3,15 @@ import sys
 import json
 import subprocess
 import traceback
+from o_shim_common import read_wire_message, write_wire_message
 from o_shim_common import json_value_to_oval
 
 
 def send_ok(value):
-    print(json.dumps({"status": "ok", "value": value}), flush=True)
+    write_wire_message({"status": "ok", "value": value})
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    write_wire_message({"status": "err", "message": message})
 
 def eval_nix_expr(code):
     cmd = [
@@ -56,9 +57,11 @@ def handle_ping():
 def handle_cleanup():
     send_ok({"t": "null"})
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message()
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

@@ -2,7 +2,7 @@
 """
 NixOS test shim — Milestone E / F backend process for the Rust O evaluator.
 
-Protocol: stdin/stdout JSON line protocol (same as all other shims).
+Protocol: length-prefixed canonical CBOR frames (same as all other shims).
 
 exec command:
   code     — Nix attrset body with `nodes` and `testScript` keys.
@@ -22,6 +22,7 @@ import platform
 import subprocess
 import sys
 import traceback
+from o_shim_common import read_wire_message, write_wire_message
 
 # Wrapper template: turns the user's attrset fragment into a full
 # pkgs.testers.runNixOSTest call.  NIXPKGS_PATH may be overridden by env var.
@@ -38,10 +39,10 @@ in
 # ---------------------------------------------------------------------------
 
 def send_ok(value):
-    print(json.dumps({"status": "ok", "value": value}), flush=True)
+    write_wire_message({"status": "ok", "value": value})
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    write_wire_message({"status": "err", "message": message})
 
 def oval_to_nix(v):
     """Render an OValue dict as a Nix expression fragment for $var splicing."""
@@ -166,9 +167,11 @@ def handle_ping():
 def handle_cleanup():
     send_ok({"t": "null"})
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message()
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

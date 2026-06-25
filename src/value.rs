@@ -1944,7 +1944,7 @@ impl OValue {
 
     /// Whether this value can be encoded and shipped across process boundaries.
     ///
-    /// Today every `OValue` is serializable via the JSON wire format.
+    /// Today every `OValue` is serializable via the hosted wire schema.
     pub fn is_serializable(&self) -> bool {
         true
     }
@@ -2462,8 +2462,8 @@ impl OValue {
 // SECTION 6: Display
 //
 // Human-readable representation for REPL output and error messages.
-// Distinct from splice_repr (which is for code injection) and from the
-// JSON wire format (which is for process communication).
+// Distinct from splice_repr (which is for code injection) and from the hosted
+// wire schema (which is for process communication).
 // ═════════════════════════════════════════════════════════════════════════════
 
 impl fmt::Display for OValue {
@@ -2648,11 +2648,11 @@ impl fmt::Display for OValue {
 // These are the three message types that O's runtime sends to backend
 // subprocess shims. The shims respond with OWireResponse.
 //
-// The protocol is synchronous and line-delimited:
-//   → one JSON object per line to the shim's stdin
-//   ← one JSON object per line from the shim's stdout
+// The protocol is synchronous and binary-framed:
+//   → 4-byte big-endian payload length + canonical CBOR command
+//   ← 4-byte big-endian payload length + canonical CBOR response
 //
-// This is intentionally simple. The shim's job is to be thin.
+// The serde shape below is the schema. `wire.rs` is the real transport codec.
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// A command from the O runtime to a backend subprocess shim.
@@ -2889,6 +2889,8 @@ mod tests {
     /// since they are what actually travels over the subprocess pipe.
     #[test]
     fn round_trip_wire_messages() {
+        use crate::wire;
+
         let mut bindings = HashMap::new();
         bindings.insert("a".to_string(), OValue::int(10));
         bindings.insert("b".to_string(), OValue::str_("hello"));
@@ -2897,15 +2899,14 @@ mod tests {
             code: "print(a + 1)".to_string(),
             bindings,
         };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let _decoded: OWireCommand = serde_json::from_str(&json).unwrap();
-        // Verify the cmd tag is present and correct
-        assert!(json.contains(r#""cmd":"exec""#));
+        let encoded = wire::encode_message(&cmd).unwrap();
+        assert_ne!(encoded.first().copied(), Some(b'{'));
+        let _decoded: OWireCommand = wire::decode_message(&encoded).unwrap();
 
         let resp = OWireResponse::ok(OValue::str_("result"));
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""status":"ok""#));
-        let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
+        let encoded = wire::encode_message(&resp).unwrap();
+        assert_ne!(encoded.first().copied(), Some(b'{'));
+        let decoded: OWireResponse = wire::decode_message(&encoded).unwrap();
         assert!(matches!(decoded, OWireResponse::Ok { .. }));
 
         // EvalRequest/EvalResult round-trip
@@ -2916,19 +2917,15 @@ mod tests {
                 OValue::int(42),
             )]))),
         };
-        let json = serde_json::to_string(&eval_req).unwrap();
-        assert!(json.contains(r#""status":"eval_request""#));
-        assert!(json.contains(r#""src":"python^(42)_python""#));
-        assert!(json.contains(r#""scope":{"t":"scope""#));
-        let decoded: OWireResponse = serde_json::from_str(&json).unwrap();
+        let encoded = wire::encode_message(&eval_req).unwrap();
+        let decoded: OWireResponse = wire::decode_message(&encoded).unwrap();
         assert!(matches!(decoded, OWireResponse::EvalRequest { .. }));
 
         let eval_result = OWireCommand::EvalResult {
             value: OValue::int(42),
         };
-        let json = serde_json::to_string(&eval_result).unwrap();
-        assert!(json.contains(r#""cmd":"eval_result""#));
-        let decoded: OWireCommand = serde_json::from_str(&json).unwrap();
+        let encoded = wire::encode_message(&eval_result).unwrap();
+        let decoded: OWireCommand = wire::decode_message(&encoded).unwrap();
         assert!(matches!(decoded, OWireCommand::EvalResult { .. }));
     }
 

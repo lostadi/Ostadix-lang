@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::capability::BackendSandboxPolicy;
 use crate::value::{OValue, OWireCommand, OWireResponse};
+use crate::wire;
 
 const PYTHON_POLICY_BOOTSTRAP: &str = r#"
 import json, os, runpy, sys
@@ -238,27 +239,13 @@ impl BackendProcess {
     }
 
     fn send_command(&mut self, command: &OWireCommand) -> Result<()> {
-        let line = serde_json::to_string(command).context("failed to serialize OWireCommand")?;
-        writeln!(self.stdin, "{line}").context("failed to write command to backend stdin")?;
-        self.stdin
-            .flush()
-            .context("failed to flush backend stdin")?;
-        Ok(())
+        wire::write_frame(&mut self.stdin, command).context("failed to write backend wire command")
     }
 
     fn recv_step(&mut self) -> Result<ExecStep> {
-        let mut response_line = String::new();
-        let bytes_read = self
-            .stdout
-            .read_line(&mut response_line)
-            .context("failed to read response from backend stdout")?;
-
-        if bytes_read == 0 {
-            return Err(anyhow!("backend process closed stdout unexpectedly"));
-        }
-
-        let response: OWireResponse = serde_json::from_str(&response_line)
-            .with_context(|| format!("failed to parse backend response: {response_line:?}"))?;
+        let response: OWireResponse = wire::read_frame(&mut self.stdout)
+            .context("failed to read backend wire response")?
+            .ok_or_else(|| anyhow!("backend process closed stdout unexpectedly"))?;
 
         match response {
             OWireResponse::Ok { value } => Ok(ExecStep::Done(value)),

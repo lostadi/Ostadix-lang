@@ -11,6 +11,7 @@ import math
 import struct
 import traceback
 import textwrap
+from o_shim_common import read_wire_message, write_wire_message
 
 # Save a reference to the real process stdout (fd 1) before anything can
 # redirect it. O.eval() must write eval_request directly over the IPC pipe
@@ -134,14 +135,11 @@ class _OMod:
                     f"scope() or O.scope(), got {type(scope_snapshot).__name__!r}"
                 )
             msg["scope"] = py_to_oval(scope_snapshot)
-        msg = json.dumps(msg) + "\n"
-        _real_stdout.write(msg)
-        _real_stdout.flush()
+        write_wire_message(msg, _real_stdout.buffer)
         # Block until the runtime replies with eval_result.
-        resp_line = sys.stdin.readline()
-        if not resp_line:
+        resp = read_wire_message(sys.stdin.buffer)
+        if resp is None:
             raise RuntimeError("O.eval: runtime closed stdin before sending eval_result")
-        resp = json.loads(resp_line)
         if resp.get("cmd") != "eval_result":
             raise RuntimeError(
                 f"O.eval: expected eval_result command, got {resp.get('cmd')!r}"
@@ -416,12 +414,10 @@ def py_to_oval(x):
     return {"t": "str", "v": str(x)}
 
 def send_ok(value=None):
-    _real_stdout.write(json.dumps({"status": "ok", "value": py_to_oval(value)}) + "\n")
-    _real_stdout.flush()
+    write_wire_message({"status": "ok", "value": py_to_oval(value)}, _real_stdout.buffer)
 
 def send_err(message):
-    _real_stdout.write(json.dumps({"status": "err", "message": message}) + "\n")
-    _real_stdout.flush()
+    write_wire_message({"status": "err", "message": message}, _real_stdout.buffer)
 
 O = _OMod()
 env = {
@@ -524,9 +520,11 @@ def handle_cleanup():
 def handle_ping():
     send_ok(None)
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message(sys.stdin.buffer)
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

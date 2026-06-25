@@ -58,7 +58,8 @@ type EvalRequestCallback<'a> = dyn FnMut(&OValue) -> Result<OValue> + 'a;
 /// Persistent on-disk cache for Request execution results.
 ///
 /// Layout: `{dir}/{fingerprint}.json` — one file per cached result.
-/// Serialization: serde_json (same OValue wire format as the IPC protocol).
+/// Serialization: serde_json for readable cache files. Backend IPC uses
+/// canonical CBOR frames over the same OValue schema.
 ///
 /// Failure modes are intentionally soft:
 ///   - A read miss or parse error falls through to re-execution.

@@ -18,3 +18,4 @@ pub mod parser;
 pub mod process;
 pub mod scheduler;
 pub mod value;
+pub(crate) mod wire;
