@@ -12,6 +12,10 @@ use o_lang::parser::Parser;
 use o_lang::value::OValue;
 
 fn main() -> Result<()> {
+    if o_lang::backend::run_backend_from_env_args()? {
+        return Ok(());
+    }
+
     let mut args = env::args().skip(1).collect::<VecDeque<_>>();
     let backends = registered_backends();
     let mut backend_grants = Vec::new();

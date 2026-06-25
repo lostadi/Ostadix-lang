@@ -8,6 +8,7 @@
 // without suppression attributes.
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub mod backend;
 mod capability;
 pub mod eval;
 pub mod ir;

@@ -184,6 +184,10 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    if o_lang::backend::run_backend_from_env_args()? {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     let backends = registered_backends();
 

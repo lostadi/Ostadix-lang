@@ -8,6 +8,7 @@ use crate::capability::BackendSandboxPolicy;
 use crate::value::{OValue, OWireCommand, OWireResponse};
 use crate::wire;
 
+#[cfg(test)]
 const PYTHON_POLICY_BOOTSTRAP: &str = r#"
 import json, os, runpy, sys
 _o_permissions = frozenset(json.loads(os.environ.pop("O_BACKEND_AUTHORITIES", "[]")))
@@ -105,6 +106,7 @@ struct BackendProcess {
     stdout: BufReader<ChildStdout>,
 }
 
+#[cfg(test)]
 fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Command> {
     let python = which::which("python3").context("python3 is required for backend shims")?;
     let shim = shim_path
@@ -136,6 +138,7 @@ fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Resu
     Ok(command)
 }
 
+#[cfg(test)]
 fn direct_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Command {
     #[cfg(target_os = "macos")]
     if let Ok(command) = macos_sandbox_command(
@@ -146,6 +149,59 @@ fn direct_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Comm
         return command;
     }
     Command::new(shim_path)
+}
+
+#[cfg(not(test))]
+fn rust_backend_command(
+    lang: &str,
+    shim_path: &Path,
+    sandbox: &BackendSandboxPolicy,
+) -> Result<Command> {
+    let executable = std::env::current_exe().context("failed to locate current executable")?;
+    let executable = executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.to_path_buf());
+    let runtime_root = if shim_path.exists() {
+        shim_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else {
+        executable
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = macos_sandbox_command(&executable, sandbox, &runtime_root)?;
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new(&executable);
+
+    command.arg("--o-backend").arg(lang).env(
+        "O_BACKEND_AUTHORITIES",
+        serde_json::to_string(&sandbox.names())?,
+    );
+    if shim_path.exists() {
+        command.env("O_BACKEND_LEGACY_SHIM", shim_path);
+        command.env(
+            "O_BACKEND_RUNTIME_ROOTS",
+            serde_json::to_string(&[runtime_root])?,
+        );
+    }
+    Ok(command)
+}
+
+#[cfg(test)]
+fn legacy_backend_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Command> {
+    if !shim_path.exists() {
+        return Err(anyhow!("backend shim not found: {}", shim_path.display()));
+    }
+    if shim_path.extension().and_then(|s| s.to_str()) == Some("py") {
+        python_shim_command(shim_path, sandbox)
+    } else {
+        Ok(direct_shim_command(shim_path, sandbox))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -203,23 +259,19 @@ fn sandbox_quote(path: &Path) -> String {
 }
 
 impl BackendProcess {
-    fn new(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Self> {
-        if !shim_path.exists() {
-            return Err(anyhow!("backend shim not found: {}", shim_path.display()));
-        }
+    fn new(lang: &str, shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Self> {
+        #[cfg(test)]
+        let mut command = legacy_backend_command(shim_path, sandbox)?;
 
-        let mut command = if shim_path.extension().and_then(|s| s.to_str()) == Some("py") {
-            python_shim_command(shim_path, sandbox)?
-        } else {
-            direct_shim_command(shim_path, sandbox)
-        };
+        #[cfg(not(test))]
+        let mut command = rust_backend_command(lang, shim_path, sandbox)?;
 
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to spawn backend shim: {}", shim_path.display()))?;
+            .with_context(|| format!("failed to spawn backend process for `{lang}`"))?;
 
         let stdin = child
             .stdin
@@ -313,7 +365,7 @@ impl ProcessRegistry {
     ) -> Result<()> {
         let key = (lang.to_string(), env_id, sandbox.clone());
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(shim_path, sandbox)
+            let process = BackendProcess::new(lang, shim_path, sandbox)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
         }
@@ -375,7 +427,7 @@ impl ProcessRegistry {
         let key = (lang.to_string(), env_id, sandbox.clone());
 
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(shim_path, sandbox)
+            let process = BackendProcess::new(lang, shim_path, sandbox)
                 .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
         }
@@ -445,13 +497,17 @@ mod tests {
     }
 
     fn spawn_python_shim() -> Result<BackendProcess> {
-        BackendProcess::new(&python_shim_path(), &BackendSandboxPolicy::none())
+        BackendProcess::new("python", &python_shim_path(), &BackendSandboxPolicy::none())
     }
 
     fn spawn_python_shim_with(
         permissions: impl IntoIterator<Item = crate::value::BackendAuthority>,
     ) -> Result<BackendProcess> {
-        BackendProcess::new(&python_shim_path(), &BackendSandboxPolicy::new(permissions))
+        BackendProcess::new(
+            "python",
+            &python_shim_path(),
+            &BackendSandboxPolicy::new(permissions),
+        )
     }
 
     fn expect_done(step: ExecStep) -> OValue {

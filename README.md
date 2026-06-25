@@ -73,14 +73,14 @@ The base Rust build needs:
 
 - Rust and Cargo
 - A C compiler and system linker
-- Python 3 for `python^` blocks and the shared Python shim protocol
+- Python 3 for the `python^` compatibility bridge and Python-backed legacy adapters
 - Git and standard POSIX command-line tools
 
 Each hosted backend uses the real local runtime named in the backend table.
 You only install the runtimes your `.O` program actually uses. Nix is needed
 for the Nix lattice and NixOS tests. Node.js is needed for `javascript^`.
 Racket is needed for `racket^`. Rust is needed for `rust^`. The same rule
-applies to the other language shims.
+applies to the other language backends.
 
 The bootable O-core proof additionally needs:
 
@@ -598,7 +598,7 @@ and its dependencies.
 O-lang is now an implemented toolchain rather than only an organizing idea.
 The repository contains the parser, evaluator, OValue protocol, persistent
 process registry, OIR and execution planner, scheduler and disk cache, real
-backend shims, native and WASI packaging, linker and unlinker, notebook,
+hosted backends, native and WASI packaging, linker and unlinker, notebook,
 static O-core front end, SSA lowering, x86_64 object generation, freestanding
 runtime, and an asserted QEMU boot. The current boundaries are documented at
 the end of this README as concrete engineering scope, not as placeholders for
@@ -908,7 +908,7 @@ language name at every call site.
 
 ### Backend authority is ambient by default
 
-Hosted source runs as normal O-lang execution, so shim backends receive every
+Hosted source runs as normal O-lang execution, so hosted backends receive every
 grantable backend right by default: `fs_read`, `fs_write`, `network`, and
 `process`. A plain block can use the host as directly as the same user could
 from Python, Bash, Nix, or another supported language:
@@ -1184,8 +1184,10 @@ session before it can resolve to a generation-tagged kernel handle.
 ## Hosted backends
 
 The Rust runtime currently registers the following languages. Inline backends
-run inside the evaluator. Shim backends execute through length-prefixed
-canonical CBOR IPC and require their local runtime to be installed.
+run inside the evaluator. Hosted backends run as Rust backend processes through
+length-prefixed canonical CBOR IPC and require their local runtime to be
+installed. A few compatibility adapters still bridge to legacy Python code for
+semantics that are not a plain external command, such as live Python `O.eval`.
 
 | Tag | Runtime or handler | Behavior |
 |-----|--------------------|----------|
@@ -1196,35 +1198,35 @@ canonical CBOR IPC and require their local runtime to be installed.
 | `latex` | inline value | Returns spliced LaTeX text. Alias: `tex`. |
 | `text` | inline value | Returns plain spliced text. Alias: `plain`. |
 | `nix_expr` | inline value | Captures deferred Nix source and dependencies as ONixExpr. |
-| `python` | CPython shim | Executes Python, preserves explicit environments, converts native values, and supports `O.quote` and `O.eval`. Alias: `py`. |
-| `nix` | Nix shim | Evaluates Nix expressions and converts JSON results to OValue. |
-| `nix_store` | Nix shim | Realizes derivations and returns OStorePath. |
-| `nixos_test` | Nix test-driver shim | Runs NixOS VM test expressions. |
-| `bash` | Bash shim | Executes Bash with scalar O bindings exported as environment variables. |
-| `shell` | POSIX `sh` shim | Executes portable shell source with scalar bindings. |
-| `rust` | `rustc` shim | Compiles a temporary Rust program, runs it, and returns stdout. |
-| `racket` | Racket shim | Executes a temporary Racket module and returns stdout. |
-| `cpp` | `g++` shim | Compiles C++17 source, runs it, and returns stdout. |
-| `csharp` | .NET or Mono shim | Builds and runs C# with the locally available toolchain. |
-| `haskell` | `runghc` or `ghc` shim | Interprets or compiles Haskell and returns stdout. |
-| `lisp` | Guile, Chicken, or Chez shim | Executes Scheme-family Lisp source. |
-| `common_lisp` | SBCL, ECL, CLISP, or CCL shim | Executes Common Lisp source. |
-| `sql` | Python SQLite shim | Executes SQL against a persistent in-memory database per environment. |
-| `ruby` | Ruby shim | Executes Ruby with scalar O bindings rendered as local values. |
-| `matlab` | Octave or MATLAB shim | Executes MATLAB-compatible source and returns stdout. |
-| `mathematica` | WolframScript shim | Executes Wolfram Language source and returns stdout. |
+| `python` | Rust backend bridge to CPython | Executes Python, preserves explicit environments, converts native values, and supports `O.quote` and `O.eval`. Alias: `py`. |
+| `nix` | Rust backend runner plus Nix CLI | Evaluates Nix expressions and converts JSON results to OValue. |
+| `nix_store` | Rust backend runner plus Nix CLI | Realizes derivations and returns OStorePath. |
+| `nixos_test` | Rust bridge to Nix test-driver adapter | Runs NixOS VM test expressions. |
+| `bash` | Rust backend runner plus Bash | Executes Bash with scalar O bindings exported as environment variables. |
+| `shell` | Rust backend runner plus POSIX `sh` | Executes portable shell source with scalar bindings. |
+| `rust` | Rust backend runner plus `rustc` | Compiles a temporary Rust program, runs it, and returns stdout. |
+| `racket` | Rust backend runner plus Racket | Executes a temporary Racket module and returns stdout. |
+| `cpp` | Rust backend runner plus `g++` | Compiles C++17 source, runs it, and returns stdout. |
+| `csharp` | Rust backend runner plus .NET or Mono | Builds and runs C# with the locally available toolchain. |
+| `haskell` | Rust backend runner plus `runghc` or `ghc` | Interprets or compiles Haskell and returns stdout. |
+| `lisp` | Rust backend runner plus SBCL or CLISP | Executes Common Lisp source. |
+| `common_lisp` | Rust backend runner plus SBCL or CLISP | Executes Common Lisp source. |
+| `sql` | Rust backend runner plus SQLite CLI | Executes SQL against a persistent SQLite database per environment. |
+| `ruby` | Rust backend runner plus Ruby | Executes Ruby with scalar O bindings rendered as local values. |
+| `matlab` | Rust backend runner plus Octave or MATLAB | Executes MATLAB-compatible source and returns stdout. |
+| `mathematica` | Rust backend runner plus WolframScript | Executes Wolfram Language source and returns stdout. |
 | `webassembly` | WABT plus Wasmtime or Wasmer | Compiles WAT when needed and executes the resulting WebAssembly module. |
-| `java` | `javac` and `java` shim | Compiles and runs a Java class. |
-| `javascript` | Node.js shim | Executes JavaScript with O bindings injected as constants. |
-| `ocaml` | OCaml toolchain shim | Interprets or compiles OCaml and returns stdout. |
+| `java` | Rust backend runner plus `javac` and `java` | Compiles and runs a Java class. |
+| `javascript` | Rust backend runner plus Node.js | Executes JavaScript with O bindings injected as constants. |
+| `ocaml` | Rust backend runner plus OCaml toolchain | Interprets or compiles OCaml and returns stdout. |
 
-These are executing shims, not parse-only registrations. A missing target
+These are executing backends, not parse-only registrations. A missing target
 runtime produces an explicit backend error. The default example suite
 exercises Python, Bash, POSIX shell, JavaScript, SQL, HTML, Nix-independent
 orchestration, and the structural backends. Backends requiring optional local
 toolchains are available when those toolchains are installed.
 
-Shim resolution for a language `<lang>` searches:
+Compatibility shim resolution for a language `<lang>` searches:
 
 ```text
 <shim-dir>/<lang>_shim.py
@@ -1233,9 +1235,9 @@ Shim resolution for a language `<lang>` searches:
 <shim-dir>/<lang>
 ```
 
-Adding another hosted language requires a shim that implements `ping`, `exec`,
-and `cleanup`, a backend registry entry describing purity and rendering, and a
-registered parser tag. A language with structural evaluation semantics can
+Adding another hosted language requires a Rust backend adapter that handles
+`exec` and `cleanup`, a backend registry entry describing purity and rendering,
+and a registered parser tag. A language with structural evaluation semantics can
 instead use an inline AST handler like `O` and `quote`.
 
 ---
@@ -1256,7 +1258,7 @@ it enters the REPL automatically.
 
 `--backend-grant NAME=LANG[:RIGHT,...]` may be repeated before the input path
 for compatibility with older sources or embedding experiments. Ordinary backend
-blocks do not need grants; the default evaluator gives shim backends full
+blocks do not need grants; the default evaluator gives hosted backends full
 grantable host authority.
 
 ### `olangc`: hosted AOT, WASI, script, and OIR
@@ -1385,7 +1387,7 @@ Hosted orchestration
     -> ONode parser tree
     -> OIR and ExecutionPlan
     -> Evaluator
-    -> inline handlers or persistent backend shims
+    -> inline handlers or persistent backend processes
     -> OValue
 
 Native computation
@@ -1409,13 +1411,14 @@ Olang/
 │   ├── capability.rs           # live bearer identity generation
 │   ├── ir.rs                   # OIR, ExecutionPlan, backend registry
 │   ├── eval.rs                 # evaluator and rendering semantics
-│   ├── process.rs              # persistent shim IPC
+│   ├── process.rs              # persistent backend IPC
+│   ├── backend.rs              # Rust hosted backend runner
 │   ├── scheduler.rs            # dependency scheduling and caches
 │   ├── nix_ops.rs              # instantiate and realise
 │   ├── nixos_ops.rs            # activation and system references
 │   ├── ocore/                  # native front end, IRs, codegen, capability bridge
 │   └── bin/                    # olangc, ocorec, o-link, o-unlink, notebook
-├── backends/                   # executing hosted-language shims
+├── backends/                   # compatibility hosted-language adapters
 ├── ocore/                      # freestanding runtime and kernel proof
 ├── c_cpp/                      # standalone C17 hosted implementation
 ├── o_lang/                     # Python reference implementation
@@ -1434,19 +1437,19 @@ The hosted evaluator runs five conceptual stages:
 2. Evaluate child expressions before their receiving parent unless a
    structural backend takes control.
 3. Render each child OValue into the parent language's source syntax.
-4. Dispatch the completed source to an inline handler or backend shim.
+4. Dispatch the completed source to an inline handler or Rust backend process.
 5. Cache only values and requests whose runtime-boundary classification
    permits reuse.
 
-Backend shims communicate with the Rust runtime through length-prefixed
+Backend processes communicate with the Rust runtime through length-prefixed
 canonical CBOR frames. The frame body carries the same tagged command/response
 schema:
 
 ```text
-Runtime -> shim: u32be_len || cbor({"cmd":"exec","code":"...","bindings":{...}})
-Shim -> runtime: u32be_len || cbor({"status":"ok","value":{"t":"int","v":42}})
-Shim -> runtime: u32be_len || cbor({"status":"eval_request","src":"...","scope":{...}})
-Runtime -> shim: u32be_len || cbor({"cmd":"eval_result","value":{...}})
+Runtime -> backend: u32be_len || cbor({"cmd":"exec","code":"...","bindings":{...}})
+Backend -> runtime: u32be_len || cbor({"status":"ok","value":{"t":"int","v":42}})
+Backend -> runtime: u32be_len || cbor({"status":"eval_request","src":"...","scope":{...}})
+Runtime -> backend: u32be_len || cbor({"cmd":"eval_result","value":{...}})
 ```
 
 The callback forms are what allow Python's `O.eval` to re-enter the O
@@ -1978,12 +1981,13 @@ features that are already present:
   requests and dry activation. Eval requests and real activation preserve the
   single evaluator thread. Race selects a winner but does not cancel
   already-running loser work.
-- `olangc` bundles the core Python and Nix shims by default. Programs using
-  additional hosted shims should compile with `--shim-dir backends` so those
-  shims are embedded as well.
-- Hosted backend policy still flows through Python audit hooks and
-  `sandbox-exec` on macOS, but the default policy is intentionally permissive:
-  O-lang gives shim code the host access available to the current process.
+- `olangc` bundles the core compatibility adapters by default. Rust-native
+  backends do not need adjacent shim files; programs using compatibility
+  adapters outside the bundled set can compile with `--shim-dir backends`.
+- Hosted backend policy is intentionally permissive by default: O-lang gives
+  backend code the host access available to the current process. Restricted
+  policies still route through `sandbox-exec` on macOS, and the direct legacy
+  Python bridge remains covered by audit-hook tests.
 - Reproducibility is currently asserted for O-core assembly and ELF relocatable
   objects under the same compiler, assembler, and target contract. Hosted
   `olangc` executables are not claimed byte-identical across different host
