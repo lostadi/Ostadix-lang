@@ -38,7 +38,10 @@ use crate::nixos_ops;
 use crate::parser::{ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind, SeqKind};
+use crate::value::{
+    BackendAuthority, CapabilityKind, DecimalSpecial, FloatFormat, FloatSpecial, GroupMode,
+    ONumber, OValue, RequestKind, SeqKind,
+};
 
 /// How to resolve group members that might be cached Request values.
 ///
@@ -2580,7 +2583,7 @@ fn render_python(val: &OValue) -> String {
                 format!("{}.0", s)
             }
         }
-        OValue::Number { .. } => render_python_opaque(val),
+        OValue::Number { v } => render_python_number(v),
 
         OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "''".to_string()),
         OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "''".to_string()),
@@ -2725,6 +2728,96 @@ fn render_python_opaque(val: &OValue) -> String {
     let wire = serde_json::to_string(val).expect("OValue must serialize for Python rendering");
     let encoded = serde_json::to_string(&wire).expect("OValue JSON string must serialize");
     format!("OOpaqueValue.from_wire_json({encoded})")
+}
+
+fn render_python_number(value: &ONumber) -> String {
+    match value {
+        ONumber::Int { v } => v.to_string(),
+        ONumber::Rational { num, den } => {
+            format!("__import__('fractions').Fraction({}, {})", num, den)
+        }
+        ONumber::Decimal {
+            coeff,
+            exp10,
+            special,
+        } => {
+            let literal = match special {
+                Some(DecimalSpecial::Nan) => "NaN".to_string(),
+                Some(DecimalSpecial::PosInf) => "Infinity".to_string(),
+                Some(DecimalSpecial::NegInf) => "-Infinity".to_string(),
+                Some(DecimalSpecial::PosZero) => "0".to_string(),
+                Some(DecimalSpecial::NegZero) => "-0".to_string(),
+                None => format!("{coeff}e{exp10}"),
+            };
+            format!(
+                "__import__('decimal').Decimal({})",
+                py_string_literal(&literal)
+            )
+        }
+        ONumber::BinaryFloat {
+            format: FloatFormat::F32,
+            bits,
+        } => {
+            let bytes = bits
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("__import__('struct').unpack('>f', bytes([{bytes}]))[0]")
+        }
+        ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits,
+        } => {
+            let bytes = bits
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("__import__('struct').unpack('>d', bytes([{bytes}]))[0]")
+        }
+        ONumber::BigFloat {
+            mantissa,
+            exp2,
+            precision: _,
+            special,
+        } => {
+            if let Some(special) = special {
+                let literal = match special {
+                    FloatSpecial::Nan => "NaN",
+                    FloatSpecial::PosInf => "Infinity",
+                    FloatSpecial::NegInf => "-Infinity",
+                    FloatSpecial::PosZero => "0",
+                    FloatSpecial::NegZero => "-0",
+                };
+                return format!(
+                    "__import__('decimal').Decimal({})",
+                    py_string_literal(literal)
+                );
+            }
+
+            let mantissa_expr = format!(
+                "__import__('decimal').Decimal({})",
+                py_string_literal(&mantissa.to_string())
+            );
+            if *exp2 == 0 {
+                mantissa_expr
+            } else {
+                format!("({mantissa_expr} * (__import__('decimal').Decimal(2) ** {exp2}))")
+            }
+        }
+        ONumber::Complex { re, im } => {
+            format!(
+                "complex({}, {})",
+                render_python_number(re),
+                render_python_number(im)
+            )
+        }
+    }
+}
+
+fn py_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "''".to_string())
 }
 
 // ── HTML ─────────────────────────────────────────────────────────────────────
@@ -3326,6 +3419,55 @@ mod tests {
         };
 
         assert_eq!(evaluator.eval_node(&block, &scope).unwrap(), capability);
+    }
+
+    #[test]
+    fn nested_python_number_result_splices_as_host_expression() {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let source = "python[0]^(python[1]^(2 ** 100)_python[1] + 1)_python[0]";
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+
+        let result = evaluator.eval_document(nodes).unwrap();
+
+        match result {
+            OValue::Number {
+                v: ONumber::Int { v },
+            } => {
+                let expected = (num_bigint::BigInt::from(1_u8) << 100_u32) + 1_u8;
+                assert_eq!(v, expected);
+            }
+            other => panic!("expected spliced big integer number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bash_stdout_scalar_decodes_to_ovalue() {
+        if which::which("bash").is_err() {
+            return;
+        }
+
+        let backends: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let nodes = Parser::new("bash^(printf 42)_bash", &backends)
+            .parse()
+            .unwrap();
+
+        assert_eq!(evaluator.eval_document(nodes).unwrap(), OValue::int(42));
+    }
+
+    #[test]
+    fn sql_single_cell_result_decodes_to_ovalue() {
+        let backends: HashSet<String> = ["sql"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let nodes = Parser::new("sql^(SELECT 40 + 2 AS answer;)_sql", &backends)
+            .parse()
+            .unwrap();
+
+        assert_eq!(evaluator.eval_document(nodes).unwrap(), OValue::int(42));
     }
 
     // ── render_child: HTML ────────────────────────────────────────────────────
@@ -5005,6 +5147,33 @@ python[0]^(O.eval($q))_python[0]
             !scope.contains_key("callback_only"),
             "O.eval bindings must not mutate the caller's lexical scope"
         );
+    }
+
+    #[test]
+    fn o_eval_number_result_rehydrates_as_host_expression() {
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let source = r#"
+let q = quote^(python[1]^(2 ** 100)_python[1])_quote
+python[0]^(O.eval($q) + 1)_python[0]
+"#;
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+
+        let result = evaluator.eval_document(nodes).unwrap();
+
+        match result {
+            OValue::Number {
+                v: ONumber::Int { v },
+            } => {
+                let expected = (num_bigint::BigInt::from(1_u8) << 100_u32) + 1_u8;
+                assert_eq!(v, expected);
+            }
+            other => panic!("expected O.eval big integer number, got {other:?}"),
+        }
     }
 
     /// The explicit two-argument form evaluates against the supplied OScope,

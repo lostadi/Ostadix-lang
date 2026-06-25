@@ -4,8 +4,8 @@ set -euo pipefail
 echo "=== O-lang setup for TinyCore ==="
 echo "TinyCore is minimal. Ensure you have a persistent tce directory mounted."
 echo "Installing packages (may need to run as tc user or with sudo if configured):"
-tce-load -wi gcc make python3.12 curl git 2>/dev/null || {
-  echo "Please run manually: tce-load -wi gcc make python3.12 curl git"
+tce-load -wi gcc make python3.12 sqlite3 curl git 2>/dev/null || {
+  echo "Please run manually: tce-load -wi gcc make python3.12 sqlite3 curl git"
   echo "For full: also install any needed for your extensions."
 }
 if ! command -v cargo >/dev/null 2>&1; then

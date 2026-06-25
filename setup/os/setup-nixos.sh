@@ -6,13 +6,13 @@ echo "NixOS is declarative. Add to your configuration.nix or use nix-env tempora
 echo "Recommended in configuration.nix:"
 cat <<NIX
   environment.systemPackages = with pkgs; [
-    rustup gcc gnumake python3
+    rustup gcc gnumake python3 sqlite
     # optional
     # nix  (already there)
   ];
 NIX
 if command -v nix-env >/dev/null 2>&1; then
-  nix-env -iA nixpkgs.rustup nixpkgs.gcc nixpkgs.gnumake nixpkgs.python3 || true
+  nix-env -iA nixpkgs.rustup nixpkgs.gcc nixpkgs.gnumake nixpkgs.python3 nixpkgs.sqlite || true
 fi
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

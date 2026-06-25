@@ -3,39 +3,17 @@ import sys
 import json
 import subprocess
 import traceback
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from o_shim_common import read_wire_message, write_wire_message
+from o_shim_common import json_value_to_oval
 
-def py_json_to_oval(x):
-    if x is None:
-        return {"t": "null"}
-
-    if isinstance(x, bool):
-        return {"t": "bool", "v": x}
-
-    if isinstance(x, int):
-        return {"t": "int", "v": x}
-
-    if isinstance(x, float):
-        return {"t": "float", "v": x}
-
-    if isinstance(x, str):
-        return {"t": "str", "v": x}
-
-    if isinstance(x, list):
-        return {"t": "list", "v": [py_json_to_oval(i) for i in x]}
-
-    if isinstance(x, dict):
-        return {
-            "t": "map",
-            "v": {str(k): py_json_to_oval(v) for k, v in x.items()}
-        }
-
-    return {"t": "str", "v": str(x)}
 
 def send_ok(value):
-    print(json.dumps({"status": "ok", "value": value}), flush=True)
+    write_wire_message({"status": "ok", "value": value})
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    write_wire_message({"status": "err", "message": message})
 
 def eval_nix_expr(code):
     cmd = [
@@ -71,7 +49,7 @@ def handle_exec(cmd):
 
     try:
         result = eval_nix_expr(code)
-        send_ok(py_json_to_oval(result))
+        send_ok(json_value_to_oval(result))
     except Exception:
         send_err(traceback.format_exc())
 
@@ -81,9 +59,11 @@ def handle_ping():
 def handle_cleanup():
     send_ok({"t": "null"})
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message()
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

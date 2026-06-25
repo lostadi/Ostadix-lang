@@ -29,8 +29,8 @@ INSTALL_WRAPPERS=true
 DRY_RUN=false
 
 RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
-RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink)
-WRAPPER_TARGETS=(O o olangc o-c olangc-c)
+RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink o-notebook)
+WRAPPER_TARGETS=(O o olangc o-c olangc-c o-notebook)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
 # --- Arg parsing ---
@@ -40,7 +40,7 @@ O-lang setup script
 
 Options:
   -h, --help           Show this help
-  -m, --minimal        Minimal setup (skip optional nix, matplotlib, extra shims)
+  -m, --minimal        Minimal setup (skip optional Nix, matplotlib, extra backend tools)
   -f, --full           Full setup (install racket, etc. for all backends)
   -y, --yes            Non-interactive (assume yes for prompts)
   -v, --verify         After build, run verification on key examples (hello, meta, etc.)
@@ -71,6 +71,10 @@ done
 if $MINIMAL && $FULL; then
   echo "Error: --minimal and --full are mutually exclusive"
   exit 1
+fi
+
+if $FULL; then
+  RUST_BIN_TARGETS+=(o-notebook)
 fi
 
 echo "=== O-lang cross-platform setup ==="
@@ -154,6 +158,21 @@ remove_managed_file() {
   fi
 }
 
+directory_is_case_insensitive() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local lower="$dir/.olang_case_probe_$$"
+  local upper="$dir/.OLANG_CASE_PROBE_$$"
+  rm -f "$lower" "$upper"
+  : > "$lower"
+  local insensitive=false
+  if [[ -e "$upper" ]]; then
+    insensitive=true
+  fi
+  rm -f "$lower" "$upper"
+  $insensitive
+}
+
 clean_rust_release_binaries() {
   echo ">>> Removing stale Rust release binaries..."
   for bin in "${RUST_STALE_BINARIES[@]}"; do
@@ -172,7 +191,7 @@ refresh_cargo_bin_binaries() {
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
-    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O"
+    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O if filesystem is case-sensitive"
     return
   fi
 
@@ -190,14 +209,22 @@ refresh_cargo_bin_binaries() {
     cp "$src" "$dst"
     chmod +x "$dst"
   done
-  cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
-  chmod +x "$CARGO_BIN_DIR/o"
+  if directory_is_case_insensitive "$CARGO_BIN_DIR"; then
+    echo "  $CARGO_BIN_DIR is case-insensitive; O also satisfies lowercase o."
+  else
+    cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
+    chmod +x "$CARGO_BIN_DIR/o"
+  fi
 }
 
 create_rust_alias_binaries() {
   echo ">>> Recreating Rust alias binaries..."
   if $DRY_RUN; then
-    echo "[DRY] replace $PROJECT_ROOT/target/release/o from $PROJECT_ROOT/target/release/O"
+    echo "[DRY] replace $PROJECT_ROOT/target/release/o from $PROJECT_ROOT/target/release/O if filesystem is case-sensitive"
+    return
+  fi
+  if directory_is_case_insensitive "$PROJECT_ROOT/target/release"; then
+    echo "  target/release is case-insensitive; O also satisfies lowercase o."
     return
   fi
   cp "$PROJECT_ROOT/target/release/O" "$PROJECT_ROOT/target/release/o"
@@ -207,7 +234,7 @@ create_rust_alias_binaries() {
 # --- Install system dependencies (extended) ---
 install_system_deps() {
   echo ">>> Installing system dependencies..."
-  if $DRY_RUN; then echo "[DRY] Would install packages for $DISTRO"; return; fi
+  if $DRY_RUN; then echo "[DRY] Would install packages for platform=$PLATFORM distro=$DISTRO"; return; fi
 
   case "$PLATFORM" in
     macos)
@@ -217,7 +244,7 @@ install_system_deps() {
         exit 1
       fi
       brew update
-      brew install --quiet gcc make python@3.12 curl git pkg-config openssl 2>/dev/null || true
+      brew install --quiet gcc make python@3.12 curl git pkg-config openssl sqlite 2>/dev/null || true
       xcode-select --install 2>/dev/null || true
       if $FULL; then
         brew install --quiet racket 2>/dev/null || true
@@ -228,64 +255,64 @@ install_system_deps() {
       case "$DISTRO" in
         debian)
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential gcc g++ make python3 python3-pip python3-venv curl git pkg-config libssl-dev
+          sudo apt-get install -y -qq build-essential gcc g++ make python3 python3-pip python3-venv curl git pkg-config libssl-dev sqlite3
           if $FULL; then sudo apt-get install -y -qq racket || true; fi
           ;;
 
         arch)
           sudo pacman -Syu --noconfirm
-          sudo pacman -S --noconfirm --needed base-devel gcc make python python-pip curl git pkgconf openssl
+          sudo pacman -S --noconfirm --needed base-devel gcc make python python-pip curl git pkgconf openssl sqlite
           if $FULL; then sudo pacman -S --noconfirm --needed racket 2>/dev/null || true; fi
           ;;
 
         fedora)
           sudo dnf groupinstall -y "Development Tools" || true
-          sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig
+          sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig sqlite
           if $FULL; then sudo dnf install -y racket 2>/dev/null || true; fi
           ;;
 
         gentoo)
           echo "Gentoo: emerging packages..."
-          sudo emerge --quiet --ask=n sys-devel/gcc sys-devel/make dev-lang/python net-misc/curl dev-vcs/git dev-libs/openssl || true
+          sudo emerge --quiet --ask=n sys-devel/gcc sys-devel/make dev-lang/python net-misc/curl dev-vcs/git dev-libs/openssl dev-db/sqlite || true
           if $FULL; then sudo emerge --quiet --ask=n dev-scheme/racket || true; fi
           ;;
 
         nixos)
           echo "NixOS: recommend managing via nixos-rebuild or home-manager."
-          echo "  Example: environment.systemPackages = with pkgs; [ rustup gcc gnumake python3 racket nix ];"
+          echo "  Example: environment.systemPackages = with pkgs; [ rustup gcc gnumake python3 sqlite racket nix ];"
           if has_cmd nix; then
-            nix-env -iA nixpkgs.rustup nixpkgs.gcc nixpkgs.gnumake nixpkgs.python3 2>/dev/null || true
+            nix-env -iA nixpkgs.rustup nixpkgs.gcc nixpkgs.gnumake nixpkgs.python3 nixpkgs.sqlite 2>/dev/null || true
             if $FULL; then nix-env -iA nixpkgs.racket 2>/dev/null || true; fi
           fi
           ;;
 
         tinycore)
           echo "TinyCore: minimal - run manually if needed:"
-          echo "  tce-load -wi gcc make python3.12 curl git"
+          echo "  tce-load -wi gcc make python3.12 sqlite3 curl git"
           if $FULL; then echo "  tce-load -wi racket (if available)"; fi
-          tce-load -wi gcc make python3.12 curl git 2>/dev/null || true
+          tce-load -wi gcc make python3.12 sqlite3 curl git 2>/dev/null || true
           ;;
 
         alpine)
           sudo apk update
-          sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf
+          sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf sqlite
           if $FULL; then sudo apk add racket 2>/dev/null || true; fi
           ;;
 
         opensuse)
           sudo zypper refresh
-          sudo zypper install -y -l gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config
+          sudo zypper install -y -l gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config sqlite3
           if $FULL; then sudo zypper install -y racket 2>/dev/null || true; fi
           ;;
 
         void)
           sudo xbps-install -Suy
-          sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config
+          sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config sqlite
           if $FULL; then sudo xbps-install -y racket 2>/dev/null || true; fi
           ;;
 
         *)
-          echo "Unknown Linux distro ($DISTRO_ID). Please manually install core build tools + python3 + curl."
+          echo "Unknown Linux distro ($DISTRO_ID). Please manually install core build tools + python3 + sqlite3 + curl."
           ;;
       esac
       ;;
@@ -293,10 +320,10 @@ install_system_deps() {
     bsd)
       echo "BSD ($DISTRO) detected."
       if has_cmd pkg; then
-        sudo pkg install -y gmake gcc python3 curl git
+        sudo pkg install -y gmake gcc python3 sqlite3 curl git
         if $FULL; then sudo pkg install -y racket 2>/dev/null || true; fi
       elif has_cmd pkg_add; then
-        sudo pkg_add gmake gcc python curl git
+        sudo pkg_add gmake gcc python sqlite3 curl git
       fi
       ;;
 
@@ -307,6 +334,7 @@ install_system_deps() {
         winget install --id Git.Git -e --silent || true
         winget install --id Python.Python.3.12 -e --silent || true
         winget install --id Rustlang.Rustup -e --silent || true
+        winget install --id SQLite.SQLite -e --silent || true
         winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools" || true
         if $FULL; then
           winget install --id Racket.Racket -e --silent || true
@@ -316,7 +344,7 @@ install_system_deps() {
       ;;
 
     *)
-      echo "Unsupported platform. Install gcc/clang + make + python3 + curl + git manually."
+      echo "Unsupported platform. Install gcc/clang + make + python3 + sqlite3 + curl + git manually."
       ;;
   esac
 }
@@ -339,6 +367,10 @@ install_rust() {
 }
 
 install_nix() {
+  if $DRY_RUN; then
+    echo "[DRY] Would optionally ensure Nix unless --minimal is set"
+    return
+  fi
   if has_cmd nix; then
     echo "Nix already present."
     return
@@ -349,6 +381,7 @@ install_nix() {
   fi
   echo ">>> Optional: Nix for nix*/nixos_test examples"
   if ! $YES; then
+    local reply=""
     read -r -p "Install Nix now? [y/N] " reply || true
     [[ "$reply" =~ ^[Yy]$ ]] || return
   fi
@@ -361,6 +394,9 @@ build_rust() {
   echo ">>> Building Rust edition (--release)..."
   clean_rust_release_binaries
   local cargo_args=(build --release)
+  if $FULL; then
+    cargo_args+=(--features notebook)
+  fi
   for bin in "${RUST_BIN_TARGETS[@]}"; do
     cargo_args+=(--bin "$bin")
   done
@@ -385,9 +421,9 @@ build_c() {
 }
 
 setup_python() {
-  echo ">>> Setting up Python shims / edition..."
+  echo ">>> Setting up Python compatibility bridge / edition..."
   if $DRY_RUN; then
-    echo "[DRY] Would install Python shim dependencies and editable Python package"
+    echo "[DRY] Would install Python compatibility dependencies and editable Python package"
     return
   fi
   if has_cmd python3; then
@@ -399,9 +435,6 @@ setup_python() {
     if [[ -f o_lang/__init__.py ]]; then
       python3 -m pip install --user -e . 2>/dev/null || true
     fi
-  fi
-  if $FULL && has_cmd pip3; then
-    pip3 install --user racket 2>/dev/null || true   # no, racket is system
   fi
 }
 
@@ -431,7 +464,11 @@ create_wrappers() {
     echo "[DRY] mkdir -p $BIN_DIR"
     for wrapper in "${WRAPPER_TARGETS[@]}"; do
       remove_managed_file "$BIN_DIR/$wrapper"
-      echo "[DRY] recreate wrapper $BIN_DIR/$wrapper"
+      if [[ "$wrapper" == "o-notebook" ]]; then
+        echo "[DRY] recreate wrapper $BIN_DIR/$wrapper if target/release/o-notebook is built"
+      else
+        echo "[DRY] recreate wrapper $BIN_DIR/$wrapper"
+      fi
     done
     return
   fi
@@ -458,6 +495,15 @@ exec "$PROJECT_ROOT/target/release/olangc" "\$@"
 WRAP
   chmod +x "$BIN_DIR/olangc"
 
+  if [[ -x "$PROJECT_ROOT/target/release/o-notebook" ]]; then
+    cat > "$BIN_DIR/o-notebook" <<WRAP
+#!/usr/bin/env bash
+export O_BACKENDS_DIR="\${O_BACKENDS_DIR:-$PROJECT_ROOT/backends}"
+exec "$PROJECT_ROOT/target/release/o-notebook" "\$@"
+WRAP
+    chmod +x "$BIN_DIR/o-notebook"
+  fi
+
   # C edition (often lighter)
   cat > "$BIN_DIR/o-c" <<WRAP
 #!/usr/bin/env bash
@@ -479,26 +525,64 @@ WRAP
 
 verify_runnable() {
   if ! $VERIFY; then return; fi
+  if $DRY_RUN; then
+    echo "[DRY] Would verify Rust, Rust-native backends, C, AOT, and Python runnable forms"
+    return
+  fi
   echo
   echo ">>> Verifying runnable forms (this may take a moment)..."
   local ok=0 fail=0
+  local missing_shims="/tmp/o-no-such-backends-setup-$$"
+  local verify_bin="/tmp/verify-o-rust-$$"
+  rm -rf "$missing_shims"
+  rm -f "$verify_bin"
 
-  echo -n "Rust (cargo): "
-  if cargo run --quiet -- examples/hello.O 2>/dev/null | grep -qE "(2|Int)"; then echo "OK"; ((ok++)); else echo "FAIL"; ((fail++)); fi
+  echo -n "Rust release interpreter: "
+  if target/release/O examples/hello.O 2>/dev/null | grep -qE "(2|Int)"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Installed O on PATH: "
+  if has_cmd O && "$(command -v O)" examples/bindings.O 2>/dev/null | grep -q "43"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Standalone O binary: "
+  local standalone_bin
+  standalone_bin="$(mktemp "${TMPDIR:-/tmp}/o-standalone-verify.XXXXXX")"
+  rm -f "$standalone_bin"
+  if cp target/release/O "$standalone_bin" && chmod +x "$standalone_bin" && (cd /tmp && "$standalone_bin" "$PROJECT_ROOT/examples/bindings.O" 2>/dev/null) | grep -q "43"; then
+    echo "OK"
+    ((ok+=1))
+  else
+    echo "FAIL"
+    ((fail+=1))
+  fi
+  rm -f "$standalone_bin" 2>/dev/null || true
+
+  echo -n "Rust-native Bash without shim dir: "
+  if target/release/O examples/bash_hello.O "$missing_shims" 2>/dev/null | grep -q "hello from bash"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Rust-native SQL without shim dir: "
+  if target/release/O examples/sql_select.O "$missing_shims" 2>/dev/null | grep -q "2"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Rust AOT (olangc): "
+  if target/release/olangc examples/bash_hello.O -o "$verify_bin" >/dev/null 2>&1 && (cd /tmp && "$verify_bin" 2>/dev/null) | grep -q "hello from bash"; then
+    echo "OK"; ((ok+=1))
+  else
+    echo "FAIL"; ((fail+=1))
+  fi
+  rm -f "$verify_bin" 2>/dev/null || true
 
   echo -n "C interp: "
-  if ./c_cpp/O examples/hello.O ./backends 2>/dev/null | grep -q "2"; then echo "OK"; ((ok++)); else echo "FAIL"; ((fail++)); fi
+  if [[ -x ./c_cpp/O ]] && ./c_cpp/O examples/hello.O ./backends 2>/dev/null | grep -q "2"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
 
-  echo -n "AOT (olangc): "
-  if ./c_cpp/olangc examples/trailing_expr.O -o /tmp/verify-o 2>&1 | tail -1 >/dev/null && /tmp/verify-o 2>/dev/null | grep -q "42"; then
-    echo "OK"; ((ok++))
+  echo -n "C AOT (olangc): "
+  if [[ -x ./c_cpp/olangc ]] && ./c_cpp/olangc examples/trailing_expr.O -o "$verify_bin" 2>&1 | tail -1 >/dev/null && "$verify_bin" 2>/dev/null | grep -q "42"; then
+    echo "OK"; ((ok+=1))
   else
-    echo "FAIL"; ((fail++))
+    echo "FAIL"; ((fail+=1))
   fi
-  rm -f /tmp/verify-o 2>/dev/null || true
+  rm -f "$verify_bin" 2>/dev/null || true
 
   echo -n "Python: "
-  if python3 -m o_lang examples/hello.O 2>/dev/null | grep -q "2"; then echo "OK"; ((ok++)); else echo "FAIL"; ((fail++)); fi
+  if python3 -m o_lang examples/hello.O 2>/dev/null | grep -q "2"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
 
   echo "Verification: $ok passed, $fail failed."
   if [[ $fail -gt 0 ]]; then

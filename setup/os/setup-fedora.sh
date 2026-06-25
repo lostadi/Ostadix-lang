@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for Fedora-based ==="
 sudo dnf groupinstall -y "Development Tools" || true
-sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig
+sudo dnf install -y gcc gcc-c++ make python3 python3-pip curl git openssl-devel pkgconfig sqlite
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"

@@ -8,6 +8,7 @@
 // without suppression attributes.
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub mod backend;
 mod capability;
 pub mod eval;
 pub mod ir;
@@ -17,4 +18,6 @@ pub mod ocore;
 pub mod parser;
 pub mod process;
 pub mod scheduler;
+pub mod shims;
 pub mod value;
+pub(crate) mod wire;

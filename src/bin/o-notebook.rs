@@ -167,6 +167,10 @@ async fn reset(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if o_lang::backend::run_backend_from_env_args()? {
+        return Ok(());
+    }
+
     let shim_dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)

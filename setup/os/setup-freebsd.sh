@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for FreeBSD ==="
 sudo pkg update
-sudo pkg install -y gmake gcc python3 curl git
+sudo pkg install -y gmake gcc python3 sqlite3 curl git
 # Note: may need pkg install rust if binary, but use rustup for latest
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

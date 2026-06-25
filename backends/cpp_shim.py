@@ -9,14 +9,18 @@ import subprocess
 import tempfile
 import os
 import traceback
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from o_shim_common import read_wire_message, write_wire_message
+from o_shim_common import stdout_result
 
 
 def send_ok(value):
-    print(json.dumps({"status": "ok", "value": value}), flush=True)
+    write_wire_message({"status": "ok", "value": value})
 
 
 def send_err(message):
-    print(json.dumps({"status": "err", "message": message}), flush=True)
+    write_wire_message({"status": "err", "message": message})
 
 
 def handle_exec(cmd):
@@ -49,10 +53,7 @@ def handle_exec(cmd):
                 stderr = result.stderr.strip()
                 send_err(f"C++ program exited with code {result.returncode}\n{stderr}")
             else:
-                output = result.stdout
-                if output.endswith("\n"):
-                    output = output[:-1]
-                send_ok({"t": "str", "v": output})
+                send_ok(stdout_result(result.stdout))
 
     except subprocess.TimeoutExpired:
         send_err("C++ compilation or execution timed out")
@@ -62,9 +63,11 @@ def handle_exec(cmd):
         send_err(traceback.format_exc())
 
 
-for line in sys.stdin:
+while True:
     try:
-        cmd = json.loads(line)
+        cmd = read_wire_message()
+        if cmd is None:
+            break
         tag = cmd.get("cmd")
 
         if tag == "exec":

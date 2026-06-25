@@ -14,15 +14,16 @@
 //
 // Target A ("binary"):
 //   1. Reads the .O source file.
-//   2. Resolves backend shim scripts: starts from shims that are bundled into
-//      olangc itself at olangc's compile time (so olangc works from any cwd
-//      with no adjacent backends/ directory), then optionally overlays files
-//      from --shim-dir if the user passed one.
+//   2. Resolves compatibility backend adapters: starts from adapters that are
+//      bundled into olangc itself at olangc's compile time (so olangc works
+//      from any cwd with no adjacent backends/ directory), then optionally
+//      overlays files from --shim-dir if the user passed one. Rust-native
+//      backends do not need shim files.
 //   3. Creates a temporary Cargo project that bundles:
 //        - All O-lang runtime source files (embedded in olangc at its own
 //          compile time via include_str!, so olangc is self-contained).
 //        - The .O source file (copied as "program.O" in the generated src/).
-//        - All shim scripts (copied into src/shims/).
+//        - Compatibility adapter scripts (copied into src/shims/).
 //        - A generated main.rs that references them via include_str!/include_bytes!.
 //        - A Cargo.toml mirroring the runtime's dependencies.
 //        - The workspace Cargo.lock so dependency resolution is instant and
@@ -32,8 +33,8 @@
 //
 //   The output binary is fully self-contained at the Rust level: it has no
 //   dependency on the .O source file, the backends/ directory, or the olangc
-//   tool itself.  At runtime it still needs the language runtimes that the .O
-//   program uses — Python for python^ blocks, Nix for nix^ blocks, etc.
+//   tool itself. At runtime it still needs the language runtimes that the .O
+//   program uses: Python for python^ blocks, Nix for nix^ blocks, etc.
 //
 // Target B ("wasm"):
 //   Generates the same hosted runtime project for wasm32-wasip1.
@@ -60,6 +61,7 @@ use std::process::Command;
 use o_lang::eval::Evaluator;
 use o_lang::ir::OIrProgram;
 use o_lang::parser::Parser;
+use o_lang::shims::read_shims;
 use o_lang::value::OValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,42 +79,15 @@ const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
+const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
 const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
+const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
 const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bundled backend shim scripts — embedded at olangc's own compile time.
-//
-// olangc is the single source of truth for shim contents: every compiled .O
-// binary gets these scripts extracted to its per-invocation temp directory
-// at runtime.  Bundling the shims into olangc itself (rather than re-reading
-// them from a `backends/` directory next to the cwd at every invocation) is
-// what makes `olangc foo.O` work from any directory, including one with no
-// adjacent `backends/`.
-//
-// To replace a shim during development, pass `--shim-dir <path>`; any file
-// in that directory whose name matches a bundled shim overrides it, and any
-// file with a new name is appended to the embedded set.
-const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
-    ("nix_shim.py", include_bytes!("../../backends/nix_shim.py")),
-    (
-        "nix_store_shim.py",
-        include_bytes!("../../backends/nix_store_shim.py"),
-    ),
-    (
-        "nixos_test_shim.py",
-        include_bytes!("../../backends/nixos_test_shim.py"),
-    ),
-    (
-        "python_shim.py",
-        include_bytes!("../../backends/python_shim.py"),
-    ),
-];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -142,7 +117,7 @@ enum CompileTarget {
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default), \
 a wasm32-wasip1 module (--target wasm), or executes executable OIR in-process \
-(--target script). Binary outputs embed the program source, backend shims, and \
+(--target script). Binary outputs embed the program source, compatibility adapters, and \
 the O-lang runtime. In ir mode the same OIR and ExecutionPlan used at runtime \
 are printed without execution."
 )]
@@ -159,10 +134,10 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Override or extend the bundled backend shim scripts with files from
-    /// this directory.  Files with names matching a bundled shim replace it;
-    /// files with new names are added.  If omitted, olangc uses only its
-    /// built-in shims, so it works from any working directory.
+    /// Override or extend the bundled compatibility adapters with files from
+    /// this directory. Files with names matching a bundled adapter replace it;
+    /// files with new names are added. If omitted, olangc uses only its
+    /// built-in adapters, so it works from any working directory.
     #[arg(long)]
     shim_dir: Option<PathBuf>,
 
@@ -172,7 +147,7 @@ struct Cli {
     keep_build_dir: bool,
 
     /// Compatibility hook: mint a live backend capability at startup and bind
-    /// it in O scope. Normal shim backends already have default host authority.
+    /// it in O scope. Normal hosted backends already have default host authority.
     /// Format: NAME=LANG[:fs_read,fs_write,network,process].
     #[arg(long = "backend-grant")]
     backend_grants: Vec<String>,
@@ -183,6 +158,10 @@ struct Cli {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    if o_lang::backend::run_backend_from_env_args()? {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     let source = fs::read_to_string(&cli.input)
@@ -265,9 +244,11 @@ fn compile_to_binary(
     fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
+    fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
     fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
+    fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
 
     // ── Program source ───────────────────────────────────────────────────────
     // Always stored as "program.O" so the generated main.rs can reference it
@@ -361,8 +342,8 @@ fn run_as_script(
     backend_grants: &[String],
 ) -> Result<()> {
     // ── Extract shims to a temp directory ────────────────────────────────────
-    // Script mode still needs shim scripts on disk because the evaluator
-    // spawns them as subprocesses (e.g. python_shim.py for python^ blocks).
+    // Script mode extracts compatibility adapters for backends that still need
+    // them, while Rust-native backends run through the current executable.
     let shims = read_shims(override_shim_dir)?;
     let shim_dir = std::env::temp_dir().join(format!("o_shims_{}", std::process::id()));
     fs::create_dir_all(&shim_dir)?;
@@ -524,6 +505,7 @@ fn generate_lib_rs() -> String {
 
 pub mod value;
 mod capability;
+pub mod backend;
 pub mod parser;
 pub mod ir;
 pub mod eval;
@@ -531,6 +513,7 @@ pub mod process;
 pub mod nix_ops;
 pub mod nixos_ops;
 pub mod scheduler;
+pub(crate) mod wire;
 "
     .to_string()
 }
@@ -541,6 +524,7 @@ fn generate_main_rs(
     shim_include_lines: &[String],
     backend_grants: &[String],
 ) -> String {
+    let lib_name = bin_name.replace('-', "_");
     let shim_entries = if shim_include_lines.is_empty() {
         "    // no shims bundled".to_string()
     } else {
@@ -559,9 +543,9 @@ fn generate_main_rs(
     format!(
         r###"// AUTO-GENERATED by olangc. DO NOT EDIT.
 
-use {bin_name}::eval::Evaluator;
-use {bin_name}::parser::Parser;
-use {bin_name}::value::OValue;
+use {lib_name}::eval::Evaluator;
+use {lib_name}::parser::Parser;
+use {lib_name}::value::OValue;
 use std::collections::HashSet;
 
 /// The compiled .O program source, embedded at compile time.
@@ -589,6 +573,10 @@ impl Drop for ShimGuard {{
 
 fn main() -> anyhow::Result<()> {{
     use anyhow::Context as _;
+
+    if {lib_name}::backend::run_backend_from_env_args()? {{
+        return Ok(());
+    }}
 
     #[cfg(not(target_family = "wasm"))]
     let shim_dir = {{
@@ -661,7 +649,7 @@ fn main() -> anyhow::Result<()> {{
     Ok(())
 }}
 "###,
-        bin_name = bin_name,
+        lib_name = lib_name,
         program_filename = program_filename,
         shim_entries = shim_entries,
         backend_grants = backend_grants,
@@ -695,6 +683,8 @@ which      = "6"
 semver     = {{ version = "1", features = ["serde"] }}
 sha2       = "0.10"
 hex        = "0.4"
+num-bigint = {{ version = "0.4", features = ["serde"] }}
+num-traits = "0.2"
 getrandom  = "0.4.3"
 thiserror  = "2"
 anyhow     = "1"
@@ -715,51 +705,6 @@ strip         = "symbols"
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolve the shim set used for a compilation.
-///
-/// Always starts from `BUNDLED_SHIMS` (embedded into olangc at its own
-/// compile time).  If `override_dir` is `Some(path)`, every file in that
-/// directory is read and overlaid on top: a file with the same name as a
-/// bundled shim replaces it; a file with a new name is appended.  Result is
-/// sorted by name (via the BTreeMap).
-///
-/// A missing `override_dir` is an error rather than a silent empty fallback,
-/// because silent fallback is exactly what produced the prior bug where
-/// `olangc foo.O` from a directory without an adjacent `backends/` emitted
-/// a binary with zero shims that died at runtime with a cryptic
-/// `python_shim.py: No such file or directory`.
-fn read_shims(override_dir: Option<&Path>) -> Result<Vec<(String, Vec<u8>)>> {
-    use std::collections::BTreeMap;
-
-    let mut by_name: BTreeMap<String, Vec<u8>> = BUNDLED_SHIMS
-        .iter()
-        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
-        .collect();
-
-    if let Some(dir) = override_dir {
-        if !dir.exists() {
-            bail!(
-                "shim directory '{}' does not exist (omit --shim-dir to use bundled shims)",
-                dir.display()
-            );
-        }
-        for entry in fs::read_dir(dir)
-            .with_context(|| format!("failed to read shim directory: {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                let content = fs::read(&path)
-                    .with_context(|| format!("failed to read shim: {}", path.display()))?;
-                by_name.insert(name, content);
-            }
-        }
-    }
-
-    Ok(by_name.into_iter().collect())
-}
 
 /// Create a fresh temporary build directory with a unique name.
 fn create_build_dir() -> Result<PathBuf> {

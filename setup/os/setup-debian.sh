@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for Debian-based ==="
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential gcc g++ make python3 python3-pip python3-venv curl git pkg-config libssl-dev
+sudo apt-get install -y -qq build-essential gcc g++ make python3 python3-pip python3-venv curl git pkg-config libssl-dev sqlite3
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"
