@@ -44,6 +44,7 @@ impl BackendSandboxPolicy {
         Self::new([])
     }
 
+    #[allow(dead_code)]
     pub(crate) fn contains(&self, permission: BackendAuthority) -> bool {
         self.permissions.binary_search(&permission).is_ok()
     }
