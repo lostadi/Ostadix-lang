@@ -81,6 +81,9 @@ rustyline   = "14"
 # Notebook server (opt-in via --features notebook)
 axum        = { version = "0.7", optional = true }
 tokio       = { version = "1", features = ["full"], optional = true }
+sherpa-onnx = "1.13.3"
+smg-wasm = "1.1.2"
+wasm = "0.0.0"
 
 [dev-dependencies]
 proptest = "1"

@@ -158,6 +158,21 @@ remove_managed_file() {
   fi
 }
 
+directory_is_case_insensitive() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local lower="$dir/.olang_case_probe_$$"
+  local upper="$dir/.OLANG_CASE_PROBE_$$"
+  rm -f "$lower" "$upper"
+  : > "$lower"
+  local insensitive=false
+  if [[ -e "$upper" ]]; then
+    insensitive=true
+  fi
+  rm -f "$lower" "$upper"
+  $insensitive
+}
+
 clean_rust_release_binaries() {
   echo ">>> Removing stale Rust release binaries..."
   for bin in "${RUST_STALE_BINARIES[@]}"; do
@@ -176,7 +191,7 @@ refresh_cargo_bin_binaries() {
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
-    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O"
+    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O if filesystem is case-sensitive"
     return
   fi
 
@@ -194,14 +209,22 @@ refresh_cargo_bin_binaries() {
     cp "$src" "$dst"
     chmod +x "$dst"
   done
-  cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
-  chmod +x "$CARGO_BIN_DIR/o"
+  if directory_is_case_insensitive "$CARGO_BIN_DIR"; then
+    echo "  $CARGO_BIN_DIR is case-insensitive; O also satisfies lowercase o."
+  else
+    cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
+    chmod +x "$CARGO_BIN_DIR/o"
+  fi
 }
 
 create_rust_alias_binaries() {
   echo ">>> Recreating Rust alias binaries..."
   if $DRY_RUN; then
-    echo "[DRY] replace $PROJECT_ROOT/target/release/o from $PROJECT_ROOT/target/release/O"
+    echo "[DRY] replace $PROJECT_ROOT/target/release/o from $PROJECT_ROOT/target/release/O if filesystem is case-sensitive"
+    return
+  fi
+  if directory_is_case_insensitive "$PROJECT_ROOT/target/release"; then
+    echo "  target/release is case-insensitive; O also satisfies lowercase o."
     return
   fi
   cp "$PROJECT_ROOT/target/release/O" "$PROJECT_ROOT/target/release/o"
@@ -519,6 +542,19 @@ verify_runnable() {
 
   echo -n "Installed O on PATH: "
   if has_cmd O && "$(command -v O)" examples/bindings.O 2>/dev/null | grep -q "43"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi
+
+  echo -n "Standalone O binary: "
+  local standalone_bin
+  standalone_bin="$(mktemp "${TMPDIR:-/tmp}/o-standalone-verify.XXXXXX")"
+  rm -f "$standalone_bin"
+  if cp target/release/O "$standalone_bin" && chmod +x "$standalone_bin" && (cd /tmp && "$standalone_bin" "$PROJECT_ROOT/examples/bindings.O" 2>/dev/null) | grep -q "43"; then
+    echo "OK"
+    ((ok+=1))
+  else
+    echo "FAIL"
+    ((fail+=1))
+  fi
+  rm -f "$standalone_bin" 2>/dev/null || true
 
   echo -n "Rust-native Bash without shim dir: "
   if target/release/O examples/bash_hello.O "$missing_shims" 2>/dev/null | grep -q "hello from bash"; then echo "OK"; ((ok+=1)); else echo "FAIL"; ((fail+=1)); fi

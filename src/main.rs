@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use o_lang::eval::Evaluator;
 use o_lang::parser::Parser;
+use o_lang::shims::ExtractedShims;
 use o_lang::value::OValue;
 
 fn main() -> Result<()> {
@@ -36,7 +37,8 @@ fn main() -> Result<()> {
             return Ok(());
         }
         None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
-            return run_repl(default_shim_dir(), backends, &backend_grants);
+            let (shim_dir, _shim_guard) = resolve_shim_dir(None)?;
+            return run_repl(shim_dir, backends, &backend_grants);
         }
         None => {
             print_usage(&mut io::stderr())?;
@@ -44,10 +46,7 @@ fn main() -> Result<()> {
         }
         Some("--repl") | Some("-i") => {
             args.pop_front();
-            let shim_dir = args
-                .pop_front()
-                .map(PathBuf::from)
-                .unwrap_or_else(default_shim_dir);
+            let (shim_dir, _shim_guard) = resolve_shim_dir(args.pop_front().map(PathBuf::from))?;
             if let Some(extra) = args.pop_front() {
                 print_usage(&mut io::stderr())?;
                 bail!("unexpected extra argument after --repl: {}", extra);
@@ -58,10 +57,7 @@ fn main() -> Result<()> {
     }
 
     let input_path = args.pop_front().unwrap();
-    let shim_dir = args
-        .pop_front()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_shim_dir);
+    let (shim_dir, _shim_guard) = resolve_shim_dir(args.pop_front().map(PathBuf::from))?;
     if let Some(extra) = args.pop_front() {
         print_usage(&mut io::stderr())?;
         bail!("unexpected extra argument: {}", extra);
@@ -122,22 +118,18 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-fn default_shim_dir() -> PathBuf {
+fn resolve_shim_dir(explicit: Option<PathBuf>) -> Result<(PathBuf, Option<ExtractedShims>)> {
+    if let Some(path) = explicit {
+        return Ok((path, None));
+    }
+
     if let Ok(path) = env::var("O_BACKENDS_DIR").or_else(|_| env::var("BACKENDS_DIR")) {
-        return PathBuf::from(path);
+        return Ok((PathBuf::from(path), None));
     }
 
-    let cwd_backends = PathBuf::from("backends");
-    if cwd_backends.exists() {
-        return cwd_backends;
-    }
-
-    let source_backends = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
-    if source_backends.exists() {
-        return source_backends;
-    }
-
-    cwd_backends
+    let extracted = o_lang::shims::extract_bundled_shims("o_shims")
+        .context("failed to extract bundled backend shims")?;
+    Ok((extracted.path().to_path_buf(), Some(extracted)))
 }
 
 // ─── REPL ─────────────────────────────────────────────────────────────────────

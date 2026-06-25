@@ -328,6 +328,9 @@ impl BackendProcess {
 
     fn cleanup(&mut self) -> Result<()> {
         let send_result = self.send_command(&OWireCommand::Cleanup);
+        if send_result.is_ok() {
+            let _ = self.recv_step();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         send_result
