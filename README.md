@@ -152,7 +152,7 @@ The usual package-manager prerequisites are:
 
 ```bash
 xcode-select --install
-brew install rust python qemu
+brew install rust python sqlite qemu
 cargo build --release
 ```
 
@@ -160,7 +160,7 @@ cargo build --release
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential clang lld python3 python3-pip \
+sudo apt-get install -y build-essential clang lld python3 python3-pip sqlite3 \
     curl git pkg-config libssl-dev qemu-system-x86
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
@@ -171,7 +171,7 @@ cargo build --release
 
 ```bash
 sudo pacman -Syu
-sudo pacman -S --needed base-devel clang lld python rustup qemu-full git
+sudo pacman -S --needed base-devel clang lld python sqlite rustup qemu-full git
 rustup default stable
 cargo build --release
 ```
@@ -180,7 +180,7 @@ cargo build --release
 
 ```bash
 sudo dnf groupinstall -y "Development Tools"
-sudo dnf install -y clang lld python3 rustup qemu-system-x86 git openssl-devel pkgconfig
+sudo dnf install -y clang lld python3 sqlite rustup qemu-system-x86 git openssl-devel pkgconfig
 rustup default stable
 cargo build --release
 ```
@@ -188,7 +188,7 @@ cargo build --release
 #### NixOS
 
 ```bash
-nix-shell -p rustup clang lld python3 qemu
+nix-shell -p rustup clang lld python3 sqlite qemu
 rustup default stable
 cargo build --release
 ```

@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for Void ==="
 sudo xbps-install -Suy
-sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config
+sudo xbps-install -y base-devel gcc make python3 python3-pip curl git openssl-devel pkg-config sqlite
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"

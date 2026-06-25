@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for openSUSE ==="
 sudo zypper refresh
-sudo zypper install -y -l gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config
+sudo zypper install -y -l gcc gcc-c++ make python3 python3-pip curl git libopenssl-devel pkg-config sqlite3
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"

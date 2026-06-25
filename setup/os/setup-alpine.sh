@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for Alpine ==="
 sudo apk update
-sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf
+sudo apk add build-base gcc g++ make python3 py3-pip curl git openssl-dev pkgconf sqlite
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"

@@ -9,6 +9,7 @@ if command -v winget >/dev/null 2>&1; then
   winget install --id Git.Git -e --silent || true
   winget install --id Python.Python.3.12 -e --silent || true
   winget install --id Rustlang.Rustup -e --silent || true
+  winget install --id SQLite.SQLite -e --silent || true
   winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools" || true
 else
   echo "winget not found. Install Git, Python, Rustup, and MSVC Build Tools manually."

@@ -3,8 +3,8 @@
 set -euo pipefail
 echo "=== O-lang setup for Gentoo ==="
 echo "This may take a while and may require --ask or manual confirmation."
-sudo emerge --quiet --ask=n sys-devel/gcc sys-devel/make dev-lang/python:3.12 net-misc/curl dev-vcs/git dev-libs/openssl || {
-  echo "Please run: sudo emerge --ask dev-lang/python sys-devel/gcc sys-devel/make curl git openssl"
+sudo emerge --quiet --ask=n sys-devel/gcc sys-devel/make dev-lang/python:3.12 net-misc/curl dev-vcs/git dev-libs/openssl dev-db/sqlite || {
+  echo "Please run: sudo emerge --ask dev-lang/python sys-devel/gcc sys-devel/make curl git openssl sqlite"
 }
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

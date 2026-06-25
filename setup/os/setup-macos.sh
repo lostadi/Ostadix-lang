@@ -7,7 +7,7 @@ if ! command -v brew >/dev/null 2>&1; then
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 brew update
-brew install --quiet gcc make python@3.12 curl git pkg-config openssl 2>/dev/null || true
+brew install --quiet gcc make python@3.12 curl git pkg-config openssl sqlite 2>/dev/null || true
 xcode-select --install 2>/dev/null || true
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

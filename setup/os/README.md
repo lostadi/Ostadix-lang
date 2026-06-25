@@ -31,11 +31,11 @@ chmod +x setup-debian.sh
 After running, follow the printed "Runnable forms" at the end.
 
 Each script:
-- Installs compilers, make, Python, curl, git, etc.
+- Installs compilers, make, Python, SQLite, curl, git, etc.
 - Installs Rust via rustup (if missing)
 - Builds the Rust edition (`cargo build --release`)
 - Builds the C/C++ edition (`cd c_cpp && make`)
-- Sets up Python shims (including optional matplotlib)
+- Sets up the Python compatibility bridge (including optional matplotlib)
 - Prints exact commands to run examples with Rust, C, AOT, and Python editions.
 
 For the universal detector (tries to pick the right one), use the top-level `setup.sh` in the repo root.

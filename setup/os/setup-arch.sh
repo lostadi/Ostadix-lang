@@ -3,7 +3,7 @@
 set -euo pipefail
 echo "=== O-lang setup for Arch-based ==="
 sudo pacman -Syu --noconfirm
-sudo pacman -S --noconfirm --needed base-devel gcc make python python-pip curl git pkgconf openssl
+sudo pacman -S --noconfirm --needed base-devel gcc make python python-pip curl git pkgconf openssl sqlite
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   source "$HOME/.cargo/env"
