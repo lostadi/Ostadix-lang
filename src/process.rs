@@ -129,11 +129,11 @@ fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Resu
     Ok(command)
 }
 
-fn direct_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Command {
+fn direct_shim_command(shim_path: &Path, _sandbox: &BackendSandboxPolicy) -> Command {
     #[cfg(target_os = "macos")]
     if let Ok(command) = macos_sandbox_command(
         shim_path,
-        sandbox,
+        _sandbox,
         shim_path.parent().unwrap_or_else(|| Path::new(".")),
     ) {
         return command;

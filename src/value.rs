@@ -132,7 +132,7 @@ pub type NodeId = u64;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GraphNode {
-    Value { value: OValue },
+    Value { value: Box<OValue> },
     Ref { target: NodeId },
 }
 
@@ -2783,7 +2783,7 @@ mod tests {
                 0,
                 vec![
                     GraphNode::Value {
-                        value: OValue::str_("root"),
+                        value: Box::new(OValue::str_("root")),
                     },
                     GraphNode::Ref { target: 0 },
                 ],
