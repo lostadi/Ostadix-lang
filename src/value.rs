@@ -9,24 +9,19 @@
 // management. It is the pure data layer. It answers one question: what IS a
 // value in O?
 //
-// The answer is a sum type with eight variants. That's it. That's the entire
-// O value universe. All inter-language richness lives in how backends
-// serialize their native values into these eight shapes, and deserialize them
-// back out. The wire protocol (JSON over stdin/stdout) is also defined here,
-// because the encoding and the type are inseparable.
-//
-// Design note on OInt: we use i64 for the MVP. This is a known limitation —
-// arbitrary precision integers exist in Python, Haskell, and Lisp, and they
-// cannot round-trip through i64 without loss. The fix (num-bigint) is
-// straightforward and will be added before the first public release.
+// The early runtime was intentionally JSON-shaped. The public model now grows
+// toward a typed, canonical, content-addressed value graph while preserving the
+// old wire tags as compatibility forms for existing shims.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hex;
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -34,27 +29,168 @@ use sha2::{Digest, Sha256};
 // SECTION 1: The OValue Sum Type
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Lossless numeric forms used by the post-MVP value model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ONumber {
+    Int {
+        v: BigInt,
+    },
+    Rational {
+        num: BigInt,
+        den: BigInt,
+    },
+    Decimal {
+        coeff: BigInt,
+        exp10: i64,
+        special: Option<DecimalSpecial>,
+    },
+    BinaryFloat {
+        format: FloatFormat,
+        bits: Vec<u8>,
+    },
+    BigFloat {
+        mantissa: BigInt,
+        exp2: i64,
+        precision: Option<u64>,
+        special: Option<FloatSpecial>,
+    },
+    Complex {
+        re: Box<ONumber>,
+        im: Box<ONumber>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecimalSpecial {
+    Nan,
+    PosInf,
+    NegInf,
+    PosZero,
+    NegZero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloatFormat {
+    F32,
+    F64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloatSpecial {
+    Nan,
+    PosInf,
+    NegInf,
+    PosZero,
+    NegZero,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OText {
+    pub utf8: String,
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OBytes {
+    pub bytes: Vec<u8>,
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeqKind {
+    List,
+    Tuple,
+    Vector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetKind {
+    Ordered,
+    Unordered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OSymbol {
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OKeyword {
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+pub type NodeId = u64;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphNode {
+    Value { value: OValue },
+    Ref { target: NodeId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeIdentity {
+    pub stable: Option<String>,
+    pub live: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCodecSafety {
+    DataOnly,
+    SourceBacked,
+    UnsafeOpaque,
+    LiveHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeBoundary {
+    Pure,
+    Referential,
+    Effectful,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RehydratePolicy {
+    Portable,
+    SameBackend,
+    SameProcess,
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ONative {
+    pub lang: String,
+    pub implementation: Option<String>,
+    pub version: Option<String>,
+    pub type_name: String,
+    pub identity: NativeIdentity,
+    pub codec: String,
+    pub payload: Option<OBytes>,
+    pub boundary: NativeBoundary,
+    pub safety: NativeCodecSafety,
+    pub capabilities: Vec<CapabilityKind>,
+    pub metadata: BTreeMap<String, OValue>,
+    pub rehydrate: RehydratePolicy,
+}
+
 /// The complete universe of values in the O language runtime.
 ///
-/// Every value that passes between language backends — from Python to HTML,
-/// from Racket to LaTeX, from Haskell to Rust — is one of these eight
-/// variants. The type is the wire protocol: `serde` derives the JSON encoding
-/// automatically from the struct shape.
-///
-/// Encoding schema (each variant's JSON representation):
-///   ONull               → `{"t":"null"}`
-///   OBool(true)         → `{"t":"bool","v":true}`
-///   OInt(42)            → `{"t":"int","v":42}`
-///   OFloat(3.14)        → `{"t":"float","v":3.14}`
-///   OStr("hi")          → `{"t":"str","v":"hi"}`
-///   OList([...])        → `{"t":"list","v":[...]}`
-///   OMap({...})         → `{"t":"map","v":{...}}`
-///   OBlob{..}           → `{"t":"blob","v":"<base64>","mime":"image/png"}`
-///
-/// The `t` tag is the type discriminant. The `v` field carries the payload.
-/// OBlob has an additional `mime` field because the blob's type information
-/// is semantic — an HTML backend needs to know whether a blob is a PNG
-/// (render as <img>), an HTML fragment (embed directly), or a PDF (link out).
+/// Legacy variants (`Int`, `Float`, `Str`, `List`, and string-keyed `Map`) stay
+/// as compatibility forms. New backends can target the richer structural forms
+/// (`Number`, `Text`, `Bytes`, `Seq`, `Object`, `EntriesMap`, `Graph`, and
+/// `Native`) without losing information before the rest of the evaluator learns
+/// their full semantics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum OValue {
@@ -76,11 +212,26 @@ pub enum OValue {
     #[serde(rename = "float")]
     Float { v: f64 },
 
+    /// A lossless numeric value: big integers, rationals, decimal/binary
+    /// floats, big floats, and complex numbers.
+    #[serde(rename = "number")]
+    Number { v: ONumber },
+
     /// A UTF-8 string. The most common inter-language value type.
     /// Raw text from backends, spliced $var values, document content —
     /// all arrive as OStr unless the backend explicitly returns something richer.
     #[serde(rename = "str")]
     Str { v: String },
+
+    /// Text with explicit encoding metadata. `Str` remains the compatibility
+    /// projection for existing shims.
+    #[serde(rename = "text")]
+    Text { v: OText },
+
+    /// A single Unicode scalar value.
+    #[serde(rename = "char")]
+    Char { scalar: char },
+
     #[serde(rename = "html")]
     Html { v: String },
     #[serde(rename = "store_path")]
@@ -113,6 +264,29 @@ pub enum OValue {
     #[serde(rename = "map")]
     Map { v: HashMap<String, OValue> },
 
+    /// A sequence whose source-language shape matters.
+    #[serde(rename = "seq")]
+    Seq { kind: SeqKind, items: Vec<OValue> },
+
+    /// A structural object with deterministic string fields.
+    #[serde(rename = "object")]
+    Object { fields: BTreeMap<String, OValue> },
+
+    /// A map whose keys are arbitrary OValues. This is the post-MVP map shape;
+    /// legacy `Map` stays as the JSON-object compatibility projection.
+    #[serde(rename = "entries_map")]
+    EntriesMap { entries: Vec<(OValue, OValue)> },
+
+    /// A set that preserves source-language ordered/unordered intent.
+    #[serde(rename = "set")]
+    Set { kind: SetKind, items: Vec<OValue> },
+
+    #[serde(rename = "symbol")]
+    Symbol { v: OSymbol },
+
+    #[serde(rename = "keyword")]
+    Keyword { v: OKeyword },
+
     /// A first-class snapshot of an O-level lexical scope.
     ///
     /// A Scope is not a plain Map. It records that its entries are bindings to
@@ -139,6 +313,21 @@ pub enum OValue {
     /// required and neither is "the value" more than the other.
     #[serde(rename = "blob")]
     Blob { v: String, mime: String }, // v = base64-encoded bytes on wire
+
+    /// Proper bytes. `Blob` remains the MIME-bearing compatibility carrier used
+    /// by renderers; `Bytes` is the structural byte value.
+    #[serde(rename = "bytes")]
+    Bytes { v: OBytes },
+
+    /// A graph frame for values with shared identity, cycles, or explicit refs.
+    #[serde(rename = "graph")]
+    Graph { root: NodeId, nodes: Vec<GraphNode> },
+
+    /// A language-native value capsule. Structural values should be preferred
+    /// whenever O understands the value; native capsules are for honest escape
+    /// hatches that only the source backend can decode.
+    #[serde(rename = "native")]
+    Native { v: ONative },
 
     /// A lazy Nix expression that has not yet been passed to `nix eval`.
     ///
@@ -567,8 +756,55 @@ impl OValue {
     pub fn float(f: f64) -> Self {
         OValue::Float { v: f }
     }
+    pub fn number(n: ONumber) -> Self {
+        OValue::Number { v: n }
+    }
+    pub fn big_int(n: impl Into<BigInt>) -> Self {
+        OValue::Number {
+            v: ONumber::Int { v: n.into() },
+        }
+    }
+    pub fn rational(num: impl Into<BigInt>, den: impl Into<BigInt>) -> Result<Self> {
+        let den = den.into();
+        if den == BigInt::from(0) {
+            bail!("rational denominator cannot be zero");
+        }
+        Ok(OValue::Number {
+            v: ONumber::Rational {
+                num: num.into(),
+                den,
+            },
+        })
+    }
     pub fn str_(s: impl Into<String>) -> Self {
         OValue::Str { v: s.into() }
+    }
+    pub fn text(s: impl Into<String>) -> Self {
+        OValue::Text {
+            v: OText {
+                utf8: s.into(),
+                encoding: Some("utf-8".to_string()),
+            },
+        }
+    }
+    pub fn text_with_encoding(s: impl Into<String>, encoding: Option<String>) -> Self {
+        OValue::Text {
+            v: OText {
+                utf8: s.into(),
+                encoding,
+            },
+        }
+    }
+    pub fn bytes(bytes: impl Into<Vec<u8>>, media_type: Option<String>) -> Self {
+        OValue::Bytes {
+            v: OBytes {
+                bytes: bytes.into(),
+                media_type,
+            },
+        }
+    }
+    pub fn char_(scalar: char) -> Self {
+        OValue::Char { scalar }
     }
     pub fn html(s: impl Into<String>) -> Self {
         OValue::Html { v: s.into() }
@@ -581,6 +817,54 @@ impl OValue {
     }
     pub fn map(entries: HashMap<String, OValue>) -> Self {
         OValue::Map { v: entries }
+    }
+    pub fn seq(kind: SeqKind, items: Vec<OValue>) -> Self {
+        OValue::Seq { kind, items }
+    }
+    pub fn tuple(items: Vec<OValue>) -> Self {
+        OValue::Seq {
+            kind: SeqKind::Tuple,
+            items,
+        }
+    }
+    pub fn object(fields: BTreeMap<String, OValue>) -> Self {
+        OValue::Object { fields }
+    }
+    pub fn entries_map(entries: Vec<(OValue, OValue)>) -> Self {
+        OValue::EntriesMap { entries }
+    }
+    pub fn set(kind: SetKind, items: Vec<OValue>) -> Self {
+        OValue::Set { kind, items }
+    }
+    pub fn symbol(name: impl Into<String>) -> Self {
+        OValue::Symbol {
+            v: OSymbol {
+                namespace: None,
+                name: name.into(),
+            },
+        }
+    }
+    pub fn namespaced_symbol(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        OValue::Symbol {
+            v: OSymbol {
+                namespace: Some(namespace.into()),
+                name: name.into(),
+            },
+        }
+    }
+    pub fn keyword(name: impl Into<String>) -> Self {
+        OValue::Keyword {
+            v: OKeyword {
+                namespace: None,
+                name: name.into(),
+            },
+        }
+    }
+    pub fn graph(root: NodeId, nodes: Vec<GraphNode>) -> Self {
+        OValue::Graph { root, nodes }
+    }
+    pub fn native(native: ONative) -> Self {
+        OValue::Native { v: native }
     }
     pub fn scope(bindings: HashMap<String, OValue>) -> Self {
         OValue::Scope { bindings }
@@ -793,7 +1077,8 @@ impl OValue {
     /// - Derivation uses SHA-256 of its Nix content-addressed path.
     /// - StorePath uses SHA-256 of its path.
     /// - Request and Thunk use their construction-time fingerprints.
-    /// - Other values use SHA-256 of their stable splice representation.
+    /// - Other values use SHA-256 of canonical tagged bytes. `splice_repr()` is
+    ///   for source injection and is not a semantic identity surface.
     pub fn content_identity(&self) -> String {
         match self {
             OValue::NixExpr { fingerprint, .. } => fingerprint.clone(),
@@ -826,8 +1111,8 @@ impl OValue {
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
             OValue::Group { fingerprint, .. } => fingerprint.clone(),
             other => {
-                let s = other.splice_repr();
-                hex::encode(Sha256::digest(s.as_bytes()))
+                let bytes = other.canonical_bytes();
+                hex::encode(Sha256::digest(bytes))
             }
         }
     }
@@ -861,6 +1146,544 @@ impl OValue {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// SECTION 2.5: Canonical encoding
+// ═════════════════════════════════════════════════════════════════════════════
+
+pub trait CanonicalEncode {
+    fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<()>;
+}
+
+impl OValue {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_canonical(&mut out)
+            .expect("OValue canonical encoding is infallible");
+        out
+    }
+}
+
+fn canonical_tag(out: &mut Vec<u8>, tag: &str) {
+    canonical_str(out, tag);
+}
+
+fn canonical_str(out: &mut Vec<u8>, s: &str) {
+    canonical_bytes(out, s.as_bytes());
+}
+
+fn canonical_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    canonical_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn canonical_bool(out: &mut Vec<u8>, value: bool) {
+    out.push(u8::from(value));
+}
+
+fn canonical_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn canonical_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn canonical_bigint(out: &mut Vec<u8>, value: &BigInt) {
+    canonical_str(out, &value.to_str_radix(10));
+}
+
+fn canonical_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            canonical_tag(out, "some");
+            canonical_str(out, value);
+        }
+        None => canonical_tag(out, "none"),
+    }
+}
+
+fn canonical_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            canonical_tag(out, "some");
+            canonical_u64(out, value);
+        }
+        None => canonical_tag(out, "none"),
+    }
+}
+
+impl ONumber {
+    fn encode_number(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            ONumber::Int { v } => {
+                canonical_tag(out, "number:int");
+                canonical_bigint(out, v);
+            }
+            ONumber::Rational { num, den } => {
+                canonical_tag(out, "number:rational");
+                canonical_bigint(out, num);
+                canonical_bigint(out, den);
+            }
+            ONumber::Decimal {
+                coeff,
+                exp10,
+                special,
+            } => {
+                canonical_tag(out, "number:decimal");
+                canonical_bigint(out, coeff);
+                canonical_i64(out, *exp10);
+                canonical_opt_str(out, special.map(decimal_special_name));
+            }
+            ONumber::BinaryFloat { format, bits } => {
+                canonical_tag(out, "number:binary_float");
+                canonical_tag(out, float_format_name(*format));
+                canonical_bytes(out, bits);
+            }
+            ONumber::BigFloat {
+                mantissa,
+                exp2,
+                precision,
+                special,
+            } => {
+                canonical_tag(out, "number:big_float");
+                canonical_bigint(out, mantissa);
+                canonical_i64(out, *exp2);
+                canonical_opt_u64(out, *precision);
+                canonical_opt_str(out, special.map(float_special_name));
+            }
+            ONumber::Complex { re, im } => {
+                canonical_tag(out, "number:complex");
+                re.encode_number(out)?;
+                im.encode_number(out)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for OValue {
+    fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<()> {
+        canonical_tag(out, "ovalue");
+        match self {
+            OValue::Null => canonical_tag(out, "null"),
+            OValue::Bool { v } => {
+                canonical_tag(out, "bool");
+                canonical_bool(out, *v);
+            }
+            OValue::Int { v } => {
+                canonical_tag(out, "int");
+                canonical_i64(out, *v);
+            }
+            OValue::Float { v } => {
+                canonical_tag(out, "float");
+                out.extend_from_slice(&v.to_bits().to_be_bytes());
+            }
+            OValue::Number { v } => v.encode_number(out)?,
+            OValue::Str { v } => {
+                canonical_tag(out, "str");
+                canonical_str(out, v);
+            }
+            OValue::Text { v } => {
+                canonical_tag(out, "text");
+                canonical_str(out, &v.utf8);
+                canonical_opt_str(out, v.encoding.as_deref());
+            }
+            OValue::Char { scalar } => {
+                canonical_tag(out, "char");
+                canonical_u64(out, *scalar as u32 as u64);
+            }
+            OValue::Html { v } => {
+                canonical_tag(out, "html");
+                canonical_str(out, v);
+            }
+            OValue::StorePath { path } => {
+                canonical_tag(out, "store_path");
+                canonical_str(out, path);
+            }
+            OValue::Expr { src } => {
+                canonical_tag(out, "expr");
+                canonical_str(out, src);
+            }
+            OValue::List { v } => {
+                canonical_tag(out, "list");
+                canonical_u64(out, v.len() as u64);
+                for value in v {
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Map { v } => {
+                canonical_tag(out, "map");
+                let mut entries = v.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                canonical_u64(out, entries.len() as u64);
+                for (key, value) in entries {
+                    canonical_str(out, key);
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Seq { kind, items } => {
+                canonical_tag(out, "seq");
+                canonical_tag(out, seq_kind_name(*kind));
+                canonical_u64(out, items.len() as u64);
+                for value in items {
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Object { fields } => {
+                canonical_tag(out, "object");
+                canonical_u64(out, fields.len() as u64);
+                for (key, value) in fields {
+                    canonical_str(out, key);
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::EntriesMap { entries } => {
+                canonical_tag(out, "entries_map");
+                let mut encoded_entries = entries
+                    .iter()
+                    .map(|(key, value)| {
+                        let key_bytes = key.canonical_bytes();
+                        let value_bytes = value.canonical_bytes();
+                        (key_bytes, value_bytes)
+                    })
+                    .collect::<Vec<_>>();
+                encoded_entries.sort();
+                canonical_u64(out, encoded_entries.len() as u64);
+                for (key_bytes, value_bytes) in encoded_entries {
+                    canonical_bytes(out, &key_bytes);
+                    canonical_bytes(out, &value_bytes);
+                }
+            }
+            OValue::Set { kind, items } => {
+                canonical_tag(out, "set");
+                canonical_tag(out, set_kind_name(*kind));
+                let mut encoded_items = items
+                    .iter()
+                    .map(OValue::canonical_bytes)
+                    .collect::<Vec<_>>();
+                if matches!(kind, SetKind::Unordered) {
+                    encoded_items.sort();
+                }
+                canonical_u64(out, encoded_items.len() as u64);
+                for item in encoded_items {
+                    canonical_bytes(out, &item);
+                }
+            }
+            OValue::Symbol { v } => {
+                canonical_tag(out, "symbol");
+                canonical_opt_str(out, v.namespace.as_deref());
+                canonical_str(out, &v.name);
+            }
+            OValue::Keyword { v } => {
+                canonical_tag(out, "keyword");
+                canonical_opt_str(out, v.namespace.as_deref());
+                canonical_str(out, &v.name);
+            }
+            OValue::Scope { bindings } => {
+                canonical_tag(out, "scope");
+                let mut entries = bindings.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                canonical_u64(out, entries.len() as u64);
+                for (key, value) in entries {
+                    canonical_str(out, key);
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Blob { v, mime } => {
+                canonical_tag(out, "blob");
+                canonical_str(out, mime);
+                match B64.decode(v) {
+                    Ok(bytes) => {
+                        canonical_tag(out, "base64:decoded");
+                        canonical_bytes(out, &bytes);
+                    }
+                    Err(_) => {
+                        canonical_tag(out, "base64:invalid");
+                        canonical_str(out, v);
+                    }
+                }
+            }
+            OValue::Bytes { v } => {
+                canonical_tag(out, "bytes");
+                canonical_opt_str(out, v.media_type.as_deref());
+                canonical_bytes(out, &v.bytes);
+            }
+            OValue::Graph { root, nodes } => {
+                canonical_tag(out, "graph");
+                canonical_u64(out, *root);
+                canonical_u64(out, nodes.len() as u64);
+                for node in nodes {
+                    node.encode_canonical(out)?;
+                }
+            }
+            OValue::Native { v } => v.encode_canonical(out)?,
+            OValue::NixExpr {
+                body,
+                deps,
+                fingerprint,
+            } => {
+                canonical_tag(out, "nix_expr");
+                canonical_str(out, body);
+                canonical_u64(out, deps.len() as u64);
+                for dep in deps {
+                    dep.encode_canonical(out)?;
+                }
+                canonical_str(out, fingerprint);
+            }
+            OValue::Derivation {
+                drv_path,
+                outputs,
+                deps,
+            } => {
+                canonical_tag(out, "derivation");
+                canonical_str(out, drv_path);
+                canonical_u64(out, outputs.len() as u64);
+                for output in outputs {
+                    canonical_str(out, output);
+                }
+                canonical_u64(out, deps.len() as u64);
+                for dep in deps {
+                    dep.encode_canonical(out)?;
+                }
+            }
+            OValue::Request {
+                kind,
+                source,
+                fingerprint,
+            } => {
+                canonical_tag(out, "request");
+                kind.encode_canonical(out)?;
+                source.encode_canonical(out)?;
+                canonical_str(out, fingerprint);
+            }
+            OValue::System { profile_path } => {
+                canonical_tag(out, "system");
+                canonical_str(out, profile_path);
+            }
+            OValue::Capability {
+                kind,
+                identity,
+                metadata,
+            } => {
+                canonical_tag(out, "capability");
+                canonical_tag(out, kind.name());
+                canonical_str(out, identity);
+                let mut entries = metadata.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                canonical_u64(out, entries.len() as u64);
+                for (key, value) in entries {
+                    canonical_str(out, key);
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Snapshot {
+                kind,
+                identity,
+                state,
+            } => {
+                canonical_tag(out, "snapshot");
+                canonical_tag(out, kind.name());
+                canonical_str(out, identity);
+                let mut entries = state.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                canonical_u64(out, entries.len() as u64);
+                for (key, value) in entries {
+                    canonical_str(out, key);
+                    value.encode_canonical(out)?;
+                }
+            }
+            OValue::Thunk {
+                body,
+                deps,
+                fingerprint,
+            } => {
+                canonical_tag(out, "thunk");
+                canonical_str(out, body);
+                canonical_u64(out, deps.len() as u64);
+                for dep in deps {
+                    dep.encode_canonical(out)?;
+                }
+                canonical_str(out, fingerprint);
+            }
+            OValue::Group {
+                mode,
+                members,
+                fingerprint,
+            } => {
+                canonical_tag(out, "group");
+                canonical_tag(out, mode.name());
+                canonical_u64(out, members.len() as u64);
+                for member in members {
+                    member.encode_canonical(out)?;
+                }
+                canonical_str(out, fingerprint);
+            }
+            OValue::Error { msg } => {
+                canonical_tag(out, "error");
+                canonical_str(out, msg);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for GraphNode {
+    fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            GraphNode::Value { value } => {
+                canonical_tag(out, "graph_node:value");
+                value.encode_canonical(out)?;
+            }
+            GraphNode::Ref { target } => {
+                canonical_tag(out, "graph_node:ref");
+                canonical_u64(out, *target);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for ONative {
+    fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<()> {
+        canonical_tag(out, "native");
+        canonical_str(out, &self.lang);
+        canonical_opt_str(out, self.implementation.as_deref());
+        canonical_opt_str(out, self.version.as_deref());
+        canonical_str(out, &self.type_name);
+        canonical_opt_str(out, self.identity.stable.as_deref());
+        canonical_opt_str(out, self.identity.live.as_deref());
+        canonical_str(out, &self.codec);
+        match &self.payload {
+            Some(payload) => {
+                canonical_tag(out, "some");
+                canonical_opt_str(out, payload.media_type.as_deref());
+                canonical_bytes(out, &payload.bytes);
+            }
+            None => canonical_tag(out, "none"),
+        }
+        canonical_tag(out, native_boundary_name(self.boundary));
+        canonical_tag(out, native_codec_safety_name(self.safety));
+        let mut capabilities = self.capabilities.clone();
+        capabilities.sort_by_key(|kind| kind.name());
+        canonical_u64(out, capabilities.len() as u64);
+        for capability in capabilities {
+            canonical_tag(out, capability.name());
+        }
+        canonical_u64(out, self.metadata.len() as u64);
+        for (key, value) in &self.metadata {
+            canonical_str(out, key);
+            value.encode_canonical(out)?;
+        }
+        canonical_tag(out, rehydrate_policy_name(self.rehydrate));
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for RequestKind {
+    fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            RequestKind::Instantiate => canonical_tag(out, "request_kind:instantiate"),
+            RequestKind::Realise => canonical_tag(out, "request_kind:realise"),
+            RequestKind::Eval {
+                lang,
+                env_id,
+                cacheable,
+                authority,
+                permissions,
+            } => {
+                canonical_tag(out, "request_kind:eval");
+                canonical_str(out, lang);
+                canonical_u64(out, u64::from(*env_id));
+                canonical_bool(out, *cacheable);
+                canonical_opt_str(out, authority.as_deref());
+                canonical_u64(out, permissions.len() as u64);
+                for permission in permissions {
+                    canonical_tag(out, permission.name());
+                }
+            }
+            RequestKind::Activate {
+                profile,
+                dry_run,
+                authority,
+            } => {
+                canonical_tag(out, "request_kind:activate");
+                canonical_str(out, profile);
+                canonical_bool(out, *dry_run);
+                canonical_opt_str(out, authority.as_deref());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decimal_special_name(value: DecimalSpecial) -> &'static str {
+    match value {
+        DecimalSpecial::Nan => "nan",
+        DecimalSpecial::PosInf => "pos_inf",
+        DecimalSpecial::NegInf => "neg_inf",
+        DecimalSpecial::PosZero => "pos_zero",
+        DecimalSpecial::NegZero => "neg_zero",
+    }
+}
+
+fn float_format_name(value: FloatFormat) -> &'static str {
+    match value {
+        FloatFormat::F32 => "f32",
+        FloatFormat::F64 => "f64",
+    }
+}
+
+fn float_special_name(value: FloatSpecial) -> &'static str {
+    match value {
+        FloatSpecial::Nan => "nan",
+        FloatSpecial::PosInf => "pos_inf",
+        FloatSpecial::NegInf => "neg_inf",
+        FloatSpecial::PosZero => "pos_zero",
+        FloatSpecial::NegZero => "neg_zero",
+    }
+}
+
+fn seq_kind_name(value: SeqKind) -> &'static str {
+    match value {
+        SeqKind::List => "list",
+        SeqKind::Tuple => "tuple",
+        SeqKind::Vector => "vector",
+    }
+}
+
+fn set_kind_name(value: SetKind) -> &'static str {
+    match value {
+        SetKind::Ordered => "ordered",
+        SetKind::Unordered => "unordered",
+    }
+}
+
+fn native_codec_safety_name(value: NativeCodecSafety) -> &'static str {
+    match value {
+        NativeCodecSafety::DataOnly => "data_only",
+        NativeCodecSafety::SourceBacked => "source_backed",
+        NativeCodecSafety::UnsafeOpaque => "unsafe_opaque",
+        NativeCodecSafety::LiveHandle => "live_handle",
+    }
+}
+
+fn native_boundary_name(value: NativeBoundary) -> &'static str {
+    match value {
+        NativeBoundary::Pure => "pure",
+        NativeBoundary::Referential => "referential",
+        NativeBoundary::Effectful => "effectful",
+    }
+}
+
+fn rehydrate_policy_name(value: RehydratePolicy) -> &'static str {
+    match value {
+        RehydratePolicy::Portable => "portable",
+        RehydratePolicy::SameBackend => "same_backend",
+        RehydratePolicy::SameProcess => "same_process",
+        RehydratePolicy::Never => "never",
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // SECTION 3: Type predicates
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -872,13 +1695,28 @@ impl OValue {
         matches!(self, OValue::Bool { .. })
     }
     pub fn is_int(&self) -> bool {
-        matches!(self, OValue::Int { .. })
+        matches!(
+            self,
+            OValue::Int { .. }
+                | OValue::Number {
+                    v: ONumber::Int { .. }
+                }
+        )
     }
     pub fn is_float(&self) -> bool {
         matches!(self, OValue::Float { .. })
     }
+    pub fn is_number(&self) -> bool {
+        matches!(self, OValue::Number { .. })
+    }
     pub fn is_str(&self) -> bool {
         matches!(self, OValue::Str { .. })
+    }
+    pub fn is_text(&self) -> bool {
+        matches!(self, OValue::Text { .. })
+    }
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, OValue::Bytes { .. })
     }
     pub fn is_html(&self) -> bool {
         matches!(self, OValue::Html { .. })
@@ -892,11 +1730,35 @@ impl OValue {
     pub fn is_map(&self) -> bool {
         matches!(self, OValue::Map { .. })
     }
+    pub fn is_seq(&self) -> bool {
+        matches!(self, OValue::Seq { .. })
+    }
+    pub fn is_object(&self) -> bool {
+        matches!(self, OValue::Object { .. })
+    }
+    pub fn is_entries_map(&self) -> bool {
+        matches!(self, OValue::EntriesMap { .. })
+    }
+    pub fn is_set(&self) -> bool {
+        matches!(self, OValue::Set { .. })
+    }
+    pub fn is_symbol(&self) -> bool {
+        matches!(self, OValue::Symbol { .. })
+    }
+    pub fn is_keyword(&self) -> bool {
+        matches!(self, OValue::Keyword { .. })
+    }
     pub fn is_scope(&self) -> bool {
         matches!(self, OValue::Scope { .. })
     }
     pub fn is_blob(&self) -> bool {
         matches!(self, OValue::Blob { .. })
+    }
+    pub fn is_graph(&self) -> bool {
+        matches!(self, OValue::Graph { .. })
+    }
+    pub fn is_native(&self) -> bool {
+        matches!(self, OValue::Native { .. })
     }
     pub fn is_nix_expr(&self) -> bool {
         matches!(self, OValue::NixExpr { .. })
@@ -929,7 +1791,7 @@ impl OValue {
         matches!(self, OValue::Error { .. })
     }
     pub fn is_numeric(&self) -> bool {
-        self.is_int() || self.is_float()
+        self.is_int() || self.is_float() || self.is_number()
     }
 
     /// The type name as it appears in the wire protocol `t` field.
@@ -939,13 +1801,25 @@ impl OValue {
             OValue::Bool { .. } => "bool",
             OValue::Int { .. } => "int",
             OValue::Float { .. } => "float",
+            OValue::Number { .. } => "number",
             OValue::Str { .. } => "str",
+            OValue::Text { .. } => "text",
+            OValue::Bytes { .. } => "bytes",
+            OValue::Char { .. } => "char",
             OValue::Html { .. } => "html",
             OValue::StorePath { .. } => "store_path",
             OValue::List { .. } => "list",
             OValue::Map { .. } => "map",
+            OValue::Seq { .. } => "seq",
+            OValue::Object { .. } => "object",
+            OValue::EntriesMap { .. } => "entries_map",
+            OValue::Set { .. } => "set",
+            OValue::Symbol { .. } => "symbol",
+            OValue::Keyword { .. } => "keyword",
             OValue::Scope { .. } => "scope",
             OValue::Blob { .. } => "blob",
+            OValue::Graph { .. } => "graph",
+            OValue::Native { .. } => "native",
             OValue::NixExpr { .. } => "nix_expr",
             OValue::Derivation { .. } => "derivation",
             OValue::Request { .. } => "request",
@@ -968,6 +1842,39 @@ impl OValue {
             | OValue::Request { .. }
             | OValue::Group { .. }
             | OValue::Error { .. } => RuntimeBoundary::Effectful,
+            OValue::Native { v } => match v.boundary {
+                NativeBoundary::Pure => RuntimeBoundary::Pure,
+                NativeBoundary::Referential => RuntimeBoundary::Referential,
+                NativeBoundary::Effectful => RuntimeBoundary::Effectful,
+            },
+            OValue::List { v } | OValue::Seq { items: v, .. } | OValue::Set { items: v, .. } => {
+                Self::join_child_boundaries(v.iter().map(OValue::runtime_boundary))
+            }
+            OValue::Map { v } => {
+                Self::join_child_boundaries(v.values().map(OValue::runtime_boundary))
+            }
+            OValue::Object { fields } => {
+                Self::join_child_boundaries(fields.values().map(OValue::runtime_boundary))
+            }
+            OValue::EntriesMap { entries } => Self::join_child_boundaries(
+                entries
+                    .iter()
+                    .flat_map(|(key, value)| [key.runtime_boundary(), value.runtime_boundary()]),
+            ),
+            OValue::Graph { nodes, .. } => {
+                Self::join_child_boundaries(nodes.iter().filter_map(|node| match node {
+                    GraphNode::Value { value } => Some(value.runtime_boundary()),
+                    GraphNode::Ref { .. } => None,
+                }))
+            }
+            OValue::NixExpr { deps, .. }
+            | OValue::Derivation { deps, .. }
+            | OValue::Thunk { deps, .. } => {
+                Self::join_child_boundaries(deps.iter().map(OValue::runtime_boundary))
+            }
+            OValue::Snapshot { state, .. } => {
+                Self::join_child_boundaries(state.values().map(OValue::runtime_boundary))
+            }
             _ => RuntimeBoundary::Pure,
         }
     }
@@ -996,8 +1903,32 @@ impl OValue {
                         permissions,
                         ..
                     },
+                source,
                 ..
-            } => *cacheable && authority.is_none() && permissions.is_empty(),
+            } => {
+                *cacheable
+                    && authority.is_none()
+                    && permissions.is_empty()
+                    && source.is_cache_safe()
+            }
+            OValue::Request { source, .. } => source.is_cache_safe(),
+            OValue::List { v } | OValue::Seq { items: v, .. } | OValue::Set { items: v, .. } => {
+                v.iter().all(OValue::is_cache_safe)
+            }
+            OValue::Map { v } => v.values().all(OValue::is_cache_safe),
+            OValue::Object { fields } => fields.values().all(OValue::is_cache_safe),
+            OValue::EntriesMap { entries } => entries
+                .iter()
+                .all(|(key, value)| key.is_cache_safe() && value.is_cache_safe()),
+            OValue::Graph { nodes, .. } => nodes.iter().all(|node| match node {
+                GraphNode::Value { value } => value.is_cache_safe(),
+                GraphNode::Ref { .. } => true,
+            }),
+            OValue::NixExpr { deps, .. }
+            | OValue::Derivation { deps, .. }
+            | OValue::Thunk { deps, .. } => deps.iter().all(OValue::is_cache_safe),
+            OValue::Snapshot { state, .. } => state.values().all(OValue::is_cache_safe),
+            OValue::Native { v } => Self::native_is_cache_safe(v),
             OValue::Error { .. } => false,
             _ => true,
         }
@@ -1020,8 +1951,28 @@ impl OValue {
                         permissions,
                         ..
                     },
+                source,
                 ..
-            } => authority.is_none() && permissions.is_empty(),
+            } => authority.is_none() && permissions.is_empty() && source.is_replay_safe(),
+            OValue::Request { source, .. } => source.is_replay_safe(),
+            OValue::List { v } | OValue::Seq { items: v, .. } | OValue::Set { items: v, .. } => {
+                v.iter().all(OValue::is_replay_safe)
+            }
+            OValue::Map { v } => v.values().all(OValue::is_replay_safe),
+            OValue::Object { fields } => fields.values().all(OValue::is_replay_safe),
+            OValue::EntriesMap { entries } => entries
+                .iter()
+                .all(|(key, value)| key.is_replay_safe() && value.is_replay_safe()),
+            OValue::Graph { nodes, .. } => nodes.iter().all(|node| match node {
+                GraphNode::Value { value } => value.is_replay_safe(),
+                GraphNode::Ref { .. } => true,
+            }),
+            OValue::NixExpr { deps, .. }
+            | OValue::Derivation { deps, .. }
+            | OValue::Thunk { deps, .. } => deps.iter().all(OValue::is_replay_safe),
+            OValue::Snapshot { state, .. } => state.values().all(OValue::is_replay_safe),
+            OValue::Native { v } => Self::native_is_replay_safe(v),
+            OValue::Error { .. } => false,
             _ => true,
         }
     }
@@ -1043,10 +1994,75 @@ impl OValue {
                         permissions,
                         ..
                     },
+                source,
                 ..
-            } => authority.is_none() && permissions.is_empty(),
+            } => authority.is_none() && permissions.is_empty() && source.is_boot_persistable(),
+            OValue::Request { source, .. } => source.is_boot_persistable(),
+            OValue::List { v } | OValue::Seq { items: v, .. } | OValue::Set { items: v, .. } => {
+                v.iter().all(OValue::is_boot_persistable)
+            }
+            OValue::Map { v } => v.values().all(OValue::is_boot_persistable),
+            OValue::Object { fields } => fields.values().all(OValue::is_boot_persistable),
+            OValue::EntriesMap { entries } => entries
+                .iter()
+                .all(|(key, value)| key.is_boot_persistable() && value.is_boot_persistable()),
+            OValue::Graph { nodes, .. } => nodes.iter().all(|node| match node {
+                GraphNode::Value { value } => value.is_boot_persistable(),
+                GraphNode::Ref { .. } => true,
+            }),
+            OValue::NixExpr { deps, .. }
+            | OValue::Derivation { deps, .. }
+            | OValue::Thunk { deps, .. } => deps.iter().all(OValue::is_boot_persistable),
+            OValue::Snapshot { state, .. } => state.values().all(OValue::is_boot_persistable),
+            OValue::Native { v } => Self::native_is_boot_persistable(v),
+            OValue::Error { .. } => false,
             _ => true,
         }
+    }
+
+    fn join_child_boundaries(boundaries: impl Iterator<Item = RuntimeBoundary>) -> RuntimeBoundary {
+        boundaries.fold(RuntimeBoundary::Pure, |acc, boundary| {
+            match (acc, boundary) {
+                (RuntimeBoundary::Effectful, _) | (_, RuntimeBoundary::Effectful) => {
+                    RuntimeBoundary::Effectful
+                }
+                (RuntimeBoundary::Referential, _) | (_, RuntimeBoundary::Referential) => {
+                    RuntimeBoundary::Referential
+                }
+                _ => RuntimeBoundary::Pure,
+            }
+        })
+    }
+
+    fn native_is_cache_safe(native: &ONative) -> bool {
+        matches!(
+            native.safety,
+            NativeCodecSafety::DataOnly | NativeCodecSafety::SourceBacked
+        ) && native.boundary == NativeBoundary::Pure
+            && native.identity.live.is_none()
+            && native.capabilities.is_empty()
+            && native.metadata.values().all(OValue::is_cache_safe)
+    }
+
+    fn native_is_replay_safe(native: &ONative) -> bool {
+        matches!(
+            native.safety,
+            NativeCodecSafety::DataOnly | NativeCodecSafety::SourceBacked
+        ) && native.boundary == NativeBoundary::Pure
+            && native.identity.live.is_none()
+            && native.capabilities.is_empty()
+            && native.metadata.values().all(OValue::is_replay_safe)
+    }
+
+    fn native_is_boot_persistable(native: &ONative) -> bool {
+        matches!(
+            native.safety,
+            NativeCodecSafety::DataOnly | NativeCodecSafety::SourceBacked
+        ) && native.boundary == NativeBoundary::Pure
+            && native.rehydrate == RehydratePolicy::Portable
+            && native.identity.live.is_none()
+            && native.capabilities.is_empty()
+            && native.metadata.values().all(OValue::is_boot_persistable)
     }
 }
 
@@ -1069,6 +2085,11 @@ impl OValue {
     pub fn as_int(&self) -> Result<i64> {
         match self {
             OValue::Int { v } => Ok(*v),
+            OValue::Number {
+                v: ONumber::Int { v },
+            } => v
+                .to_i64()
+                .ok_or_else(|| anyhow::anyhow!("Expected i64-sized int, got number")),
             other => bail!("Expected int, got {}", other.type_name()),
         }
     }
@@ -1078,6 +2099,44 @@ impl OValue {
             OValue::Float { v } => Ok(*v),
             // Implicit int → float widening, because this is always safe
             OValue::Int { v } => Ok(*v as f64),
+            OValue::Number {
+                v: ONumber::Int { v },
+            } => v
+                .to_f64()
+                .ok_or_else(|| anyhow::anyhow!("Expected float-sized number, got big int")),
+            OValue::Number {
+                v: ONumber::Rational { num, den },
+            } => {
+                let num = num
+                    .to_f64()
+                    .ok_or_else(|| anyhow::anyhow!("Expected float-sized rational numerator"))?;
+                let den = den
+                    .to_f64()
+                    .ok_or_else(|| anyhow::anyhow!("Expected float-sized rational denominator"))?;
+                Ok(num / den)
+            }
+            OValue::Number {
+                v:
+                    ONumber::BinaryFloat {
+                        format: FloatFormat::F32,
+                        bits,
+                    },
+            } if bits.len() == 4 => {
+                let mut raw = [0_u8; 4];
+                raw.copy_from_slice(bits);
+                Ok(f32::from_bits(u32::from_be_bytes(raw)) as f64)
+            }
+            OValue::Number {
+                v:
+                    ONumber::BinaryFloat {
+                        format: FloatFormat::F64,
+                        bits,
+                    },
+            } if bits.len() == 8 => {
+                let mut raw = [0_u8; 8];
+                raw.copy_from_slice(bits);
+                Ok(f64::from_bits(u64::from_be_bytes(raw)))
+            }
             other => bail!("Expected float, got {}", other.type_name()),
         }
     }
@@ -1085,6 +2144,7 @@ impl OValue {
     pub fn as_str(&self) -> Result<&str> {
         match self {
             OValue::Str { v } => Ok(v.as_str()),
+            OValue::Text { v } => Ok(v.utf8.as_str()),
             other => bail!("Expected str, got {}", other.type_name()),
         }
     }
@@ -1092,6 +2152,7 @@ impl OValue {
     pub fn as_list(&self) -> Result<&Vec<OValue>> {
         match self {
             OValue::List { v } => Ok(v),
+            OValue::Seq { items, .. } => Ok(items),
             other => bail!("Expected list, got {}", other.type_name()),
         }
     }
@@ -1101,6 +2162,67 @@ impl OValue {
             OValue::Map { v } => Ok(v),
             other => bail!("Expected map, got {}", other.type_name()),
         }
+    }
+}
+
+fn number_repr(value: &ONumber) -> String {
+    match value {
+        ONumber::Int { v } => v.to_string(),
+        ONumber::Rational { num, den } => format!("{}/{}", num, den),
+        ONumber::Decimal {
+            coeff,
+            exp10,
+            special,
+        } => match special {
+            Some(special) => decimal_special_name(*special).to_string(),
+            None => format!("{}e{}", coeff, exp10),
+        },
+        ONumber::BinaryFloat {
+            format: FloatFormat::F32,
+            bits,
+        } if bits.len() == 4 => {
+            let mut raw = [0_u8; 4];
+            raw.copy_from_slice(bits);
+            f32::from_bits(u32::from_be_bytes(raw)).to_string()
+        }
+        ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits,
+        } if bits.len() == 8 => {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(bits);
+            f64::from_bits(u64::from_be_bytes(raw)).to_string()
+        }
+        ONumber::BinaryFloat { format, bits } => {
+            format!("<{}:{}>", float_format_name(*format), hex::encode(bits))
+        }
+        ONumber::BigFloat {
+            mantissa,
+            exp2,
+            precision,
+            special,
+        } => match special {
+            Some(special) => float_special_name(*special).to_string(),
+            None => match precision {
+                Some(precision) => format!("{}p{}:{}", mantissa, exp2, precision),
+                None => format!("{}p{}", mantissa, exp2),
+            },
+        },
+        ONumber::Complex { re, im } => format!("{}+{}i", number_repr(re), number_repr(im)),
+    }
+}
+
+fn symbol_repr(value: &OSymbol) -> String {
+    match &value.namespace {
+        Some(namespace) => format!("{}/{}", namespace, value.name),
+        None => value.name.clone(),
+    }
+}
+
+fn keyword_repr(value: &OKeyword) -> String {
+    match &value.namespace {
+        Some(namespace) => format!(":{}/{}", namespace, value.name),
+        None => format!(":{}", value.name),
     }
 }
 
@@ -1135,7 +2257,10 @@ impl OValue {
                     v.to_string()
                 }
             }
+            OValue::Number { v } => number_repr(v),
             OValue::Str { v } => v.clone(),
+            OValue::Text { v } => v.utf8.clone(),
+            OValue::Char { scalar } => scalar.to_string(),
             OValue::Html { v } => v.clone(),
             OValue::StorePath { path } => path.clone(),
             OValue::List { v } => {
@@ -1151,9 +2276,46 @@ impl OValue {
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
             }
+            OValue::Seq { kind, items } => {
+                let items: Vec<String> = items.iter().map(|i| i.splice_repr()).collect();
+                match kind {
+                    SeqKind::Tuple => format!("({})", items.join(", ")),
+                    SeqKind::List | SeqKind::Vector => format!("[{}]", items.join(", ")),
+                }
+            }
+            OValue::Object { fields } => {
+                let pairs: Vec<String> = fields
+                    .iter()
+                    .map(|(k, val)| format!("{:?}: {}", k, val.splice_repr()))
+                    .collect();
+                format!("{{{}}}", pairs.join(", "))
+            }
+            OValue::EntriesMap { entries } => {
+                let pairs: Vec<String> = entries
+                    .iter()
+                    .map(|(k, val)| format!("{} => {}", k.splice_repr(), val.splice_repr()))
+                    .collect();
+                format!("{{{}}}", pairs.join(", "))
+            }
+            OValue::Set { items, .. } => {
+                let items: Vec<String> = items.iter().map(|i| i.splice_repr()).collect();
+                format!("{{{}}}", items.join(", "))
+            }
+            OValue::Symbol { v } => symbol_repr(v),
+            OValue::Keyword { v } => keyword_repr(v),
             OValue::Scope { bindings } => format!("<scope bindings={}>", bindings.len()),
             OValue::Blob { v, mime } => {
                 format!("data:{};base64,{}", mime, v)
+            }
+            OValue::Bytes { v } => match &v.media_type {
+                Some(media_type) => format!("data:{};base64,{}", media_type, B64.encode(&v.bytes)),
+                None => format!("<bytes:{}>", v.bytes.len()),
+            },
+            OValue::Graph { root, nodes } => {
+                format!("<graph root={} nodes={}>", root, nodes.len())
+            }
+            OValue::Native { v } => {
+                format!("<native:{} {}>", v.lang, v.type_name)
             }
             // ONixExpr splices as the raw Nix body — the expression is already
             // valid Nix source text that can be embedded directly in a Nix context.
@@ -1248,7 +2410,10 @@ impl fmt::Display for OValue {
             OValue::Bool { v } => write!(f, "{}", v),
             OValue::Int { v } => write!(f, "{}", v),
             OValue::Float { v } => write!(f, "{}", v),
+            OValue::Number { v } => write!(f, "{}", number_repr(v)),
             OValue::Str { v } => write!(f, "{:?}", v),
+            OValue::Text { v } => write!(f, "{:?}", v.utf8),
+            OValue::Char { scalar } => write!(f, "{:?}", scalar),
             OValue::List { v } => {
                 write!(f, "[")?;
                 for (i, item) in v.iter().enumerate() {
@@ -1271,10 +2436,66 @@ impl fmt::Display for OValue {
                 }
                 write!(f, "}}")
             }
+            OValue::Seq { kind, items } => {
+                let (open, close) = match kind {
+                    SeqKind::Tuple => ("(", ")"),
+                    SeqKind::List | SeqKind::Vector => ("[", "]"),
+                };
+                write!(f, "{}", open)?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "{}", close)
+            }
+            OValue::Object { fields } => {
+                write!(f, "{{")?;
+                for (i, (k, val)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {}", k, val)?;
+                }
+                write!(f, "}}")
+            }
+            OValue::EntriesMap { entries } => {
+                write!(f, "{{")?;
+                for (i, (k, val)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{} => {}", k, val)?;
+                }
+                write!(f, "}}")
+            }
+            OValue::Set { items, .. } => {
+                write!(f, "{{")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "}}")
+            }
+            OValue::Symbol { v } => write!(f, "{}", symbol_repr(v)),
+            OValue::Keyword { v } => write!(f, "{}", keyword_repr(v)),
             OValue::Scope { bindings } => write!(f, "<scope bindings={}>", bindings.len()),
             OValue::Html { v } => write!(f, "{}", v),
             OValue::StorePath { path } => write!(f, "{}", path),
             OValue::Blob { mime, .. } => write!(f, "<blob:{}>", mime),
+            OValue::Bytes { v } => match &v.media_type {
+                Some(media_type) => write!(f, "<bytes:{} {}>", media_type, v.bytes.len()),
+                None => write!(f, "<bytes:{}>", v.bytes.len()),
+            },
+            OValue::Graph { root, nodes } => {
+                write!(f, "<graph root={} nodes={}>", root, nodes.len())
+            }
+            OValue::Native { v } => {
+                write!(f, "<native {} {} codec={}>", v.lang, v.type_name, v.codec)
+            }
             OValue::NixExpr {
                 fingerprint, deps, ..
             } => {
@@ -1481,6 +2702,29 @@ pub enum OValueError {
 mod tests {
     use super::*;
 
+    fn sample_native() -> ONative {
+        ONative {
+            lang: "python".to_string(),
+            implementation: Some("cpython".to_string()),
+            version: Some("3.14".to_string()),
+            type_name: "decimal.Decimal".to_string(),
+            identity: NativeIdentity {
+                stable: Some("decimal:1.25".to_string()),
+                live: None,
+            },
+            codec: "repr".to_string(),
+            payload: Some(OBytes {
+                bytes: b"Decimal('1.25')".to_vec(),
+                media_type: Some("text/x-python-repr".to_string()),
+            }),
+            boundary: NativeBoundary::Pure,
+            safety: NativeCodecSafety::SourceBacked,
+            capabilities: vec![],
+            metadata: BTreeMap::new(),
+            rehydrate: RehydratePolicy::Portable,
+        }
+    }
+
     /// Every OValue variant must round-trip through JSON without loss.
     /// This test is the foundational correctness guarantee of the wire protocol.
     #[test]
@@ -1495,9 +2739,17 @@ mod tests {
             OValue::int(i64::MIN),
             OValue::float(std::f64::consts::PI),
             OValue::float(-0.0),
+            OValue::big_int(BigInt::parse_bytes(b"123456789123456789123456789", 10).unwrap()),
+            OValue::rational(22, 7).unwrap(),
             // NOTE: f64::INFINITY excluded — JSON RFC 8259 has no infinity repr.
             // serde_json serializes it as null. Custom serializer needed (tracked).
             OValue::str_("hello, world"),
+            OValue::text("hello, text"),
+            OValue::bytes(
+                b"abc".to_vec(),
+                Some("application/octet-stream".to_string()),
+            ),
+            OValue::char_('x'),
             OValue::str_(""),
             OValue::str_("unicode: こんにちは 🦀"),
             OValue::list(vec![
@@ -1513,9 +2765,30 @@ mod tests {
                 m.insert("nested".to_string(), OValue::list(vec![OValue::null()]));
                 m
             }),
+            OValue::seq(SeqKind::Vector, vec![OValue::int(1), OValue::int(2)]),
+            OValue::tuple(vec![OValue::str_("a"), OValue::str_("b")]),
+            OValue::object(BTreeMap::from([("field".to_string(), OValue::bool_(true))])),
+            OValue::entries_map(vec![(
+                OValue::tuple(vec![OValue::int(1)]),
+                OValue::str_("one"),
+            )]),
+            OValue::set(SetKind::Unordered, vec![OValue::int(2), OValue::int(1)]),
+            OValue::symbol("answer"),
+            OValue::namespaced_symbol("math", "pi"),
+            OValue::keyword("required"),
             OValue::scope(HashMap::from([("answer".to_string(), OValue::int(42))])),
             OValue::blob(b"\x89PNG\r\n", "image/png"),
             OValue::blob(&[], "application/octet-stream"),
+            OValue::graph(
+                0,
+                vec![
+                    GraphNode::Value {
+                        value: OValue::str_("root"),
+                    },
+                    GraphNode::Ref { target: 0 },
+                ],
+            ),
+            OValue::native(sample_native()),
             // OExpr round-trips its src string.
             OValue::Expr {
                 src: "python^(6 * 7)_python".to_string(),
@@ -1605,11 +2878,23 @@ mod tests {
             (OValue::bool_(true), "bool"),
             (OValue::int(0), "int"),
             (OValue::float(0.0), "float"),
+            (OValue::big_int(0), "number"),
             (OValue::str_(""), "str"),
+            (OValue::text(""), "text"),
+            (OValue::bytes(Vec::<u8>::new(), None), "bytes"),
+            (OValue::char_('a'), "char"),
             (OValue::list(vec![]), "list"),
             (OValue::map(HashMap::new()), "map"),
+            (OValue::seq(SeqKind::List, vec![]), "seq"),
+            (OValue::object(BTreeMap::new()), "object"),
+            (OValue::entries_map(vec![]), "entries_map"),
+            (OValue::set(SetKind::Ordered, vec![]), "set"),
+            (OValue::symbol("s"), "symbol"),
+            (OValue::keyword("k"), "keyword"),
             (OValue::scope(HashMap::new()), "scope"),
             (OValue::blob(&[], ""), "blob"),
+            (OValue::graph(0, vec![]), "graph"),
+            (OValue::native(sample_native()), "native"),
             (
                 OValue::Expr {
                     src: "x".to_string(),
@@ -1660,6 +2945,19 @@ mod tests {
     }
 
     #[test]
+    fn content_identity_uses_canonical_bytes_not_splice_repr() {
+        let int_one = OValue::int(1);
+        let str_one = OValue::str_("1");
+
+        assert_eq!(int_one.splice_repr(), str_one.splice_repr());
+        assert_ne!(int_one.content_identity(), str_one.content_identity());
+
+        let nan_a = OValue::float(f64::from_bits(0x7ff8_0000_0000_0001));
+        let nan_b = OValue::float(f64::from_bits(0x7ff8_0000_0000_0002));
+        assert_ne!(nan_a.content_identity(), nan_b.content_identity());
+    }
+
+    #[test]
     fn runtime_boundary_classifies_live_world_values() {
         let pure = OValue::snapshot(SnapshotKind::System, "gen-1", HashMap::new());
         let referential = OValue::system("/nix/var/nix/profiles/system");
@@ -1673,6 +2971,46 @@ mod tests {
         assert!(!scope.is_cache_safe());
         assert!(!scope.is_replay_safe());
         assert!(!scope.is_boot_persistable());
+    }
+
+    #[test]
+    fn safety_predicates_recurse_into_child_values() {
+        let capability = OValue::capability(CapabilityKind::File, "/etc/passwd", HashMap::new());
+        let list = OValue::list(vec![capability.clone()]);
+        let object = OValue::object(BTreeMap::from([("cap".to_string(), capability.clone())]));
+        let entries_map = OValue::entries_map(vec![(OValue::str_("cap"), capability.clone())]);
+        let request = OValue::request(
+            RequestKind::Eval {
+                lang: "python".to_string(),
+                env_id: 0,
+                cacheable: true,
+                authority: None,
+                permissions: vec![],
+            },
+            list.clone(),
+        );
+
+        for value in [list, object, entries_map, request] {
+            assert!(!value.is_cache_safe());
+            assert!(!value.is_replay_safe());
+            assert!(!value.is_boot_persistable());
+        }
+    }
+
+    #[test]
+    fn native_capsule_safety_requires_inert_payload() {
+        let pure = OValue::native(sample_native());
+        assert!(pure.is_cache_safe());
+        assert!(pure.is_replay_safe());
+        assert!(pure.is_boot_persistable());
+
+        let mut live = sample_native();
+        live.identity.live = Some("py-object:0x1".to_string());
+        let live = OValue::native(live);
+
+        assert!(!live.is_cache_safe());
+        assert!(!live.is_replay_safe());
+        assert!(!live.is_boot_persistable());
     }
 
     #[test]

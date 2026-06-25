@@ -38,7 +38,7 @@ use crate::nixos_ops;
 use crate::parser::{ONode, Parser};
 use crate::process::{ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
-use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind};
+use crate::value::{BackendAuthority, CapabilityKind, GroupMode, OValue, RequestKind, SeqKind};
 
 /// How to resolve group members that might be cached Request values.
 ///
@@ -2258,6 +2258,18 @@ fn container_fidelity<'a>(
         })
 }
 
+fn entry_container_fidelity(
+    renderer: SpliceRenderer,
+    entries: &[(OValue, OValue)],
+    base: RenderFidelity,
+) -> RenderFidelity {
+    container_fidelity(
+        renderer,
+        entries.iter().flat_map(|(key, value)| [key, value]),
+        base,
+    )
+}
+
 pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity {
     use OValue::*;
     use RenderFidelity::*;
@@ -2268,6 +2280,7 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Bool { .. }
             | Int { .. }
             | Float { .. }
+            | Number { .. }
             | Str { .. }
             | Html { .. }
             | StorePath { .. }
@@ -2281,15 +2294,32 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Snapshot { .. }
             | Thunk { .. }
             | Group { .. }
+            | Graph { .. }
+            | Native { .. }
             | Error { .. } => Typed,
+            Text { .. } | Char { .. } | Bytes { .. } | Symbol { .. } | Keyword { .. } => Structural,
             List { v } => container_fidelity(renderer, v, Typed),
             Map { v } => container_fidelity(renderer, v.values(), Typed),
+            Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
+            Object { fields } => container_fidelity(renderer, fields.values(), Typed),
+            EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
             Blob { .. } => Structural,
         },
         SpliceRenderer::Nix => match val {
             Null | Bool { .. } | Int { .. } | Float { .. } | Str { .. } | NixExpr { .. } => Typed,
             List { v } => container_fidelity(renderer, v, Typed),
             Map { v } => container_fidelity(renderer, v.values(), Typed),
+            Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
+            Object { fields } => container_fidelity(renderer, fields.values(), Typed),
+            EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
+            Number { .. }
+            | Text { .. }
+            | Char { .. }
+            | Bytes { .. }
+            | Symbol { .. }
+            | Keyword { .. }
+            | Graph { .. }
+            | Native { .. } => Structural,
             Html { .. }
             | StorePath { .. }
             | Blob { .. }
@@ -2309,10 +2339,16 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Bool { .. }
             | Int { .. }
             | Float { .. }
+            | Number { .. }
             | Str { .. }
+            | Text { .. }
+            | Char { .. }
             | Html { .. }
             | StorePath { .. }
             | Blob { .. }
+            | Bytes { .. }
+            | Symbol { .. }
+            | Keyword { .. }
             | NixExpr { .. }
             | Derivation { .. }
             | System { .. }
@@ -2320,17 +2356,39 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Error { .. } => Presentation,
             List { v } => container_fidelity(renderer, v, Presentation),
             Map { v } => container_fidelity(renderer, v.values(), Presentation),
+            Seq { items, .. } | Set { items, .. } => {
+                container_fidelity(renderer, items, Presentation)
+            }
+            Object { fields } => container_fidelity(renderer, fields.values(), Presentation),
+            EntriesMap { entries } => entry_container_fidelity(renderer, entries, Presentation),
             Scope { .. }
             | Request { .. }
             | Capability { .. }
             | Snapshot { .. }
             | Thunk { .. }
-            | Group { .. } => Opaque,
+            | Group { .. }
+            | Graph { .. }
+            | Native { .. } => Opaque,
         },
         SpliceRenderer::Default => match val {
-            Null | Bool { .. } | Int { .. } | Float { .. } | Str { .. } => Structural,
+            Null
+            | Bool { .. }
+            | Int { .. }
+            | Float { .. }
+            | Number { .. }
+            | Str { .. }
+            | Text { .. }
+            | Char { .. }
+            | Bytes { .. }
+            | Symbol { .. }
+            | Keyword { .. } => Structural,
             List { v } => container_fidelity(renderer, v, Structural),
             Map { v } => container_fidelity(renderer, v.values(), Structural),
+            Seq { items, .. } | Set { items, .. } => {
+                container_fidelity(renderer, items, Structural)
+            }
+            Object { fields } => container_fidelity(renderer, fields.values(), Structural),
+            EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
             Html { .. }
             | StorePath { .. }
             | Expr { .. }
@@ -2344,6 +2402,8 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             | Snapshot { .. }
             | Thunk { .. }
             | Group { .. }
+            | Graph { .. }
+            | Native { .. }
             | Error { .. } => Opaque,
         },
     }
@@ -2373,7 +2433,14 @@ fn render_nix(val: &OValue) -> String {
         }
         OValue::Int { v } => v.to_string(),
         OValue::Float { v } => v.to_string(),
+        OValue::Number { .. } => {
+            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
+        }
         OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
+        OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "\"".to_string()),
+        OValue::Char { scalar } => {
+            serde_json::to_string(&scalar.to_string()).unwrap_or_else(|_| "\"".to_string())
+        }
         OValue::Html { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
         OValue::StorePath { path } => {
             serde_json::to_string(path).unwrap_or_else(|_| "\"".to_string())
@@ -2393,10 +2460,45 @@ fn render_nix(val: &OValue) -> String {
                 .join(" ");
             format!("{{ {} }}", items)
         }
+        OValue::Seq { items, .. } | OValue::Set { items, .. } => {
+            let items = items.iter().map(render_nix).collect::<Vec<_>>().join(" ");
+            format!("[ {} ]", items)
+        }
+        OValue::Object { fields } => {
+            let items = fields
+                .iter()
+                .map(|(k, val)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
+                    format!("{} = {};", key, render_nix(val))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{{ {} }}", items)
+        }
+        OValue::EntriesMap { entries } => {
+            let items = entries
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{{ key = {}; value = {}; }}",
+                        render_nix(key),
+                        render_nix(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("[ {} ]", items)
+        }
+        OValue::Symbol { .. } | OValue::Keyword { .. } => {
+            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
+        }
         OValue::Scope { bindings } => {
             format!("\"<scope bindings={}>\"", bindings.len())
         }
         OValue::Blob { v, .. } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
+        OValue::Bytes { .. } | OValue::Graph { .. } | OValue::Native { .. } => {
+            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
+        }
         // An ONixExpr spliced into a Nix context is its already-assembled body —
         // it is a valid Nix expression that can be parenthesised inline.
         OValue::NixExpr { body, .. } => format!("({})", body),
@@ -2478,8 +2580,13 @@ fn render_python(val: &OValue) -> String {
                 format!("{}.0", s)
             }
         }
+        OValue::Number { .. } => render_python_opaque(val),
 
         OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "''".to_string()),
+        OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "''".to_string()),
+        OValue::Char { scalar } => {
+            serde_json::to_string(&scalar.to_string()).unwrap_or_else(|_| "''".to_string())
+        }
 
         OValue::Html { v } => {
             let lit = serde_json::to_string(v).unwrap_or_else(|_| "''".to_string());
@@ -2496,6 +2603,30 @@ fn render_python(val: &OValue) -> String {
 
             format!("[{}]", items)
         }
+        OValue::Seq {
+            kind: SeqKind::Tuple,
+            items,
+        } => {
+            let singleton = items.len() == 1;
+            let rendered = items
+                .iter()
+                .map(render_python)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if singleton {
+                format!("({},)", rendered)
+            } else {
+                format!("({})", rendered)
+            }
+        }
+        OValue::Seq { items, .. } => {
+            let items = items
+                .iter()
+                .map(render_python)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{}]", items)
+        }
 
         OValue::Map { v } => {
             let items = sorted_map_entries(v)
@@ -2508,6 +2639,37 @@ fn render_python(val: &OValue) -> String {
                 .join(", ");
 
             format!("{{{}}}", items)
+        }
+        OValue::Object { fields } => {
+            let items = fields
+                .iter()
+                .map(|(k, val)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "''".to_string());
+                    format!("{}: {}", key, render_python(val))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            format!("{{{}}}", items)
+        }
+        OValue::EntriesMap { entries } => {
+            let items = entries
+                .iter()
+                .map(|(key, value)| format!("({}, {})", render_python(key), render_python(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{}]", items)
+        }
+        OValue::Set { items, .. } => {
+            let items = items
+                .iter()
+                .map(render_python)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("set([{}])", items)
+        }
+        OValue::Symbol { .. } | OValue::Keyword { .. } => {
+            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "''".to_string())
         }
 
         OValue::Scope { bindings } => {
@@ -2525,6 +2687,15 @@ fn render_python(val: &OValue) -> String {
 
             format!("{{'mime': {}, 'base64': {}}}", mime_lit, data_lit)
         }
+        OValue::Bytes { v } => {
+            let items = v
+                .bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("bytes([{}])", items)
+        }
 
         OValue::NixExpr { .. }
         | OValue::Derivation { .. }
@@ -2533,6 +2704,8 @@ fn render_python(val: &OValue) -> String {
         | OValue::System { .. }
         | OValue::Capability { .. }
         | OValue::Snapshot { .. }
+        | OValue::Graph { .. }
+        | OValue::Native { .. }
         | OValue::Group { .. }
         | OValue::Error { .. } => render_python_opaque(val),
 
@@ -2563,11 +2736,14 @@ fn render_html(val: &OValue) -> String {
         OValue::Bool { v } => html_escape(&v.to_string()),
         OValue::Int { v } => html_escape(&v.to_string()),
         OValue::Float { v } => html_escape(&v.to_string()),
+        OValue::Number { .. } => html_escape(&val.splice_repr()),
 
         // Plain strings are untrusted text — escape them. Trusted raw HTML
         // must arrive as OValue::Html (the "trusted HTML fragment" type per
         // SPEC.md), e.g. produced by an inner html^(...)_html block.
         OValue::Str { v } => html_escape(v),
+        OValue::Text { v } => html_escape(&v.utf8),
+        OValue::Char { scalar } => html_escape(&scalar.to_string()),
         OValue::Html { v } => v.clone(),
 
         OValue::StorePath { path } => {
@@ -2576,6 +2752,14 @@ fn render_html(val: &OValue) -> String {
 
         OValue::List { v } => {
             let items = v
+                .iter()
+                .map(|item| format!("<li>{}</li>", render_html(item)))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("<ul>{}</ul>", items)
+        }
+        OValue::Seq { items, .. } | OValue::Set { items, .. } => {
+            let items = items
                 .iter()
                 .map(|item| format!("<li>{}</li>", render_html(item)))
                 .collect::<Vec<_>>()
@@ -2594,6 +2778,29 @@ fn render_html(val: &OValue) -> String {
             })
             .collect::<Vec<_>>()
             .join(""),
+        OValue::Object { fields } => fields
+            .iter()
+            .map(|(k, val)| {
+                format!(
+                    "<div data-o-key=\"{}\">{}</div>",
+                    html_escape(k),
+                    render_html(val)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        OValue::EntriesMap { entries } => entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "<div data-o-entry><span>{}</span>{}</div>",
+                    render_html(key),
+                    render_html(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        OValue::Symbol { .. } | OValue::Keyword { .. } => html_escape(&val.splice_repr()),
 
         OValue::Scope { bindings } => {
             format!(
@@ -2603,6 +2810,27 @@ fn render_html(val: &OValue) -> String {
         }
 
         OValue::Blob { v, mime } => render_html_blob(v, mime),
+        OValue::Bytes { v } => render_html_blob(
+            &B64.encode(&v.bytes),
+            v.media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        ),
+        OValue::Graph { root, nodes } => {
+            format!(
+                "<code class=\"o-graph\" data-root=\"{}\" data-nodes=\"{}\">&lt;graph&gt;</code>",
+                root,
+                nodes.len(),
+            )
+        }
+        OValue::Native { v } => {
+            format!(
+                "<code class=\"o-native\" data-lang=\"{}\" data-codec=\"{}\">{}</code>",
+                html_escape(&v.lang),
+                html_escape(&v.codec),
+                html_escape(&v.type_name),
+            )
+        }
 
         OValue::NixExpr {
             body, fingerprint, ..
@@ -2751,21 +2979,51 @@ fn render_latex(val: &OValue) -> String {
         OValue::Bool { v } => v.to_string(),
         OValue::Int { v } => v.to_string(),
         OValue::Float { v } => v.to_string(),
+        OValue::Number { .. } => val.splice_repr(),
         OValue::Str { v } => v.clone(),
+        OValue::Text { v } => v.utf8.clone(),
+        OValue::Char { scalar } => scalar.to_string(),
         OValue::Html { v } => v.clone(),
         OValue::StorePath { path } => {
             format!("\\texttt{{{}}}", path.replace("_", "\\_"))
         }
         OValue::List { v } => v.iter().map(render_latex).collect::<Vec<_>>().join(", "),
+        OValue::Seq { items, .. } | OValue::Set { items, .. } => items
+            .iter()
+            .map(render_latex)
+            .collect::<Vec<_>>()
+            .join(", "),
         OValue::Map { v } => sorted_map_entries(v)
             .into_iter()
             .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
             .collect::<Vec<_>>()
             .join(", "),
+        OValue::Object { fields } => fields
+            .iter()
+            .map(|(k, val)| format!("{}: {}", k, render_latex(val)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        OValue::EntriesMap { entries } => entries
+            .iter()
+            .map(|(key, value)| format!("{} => {}", render_latex(key), render_latex(value)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        OValue::Symbol { .. } | OValue::Keyword { .. } => val.splice_repr(),
         OValue::Scope { bindings } => {
             format!("\\texttt{{<scope bindings={}>}}", bindings.len())
         }
         OValue::Blob { mime, .. } => format!("\\texttt{{<blob:{}>}}", mime),
+        OValue::Bytes { v } => format!("\\texttt{{<bytes:{}>}}", v.bytes.len()),
+        OValue::Graph { root, nodes } => {
+            format!("\\texttt{{<graph root={} nodes={}>}}", root, nodes.len())
+        }
+        OValue::Native { v } => {
+            format!(
+                "\\texttt{{<native:{} {}>}}",
+                v.lang.replace("_", "\\_"),
+                v.type_name.replace("_", "\\_")
+            )
+        }
         OValue::NixExpr { body, .. } => format!("\\texttt{{{}}}", body.replace("_", "\\_")),
         OValue::Derivation { drv_path, .. } => {
             format!("\\texttt{{{}}}", drv_path.replace("_", "\\_"))
@@ -2822,17 +3080,39 @@ fn render_markdown(val: &OValue) -> String {
         OValue::Bool { v } => v.to_string(),
         OValue::Int { v } => v.to_string(),
         OValue::Float { v } => v.to_string(),
+        OValue::Number { .. } => val.splice_repr(),
         OValue::Str { v } => v.clone(),
+        OValue::Text { v } => v.utf8.clone(),
+        OValue::Char { scalar } => scalar.to_string(),
         OValue::Html { v } => v.clone(),
         OValue::StorePath { path } => format!("`{}`", path),
         OValue::List { v } => v.iter().map(render_markdown).collect::<Vec<_>>().join("\n"),
+        OValue::Seq { items, .. } | OValue::Set { items, .. } => items
+            .iter()
+            .map(render_markdown)
+            .collect::<Vec<_>>()
+            .join("\n"),
         OValue::Map { v } => sorted_map_entries(v)
             .into_iter()
             .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
             .collect::<Vec<_>>()
             .join("\n"),
+        OValue::Object { fields } => fields
+            .iter()
+            .map(|(k, val)| format!("**{}**: {}", k, render_markdown(val)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        OValue::EntriesMap { entries } => entries
+            .iter()
+            .map(|(key, value)| format!("{} => {}", render_markdown(key), render_markdown(value)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        OValue::Symbol { .. } | OValue::Keyword { .. } => val.splice_repr(),
         OValue::Scope { bindings } => format!("`<scope bindings={}>`", bindings.len()),
         OValue::Blob { mime, .. } => format!("<blob:{}>", mime),
+        OValue::Bytes { v } => format!("<bytes:{}>", v.bytes.len()),
+        OValue::Graph { root, nodes } => format!("`<graph root={} nodes={}>`", root, nodes.len()),
+        OValue::Native { v } => format!("`<native:{} {}>`", v.lang, v.type_name),
         OValue::NixExpr { body, .. } => format!("`{}`", body),
         OValue::Derivation { drv_path, .. } => format!("`{}`", drv_path),
         OValue::Request { fingerprint, .. } => {
@@ -3965,7 +4245,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_deferred_request_cannot_omit_adapter_required_rights() {
+    fn forged_deferred_request_cannot_omit_default_backend_rights() {
         let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
         let capability = evaluator
             .issue_backend_execution_capability("bash", [])
@@ -3986,7 +4266,11 @@ mod tests {
         );
 
         let error = format!("{:#}", evaluator.force_request(&request).unwrap_err());
-        assert!(error.contains("lacks `process` authority"));
+        assert!(
+            error.contains("backend execution capability for bash lacks")
+                && error.contains("authority"),
+            "underpowered capability must fail before spawn, got: {error}"
+        );
         assert!(!error.contains("failed to spawn backend shim"));
     }
 
