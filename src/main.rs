@@ -372,6 +372,7 @@ fn print_result(value: &OValue) {
 
     match value {
         OValue::Str { v } => print!("{v}"),
+        OValue::Text { v } => print!("{}", v.utf8),
         OValue::Html { v } => print!("{v}"),
         OValue::Null => {
             println!("{}", if color { "\x1b[2mnull\x1b[0m" } else { "null" });
@@ -477,6 +478,13 @@ fn format_value(v: &OValue, color: bool, depth: usize) -> String {
                 format!("\x1b[32m{v:?}\x1b[0m")
             } else {
                 format!("{v:?}")
+            }
+        }
+        OValue::Text { v } => {
+            if color {
+                format!("\x1b[32m{:?}\x1b[0m", v.utf8)
+            } else {
+                format!("{:?}", v.utf8)
             }
         }
         OValue::Html { v } => {

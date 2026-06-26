@@ -1702,6 +1702,7 @@ impl Evaluator {
                 }
                 let profile = match arg_vals.get(1) {
                     Some(OValue::Str { v }) => v.clone(),
+                    Some(OValue::Text { v }) => v.utf8.clone(),
                     Some(OValue::System { profile_path }) => profile_path.clone(),
                     Some(other) => bail!(
                         "dry_activate's profile must be a string path or System, got {}",
@@ -1754,6 +1755,7 @@ impl Evaluator {
                         })?;
                     let requested_profile = match arg_vals.get(2) {
                         Some(OValue::Str { v }) => v.clone(),
+                        Some(OValue::Text { v }) => v.utf8.clone(),
                         Some(OValue::System { profile_path }) => profile_path.clone(),
                         Some(other) => bail!(
                             "activate's profile must be a string path or System, got {}",
@@ -1780,6 +1782,7 @@ impl Evaluator {
                     }
                     let profile = match arg_vals.get(1) {
                         Some(OValue::Str { v }) => v.clone(),
+                        Some(OValue::Text { v }) => v.utf8.clone(),
                         Some(OValue::System { profile_path }) => profile_path.clone(),
                         Some(other) => bail!(
                             "activate's profile must be a string path or System, got {}",
@@ -2455,9 +2458,7 @@ fn render_nix(val: &OValue) -> String {
         }
         OValue::Int { v } => v.to_string(),
         OValue::Float { v } => v.to_string(),
-        OValue::Number { .. } => {
-            serde_json::to_string(&val.splice_repr()).unwrap_or_else(|_| "\"\"".to_string())
-        }
+        OValue::Number { v } => render_nix_number(v),
         OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
         OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "\"".to_string()),
         OValue::Char { scalar } => {
@@ -2749,6 +2750,77 @@ fn render_python_opaque(val: &OValue) -> String {
     format!("OOpaqueValue.from_wire_json({encoded})")
 }
 
+fn render_nix_number(value: &ONumber) -> String {
+    match value {
+        ONumber::Int { v } => v.to_string(),
+        ONumber::BinaryFloat {
+            format: FloatFormat::F32,
+            bits,
+        } if bits.len() == 4 => {
+            let mut raw = [0_u8; 4];
+            raw.copy_from_slice(bits);
+            render_float_literal(f32::from_bits(u32::from_be_bytes(raw)) as f64)
+        }
+        ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits,
+        } if bits.len() == 8 => {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(bits);
+            render_float_literal(f64::from_bits(u64::from_be_bytes(raw)))
+        }
+        other => serde_json::to_string(&render_number_fallback(other))
+            .unwrap_or_else(|_| "\"\"".to_string()),
+    }
+}
+
+fn render_number_fallback(value: &ONumber) -> String {
+    match value {
+        ONumber::Int { v } => v.to_string(),
+        ONumber::Rational { num, den } => format!("{num}/{den}"),
+        ONumber::Decimal {
+            coeff,
+            exp10,
+            special,
+        } => match special {
+            Some(special) => format!("{special:?}").to_lowercase(),
+            None => format!("{coeff}e{exp10}"),
+        },
+        ONumber::BinaryFloat { format, bits } => {
+            format!("{format:?}:{}", hex::encode(bits))
+        }
+        ONumber::BigFloat {
+            mantissa,
+            exp2,
+            precision,
+            special,
+        } => match special {
+            Some(special) => format!("{special:?}").to_lowercase(),
+            None => format!("{mantissa}p{exp2}@{precision:?}"),
+        },
+        ONumber::Complex { re, im } => {
+            format!(
+                "{}+{}i",
+                render_number_fallback(re),
+                render_number_fallback(im)
+            )
+        }
+    }
+}
+
+fn render_float_literal(value: f64) -> String {
+    let rendered = value.to_string();
+    if value.is_finite()
+        && !rendered.contains('.')
+        && !rendered.contains('e')
+        && !rendered.contains('E')
+    {
+        format!("{rendered}.0")
+    } else {
+        rendered
+    }
+}
+
 fn render_python_number(value: &ONumber) -> String {
     match value {
         ONumber::Int { v } => v.to_string(),
@@ -2776,7 +2848,13 @@ fn render_python_number(value: &ONumber) -> String {
         ONumber::BinaryFloat {
             format: FloatFormat::F32,
             bits,
-        } => {
+        } if bits.len() == 4 => {
+            let mut raw = [0_u8; 4];
+            raw.copy_from_slice(bits);
+            let value = f32::from_bits(u32::from_be_bytes(raw)) as f64;
+            if value.is_finite() {
+                return render_float_literal(value);
+            }
             let bytes = bits
                 .iter()
                 .map(u8::to_string)
@@ -2787,13 +2865,31 @@ fn render_python_number(value: &ONumber) -> String {
         ONumber::BinaryFloat {
             format: FloatFormat::F64,
             bits,
-        } => {
+        } if bits.len() == 8 => {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(bits);
+            let value = f64::from_bits(u64::from_be_bytes(raw));
+            if value.is_finite() {
+                return render_float_literal(value);
+            }
             let bytes = bits
                 .iter()
                 .map(u8::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("__import__('struct').unpack('>d', bytes([{bytes}]))[0]")
+        }
+        ONumber::BinaryFloat { format, bits } => {
+            let unpack = match format {
+                FloatFormat::F32 => ">f",
+                FloatFormat::F64 => ">d",
+            };
+            let bytes = bits
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("__import__('struct').unpack('{unpack}', bytes([{bytes}]))[0]")
         }
         ONumber::BigFloat {
             mantissa,

@@ -343,7 +343,7 @@ pub struct ONative {
 /// (`Number`, `Text`, `Bytes`, `Seq`, `Object`, `EntriesMap`, `Graph`, and
 /// `Native`) without losing information before the rest of the evaluator learns
 /// their full semantics.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum OValue {
     /// The absence of a value. Distinct from false and from zero.
@@ -662,6 +662,267 @@ pub enum OValue {
     Error { msg: String },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum OValueWire {
+    Null,
+    #[serde(rename = "bool")]
+    Bool {
+        v: bool,
+    },
+    #[serde(rename = "int")]
+    Int {
+        #[serde(with = "bigint_json")]
+        v: BigInt,
+    },
+    #[serde(rename = "float")]
+    Float {
+        v: f64,
+    },
+    #[serde(rename = "number")]
+    Number {
+        v: ONumber,
+    },
+    #[serde(rename = "str")]
+    Str {
+        v: String,
+    },
+    #[serde(rename = "text")]
+    Text {
+        v: OText,
+    },
+    #[serde(rename = "char")]
+    Char {
+        scalar: char,
+    },
+    #[serde(rename = "html")]
+    Html {
+        v: String,
+    },
+    #[serde(rename = "store_path")]
+    StorePath {
+        path: String,
+    },
+    #[serde(rename = "expr")]
+    Expr {
+        src: String,
+    },
+    #[serde(rename = "list")]
+    List {
+        v: Vec<OValue>,
+    },
+    #[serde(rename = "map")]
+    Map {
+        v: HashMap<String, OValue>,
+    },
+    #[serde(rename = "seq")]
+    Seq {
+        kind: SeqKind,
+        items: Vec<OValue>,
+    },
+    #[serde(rename = "object")]
+    Object {
+        fields: BTreeMap<String, OValue>,
+    },
+    #[serde(rename = "entries_map")]
+    EntriesMap {
+        entries: Vec<(OValue, OValue)>,
+    },
+    #[serde(rename = "set")]
+    Set {
+        kind: SetKind,
+        items: Vec<OValue>,
+    },
+    #[serde(rename = "symbol")]
+    Symbol {
+        v: OSymbol,
+    },
+    #[serde(rename = "keyword")]
+    Keyword {
+        v: OKeyword,
+    },
+    #[serde(rename = "scope")]
+    Scope {
+        bindings: HashMap<String, OValue>,
+    },
+    #[serde(rename = "blob")]
+    Blob {
+        v: String,
+        mime: String,
+    },
+    #[serde(rename = "bytes")]
+    Bytes {
+        v: OBytes,
+    },
+    #[serde(rename = "graph")]
+    Graph {
+        root: NodeId,
+        nodes: Vec<GraphNode>,
+    },
+    #[serde(rename = "native")]
+    Native {
+        v: ONative,
+    },
+    #[serde(rename = "nix_expr")]
+    NixExpr {
+        body: String,
+        deps: Vec<OValue>,
+        fingerprint: String,
+    },
+    #[serde(rename = "derivation")]
+    Derivation {
+        drv_path: String,
+        outputs: Vec<String>,
+        deps: Vec<OValue>,
+    },
+    #[serde(rename = "request")]
+    Request {
+        kind: RequestKind,
+        source: Box<OValue>,
+        fingerprint: String,
+    },
+    #[serde(rename = "system")]
+    System {
+        profile_path: String,
+    },
+    #[serde(rename = "capability")]
+    Capability {
+        kind: CapabilityKind,
+        identity: String,
+        metadata: HashMap<String, OValue>,
+    },
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        kind: SnapshotKind,
+        identity: String,
+        state: HashMap<String, OValue>,
+    },
+    #[serde(rename = "thunk")]
+    Thunk {
+        body: String,
+        deps: Vec<OValue>,
+        fingerprint: String,
+    },
+    #[serde(rename = "group")]
+    Group {
+        mode: GroupMode,
+        members: Vec<OValue>,
+        fingerprint: String,
+    },
+    #[serde(rename = "error")]
+    Error {
+        msg: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for OValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(OValueWire::deserialize(deserializer)?.into_ovalue())
+    }
+}
+
+impl OValueWire {
+    fn into_ovalue(self) -> OValue {
+        match self {
+            OValueWire::Null => OValue::Null,
+            OValueWire::Bool { v } => OValue::Bool { v },
+            OValueWire::Int { v } => OValue::big_int(v),
+            OValueWire::Float { v } => OValue::number(ONumber::BinaryFloat {
+                format: FloatFormat::F64,
+                bits: v.to_bits().to_be_bytes().to_vec(),
+            }),
+            OValueWire::Number { v } => OValue::Number { v },
+            OValueWire::Str { v } => OValue::text(v),
+            OValueWire::Text { v } => OValue::Text { v },
+            OValueWire::Char { scalar } => OValue::Char { scalar },
+            OValueWire::Html { v } => OValue::Html { v },
+            OValueWire::StorePath { path } => OValue::StorePath { path },
+            OValueWire::Expr { src } => OValue::Expr { src },
+            OValueWire::List { v } => OValue::List { v },
+            OValueWire::Map { v } => OValue::Map { v },
+            OValueWire::Seq { kind, items } => OValue::Seq { kind, items },
+            OValueWire::Object { fields } => OValue::Object { fields },
+            OValueWire::EntriesMap { entries } => OValue::EntriesMap { entries },
+            OValueWire::Set { kind, items } => OValue::Set { kind, items },
+            OValueWire::Symbol { v } => OValue::Symbol { v },
+            OValueWire::Keyword { v } => OValue::Keyword { v },
+            OValueWire::Scope { bindings } => OValue::Scope { bindings },
+            OValueWire::Blob { v, mime } => OValue::Blob { v, mime },
+            OValueWire::Bytes { v } => OValue::Bytes { v },
+            OValueWire::Graph { root, nodes } => OValue::Graph { root, nodes },
+            OValueWire::Native { v } => OValue::Native { v },
+            OValueWire::NixExpr {
+                body,
+                deps,
+                fingerprint,
+            } => OValue::NixExpr {
+                body,
+                deps,
+                fingerprint,
+            },
+            OValueWire::Derivation {
+                drv_path,
+                outputs,
+                deps,
+            } => OValue::Derivation {
+                drv_path,
+                outputs,
+                deps,
+            },
+            OValueWire::Request {
+                kind,
+                source,
+                fingerprint,
+            } => OValue::Request {
+                kind,
+                source,
+                fingerprint,
+            },
+            OValueWire::System { profile_path } => OValue::System { profile_path },
+            OValueWire::Capability {
+                kind,
+                identity,
+                metadata,
+            } => OValue::Capability {
+                kind,
+                identity,
+                metadata,
+            },
+            OValueWire::Snapshot {
+                kind,
+                identity,
+                state,
+            } => OValue::Snapshot {
+                kind,
+                identity,
+                state,
+            },
+            OValueWire::Thunk {
+                body,
+                deps,
+                fingerprint,
+            } => OValue::Thunk {
+                body,
+                deps,
+                fingerprint,
+            },
+            OValueWire::Group {
+                mode,
+                members,
+                fingerprint,
+            } => OValue::Group {
+                mode,
+                members,
+                fingerprint,
+            },
+            OValueWire::Error { msg } => OValue::Error { msg },
+        }
+    }
+}
+
 /// The execution topology of an `OValue::Group`.
 ///
 /// This is the "shape" axis of coordination: given several computations, the
@@ -902,10 +1163,13 @@ impl OValue {
         OValue::Bool { v: b }
     }
     pub fn int(n: i64) -> Self {
-        OValue::Int { v: n }
+        OValue::big_int(n)
     }
     pub fn float(f: f64) -> Self {
-        OValue::Float { v: f }
+        OValue::number(ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits: f.to_bits().to_be_bytes().to_vec(),
+        })
     }
     pub fn number(n: ONumber) -> Self {
         OValue::Number { v: n }
@@ -928,7 +1192,7 @@ impl OValue {
         })
     }
     pub fn str_(s: impl Into<String>) -> Self {
-        OValue::Str { v: s.into() }
+        OValue::text(s)
     }
     pub fn text(s: impl Into<String>) -> Self {
         OValue::Text {
@@ -1421,17 +1685,23 @@ impl CanonicalEncode for OValue {
                 canonical_bool(out, *v);
             }
             OValue::Int { v } => {
-                canonical_tag(out, "int");
-                canonical_i64(out, *v);
+                ONumber::Int {
+                    v: BigInt::from(*v),
+                }
+                .encode_number(out)?;
             }
             OValue::Float { v } => {
-                canonical_tag(out, "float");
-                out.extend_from_slice(&v.to_bits().to_be_bytes());
+                ONumber::BinaryFloat {
+                    format: FloatFormat::F64,
+                    bits: v.to_bits().to_be_bytes().to_vec(),
+                }
+                .encode_number(out)?;
             }
             OValue::Number { v } => v.encode_number(out)?,
             OValue::Str { v } => {
-                canonical_tag(out, "str");
+                canonical_tag(out, "text");
                 canonical_str(out, v);
+                canonical_opt_str(out, Some("utf-8"));
             }
             OValue::Text { v } => {
                 canonical_tag(out, "text");
@@ -1855,13 +2125,19 @@ impl OValue {
         )
     }
     pub fn is_float(&self) -> bool {
-        matches!(self, OValue::Float { .. })
+        matches!(
+            self,
+            OValue::Float { .. }
+                | OValue::Number {
+                    v: ONumber::BinaryFloat { .. } | ONumber::BigFloat { .. }
+                }
+        )
     }
     pub fn is_number(&self) -> bool {
         matches!(self, OValue::Number { .. })
     }
     pub fn is_str(&self) -> bool {
-        matches!(self, OValue::Str { .. })
+        matches!(self, OValue::Str { .. } | OValue::Text { .. })
     }
     pub fn is_text(&self) -> bool {
         matches!(self, OValue::Text { .. })
@@ -2334,7 +2610,7 @@ fn number_repr(value: &ONumber) -> String {
         } if bits.len() == 4 => {
             let mut raw = [0_u8; 4];
             raw.copy_from_slice(bits);
-            f32::from_bits(u32::from_be_bytes(raw)).to_string()
+            float_repr(f32::from_bits(u32::from_be_bytes(raw)) as f64)
         }
         ONumber::BinaryFloat {
             format: FloatFormat::F64,
@@ -2342,7 +2618,7 @@ fn number_repr(value: &ONumber) -> String {
         } if bits.len() == 8 => {
             let mut raw = [0_u8; 8];
             raw.copy_from_slice(bits);
-            f64::from_bits(u64::from_be_bytes(raw)).to_string()
+            float_repr(f64::from_bits(u64::from_be_bytes(raw)))
         }
         ONumber::BinaryFloat { format, bits } => {
             format!("<{}:{}>", float_format_name(*format), hex::encode(bits))
@@ -2360,6 +2636,19 @@ fn number_repr(value: &ONumber) -> String {
             },
         },
         ONumber::Complex { re, im } => format!("{}+{}i", number_repr(re), number_repr(im)),
+    }
+}
+
+fn float_repr(value: f64) -> String {
+    let rendered = value.to_string();
+    if value.is_finite()
+        && !rendered.contains('.')
+        && !rendered.contains('e')
+        && !rendered.contains('E')
+    {
+        format!("{rendered}.0")
+    } else {
+        rendered
     }
 }
 
@@ -3017,6 +3306,41 @@ mod tests {
         assert!(matches!(decoded, OWireCommand::EvalResult { .. }));
     }
 
+    #[test]
+    fn legacy_scalar_wire_tags_deserialize_to_structural_values() {
+        let int_value: OValue = serde_json::from_str(r#"{"t":"int","v":42}"#).unwrap();
+        assert_eq!(int_value, OValue::big_int(42));
+
+        let big_value: OValue =
+            serde_json::from_str(r#"{"t":"int","v":9223372036854775808}"#).unwrap();
+        assert_eq!(
+            big_value,
+            OValue::big_int(BigInt::parse_bytes(b"9223372036854775808", 10).unwrap())
+        );
+
+        let float_value: OValue = serde_json::from_str(r#"{"t":"float","v":3.0}"#).unwrap();
+        assert_eq!(float_value, OValue::float(3.0));
+
+        let str_value: OValue = serde_json::from_str(r#"{"t":"str","v":"hello"}"#).unwrap();
+        assert_eq!(str_value, OValue::text("hello"));
+
+        assert_eq!(
+            OValue::Int { v: 42 }.content_identity(),
+            OValue::big_int(42).content_identity()
+        );
+        assert_eq!(
+            OValue::Float { v: 3.0 }.content_identity(),
+            OValue::float(3.0).content_identity()
+        );
+        assert_eq!(
+            OValue::Str {
+                v: "hello".to_string()
+            }
+            .content_identity(),
+            OValue::text("hello").content_identity()
+        );
+    }
+
     /// The type_name method must return the exact string used as the
     /// wire protocol `t` tag — they must stay in sync.
     #[test]
@@ -3024,10 +3348,13 @@ mod tests {
         let cases = vec![
             (OValue::null(), "null"),
             (OValue::bool_(true), "bool"),
-            (OValue::int(0), "int"),
-            (OValue::float(0.0), "float"),
+            (OValue::Int { v: 0 }, "int"),
+            (OValue::Float { v: 0.0 }, "float"),
+            (OValue::Str { v: String::new() }, "str"),
+            (OValue::int(0), "number"),
+            (OValue::float(0.0), "number"),
             (OValue::big_int(0), "number"),
-            (OValue::str_(""), "str"),
+            (OValue::str_(""), "text"),
             (OValue::text(""), "text"),
             (OValue::bytes(Vec::<u8>::new(), None), "bytes"),
             (OValue::char_('a'), "char"),
