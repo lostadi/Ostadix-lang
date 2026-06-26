@@ -357,10 +357,12 @@ pub enum OValue {
     /// A legacy 64-bit signed integer compatibility form. Arbitrary precision
     /// integers cross as `OValue::Number { ONumber::Int(BigInt) }`.
     #[serde(rename = "int")]
+    #[deprecated(since = "0.3.0", note = "use OValue::Number via OValue::int()")]
     Int { v: i64 },
 
     /// A 64-bit IEEE 754 floating point number.
     #[serde(rename = "float")]
+    #[deprecated(since = "0.3.0", note = "use OValue::Number via OValue::float()")]
     Float { v: f64 },
 
     /// A lossless numeric value: big integers, rationals, decimal/binary
@@ -372,6 +374,7 @@ pub enum OValue {
     /// Raw text from backends, spliced $var values, document content —
     /// all arrive as OStr unless the backend explicitly returns something richer.
     #[serde(rename = "str")]
+    #[deprecated(since = "0.3.0", note = "use OValue::Text via OValue::str_()")]
     Str { v: String },
 
     /// Text with explicit encoding metadata. `Str` remains the compatibility
