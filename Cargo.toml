@@ -61,6 +61,7 @@ hex         = "0.4"
 # Lossless numeric value vocabulary for ONumber.
 num-bigint  = { version = "0.4", features = ["serde"] }
 num-traits  = "0.2"
+bitflags    = "2"
 
 # Operating-system entropy for live bearer capability identities
 getrandom   = "0.4.3"

@@ -151,6 +151,95 @@ pub enum FloatSpecial {
     NegZero,
 }
 
+/// A class of information that can be dropped when a native backend value is
+/// projected into O or when an OValue is rendered into another backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnnotationKind {
+    TypeTag,
+    NumericPrecision,
+    NumericExactness,
+    Encoding,
+    Ordering,
+    Identity,
+    Constraint,
+    Capability,
+    Presentation,
+    BackendSpecific { lang: String, label: String },
+}
+
+/// Explicit fidelity contract for backend value crossings.
+///
+/// This is deliberately internal-kernel vocabulary, not user-facing syntax.
+/// Each backend injection/projection path should be able to say whether a
+/// crossing preserved the value exactly, preserved only portable structure,
+/// kept an opaque same-backend capsule, or could not represent the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Fidelity {
+    Lossless,
+    Structural { lost: Vec<AnnotationKind> },
+    NativeCapsule,
+    Unsupported,
+}
+
+impl Fidelity {
+    pub fn structural(lost: impl IntoIterator<Item = AnnotationKind>) -> Self {
+        let mut lost = lost.into_iter().collect::<Vec<_>>();
+        lost.dedup();
+        if lost.is_empty() {
+            Self::Lossless
+        } else {
+            Self::Structural { lost }
+        }
+    }
+
+    /// Compose two fidelity judgments along a value path. The result is the
+    /// weaker of the two crossings, accumulating structural losses when both
+    /// crossings preserve portable structure.
+    pub fn compose(self, next: Self) -> Self {
+        use Fidelity::*;
+        match (self, next) {
+            (Unsupported, _) | (_, Unsupported) => Unsupported,
+            (NativeCapsule, _) | (_, NativeCapsule) => NativeCapsule,
+            (Lossless, other) | (other, Lossless) => other,
+            (Structural { mut lost }, Structural { lost: mut more }) => {
+                lost.append(&mut more);
+                lost.dedup();
+                Structural { lost }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionError {
+    pub backend: String,
+    pub message: String,
+}
+
+impl ProjectionError {
+    pub fn new(backend: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            backend: backend.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Backend morphism law for native <-> OValue crossings.
+///
+/// For native values a backend reports as `Fidelity::Lossless`:
+/// `project(inject(v).0)` must produce a native value equivalent to `v` under
+/// that backend's own equality semantics, and injecting the projection again
+/// must be stable at the OValue layer.
+pub trait BackendMorphism {
+    type NativeRepr;
+
+    fn inject(&self, native: Self::NativeRepr) -> (OValue, Fidelity);
+    fn project(&self, value: &OValue) -> std::result::Result<Self::NativeRepr, ProjectionError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OText {
     pub utf8: String,
@@ -265,9 +354,8 @@ pub enum OValue {
     #[serde(rename = "bool")]
     Bool { v: bool },
 
-    /// A 64-bit signed integer.
-    /// Known limitation: Python/Haskell arbitrary precision integers that
-    /// exceed i64::MAX will lose precision. To be fixed with num-bigint.
+    /// A legacy 64-bit signed integer compatibility form. Arbitrary precision
+    /// integers cross as `OValue::Number { ONumber::Int(BigInt) }`.
     #[serde(rename = "int")]
     Int { v: i64 },
 
@@ -3015,6 +3103,32 @@ mod tests {
         let nan_a = OValue::float(f64::from_bits(0x7ff8_0000_0000_0001));
         let nan_b = OValue::float(f64::from_bits(0x7ff8_0000_0000_0002));
         assert_ne!(nan_a.content_identity(), nan_b.content_identity());
+    }
+
+    #[test]
+    fn fidelity_composition_accumulates_structural_losses() {
+        let first =
+            Fidelity::structural([AnnotationKind::TypeTag, AnnotationKind::NumericPrecision]);
+        let second = Fidelity::structural([AnnotationKind::Encoding]);
+
+        assert_eq!(
+            first.compose(second),
+            Fidelity::Structural {
+                lost: vec![
+                    AnnotationKind::TypeTag,
+                    AnnotationKind::NumericPrecision,
+                    AnnotationKind::Encoding,
+                ],
+            }
+        );
+        assert_eq!(
+            Fidelity::Lossless.compose(Fidelity::NativeCapsule),
+            Fidelity::NativeCapsule
+        );
+        assert_eq!(
+            Fidelity::NativeCapsule.compose(Fidelity::Unsupported),
+            Fidelity::Unsupported
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 pub mod backend;
 mod capability;
 pub mod eval;
+pub mod hgraph;
 pub mod ir;
 pub mod nix_ops;
 pub mod nixos_ops;

@@ -150,6 +150,15 @@ impl OIrProgram {
 
         builder.finish(roots)
     }
+
+    /// Build the value-node/operation-edge hypergraph for this program.
+    ///
+    /// The current evaluator still interprets OIR, but this keeps the new
+    /// hypergraph substrate in lockstep with the same lowered program that
+    /// runtime execution uses.
+    pub fn hgraph(&self) -> crate::hgraph::HGraph {
+        crate::hgraph::from_oir::build_program(self)
+    }
 }
 
 /// ONode → OIr lowering. Purely structural; never fails.

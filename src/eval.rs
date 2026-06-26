@@ -304,6 +304,12 @@ pub struct Evaluator {
     /// The validated plan used by the most recent document execution.
     last_execution_plan: Option<ExecutionPlan>,
 
+    /// The hypergraph schedule built from the most recent lowered OIR program.
+    /// This is the compiled foothold for the graph executor: current runtime
+    /// dispatch still interprets OIR, but graph construction, type solving,
+    /// backend-fidelity propagation, and clustering run on every document.
+    last_hgraph_schedule: Option<crate::hgraph::Schedule>,
+
     /// Optional live, process-local authority for embedding-specific activation
     /// guards.
     ///
@@ -407,6 +413,7 @@ impl Evaluator {
             scheduler: AutonomousScheduler::new(),
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
+            last_hgraph_schedule: None,
             activation_authorities: HashMap::new(),
             backend_authorities,
             default_backend_authority,
@@ -432,6 +439,11 @@ impl Evaluator {
     /// The dependency plan that mediated the most recent document execution.
     pub fn last_execution_plan(&self) -> Option<&ExecutionPlan> {
         self.last_execution_plan.as_ref()
+    }
+
+    /// The hypergraph schedule that was built for the most recent document.
+    pub fn last_hgraph_schedule(&self) -> Option<&crate::hgraph::Schedule> {
+        self.last_hgraph_schedule.as_ref()
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1354,6 +1366,11 @@ impl Evaluator {
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
+        let mut hgraph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut hgraph);
+        let hgraph_schedule = crate::hgraph::schedule::schedule(&hgraph);
+        self.last_hgraph_schedule = Some(hgraph_schedule);
+
         let plan = program.plan();
         plan.validate(program.nodes.len())
             .map_err(anyhow::Error::msg)
@@ -3635,6 +3652,11 @@ mod tests {
                     crate::ir::PlanNodeKind::Load { name } if name == "x"
                 )
         }));
+
+        let hgraph_schedule = evaluator
+            .last_hgraph_schedule()
+            .expect("document execution must also build a hypergraph schedule");
+        assert!(!hgraph_schedule.clusters.is_empty());
     }
 
     #[test]
@@ -3654,6 +3676,7 @@ mod tests {
             OValue::html("<p>executed from OIR</p>")
         );
         assert!(evaluator.last_execution_plan().is_some());
+        assert!(evaluator.last_hgraph_schedule().is_some());
     }
 
     #[test]
