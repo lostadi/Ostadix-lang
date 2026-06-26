@@ -1069,7 +1069,7 @@ data, live references, and authority-bearing values.
 |--------|---------|
 | ONull | Absence of a result. |
 | OBool | Boolean true/false. |
-| ONumber | Arbitrary precision integers, exact rationals, decimal and binary floats, big floats, and complex numbers. |
+| ONumber | Supports arbitrary-precision integers, exact rationals, and binary floats; the legacy OInt alias is retained for wire compatibility. |
 | OText | Text with explicit encoding metadata. |
 | OChar | A single Unicode scalar value. |
 | OHtml | Trusted HTML fragment, kept distinct from escaped text. |
