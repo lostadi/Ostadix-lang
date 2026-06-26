@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::ir::OIr;
 use crate::value::{Fidelity, OValue};
 
 use super::kinds::{DomainFlags, OpKind, RepFlags};
@@ -72,6 +73,8 @@ pub struct HGraph {
     pub nodes: HashMap<NodeId, HNode>,
     pub edges: HashMap<EdgeId, HEdge>,
     pub bindings: HashMap<String, NodeId>,
+    pub ir_map: HashMap<NodeId, OIr>,
+    pub root_nodes: Vec<NodeId>,
     next_node: u64,
     next_edge: u64,
 }
@@ -128,5 +131,13 @@ impl HGraph {
         let mut ids = self.edges.keys().copied().collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    pub fn record_ir(&mut self, node: NodeId, ir: &OIr) {
+        self.ir_map.insert(node, ir.clone());
+    }
+
+    pub fn push_root(&mut self, node: NodeId) {
+        self.root_nodes.push(node);
     }
 }

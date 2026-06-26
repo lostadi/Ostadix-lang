@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    ir::{InvokeMode, OIr, OIrProgram},
+    ir::{BackendInterface, InvokeMode, OIr, OIrProgram},
     value::{GroupMode, OValue},
 };
 
@@ -22,6 +22,7 @@ pub fn build(nodes: &[OIr]) -> HGraph {
     let mut previous = None;
     for node in nodes {
         let id = builder.build_node(node);
+        builder.graph.push_root(id);
         if let Some(prev) = previous {
             builder.add_sequence(prev, id);
         }
@@ -42,23 +43,13 @@ impl Builder {
                 let id = self
                     .graph
                     .add_node(HNode::with_value(OValue::str_(text.clone())));
-                if looks_like_integer(text) {
-                    if let Ok(value) = text.trim().parse::<num_bigint::BigInt>() {
-                        self.graph.add_edge(HEdge {
-                            id: EdgeId(0),
-                            kind: OpKind::Bounded { value },
-                            ports: vec![Port {
-                                node: id,
-                                role: PortRole::Output,
-                            }],
-                        });
-                    }
-                } else if !text.is_empty() {
+                if !text.is_empty() {
                     if let Some(node) = self.graph.node_mut(id) {
                         node.domain = DomainFlags::STRING;
                         node.rep = RepFlags::STR;
                     }
                 }
+                self.graph.record_ir(id, node);
                 id
             }
             OIr::Load(name) => {
@@ -79,6 +70,7 @@ impl Builder {
                         ],
                     });
                 }
+                self.graph.record_ir(consumer, node);
                 consumer
             }
             OIr::Store { name, expr } => {
@@ -86,6 +78,7 @@ impl Builder {
                 let value = self.build_node(expr);
                 self.scopes.pop();
                 self.bind(name.clone(), value);
+                self.graph.record_ir(value, node);
                 value
             }
             OIr::Invoke { mode, args, .. } => {
@@ -111,10 +104,15 @@ impl Builder {
                     _ => OpKind::StructuralBarrier,
                 };
                 self.add_barrier(kind, &child_ids, result);
+                self.graph.record_ir(result, node);
                 result
             }
             OIr::Exec {
-                lang, env_id, body, ..
+                lang,
+                env_id,
+                backend,
+                body,
+                ..
             } => {
                 self.scopes.push(HashMap::new());
                 let mut child_ids = Vec::new();
@@ -131,6 +129,16 @@ impl Builder {
 
                 let result = self.graph.add_node(HNode::fresh());
                 self.add_barrier(OpKind::StructuralBarrier, &child_ids, result);
+                if let Some((dom, rep)) = backend_output_constraints(backend) {
+                    self.graph.add_edge(HEdge {
+                        id: EdgeId(0),
+                        kind: OpKind::AbiFixed { dom, rep },
+                        ports: vec![Port {
+                            node: result,
+                            role: PortRole::Output,
+                        }],
+                    });
+                }
                 for child in &child_ids {
                     self.graph.add_edge(HEdge {
                         id: EdgeId(0),
@@ -150,6 +158,7 @@ impl Builder {
                         ],
                     });
                 }
+                self.graph.record_ir(result, node);
                 if *env_id != u32::MAX {
                     let actor = ActorId {
                         lang: intern_lang(lang),
@@ -226,16 +235,17 @@ impl Builder {
     }
 }
 
-fn looks_like_integer(text: &str) -> bool {
-    let trimmed = text.trim();
-    let rest = trimmed
-        .strip_prefix('+')
-        .or_else(|| trimmed.strip_prefix('-'))
-        .unwrap_or(trimmed);
-    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
-}
-
 fn intern_lang(lang: &str) -> u32 {
     lang.bytes()
         .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32))
+}
+
+fn backend_output_constraints(backend: &BackendInterface) -> Option<(DomainFlags, RepFlags)> {
+    if !backend.pure {
+        return None;
+    }
+    match backend.canonical.as_str() {
+        "html" | "markdown" | "latex" | "text" => Some((DomainFlags::STRING, RepFlags::STR)),
+        _ => None,
+    }
 }

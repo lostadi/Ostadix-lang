@@ -47,6 +47,7 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
         OpKind::Bounded { value } => {
             let mut changed = apply_domain_to_outputs(graph, &edge, DomainFlags::INTEGER);
             changed |= apply_rep_to_outputs(graph, &edge, min_rep_for_bigint(value));
+            changed |= materialize_bounded_outputs(graph, &edge, value);
             changed
         }
         OpKind::AbiFixed { dom, rep } => {
@@ -74,8 +75,8 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
                 .unwrap_or(Fidelity::Unsupported);
             apply_fidelity_to_outputs(graph, &edge, fidelity)
         }
-        OpKind::DataFlow
-        | OpKind::StructuralBarrier
+        OpKind::DataFlow => propagate_dataflow(graph, &edge),
+        OpKind::StructuralBarrier
         | OpKind::Sequence
         | OpKind::ActorSerial { .. }
         | OpKind::Batch
@@ -95,6 +96,69 @@ pub fn min_rep_for_bigint(value: &BigInt) -> RepFlags {
         Some(_) => RepFlags::I64,
         None => RepFlags::BIG,
     }
+}
+
+fn propagate_dataflow(graph: &mut HGraph, edge: &HEdge) -> bool {
+    let Some(input) = input_nodes(edge)
+        .next()
+        .and_then(|id| graph.node(id).cloned())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for nid in edge
+        .ports
+        .iter()
+        .filter(|p| matches!(p.role, PortRole::Output | PortRole::InOut))
+        .map(|p| p.node)
+        .collect::<Vec<_>>()
+    {
+        if let Some(output) = graph.node_mut(nid) {
+            if output.domain != input.domain {
+                output.domain = input.domain;
+                changed = true;
+            }
+            if output.rep != input.rep {
+                output.rep = input.rep;
+                changed = true;
+            }
+            if output.fidelity != input.fidelity {
+                output.fidelity = input.fidelity.clone();
+                changed = true;
+            }
+            if output.value.is_none() && input.value.is_some() {
+                output.value = input.value.clone();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn materialize_bounded_outputs(graph: &mut HGraph, edge: &HEdge, value: &BigInt) -> bool {
+    let mut changed = false;
+    for nid in edge
+        .ports
+        .iter()
+        .filter(|p| matches!(p.role, PortRole::Output | PortRole::InOut))
+        .map(|p| p.node)
+        .collect::<Vec<_>>()
+    {
+        if let Some(node) = graph.node_mut(nid) {
+            let should_write = matches!(
+                node.value,
+                None | Some(OValue::Int { .. }) | Some(OValue::Number { .. })
+            );
+            if should_write {
+                let new_value = OValue::big_int(value.clone());
+                if node.value.as_ref() != Some(&new_value) {
+                    node.value = Some(new_value);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {

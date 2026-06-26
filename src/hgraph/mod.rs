@@ -13,7 +13,7 @@ pub mod solve;
 
 pub use graph::{ActorId, EdgeId, HEdge, HGraph, HNode, NodeId, Port, PortRole};
 pub use kinds::{DomainFlags, MemOrder, OcoreOpKind, OpKind, RepFlags};
-pub use schedule::{schedule, ExecutionCluster, Schedule};
+pub use schedule::{schedule, try_schedule, ExecutionCluster, Schedule};
 
 #[cfg(test)]
 mod tests {
@@ -21,7 +21,7 @@ mod tests {
 
     use crate::{
         ir::{BackendRegistry, InvokeMode, OIr, OIrProgram},
-        value::{AnnotationKind, Fidelity, GroupMode, OValue},
+        value::{AnnotationKind, Fidelity, GroupMode, ONumber, OValue},
     };
 
     use super::*;
@@ -52,6 +52,13 @@ mod tests {
         let mut graph = program.hgraph();
         solve::solve_types(&mut graph);
 
+        assert_eq!(graph.root_nodes.len(), 3);
+        for root in &graph.root_nodes {
+            assert!(
+                graph.ir_map.contains_key(root),
+                "root nodes must retain OIR provenance"
+            );
+        }
         assert!(graph
             .edges
             .values()
@@ -77,9 +84,40 @@ mod tests {
             .nodes
             .values()
             .find(|node| node.value == Some(OValue::str_("9223372036854775808")))
-            .expect("integer-looking OIR text should become a graph node");
-        assert!(big_literal.domain.contains(DomainFlags::INTEGER));
-        assert_eq!(big_literal.rep, RepFlags::BIG);
+            .expect("OIR text should become a graph node");
+        assert!(big_literal.domain.contains(DomainFlags::STRING));
+        assert_eq!(big_literal.rep, RepFlags::STR);
+
+        let schedule = schedule::try_schedule(&graph).unwrap();
+        assert_eq!(schedule.root_order(&graph).unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bounded_integer_nodes_materialize_number_int() {
+        let mut graph = HGraph::default();
+        let out = graph.add_node(HNode::fresh());
+        let bigint = BigInt::from(i64::MAX) + BigInt::from(1_u8);
+        graph.add_edge(HEdge {
+            id: EdgeId(0),
+            kind: OpKind::Bounded {
+                value: bigint.clone(),
+            },
+            ports: vec![Port {
+                node: out,
+                role: PortRole::Output,
+            }],
+        });
+
+        solve::solve_types(&mut graph);
+        let node = graph.node(out).unwrap();
+        assert!(node.domain.contains(DomainFlags::INTEGER));
+        assert_eq!(node.rep, RepFlags::BIG);
+        assert_eq!(
+            node.value,
+            Some(OValue::Number {
+                v: ONumber::Int { v: bigint }
+            })
+        );
     }
 
     #[test]
@@ -156,5 +194,44 @@ mod tests {
 
         assert!(first_cluster < second_cluster);
         assert!(!schedule.clusters[first_cluster].nodes.contains(&second));
+    }
+
+    #[test]
+    fn scheduler_rejects_cycles() {
+        let mut graph = HGraph::default();
+        let left = graph.add_node(HNode::fresh());
+        let right = graph.add_node(HNode::fresh());
+        graph.add_edge(HEdge {
+            id: EdgeId(0),
+            kind: OpKind::Sequence,
+            ports: vec![
+                Port {
+                    node: left,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: right,
+                    role: PortRole::Output,
+                },
+            ],
+        });
+        graph.add_edge(HEdge {
+            id: EdgeId(0),
+            kind: OpKind::Sequence,
+            ports: vec![
+                Port {
+                    node: right,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: left,
+                    role: PortRole::Output,
+                },
+            ],
+        });
+
+        assert!(schedule::try_schedule(&graph)
+            .unwrap_err()
+            .contains("cycle"));
     }
 }

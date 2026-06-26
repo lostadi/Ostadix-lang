@@ -17,7 +17,39 @@ pub struct Schedule {
     pub clusters: Vec<ExecutionCluster>,
 }
 
+impl Schedule {
+    pub fn root_order(&self, graph: &HGraph) -> Result<Vec<usize>, String> {
+        let root_positions = graph
+            .root_nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, node)| (node, index))
+            .collect::<HashMap<_, _>>();
+        let mut order = Vec::with_capacity(graph.root_nodes.len());
+        for cluster in &self.clusters {
+            for node in &cluster.nodes {
+                if let Some(index) = root_positions.get(node) {
+                    order.push(*index);
+                }
+            }
+        }
+        if order.len() != graph.root_nodes.len() {
+            return Err(format!(
+                "hypergraph schedule covered {} of {} root nodes",
+                order.len(),
+                graph.root_nodes.len()
+            ));
+        }
+        Ok(order)
+    }
+}
+
 pub fn schedule(graph: &HGraph) -> Schedule {
+    try_schedule(graph).expect("invalid hypergraph schedule")
+}
+
+pub fn try_schedule(graph: &HGraph) -> Result<Schedule, String> {
     let mut precedes: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
     let mut actor_members: HashMap<ActorId, Vec<NodeId>> = HashMap::new();
 
@@ -70,7 +102,10 @@ pub fn schedule(graph: &HGraph) -> Schedule {
     topological_clusters(graph, &precedes)
 }
 
-fn topological_clusters(graph: &HGraph, precedes: &HashMap<NodeId, HashSet<NodeId>>) -> Schedule {
+fn topological_clusters(
+    graph: &HGraph,
+    precedes: &HashMap<NodeId, HashSet<NodeId>>,
+) -> Result<Schedule, String> {
     let mut indegree: HashMap<NodeId, usize> =
         graph.node_ids().into_iter().map(|id| (id, 0)).collect();
     let mut successors: HashMap<NodeId, BTreeSet<NodeId>> = HashMap::new();
@@ -112,5 +147,13 @@ fn topological_clusters(graph: &HGraph, precedes: &HashMap<NodeId, HashSet<NodeI
         }
     }
 
-    Schedule { clusters }
+    let scheduled: usize = clusters.iter().map(|cluster| cluster.nodes.len()).sum();
+    if scheduled != graph.nodes.len() {
+        return Err(format!(
+            "hypergraph dependency graph contains a cycle or invalid dependency: scheduled {scheduled} of {} nodes",
+            graph.nodes.len()
+        ));
+    }
+
+    Ok(Schedule { clusters })
 }
