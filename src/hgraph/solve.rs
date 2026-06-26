@@ -145,10 +145,7 @@ fn materialize_bounded_outputs(graph: &mut HGraph, edge: &HEdge, value: &BigInt)
         .collect::<Vec<_>>()
     {
         if let Some(node) = graph.node_mut(nid) {
-            let should_write = matches!(
-                node.value,
-                None | Some(OValue::Int { .. }) | Some(OValue::Number { .. })
-            );
+            let should_write = matches!(node.value, None | Some(OValue::Number { .. }));
             if should_write {
                 let new_value = OValue::big_int(value.clone());
                 if node.value.as_ref() != Some(&new_value) {

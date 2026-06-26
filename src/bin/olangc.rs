@@ -404,7 +404,7 @@ fn run_as_script(
 
     // ── Print result ─────────────────────────────────────────────────────────
     match result {
-        OValue::Str { v } | OValue::Html { v } => print!("{v}"),
+        OValue::Html { v } => print!("{v}"),
         OValue::Text { v } => print!("{}", v.utf8),
         other => println!("{other}"),
     }
@@ -643,7 +643,7 @@ fn main() -> anyhow::Result<()> {{
         .context("failed to evaluate program")?;
 
     match result {{
-        OValue::Str {{ v }} | OValue::Html {{ v }} => print!("{{v}}"),
+        OValue::Html {{ v }} => print!("{{v}}"),
         OValue::Text {{ v }} => print!("{{}}", v.utf8),
         other => println!("{{other}}"),
     }}

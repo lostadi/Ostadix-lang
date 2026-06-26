@@ -416,11 +416,11 @@ the boundary. In O-lang that something is always an `OValue`, a tagged union
 that every backend speaks.
 
 ```text
-ONull | OBool | OInt | OFloat | OStr | OHtml
-OList | OMap | OBlob | OExpr
-ONixExpr | ODerivation | OStorePath | OSystem
-ORequest | OThunk | OGroup | OError
-OCapability | OSnapshot
+ONull | OBool | ONumber | OText | OChar | OHtml
+OList | OMap | OSeq | OObject | OEntriesMap | OSet
+OSymbol | OKeyword | OScope | OBlob | OBytes | OGraph | OExpr
+ONixExpr | ODerivation | OStorePath | OSystem | ONative
+ORequest | OThunk | OGroup | OError | OCapability | OSnapshot
 ```
 
 The critical insight is that **the receiving language decides how to render a
@@ -431,10 +431,10 @@ operation: each backend knows how to turn OValue into its own source syntax.
 HTML.render_child(OBlob(png, "image/png"))
   -> <img src="data:image/png;base64,...">
 
-HTML.render_child(OList([OStr("a"), OStr("b")]))
+HTML.render_child(OList([OText("a"), OText("b")]))
   -> <ul><li>a</li><li>b</li></ul>
 
-Python.render_child(OInt(42))
+Python.render_child(ONumber::Int(42))
   -> 42
 ```
 
@@ -668,9 +668,9 @@ $answer + 1
 )_python
 ```
 
-The first expression binds an OInt to `$answer`. The receiving Python backend
-renders that OInt as the Python literal `42`, so the second block evaluates
-`42 + 1`.
+The first expression binds an ONumber integer to `$answer`. The receiving
+Python backend renders that number as the Python literal `42`, so the second
+block evaluates `42 + 1`.
 
 ### Persistent state when you ask for it
 
@@ -1068,10 +1068,14 @@ data, live references, and authority-bearing values.
 | OValue | Meaning |
 |--------|---------|
 | ONull | Absence of a result. |
-| OBool, OInt, OFloat | Primitive scalar values. OInt is a signed 64-bit integer. |
-| OStr | UTF-8 text. |
+| OBool | Boolean true/false. |
+| ONumber | Arbitrary precision integers, exact rationals, decimal and binary floats, big floats, and complex numbers. |
+| OText | Text with explicit encoding metadata. |
+| OChar | A single Unicode scalar value. |
 | OHtml | Trusted HTML fragment, kept distinct from escaped text. |
 | OList, OMap | Recursive heterogeneous containers. Map keys are strings. |
+| OSeq, OObject, OEntriesMap, OSet | Richer structural collections used by the canonical value model. |
+| OSymbol, OKeyword | Interned symbolic identifiers and keyword values. |
 | OScope | Detached O-level lexical bindings for `O.eval(expr, scope)`. |
 | OBlob | Base64 wire data with a MIME type. |
 | OExpr | Unevaluated O source captured by `quote^`. |
@@ -1085,6 +1089,11 @@ data, live references, and authority-bearing values.
 | OSystem | Live reference to a system profile. |
 | OCapability | Authority-bearing reference to a resource. |
 | OSnapshot | Inert captured world state suitable for persistence. |
+| ONative | Same-backend native capsule with explicit rehydration policy. |
+
+Legacy wire tags `int`, `float`, and `str` are still accepted for hosted IPC
+compatibility, but they deserialize into `ONumber` and `OText`. New runtime code
+emits the canonical variants.
 
 The runtime classifies values into three groups:
 
@@ -1138,14 +1147,16 @@ value. The implemented matrix is:
 
 | OValue family | Python | Nix | HTML | LaTeX | Markdown | Default |
 |---------------|--------|-----|------|-------|----------|---------|
-| Null, bool, int, float, string | T | T | P | P | P | S |
-| HTML, store path | T | S | P | P | P | O |
-| List, map | T | T | P | P | P | S |
-| Scope | T | O | O | O | O | O |
+| Null, bool, number | T | T | P | P | P | S |
+| Text | S | T | P | P | P | S |
+| Char, bytes, symbol, keyword | S | S | P | P | P | S |
+| HTML, store path, expr, derivation, system | T | S | P | P | P | O |
 | Blob | S | S | P | P | P | O |
-| Expr | T | S | P | P | P | O |
 | NixExpr | T | T | P | P | P | O |
-| Derivation, system | T | S | P | P | P | O |
+| List, map, seq, set, object | T | T | P | P | P | S |
+| EntriesMap | S | S | P | P | P | S |
+| Scope | T | O | O | O | O | O |
+| Graph, native | T | S | O | O | O | O |
 | Thunk | T | O | O | O | O | O |
 | Error | T | O | P | P | P | O |
 | Request, capability, snapshot, group | T | O | O | O | O | O |
@@ -1978,9 +1989,8 @@ features that are already present:
   backend environment that is currently waiting for its result; use a
   different environment index for that nested block.
 - Concurrent group dispatch currently applies to threadable Nix-family
-  requests and dry activation. Eval requests and real activation preserve the
-  single evaluator thread. Race selects a winner but does not cancel
-  already-running loser work.
+  requests. Eval requests preserve the single evaluator thread. Race selects a
+  winner but does not cancel already-running loser work.
 - `olangc` bundles the core compatibility adapters by default. Rust-native
   backends do not need adjacent shim files; programs using compatibility
   adapters outside the bundled set can compile with `--shim-dir backends`.

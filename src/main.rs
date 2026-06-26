@@ -371,15 +371,12 @@ fn print_result(value: &OValue) {
     let color = io::stdout().is_terminal();
 
     match value {
-        OValue::Str { v } => print!("{v}"),
         OValue::Text { v } => print!("{}", v.utf8),
         OValue::Html { v } => print!("{v}"),
         OValue::Null => {
             println!("{}", if color { "\x1b[2mnull\x1b[0m" } else { "null" });
         }
         OValue::Bool { v } => println!("{}", colored(v, "\x1b[33m", color)),
-        OValue::Int { v } => println!("{}", colored(v, "\x1b[36m", color)),
-        OValue::Float { v } => println!("{}", colored(v, "\x1b[36m", color)),
         OValue::List { v } => println!("{}", format_list(v, color, 0)),
         OValue::Map { v } => println!("{}", format_map(v, color, 0)),
         other => {
@@ -471,15 +468,6 @@ fn format_value(v: &OValue, color: bool, depth: usize) -> String {
             }
         }
         OValue::Bool { v } => colored(v, "\x1b[33m", color),
-        OValue::Int { v } => colored(v, "\x1b[36m", color),
-        OValue::Float { v } => colored(v, "\x1b[36m", color),
-        OValue::Str { v } => {
-            if color {
-                format!("\x1b[32m{v:?}\x1b[0m")
-            } else {
-                format!("{v:?}")
-            }
-        }
         OValue::Text { v } => {
             if color {
                 format!("\x1b[32m{:?}\x1b[0m", v.utf8)

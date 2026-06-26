@@ -803,16 +803,36 @@ fn scalar_env(bindings: HashMap<String, OValue>) -> HashMap<String, String> {
 
 fn scalar_string(value: &OValue) -> Option<String> {
     match value {
-        OValue::Str { v }
-        | OValue::Text {
+        OValue::Text {
             v: crate::value::OText { utf8: v, .. },
         } => Some(v.clone()),
-        OValue::Int { v } => Some(v.to_string()),
-        OValue::Float { v } => Some(v.to_string()),
-        OValue::Number {
-            v: ONumber::Int { v },
-        } => Some(v.to_string()),
+        OValue::Number { v } => number_scalar_string(v),
         OValue::Bool { v } => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+fn number_scalar_string(value: &ONumber) -> Option<String> {
+    match value {
+        ONumber::Int { v } => Some(v.to_string()),
+        ONumber::BinaryFloat {
+            format: FloatFormat::F32,
+            bits,
+        } if bits.len() == 4 => {
+            let mut raw = [0_u8; 4];
+            raw.copy_from_slice(bits);
+            let value = f32::from_bits(u32::from_be_bytes(raw)) as f64;
+            value.is_finite().then(|| value.to_string())
+        }
+        ONumber::BinaryFloat {
+            format: FloatFormat::F64,
+            bits,
+        } if bits.len() == 8 => {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(bits);
+            let value = f64::from_bits(u64::from_be_bytes(raw));
+            value.is_finite().then(|| value.to_string())
+        }
         _ => None,
     }
 }
@@ -824,15 +844,16 @@ fn javascript_preamble(bindings: &HashMap<String, OValue>) -> String {
             continue;
         }
         match value {
-            OValue::Str { v } => {
+            OValue::Text { v } => {
                 preamble.push_str(&format!(
                     "const {name} = {};\n",
-                    serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+                    serde_json::to_string(&v.utf8).unwrap_or_else(|_| "null".to_string())
                 ));
             }
-            OValue::Int { v } => preamble.push_str(&format!("const {name} = {v};\n")),
-            OValue::Float { v } if v.is_finite() => {
-                preamble.push_str(&format!("const {name} = {v};\n"));
+            OValue::Number { v } => {
+                if let Some(value) = number_scalar_string(v) {
+                    preamble.push_str(&format!("const {name} = {value};\n"));
+                }
             }
             OValue::Bool { v } => {
                 preamble.push_str(&format!(
@@ -862,14 +883,17 @@ fn ruby_preamble(bindings: &HashMap<String, OValue>) -> String {
             continue;
         }
         match value {
-            OValue::Str { v } => {
+            OValue::Text { v } => {
                 preamble.push_str(&format!(
                     "{name} = {}\n",
-                    serde_json::to_string(v).unwrap_or_else(|_| "nil".to_string())
+                    serde_json::to_string(&v.utf8).unwrap_or_else(|_| "nil".to_string())
                 ));
             }
-            OValue::Int { v } => preamble.push_str(&format!("{name} = {v}\n")),
-            OValue::Float { v } if v.is_finite() => preamble.push_str(&format!("{name} = {v}\n")),
+            OValue::Number { v } => {
+                if let Some(value) = number_scalar_string(v) {
+                    preamble.push_str(&format!("{name} = {value}\n"));
+                }
+            }
             OValue::Bool { v } => {
                 preamble.push_str(&format!("{name} = {}\n", if *v { "true" } else { "false" }));
             }

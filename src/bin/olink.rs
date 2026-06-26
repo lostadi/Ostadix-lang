@@ -290,7 +290,7 @@ fn run_combined(
         .context("failed to evaluate combined .O program")?;
 
     match result {
-        OValue::Str { v } | OValue::Html { v } => println!("{}", v),
+        OValue::Html { v } => println!("{}", v),
         OValue::Text { v } => println!("{}", v.utf8),
         other => println!("{}", other),
     }

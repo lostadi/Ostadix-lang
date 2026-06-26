@@ -1701,7 +1701,6 @@ impl Evaluator {
                     );
                 }
                 let profile = match arg_vals.get(1) {
-                    Some(OValue::Str { v }) => v.clone(),
                     Some(OValue::Text { v }) => v.utf8.clone(),
                     Some(OValue::System { profile_path }) => profile_path.clone(),
                     Some(other) => bail!(
@@ -1754,7 +1753,6 @@ impl Evaluator {
                             )
                         })?;
                     let requested_profile = match arg_vals.get(2) {
-                        Some(OValue::Str { v }) => v.clone(),
                         Some(OValue::Text { v }) => v.utf8.clone(),
                         Some(OValue::System { profile_path }) => profile_path.clone(),
                         Some(other) => bail!(
@@ -1781,7 +1779,6 @@ impl Evaluator {
                         bail!("activate accepts only path and optional profile");
                     }
                     let profile = match arg_vals.get(1) {
-                        Some(OValue::Str { v }) => v.clone(),
                         Some(OValue::Text { v }) => v.utf8.clone(),
                         Some(OValue::System { profile_path }) => profile_path.clone(),
                         Some(other) => bail!(
@@ -2303,10 +2300,7 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
         SpliceRenderer::Python => match val {
             Null
             | Bool { .. }
-            | Int { .. }
-            | Float { .. }
             | Number { .. }
-            | Str { .. }
             | Html { .. }
             | StorePath { .. }
             | Expr { .. }
@@ -2331,15 +2325,13 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
             Blob { .. } => Structural,
         },
         SpliceRenderer::Nix => match val {
-            Null | Bool { .. } | Int { .. } | Float { .. } | Str { .. } | NixExpr { .. } => Typed,
+            Null | Bool { .. } | Number { .. } | Text { .. } | NixExpr { .. } => Typed,
             List { v } => container_fidelity(renderer, v, Typed),
             Map { v } => container_fidelity(renderer, v.values(), Typed),
             Seq { items, .. } | Set { items, .. } => container_fidelity(renderer, items, Typed),
             Object { fields } => container_fidelity(renderer, fields.values(), Typed),
             EntriesMap { entries } => entry_container_fidelity(renderer, entries, Structural),
-            Number { .. }
-            | Text { .. }
-            | Char { .. }
+            Char { .. }
             | Bytes { .. }
             | Symbol { .. }
             | Keyword { .. }
@@ -2362,10 +2354,7 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
         SpliceRenderer::Html | SpliceRenderer::Latex | SpliceRenderer::Markdown => match val {
             Null
             | Bool { .. }
-            | Int { .. }
-            | Float { .. }
             | Number { .. }
-            | Str { .. }
             | Text { .. }
             | Char { .. }
             | Html { .. }
@@ -2398,10 +2387,7 @@ pub fn render_fidelity(renderer: SpliceRenderer, val: &OValue) -> RenderFidelity
         SpliceRenderer::Default => match val {
             Null
             | Bool { .. }
-            | Int { .. }
-            | Float { .. }
             | Number { .. }
-            | Str { .. }
             | Text { .. }
             | Char { .. }
             | Bytes { .. }
@@ -2456,10 +2442,7 @@ fn render_nix(val: &OValue) -> String {
                 "false".to_string()
             }
         }
-        OValue::Int { v } => v.to_string(),
-        OValue::Float { v } => v.to_string(),
         OValue::Number { v } => render_nix_number(v),
-        OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "\"".to_string()),
         OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "\"".to_string()),
         OValue::Char { scalar } => {
             serde_json::to_string(&scalar.to_string()).unwrap_or_else(|_| "\"".to_string())
@@ -2594,18 +2577,8 @@ fn render_python(val: &OValue) -> String {
             }
         }
 
-        OValue::Int { v } => v.to_string(),
-        OValue::Float { v } => {
-            let s = v.to_string();
-            if s.contains('.') || s.contains('e') || s.contains('E') {
-                s
-            } else {
-                format!("{}.0", s)
-            }
-        }
         OValue::Number { v } => render_python_number(v),
 
-        OValue::Str { v } => serde_json::to_string(v).unwrap_or_else(|_| "''".to_string()),
         OValue::Text { v } => serde_json::to_string(&v.utf8).unwrap_or_else(|_| "''".to_string()),
         OValue::Char { scalar } => {
             serde_json::to_string(&scalar.to_string()).unwrap_or_else(|_| "''".to_string())
@@ -2942,14 +2915,11 @@ fn render_html(val: &OValue) -> String {
         OValue::Null => String::new(),
 
         OValue::Bool { v } => html_escape(&v.to_string()),
-        OValue::Int { v } => html_escape(&v.to_string()),
-        OValue::Float { v } => html_escape(&v.to_string()),
         OValue::Number { .. } => html_escape(&val.splice_repr()),
 
         // Plain strings are untrusted text — escape them. Trusted raw HTML
         // must arrive as OValue::Html (the "trusted HTML fragment" type per
         // SPEC.md), e.g. produced by an inner html^(...)_html block.
-        OValue::Str { v } => html_escape(v),
         OValue::Text { v } => html_escape(&v.utf8),
         OValue::Char { scalar } => html_escape(&scalar.to_string()),
         OValue::Html { v } => v.clone(),
@@ -3185,10 +3155,7 @@ fn render_latex(val: &OValue) -> String {
     match val {
         OValue::Null => String::new(),
         OValue::Bool { v } => v.to_string(),
-        OValue::Int { v } => v.to_string(),
-        OValue::Float { v } => v.to_string(),
         OValue::Number { .. } => val.splice_repr(),
-        OValue::Str { v } => v.clone(),
         OValue::Text { v } => v.utf8.clone(),
         OValue::Char { scalar } => scalar.to_string(),
         OValue::Html { v } => v.clone(),
@@ -3286,10 +3253,7 @@ fn render_markdown(val: &OValue) -> String {
     match val {
         OValue::Null => String::new(),
         OValue::Bool { v } => v.to_string(),
-        OValue::Int { v } => v.to_string(),
-        OValue::Float { v } => v.to_string(),
         OValue::Number { .. } => val.splice_repr(),
-        OValue::Str { v } => v.clone(),
         OValue::Text { v } => v.utf8.clone(),
         OValue::Char { scalar } => scalar.to_string(),
         OValue::Html { v } => v.clone(),
@@ -3878,7 +3842,7 @@ mod tests {
         scope.insert("n".to_string(), OValue::int(7));
 
         // nix_expr^( prefix $n suffix )_nix_expr
-        // $n is a VarRef that resolves to OValue::Int(7)
+        // $n is a VarRef that resolves to OValue::Number(7)
         let body_nodes = vec![
             ONode::RawText("prefix ".to_string()),
             ONode::VarRef("n".to_string()),

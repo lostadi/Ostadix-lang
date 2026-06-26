@@ -338,11 +338,10 @@ pub struct ONative {
 
 /// The complete universe of values in the O language runtime.
 ///
-/// Legacy variants (`Int`, `Float`, `Str`, `List`, and string-keyed `Map`) stay
-/// as compatibility forms. New backends can target the richer structural forms
-/// (`Number`, `Text`, `Bytes`, `Seq`, `Object`, `EntriesMap`, `Graph`, and
-/// `Native`) without losing information before the rest of the evaluator learns
-/// their full semantics.
+/// Legacy wire tags (`int`, `float`, and `str`) deserialize into canonical
+/// structural forms. `List` and string-keyed `Map` remain compatibility
+/// projections next to the richer structural forms (`Number`, `Text`, `Bytes`,
+/// `Seq`, `Object`, `EntriesMap`, `Graph`, and `Native`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum OValue {
@@ -354,31 +353,12 @@ pub enum OValue {
     #[serde(rename = "bool")]
     Bool { v: bool },
 
-    /// A legacy 64-bit signed integer compatibility form. Arbitrary precision
-    /// integers cross as `OValue::Number { ONumber::Int(BigInt) }`.
-    #[serde(rename = "int")]
-    #[deprecated(since = "0.3.0", note = "use OValue::Number via OValue::int()")]
-    Int { v: i64 },
-
-    /// A 64-bit IEEE 754 floating point number.
-    #[serde(rename = "float")]
-    #[deprecated(since = "0.3.0", note = "use OValue::Number via OValue::float()")]
-    Float { v: f64 },
-
     /// A lossless numeric value: big integers, rationals, decimal/binary
     /// floats, big floats, and complex numbers.
     #[serde(rename = "number")]
     Number { v: ONumber },
 
-    /// A UTF-8 string. The most common inter-language value type.
-    /// Raw text from backends, spliced $var values, document content —
-    /// all arrive as OStr unless the backend explicitly returns something richer.
-    #[serde(rename = "str")]
-    #[deprecated(since = "0.3.0", note = "use OValue::Text via OValue::str_()")]
-    Str { v: String },
-
-    /// Text with explicit encoding metadata. `Str` remains the compatibility
-    /// projection for existing shims.
+    /// Text with explicit encoding metadata.
     #[serde(rename = "text")]
     Text { v: OText },
 
@@ -1154,8 +1134,8 @@ pub enum RequestKind {
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 2: Constructors
 //
-// Ergonomic constructors so call sites don't have to write
-// OValue::Str { v: "hello".to_string() } everywhere.
+// Ergonomic constructors so call sites don't have to write structural variants
+// by hand.
 // ═════════════════════════════════════════════════════════════════════════════
 
 impl OValue {
@@ -1687,25 +1667,7 @@ impl CanonicalEncode for OValue {
                 canonical_tag(out, "bool");
                 canonical_bool(out, *v);
             }
-            OValue::Int { v } => {
-                ONumber::Int {
-                    v: BigInt::from(*v),
-                }
-                .encode_number(out)?;
-            }
-            OValue::Float { v } => {
-                ONumber::BinaryFloat {
-                    format: FloatFormat::F64,
-                    bits: v.to_bits().to_be_bytes().to_vec(),
-                }
-                .encode_number(out)?;
-            }
             OValue::Number { v } => v.encode_number(out)?,
-            OValue::Str { v } => {
-                canonical_tag(out, "text");
-                canonical_str(out, v);
-                canonical_opt_str(out, Some("utf-8"));
-            }
             OValue::Text { v } => {
                 canonical_tag(out, "text");
                 canonical_str(out, &v.utf8);
@@ -2121,26 +2083,24 @@ impl OValue {
     pub fn is_int(&self) -> bool {
         matches!(
             self,
-            OValue::Int { .. }
-                | OValue::Number {
-                    v: ONumber::Int { .. }
-                }
+            OValue::Number {
+                v: ONumber::Int { .. }
+            }
         )
     }
     pub fn is_float(&self) -> bool {
         matches!(
             self,
-            OValue::Float { .. }
-                | OValue::Number {
-                    v: ONumber::BinaryFloat { .. } | ONumber::BigFloat { .. }
-                }
+            OValue::Number {
+                v: ONumber::BinaryFloat { .. } | ONumber::BigFloat { .. }
+            }
         )
     }
     pub fn is_number(&self) -> bool {
         matches!(self, OValue::Number { .. })
     }
     pub fn is_str(&self) -> bool {
-        matches!(self, OValue::Str { .. } | OValue::Text { .. })
+        matches!(self, OValue::Text { .. })
     }
     pub fn is_text(&self) -> bool {
         matches!(self, OValue::Text { .. })
@@ -2229,10 +2189,7 @@ impl OValue {
         match self {
             OValue::Null => "null",
             OValue::Bool { .. } => "bool",
-            OValue::Int { .. } => "int",
-            OValue::Float { .. } => "float",
             OValue::Number { .. } => "number",
-            OValue::Str { .. } => "str",
             OValue::Text { .. } => "text",
             OValue::Bytes { .. } => "bytes",
             OValue::Char { .. } => "char",
@@ -2514,7 +2471,6 @@ impl OValue {
 
     pub fn as_int(&self) -> Result<i64> {
         match self {
-            OValue::Int { v } => Ok(*v),
             OValue::Number {
                 v: ONumber::Int { v },
             } => v
@@ -2526,9 +2482,6 @@ impl OValue {
 
     pub fn as_float(&self) -> Result<f64> {
         match self {
-            OValue::Float { v } => Ok(*v),
-            // Implicit int → float widening, because this is always safe
-            OValue::Int { v } => Ok(*v as f64),
             OValue::Number {
                 v: ONumber::Int { v },
             } => v
@@ -2573,7 +2526,6 @@ impl OValue {
 
     pub fn as_str(&self) -> Result<&str> {
         match self {
-            OValue::Str { v } => Ok(v.as_str()),
             OValue::Text { v } => Ok(v.utf8.as_str()),
             other => bail!("Expected str, got {}", other.type_name()),
         }
@@ -2691,17 +2643,7 @@ impl OValue {
         match self {
             OValue::Null => "null".to_string(),
             OValue::Bool { v } => v.to_string(),
-            OValue::Int { v } => v.to_string(),
-            OValue::Float { v } => {
-                // Always include decimal point — "3" vs "3.0" matters in some langs
-                if v.fract() == 0.0 {
-                    format!("{:.1}", v)
-                } else {
-                    v.to_string()
-                }
-            }
             OValue::Number { v } => number_repr(v),
-            OValue::Str { v } => v.clone(),
             OValue::Text { v } => v.utf8.clone(),
             OValue::Char { scalar } => scalar.to_string(),
             OValue::Html { v } => v.clone(),
@@ -2851,10 +2793,7 @@ impl fmt::Display for OValue {
         match self {
             OValue::Null => write!(f, "null"),
             OValue::Bool { v } => write!(f, "{}", v),
-            OValue::Int { v } => write!(f, "{}", v),
-            OValue::Float { v } => write!(f, "{}", v),
             OValue::Number { v } => write!(f, "{}", number_repr(v)),
-            OValue::Str { v } => write!(f, "{:?}", v),
             OValue::Text { v } => write!(f, "{:?}", v.utf8),
             OValue::Char { scalar } => write!(f, "{:?}", scalar),
             OValue::List { v } => {
@@ -3328,18 +3267,15 @@ mod tests {
         assert_eq!(str_value, OValue::text("hello"));
 
         assert_eq!(
-            OValue::Int { v: 42 }.content_identity(),
+            int_value.content_identity(),
             OValue::big_int(42).content_identity()
         );
         assert_eq!(
-            OValue::Float { v: 3.0 }.content_identity(),
+            float_value.content_identity(),
             OValue::float(3.0).content_identity()
         );
         assert_eq!(
-            OValue::Str {
-                v: "hello".to_string()
-            }
-            .content_identity(),
+            str_value.content_identity(),
             OValue::text("hello").content_identity()
         );
     }
@@ -3351,9 +3287,6 @@ mod tests {
         let cases = vec![
             (OValue::null(), "null"),
             (OValue::bool_(true), "bool"),
-            (OValue::Int { v: 0 }, "int"),
-            (OValue::Float { v: 0.0 }, "float"),
-            (OValue::Str { v: String::new() }, "str"),
             (OValue::int(0), "number"),
             (OValue::float(0.0), "number"),
             (OValue::big_int(0), "number"),
