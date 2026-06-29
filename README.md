@@ -272,7 +272,7 @@ needs QEMU and the local Rust linker toolchain.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, or OIR dumps. |
+| `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to x86_64 ELF objects. |
 | `o-link` | `target/release/o-link` | Combines scripts, source trees, and `.O` files into one validated `.O` program. |
 | `o-unlink` | `target/release/o-unlink` | Restores the source files embedded by `o-link`. |
@@ -753,6 +753,8 @@ cargo run --bin olangc -- examples/hello.O -o target/hello
 
 cargo run --bin olangc -- examples/hello.O --target script
 cargo run --bin olangc -- examples/hello.O --target ir
+cargo run --bin olangc -- examples/hello.O --target dot
+cargo run --bin olangc -- examples/hello.O --target dot | dot -Tpng -o graph.png
 ```
 
 ### Compile O-core
@@ -1272,7 +1274,7 @@ for compatibility with older sources or embedding experiments. Ordinary backend
 blocks do not need grants; the default evaluator gives hosted backends full
 grantable host authority.
 
-### `olangc`: hosted AOT, WASI, script, and OIR
+### `olangc`: hosted AOT, WASI, script, OIR, and DOT graph
 
 `olangc` shares the parser, evaluator, OValue model, and OIR implementation
 with `O`.
@@ -1283,6 +1285,7 @@ with `O`.
 | `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
 | `ir` | `olangc app.O --target ir` | Prints lowered OIR and its ExecutionPlan without executing the program. |
+| `dot` | `olangc app.O --target dot` | Builds HGraph from OIR, solves types, emits Graphviz DOT digraph on stdout. Pipe to `dot -Tpng` for a rendered graph. |
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language

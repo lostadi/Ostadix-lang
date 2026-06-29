@@ -219,7 +219,7 @@ bash test_o_lang_examples.sh
 
 ## Compiler Targets (`olangc`)
 
-`olangc` supports four compilation targets, selected via `--target`:
+`olangc` supports five compilation targets, selected via `--target`:
 
 | Target   | Flag              | Output                              |
 |----------|-------------------|-------------------------------------|
@@ -227,6 +227,7 @@ bash test_o_lang_examples.sh
 | `wasm`   | `--target wasm`   | `wasm32-wasip1` module on disk     |
 | `script` | `--target script` | In-process execution (no disk file) |
 | `ir`     | `--target ir`     | Lowered OIR dump on stdout          |
+| `dot`    | `--target dot`    | Graphviz DOT hypergraph on stdout   |
 
 **Target A — Binary** (default): creates a temporary Cargo project that
 bundles the .O source, runtime, and backend shims, then compiles it with
@@ -248,6 +249,14 @@ is produced.
 stdout.  A debugging/inspection target — nothing is executed and no output
 file is produced.
 
+**Target E — Dot**: parses and lowers to OIR, then builds the full
+`HGraph` hypergraph (`src/hgraph/`) from that OIR, runs the type solver, and
+serialises the result as a Graphviz DOT digraph on stdout.  Each `HNode` maps
+to a graph node; each `HEdge` is projected to binary directed edges between its
+Input/InOut and Output/InOut ports.  Edge labels identify the relation kind
+(dataflow, structural, sequence, crossing:L1→L2, …).  Nothing is executed and
+no output file is produced.
+
 ```bash
 # Compile to a binary (Target A)
 cargo run --bin olangc -- examples/hello.O -o hello
@@ -260,6 +269,12 @@ cargo run --bin olangc -- examples/hello.O --target script
 
 # Dump the lowered OIR (Target D)
 cargo run --bin olangc -- examples/hello.O --target ir
+
+# Emit Graphviz DOT hypergraph (Target E)
+cargo run --bin olangc -- examples/hello.O --target dot
+
+# Render to PNG via Graphviz
+cargo run --bin olangc -- examples/hello.O --target dot | dot -Tpng -o graph.png
 ```
 
 ## Implementations

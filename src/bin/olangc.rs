@@ -2,7 +2,8 @@
 // olangc — the O-lang compiler
 //
 // Compiles a .O source file to a hosted native or WASI binary, executes its
-// OIR directly in-process, or prints that same executable OIR and plan.
+// OIR directly in-process, prints that same executable OIR and plan, or emits
+// the program's execution hypergraph as Graphviz DOT.
 //
 // Usage:
 //   olangc <input.O>                              # binary target (default)
@@ -10,6 +11,7 @@
 //   olangc <input.O> --target wasm                # wasm32-wasip1
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
+//   olangc <input.O> --target dot                 # Graphviz DOT hypergraph
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
 //
 // Target A ("binary"):
@@ -49,6 +51,15 @@
 //   representation (src/ir.rs), builds the canonical ExecutionPlan dependency
 //   graph from that OIR, and prints both to stdout. This is the same OIR the
 //   script and generated-binary runtimes execute.
+//
+// Target E ("dot"):
+//   Parses and lowers to OIR, then builds the full hypergraph (src/hgraph/)
+//   from that OIR, runs the type solver over it, and serialises the result as
+//   a Graphviz DOT digraph on stdout. Each HNode becomes a graph node; each
+//   HEdge is projected to binary directed edges between its Input/InOut and
+//   Output/InOut ports. Edge labels identify the relation kind (dataflow,
+//   structural, sequence, crossing:L1→L2, …). Pipe to `dot -Tpng -o out.png`
+//   or any other Graphviz renderer.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -85,6 +96,14 @@ const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 
+// hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
+const RUNTIME_HGRAPH_MOD_RS:      &str = include_str!("../hgraph/mod.rs");
+const RUNTIME_HGRAPH_GRAPH_RS:    &str = include_str!("../hgraph/graph.rs");
+const RUNTIME_HGRAPH_KINDS_RS:    &str = include_str!("../hgraph/kinds.rs");
+const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
+const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
+const RUNTIME_HGRAPH_SOLVE_RS:    &str = include_str!("../hgraph/solve.rs");
+
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
 const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
@@ -108,6 +127,9 @@ enum CompileTarget {
     /// Lower the parsed program to OIR, build its ExecutionPlan, and print
     /// both to stdout without executing them.
     Ir,
+    /// Lower the parsed program to OIR, build its HGraph, solve types, and
+    /// emit a Graphviz DOT digraph to stdout. Pipe to `dot -Tpng` for a PNG.
+    Dot,
 }
 
 #[derive(ClapParser, Debug)]
@@ -116,10 +138,13 @@ enum CompileTarget {
     about = "Compile or run a .O program",
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default), \
-a wasm32-wasip1 module (--target wasm), or executes executable OIR in-process \
-(--target script). Binary outputs embed the program source, compatibility adapters, and \
-the O-lang runtime. In ir mode the same OIR and ExecutionPlan used at runtime \
-are printed without execution."
+a wasm32-wasip1 module (--target wasm), executes executable OIR in-process \
+(--target script), prints the lowered OIR and ExecutionPlan (--target ir), or \
+emits the program execution hypergraph as Graphviz DOT (--target dot). Binary \
+outputs embed the program source, compatibility adapters, and the O-lang \
+runtime. In ir mode the same OIR and ExecutionPlan used at runtime are printed \
+without execution. In dot mode the HGraph is built and type-solved, then \
+serialised as a digraph; pipe to `dot -Tpng` for a rendered image."
 )]
 struct Cli {
     /// The .O source file to compile or run
@@ -130,7 +155,7 @@ struct Cli {
     target: CompileTarget,
 
     /// Output binary path (default: input file stem in the current directory).
-    /// Ignored when --target is "script" or "ir".
+    /// Ignored when --target is "script", "ir", or "dot".
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -216,6 +241,7 @@ fn main() -> Result<()> {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
         }
         CompileTarget::Ir => dump_ir(&source),
+        CompileTarget::Dot => dump_dot(&source),
     }
 }
 
@@ -249,6 +275,16 @@ fn compile_to_binary(
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
+
+    // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
+    let hgraph_dir = src_dir.join("hgraph");
+    fs::create_dir_all(&hgraph_dir)?;
+    fs::write(hgraph_dir.join("mod.rs"),      RUNTIME_HGRAPH_MOD_RS)?;
+    fs::write(hgraph_dir.join("graph.rs"),    RUNTIME_HGRAPH_GRAPH_RS)?;
+    fs::write(hgraph_dir.join("kinds.rs"),    RUNTIME_HGRAPH_KINDS_RS)?;
+    fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
+    fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
+    fs::write(hgraph_dir.join("solve.rs"),    RUNTIME_HGRAPH_SOLVE_RS)?;
 
     // ── Program source ───────────────────────────────────────────────────────
     // Always stored as "program.O" so the generated main.rs can reference it
@@ -434,6 +470,161 @@ fn dump_ir(source: &str) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Target E — emit a Graphviz DOT digraph from the HGraph
+//
+// Builds the same HGraph that eval.rs uses at runtime, runs the type solver
+// on it, then projects the hypergraph onto a binary digraph and serialises
+// it as DOT.  Pipe the output to `dot -Tpng -o out.png` for a rendered image.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dump_dot(source: &str) -> Result<()> {
+    use o_lang::hgraph::solve;
+
+    let src = strip_shebang(source);
+    let registered = registered_backends();
+    let mut parser = Parser::new(&src, &registered);
+    let nodes = parser.parse().context("failed to parse .O source")?;
+    let program = OIrProgram::lower(&nodes);
+    let mut graph = program.hgraph();
+    solve::solve_types(&mut graph);
+    print!("{}", hgraph_to_dot(&graph));
+    Ok(())
+}
+
+/// Project the hypergraph onto a binary `petgraph::StableDiGraph` and render
+/// it as Graphviz DOT.
+///
+/// Hyperedge → binary-edge projection rule:
+///   For each `HEdge`, emit one directed edge from every Input/InOut port to
+///   every Output/InOut port (excluding self-loops).  The edge weight carries
+///   the `OpKind` name so the rendered graph shows the relation type.
+fn hgraph_to_dot(hgraph: &o_lang::hgraph::HGraph) -> String {
+    use o_lang::hgraph::graph::{NodeId, PortRole};
+    use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+    use std::collections::HashMap;
+
+    let mut graph: StableDiGraph<String, String> = StableDiGraph::new();
+    let mut node_map: HashMap<NodeId, NodeIndex> = HashMap::new();
+
+    // Add one graph node per HNode, labelled with its ID and known value.
+    for id in hgraph.node_ids() {
+        let label = match hgraph.node(id) {
+            None => format!("N{}", id.0),
+            Some(node) => {
+                let value_part = match &node.value {
+                    Some(v) => {
+                        let s = format!("{v}");
+                        if s.len() > 24 {
+                            format!("{}…", &s[..24])
+                        } else {
+                            s
+                        }
+                    }
+                    None => String::new(),
+                };
+                let actor_part = node
+                    .actor
+                    .map(|a| format!(" actor({}/{})", a.lang, a.env))
+                    .unwrap_or_default();
+                if value_part.is_empty() {
+                    format!("N{}{}", id.0, actor_part)
+                } else {
+                    format!("N{}: {}{}", id.0, value_part, actor_part)
+                }
+            }
+        };
+        let idx = graph.add_node(label);
+        node_map.insert(id, idx);
+    }
+
+    // Project each hyperedge to directed binary edges.
+    for eid in hgraph.edge_ids() {
+        let Some(edge) = hgraph.edge(eid) else {
+            continue;
+        };
+
+        let label = op_kind_label(&edge.kind);
+
+        let inputs: Vec<NodeIndex> = edge
+            .ports
+            .iter()
+            .filter(|p| matches!(p.role, PortRole::Input | PortRole::InOut))
+            .filter_map(|p| node_map.get(&p.node).copied())
+            .collect();
+
+        let outputs: Vec<NodeIndex> = edge
+            .ports
+            .iter()
+            .filter(|p| matches!(p.role, PortRole::Output | PortRole::InOut))
+            .filter_map(|p| node_map.get(&p.node).copied())
+            .collect();
+
+        for &src in &inputs {
+            for &dst in &outputs {
+                if src != dst {
+                    graph.add_edge(src, dst, label.clone());
+                }
+            }
+        }
+    }
+
+    // Serialize to DOT manually — petgraph's Dot uses Debug on String weights
+    // which double-quotes labels (label = "\"text\""). Writing it ourselves
+    // produces clean label = "text" output.
+    let mut out = String::from("digraph {\n");
+    for idx in graph.node_indices() {
+        let label = dot_escape(&graph[idx]);
+        out.push_str(&format!("    {} [ label = \"{}\" ]\n", idx.index(), label));
+    }
+    for eidx in graph.edge_indices() {
+        let (src, dst) = graph.edge_endpoints(eidx).unwrap();
+        let label = dot_escape(graph.edge_weight(eidx).unwrap());
+        out.push_str(&format!(
+            "    {} -> {} [ label = \"{}\" ]\n",
+            src.index(),
+            dst.index(),
+            label
+        ));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Escape a string for use as a DOT label value (inside double quotes).
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn op_kind_label(kind: &o_lang::hgraph::kinds::OpKind) -> String {
+    use o_lang::hgraph::kinds::OpKind;
+    match kind {
+        OpKind::Additive => "additive".into(),
+        OpKind::Multiplicative => "multiplicative".into(),
+        OpKind::Bitwise => "bitwise".into(),
+        OpKind::Ordered => "ordered".into(),
+        OpKind::Bounded { .. } => "bounded".into(),
+        OpKind::AbiFixed { .. } => "abi_fixed".into(),
+        OpKind::Dereferenceable => "deref".into(),
+        OpKind::FieldAccess { field } => format!("field:{field}"),
+        OpKind::DataFlow => "dataflow".into(),
+        OpKind::StructuralBarrier => "structural".into(),
+        OpKind::Sequence => "sequence".into(),
+        OpKind::ActorSerial { actor } => format!("actor_serial({}/{})", actor.lang, actor.env),
+        OpKind::Batch => "batch".into(),
+        OpKind::All => "all".into(),
+        OpKind::Any => "any".into(),
+        OpKind::Race => "race".into(),
+        OpKind::BackendCrossing { from_lang, to_lang } => {
+            format!("crossing:{from_lang}→{to_lang}")
+        }
+        OpKind::X86 { mnemonic } => format!("x86:{mnemonic}"),
+        OpKind::OcoreOp { kind } => format!("ocore:{kind:?}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared front-end helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -509,6 +700,7 @@ mod capability;
 pub mod backend;
 pub mod parser;
 pub mod ir;
+pub mod hgraph;
 pub mod eval;
 pub mod process;
 pub mod nix_ops;
@@ -687,6 +879,7 @@ sha2       = "0.10"
 hex        = "0.4"
 num-bigint = {{ version = "0.4", features = ["serde"] }}
 num-traits = "0.2"
+bitflags   = "2"
 getrandom  = "0.4.3"
 thiserror  = "2"
 anyhow     = "1"

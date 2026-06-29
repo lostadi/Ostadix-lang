@@ -1691,6 +1691,7 @@ dependencies = [
  "ignore",
  "num-bigint",
  "num-traits",
+ "petgraph",
  "proptest",
  "rustyline",
  "semver",

@@ -70,6 +70,10 @@ getrandom   = "0.4.3"
 thiserror   = "2"
 anyhow      = "1"
 
+# Graph algorithms and DOT export (used by olangc --target dot; not linked into
+# compiled .O programs — petgraph never appears in generate_cargo_toml output)
+petgraph    = "0.6"
+
 # CLI argument parsing
 clap        = { version = "4", features = ["derive"] }
 
