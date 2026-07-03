@@ -151,13 +151,19 @@ impl OIrProgram {
         builder.finish(roots)
     }
 
-    /// Build the value-node/operation-edge hypergraph for this program.
-    ///
-    /// The current evaluator still interprets OIR, but this keeps the new
-    /// hypergraph substrate in lockstep with the same lowered program that
-    /// runtime execution uses.
+    /// Build the value-node/operation-edge hypergraph for this program from
+    /// the canonical execution plan.
     pub fn hgraph(&self) -> crate::hgraph::HGraph {
-        crate::hgraph::from_oir::build_program(self)
+        let plan = self.plan();
+        self.hgraph_for_plan(&plan)
+            .expect("freshly-built OIR execution plan should project to HGraph")
+    }
+
+    /// Project an already-validated execution plan into the hypergraph
+    /// substrate. This keeps dependency ownership in `ExecutionPlan`; HGraph
+    /// is a scheduling/type/fidelity projection over that plan.
+    pub fn hgraph_for_plan(&self, plan: &ExecutionPlan) -> Result<crate::hgraph::HGraph, String> {
+        crate::hgraph::from_oir::build_program_with_plan(self, plan)
     }
 }
 
@@ -337,6 +343,47 @@ impl PlanEdgeKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanNodeClass {
+    Pure,
+    Effect,
+    Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRequestKind {
+    Instantiate,
+    Realise,
+    Activate,
+}
+
+impl PlanRequestKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instantiate => "instantiate",
+            Self::Realise => "realise",
+            Self::Activate => "activate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanScheduleKind {
+    Force,
+    Lazy,
+    Autonomous,
+}
+
+impl PlanScheduleKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Force => "force",
+            Self::Lazy => "lazy",
+            Self::Autonomous => "autonomous",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEdge {
     pub from: PlanNodeId,
@@ -381,9 +428,23 @@ pub enum PlanNodeKind {
     Store {
         name: String,
     },
-    Invoke {
+    Call {
         fn_name: String,
         mode: InvokeMode,
+        arg_count: usize,
+    },
+    Request {
+        fn_name: String,
+        kind: PlanRequestKind,
+        arg_count: usize,
+    },
+    Group {
+        mode: GroupMode,
+        member_count: usize,
+    },
+    Schedule {
+        fn_name: String,
+        kind: PlanScheduleKind,
         arg_count: usize,
     },
     Exec {
@@ -554,17 +615,49 @@ impl ExecutionPlan {
 }
 
 impl PlanNodeKind {
+    pub fn class(&self) -> PlanNodeClass {
+        match self {
+            Self::Text | Self::Load { .. } | Self::Store { .. } | Self::Call { .. } => {
+                PlanNodeClass::Pure
+            }
+            Self::Exec { attr, .. } if exec_eval_cache_annotation(attr.as_deref()).is_some() => {
+                PlanNodeClass::Control
+            }
+            Self::Exec { .. } => PlanNodeClass::Effect,
+            Self::Request { .. } | Self::Group { .. } | Self::Schedule { .. } => {
+                PlanNodeClass::Control
+            }
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             PlanNodeKind::Text => "text".to_string(),
             PlanNodeKind::Load { name } => format!("load ${name}"),
             PlanNodeKind::Store { name } => format!("store ${name}"),
-            PlanNodeKind::Invoke {
+            PlanNodeKind::Call {
                 fn_name,
                 mode,
                 arg_count,
             } => {
-                format!("invoke {fn_name}/{arg_count} [{}]", mode.label())
+                format!("call {fn_name}/{arg_count} [{}]", mode.label())
+            }
+            PlanNodeKind::Request {
+                fn_name,
+                kind,
+                arg_count,
+            } => {
+                format!("request {fn_name}/{arg_count} [{}]", kind.label())
+            }
+            PlanNodeKind::Group { mode, member_count } => {
+                format!("group {}/{}", mode.name(), member_count)
+            }
+            PlanNodeKind::Schedule {
+                fn_name,
+                kind,
+                arg_count,
+            } => {
+                format!("schedule {fn_name}/{arg_count} [{}]", kind.label())
             }
             PlanNodeKind::Exec {
                 lang,
@@ -601,6 +694,18 @@ impl PlanNodeKind {
             }
         }
     }
+}
+
+fn exec_eval_cache_annotation(attr: Option<&str>) -> Option<bool> {
+    let mut cacheable = None;
+    for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
+        match entry.trim() {
+            "lazy" => cacheable = Some(true),
+            "defer" => cacheable = Some(false),
+            _ => {}
+        }
+    }
+    cacheable
 }
 
 struct PlanBuilder {
@@ -712,10 +817,48 @@ impl PlanBuilder {
                 fn_name,
                 mode,
                 args,
-            } => PlanNodeKind::Invoke {
-                fn_name: fn_name.clone(),
-                mode: *mode,
-                arg_count: args.len(),
+            } => match mode {
+                InvokeMode::Group(mode) => PlanNodeKind::Group {
+                    mode: *mode,
+                    member_count: args.len(),
+                },
+                InvokeMode::Lazy => PlanNodeKind::Schedule {
+                    fn_name: fn_name.clone(),
+                    kind: PlanScheduleKind::Lazy,
+                    arg_count: args.len(),
+                },
+                InvokeMode::Autonomous => PlanNodeKind::Schedule {
+                    fn_name: fn_name.clone(),
+                    kind: PlanScheduleKind::Autonomous,
+                    arg_count: args.len(),
+                },
+                InvokeMode::Eager => match fn_name.as_str() {
+                    "instantiate" => PlanNodeKind::Request {
+                        fn_name: fn_name.clone(),
+                        kind: PlanRequestKind::Instantiate,
+                        arg_count: args.len(),
+                    },
+                    "realise" => PlanNodeKind::Request {
+                        fn_name: fn_name.clone(),
+                        kind: PlanRequestKind::Realise,
+                        arg_count: args.len(),
+                    },
+                    "activate" | "dry_activate" => PlanNodeKind::Request {
+                        fn_name: fn_name.clone(),
+                        kind: PlanRequestKind::Activate,
+                        arg_count: args.len(),
+                    },
+                    "now" => PlanNodeKind::Schedule {
+                        fn_name: fn_name.clone(),
+                        kind: PlanScheduleKind::Force,
+                        arg_count: args.len(),
+                    },
+                    _ => PlanNodeKind::Call {
+                        fn_name: fn_name.clone(),
+                        mode: *mode,
+                        arg_count: args.len(),
+                    },
+                },
             },
             OIr::Exec {
                 lang,
@@ -1428,7 +1571,7 @@ mod tests {
             .find(|node| {
                 matches!(
                     &node.kind,
-                    PlanNodeKind::Invoke { fn_name, .. } if fn_name == "scope"
+                    PlanNodeKind::Call { fn_name, .. } if fn_name == "scope"
                 )
             })
             .unwrap()
@@ -1468,6 +1611,81 @@ mod tests {
             vec![PlanNodeId(4)]
         );
         assert_eq!(plan.topological_order().unwrap().len(), plan.nodes.len());
+    }
+
+    #[test]
+    fn plan_promotes_request_group_and_schedule_nodes() {
+        let program = OIrProgram::lower(&[
+            ONode::Call {
+                fn_name: "instantiate".into(),
+                args: vec![ONode::RawText("drv".into())],
+            },
+            ONode::Call {
+                fn_name: "batch".into(),
+                args: vec![ONode::RawText("a".into()), ONode::RawText("b".into())],
+            },
+            ONode::Call {
+                fn_name: "autonomous".into(),
+                args: vec![ONode::RawText("body".into())],
+            },
+            ONode::Call {
+                fn_name: "now".into(),
+                args: vec![ONode::RawText("req".into())],
+            },
+            ONode::TypedExpr {
+                lang: "html".into(),
+                env_id: 0,
+                attr: Some("lazy".into()),
+                body: vec![ONode::RawText("<p>x</p>".into())],
+            },
+        ]);
+        let plan = program.plan();
+
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Request {
+                    kind: PlanRequestKind::Instantiate,
+                    ..
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Group {
+                    mode: GroupMode::Batch,
+                    member_count: 2,
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Schedule {
+                    kind: PlanScheduleKind::Autonomous,
+                    ..
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Schedule {
+                    kind: PlanScheduleKind::Force,
+                    ..
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Exec {
+                    attr: Some(attr),
+                    ..
+                } if attr == "lazy"
+            ) && node.kind.class() == PlanNodeClass::Control
+        }));
     }
 
     #[test]
