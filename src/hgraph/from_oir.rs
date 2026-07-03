@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    ir::{BackendInterface, InvokeMode, OIr, OIrProgram},
+    ir::{
+        BackendInterface, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind,
+        PlanRequestKind,
+    },
     value::{GroupMode, OValue},
 };
 
@@ -11,136 +14,145 @@ use super::{
 };
 
 pub fn build_program(program: &OIrProgram) -> HGraph {
-    build(&program.nodes)
+    let plan = program.plan();
+    build_program_with_plan(program, &plan)
+        .expect("freshly-built OIR execution plan should project to HGraph")
 }
 
-pub fn build(nodes: &[OIr]) -> HGraph {
-    let mut builder = Builder {
-        graph: HGraph::default(),
-        scopes: vec![HashMap::new()],
-    };
-    let mut previous = None;
-    for node in nodes {
-        let id = builder.build_node(node);
-        builder.graph.push_root(id);
-        if let Some(prev) = previous {
-            builder.add_sequence(prev, id);
-        }
-        previous = Some(id);
+pub fn build_program_with_plan(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+) -> Result<HGraph, String> {
+    plan.validate(program.nodes.len())?;
+
+    let oir_nodes = flatten_program(&program.nodes);
+    if oir_nodes.len() != plan.nodes.len() {
+        return Err(format!(
+            "OIR flatten produced {} nodes for execution plan with {} nodes",
+            oir_nodes.len(),
+            plan.nodes.len()
+        ));
     }
-    builder.graph
-}
 
-struct Builder {
-    graph: HGraph,
-    scopes: Vec<HashMap<String, NodeId>>,
-}
+    let mut graph = HGraph::default();
+    let mut node_map: HashMap<PlanNodeId, NodeId> = HashMap::new();
 
-impl Builder {
-    fn build_node(&mut self, node: &OIr) -> NodeId {
-        match node {
-            OIr::Text(text) => {
-                let id = self
-                    .graph
-                    .add_node(HNode::with_value(OValue::str_(text.clone())));
-                if !text.is_empty() {
-                    if let Some(node) = self.graph.node_mut(id) {
-                        node.domain = DomainFlags::STRING;
-                        node.rep = RepFlags::STR;
-                    }
-                }
-                self.graph.record_ir(id, node);
-                id
-            }
-            OIr::Load(name) => {
-                let consumer = self.graph.add_node(HNode::fresh());
-                if let Some(producer) = self.lookup(name) {
-                    self.graph.add_edge(HEdge {
-                        id: EdgeId(0),
-                        kind: OpKind::DataFlow,
-                        ports: vec![
-                            Port {
-                                node: producer,
-                                role: PortRole::Input,
-                            },
-                            Port {
-                                node: consumer,
-                                role: PortRole::Output,
-                            },
-                        ],
+    for plan_node in &plan.nodes {
+        let oir = oir_nodes[plan_node.id.0];
+        let graph_node = graph.add_node(hnode_for_oir(oir));
+        if let PlanNodeKind::Exec { lang, env_id, .. } = &plan_node.kind {
+            if *env_id != u32::MAX {
+                if let Some(node) = graph.node_mut(graph_node) {
+                    node.actor = Some(ActorId {
+                        lang: intern_lang(lang),
+                        env: *env_id,
                     });
                 }
-                self.graph.record_ir(consumer, node);
-                consumer
             }
-            OIr::Store { name, expr } => {
-                self.scopes.push(HashMap::new());
-                let value = self.build_node(expr);
-                self.scopes.pop();
-                self.bind(name.clone(), value);
-                self.graph.record_ir(value, node);
-                value
-            }
-            OIr::Invoke { mode, args, .. } => {
-                self.scopes.push(HashMap::new());
-                let mut child_ids = Vec::new();
-                let mut previous = None;
-                for arg in args {
-                    let child = self.build_node(arg);
-                    if let Some(prev) = previous {
-                        self.add_sequence(prev, child);
-                    }
-                    previous = Some(child);
-                    child_ids.push(child);
-                }
-                self.scopes.pop();
+        }
+        graph.record_ir(graph_node, oir);
+        node_map.insert(plan_node.id, graph_node);
+    }
 
-                let result = self.graph.add_node(HNode::fresh());
-                let kind = match mode {
-                    InvokeMode::Group(GroupMode::Batch) => OpKind::Batch,
-                    InvokeMode::Group(GroupMode::All) => OpKind::All,
-                    InvokeMode::Group(GroupMode::Any) => OpKind::Any,
-                    InvokeMode::Group(GroupMode::Race) => OpKind::Race,
-                    _ => OpKind::StructuralBarrier,
-                };
-                self.add_barrier(kind, &child_ids, result);
-                self.graph.record_ir(result, node);
-                result
+    for root in &plan.roots {
+        let node = node_map[root];
+        graph.push_root(node);
+    }
+
+    for edge in &plan.edges {
+        graph.add_edge(HEdge {
+            id: EdgeId(0),
+            kind: match edge.kind {
+                PlanEdgeKind::Structural => OpKind::StructuralBarrier,
+                PlanEdgeKind::Sequence => OpKind::Sequence,
+                PlanEdgeKind::Data => OpKind::DataFlow,
+            },
+            ports: vec![
+                Port {
+                    node: node_map[&edge.from],
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: node_map[&edge.to],
+                    role: PortRole::Output,
+                },
+            ],
+        });
+    }
+
+    add_plan_semantics(&mut graph, plan, &node_map);
+    Ok(graph)
+}
+
+fn flatten_program(nodes: &[OIr]) -> Vec<&OIr> {
+    let mut out = Vec::new();
+    for node in nodes {
+        flatten_node(node, &mut out);
+    }
+    out
+}
+
+fn flatten_node<'a>(node: &'a OIr, out: &mut Vec<&'a OIr>) {
+    out.push(node);
+    match node {
+        OIr::Text(_) | OIr::Load(_) => {}
+        OIr::Store { expr, .. } => flatten_node(expr, out),
+        OIr::Invoke { args, .. } => {
+            for arg in args {
+                flatten_node(arg, out);
             }
-            OIr::Exec {
+        }
+        OIr::Exec { body, .. } => {
+            for child in body {
+                flatten_node(child, out);
+            }
+        }
+    }
+}
+
+fn hnode_for_oir(node: &OIr) -> HNode {
+    match node {
+        OIr::Text(text) => {
+            let mut node = HNode::with_value(OValue::str_(text.clone()));
+            if !text.is_empty() {
+                node.domain = DomainFlags::STRING;
+                node.rep = RepFlags::STR;
+            }
+            node
+        }
+        _ => HNode::fresh(),
+    }
+}
+
+fn add_plan_semantics(
+    graph: &mut HGraph,
+    plan: &ExecutionPlan,
+    node_map: &HashMap<PlanNodeId, NodeId>,
+) {
+    for plan_node in &plan.nodes {
+        let output = node_map[&plan_node.id];
+        let inputs = structural_inputs(plan, node_map, plan_node.id);
+
+        match &plan_node.kind {
+            PlanNodeKind::Exec {
                 lang,
                 env_id,
+                attr,
                 backend,
-                body,
-                ..
             } => {
-                self.scopes.push(HashMap::new());
-                let mut child_ids = Vec::new();
-                let mut previous = None;
-                for child in body {
-                    let child_id = self.build_node(child);
-                    if let Some(prev) = previous {
-                        self.add_sequence(prev, child_id);
-                    }
-                    previous = Some(child_id);
-                    child_ids.push(child_id);
-                }
-                self.scopes.pop();
-
-                let result = self.graph.add_node(HNode::fresh());
-                self.add_barrier(OpKind::StructuralBarrier, &child_ids, result);
                 if let Some((dom, rep)) = backend_output_constraints(backend) {
-                    self.graph.add_edge(HEdge {
+                    graph.add_edge(HEdge {
                         id: EdgeId(0),
                         kind: OpKind::AbiFixed { dom, rep },
                         ports: vec![Port {
-                            node: result,
+                            node: output,
                             role: PortRole::Output,
                         }],
                     });
                 }
-                for child in &child_ids {
-                    self.graph.add_edge(HEdge {
+
+                for input in &inputs {
+                    graph.add_edge(HEdge {
                         id: EdgeId(0),
                         kind: OpKind::BackendCrossing {
                             from_lang: "O".to_string(),
@@ -148,91 +160,147 @@ impl Builder {
                         },
                         ports: vec![
                             Port {
-                                node: *child,
+                                node: *input,
                                 role: PortRole::Input,
                             },
                             Port {
-                                node: result,
+                                node: output,
                                 role: PortRole::Output,
                             },
                         ],
                     });
                 }
-                self.graph.record_ir(result, node);
+
                 if *env_id != u32::MAX {
                     let actor = ActorId {
                         lang: intern_lang(lang),
                         env: *env_id,
                     };
-                    if let Some(node) = self.graph.node_mut(result) {
-                        node.actor = Some(actor);
-                    }
-                    self.graph.add_edge(HEdge {
+                    graph.add_edge(HEdge {
                         id: EdgeId(0),
                         kind: OpKind::ActorSerial { actor },
                         ports: vec![Port {
-                            node: result,
+                            node: output,
                             role: PortRole::InOut,
                         }],
                     });
                 }
-                result
+
+                if let Some(cacheable) = eval_cache_annotation(attr.as_deref()) {
+                    add_control_relation(
+                        graph,
+                        OpKind::Request {
+                            kind: "eval".to_string(),
+                        },
+                        &inputs,
+                        output,
+                    );
+                    add_control_relation(graph, OpKind::CacheMemo { cacheable }, &inputs, output);
+                }
             }
+            PlanNodeKind::Request { kind, .. } => {
+                add_control_relation(
+                    graph,
+                    OpKind::Request {
+                        kind: kind.label().to_string(),
+                    },
+                    &inputs,
+                    output,
+                );
+                if matches!(
+                    kind,
+                    PlanRequestKind::Instantiate | PlanRequestKind::Realise
+                ) {
+                    add_control_relation(
+                        graph,
+                        OpKind::CacheMemo { cacheable: true },
+                        &inputs,
+                        output,
+                    );
+                } else {
+                    add_control_relation(
+                        graph,
+                        OpKind::CacheMemo { cacheable: false },
+                        &inputs,
+                        output,
+                    );
+                }
+            }
+            PlanNodeKind::Group { mode, .. } => {
+                add_control_relation(graph, group_op(*mode), &inputs, output);
+            }
+            PlanNodeKind::Schedule { kind, .. } => {
+                add_control_relation(
+                    graph,
+                    OpKind::Schedule {
+                        kind: kind.label().to_string(),
+                    },
+                    &inputs,
+                    output,
+                );
+            }
+            PlanNodeKind::Text
+            | PlanNodeKind::Load { .. }
+            | PlanNodeKind::Store { .. }
+            | PlanNodeKind::Call { .. } => {}
         }
     }
+}
 
-    fn add_sequence(&mut self, before: NodeId, after: NodeId) {
-        self.graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: OpKind::Sequence,
-            ports: vec![
-                Port {
-                    node: before,
-                    role: PortRole::Input,
-                },
-                Port {
-                    node: after,
-                    role: PortRole::Output,
-                },
-            ],
-        });
-    }
+fn structural_inputs(
+    plan: &ExecutionPlan,
+    node_map: &HashMap<PlanNodeId, NodeId>,
+    parent: PlanNodeId,
+) -> Vec<NodeId> {
+    let mut children = plan
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == PlanEdgeKind::Structural && edge.to == parent)
+        .map(|edge| (edge.from.0, node_map[&edge.from]))
+        .collect::<Vec<_>>();
+    children.sort_by_key(|(id, _)| *id);
+    children.into_iter().map(|(_, node)| node).collect()
+}
 
-    fn add_barrier(&mut self, kind: OpKind, inputs: &[NodeId], output: NodeId) {
-        let mut ports = inputs
-            .iter()
-            .copied()
-            .map(|node| Port {
-                node,
-                role: PortRole::Input,
-            })
-            .collect::<Vec<_>>();
-        ports.push(Port {
-            node: output,
-            role: PortRole::Output,
-        });
-        self.graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind,
-            ports,
-        });
-    }
+fn add_control_relation(graph: &mut HGraph, kind: OpKind, inputs: &[NodeId], output: NodeId) {
+    let mut ports = inputs
+        .iter()
+        .copied()
+        .map(|node| Port {
+            node,
+            role: PortRole::Input,
+        })
+        .collect::<Vec<_>>();
+    ports.push(Port {
+        node: output,
+        role: PortRole::Output,
+    });
+    graph.add_edge(HEdge {
+        id: EdgeId(0),
+        kind,
+        ports,
+    });
+}
 
-    fn bind(&mut self, name: String, node: NodeId) {
-        self.graph.bind(name.clone(), node);
-        self.scopes
-            .last_mut()
-            .expect("scope stack always has a root")
-            .insert(name, node);
+fn group_op(mode: GroupMode) -> OpKind {
+    match mode {
+        GroupMode::Batch => OpKind::Batch,
+        GroupMode::All => OpKind::All,
+        GroupMode::Any => OpKind::Any,
+        GroupMode::Race => OpKind::Race,
     }
+}
 
-    fn lookup(&self, name: &str) -> Option<NodeId> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).copied())
-            .or_else(|| self.graph.lookup(name))
+fn eval_cache_annotation(attr: Option<&str>) -> Option<bool> {
+    let mut cacheable = None;
+    for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
+        match entry.trim() {
+            "lazy" => cacheable = Some(true),
+            "defer" => cacheable = Some(false),
+            _ => {}
+        }
     }
+    cacheable
 }
 
 fn intern_lang(lang: &str) -> u32 {

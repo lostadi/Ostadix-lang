@@ -46,13 +46,23 @@ mod tests {
                     mode: InvokeMode::Group(GroupMode::Batch),
                     args: vec![OIr::Text("1".into()), OIr::Text("2".into())],
                 },
+                OIr::Invoke {
+                    fn_name: "instantiate".into(),
+                    mode: InvokeMode::Eager,
+                    args: vec![OIr::Text("{ name = \"demo\"; }".into())],
+                },
+                OIr::Invoke {
+                    fn_name: "autonomous".into(),
+                    mode: InvokeMode::Autonomous,
+                    args: vec![OIr::Text("body".into())],
+                },
             ],
         };
 
         let mut graph = program.hgraph();
         solve::solve_types(&mut graph);
 
-        assert_eq!(graph.root_nodes.len(), 3);
+        assert_eq!(graph.root_nodes.len(), 5);
         for root in &graph.root_nodes {
             assert!(
                 graph.ir_map.contains_key(root),
@@ -79,6 +89,18 @@ mod tests {
             .edges
             .values()
             .any(|edge| matches!(edge.kind, OpKind::Batch)));
+        assert!(graph
+            .edges
+            .values()
+            .any(|edge| matches!(edge.kind, OpKind::Request { .. })));
+        assert!(graph
+            .edges
+            .values()
+            .any(|edge| matches!(edge.kind, OpKind::Schedule { .. })));
+        assert!(graph
+            .edges
+            .values()
+            .any(|edge| matches!(edge.kind, OpKind::CacheMemo { cacheable: true })));
 
         let big_literal = graph
             .nodes
@@ -89,7 +111,7 @@ mod tests {
         assert_eq!(big_literal.rep, RepFlags::STR);
 
         let schedule = schedule::try_schedule(&graph).unwrap();
-        assert_eq!(schedule.root_order(&graph).unwrap(), vec![0, 1, 2]);
+        assert_eq!(schedule.root_order(&graph).unwrap(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

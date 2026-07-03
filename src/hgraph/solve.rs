@@ -83,6 +83,9 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
         | OpKind::All
         | OpKind::Any
         | OpKind::Race
+        | OpKind::Request { .. }
+        | OpKind::Schedule { .. }
+        | OpKind::CacheMemo { .. }
         | OpKind::X86 { .. }
         | OpKind::OcoreOp { .. } => false,
     }

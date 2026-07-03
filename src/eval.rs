@@ -1366,22 +1366,36 @@ impl Evaluator {
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
-        let mut hgraph = program.hgraph();
-        crate::hgraph::solve::solve_types(&mut hgraph);
-        let hgraph_schedule = crate::hgraph::schedule::try_schedule(&hgraph)
-            .map_err(anyhow::Error::msg)
-            .context("failed to schedule OIR hypergraph")?;
-        let root_schedule = hgraph_schedule
-            .root_order(&hgraph)
-            .map_err(anyhow::Error::msg)
-            .context("failed to derive OIR root order from hypergraph schedule")?;
-        self.last_hgraph_schedule = Some(hgraph_schedule);
-
         let plan = program.plan();
         plan.validate(program.nodes.len())
             .map_err(anyhow::Error::msg)
             .context("invalid OIR execution plan")?;
+        let root_schedule = plan
+            .root_schedule()
+            .map_err(anyhow::Error::msg)
+            .context("failed to derive OIR root order from execution plan")?;
         self.last_execution_plan = Some(plan.clone());
+
+        let mut hgraph = program
+            .hgraph_for_plan(&plan)
+            .map_err(anyhow::Error::msg)
+            .context("failed to project OIR execution plan into hypergraph")?;
+        crate::hgraph::solve::solve_types(&mut hgraph);
+        let hgraph_schedule = crate::hgraph::schedule::try_schedule(&hgraph)
+            .map_err(anyhow::Error::msg)
+            .context("failed to schedule OIR hypergraph projection")?;
+        let projected_root_schedule = hgraph_schedule
+            .root_order(&hgraph)
+            .map_err(anyhow::Error::msg)
+            .context("failed to derive OIR root order from hypergraph projection")?;
+        if projected_root_schedule != root_schedule {
+            bail!(
+                "hypergraph projection diverged from execution plan root order: {:?} != {:?}",
+                projected_root_schedule,
+                root_schedule
+            );
+        }
+        self.last_hgraph_schedule = Some(hgraph_schedule);
 
         let mut last = OValue::null();
         for root_index in root_schedule {

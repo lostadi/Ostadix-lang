@@ -788,12 +788,14 @@ fn link_files(
 /// Cycles are broken conservatively: any file that participates in a cycle
 /// keeps its original position relative to the other cycle members.
 pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
-    // Group files by backend language, preserving original indices so we can
-    // interleave the sorted groups back correctly.
+    // Group files by dependency language, preserving original indices so we
+    // can interleave the sorted groups back correctly. This differs from the
+    // output backend for C/C++ headers: .h/.hpp still render as inert text,
+    // but they must be visible to C/C++ include ordering.
     let mut groups: HashMap<String, Vec<(usize, &PathBuf)>> = HashMap::new();
     for (i, path) in files.iter().enumerate() {
         groups
-            .entry(file_backend(path, ext_map))
+            .entry(dependency_group(path, ext_map))
             .or_default()
             .push((i, path));
     }
@@ -815,6 +817,21 @@ pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> V
 
     sorted_entries.sort_by_key(|(i, _)| *i);
     sorted_entries.into_iter().map(|(_, p)| p).collect()
+}
+
+fn dependency_group(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
+    let backend = file_backend(path, ext_map);
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    if matches!(backend.as_str(), "c" | "cpp")
+        || matches!(extension.as_deref(), Some("h" | "hh" | "hpp" | "hxx"))
+    {
+        "c-family".to_string()
+    } else {
+        backend
+    }
 }
 
 /// Topological sort of a single-language file group.
@@ -996,7 +1013,7 @@ fn imported_modules(src: &str, ext_map: &BTreeMap<String, String>, path: &Path) 
                     push_import_candidates(&mut mods, module.trim_end_matches(';'));
                 }
             }
-            "cpp" => {
+            "c" | "cpp" => {
                 if let Some(include) = line.strip_prefix("#include") {
                     if include.trim_start().starts_with('"') {
                         if let Some(specifier) = quoted_text(include) {

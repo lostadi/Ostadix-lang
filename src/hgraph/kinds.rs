@@ -57,6 +57,11 @@ pub enum OpKind {
     Any,
     Race,
 
+    // First-class control topology projected from ExecutionPlan.
+    Request { kind: String },
+    Schedule { kind: String },
+    CacheMemo { cacheable: bool },
+
     // Backend value crossing.
     BackendCrossing { from_lang: String, to_lang: String },
 

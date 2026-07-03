@@ -64,7 +64,10 @@ pub fn try_schedule(graph: &HGraph) -> Result<Schedule, String> {
             | OpKind::Batch
             | OpKind::All
             | OpKind::Any
-            | OpKind::Race => {
+            | OpKind::Race
+            | OpKind::Request { .. }
+            | OpKind::Schedule { .. }
+            | OpKind::CacheMemo { .. } => {
                 let inputs: Vec<_> = edge
                     .ports
                     .iter()

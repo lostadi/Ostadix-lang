@@ -97,12 +97,12 @@ const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 
 // hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
-const RUNTIME_HGRAPH_MOD_RS:      &str = include_str!("../hgraph/mod.rs");
-const RUNTIME_HGRAPH_GRAPH_RS:    &str = include_str!("../hgraph/graph.rs");
-const RUNTIME_HGRAPH_KINDS_RS:    &str = include_str!("../hgraph/kinds.rs");
+const RUNTIME_HGRAPH_MOD_RS: &str = include_str!("../hgraph/mod.rs");
+const RUNTIME_HGRAPH_GRAPH_RS: &str = include_str!("../hgraph/graph.rs");
+const RUNTIME_HGRAPH_KINDS_RS: &str = include_str!("../hgraph/kinds.rs");
 const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
 const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
-const RUNTIME_HGRAPH_SOLVE_RS:    &str = include_str!("../hgraph/solve.rs");
+const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
@@ -279,12 +279,12 @@ fn compile_to_binary(
     // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
     let hgraph_dir = src_dir.join("hgraph");
     fs::create_dir_all(&hgraph_dir)?;
-    fs::write(hgraph_dir.join("mod.rs"),      RUNTIME_HGRAPH_MOD_RS)?;
-    fs::write(hgraph_dir.join("graph.rs"),    RUNTIME_HGRAPH_GRAPH_RS)?;
-    fs::write(hgraph_dir.join("kinds.rs"),    RUNTIME_HGRAPH_KINDS_RS)?;
+    fs::write(hgraph_dir.join("mod.rs"), RUNTIME_HGRAPH_MOD_RS)?;
+    fs::write(hgraph_dir.join("graph.rs"), RUNTIME_HGRAPH_GRAPH_RS)?;
+    fs::write(hgraph_dir.join("kinds.rs"), RUNTIME_HGRAPH_KINDS_RS)?;
     fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
     fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
-    fs::write(hgraph_dir.join("solve.rs"),    RUNTIME_HGRAPH_SOLVE_RS)?;
+    fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
 
     // ── Program source ───────────────────────────────────────────────────────
     // Always stored as "program.O" so the generated main.rs can reference it
@@ -616,6 +616,11 @@ fn op_kind_label(kind: &o_lang::hgraph::kinds::OpKind) -> String {
         OpKind::All => "all".into(),
         OpKind::Any => "any".into(),
         OpKind::Race => "race".into(),
+        OpKind::Request { kind } => format!("request:{kind}"),
+        OpKind::Schedule { kind } => format!("schedule:{kind}"),
+        OpKind::CacheMemo { cacheable } => {
+            format!("cache:{}", if *cacheable { "memo" } else { "bypass" })
+        }
         OpKind::BackendCrossing { from_lang, to_lang } => {
             format!("crossing:{from_lang}→{to_lang}")
         }
