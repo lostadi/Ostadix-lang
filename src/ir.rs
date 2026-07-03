@@ -1004,6 +1004,14 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         &[BackendAuthority::FileWrite, BackendAuthority::Process],
     ),
     BackendSpec::with_authority(
+        "c",
+        &[],
+        false,
+        SpliceRenderer::Default,
+        ExecutionMode::Shim,
+        &[BackendAuthority::FileWrite, BackendAuthority::Process],
+    ),
+    BackendSpec::with_authority(
         "cpp",
         &[],
         false,
