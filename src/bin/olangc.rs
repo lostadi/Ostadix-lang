@@ -264,27 +264,7 @@ fn compile_to_binary(
     fs::create_dir_all(&shim_dir)?;
 
     // ── Runtime source files ─────────────────────────────────────────────────
-    fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
-    fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
-    fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
-    fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
-    fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
-    fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
-    fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
-    fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
-    fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
-    fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
-    fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
-
-    // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
-    let hgraph_dir = src_dir.join("hgraph");
-    fs::create_dir_all(&hgraph_dir)?;
-    fs::write(hgraph_dir.join("mod.rs"), RUNTIME_HGRAPH_MOD_RS)?;
-    fs::write(hgraph_dir.join("graph.rs"), RUNTIME_HGRAPH_GRAPH_RS)?;
-    fs::write(hgraph_dir.join("kinds.rs"), RUNTIME_HGRAPH_KINDS_RS)?;
-    fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
-    fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
-    fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
+    write_runtime_sources(&src_dir)?;
 
     // ── Program source ───────────────────────────────────────────────────────
     // Always stored as "program.O" so the generated main.rs can reference it
@@ -356,6 +336,32 @@ fn compile_to_binary(
     }
 
     eprintln!("olangc: compiled → {}", dest.display());
+    Ok(())
+}
+
+fn write_runtime_sources(src_dir: &Path) -> Result<()> {
+    fs::create_dir_all(src_dir)?;
+    fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
+    fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
+    fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
+    fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
+    fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
+    fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
+    fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
+    fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
+    fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
+    fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
+    fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
+
+    // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
+    let hgraph_dir = src_dir.join("hgraph");
+    fs::create_dir_all(&hgraph_dir)?;
+    fs::write(hgraph_dir.join("mod.rs"), RUNTIME_HGRAPH_MOD_RS)?;
+    fs::write(hgraph_dir.join("graph.rs"), RUNTIME_HGRAPH_GRAPH_RS)?;
+    fs::write(hgraph_dir.join("kinds.rs"), RUNTIME_HGRAPH_KINDS_RS)?;
+    fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
+    fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
+    fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
     Ok(())
 }
 
@@ -514,8 +520,8 @@ fn hgraph_to_dot(hgraph: &o_lang::hgraph::HGraph) -> String {
                 let value_part = match &node.value {
                     Some(v) => {
                         let s = format!("{v}");
-                        if s.len() > 24 {
-                            format!("{}…", &s[..24])
+                        if s.chars().count() > 24 {
+                            format!("{}...", s.chars().take(24).collect::<String>())
                         } else {
                             s
                         }
@@ -989,5 +995,39 @@ fn canonicalize_output(output: &Path) -> Result<PathBuf> {
         Ok(std::env::current_dir()
             .context("failed to get current directory")?
             .join(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_runtime_includes_hgraph_modules() {
+        let build_dir = create_build_dir().unwrap();
+        let src_dir = build_dir.join("src");
+
+        write_runtime_sources(&src_dir).unwrap();
+        fs::write(src_dir.join("lib.rs"), generate_lib_rs()).unwrap();
+
+        let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+        assert!(lib_rs.contains("pub mod hgraph;"));
+
+        for path in [
+            "hgraph/mod.rs",
+            "hgraph/graph.rs",
+            "hgraph/kinds.rs",
+            "hgraph/from_oir.rs",
+            "hgraph/schedule.rs",
+            "hgraph/solve.rs",
+        ] {
+            let content = fs::read_to_string(src_dir.join(path)).unwrap();
+            assert!(
+                !content.trim().is_empty(),
+                "generated runtime file {path} must not be empty"
+            );
+        }
+
+        fs::remove_dir_all(build_dir).unwrap();
     }
 }

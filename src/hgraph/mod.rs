@@ -115,6 +115,45 @@ mod tests {
     }
 
     #[test]
+    fn oir_hgraph_preserves_activation_request_kind() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Invoke {
+                    fn_name: "dry_activate".into(),
+                    mode: InvokeMode::Eager,
+                    args: vec![OIr::Text("/nix/store/demo-system".into())],
+                },
+                OIr::Invoke {
+                    fn_name: "activate".into(),
+                    mode: InvokeMode::Eager,
+                    args: vec![OIr::Text("/nix/store/demo-system".into())],
+                },
+            ],
+        };
+
+        let graph = program.hgraph();
+        let request_kinds = graph
+            .edges
+            .values()
+            .filter_map(|edge| match &edge.kind {
+                OpKind::Request { kind } => Some(kind.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(request_kinds.contains(&"dry_activate"));
+        assert!(request_kinds.contains(&"activate"));
+        assert!(
+            graph
+                .edges
+                .values()
+                .filter(|edge| matches!(edge.kind, OpKind::CacheMemo { cacheable: false }))
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
     fn bounded_integer_nodes_materialize_number_int() {
         let mut graph = HGraph::default();
         let out = graph.add_node(HNode::fresh());
