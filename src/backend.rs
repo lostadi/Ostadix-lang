@@ -42,6 +42,7 @@ pub fn has_native_backend(lang: &str) -> bool {
             | "javascript"
             | "ruby"
             | "rust"
+            | "c"
             | "cpp"
             | "java"
             | "nix"
@@ -112,6 +113,7 @@ impl RustBackend {
             "javascript" => run_script("javascript", "js", &javascript_preamble(&bindings), code),
             "ruby" => run_script("ruby", "rb", &ruby_preamble(&bindings), code),
             "rust" => run_rust(code),
+            "c" => run_c(code),
             "cpp" => run_cpp(code),
             "java" => run_java(code),
             "nix" | "nix_expr" => run_nix(code),
@@ -313,6 +315,29 @@ fn run_rust(code: &str) -> Result<OValue> {
         Command::new(&binary)
             .output()
             .context("failed to execute compiled Rust program")?,
+    )
+}
+
+fn run_c(code: &str) -> Result<OValue> {
+    let temp = TempDir::new("o-backend-c")?;
+    let source = temp.path().join("main.c");
+    let binary = temp.path().join("main");
+    fs::write(&source, code)?;
+    expect_success(
+        "cc compilation failed",
+        Command::new("cc")
+            .arg("-std=c17")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&source)
+            .output()
+            .context("cc is not installed or not in PATH")?,
+    )?;
+    output_to_value(
+        "C program",
+        Command::new(&binary)
+            .output()
+            .context("failed to execute compiled C program")?,
     )
 }
 

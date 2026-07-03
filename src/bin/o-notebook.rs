@@ -231,6 +231,7 @@ fn registered_backends() -> HashSet<String> {
         "nixos_test",
         "text",
         "csharp",
+        "c",
         "cpp",
         "haskell",
         "lisp",

@@ -1,0 +1,154 @@
+diff --git a/src/backend.rs b/src/backend.rs
+index 4ba3887..07275e5 100644
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -42,6 +42,7 @@ pub fn has_native_backend(lang: &str) -> bool {
+             | "javascript"
+             | "ruby"
+             | "rust"
++            | "c"
+             | "cpp"
+             | "java"
+             | "nix"
+@@ -112,6 +113,7 @@ impl RustBackend {
+             "javascript" => run_script("javascript", "js", &javascript_preamble(&bindings), code),
+             "ruby" => run_script("ruby", "rb", &ruby_preamble(&bindings), code),
+             "rust" => run_rust(code),
++            "c" => run_c(code),
+             "cpp" => run_cpp(code),
+             "java" => run_java(code),
+             "nix" | "nix_expr" => run_nix(code),
+@@ -316,6 +318,29 @@ fn run_rust(code: &str) -> Result<OValue> {
+     )
+ }
+ 
++fn run_c(code: &str) -> Result<OValue> {
++    let temp = TempDir::new("o-backend-c")?;
++    let source = temp.path().join("main.c");
++    let binary = temp.path().join("main");
++    fs::write(&source, code)?;
++    expect_success(
++        "cc compilation failed",
++        Command::new("cc")
++            .arg("-std=c17")
++            .arg("-o")
++            .arg(&binary)
++            .arg(&source)
++            .output()
++            .context("cc is not installed or not in PATH")?,
++    )?;
++    output_to_value(
++        "C program",
++        Command::new(&binary)
++            .output()
++            .context("failed to execute compiled C program")?,
++    )
++}
++
+ fn run_cpp(code: &str) -> Result<OValue> {
+     let temp = TempDir::new("o-backend-cpp")?;
+     let source = temp.path().join("main.cpp");
+diff --git a/src/bin/o-notebook.rs b/src/bin/o-notebook.rs
+index ebecbe2..dcc9b66 100644
+--- a/src/bin/o-notebook.rs
++++ b/src/bin/o-notebook.rs
+@@ -231,6 +231,7 @@ fn registered_backends() -> HashSet<String> {
+         "nixos_test",
+         "text",
+         "csharp",
++        "c",
+         "cpp",
+         "haskell",
+         "lisp",
+diff --git a/src/bin/olangc.rs b/src/bin/olangc.rs
+index 194a352..872f4e1 100644
+--- a/src/bin/olangc.rs
++++ b/src/bin/olangc.rs
+@@ -646,6 +646,7 @@ fn registered_backends() -> HashSet<String> {
+         "nixos_test",
+         "text",
+         "csharp",
++        "c",
+         "cpp",
+         "haskell",
+         "lisp",
+@@ -801,7 +802,7 @@ fn main() -> anyhow::Result<()> {{
+         "O", "python", "html", "latex", "markdown", "bash", "shell",
+         "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
+         "text",
+-        "csharp", "cpp", "haskell", "lisp", "common_lisp", "sql",
++        "csharp", "c", "cpp", "haskell", "lisp", "common_lisp", "sql",
+         "ruby", "matlab", "mathematica", "webassembly", "java",
+         "javascript", "ocaml",
+         "quote",
+diff --git a/src/bin/olink.rs b/src/bin/olink.rs
+index 298b17d..a68b0f4 100644
+--- a/src/bin/olink.rs
++++ b/src/bin/olink.rs
+@@ -1255,12 +1255,12 @@ fn default_extension_map() -> BTreeMap<String, String> {
+         ("nix", "nix"),
+         ("txt", "text"),
+         ("cs", "csharp"),
+-        ("c", "cpp"),
++        ("c", "c"),
+         ("cc", "cpp"),
+         ("cpp", "cpp"),
+         ("cxx", "cpp"),
+-        ("h", "cpp"),
+-        ("hpp", "cpp"),
++        ("h", "text"),
++        ("hpp", "text"),
+         ("hs", "haskell"),
+         ("lisp", "lisp"),
+         ("cl", "common_lisp"),
+@@ -1299,6 +1299,7 @@ fn registered_backends() -> HashSet<String> {
+         "nixos_test",
+         "text",
+         "csharp",
++        "c",
+         "cpp",
+         "haskell",
+         "lisp",
+diff --git a/src/bin/ounlink.rs b/src/bin/ounlink.rs
+index c7067bf..6430834 100644
+--- a/src/bin/ounlink.rs
++++ b/src/bin/ounlink.rs
+@@ -465,6 +465,7 @@ fn registered_backends() -> HashSet<String> {
+         "nixos_test",
+         "text",
+         "csharp",
++        "c",
+         "cpp",
+         "haskell",
+         "lisp",
+diff --git a/src/ir.rs b/src/ir.rs
+index 7cfb856..53c1ea5 100644
+--- a/src/ir.rs
++++ b/src/ir.rs
+@@ -1003,6 +1003,14 @@ const BACKEND_SPECS: &[BackendSpec] = &[
+         ExecutionMode::Shim,
+         &[BackendAuthority::FileWrite, BackendAuthority::Process],
+     ),
++    BackendSpec::with_authority(
++        "c",
++        &[],
++        false,
++        SpliceRenderer::Default,
++        ExecutionMode::Shim,
++        &[BackendAuthority::FileWrite, BackendAuthority::Process],
++    ),
+     BackendSpec::with_authority(
+         "cpp",
+         &[],
+diff --git a/src/main.rs b/src/main.rs
+index 57b8917..d523c05 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -515,6 +515,7 @@ fn registered_backends() -> HashSet<String> {
+         "nixos_test",
+         "text",
+         "csharp",
++        "c",
+         "cpp",
+         "haskell",
+         "lisp",
