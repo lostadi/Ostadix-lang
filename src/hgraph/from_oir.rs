@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use crate::{
     ir::{
         BackendInterface, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind,
-        PlanRequestKind,
     },
     value::{GroupMode, OValue},
 };
@@ -137,8 +136,8 @@ fn add_plan_semantics(
             PlanNodeKind::Exec {
                 lang,
                 env_id,
-                attr,
                 backend,
+                ..
             } => {
                 if let Some((dom, rep)) = backend_output_constraints(backend) {
                     graph.add_edge(HEdge {
@@ -186,7 +185,7 @@ fn add_plan_semantics(
                     });
                 }
 
-                if let Some(cacheable) = eval_cache_annotation(attr.as_deref()) {
+                if let Some(policy) = plan_node.kind.eval_cache_policy() {
                     add_control_relation(
                         graph,
                         OpKind::Request {
@@ -195,7 +194,14 @@ fn add_plan_semantics(
                         &inputs,
                         output,
                     );
-                    add_control_relation(graph, OpKind::CacheMemo { cacheable }, &inputs, output);
+                    add_control_relation(
+                        graph,
+                        OpKind::CacheMemo {
+                            cacheable: policy.cacheable(),
+                        },
+                        &inputs,
+                        output,
+                    );
                 }
             }
             PlanNodeKind::Request { kind, .. } => {
@@ -207,20 +213,12 @@ fn add_plan_semantics(
                     &inputs,
                     output,
                 );
-                if matches!(
-                    kind,
-                    PlanRequestKind::Instantiate | PlanRequestKind::Realise
-                ) {
+                if let Some(policy) = plan_node.kind.eval_cache_policy() {
                     add_control_relation(
                         graph,
-                        OpKind::CacheMemo { cacheable: true },
-                        &inputs,
-                        output,
-                    );
-                } else {
-                    add_control_relation(
-                        graph,
-                        OpKind::CacheMemo { cacheable: false },
+                        OpKind::CacheMemo {
+                            cacheable: policy.cacheable(),
+                        },
                         &inputs,
                         output,
                     );
@@ -289,18 +287,6 @@ fn group_op(mode: GroupMode) -> OpKind {
         GroupMode::Any => OpKind::Any,
         GroupMode::Race => OpKind::Race,
     }
-}
-
-fn eval_cache_annotation(attr: Option<&str>) -> Option<bool> {
-    let mut cacheable = None;
-    for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
-        match entry.trim() {
-            "lazy" => cacheable = Some(true),
-            "defer" => cacheable = Some(false),
-            _ => {}
-        }
-    }
-    cacheable
 }
 
 fn intern_lang(lang: &str) -> u32 {

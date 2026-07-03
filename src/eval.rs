@@ -56,6 +56,38 @@ pub(crate) enum CacheMode {
     Strict,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionTrace {
+    pub events: Vec<TraceEvent>,
+}
+
+impl ExecutionTrace {
+    pub fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+}
+
+impl Default for ExecutionTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceEvent {
+    NodeReady(PlanNodeId),
+    NodeStarted(PlanNodeId),
+    NodeFinished {
+        id: PlanNodeId,
+        value_type: String,
+        fingerprint: Option<String>,
+    },
+    NodeFailed {
+        id: PlanNodeId,
+        message: String,
+    },
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // exec_nix_kind — thread-safe Nix-family dispatcher
 //
@@ -304,6 +336,9 @@ pub struct Evaluator {
     /// The validated plan used by the most recent document execution.
     last_execution_plan: Option<ExecutionPlan>,
 
+    /// Deterministic lifecycle trace for the most recent OIR execution.
+    last_execution_trace: Option<ExecutionTrace>,
+
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
     /// dispatch still interprets OIR, but graph construction, type solving,
@@ -413,6 +448,7 @@ impl Evaluator {
             scheduler: AutonomousScheduler::new(),
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
+            last_execution_trace: None,
             last_hgraph_schedule: None,
             activation_authorities: HashMap::new(),
             backend_authorities,
@@ -441,9 +477,30 @@ impl Evaluator {
         self.last_execution_plan.as_ref()
     }
 
+    /// The node-level execution trace from the most recent document.
+    pub fn last_execution_trace(&self) -> Option<&ExecutionTrace> {
+        self.last_execution_trace.as_ref()
+    }
+
     /// The hypergraph schedule that was built for the most recent document.
     pub fn last_hgraph_schedule(&self) -> Option<&crate::hgraph::Schedule> {
         self.last_hgraph_schedule.as_ref()
+    }
+
+    fn record_trace_event(&mut self, event: TraceEvent) {
+        if let Some(trace) = &mut self.last_execution_trace {
+            trace.events.push(event);
+        }
+    }
+
+    fn trace_fingerprint(value: &OValue) -> Option<String> {
+        match value {
+            OValue::NixExpr { fingerprint, .. }
+            | OValue::Request { fingerprint, .. }
+            | OValue::Thunk { fingerprint, .. }
+            | OValue::Group { fingerprint, .. } => Some(fingerprint.clone()),
+            _ => None,
+        }
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1375,6 +1432,7 @@ impl Evaluator {
             .map_err(anyhow::Error::msg)
             .context("failed to derive OIR root order from execution plan")?;
         self.last_execution_plan = Some(plan.clone());
+        self.last_execution_trace = Some(ExecutionTrace::new());
 
         let mut hgraph = program
             .hgraph_for_plan(&plan)
@@ -1406,17 +1464,10 @@ impl Evaluator {
                 OIr::Text(text) if !text.is_empty() && text.chars().all(char::is_whitespace)
             );
 
-            let value = match node {
-                OIr::Store { name, expr } => {
-                    let children =
-                        planned_children(&plan, node_id, std::slice::from_ref(expr.as_ref()))?;
-                    let (expr_id, _) = children[0];
-                    let value = self.eval_ir_node(expr, expr_id, &plan, scope)?;
-                    scope.insert(name.clone(), value.clone());
-                    value
-                }
-                _ => self.eval_ir_node(node, node_id, &plan, scope)?,
-            };
+            let value = self.eval_ir_node(node, node_id, &plan, scope)?;
+            if let OIr::Store { name, .. } = node {
+                scope.insert(name.clone(), value.clone());
+            }
 
             if !value.is_null() && !is_pure_whitespace_text {
                 last = value;
@@ -1436,6 +1487,35 @@ impl Evaluator {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn eval_ir_node(
+        &mut self,
+        node: &OIr,
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+        scope: &HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        self.record_trace_event(TraceEvent::NodeReady(node_id));
+        self.record_trace_event(TraceEvent::NodeStarted(node_id));
+        match self.eval_ir_node_inner(node, node_id, plan, scope) {
+            Ok(value) => {
+                self.record_trace_event(TraceEvent::NodeFinished {
+                    id: node_id,
+                    value_type: value.type_name().to_string(),
+                    fingerprint: Self::trace_fingerprint(&value),
+                });
+                Ok(value)
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.record_trace_event(TraceEvent::NodeFailed {
+                    id: node_id,
+                    message,
+                });
+                Err(err)
+            }
+        }
+    }
+
+    fn eval_ir_node_inner(
         &mut self,
         node: &OIr,
         node_id: PlanNodeId,
@@ -1894,17 +1974,10 @@ impl Evaluator {
                     OIr::Text(text)
                         if !text.is_empty() && text.chars().all(char::is_whitespace)
                 );
-                let value = match *child {
-                    OIr::Store { name, expr } => {
-                        let children =
-                            planned_children(plan, *child_id, std::slice::from_ref(expr.as_ref()))?;
-                        let (expr_id, _) = children[0];
-                        let value = self.eval_ir_node(expr, expr_id, plan, &local_scope)?;
-                        local_scope.insert(name.clone(), value.clone());
-                        value
-                    }
-                    _ => self.eval_ir_node(child, *child_id, plan, &local_scope)?,
-                };
+                let value = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
+                if let OIr::Store { name, .. } = *child {
+                    local_scope.insert(name.clone(), value.clone());
+                }
                 if !value.is_null() && !is_whitespace {
                     last = value;
                 }
@@ -1988,25 +2061,20 @@ impl Evaluator {
 
         for (child_id, child) in &planned_body {
             match *child {
-                OIr::Store { name, expr } => {
+                OIr::Store { name, .. } => {
                     // Evaluate the RHS and bind it into the local scope.
                     // The binding itself produces no text for the backend.
-                    let children =
-                        planned_children(plan, *child_id, std::slice::from_ref(expr.as_ref()))?;
-                    let (expr_id, _) = children[0];
-                    let value = self.eval_ir_node(expr, expr_id, plan, &local_scope)?;
+                    let value = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
                     local_scope.insert(name.clone(), value);
                 }
 
                 OIr::Text(text) => {
+                    let _ = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
                     buf.push_str(text);
                 }
 
-                OIr::Load(name) => {
-                    let val = local_scope
-                        .get(name)
-                        .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))?
-                        .clone();
+                OIr::Load(_) => {
+                    let val = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
                     // STEP-3.5: auto-force {lazy} thunks before splicing; error
                     // on {defer} thunks. {lazy} is safe to auto-force because
                     // pure-backend results don't have side effects.
@@ -2017,27 +2085,10 @@ impl Evaluator {
                     }
                 }
 
-                OIr::Exec {
-                    lang: child_lang,
-                    env_id: child_env_id,
-                    attr: child_attr,
-                    backend: child_backend,
-                    body: child_body,
-                } => {
+                OIr::Exec { .. } => {
                     // Evaluate the nested expression first (leaves-up / applicative order),
                     // then render its value into the parent language's source syntax.
-                    let child_val = self.eval_ir_exec(
-                        IrExecRegion {
-                            lang: child_lang,
-                            env_id: *child_env_id,
-                            attr: child_attr.as_deref(),
-                            backend: child_backend,
-                            body: child_body,
-                            node_id: *child_id,
-                        },
-                        plan,
-                        &local_scope,
-                    )?;
+                    let child_val = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
                     let resolved = self.resolve_for_splice(child_val)?;
                     buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
@@ -2045,13 +2096,8 @@ impl Evaluator {
                     }
                 }
 
-                OIr::Invoke {
-                    fn_name,
-                    mode,
-                    args,
-                } => {
-                    let raw =
-                        self.eval_ir_invoke(fn_name, *mode, args, *child_id, plan, &local_scope)?;
+                OIr::Invoke { .. } => {
+                    let raw = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
                     let resolved = self.resolve_for_splice(raw)?;
                     buf.push_str(&render_with(backend.renderer, &resolved));
                     if constructs_thunk {
@@ -3733,6 +3779,84 @@ mod tests {
             .last_hgraph_schedule()
             .expect("document execution must also build a hypergraph schedule");
         assert!(!hgraph_schedule.clusters.is_empty());
+    }
+
+    #[test]
+    fn execution_trace_records_node_lifecycle_and_fingerprint() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Store {
+                    name: "expr".into(),
+                    expr: Box::new(OIr::Exec {
+                        lang: "nix_expr".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: BackendRegistry::global().interface_for("nix_expr"),
+                        body: vec![OIr::Text("{ name = \"demo\"; }".into())],
+                    }),
+                },
+                OIr::Load("expr".into()),
+            ],
+        };
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let result = evaluator.eval_ir_program(&program).unwrap();
+        assert_eq!(result.type_name(), "nix_expr");
+
+        let trace = evaluator
+            .last_execution_trace()
+            .expect("document execution must install an execution trace");
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::NodeReady(PlanNodeId(0)))));
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::NodeStarted(PlanNodeId(0)))));
+        assert!(trace.events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::NodeFinished {
+                    id: PlanNodeId(1),
+                    value_type,
+                    fingerprint,
+                } if value_type == "nix_expr"
+                    && fingerprint.as_ref().map(|fp| fp.len() == 64).unwrap_or(false)
+            )
+        }));
+        assert!(trace.events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::NodeFinished {
+                    id: PlanNodeId(3),
+                    value_type,
+                    ..
+                } if value_type == "nix_expr"
+            )
+        }));
+    }
+
+    #[test]
+    fn execution_trace_records_node_failures() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Load("missing".into())],
+        };
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let error = evaluator.eval_ir_program(&program).unwrap_err().to_string();
+        assert!(error.contains("Undefined variable"));
+
+        let trace = evaluator
+            .last_execution_trace()
+            .expect("failed execution should retain its trace");
+        assert!(trace.events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::NodeFailed {
+                    id: PlanNodeId(0),
+                    message,
+                } if message.contains("Undefined variable")
+            )
+        }));
     }
 
     #[test]

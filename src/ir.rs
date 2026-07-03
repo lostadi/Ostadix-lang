@@ -351,9 +351,25 @@ pub enum PlanNodeClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    Memoize,
+    Bypass,
+}
+
+impl CachePolicy {
+    pub fn cacheable(self) -> bool {
+        match self {
+            Self::Memoize => true,
+            Self::Bypass => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanRequestKind {
     Instantiate,
     Realise,
+    DryActivate,
     Activate,
 }
 
@@ -362,7 +378,15 @@ impl PlanRequestKind {
         match self {
             Self::Instantiate => "instantiate",
             Self::Realise => "realise",
+            Self::DryActivate => "dry_activate",
             Self::Activate => "activate",
+        }
+    }
+
+    pub fn cache_policy(self) -> CachePolicy {
+        match self {
+            Self::Instantiate | Self::Realise => CachePolicy::Memoize,
+            Self::DryActivate | Self::Activate => CachePolicy::Bypass,
         }
     }
 }
@@ -620,13 +644,19 @@ impl PlanNodeKind {
             Self::Text | Self::Load { .. } | Self::Store { .. } | Self::Call { .. } => {
                 PlanNodeClass::Pure
             }
-            Self::Exec { attr, .. } if exec_eval_cache_annotation(attr.as_deref()).is_some() => {
-                PlanNodeClass::Control
-            }
+            Self::Exec { .. } if self.eval_cache_policy().is_some() => PlanNodeClass::Control,
             Self::Exec { .. } => PlanNodeClass::Effect,
             Self::Request { .. } | Self::Group { .. } | Self::Schedule { .. } => {
                 PlanNodeClass::Control
             }
+        }
+    }
+
+    pub fn eval_cache_policy(&self) -> Option<CachePolicy> {
+        match self {
+            Self::Exec { attr, .. } => parse_eval_cache_policy(attr.as_deref()),
+            Self::Request { kind, .. } => Some(kind.cache_policy()),
+            _ => None,
         }
     }
 
@@ -696,16 +726,16 @@ impl PlanNodeKind {
     }
 }
 
-fn exec_eval_cache_annotation(attr: Option<&str>) -> Option<bool> {
-    let mut cacheable = None;
+fn parse_eval_cache_policy(attr: Option<&str>) -> Option<CachePolicy> {
+    let mut policy = None;
     for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
         match entry.trim() {
-            "lazy" => cacheable = Some(true),
-            "defer" => cacheable = Some(false),
+            "lazy" => policy = Some(CachePolicy::Memoize),
+            "defer" => policy = Some(CachePolicy::Bypass),
             _ => {}
         }
     }
-    cacheable
+    policy
 }
 
 struct PlanBuilder {
@@ -843,7 +873,12 @@ impl PlanBuilder {
                         kind: PlanRequestKind::Realise,
                         arg_count: args.len(),
                     },
-                    "activate" | "dry_activate" => PlanNodeKind::Request {
+                    "dry_activate" => PlanNodeKind::Request {
+                        fn_name: fn_name.clone(),
+                        kind: PlanRequestKind::DryActivate,
+                        arg_count: args.len(),
+                    },
+                    "activate" => PlanNodeKind::Request {
                         fn_name: fn_name.clone(),
                         kind: PlanRequestKind::Activate,
                         arg_count: args.len(),
@@ -1621,6 +1656,14 @@ mod tests {
                 args: vec![ONode::RawText("drv".into())],
             },
             ONode::Call {
+                fn_name: "dry_activate".into(),
+                args: vec![ONode::RawText("/nix/store/demo-system".into())],
+            },
+            ONode::Call {
+                fn_name: "activate".into(),
+                args: vec![ONode::RawText("/nix/store/demo-system".into())],
+            },
+            ONode::Call {
                 fn_name: "batch".into(),
                 args: vec![ONode::RawText("a".into()), ONode::RawText("b".into())],
             },
@@ -1649,6 +1692,27 @@ mod tests {
                     ..
                 }
             ) && node.kind.class() == PlanNodeClass::Control
+                && node.kind.eval_cache_policy() == Some(CachePolicy::Memoize)
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Request {
+                    kind: PlanRequestKind::DryActivate,
+                    ..
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+                && node.kind.eval_cache_policy() == Some(CachePolicy::Bypass)
+        }));
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(
+                &node.kind,
+                PlanNodeKind::Request {
+                    kind: PlanRequestKind::Activate,
+                    ..
+                }
+            ) && node.kind.class() == PlanNodeClass::Control
+                && node.kind.eval_cache_policy() == Some(CachePolicy::Bypass)
         }));
         assert!(plan.nodes.iter().any(|node| {
             matches!(
@@ -1685,6 +1749,7 @@ mod tests {
                     ..
                 } if attr == "lazy"
             ) && node.kind.class() == PlanNodeClass::Control
+                && node.kind.eval_cache_policy() == Some(CachePolicy::Memoize)
         }));
     }
 
