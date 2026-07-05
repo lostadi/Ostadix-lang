@@ -34,6 +34,10 @@ name = "o-notebook"
 path = "src/bin/o-notebook.rs"
 required-features = ["notebook"]
 
+[[bin]]
+name = "ogit"
+path = "src/bin/ogit.rs"
+
 [features]
 notebook = ["dep:axum", "dep:tokio"]
 
