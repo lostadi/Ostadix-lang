@@ -24,7 +24,7 @@ pub fn build_program_with_plan(
 ) -> Result<HGraph, String> {
     plan.validate(program.nodes.len())?;
 
-    let oir_nodes = flatten_program(&program.nodes);
+    let oir_nodes = program.flatten_for_plan();
     if oir_nodes.len() != plan.nodes.len() {
         return Err(format!(
             "OIR flatten produced {} nodes for execution plan with {} nodes",
@@ -64,7 +64,12 @@ pub fn build_program_with_plan(
             kind: match edge.kind {
                 PlanEdgeKind::Structural => OpKind::StructuralBarrier,
                 PlanEdgeKind::Sequence => OpKind::Sequence,
-                PlanEdgeKind::Data => OpKind::DataFlow,
+                PlanEdgeKind::Data
+                    if matches!(plan.nodes[edge.to.0].kind, PlanNodeKind::Load { .. }) =>
+                {
+                    OpKind::DataFlow
+                }
+                PlanEdgeKind::Data => OpKind::Sequence,
             },
             ports: vec![
                 Port {
@@ -81,32 +86,6 @@ pub fn build_program_with_plan(
 
     add_plan_semantics(&mut graph, plan, &node_map);
     Ok(graph)
-}
-
-fn flatten_program(nodes: &[OIr]) -> Vec<&OIr> {
-    let mut out = Vec::new();
-    for node in nodes {
-        flatten_node(node, &mut out);
-    }
-    out
-}
-
-fn flatten_node<'a>(node: &'a OIr, out: &mut Vec<&'a OIr>) {
-    out.push(node);
-    match node {
-        OIr::Text(_) | OIr::Load(_) => {}
-        OIr::Store { expr, .. } => flatten_node(expr, out),
-        OIr::Invoke { args, .. } => {
-            for arg in args {
-                flatten_node(arg, out);
-            }
-        }
-        OIr::Exec { body, .. } => {
-            for child in body {
-                flatten_node(child, out);
-            }
-        }
-    }
 }
 
 fn hnode_for_oir(node: &OIr) -> HNode {
