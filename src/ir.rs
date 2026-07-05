@@ -151,6 +151,15 @@ impl OIrProgram {
         builder.finish(roots)
     }
 
+    /// Return the executable OIR nodes in the same preorder used by
+    /// `ExecutionPlan` node allocation.
+    ///
+    /// Quoted bodies are deliberately skipped: `quote^` owns its body as syntax,
+    /// so nested expressions inside it are not executable plan nodes.
+    pub fn flatten_for_plan(&self) -> Vec<&OIr> {
+        flatten_nodes_for_plan(&self.nodes)
+    }
+
     /// Build the value-node/operation-edge hypergraph for this program from
     /// the canonical execution plan.
     pub fn hgraph(&self) -> crate::hgraph::HGraph {
@@ -165,6 +174,43 @@ impl OIrProgram {
     pub fn hgraph_for_plan(&self, plan: &ExecutionPlan) -> Result<crate::hgraph::HGraph, String> {
         crate::hgraph::from_oir::build_program_with_plan(self, plan)
     }
+}
+
+fn flatten_nodes_for_plan(nodes: &[OIr]) -> Vec<&OIr> {
+    let mut out = Vec::new();
+    for node in nodes {
+        flatten_node_for_plan(node, &mut out);
+    }
+    out
+}
+
+fn flatten_node_for_plan<'a>(node: &'a OIr, out: &mut Vec<&'a OIr>) {
+    out.push(node);
+    match node {
+        OIr::Text(_) | OIr::Load(_) => {}
+        OIr::Store { expr, .. } => flatten_node_for_plan(expr, out),
+        OIr::Invoke { args, .. } => {
+            for arg in args {
+                flatten_node_for_plan(arg, out);
+            }
+        }
+        OIr::Exec { body, .. } if is_quote_exec(node) => {
+            let _ = body;
+        }
+        OIr::Exec { body, .. } => {
+            for child in body {
+                flatten_node_for_plan(child, out);
+            }
+        }
+    }
+}
+
+fn is_quote_exec(node: &OIr) -> bool {
+    matches!(
+        node,
+        OIr::Exec { backend, .. }
+            if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote"
+    )
 }
 
 /// ONode → OIr lowering. Purely structural; never fails.
@@ -760,7 +806,13 @@ impl PlanBuilder {
     }
 
     fn add_edge(&mut self, from: PlanNodeId, to: PlanNodeId, kind: PlanEdgeKind) {
-        self.edges.push(PlanEdge { from, to, kind });
+        if !self
+            .edges
+            .iter()
+            .any(|edge| edge.from == from && edge.to == to && edge.kind == kind)
+        {
+            self.edges.push(PlanEdge { from, to, kind });
+        }
     }
 
     fn add_node(
@@ -825,7 +877,29 @@ impl PlanBuilder {
                 }
                 scope_stack.pop();
             }
-            OIr::Exec { body, .. } => {
+            OIr::Exec {
+                attr,
+                backend,
+                body,
+                ..
+            } => {
+                if backend.execution == ExecutionMode::Shim {
+                    for source in visible_scope_sources(scope_stack) {
+                        self.add_edge(source, id, PlanEdgeKind::Data);
+                    }
+                }
+                if let Some(binding) = attr_capability_binding(attr.as_deref()) {
+                    if let Some(source) = scope_stack
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.get(binding.as_str()))
+                    {
+                        self.add_edge(*source, id, PlanEdgeKind::Data);
+                    }
+                }
+                if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
+                    return id;
+                }
                 scope_stack.push(std::collections::HashMap::new());
                 let mut prev = None;
                 for child in body {
@@ -909,6 +983,34 @@ impl PlanBuilder {
             },
         }
     }
+}
+
+fn visible_scope_sources(
+    scope_stack: &[std::collections::HashMap<String, PlanNodeId>],
+) -> Vec<PlanNodeId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    for lexical_scope in scope_stack.iter().rev() {
+        for (name, source) in lexical_scope {
+            if seen.insert(name.clone()) {
+                sources.push(*source);
+            }
+        }
+    }
+    sources.sort_by_key(|source| source.0);
+    sources
+}
+
+fn attr_capability_binding(attr: Option<&str>) -> Option<String> {
+    attr.into_iter()
+        .flat_map(|attr| attr.split(','))
+        .map(str::trim)
+        .find_map(|entry| {
+            entry
+                .strip_prefix("cap=")
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1577,6 +1679,62 @@ mod tests {
         }));
         assert!(plan.edges.iter().any(|e| {
             e.from == PlanNodeId(0) && e.to == PlanNodeId(4) && e.kind == PlanEdgeKind::Data
+        }));
+    }
+
+    #[test]
+    fn quote_body_is_syntax_not_executable_plan_nodes() {
+        let program = OIrProgram::lower(&[typed(
+            "quote",
+            vec![typed("python", vec![ONode::RawText("6 * 7".into())])],
+        )]);
+
+        let plan = program.plan();
+        assert_eq!(program.flatten_for_plan().len(), 1);
+        assert_eq!(plan.nodes.len(), 1);
+        assert!(plan
+            .edges
+            .iter()
+            .all(|edge| edge.kind != PlanEdgeKind::Structural));
+    }
+
+    #[test]
+    fn backend_capability_attr_is_a_graph_visible_data_dependency() {
+        let program = OIrProgram::lower(&[
+            ONode::LetBinding {
+                name: "runner".into(),
+                expr: Box::new(ONode::RawText("capability placeholder".into())),
+            },
+            ONode::TypedExpr {
+                lang: "python".into(),
+                env_id: 0,
+                attr: Some("cap=runner,process".into()),
+                body: vec![ONode::RawText("__oval_result__ = 1".into())],
+            },
+        ]);
+
+        let plan = program.plan();
+        let runner_store = plan
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.kind, PlanNodeKind::Store { name } if name == "runner"))
+            .unwrap()
+            .id;
+        let python_exec = plan
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    PlanNodeKind::Exec { lang, attr, .. }
+                        if lang == "python" && attr.as_deref() == Some("cap=runner,process")
+                )
+            })
+            .unwrap()
+            .id;
+
+        assert!(plan.edges.iter().any(|edge| {
+            edge.from == runner_store && edge.to == python_exec && edge.kind == PlanEdgeKind::Data
         }));
     }
 

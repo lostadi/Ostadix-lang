@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // eval.rs
 //
-// The O-language OIR evaluator — applicative order, leaves-up.
+// The O-language OIR evaluator — plan-owned graph execution.
 //
 // Evaluation semantics (mirrors o_lang/evaluator.py):
 //
@@ -9,13 +9,13 @@
 //     1. Walk body children left-to-right, building a splice buffer:
 //          Text  → append verbatim
 //          Load  → look up scope, render through the OIR backend interface
-//          Exec  → evaluate recursively first, then render into the parent
+//          Exec  → read already-computed child values from the execution frame
 //     2. Call ProcessRegistry::exec(lang, env_id, buffer, scope, shim)
 //     3. For ephemeral envs (env_id == u32::MAX, used internally for re-entrancy etc): call cleanup_env (always, even on err)
 //
 //   Root document (eval_document):
 //     Lower ONode syntax to OIR, build and validate ExecutionPlan, execute its
-//     root schedule, and return the last non-null OValue.
+//     topological schedule, and return the last non-null root OValue.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::collections::{HashMap, HashSet};
@@ -31,7 +31,8 @@ use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSa
 use crate::ir::lower_node;
 use crate::ir::{
     reconstruct_source as reconstruct_ir_source, BackendInterface, BackendRegistry, ExecutionMode,
-    ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanNodeId, SpliceRenderer,
+    ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind,
+    SpliceRenderer,
 };
 use crate::nix_ops;
 use crate::nixos_ops;
@@ -371,6 +372,59 @@ struct IrExecRegion<'a> {
     node_id: PlanNodeId,
 }
 
+struct GraphEvalFrame {
+    values: Vec<Option<OValue>>,
+    base_scope: HashMap<String, OValue>,
+    node_policy: Vec<Policy>,
+    trace: ExecutionTrace,
+}
+
+impl GraphEvalFrame {
+    fn value(&self, id: PlanNodeId) -> Result<&OValue> {
+        self.values
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("plan node {} has not produced a value", id.0))
+    }
+
+    fn set_value(&mut self, id: PlanNodeId, value: OValue) -> Result<()> {
+        let slot = self
+            .values
+            .get_mut(id.0)
+            .ok_or_else(|| anyhow::anyhow!("plan node {} is out of bounds", id.0))?;
+        *slot = Some(value);
+        Ok(())
+    }
+
+    fn scope_from_data_edges(
+        &self,
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+    ) -> Result<HashMap<String, OValue>> {
+        let mut scope = self.base_scope.clone();
+        for source in data_predecessors(plan, node_id) {
+            if let PlanNodeKind::Store { name } = &plan.nodes[source.0].kind {
+                scope.insert(name.clone(), self.value(source)?.clone());
+            }
+        }
+        Ok(scope)
+    }
+
+    fn exec_scope(
+        &self,
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+    ) -> Result<HashMap<String, OValue>> {
+        let mut scope = self.scope_from_data_edges(node_id, plan)?;
+        for child in structural_children(plan, node_id) {
+            if let PlanNodeKind::Store { name } = &plan.nodes[child.0].kind {
+                scope.insert(name.clone(), self.value(child)?.clone());
+            }
+        }
+        Ok(scope)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockEvalPolicy {
     Lazy,
@@ -485,12 +539,6 @@ impl Evaluator {
     /// The hypergraph schedule that was built for the most recent document.
     pub fn last_hgraph_schedule(&self) -> Option<&crate::hgraph::Schedule> {
         self.last_hgraph_schedule.as_ref()
-    }
-
-    fn record_trace_event(&mut self, event: TraceEvent) {
-        if let Some(trace) = &mut self.last_execution_trace {
-            trace.events.push(event);
-        }
     }
 
     fn trace_fingerprint(value: &OValue) -> Option<String> {
@@ -1455,8 +1503,64 @@ impl Evaluator {
         }
         self.last_hgraph_schedule = Some(hgraph_schedule);
 
+        self.execute_plan_serial(program, &plan, scope)
+    }
+
+    fn execute_plan_serial(
+        &mut self,
+        program: &OIrProgram,
+        plan: &ExecutionPlan,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let flat = program.flatten_for_plan();
+        if flat.len() != plan.nodes.len() {
+            bail!(
+                "OIR flatten produced {} nodes but plan has {} nodes",
+                flat.len(),
+                plan.nodes.len()
+            );
+        }
+        self.prevalidate_graph_execution(plan, &flat)?;
+
+        let base_policy = self.policy;
+        let mut frame = GraphEvalFrame {
+            values: vec![None; plan.nodes.len()],
+            base_scope: scope.clone(),
+            node_policy: derive_policy_contexts(plan, &flat, base_policy)?,
+            trace: ExecutionTrace::new(),
+        };
+
+        for id in plan.topological_order().map_err(anyhow::Error::msg)? {
+            frame.trace.events.push(TraceEvent::NodeReady(id));
+            frame.trace.events.push(TraceEvent::NodeStarted(id));
+
+            let saved_policy = self.policy;
+            self.policy = frame.node_policy[id.0];
+            let value = self.execute_ready_plan_node(id, flat[id.0], plan, &mut frame);
+            self.policy = saved_policy;
+
+            match value {
+                Ok(value) => {
+                    frame.trace.events.push(TraceEvent::NodeFinished {
+                        id,
+                        value_type: value.type_name().to_string(),
+                        fingerprint: Self::trace_fingerprint(&value),
+                    });
+                    frame.set_value(id, value)?;
+                }
+                Err(err) => {
+                    frame.trace.events.push(TraceEvent::NodeFailed {
+                        id,
+                        message: err.to_string(),
+                    });
+                    self.last_execution_trace = Some(frame.trace);
+                    return Err(err);
+                }
+            }
+        }
+
         let mut last = OValue::null();
-        for root_index in root_schedule {
+        for root_index in plan.root_schedule().map_err(anyhow::Error::msg)? {
             let node = &program.nodes[root_index];
             let node_id = plan.roots[root_index];
             let is_pure_whitespace_text = matches!(
@@ -1464,7 +1568,7 @@ impl Evaluator {
                 OIr::Text(text) if !text.is_empty() && text.chars().all(char::is_whitespace)
             );
 
-            let value = self.eval_ir_node(node, node_id, &plan, scope)?;
+            let value = frame.value(node_id)?.clone();
             if let OIr::Store { name, .. } = node {
                 scope.insert(name.clone(), value.clone());
             }
@@ -1474,11 +1578,12 @@ impl Evaluator {
             }
         }
 
-        if self.policy == Policy::Autonomous {
+        if base_policy == Policy::Autonomous {
             self.flush_autonomous_buffer()?;
             last = self.resolve_after_flush(last)?;
         }
 
+        self.last_execution_trace = Some(frame.trace);
         Ok(last)
     }
 
@@ -1486,63 +1591,155 @@ impl Evaluator {
     // Executable OIR dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_ir_node(
-        &mut self,
-        node: &OIr,
-        node_id: PlanNodeId,
-        plan: &ExecutionPlan,
-        scope: &HashMap<String, OValue>,
-    ) -> Result<OValue> {
-        self.record_trace_event(TraceEvent::NodeReady(node_id));
-        self.record_trace_event(TraceEvent::NodeStarted(node_id));
-        match self.eval_ir_node_inner(node, node_id, plan, scope) {
-            Ok(value) => {
-                self.record_trace_event(TraceEvent::NodeFinished {
-                    id: node_id,
-                    value_type: value.type_name().to_string(),
-                    fingerprint: Self::trace_fingerprint(&value),
-                });
-                Ok(value)
-            }
-            Err(err) => {
-                let message = err.to_string();
-                self.record_trace_event(TraceEvent::NodeFailed {
-                    id: node_id,
-                    message,
-                });
-                Err(err)
+    fn prevalidate_graph_execution(&self, _plan: &ExecutionPlan, flat: &[&OIr]) -> Result<()> {
+        for node in flat {
+            match node {
+                OIr::Invoke {
+                    fn_name,
+                    mode: InvokeMode::Lazy,
+                    args,
+                } => {
+                    if args.len() != 1 {
+                        bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
+                    }
+                    if fn_name != "lazy" {
+                        bail!("lazy schedule node must be named lazy, got {fn_name}");
+                    }
+                }
+                OIr::Invoke {
+                    fn_name,
+                    mode: InvokeMode::Autonomous,
+                    args,
+                } => {
+                    if args.len() != 1 {
+                        bail!(
+                            "autonomous(expr) takes exactly 1 argument, got {}",
+                            args.len()
+                        );
+                    }
+                    if fn_name != "autonomous" {
+                        bail!("autonomous schedule node must be named autonomous, got {fn_name}");
+                    }
+                }
+                OIr::Invoke {
+                    fn_name,
+                    mode: InvokeMode::Group(_),
+                    args,
+                } => {
+                    if args.is_empty() {
+                        bail!("{}(...) takes at least 1 argument, got 0", fn_name);
+                    }
+                }
+                OIr::Exec {
+                    lang,
+                    attr,
+                    backend,
+                    ..
+                } => self.prevalidate_exec_metadata(lang, attr.as_deref(), backend)?,
+                _ => {}
             }
         }
+        Ok(())
     }
 
-    fn eval_ir_node_inner(
+    fn prevalidate_exec_metadata(
+        &self,
+        lang: &str,
+        attr: Option<&str>,
+        backend: &BackendInterface,
+    ) -> Result<()> {
+        let registered_backend = BackendRegistry::global().interface_for(lang);
+        if backend != &registered_backend {
+            bail!(
+                "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
+            );
+        }
+
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `quote` backend");
+            }
+            return Ok(());
+        }
+
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `O` backend");
+            }
+            return Ok(());
+        }
+
+        if backend.execution == ExecutionMode::InlineAst {
+            bail!(
+                "OIR backend `{}` declares inline_ast execution without an executor",
+                backend.canonical
+            );
+        }
+
+        let options = BlockOptions::parse(attr, lang)?;
+        if let Some(policy) = options.policy {
+            match policy {
+                BlockEvalPolicy::Lazy => {
+                    if lang == "nix_expr" {
+                        bail!(
+                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ is already \
+                             lazy. Use bare nix_expr^, or use nix{{lazy}}^ if you \
+                             want a generic deferred Nix eval."
+                        );
+                    }
+                    if !backend.pure {
+                        bail!(
+                            "`{lang}{{lazy}}^` is invalid because {lang} is not a \
+                             pure backend; caching a thunk that re-runs with side \
+                             effects would be unsound. Use `{lang}{{defer}}^` instead \
+                             — it captures the same thunk but never caches and \
+                             always re-runs on force.",
+                            lang = lang
+                        );
+                    }
+                }
+                BlockEvalPolicy::Defer => {
+                    if lang == "nix_expr" {
+                        bail!(
+                            "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
+                             lazy. If you want a non-cacheable deferred Nix eval, \
+                             write nix{{defer}}^."
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_ready_plan_node(
         &mut self,
-        node: &OIr,
         node_id: PlanNodeId,
+        node: &OIr,
         plan: &ExecutionPlan,
-        scope: &HashMap<String, OValue>,
+        frame: &mut GraphEvalFrame,
     ) -> Result<OValue> {
         match node {
             OIr::Store { expr, .. } => {
                 let children =
                     planned_children(plan, node_id, std::slice::from_ref(expr.as_ref()))?;
                 let (expr_id, _) = children[0];
-                self.eval_ir_node(expr, expr_id, plan, scope)
+                Ok(frame.value(expr_id)?.clone())
             }
             OIr::Text(text) => Ok(OValue::str_(text.clone())),
-
-            OIr::Load(name) => scope
-                .get(name)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name)),
-
+            OIr::Load(name) => self.execute_ready_load(name, node_id, plan, frame),
+            OIr::Invoke {
+                fn_name,
+                mode,
+                args,
+            } => self.execute_ready_invoke(fn_name, *mode, args, node_id, plan, frame),
             OIr::Exec {
                 lang,
                 env_id,
                 attr,
                 backend,
                 body,
-            } => self.eval_ir_exec(
+            } => self.execute_ready_exec(
                 IrExecRegion {
                     lang,
                     env_id: *env_id,
@@ -1552,15 +1749,272 @@ impl Evaluator {
                     node_id,
                 },
                 plan,
-                scope,
+                frame,
             ),
-
-            OIr::Invoke {
-                fn_name,
-                mode,
-                args,
-            } => self.eval_ir_invoke(fn_name, *mode, args, node_id, plan, scope),
         }
+    }
+
+    fn execute_ready_load(
+        &self,
+        name: &str,
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+        frame: &GraphEvalFrame,
+    ) -> Result<OValue> {
+        let store_sources = data_predecessors(plan, node_id)
+            .into_iter()
+            .filter(|source| matches!(plan.nodes[source.0].kind, PlanNodeKind::Store { .. }))
+            .collect::<Vec<_>>();
+        if let Some(source) = store_sources.first().copied() {
+            return Ok(frame.value(source)?.clone());
+        }
+        frame
+            .base_scope
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Undefined variable: ${}", name))
+    }
+
+    fn execute_ready_invoke(
+        &mut self,
+        fn_name: &str,
+        invoke_mode: InvokeMode,
+        args: &[OIr],
+        node_id: PlanNodeId,
+        plan: &ExecutionPlan,
+        frame: &mut GraphEvalFrame,
+    ) -> Result<OValue> {
+        let planned_args = planned_children(plan, node_id, args)?;
+        let arg_vals = planned_args
+            .iter()
+            .map(|(id, _)| frame.value(*id).cloned())
+            .collect::<Result<Vec<_>>>()?;
+
+        if invoke_mode == InvokeMode::Lazy {
+            if arg_vals.len() != 1 {
+                bail!(
+                    "lazy(expr) takes exactly 1 argument, got {}",
+                    arg_vals.len()
+                );
+            }
+            return Ok(arg_vals.into_iter().next().unwrap());
+        }
+
+        if invoke_mode == InvokeMode::Autonomous {
+            if arg_vals.len() != 1 {
+                bail!(
+                    "autonomous(expr) takes exactly 1 argument, got {}",
+                    arg_vals.len()
+                );
+            }
+            let value = arg_vals.into_iter().next().unwrap();
+            match self.flush_autonomous_buffer() {
+                Ok(()) => self.resolve_after_flush(value),
+                Err(err) => {
+                    self.autonomous_buffer.clear();
+                    Err(err)
+                }
+            }
+        } else if let InvokeMode::Group(mode) = invoke_mode {
+            if arg_vals.is_empty() {
+                bail!("{}(...) takes at least 1 argument, got 0", fn_name);
+            }
+            Ok(OValue::group(mode, arg_vals))
+        } else {
+            let scope = frame.scope_from_data_edges(node_id, plan)?;
+            self.apply_ir_builtin(fn_name, arg_vals, scope)
+        }
+    }
+
+    fn execute_ready_exec(
+        &mut self,
+        region: IrExecRegion<'_>,
+        plan: &ExecutionPlan,
+        frame: &mut GraphEvalFrame,
+    ) -> Result<OValue> {
+        let IrExecRegion {
+            lang,
+            env_id,
+            attr,
+            backend,
+            body,
+            node_id,
+        } = region;
+        let registered_backend = BackendRegistry::global().interface_for(lang);
+        if backend != &registered_backend {
+            bail!(
+                "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
+            );
+        }
+
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `quote` backend");
+            }
+            let src = reconstruct_ir_source(body);
+            return Ok(OValue::Expr { src });
+        }
+
+        let planned_body = planned_children(plan, node_id, body)?;
+
+        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
+            if attr.is_some() {
+                bail!("attributes are not valid on the structural `O` backend");
+            }
+            let mut last = OValue::null();
+            for (child_id, child) in &planned_body {
+                let is_whitespace = matches!(
+                    *child,
+                    OIr::Text(text) if !text.is_empty() && text.chars().all(char::is_whitespace)
+                );
+                let value = frame.value(*child_id)?.clone();
+                if !value.is_null() && !is_whitespace {
+                    last = value;
+                }
+            }
+            return Ok(last);
+        }
+
+        if backend.execution == ExecutionMode::InlineAst {
+            bail!(
+                "OIR backend `{}` declares inline_ast execution without an executor",
+                backend.canonical
+            );
+        }
+
+        let options = BlockOptions::parse(attr, lang)?;
+        let sandbox = self.backend_sandbox_policy(backend, &options);
+        let authority_scope = frame.scope_from_data_edges(node_id, plan)?;
+        let authority_identity = self.resolve_backend_authority(
+            backend.canonical.as_str(),
+            &options,
+            sandbox.permissions(),
+            &authority_scope,
+        )?;
+
+        let mut buf = String::new();
+        let mut deps: Vec<OValue> = Vec::new();
+        let constructs_thunk = backend.canonical == "nix_expr" || options.policy.is_some();
+        let mut local_scope = frame.exec_scope(node_id, plan)?;
+
+        for (child_id, child) in &planned_body {
+            match *child {
+                OIr::Store { name, .. } => {
+                    let value = frame.value(*child_id)?.clone();
+                    local_scope.insert(name.clone(), value);
+                }
+
+                OIr::Text(text) => {
+                    buf.push_str(text);
+                }
+
+                OIr::Load(_) | OIr::Exec { .. } | OIr::Invoke { .. } => {
+                    let raw = frame.value(*child_id)?.clone();
+                    let resolved = self.resolve_for_splice(raw)?;
+                    buf.push_str(&render_with(backend.renderer, &resolved));
+                    if constructs_thunk {
+                        deps.push(resolved);
+                    }
+                }
+            }
+        }
+
+        if let Some(policy) = options.policy {
+            let cacheable = policy == BlockEvalPolicy::Lazy;
+            let thunk = OValue::thunk(buf, deps);
+            return Ok(OValue::request(
+                RequestKind::Eval {
+                    lang: lang.to_string(),
+                    env_id,
+                    cacheable,
+                    authority: authority_identity,
+                    permissions: sandbox.permissions().to_vec(),
+                },
+                thunk,
+            ));
+        }
+
+        if backend.canonical == "nix_expr" {
+            return Ok(OValue::nix_expr(buf, deps));
+        }
+
+        if backend.execution == ExecutionMode::InlineValue {
+            return match backend.canonical.as_str() {
+                "html" => Ok(OValue::html(buf)),
+                "markdown" | "text" | "latex" => Ok(OValue::str_(buf)),
+                other => bail!("inline OIR backend `{other}` has no value executor"),
+            };
+        }
+
+        debug_assert_eq!(backend.execution, ExecutionMode::Shim);
+        let runtime_lang = backend.canonical.as_str();
+        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
+        let env_label = if env_id == u32::MAX {
+            format!("{runtime_lang}[*ephemeral*]")
+        } else {
+            format!("{runtime_lang}[{env_id}]")
+        };
+
+        self.registry
+            .send_exec(
+                runtime_lang,
+                env_id,
+                &buf,
+                local_scope.clone(),
+                &shim,
+                &sandbox,
+            )
+            .with_context(|| format!("[{}]", env_label))?;
+
+        let result: Result<OValue> = loop {
+            let step = self
+                .registry
+                .recv_exec_step(runtime_lang, env_id, &sandbox)
+                .with_context(|| format!("[{}]", env_label))?;
+
+            match step {
+                ExecStep::Done(v) => break Ok(v),
+                ExecStep::EvalRequest {
+                    src,
+                    scope: explicit_scope,
+                } => {
+                    let callback_scope = match explicit_scope {
+                        None => local_scope.clone(),
+                        Some(OValue::Scope { bindings }) => bindings,
+                        Some(other) => {
+                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
+                            bail!(
+                                "[{}] O.eval explicit scope must be an OScope, got {}",
+                                env_label,
+                                other.type_name()
+                            );
+                        }
+                    };
+                    match self.eval_source_with_scope(&src, &callback_scope) {
+                        Ok(result) => {
+                            self.registry
+                                .send_eval_result(runtime_lang, env_id, result, &sandbox)
+                                .with_context(|| format!("[{}] send_eval_result", env_label))?;
+                        }
+                        Err(e) => {
+                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "[{}] O.eval() failed while evaluating quoted source",
+                                    env_label
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        };
+
+        if env_id == u32::MAX {
+            let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
+        }
+
+        result.with_context(|| format!("[{}]", env_label))
     }
 
     /// Test-only compatibility entry point. It proves individual legacy test
@@ -1618,130 +2072,12 @@ impl Evaluator {
     //   activate(cfg)       → OS-as-participant: switch system to a config
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_ir_invoke(
+    fn apply_ir_builtin(
         &mut self,
         fn_name: &str,
-        invoke_mode: InvokeMode,
-        args: &[OIr],
-        node_id: PlanNodeId,
-        plan: &ExecutionPlan,
-        scope: &HashMap<String, OValue>,
+        arg_vals: Vec<OValue>,
+        scope: HashMap<String, OValue>,
     ) -> Result<OValue> {
-        let planned_args = planned_children(plan, node_id, args)?;
-        // STEP-3: `lazy(expr)` is a POLICY-MODIFYING builtin — it must take
-        // control of its argument's evaluation so that the policy switch
-        // applies to the construction of the inner Requests. It cannot go
-        // through the standard "evaluate args first" path; by the time args
-        // are evaluated under that path, the inner Requests would have been
-        // constructed (and auto-resolved) under the wrong policy.
-        if invoke_mode == InvokeMode::Lazy {
-            if args.len() != 1 {
-                bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
-            }
-            let saved_policy = self.policy;
-            self.policy = Policy::Lazy;
-            let (arg_id, arg) = planned_args[0];
-            let result = self.eval_ir_node(arg, arg_id, plan, scope);
-            self.policy = saved_policy; // restored even on error path
-            return result;
-        }
-
-        // STEP-4: `autonomous(expr)` — evaluate `expr` under Policy::Autonomous.
-        //
-        // Non-Eval Requests constructed during the evaluation are buffered
-        // instead of being executed immediately. When the body finishes, the
-        // scheduler flushes the buffer: it collects the full dependency graph,
-        // executes independent Nix-family requests as concurrent threads, and
-        // writes results to the two-level cache.
-        //
-        // If the body returns a Request value (a request that was buffered and
-        // therefore left unforced in the return position), the method resolves
-        // it from the freshly-populated cache so the caller always receives a
-        // concrete value.
-        //
-        // Like `lazy`, this must intercept the argument BEFORE the standard
-        // "evaluate args first" path runs, so the policy is in effect for the
-        // entire body evaluation.
-        if invoke_mode == InvokeMode::Autonomous {
-            if args.len() != 1 {
-                bail!(
-                    "autonomous(expr) takes exactly 1 argument, got {}",
-                    args.len()
-                );
-            }
-            let saved_policy = self.policy;
-            self.policy = Policy::Autonomous;
-            let (arg_id, arg) = planned_args[0];
-            let result = self.eval_ir_node(arg, arg_id, plan, scope);
-            self.policy = saved_policy; // restore before flush
-
-            match result {
-                Ok(value) => {
-                    // Flush all buffered Nix-family requests concurrently.
-                    self.flush_autonomous_buffer()?;
-                    // Resolve the return value (Request or Group) from the
-                    // cache that the flush just populated, so the caller always
-                    // receives concrete values rather than unforced handles.
-                    let resolved = self.resolve_after_flush(value)?;
-                    return Ok(resolved);
-                }
-                Err(e) => {
-                    // Clear the buffer so stale entries don't leak into future calls.
-                    self.autonomous_buffer.clear();
-                    return Err(e);
-                }
-            }
-        }
-
-        // ── Group constructors as special forms ──────────────────────────────
-        //
-        // `batch`, `all`, `any`, and `race` must be special forms, not ordinary
-        // functions.  Under the standard "evaluate args left-to-right" path, any
-        // request-producing call (e.g. `realise(instantiate($e))`) would already
-        // be forced to a StorePath before the group constructor ever sees it.
-        // That would make the group contain concrete values rather than deferred
-        // Requests, defeating the whole coordination abstraction.
-        //
-        // The fix: evaluate members under a capture policy, then restore the
-        // outer policy once members are captured. Eager evaluation is lowered to
-        // Lazy so request chains are captured instead of forced. Autonomous is
-        // preserved so those captured requests are also buffered for the
-        // autonomous scheduler. This guarantees that:
-        //   batch(realise(instantiate($e1)), realise(instantiate($e2)))
-        // always builds:
-        //   Group(Batch, [Request[Realise(Request[Instantiate(e1)])], ...])
-        // whether the surrounding policy is Eager, Lazy, or Autonomous, while
-        // autonomous(batch(...)) still records the inner requests for flushing.
-        //
-        // The Group itself performs no work — it is a first-class coordination
-        // value forced later by `now(group)`, `autonomous(group)`, or by the
-        // Autonomous flush at document end.
-        if let InvokeMode::Group(mode) = invoke_mode {
-            if args.is_empty() {
-                bail!("{}(...) takes at least 1 argument, got 0", fn_name);
-            }
-            let saved_policy = self.policy;
-            let capture_policy = match saved_policy {
-                Policy::Autonomous => Policy::Autonomous,
-                Policy::Lazy => Policy::Lazy,
-                Policy::Eager => Policy::Lazy,
-            };
-            self.policy = capture_policy;
-            let result: Result<Vec<OValue>> = planned_args
-                .iter()
-                .map(|(id, arg)| self.eval_ir_node(arg, *id, plan, scope))
-                .collect();
-            self.policy = saved_policy;
-            let members = result?;
-            return Ok(OValue::group(mode, members));
-        }
-
-        // Standard builtins: evaluate args left-to-right (applicative order).
-        let arg_vals: Vec<OValue> = planned_args
-            .iter()
-            .map(|(id, arg)| self.eval_ir_node(arg, *id, plan, scope))
-            .collect::<Result<_>>()?;
-
         match fn_name {
             "instantiate" => {
                 if arg_vals.len() != 1 {
@@ -1774,8 +2110,6 @@ impl Evaluator {
                 let req = arg_vals.into_iter().next().unwrap();
                 match &req {
                     OValue::Request { .. } => self.force_request(&req),
-                    // now(group): force the whole group per its topology mode,
-                    // resolving each member fresh via the scheduler path.
                     OValue::Group { mode, members, .. } => {
                         let (mode, members) = (*mode, members.clone());
                         self.resolve_group(mode, &members, CacheMode::Fresh)
@@ -1786,7 +2120,6 @@ impl Evaluator {
                     ),
                 }
             }
-            // STEP-4: OS-as-participant builtins.
             "dry_activate" => {
                 if arg_vals.is_empty() || arg_vals.len() > 2 {
                     bail!(
@@ -1895,9 +2228,6 @@ impl Evaluator {
                 self.auto_resolve(req)
             }
             "current_system" => {
-                // Read the system profile symlink without going through a
-                // Request — this is a pure inspection, not a deferred
-                // computation. The result is an OValue::System reference.
                 if !arg_vals.is_empty() {
                     bail!(
                         "current_system() takes no arguments, got {}",
@@ -1910,333 +2240,10 @@ impl Evaluator {
                 if !arg_vals.is_empty() {
                     bail!("scope() takes no arguments, got {}", arg_vals.len());
                 }
-                Ok(OValue::scope(scope.clone()))
+                Ok(OValue::scope(scope))
             }
             other => bail!("Unknown built-in function: `{}(...)`", other),
         }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Core evaluation: build splice buffer then dispatch to backend
-    // ─────────────────────────────────────────────────────────────────────────
-
-    fn eval_ir_exec(
-        &mut self,
-        region: IrExecRegion<'_>,
-        plan: &ExecutionPlan,
-        scope: &HashMap<String, OValue>,
-    ) -> Result<OValue> {
-        let IrExecRegion {
-            lang,
-            env_id,
-            attr,
-            backend,
-            body,
-            node_id,
-        } = region;
-        let registered_backend = BackendRegistry::global().interface_for(lang);
-        if backend != &registered_backend {
-            bail!(
-                "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
-            );
-        }
-        let planned_body = planned_children(plan, node_id, body)?;
-        // ─────────────────────────────────────────────────────────────────────
-        // Short-circuit for `quote^`: capture the body as an unevaluated
-        // OValue::Expr WITHOUT evaluating its children or calling any shim.
-        // Must be first — the body-walking loop below would otherwise start
-        // evaluating nested typed expressions (e.g. python^(6*7)_python inside
-        // a quote body), which would hang waiting for shims.
-        //
-        // reconstruct_source converts the ONode tree back to O source text;
-        // O.eval() in a Python block can then round-trip it through eval_source.
-        // ─────────────────────────────────────────────────────────────────────
-        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
-            if attr.is_some() {
-                bail!("attributes are not valid on the structural `quote` backend");
-            }
-            let src = reconstruct_ir_source(body);
-            return Ok(OValue::Expr { src });
-        }
-
-        // `O` is an executable structural region. It sequences its OIR
-        // children exactly once with a lexical child scope; it never builds a
-        // backend splice buffer and never re-walks parser nodes.
-        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
-            if attr.is_some() {
-                bail!("attributes are not valid on the structural `O` backend");
-            }
-            let mut local_scope = scope.clone();
-            let mut last = OValue::null();
-            for (child_id, child) in &planned_body {
-                let is_whitespace = matches!(
-                    *child,
-                    OIr::Text(text)
-                        if !text.is_empty() && text.chars().all(char::is_whitespace)
-                );
-                let value = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                if let OIr::Store { name, .. } = *child {
-                    local_scope.insert(name.clone(), value.clone());
-                }
-                if !value.is_null() && !is_whitespace {
-                    last = value;
-                }
-            }
-            return Ok(last);
-        }
-
-        if backend.execution == ExecutionMode::InlineAst {
-            bail!(
-                "OIR backend `{}` declares inline_ast execution without an executor",
-                backend.canonical
-            );
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Validate block policy and authority declarations early so misuses are
-        // caught at the block we're evaluating, not somewhere downstream.
-        //
-        //   {lazy}  — pure backends only; produces a cacheable Eval Request
-        //   {defer} — any backend; produces a non-cacheable Eval Request
-        //
-        // `nix_expr^` is already lazy by construction; attributes on it are
-        // rejected as redundant. STEP4 may add other attributes (trace, etc.).
-        // ─────────────────────────────────────────────────────────────────────
-        let options = BlockOptions::parse(attr, lang)?;
-        if let Some(policy) = options.policy {
-            match policy {
-                BlockEvalPolicy::Lazy => {
-                    if lang == "nix_expr" {
-                        bail!(
-                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ is already \
-                             lazy. Use bare nix_expr^, or use nix{{lazy}}^ if you \
-                             want a generic deferred Nix eval."
-                        );
-                    }
-                    if !backend.pure {
-                        bail!(
-                            "`{lang}{{lazy}}^` is invalid because {lang} is not a \
-                             pure backend; caching a thunk that re-runs with side \
-                             effects would be unsound. Use `{lang}{{defer}}^` instead \
-                             — it captures the same thunk but never caches and \
-                             always re-runs on force.",
-                            lang = lang
-                        );
-                    }
-                }
-                BlockEvalPolicy::Defer => {
-                    if lang == "nix_expr" {
-                        bail!(
-                            "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
-                             lazy. If you want a non-cacheable deferred Nix eval, \
-                             write nix{{defer}}^."
-                        );
-                    }
-                    // {defer} works on any backend; nothing else to check.
-                }
-            }
-        }
-        let sandbox = self.backend_sandbox_policy(backend, &options);
-        let authority_identity = self.resolve_backend_authority(
-            backend.canonical.as_str(),
-            &options,
-            sandbox.permissions(),
-            scope,
-        )?;
-
-        // Step 1 — build the fully-spliced source string for the backend.
-        // For `nix_expr` blocks and `{lazy}`/`{defer}` blocks we also collect
-        // the evaluated child OValues as deps so the returned thunk carries
-        // its full dependency tree for fingerprint composition.
-        let mut buf = String::new();
-        let mut deps: Vec<OValue> = Vec::new();
-
-        // Whether this block constructs a Thunk (and so should track deps).
-        let constructs_thunk = backend.canonical == "nix_expr" || options.policy.is_some();
-
-        // Own a mutable copy of the scope so that LetBinding nodes inside this
-        // body can extend it for subsequent children. Cloning is cheap compared
-        // to the subprocess dispatch that follows.
-        let mut local_scope = scope.clone();
-
-        for (child_id, child) in &planned_body {
-            match *child {
-                OIr::Store { name, .. } => {
-                    // Evaluate the RHS and bind it into the local scope.
-                    // The binding itself produces no text for the backend.
-                    let value = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                    local_scope.insert(name.clone(), value);
-                }
-
-                OIr::Text(text) => {
-                    let _ = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                    buf.push_str(text);
-                }
-
-                OIr::Load(_) => {
-                    let val = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                    // STEP-3.5: auto-force {lazy} thunks before splicing; error
-                    // on {defer} thunks. {lazy} is safe to auto-force because
-                    // pure-backend results don't have side effects.
-                    let resolved = self.resolve_for_splice(val)?;
-                    buf.push_str(&render_with(backend.renderer, &resolved));
-                    if constructs_thunk {
-                        deps.push(resolved);
-                    }
-                }
-
-                OIr::Exec { .. } => {
-                    // Evaluate the nested expression first (leaves-up / applicative order),
-                    // then render its value into the parent language's source syntax.
-                    let child_val = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                    let resolved = self.resolve_for_splice(child_val)?;
-                    buf.push_str(&render_with(backend.renderer, &resolved));
-                    if constructs_thunk {
-                        deps.push(resolved);
-                    }
-                }
-
-                OIr::Invoke { .. } => {
-                    let raw = self.eval_ir_node(child, *child_id, plan, &local_scope)?;
-                    let resolved = self.resolve_for_splice(raw)?;
-                    buf.push_str(&render_with(backend.renderer, &resolved));
-                    if constructs_thunk {
-                        deps.push(resolved);
-                    }
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // STEP-3.5: if the block had a `{lazy}` or `{defer}` attribute, wrap
-        // the captured (body, deps) in a Thunk and return a Request[Eval]
-        // over it. The Request does NOT auto-resolve at construction —
-        // syntactic deferral is unconditional. The user forces via now() or
-        // by splicing it (auto-force for {lazy} only).
-        // ─────────────────────────────────────────────────────────────────────
-        if let Some(policy) = options.policy {
-            let cacheable = policy == BlockEvalPolicy::Lazy;
-            let thunk = OValue::thunk(buf, deps);
-            return Ok(OValue::request(
-                RequestKind::Eval {
-                    lang: lang.to_string(),
-                    env_id,
-                    cacheable,
-                    authority: authority_identity,
-                    permissions: sandbox.permissions().to_vec(),
-                },
-                thunk,
-            ));
-        }
-
-        // Short-circuit for `nix_expr`: return a lazy ONixExpr instead of
-        // calling the Nix shim immediately.  The fingerprint is sha256(body)
-        // — the cheap step-1 scheme.  `nix^` (immediate evaluation) is
-        // unchanged (step-1 decision, option a).
-        if backend.canonical == "nix_expr" {
-            return Ok(OValue::nix_expr(buf, deps));
-        }
-
-        // Dispatch is an OIR property frozen at lowering time.
-        if backend.execution == ExecutionMode::InlineValue {
-            return match backend.canonical.as_str() {
-                "html" => Ok(OValue::html(buf)),
-                "markdown" | "text" | "latex" => Ok(OValue::str_(buf)),
-                other => bail!("inline OIR backend `{other}` has no value executor"),
-            };
-        }
-
-        debug_assert_eq!(backend.execution, ExecutionMode::Shim);
-        let runtime_lang = backend.canonical.as_str();
-        let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
-        // Send the exec command to the shim, then drive the eval_request loop.
-        //
-        // Normally the shim sends Ok/Err immediately and the loop runs once.
-        // If the shim's user code calls `O.eval(q)`, it sends EvalRequest with
-        // the quoted source; we evaluate it here and send back EvalResult, then
-        // loop to read the next response. The loop terminates on Ok or Err.
-        let env_label = if env_id == u32::MAX {
-            format!("{runtime_lang}[*ephemeral*]")
-        } else {
-            format!("{runtime_lang}[{env_id}]")
-        };
-
-        self.registry
-            .send_exec(
-                runtime_lang,
-                env_id,
-                &buf,
-                local_scope.clone(),
-                &shim,
-                &sandbox,
-            )
-            .with_context(|| format!("[{}]", env_label))?;
-
-        let result: Result<OValue> = loop {
-            let step = self
-                .registry
-                .recv_exec_step(runtime_lang, env_id, &sandbox)
-                .with_context(|| format!("[{}]", env_label))?;
-
-            match step {
-                ExecStep::Done(v) => break Ok(v),
-
-                ExecStep::EvalRequest {
-                    src,
-                    scope: explicit_scope,
-                } => {
-                    // Evaluate the quoted source. If eval fails, propagate the
-                    // error — the shim's `O.eval(q)` will raise on the Python
-                    // side because the runtime never sends eval_result.
-                    let callback_scope = match explicit_scope {
-                        None => local_scope.clone(),
-                        Some(OValue::Scope { bindings }) => bindings,
-                        Some(other) => {
-                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
-                            bail!(
-                                "[{}] O.eval explicit scope must be an OScope, got {}",
-                                env_label,
-                                other.type_name()
-                            );
-                        }
-                    };
-                    match self.eval_source_with_scope(&src, &callback_scope) {
-                        Ok(result) => {
-                            self.registry
-                                .send_eval_result(runtime_lang, env_id, result, &sandbox)
-                                .with_context(|| format!("[{}] send_eval_result", env_label))?;
-                        }
-                        Err(e) => {
-                            // Remove the process from the registry so the
-                            // stuck shim doesn't pollute future calls.
-                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "[{}] O.eval() failed while evaluating quoted source",
-                                    env_label
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-        };
-
-        // Step 3 — discard ephemeral envs (env_id == u32::MAX) after every expression,
-        // regardless of whether exec succeeded.  (MAX is used for certain internal
-        // re-entrant O.eval cases to avoid deadlock on a persistent env; bare
-        // user-level blocks now default to env 0 per the spec.)
-        if env_id == u32::MAX {
-            let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
-        }
-
-        // Attach a `[lang[env_id]]` tag to the existing error CHAIN — using
-        // anyhow::Context preserves the underlying source error (shim stderr,
-        // SyntaxError details, etc.) as a "Caused by:" entry.  Previously this
-        // path used `anyhow!("[{}] {}", env_label, e)`, which formats `e` as a
-        // string and DROPS the source chain — the actual shim error message
-        // was lost, leaving the user with only the wrapper.
-        result.with_context(|| format!("[{}]", env_label))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2286,6 +2293,75 @@ fn planned_children<'a>(
             Ok((id, &children[source_index]))
         })
         .collect()
+}
+
+fn data_predecessors(plan: &ExecutionPlan, node_id: PlanNodeId) -> Vec<PlanNodeId> {
+    let mut sources = plan
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            (edge.kind == PlanEdgeKind::Data && edge.to == node_id).then_some(edge.from)
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|id| id.0);
+    sources
+}
+
+fn structural_children(plan: &ExecutionPlan, parent: PlanNodeId) -> Vec<PlanNodeId> {
+    let mut children = plan
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            (edge.kind == PlanEdgeKind::Structural && edge.to == parent).then_some(edge.from)
+        })
+        .collect::<Vec<_>>();
+    children.sort_by_key(|id| id.0);
+    children
+}
+
+fn derive_policy_contexts(
+    plan: &ExecutionPlan,
+    flat: &[&OIr],
+    base_policy: Policy,
+) -> Result<Vec<Policy>> {
+    if flat.len() != plan.nodes.len() {
+        bail!(
+            "OIR flatten produced {} nodes but plan has {} nodes",
+            flat.len(),
+            plan.nodes.len()
+        );
+    }
+
+    let mut policies = vec![base_policy; plan.nodes.len()];
+    for plan_node in &plan.nodes {
+        let id = plan_node.id;
+        let parent_policy = policies[id.0];
+        let child_policy = match flat[id.0] {
+            OIr::Invoke {
+                mode: InvokeMode::Lazy,
+                ..
+            } => Policy::Lazy,
+            OIr::Invoke {
+                mode: InvokeMode::Autonomous,
+                ..
+            } => Policy::Autonomous,
+            OIr::Invoke {
+                mode: InvokeMode::Group(_),
+                ..
+            } => match parent_policy {
+                Policy::Autonomous => Policy::Autonomous,
+                Policy::Lazy => Policy::Lazy,
+                Policy::Eager => Policy::Lazy,
+            },
+            _ => parent_policy,
+        };
+
+        for child in structural_children(plan, id) {
+            policies[child.0] = child_policy;
+        }
+    }
+
+    Ok(policies)
 }
 
 /// Render using the strategy frozen into executable OIR. Keeping this as a
@@ -3837,6 +3913,50 @@ mod tests {
     }
 
     #[test]
+    fn execution_trace_finishes_each_planned_node_once() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Store {
+                    name: "x".into(),
+                    expr: Box::new(OIr::Text("one".into())),
+                },
+                OIr::Exec {
+                    lang: "html".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: BackendRegistry::global().interface_for("html"),
+                    body: vec![OIr::Load("x".into()), OIr::Text(" two".into())],
+                },
+            ],
+        };
+        let mut evaluator = Evaluator::new("/tmp".into());
+        assert_eq!(
+            evaluator.eval_ir_program(&program).unwrap(),
+            OValue::html("one two")
+        );
+
+        let plan = evaluator.last_execution_plan().unwrap();
+        let trace = evaluator.last_execution_trace().unwrap();
+        let mut finished = trace
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let TraceEvent::NodeFinished { id, .. } = event {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let raw_count = finished.len();
+        finished.sort_by_key(|id| id.0);
+        finished.dedup();
+
+        assert_eq!(raw_count, plan.nodes.len());
+        assert_eq!(finished.len(), plan.nodes.len());
+    }
+
+    #[test]
     fn execution_trace_records_node_failures() {
         let program = OIrProgram {
             nodes: vec![OIr::Load("missing".into())],
@@ -5306,6 +5426,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quote_body_is_absent_from_execution_trace() {
+        let backends: HashSet<String> = ["python", "quote", "O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut evaluator =
+            Evaluator::new("/tmp".into()).with_registered_backends(backends.clone());
+        let src = r"quote^(python^(6*7)_python)_quote";
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+
+        let result = evaluator.eval_document(nodes).unwrap();
+        assert!(matches!(result, OValue::Expr { .. }));
+
+        let plan = evaluator.last_execution_plan().unwrap();
+        assert_eq!(plan.nodes.len(), 1);
+        let trace = evaluator.last_execution_trace().unwrap();
+        let started = trace
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let TraceEvent::NodeStarted(id) = event {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started, vec![PlanNodeId(0)]);
+    }
+
     /// A quoted body with MULTIPLE children should capture the raw source text
     /// so the outer O.eval round-trip works.
     #[test]
@@ -6335,15 +6486,10 @@ python[0]^(O.eval($q, $captured))_python[0]
     }
 
     /// Under Policy::Autonomous, group constructors still capture Request
-    /// members, but they must not downgrade policy to Lazy. The inner Nix-family
-    /// requests must also be buffered for the autonomous scheduler.
+    /// members, but they must not downgrade policy to Lazy. The graph executor
+    /// gets that behavior from derived node policies before requests are built.
     #[test]
-    fn batch_under_autonomous_buffers_captured_request_chains() {
-        let mut e = Evaluator::new("/tmp".into());
-        e.scheduler = AutonomousScheduler::no_disk();
-        e.policy = Policy::Autonomous;
-        let scope = scope_with_nix_expr();
-
+    fn graph_policy_context_preserves_autonomous_group_capture() {
         let mk_chain = |var: &str| ONode::Call {
             fn_name: "realise".into(),
             args: vec![ONode::Call {
@@ -6361,52 +6507,30 @@ python[0]^(O.eval($q, $captured))_python[0]
         };
         let plan = program.plan();
         plan.validate(program.nodes.len()).unwrap();
-        let root_id = plan.roots[0];
-        let group = e
-            .eval_ir_node(&program.nodes[0], root_id, &plan, &scope)
-            .unwrap();
-        match group {
-            OValue::Group { mode, members, .. } => {
-                assert_eq!(mode, GroupMode::Batch);
-                assert_eq!(members.len(), 2);
-                assert!(
-                    members.iter().all(|m| matches!(
-                        m,
-                        OValue::Request {
-                            kind: RequestKind::Realise,
-                            ..
-                        }
-                    )),
-                    "batch members must be captured Realise requests, got {:?}",
-                    members
-                );
-            }
-            other => panic!("batch() must return a Group, got {:?}", other),
-        }
-
-        let kinds: Vec<RequestKind> = e
-            .autonomous_buffer
+        let flat = program.flatten_for_plan();
+        let autonomous_policies = derive_policy_contexts(&plan, &flat, Policy::Autonomous).unwrap();
+        let eager_policies = derive_policy_contexts(&plan, &flat, Policy::Eager).unwrap();
+        let request_ids = plan
+            .nodes
             .iter()
-            .map(|v| match v {
-                OValue::Request { kind, .. } => kind.clone(),
-                other => panic!("autonomous_buffer must contain only Requests, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                RequestKind::Instantiate,
-                RequestKind::Realise,
-                RequestKind::Instantiate,
-                RequestKind::Realise,
-            ],
-            "autonomous batch capture must buffer every inner request in source order"
-        );
-        assert_eq!(
-            e.policy,
-            Policy::Autonomous,
-            "group construction must restore the surrounding Autonomous policy"
-        );
+            .filter_map(|node| matches!(node.kind, PlanNodeKind::Request { .. }).then_some(node.id))
+            .collect::<Vec<_>>();
+        assert_eq!(request_ids.len(), 4);
+
+        for id in &request_ids {
+            assert_eq!(
+                autonomous_policies[id.0],
+                Policy::Autonomous,
+                "request node {} should preserve autonomous capture",
+                id.0
+            );
+            assert_eq!(
+                eager_policies[id.0],
+                Policy::Lazy,
+                "request node {} should be captured lazily under eager batch(...)",
+                id.0
+            );
+        }
     }
 
     /// If a member expression fails while a group constructor is capturing
