@@ -1,0 +1,40 @@
+#!/usr/bin/env O
+# O-Git semantic receipt demo: What Compilation Forgets.
+# This variant changes exactly the semantic policy line.
+#
+# ogit: group normalize_pipeline
+# ogit: policy eager
+# ogit: invariant output_count == input_count
+# ogit: effects read examples/group_pipeline/input.txt write examples/group_pipeline/output.txt
+# ogit: steps load -> normalize -> emit
+# ogit: intent normalize during construction rather than on demand
+
+let load_data = python{defer,fs_read}^(
+with open("examples/group_pipeline/input.txt", "r", encoding="utf-8") as f:
+    __oval_result__ = [float(x) for x in f.read().split()]
+)_python{defer,fs_read}
+
+let normalize_data = python{defer}^(
+values = [1, 2, 3, 4, 5]
+scale = max(values)
+__oval_result__ = [round(v / scale, 2) for v in values]
+)_python{defer}
+
+let emit_result = python{defer,fs_write}^(
+values = [0.20, 0.40, 0.60, 0.80, 1.00]
+with open("examples/group_pipeline/output.txt", "w", encoding="utf-8") as f:
+    f.write("normalized: " + str(values) + "\n")
+__oval_result__ = "normalized: " + str(values)
+)_python{defer,fs_write}
+
+let normalize_pipeline = batch($load_data, $normalize_data, $emit_result)
+
+markdown^(
+# normalize_pipeline
+
+- policy: eager
+- invariant: output_count == input_count
+- effects: read input.txt, write output.txt
+- steps: load -> normalize -> emit
+- group value: `$normalize_pipeline`
+)_markdown

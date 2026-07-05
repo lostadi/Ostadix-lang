@@ -146,6 +146,21 @@ cargo build --release
 ./target/hello
 ```
 
+### O-Git semantic receipt demo
+
+The smallest O-Git surface is a one-command receipt demo. It lowers one tiny
+O-lang group pipeline to C, runs the compiled artifact, records what semantic
+structure survived or disappeared, and shows a policy-aware diff:
+
+```bash
+cargo run --bin ogit -- demo semantic-receipt
+```
+
+The checked-in source lives in `examples/group_pipeline/main.O`. The generated
+C target, visible HTML graph, and DOT graph are written to
+`examples/group_pipeline/generated/`, and the receipt is written to
+`.ogit/receipts/semantic-receipt-001.json`.
+
 The usual package-manager prerequisites are:
 
 #### macOS
@@ -1852,6 +1867,7 @@ capability contract is in [docs/OCORE.md](docs/OCORE.md).
 | `examples/instantiate_realise_basic.O` | ONixExpr to derivation to store path. |
 | `examples/lazy_defer_attrs_basic.O` | Lazy and deferred Eval requests. |
 | `examples/coordination_groups.O` | Batch, all, any, and race values. |
+| `examples/group_pipeline/main.O` | O-Git semantic receipt group pipeline. |
 | `examples/os_as_participant_basic.O` | OSystem and activation boundary. |
 | `examples/nixos_test.O` | Single-machine NixOS VM test. |
 | `examples/nixos_test_two_machine.O` | Two-machine NixOS VM test. |

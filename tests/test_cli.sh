@@ -24,6 +24,7 @@ mkdir -p "$ARTIFACT_DIR"
 O_BIN="./target/release/O"
 OLANGC_BIN="./target/release/olangc"
 OCOREC_BIN="./target/release/ocorec"
+OGIT_BIN="./target/release/ogit"
 if [ -x ./target/release/olink ]; then
     OLINK_BIN="./target/release/olink"
 else
@@ -31,7 +32,7 @@ else
 fi
 OUNLINK_BIN="./target/release/o-unlink"
 
-for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
+for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
     if [ ! -x "$bin" ]; then
         echo "Missing executable: $bin" >&2
         exit 1
@@ -285,16 +286,19 @@ EOF
 
 check_stderr_contains "O with no args shows usage error" 1 'Usage:|missing input file' "$O_BIN"
 check_nonzero_stderr_contains "O missing file errors" 'failed to read input file|No such file' "$O_BIN" nonexistent.O backends/
-check_stdout_contains "O runs hello.O" 0 '^2$' "$O_BIN" examples/hello.O backends/
-check_stdout_contains "legacy backend cap attrs run without a host grant" 0 '^0$' "$O_BIN" "$CAPABILITY_SOURCE" backends/
-check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
-check_stdout_contains "plain Python has ambient process authority" 0 '^0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
+check_stdout_contains "O runs hello.O" 0 '^(\[number\] )?2$' "$O_BIN" examples/hello.O backends/
+check_stdout_contains "legacy backend cap attrs run without a host grant" 0 '^(\[number\] )?0$' "$O_BIN" "$CAPABILITY_SOURCE" backends/
+check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^(\[number\] )?0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
+check_stdout_contains "plain Python has ambient process authority" 0 '^(\[number\] )?0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
 check_olangc_capability_compile_and_run "olangc compiles legacy backend cap attrs without a host grant"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
+check_stdout_contains "ogit demo help lists semantic receipt" 0 'semantic-receipt' "$OGIT_BIN" demo --help
+check_stdout_contains "ogit semantic diff detects policy change" 0 'runtime demand model changed' \
+    "$OGIT_BIN" diff-semantic examples/group_pipeline/main.O examples/group_pipeline/main.eager.O
 check_stdout_contains "olink help shows usage" 0 'Usage: (olink|o-link)' "$OLINK_BIN" --help
 check_olink_hardened_round_trip
 check_nonzero_stderr_contains "O invalid syntax exits with an error" 'failed to parse \.O source|error:' "$O_BIN" "$INVALID_SOURCE" backends/

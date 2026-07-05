@@ -1,5 +1,6 @@
 # Rust and Cargo build artifacts
 /target/
+/target
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/coverage/
@@ -41,6 +42,7 @@
 /o-unlink
 /o-notebook
 /olangc
+/ogit
 /ocorec
 /hello
 /script
@@ -55,6 +57,9 @@
 /combined.O
 /extracted_md/
 /extracted_segments/
+/.ogit/
+/examples/group_pipeline/generated/
+/examples/group_pipeline/output.txt
 
 # OS metadata
 .DS_Store
@@ -89,7 +94,6 @@ coverage.xml
 target/
 fuzz/corpus/
 *.wasm
-*.o
 *.elf
 patcheck.tmp
 test.html
