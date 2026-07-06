@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -76,6 +76,23 @@ fn write_tree(root: &Path, files: &BTreeMap<String, String>) {
     }
 }
 
+fn is_valid_file_tree(files: &BTreeMap<String, String>) -> bool {
+    let file_paths = files.keys().map(PathBuf::from).collect::<BTreeSet<_>>();
+    for relative in &file_paths {
+        let mut current = relative.as_path();
+        while let Some(parent) = current.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if file_paths.contains(&parent.to_path_buf()) {
+                return false;
+            }
+            current = parent;
+        }
+    }
+    true
+}
+
 fn run(command: &mut Command) -> Output {
     let output = command.output().unwrap();
     assert!(
@@ -122,6 +139,7 @@ proptest! {
         files in prop::collection::btree_map(relative_path_strategy(), content_strategy(), 1..9),
         symlink_mode in 0u8..4,
     ) {
+        prop_assume!(is_valid_file_tree(&files));
         let (temp, source, expected) = setup(&files, symlink_mode);
         let combined = temp.path().join("combined.O");
         let restored = temp.path().join("restored");
