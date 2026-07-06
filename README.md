@@ -4,7 +4,7 @@
 
 # Ostadix-lang
 
-*By Lee Daghlar Ostadi*
+*By Lee Ostadi*
 
 [![CI](https://github.com/lostadi/O-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/ci.yml)
 [![Parser fuzz campaign](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml)
