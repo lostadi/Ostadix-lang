@@ -1095,6 +1095,8 @@ data, live references, and authority-bearing values.
 | OSymbol, OKeyword | Interned symbolic identifiers and keyword values. |
 | OScope | Detached O-level lexical bindings for `O.eval(expr, scope)`. |
 | OBlob | Base64 wire data with a MIME type. |
+| OBytes | Structural byte value. |
+| OGraph | Value graph frame for values with shared identity or cycles. |
 | OExpr | Unevaluated O source captured by `quote^`. |
 | ONixExpr | Unevaluated Nix source plus dependencies and a fingerprint. |
 | ODerivation | Instantiated Nix derivation and output metadata. |
@@ -1235,6 +1237,7 @@ semantics that are not a plain external command, such as live Python `O.eval`.
 | `rust` | Rust backend runner plus `rustc` | Compiles a temporary Rust program, runs it, and returns stdout. |
 | `racket` | Rust backend runner plus Racket | Executes a temporary Racket module and returns stdout. |
 | `cpp` | Rust backend runner plus `g++` | Compiles C++17 source, runs it, and returns stdout. |
+| `c` | Rust backend runner plus `cc` | Compiles C17 source, runs it, and returns stdout. |
 | `csharp` | Rust backend runner plus .NET or Mono | Builds and runs C# with the locally available toolchain. |
 | `haskell` | Rust backend runner plus `runghc` or `ghc` | Interprets or compiles Haskell and returns stdout. |
 | `lisp` | Rust backend runner plus SBCL or CLISP | Executes Common Lisp source. |
@@ -1847,25 +1850,39 @@ capability contract is in [docs/OCORE.md](docs/OCORE.md).
 | `examples/hello.O` | Smallest Python-backed O program. |
 | `examples/bindings.O` | `let` and `$var` splicing. |
 | `examples/nested_splice.O` | Nested Python expressions. |
+| `examples/trailing_expr.O` | Python trailing-expression result rule. |
 | `examples/html_basic.O` | HTML with an embedded computation. |
 | `examples/html_python_html.O` | HTML receiving an OHtml fragment produced through Python. |
-| `examples/python_html_python.O` | Three nested language levels. |
 | `examples/html_escape.O` | Escaped strings versus trusted OHtml. |
+| `examples/html_raw_roundtrip.O` | OText round-trip through HTML. |
+| `examples/python_html_python.O` | Three nested language levels. |
 | `examples/computed_plot.O` | Matplotlib image blob rendered as an HTML image. |
 | `examples/literate_report.O` | Markdown report with persistent Python state. |
 | `examples/persist.O` | Explicit persistent environment. |
 | `examples/env_split.O` | Independent environment indices. |
 | `examples/ephemeral.O` | Fresh state for bare blocks. |
 | `examples/meta_eval.O` | `quote^`, OExpr, `O.quote`, and `O.eval`. |
+| `examples/script.O` | Executable O document with shebang. |
 | `examples/bash_hello.O` | Executing Bash backend. |
+| `examples/bash_binding.O` | Passing O bindings into Bash. |
+| `examples/bash_exit_code.O` | Bash success-path exit code. |
+| `examples/bash_multiline.O` | Multi-statement Bash block. |
 | `examples/shell_hello.O` | Executing POSIX shell backend. |
 | `examples/js_hello.O` | Executing JavaScript backend. |
+| `examples/js_binding.O` | Passing O bindings into JavaScript. |
+| `examples/js_json.O` | JavaScript returning a JSON object. |
+| `examples/js_multiline.O` | Multi-function JavaScript block. |
 | `examples/sql_create_insert_select.O` | Persistent in-memory SQLite state. |
+| `examples/sql_select.O` | Simple SQL query. |
+| `examples/sql_aggregation.O` | SQL aggregate over persistent table. |
 | `examples/sql_python_sql.O` | SQL to Python to SQL value flow. |
 | `examples/nix_basic.O` | Immediate Nix evaluation. |
 | `examples/nix_python_html.O` | Nix to Python to HTML. |
+| `examples/nix_storepath.O` | `nix_store^` returning an OStorePath. |
+| `examples/nix_storepath_python.O` | Store path passed into Python. |
 | `examples/instantiate_realise_basic.O` | ONixExpr to derivation to store path. |
 | `examples/lazy_defer_attrs_basic.O` | Lazy and deferred Eval requests. |
+| `examples/lazy_request_basic.O` | Lazy-wrapped Nix request chain. |
 | `examples/coordination_groups.O` | Batch, all, any, and race values. |
 | `examples/group_pipeline/main.O` | O-Git semantic receipt group pipeline. |
 | `examples/os_as_participant_basic.O` | OSystem and activation boundary. |
