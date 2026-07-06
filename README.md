@@ -6,8 +6,8 @@
 
 *By Lee Daghlar Ostadi*
 
-[![CI](https://github.com/lostadi/Olang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/Olang/actions/workflows/ci.yml)
-[![Parser fuzz campaign](https://github.com/lostadi/Olang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/Olang/actions/workflows/fuzz.yml)
+[![CI](https://github.com/lostadi/O-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/ci.yml)
+[![Parser fuzz campaign](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml)
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
@@ -102,8 +102,8 @@ runtime dependencies, builds the Rust and C17 editions, prepares the Python
 reference, and creates convenience wrappers:
 
 ```bash
-git clone https://github.com/lostadi/Olang.git
-cd Olang
+git clone https://github.com/lostadi/O-lang.git
+cd O-lang
 ./setup.sh
 ```
 
@@ -137,8 +137,8 @@ python3 -m o_lang examples/hello.O
 ### Option B: Manual Rust setup
 
 ```bash
-git clone https://github.com/lostadi/Olang.git
-cd Olang
+git clone https://github.com/lostadi/O-lang.git
+cd O-lang
 cargo build --release
 
 ./target/release/O examples/hello.O backends
@@ -1432,7 +1432,7 @@ Native computation
 ### Repository layout
 
 ```text
-Olang/
+O-lang/
 ├── src/
 │   ├── main.rs                 # O interpreter and REPL
 │   ├── parser.rs               # hosted typed-parenthesis parser
@@ -2064,7 +2064,7 @@ If you use, fork, compare, derive from, or discuss this project, cite the
 canonical repository:
 
     Lee Daghlar Ostadi. O-lang / ^Olang_: the Ouroboros Language.
-    https://github.com/lostadi/Olang
+    https://github.com/lostadi/O-lang
 
 Core contribution:
 
