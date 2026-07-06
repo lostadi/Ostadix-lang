@@ -1,6 +1,6 @@
-# O-lang Architecture
+# Ostadix-lang Architecture
 
-O-lang is a universal polyglot expression framework where every expression
+Ostadix-lang is a universal polyglot expression framework where every expression
 syntactically declares which language it is written in.
 
 ```
@@ -10,7 +10,7 @@ html^( <p>Result: python^( 2 + 2 )_python</p> )_html
 ## Repository Layout
 
 ```
-O-lang/
+Ostadix-lang/
 ├── src/              # Rust implementation (primary, active)
 │   ├── main.rs       #   CLI entry point
 │   ├── lib.rs        #   Library crate root
@@ -39,7 +39,7 @@ O-lang/
 
 ## Evaluation Pipeline
 
-O-lang processes hosted code through a 6-stage pipeline:
+Ostadix-lang processes hosted code through a 6-stage pipeline:
 
 1. **Parse** — Tokenize source into typed expression trees. Each expression
    carries a language tag (e.g., `python`, `html`, `nix`).

@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// olangc — the O-lang compiler
+// olangc — the Ostadix-lang compiler
 //
 // Compiles a .O source file to a hosted native or WASI binary, executes its
 // OIR directly in-process, prints that same executable OIR and plan, or emits
@@ -22,7 +22,7 @@
 //      overlays files from --shim-dir if the user passed one. Rust-native
 //      backends do not need shim files.
 //   3. Creates a temporary Cargo project that bundles:
-//        - All O-lang runtime source files (embedded in olangc at its own
+//        - All Ostadix-lang runtime source files (embedded in olangc at its own
 //          compile time via include_str!, so olangc is self-contained).
 //        - The .O source file (copied as "program.O" in the generated src/).
 //        - Compatibility adapter scripts (copied into src/shims/).
@@ -79,7 +79,7 @@ use o_lang::value::OValue;
 // Runtime source files — embedded at olangc's own compile time.
 //
 // These are written verbatim into the temp project so the generated binary
-// gets an identical copy of the O-lang runtime.  When the runtime changes,
+// gets an identical copy of the Ostadix-lang runtime.  When the runtime changes,
 // olangc must be recompiled for those changes to appear in newly compiled
 // .O programs.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ Compiles a .O source file into a native binary (--target binary, the default), \
 a wasm32-wasip1 module (--target wasm), executes executable OIR in-process \
 (--target script), prints the lowered OIR and ExecutionPlan (--target ir), or \
 emits the program execution hypergraph as Graphviz DOT (--target dot). Binary \
-outputs embed the program source, compatibility adapters, and the O-lang \
+outputs embed the program source, compatibility adapters, and the Ostadix-lang \
 runtime. In ir mode the same OIR and ExecutionPlan used at runtime are printed \
 without execution. In dot mode the HGraph is built and type-solved, then \
 serialised as a digraph; pipe to `dot -Tpng` for a rendered image."
@@ -368,7 +368,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Target B — execute in-process (script mode)
 //
-// The O-lang runtime (parser, evaluator, value system) is already compiled
+// The Ostadix-lang runtime (parser, evaluator, value system) is already compiled
 // into the olangc binary.  Script mode invokes that code directly: the
 // machine code sitting in the .text section of the running olangc process
 // is the "executable memory buffer" — loaded and mapped by the OS at

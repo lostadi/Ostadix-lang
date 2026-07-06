@@ -11,7 +11,7 @@
 //   ...escaped file contents...
 //   )_python[N]
 //
-// `o-unlink` reads these markers, un-escapes the body (the O-lang parser
+// `o-unlink` reads these markers, un-escapes the body (the Ostadix-lang parser
 // consumes escape sequences like `\$HOME` → `$HOME` and `\python^(` →
 // `python^(` automatically), and writes the recovered content to
 // `<output-dir>/path/to/file.py`, creating parent directories as needed.
@@ -123,8 +123,8 @@ fn main() -> Result<()> {
 ///
 /// ## Why we scan text rather than the AST
 ///
-/// The O-lang parser strips `#` comment lines at the top level (the same
-/// rule that ignores O-lang comments inside sequencing blocks).  This means
+/// The Ostadix-lang parser strips `#` comment lines at the top level (the same
+/// rule that ignores Ostadix-lang comments inside sequencing blocks).  This means
 /// the `# ── path ──` markers written by `o-link` are silently dropped from
 /// the parsed AST.  We therefore scan the raw source text to locate section
 /// boundaries, then use the parser only for body un-escaping.

@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// ir.rs — the executable O-lang intermediate representation.
+// ir.rs — the executable Ostadix-lang intermediate representation.
 //
 // This module is the stable seam between four concerns that were previously
 // fused inside parser.rs / eval.rs / olangc.rs:
