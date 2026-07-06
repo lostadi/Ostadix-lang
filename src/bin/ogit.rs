@@ -96,9 +96,9 @@ const DEMO_INPUT: &str = "1 2 3 4 5\n";
 #[derive(ClapParser, Debug)]
 #[command(
     name = "ogit",
-    about = "Semantic receipt tools for O-lang transformations",
+    about = "Semantic receipt tools for Ostadix-lang transformations",
     long_about = "\
-O-Git is a small semantic-ledger companion for O-lang demos. The current \
+O-Git is a small semantic-ledger companion for Ostadix-lang demos. The current \
 surface is intentionally narrow: it can run the semantic receipt demo and \
 compare two demo sources for meaning-level changes that ordinary textual diff \
 does not explain."
@@ -115,7 +115,7 @@ enum Commands {
         #[command(subcommand)]
         command: DemoCommand,
     },
-    /// Compare two O-lang demo sources as semantic declarations, not text.
+    /// Compare two Ostadix-lang demo sources as semantic declarations, not text.
     DiffSemantic {
         /// Earlier .O source.
         old: PathBuf,
@@ -327,7 +327,7 @@ fn repo_root() -> Result<PathBuf> {
             return Ok(dir);
         }
         if !dir.pop() {
-            bail!("could not find O-lang repository root from current directory");
+            bail!("could not find Ostadix-lang repository root from current directory");
         }
     }
 }

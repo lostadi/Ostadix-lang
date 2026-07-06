@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // eval.rs
 //
-// The O-language OIR evaluator — plan-owned graph execution.
+// The Ostadix-lang OIR evaluator — plan-owned graph execution.
 //
 // Evaluation semantics (mirrors o_lang/evaluator.py):
 //
@@ -357,8 +357,8 @@ pub struct Evaluator {
     /// Live bearer bindings for authority requested by hosted backend blocks.
     backend_authorities: BackendAuthorityBroker,
 
-    /// Built-in wildcard backend authority used by default O-lang execution.
-    /// O-lang treats hosted backends as the normal execution substrate, so
+    /// Built-in wildcard backend authority used by default Ostadix-lang execution.
+    /// Ostadix-lang treats hosted backends as the normal execution substrate, so
     /// grantable backend rights are available by default.
     default_backend_authority: String,
 }

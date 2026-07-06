@@ -112,7 +112,7 @@ impl<'a> Parser<'a> {
             // Skip `#` line comments at the top level and inside sequencing
             // langs (quote^, O^).  Inside other typed-expression bodies the
             // `#` character is valid syntax (e.g. markdown headings, Python
-            // comments) and must NOT be swallowed by the O-lang parser.
+            // comments) and must NOT be swallowed by the Ostadix-lang parser.
             if inside_sequencing && self.current_byte() == Some(b'#') {
                 self.flush_text(&mut nodes, text_start, self.pos);
                 self.skip_to_end_of_line();

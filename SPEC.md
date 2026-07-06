@@ -1,6 +1,6 @@
-# O-lang Specification (v0.2.0)
+# Ostadix-lang Specification (v0.2.0)
 
-O-lang is a meta-language whose syntactic unit ( the _typed expression_ ) carries
+Ostadix-lang is a meta-language whose syntactic unit ( the _typed expression_ ) carries
 its own interpreter as part of its syntax. Every expression declares which
 language it is written in; the runtime dispatches evaluation to a backend for
 that language; the resulting value is a language-neutral `OValue` that can be
@@ -30,11 +30,11 @@ backslash-escape
 ```
 
 The `\$IDENT` escape is important when writing real target-language code inside block
-bodies. O-lang parses `$IDENT` everywhere (including inside `bash^`, `python^`, etc.)
+bodies. Ostadix-lang parses `$IDENT` everywhere (including inside `bash^`, `python^`, etc.)
 as a binding reference (VarRef). To write a bare shell variable like `$PATH` in a
 `bash{cap=runner}^(...)_bash{cap=runner}` block without triggering an
 "Undefined variable" error, write `\$PATH`.
-O-lang strips the backslash and passes `$PATH` verbatim to the bash backend.
+Ostadix-lang strips the backslash and passes `$PATH` verbatim to the bash backend.
 
 An `IDENT` that is **not in the registered-language set** is NOT treated as an
 opener, even if followed by `^(`. This keeps inner-language code safe -
@@ -313,7 +313,7 @@ LANG^(body)_LANG
 
 The evaluator MUST make all grantable backend rights available to shim
 backends: `fs_read`, `fs_write`, `network`, and `process`. This is the normal
-O-lang execution substrate, not a privilege exception. The older
+Ostadix-lang execution substrate, not a privilege exception. The older
 `LANG{cap=NAME,RIGHT,...}^` spelling remains accepted for compatibility and
 embedding experiments, but ordinary source MUST NOT require a host-injected
 backend grant to access backend capacities.

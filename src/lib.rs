@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// O-lang runtime library
+// Ostadix-lang runtime library
 //
 // All runtime modules are re-exported here so that both the `O` interpreter
 // binary and `olangc`-compiled binaries share the same public API surface.

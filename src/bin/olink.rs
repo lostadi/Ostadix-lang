@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// o-link: the O-lang linker / combiner compiler
+// o-link: the Ostadix-lang linker / combiner compiler
 //
 // Accepts a list of scripts, source files, or whole codebases (directories)
 // and links them into a single .O file. Each input file is wrapped in the
@@ -9,7 +9,7 @@
 //   build.sh    →  bash[N]^( ...file contents... )_bash[N]
 //   index.html  →  html[N]^( ...file contents... )_html[N]
 //   notes.md    →  markdown[N]^( ... )_markdown[N]
-//   prog.O      →  inlined verbatim (it is already O-lang source)
+//   prog.O      →  inlined verbatim (it is already Ostadix-lang source)
 //
 // Every wrapped file receives a unique `[N]` environment index within its
 // language group (python[0], python[1], …), so each file runs in its own
@@ -25,10 +25,10 @@
 // sorted order so the output is deterministic. Unknown and extensionless
 // files use the inert text backend unless --lang selects another backend.
 //
-// Any text inside a wrapped file that would collide with O-lang syntax:
+// Any text inside a wrapped file that would collide with Ostadix-lang syntax:
 // a registered opener like `python^(`, the wrapping block's own closer
 // like `)_python`, or a splice like `$HOME`, is backslash-escaped
-// (`\python^(`, `\)_python`, `\$HOME`), which the O-lang parser turns
+// (`\python^(`, `\)_python`, `\$HOME`), which the Ostadix-lang parser turns
 // back into the literal text at evaluation time, so file contents survive
 // the round trip byte-for-byte.
 //
@@ -42,7 +42,7 @@
 //   o-link src/ -o app.O --verbose-skips      # report every excluded path
 //
 // Robustness guarantees:
-//   * The combined output is re-parsed with the O-lang parser before it is
+//   * The combined output is re-parsed with the Ostadix-lang parser before it is
 //     written, so o-link never emits a .O file that the runtime cannot read.
 //   * Directory walks skip binary / non-UTF-8 files, group warnings by reason,
 //     do not descend into excluded subtrees unless --verbose-skips is set,
@@ -1158,7 +1158,7 @@ fn push_import_candidates(modules: &mut Vec<String>, specifier: &str) {
     }
 }
 
-/// Backslash-escape any text in `body` that the O-lang parser would otherwise
+/// Backslash-escape any text in `body` that the Ostadix-lang parser would otherwise
 /// treat as syntax inside a `wrapper^( ... )_wrapper` block:
 ///
 ///   * any registered opener `IDENT[N]?{attr}?^(`  →  `\IDENT...^(`
@@ -1185,7 +1185,7 @@ fn escape_body(body: &str, closer: &str, backends: &HashSet<String>) -> String {
             i += len;
             continue;
         }
-        // Escape `$IDENT`. The O-lang parser treats `$name` as a splice
+        // Escape `$IDENT`. The Ostadix-lang parser treats `$name` as a splice
         // (variable reference). Backslash-escaping it (`\$name`) makes the
         // parser emit the literal text `$name`, so the backend receives the
         // original file contents unchanged. This is critical for shell
