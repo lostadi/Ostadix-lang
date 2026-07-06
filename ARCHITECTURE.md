@@ -123,28 +123,38 @@ semantics from being conflated with OIR's backend dependency graph.
 
 Every value crossing language boundaries is represented as one of these types:
 
-| Type           | Purpose                              |
-|----------------|--------------------------------------|
-| `ONull`        | Absence of value                     |
-| `OBool`        | Boolean true/false                   |
-| `OInt`         | Integer number                       |
-| `OFloat`       | Floating-point number                |
-| `OStr`         | Text string                          |
-| `OList`        | Ordered collection                   |
-| `OMap`         | Key-value mapping                    |
-| `OScope`       | Detached lexical binding snapshot    |
-| `OHtml`        | HTML fragment                        |
-| `OStorePath`   | Nix store path                       |
-| `ONixExpr`     | Unevaluated Nix expression           |
-| `ODerivation`  | Nix derivation                       |
-| `OBlob`        | Binary data                          |
-| `OExpr`        | Unevaluated O expression             |
-| `ORequest`     | Deferred computation / control value |
-| `OThunk`       | Deferred computation                 |
-| `OGroup`       | Explicit execution topology          |
-| `OSystem`      | Live OS/profile reference            |
-| `OCapability`  | Authority-bearing resource handle    |
-| `OSnapshot`    | Persistable captured world state     |
+| Type           | Purpose                                             |
+|----------------|-----------------------------------------------------|
+| `ONull`        | Absence of value                                    |
+| `OBool`        | Boolean true/false                                  |
+| `ONumber`      | Arbitrary-precision integers, rationals, and floats |
+| `OText`        | Text with explicit encoding metadata                |
+| `OChar`        | Single Unicode scalar value                         |
+| `OHtml`        | HTML fragment                                       |
+| `OList`        | Ordered heterogeneous collection                    |
+| `OMap`         | String-keyed value mapping                          |
+| `OSeq`         | Sequence with source-language shape metadata        |
+| `OObject`      | Structural object with deterministic string fields  |
+| `OEntriesMap`  | Map with arbitrary OValue keys                      |
+| `OSet`         | Set preserving ordered/unordered source intent      |
+| `OSymbol`      | Interned symbolic identifier                        |
+| `OKeyword`     | Keyword value                                       |
+| `OScope`       | Detached lexical binding snapshot                   |
+| `OBlob`        | Binary data with MIME type                          |
+| `OBytes`       | Structural byte value                               |
+| `OGraph`       | Value graph frame for shared identity and cycles    |
+| `ONative`      | Language-native capsule with rehydration policy     |
+| `OStorePath`   | Nix store path                                      |
+| `ONixExpr`     | Unevaluated Nix expression                          |
+| `ODerivation`  | Nix derivation                                      |
+| `OExpr`        | Unevaluated O expression                            |
+| `ORequest`     | Deferred computation with compositional fingerprint |
+| `OThunk`       | Captured backend body for Eval requests             |
+| `OGroup`       | Explicit execution topology                         |
+| `OError`       | Captured failed outcome (produced by `batch`)       |
+| `OSystem`      | Live OS/profile reference                           |
+| `OCapability`  | Authority-bearing resource handle                   |
+| `OSnapshot`    | Persistable captured world state                    |
 
 The runtime boundary is intentionally split:
 
