@@ -531,7 +531,7 @@ pub enum OValue {
     /// symlink's target — the currently-active generation — can change at
     /// any time, by:
     ///   - this runtime (via an Activate request)
-    ///   - other Nix tooling running outside O-lang
+    ///   - other Nix tooling running outside Ostadix-lang
     ///   - the user manually rolling back
     ///   - automatic rollbacks (boot-time generation selection)
     ///
