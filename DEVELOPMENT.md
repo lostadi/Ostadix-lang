@@ -1,8 +1,8 @@
-# O-lang Developer Guide
+# Ostadix-lang Developer Guide
 
-*Build, test, architecture, and conventions for working on O-lang.*
+*Build, test, architecture, and conventions for working on Ostadix-lang.*
 
-O-lang is a polyglot meta-language where every expression carries its own evaluator tag: `LANG^( ... )_LANG`. The repo contains two implementations: a **Rust runtime** (`src/`) that is the primary binary, and a **Python reference implementation** (`o_lang/`) used by the Python test suite.
+Ostadix-lang is a polyglot meta-language where every expression carries its own evaluator tag: `LANG^( ... )_LANG`. The repo contains two implementations: a **Rust runtime** (`src/`) that is the primary binary, and a **Python reference implementation** (`o_lang/`) used by the Python test suite.
 
 ---
 

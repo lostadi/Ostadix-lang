@@ -1,4 +1,4 @@
-/// O ◦ Notebook — a Jupyter-style interactive notebook for O-lang.
+/// O ◦ Notebook — a Jupyter-style interactive notebook for Ostadix-lang.
 ///
 /// Launch:  cargo run --features notebook --bin o-notebook [backends_dir]
 /// Opens http://localhost:8888 in your default browser automatically.
@@ -527,7 +527,7 @@ function createCell(code = '') {
         <button class="cbtn del" onclick="deleteCell(${id})" title="Delete">✕</button>
       </div>
     </div>
-    <textarea class="ci" id="ci${id}" placeholder="O-lang expression… (Shift+Enter to run)" spellcheck="false">${esc(code)}</textarea>
+    <textarea class="ci" id="ci${id}" placeholder="Ostadix-lang expression… (Shift+Enter to run)" spellcheck="false">${esc(code)}</textarea>
     <div class="co" id="co${id}"><div class="coi" id="coi${id}"></div></div>
   `;
 

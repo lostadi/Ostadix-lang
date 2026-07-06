@@ -1,8 +1,8 @@
 cff-version: 1.2.0
-message: "If you use O-lang in your research, please cite it as below."
-title: "O-lang (Ouroboros Language): interpreter-as-syntax polyglot metaprogramming"
+message: "If you use Ostadix-lang in your research, please cite it as below."
+title: "Ostadix-lang: interpreter-as-syntax polyglot metaprogramming"
 abstract: >-
-  O-lang (Ouroboros language) is a meta-language in which the evaluator for an
+  Ostadix-lang is a meta-language in which the evaluator for an
   expression is named by its delimiter syntax (LANG^( ... )_LANG), making the
   choice of interpreter a structural, compositional property of the expression
   rather than a global mode. Heterogeneous language blocks nest to arbitrary

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./assets/olang-logo.png" alt="O-lang, Ouroboros Language" width="900" />
+  <img src="./assets/olang-logo.png" alt="Ostadix-lang" width="900" />
 </p>
 
-# O-lang: Ouroboros Language
+# Ostadix-lang
 
 *By Lee Daghlar Ostadi*
 
@@ -11,7 +11,7 @@
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
-O-lang, short for **Ouroboros language**, is a language system built on one
+Ostadix-lang is a language system built on one
 radical idea: the language an expression is written in is a structural part
 of the expression itself, not a file extension, not a global mode switch, not
 a pragma. You write the language name directly around the code, and the
@@ -31,7 +31,7 @@ the syntax that says "evaluate this in Python." The result is an OValue that
 HTML can embed directly, without either side knowing about the other's type
 system.
 
-O-lang now has two computation layers that share one project but do different
+Ostadix-lang now has two computation layers that share one project but do different
 jobs:
 
 1. **O orchestration**, written in `.O` files, composes real hosted languages,
@@ -103,7 +103,7 @@ reference, and creates convenience wrappers:
 
 ```bash
 git clone https://github.com/lostadi/O-lang.git
-cd O-lang
+cd Ostadix-lang
 ./setup.sh
 ```
 
@@ -121,7 +121,7 @@ The script supports several levels of setup:
 `--minimal` skips optional Nix, matplotlib, and extra backend tools. `--full`
 adds optional runtimes such as Racket when the operating system package
 manager provides them. `--verify` runs the hosted implementations after the
-build. Each setup run removes stale generated O-lang binaries before rebuilding
+build. Each setup run removes stale generated Ostadix-lang binaries before rebuilding
 them, refreshes installed Rust copies in `~/.cargo/bin`, and recreates wrappers
 in `~/.local/bin`.
 
@@ -138,7 +138,7 @@ python3 -m o_lang examples/hello.O
 
 ```bash
 git clone https://github.com/lostadi/O-lang.git
-cd O-lang
+cd Ostadix-lang
 cargo build --release
 
 ./target/release/O examples/hello.O backends
@@ -149,7 +149,7 @@ cargo build --release
 ### O-Git semantic receipt demo
 
 The smallest O-Git surface is a one-command receipt demo. It lowers one tiny
-O-lang group pipeline to C, runs the compiled artifact, records what semantic
+Ostadix-lang group pipeline to C, runs the compiled artifact, records what semantic
 structure survived or disappeared, and shows a policy-aware diff:
 
 ```bash
@@ -297,7 +297,7 @@ needs QEMU and the local Rust linker toolchain.
 
 ### Build artifacts and source-only checkout
 
-The repository tracks source, specifications, tests, examples, the O-lang
+The repository tracks source, specifications, tests, examples, the Ostadix-lang
 logo, and the intentional mascot assets. It does not track compiled programs,
 object files, Python bytecode, fuzz crashes, coverage output, virtual
 environments, or compiler caches.
@@ -311,13 +311,13 @@ locations are ignored by Git.
 The ignore rules cover:
 
 - Cargo, cargo-fuzz, C, C++, CMake, linker, profiler, and WebAssembly output.
-- Root-level generated O-lang command binaries and the C17 binaries.
+- Root-level generated Ostadix-lang command binaries and the C17 binaries.
 - Python `__pycache__`, bytecode, virtual environments, test caches, type-check
   caches, lint caches, and coverage output.
 - Default `o-link` output, generated extraction directories, editor state, and
   operating-system metadata.
 
-Uppercase `.O` files are O-lang source and remain trackable. Lowercase `.o`
+Uppercase `.O` files are Ostadix-lang source and remain trackable. Lowercase `.o`
 files are native objects. On case-folding macOS filesystems Git can treat those
 patterns as equivalent, so object rules are scoped to real build directories
 instead of using a global `*.o` rule.
@@ -366,7 +366,7 @@ python3 -m tests.test_evaluator
 ## Table of Contents
 
 1. [What is new here?](#what-is-new-here)
-2. [Related work and how O-lang differs](#related-work-and-how-o-lang-differs)
+2. [Related work and how Ostadix-lang differs](#related-work-and-how-ostadix-lang-differs)
 3. [Gentle introduction](#gentle-introduction)
 4. [Quickstart](#quickstart)
 5. [Hosted language tour](#hosted-language-tour)
@@ -391,7 +391,7 @@ Most languages make one or all of these assumptions:
 * Native systems code and orchestration code must share one intermediate
   representation even though they have different semantics.
 
-O-lang breaks all four assumptions. Here are the five ideas that make it
+Ostadix-lang breaks all four assumptions. Here are the five ideas that make it
 different.
 
 ### 1. Typed parentheses: the language is in the syntax
@@ -400,7 +400,7 @@ In every ordinary language, parentheses are anonymous. `(x + y)` is grouping;
 nothing about the parentheses tells you what evaluator will handle the
 contents.
 
-O-lang gives parentheses a *type*: the identifier before `^(` names the
+Ostadix-lang gives parentheses a *type*: the identifier before `^(` names the
 evaluator, and the matching `)_IDENT` closes it.
 
 ```O
@@ -427,7 +427,7 @@ pairwise FFI. No template bridge. The nesting is the interface.**
 ### 2. OValue: the universal exchange type
 
 When Python produces `42` and HTML needs to embed it, something has to cross
-the boundary. In O-lang that something is always an `OValue`, a tagged union
+the boundary. In Ostadix-lang that something is always an `OValue`, a tagged union
 that every backend speaks.
 
 ```text
@@ -481,13 +481,13 @@ and backend-owned resources survive for the life of the evaluator for every
 expression that names the same `(language, index)` pair. Different indices
 are isolated from one another.
 
-This gives O-lang notebook-like state without making the notebook's one global
+This gives Ostadix-lang notebook-like state without making the notebook's one global
 namespace an invisible part of the language.
 
 ### 4. Homoiconicity across languages
 
 Lisp is famous for homoiconicity: code and data have the same shape, so a
-program can inspect another program, transform it, and evaluate it. O-lang
+program can inspect another program, transform it, and evaluate it. Ostadix-lang
 generalizes that idea across multiple languages.
 
 The `quote^` backend captures an O expression as `OExpr` without evaluating
@@ -540,7 +540,7 @@ Python can also call `O.scope()` to capture the current O bindings or
 
 ### 5. Orchestration and machine computation have different IRs
 
-O-lang does not force every kind of computation into the same abstraction.
+Ostadix-lang does not force every kind of computation into the same abstraction.
 
 Hosted `.O` programs lower into OIR. OIR names text, loads, stores, builtin
 calls, backend execution, structural dependencies, sequencing dependencies,
@@ -557,14 +557,14 @@ machine code.
 .oc -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
 ```
 
-This is the point where O-lang becomes both a polyglot meta-language and a
+This is the point where Ostadix-lang becomes both a polyglot meta-language and a
 systems programming language without pretending those are the same problem.
 
 ---
 
-## Related work and how O-lang differs
+## Related work and how Ostadix-lang differs
 
-O-lang sits at the intersection of language-oriented programming, polyglot
+Ostadix-lang sits at the intersection of language-oriented programming, polyglot
 execution, metaprogramming, workflow systems, and native systems languages.
 The one-sentence thesis is: **the evaluator is named by the delimiter shape,
 so language choice becomes a structural property of an expression at any
@@ -575,42 +575,42 @@ native computation remains in a separate typed compiler pipeline.**
 idea that a program declares its own language and that defining new languages
 should be cheap. The differences are granularity and substrate. `#lang` is a
 module-level declaration, and its languages ultimately run through Racket.
-O-lang places the language tag at expression level and dispatches to separate,
+Ostadix-lang places the language tag at expression level and dispatches to separate,
 real runtimes such as CPython, Nix, Node.js, Rust, SQLite, Racket, and others.
-Racket unifies languages through a common host. O-lang keeps the evaluators
+Racket unifies languages through a common host. Ostadix-lang keeps the evaluators
 distinct and unifies the values that cross between them.
 
 **Polyglot notebooks and literate programming.** Jupyter, .NET Interactive,
-and Org-mode Babel let top-level cells use different languages. O-lang makes a
+and Org-mode Babel let top-level cells use different languages. Ostadix-lang makes a
 language block an expression inside the AST. A Python expression can occur
 inside HTML which occurs inside another Python expression. The boundary is a
 composable node, not only a cell delimiter. The local O notebook is one UI
 over this evaluator, not the definition of the language.
 
 **Staged metaprogramming.** Lisp quotation, MetaOCaml, Template Haskell, and
-Terra all make code available as data. O-lang's generalization is across
+Terra all make code available as data. Ostadix-lang's generalization is across
 backend languages. `OExpr` carries O syntax, `quote^` captures it, and
 `O.eval` re-enters the active evaluator.
 
 **String-embedded DSLs.** Heredocs, JSX, tagged templates, and SQL strings
-usually leave the embedded language opaque to the host. O-lang parses the
+usually leave the embedded language opaque to the host. Ostadix-lang parses the
 typed-expression boundary into its AST, evaluates the named backend, and
 returns an OValue that the surrounding expression consumes as a first-class
 atom.
 
 **Workflow engines.** Deferred requests, content fingerprints, execution
-plans, groups, and autonomous scheduling make O-lang capable of expressing
+plans, groups, and autonomous scheduling make Ostadix-lang capable of expressing
 workflow topology. The difference is that these control values live in the
 same value system as the language results. `batch`, `all`, `any`, and `race`
 are not external scheduler configuration; they are O expressions.
 
 **Systems languages.** C, Rust, Zig, and freestanding subsets of other
 languages already compile kernels. O-core's distinct point is its placement
-inside O-lang's two-level model. Hosted O can generate, compose, build, boot,
+inside Ostadix-lang's two-level model. Hosted O can generate, compose, build, boot,
 and inspect native O-core while O-core itself stays free of the hosted runtime
 and its dependencies.
 
-O-lang is now an implemented toolchain rather than only an organizing idea.
+Ostadix-lang is now an implemented toolchain rather than only an organizing idea.
 The repository contains the parser, evaluator, OValue protocol, persistent
 process registry, OIR and execution planner, scheduler and disk cache, real
 hosted backends, native and WASI packaging, linker and unlinker, notebook,
@@ -639,7 +639,7 @@ programming language is, at bottom, a pair of things:
 Most of the time, you pick one language and use its evaluator for the whole
 file.
 
-O-lang changes the unit at which that choice is made. The evaluator belongs to
+Ostadix-lang changes the unit at which that choice is made. The evaluator belongs to
 the expression:
 
 ```O
@@ -925,7 +925,7 @@ language name at every call site.
 
 ### Backend authority is ambient by default
 
-Hosted source runs as normal O-lang execution, so hosted backends receive every
+Hosted source runs as normal Ostadix-lang execution, so hosted backends receive every
 grantable backend right by default: `fs_read`, `fs_write`, `network`, and
 `process`. A plain block can use the host as directly as the same user could
 from Python, Bash, Nix, or another supported language:
@@ -977,7 +977,7 @@ lexical root.
 
 ### The Nix lattice
 
-O-lang models the Nix and NixOS path as a value chain:
+Ostadix-lang models the Nix and NixOS path as a value chain:
 
 ```text
 nix_expr^(...)_nix_expr -> ONixExpr
@@ -1409,7 +1409,7 @@ cargo run --features notebook --bin o-notebook -- backends
 
 ## Architecture
 
-O-lang has two compiler and execution pipelines with a deliberate boundary
+Ostadix-lang has two compiler and execution pipelines with a deliberate boundary
 between them.
 
 ```text
@@ -1435,7 +1435,7 @@ Native computation
 ### Repository layout
 
 ```text
-O-lang/
+Ostadix-lang/
 ├── src/
 │   ├── main.rs                 # O interpreter and REPL
 │   ├── parser.rs               # hosted typed-parenthesis parser
@@ -1538,7 +1538,7 @@ belong to O-core MIR.
 
 ## O-core native systems language
 
-O-core is the statically typed, ahead-of-time systems member of O-lang. Its
+O-core is the statically typed, ahead-of-time systems member of Ostadix-lang. Its
 first target is `x86_64-unknown-none`, using ELF64, the LP64 data model, and
 the System V AMD64 calling convention.
 
@@ -2030,7 +2030,7 @@ features that are already present:
 - `olangc` bundles the core compatibility adapters by default. Rust-native
   backends do not need adjacent shim files; programs using compatibility
   adapters outside the bundled set can compile with `--shim-dir backends`.
-- Hosted backend policy is intentionally permissive by default: O-lang gives
+- Hosted backend policy is intentionally permissive by default: Ostadix-lang gives
   backend code the host access available to the current process. Restricted
   policies still route through `sandbox-exec` on macOS, and the direct legacy
   Python bridge remains covered by audit-hook tests.
@@ -2075,12 +2075,12 @@ Apache License 2.0. See [LICENSE](LICENSE) for the full text.
 
 ## Citation and authorship
 
-O-lang / ^Olang_ -- the Ouroboros Language -- was created by Lee Daghlar Ostadi.
+Ostadix-lang / ^Ostadix_ was created by Lee Daghlar Ostadi.
 
 If you use, fork, compare, derive from, or discuss this project, cite the
 canonical repository:
 
-    Lee Daghlar Ostadi. O-lang / ^Olang_: the Ouroboros Language.
+    Lee Daghlar Ostadi. Ostadix-lang / ^Ostadix_.
     https://github.com/lostadi/O-lang
 
 Core contribution:

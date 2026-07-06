@@ -8,7 +8,7 @@
 // implements the StorePath → System transition: applying a built NixOS
 // system closure to a profile and switching the live system to it.
 //
-// SAFETY POSTURE: O-lang is a host language, not a sandbox around the host.
+// SAFETY POSTURE: Ostadix-lang is a host language, not a sandbox around the host.
 // A real switch can reach this boundary through Evaluator::exec_activate using
 // the same ambient authority available to Bash in this process environment.
 // Optional profile-scoped SystemActivation capabilities are embedding guards,
