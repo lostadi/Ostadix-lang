@@ -24,13 +24,13 @@ with open("examples/group_pipeline/input.txt", "r", encoding="utf-8") as f:
 )_python{defer,fs_read}
 
 let normalize_data = python{defer}^(
-values = [1, 2, 3, 4, 5]
+values = $load_data
 scale = max(values)
 __oval_result__ = [round(v / scale, 2) for v in values]
 )_python{defer}
 
 let emit_result = python{defer,fs_write}^(
-values = [0.20, 0.40, 0.60, 0.80, 1.00]
+values = $normalize_data
 with open("examples/group_pipeline/output.txt", "w", encoding="utf-8") as f:
     f.write("normalized: " + str(values) + "\n")
 __oval_result__ = "normalized: " + str(values)
@@ -66,13 +66,13 @@ with open("examples/group_pipeline/input.txt", "r", encoding="utf-8") as f:
 )_python{defer,fs_read}
 
 let normalize_data = python{defer}^(
-values = [1, 2, 3, 4, 5]
+values = $load_data
 scale = max(values)
 __oval_result__ = [round(v / scale, 2) for v in values]
 )_python{defer}
 
 let emit_result = python{defer,fs_write}^(
-values = [0.20, 0.40, 0.60, 0.80, 1.00]
+values = $normalize_data
 with open("examples/group_pipeline/output.txt", "w", encoding="utf-8") as f:
     f.write("normalized: " + str(values) + "\n")
 __oval_result__ = "normalized: " + str(values)
@@ -696,6 +696,20 @@ fn semantic_changes(old: &DemoProgram, new: &DemoProgram) -> Vec<SemanticChange>
         });
     }
 
+    if old.intent != new.intent {
+        changes.push(SemanticChange {
+            category: "intent",
+            subject: old.group.clone(),
+            before: old.intent.clone(),
+            after: new.intent.clone(),
+            meaning: "the declared purpose of the group changed".to_string(),
+            implications: vec![
+                "policy, invariant, effects, and steps may be unchanged while the stated reason for the group changed".to_string(),
+                "a receipt taken before and after may match on every other field yet no longer represent the same intent".to_string(),
+            ],
+        });
+    }
+
     changes
 }
 
@@ -1128,13 +1142,19 @@ mod tests {
         let old = parse_demo_program(DEMO_SOURCE).unwrap();
         let new = parse_demo_program(DEMO_EAGER_SOURCE).unwrap();
         let changes = semantic_changes(&old, &new);
-        assert_eq!(changes.len(), 1);
+        assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].category, "policy");
         assert_eq!(changes[0].meaning, "runtime demand model changed");
         assert!(changes[0]
             .implications
             .iter()
             .any(|s| s.contains("file reads may happen before")));
+        assert_eq!(changes[1].category, "intent");
+        assert_eq!(changes[1].before, "normalize only when requested");
+        assert_eq!(
+            changes[1].after,
+            "normalize during construction rather than on demand"
+        );
     }
 
     #[test]
