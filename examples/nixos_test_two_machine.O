@@ -9,8 +9,16 @@
 let lab = nixos_test^({
   name = "o-nixos-two-machine";
   nodes.server = { pkgs, ... }: {
-    services.nginx.enable = true;
     networking.firewall.allowedTCPPorts = [ 80 ];
+    services.nginx = {
+      enable = true;
+      # Explicit vhost required: bare `enable = true` yields no listen sockets
+      # on current nixpkgs (empty virtualHosts), so cross-VM curl gets exit 7.
+      virtualHosts.localhost = {
+        default = true;
+        locations."/".return = "200 'Welcome to nginx'";
+      };
+    };
   };
 
   nodes.client = { pkgs, ... }: {
@@ -18,10 +26,10 @@ let lab = nixos_test^({
   };
 
   testScript = ''
-    server.start()
-    client.start()
-    server.wait_for_unit("nginx")
-    result = client.succeed("curl -sf http://server")
+    start_all()
+    server.wait_for_unit("nginx.service")
+    server.wait_for_open_port(80)
+    result = client.wait_until_succeeds("curl -sf http://server/")
     assert "nginx" in result.lower(), f"unexpected page: {result!r}"
   '';
 })_nixos_test

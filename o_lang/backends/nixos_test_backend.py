@@ -22,12 +22,20 @@ Single-machine example (Milestone E):
 
     let lab = nixos_test^({
       nodes.machine = { pkgs, ... }: {
-        services.nginx.enable = true;
+        environment.systemPackages = [ pkgs.curl ];
+        services.nginx = {
+          enable = true;
+          virtualHosts.localhost = {
+            default = true;
+            locations."/".return = "200 'Welcome to nginx'";
+          };
+        };
       };
       testScript = ''
         machine.start()
-        machine.wait_for_unit("nginx")
-        machine.succeed("curl -s http://localhost | grep nginx")
+        machine.wait_for_unit("nginx.service")
+        machine.wait_for_open_port(80)
+        machine.succeed("curl -sf http://127.0.0.1 | grep -i nginx")
       '';
     })_nixos_test
 
@@ -35,16 +43,23 @@ Two-machine example (Milestone F):
 
     let lab = nixos_test^({
       nodes.server = { pkgs, ... }: {
-        services.nginx.enable = true;
+        networking.firewall.allowedTCPPorts = [ 80 ];
+        services.nginx = {
+          enable = true;
+          virtualHosts.localhost = {
+            default = true;
+            locations."/".return = "200 'Welcome to nginx'";
+          };
+        };
       };
       nodes.client = { pkgs, ... }: {
         environment.systemPackages = [ pkgs.curl ];
       };
       testScript = ''
-        server.start()
-        client.start()
-        server.wait_for_unit("nginx")
-        result = client.succeed("curl -s http://server")
+        start_all()
+        server.wait_for_unit("nginx.service")
+        server.wait_for_open_port(80)
+        result = client.wait_until_succeeds("curl -sf http://server/")
       '';
     })_nixos_test
 
