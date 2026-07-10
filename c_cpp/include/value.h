@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -208,6 +209,10 @@ typedef struct {
 char *owire_cmd_to_json(const OWireCommand *cmd);
 OWireResponse *owire_resp_from_json(const char *json);
 void owire_resp_free(OWireResponse *resp);
+
+/* Length-prefixed CBOR frames (shared wire with Rust / Python shims). */
+bool owire_cmd_write_frame(FILE *out, const OWireCommand *cmd);
+OWireResponse *owire_resp_read_frame(FILE *in);
 
 /* ── Utility: SHA-256 hex digest ──────────────────────────────────────── */
 char *sha256_hex(const char *data, size_t len);

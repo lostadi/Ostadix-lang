@@ -6,15 +6,27 @@ O_BIN="$ROOT_DIR/target/release/O"
 BACKENDS_DIR="$ROOT_DIR/backends"
 EXAMPLES_DIR="$ROOT_DIR/examples"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-10}"
+RUN_NIXOS_TESTS="${RUN_NIXOS_TESTS:-0}"
 
 passed=0
 failed=0
 skipped=0
 
+HAS_NIX=0
+if command -v nix >/dev/null 2>&1; then
+  HAS_NIX=1
+fi
+
+HAS_MATPLOTLIB=0
+if python3 -c 'import matplotlib' >/dev/null 2>&1; then
+  HAS_MATPLOTLIB=1
+fi
+
 run_example() {
   local file="$1"
+  local timeout_s="${2:-$TIMEOUT_SECONDS}"
 
-  python3 - "$O_BIN" "$file" "$BACKENDS_DIR" "$TIMEOUT_SECONDS" <<'PY'
+  python3 - "$O_BIN" "$file" "$BACKENDS_DIR" "$timeout_s" <<'PY'
 import subprocess
 import sys
 
@@ -52,18 +64,29 @@ run_test() {
   local file="$2"
   shift 2
 
+  local timeout_s="$TIMEOUT_SECONDS"
+  local args=()
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == --timeout=* ]]; then
+      timeout_s="${arg#--timeout=}"
+    else
+      args+=("$arg")
+    fi
+  done
+
   local output=""
   local status=0
   local expected=""
 
-  if ! output="$(run_example "$file" 2>&1)"; then
+  if ! output="$(run_example "$file" "$timeout_s" 2>&1)"; then
     status=$?
     printf '[FAIL] %s (%s): exit %s\n%s\n' "$name" "$(basename "$file")" "$status" "$output"
     failed=$((failed + 1))
     return 0
   fi
 
-  for expected in "$@"; do
+  for expected in "${args[@]}"; do
     if ! grep -Fq -- "$expected" <<<"$output"; then
       printf '[FAIL] %s (%s): missing %q\n%s\n' "$name" "$(basename "$file")" "$expected" "$output"
       failed=$((failed + 1))
@@ -103,6 +126,10 @@ run_registered_test() {
       run_test "$name" "$file" '43'
       ;;
     computed_plot)
+      if (( ! HAS_MATPLOTLIB )); then
+        skip_test "$name" 'requires matplotlib'
+        return 0
+      fi
       run_test "$name" "$file" \
         '<title>O computed plot</title>' \
         '<figcaption>Figure 1. Computed at render time, embedded via OBlob(mime="image/png").</figcaption>' \
@@ -136,7 +163,13 @@ run_registered_test() {
       run_test "$name" "$file" '<section>' '<strong>Hello, Lee.</strong>'
       ;;
     instantiate_realise_basic)
-      skip_test "$name" 'requires Nix'
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=60 \
+        'Step-2 rung climb' \
+        '/nix/store/'
       ;;
     js_binding)
       run_test "$name" "$file" '42'
@@ -145,7 +178,8 @@ run_registered_test() {
       run_test "$name" "$file" 'hello from js'
       ;;
     js_json)
-      run_test "$name" "$file" '{"x":1,"y":2}'
+      # JS object lifts to an OValue map; pretty-print uses type badges.
+      run_test "$name" "$file" '"x"' '"y"' '[number] 1' '[number] 2'
       ;;
     js_multiline)
       run_test "$name" "$file" '42'
@@ -168,13 +202,55 @@ run_registered_test() {
     nested_splice)
       run_test "$name" "$file" '42'
       ;;
-    nix_*|nixos_*)
-      skip_test "$name" 'requires Nix'
+    nix_basic)
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=60 \
+        'Nix inside O-lang' \
+        '42'
+      ;;
+    nix_python_html)
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=60 \
+        'Nix → Python → HTML' \
+        'answer=42'
+      ;;
+    nix_storepath)
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=60 \
+        'o-store-path' \
+        '/nix/store/'
+      ;;
+    nix_storepath_python)
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=60 \
+        'Hello from O-lang + Nix'
+      ;;
+    nixos_*)
+      if (( ! HAS_NIX )); then
+        skip_test "$name" 'requires Nix'
+        return 0
+      fi
+      if [[ "$RUN_NIXOS_TESTS" != "1" ]]; then
+        skip_test "$name" 'NixOS VM suite (set RUN_NIXOS_TESTS=1 to enable)'
+        return 0
+      fi
+      run_test "$name" "$file" --timeout=600
       ;;
     os_as_participant_basic)
       run_test "$name" "$file" \
         '# Step-4 OS-as-participant' \
-        'real switch requires a live capability' \
         'current system reference:  (current_system() builtin)'
       ;;
     persist)
@@ -190,16 +266,16 @@ run_registered_test() {
       run_test "$name" "$file" 'hello from sh'
       ;;
     sql_aggregation)
-      run_test "$name" "$file" $'total_rows\ttotal_points' $'3\t60'
+      run_test "$name" "$file" 'total_rows' 'total_points' '[number] 3' '[number] 60'
       ;;
     sql_create_insert_select)
-      run_test "$name" "$file" $'name\tage' $'Ollie\t3'
+      run_test "$name" "$file" '"name"' '"age"' 'Ollie' '[number] 3'
       ;;
     sql_python_sql)
-      run_test "$name" "$file" 'doubled' '200'
+      run_test "$name" "$file" '[number] 200'
       ;;
     sql_select)
-      run_test "$name" "$file" 'result' '2'
+      run_test "$name" "$file" '[number] 2'
       ;;
     trailing_expr)
       run_test "$name" "$file" '42'

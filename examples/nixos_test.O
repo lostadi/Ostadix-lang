@@ -10,13 +10,24 @@
 let lab = nixos_test^({
   name = "o-nixos-basic";
   nodes.machine = { pkgs, ... }: {
-    services.nginx.enable = true;
+    environment.systemPackages = [ pkgs.curl ];
+    services.nginx = {
+      enable = true;
+      # Current nixpkgs does not materialize the documented default vhost when
+      # only `enable = true` is set — without an explicit virtualHost nginx
+      # starts with no listen sockets and curl fails (exit 7).
+      virtualHosts.localhost = {
+        default = true;
+        locations."/".return = "200 'Welcome to nginx'";
+      };
+    };
   };
 
   testScript = ''
     machine.start()
-    machine.wait_for_unit("nginx")
-    machine.succeed("curl -sf http://localhost | grep -i nginx")
+    machine.wait_for_unit("nginx.service")
+    machine.wait_for_open_port(80)
+    machine.succeed("curl -sf http://127.0.0.1 | grep -i nginx")
   '';
 })_nixos_test
 

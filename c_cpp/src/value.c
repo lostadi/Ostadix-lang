@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2487,23 +2488,19 @@ OValue *oval_from_json(const char *json) {
     return out;
 }
 
-OWireResponse *owire_resp_from_json(const char *json) {
-    JsonNode *root = json_parse_document(json);
+static OWireResponse *owire_resp_from_node(const JsonNode *root) {
     OWireResponse *resp;
     const char *status;
 
     if (root == NULL || root->type != JSON_OBJECT) {
-        json_node_free(root);
         return NULL;
     }
     status = json_node_string(json_object_get(root, "status"));
     if (status == NULL) {
-        json_node_free(root);
         return NULL;
     }
     resp = (OWireResponse *)calloc(1U, sizeof(OWireResponse));
     if (resp == NULL) {
-        json_node_free(root);
         return NULL;
     }
     if (strcmp(status, "ok") == 0) {
@@ -2511,43 +2508,697 @@ OWireResponse *owire_resp_from_json(const char *json) {
         resp->value = ovalue_from_json_node(json_object_get(root, "value"));
         if (resp->value == NULL) {
             free(resp);
-            json_node_free(root);
             return NULL;
         }
     } else if (strcmp(status, "err") == 0) {
         const char *message = json_node_string(json_object_get(root, "message"));
         if (message == NULL) {
             free(resp);
-            json_node_free(root);
             return NULL;
         }
         resp->tag = WIRE_RESP_ERR;
         resp->message = dup_cstr(message);
         if (resp->message == NULL) {
             free(resp);
-            json_node_free(root);
             return NULL;
         }
     } else if (strcmp(status, "eval_request") == 0) {
         const char *src = json_node_string(json_object_get(root, "src"));
         if (src == NULL) {
             free(resp);
-            json_node_free(root);
             return NULL;
         }
         resp->tag = WIRE_RESP_EVAL_REQUEST;
         resp->src = dup_cstr(src);
         if (resp->src == NULL) {
             free(resp);
-            json_node_free(root);
             return NULL;
         }
     } else {
         free(resp);
-        json_node_free(root);
         return NULL;
     }
+    return resp;
+}
+
+OWireResponse *owire_resp_from_json(const char *json) {
+    JsonNode *root = json_parse_document(json);
+    OWireResponse *resp;
+
+    if (root == NULL) {
+        return NULL;
+    }
+    resp = owire_resp_from_node(root);
     json_node_free(root);
+    return resp;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Length-prefixed CBOR wire (matches src/wire.rs / o_shim_common.py)     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+#define OWIRE_MAX_FRAME_LEN (128U * 1024U * 1024U)
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+typedef struct {
+    const unsigned char *data;
+    size_t len;
+    size_t pos;
+} CborReader;
+
+static void bytebuf_free(ByteBuf *b) {
+    if (b == NULL) {
+        return;
+    }
+    free(b->buf);
+    b->buf = NULL;
+    b->len = 0U;
+    b->cap = 0U;
+}
+
+static bool bytebuf_reserve(ByteBuf *b, size_t extra) {
+    size_t need;
+    size_t new_cap;
+    unsigned char *nbuf;
+
+    if (b == NULL) {
+        return false;
+    }
+    need = b->len + extra;
+    if (need <= b->cap) {
+        return true;
+    }
+    new_cap = b->cap == 0U ? 64U : b->cap;
+    while (new_cap < need) {
+        if (new_cap > (SIZE_MAX / 2U)) {
+            return false;
+        }
+        new_cap *= 2U;
+    }
+    nbuf = (unsigned char *)realloc(b->buf, new_cap);
+    if (nbuf == NULL) {
+        return false;
+    }
+    b->buf = nbuf;
+    b->cap = new_cap;
+    return true;
+}
+
+static bool bytebuf_push(ByteBuf *b, unsigned char byte) {
+    if (!bytebuf_reserve(b, 1U)) {
+        return false;
+    }
+    b->buf[b->len++] = byte;
+    return true;
+}
+
+static bool bytebuf_append(ByteBuf *b, const void *data, size_t n) {
+    if (n == 0U) {
+        return true;
+    }
+    if (!bytebuf_reserve(b, n)) {
+        return false;
+    }
+    memcpy(b->buf + b->len, data, n);
+    b->len += n;
+    return true;
+}
+
+static bool cbor_encode_type_len(ByteBuf *b, unsigned major, uint64_t length) {
+    unsigned char prefix = (unsigned char)(major << 5);
+
+    if (length <= 23U) {
+        return bytebuf_push(b, (unsigned char)(prefix | (unsigned char)length));
+    }
+    if (length <= 0xffU) {
+        return bytebuf_push(b, (unsigned char)(prefix | 24U)) &&
+               bytebuf_push(b, (unsigned char)length);
+    }
+    if (length <= 0xffffU) {
+        unsigned char raw[2];
+        raw[0] = (unsigned char)((length >> 8) & 0xffU);
+        raw[1] = (unsigned char)(length & 0xffU);
+        return bytebuf_push(b, (unsigned char)(prefix | 25U)) &&
+               bytebuf_append(b, raw, 2U);
+    }
+    if (length <= 0xffffffffULL) {
+        unsigned char raw[4];
+        raw[0] = (unsigned char)((length >> 24) & 0xffU);
+        raw[1] = (unsigned char)((length >> 16) & 0xffU);
+        raw[2] = (unsigned char)((length >> 8) & 0xffU);
+        raw[3] = (unsigned char)(length & 0xffU);
+        return bytebuf_push(b, (unsigned char)(prefix | 26U)) &&
+               bytebuf_append(b, raw, 4U);
+    }
+    {
+        unsigned char raw[8];
+        int i;
+        for (i = 7; i >= 0; --i) {
+            raw[7 - i] = (unsigned char)((length >> (uint64_t)(i * 8)) & 0xffU);
+        }
+        return bytebuf_push(b, (unsigned char)(prefix | 27U)) &&
+               bytebuf_append(b, raw, 8U);
+    }
+}
+
+static bool cbor_encode_text(ByteBuf *b, const char *text) {
+    size_t n = text != NULL ? strlen(text) : 0U;
+    return cbor_encode_type_len(b, 3U, (uint64_t)n) &&
+           bytebuf_append(b, text != NULL ? text : "", n);
+}
+
+static bool cbor_encode_node(ByteBuf *b, const JsonNode *node);
+
+static bool cbor_encode_number_str(ByteBuf *b, const char *num) {
+    char *end = NULL;
+    const char *p;
+    bool is_float = false;
+
+    if (num == NULL || num[0] == '\0') {
+        return false;
+    }
+    for (p = num; *p != '\0'; ++p) {
+        if (*p == '.' || *p == 'e' || *p == 'E') {
+            is_float = true;
+            break;
+        }
+    }
+    if (is_float) {
+        double value = strtod(num, &end);
+        unsigned char raw[8];
+        union {
+            double d;
+            uint64_t u;
+        } conv;
+        int i;
+        if (end == num || *end != '\0') {
+            return false;
+        }
+        conv.d = value;
+        for (i = 7; i >= 0; --i) {
+            raw[7 - i] = (unsigned char)((conv.u >> (uint64_t)(i * 8)) & 0xffU);
+        }
+        return bytebuf_push(b, 0xfbU) && bytebuf_append(b, raw, 8U);
+    }
+    {
+        long long value = strtoll(num, &end, 10);
+        if (end == num || *end != '\0') {
+            return false;
+        }
+        if (value >= 0) {
+            return cbor_encode_type_len(b, 0U, (uint64_t)value);
+        }
+        return cbor_encode_type_len(b, 1U, (uint64_t)(-1LL - value));
+    }
+}
+
+typedef struct {
+    ByteBuf key;
+    ByteBuf value;
+} CborMapEntry;
+
+static int cbor_map_entry_cmp(const void *a, const void *b) {
+    const CborMapEntry *ea = (const CborMapEntry *)a;
+    const CborMapEntry *eb = (const CborMapEntry *)b;
+    size_t n = ea->key.len < eb->key.len ? ea->key.len : eb->key.len;
+    int cmp = 0;
+    if (n > 0U) {
+        cmp = memcmp(ea->key.buf, eb->key.buf, n);
+    }
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (ea->key.len < eb->key.len) {
+        return -1;
+    }
+    if (ea->key.len > eb->key.len) {
+        return 1;
+    }
+    return 0;
+}
+
+static bool cbor_encode_node(ByteBuf *b, const JsonNode *node) {
+    size_t i;
+    size_t count;
+    JsonPair *pair;
+    CborMapEntry *entries = NULL;
+
+    if (b == NULL || node == NULL) {
+        return false;
+    }
+    switch (node->type) {
+        case JSON_NULL:
+            return bytebuf_push(b, 0xf6U);
+        case JSON_BOOL:
+            return bytebuf_push(b, node->u.bool_val ? 0xf5U : 0xf4U);
+        case JSON_NUMBER:
+            return cbor_encode_number_str(b, node->u.str_val);
+        case JSON_STRING:
+            return cbor_encode_text(b, node->u.str_val);
+        case JSON_ARRAY:
+            if (!cbor_encode_type_len(b, 4U, (uint64_t)node->u.array.len)) {
+                return false;
+            }
+            for (i = 0U; i < node->u.array.len; ++i) {
+                if (!cbor_encode_node(b, node->u.array.items[i])) {
+                    return false;
+                }
+            }
+            return true;
+        case JSON_OBJECT:
+            count = 0U;
+            for (pair = node->u.object; pair != NULL; pair = pair->next) {
+                count += 1U;
+            }
+            if (count > 0U) {
+                entries = (CborMapEntry *)calloc(count, sizeof(CborMapEntry));
+                if (entries == NULL) {
+                    return false;
+                }
+            }
+            i = 0U;
+            for (pair = node->u.object; pair != NULL; pair = pair->next) {
+                if (!cbor_encode_text(&entries[i].key, pair->key) ||
+                    !cbor_encode_node(&entries[i].value, pair->value)) {
+                    size_t j;
+                    for (j = 0U; j <= i; ++j) {
+                        bytebuf_free(&entries[j].key);
+                        bytebuf_free(&entries[j].value);
+                    }
+                    free(entries);
+                    return false;
+                }
+                i += 1U;
+            }
+            if (count > 1U) {
+                qsort(entries, count, sizeof(CborMapEntry), cbor_map_entry_cmp);
+            }
+            if (!cbor_encode_type_len(b, 5U, (uint64_t)count)) {
+                for (i = 0U; i < count; ++i) {
+                    bytebuf_free(&entries[i].key);
+                    bytebuf_free(&entries[i].value);
+                }
+                free(entries);
+                return false;
+            }
+            for (i = 0U; i < count; ++i) {
+                if (!bytebuf_append(b, entries[i].key.buf, entries[i].key.len) ||
+                    !bytebuf_append(b, entries[i].value.buf, entries[i].value.len)) {
+                    size_t j;
+                    for (j = 0U; j < count; ++j) {
+                        bytebuf_free(&entries[j].key);
+                        bytebuf_free(&entries[j].value);
+                    }
+                    free(entries);
+                    return false;
+                }
+                bytebuf_free(&entries[i].key);
+                bytebuf_free(&entries[i].value);
+            }
+            free(entries);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool cbor_read_exact(CborReader *r, void *out, size_t n) {
+    if (r == NULL || r->pos + n > r->len) {
+        return false;
+    }
+    if (n > 0U && out != NULL) {
+        memcpy(out, r->data + r->pos, n);
+    }
+    r->pos += n;
+    return true;
+}
+
+static bool cbor_read_u8(CborReader *r, unsigned char *out) {
+    return cbor_read_exact(r, out, 1U);
+}
+
+static bool cbor_read_len(CborReader *r, unsigned additional, uint64_t *out) {
+    unsigned char buf[8];
+    size_t n;
+    size_t i;
+    uint64_t value = 0U;
+
+    if (additional <= 23U) {
+        *out = additional;
+        return true;
+    }
+    if (additional == 24U) {
+        n = 1U;
+    } else if (additional == 25U) {
+        n = 2U;
+    } else if (additional == 26U) {
+        n = 4U;
+    } else if (additional == 27U) {
+        n = 8U;
+    } else {
+        return false;
+    }
+    if (!cbor_read_exact(r, buf, n)) {
+        return false;
+    }
+    for (i = 0U; i < n; ++i) {
+        value = (value << 8) | (uint64_t)buf[i];
+    }
+    *out = value;
+    return true;
+}
+
+static JsonNode *cbor_decode_node(CborReader *r) {
+    unsigned char initial = 0U;
+    unsigned major;
+    unsigned additional;
+    uint64_t length = 0U;
+    JsonNode *node;
+
+    if (!cbor_read_u8(r, &initial)) {
+        return NULL;
+    }
+    major = (unsigned)(initial >> 5);
+    additional = (unsigned)(initial & 0x1fU);
+
+    if (major == 0U) {
+        char num[32];
+        if (!cbor_read_len(r, additional, &length)) {
+            return NULL;
+        }
+        node = json_node_new(JSON_NUMBER);
+        if (node == NULL) {
+            return NULL;
+        }
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)length);
+        node->u.str_val = dup_cstr(num);
+        if (node->u.str_val == NULL) {
+            json_node_free(node);
+            return NULL;
+        }
+        return node;
+    }
+    if (major == 1U) {
+        char num[32];
+        long long value;
+        if (!cbor_read_len(r, additional, &length)) {
+            return NULL;
+        }
+        value = -1LL - (long long)length;
+        node = json_node_new(JSON_NUMBER);
+        if (node == NULL) {
+            return NULL;
+        }
+        snprintf(num, sizeof(num), "%lld", value);
+        node->u.str_val = dup_cstr(num);
+        if (node->u.str_val == NULL) {
+            json_node_free(node);
+            return NULL;
+        }
+        return node;
+    }
+    if (major == 2U) {
+        /* Bytes → not expected on command wire; reject. */
+        if (!cbor_read_len(r, additional, &length) || length > OWIRE_MAX_FRAME_LEN) {
+            return NULL;
+        }
+        if (!cbor_read_exact(r, NULL, (size_t)length)) {
+            return NULL;
+        }
+        return NULL;
+    }
+    if (major == 3U) {
+        char *text;
+        if (!cbor_read_len(r, additional, &length) || length > OWIRE_MAX_FRAME_LEN) {
+            return NULL;
+        }
+        text = (char *)malloc((size_t)length + 1U);
+        if (text == NULL) {
+            return NULL;
+        }
+        if (length > 0U && !cbor_read_exact(r, text, (size_t)length)) {
+            free(text);
+            return NULL;
+        }
+        text[length] = '\0';
+        node = json_node_new(JSON_STRING);
+        if (node == NULL) {
+            free(text);
+            return NULL;
+        }
+        node->u.str_val = text;
+        return node;
+    }
+    if (major == 4U) {
+        size_t i;
+        if (!cbor_read_len(r, additional, &length) || length > OWIRE_MAX_FRAME_LEN) {
+            return NULL;
+        }
+        node = json_node_new(JSON_ARRAY);
+        if (node == NULL) {
+            return NULL;
+        }
+        for (i = 0U; i < (size_t)length; ++i) {
+            JsonNode *item = cbor_decode_node(r);
+            JsonNode **new_items;
+            if (item == NULL) {
+                json_node_free(node);
+                return NULL;
+            }
+            if (node->u.array.len == node->u.array.cap) {
+                size_t new_cap = node->u.array.cap == 0U ? 4U : node->u.array.cap * 2U;
+                new_items = (JsonNode **)realloc(node->u.array.items, new_cap * sizeof(JsonNode *));
+                if (new_items == NULL) {
+                    json_node_free(item);
+                    json_node_free(node);
+                    return NULL;
+                }
+                node->u.array.items = new_items;
+                node->u.array.cap = new_cap;
+            }
+            node->u.array.items[node->u.array.len++] = item;
+        }
+        return node;
+    }
+    if (major == 5U) {
+        size_t i;
+        JsonPair **tail;
+        if (!cbor_read_len(r, additional, &length) || length > OWIRE_MAX_FRAME_LEN) {
+            return NULL;
+        }
+        node = json_node_new(JSON_OBJECT);
+        if (node == NULL) {
+            return NULL;
+        }
+        tail = &node->u.object;
+        for (i = 0U; i < (size_t)length; ++i) {
+            JsonNode *key_node = cbor_decode_node(r);
+            JsonNode *value_node;
+            JsonPair *pair;
+            if (key_node == NULL || key_node->type != JSON_STRING || key_node->u.str_val == NULL) {
+                json_node_free(key_node);
+                json_node_free(node);
+                return NULL;
+            }
+            value_node = cbor_decode_node(r);
+            if (value_node == NULL) {
+                json_node_free(key_node);
+                json_node_free(node);
+                return NULL;
+            }
+            pair = (JsonPair *)calloc(1U, sizeof(JsonPair));
+            if (pair == NULL) {
+                json_node_free(key_node);
+                json_node_free(value_node);
+                json_node_free(node);
+                return NULL;
+            }
+            pair->key = key_node->u.str_val;
+            key_node->u.str_val = NULL;
+            json_node_free(key_node);
+            pair->value = value_node;
+            *tail = pair;
+            tail = &pair->next;
+        }
+        return node;
+    }
+    if (major == 7U) {
+        if (additional == 20U) {
+            node = json_node_new(JSON_BOOL);
+            if (node != NULL) {
+                node->u.bool_val = false;
+            }
+            return node;
+        }
+        if (additional == 21U) {
+            node = json_node_new(JSON_BOOL);
+            if (node != NULL) {
+                node->u.bool_val = true;
+            }
+            return node;
+        }
+        if (additional == 22U) {
+            return json_node_new(JSON_NULL);
+        }
+        if (additional == 26U) {
+            unsigned char raw[4];
+            union {
+                float f;
+                uint32_t u;
+            } conv;
+            char num[64];
+            if (!cbor_read_exact(r, raw, 4U)) {
+                return NULL;
+            }
+            conv.u = ((uint32_t)raw[0] << 24) | ((uint32_t)raw[1] << 16) |
+                     ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
+            node = json_node_new(JSON_NUMBER);
+            if (node == NULL) {
+                return NULL;
+            }
+            snprintf(num, sizeof(num), "%.9g", (double)conv.f);
+            node->u.str_val = dup_cstr(num);
+            if (node->u.str_val == NULL) {
+                json_node_free(node);
+                return NULL;
+            }
+            return node;
+        }
+        if (additional == 27U) {
+            unsigned char raw[8];
+            union {
+                double d;
+                uint64_t u;
+            } conv;
+            char num[64];
+            size_t i;
+            if (!cbor_read_exact(r, raw, 8U)) {
+                return NULL;
+            }
+            conv.u = 0U;
+            for (i = 0U; i < 8U; ++i) {
+                conv.u = (conv.u << 8) | (uint64_t)raw[i];
+            }
+            node = json_node_new(JSON_NUMBER);
+            if (node == NULL) {
+                return NULL;
+            }
+            snprintf(num, sizeof(num), "%.17g", conv.d);
+            node->u.str_val = dup_cstr(num);
+            if (node->u.str_val == NULL) {
+                json_node_free(node);
+                return NULL;
+            }
+            return node;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+bool owire_cmd_write_frame(FILE *out, const OWireCommand *cmd) {
+    char *json = NULL;
+    JsonNode *root = NULL;
+    ByteBuf payload = {0};
+    unsigned char header[4];
+    bool ok = false;
+
+    if (out == NULL || cmd == NULL) {
+        return false;
+    }
+    json = owire_cmd_to_json(cmd);
+    if (json == NULL) {
+        return false;
+    }
+    root = json_parse_document(json);
+    free(json);
+    if (root == NULL) {
+        return false;
+    }
+    if (!cbor_encode_node(&payload, root) || payload.len > OWIRE_MAX_FRAME_LEN) {
+        goto done;
+    }
+    header[0] = (unsigned char)((payload.len >> 24) & 0xffU);
+    header[1] = (unsigned char)((payload.len >> 16) & 0xffU);
+    header[2] = (unsigned char)((payload.len >> 8) & 0xffU);
+    header[3] = (unsigned char)(payload.len & 0xffU);
+    if (fwrite(header, 1U, 4U, out) != 4U) {
+        goto done;
+    }
+    if (payload.len > 0U && fwrite(payload.buf, 1U, payload.len, out) != payload.len) {
+        goto done;
+    }
+    if (fflush(out) != 0) {
+        goto done;
+    }
+    ok = true;
+
+done:
+    json_node_free(root);
+    bytebuf_free(&payload);
+    return ok;
+}
+
+static bool read_exact_file(FILE *in, void *buf, size_t n) {
+    size_t got = 0U;
+    unsigned char *p = (unsigned char *)buf;
+
+    while (got < n) {
+        size_t chunk = fread(p + got, 1U, n - got, in);
+        if (chunk == 0U) {
+            return false;
+        }
+        got += chunk;
+    }
+    return true;
+}
+
+OWireResponse *owire_resp_read_frame(FILE *in) {
+    unsigned char header[4];
+    size_t length;
+    unsigned char *payload = NULL;
+    CborReader reader;
+    JsonNode *root = NULL;
+    OWireResponse *resp = NULL;
+
+    if (in == NULL) {
+        return NULL;
+    }
+    if (!read_exact_file(in, header, 4U)) {
+        return NULL;
+    }
+    length = ((size_t)header[0] << 24) | ((size_t)header[1] << 16) |
+             ((size_t)header[2] << 8) | (size_t)header[3];
+    if (length > OWIRE_MAX_FRAME_LEN) {
+        return NULL;
+    }
+    if (length > 0U) {
+        payload = (unsigned char *)malloc(length);
+        if (payload == NULL) {
+            return NULL;
+        }
+        if (!read_exact_file(in, payload, length)) {
+            free(payload);
+            return NULL;
+        }
+    }
+    reader.data = payload;
+    reader.len = length;
+    reader.pos = 0U;
+    root = cbor_decode_node(&reader);
+    if (root == NULL || reader.pos != reader.len) {
+        json_node_free(root);
+        free(payload);
+        return NULL;
+    }
+    resp = owire_resp_from_node(root);
+    json_node_free(root);
+    free(payload);
     return resp;
 }
 

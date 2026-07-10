@@ -172,52 +172,32 @@ void olang_backend_process_send_command(OBackendProcess *bp, const OWireCommand 
         fprintf(stderr, "process: send_command on dead process\n");
         return;
     }
-    char *json = owire_cmd_to_json(cmd);
-    if (!json) {
-        fprintf(stderr, "process: failed to serialize command\n");
-        return;
+    if (!owire_cmd_write_frame(p->stdin_file, cmd)) {
+        fprintf(stderr, "process: failed to write CBOR wire frame to shim\n");
+        p->alive = false;
     }
-    if (fprintf(p->stdin_file, "%s\n", json) < 0) {
-        perror("fprintf to shim");
-    }
-    fflush(p->stdin_file);
-    free(json);
 }
 
 OExecStep olang_backend_process_recv_step(OBackendProcess *bp) {
     BackendProcessImpl *p = (BackendProcessImpl *)bp;
     OExecStep step = {0};
+    OWireResponse *resp;
     if (!p || !p->alive || !p->stdout_file) {
         step.kind = EXEC_STEP_DONE;
         return step;
     }
 
-    char *line = NULL;
-    size_t cap = 0;
     errno = 0;
-    ssize_t n = getline(&line, &cap, p->stdout_file);
-    if (n < 0) {
-        free(line);
-        if (errno == 0) {
+    resp = owire_resp_read_frame(p->stdout_file);
+    if (!resp) {
+        if (feof(p->stdout_file)) {
             fprintf(stderr, "process: shim closed stdout\n");
+        } else if (errno != 0) {
+            perror("read shim frame");
         } else {
-            perror("getline shim");
+            fprintf(stderr, "process: bad CBOR frame from shim\n");
         }
         p->alive = false;
-        step.kind = EXEC_STEP_DONE;
-        return step;
-    }
-    if (n == 0) {
-        free(line);
-        p->alive = false;
-        step.kind = EXEC_STEP_DONE;
-        return step;
-    }
-
-    OWireResponse *resp = owire_resp_from_json(line);
-    free(line);
-    if (!resp) {
-        fprintf(stderr, "process: bad JSON from shim\n");
         step.kind = EXEC_STEP_DONE;
         return step;
     }

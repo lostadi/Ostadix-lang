@@ -143,10 +143,26 @@ def test_backslash_escaped_closer_is_literal_in_python():
     assert v.value == ")_python"
 
 
+def _matplotlib_available() -> bool:
+    try:
+        import matplotlib  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def test_example_files_parse_and_eval():
     root = Path(__file__).resolve().parents[1] / "examples"
+    has_matplotlib = _matplotlib_available()
     for p in sorted(root.glob("*.O")):
-        if not _nix_available() and p.name.startswith(("nix_", "nixos_")):
+        if not _nix_available() and (
+            p.name.startswith(("nix_", "nixos_")) or p.name == "instantiate_realise_basic.O"
+        ):
+            continue
+        if p.name.startswith("nixos_"):
+            # Heavy multi-machine VM demos — not part of the unit suite.
+            continue
+        if p.name == "computed_plot.O" and not has_matplotlib:
             continue
         src = p.read_text(encoding="utf-8")
         v = run(src)
@@ -348,7 +364,7 @@ def test_nix_to_html():
         print("  (skipping nix->html test -- nix not installed)")
         return
     v = run('html^(<p>nix^(40 + 2)_nix</p>)_html')
-    assert isinstance(v, OStr)
+    assert isinstance(v, OHtml)
     assert "42" in v.value
 
 
