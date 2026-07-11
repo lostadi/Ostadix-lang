@@ -162,11 +162,14 @@ fn materialize_bounded_outputs(graph: &mut HGraph, edge: &HEdge, value: &BigInt)
 }
 
 pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {
-    if from_lang == to_lang {
-        return Fidelity::Lossless;
-    }
+    // Native values are process-bound: two evaluators with the same canonical
+    // language name are not interchangeable processes, so the Native check
+    // must precede the same-language shortcut.
     if matches!(node.value, Some(OValue::Native { .. })) {
         return Fidelity::NativeCapsule;
+    }
+    if from_lang == to_lang {
+        return Fidelity::Lossless;
     }
     if let Some(value) = &node.value {
         return fidelity_for_value(value, to_lang);

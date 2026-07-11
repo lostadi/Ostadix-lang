@@ -194,9 +194,9 @@ autonomous disk-cached scheduler.
 ## Backend Shims
 
 Each supported language has a shim script in `backends/` that:
-- Reads JSON input from stdin
+- Reads length-prefixed canonical CBOR input from stdin
 - Evaluates the expression in the target language
-- Writes JSON output to stdout
+- Writes length-prefixed canonical CBOR output to stdout
 
 Python shims run under an audit policy derived from the validated capability.
 On macOS the shim also runs under an operating-system sandbox profile. Bash,
