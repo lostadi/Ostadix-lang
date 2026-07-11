@@ -50,7 +50,7 @@ src/
 
 ### Backend shims (`backends/`)
 
-Each language is a separate subprocess (Python script or executable). The Rust runtime communicates with shims via **newline-delimited JSON IPC**:
+Each language is a separate subprocess (Python script or executable). The Rust runtime communicates with shims via **length-prefixed canonical CBOR frames** (deterministic map ordering, definite lengths, bounded frame size; see `src/wire.rs` and `backends/o_shim_common.py`):
 
 - Runtime → shim: `OWireCommand` (`exec` / `cleanup` / `ping`)
 - Shim → runtime: `OWireResponse` (`{"status":"ok","value":{...}}` or `{"status":"err","message":"..."}`)
@@ -69,7 +69,7 @@ Five-file structure: `ovalue.py` (OValue types), `parser.py` (typed-paren parser
 
 ### OValue wire format
 
-Every value crossing a language boundary is an `OValue`. JSON encoding uses a `t` discriminant:
+Every value crossing a language boundary is an `OValue`. The wire encoding is canonical CBOR whose logical structure uses a `t` discriminant (shown here in JSON notation):
 
 ```json
 {"t":"null"}
@@ -114,6 +114,6 @@ Top-level `let name = LANG^(...)_LANG` binds the result to `$name` for use via `
 
 ## Tests
 
-- Rust unit tests: inline in `src/value.rs` under `#[cfg(test)]`—cover OValue JSON round-trips and wire protocol correctness.
+- Rust unit tests: inline in `src/value.rs` under `#[cfg(test)]`—cover OValue round-trips and wire protocol correctness.
 - Python unit tests: `tests/test_parser.py` and `tests/test_evaluator.py`—cover the Python reference implementation. Run with `python -m tests.test_parser` (not `pytest`).
 - Integration tests: `test_o_lang_examples.sh`—runs `cargo run` against `.O` files in `examples/` and greps expected output.
