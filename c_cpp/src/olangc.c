@@ -195,6 +195,7 @@ static char *read_text_file(const char *path) {
 
 /* Very small embedded shim table for standalone (python is critical) */
 static const char *SHIM_NAMES[] = {
+    "o_shim_common.py",
     "python_shim.py",
     "nix_shim.py",
     "nix_store_shim.py",
@@ -374,7 +375,9 @@ int main(int argc, char **argv) {
     /* compile */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "cd %s && %s -std=c17 -Wall -O2 -I../include -I. -pthread "
+        "cd %s && %s -std=c17 -Wall -O2 "
+        "-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 "
+        "-I../include -I. -pthread "
         "value.c parser.c process.c eval.c scheduler.c "
         "nix_ops.c nixos_ops.c generated_main.c -o prog 2>&1",
         srcdir, getenv("CC") ? getenv("CC") : "cc");

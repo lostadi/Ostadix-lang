@@ -237,7 +237,8 @@ Two additional system-facing forms freeze the runtime boundary:
   (for example a system generation, service state, or filesystem view). It is
   the persistable counterpart to live references such as `OSystem`.
 
-The Rust runtime uses the JSON wire format with a `"t"` discriminant:
+The Rust runtime uses length-prefixed canonical CBOR on the wire; the logical
+message shape uses a `"t"` discriminant (shown below in JSON notation):
 
 | Tag           | Wire form                                    | Notes                                 |
 |---------------|----------------------------------------------|---------------------------------------|
