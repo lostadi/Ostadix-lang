@@ -1203,14 +1203,18 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Default,
         ExecutionMode::InlineValue,
     ),
-    // Declarative / pure-by-default languages.
+    // SQL keeps a persistent SQLite connection per environment (see
+    // backends/sql_shim.py), so blocks can create and mutate state that the
+    // `{lazy}` fingerprint does not capture. It must stay impure until the
+    // database snapshot/revision participates in the request identity.
     BackendSpec::new(
         "sql",
         &[],
-        true,
+        false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
     ),
+    // Declarative / pure-by-default languages.
     BackendSpec::with_authority(
         "haskell",
         &[],
@@ -1582,7 +1586,6 @@ mod tests {
             "markdown",
             "latex",
             "text",
-            "sql",
             "haskell",
             "ocaml",
             "webassembly",
@@ -1598,6 +1601,7 @@ mod tests {
             "java",
             "javascript",
             "ruby",
+            "sql",
             "O",
             "quote",
             "cobol",

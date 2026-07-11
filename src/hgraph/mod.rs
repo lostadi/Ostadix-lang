@@ -295,4 +295,44 @@ mod tests {
             .unwrap_err()
             .contains("cycle"));
     }
+
+    #[test]
+    fn same_language_native_value_is_not_lossless() {
+        use crate::value::{
+            NativeBoundary, NativeCodecSafety, NativeIdentity, ONative, RehydratePolicy,
+        };
+
+        let mut node = HNode::fresh();
+        node.value = Some(OValue::Native {
+            v: ONative {
+                lang: "python".into(),
+                implementation: None,
+                version: None,
+                type_name: "socket".into(),
+                identity: NativeIdentity {
+                    stable: None,
+                    live: Some("handle-1".into()),
+                },
+                codec: "opaque".into(),
+                payload: None,
+                boundary: NativeBoundary::Effectful,
+                safety: NativeCodecSafety::LiveHandle,
+                capabilities: Vec::new(),
+                metadata: Default::default(),
+                rehydrate: RehydratePolicy::SameProcess,
+            },
+        });
+
+        // Two evaluators sharing the canonical language name are not the same
+        // process: a process-bound native value must never be classified as a
+        // lossless same-language crossing.
+        assert_eq!(
+            solve::fidelity_for(&node, "python", "python"),
+            Fidelity::NativeCapsule
+        );
+        assert_eq!(
+            solve::fidelity_for(&node, "python", "rust"),
+            Fidelity::NativeCapsule
+        );
+    }
 }
