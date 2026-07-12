@@ -1682,9 +1682,10 @@ impl Evaluator {
                 BlockEvalPolicy::Lazy => {
                     if lang == "nix_expr" {
                         bail!(
-                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ is already \
-                             lazy. Use bare nix_expr^, or use nix{{lazy}}^ if you \
-                             want a generic deferred Nix eval."
+                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ already \
+                             captures its expression lazily. Use bare nix_expr^ for \
+                             a captured Nix expression, or nix{{defer}}^ for a \
+                             non-cacheable deferred raw Nix evaluation."
                         );
                     }
                     if !backend.pure {
@@ -4561,19 +4562,16 @@ mod tests {
         );
     }
 
-    /// {lazy} on a pure backend (nix) returns a Request[Eval] without
-    /// invoking the shim. The Thunk inside carries body + deps.
+    /// {lazy} on a cache-safe inline backend (html) returns a Request[Eval]
+    /// without executing. The Thunk inside carries body + deps.
     #[test]
     fn lazy_attr_on_pure_backend_produces_eval_request() {
         let mut e = Evaluator::new("/tmp".into());
-        let capability = e
-            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
-            .unwrap();
-        let scope = HashMap::from([("runner".into(), capability)]);
+        let scope = HashMap::new();
         let block = ONode::TypedExpr {
-            lang: "nix".into(),
+            lang: "html".into(),
             env_id: u32::MAX,
-            attr: Some("lazy,cap=runner".into()),
+            attr: Some("lazy".into()),
             body: vec![ONode::RawText("1 + 2".into())],
         };
         let result = e.eval_node(&block, &scope).unwrap();
@@ -4585,7 +4583,7 @@ mod tests {
                     cacheable,
                     ..
                 } => {
-                    assert_eq!(lang, "nix");
+                    assert_eq!(lang, "html");
                     assert!(*cacheable, "{{lazy}} must produce cacheable=true");
                 }
                 other => panic!("expected RequestKind::Eval, got {:?}", other),
@@ -4596,6 +4594,73 @@ mod tests {
             }
         } else {
             panic!("expected Request, got {:?}", result);
+        }
+    }
+
+    /// `sql{lazy}^(...)_sql{lazy}` is rejected before any shim execution:
+    /// each SQL environment owns mutable persistent SQLite state that the
+    /// generic `{lazy}` cache fingerprint does not capture. The error must
+    /// suggest `{defer}`.
+    #[test]
+    fn lazy_attr_on_stateful_sql_backend_is_rejected() {
+        let mut e = Evaluator::new("/definitely/missing/shims".into());
+        let scope = HashMap::new();
+        let block = ONode::TypedExpr {
+            lang: "sql".into(),
+            env_id: u32::MAX,
+            attr: Some("lazy".into()),
+            body: vec![ONode::RawText("SELECT 1;".into())],
+        };
+        let err = e.eval_node(&block, &scope).unwrap_err().to_string();
+        assert!(
+            err.contains("not a pure backend"),
+            "sql{{lazy}} must be rejected for cache-safety, got: {err}"
+        );
+        assert!(
+            err.contains("defer"),
+            "error must suggest {{defer}}, got: {err}"
+        );
+        assert!(
+            !err.contains("failed to spawn backend shim"),
+            "rejection must happen before shim execution, got: {err}"
+        );
+    }
+
+    /// Every unrestricted shim-backed external backend rejects `{lazy}`
+    /// before shim execution — no backend runtime needs to be installed
+    /// for this table to hold.
+    #[test]
+    fn lazy_attr_on_unrestricted_external_backends_is_rejected() {
+        for lang in [
+            "nix",
+            "nix_store",
+            "nixos_test",
+            "haskell",
+            "ocaml",
+            "webassembly",
+            "sql",
+        ] {
+            let mut e = Evaluator::new("/definitely/missing/shims".into());
+            let scope = HashMap::new();
+            let block = ONode::TypedExpr {
+                lang: lang.to_string(),
+                env_id: u32::MAX,
+                attr: Some("lazy".into()),
+                body: vec![ONode::RawText("body".into())],
+            };
+            let err = e.eval_node(&block, &scope).unwrap_err().to_string();
+            assert!(
+                err.contains("not a pure backend"),
+                "{lang}{{lazy}} must be rejected, got: {err}"
+            );
+            assert!(
+                err.contains("defer"),
+                "{lang}{{lazy}} rejection must suggest {{defer}}, got: {err}"
+            );
+            assert!(
+                !err.contains("failed to spawn backend shim"),
+                "{lang}{{lazy}} rejection must precede shim execution, got: {err}"
+            );
         }
     }
 
@@ -4794,20 +4859,17 @@ mod tests {
         assert!(err.contains("Known attributes"));
     }
 
-    /// now() on a {lazy} Eval request fires the shim. We seed the cache
-    /// directly to verify the cache-hit path without spawning a real shim.
+    /// now() on a {lazy} Eval request returns the cached value. We seed the
+    /// cache directly to verify the cache-hit path.
     #[test]
     fn now_on_lazy_eval_request_returns_cached_value() {
         let mut e = Evaluator::new("/tmp".into());
-        let capability = e
-            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
-            .unwrap();
-        let scope = HashMap::from([("runner".into(), capability)]);
+        let scope = HashMap::new();
 
         let block = ONode::TypedExpr {
-            lang: "nix".into(),
+            lang: "html".into(),
             env_id: u32::MAX,
-            attr: Some("lazy,cap=runner".into()),
+            attr: Some("lazy".into()),
             body: vec![ONode::RawText("3 + 4".into())],
         };
         let req = e.eval_node(&block, &scope).unwrap();
@@ -4871,16 +4933,14 @@ mod tests {
     #[test]
     fn splice_auto_forces_lazy_eval_request() {
         let mut e = Evaluator::new("/tmp".into());
-        let capability = e
-            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
-            .unwrap();
-        let mut scope = HashMap::from([("runner".into(), capability)]);
+        let mut scope = HashMap::new();
 
-        // Construct a {lazy} nix block, find its fingerprint, seed the cache.
+        // Construct a {lazy} block on a cache-safe inline backend, find its
+        // fingerprint, seed the cache.
         let lazy_block = ONode::TypedExpr {
-            lang: "nix".into(),
+            lang: "text".into(),
             env_id: u32::MAX,
-            attr: Some("lazy,cap=runner".into()),
+            attr: Some("lazy".into()),
             body: vec![ONode::RawText("123".into())],
         };
         let req = e.eval_node(&lazy_block, &scope).unwrap();
@@ -5643,41 +5703,40 @@ python[0]^(O.eval($q, $captured))_python[0]
         );
     }
 
-    /// Under autonomous(), Eval requests (nix^{lazy}^()_nix) are executed
-    /// eagerly, bypassing the buffer. The buffer only collects Nix-family requests.
+    /// Under autonomous(), Eval requests ({lazy} blocks on cache-safe
+    /// backends) are executed eagerly, bypassing the buffer. The buffer only
+    /// collects Nix-family requests.
     #[test]
     fn autonomous_eval_requests_are_executed_eagerly() {
         let mut e = Evaluator::new("/tmp".into());
-        let capability = e
-            .issue_backend_execution_capability("nix", BackendAuthority::ALL)
-            .unwrap();
-        let scope = HashMap::from([("runner".into(), capability)]);
+        let scope = HashMap::new();
 
-        // Construct an Eval Request (nix {lazy} block) — this should go
-        // through the Evaluator's eval_cache, not the scheduler buffer.
-        let lazy_nix = ONode::TypedExpr {
-            lang: "nix".into(),
+        // Construct an Eval Request ({lazy} block on a cache-safe inline
+        // backend) — this should go through the Evaluator's eval_cache,
+        // not the scheduler buffer.
+        let lazy_block = ONode::TypedExpr {
+            lang: "html".into(),
             env_id: u32::MAX,
-            attr: Some("lazy,cap=runner".into()),
+            attr: Some("lazy".into()),
             body: vec![ONode::RawText("1 + 2".into())],
         };
         // First, collect the fingerprint to seed the eval_cache.
-        let req = e.eval_node(&lazy_nix, &scope).unwrap();
+        let req = e.eval_node(&lazy_block, &scope).unwrap();
         let fp = match &req {
             OValue::Request { fingerprint, .. } => fingerprint.clone(),
             _ => panic!(),
         };
         e.eval_cache.insert(fp.clone(), OValue::int(3));
 
-        // Now call autonomous() wrapping another {lazy} nix block for the same expression.
+        // Now call autonomous() wrapping another {lazy} block for the same expression.
         let call = ONode::Call {
             fn_name: "autonomous".into(),
             args: vec![ONode::Call {
                 fn_name: "now".into(),
                 args: vec![ONode::TypedExpr {
-                    lang: "nix".into(),
+                    lang: "html".into(),
                     env_id: u32::MAX,
-                    attr: Some("lazy,cap=runner".into()),
+                    attr: Some("lazy".into()),
                     body: vec![ONode::RawText("1 + 2".into())],
                 }],
             }],

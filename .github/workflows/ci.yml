@@ -10,7 +10,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  # ── Rust authoritative runtime ─────────────────────────────────────────────
+  rust:
+    name: Rust authoritative runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,3 +51,64 @@ jobs:
 
       - name: Clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ── Python reference runtime ───────────────────────────────────────────────
+  python:
+    name: Python reference runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Parser tests
+        run: python3 -m tests.test_parser
+
+      - name: Evaluator tests
+        run: python3 -m tests.test_evaluator
+
+      - name: Byte-compile all Python sources
+        run: python3 -m compileall -q o_lang backends tests
+
+  # ── C17 runtime and AOT compiler ───────────────────────────────────────────
+  c17:
+    name: C17 runtime and AOT compiler
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make clean
+        run: make -C c_cpp clean
+
+      - name: Make build (interpreter + olangc)
+        run: make -C c_cpp
+
+      - name: Make interpreter smoke tests (incl. meta_eval quote/O.eval)
+        run: make -C c_cpp test
+
+      - name: Make AOT compiler smoke tests
+        run: make -C c_cpp olangc-test
+
+      - name: CMake configure (clean out-of-source build)
+        run: |
+          rm -rf "${{ runner.temp }}/olang-cmake-build"
+          cmake -S c_cpp -B "${{ runner.temp }}/olang-cmake-build" -DCMAKE_BUILD_TYPE=Release
+
+      - name: CMake build
+        run: cmake --build "${{ runner.temp }}/olang-cmake-build" --parallel
+
+      - name: CTest smoke tests (interpreter + AOT, incl. meta_eval quote/O.eval)
+        run: ctest --test-dir "${{ runner.temp }}/olang-cmake-build" --output-on-failure
+
+  # ── Release-claim regression guard ─────────────────────────────────────────
+  release-claims:
+    name: Release-claim guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check active docs for stale claims
+        run: bash scripts/check_release_claims.sh

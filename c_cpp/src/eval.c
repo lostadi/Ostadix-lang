@@ -81,7 +81,13 @@ static char *dup_cstr(const char *s) {
 
 static bool is_pure_backend(const char *lang) {
     if (!lang) return false;
-    const char *pures[] = {"html","markdown","md","latex","tex","text","plain","nix","nix_expr","nix_store","nixos_test", NULL};
+    /* Cache-safety contract for generic {lazy}, mirroring the Rust
+     * BackendRegistry: only deterministic inline representation handlers
+     * (plus nix_expr's deterministic expression capture, which never runs a
+     * shim). Unrestricted shim backends (nix, sql, haskell, ...) are impure:
+     * they can observe external state the {lazy} fingerprint does not
+     * capture. Use {defer} for them. */
+    const char *pures[] = {"html","markdown","md","latex","tex","text","plain","nix_expr", NULL};
     for (int i=0; pures[i]; ++i) if (strcmp(lang, pures[i])==0) return true;
     return false;
 }

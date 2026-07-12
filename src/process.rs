@@ -140,6 +140,8 @@ fn python_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Resu
 
 #[cfg(test)]
 fn direct_shim_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Command {
+    #[cfg(not(target_os = "macos"))]
+    let _ = sandbox;
     #[cfg(target_os = "macos")]
     if let Ok(command) = macos_sandbox_command(
         shim_path,
