@@ -104,6 +104,16 @@ const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
 const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
 const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
+// executor — the readiness-driven graph coordinator used by eval.rs as the
+// default execution engine.
+const RUNTIME_EXECUTOR_MOD_RS: &str = include_str!("../executor/mod.rs");
+const RUNTIME_EXECUTOR_ACTOR_RS: &str = include_str!("../executor/actor.rs");
+const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancellation.rs");
+const RUNTIME_EXECUTOR_COORDINATOR_RS: &str = include_str!("../executor/coordinator.rs");
+const RUNTIME_EXECUTOR_EFFECTS_RS: &str = include_str!("../executor/effects.rs");
+const RUNTIME_EXECUTOR_PARALLEL_RS: &str = include_str!("../executor/parallel.rs");
+const RUNTIME_EXECUTOR_TRACE_RS: &str = include_str!("../executor/trace.rs");
+
 // project — first-class project/route/bundle model, embedded so compiled
 // project binaries can materialize and run their embedded routes.
 const RUNTIME_PROJECT_MOD_RS: &str = include_str!("../project/mod.rs");
@@ -676,6 +686,23 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(hgraph_dir.join("from_oir.rs"), RUNTIME_HGRAPH_FROM_OIR_RS)?;
     fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
     fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
+
+    // ── executor — graph coordinator (default execution engine) ─────────────
+    let executor_dir = src_dir.join("executor");
+    fs::create_dir_all(&executor_dir)?;
+    fs::write(executor_dir.join("mod.rs"), RUNTIME_EXECUTOR_MOD_RS)?;
+    fs::write(executor_dir.join("actor.rs"), RUNTIME_EXECUTOR_ACTOR_RS)?;
+    fs::write(
+        executor_dir.join("cancellation.rs"),
+        RUNTIME_EXECUTOR_CANCELLATION_RS,
+    )?;
+    fs::write(
+        executor_dir.join("coordinator.rs"),
+        RUNTIME_EXECUTOR_COORDINATOR_RS,
+    )?;
+    fs::write(executor_dir.join("effects.rs"), RUNTIME_EXECUTOR_EFFECTS_RS)?;
+    fs::write(executor_dir.join("parallel.rs"), RUNTIME_EXECUTOR_PARALLEL_RS)?;
+    fs::write(executor_dir.join("trace.rs"), RUNTIME_EXECUTOR_TRACE_RS)?;
     Ok(())
 }
 
@@ -996,6 +1023,7 @@ pub mod backend;
 pub mod parser;
 pub mod ir;
 pub mod hgraph;
+pub mod executor;
 pub mod eval;
 pub mod process;
 pub mod nix_ops;
@@ -1292,6 +1320,7 @@ mod tests {
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod hgraph;"));
+        assert!(lib_rs.contains("pub mod executor;"));
 
         for path in [
             "hgraph/mod.rs",
@@ -1300,6 +1329,13 @@ mod tests {
             "hgraph/from_oir.rs",
             "hgraph/schedule.rs",
             "hgraph/solve.rs",
+            "executor/mod.rs",
+            "executor/actor.rs",
+            "executor/cancellation.rs",
+            "executor/coordinator.rs",
+            "executor/effects.rs",
+            "executor/parallel.rs",
+            "executor/trace.rs",
         ] {
             let content = fs::read_to_string(src_dir.join(path)).unwrap();
             assert!(
