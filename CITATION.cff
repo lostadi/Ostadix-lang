@@ -1,34 +1,42 @@
 cff-version: 1.2.0
 message: "If you use Ostadix-lang in your research, please cite it as below."
-title: "Ostadix-lang: interpreter-as-syntax polyglot metaprogramming"
+title: "Ostadix-lang: Recursive Evaluator Composition for Whole-Program Polyglot Execution"
 abstract: >-
-  Ostadix-lang is a meta-language in which the evaluator for an
-  expression is named by its delimiter syntax (LANG^( ... )_LANG), making the
-  choice of interpreter a structural, compositional property of the expression
-  rather than a global mode. Heterogeneous language blocks nest to arbitrary
-  depth and exchange values through a single language-neutral value type
-  (OValue), with homoiconic quote/eval generalized across multiple independent
-  real runtimes. The reference implementation includes a Rust runtime, a C
-  edition, and a Python reference interpreter.
+  Ostadix-lang (O-lang) is a language system built on recursive evaluator
+  composition: the evaluator for an expression is named by its delimiter
+  syntax (LANG^( ... )_LANG), making the choice of interpreter a structural,
+  compositional property of the expression rather than a global mode.
+  Heterogeneous language blocks nest to arbitrary depth across a
+  registry-extensible family of independently implemented real runtimes and
+  exchange values through a single language-neutral value type (OValue).
+  Programs lower into a unified intermediate representation (OIR) from which
+  the runtime derives, validates, solves, and schedules a whole-program
+  hypergraph (HGraph); arbitrary evaluator operations currently dispatch
+  through the serial OIR executor. The repository contains the authoritative
+  Rust runtime, an actively supported C17 interpreter and AOT compiler, a
+  readable Python semantic reference implementation, and the O-core
+  freestanding native compiler path.
 type: software
 authors:
   - family-names: Ostadi
     given-names: Lee Daghlar
     orcid: "https://orcid.org/0009-0001-6380-9558"
 version: "0.2.0"
-date-released: "2026-06-08"
 license: Apache-2.0
 repository-code: "https://github.com/lostadi/O-lang"
 url: "https://github.com/lostadi/O-lang"
 keywords:
+  - recursive-evaluator-composition
+  - polyglot-programming
+  - language-composition
   - programming-languages
-  - polyglot
+  - intermediate-representations
+  - hypergraph-scheduling
   - metaprogramming
-  - homoiconicity
-  - language-oriented-programming
-  - interpreters
-  - domain-specific-languages
+  - research-software
+# date-released: intentionally omitted until an actual public release is
+# published. Set it to the real release date when tagging.
 # doi: "10.5281/zenodo.XXXXXXX"
-# ^ Uncomment and fill in after minting a DOI via Zenodo (see README "Citing" notes).
-#   Once set, GitHub's "Cite this repository" button will surface this metadata,
-#   and the DOI gives you a permanent, citable, timestamped archive.
+# ^ Placeholder comment only — uncomment and fill in after Zenodo mints a DOI
+#   for a published GitHub release (see docs/RELEASE_CHECKLIST.md). Once set,
+#   GitHub's "Cite this repository" button will surface this metadata.
