@@ -361,6 +361,13 @@ pub struct Evaluator {
     /// Ostadix-lang treats hosted backends as the normal execution substrate, so
     /// grantable backend rights are available by default.
     default_backend_authority: String,
+
+    /// Persistent backend actors `(language, environment)` currently suspended
+    /// while awaiting the result of a nested `O.eval` callback. Used by the
+    /// graph executor to detect reentrant deadlocks: a nested evaluation that
+    /// tries to run a new command on an actor already suspended awaiting its
+    /// own eval result is a precise error rather than a hang.
+    suspended_actors: HashSet<(String, u32)>,
 }
 
 struct IrExecRegion<'a> {
@@ -372,22 +379,22 @@ struct IrExecRegion<'a> {
     node_id: PlanNodeId,
 }
 
-struct GraphEvalFrame {
-    values: Vec<Option<OValue>>,
-    base_scope: HashMap<String, OValue>,
-    node_policy: Vec<Policy>,
-    trace: ExecutionTrace,
+pub(crate) struct GraphEvalFrame {
+    pub(crate) values: Vec<Option<OValue>>,
+    pub(crate) base_scope: HashMap<String, OValue>,
+    pub(crate) node_policy: Vec<Policy>,
+    pub(crate) trace: ExecutionTrace,
 }
 
 impl GraphEvalFrame {
-    fn value(&self, id: PlanNodeId) -> Result<&OValue> {
+    pub(crate) fn value(&self, id: PlanNodeId) -> Result<&OValue> {
         self.values
             .get(id.0)
             .and_then(Option::as_ref)
             .ok_or_else(|| anyhow::anyhow!("plan node {} has not produced a value", id.0))
     }
 
-    fn set_value(&mut self, id: PlanNodeId, value: OValue) -> Result<()> {
+    pub(crate) fn set_value(&mut self, id: PlanNodeId, value: OValue) -> Result<()> {
         let slot = self
             .values
             .get_mut(id.0)
@@ -507,6 +514,7 @@ impl Evaluator {
             activation_authorities: HashMap::new(),
             backend_authorities,
             default_backend_authority,
+            suspended_actors: HashSet::new(),
         }
     }
 
@@ -541,7 +549,25 @@ impl Evaluator {
         self.last_hgraph_schedule.as_ref()
     }
 
-    fn trace_fingerprint(value: &OValue) -> Option<String> {
+    /// Install a new evaluation policy, returning the previous one. Used by the
+    /// graph coordinator to run each operation under its derived policy context.
+    pub(crate) fn set_policy(&mut self, policy: Policy) -> Policy {
+        std::mem::replace(&mut self.policy, policy)
+    }
+
+    /// Whether the persistent backend actor `(lang, env)` is currently
+    /// suspended awaiting a nested `O.eval` result.
+    pub(crate) fn is_actor_suspended(&self, lang: &str, env: u32) -> bool {
+        self.suspended_actors.contains(&(lang.to_string(), env))
+    }
+
+    /// Install the execution trace produced by the graph coordinator so it is
+    /// observable via [`Self::last_execution_trace`].
+    pub(crate) fn install_execution_trace(&mut self, trace: ExecutionTrace) {
+        self.last_execution_trace = Some(trace);
+    }
+
+    pub(crate) fn trace_fingerprint(value: &OValue) -> Option<String> {
         match value {
             OValue::NixExpr { fingerprint, .. }
             | OValue::Request { fingerprint, .. }
@@ -840,7 +866,7 @@ impl Evaluator {
     /// `self.scheduler.mem_cache` (and written to disk cache if available).
     /// The buffer is cleared regardless of success or failure to avoid
     /// polluting future calls with stale entries.
-    fn flush_autonomous_buffer(&mut self) -> Result<()> {
+    pub(crate) fn flush_autonomous_buffer(&mut self) -> Result<()> {
         let buffer = std::mem::take(&mut self.autonomous_buffer);
         if buffer.is_empty() {
             return Ok(());
@@ -882,7 +908,7 @@ impl Evaluator {
     ///   request, so a miss indicates a scheduler bug).
     /// - A Group → resolved per its topology mode using Strict cache reads.
     /// - Anything else → returned unchanged.
-    fn resolve_after_flush(&mut self, value: OValue) -> Result<OValue> {
+    pub(crate) fn resolve_after_flush(&mut self, value: OValue) -> Result<OValue> {
         match &value {
             OValue::Group { mode, members, .. } => {
                 let (mode, members) = (*mode, members.clone());
@@ -1471,6 +1497,19 @@ impl Evaluator {
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
+        self.eval_ir_program_with_mode(program, scope, None)
+    }
+
+    /// Project, validate, and execute a lowered program. `forced` overrides the
+    /// executor choice for tests: `Some(true)` forces the serial reference
+    /// executor, `Some(false)` forces the graph coordinator, and `None` follows
+    /// the `O_EXECUTOR` environment variable (graph by default).
+    fn eval_ir_program_with_mode(
+        &mut self,
+        program: &OIrProgram,
+        scope: &mut HashMap<String, OValue>,
+        forced: Option<bool>,
+    ) -> Result<OValue> {
         let plan = program.plan();
         plan.validate(program.nodes.len())
             .map_err(anyhow::Error::msg)
@@ -1490,20 +1529,67 @@ impl Evaluator {
         let hgraph_schedule = crate::hgraph::schedule::try_schedule(&hgraph)
             .map_err(anyhow::Error::msg)
             .context("failed to schedule OIR hypergraph projection")?;
-        let projected_root_schedule = hgraph_schedule
-            .root_order(&hgraph)
+
+        // Semantic projection check (replaces the former strict "projected root
+        // order == plan root order" assertion). Under the graph executor,
+        // operations may COMPLETE out of order; what must hold is that every
+        // plan root has a corresponding scheduled operation or materialized
+        // value, and that commits are applied in `root_schedule` order (the
+        // coordinator's commit step guarantees the latter). We additionally
+        // require the ready-operation schedule to be acyclic.
+        crate::hgraph::schedule::ReadySchedule::derive(&hgraph)
+            .and_then(|schedule| schedule.launch_order().map(|_| ()))
             .map_err(anyhow::Error::msg)
-            .context("failed to derive OIR root order from hypergraph projection")?;
-        if projected_root_schedule != root_schedule {
-            bail!(
-                "hypergraph projection diverged from execution plan root order: {:?} != {:?}",
-                projected_root_schedule,
-                root_schedule
-            );
+            .context("ready-operation schedule is not executable")?;
+        for &root_index in &root_schedule {
+            let root = plan.roots[root_index];
+            let materialized = matches!(plan.nodes[root.0].kind, PlanNodeKind::Text)
+                || hgraph.op_for(root).is_some();
+            if !materialized {
+                bail!(
+                    "hypergraph projection is missing an operation or value for plan root {}",
+                    root.0
+                );
+            }
         }
         self.last_hgraph_schedule = Some(hgraph_schedule);
 
-        self.execute_plan_serial(program, &plan, scope)
+        // Default execution path is the readiness-driven graph coordinator.
+        // `O_EXECUTOR=serial` selects the reference serial executor for
+        // cross-checking; an explicit `forced` override wins for tests.
+        let use_serial = match forced {
+            Some(serial) => serial,
+            None => std::env::var("O_EXECUTOR")
+                .map(|value| value.eq_ignore_ascii_case("serial"))
+                .unwrap_or(false),
+        };
+        if use_serial {
+            self.execute_plan_serial(program, &plan, scope)
+        } else {
+            self.execute_plan_graph(program, &plan, &hgraph, scope)
+        }
+    }
+
+    /// Execute a validated plan through the readiness-driven graph coordinator.
+    /// This is the default execution engine; results and scope commits are
+    /// identical to [`Self::execute_plan_serial`], but independent operations
+    /// may run concurrently and are committed in deterministic root order.
+    fn execute_plan_graph(
+        &mut self,
+        program: &OIrProgram,
+        plan: &ExecutionPlan,
+        hgraph: &crate::hgraph::HGraph,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let base_policy = self.policy;
+        let mut coordinator = crate::executor::Coordinator::new(
+            program,
+            plan,
+            hgraph,
+            base_policy,
+            |_lang, _env| 0,
+        )?;
+        coordinator.run(self, scope)
     }
 
     fn execute_plan_serial(
@@ -1591,7 +1677,7 @@ impl Evaluator {
     // Executable OIR dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn prevalidate_graph_execution(&self, _plan: &ExecutionPlan, flat: &[&OIr]) -> Result<()> {
+    pub(crate) fn prevalidate_graph_execution(&self, _plan: &ExecutionPlan, flat: &[&OIr]) -> Result<()> {
         for node in flat {
             match node {
                 OIr::Invoke {
@@ -1713,7 +1799,7 @@ impl Evaluator {
         Ok(())
     }
 
-    fn execute_ready_plan_node(
+    pub(crate) fn execute_ready_plan_node(
         &mut self,
         node_id: PlanNodeId,
         node: &OIr,
@@ -1956,6 +2042,18 @@ impl Evaluator {
             format!("{runtime_lang}[{env_id}]")
         };
 
+        // Reentrancy guard: a nested O.eval evaluation must never dispatch a new
+        // command onto a persistent actor that is currently suspended awaiting
+        // its own eval result — that would deadlock the shim protocol.
+        if env_id != u32::MAX && self.is_actor_suspended(runtime_lang, env_id) {
+            bail!(
+                "[{}] reentrant deadlock: this operation targets backend actor {} \
+                 which is suspended awaiting the result of its own O.eval callback",
+                env_label,
+                env_label
+            );
+        }
+
         self.registry
             .send_exec(
                 runtime_lang,
@@ -1991,7 +2089,19 @@ impl Evaluator {
                             );
                         }
                     };
-                    match self.eval_source_with_scope(&src, &callback_scope) {
+                    // Mark this persistent actor suspended for the duration of
+                    // the nested evaluation so a reentrant command targeting it
+                    // fails fast instead of deadlocking.
+                    let suspended_key =
+                        (env_id != u32::MAX).then(|| (runtime_lang.to_string(), env_id));
+                    if let Some(key) = &suspended_key {
+                        self.suspended_actors.insert(key.clone());
+                    }
+                    let eval_outcome = self.eval_source_with_scope(&src, &callback_scope);
+                    if let Some(key) = &suspended_key {
+                        self.suspended_actors.remove(key);
+                    }
+                    match eval_outcome {
                         Ok(result) => {
                             self.registry
                                 .send_eval_result(runtime_lang, env_id, result, &sandbox)
@@ -2016,6 +2126,19 @@ impl Evaluator {
         }
 
         result.with_context(|| format!("[{}]", env_label))
+    }
+
+    /// Test-only helper: evaluate a lowered program forcing a specific executor
+    /// (`serial = true` uses the reference serial executor, `false` uses the
+    /// graph coordinator). Used by the graph/serial equivalence tests.
+    #[cfg(test)]
+    fn eval_ir_program_forcing(
+        &mut self,
+        program: &OIrProgram,
+        scope: &mut HashMap<String, OValue>,
+        serial: bool,
+    ) -> Result<OValue> {
+        self.eval_ir_program_with_mode(program, scope, Some(serial))
     }
 
     /// Test-only compatibility entry point. It proves individual legacy test
@@ -2320,7 +2443,7 @@ fn structural_children(plan: &ExecutionPlan, parent: PlanNodeId) -> Vec<PlanNode
     children
 }
 
-fn derive_policy_contexts(
+pub(crate) fn derive_policy_contexts(
     plan: &ExecutionPlan,
     flat: &[&OIr],
     base_policy: Policy,
@@ -2368,7 +2491,7 @@ fn derive_policy_contexts(
 /// Render using the strategy frozen into executable OIR. Keeping this as a
 /// value-level function lets tests exercise renderers directly while runtime
 /// execution never has to rediscover backend policy from a language string.
-fn render_with(renderer: SpliceRenderer, val: &OValue) -> String {
+pub(crate) fn render_with(renderer: SpliceRenderer, val: &OValue) -> String {
     match renderer {
         SpliceRenderer::Python => render_python(val),
         SpliceRenderer::Html => render_html(val),
@@ -6782,5 +6905,162 @@ python[0]^(O.eval($q, $captured))_python[0]
             fp_ab, fp_ab2,
             "fingerprints must be stable for identical groups"
         );
+    }
+
+    // ── graph executor vs serial reference executor ───────────────────────────
+
+    /// A corpus of backend-free programs (inline text/html/group/store/load)
+    /// that both executors must evaluate identically.
+    fn equivalence_corpus() -> Vec<OIrProgram> {
+        let html = BackendRegistry::global().interface_for("html");
+        let text = BackendRegistry::global().interface_for("text");
+        vec![
+            // Independent inline renders (become concurrently ready).
+            OIrProgram {
+                nodes: vec![
+                    OIr::Exec {
+                        lang: "html".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: html.clone(),
+                        body: vec![OIr::Text("a".into())],
+                    },
+                    OIr::Exec {
+                        lang: "html".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: html.clone(),
+                        body: vec![OIr::Text("b".into())],
+                    },
+                ],
+            },
+            // Store then load (data dependency).
+            OIrProgram {
+                nodes: vec![
+                    OIr::Store {
+                        name: "x".into(),
+                        expr: Box::new(OIr::Text("hi".into())),
+                    },
+                    OIr::Exec {
+                        lang: "text".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: text.clone(),
+                        body: vec![OIr::Load("x".into()), OIr::Text("!".into())],
+                    },
+                ],
+            },
+            // Group of inline members.
+            OIrProgram {
+                nodes: vec![OIr::Invoke {
+                    fn_name: "batch".into(),
+                    mode: InvokeMode::Group(GroupMode::Batch),
+                    args: vec![
+                        OIr::Exec {
+                            lang: "text".into(),
+                            env_id: u32::MAX,
+                            attr: None,
+                            backend: text.clone(),
+                            body: vec![OIr::Text("one".into())],
+                        },
+                        OIr::Exec {
+                            lang: "text".into(),
+                            env_id: u32::MAX,
+                            attr: None,
+                            backend: text.clone(),
+                            body: vec![OIr::Text("two".into())],
+                        },
+                    ],
+                }],
+            },
+            // Nested inline splice.
+            OIrProgram {
+                nodes: vec![OIr::Exec {
+                    lang: "html".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: html.clone(),
+                    body: vec![
+                        OIr::Text("<b>".into()),
+                        OIr::Exec {
+                            lang: "text".into(),
+                            env_id: u32::MAX,
+                            attr: None,
+                            backend: text.clone(),
+                            body: vec![OIr::Text("deep".into())],
+                        },
+                        OIr::Text("</b>".into()),
+                    ],
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn graph_executor_matches_serial_on_corpus() {
+        for (index, program) in equivalence_corpus().into_iter().enumerate() {
+            let mut serial_eval = Evaluator::new("/tmp".into());
+            let mut serial_scope = HashMap::new();
+            let serial = serial_eval
+                .eval_ir_program_forcing(&program, &mut serial_scope, true)
+                .unwrap_or_else(|e| panic!("serial program {index} failed: {e}"));
+
+            let mut graph_eval = Evaluator::new("/tmp".into());
+            let mut graph_scope = HashMap::new();
+            let graph = graph_eval
+                .eval_ir_program_forcing(&program, &mut graph_scope, false)
+                .unwrap_or_else(|e| panic!("graph program {index} failed: {e}"));
+
+            assert_eq!(
+                serial, graph,
+                "graph executor result diverged from serial for corpus program {index}"
+            );
+            assert_eq!(
+                serial_scope, graph_scope,
+                "graph executor scope commit diverged from serial for corpus program {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_executor_commits_store_in_root_order() {
+        // Two stores to the same name; the later root must win under both.
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Store {
+                    name: "x".into(),
+                    expr: Box::new(OIr::Text("first".into())),
+                },
+                OIr::Store {
+                    name: "x".into(),
+                    expr: Box::new(OIr::Text("second".into())),
+                },
+                OIr::Load("x".into()),
+            ],
+        };
+        for serial in [true, false] {
+            let mut eval = Evaluator::new("/tmp".into());
+            let mut scope = HashMap::new();
+            let result = eval
+                .eval_ir_program_forcing(&program, &mut scope, serial)
+                .unwrap();
+            assert_eq!(result, OValue::str_("second"));
+            assert_eq!(scope.get("x"), Some(&OValue::str_("second")));
+        }
+    }
+
+    #[test]
+    fn graph_executor_selects_deterministic_error() {
+        // A missing variable fails under both executors with the same message.
+        let program = OIrProgram {
+            nodes: vec![OIr::Load("missing".into())],
+        };
+        let mut graph_eval = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        let err = graph_eval
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Undefined variable"), "got: {err}");
     }
 }

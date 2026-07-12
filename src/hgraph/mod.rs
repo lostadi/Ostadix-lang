@@ -11,9 +11,12 @@ pub mod kinds;
 pub mod schedule;
 pub mod solve;
 
-pub use graph::{ActorId, EdgeId, HEdge, HGraph, HNode, NodeId, Port, PortRole};
-pub use kinds::{DomainFlags, MemOrder, OcoreOpKind, OpKind, RepFlags};
-pub use schedule::{schedule, try_schedule, ExecutionCluster, Schedule};
+pub use graph::{ActorId, EdgeId, ExecInfo, HEdge, HGraph, HNode, NodeId, Port, PortRole};
+pub use kinds::{
+    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, MemOrder, OcoreOpKind, OpKind, RepFlags,
+    ValueState,
+};
+pub use schedule::{schedule, try_schedule, ExecutionCluster, ReadyOp, ReadySchedule, Schedule};
 
 #[cfg(test)]
 mod tests {
@@ -158,16 +161,15 @@ mod tests {
         let mut graph = HGraph::default();
         let out = graph.add_node(HNode::fresh());
         let bigint = BigInt::from(i64::MAX) + BigInt::from(1_u8);
-        graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: OpKind::Bounded {
+        graph.add_edge(HEdge::constraint(
+            OpKind::Bounded {
                 value: bigint.clone(),
             },
-            ports: vec![Port {
+            vec![Port {
                 node: out,
                 role: PortRole::Output,
             }],
-        });
+        ));
 
         solve::solve_types(&mut graph);
         let node = graph.node(out).unwrap();
@@ -191,13 +193,12 @@ mod tests {
             ..HNode::fresh()
         });
         let output = graph.add_node(HNode::fresh());
-        graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: OpKind::BackendCrossing {
+        graph.add_edge(HEdge::constraint(
+            OpKind::BackendCrossing {
                 from_lang: "O".into(),
                 to_lang: "javascript".into(),
             },
-            ports: vec![
+            vec![
                 Port {
                     node: input,
                     role: PortRole::Input,
@@ -207,7 +208,7 @@ mod tests {
                     role: PortRole::Output,
                 },
             ],
-        });
+        ));
 
         solve::solve_types(&mut graph);
         assert_eq!(
@@ -231,14 +232,13 @@ mod tests {
             ..HNode::fresh()
         });
         for node in [first, second] {
-            graph.add_edge(HEdge {
-                id: EdgeId(0),
-                kind: OpKind::ActorSerial { actor },
-                ports: vec![Port {
+            graph.add_edge(HEdge::constraint(
+                OpKind::ActorSerial { actor },
+                vec![Port {
                     node,
                     role: PortRole::InOut,
                 }],
-            });
+            ));
         }
 
         let schedule = schedule::schedule(&graph);
@@ -262,10 +262,9 @@ mod tests {
         let mut graph = HGraph::default();
         let left = graph.add_node(HNode::fresh());
         let right = graph.add_node(HNode::fresh());
-        graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: OpKind::Sequence,
-            ports: vec![
+        graph.add_edge(HEdge::constraint(
+            OpKind::Sequence,
+            vec![
                 Port {
                     node: left,
                     role: PortRole::Input,
@@ -275,11 +274,10 @@ mod tests {
                     role: PortRole::Output,
                 },
             ],
-        });
-        graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: OpKind::Sequence,
-            ports: vec![
+        ));
+        graph.add_edge(HEdge::constraint(
+            OpKind::Sequence,
+            vec![
                 Port {
                     node: right,
                     role: PortRole::Input,
@@ -289,7 +287,7 @@ mod tests {
                     role: PortRole::Output,
                 },
             ],
-        });
+        ));
 
         assert!(schedule::try_schedule(&graph)
             .unwrap_err()

@@ -2,14 +2,15 @@ use std::collections::HashMap;
 
 use crate::{
     ir::{
-        BackendInterface, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind,
+        BackendInterface, ExecutionMode, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId,
+        PlanNodeKind, PlanScheduleKind,
     },
     value::{GroupMode, OValue},
 };
 
 use super::{
-    graph::{ActorId, EdgeId, HEdge, HGraph, HNode, NodeId, Port, PortRole},
-    kinds::{DomainFlags, OpKind, RepFlags},
+    graph::{ActorId, HEdge, HGraph, HNode, NodeId, Port, PortRole},
+    kinds::{DomainFlags, ExecutableOp, OpKind, RepFlags},
 };
 
 pub fn build_program(program: &OIrProgram) -> HGraph {
@@ -39,6 +40,9 @@ pub fn build_program_with_plan(
     for plan_node in &plan.nodes {
         let oir = oir_nodes[plan_node.id.0];
         let graph_node = graph.add_node(hnode_for_oir(oir));
+        if let Some(node) = graph.node_mut(graph_node) {
+            node.plan_node = Some(plan_node.id);
+        }
         if let PlanNodeKind::Exec { lang, env_id, .. } = &plan_node.kind {
             if *env_id != u32::MAX {
                 if let Some(node) = graph.node_mut(graph_node) {
@@ -58,10 +62,12 @@ pub fn build_program_with_plan(
         graph.push_root(node);
     }
 
+    // Constraint/type edges — kept structurally identical to the historical
+    // projection so the type/fidelity solver and the DOT exporter operate over
+    // the same `OpKind` relations they always did.
     for edge in &plan.edges {
-        graph.add_edge(HEdge {
-            id: EdgeId(0),
-            kind: match edge.kind {
+        graph.add_edge(HEdge::constraint(
+            match edge.kind {
                 PlanEdgeKind::Structural => OpKind::StructuralBarrier,
                 PlanEdgeKind::Sequence => OpKind::Sequence,
                 PlanEdgeKind::Data
@@ -71,7 +77,7 @@ pub fn build_program_with_plan(
                 }
                 PlanEdgeKind::Data => OpKind::Sequence,
             },
-            ports: vec![
+            vec![
                 Port {
                     node: node_map[&edge.from],
                     role: PortRole::Input,
@@ -81,11 +87,92 @@ pub fn build_program_with_plan(
                     role: PortRole::Output,
                 },
             ],
-        });
+        ));
     }
 
     add_plan_semantics(&mut graph, plan, &node_map);
+    add_execute_edges(&mut graph, plan, &node_map);
     Ok(graph)
+}
+
+/// Lower every non-literal plan operation to an executable operation hyperedge
+/// that consumes its structural children and data-dependency value nodes and
+/// produces its own output value node. Literal `Text` nodes are materialized
+/// value nodes with no Execute edge.
+fn add_execute_edges(
+    graph: &mut HGraph,
+    plan: &ExecutionPlan,
+    node_map: &HashMap<PlanNodeId, NodeId>,
+) {
+    for plan_node in &plan.nodes {
+        let Some(op) = executable_op(&plan_node.kind) else {
+            continue;
+        };
+        let output = node_map[&plan_node.id];
+        let inputs = operation_inputs(plan, node_map, plan_node.id);
+        let ordinal = plan_node.id.0 as u64;
+        graph.add_exec_edge(plan_node.id, op, inputs, output, ordinal);
+    }
+}
+
+/// Value-node inputs an operation consumes: its structural children (in source
+/// order) followed by any additional data predecessors. Both must be
+/// materialized before the operation becomes ready.
+fn operation_inputs(
+    plan: &ExecutionPlan,
+    node_map: &HashMap<PlanNodeId, NodeId>,
+    parent: PlanNodeId,
+) -> Vec<NodeId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<(usize, NodeId)> = Vec::new();
+
+    for edge in &plan.edges {
+        let is_input = (edge.kind == PlanEdgeKind::Structural || edge.kind == PlanEdgeKind::Data)
+            && edge.to == parent;
+        if is_input && seen.insert(edge.from) {
+            ordered.push((edge.from.0, node_map[&edge.from]));
+        }
+    }
+    ordered.sort_by_key(|(source, _)| *source);
+    ordered.into_iter().map(|(_, node)| node).collect()
+}
+
+fn executable_op(kind: &PlanNodeKind) -> Option<ExecutableOp> {
+    match kind {
+        PlanNodeKind::Text => None,
+        PlanNodeKind::Load { .. } => Some(ExecutableOp::LoadBinding),
+        PlanNodeKind::Store { .. } => Some(ExecutableOp::Store),
+        PlanNodeKind::Call { fn_name, mode, .. } => Some(ExecutableOp::Invoke {
+            fn_name: fn_name.clone(),
+            mode: *mode,
+        }),
+        PlanNodeKind::Request { kind, .. } => Some(ExecutableOp::Request {
+            kind: kind.label().to_string(),
+        }),
+        PlanNodeKind::Group { mode, .. } => Some(ExecutableOp::Group { mode: *mode }),
+        PlanNodeKind::Schedule { kind, .. } => match kind {
+            PlanScheduleKind::Force => Some(ExecutableOp::ForceRequest {
+                kind: "force".to_string(),
+            }),
+            other => Some(ExecutableOp::Schedule {
+                kind: other.label().to_string(),
+            }),
+        },
+        PlanNodeKind::Exec {
+            lang,
+            env_id,
+            backend,
+            ..
+        } => match backend.execution {
+            ExecutionMode::InlineAst | ExecutionMode::InlineValue => {
+                Some(ExecutableOp::InlineBackend { lang: lang.clone() })
+            }
+            ExecutionMode::Shim => Some(ExecutableOp::EvalBackend {
+                lang: lang.clone(),
+                env: *env_id,
+            }),
+        },
+    }
 }
 
 fn hnode_for_oir(node: &OIr) -> HNode {
@@ -119,24 +206,22 @@ fn add_plan_semantics(
                 ..
             } => {
                 if let Some((dom, rep)) = backend_output_constraints(backend) {
-                    graph.add_edge(HEdge {
-                        id: EdgeId(0),
-                        kind: OpKind::AbiFixed { dom, rep },
-                        ports: vec![Port {
+                    graph.add_edge(HEdge::constraint(
+                        OpKind::AbiFixed { dom, rep },
+                        vec![Port {
                             node: output,
                             role: PortRole::Output,
                         }],
-                    });
+                    ));
                 }
 
                 for input in &inputs {
-                    graph.add_edge(HEdge {
-                        id: EdgeId(0),
-                        kind: OpKind::BackendCrossing {
+                    graph.add_edge(HEdge::constraint(
+                        OpKind::BackendCrossing {
                             from_lang: "O".to_string(),
                             to_lang: lang.clone(),
                         },
-                        ports: vec![
+                        vec![
                             Port {
                                 node: *input,
                                 role: PortRole::Input,
@@ -146,7 +231,7 @@ fn add_plan_semantics(
                                 role: PortRole::Output,
                             },
                         ],
-                    });
+                    ));
                 }
 
                 if *env_id != u32::MAX {
@@ -154,14 +239,13 @@ fn add_plan_semantics(
                         lang: intern_lang(lang),
                         env: *env_id,
                     };
-                    graph.add_edge(HEdge {
-                        id: EdgeId(0),
-                        kind: OpKind::ActorSerial { actor },
-                        ports: vec![Port {
+                    graph.add_edge(HEdge::constraint(
+                        OpKind::ActorSerial { actor },
+                        vec![Port {
                             node: output,
                             role: PortRole::InOut,
                         }],
-                    });
+                    ));
                 }
 
                 if let Some(policy) = plan_node.kind.eval_cache_policy() {
@@ -252,11 +336,7 @@ fn add_control_relation(graph: &mut HGraph, kind: OpKind, inputs: &[NodeId], out
         node: output,
         role: PortRole::Output,
     });
-    graph.add_edge(HEdge {
-        id: EdgeId(0),
-        kind,
-        ports,
-    });
+    graph.add_edge(HEdge::constraint(kind, ports));
 }
 
 fn group_op(mode: GroupMode) -> OpKind {

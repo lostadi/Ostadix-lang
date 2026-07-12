@@ -181,6 +181,34 @@ struct Cli {
     /// combined .O file can be run directly (`./program.O`).
     #[arg(long = "shebang", conflicts_with = "to_stdout")]
     shebang: bool,
+
+    /// Treat a single input directory as a *project*: bundle its files,
+    /// discover + apply manifest routes, and lift it into one .O document
+    /// (instead of wrapping each file independently). Combine with `--run`
+    /// to execute a route via the project runtime.
+    #[arg(long = "project")]
+    project: bool,
+
+    /// Print the discovered + manifest route table for the input directory or
+    /// an existing lifted .O file, then exit without executing anything.
+    #[arg(long = "list-routes")]
+    list_routes: bool,
+
+    /// With `--run`, execute this route (or route set, by its `provides`
+    /// token) through the project runtime.
+    #[arg(long = "route", value_name = "ID")]
+    route: Option<String>,
+
+    /// With `--run`, apply this policy to the selected route set.
+    /// One of: explicit, default, fallback, any_success, race_success,
+    /// race_settle, all, verify_equivalent, benchmark_and_select.
+    #[arg(long = "routes-policy", value_name = "POLICY")]
+    routes_policy: Option<String>,
+
+    /// Add or override a route from the command line (repeatable). Micro-syntax:
+    /// `id=NAME;cmd=PROGRAM ARGS;cwd=.;provides=a,b;codec=json;depends=r1,r2`.
+    #[arg(long = "route-decl", value_name = "DECL")]
+    route_decls: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -190,6 +218,19 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let backends = registered_backends();
+
+    // ── Project mode ─────────────────────────────────────────────────────────
+    // `--list-routes`, `--project`, and route selection/override flags route
+    // through the first-class project model instead of per-file wrapping.
+    if cli.list_routes {
+        return list_routes_mode(&cli);
+    }
+    if cli.project {
+        return project_mode(&cli);
+    }
+    if cli.route.is_some() || cli.routes_policy.is_some() || !cli.route_decls.is_empty() {
+        bail!("--route/--routes-policy/--route-decl require --project (or --list-routes)");
+    }
 
     let mut ext_map = default_extension_map();
     for spec in &cli.lang {
@@ -293,6 +334,112 @@ fn run_combined(
         OValue::Html { v } => println!("{}", v),
         OValue::Text { v } => println!("{}", v.utf8),
         other => println!("{}", other),
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the single input for project mode, requiring exactly one path.
+fn single_input(cli: &Cli) -> Result<PathBuf> {
+    if cli.inputs.len() != 1 {
+        bail!("project mode takes exactly one input (a directory or a lifted .O file)");
+    }
+    Ok(cli.inputs[0].clone())
+}
+
+/// Build a [`ProjectBundle`] for the single input, whether it is a directory
+/// or an already-lifted `.O` file.
+fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
+    let input = single_input(cli)?;
+    if input.is_dir() {
+        let name = o_lang::project::name_from_path(&input);
+        o_lang::project::assemble(&input, &name, &cli.route_decls)
+    } else if input.is_file() {
+        let source = fs::read_to_string(&input)
+            .with_context(|| format!("failed to read {}", input.display()))?;
+        if !o_lang::project::lower::has_embedded_bundle(&source) {
+            bail!(
+                "{}: not a project directory and not a lifted .O project file",
+                input.display()
+            );
+        }
+        let mut bundle = o_lang::project::lower::extract_bundle_from_o(&source)?;
+        o_lang::project::manifest::apply_cli_overrides(&mut bundle, &cli.route_decls)?;
+        o_lang::project::finalize_default(&mut bundle);
+        Ok(bundle)
+    } else {
+        bail!("{}: no such file or directory", input.display());
+    }
+}
+
+/// `--list-routes`: print the route table and exit without executing.
+fn list_routes_mode(cli: &Cli) -> Result<()> {
+    let bundle = load_project_bundle(cli)?;
+    print!("{}", bundle.route_table());
+    Ok(())
+}
+
+/// `--project`: lift into a single .O document, or (with `--run`) execute a
+/// route through the project runtime.
+fn project_mode(cli: &Cli) -> Result<()> {
+    let bundle = load_project_bundle(cli)?;
+
+    if cli.run {
+        return run_project(cli, &bundle);
+    }
+
+    // Lift into one valid .O document.
+    let mut lifted = o_lang::project::lower::lower_to_o_validated(&bundle)
+        .context("failed to lift project into a .O document")?;
+    if cli.shebang {
+        lifted.insert_str(0, "#!/usr/bin/env o\n");
+    }
+
+    if cli.to_stdout {
+        print!("{}", lifted);
+    } else {
+        fs::write(&cli.output, &lifted)
+            .with_context(|| format!("failed to write {}", cli.output.display()))?;
+        if cli.shebang {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&cli.output, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        eprintln!(
+            "lifted project '{}' ({} file(s), {} route(s)) into {}",
+            bundle.name,
+            bundle.files.len(),
+            bundle.routes.len(),
+            cli.output.display()
+        );
+    }
+    Ok(())
+}
+
+/// Execute a route (or route set) through the project runtime.
+fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()> {
+    use o_lang::project::runtime::{run_selection, RunOptions};
+    use o_lang::project::RoutePolicy;
+
+    if cli.route.is_none() && cli.routes_policy.is_none() && bundle.resolved_default().is_none() {
+        print!("{}", bundle.route_table());
+        bail!("no unambiguous default route — select one with --route <ID>");
+    }
+
+    let policy = cli.routes_policy.as_deref().map(RoutePolicy::parse);
+    let opts = RunOptions::default();
+    let results = run_selection(bundle, cli.route.as_deref(), policy, &opts)?;
+
+    for result in &results {
+        print!("{}", result.summary());
+    }
+    if !results.iter().any(|r| r.succeeded()) {
+        bail!("no route succeeded");
     }
     Ok(())
 }

@@ -104,6 +104,29 @@ const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
 const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
 const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
+// project — first-class project/route/bundle model, embedded so compiled
+// project binaries can materialize and run their embedded routes.
+const RUNTIME_PROJECT_MOD_RS: &str = include_str!("../project/mod.rs");
+const RUNTIME_PROJECT_MODEL_RS: &str = include_str!("../project/model.rs");
+const RUNTIME_PROJECT_BUNDLE_RS: &str = include_str!("../project/bundle.rs");
+const RUNTIME_PROJECT_MATERIALIZE_RS: &str = include_str!("../project/materialize.rs");
+const RUNTIME_PROJECT_MANIFEST_RS: &str = include_str!("../project/manifest.rs");
+const RUNTIME_PROJECT_DISCOVER_RS: &str = include_str!("../project/discover.rs");
+const RUNTIME_PROJECT_LOWER_RS: &str = include_str!("../project/lower.rs");
+const RUNTIME_PROJECT_RUNTIME_RS: &str = include_str!("../project/runtime.rs");
+const RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS: &str = include_str!("../project/ecosystems/mod.rs");
+const RUNTIME_PROJECT_ECO_PYTHON_RS: &str = include_str!("../project/ecosystems/python.rs");
+const RUNTIME_PROJECT_ECO_JAVASCRIPT_RS: &str = include_str!("../project/ecosystems/javascript.rs");
+const RUNTIME_PROJECT_ECO_RUST_RS: &str = include_str!("../project/ecosystems/rust.rs");
+const RUNTIME_PROJECT_ECO_SHELL_RS: &str = include_str!("../project/ecosystems/shell.rs");
+const RUNTIME_PROJECT_ECO_GENERIC_RS: &str = include_str!("../project/ecosystems/generic.rs");
+const RUNTIME_PROJECT_ECO_C_FAMILY_RS: &str = include_str!("../project/ecosystems/c_family.rs");
+const RUNTIME_PROJECT_ECO_JAVA_RS: &str = include_str!("../project/ecosystems/java.rs");
+const RUNTIME_PROJECT_ECO_DOTNET_RS: &str = include_str!("../project/ecosystems/dotnet.rs");
+const RUNTIME_PROJECT_ECO_HASKELL_OCAML_RS: &str =
+    include_str!("../project/ecosystems/haskell_ocaml.rs");
+const RUNTIME_PROJECT_ECO_NIX_RS: &str = include_str!("../project/ecosystems/nix.rs");
+
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
 const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
@@ -189,8 +212,21 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let source = fs::read_to_string(&cli.input)
-        .with_context(|| format!("failed to read {}", cli.input.display()))?;
+    let input_is_dir = cli.input.is_dir();
+    let source = if input_is_dir {
+        String::new()
+    } else {
+        fs::read_to_string(&cli.input)
+            .with_context(|| format!("failed to read {}", cli.input.display()))?
+    };
+
+    // A project input is either a directory or a lifted .O file carrying an
+    // embedded project bundle. Projects compile into a native binary that
+    // lists and runs the same routes.
+    let is_project = input_is_dir || o_lang::project::lower::has_embedded_bundle(&source);
+    if is_project {
+        return compile_or_run_project(&cli, input_is_dir, &source);
+    }
 
     match cli.target {
         CompileTarget::Binary | CompileTarget::Wasm => {
@@ -246,6 +282,284 @@ fn main() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Project compilation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the [`ProjectBundle`] for a project input (a directory or a lifted
+/// `.O` file with an embedded bundle).
+fn load_project_bundle(
+    input: &Path,
+    input_is_dir: bool,
+    source: &str,
+) -> Result<o_lang::project::ProjectBundle> {
+    if input_is_dir {
+        let name = o_lang::project::name_from_path(input);
+        o_lang::project::assemble(input, &name, &[])
+    } else {
+        o_lang::project::lower::extract_bundle_from_o(source)
+    }
+}
+
+/// Dispatch a project input to the right pipeline based on the compile target.
+fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result<()> {
+    match cli.target {
+        CompileTarget::Binary | CompileTarget::Wasm => {
+            let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
+
+            let mut output = match cli.output.clone() {
+                Some(p) => p,
+                None => {
+                    let stem = if input_is_dir {
+                        o_lang::project::name_from_path(&cli.input)
+                    } else {
+                        cli.input
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "project".to_string())
+                    };
+                    PathBuf::from(stem)
+                }
+            };
+            if cli.target == CompileTarget::Wasm {
+                output.set_extension("wasm");
+            }
+
+            let shims = read_shims(cli.shim_dir.as_deref())?;
+            let build_dir = create_build_dir()?;
+            eprintln!("olangc: building project in {}", build_dir.display());
+            eprintln!(
+                "olangc: project '{}' — {} file(s), {} route(s)",
+                bundle.name,
+                bundle.files.len(),
+                bundle.routes.len()
+            );
+
+            let result = compile_project_to_binary(
+                &bundle,
+                &shims,
+                &build_dir,
+                &output,
+                cli.target == CompileTarget::Wasm,
+            );
+
+            if !cli.keep_build_dir {
+                let _ = fs::remove_dir_all(&build_dir);
+            } else {
+                eprintln!("olangc: keeping build directory: {}", build_dir.display());
+            }
+            result
+        }
+        CompileTarget::Script => {
+            let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
+            run_project_script(&bundle)
+        }
+        CompileTarget::Ir | CompileTarget::Dot => {
+            bail!(
+                "--target {:?} is not supported for project inputs; use --target binary or script",
+                cli.target
+            )
+        }
+    }
+}
+
+/// Run a project's default route in-process (script mode).
+fn run_project_script(bundle: &o_lang::project::ProjectBundle) -> Result<()> {
+    use o_lang::project::runtime::{run_selection, RunOptions};
+    eprintln!("olangc: project script mode — running default route");
+    let results = run_selection(bundle, None, None, &RunOptions::default())?;
+    for result in &results {
+        print!("{}", result.summary());
+    }
+    if !results.iter().any(|r| r.succeeded()) {
+        bail!("no route succeeded");
+    }
+    Ok(())
+}
+
+/// Generate a hosted Cargo project that embeds the serialized bundle and, at
+/// runtime, lists/materializes/runs the same routes via the project runtime.
+fn compile_project_to_binary(
+    bundle: &o_lang::project::ProjectBundle,
+    shims: &[(String, Vec<u8>)],
+    build_dir: &Path,
+    output: &Path,
+    is_wasm: bool,
+) -> Result<()> {
+    let bin_name = derive_bin_name(output);
+    let src_dir = build_dir.join("src");
+    let shim_dir = src_dir.join("shims");
+    fs::create_dir_all(&shim_dir)?;
+
+    write_runtime_sources(&src_dir)?;
+    write_project_sources(&src_dir)?;
+
+    // Embed the serialized bundle as bytes.
+    let bundle_bytes = o_lang::project::bundle::serialize(bundle)?;
+    fs::write(src_dir.join("project_bundle.json"), &bundle_bytes)?;
+
+    // Shim scripts.
+    let mut shim_include_lines = Vec::new();
+    for (name, content) in shims {
+        fs::write(shim_dir.join(name), content)?;
+        shim_include_lines.push(format!(
+            "    ({name:?}, include_bytes!({path:?})),",
+            name = name,
+            path = format!("shims/{name}"),
+        ));
+    }
+
+    let lib_rs = generate_lib_rs(true);
+    fs::write(src_dir.join("lib.rs"), &lib_rs)?;
+    let main_rs = generate_project_main_rs(&bin_name, &shim_include_lines);
+    fs::write(src_dir.join("main.rs"), &main_rs)?;
+
+    fs::write(build_dir.join("Cargo.toml"), generate_cargo_toml(&bin_name, true))?;
+    fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
+
+    let mut cargo_args = vec!["build", "--release"];
+    if is_wasm {
+        cargo_args.push("--target");
+        cargo_args.push("wasm32-wasip1");
+        eprintln!("olangc: running cargo build --release --target wasm32-wasip1 ...");
+    } else {
+        eprintln!("olangc: running cargo build --release ...");
+    }
+
+    let status = Command::new("cargo")
+        .args(&cargo_args)
+        .current_dir(build_dir)
+        .status()
+        .context("failed to spawn cargo — is Rust/Cargo installed?")?;
+    if !status.success() {
+        bail!("cargo build --release failed (see output above)");
+    }
+
+    let built = built_binary_path(build_dir, &bin_name, is_wasm);
+    let dest = canonicalize_output(output)?;
+    fs::copy(&built, &dest)
+        .with_context(|| format!("failed to copy {} → {}", built.display(), dest.display()))?;
+
+    #[cfg(unix)]
+    if !is_wasm {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    }
+
+    eprintln!("olangc: compiled project → {}", dest.display());
+    Ok(())
+}
+
+/// Write the embedded `project` module tree into the generated `src/`.
+fn write_project_sources(src_dir: &Path) -> Result<()> {
+    let project_dir = src_dir.join("project");
+    let eco_dir = project_dir.join("ecosystems");
+    fs::create_dir_all(&eco_dir)?;
+
+    fs::write(project_dir.join("mod.rs"), RUNTIME_PROJECT_MOD_RS)?;
+    fs::write(project_dir.join("model.rs"), RUNTIME_PROJECT_MODEL_RS)?;
+    fs::write(project_dir.join("bundle.rs"), RUNTIME_PROJECT_BUNDLE_RS)?;
+    fs::write(project_dir.join("materialize.rs"), RUNTIME_PROJECT_MATERIALIZE_RS)?;
+    fs::write(project_dir.join("manifest.rs"), RUNTIME_PROJECT_MANIFEST_RS)?;
+    fs::write(project_dir.join("discover.rs"), RUNTIME_PROJECT_DISCOVER_RS)?;
+    fs::write(project_dir.join("lower.rs"), RUNTIME_PROJECT_LOWER_RS)?;
+    fs::write(project_dir.join("runtime.rs"), RUNTIME_PROJECT_RUNTIME_RS)?;
+
+    fs::write(eco_dir.join("mod.rs"), RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS)?;
+    fs::write(eco_dir.join("python.rs"), RUNTIME_PROJECT_ECO_PYTHON_RS)?;
+    fs::write(eco_dir.join("javascript.rs"), RUNTIME_PROJECT_ECO_JAVASCRIPT_RS)?;
+    fs::write(eco_dir.join("rust.rs"), RUNTIME_PROJECT_ECO_RUST_RS)?;
+    fs::write(eco_dir.join("shell.rs"), RUNTIME_PROJECT_ECO_SHELL_RS)?;
+    fs::write(eco_dir.join("generic.rs"), RUNTIME_PROJECT_ECO_GENERIC_RS)?;
+    fs::write(eco_dir.join("c_family.rs"), RUNTIME_PROJECT_ECO_C_FAMILY_RS)?;
+    fs::write(eco_dir.join("java.rs"), RUNTIME_PROJECT_ECO_JAVA_RS)?;
+    fs::write(eco_dir.join("dotnet.rs"), RUNTIME_PROJECT_ECO_DOTNET_RS)?;
+    fs::write(
+        eco_dir.join("haskell_ocaml.rs"),
+        RUNTIME_PROJECT_ECO_HASKELL_OCAML_RS,
+    )?;
+    fs::write(eco_dir.join("nix.rs"), RUNTIME_PROJECT_ECO_NIX_RS)?;
+    Ok(())
+}
+
+/// Generate the `main.rs` for a compiled project binary. It embeds the bundle
+/// and supports `--list-routes`, `--route <ID>`, `--routes-policy <POLICY>`,
+/// and default-route execution.
+fn generate_project_main_rs(bin_name: &str, shim_include_lines: &[String]) -> String {
+    let lib_name = bin_name.replace('-', "_");
+    let shim_entries = if shim_include_lines.is_empty() {
+        "    // no shims bundled".to_string()
+    } else {
+        shim_include_lines.join("\n")
+    };
+
+    format!(
+        r###"// AUTO-GENERATED by olangc. DO NOT EDIT.
+
+use {lib_name}::project::{{self, RoutePolicy}};
+use {lib_name}::project::runtime::{{run_selection, RunOptions}};
+
+/// The serialized project bundle, embedded at compile time.
+const PROJECT_BUNDLE: &[u8] = include_bytes!("project_bundle.json");
+
+#[cfg(not(target_family = "wasm"))]
+const EMBEDDED_SHIMS: &[(&str, &[u8])] = &[
+{shim_entries}
+];
+
+fn main() -> anyhow::Result<()> {{
+    if {lib_name}::backend::run_backend_from_env_args()? {{
+        return Ok(());
+    }}
+
+    #[cfg(not(target_family = "wasm"))]
+    let _ = EMBEDDED_SHIMS;
+
+    let bundle = project::bundle::deserialize(PROJECT_BUNDLE)?;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut list_routes = false;
+    let mut route: Option<String> = None;
+    let mut policy: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {{
+        match args[i].as_str() {{
+            "--list-routes" => list_routes = true,
+            "--route" => {{
+                i += 1;
+                route = args.get(i).cloned();
+            }}
+            "--routes-policy" => {{
+                i += 1;
+                policy = args.get(i).cloned();
+            }}
+            other => return Err(anyhow::anyhow!("unknown argument: {{other}}")),
+        }}
+        i += 1;
+    }}
+
+    if list_routes {{
+        print!("{{}}", bundle.route_table());
+        return Ok(());
+    }}
+
+    let policy = policy.as_deref().map(RoutePolicy::parse);
+    let opts = RunOptions::default();
+    let results = run_selection(&bundle, route.as_deref(), policy, &opts)?;
+    for result in &results {{
+        print!("{{}}", result.summary());
+    }}
+    if !results.iter().any(|r| r.succeeded()) {{
+        std::process::exit(1);
+    }}
+    Ok(())
+}}
+"###,
+        lib_name = lib_name,
+        shim_entries = shim_entries,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Target A — compile to a native binary on disk
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -285,7 +599,7 @@ fn compile_to_binary(
     }
 
     // ── Generated lib.rs and main.rs ────────────────────────────────────────
-    let lib_rs = generate_lib_rs();
+    let lib_rs = generate_lib_rs(false);
     fs::write(src_dir.join("lib.rs"), &lib_rs)?;
     let main_rs = generate_main_rs(
         &bin_name,
@@ -296,7 +610,7 @@ fn compile_to_binary(
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
     // ── Cargo.toml ───────────────────────────────────────────────────────────
-    fs::write(build_dir.join("Cargo.toml"), generate_cargo_toml(&bin_name))?;
+    fs::write(build_dir.join("Cargo.toml"), generate_cargo_toml(&bin_name, false))?;
 
     // ── Cargo.lock — embed workspace lock for reproducible/fast first build ──
     fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
@@ -662,8 +976,14 @@ fn strip_shebang(source: &str) -> String {
 // Code generation
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn generate_lib_rs() -> String {
-    "\
+fn generate_lib_rs(include_project: bool) -> String {
+    let project_mod = if include_project {
+        "pub mod project;\n"
+    } else {
+        ""
+    };
+    format!(
+        "\
 // AUTO-GENERATED by olangc. DO NOT EDIT.
 //
 // Runtime library crate — all pub items are part of the public API surface,
@@ -681,9 +1001,9 @@ pub mod process;
 pub mod nix_ops;
 pub mod nixos_ops;
 pub mod scheduler;
-pub(crate) mod wire;
+{project_mod}pub(crate) mod wire;
 "
-    .to_string()
+    )
 }
 
 fn generate_main_rs(
@@ -813,10 +1133,15 @@ fn main() -> anyhow::Result<()> {{
     )
 }
 
-fn generate_cargo_toml(bin_name: &str) -> String {
+fn generate_cargo_toml(bin_name: &str, include_project: bool) -> String {
     // Keep dependency versions in sync with the workspace Cargo.toml.
     // The Cargo.lock (embedded above) pins exact versions, so this just
     // needs to be a compatible range — which the workspace lock already satisfies.
+    let ignore_dep = if include_project {
+        "ignore     = \"0.4\"\n"
+    } else {
+        ""
+    };
     format!(
         r#"[package]
 name    = "{bin_name}"
@@ -847,7 +1172,7 @@ getrandom  = "0.4.3"
 thiserror  = "2"
 anyhow     = "1"
 clap       = {{ version = "4", features = ["derive"] }}
-
+{ignore_dep}
 [profile.release]
 opt-level     = 3
 lto           = "fat"
@@ -857,6 +1182,7 @@ strip         = "symbols"
 "#,
         bin_name = bin_name,
         lib_name = bin_name.replace('-', "_"),
+        ignore_dep = ignore_dep,
     )
 }
 
@@ -959,7 +1285,7 @@ mod tests {
         let src_dir = build_dir.join("src");
 
         write_runtime_sources(&src_dir).unwrap();
-        fs::write(src_dir.join("lib.rs"), generate_lib_rs()).unwrap();
+        fs::write(src_dir.join("lib.rs"), generate_lib_rs(false)).unwrap();
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod hgraph;"));
