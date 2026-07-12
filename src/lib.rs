@@ -11,6 +11,7 @@
 pub mod backend;
 mod capability;
 pub mod eval;
+pub mod executor;
 pub mod hgraph;
 pub mod ir;
 pub mod nix_ops;
@@ -18,6 +19,7 @@ pub mod nixos_ops;
 pub mod ocore;
 pub mod parser;
 pub mod process;
+pub mod project;
 pub mod scheduler;
 pub mod shims;
 pub mod value;
