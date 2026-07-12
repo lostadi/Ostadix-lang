@@ -2,7 +2,8 @@
 name        = "o-lang"
 version     = "0.2.0"
 edition     = "2021"
-description = "The O Language: a universal polyglot expression framework"
+description = "Ostadix-lang (O-lang): recursive evaluator composition for whole-program polyglot execution"
+repository  = "https://github.com/lostadi/O-lang"
 authors     = ["Lee Daghlar Ostadi"]
 license     = "Apache-2.0"
 # `cargo run` and the test_o_lang_examples.sh smoke suite invoke the
@@ -90,9 +91,6 @@ rustyline   = "14"
 # Notebook server (opt-in via --features notebook)
 axum        = { version = "0.7", optional = true }
 tokio       = { version = "1", features = ["full"], optional = true }
-sherpa-onnx = "1.13.3"
-smg-wasm = "1.1.2"
-wasm = "0.0.0"
 
 [dev-dependencies]
 proptest = "1"

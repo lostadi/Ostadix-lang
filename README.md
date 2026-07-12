@@ -47,6 +47,13 @@ runtimes. O-core MIR describes machine computation, control flow, memory, and
 hardware. Hosted blocks such as `python^`, `rust^`, `nix^`, and `sql^` remain
 available in user space without becoming kernel dependencies.
 
+**Portability.** Hosted Ostadix-lang is architecture-portable through its
+Rust/Cargo, C17, and Python implementations, subject to availability of the
+evaluator runtimes used by a program. It has been developed and run on macOS
+ARM64, Android ARM64 on a rooted Pixel 8 Pro, and Intel x86_64 Linux. The
+current x86_64 limitation applies only to O-core's emitted freestanding ELF
+target, not to hosted `.O` execution.
+
 ---
 
 ## Getting Started: Full Setup Guide
@@ -102,7 +109,7 @@ runtime dependencies, builds the Rust and C17 editions, prepares the Python
 reference, and creates convenience wrappers:
 
 ```bash
-git clone https://github.com/lostadi/O-lang.git
+git clone https://github.com/lostadi/O-lang.git Ostadix-lang
 cd Ostadix-lang
 ./setup.sh
 ```
@@ -137,7 +144,7 @@ python3 -m o_lang examples/hello.O
 ### Option B: Manual Rust setup
 
 ```bash
-git clone https://github.com/lostadi/O-lang.git
+git clone https://github.com/lostadi/O-lang.git Ostadix-lang
 cd Ostadix-lang
 cargo build --release
 
@@ -617,8 +624,10 @@ properties rather than any single one:
    level of an individual expression, not a file, module, or cell.
 2. **Recursive nestability.** Evaluator expressions may contain other
    evaluator expressions to arbitrary depth.
-3. **An open evaluator set.** The set of evaluators is an extensible registry,
-   not a fixed pair.
+3. **A registry-extensible evaluator family.** The set of evaluators is a
+   compile-time-extensible registry, not a fixed pair. Adding an evaluator
+   means adding a registry entry and rebuilding; registration is static, not
+   a runtime plugin system.
 4. **Independent runtimes.** Evaluators are independently implemented real
    runtimes such as CPython, Node.js, Nix, SQLite, Racket, and rustc, not
    reimplementations on one shared substrate.
@@ -630,9 +639,14 @@ properties rather than any single one:
    scheduling and analysis.
 
 To our knowledge, Ostadix-lang is the first general-purpose programming system
-to combine open-world recursive evaluator composition over independently
-implemented runtimes with a language-neutral value boundary and source-derived
-whole-program graph execution. Wherever a prior system satisfies part of this
+to combine expression-granular recursive evaluator composition across a
+registry-extensible family of independently implemented runtimes with a
+language-neutral value boundary and source-derived lowering into a unified
+whole-program execution representation. The current Rust implementation
+derives, validates, analyzes, and schedules the HGraph; arbitrary evaluator
+operations still dispatch through the serial OIR executor, while supported
+request classes provide the current concurrent execution path. Wherever a
+prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
 prior art are welcome as issues.
 
@@ -2116,8 +2130,9 @@ file, which GitHub surfaces through the repository's **"Cite this
 repository"** button. Until the first archival release mints a DOI, cite the
 canonical repository:
 
-    Lee Daghlar Ostadi. Ostadix-lang: interpreter-as-syntax polyglot
-    metaprogramming. Version 0.2.0. https://github.com/lostadi/O-lang
+    Lee Daghlar Ostadi. Ostadix-lang: Recursive Evaluator Composition for
+    Whole-Program Polyglot Execution. Version 0.2.0.
+    https://github.com/lostadi/O-lang
 
 Once the Zenodo DOI exists, prefer citing the DOI of the exact archived
 release you used.

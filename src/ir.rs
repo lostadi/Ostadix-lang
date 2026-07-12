@@ -1047,11 +1047,16 @@ pub struct BackendSpec {
     pub aliases: &'static [&'static str],
     /// Whether `{lazy}` may cache results from this backend.
     ///
-    /// "Pure" means: same body + same deps + same env ⇒ same output. No
-    /// hidden IO, no clock, no random, no mutable global state. The flag is
-    /// conservative — a backend is marked pure only when we're confident.
-    /// `{defer}` works on any backend (it never caches), so it's the
-    /// impure-backend escape hatch.
+    /// This is a cache-safety contract for the current invocation mode, not
+    /// a claim that the source language is mathematically pure. `pure: true`
+    /// means: "safe for generic `{lazy}` memoization under the current
+    /// fingerprint (body + dep identities + env id) and runtime model" —
+    /// no hidden IO, clocks, randomness, or mutable external state can leak
+    /// into the result. Shim-backed backends that run arbitrary programs in
+    /// an unrestricted host environment must be `false` even when the
+    /// backend language is nominally pure or declarative. `{defer}` works on
+    /// any backend (it never caches), so it's the impure-backend escape
+    /// hatch.
     pub pure: bool,
     /// Which splice-rendering strategy `render_child` should use.
     pub renderer: SpliceRenderer,
@@ -1124,11 +1129,16 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Default,
         ExecutionMode::InlineAst,
     ),
-    // Nix family — deterministic by design.
+    // Nix family — shim-backed and NOT cache-safe under generic `{lazy}`.
+    // `nix` currently runs with impure evaluation and can observe
+    // filesystem/environment state that the `{lazy}` fingerprint does not
+    // capture; `nix_store`/`nixos_test` interact with external mutable
+    // stores, processes, networks, files, or VM state. Use `{defer}` for
+    // deferred non-cacheable evaluation.
     BackendSpec::with_authority(
         "nix",
         &[],
-        true,
+        false,
         SpliceRenderer::Nix,
         ExecutionMode::Shim,
         &[
@@ -1138,9 +1148,12 @@ const BACKEND_SPECS: &[BackendSpec] = &[
             BackendAuthority::Process,
         ],
     ),
-    // nix_expr is already lazy by construction; {lazy}/{defer} are rejected
-    // anyway. It splices via the default representation (its body is
-    // assembled before any Nix evaluation happens).
+    // nix_expr captures an expression *value* deterministically without
+    // evaluating it — no shim runs, so capture is trivially cache-safe.
+    // Generic `{lazy}` and `{defer}` are rejected for it as redundant, so
+    // `pure: true` here is NOT a claim about arbitrary Nix evaluation. It
+    // splices via the default representation (its body is assembled before
+    // any Nix evaluation happens).
     BackendSpec::new(
         "nix_expr",
         &[],
@@ -1151,7 +1164,7 @@ const BACKEND_SPECS: &[BackendSpec] = &[
     BackendSpec::with_authority(
         "nix_store",
         &[],
-        true,
+        false,
         SpliceRenderer::Nix,
         ExecutionMode::Shim,
         &[
@@ -1164,7 +1177,7 @@ const BACKEND_SPECS: &[BackendSpec] = &[
     BackendSpec::with_authority(
         "nixos_test",
         &[],
-        true,
+        false,
         SpliceRenderer::Nix,
         ExecutionMode::Shim,
         &[
@@ -1174,7 +1187,9 @@ const BACKEND_SPECS: &[BackendSpec] = &[
             BackendAuthority::Process,
         ],
     ),
-    // Pure templating.
+    // Cache-safe inline representation handlers: the runtime itself
+    // assembles the value deterministically from the block body and splices
+    // — no external process or hidden state is involved.
     BackendSpec::new(
         "html",
         &[],
@@ -1214,11 +1229,16 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         SpliceRenderer::Default,
         ExecutionMode::Shim,
     ),
-    // Declarative / pure-by-default languages.
+    // Haskell/OCaml/WebAssembly blocks are arbitrary programs executed via
+    // unrestricted shims: they may perform I/O, read clocks/environment
+    // variables, use randomness, receive host capabilities (WASI), or
+    // mutate external state. The runtime does not enforce a closed,
+    // deterministic, fully fingerprinted execution environment, so they are
+    // not cache-safe under generic `{lazy}`; use `{defer}`.
     BackendSpec::with_authority(
         "haskell",
         &[],
-        true,
+        false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
         &[BackendAuthority::FileWrite, BackendAuthority::Process],
@@ -1226,7 +1246,7 @@ const BACKEND_SPECS: &[BackendSpec] = &[
     BackendSpec::with_authority(
         "ocaml",
         &[],
-        true,
+        false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
         &[BackendAuthority::FileWrite, BackendAuthority::Process],
@@ -1234,7 +1254,7 @@ const BACKEND_SPECS: &[BackendSpec] = &[
     BackendSpec::with_authority(
         "webassembly",
         &[],
-        true,
+        false,
         SpliceRenderer::Default,
         ExecutionMode::Shim,
         &[BackendAuthority::FileWrite, BackendAuthority::Process],
@@ -1449,6 +1469,28 @@ impl BackendRegistry {
             .find(|p| p.exists())
             .unwrap_or_else(|| shim_dir.join(format!("{lang}_shim.py")))
     }
+
+    /// All parser tags accepted by the registry: every canonical backend
+    /// name plus every declared alias, in the deterministic order of the
+    /// static spec table (canonical name first, then its aliases).
+    ///
+    /// This is the single source of truth for the set of accepted language
+    /// tags; binaries must not maintain their own copies.
+    pub fn registered_backend_names(&self) -> Vec<&'static str> {
+        self.specs
+            .iter()
+            .flat_map(|s| std::iter::once(s.name).chain(s.aliases.iter().copied()))
+            .collect()
+    }
+
+    /// Convenience: the accepted tag set as owned `String`s, ready for
+    /// `Parser::new` / `Evaluator::with_registered_backends`.
+    pub fn registered_backend_tags(&self) -> std::collections::HashSet<String> {
+        self.registered_backend_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1575,24 +1617,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_purity_matches_legacy_table() {
+    fn registry_purity_is_conservative() {
         let reg = BackendRegistry::global();
+        // The cache-safe set is limited to deterministic inline
+        // representation handlers plus nix_expr's deterministic expression
+        // *capture* (which never invokes a shim).
+        for lang in ["nix_expr", "html", "markdown", "latex", "text"] {
+            assert!(reg.is_pure(lang), "{lang} should be cache-safe");
+        }
+        // Every unrestricted shim-backed backend is impure: the runtime
+        // does not enforce a closed deterministic execution environment,
+        // so generic `{lazy}` caching would be unsound.
         for lang in [
             "nix",
-            "nix_expr",
             "nix_store",
             "nixos_test",
-            "html",
-            "markdown",
-            "latex",
-            "text",
             "haskell",
             "ocaml",
             "webassembly",
-        ] {
-            assert!(reg.is_pure(lang), "{lang} should be pure");
-        }
-        for lang in [
             "python",
             "shell",
             "bash",
@@ -1608,6 +1650,50 @@ mod tests {
         ] {
             assert!(!reg.is_pure(lang), "{lang} should be impure");
         }
+    }
+
+    /// The accepted tag set exposed by the registry contains every
+    /// canonical backend name and every declared alias, with no duplicate
+    /// or missing entries. Binaries derive their parser tag sets from this
+    /// method instead of maintaining copies.
+    #[test]
+    fn registry_tag_set_covers_all_canonical_names_and_aliases() {
+        let reg = BackendRegistry::global();
+        let names = reg.registered_backend_names();
+
+        // No duplicates.
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate tags in registry: {names:?}"
+        );
+
+        // Every canonical name and every alias is present.
+        for spec in BACKEND_SPECS {
+            assert!(
+                unique.contains(spec.name),
+                "missing canonical name {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(unique.contains(alias), "missing alias {alias}");
+            }
+        }
+
+        // Every tag maps back to some spec (nothing extra).
+        for tag in &names {
+            assert!(reg.get(tag).is_some(), "tag {tag} resolves to no spec");
+        }
+
+        // Known aliases used by the parser remain accepted.
+        for alias in ["py", "md", "tex", "plain", "o"] {
+            assert!(unique.contains(alias), "parser alias {alias} must remain");
+        }
+
+        // Owned-tag convenience view agrees.
+        let owned = reg.registered_backend_tags();
+        assert_eq!(owned.len(), names.len());
     }
 
     #[test]

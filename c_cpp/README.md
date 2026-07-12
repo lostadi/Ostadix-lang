@@ -39,7 +39,7 @@ make
 - `make olangc-test` — also exercises the AOT path
 - `make run EX=meta_eval` — quick run of an example
 
-Everything is built from the `.c` files in `src/` + headers in `include/`. The Makefile is deliberately simple (no subdirs, no generated build system).
+The active implementation is built from the C17 `.c` files in `src/` plus `.h` headers in `include/`. The Makefile is deliberately simple (no subdirs, no generated build system); CMake builds the same C17 implementation for users who prefer it.
 
 ## What works
 
@@ -80,22 +80,30 @@ The binary has **no dependency on the olangc tool or the source tree** at runtim
 c_cpp/
 ├── Makefile          # the easy build
 ├── include/          # public + internal C headers
+│   ├── value.h
+│   ├── parser.h
+│   ├── process.h
+│   ├── eval.h
+│   ├── scheduler.h
+│   └── nix_ops.h
 ├── src/
-│   ├── value.c       # OValue + JSON wire (core)
+│   ├── value.c       # OValue + 4-byte length-prefixed canonical CBOR wire (core)
 │   ├── parser.c      # typed-paren parser + AST
-│   ├── process.c     # shim subprocess mgmt + JSON IPC
+│   ├── process.c     # shim subprocess mgmt + 4-byte length-prefixed canonical CBOR IPC
 │   ├── eval.c        # leaves-up evaluator, splice, structural backends, render_child
 │   ├── scheduler.c   # (serial for MVP) autonomous + disk cache
 │   ├── nix_ops.c     # instantiate / realise / activate
+│   ├── nixos_ops.c   # NixOS-related operations
 │   ├── main.c        # the `O` interpreter
 │   └── olangc.c      # the AOT compiler
+├── legacy_cpp/       # historical obsolete C++ prototype (not built)
 └── README.md         # this file
 ```
 
 ## Adding a language (for hackers)
 
 1. Add the tag to the registered list in `main.c` / `olangc` generated mains.
-2. Implement a `_shim.py` (or native executable) speaking the newline-JSON protocol.
+2. Implement a `_shim.py` (or native executable) speaking the 4-byte length-prefixed canonical CBOR protocol.
 3. Add a `render_*` case in `eval.c` if the language needs special `render_child` rules.
 4. For structural behaviour (like `O` / `quote`), handle in `eval_typed_expr`.
 
