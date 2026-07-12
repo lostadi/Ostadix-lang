@@ -288,15 +288,18 @@ pub enum RoutePolicy {
     Fallback,
     /// Run alternatives sequentially, returning the first success.
     AnySuccess,
-    /// Race alternatives, return the first success (not yet executable).
+    /// Race alternatives in parallel, return the first success and cancel
+    /// the losers cooperatively.
     RaceSuccess,
-    /// Race alternatives, return the first to settle (not yet executable).
+    /// Race alternatives in parallel, return the first to settle (success or
+    /// failure) and cancel the losers cooperatively.
     RaceSettle,
     /// Run every alternative (each in its own isolated workspace).
     All,
-    /// Run all and verify their results are equivalent (not yet executable).
+    /// Run all in parallel and verify their results are equivalent
+    /// (JSON values when decoded, trimmed stdout otherwise).
     VerifyEquivalent,
-    /// Benchmark all and select the best (not yet executable).
+    /// Run all in parallel and select the fastest successful alternative.
     BenchmarkAndSelect,
 }
 
@@ -350,15 +353,9 @@ impl RoutePolicy {
     }
 
     /// Whether the route runtime can currently execute this policy.
+    /// Every represented policy is now executable.
     pub fn is_executable(&self) -> bool {
-        matches!(
-            self,
-            RoutePolicy::Explicit(_)
-                | RoutePolicy::Default
-                | RoutePolicy::Fallback
-                | RoutePolicy::AnySuccess
-                | RoutePolicy::All
-        )
+        true
     }
 }
 

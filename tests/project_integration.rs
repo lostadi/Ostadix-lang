@@ -554,16 +554,168 @@ fn project_runtime_fallback_stops_at_first_success() {
 }
 
 #[test]
-fn project_runtime_unexecutable_policy_reports_clearly() {
-    let a = shell_route("alt-a", "echo A");
-    let mut bundle = bundle_with_routes(vec![a]);
+fn project_runtime_race_success_selects_success_and_cancels_losers() {
+    // fast-fail settles first but fails; slow-ok is the only success. The
+    // hanging alternative would block forever without cooperative cancellation.
+    let fast_fail = shell_route("fast-fail", "exit 3");
+    let slow_ok = shell_route("slow-ok", "sleep 0.2; echo winner");
+    let hang = shell_route("hang", "sleep 30; echo never");
+    let mut bundle = bundle_with_routes(vec![fast_fail, slow_ok, hang]);
     bundle.route_sets.push(RouteSet {
         provides: "main".into(),
-        alternatives: vec!["alt-a".into()],
+        alternatives: vec!["fast-fail".into(), "slow-ok".into(), "hang".into()],
+        policy: RoutePolicy::RaceSuccess,
+    });
+
+    let start = std::time::Instant::now();
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "losers were not cancelled"
+    );
+    let selected = results.last().unwrap();
+    assert_eq!(selected.route_id, "slow-ok");
+    assert!(selected.succeeded());
+    assert!(selected.stdout_text().contains("winner"));
+}
+
+#[test]
+fn project_runtime_race_success_all_failures_reports_no_success() {
+    let a = shell_route("a", "exit 1");
+    let b = shell_route("b", "exit 2");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["a".into(), "b".into()],
+        policy: RoutePolicy::RaceSuccess,
+    });
+
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| !r.succeeded()));
+}
+
+#[test]
+fn project_runtime_race_settle_returns_first_settled_even_failure() {
+    let fast_fail = shell_route("fast-fail", "exit 7");
+    let hang = shell_route("hang", "sleep 30; echo never");
+    let mut bundle = bundle_with_routes(vec![fast_fail, hang]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["hang".into(), "fast-fail".into()],
+        policy: RoutePolicy::RaceSettle,
+    });
+
+    let start = std::time::Instant::now();
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "loser was not cancelled"
+    );
+    let selected = results.last().unwrap();
+    assert_eq!(selected.route_id, "fast-fail");
+    assert_eq!(selected.exit_code, Some(7));
+}
+
+#[test]
+fn project_runtime_verify_equivalent_accepts_matching_outputs() {
+    let a = shell_route("alt-a", "echo same");
+    let b = shell_route("alt-b", "printf 'same\\n'");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["alt-a".into(), "alt-b".into()],
         policy: RoutePolicy::VerifyEquivalent,
     });
+
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.succeeded()));
+}
+
+#[test]
+fn project_runtime_verify_equivalent_rejects_divergent_outputs() {
+    let a = shell_route("alt-a", "echo one");
+    let b = shell_route("alt-b", "echo two");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["alt-a".into(), "alt-b".into()],
+        policy: RoutePolicy::VerifyEquivalent,
+    });
+
     let err = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
-    assert!(err.to_string().contains("not yet executable"), "got: {err}");
+    assert!(err.to_string().contains("different stdout"), "got: {err}");
+}
+
+#[test]
+fn project_runtime_verify_equivalent_compares_json_values() {
+    let mut a = shell_route("alt-a", "echo '{\"x\": 1, \"y\": 2}'");
+    a.result_codec = ResultCodec::Json;
+    let mut b = shell_route("alt-b", "echo '{\"y\":2,\"x\":1}'");
+    b.result_codec = ResultCodec::Json;
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["alt-a".into(), "alt-b".into()],
+        policy: RoutePolicy::VerifyEquivalent,
+    });
+
+    // Key order differs but decoded JSON values are equal.
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
+fn project_runtime_verify_equivalent_requires_all_success() {
+    let a = shell_route("alt-a", "echo ok");
+    let b = shell_route("alt-b", "exit 1");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["alt-a".into(), "alt-b".into()],
+        policy: RoutePolicy::VerifyEquivalent,
+    });
+
+    let err = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("requires every alternative to succeed"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn project_runtime_benchmark_selects_fastest_success() {
+    let slow = shell_route("slow", "sleep 0.4; echo slow");
+    let fast = shell_route("fast", "echo fast");
+    let broken = shell_route("broken", "exit 1");
+    let mut bundle = bundle_with_routes(vec![slow, fast, broken]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["slow".into(), "fast".into(), "broken".into()],
+        policy: RoutePolicy::BenchmarkAndSelect,
+    });
+
+    let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
+    assert_eq!(results.len(), 3);
+    let selected = results.last().unwrap();
+    assert_eq!(selected.route_id, "fast");
+    assert!(selected.succeeded());
+}
+
+#[test]
+fn project_runtime_benchmark_fails_when_nothing_succeeds() {
+    let a = shell_route("a", "exit 1");
+    let b = shell_route("b", "exit 2");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["a".into(), "b".into()],
+        policy: RoutePolicy::BenchmarkAndSelect,
+    });
+
+    let err = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("no alternative succeeded"), "got: {err}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
