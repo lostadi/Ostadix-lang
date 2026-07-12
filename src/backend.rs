@@ -772,8 +772,7 @@ fn sqlite_json_to_ovalue(value: Value) -> Result<OValue> {
 fn sql_has_query_result(code: &str) -> bool {
     code.split(';')
         .map(str::trim)
-        .filter(|stmt| !stmt.is_empty())
-        .next_back()
+        .rfind(|stmt| !stmt.is_empty())
         .is_some_and(|stmt| {
             let upper = stmt
                 .chars()

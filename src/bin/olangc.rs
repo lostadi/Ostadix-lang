@@ -641,46 +641,9 @@ fn op_kind_label(kind: &o_lang::hgraph::kinds::OpKind) -> String {
 
 /// The backend names accepted in language tags — same set as the O interpreter.
 fn registered_backends() -> HashSet<String> {
-    [
-        "O",
-        "python",
-        "html",
-        "latex",
-        "markdown",
-        "bash",
-        "shell",
-        "rust",
-        "racket",
-        "nix",
-        "nix_expr",
-        "nix_store",
-        "nixos_test",
-        "text",
-        "csharp",
-        "c",
-        "cpp",
-        "haskell",
-        "lisp",
-        "common_lisp",
-        "sql",
-        "ruby",
-        "matlab",
-        "mathematica",
-        "webassembly",
-        "java",
-        "javascript",
-        "ocaml",
-        "quote",
-        // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py",
-        "md",
-        "tex",
-        "plain",
-        "o",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    // Single source of truth: the central BackendRegistry owns the set of
+    // accepted parser tags (canonical names plus aliases).
+    o_lang::ir::BackendRegistry::global().registered_backend_tags()
 }
 
 /// Drop a leading `#!...` shebang line, if present.
@@ -809,20 +772,8 @@ fn main() -> anyhow::Result<()> {{
     #[cfg(not(target_family = "wasm"))]
     let _guard = ShimGuard(shim_dir.clone());
 
-    let registered_backends: HashSet<String> = [
-        "O", "python", "html", "latex", "markdown", "bash", "shell",
-        "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test",
-        "text",
-        "csharp", "c", "cpp", "haskell", "lisp", "common_lisp", "sql",
-        "ruby", "matlab", "mathematica", "webassembly", "java",
-        "javascript", "ocaml",
-        "quote",
-        // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py", "md", "tex", "plain", "o",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let registered_backends: HashSet<String> =
+        {lib_name}::ir::BackendRegistry::global().registered_backend_tags();
 
     let mut source = PROGRAM_SOURCE.to_string();
     if source.starts_with("#!") {{
