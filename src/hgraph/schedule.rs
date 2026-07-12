@@ -1,9 +1,168 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::ir::PlanNodeId;
+
 use super::{
-    graph::{ActorId, HGraph, NodeId, PortRole},
+    graph::{ActorId, EdgeId, HGraph, NodeId, PortRole},
     kinds::OpKind,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ready-operation scheduler
+//
+// An Execute hyperedge is ready when all of its input value nodes are
+// materialized, its blocking constraints (data/structural producers and its
+// same-actor predecessor) are satisfied, and its branch guard (if any) is
+// active. Every Execute edge carries a stable source ordinal used both for
+// tie-breaking when several operations become ready simultaneously and for the
+// deterministic commit order. Plain sibling sequencing is NOT a blocking
+// constraint here — that is how independent siblings become concurrently ready.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One schedulable operation: its plan node, its Execute edge, the value nodes
+/// it consumes/produces, its stable ordinal, and (for backend blocks) its actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyOp {
+    pub plan_node: PlanNodeId,
+    pub edge: EdgeId,
+    pub output: NodeId,
+    pub inputs: Vec<NodeId>,
+    pub ordinal: u64,
+    pub actor: Option<ActorId>,
+    /// Indices (into `ReadySchedule::ops`) of operations that must complete
+    /// before this one can run.
+    pub blocked_by: Vec<usize>,
+}
+
+/// The derived ready-operation schedule for a graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadySchedule {
+    pub ops: Vec<ReadyOp>,
+}
+
+impl ReadySchedule {
+    /// Derive the ready-operation schedule from the graph's Execute hyperedges.
+    pub fn derive(graph: &HGraph) -> Result<ReadySchedule, String> {
+        let infos = graph.exec_ops_ordered();
+
+        // producer value node → op index (an op's output node)
+        let mut producer_op: HashMap<NodeId, usize> = HashMap::new();
+        for (index, info) in infos.iter().enumerate() {
+            producer_op.insert(info.output, index);
+        }
+
+        let mut ops: Vec<ReadyOp> = infos
+            .iter()
+            .map(|info| ReadyOp {
+                plan_node: info.plan_node,
+                edge: info.edge,
+                output: info.output,
+                inputs: info.inputs.clone(),
+                ordinal: info.ordinal,
+                actor: graph.node(info.output).and_then(|node| node.actor),
+                blocked_by: Vec::new(),
+            })
+            .collect();
+
+        // Data/structural blocking: an op waits on the producers of its inputs.
+        for index in 0..ops.len() {
+            let mut deps: BTreeSet<usize> = BTreeSet::new();
+            for input in ops[index].inputs.clone() {
+                if let Some(&producer) = producer_op.get(&input) {
+                    if producer != index {
+                        deps.insert(producer);
+                    }
+                }
+            }
+            ops[index].blocked_by = deps.into_iter().collect();
+        }
+
+        // Actor serialization: same-actor ops run in stable ordinal order.
+        let mut by_actor: HashMap<ActorId, Vec<usize>> = HashMap::new();
+        for (index, op) in ops.iter().enumerate() {
+            if let Some(actor) = op.actor {
+                by_actor.entry(actor).or_default().push(index);
+            }
+        }
+        for members in by_actor.values() {
+            let mut ordered = members.clone();
+            ordered.sort_by_key(|&i| (ops[i].ordinal, i));
+            for window in ordered.windows(2) {
+                let (prev, next) = (window[0], window[1]);
+                if !ops[next].blocked_by.contains(&prev) {
+                    ops[next].blocked_by.push(prev);
+                }
+            }
+        }
+        for op in &mut ops {
+            op.blocked_by.sort_unstable();
+            op.blocked_by.dedup();
+        }
+
+        Ok(ReadySchedule { ops })
+    }
+
+    /// Topological "waves": each wave is the set of operations that become
+    /// ready at the same step (in stable ordinal order). Independent siblings
+    /// share a wave; same-actor and data-dependent operations land in later
+    /// waves. Returns an error if the operation dependency graph has a cycle.
+    pub fn waves(&self) -> Result<Vec<Vec<PlanNodeId>>, String> {
+        let mut indegree = vec![0usize; self.ops.len()];
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); self.ops.len()];
+        for (index, op) in self.ops.iter().enumerate() {
+            for &dep in &op.blocked_by {
+                indegree[index] += 1;
+                successors[dep].push(index);
+            }
+        }
+
+        let order_key = |i: usize| (self.ops[i].ordinal, i);
+        let mut ready: Vec<usize> = (0..self.ops.len()).filter(|&i| indegree[i] == 0).collect();
+        ready.sort_by_key(|&i| order_key(i));
+
+        let mut waves: Vec<Vec<PlanNodeId>> = Vec::new();
+        let mut scheduled = 0usize;
+        while !ready.is_empty() {
+            let wave = std::mem::take(&mut ready);
+            waves.push(wave.iter().map(|&i| self.ops[i].plan_node).collect());
+            scheduled += wave.len();
+            let mut next: Vec<usize> = Vec::new();
+            for node in wave {
+                for &successor in &successors[node] {
+                    indegree[successor] -= 1;
+                    if indegree[successor] == 0 {
+                        next.push(successor);
+                    }
+                }
+            }
+            next.sort_by_key(|&i| order_key(i));
+            ready = next;
+        }
+
+        if scheduled != self.ops.len() {
+            return Err(format!(
+                "ready-operation graph contains a cycle: scheduled {scheduled} of {} operations",
+                self.ops.len()
+            ));
+        }
+        Ok(waves)
+    }
+
+    /// The plan nodes in a deterministic, dependency-respecting order (stable
+    /// ordinal breaks ties). This is the order the coordinator uses to launch
+    /// operations onto the ready frontier.
+    pub fn launch_order(&self) -> Result<Vec<PlanNodeId>, String> {
+        Ok(self.waves()?.into_iter().flatten().collect())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy node-clustering schedule (compatibility surface)
+//
+// The reference (serial) executor and a number of analysis tests still consume
+// the node-level clustering schedule. It is retained here as a compatibility
+// API over the constraint/type edge set.
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCluster {

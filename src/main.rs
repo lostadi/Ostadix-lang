@@ -20,12 +20,24 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1).collect::<VecDeque<_>>();
     let backends = registered_backends();
     let mut backend_grants = Vec::new();
-    while args.front().is_some_and(|arg| arg == "--backend-grant") {
-        args.pop_front();
-        backend_grants.push(
-            args.pop_front()
-                .context("--backend-grant requires NAME=LANG[:RIGHT,...]")?,
-        );
+    while args.front().is_some_and(|arg| arg == "--backend-grant" || arg == "--executor") {
+        match args.pop_front().unwrap().as_str() {
+            "--backend-grant" => backend_grants.push(
+                args.pop_front()
+                    .context("--backend-grant requires NAME=LANG[:RIGHT,...]")?,
+            ),
+            "--executor" => {
+                let choice = args
+                    .pop_front()
+                    .context("--executor requires `serial` or `graph`")?;
+                match choice.as_str() {
+                    "serial" => env::set_var("O_EXECUTOR", "serial"),
+                    "graph" => env::set_var("O_EXECUTOR", "graph"),
+                    other => bail!("unknown --executor value `{other}` (expected serial or graph)"),
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     // No args in an interactive terminal → REPL.
@@ -107,6 +119,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  O --backend-grant NAME=LANG[:RIGHT,...] <input.O> [backends_dir]  # compatibility"
+    )?;
+    writeln!(
+        out,
+        "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: graph)"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;
