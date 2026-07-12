@@ -377,6 +377,7 @@ python3 -m tests.test_evaluator
 10. [O-core native systems language](#o-core-native-systems-language)
 11. [Running the tests](#running-the-tests)
 12. [Status](#status)
+13. [Citation and authorship](#citation-and-authorship)
 
 ---
 
@@ -603,6 +604,37 @@ plans, groups, and autonomous scheduling make Ostadix-lang capable of expressing
 workflow topology. The difference is that these control values live in the
 same value system as the language results. `batch`, `all`, `any`, and `race`
 are not external scheduler configuration; they are O expressions.
+
+**The claim, stated exactly.** Individual prior systems provide pieces of
+this design. Eco composes languages through arbitrarily nested language boxes,
+but it is primarily a language-composition editor. PyHyp provides executable
+fine-grained nesting for one specifically engineered language pair. GraalVM
+standardizes interoperability across languages implemented within or exposed
+through its polyglot substrate. Ostadix-lang's novelty is a *conjunction* of
+properties rather than any single one:
+
+1. **Expression-granular evaluator selection.** The evaluator is chosen at the
+   level of an individual expression, not a file, module, or cell.
+2. **Recursive nestability.** Evaluator expressions may contain other
+   evaluator expressions to arbitrary depth.
+3. **An open evaluator set.** The set of evaluators is an extensible registry,
+   not a fixed pair.
+4. **Independent runtimes.** Evaluators are independently implemented real
+   runtimes such as CPython, Node.js, Nix, SQLite, Racket, and rustc, not
+   reimplementations on one shared substrate.
+5. **A common value domain.** Results cross boundaries through OValue, a
+   single language-neutral value type, instead of pairwise foreign-function
+   interfaces.
+6. **Global lowering.** The full heterogeneous computation lowers into one
+   execution representation (OIR and its value-flow graph) for whole-program
+   scheduling and analysis.
+
+To our knowledge, Ostadix-lang is the first general-purpose programming system
+to combine open-world recursive evaluator composition over independently
+implemented runtimes with a language-neutral value boundary and source-derived
+whole-program graph execution. Wherever a prior system satisfies part of this
+conjunction, the paragraphs above and below say so; corrections and closer
+prior art are welcome as issues.
 
 **Systems languages.** C, Rust, Zig, and freestanding subsets of other
 languages already compile kernels. O-core's distinct point is its placement
@@ -2077,13 +2109,41 @@ Apache License 2.0. See [LICENSE](LICENSE) for the full text.
 
 Ostadix-lang / ^Ostadix_ was created by Lee Daghlar Ostadi.
 
-If you use, fork, compare, derive from, or discuss this project, cite the
+### How to cite
+
+Citation metadata lives in the root-level [`CITATION.cff`](CITATION.cff)
+file, which GitHub surfaces through the repository's **"Cite this
+repository"** button. Until the first archival release mints a DOI, cite the
 canonical repository:
 
-    Lee Daghlar Ostadi. Ostadix-lang / ^Ostadix_.
-    https://github.com/lostadi/O-lang
+    Lee Daghlar Ostadi. Ostadix-lang: interpreter-as-syntax polyglot
+    metaprogramming. Version 0.2.0. https://github.com/lostadi/O-lang
 
-Core contribution:
+Once the Zenodo DOI exists, prefer citing the DOI of the exact archived
+release you used.
+
+### Archival releases and DOI
+
+The publication path for the software follows the standard research-software
+sequence: tagged GitHub release → Zenodo archive with DOI → preprint →
+peer-reviewed paper. Concretely, for each archival release:
+
+1. Choose the exact commit that represents the archival research release.
+2. Give it a real Git tag and a published GitHub release whose version
+   matches `CITATION.cff` and `Cargo.toml`.
+3. With the repository connected to Zenodo's GitHub integration, publishing
+   the release causes Zenodo to archive the repository state and mint a DOI
+   for that release.
+4. Put the resulting DOI back into `CITATION.cff` (uncomment the `doi:`
+   field) and into this section of the README.
+
+Evaluation artifacts associated with any paper — benchmark scripts, inputs,
+raw results, and reproduction instructions — should be deposited on Zenodo as
+their own archived, DOI-bearing artifact alongside the software release.
+Software Heritage archival can additionally be requested to obtain a
+content-addressed persistent identifier for the source itself.
+
+### Core contribution
 
     Typed expression boundaries: LANG^( body )_LANG
 
