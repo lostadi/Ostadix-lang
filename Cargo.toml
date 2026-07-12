@@ -40,6 +40,12 @@ name = "ogit"
 path = "src/bin/ogit.rs"
 
 [features]
+default = ["graph_executor"]
+# graph_executor: enable the readiness-driven operation-hypergraph coordinator
+# as the default execution engine. When disabled (e.g. in the standalone crate
+# emitted by olangc, whose lib.rs does not bundle the executor module) the
+# runtime falls back to the reference serial executor.
+graph_executor = []
 notebook = ["dep:axum", "dep:tokio"]
 
 [dependencies]

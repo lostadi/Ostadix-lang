@@ -53,11 +53,11 @@ check 'JSON IPC' \
 check 'OValue \+ JSON wire' \
     "the wire format is canonical CBOR, not JSON"
 
-# Overstated execution claims: the runtime lowers, validates, solves, and
-# schedules the HGraph, but arbitrary evaluator operations still execute
-# through execute_plan_serial.
-check 'whole-program graph execution' \
-    "graph lowering/schedule derivation is implemented; general graph execution is not"
+# The graph executor is now the runtime default: `eval_ir_program_with_scope`
+# drives a readiness-based operation-hypergraph coordinator, with the serial
+# reference executor available behind `O_EXECUTOR=serial`. The former guard
+# against claiming general graph execution is therefore no longer applicable and
+# has been removed.
 
 # Overstated openness claims: the evaluator registry is compile-time/static
 # (registry-extensible), not a runtime-open universe.
