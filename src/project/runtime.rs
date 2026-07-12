@@ -309,6 +309,8 @@ fn spawn_route(
                     let _ = stderr_handle.join();
                     bail!("{CANCEL_MARKER} route `{}` canceled", route.id);
                 }
+                // Short poll keeps cancellation latency low; the sleeping
+                // coordinator thread costs no meaningful CPU between polls.
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(err) => {
@@ -322,6 +324,8 @@ fn spawn_route(
     };
     let duration_ns = start.elapsed().as_nanos();
 
+    // A drain-thread panic (only possible via a std I/O bug) degrades to
+    // empty captured output rather than poisoning the route result.
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
 
@@ -364,6 +368,11 @@ fn kill_route_process(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
+        // SAFETY: `kill` is a plain syscall with no memory-safety
+        // preconditions. The negative pid targets the whole process group,
+        // whose pgid equals the leader's pid because the route was spawned
+        // with `process_group(0)`, and the pid is valid: `child` has not been
+        // reaped yet (no `wait` has returned for it).
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
@@ -759,6 +768,8 @@ fn run_all_parallel(
                         alternatives[index]
                     )))
                 }
+                // Defensive: unreachable in practice — every scoped thread
+                // sends exactly one message before the channel closes.
                 None => bail!("alternative `{}` never reported a result", alternatives[index]),
             }
         }
@@ -835,6 +846,9 @@ fn race_alternatives(
                 }
             }
             if results.is_empty() {
+                // Defensive: unreachable in practice — cancellation only
+                // starts after a qualifying settlement, so at least one
+                // alternative settles with a result or a real error above.
                 bail!("race: no alternative settled");
             }
             return Ok(results);
