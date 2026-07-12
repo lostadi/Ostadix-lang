@@ -1300,46 +1300,9 @@ fn default_extension_map() -> BTreeMap<String, String> {
 /// The registered backend set must stay in sync with `registered_backends`
 /// in src/main.rs so o-link escapes exactly the openers the runtime parses.
 fn registered_backends() -> HashSet<String> {
-    [
-        "O",
-        "python",
-        "html",
-        "latex",
-        "markdown",
-        "bash",
-        "shell",
-        "rust",
-        "racket",
-        "nix",
-        "nix_expr",
-        "nix_store",
-        "nixos_test",
-        "text",
-        "csharp",
-        "c",
-        "cpp",
-        "haskell",
-        "lisp",
-        "common_lisp",
-        "sql",
-        "ruby",
-        "matlab",
-        "mathematica",
-        "webassembly",
-        "java",
-        "javascript",
-        "ocaml",
-        "quote",
-        // Aliases (canonicalized by the parser via the BackendRegistry).
-        "py",
-        "md",
-        "tex",
-        "plain",
-        "o",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+    // Single source of truth: the central BackendRegistry owns the set of
+    // accepted parser tags (canonical names plus aliases).
+    o_lang::ir::BackendRegistry::global().registered_backend_tags()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

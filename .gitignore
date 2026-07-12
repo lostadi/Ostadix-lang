@@ -105,3 +105,9 @@ cvelist.diff
 computed_plot/
 env_split/
 sql_create_insert_select/
+# CMake generated files
+/c_cpp/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt

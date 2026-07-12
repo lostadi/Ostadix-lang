@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # O-lang cross-platform setup & bootstrap script
-# Sets up dependencies, builds Rust + C/C++ + Python editions for the *current machine*,
+# Sets up dependencies, builds Rust + C17 + Python editions for the *current machine*,
 # and leaves everything in a convenient runnable form.
 #
 # Supports: macOS, Windows (Git Bash/WSL), Debian/Ubuntu, Arch/CachyOS, Fedora, Gentoo,
@@ -407,12 +407,12 @@ build_rust() {
 }
 
 build_c() {
-  echo ">>> Building C/C++ edition..."
+  echo ">>> Building C17 edition..."
   if [[ -d c_cpp ]]; then
     remove_managed_file "$PROJECT_ROOT/c_cpp/O"
     remove_managed_file "$PROJECT_ROOT/c_cpp/olangc"
     if $DRY_RUN; then
-      echo "[DRY] Would build C/C++ edition in $PROJECT_ROOT/c_cpp"
+      echo "[DRY] Would build C17 edition in $PROJECT_ROOT/c_cpp"
       return
     fi
     (cd c_cpp && make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" || make)

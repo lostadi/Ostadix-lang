@@ -617,8 +617,10 @@ properties rather than any single one:
    level of an individual expression, not a file, module, or cell.
 2. **Recursive nestability.** Evaluator expressions may contain other
    evaluator expressions to arbitrary depth.
-3. **An open evaluator set.** The set of evaluators is an extensible registry,
-   not a fixed pair.
+3. **A registry-extensible evaluator family.** The set of evaluators is a
+   compile-time-extensible registry, not a fixed pair. Adding an evaluator
+   means adding a registry entry and rebuilding; registration is static, not
+   a runtime plugin system.
 4. **Independent runtimes.** Evaluators are independently implemented real
    runtimes such as CPython, Node.js, Nix, SQLite, Racket, and rustc, not
    reimplementations on one shared substrate.
@@ -630,9 +632,14 @@ properties rather than any single one:
    scheduling and analysis.
 
 To our knowledge, Ostadix-lang is the first general-purpose programming system
-to combine open-world recursive evaluator composition over independently
-implemented runtimes with a language-neutral value boundary and source-derived
-whole-program graph execution. Wherever a prior system satisfies part of this
+to combine expression-granular recursive evaluator composition across a
+registry-extensible family of independently implemented runtimes with a
+language-neutral value boundary and source-derived lowering into a unified
+whole-program execution representation. The current Rust implementation
+derives, validates, analyzes, and schedules the HGraph; arbitrary evaluator
+operations still dispatch through the serial OIR executor, while supported
+request classes provide the current concurrent execution path. Wherever a
+prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
 prior art are welcome as issues.
 
