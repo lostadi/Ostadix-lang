@@ -98,6 +98,10 @@ rustyline   = "14"
 axum        = { version = "0.7", optional = true }
 tokio       = { version = "1", features = ["full"], optional = true }
 
+# Process-group termination for cooperative route cancellation
+[target.'cfg(unix)'.dependencies]
+libc        = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

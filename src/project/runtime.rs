@@ -8,12 +8,21 @@
 //!
 //! Route sets are executed under their policy. Alternatives never all execute
 //! by default — only the selected policy activates them, and `Default` requires
-//! an unambiguous default route or an explicit selection.
+//! an unambiguous default route or an explicit selection. The parallel
+//! policies (`race_success`, `race_settle`, `verify_equivalent`,
+//! `benchmark_and_select`) run every alternative concurrently, each in its own
+//! isolated workspace, and cancel losers cooperatively where the policy
+//! permits it. Selection is deterministic: when several alternatives settle
+//! successfully, the one earliest in declaration order wins.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use crate::executor::CancellationToken;
 
 use super::bundle::sha256_hex;
 use super::materialize::{materialize_isolated, Workspace};
@@ -117,6 +126,7 @@ fn is_executable(path: &Path) -> bool {
 struct RunCtx<'a> {
     bundle: &'a ProjectBundle,
     opts: &'a RunOptions,
+    cancel: CancellationToken,
     done: HashMap<String, OExecutionResult>,
     skipped: HashSet<String>,
     stack: Vec<String>,
@@ -129,6 +139,19 @@ pub fn run_route(
     route_id: &str,
     opts: &RunOptions,
 ) -> Result<OExecutionResult> {
+    run_route_cancellable(bundle, route_id, opts, CancellationToken::new())
+}
+
+/// Like [`run_route`], but observes a cooperative cancellation token: when the
+/// token trips, the running child process is killed and a structured
+/// "canceled" error is returned. Used by the parallel route policies to stop
+/// losing alternatives.
+pub fn run_route_cancellable(
+    bundle: &ProjectBundle,
+    route_id: &str,
+    opts: &RunOptions,
+    cancel: CancellationToken,
+) -> Result<OExecutionResult> {
     if bundle.route(route_id).is_none() {
         bail!("no route named `{route_id}`");
     }
@@ -137,6 +160,7 @@ pub fn run_route(
     let mut ctx = RunCtx {
         bundle,
         opts,
+        cancel,
         done: HashMap::new(),
         skipped: HashSet::new(),
         stack: Vec::new(),
@@ -195,7 +219,7 @@ fn execute_in_workspace(
     }
 
     // ── Execute ─────────────────────────────────────────────────────────────
-    let result = spawn_route(&route, workspace, ctx.opts)?;
+    let result = spawn_route(&route, workspace, ctx.opts, &ctx.cancel)?;
     ctx.stack.pop();
     ctx.done.insert(route_id.to_string(), result.clone());
     Ok(result)
@@ -218,14 +242,26 @@ fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OEx
     }
 }
 
+/// Marker message used in the error of a cancellation-terminated route.
+const CANCEL_MARKER: &str = "[olang:route-canceled]";
+
+/// Whether an error came from cooperative route cancellation.
+pub fn is_cancellation_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains(CANCEL_MARKER)
+}
+
 fn spawn_route(
     route: &RouteSpec,
     workspace: &Workspace,
     opts: &RunOptions,
+    cancel: &CancellationToken,
 ) -> Result<OExecutionResult> {
     let command = route.full_command();
     if command.is_empty() {
         bail!("route `{}` has an empty command", route.id);
+    }
+    if cancel.is_cancelled() {
+        bail!("{CANCEL_MARKER} route `{}` canceled before launch", route.id);
     }
 
     let cwd = resolve_cwd(&workspace.root, &route.working_directory)?;
@@ -239,15 +275,58 @@ fn spawn_route(
     for (key, value) in &route.environment {
         cmd.env(key, value);
     }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // Place the route in its own process group so cancellation can terminate
+    // the whole tree (e.g. a shell plus its children), not just the leader.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let start = Instant::now();
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("failed to spawn `{}`", command.join(" ")))?;
+
+    // Drain pipes on helper threads so the child never blocks on a full pipe
+    // while the coordinator polls for exit or cancellation.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || drain_pipe(stdout_pipe));
+    let stderr_handle = std::thread::spawn(move || drain_pipe(stderr_pipe));
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if cancel.is_cancelled() {
+                    kill_route_process(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    bail!("{CANCEL_MARKER} route `{}` canceled", route.id);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => {
+                kill_route_process(&mut child);
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(err)
+                    .with_context(|| format!("failed waiting on `{}`", command.join(" ")));
+            }
+        }
+    };
     let duration_ns = start.elapsed().as_nanos();
 
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
     let value = match route.result_codec {
-        ResultCodec::Json => serde_json::from_slice::<serde_json::Value>(&output.stdout).ok(),
+        ResultCodec::Json => serde_json::from_slice::<serde_json::Value>(&stdout).ok(),
         _ => None,
     };
 
@@ -255,9 +334,9 @@ fn spawn_route(
 
     Ok(OExecutionResult {
         route_id: route.id.clone(),
-        exit_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        exit_code: status.code(),
+        stdout,
+        stderr,
         value,
         artifacts,
         duration_ns,
@@ -267,6 +346,29 @@ fn spawn_route(
             cwd,
         },
     })
+}
+
+/// Read a child pipe to completion, returning the captured bytes.
+fn drain_pipe(pipe: Option<impl Read>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut bytes);
+    }
+    bytes
+}
+
+/// Terminate a route's process tree. On unix the route runs in its own
+/// process group, so the whole group is signalled; elsewhere only the group
+/// leader can be killed.
+fn kill_route_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Resolve a route's working directory inside the workspace, rejecting escapes.
@@ -546,9 +648,260 @@ fn execute_policy(
             }
             Ok(results)
         }
-        other => bail!(
-            "route policy `{}` is represented but not yet executable",
-            other.token()
-        ),
+        RoutePolicy::RaceSuccess => race_alternatives(bundle, alternatives, opts, RaceMode::FirstSuccess),
+        RoutePolicy::RaceSettle => race_alternatives(bundle, alternatives, opts, RaceMode::FirstSettle),
+        RoutePolicy::VerifyEquivalent => {
+            let results = run_all_parallel(bundle, alternatives, opts)?;
+            let failures: Vec<&OExecutionResult> =
+                results.iter().filter(|r| !r.succeeded()).collect();
+            if !failures.is_empty() {
+                bail!(
+                    "verify_equivalent requires every alternative to succeed; failed: {}",
+                    failures
+                        .iter()
+                        .map(|r| format!("`{}` (exit {:?})", r.route_id, r.exit_code))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            verify_results_equivalent(&results)?;
+            Ok(results)
+        }
+        RoutePolicy::BenchmarkAndSelect => {
+            let mut results = run_all_parallel(bundle, alternatives, opts)?;
+            let winner = results
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.succeeded())
+                .min_by_key(|(index, r)| (r.duration_ns, *index))
+                .map(|(index, _)| index);
+            match winner {
+                Some(index) => {
+                    // The selected (fastest successful) result is returned
+                    // last, mirroring the fallback policy where the effective
+                    // result is the final element.
+                    let selected = results.remove(index);
+                    results.push(selected);
+                    Ok(results)
+                }
+                None => bail!("benchmark_and_select: no alternative succeeded"),
+            }
+        }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parallel policy machinery
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceMode {
+    /// Cancel the race as soon as one alternative succeeds.
+    FirstSuccess,
+    /// Cancel the race as soon as one alternative settles at all.
+    FirstSettle,
+}
+
+/// Launch every alternative on its own thread, each in its own isolated
+/// workspace with its own cancellation token, and forward `(index, outcome)`
+/// completions over a channel to the caller-provided selector.
+fn run_alternatives_parallel<T>(
+    bundle: &ProjectBundle,
+    alternatives: &[String],
+    opts: &RunOptions,
+    select: impl FnOnce(
+        &mpsc::Receiver<(usize, Result<OExecutionResult>)>,
+        &[CancellationToken],
+    ) -> Result<T>,
+) -> Result<T> {
+    let tokens: Vec<CancellationToken> = alternatives
+        .iter()
+        .map(|_| CancellationToken::new())
+        .collect();
+    let (sender, receiver) = mpsc::channel::<(usize, Result<OExecutionResult>)>();
+
+    std::thread::scope(|scope| {
+        for (index, id) in alternatives.iter().enumerate() {
+            let sender = sender.clone();
+            let token = tokens[index].clone();
+            scope.spawn(move || {
+                let outcome = run_route_cancellable(bundle, id, opts, token);
+                let _ = sender.send((index, outcome));
+            });
+        }
+        drop(sender);
+        select(&receiver, &tokens)
+    })
+}
+
+/// Run all alternatives concurrently to completion (no cancellation), and
+/// return their results in declaration order. Real launch errors propagate
+/// deterministically: the error of the earliest-declared failing alternative
+/// wins.
+fn run_all_parallel(
+    bundle: &ProjectBundle,
+    alternatives: &[String],
+    opts: &RunOptions,
+) -> Result<Vec<OExecutionResult>> {
+    run_alternatives_parallel(bundle, alternatives, opts, |receiver, _tokens| {
+        let mut slots: Vec<Option<Result<OExecutionResult>>> =
+            (0..alternatives.len()).map(|_| None).collect();
+        for (index, outcome) in receiver.iter() {
+            slots[index] = Some(outcome);
+        }
+        let mut results = Vec::with_capacity(alternatives.len());
+        for (index, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(Ok(result)) => results.push(result),
+                Some(Err(err)) => {
+                    return Err(err.context(format!(
+                        "alternative `{}` failed to launch",
+                        alternatives[index]
+                    )))
+                }
+                None => bail!("alternative `{}` never reported a result", alternatives[index]),
+            }
+        }
+        Ok(results)
+    })
+}
+
+/// Race all alternatives. On the first qualifying settlement (per `mode`) the
+/// remaining alternatives are cancelled cooperatively. Returns every settled
+/// (non-cancelled) result in declaration order with the selected result last.
+/// Selection is deterministic under ties: among qualifying settlements the
+/// earliest-declared alternative wins.
+fn race_alternatives(
+    bundle: &ProjectBundle,
+    alternatives: &[String],
+    opts: &RunOptions,
+    mode: RaceMode,
+) -> Result<Vec<OExecutionResult>> {
+    run_alternatives_parallel(bundle, alternatives, opts, |receiver, tokens| {
+        let mut slots: Vec<Option<Result<OExecutionResult>>> =
+            (0..alternatives.len()).map(|_| None).collect();
+        let mut winner: Option<usize> = None;
+
+        for (index, outcome) in receiver.iter() {
+            let qualifies = match (&outcome, mode) {
+                (Ok(result), RaceMode::FirstSuccess) => result.succeeded(),
+                (Ok(_), RaceMode::FirstSettle) => true,
+                (Err(err), RaceMode::FirstSettle) => !is_cancellation_error(err),
+                (Err(_), RaceMode::FirstSuccess) => false,
+            };
+            slots[index] = Some(outcome);
+            if qualifies && winner.is_none() {
+                winner = Some(index);
+                for (other, token) in tokens.iter().enumerate() {
+                    if other != index {
+                        token.cancel();
+                    }
+                }
+            }
+        }
+
+        // Deterministic tie-break: if several qualifying settlements arrived
+        // before cancellation took effect, prefer the earliest declared one.
+        if winner.is_some() {
+            for (index, slot) in slots.iter().enumerate() {
+                let qualifies = match (slot, mode) {
+                    (Some(Ok(result)), RaceMode::FirstSuccess) => result.succeeded(),
+                    (Some(Ok(_)), RaceMode::FirstSettle) => true,
+                    (Some(Err(err)), RaceMode::FirstSettle) => !is_cancellation_error(err),
+                    _ => false,
+                };
+                if qualifies {
+                    winner = Some(index);
+                    break;
+                }
+            }
+        }
+
+        let Some(winner) = winner else {
+            // No qualifying settlement: propagate the earliest real error, or
+            // return every settled failure so the caller reports "no route
+            // succeeded".
+            let mut results = Vec::new();
+            for (index, slot) in slots.into_iter().enumerate() {
+                match slot {
+                    Some(Ok(result)) => results.push(result),
+                    Some(Err(err)) if !is_cancellation_error(&err) => {
+                        return Err(err.context(format!(
+                            "alternative `{}` failed to launch",
+                            alternatives[index]
+                        )))
+                    }
+                    _ => {}
+                }
+            }
+            if results.is_empty() {
+                bail!("race: no alternative settled");
+            }
+            return Ok(results);
+        };
+
+        let mut results = Vec::new();
+        let mut selected = None;
+        for (index, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(Ok(result)) if index == winner => selected = Some(result),
+                Some(Ok(result)) => results.push(result),
+                Some(Err(err)) if index == winner => {
+                    // FirstSettle winner settled with a launch error.
+                    return Err(err.context(format!(
+                        "race: selected alternative `{}` settled with an error",
+                        alternatives[index]
+                    )));
+                }
+                _ => {}
+            }
+        }
+        match selected {
+            Some(result) => {
+                results.push(result);
+                Ok(results)
+            }
+            None => bail!(
+                "race: selected alternative `{}` produced no result",
+                alternatives[winner]
+            ),
+        }
+    })
+}
+
+/// The equivalence contract for `verify_equivalent`: when every result carries
+/// a decoded JSON value, values must be equal; otherwise trimmed stdout text
+/// must match across all alternatives.
+fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
+    if results.len() < 2 {
+        return Ok(());
+    }
+    let all_json = results.iter().all(|r| r.value.is_some());
+    if all_json {
+        let reference = &results[0];
+        for other in &results[1..] {
+            if other.value != reference.value {
+                bail!(
+                    "verify_equivalent: route `{}` and route `{}` produced different JSON values",
+                    reference.route_id,
+                    other.route_id
+                );
+            }
+        }
+        return Ok(());
+    }
+    let reference = &results[0];
+    let reference_text = reference.stdout_text();
+    let reference_out = reference_text.trim_end();
+    for other in &results[1..] {
+        let other_text = other.stdout_text();
+        if other_text.trim_end() != reference_out {
+            bail!(
+                "verify_equivalent: route `{}` and route `{}` produced different stdout",
+                reference.route_id,
+                other.route_id
+            );
+        }
+    }
+    Ok(())
 }

@@ -1173,6 +1173,9 @@ thiserror  = "2"
 anyhow     = "1"
 clap       = {{ version = "4", features = ["derive"] }}
 {ignore_dep}
+[target.'cfg(unix)'.dependencies]
+libc       = "0.2"
+
 [profile.release]
 opt-level     = 3
 lto           = "fat"
