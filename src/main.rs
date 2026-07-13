@@ -122,7 +122,7 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: graph)"
+        "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: serial during HGraph refactor)"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;

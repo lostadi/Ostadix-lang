@@ -11,12 +11,13 @@ use super::{
 // Ready-operation scheduler
 //
 // An Execute hyperedge is ready when all of its input value nodes are
-// materialized, its blocking constraints (data/structural producers and its
+// materialized, its blocking constraints (data, structural, sequence, and its
 // same-actor predecessor) are satisfied, and its branch guard (if any) is
 // active. Every Execute edge carries a stable source ordinal used both for
 // tie-breaking when several operations become ready simultaneously and for the
-// deterministic commit order. Plain sibling sequencing is NOT a blocking
-// constraint here — that is how independent siblings become concurrently ready.
+// deterministic commit order. Source sequence remains blocking until it can be
+// represented by explicit completion/control values and safely relaxed by a
+// verified rule.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One schedulable operation: its plan node, its Execute edge, the value nodes

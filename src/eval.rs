@@ -1503,7 +1503,8 @@ impl Evaluator {
     /// Project, validate, and execute a lowered program. `forced` overrides the
     /// executor choice for tests: `Some(true)` forces the serial reference
     /// executor, `Some(false)` forces the graph coordinator, and `None` follows
-    /// the `O_EXECUTOR` environment variable (graph by default).
+    /// the `O_EXECUTOR` environment variable (serial by default until the
+    /// state-complete graph conformance suite passes).
     fn eval_ir_program_with_mode(
         &mut self,
         program: &OIrProgram,
@@ -1554,14 +1555,15 @@ impl Evaluator {
         }
         self.last_hgraph_schedule = Some(hgraph_schedule);
 
-        // Default execution path is the readiness-driven graph coordinator.
-        // `O_EXECUTOR=serial` selects the reference serial executor for
-        // cross-checking; an explicit `forced` override wins for tests.
+        // The serial executor remains the temporary default while the
+        // state/control-node refactor is in progress. `O_EXECUTOR=graph`
+        // explicitly selects the graph coordinator; a `forced` test override
+        // wins over the environment.
         let use_serial = match forced {
             Some(serial) => serial,
             None => std::env::var("O_EXECUTOR")
-                .map(|value| value.eq_ignore_ascii_case("serial"))
-                .unwrap_or(false),
+                .map(|value| !value.eq_ignore_ascii_case("graph"))
+                .unwrap_or(true),
         };
         if use_serial {
             self.execute_plan_serial(program, &plan, scope)
@@ -1571,9 +1573,9 @@ impl Evaluator {
     }
 
     /// Execute a validated plan through the readiness-driven graph coordinator.
-    /// This is the default execution engine; results and scope commits are
-    /// identical to [`Self::execute_plan_serial`], but independent operations
-    /// may run concurrently and are committed in deterministic root order.
+    /// Results and scope commits are intended to match
+    /// [`Self::execute_plan_serial`]; independent operations may run
+    /// concurrently and are committed in deterministic root order.
     fn execute_plan_graph(
         &mut self,
         program: &OIrProgram,
@@ -7020,6 +7022,137 @@ python[0]^(O.eval($q, $captured))_python[0]
                 "graph executor scope commit diverged from serial for corpus program {index}"
             );
         }
+    }
+
+    fn nested_python_effect_program(path: &std::path::Path, fail_first: bool) -> OIrProgram {
+        let registry = BackendRegistry::global();
+        let path = format!("{:?}", path);
+        let first_tail = if fail_first {
+            "\nraise RuntimeError(\"stop\")\n".to_string()
+        } else {
+            format!(
+                "\nwith open({path}, \"a\", encoding=\"utf-8\") as stream:\n    stream.write(label + \"\\n\")\n__oval_result__ = label\n"
+            )
+        };
+        let second = format!(
+            "with open({path}, \"a\", encoding=\"utf-8\") as stream:\n    stream.write(\"B\\n\")\n__oval_result__ = \"B\"\n"
+        );
+
+        OIrProgram {
+            nodes: vec![
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: registry.interface_for("python"),
+                    body: vec![
+                        OIr::Text("label = ".into()),
+                        OIr::Exec {
+                            lang: "text".into(),
+                            env_id: u32::MAX,
+                            attr: None,
+                            backend: registry.interface_for("text"),
+                            body: vec![OIr::Text("A".into())],
+                        },
+                        OIr::Text(first_tail),
+                    ],
+                },
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: registry.interface_for("python"),
+                    body: vec![OIr::Text(second)],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn graph_executor_preserves_file_effect_order_after_nested_child() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let serial_dir = tempfile::tempdir().unwrap();
+        let graph_dir = tempfile::tempdir().unwrap();
+        let serial_path = serial_dir.path().join("order.txt");
+        let graph_path = graph_dir.path().join("order.txt");
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+
+        let mut serial_eval = Evaluator::new(shim_dir.clone());
+        let mut serial_scope = HashMap::new();
+        serial_eval
+            .eval_ir_program_forcing(
+                &nested_python_effect_program(&serial_path, false),
+                &mut serial_scope,
+                true,
+            )
+            .unwrap();
+
+        let mut graph_eval = Evaluator::new(shim_dir);
+        let mut graph_scope = HashMap::new();
+        graph_eval
+            .eval_ir_program_forcing(
+                &nested_python_effect_program(&graph_path, false),
+                &mut graph_scope,
+                false,
+            )
+            .unwrap();
+
+        let expected = b"A\nB\n";
+        assert_eq!(std::fs::read(&serial_path).unwrap(), expected);
+        assert_eq!(std::fs::read(&graph_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn graph_executor_does_not_run_later_effect_after_earlier_failure() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let serial_dir = tempfile::tempdir().unwrap();
+        let graph_dir = tempfile::tempdir().unwrap();
+        let serial_path = serial_dir.path().join("must-not-exist");
+        let graph_path = graph_dir.path().join("must-not-exist");
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+
+        let mut serial_eval = Evaluator::new(shim_dir.clone());
+        let mut serial_scope = HashMap::new();
+        let serial_error = serial_eval
+            .eval_ir_program_forcing(
+                &nested_python_effect_program(&serial_path, true),
+                &mut serial_scope,
+                true,
+            )
+            .unwrap_err();
+        let serial_error = format!("{serial_error:#}");
+
+        let mut graph_eval = Evaluator::new(shim_dir);
+        let mut graph_scope = HashMap::new();
+        let graph_error = graph_eval
+            .eval_ir_program_forcing(
+                &nested_python_effect_program(&graph_path, true),
+                &mut graph_scope,
+                false,
+            )
+            .unwrap_err();
+        let graph_error = format!("{graph_error:#}");
+
+        assert!(!serial_path.exists());
+        assert!(!graph_path.exists());
+        assert!(
+            serial_error.contains("RuntimeError: stop"),
+            "{serial_error}"
+        );
+        assert!(graph_error.contains("RuntimeError: stop"), "{graph_error}");
+        let normalize = |error: &str| {
+            error
+                .lines()
+                .find(|line| line.contains("RuntimeError: stop"))
+                .map(str::trim)
+                .unwrap_or(error)
+                .to_string()
+        };
+        assert_eq!(normalize(&serial_error), normalize(&graph_error));
     }
 
     #[test]

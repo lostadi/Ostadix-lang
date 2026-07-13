@@ -115,9 +115,10 @@ fn add_execute_edges(
     }
 }
 
-/// Value-node inputs an operation consumes: its structural children (in source
-/// order) followed by any additional data predecessors. Both must be
-/// materialized before the operation becomes ready.
+/// Value-node inputs an operation consumes: its structural children, data
+/// predecessors, and (during the conservative soundness milestone) ordinary
+/// sequence predecessors. Every one must be materialized before the operation
+/// becomes ready.
 fn operation_inputs(
     plan: &ExecutionPlan,
     node_map: &HashMap<PlanNodeId, NodeId>,
@@ -127,10 +128,39 @@ fn operation_inputs(
     let mut ordered: Vec<(usize, NodeId)> = Vec::new();
 
     for edge in &plan.edges {
-        let is_input = (edge.kind == PlanEdgeKind::Structural || edge.kind == PlanEdgeKind::Data)
-            && edge.to == parent;
+        let is_input =
+            matches!(edge.kind, PlanEdgeKind::Structural | PlanEdgeKind::Data) && edge.to == parent;
         if is_input && seen.insert(edge.from) {
             ordered.push((edge.from.0, node_map[&edge.from]));
+        }
+    }
+
+    // Literal text has no executable edge and is materialized from the start.
+    // A source sequence such as `effect A -> whitespace -> effect B` must still
+    // make B wait for A, so walk backward across non-executable sequence nodes
+    // to the nearest operation that can actually complete.
+    for edge in plan
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == PlanEdgeKind::Sequence && edge.to == parent)
+    {
+        let mut source = edge.from;
+        let mut visited = std::collections::HashSet::new();
+        while executable_op(&plan.nodes[source.0].kind).is_none() && visited.insert(source) {
+            let Some(predecessor) = plan
+                .edges
+                .iter()
+                .find(|candidate| {
+                    candidate.kind == PlanEdgeKind::Sequence && candidate.to == source
+                })
+                .map(|candidate| candidate.from)
+            else {
+                break;
+            };
+            source = predecessor;
+        }
+        if seen.insert(source) {
+            ordered.push((source.0, node_map[&source]));
         }
     }
     ordered.sort_by_key(|(source, _)| *source);

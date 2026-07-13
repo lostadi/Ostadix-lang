@@ -105,7 +105,7 @@ const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
 const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
 // executor — the readiness-driven graph coordinator used by eval.rs as the
-// default execution engine.
+// optional graph execution engine.
 const RUNTIME_EXECUTOR_MOD_RS: &str = include_str!("../executor/mod.rs");
 const RUNTIME_EXECUTOR_ACTOR_RS: &str = include_str!("../executor/actor.rs");
 const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancellation.rs");
@@ -687,7 +687,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
     fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
 
-    // ── executor — graph coordinator (default execution engine) ─────────────
+    // ── executor — opt-in graph coordinator ─────────────────────────────────
     let executor_dir = src_dir.join("executor");
     fs::create_dir_all(&executor_dir)?;
     fs::write(executor_dir.join("mod.rs"), RUNTIME_EXECUTOR_MOD_RS)?;

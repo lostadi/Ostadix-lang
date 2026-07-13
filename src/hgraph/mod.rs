@@ -295,6 +295,82 @@ mod tests {
     }
 
     #[test]
+    fn ready_schedule_preserves_effectful_sequence_after_nested_dependency() {
+        let registry = BackendRegistry::global();
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: registry.interface_for("python"),
+                    body: vec![OIr::Exec {
+                        lang: "text".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: registry.interface_for("text"),
+                        body: vec![OIr::Text("A".into())],
+                    }],
+                },
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: registry.interface_for("python"),
+                    body: vec![OIr::Text("B".into())],
+                },
+            ],
+        };
+        let plan = program.plan();
+
+        assert!(plan.edges.iter().any(|edge| {
+            edge.from == crate::ir::PlanNodeId(1)
+                && edge.to == crate::ir::PlanNodeId(0)
+                && edge.kind == crate::ir::PlanEdgeKind::Structural
+        }));
+        assert!(plan.edges.iter().any(|edge| {
+            edge.from == crate::ir::PlanNodeId(0)
+                && edge.to == crate::ir::PlanNodeId(3)
+                && edge.kind == crate::ir::PlanEdgeKind::Sequence
+        }));
+
+        let graph = program.hgraph_for_plan(&plan).unwrap();
+        let waves = ReadySchedule::derive(&graph).unwrap().waves().unwrap();
+        assert_eq!(
+            waves,
+            vec![
+                vec![crate::ir::PlanNodeId(1)],
+                vec![crate::ir::PlanNodeId(0)],
+                vec![crate::ir::PlanNodeId(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn ready_schedule_preserves_sequence_across_literal_separator() {
+        let registry = BackendRegistry::global();
+        let python = || OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: registry.interface_for("python"),
+            body: vec![OIr::Text("__oval_result__ = 1".into())],
+        };
+        let program = OIrProgram {
+            nodes: vec![python(), OIr::Text("\n".into()), python()],
+        };
+
+        let graph = program.hgraph();
+        assert_eq!(
+            ReadySchedule::derive(&graph).unwrap().waves().unwrap(),
+            vec![
+                vec![crate::ir::PlanNodeId(0)],
+                vec![crate::ir::PlanNodeId(3)],
+            ]
+        );
+    }
+
+    #[test]
     fn same_language_native_value_is_not_lossless() {
         use crate::value::{
             NativeBoundary, NativeCodecSafety, NativeIdentity, ONative, RehydratePolicy,

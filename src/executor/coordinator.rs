@@ -2,10 +2,9 @@
 //!
 //! The coordinator owns the mutable execution state for one plan evaluation and
 //! drives a readiness-based event loop over the plan's operation hyperedges.
-//! An operation becomes ready once all of its blocking predecessors — data and
-//! structural producers plus its same-actor serial predecessor — have
-//! committed. Independent siblings therefore become ready together instead of
-//! being forced into wall-clock serialization by blanket sibling sequencing.
+//! An operation becomes ready once all of its blocking predecessors have
+//! committed. During the conservative soundness milestone this includes source
+//! sequence as well as data, structural, and same-actor dependencies.
 //!
 //! Operations that are provably pure and side-effect free (literal text and
 //! attribute-free pure inline renderers) are executed on a worker-thread pool
@@ -181,19 +180,23 @@ impl<'a> Coordinator<'a> {
                 );
             }
 
-            // Partition the ready frontier into a parallel-safe batch and the
-            // operations that must run on the coordinator thread.
-            let (parallel, sequential): (Vec<usize>, Vec<usize>) = ready
-                .into_iter()
-                .partition(|&index| self.is_parallel_safe(index));
+            let parallel: Vec<usize> = ready
+                .iter()
+                .copied()
+                .filter(|&index| self.is_parallel_safe(index))
+                .collect();
 
             if !parallel.is_empty() {
                 self.run_parallel_batch(&parallel)?;
+                // A completed batch can expose an earlier-ordinal operation.
+                // Always derive a fresh frontier before launching more work.
+                continue;
             }
 
-            for index in sequential {
-                self.run_coordinator_op(evaluator, index)?;
-            }
+            // Coordinator-thread work uses mutable evaluator state. Run only
+            // the smallest currently legal operation, then recompute readiness
+            // so a stale frontier can never launch a later effect first.
+            self.run_coordinator_op(evaluator, ready[0])?;
         }
     }
 
