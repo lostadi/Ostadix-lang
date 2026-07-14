@@ -34,7 +34,11 @@ fn olink_list_routes_for_directory() {
         .arg(dir.path())
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("py-main"), "route table:\n{stdout}");
     // Listing must not execute anything.
@@ -52,7 +56,11 @@ fn olink_project_lifts_to_o_document() {
         .arg(&out_file)
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let lifted = fs::read_to_string(&out_file).unwrap();
     assert!(lifted.contains("O-PROJECT-BUNDLE-V1"), "sentinel missing");
@@ -84,7 +92,11 @@ fn olink_project_run_default_route() {
         .arg("--run")
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

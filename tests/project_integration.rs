@@ -13,9 +13,7 @@ use o_lang::project::model::{
     FileRole, ProjectBundle, ProjectFile, ResultCodec, RoutePolicy, RouteProvenance, RouteSet,
     RouteSpec,
 };
-use o_lang::project::runtime::{
-    glob_match, run_route, run_selection, GuardBehavior, RunOptions,
-};
+use o_lang::project::runtime::{glob_match, run_route, run_selection, GuardBehavior, RunOptions};
 use o_lang::project::{assemble, discover, RouteGuard};
 
 fn write(root: &Path, rel: &str, contents: &[u8]) {
@@ -69,7 +67,10 @@ fn project_bundle_roundtrip_lossless() {
         vec![0u8, 1, 2, 255, 254, 0, 42]
     );
     assert_eq!(fs::read(out.path().join("empty")).unwrap(), b"");
-    assert_eq!(fs::read(out.path().join("LICENSE")).unwrap(), b"MIT-ish text");
+    assert_eq!(
+        fs::read(out.path().join("LICENSE")).unwrap(),
+        b"MIT-ish text"
+    );
 
     #[cfg(unix)]
     {
@@ -243,11 +244,7 @@ fn project_cli_overrides_replace_existing_routes() {
     r.command = vec!["echo".into(), "old".into()];
     bundle.routes.push(r);
 
-    apply_cli_overrides(
-        &mut bundle,
-        &["id=run;cmd=echo new".to_string()],
-    )
-    .unwrap();
+    apply_cli_overrides(&mut bundle, &["id=run;cmd=echo new".to_string()]).unwrap();
 
     assert_eq!(bundle.routes.len(), 1);
     assert_eq!(bundle.route("run").unwrap().command, vec!["echo", "new"]);
@@ -260,7 +257,11 @@ fn project_cli_overrides_replace_existing_routes() {
 #[test]
 fn project_discovery_python() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "app.py", b"def go():\n    pass\n\nif __name__ == \"__main__\":\n    go()\n");
+    write(
+        dir.path(),
+        "app.py",
+        b"def go():\n    pass\n\nif __name__ == \"__main__\":\n    go()\n",
+    );
     write(dir.path(), "pkg/__main__.py", b"print('pkg')\n");
     write(
         dir.path(),
@@ -468,9 +469,9 @@ fn project_runtime_failed_prerequisite_aborts() {
 #[test]
 fn project_runtime_guard_enforce_vs_skip() {
     let mut route = shell_route("guarded", "echo ran");
-    route
-        .guards
-        .push(RouteGuard::CommandAvailable("definitely-not-a-real-cmd-xyz".into()));
+    route.guards.push(RouteGuard::CommandAvailable(
+        "definitely-not-a-real-cmd-xyz".into(),
+    ));
     let bundle = bundle_with_routes(vec![route]);
 
     // Enforce → error.
@@ -506,7 +507,10 @@ fn project_runtime_all_policy_uses_isolated_workspaces() {
     let results = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|r| r.succeeded()));
-    let outputs: Vec<String> = results.iter().map(|r| r.stdout_text().trim().to_string()).collect();
+    let outputs: Vec<String> = results
+        .iter()
+        .map(|r| r.stdout_text().trim().to_string())
+        .collect();
     assert!(outputs.contains(&"A".to_string()));
     assert!(outputs.contains(&"B".to_string()));
     // Distinct workspaces.
@@ -679,7 +683,8 @@ fn project_runtime_verify_equivalent_requires_all_success() {
 
     let err = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
     assert!(
-        err.to_string().contains("requires every alternative to succeed"),
+        err.to_string()
+            .contains("requires every alternative to succeed"),
         "got: {err}"
     );
 }
@@ -715,7 +720,10 @@ fn project_runtime_benchmark_fails_when_nothing_succeeds() {
     });
 
     let err = run_selection(&bundle, Some("main"), None, &RunOptions::default()).unwrap_err();
-    assert!(err.to_string().contains("no alternative succeeded"), "got: {err}");
+    assert!(
+        err.to_string().contains("no alternative succeeded"),
+        "got: {err}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

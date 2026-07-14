@@ -643,9 +643,11 @@ to combine expression-granular recursive evaluator composition across a
 registry-extensible family of independently implemented runtimes with a
 language-neutral value boundary and source-derived lowering into a unified
 whole-program execution representation. The current Rust implementation
-derives, validates, analyzes, and schedules the HGraph; arbitrary evaluator
-operations still dispatch through the serial OIR executor, while supported
-request classes provide the current concurrent execution path. Wherever a
+derives, validates, analyzes, and executes a directed state-complete HGraph.
+Arbitrary hosted effects remain conservative: unknown operations are serialized
+through `HostWorld`, persistent evaluator state is carried by actor-state
+tokens, and worker dispatch is restricted to verified pure inline renderers.
+The serial OIR executor remains the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
 prior art are welcome as issues.
@@ -1070,6 +1072,12 @@ Eval requests remain on the evaluator thread because the live process
 registry is not Send. This preserves persistent backend state while still
 parallelizing the Nix operations that can safely run on worker threads.
 
+The main graph executor follows the same ownership boundary. It represents
+unknown host effects with `HostWorld` state and persistent environments with
+actor-state versions, but executes shim operations on the evaluator owner
+thread. Only verified pure inline `html`, `markdown`, `text`, and `latex`
+renderers enter the graph worker pool.
+
 ### Coordination groups
 
 Groups make execution topology part of the value model:
@@ -1348,7 +1356,7 @@ with `O`.
 | `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
 | `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
-| `ir` | `olangc app.O --target ir` | Prints lowered OIR and its ExecutionPlan without executing the program. |
+| `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and the directed executable HGraph without executing the program. |
 | `dot` | `olangc app.O --target dot` | Builds HGraph from OIR, solves types, emits Graphviz DOT digraph on stdout. Pipe to `dot -Tpng` for a rendered graph. |
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
@@ -1573,9 +1581,28 @@ topological root schedule and direct-child schedules used by every `Store`,
 specific coordination-group mode. The evaluator does not rediscover special
 form policy from an unrelated name table after planning.
 
-`olangc --target ir` prints the same executable program and plan used by the
-runtime. It is an inspection target for the execution engine, not a parallel
-analysis representation.
+The validated plan is projected into a directed HGraph before execution.
+Ordinary results, successful completion, evaluator/host resource versions, and
+persistent actor state are nodes. Operations are directed hyperedges whose
+outputs include one ordinary value, one completion token, and successor state
+versions. The graph coordinator runs an operation exactly when every input node
+is materialized, then recomputes readiness after each completion. A failure
+produces no completion or successor state.
+
+Unknown hosted code reads and writes the shared `HostWorld` resource. Exact
+filesystem and network footprints are not inferred from arbitrary source.
+Source effect declarations can add constraints, but `effects=pure` cannot
+upgrade an unknown shim. Ordinary sequence becomes a completion-token input
+unless direct concurrent-group semantics apply or both operations are verified,
+infallible, state-free trusted inline renderers whose complete structural
+subtrees contain only literals and recursively trusted renderers, outside a
+structural `O` sequencing region. `O_EXECUTOR=serial` selects the reference
+executor used by graph/serial conformance tests.
+
+`olangc --target ir` prints the same executable program, plan, and textual
+state-complete HGraph used by the runtime. `olangc --target dot` shows both
+constraint hyperedges and the directed operation ports for ordinary, resource,
+actor, and completion/control nodes.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.

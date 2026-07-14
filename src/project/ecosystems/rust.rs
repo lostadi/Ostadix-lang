@@ -21,7 +21,9 @@ fn discovered(id: String, evidence: String) -> RouteSpec {
             evidence,
         },
     );
-    route.guards.push(RouteGuard::CommandAvailable("cargo".to_string()));
+    route
+        .guards
+        .push(RouteGuard::CommandAvailable("cargo".to_string()));
     route
 }
 
@@ -52,8 +54,12 @@ impl EcosystemDiscoverer for RustDiscoverer {
                     format!("Cargo.toml [[bin]] target `{name}`"),
                 );
                 route.kind = RouteKind::CompiledBinary;
-                route.command =
-                    vec!["cargo".to_string(), "run".to_string(), "--bin".to_string(), name.to_string()];
+                route.command = vec![
+                    "cargo".to_string(),
+                    "run".to_string(),
+                    "--bin".to_string(),
+                    name.to_string(),
+                ];
                 route.label = format!("cargo run --bin {name}");
                 route.provides = vec![name.to_string()];
                 routes.push(route);

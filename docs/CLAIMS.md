@@ -20,10 +20,18 @@
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
   (`o_lang/`). It also contains O-core freestanding x86_64 ELF object emission
   through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `src/ocore/driver.rs`).
-- Hosted evaluation lowers to OIR, builds an `ExecutionPlan`, validates the
-  plan, projects it into HGraph for analysis, derives a schedule, and then
-  interprets the OIR in topological order through `execute_plan_serial` in
-  `src/eval.rs`.
+- Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
+  projects it into a directed state-complete HGraph. The graph coordinator is
+  the default executor; `O_EXECUTOR=serial` retains the topological OIR
+  interpreter as a differential oracle.
+- HGraph represents ordinary results, successful completion, evaluator state,
+  host-resource state, and persistent actor state as nodes. Executable
+  operations are directed, multi-output hyperedges. Readiness follows only from
+  materialized inputs and their producers.
+- Unknown hosted operations are conservatively serialized through a shared
+  `HostWorld` state chain. Persistent environments also use typed actor-state
+  chains. The implementation does not claim exact effect inference from
+  arbitrary Python, Bash, JavaScript, Rust, or other hosted source.
 - Conservative `{lazy}` cache safety is enforced from backend metadata in
   `src/ir.rs` and validation in `src/eval.rs`: inline `html`, `markdown`,
   `latex`, and `text` are cache-safe; unrestricted shim backends including
@@ -42,31 +50,27 @@
   `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
 
-## Implemented as representation/analysis but not general dispatch
+## Implemented conservatively
 
-- HGraph construction from OIR exists in `src/hgraph/from_oir.rs` and is
-  invoked from `OIrProgram::hgraph_for_plan` in `src/ir.rs`.
-- HGraph validation through the source `ExecutionPlan`, type/fidelity solving,
-  actor constraints, group/control edges, clustering, and schedule derivation
-  exist in `src/hgraph/graph.rs`, `src/hgraph/kinds.rs`, `src/hgraph/solve.rs`,
-  and `src/hgraph/schedule.rs`.
-- The derived HGraph schedule is currently checked against the OIR root schedule
-  in `src/eval.rs`, but arbitrary evaluator operations still dispatch through
-  the serial OIR executor `execute_plan_serial`.
-- General arbitrary-Eval HGraph parallel dispatch is not implemented.
+- Graph construction, multi-output validation, type/fidelity solving, explicit
+  resource and completion lowering, scheduling, and readiness-driven dispatch
+  are implemented in `src/hgraph/`, `src/effects.rs`, and `src/executor/`.
+- Parallel dispatch is correctness-first. Only verified pure, deterministic,
+  infallible, state-free inline renderers run on workers. Arbitrary Eval/shim
+  operations stay on the evaluator owner thread and are ordered by graph state.
+- Ordinary source sequence is preserved by completion dependencies unless an
+  explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue
   crossings remain conservatively represented as `NativeCapsule`.
 
 ## Research directions enabled by the architecture
 
-- Actor-oriented general graph dispatch over persistent evaluator actors, as
-  scoped in `docs/HGRAPH_EXECUTOR_PLAN.md`.
+- Parallel read leases and verified path-, endpoint-, and service-specific
+  resource models that safely reduce `HostWorld` serialization.
 - Runtime plugin registration beyond the current static `BackendRegistry` table
   in `src/ir.rs`.
-- Fingerprint-complete effect tracking that could safely broaden `{lazy}` beyond
-  the current inline cache-safe backends.
-- Cross-runtime schedule optimization using HGraph data, sequence, actor,
-  effect, and authority edges.
+- Fingerprint-complete effect tracking and verified backend analyzers that could
+  safely broaden `{lazy}` and graph parallelism beyond trusted inline backends.
 - More precise backend morphism proofs and fidelity accounting for OValue
   crossings, extending the current `Fidelity` and `BackendMorphism` vocabulary
   in `src/value.rs`.

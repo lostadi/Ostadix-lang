@@ -29,7 +29,9 @@ impl EcosystemDiscoverer for NixDiscoverer {
             route.command = vec!["nix".to_string(), "run".to_string()];
             route.label = "nix run".to_string();
             route.provides = vec!["main".to_string()];
-            route.guards.push(RouteGuard::CommandAvailable("nix".to_string()));
+            route
+                .guards
+                .push(RouteGuard::CommandAvailable("nix".to_string()));
             routes.push(route);
         }
 
@@ -45,7 +47,9 @@ impl EcosystemDiscoverer for NixDiscoverer {
             route.command = vec!["nix-build".to_string()];
             route.label = "nix-build".to_string();
             route.provides = vec!["build".to_string()];
-            route.guards.push(RouteGuard::CommandAvailable("nix-build".to_string()));
+            route
+                .guards
+                .push(RouteGuard::CommandAvailable("nix-build".to_string()));
             routes.push(route);
         }
 

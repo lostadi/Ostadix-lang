@@ -189,6 +189,40 @@ execution order from the plan. Policy-changing Invoke instructions such as
 `lazy`, `autonomous`, `batch`, `all`, `any`, and `race` retain control over how
 their planned child regions are evaluated.
 
+The Rust execution engine MUST project executable OIR into a directed HGraph.
+Ordinary OValues, successful-completion tokens, resource-state versions, and
+persistent actor-state versions are graph nodes. Each evaluator invocation is a
+directed hyperedge consuming all of its ordinary and state/control inputs and
+producing one distinguished ordinary result, one completion token, and every
+successor resource state. An operation is runnable exactly when every input
+node is materialized. Failure produces none of its output tokens.
+
+Hosted operations whose complete effect footprint is not verified MUST read and
+write `HostWorld`. Persistent `LANG[n]` shim operations MUST additionally read
+and write `ActorState(canonical-LANG[n])`. Ordinary sequence MUST consume the
+predecessor's completion token unless the operations are direct members of an
+explicit concurrent group or both are verified, deterministic, infallible,
+resource-free trusted inline renderers whose complete structural subtrees
+contain only literal text and recursively trusted renderers, outside a
+structural `O` sequencing region. Any unknown fact preserves sequence.
+Conflicting state chains still constrain explicit group members.
+
+Effect block attributes MAY add conservative constraints:
+
+```text
+effects=pure | effects=unknown
+reads=RESOURCE[+RESOURCE...]
+writes=RESOURCE[+RESOURCE...]
+serial=host
+```
+
+Modeled resources are `host:*`/`host:PATH`, `project:PATH`, `env:NAME`,
+`stdio`, `network:*`/`network:ENDPOINT`, `service:NAME`, `scope:NAME`,
+`evaluator`, and `actor:LANG[n]`. A user declaration MUST NOT upgrade an
+unverified hosted operation to pure. Resource declarations add dependencies;
+they MUST NOT erase the conservative `HostWorld` fallback. Authority attributes
+describe permission, not an exact effect footprint.
+
 ---
 
 ## 3. OValue: the canonical intermediate value

@@ -4,7 +4,7 @@ use num_traits::ToPrimitive;
 use crate::value::{AnnotationKind, Fidelity, ONumber, OValue};
 
 use super::{
-    graph::{EdgeId, HEdge, HGraph, HNode, NodeId, PortRole},
+    graph::{EdgeId, HEdge, HGraph, HNode, HNodeKind, NodeId, PortRole},
     kinds::{DomainFlags, OpKind, RepFlags},
 };
 
@@ -28,7 +28,7 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
             let intersection = edge
                 .ports
                 .iter()
-                .filter_map(|p| graph.node(p.node))
+                .filter_map(|p| value_node(graph, p.node))
                 .fold(DomainFlags::NUMERIC, |acc, n| {
                     acc & n.domain & DomainFlags::NUMERIC
                 });
@@ -53,7 +53,7 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
         OpKind::AbiFixed { dom, rep } => {
             let mut changed = false;
             for port in &edge.ports {
-                if let Some(node) = graph.node_mut(port.node) {
+                if let Some(node) = value_node_mut(graph, port.node) {
                     let new_dom = node.domain & *dom;
                     let new_rep = node.rep & *rep;
                     if new_dom != node.domain || new_rep != node.rep {
@@ -68,9 +68,8 @@ fn propagate(graph: &mut HGraph, eid: EdgeId) -> bool {
         OpKind::FieldAccess { .. } => apply_domain_to_inputs(graph, &edge, DomainFlags::STRUCT),
         OpKind::Dereferenceable => apply_domain_to_all(graph, &edge, DomainFlags::POINTER),
         OpKind::BackendCrossing { from_lang, to_lang } => {
-            let fidelity = input_nodes(&edge)
+            let fidelity = input_value_nodes(graph, &edge)
                 .next()
-                .and_then(|id| graph.node(id))
                 .map(|node| fidelity_for(node, from_lang, to_lang))
                 .unwrap_or(Fidelity::Unsupported);
             apply_fidelity_to_outputs(graph, &edge, fidelity)
@@ -102,10 +101,7 @@ pub fn min_rep_for_bigint(value: &BigInt) -> RepFlags {
 }
 
 fn propagate_dataflow(graph: &mut HGraph, edge: &HEdge) -> bool {
-    let Some(input) = input_nodes(edge)
-        .next()
-        .and_then(|id| graph.node(id).cloned())
-    else {
+    let Some(input) = input_value_nodes(graph, edge).next().cloned() else {
         return false;
     };
     let mut changed = false;
@@ -116,7 +112,7 @@ fn propagate_dataflow(graph: &mut HGraph, edge: &HEdge) -> bool {
         .map(|p| p.node)
         .collect::<Vec<_>>()
     {
-        if let Some(output) = graph.node_mut(nid) {
+        if let Some(output) = value_node_mut(graph, nid) {
             if output.domain != input.domain {
                 output.domain = input.domain;
                 changed = true;
@@ -147,7 +143,7 @@ fn materialize_bounded_outputs(graph: &mut HGraph, edge: &HEdge, value: &BigInt)
         .map(|p| p.node)
         .collect::<Vec<_>>()
     {
-        if let Some(node) = graph.node_mut(nid) {
+        if let Some(node) = value_node_mut(graph, nid) {
             let should_write = matches!(node.value, None | Some(OValue::Number { .. }));
             if should_write {
                 let new_value = OValue::big_int(value.clone());
@@ -162,6 +158,9 @@ fn materialize_bounded_outputs(graph: &mut HGraph, edge: &HEdge, value: &BigInt)
 }
 
 pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {
+    if !node.is_value() {
+        return Fidelity::Unsupported;
+    }
     // Native values are process-bound: two evaluators with the same canonical
     // language name are not interchangeable processes, so the Native check
     // must precede the same-language shortcut.
@@ -214,7 +213,7 @@ fn backend_supports_rich_numbers(lang: &str) -> bool {
 fn apply_domain_to_all(graph: &mut HGraph, edge: &HEdge, mask: DomainFlags) -> bool {
     let mut changed = false;
     for port in &edge.ports {
-        if let Some(node) = graph.node_mut(port.node) {
+        if let Some(node) = value_node_mut(graph, port.node) {
             let new = node.domain & mask;
             if new != node.domain {
                 node.domain = new;
@@ -251,7 +250,7 @@ fn apply_domain_to_roles(
         .map(|p| p.node)
         .collect::<Vec<_>>()
     {
-        if let Some(node) = graph.node_mut(nid) {
+        if let Some(node) = value_node_mut(graph, nid) {
             let new = node.domain & mask;
             if new != node.domain {
                 node.domain = new;
@@ -271,7 +270,7 @@ fn apply_rep_to_outputs(graph: &mut HGraph, edge: &HEdge, mask: RepFlags) -> boo
         .map(|p| p.node)
         .collect::<Vec<_>>()
     {
-        if let Some(node) = graph.node_mut(nid) {
+        if let Some(node) = value_node_mut(graph, nid) {
             let new = node.rep & mask;
             if new != node.rep {
                 node.rep = new;
@@ -291,7 +290,7 @@ fn apply_fidelity_to_outputs(graph: &mut HGraph, edge: &HEdge, fidelity: Fidelit
         .map(|p| p.node)
         .collect::<Vec<_>>()
     {
-        if let Some(node) = graph.node_mut(nid) {
+        if let Some(node) = value_node_mut(graph, nid) {
             let old = node.fidelity.clone();
             let new = match old.clone() {
                 Some(existing) => existing.compose(fidelity.clone()),
@@ -306,9 +305,24 @@ fn apply_fidelity_to_outputs(graph: &mut HGraph, edge: &HEdge, fidelity: Fidelit
     changed
 }
 
-fn input_nodes(edge: &HEdge) -> impl Iterator<Item = NodeId> + '_ {
+fn input_value_nodes<'a>(
+    graph: &'a HGraph,
+    edge: &'a HEdge,
+) -> impl Iterator<Item = &'a HNode> + 'a {
     edge.ports
         .iter()
         .filter(|p| matches!(p.role, PortRole::Input | PortRole::InOut))
-        .map(|p| p.node)
+        .filter_map(|p| value_node(graph, p.node))
+}
+
+fn value_node(graph: &HGraph, id: NodeId) -> Option<&HNode> {
+    graph
+        .node(id)
+        .filter(|node| matches!(&node.kind, HNodeKind::Value))
+}
+
+fn value_node_mut(graph: &mut HGraph, id: NodeId) -> Option<&mut HNode> {
+    graph
+        .node_mut(id)
+        .filter(|node| matches!(&node.kind, HNodeKind::Value))
 }

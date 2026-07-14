@@ -11,9 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use super::model::{
-    FileRole, ProjectBundle, ProjectFile, BUNDLE_FORMAT_VERSION,
-};
+use super::model::{FileRole, ProjectBundle, ProjectFile, BUNDLE_FORMAT_VERSION};
 
 /// Directories that are never captured (build outputs, VCS metadata, caches).
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "__pycache__", ".git"];
@@ -203,7 +201,8 @@ fn capture_file(
     out: &mut Vec<ProjectFile>,
 ) -> Result<()> {
     let rel = relative_path(root, path)?;
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let unix_mode = mode_of(meta);
     let executable = unix_mode.map(|m| m & 0o111 != 0).unwrap_or(false);
     let content_hash = sha256_hex(&bytes);

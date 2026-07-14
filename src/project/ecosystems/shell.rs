@@ -34,7 +34,9 @@ impl EcosystemDiscoverer for ShellDiscoverer {
             if !file.executable {
                 continue;
             }
-            let Some(text) = file_text(file) else { continue };
+            let Some(text) = file_text(file) else {
+                continue;
+            };
             let Some(shebang) = shebang_interpreter(text) else {
                 continue;
             };

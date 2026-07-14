@@ -27,6 +27,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
+use crate::effects::EffectDeclaration;
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
@@ -445,10 +446,22 @@ struct BlockOptions {
     permissions: Vec<BackendAuthority>,
 }
 
+fn is_o_identifier(name: &str) -> bool {
+    name.as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 impl BlockOptions {
     fn parse(attr: Option<&str>, lang: &str) -> Result<Self> {
         let mut options = Self::default();
         let mut seen = HashSet::new();
+        EffectDeclaration::parse(attr)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("invalid effect declaration on {lang}^"))?;
         for entry in attr.into_iter().flat_map(|attr| attr.split(',')) {
             let entry = entry.trim();
             if !seen.insert(entry.to_string()) {
@@ -467,15 +480,18 @@ impl BlockOptions {
                 }
                 _ if entry.starts_with("cap=") => {
                     let name = entry.trim_start_matches("cap=");
-                    if name.is_empty() || options.capability_binding.replace(name.into()).is_some()
-                    {
+                    if !is_o_identifier(name) {
+                        bail!("backend capability binding `{name}` is not an O identifier");
+                    }
+                    if options.capability_binding.replace(name.into()).is_some() {
                         bail!("a block must name exactly one backend capability binding");
                     }
                 }
+                _ if EffectDeclaration::recognizes_entry(entry) => {}
                 _ => {
                     let permission = BackendAuthority::parse(entry).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "unknown block attribute `{{{entry}}}` on {lang}^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process"
+                            "unknown block attribute `{{{entry}}}` on {lang}^. Known attributes: lazy, defer, cap=name, fs_read, fs_write, network, process, effects=pure|unknown, reads=..., writes=..., serial=host"
                         )
                     })?;
                     options.permissions.push(permission);
@@ -484,6 +500,23 @@ impl BlockOptions {
         }
         options.permissions.sort();
         Ok(options)
+    }
+}
+
+/// Resolve the execution engine without reading process-global state. Keeping
+/// this decision pure makes the graph-by-default contract directly testable;
+/// the caller is responsible only for decoding the environment variable.
+fn select_serial_executor(forced: Option<bool>, configured: Option<&str>) -> Result<bool> {
+    match forced {
+        Some(serial) => Ok(serial),
+        None => match configured {
+            Some(value) if value.eq_ignore_ascii_case("serial") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("graph") => Ok(false),
+            Some(value) => {
+                bail!("unknown O_EXECUTOR value `{value}`; expected `graph` or `serial`")
+            }
+            None => Ok(false),
+        },
     }
 }
 
@@ -660,15 +693,7 @@ impl Evaluator {
         let (name, grant) = spec.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("backend grant must be NAME=LANG[:RIGHT,...], got `{spec}`")
         })?;
-        if name.is_empty()
-            || !name
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
+        if !is_o_identifier(name) {
             bail!("backend grant binding `{name}` is not an O identifier");
         }
         let (language, permissions) = grant.split_once(':').unwrap_or((grant, ""));
@@ -1503,8 +1528,8 @@ impl Evaluator {
     /// Project, validate, and execute a lowered program. `forced` overrides the
     /// executor choice for tests: `Some(true)` forces the serial reference
     /// executor, `Some(false)` forces the graph coordinator, and `None` follows
-    /// the `O_EXECUTOR` environment variable (serial by default until the
-    /// state-complete graph conformance suite passes).
+    /// the `O_EXECUTOR` environment variable (graph by default, with `serial`
+    /// retaining the reference semantics used by the differential suite).
     fn eval_ir_program_with_mode(
         &mut self,
         program: &OIrProgram,
@@ -1555,16 +1580,21 @@ impl Evaluator {
         }
         self.last_hgraph_schedule = Some(hgraph_schedule);
 
-        // The serial executor remains the temporary default while the
-        // state/control-node refactor is in progress. `O_EXECUTOR=graph`
-        // explicitly selects the graph coordinator; a `forced` test override
-        // wins over the environment.
-        let use_serial = match forced {
-            Some(serial) => serial,
-            None => std::env::var("O_EXECUTOR")
-                .map(|value| !value.eq_ignore_ascii_case("graph"))
-                .unwrap_or(true),
+        // The state-complete graph coordinator is the default. The serial
+        // executor remains an explicit differential oracle. A forced test
+        // override wins over the environment.
+        let configured = if forced.is_some() {
+            None
+        } else {
+            match std::env::var("O_EXECUTOR") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    bail!("O_EXECUTOR is not valid Unicode; expected `graph` or `serial`")
+                }
+            }
         };
+        let use_serial = select_serial_executor(forced, configured.as_deref())?;
         if use_serial {
             self.execute_plan_serial(program, &plan, scope)
         } else {
@@ -1584,13 +1614,8 @@ impl Evaluator {
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
         let base_policy = self.policy;
-        let mut coordinator = crate::executor::Coordinator::new(
-            program,
-            plan,
-            hgraph,
-            base_policy,
-            |_lang, _env| 0,
-        )?;
+        let mut coordinator =
+            crate::executor::Coordinator::new(program, plan, hgraph, base_policy)?;
         coordinator.run(self, scope)
     }
 
@@ -1679,7 +1704,11 @@ impl Evaluator {
     // Executable OIR dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
-    pub(crate) fn prevalidate_graph_execution(&self, _plan: &ExecutionPlan, flat: &[&OIr]) -> Result<()> {
+    pub(crate) fn prevalidate_graph_execution(
+        &self,
+        _plan: &ExecutionPlan,
+        flat: &[&OIr],
+    ) -> Result<()> {
         for node in flat {
             match node {
                 OIr::Invoke {
@@ -3593,6 +3622,16 @@ fn render_markdown(val: &OValue) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn graph_executor_is_the_unconfigured_default() {
+        assert!(!select_serial_executor(None, None).unwrap());
+        assert!(!select_serial_executor(None, Some("graph")).unwrap());
+        assert!(select_serial_executor(None, Some("serial")).unwrap());
+        assert!(select_serial_executor(Some(true), Some("graph")).unwrap());
+        assert!(!select_serial_executor(Some(false), Some("serial")).unwrap());
+        assert!(select_serial_executor(None, Some("legacy")).is_err());
+    }
+
     // ── render_child: Python ──────────────────────────────────────────────────
 
     #[test]
@@ -4661,6 +4700,22 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // STEP-3.5: {lazy} / {defer} block attributes
     // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_capability_binding_must_be_an_o_identifier() {
+        let error = BlockOptions::parse(Some("cap=-"), "python").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "backend capability binding `-` is not an O identifier"
+        );
+    }
+
+    #[test]
+    fn block_capability_binding_accepts_valid_o_identifier() {
+        let options = BlockOptions::parse(Some("cap=_runner2,process"), "python").unwrap();
+        assert_eq!(options.capability_binding.as_deref(), Some("_runner2"));
+        assert_eq!(options.permissions, vec![BackendAuthority::Process]);
+    }
 
     /// {lazy} on an impure backend (python) is rejected at evaluation with a
     /// message suggesting {defer} as the alternative.
@@ -6995,33 +7050,55 @@ python[0]^(O.eval($q, $captured))_python[0]
                     ],
                 }],
             },
+            // Identical failure outcome and normalized diagnostic.
+            OIrProgram {
+                nodes: vec![OIr::Load("missing_binding".into())],
+            },
         ]
     }
 
     #[test]
     fn graph_executor_matches_serial_on_corpus() {
+        let normalize_error = |error: anyhow::Error| error.to_string().replace("\r\n", "\n");
         for (index, program) in equivalence_corpus().into_iter().enumerate() {
             let mut serial_eval = Evaluator::new("/tmp".into());
             let mut serial_scope = HashMap::new();
             let serial = serial_eval
                 .eval_ir_program_forcing(&program, &mut serial_scope, true)
-                .unwrap_or_else(|e| panic!("serial program {index} failed: {e}"));
+                .map_err(&normalize_error);
 
             let mut graph_eval = Evaluator::new("/tmp".into());
             let mut graph_scope = HashMap::new();
             let graph = graph_eval
                 .eval_ir_program_forcing(&program, &mut graph_scope, false)
-                .unwrap_or_else(|e| panic!("graph program {index} failed: {e}"));
+                .map_err(&normalize_error);
 
             assert_eq!(
                 serial, graph,
-                "graph executor result diverged from serial for corpus program {index}"
+                "graph executor value/error outcome or diagnostic diverged from serial for corpus program {index}"
             );
             assert_eq!(
                 serial_scope, graph_scope,
                 "graph executor scope commit diverged from serial for corpus program {index}"
             );
         }
+    }
+
+    #[test]
+    fn graph_coordinator_executes_independent_inline_roots_concurrently() {
+        let program = equivalence_corpus().remove(0);
+        let overlap = crate::executor::parallel::TestOverlapSession::begin(2);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect("graph execution succeeds");
+
+        assert!(
+            overlap.peak() > 1,
+            "independent graph operations did not overlap on renderer workers"
+        );
     }
 
     fn nested_python_effect_program(path: &std::path::Path, fail_first: bool) -> OIrProgram {

@@ -14,9 +14,9 @@ impl EcosystemDiscoverer for DotnetDiscoverer {
     }
 
     fn discover(&self, _root: &Path, files: &[ProjectFile]) -> Vec<RouteSpec> {
-        let has_project = files
-            .iter()
-            .any(|f| f.path.ends_with(".csproj") || f.path.ends_with(".fsproj") || f.path.ends_with(".sln"));
+        let has_project = files.iter().any(|f| {
+            f.path.ends_with(".csproj") || f.path.ends_with(".fsproj") || f.path.ends_with(".sln")
+        });
         if !has_project {
             return Vec::new();
         }
@@ -31,7 +31,9 @@ impl EcosystemDiscoverer for DotnetDiscoverer {
         route.command = vec!["dotnet".to_string(), "run".to_string()];
         route.label = "dotnet run".to_string();
         route.provides = vec!["main".to_string()];
-        route.guards.push(RouteGuard::CommandAvailable("dotnet".to_string()));
+        route
+            .guards
+            .push(RouteGuard::CommandAvailable("dotnet".to_string()));
         vec![route]
     }
 }

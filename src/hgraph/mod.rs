@@ -1,9 +1,9 @@
 //! Hypergraph substrate for O execution and value-fidelity analysis.
 //!
-//! Values are nodes. Operations, dependencies, actor constraints, and group
-//! barriers are hyperedges. This mirrors the design note in the pasted brief:
-//! type/fidelity facts live on values, while operations are relations over
-//! those values.
+//! Semantic values, resource versions, successful-completion tokens, and
+//! branch controls are nodes. Executable operations and typed dependency
+//! relations are hyperedges. Persistent backend state is modeled explicitly as
+//! an actor-state resource, not by a hidden actor scheduler.
 
 pub mod from_oir;
 pub mod graph;
@@ -11,7 +11,10 @@ pub mod kinds;
 pub mod schedule;
 pub mod solve;
 
-pub use graph::{ActorId, EdgeId, ExecInfo, HEdge, HGraph, HNode, NodeId, Port, PortRole};
+pub use graph::{
+    ActorId, EdgeId, ExecInfo, HEdge, HGraph, HNode, HNodeKind, NodeId, Port, PortRole,
+    SequenceDependency,
+};
 pub use kinds::{
     ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, MemOrder, OcoreOpKind, OpKind, RepFlags,
     ValueState,
@@ -23,6 +26,7 @@ mod tests {
     use num_bigint::BigInt;
 
     use crate::{
+        effects::ResourceKey,
         ir::{BackendRegistry, InvokeMode, OIr, OIrProgram},
         value::{AnnotationKind, Fidelity, GroupMode, ONumber, OValue},
     };
@@ -84,10 +88,19 @@ mod tests {
             .edges
             .values()
             .any(|edge| matches!(edge.kind, OpKind::StructuralBarrier)));
-        assert!(graph
-            .edges
+        let mut actor_versions = graph
+            .nodes
             .values()
-            .any(|edge| matches!(edge.kind, OpKind::ActorSerial { .. })));
+            .filter_map(|node| match &node.kind {
+                HNodeKind::ResourceState {
+                    resource: ResourceKey::ActorState(_),
+                    version,
+                } => Some(*version),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        actor_versions.sort_unstable();
+        assert_eq!(actor_versions, vec![0, 1]);
         assert!(graph
             .edges
             .values()

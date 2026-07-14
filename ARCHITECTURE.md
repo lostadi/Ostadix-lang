@@ -17,6 +17,9 @@ Ostadix-lang/
 │   ├── parser.rs     #   Tokenizer & expression parser
 │   ├── ir.rs         #   OIR intermediate representation & backend registry
 │   ├── eval.rs       #   Recursive evaluator
+│   ├── effects.rs    #   Semantic effect/resource summaries
+│   ├── executor/     #   Graph coordinator and serial oracle
+│   ├── hgraph/       #   Directed value/state/control hypergraph
 │   ├── value.rs      #   OValue universal type system
 │   ├── process.rs    #   Subprocess management for backends
 │   ├── nix_ops.rs    #   Nix build/realise operations
@@ -52,9 +55,11 @@ Ostadix-lang processes hosted code through a 6-stage pipeline:
    children to parents, sequence edges preserve source order, and data edges
    connect loads to their visible stores.
 
-4. **Execute** — Interpret OIR through the plan's stable topological root
-   schedule. Structural OIR regions implement `O` and `quote`; ordinary
-   execution regions build splice buffers from child OValues.
+4. **Project and execute** — Lower executable operations into a directed HGraph.
+   Ordinary results, resource versions, actor state, and successful completion
+   are nodes. Operations are directed hyperedges and become runnable exactly
+   when every input node is materialized. `O_EXECUTOR=serial` retains the
+   topological OIR interpreter as the differential reference semantics.
 
 5. **Render, authorize, and dispatch** - Convert child values with the renderer
    embedded in OIR, resolve the block's live backend capability against the
@@ -118,6 +123,39 @@ O-core does not lower into this representation. Native `.oc` files use the
 separate `AST -> typed HIR -> SSA MIR -> object` pipeline under `src/ocore/`.
 This separation prevents machine-level mutation, layout, and control-flow
 semantics from being conflated with OIR's backend dependency graph.
+
+## Directed HGraph execution
+
+`src/hgraph/from_oir.rs` derives one semantic effect summary before constructing
+each executable edge. Every executable edge has one distinguished OValue output,
+one successful-completion output, and zero or more successor resource-state
+outputs. Its inputs include ordinary child/data values plus the prior versions
+of every resource it accesses. Persistent shim operations also consume and
+produce `ActorState(canonical-language[environment])`.
+
+Unknown hosted effects read and write `HostWorld`, which is a conservative
+umbrella for host-observable state. The graph does not infer exact filesystem or
+network footprints from arbitrary hosted source. Source `reads=`, `writes=`,
+and `serial=host` declarations can add constraints, but cannot erase an unknown
+fallback. Likewise, `effects=pure` cannot upgrade an arbitrary shim into trusted
+worker-pool work.
+
+Ordinary source sequence is lowered as a predecessor completion-token input.
+That dependency is omitted only for direct members of an explicit concurrent
+group, or when both operations are verified, deterministic, infallible,
+resource-free inline renderers from the trusted `html`, `markdown`, `text`, and
+`latex` set, each complete structural subtree contains only literal text and
+recursively trusted renderers, and neither operation is a child of a structural
+`O` sequencing region. Unknown facts preserve sequence. Resource chains can
+still order members of a concurrent group when their effects conflict.
+
+`ReadySchedule` derives blockers only from producers of directed operation
+inputs. The coordinator materializes all outputs atomically after success,
+recomputes the frontier after each completion, and emits no completion or
+successor-state token after failure. Deterministic commit order does not stand
+in for effect ordering. Parallel worker dispatch remains limited to the
+verified pure inline renderer class. Broader read sharing and precise resource
+models are future optimizations.
 
 ## Universal Value System (OValue)
 
@@ -236,7 +274,7 @@ bash test_o_lang_examples.sh
 | `binary` | `--target binary` | Native ELF/Mach-O binary on disk    |
 | `wasm`   | `--target wasm`   | `wasm32-wasip1` module on disk     |
 | `script` | `--target script` | In-process execution (no disk file) |
-| `ir`     | `--target ir`     | Lowered OIR dump on stdout          |
+| `ir`     | `--target ir`     | OIR, plan, and textual HGraph dump  |
 | `dot`    | `--target dot`    | Graphviz DOT hypergraph on stdout   |
 
 **Target A — Binary** (default): creates a temporary Cargo project that
@@ -261,11 +299,11 @@ file is produced.
 
 **Target E — Dot**: parses and lowers to OIR, then builds the full
 `HGraph` hypergraph (`src/hgraph/`) from that OIR, runs the type solver, and
-serialises the result as a Graphviz DOT digraph on stdout.  Each `HNode` maps
-to a graph node; each `HEdge` is projected to binary directed edges between its
-Input/InOut and Output/InOut ports.  Edge labels identify the relation kind
-(dataflow, structural, sequence, crossing:L1→L2, …).  Nothing is executed and
-no output file is produced.
+serialises the result as a Graphviz DOT digraph on stdout. Ordinary values,
+resource versions, actor-state versions, and completion/control values have
+distinct styles. Executable and constraint hyperedges are explicit vertices,
+so input-to-operation and operation-to-output port direction remains visible.
+Nothing is executed and no output file is produced.
 
 ```bash
 # Compile to a binary (Target A)
