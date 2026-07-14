@@ -29,7 +29,9 @@ impl EcosystemDiscoverer for HaskellOcamlDiscoverer {
             route.command = vec!["cabal".to_string(), "run".to_string()];
             route.label = "cabal run".to_string();
             route.provides = vec!["main".to_string()];
-            route.guards.push(RouteGuard::CommandAvailable("cabal".to_string()));
+            route
+                .guards
+                .push(RouteGuard::CommandAvailable("cabal".to_string()));
             routes.push(route);
         }
 
@@ -45,7 +47,9 @@ impl EcosystemDiscoverer for HaskellOcamlDiscoverer {
             route.command = vec!["dune".to_string(), "build".to_string()];
             route.label = "dune build".to_string();
             route.provides = vec!["build".to_string()];
-            route.guards.push(RouteGuard::CommandAvailable("dune".to_string()));
+            route
+                .guards
+                .push(RouteGuard::CommandAvailable("dune".to_string()));
             routes.push(route);
         }
 

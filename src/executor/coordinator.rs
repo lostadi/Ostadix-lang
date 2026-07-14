@@ -2,29 +2,28 @@
 //!
 //! The coordinator owns the mutable execution state for one plan evaluation and
 //! drives a readiness-based event loop over the plan's operation hyperedges.
-//! An operation becomes ready once all of its blocking predecessors have
-//! committed. During the conservative soundness milestone this includes source
-//! sequence as well as data, structural, and same-actor dependencies.
+//! An operation becomes ready exactly when all ordinary and synthetic input
+//! nodes are materialized. Data, source completion, resource state, and actor
+//! state therefore share one directed producer/input dependency rule.
 //!
 //! Operations that are provably pure and side-effect free (literal text and
-//! attribute-free pure inline renderers) are executed on a worker-thread pool
+//! attribute-free verified inline renderers) are executed on a worker-thread pool
 //! via `std::thread::scope`; every other operation — anything that needs the
 //! evaluator's `!Send` process registry or mutable state — runs on the
 //! coordinator thread in stable ordinal order. Results are committed in the
-//! plan's deterministic root order, so out-of-order completion never changes
-//! observable output.
+//! plan's deterministic root order. State/control inputs, rather than commit
+//! order, preserve externally observable effect ordering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, Result};
 
+use crate::effects::EffectSummary;
 use crate::eval::{derive_policy_contexts, Evaluator, ExecutionTrace, GraphEvalFrame, Policy};
-use crate::hgraph::{schedule::ReadySchedule, HGraph};
+use crate::hgraph::{schedule::ReadySchedule, HGraph, NodeId, ValueState};
 use crate::ir::{ExecutionPlan, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use crate::value::OValue;
 
-use super::actor::ActorTable;
-use super::effects::{EffectDeclaration, EffectSummary};
 use super::parallel;
 use super::trace::TraceSink;
 
@@ -32,7 +31,10 @@ use super::trace::TraceSink;
 struct OpState {
     plan_node: PlanNodeId,
     ordinal: u64,
-    blocked_by: Vec<usize>,
+    value_output: NodeId,
+    inputs: Vec<NodeId>,
+    outputs: Vec<NodeId>,
+    effect: EffectSummary,
     completed: bool,
 }
 
@@ -41,8 +43,8 @@ pub struct Coordinator<'a> {
     plan: &'a ExecutionPlan,
     flat: Vec<&'a OIr>,
     ops: Vec<OpState>,
-    effects: Vec<EffectSummary>,
-    actors: ActorTable,
+    materialized: HashSet<NodeId>,
+    failed_outputs: HashMap<NodeId, String>,
     frame: GraphEvalFrame,
     trace: TraceSink,
     base_policy: Policy,
@@ -56,7 +58,6 @@ impl<'a> Coordinator<'a> {
         plan: &'a ExecutionPlan,
         hgraph: &HGraph,
         base_policy: Policy,
-        generation_of: impl Fn(&str, u32) -> u64,
     ) -> Result<Self> {
         let flat = program.flatten_for_plan();
         if flat.len() != plan.nodes.len() {
@@ -67,25 +68,41 @@ impl<'a> Coordinator<'a> {
             );
         }
 
+        hgraph
+            .validate_execution_source(program, plan)
+            .map_err(anyhow::Error::msg)?;
         let schedule = ReadySchedule::derive(hgraph).map_err(anyhow::Error::msg)?;
         let ops = schedule
             .ops
             .iter()
-            .map(|op| OpState {
-                plan_node: op.plan_node,
-                ordinal: op.ordinal,
-                blocked_by: op.blocked_by.clone(),
-                completed: false,
+            .map(|op| {
+                let effect = hgraph
+                    .effect_summary(op.plan_node)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "operation {} has no lowered effect summary",
+                            op.plan_node.0
+                        )
+                    })?;
+                Ok(OpState {
+                    plan_node: op.plan_node,
+                    ordinal: op.ordinal,
+                    value_output: op.value_output,
+                    inputs: op.inputs.clone(),
+                    outputs: op.outputs.clone(),
+                    effect,
+                    completed: false,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         let node_policy = derive_policy_contexts(plan, &flat, base_policy)?;
-        let actors = ActorTable::build(plan, generation_of);
-        let effects = plan
+        let materialized = hgraph
             .nodes
             .iter()
-            .map(|node| effect_summary_for(node.id, &node.kind, &actors))
-            .collect::<Vec<_>>();
+            .filter_map(|(id, node)| (node.state == ValueState::Materialized).then_some(*id))
+            .collect();
 
         let frame = GraphEvalFrame {
             values: vec![None; plan.nodes.len()],
@@ -99,8 +116,8 @@ impl<'a> Coordinator<'a> {
             plan,
             flat,
             ops,
-            effects,
-            actors,
+            materialized,
+            failed_outputs: HashMap::new(),
             frame,
             trace: TraceSink::new(),
             base_policy,
@@ -174,9 +191,11 @@ impl<'a> Coordinator<'a> {
                 }
                 bail!(
                     "graph executor stalled: {} of {} operations never became ready \
-                     (dependency cycle or unsatisfiable constraint)",
+                     (dependency cycle, failed input, or unsatisfiable constraint; \
+                     {} failed outputs)",
                     self.ops.iter().filter(|op| !op.completed).count(),
-                    self.ops.len()
+                    self.ops.len(),
+                    self.failed_outputs.len()
                 );
             }
 
@@ -200,25 +219,29 @@ impl<'a> Coordinator<'a> {
         }
     }
 
-    /// Indices of operations whose blocking predecessors have all completed.
+    /// Indices of operations for which every ordinary/state/control input has
+    /// materialized successfully.
     fn ready_ops(&self) -> Vec<usize> {
         let mut ready: Vec<usize> = (0..self.ops.len())
             .filter(|&index| {
                 let op = &self.ops[index];
-                !op.completed && op.blocked_by.iter().all(|&dep| self.ops[dep].completed)
+                !op.completed
+                    && op
+                        .inputs
+                        .iter()
+                        .all(|input| self.materialized.contains(input))
             })
             .collect();
         ready.sort_by_key(|&index| (self.ops[index].ordinal, self.ops[index].plan_node.0));
         ready
     }
 
-    /// Whether an operation may run on a worker thread: it must be a pure,
-    /// deterministic, side-effect-free renderer (literal-style) whose effect
-    /// summary carries no writes and no unknown/host-global footprint.
+    /// Whether an operation may run on a worker thread: it must have a verified,
+    /// deterministic, infallible, resource-free summary and a Send-only inline
+    /// renderer implementation. Source assertions cannot establish this class.
     fn is_parallel_safe(&self, index: usize) -> bool {
         let id = self.ops[index].plan_node;
-        let summary = &self.effects[id.0];
-        if summary.unknown || !summary.deterministic || !summary.writes.is_empty() {
+        if !self.ops[index].effect.is_verified_pure_infallible() {
             return false;
         }
         parallel::classify(self.plan, self.flat[id.0], id).is_some()
@@ -234,7 +257,8 @@ impl<'a> Coordinator<'a> {
 
         let policy = self.frame.node_policy[id.0];
         let saved = evaluator.set_policy(policy);
-        let outcome = evaluator.execute_ready_plan_node(id, self.flat[id.0], self.plan, &mut self.frame);
+        let outcome =
+            evaluator.execute_ready_plan_node(id, self.flat[id.0], self.plan, &mut self.frame);
         evaluator.set_policy(saved);
 
         match outcome {
@@ -245,11 +269,12 @@ impl<'a> Coordinator<'a> {
                     Evaluator::trace_fingerprint(&value),
                 );
                 self.frame.set_value(id, value)?;
-                self.ops[index].completed = true;
+                self.materialize_success(index);
                 Ok(())
             }
             Err(err) => {
                 self.trace.failed(id, err.to_string());
+                self.record_failure(index, &err.to_string());
                 Err(err)
             }
         }
@@ -277,7 +302,7 @@ impl<'a> Coordinator<'a> {
         // Commit in ordinal order; select the smallest-ordinal failure.
         let mut completions: BTreeMap<(u64, usize), (usize, PlanNodeId, Result<OValue>)> =
             BTreeMap::new();
-        for ((index, id, _), result) in tasks.into_iter().zip(results.into_iter()) {
+        for ((index, id, _), result) in tasks.into_iter().zip(results) {
             let ordinal = self.ops[index].ordinal;
             completions.insert((ordinal, id.0), (index, id, result));
         }
@@ -291,10 +316,11 @@ impl<'a> Coordinator<'a> {
                         Evaluator::trace_fingerprint(&value),
                     );
                     self.frame.set_value(id, value)?;
-                    self.ops[index].completed = true;
+                    self.materialize_success(index);
                 }
                 Err(err) => {
                     self.trace.failed(id, err.to_string());
+                    self.record_failure(index, &err.to_string());
                     return Err(err);
                 }
             }
@@ -302,12 +328,30 @@ impl<'a> Coordinator<'a> {
         Ok(())
     }
 
+    /// Successful execution produces the ordinary value, completion token, and
+    /// every successor resource/control version atomically from the scheduler's
+    /// perspective. Effects have already happened by this point; deterministic
+    /// commit order is not used as a substitute for their graph ordering.
+    fn materialize_success(&mut self, index: usize) {
+        debug_assert!(self.ops[index]
+            .outputs
+            .contains(&self.ops[index].value_output));
+        for output in self.ops[index].outputs.clone() {
+            self.materialized.insert(output);
+        }
+        self.ops[index].completed = true;
+    }
+
+    fn record_failure(&mut self, index: usize, message: &str) {
+        for output in self.ops[index].outputs.clone() {
+            self.materialized.remove(&output);
+            self.failed_outputs.insert(output, message.to_string());
+        }
+    }
+
     /// Commit root values into `scope` in deterministic root order, returning
     /// the document value (the last non-null, non-whitespace root).
-    fn commit(
-        &self,
-        scope: &mut std::collections::HashMap<String, OValue>,
-    ) -> Result<OValue> {
+    fn commit(&self, scope: &mut std::collections::HashMap<String, OValue>) -> Result<OValue> {
         let mut last = OValue::null();
         for root_index in self.plan.root_schedule().map_err(anyhow::Error::msg)? {
             let node = &self.program.nodes[root_index];
@@ -326,56 +370,132 @@ impl<'a> Coordinator<'a> {
         }
         Ok(last)
     }
-
-    /// Read-only view of the actor table (used by tests).
-    pub fn actor_table(&self) -> &ActorTable {
-        &self.actors
-    }
-
-    /// Read-only view of the derived per-node effect summaries (used by tests).
-    pub fn effect_summaries(&self) -> &[EffectSummary] {
-        &self.effects
-    }
 }
 
-/// Derive the effect summary for a single plan node.
-pub fn effect_summary_for(
-    id: PlanNodeId,
-    kind: &PlanNodeKind,
-    actors: &ActorTable,
-) -> EffectSummary {
-    match kind {
-        PlanNodeKind::Text
-        | PlanNodeKind::Load { .. }
-        | PlanNodeKind::Store { .. }
-        | PlanNodeKind::Group { .. } => EffectSummary::pure(),
-        // Builtins and schedule points may touch evaluator state; keep them on
-        // the coordinator thread.
-        PlanNodeKind::Call { .. }
-        | PlanNodeKind::Request { .. }
-        | PlanNodeKind::Schedule { .. } => EffectSummary::unknown(),
-        PlanNodeKind::Exec {
-            lang,
-            env_id,
-            attr,
-            backend,
-        } => {
-            let declaration = EffectDeclaration::parse(attr.as_deref());
-            // quote/O structural inline backends and pure inline value/thunk
-            // backends are pure by default; shim backends are unknown/impure.
-            let base = if backend.pure {
-                EffectSummary::pure()
-            } else {
-                let mut summary = EffectSummary::unknown();
-                if let Some(actor) = actors.actor_for(id) {
-                    if !actor.is_ephemeral() {
-                        summary = summary.with_actor_state(actor.clone());
-                    }
-                }
-                summary
-            };
-            let _ = (lang, env_id);
-            declaration.apply(base)
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::hgraph::from_oir::build_program;
+    use crate::hgraph::HNodeKind;
+    use crate::ir::BackendRegistry;
+
+    #[test]
+    fn coordinator_rejects_hgraph_from_a_different_plan_or_program() {
+        let graph_program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "html".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("html"),
+                body: vec![OIr::Text("pure".into())],
+            }],
+        };
+        let graph = build_program(&graph_program);
+        let different_plan_program = OIrProgram {
+            nodes: vec![OIr::Store {
+                name: "x".into(),
+                expr: Box::new(OIr::Text("effect classification differs".into())),
+            }],
+        };
+        let different_plan = different_plan_program.plan();
+        let error = Coordinator::new(
+            &different_plan_program,
+            &different_plan,
+            &graph,
+            Policy::Eager,
+        )
+        .err()
+        .expect("a graph cannot schedule unrelated OIR");
+        assert!(error
+            .to_string()
+            .contains("does not match the HGraph source plan"));
+
+        // Text content is absent from PlanNodeKind, so exact OIR provenance is
+        // checked independently even when the two ExecutionPlans compare equal.
+        let source = OIrProgram {
+            nodes: vec![OIr::Text("source".into())],
+        };
+        let source_graph = build_program(&source);
+        let different_text = OIrProgram {
+            nodes: vec![OIr::Text("different".into())],
+        };
+        let same_shape_plan = different_text.plan();
+        let error = Coordinator::new(
+            &different_text,
+            &same_shape_plan,
+            &source_graph,
+            Policy::Eager,
+        )
+        .err()
+        .expect("same-shaped OIR must still match graph provenance");
+        assert!(error
+            .to_string()
+            .contains("does not match HGraph source provenance"));
+    }
+
+    #[test]
+    fn failed_operation_produces_no_value_completion_or_resource_state() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Load("missing".into())],
+        };
+        let plan = program.plan();
+        let graph = build_program(&program);
+        let load_id = plan.roots[0];
+        let outputs = graph
+            .op_for(load_id)
+            .expect("load must lower to an operation")
+            .outputs
+            .clone();
+
+        assert!(outputs.iter().any(|output| matches!(
+            graph.node(*output).map(|node| &node.kind),
+            Some(HNodeKind::Value)
+        )));
+        assert!(outputs.iter().any(|output| matches!(
+            graph.node(*output).map(|node| &node.kind),
+            Some(HNodeKind::Completion { plan_node }) if *plan_node == load_id
+        )));
+        assert!(outputs.iter().any(|output| matches!(
+            graph.node(*output).map(|node| &node.kind),
+            Some(HNodeKind::ResourceState {
+                resource: crate::effects::ResourceKey::ScopeBinding(name),
+                version: 1,
+            }) if name == "missing"
+        )));
+
+        let mut coordinator =
+            Coordinator::new(&program, &plan, &graph, Policy::Eager).expect("valid graph");
+        assert!(outputs
+            .iter()
+            .all(|output| !coordinator.materialized.contains(output)));
+
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+        let error = coordinator
+            .run(&mut evaluator, &mut scope)
+            .expect_err("undefined load must fail");
+        assert!(error.to_string().contains("Undefined variable: $missing"));
+
+        assert!(
+            coordinator.frame.values[load_id.0].is_none(),
+            "a failed operation must not publish its ordinary value"
+        );
+        assert!(
+            !coordinator.ops[0].completed,
+            "failure must not be recorded as successful completion"
+        );
+        for output in outputs {
+            assert!(
+                !coordinator.materialized.contains(&output),
+                "failed output {output:?} became materialized"
+            );
+            assert_eq!(
+                coordinator.failed_outputs.get(&output).map(String::as_str),
+                Some("Undefined variable: $missing"),
+                "every ordinary, completion, and state output must carry failure"
+            );
         }
     }
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::ir::PlanNodeId;
 
 use super::{
-    graph::{ActorId, EdgeId, HGraph, NodeId, PortRole},
+    graph::{ActorId, EdgeId, HGraph, HNodeKind, NodeId, PortRole},
     kinds::OpKind,
 };
 
@@ -11,25 +11,23 @@ use super::{
 // Ready-operation scheduler
 //
 // An Execute hyperedge is ready when all of its input value nodes are
-// materialized, its blocking constraints (data, structural, sequence, and its
-// same-actor predecessor) are satisfied, and its branch guard (if any) is
-// active. Every Execute edge carries a stable source ordinal used both for
-// tie-breaking when several operations become ready simultaneously and for the
-// deterministic commit order. Source sequence remains blocking until it can be
-// represented by explicit completion/control values and safely relaxed by a
-// verified rule.
+// materialized. Blockers are derived only from the producers of input nodes, so
+// the same rule covers ordinary data, resource/evaluator state, actor state,
+// successful completion, and branch-control values. Source sequence is lowered
+// as completion input unless explicit concurrency or the narrow verified-pure
+// rule safely relaxes it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One schedulable operation: its plan node, its Execute edge, the value nodes
-/// it consumes/produces, its stable ordinal, and (for backend blocks) its actor.
+/// it consumes/produces, and its stable ordinal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyOp {
     pub plan_node: PlanNodeId,
     pub edge: EdgeId,
-    pub output: NodeId,
+    pub value_output: NodeId,
     pub inputs: Vec<NodeId>,
+    pub outputs: Vec<NodeId>,
     pub ordinal: u64,
-    pub actor: Option<ActorId>,
     /// Indices (into `ReadySchedule::ops`) of operations that must complete
     /// before this one can run.
     pub blocked_by: Vec<usize>,
@@ -44,12 +42,21 @@ pub struct ReadySchedule {
 impl ReadySchedule {
     /// Derive the ready-operation schedule from the graph's Execute hyperedges.
     pub fn derive(graph: &HGraph) -> Result<ReadySchedule, String> {
+        graph.validate_execution_graph()?;
         let infos = graph.exec_ops_ordered();
 
-        // producer value node → op index (an op's output node)
+        // Every ordinary, resource, actor, completion, and control output can
+        // be consumed by a later operation.
         let mut producer_op: HashMap<NodeId, usize> = HashMap::new();
         for (index, info) in infos.iter().enumerate() {
-            producer_op.insert(info.output, index);
+            for output in &info.outputs {
+                if producer_op.insert(*output, index).is_some() {
+                    return Err(format!(
+                        "node {} has multiple operation producers",
+                        output.0
+                    ));
+                }
+            }
         }
 
         let mut ops: Vec<ReadyOp> = infos
@@ -57,44 +64,27 @@ impl ReadySchedule {
             .map(|info| ReadyOp {
                 plan_node: info.plan_node,
                 edge: info.edge,
-                output: info.output,
+                value_output: info.value_output,
                 inputs: info.inputs.clone(),
+                outputs: info.outputs.clone(),
                 ordinal: info.ordinal,
-                actor: graph.node(info.output).and_then(|node| node.actor),
                 blocked_by: Vec::new(),
             })
             .collect();
 
         // Data/structural blocking: an op waits on the producers of its inputs.
-        for index in 0..ops.len() {
+        for (index, op) in ops.iter_mut().enumerate() {
             let mut deps: BTreeSet<usize> = BTreeSet::new();
-            for input in ops[index].inputs.clone() {
+            for input in op.inputs.clone() {
                 if let Some(&producer) = producer_op.get(&input) {
                     if producer != index {
                         deps.insert(producer);
                     }
                 }
             }
-            ops[index].blocked_by = deps.into_iter().collect();
+            op.blocked_by = deps.into_iter().collect();
         }
 
-        // Actor serialization: same-actor ops run in stable ordinal order.
-        let mut by_actor: HashMap<ActorId, Vec<usize>> = HashMap::new();
-        for (index, op) in ops.iter().enumerate() {
-            if let Some(actor) = op.actor {
-                by_actor.entry(actor).or_default().push(index);
-            }
-        }
-        for members in by_actor.values() {
-            let mut ordered = members.clone();
-            ordered.sort_by_key(|&i| (ops[i].ordinal, i));
-            for window in ordered.windows(2) {
-                let (prev, next) = (window[0], window[1]);
-                if !ops[next].blocked_by.contains(&prev) {
-                    ops[next].blocked_by.push(prev);
-                }
-            }
-        }
         for op in &mut ops {
             op.blocked_by.sort_unstable();
             op.blocked_by.dedup();
@@ -269,8 +259,17 @@ fn topological_clusters(
     graph: &HGraph,
     precedes: &HashMap<NodeId, HashSet<NodeId>>,
 ) -> Result<Schedule, String> {
+    let value_nodes = graph
+        .node_ids()
+        .into_iter()
+        .filter(|id| {
+            graph
+                .node(*id)
+                .is_some_and(|node| matches!(node.kind, HNodeKind::Value))
+        })
+        .collect::<Vec<_>>();
     let mut indegree: HashMap<NodeId, usize> =
-        graph.node_ids().into_iter().map(|id| (id, 0)).collect();
+        value_nodes.iter().copied().map(|id| (id, 0)).collect();
     let mut successors: HashMap<NodeId, BTreeSet<NodeId>> = HashMap::new();
 
     for (from, tos) in precedes {
@@ -311,10 +310,10 @@ fn topological_clusters(
     }
 
     let scheduled: usize = clusters.iter().map(|cluster| cluster.nodes.len()).sum();
-    if scheduled != graph.nodes.len() {
+    if scheduled != value_nodes.len() {
         return Err(format!(
             "hypergraph dependency graph contains a cycle or invalid dependency: scheduled {scheduled} of {} nodes",
-            graph.nodes.len()
+            value_nodes.len()
         ));
     }
 

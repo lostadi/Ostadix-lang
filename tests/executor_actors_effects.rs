@@ -1,13 +1,14 @@
-//! Actor-identity and effect-model tests for the graph executor.
+//! Compatibility actor-label and semantic effect-model tests.
 //!
-//! These cover: unique ephemeral actor identities (so unrelated ephemeral
-//! computations never serialize), persistent-actor sharing, effect-declaration
-//! parsing, and the conflict relation that gates parallel readiness.
+//! These cover stable diagnostic labels, persistent-environment identity,
+//! effect-declaration parsing, and the compatibility conflict predicate.
+//! Production readiness itself is derived from executable graph inputs.
 
 use o_lang::executor::{
-    ActorTable, DeclaredPurity, EffectDeclaration, EffectSummary, ResourceKey,
+    effect_summary_for_plan_node, ActorResourceId, ActorTable, DeclaredPurity, EffectConfidence,
+    EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, ResourceKey,
 };
-use o_lang::ir::{BackendRegistry, OIr, OIrProgram, PlanNodeKind};
+use o_lang::ir::{BackendRegistry, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 
 fn shim(lang: &str) -> o_lang::ir::BackendInterface {
     BackendRegistry::global().interface_for(lang)
@@ -15,7 +16,8 @@ fn shim(lang: &str) -> o_lang::ir::BackendInterface {
 
 #[test]
 fn ephemeral_blocks_get_unique_actor_identities() {
-    // Two independent ephemeral (env_id == u32::MAX) python blocks.
+    // Two ephemeral (env_id == u32::MAX) Python blocks receive distinct
+    // diagnostic labels; this assertion makes no scheduling claim.
     let program = OIrProgram {
         nodes: vec![
             OIr::Exec {
@@ -46,7 +48,9 @@ fn ephemeral_blocks_get_unique_actor_identities() {
     assert_eq!(exec_ids.len(), 2);
 
     let a = actors.actor_for(exec_ids[0]).expect("actor for first exec");
-    let b = actors.actor_for(exec_ids[1]).expect("actor for second exec");
+    let b = actors
+        .actor_for(exec_ids[1])
+        .expect("actor for second exec");
 
     assert!(a.is_ephemeral() && b.is_ephemeral());
     assert_ne!(
@@ -106,7 +110,8 @@ fn persistent_same_env_shares_one_actor() {
 fn effect_declaration_parses_all_forms() {
     let decl = EffectDeclaration::parse(Some(
         "lazy, effects=unknown, reads=project:src+host:/etc/hosts, writes=env:PATH, serial=host",
-    ));
+    ))
+    .unwrap();
     assert_eq!(decl.purity, Some(DeclaredPurity::Unknown));
     assert!(decl.reads.contains(&ResourceKey::ProjectPath("src".into())));
     assert!(decl
@@ -116,29 +121,38 @@ fn effect_declaration_parses_all_forms() {
     assert!(decl.serial_host);
 
     // Unknown / unrelated attributes must not break parsing.
-    let plain = EffectDeclaration::parse(Some("lazy, defer"));
+    let plain = EffectDeclaration::parse(Some("lazy, defer")).unwrap();
     assert!(plain.is_empty());
 }
 
 #[test]
-fn pure_declaration_overrides_unknown_base() {
-    // A shim block defaults to unknown/impure, but `effects=pure` makes it pure.
-    let decl = EffectDeclaration::parse(Some("effects=pure"));
-    let effective = decl.apply(EffectSummary::unknown());
-    assert!(!effective.unknown, "declared-pure block must not be unknown");
-    assert!(effective.deterministic);
+fn pure_declaration_cannot_upgrade_unknown_base() {
+    let decl = EffectDeclaration::parse(Some("effects=pure")).unwrap();
+    let error = decl
+        .apply_checked(EffectSummary::unknown(), EffectTrustPolicy::Strict)
+        .unwrap_err();
+    assert!(error.contains("cannot upgrade"), "{error}");
 }
 
 #[test]
-fn effect_conflicts_gate_parallel_readiness() {
-    // Read/read: no conflict → may run in parallel.
+fn redundant_pure_declaration_preserves_verified_purity() {
+    let decl = EffectDeclaration::parse(Some("effects=pure")).unwrap();
+    let effective = decl
+        .apply_checked(EffectSummary::pure(), EffectTrustPolicy::Strict)
+        .unwrap();
+    assert!(effective.is_verified_pure_infallible());
+}
+
+#[test]
+fn effect_conflict_predicate_reports_resource_hazards() {
+    // Read/read is not a write hazard in the compatibility predicate.
     let mut read_a = EffectSummary::pure();
     read_a.reads.insert(ResourceKey::ProjectPath("data".into()));
     let mut read_b = EffectSummary::pure();
     read_b.reads.insert(ResourceKey::ProjectPath("data".into()));
     assert!(!read_a.conflicts_with(&read_b));
 
-    // Write vs read on the same resource: conflict → must serialize.
+    // Write vs read on the same resource is a conflict.
     let mut write = EffectSummary::pure();
     write.writes.insert(ResourceKey::ProjectPath("data".into()));
     assert!(write.conflicts_with(&read_a));
@@ -147,6 +161,176 @@ fn effect_conflicts_gate_parallel_readiness() {
     let unknown = EffectSummary::unknown();
     assert!(unknown.conflicts_with(&EffectSummary::unknown()));
 
+    // HostWorld is an umbrella over precise host resources.
+    assert!(unknown.conflicts_with(&read_a));
+
     // Two pure, resource-free summaries never conflict.
     assert!(!EffectSummary::pure().conflicts_with(&EffectSummary::pure()));
+}
+
+#[test]
+fn unknown_summary_has_explicit_host_world_transition() {
+    let summary = EffectSummary::unknown();
+    assert_eq!(summary.confidence, EffectConfidence::Conservative);
+    assert_eq!(summary.fallibility, Fallibility::MayFail);
+    assert!(summary.unknown);
+    assert!(summary.reads.contains(&ResourceKey::HostWorld));
+    assert!(summary.writes.contains(&ResourceKey::HostWorld));
+}
+
+#[test]
+fn actor_state_is_typed_and_added_to_both_access_sets() {
+    let actor = ActorResourceId::new("python", 7);
+    let summary = EffectSummary::unknown().with_actor_state(actor.clone());
+    let resource = ResourceKey::ActorState(actor.clone());
+    assert_eq!(summary.actor_state, Some(actor));
+    assert!(summary.reads.contains(&resource));
+    assert!(summary.writes.contains(&resource));
+    assert!(summary.accessed_resources().contains(&resource));
+    assert_eq!(resource.to_string(), "actor:python[7]");
+}
+
+#[test]
+fn unknown_declaration_downgrades_verified_pure_base() {
+    let decl = EffectDeclaration::parse(Some("effects=unknown")).unwrap();
+    let summary = decl
+        .apply_checked(EffectSummary::pure(), EffectTrustPolicy::Strict)
+        .unwrap();
+    assert_eq!(summary.confidence, EffectConfidence::Conservative);
+    assert_eq!(summary.fallibility, Fallibility::MayFail);
+    assert!(summary.unknown);
+    assert!(summary.reads.contains(&ResourceKey::HostWorld));
+    assert!(summary.writes.contains(&ResourceKey::HostWorld));
+}
+
+#[test]
+fn user_host_resources_add_constraints_without_losing_world_umbrella() {
+    let decl =
+        EffectDeclaration::parse(Some("reads=project:input, writes=env:OUTPUT, serial=host"))
+            .unwrap();
+    let summary = decl
+        .apply_checked(EffectSummary::pure(), EffectTrustPolicy::Strict)
+        .unwrap();
+
+    assert_eq!(summary.confidence, EffectConfidence::UserDeclared);
+    assert!(!summary.unknown);
+    assert!(summary
+        .reads
+        .contains(&ResourceKey::ProjectPath("input".into())));
+    assert!(summary
+        .writes
+        .contains(&ResourceKey::EnvVar("OUTPUT".into())));
+    assert!(summary.reads.contains(&ResourceKey::HostWorld));
+    assert!(summary.writes.contains(&ResourceKey::HostWorld));
+    assert!(!summary.is_verified_pure_infallible());
+}
+
+#[test]
+fn malformed_effect_resource_syntax_is_rejected() {
+    for attr in [
+        "effects=trusted",
+        "serial=actor",
+        "reads=project:/absolute",
+        "writes=env:bad-name",
+        "reads=actor:python[*]",
+        "reads=",
+    ] {
+        assert!(
+            EffectDeclaration::parse(Some(attr)).is_err(),
+            "{attr} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn plan_node_effects_distinguish_scope_pure_and_control_state() {
+    let text = effect_summary_for_plan_node(PlanNodeId(0), &PlanNodeKind::Text).unwrap();
+    assert!(text.is_verified_pure_infallible());
+
+    let load =
+        effect_summary_for_plan_node(PlanNodeId(1), &PlanNodeKind::Load { name: "x".into() })
+            .unwrap();
+    assert_eq!(load.confidence, EffectConfidence::Verified);
+    assert_eq!(load.fallibility, Fallibility::MayFail);
+    assert!(load.reads.contains(&ResourceKey::ScopeBinding("x".into())));
+
+    let store =
+        effect_summary_for_plan_node(PlanNodeId(2), &PlanNodeKind::Store { name: "x".into() })
+            .unwrap();
+    assert_eq!(store.fallibility, Fallibility::Infallible);
+    assert!(store
+        .writes
+        .contains(&ResourceKey::ScopeBinding("x".into())));
+
+    let call = effect_summary_for_plan_node(
+        PlanNodeId(3),
+        &PlanNodeKind::Call {
+            fn_name: "scope".into(),
+            mode: o_lang::ir::InvokeMode::Eager,
+            arg_count: 0,
+        },
+    )
+    .unwrap();
+    assert!(call.reads.contains(&ResourceKey::HostWorld));
+    assert!(call.reads.contains(&ResourceKey::EvaluatorState));
+    assert!(call.writes.contains(&ResourceKey::HostWorld));
+    assert!(call.writes.contains(&ResourceKey::EvaluatorState));
+}
+
+#[test]
+fn plan_node_effects_trust_only_known_inline_renderers() {
+    let html = PlanNodeKind::Exec {
+        lang: "html".into(),
+        env_id: u32::MAX,
+        attr: None,
+        backend: shim("html"),
+    };
+    let summary = effect_summary_for_plan_node(PlanNodeId(0), &html).unwrap();
+    assert!(summary.is_verified_pure_infallible());
+
+    let deferred_html = PlanNodeKind::Exec {
+        lang: "html".into(),
+        env_id: u32::MAX,
+        attr: Some("defer".into()),
+        backend: shim("html"),
+    };
+    let summary = effect_summary_for_plan_node(PlanNodeId(1), &deferred_html).unwrap();
+    assert_eq!(summary.confidence, EffectConfidence::Conservative);
+    assert!(summary.reads.contains(&ResourceKey::HostWorld));
+    assert!(summary.reads.contains(&ResourceKey::EvaluatorState));
+}
+
+#[test]
+fn persistent_shim_uses_canonical_actor_resource() {
+    let python = PlanNodeKind::Exec {
+        lang: "py".into(),
+        env_id: 9,
+        attr: None,
+        backend: shim("py"),
+    };
+    let summary = effect_summary_for_plan_node(PlanNodeId(0), &python).unwrap();
+    let actor = ActorResourceId::new("python", 9);
+    let resource = ResourceKey::ActorState(actor.clone());
+    assert_eq!(summary.actor_state, Some(actor));
+    assert!(summary.reads.contains(&resource));
+    assert!(summary.writes.contains(&resource));
+    assert!(summary.reads.contains(&ResourceKey::HostWorld));
+    assert!(summary.reads.contains(&ResourceKey::EvaluatorState));
+}
+
+#[test]
+fn explicit_inline_environment_is_conservatively_actor_stateful() {
+    let inline = PlanNodeKind::Exec {
+        lang: "html".into(),
+        env_id: 7,
+        attr: None,
+        backend: shim("html"),
+    };
+    let summary = effect_summary_for_plan_node(PlanNodeId(5), &inline).unwrap();
+    let actor = ActorResourceId::new("html", 7);
+    let resource = ResourceKey::ActorState(actor.clone());
+    assert_eq!(summary.actor_state, Some(actor));
+    assert!(summary.reads.contains(&resource));
+    assert!(summary.writes.contains(&resource));
+    assert!(!summary.is_verified_pure_infallible());
 }

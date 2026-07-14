@@ -42,8 +42,8 @@ path = "src/bin/ogit.rs"
 [features]
 default = ["graph_executor"]
 # graph_executor: include the readiness-driven operation-hypergraph
-# coordinator. During the state-complete refactor it is selected explicitly
-# with O_EXECUTOR=graph; the reference serial executor remains the default.
+# coordinator. It is the default execution path; O_EXECUTOR=serial selects the
+# reference semantics used by the differential conformance suite.
 graph_executor = []
 notebook = ["dep:axum", "dep:tokio"]
 

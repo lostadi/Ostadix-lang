@@ -104,7 +104,7 @@ pub fn has_file(files: &[ProjectFile], path: &str) -> bool {
 }
 
 /// The UTF-8 text of a captured file, if it decodes.
-pub fn file_text<'a>(file: &'a ProjectFile) -> Option<&'a str> {
+pub fn file_text(file: &ProjectFile) -> Option<&str> {
     std::str::from_utf8(&file.bytes).ok()
 }
 

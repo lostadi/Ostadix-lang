@@ -55,11 +55,12 @@
 // Target E ("dot"):
 //   Parses and lowers to OIR, then builds the full hypergraph (src/hgraph/)
 //   from that OIR, runs the type solver over it, and serialises the result as
-//   a Graphviz DOT digraph on stdout. Each HNode becomes a graph node; each
-//   HEdge is projected to binary directed edges between its Input/InOut and
-//   Output/InOut ports. Edge labels identify the relation kind (dataflow,
-//   structural, sequence, crossing:L1→L2, …). Pipe to `dot -Tpng -o out.png`
-//   or any other Graphviz renderer.
+//   a Graphviz DOT digraph on stdout. Ordinary values, resource/actor state,
+//   and completion/control tokens use distinct node styles. Each directed
+//   hyperedge is rendered as its own vertex, with arrows from every input port
+//   into the vertex and arrows from the vertex to every output port. Execute
+//   and constraint/type hyperedges are visually distinct. Pipe to
+//   `dot -Tpng -o out.png` or any other Graphviz renderer.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -95,6 +96,7 @@ const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
+const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
 
 // hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
 const RUNTIME_HGRAPH_MOD_RS: &str = include_str!("../hgraph/mod.rs");
@@ -104,8 +106,8 @@ const RUNTIME_HGRAPH_FROM_OIR_RS: &str = include_str!("../hgraph/from_oir.rs");
 const RUNTIME_HGRAPH_SCHEDULE_RS: &str = include_str!("../hgraph/schedule.rs");
 const RUNTIME_HGRAPH_SOLVE_RS: &str = include_str!("../hgraph/solve.rs");
 
-// executor — the readiness-driven graph coordinator used by eval.rs as the
-// optional graph execution engine.
+// executor: the readiness-driven graph coordinator used by eval.rs as the
+// default execution engine, with its serial reference path retained in eval.rs.
 const RUNTIME_EXECUTOR_MOD_RS: &str = include_str!("../executor/mod.rs");
 const RUNTIME_EXECUTOR_ACTOR_RS: &str = include_str!("../executor/actor.rs");
 const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancellation.rs");
@@ -157,8 +159,8 @@ enum CompileTarget {
     Wasm,
     /// Execute the lowered and planned OIR inside the olangc process.
     Script,
-    /// Lower the parsed program to OIR, build its ExecutionPlan, and print
-    /// both to stdout without executing them.
+    /// Lower to OIR, build the ExecutionPlan and directed HGraph, and print all
+    /// three to stdout without executing them.
     Ir,
     /// Lower the parsed program to OIR, build its HGraph, solve types, and
     /// emit a Graphviz DOT digraph to stdout. Pipe to `dot -Tpng` for a PNG.
@@ -172,10 +174,10 @@ enum CompileTarget {
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default), \
 a wasm32-wasip1 module (--target wasm), executes executable OIR in-process \
-(--target script), prints the lowered OIR and ExecutionPlan (--target ir), or \
+(--target script), prints the lowered OIR, ExecutionPlan, and HGraph (--target ir), or \
 emits the program execution hypergraph as Graphviz DOT (--target dot). Binary \
 outputs embed the program source, compatibility adapters, and the Ostadix-lang \
-runtime. In ir mode the same OIR and ExecutionPlan used at runtime are printed \
+runtime. In ir mode the same OIR, plan, and directed execution HGraph are printed \
 without execution. In dot mode the HGraph is built and type-solved, then \
 serialised as a digraph; pipe to `dot -Tpng` for a rendered image."
 )]
@@ -423,7 +425,10 @@ fn compile_project_to_binary(
     let main_rs = generate_project_main_rs(&bin_name, &shim_include_lines);
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
-    fs::write(build_dir.join("Cargo.toml"), generate_cargo_toml(&bin_name, true))?;
+    fs::write(
+        build_dir.join("Cargo.toml"),
+        generate_cargo_toml(&bin_name, true),
+    )?;
     fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
 
     let mut cargo_args = vec!["build", "--release"];
@@ -468,7 +473,10 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
     fs::write(project_dir.join("mod.rs"), RUNTIME_PROJECT_MOD_RS)?;
     fs::write(project_dir.join("model.rs"), RUNTIME_PROJECT_MODEL_RS)?;
     fs::write(project_dir.join("bundle.rs"), RUNTIME_PROJECT_BUNDLE_RS)?;
-    fs::write(project_dir.join("materialize.rs"), RUNTIME_PROJECT_MATERIALIZE_RS)?;
+    fs::write(
+        project_dir.join("materialize.rs"),
+        RUNTIME_PROJECT_MATERIALIZE_RS,
+    )?;
     fs::write(project_dir.join("manifest.rs"), RUNTIME_PROJECT_MANIFEST_RS)?;
     fs::write(project_dir.join("discover.rs"), RUNTIME_PROJECT_DISCOVER_RS)?;
     fs::write(project_dir.join("lower.rs"), RUNTIME_PROJECT_LOWER_RS)?;
@@ -476,7 +484,10 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
 
     fs::write(eco_dir.join("mod.rs"), RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS)?;
     fs::write(eco_dir.join("python.rs"), RUNTIME_PROJECT_ECO_PYTHON_RS)?;
-    fs::write(eco_dir.join("javascript.rs"), RUNTIME_PROJECT_ECO_JAVASCRIPT_RS)?;
+    fs::write(
+        eco_dir.join("javascript.rs"),
+        RUNTIME_PROJECT_ECO_JAVASCRIPT_RS,
+    )?;
     fs::write(eco_dir.join("rust.rs"), RUNTIME_PROJECT_ECO_RUST_RS)?;
     fs::write(eco_dir.join("shell.rs"), RUNTIME_PROJECT_ECO_SHELL_RS)?;
     fs::write(eco_dir.join("generic.rs"), RUNTIME_PROJECT_ECO_GENERIC_RS)?;
@@ -620,7 +631,10 @@ fn compile_to_binary(
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
     // ── Cargo.toml ───────────────────────────────────────────────────────────
-    fs::write(build_dir.join("Cargo.toml"), generate_cargo_toml(&bin_name, false))?;
+    fs::write(
+        build_dir.join("Cargo.toml"),
+        generate_cargo_toml(&bin_name, false),
+    )?;
 
     // ── Cargo.lock — embed workspace lock for reproducible/fast first build ──
     fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
@@ -676,6 +690,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
+    fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
 
     // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
     let hgraph_dir = src_dir.join("hgraph");
@@ -687,7 +702,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(hgraph_dir.join("schedule.rs"), RUNTIME_HGRAPH_SCHEDULE_RS)?;
     fs::write(hgraph_dir.join("solve.rs"), RUNTIME_HGRAPH_SOLVE_RS)?;
 
-    // ── executor — opt-in graph coordinator ─────────────────────────────────
+    // ── executor: state-complete graph coordinator ──────────────────────────
     let executor_dir = src_dir.join("executor");
     fs::create_dir_all(&executor_dir)?;
     fs::write(executor_dir.join("mod.rs"), RUNTIME_EXECUTOR_MOD_RS)?;
@@ -701,7 +716,10 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         RUNTIME_EXECUTOR_COORDINATOR_RS,
     )?;
     fs::write(executor_dir.join("effects.rs"), RUNTIME_EXECUTOR_EFFECTS_RS)?;
-    fs::write(executor_dir.join("parallel.rs"), RUNTIME_EXECUTOR_PARALLEL_RS)?;
+    fs::write(
+        executor_dir.join("parallel.rs"),
+        RUNTIME_EXECUTOR_PARALLEL_RS,
+    )?;
     fs::write(executor_dir.join("trace.rs"), RUNTIME_EXECUTOR_TRACE_RS)?;
     Ok(())
 }
@@ -799,7 +817,8 @@ fn run_as_script(
 // Target C — dump the OIR intermediate representation
 //
 // Parses the program with the same front end as the other targets, lowers
-// the ONode forest to OIR (see src/ir.rs), and prints the lowered program.
+// the ONode forest to OIR (see src/ir.rs), then prints the lowered program,
+// ExecutionPlan, and directed executable HGraph.
 // Purely an inspection/debugging surface: nothing is executed and no output
 // file is produced.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -812,16 +831,21 @@ fn dump_ir(source: &str) -> Result<()> {
     let nodes = parser.parse().context("failed to parse .O source")?;
 
     let program = OIrProgram::lower(&nodes);
-    print!("{}", program.to_text());
+    let plan = program.plan();
+    let graph = program
+        .hgraph_for_plan(&plan)
+        .map_err(anyhow::Error::msg)
+        .context("failed to build HGraph for IR target")?;
+    print!("{}\n{}", program.to_text(), graph.to_execution_text());
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Target E — emit a Graphviz DOT digraph from the HGraph
 //
-// Builds the same HGraph that eval.rs uses at runtime, runs the type solver
-// on it, then projects the hypergraph onto a binary digraph and serialises
-// it as DOT.  Pipe the output to `dot -Tpng -o out.png` for a rendered image.
+// Builds the same HGraph that eval.rs uses at runtime, runs the type solver,
+// then renders nodes and directed hyperedge ports without flattening away the
+// operation boundary. Pipe the output to `dot -Tpng -o out.png` for an image.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dump_dot(source: &str) -> Result<()> {
@@ -832,116 +856,290 @@ fn dump_dot(source: &str) -> Result<()> {
     let mut parser = Parser::new(&src, &registered);
     let nodes = parser.parse().context("failed to parse .O source")?;
     let program = OIrProgram::lower(&nodes);
-    let mut graph = program.hgraph();
+    let plan = program.plan();
+    let mut graph = program
+        .hgraph_for_plan(&plan)
+        .map_err(anyhow::Error::msg)
+        .context("failed to build HGraph for DOT target")?;
     solve::solve_types(&mut graph);
     print!("{}", hgraph_to_dot(&graph));
     Ok(())
 }
 
-/// Project the hypergraph onto a binary `petgraph::StableDiGraph` and render
-/// it as Graphviz DOT.
+/// Render the HGraph as Graphviz DOT while preserving hyperedge port direction.
 ///
-/// Hyperedge → binary-edge projection rule:
-///   For each `HEdge`, emit one directed edge from every Input/InOut port to
-///   every Output/InOut port (excluding self-loops).  The edge weight carries
-///   the `OpKind` name so the rendered graph shows the relation type.
+/// Every HNode is a DOT vertex whose style identifies whether it carries an
+/// ordinary OValue, resource state, persistent actor state, completion, or
+/// branch control. Every hyperedge is also a DOT vertex. Input/InOut ports
+/// point into that vertex; Output/InOut ports point out. Execute edges use
+/// `ExecInfo` so every ordinary and synthetic output is rendered explicitly.
 fn hgraph_to_dot(hgraph: &o_lang::hgraph::HGraph) -> String {
-    use o_lang::hgraph::graph::{NodeId, PortRole};
-    use petgraph::stable_graph::{NodeIndex, StableDiGraph};
-    use std::collections::HashMap;
+    use o_lang::hgraph::{HEdgeKind, PortRole};
 
-    let mut graph: StableDiGraph<String, String> = StableDiGraph::new();
-    let mut node_map: HashMap<NodeId, NodeIndex> = HashMap::new();
+    let mut out = String::from(
+        "digraph hgraph {\n\
+         \x20   graph [bgcolor = \"#11111b\", rankdir = \"LR\"];\n\
+         \x20   node [fontname = \"FiraCode\", fontcolor = \"#cdd6f4\"];\n\
+         \x20   edge [fontname = \"FiraCode\", fontcolor = \"#bac2de\", color = \"#bac2de\"];\n",
+    );
 
-    // Add one graph node per HNode, labelled with its ID and known value.
+    // Semantic values and state/control tokens.
     for id in hgraph.node_ids() {
-        let label = match hgraph.node(id) {
-            None => format!("N{}", id.0),
-            Some(node) => {
-                let value_part = match &node.value {
-                    Some(v) => {
-                        let s = format!("{v}");
-                        if s.chars().count() > 24 {
-                            format!("{}...", s.chars().take(24).collect::<String>())
-                        } else {
-                            s
-                        }
-                    }
-                    None => String::new(),
-                };
-                let actor_part = node
-                    .actor
-                    .map(|a| format!(" actor({}/{})", a.lang, a.env))
-                    .unwrap_or_default();
-                if value_part.is_empty() {
-                    format!("N{}{}", id.0, actor_part)
-                } else {
-                    format!("N{}: {}{}", id.0, value_part, actor_part)
-                }
-            }
+        let Some(node) = hgraph.node(id) else {
+            continue;
         };
-        let idx = graph.add_node(label);
-        node_map.insert(id, idx);
+        let (label, style) = hnode_dot_appearance(id, node);
+        push_dot_vertex(&mut out, &format!("n{}", id.0), &label, style);
     }
 
-    // Project each hyperedge to directed binary edges.
+    // Constraint/type relations remain explicit hyperedge vertices. InOut
+    // ports receive one arrow in each direction, exactly matching their role.
     for eid in hgraph.edge_ids() {
         let Some(edge) = hgraph.edge(eid) else {
             continue;
         };
+        let constraint_id = format!("constraint{}", eid.0);
+        let label = format!("Constraint E{}\n{}", eid.0, op_kind_label(&edge.kind));
+        push_dot_vertex(&mut out, &constraint_id, &label, DOT_CONSTRAINT_STYLE);
 
-        let label = op_kind_label(&edge.kind);
-
-        let inputs: Vec<NodeIndex> = edge
-            .ports
-            .iter()
-            .filter(|p| matches!(p.role, PortRole::Input | PortRole::InOut))
-            .filter_map(|p| node_map.get(&p.node).copied())
-            .collect();
-
-        let outputs: Vec<NodeIndex> = edge
-            .ports
-            .iter()
-            .filter(|p| matches!(p.role, PortRole::Output | PortRole::InOut))
-            .filter_map(|p| node_map.get(&p.node).copied())
-            .collect();
-
-        for &src in &inputs {
-            for &dst in &outputs {
-                if src != dst {
-                    graph.add_edge(src, dst, label.clone());
-                }
+        for port in &edge.ports {
+            let node_id = format!("n{}", port.node.0);
+            if matches!(port.role, PortRole::Input | PortRole::InOut) {
+                push_dot_arrow(&mut out, &node_id, &constraint_id, "in", "constraint");
+            }
+            if matches!(port.role, PortRole::Output | PortRole::InOut) {
+                push_dot_arrow(&mut out, &constraint_id, &node_id, "out", "constraint");
             }
         }
     }
 
-    // Serialize to DOT manually — petgraph's Dot uses Debug on String weights
-    // which double-quotes labels (label = "\"text\""). Writing it ourselves
-    // produces clean label = "text" output.
-    let mut out = String::from("digraph {\n");
-    for idx in graph.node_indices() {
-        let label = dot_escape(&graph[idx]);
-        out.push_str(&format!("    {} [ label = \"{}\" ]\n", idx.index(), label));
+    // Executable hyperedges expose all dependency inputs and every result,
+    // successor-state, completion, and control output.
+    for info in hgraph.exec_ops_ordered() {
+        let Some(edge) = hgraph.exec_edge(info.edge) else {
+            continue;
+        };
+        let HEdgeKind::Execute(op) = &edge.op else {
+            continue;
+        };
+        let exec_id = format!("execute{}", info.edge.0);
+        let label = format!(
+            "Execute E{}\nP{} ordinal {}\n{}",
+            info.edge.0,
+            info.plan_node.0,
+            info.ordinal,
+            executable_op_label(op)
+        );
+        push_dot_vertex(&mut out, &exec_id, &label, DOT_EXECUTE_STYLE);
+
+        for input in &info.inputs {
+            push_dot_arrow(
+                &mut out,
+                &format!("n{}", input.0),
+                &exec_id,
+                &format!("input:{}", hnode_port_label(hgraph.node(*input))),
+                "execute",
+            );
+        }
+        for output in &info.outputs {
+            let role = if *output == info.value_output {
+                "result"
+            } else {
+                hnode_port_label(hgraph.node(*output))
+            };
+            push_dot_arrow(
+                &mut out,
+                &exec_id,
+                &format!("n{}", output.0),
+                role,
+                "execute",
+            );
+        }
     }
-    for eidx in graph.edge_indices() {
-        let (src, dst) = graph.edge_endpoints(eidx).unwrap();
-        let label = dot_escape(graph.edge_weight(eidx).unwrap());
-        out.push_str(&format!(
-            "    {} -> {} [ label = \"{}\" ]\n",
-            src.index(),
-            dst.index(),
-            label
-        ));
-    }
+
     out.push_str("}\n");
     out
+}
+
+#[derive(Clone, Copy)]
+struct DotVertexStyle {
+    shape: &'static str,
+    style: &'static str,
+    fillcolor: &'static str,
+    color: &'static str,
+    penwidth: u8,
+}
+
+const DOT_VALUE_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "ellipse",
+    style: "filled",
+    fillcolor: "#1e1e2e",
+    color: "#89b4fa",
+    penwidth: 1,
+};
+const DOT_RESOURCE_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "hexagon",
+    style: "filled",
+    fillcolor: "#243447",
+    color: "#74c7ec",
+    penwidth: 1,
+};
+const DOT_ACTOR_STATE_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "doubleoctagon",
+    style: "filled,bold",
+    fillcolor: "#3b3154",
+    color: "#cba6f7",
+    penwidth: 2,
+};
+const DOT_COMPLETION_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "diamond",
+    style: "filled",
+    fillcolor: "#24352d",
+    color: "#a6e3a1",
+    penwidth: 1,
+};
+const DOT_CONTROL_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "octagon",
+    style: "filled",
+    fillcolor: "#403827",
+    color: "#f9e2af",
+    penwidth: 1,
+};
+const DOT_EXECUTE_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "box",
+    style: "rounded,filled,bold",
+    fillcolor: "#452f3b",
+    color: "#f38ba8",
+    penwidth: 2,
+};
+const DOT_CONSTRAINT_STYLE: DotVertexStyle = DotVertexStyle {
+    shape: "diamond",
+    style: "filled,dashed",
+    fillcolor: "#313244",
+    color: "#6c7086",
+    penwidth: 1,
+};
+
+fn hnode_dot_appearance(
+    id: o_lang::hgraph::NodeId,
+    node: &o_lang::hgraph::HNode,
+) -> (String, DotVertexStyle) {
+    use o_lang::effects::ResourceKey;
+    use o_lang::hgraph::HNodeKind;
+
+    match &node.kind {
+        HNodeKind::Value => {
+            let mut label = format!("Value N{}", id.0);
+            if let Some(value) = &node.value {
+                label.push('\n');
+                label.push_str(&abbreviate_dot_value(&format!("{value}"), 40));
+            }
+            if let Some(actor) = node.actor {
+                label.push_str(&format!("\nactor({}/{})", actor.lang, actor.env));
+            }
+            (label, DOT_VALUE_STYLE)
+        }
+        HNodeKind::ResourceState {
+            resource: ResourceKey::ActorState(actor),
+            version,
+        } => (
+            format!("ActorState({actor})@{version}\nN{}", id.0),
+            DOT_ACTOR_STATE_STYLE,
+        ),
+        HNodeKind::ResourceState { resource, version } => (
+            format!("{resource}@{version}\nResource N{}", id.0),
+            DOT_RESOURCE_STYLE,
+        ),
+        HNodeKind::Completion { plan_node } => (
+            format!("Completion(P{})\nN{}", plan_node.0, id.0),
+            DOT_COMPLETION_STYLE,
+        ),
+        HNodeKind::BranchControl { label, version } => (
+            format!("Control({label})@{version}\nN{}", id.0),
+            DOT_CONTROL_STYLE,
+        ),
+    }
+}
+
+fn abbreviate_dot_value(value: &str, max_chars: usize) -> String {
+    if value.chars().count() > max_chars {
+        format!("{}…", value.chars().take(max_chars).collect::<String>())
+    } else {
+        value.to_string()
+    }
+}
+
+fn hnode_port_label(node: Option<&o_lang::hgraph::HNode>) -> &'static str {
+    use o_lang::effects::ResourceKey;
+    use o_lang::hgraph::HNodeKind;
+
+    match node.map(|node| &node.kind) {
+        Some(HNodeKind::Value) => "value",
+        Some(HNodeKind::ResourceState {
+            resource: ResourceKey::ActorState(_),
+            ..
+        }) => "actor-state",
+        Some(HNodeKind::ResourceState { .. }) => "resource-state",
+        Some(HNodeKind::Completion { .. }) => "completion",
+        Some(HNodeKind::BranchControl { .. }) => "control",
+        None => "missing-node",
+    }
+}
+
+fn push_dot_vertex(out: &mut String, id: &str, label: &str, style: DotVertexStyle) {
+    out.push_str(&format!(
+        "    {id} [label = \"{}\", shape = \"{}\", style = \"{}\", fillcolor = \"{}\", color = \"{}\", penwidth = \"{}\"];\n",
+        dot_escape(label),
+        style.shape,
+        style.style,
+        style.fillcolor,
+        style.color,
+        style.penwidth,
+    ));
+}
+
+fn push_dot_arrow(out: &mut String, from: &str, to: &str, label: &str, class: &str) {
+    let (color, style) = if class == "constraint" {
+        ("#6c7086", "dashed")
+    } else {
+        ("#f38ba8", "solid")
+    };
+    out.push_str(&format!(
+        "    {from} -> {to} [label = \"{}\", color = \"{color}\", style = \"{style}\"];\n",
+        dot_escape(label),
+    ));
 }
 
 /// Escape a string for use as a DOT label value (inside double quotes).
 fn dot_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
+        .replace('\r', "\\r")
         .replace('\n', "\\n")
+}
+
+fn executable_op_label(op: &o_lang::hgraph::ExecutableOp) -> String {
+    use o_lang::hgraph::ExecutableOp;
+
+    match op {
+        ExecutableOp::Store => "store".into(),
+        ExecutableOp::LoadBinding => "load binding".into(),
+        ExecutableOp::Invoke { fn_name, mode } => format!("invoke:{fn_name} ({mode:?})"),
+        ExecutableOp::EvalBackend { lang, env } if *env == u32::MAX => {
+            format!("eval:{lang}")
+        }
+        ExecutableOp::EvalBackend { lang, env } => format!("eval:{lang}[{env}]"),
+        ExecutableOp::InlineBackend { lang } => format!("inline:{lang}"),
+        ExecutableOp::ForceRequest { kind } => format!("force-request:{kind}"),
+        ExecutableOp::Request { kind } => format!("request:{kind}"),
+        ExecutableOp::Group { mode } => format!("group:{mode:?}"),
+        ExecutableOp::Schedule { kind } => format!("schedule:{kind}"),
+        ExecutableOp::MaterializeProject => "materialize-project".into(),
+        ExecutableOp::BuildRoute { route_id } => format!("build-route:{route_id}"),
+        ExecutableOp::RunRoute { route_id } => format!("run-route:{route_id}"),
+        ExecutableOp::SelectRoute { policy } => format!("select-route:{policy}"),
+        ExecutableOp::CompareRouteResults => "compare-route-results".into(),
+    }
 }
 
 fn op_kind_label(kind: &o_lang::hgraph::kinds::OpKind) -> String {
@@ -1022,6 +1220,7 @@ mod capability;
 pub mod backend;
 pub mod parser;
 pub mod ir;
+pub mod effects;
 pub mod hgraph;
 pub mod executor;
 pub mod eval;
@@ -1311,6 +1510,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dot_reports_invalid_effect_declarations_without_panicking() {
+        for (source, evidence) in [
+            (
+                "python{effects=bogus}^(1)_python{effects=bogus}",
+                "invalid effect classification `bogus`",
+            ),
+            (
+                "python{effects=pure}^(1)_python{effects=pure}",
+                "cannot upgrade an unverified",
+            ),
+        ] {
+            let error = dump_dot(source).unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("failed to build HGraph for DOT target"));
+            assert!(diagnostic.contains(evidence), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn ir_reports_unsafe_purity_upgrade_without_panicking() {
+        let error = dump_ir("python{effects=pure}^(1)_python{effects=pure}").unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("failed to build HGraph for IR target"));
+        assert!(diagnostic.contains("cannot upgrade an unverified"));
+    }
+
+    #[test]
     fn generated_runtime_includes_hgraph_modules() {
         let build_dir = create_build_dir().unwrap();
         let src_dir = build_dir.join("src");
@@ -1319,10 +1545,12 @@ mod tests {
         fs::write(src_dir.join("lib.rs"), generate_lib_rs(false)).unwrap();
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+        assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
 
         for path in [
+            "effects.rs",
             "hgraph/mod.rs",
             "hgraph/graph.rs",
             "hgraph/kinds.rs",
@@ -1343,7 +1571,175 @@ mod tests {
                 "generated runtime file {path} must not be empty"
             );
         }
+        assert_eq!(
+            fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
+            RUNTIME_EFFECTS_RS,
+            "generated runtimes must receive the shared semantic effect model verbatim"
+        );
 
         fs::remove_dir_all(build_dir).unwrap();
+    }
+
+    #[test]
+    fn dot_renders_directed_execute_ports_and_distinct_synthetic_nodes() {
+        use o_lang::effects::ResourceKey;
+        use o_lang::hgraph::{HNode, HNodeKind};
+        use o_lang::ir::{BackendRegistry, OIr};
+
+        let python = BackendRegistry::global().interface_for("python");
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: 0,
+                    attr: None,
+                    backend: python.clone(),
+                    body: vec![OIr::Text("first".into())],
+                },
+                OIr::Exec {
+                    lang: "python".into(),
+                    env_id: 0,
+                    attr: None,
+                    backend: python,
+                    body: vec![OIr::Text("second".into())],
+                },
+            ],
+        };
+        let mut graph = program.hgraph();
+        let control = graph.add_node(HNode::branch_control("then", 0, true));
+        let dot = hgraph_to_dot(&graph);
+
+        let value = graph
+            .node_ids()
+            .into_iter()
+            .find(|id| {
+                matches!(
+                    graph.node(*id).map(|node| &node.kind),
+                    Some(HNodeKind::Value)
+                )
+            })
+            .expect("graph has an ordinary value");
+        let host_world = graph
+            .node_ids()
+            .into_iter()
+            .find(|id| {
+                matches!(
+                    graph.node(*id).map(|node| &node.kind),
+                    Some(HNodeKind::ResourceState {
+                        resource: ResourceKey::HostWorld,
+                        ..
+                    })
+                )
+            })
+            .expect("unknown Python execution has HostWorld state");
+        let actor_state = graph
+            .node_ids()
+            .into_iter()
+            .find(|id| {
+                matches!(
+                    graph.node(*id).map(|node| &node.kind),
+                    Some(HNodeKind::ResourceState {
+                        resource: ResourceKey::ActorState(_),
+                        ..
+                    })
+                )
+            })
+            .expect("persistent Python execution has actor state");
+        let completion = graph
+            .node_ids()
+            .into_iter()
+            .find(|id| {
+                matches!(
+                    graph.node(*id).map(|node| &node.kind),
+                    Some(HNodeKind::Completion { .. })
+                )
+            })
+            .expect("execute edge has a completion output");
+
+        assert_dot_vertex_style(&dot, &format!("n{}", value.0), "ellipse", "#89b4fa");
+        assert_dot_vertex_style(&dot, &format!("n{}", host_world.0), "hexagon", "#74c7ec");
+        assert_dot_vertex_style(
+            &dot,
+            &format!("n{}", actor_state.0),
+            "doubleoctagon",
+            "#cba6f7",
+        );
+        assert_dot_vertex_style(&dot, &format!("n{}", completion.0), "diamond", "#a6e3a1");
+        assert_dot_vertex_style(&dot, &format!("n{}", control.0), "octagon", "#f9e2af");
+        assert!(dot.contains("HostWorld@0"));
+        assert!(dot.contains("ActorState(python[0])@0"));
+        assert!(dot.contains("Completion(P"));
+        assert!(dot.contains("Control(then)@0"));
+
+        let infos = graph.exec_ops_ordered();
+        assert_eq!(infos.len(), 2, "the two Python blocks are executable edges");
+        for info in infos {
+            let execute = format!("execute{}", info.edge.0);
+            assert_dot_vertex_style(&dot, &execute, "box", "#f38ba8");
+
+            for input in &info.inputs {
+                let arrow = format!("n{} -> {execute} [", input.0);
+                assert_eq!(
+                    dot.matches(&arrow).count(),
+                    1,
+                    "each execute input must point into its operation vertex: {arrow}"
+                );
+            }
+            for output in &info.outputs {
+                let arrow = format!("{execute} -> n{} [", output.0);
+                assert_eq!(
+                    dot.matches(&arrow).count(),
+                    1,
+                    "each execute output must receive one arrow from its operation vertex: {arrow}"
+                );
+            }
+        }
+
+        let constraint = graph
+            .edge_ids()
+            .into_iter()
+            .next()
+            .expect("lowering has constraint hyperedges");
+        assert_dot_vertex_style(
+            &dot,
+            &format!("constraint{}", constraint.0),
+            "diamond",
+            "#6c7086",
+        );
+    }
+
+    #[test]
+    fn dot_preserves_inout_port_direction() {
+        use o_lang::hgraph::{HEdge, HGraph, HNode, OpKind, Port, PortRole};
+
+        let mut graph = HGraph::default();
+        let node = graph.add_node(HNode::with_value(OValue::Null));
+        let edge = graph.add_edge(HEdge::constraint(
+            OpKind::Additive,
+            vec![Port {
+                node,
+                role: PortRole::InOut,
+            }],
+        ));
+        let dot = hgraph_to_dot(&graph);
+
+        assert!(dot.contains(&format!("n{} -> constraint{} [", node.0, edge.0)));
+        assert!(dot.contains(&format!("constraint{} -> n{} [", edge.0, node.0)));
+    }
+
+    fn assert_dot_vertex_style(dot: &str, id: &str, shape: &str, color: &str) {
+        let prefix = format!("    {id} [");
+        let line = dot
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing DOT vertex {id}"));
+        assert!(
+            line.contains(&format!("shape = \"{shape}\"")),
+            "DOT vertex {id} has wrong shape: {line}"
+        );
+        assert!(
+            line.contains(&format!("color = \"{color}\"")),
+            "DOT vertex {id} has wrong color: {line}"
+        );
     }
 }

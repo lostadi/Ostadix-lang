@@ -1,5 +1,6 @@
 use num_bigint::BigInt;
 
+use crate::effects::ResourceKey;
 use crate::ir::InvokeMode;
 use crate::value::GroupMode;
 
@@ -100,9 +101,10 @@ pub enum MemOrder {
 // ─────────────────────────────────────────────────────────────────────────────
 // Ontology: values are nodes, operations are hyperedges.
 //
-// Every hyperedge is either an executable operation that consumes input value
-// nodes and produces an output value node (`Execute`), or a constraint relation
-// over value nodes that carries type/fidelity/scheduling facts (`Constraint`).
+// Every hyperedge is either an executable operation that consumes input nodes
+// and produces one or more value/resource/completion outputs (`Execute`), or a
+// constraint relation over nodes that carries type/fidelity/scheduling facts
+// (`Constraint`).
 //
 // The pre-existing typed-relation vocabulary lives in `OpKind` and is reached
 // through `ConstraintOp::Type(OpKind)`. This keeps the type/fidelity solver in
@@ -113,7 +115,7 @@ pub enum MemOrder {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HEdgeKind {
-    /// An operation hyperedge: inputs (value nodes) → output (value node).
+    /// An operation hyperedge: input nodes → one or more output nodes.
     Execute(ExecutableOp),
     /// A constraint relation over value nodes.
     Constraint(ConstraintOp),
@@ -128,25 +130,47 @@ pub enum ExecutableOp {
     /// Read a binding from scope / a dominating store (`$name`).
     LoadBinding,
     /// Invoke an O-level builtin (`instantiate`, `now`, `scope`, …).
-    Invoke { fn_name: String, mode: InvokeMode },
+    Invoke {
+        fn_name: String,
+        mode: InvokeMode,
+    },
     /// Execute a hosted backend block that reaches a shim / nix_expr / thunk.
-    EvalBackend { lang: String, env: u32 },
+    EvalBackend {
+        lang: String,
+        env: u32,
+    },
     /// Assemble a pure inline backend body (`html`, `markdown`, `text`,
     /// `latex`, `quote`, `O`).
-    InlineBackend { lang: String },
+    InlineBackend {
+        lang: String,
+    },
     /// Force a request immediately (`now(req)`).
-    ForceRequest { kind: String },
+    ForceRequest {
+        kind: String,
+    },
     /// Construct a request value (`instantiate`, `realise`, `activate`, …).
-    Request { kind: String },
+    Request {
+        kind: String,
+    },
     /// Bundle members into a group (`batch`, `all`, `any`, `race`).
-    Group { mode: GroupMode },
+    Group {
+        mode: GroupMode,
+    },
     /// Scheduling control point (`lazy`, `autonomous`, `force`).
-    Schedule { kind: String },
+    Schedule {
+        kind: String,
+    },
     // ── Declared for project-lowering; not yet constructed by from_oir. ──
     MaterializeProject,
-    BuildRoute { route_id: String },
-    RunRoute { route_id: String },
-    SelectRoute { policy: String },
+    BuildRoute {
+        route_id: String,
+    },
+    RunRoute {
+        route_id: String,
+    },
+    SelectRoute {
+        policy: String,
+    },
     CompareRouteResults,
 }
 
@@ -157,10 +181,14 @@ pub enum ConstraintOp {
     DataFlow,
     /// A structural child → parent evaluation dependency.
     Structural,
-    /// Operations targeting the same persistent actor must be serialized.
+    /// Source sequence lowered as successful-completion control.
+    SequenceControl,
+    /// Compatibility relation for actor-oriented analysis. Production
+    /// execution serializes persistent actors through `ActorState` resource
+    /// transitions in executable-edge inputs and outputs.
     ActorSerial { actor: ActorId },
     /// Operations touching the same effectful resource must be ordered.
-    EffectOrder { resource: String },
+    EffectOrder { resource: ResourceKey },
     /// A non-blocking deterministic commit-order fact (stable ordinal).
     CommitOrder { ordinal: u64 },
     /// A backend value crossing from one language to another.
@@ -179,6 +207,7 @@ impl ConstraintOp {
         match kind {
             OpKind::DataFlow => ConstraintOp::DataFlow,
             OpKind::StructuralBarrier => ConstraintOp::Structural,
+            OpKind::Sequence => ConstraintOp::SequenceControl,
             OpKind::ActorSerial { actor } => ConstraintOp::ActorSerial { actor: *actor },
             OpKind::BackendCrossing { from_lang, to_lang } => ConstraintOp::BackendCrossing {
                 from_lang: from_lang.clone(),

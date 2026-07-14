@@ -11,8 +11,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::model::{
-    ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
-    RouteSpec, ProjectBundle,
+    ProjectBundle, ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance,
+    RouteSet, RouteSpec,
 };
 
 /// The canonical manifest filename at a project root.
@@ -94,9 +94,7 @@ fn parse_kind(token: Option<&str>, has_evaluator: bool) -> RouteKind {
                 RouteKind::CompiledBinary
             }
             "build" | "buildtarget" | "build_target" => RouteKind::BuildTarget,
-            "package" | "packageentrypoint" | "package_entrypoint" => {
-                RouteKind::PackageEntrypoint
-            }
+            "package" | "packageentrypoint" | "package_entrypoint" => RouteKind::PackageEntrypoint,
             "shell" | "shelltask" | "shell_task" | "task" => RouteKind::ShellTask,
             "evaluator" | "oevaluator" | "o" => RouteKind::OEvaluator,
             "composite" => RouteKind::Composite,
@@ -338,7 +336,10 @@ pub fn parse_route_decl(decl: &str) -> Result<RouteSpec> {
     if let Some(codec) = fields.get("codec") {
         spec.result_codec = ResultCodec::parse(codec);
     }
-    spec.kind = parse_kind(fields.get("kind").map(|s| s.as_str()), spec.evaluator.is_some());
+    spec.kind = parse_kind(
+        fields.get("kind").map(|s| s.as_str()),
+        spec.evaluator.is_some(),
+    );
     if let Some(priority) = fields.get("priority") {
         spec.priority = priority
             .parse()

@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
+    effects::{effect_summary_for_plan_node, EffectSummary, ResourceKey},
     ir::{
         BackendInterface, ExecutionMode, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId,
         PlanNodeKind, PlanScheduleKind,
@@ -9,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    graph::{ActorId, HEdge, HGraph, HNode, NodeId, Port, PortRole},
+    graph::{HEdge, HGraph, HNode, NodeId, Port, PortRole},
     kinds::{DomainFlags, ExecutableOp, OpKind, RepFlags},
 };
 
@@ -25,6 +26,18 @@ pub fn build_program_with_plan(
 ) -> Result<HGraph, String> {
     plan.validate(program.nodes.len())?;
 
+    // A caller may supply alternate dependency edges for analysis/testing, but
+    // node identity and root identity must still describe this exact OIR tree.
+    // Otherwise the coordinator would schedule one semantic operation while
+    // executing a different instruction from `ir_map`.
+    let canonical_plan = program.plan();
+    if plan.nodes != canonical_plan.nodes {
+        return Err("execution plan node semantics do not match the OIR program".to_string());
+    }
+    if plan.roots != canonical_plan.roots {
+        return Err("execution plan roots do not match the OIR program".to_string());
+    }
+
     let oir_nodes = program.flatten_for_plan();
     if oir_nodes.len() != plan.nodes.len() {
         return Err(format!(
@@ -35,6 +48,7 @@ pub fn build_program_with_plan(
     }
 
     let mut graph = HGraph::default();
+    graph.set_source_plan(plan.clone());
     let mut node_map: HashMap<PlanNodeId, NodeId> = HashMap::new();
 
     for plan_node in &plan.nodes {
@@ -42,16 +56,6 @@ pub fn build_program_with_plan(
         let graph_node = graph.add_node(hnode_for_oir(oir));
         if let Some(node) = graph.node_mut(graph_node) {
             node.plan_node = Some(plan_node.id);
-        }
-        if let PlanNodeKind::Exec { lang, env_id, .. } = &plan_node.kind {
-            if *env_id != u32::MAX {
-                if let Some(node) = graph.node_mut(graph_node) {
-                    node.actor = Some(ActorId {
-                        lang: intern_lang(lang),
-                        env: *env_id,
-                    });
-                }
-            }
         }
         graph.record_ir(graph_node, oir);
         node_map.insert(plan_node.id, graph_node);
@@ -91,40 +95,129 @@ pub fn build_program_with_plan(
     }
 
     add_plan_semantics(&mut graph, plan, &node_map);
-    add_execute_edges(&mut graph, plan, &node_map);
+    add_execute_edges(&mut graph, plan, &node_map)?;
+    graph.validate_execution_graph()?;
     Ok(graph)
 }
 
-/// Lower every non-literal plan operation to an executable operation hyperedge
-/// that consumes its structural children and data-dependency value nodes and
-/// produces its own output value node. Literal `Text` nodes are materialized
-/// value nodes with no Execute edge.
+/// Lower every non-literal plan operation to an executable hyperedge consuming
+/// ordinary values, prior resource versions, and preserved completion tokens,
+/// then producing one ordinary value plus completion and successor states.
+/// Literal `Text` nodes are materialized values with no Execute edge.
 fn add_execute_edges(
     graph: &mut HGraph,
     plan: &ExecutionPlan,
     node_map: &HashMap<PlanNodeId, NodeId>,
-) {
+) -> Result<(), String> {
+    let mut summaries: HashMap<PlanNodeId, EffectSummary> = HashMap::new();
     for plan_node in &plan.nodes {
+        if executable_op(&plan_node.kind).is_none() {
+            continue;
+        }
+        let summary = effect_summary_for_plan_node(plan_node.id, &plan_node.kind)?;
+        graph.set_effect_summary(plan_node.id, summary.clone());
+        summaries.insert(plan_node.id, summary);
+        graph.add_completion_node(plan_node.id)?;
+    }
+
+    // Plan ids are allocated preorder (parents before nested children), so
+    // resource versions must advance in dependency/topological order. Using
+    // source ids here would create A -> C state edges against C -> A structural
+    // edges for a nested effect and make the executable graph cyclic.
+    let mut state = StateLowering::default();
+    for id in plan.topological_order()? {
+        let plan_node = &plan.nodes[id.0];
         let Some(op) = executable_op(&plan_node.kind) else {
             continue;
         };
-        let output = node_map[&plan_node.id];
-        let inputs = operation_inputs(plan, node_map, plan_node.id);
-        let ordinal = plan_node.id.0 as u64;
-        graph.add_exec_edge(plan_node.id, op, inputs, output, ordinal);
+        let summary = summaries
+            .get(&id)
+            .ok_or_else(|| format!("missing effect summary for plan node {}", id.0))?;
+        let value_output = node_map[&id];
+        let completion = graph
+            .completion_node(id)
+            .ok_or_else(|| format!("missing completion node for plan node {}", id.0))?;
+        let mut inputs = operation_value_inputs(plan, node_map, id);
+        let mut outputs = vec![value_output, completion];
+
+        let preserved_sequences = executable_sequence_predecessors(plan, id)
+            .into_iter()
+            .filter(|predecessor| !sequence_can_relax(plan, *predecessor, id, &summaries))
+            .collect::<Vec<_>>();
+        for predecessor in &preserved_sequences {
+            let predecessor_completion = graph.completion_node(*predecessor).ok_or_else(|| {
+                format!(
+                    "sequence predecessor {} has no completion node",
+                    predecessor.0
+                )
+            })?;
+            inputs.push(predecessor_completion);
+        }
+
+        for resource in summary.accessed_resources() {
+            let (prior, successor) = state.transition(graph, resource, id);
+            inputs.push(prior);
+            outputs.push(successor);
+        }
+
+        deduplicate_nodes(&mut inputs);
+        deduplicate_nodes(&mut outputs);
+        graph.add_exec_edge(id, op, inputs, outputs, value_output, plan_node.id.0 as u64)?;
+        for predecessor in preserved_sequences {
+            let completion = graph
+                .completion_node(predecessor)
+                .expect("preserved predecessor completion was checked above");
+            graph.record_sequence_dependency(predecessor, id, completion)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ResourceHead {
+    node: NodeId,
+    version: u64,
+}
+
+#[derive(Default)]
+struct StateLowering {
+    heads: BTreeMap<ResourceKey, ResourceHead>,
+}
+
+impl StateLowering {
+    fn transition(
+        &mut self,
+        graph: &mut HGraph,
+        resource: ResourceKey,
+        producer: PlanNodeId,
+    ) -> (NodeId, NodeId) {
+        let head = self.heads.entry(resource.clone()).or_insert_with(|| {
+            let node = graph.add_node(HNode::resource_state(resource.clone(), 0));
+            ResourceHead { node, version: 0 }
+        });
+        let prior = head.node;
+        let next_version = head.version + 1;
+        let successor = graph.add_node(HNode::resource_state(resource, next_version));
+        if let Some(node) = graph.node_mut(successor) {
+            node.plan_node = Some(producer);
+        }
+        *head = ResourceHead {
+            node: successor,
+            version: next_version,
+        };
+        (prior, successor)
     }
 }
 
-/// Value-node inputs an operation consumes: its structural children, data
-/// predecessors, and (during the conservative soundness milestone) ordinary
-/// sequence predecessors. Every one must be materialized before the operation
-/// becomes ready.
-fn operation_inputs(
+/// Ordinary value inputs an operation consumes: structural children followed
+/// by additional lexical/data predecessors. State and completion inputs are
+/// appended separately by `add_execute_edges`.
+fn operation_value_inputs(
     plan: &ExecutionPlan,
     node_map: &HashMap<PlanNodeId, NodeId>,
     parent: PlanNodeId,
 ) -> Vec<NodeId> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut ordered: Vec<(usize, NodeId)> = Vec::new();
 
     for edge in &plan.edges {
@@ -135,39 +228,152 @@ fn operation_inputs(
         }
     }
 
-    // Literal text has no executable edge and is materialized from the start.
-    // A source sequence such as `effect A -> whitespace -> effect B` must still
-    // make B wait for A, so walk backward across non-executable sequence nodes
-    // to the nearest operation that can actually complete.
-    for edge in plan
-        .edges
-        .iter()
-        .filter(|edge| edge.kind == PlanEdgeKind::Sequence && edge.to == parent)
-    {
-        let mut source = edge.from;
-        let mut visited = std::collections::HashSet::new();
-        while executable_op(&plan.nodes[source.0].kind).is_none() && visited.insert(source) {
-            let Some(predecessor) = plan
-                .edges
-                .iter()
-                .find(|candidate| {
-                    candidate.kind == PlanEdgeKind::Sequence && candidate.to == source
-                })
-                .map(|candidate| candidate.from)
-            else {
-                break;
-            };
-            source = predecessor;
-        }
-        if seen.insert(source) {
-            ordered.push((source.0, node_map[&source]));
-        }
-    }
     ordered.sort_by_key(|(source, _)| *source);
     ordered.into_iter().map(|(_, node)| node).collect()
 }
 
-fn executable_op(kind: &PlanNodeKind) -> Option<ExecutableOp> {
+/// Follow every incoming source-sequence path backward across materialized
+/// literal nodes until its nearest executable predecessor. This preserves
+/// `A -> whitespace -> B` as `Completion(A) -> B`, and it deliberately handles
+/// validated custom plans with more than one incoming sequence edge.
+pub(super) fn executable_sequence_predecessors(
+    plan: &ExecutionPlan,
+    target: PlanNodeId,
+) -> BTreeSet<PlanNodeId> {
+    let mut pending = plan
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            (edge.kind == PlanEdgeKind::Sequence && edge.to == target).then_some(edge.from)
+        })
+        .collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    let mut executable = BTreeSet::new();
+
+    while let Some(source) = pending.pop() {
+        if !visited.insert(source) {
+            continue;
+        }
+        if executable_op(&plan.nodes[source.0].kind).is_some() {
+            executable.insert(source);
+            continue;
+        }
+        pending.extend(plan.edges.iter().filter_map(|edge| {
+            (edge.kind == PlanEdgeKind::Sequence && edge.to == source).then_some(edge.from)
+        }));
+    }
+    executable
+}
+
+pub(super) fn sequence_can_relax(
+    plan: &ExecutionPlan,
+    predecessor: PlanNodeId,
+    successor: PlanNodeId,
+    summaries: &HashMap<PlanNodeId, EffectSummary>,
+) -> bool {
+    if direct_members_of_concurrent_group(plan, predecessor, successor) {
+        return true;
+    }
+    let Some(left) = summaries.get(&predecessor) else {
+        return false;
+    };
+    let Some(right) = summaries.get(&successor) else {
+        return false;
+    };
+    if inside_left_to_right_region(plan, predecessor)
+        || inside_left_to_right_region(plan, successor)
+    {
+        return false;
+    }
+    left.is_verified_pure_infallible()
+        && right.is_verified_pure_infallible()
+        && verified_reorderable_inline(plan, predecessor, summaries, &mut HashSet::new())
+        && verified_reorderable_inline(plan, successor, summaries, &mut HashSet::new())
+}
+
+/// Structural `O` regions promise left-to-right child evaluation. Even a pair
+/// of otherwise reorderable inline renders keeps its completion dependency
+/// there. Explicit concurrent groups are handled before this check and retain
+/// their own topology.
+fn inside_left_to_right_region(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
+    plan.edges
+        .iter()
+        .filter(|edge| edge.kind == PlanEdgeKind::Structural && edge.from == node)
+        .map(|edge| &plan.nodes[edge.to.0].kind)
+        .any(|kind| {
+            matches!(
+                kind,
+                PlanNodeKind::Exec { backend, .. }
+                    if backend.execution == ExecutionMode::InlineAst
+                        && backend.canonical == "O"
+            )
+        })
+}
+
+fn direct_members_of_concurrent_group(
+    plan: &ExecutionPlan,
+    left: PlanNodeId,
+    right: PlanNodeId,
+) -> bool {
+    plan.edges
+        .iter()
+        .filter(|edge| edge.kind == PlanEdgeKind::Structural && edge.from == left)
+        .map(|edge| edge.to)
+        .any(|parent| {
+            matches!(plan.nodes[parent.0].kind, PlanNodeKind::Group { .. })
+                && plan.edges.iter().any(|edge| {
+                    edge.kind == PlanEdgeKind::Structural && edge.from == right && edge.to == parent
+                })
+        })
+}
+
+fn verified_reorderable_inline(
+    plan: &ExecutionPlan,
+    node: PlanNodeId,
+    summaries: &HashMap<PlanNodeId, EffectSummary>,
+    visited: &mut HashSet<PlanNodeId>,
+) -> bool {
+    if !visited.insert(node) {
+        return false;
+    }
+    let is_trusted_renderer = matches!(
+        &plan.nodes[node.0].kind,
+        PlanNodeKind::Exec { backend, .. }
+            if backend.pure
+                && backend.execution == ExecutionMode::InlineValue
+                && matches!(backend.canonical.as_str(), "html" | "markdown" | "text" | "latex")
+    );
+    if !is_trusted_renderer {
+        return false;
+    }
+
+    // A pure outer renderer can still contain a load, request, schedule, or
+    // hosted evaluation that fails or mutates state while its body is forced.
+    // Relaxation is therefore justified only when the complete structural
+    // subtree consists of literals and recursively verified renderers.
+    plan.edges
+        .iter()
+        .filter_map(|edge| {
+            (edge.kind == PlanEdgeKind::Structural && edge.to == node).then_some(edge.from)
+        })
+        .all(|child| match &plan.nodes[child.0].kind {
+            PlanNodeKind::Text => true,
+            PlanNodeKind::Exec { .. } => {
+                summaries
+                    .get(&child)
+                    .is_some_and(EffectSummary::is_verified_pure_infallible)
+                    && verified_reorderable_inline(plan, child, summaries, visited)
+            }
+            _ => false,
+        })
+}
+
+fn deduplicate_nodes(nodes: &mut Vec<NodeId>) {
+    let mut seen = HashSet::new();
+    nodes.retain(|node| seen.insert(*node));
+}
+
+pub(super) fn executable_op(kind: &PlanNodeKind) -> Option<ExecutableOp> {
     match kind {
         PlanNodeKind::Text => None,
         PlanNodeKind::Load { .. } => Some(ExecutableOp::LoadBinding),
@@ -189,16 +395,15 @@ fn executable_op(kind: &PlanNodeKind) -> Option<ExecutableOp> {
             }),
         },
         PlanNodeKind::Exec {
-            lang,
-            env_id,
-            backend,
-            ..
+            env_id, backend, ..
         } => match backend.execution {
             ExecutionMode::InlineAst | ExecutionMode::InlineValue => {
-                Some(ExecutableOp::InlineBackend { lang: lang.clone() })
+                Some(ExecutableOp::InlineBackend {
+                    lang: backend.canonical.clone(),
+                })
             }
             ExecutionMode::Shim => Some(ExecutableOp::EvalBackend {
-                lang: lang.clone(),
+                lang: backend.canonical.clone(),
                 env: *env_id,
             }),
         },
@@ -229,12 +434,7 @@ fn add_plan_semantics(
         let inputs = structural_inputs(plan, node_map, plan_node.id);
 
         match &plan_node.kind {
-            PlanNodeKind::Exec {
-                lang,
-                env_id,
-                backend,
-                ..
-            } => {
+            PlanNodeKind::Exec { lang, backend, .. } => {
                 if let Some((dom, rep)) = backend_output_constraints(backend) {
                     graph.add_edge(HEdge::constraint(
                         OpKind::AbiFixed { dom, rep },
@@ -261,20 +461,6 @@ fn add_plan_semantics(
                                 role: PortRole::Output,
                             },
                         ],
-                    ));
-                }
-
-                if *env_id != u32::MAX {
-                    let actor = ActorId {
-                        lang: intern_lang(lang),
-                        env: *env_id,
-                    };
-                    graph.add_edge(HEdge::constraint(
-                        OpKind::ActorSerial { actor },
-                        vec![Port {
-                            node: output,
-                            role: PortRole::InOut,
-                        }],
                     ));
                 }
 
@@ -376,11 +562,6 @@ fn group_op(mode: GroupMode) -> OpKind {
         GroupMode::Any => OpKind::Any,
         GroupMode::Race => OpKind::Race,
     }
-}
-
-fn intern_lang(lang: &str) -> u32 {
-    lang.bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32))
 }
 
 fn backend_output_constraints(backend: &BackendInterface) -> Option<(DomainFlags, RepFlags)> {

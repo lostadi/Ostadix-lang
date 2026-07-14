@@ -21,7 +21,9 @@ fn build_route(id: &str, evidence: &str, tool: &str, args: &[&str]) -> RouteSpec
         .collect();
     route.label = route.command.join(" ");
     route.provides = vec!["build".to_string()];
-    route.guards.push(RouteGuard::CommandAvailable(tool.to_string()));
+    route
+        .guards
+        .push(RouteGuard::CommandAvailable(tool.to_string()));
     route
 }
 

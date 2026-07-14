@@ -39,7 +39,10 @@ pub fn lower_to_o(bundle: &ProjectBundle) -> String {
     let mut out = String::new();
     out.push_str("# Ostadix-lang lifted project\n");
     out.push_str(&format!("# project: {}\n", bundle.name));
-    out.push_str(&format!("# root_fingerprint: {}\n", bundle.root_fingerprint));
+    out.push_str(&format!(
+        "# root_fingerprint: {}\n",
+        bundle.root_fingerprint
+    ));
     out.push_str(&format!(
         "# files: {}   routes: {}   route_sets: {}\n",
         bundle.files.len(),
@@ -54,9 +57,7 @@ pub fn lower_to_o(bundle: &ProjectBundle) -> String {
         out.push('\n');
     }
     out.push_str("#\n");
-    out.push_str(
-        "# The complete project (all files + routes) is embedded losslessly below.\n",
-    );
+    out.push_str("# The complete project (all files + routes) is embedded losslessly below.\n");
     out.push_str("# Extract it with the project tooling; run it through its routes.\n");
     out.push('\n');
 

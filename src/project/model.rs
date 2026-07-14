@@ -37,7 +37,7 @@ pub(crate) mod b64_bytes {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The semantic role a stored file plays in the project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileRole {
     /// Human-authored source in some language.
     Source,
@@ -50,13 +50,8 @@ pub enum FileRole {
     /// A file identified as a runnable entrypoint.
     Entrypoint,
     /// Anything else (empty files, extensionless files, unclassified).
+    #[default]
     Other,
-}
-
-impl Default for FileRole {
-    fn default() -> Self {
-        FileRole::Other
-    }
 }
 
 /// A single file captured losslessly inside a [`ProjectBundle`].
@@ -94,7 +89,7 @@ impl ProjectFile {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The broad category of a route, used for reporting and lowering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteKind {
     /// A language interpreter invoked with a script (e.g. `python3 main.py`).
     InterpreterCommand,
@@ -105,6 +100,7 @@ pub enum RouteKind {
     /// A package-declared entrypoint (`[project.scripts]`, `bin`, …).
     PackageEntrypoint,
     /// A shell task / script runner target (npm scripts, Makefile targets).
+    #[default]
     ShellTask,
     /// An O-lang evaluator block.
     OEvaluator,
@@ -112,27 +108,16 @@ pub enum RouteKind {
     Composite,
 }
 
-impl Default for RouteKind {
-    fn default() -> Self {
-        RouteKind::ShellTask
-    }
-}
-
 /// How the stdout of a route should be interpreted into a structured value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultCodec {
     /// Treat stdout as opaque UTF-8 text.
+    #[default]
     Text,
     /// Parse stdout as JSON into `OExecutionResult.value`.
     Json,
     /// Treat stdout as raw bytes only.
     Bytes,
-}
-
-impl Default for ResultCodec {
-    fn default() -> Self {
-        ResultCodec::Text
-    }
 }
 
 impl ResultCodec {
@@ -278,11 +263,12 @@ impl RouteSpec {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The policy that decides which alternative(s) of a [`RouteSet`] execute.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutePolicy {
     /// Run exactly the named route id.
     Explicit(String),
     /// Run the unambiguous default route.
+    #[default]
     Default,
     /// Try alternatives in priority/declared order until one succeeds.
     Fallback,
@@ -301,12 +287,6 @@ pub enum RoutePolicy {
     VerifyEquivalent,
     /// Run all in parallel and select the fastest successful alternative.
     BenchmarkAndSelect,
-}
-
-impl Default for RoutePolicy {
-    fn default() -> Self {
-        RoutePolicy::Default
-    }
 }
 
 impl RoutePolicy {
@@ -572,7 +552,10 @@ impl OExecutionResult {
             status,
             self.duration_ns / 1_000_000,
         ));
-        out.push_str(&format!("  command: {}\n", self.provenance.command.join(" ")));
+        out.push_str(&format!(
+            "  command: {}\n",
+            self.provenance.command.join(" ")
+        ));
         out.push_str(&format!("  cwd: {}\n", self.provenance.cwd.display()));
         let stdout = self.stdout_text();
         if !stdout.trim().is_empty() {

@@ -1,26 +1,25 @@
-//! Actor identities for the graph executor.
+//! Compatibility actor identities for plan analysis.
 //!
-//! Every backend operation runs "as" some actor. Persistent environments
-//! (`env_id != u32::MAX`) map to a stable actor keyed by `(language,
-//! environment)` so that repeated operations against the same environment are
-//! serialized in stable ordinal order. Ephemeral blocks (`env_id ==
-//! u32::MAX`) each get a UNIQUE `ephemeral_instance` so that two unrelated
-//! ephemeral computations never serialize against one another.
+//! This table gives backend plan nodes stable labels for diagnostics and older
+//! analysis callers. It is not a second production scheduler: executable graph
+//! readiness is controlled by explicit resource-state and completion-token
+//! nodes. Persistent environment serialization is represented there by
+//! `ResourceKey::ActorState`; distinct ephemeral labels alone make no
+//! concurrency guarantee.
 
 use std::collections::HashMap;
 
 use crate::ir::{ExecutionPlan, PlanNodeId, PlanNodeKind};
 
-/// A concrete actor identity. Two operations may only run concurrently if
-/// their actor keys differ.
+/// A concrete actor label used by compatibility analysis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ActorKey {
     pub language: String,
     pub environment: u32,
     /// Unique per ephemeral block; `None` for persistent environments.
     pub ephemeral_instance: Option<u64>,
-    /// Bumped whenever a backend process for this actor is torn down after a
-    /// protocol error, so post-failure operations observe a fresh generation.
+    /// Opaque generation metadata supplied by the caller. `ActorTable` does
+    /// not inspect backend processes or infer process generations.
     pub generation: u64,
 }
 
@@ -30,8 +29,8 @@ impl ActorKey {
         self.ephemeral_instance.is_some()
     }
 
-    /// The persistent identity `(language, environment)` this actor serializes
-    /// against. Ephemeral actors serialize only against themselves.
+    /// The persistent `(language, environment)` identity represented by this
+    /// label. Ephemeral labels have no persistent identity.
     pub fn persistent_id(&self) -> Option<(String, u32)> {
         if self.is_ephemeral() {
             None
@@ -48,16 +47,16 @@ impl ActorKey {
     }
 }
 
-/// Assigns actor identities to the backend operations of a plan. Ephemeral
-/// blocks receive monotonically increasing instance ids in stable plan order.
+/// Assigns compatibility actor labels to backend operations in stable plan
+/// order. These labels do not participate in production readiness decisions.
 #[derive(Debug, Default)]
 pub struct ActorTable {
     by_node: HashMap<PlanNodeId, ActorKey>,
 }
 
 impl ActorTable {
-    /// Build the actor table for a plan, consulting `generation_of` for the
-    /// current per-`(lang, env)` generation of persistent environments.
+    /// Build the actor table, copying caller-provided generation metadata for
+    /// persistent `(language, environment)` labels.
     pub fn build(plan: &ExecutionPlan, generation_of: impl Fn(&str, u32) -> u64) -> Self {
         let mut by_node = HashMap::new();
         let mut next_ephemeral: u64 = 0;

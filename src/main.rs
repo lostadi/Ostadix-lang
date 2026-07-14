@@ -20,7 +20,10 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1).collect::<VecDeque<_>>();
     let backends = registered_backends();
     let mut backend_grants = Vec::new();
-    while args.front().is_some_and(|arg| arg == "--backend-grant" || arg == "--executor") {
+    while args
+        .front()
+        .is_some_and(|arg| arg == "--backend-grant" || arg == "--executor")
+    {
         match args.pop_front().unwrap().as_str() {
             "--backend-grant" => backend_grants.push(
                 args.pop_front()
@@ -122,7 +125,7 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: serial during HGraph refactor)"
+        "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: graph)"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;

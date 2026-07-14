@@ -39,10 +39,12 @@ c_cpp/O examples/hello.O backends
 
 - `src/parser.rs` parses typed parentheses into `ONode` trees. An identifier is an opener only if the registry accepts that language tag or alias.
 - `src/ir.rs` lowers syntax to OIR and contains `BackendSpec` / `BackendRegistry`, the single source of truth for accepted evaluator tags, aliases, cache-safety, splice renderers, execution mode, required authorities, and shim path resolution.
-- `src/eval.rs` executes validated OIR plans. It projects OIR to HGraph, solves and schedules that projection, checks it against the OIR plan, then arbitrary evaluator operations still run through the serial `execute_plan_serial` executor.
+- `src/eval.rs` executes validated OIR plans. It projects OIR to the directed HGraph and uses the state-complete graph coordinator by default. `O_EXECUTOR=serial` selects `execute_plan_serial` as the semantic differential oracle.
+- `src/effects.rs` defines shared effect confidence, fallibility, typed resources, checked source declarations, and conservative backend classification. Unknown hosted operations use `HostWorld`.
+- `src/executor/` contains the readiness coordinator and the worker path for verified pure inline renderers. The coordinator owns evaluator-local mutable state; it never sends the process registry across worker threads.
 - `src/value.rs` defines `OValue`, the shared value vocabulary crossing language boundaries.
 - `src/wire.rs` implements the hosted evaluator protocol: **4-byte length-prefixed canonical CBOR** frames.
-- `src/hgraph/` builds HGraph from OIR, solves type/fidelity facts, clusters nodes, and derives schedules. General concurrent graph dispatch is not implemented.
+- `src/hgraph/` builds and validates the directed execution HGraph. OValue, completion, resource-state, and actor-state values are nodes; evaluator invocations are multi-output hyperedges. `ReadySchedule` derives blockers only from input producers.
 - `src/scheduler.rs` schedules autonomous request forcing and cache interaction.
 - `src/capability.rs` models runtime authority-bearing capabilities and snapshots.
 - `src/process.rs` manages backend shim subprocess lifetimes and requests.
@@ -68,6 +70,13 @@ To add a Rust-hosted language backend:
 Do not add per-binary backend lists or ad hoc evaluator dispatch tables. Binaries call `BackendRegistry::global().registered_backend_tags()`.
 
 Cache-safe `{lazy}` backends are `html`, `markdown`, `latex`, and `text`; impure or host-effecting backends should use `{defer}` for explicit forcing. Nix-family evaluation is not cache-safe under generic lazy memoization.
+
+Effect attributes are semantic constraints, not authority grants. `effects=unknown`
+downgrades a trusted renderer, while `effects=pure` is accepted only when the
+derived backend classification is already verified pure. `reads=`, `writes=`,
+and `serial=host` add typed resource dependencies. Declarations do not prove a
+complete arbitrary host footprint, so host declarations keep the `HostWorld`
+umbrella unless a future verified analyzer supplies a precise model.
 
 ## Test and validation commands
 
@@ -104,5 +113,5 @@ The byte-reproducible O-core object test protects deterministic native object ou
 
 - Keep the Rust implementation authoritative for hosted `.O` semantics; keep Python readable and C17 active rather than treating either as abandoned.
 - Keep wire-protocol claims precise: hosted shims use 4-byte length-prefixed canonical CBOR.
-- Keep HGraph wording precise: lowering, type/fidelity solving, clustering, and schedule derivation exist; general concurrent graph dispatch does not.
+- Keep HGraph wording precise: graph dispatch is implemented, but worker-pool execution is limited to verified pure inline renderers. Unknown shims are serialized through `HostWorld`, and exact arbitrary-source filesystem/network inference is not implemented.
 - Prefer registry metadata over duplicated backend-name, purity, renderer, or authority tables.

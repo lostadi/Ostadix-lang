@@ -475,9 +475,12 @@ impl<'a> Parser<'a> {
         }
 
         // Optional comma-separated `{attr}` list after the env slot. Entries
-        // are identifiers or `cap=scope_name`; whitespace around entries is
-        // ignored. The exact source spelling remains part of `raw` so closer
-        // matching stays literal.
+        // are identifiers or `name=value`; whitespace around entries is
+        // ignored. Attribute values use a single-line visible-ASCII
+        // vocabulary that covers capability names and semantic resource
+        // declarations such as `project:src+host:/etc/hosts` without making
+        // braces, commas, or newlines ambiguous. The exact source spelling
+        // remains part of `raw` so closer matching stays literal.
         let mut attr: Option<String> = None;
         if i < bytes.len() && bytes[i] == b'{' {
             let attr_start = i;
@@ -486,7 +489,9 @@ impl<'a> Parser<'a> {
             let content_start = i;
             while i < bytes.len() && bytes[i] != b'}' {
                 let byte = bytes[i];
-                if !(is_ident_continue(byte) || matches!(byte, b',' | b'=' | b' ' | b'\t')) {
+                if !(is_attribute_value_continue(byte)
+                    || matches!(byte, b',' | b'=' | b' ' | b'\t'))
+                {
                     if attribute_suffix_closes_as_opener(bytes, i) {
                         bail!(
                             "Invalid character in block attribute list at line {}",
@@ -524,9 +529,9 @@ impl<'a> Parser<'a> {
                         value.is_empty()
                             || !value
                                 .as_bytes()
-                                .first()
-                                .is_some_and(|byte| is_ident_start(*byte))
-                            || !value.as_bytes().iter().copied().all(is_ident_continue)
+                                .iter()
+                                .copied()
+                                .all(is_attribute_value_continue)
                     })
                 {
                     if attribute_suffix_closes_as_opener(bytes, i) {
@@ -684,6 +689,16 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Bytes accepted inside the value half of a block attribute. This deliberately
+/// excludes the parser's structural separators: comma separates
+/// entries, `=` separates name from value, and braces delimit the attribute
+/// list. Whitespace and newlines are not value bytes. Other visible ASCII
+/// punctuation is safe here and permits resource schemes, paths, endpoints,
+/// and `+`/`;` resource lists without assigning them semantic meaning.
+fn is_attribute_value_continue(b: u8) -> bool {
+    b.is_ascii_graphic() && !matches!(b, b'{' | b'}' | b',' | b'=')
+}
+
 fn attribute_suffix_closes_as_opener(bytes: &[u8], start: usize) -> bool {
     for (offset, byte) in bytes[start..].iter().enumerate() {
         match byte {
@@ -831,6 +846,69 @@ mod tests {
             reconstruct_source(&nodes),
             "python{defer,cap=runner,process,fs_read}^(1)_python{defer,cap=runner,process,fs_read}"
         );
+    }
+
+    #[test]
+    fn effect_attributes_accept_resource_values_and_roundtrip_canonically() {
+        let backends = make_backends(&["python"]);
+
+        for purity in ["pure", "unknown"] {
+            let source_attr = format!(
+                " effects={purity}, reads=project:src_2/../data-file.1+host:/etc/hosts;network:https://api.example.com/v1, writes=env:PATH+service:db-main, serial=host "
+            );
+            let canonical_attr = format!(
+                "effects={purity},reads=project:src_2/../data-file.1+host:/etc/hosts;network:https://api.example.com/v1,writes=env:PATH+service:db-main,serial=host"
+            );
+            let source = format!("python{{{source_attr}}}^(1)_python{{{source_attr}}}");
+
+            let nodes = Parser::new(&source, &backends).parse().unwrap();
+            let ONode::TypedExpr { attr, .. } = &nodes[0] else {
+                panic!("expected typed expression")
+            };
+            assert_eq!(attr.as_deref(), Some(canonical_attr.as_str()));
+
+            let canonical_source =
+                format!("python{{{canonical_attr}}}^(1)_python{{{canonical_attr}}}");
+            assert_eq!(reconstruct_source(&nodes), canonical_source);
+
+            let reparsed = Parser::new(&canonical_source, &backends).parse().unwrap();
+            assert_eq!(reparsed, nodes);
+        }
+    }
+
+    #[test]
+    fn malformed_attribute_assignments_on_actual_openers_are_rejected() {
+        let backends = make_backends(&["python"]);
+        for attr in [
+            "",
+            " ",
+            "effects=",
+            "=pure",
+            "effects==pure",
+            "effects=pure=unknown",
+            ",effects=pure",
+            "effects=pure,",
+            "effects=pure,,serial=host",
+        ] {
+            let source = format!("python{{{attr}}}^(1)_python{{{attr}}}");
+            let error = Parser::new(&source, &backends)
+                .parse()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Empty block attribute")
+                    || error.contains("Malformed block attribute"),
+                "unexpected error for attribute {attr:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_like_text_without_an_opener_remains_raw() {
+        let source = "python{reads=host:/tmp/state-file.1+env:PATH}";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+        assert_eq!(nodes, vec![ONode::RawText(source.into())]);
     }
 
     #[test]

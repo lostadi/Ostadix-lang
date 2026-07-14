@@ -3,10 +3,10 @@
 //! This module turns the projected operation hypergraph into a runtime
 //! execution engine. The [`coordinator::Coordinator`] drives a
 //! readiness-based event loop over operation hyperedges: an operation runs once
-//! its data/structural/actor predecessors have committed, independent work runs
+//! every ordinary/state/control input has materialized, independent work runs
 //! concurrently where provably safe, and results are committed in the plan's
-//! deterministic root order. During the state-complete refactor, the reference
-//! serial executor remains the default and `O_EXECUTOR=graph` opts in.
+//! deterministic root order. The state-complete graph coordinator is the
+//! default; `O_EXECUTOR=serial` selects the differential reference executor.
 
 pub mod actor;
 pub mod cancellation;
@@ -18,4 +18,7 @@ pub mod trace;
 pub use actor::{ActorKey, ActorTable};
 pub use cancellation::CancellationToken;
 pub use coordinator::Coordinator;
-pub use effects::{DeclaredPurity, EffectDeclaration, EffectSummary, ResourceKey};
+pub use effects::{
+    effect_summary_for_plan_node, ActorResourceId, DeclaredPurity, EffectConfidence,
+    EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, ResourceKey,
+};

@@ -1,140 +1,101 @@
-# General HGraph executor plan
+# State-complete HGraph executor
 
-This is a next-stage design document, not a claim about the current release.
-The current evaluator projects OIR into HGraph, solves and schedules it, checks
-the projected root order, and still executes arbitrary evaluator operations via
-the serial OIR executor in `src/eval.rs`. A general HGraph executor would replace
-that final serial dispatch only after the obligations below are met.
+The Rust hosted runtime executes OIR through a directed HGraph. The graph
+coordinator is the default; `O_EXECUTOR=serial` selects the reference OIR
+executor used by the differential conformance suite.
 
-## Current grounding
+## Implemented operation shape
 
-- Persistent hosted processes are owned by `ProcessRegistry` in `src/process.rs`,
-  keyed today by `(language, env_id, BackendSandboxPolicy)`.
-- HGraph schedule derivation in `src/hgraph/schedule.rs` converts structural,
-  sequence, data, group, request, cache, and `ActorSerial` relations into
-  topological clusters.
-- HGraph actor identity is currently represented as `ActorId { lang, env }` in
-  `src/hgraph/graph.rs`; that is sufficient for analysis but too coarse for a
-  safe executor.
+```text
+ordinary child/data values ----\
+completion dependencies --------> [ Execute(plan node) ] -> ordinary OValue
+resource state R@n ------------/                         -> Completion(plan node)
+actor state A@n --------------/                          -> resource state R@n+1
+                                                         -> actor state A@n+1
+```
 
-## Executor invariants
+Every executable hyperedge has one distinguished ordinary result and one
+successful-completion output. Resource/control outputs are synthetic scheduling
+values and carry no `OValue`. Every output has exactly one producer.
 
-1. **Actor identity is explicit and generation-aware.** Each persistent
-   evaluator instance is an actor identified by at least `(canonical language,
-   implementation/runtime identity, environment ID, process generation)`.
-   `ProcessRegistry` already owns live child processes; the graph executor must
-   lift that ownership into an actor table so a restarted Python environment is
-   not confused with the prior process that used the same `python[0]` syntax.
+## Effect and state model
 
-2. **Same-actor operations are serialized.** Operations targeting the same live
-   evaluator actor must execute in program-order-compatible sequence. The
-   existing HGraph `ActorSerial` edge in `src/hgraph/schedule.rs` is the analysis
-   seed; the executor must enforce it at runtime with per-actor mailboxes or
-   equivalent queues.
+`src/effects.rs` derives summaries before executable edges are built. The
+currently modeled resource keys are:
 
-3. **Independent actors may run concurrently only when all constraints permit.**
-   Two operations may run in parallel only if structural, sequence, data, effect,
-   and authority constraints all permit it. The current scheduler accounts for
-   structural, sequence, data, group, request, cache, and actor edges; a general
-   executor must add explicit effect and authority edges before treating a
-   cluster as parallel-safe.
+- `HostWorld`
+- evaluator-local state
+- O scope bindings
+- project-relative paths
+- host paths
+- environment variables
+- standard I/O
+- exact or unknown network endpoints
+- named services
+- persistent actor state keyed by canonical language and environment number
 
-4. **Ephemeral evaluator instances get unique identities.** Ephemeral blocks
-   currently use `u32::MAX` in OIR. A graph executor must allocate a fresh actor
-   identity for every ephemeral evaluation, including a unique generation, so
-   there is no accidental sharing or serialization collapse between unrelated
-   ephemeral shims.
+Unknown hosted operations read and write `HostWorld` and evaluator-local state.
+`HostWorld` aliases precise host resource declarations conservatively. A
+persistent shim also consumes and produces its actor-state token. The live
+process registry does not expose a trustworthy generation, so actor resource
+identity does not invent a constant generation field.
 
-5. **No unsafe cross-thread process registry sharing.** `ProcessRegistry`
-   contains live child process handles and buffered pipes. It must not be shared
-   across threads via unsafe trait assertions; specifically, do not add unsafe
-   `Send` or `Sync` implementations to make the current registry fit a parallel
-   executor. Use actor-owned threads, channels, or a single owner that drives
-   processes from explicit messages.
+Effect attributes are checked constraints. `effects=unknown` can downgrade a
+verified renderer. `effects=pure` cannot upgrade an arbitrary shim. `reads=`,
+`writes=`, and `serial=host` add dependencies without removing unknown
+fallbacks. Backend authority remains a permission model and is not treated as
+an exact footprint.
 
-6. **Completion materializes OValue outputs and releases dependent hyperedges.**
-   Every completed operation must publish its `OValue` to the graph node that
-   represents the operation result. Dependent hyperedges become ready only after
-   all input OValue materializations and authority checks are complete.
+## Sequence and group control
 
-7. **Error and final-result semantics are deterministic.** If multiple
-   operations fail, select the reported error by first error in stable schedule
-   order, not by wall-clock completion order. Cancellation should be best-effort:
-   after the selected error is known, stop launching unscheduled work and send
-   cancellation to running actors where supported; already-committed external
-   effects remain observable and must be documented.
+Ordinary source sequence is implemented by adding the earlier operation's
+completion token to the later operation's executable inputs. Sequence is
+relaxed only in either of these cases:
 
-8. **Tests compare serial and graph execution observationally.** A scoped
-   effect-safe fragment should run through both `execute_plan_serial` and the
-   graph executor. Tests must compare final OValues, visible scope updates,
-   stable traces, backend process reuse where applicable, and deterministic
-   errors.
+1. Both operations are direct members of the same explicit `batch`, `all`,
+   `any`, or `race` group.
+2. Both operations are verified, deterministic, infallible, resource-free
+   inline renderers from the trusted `html`, `markdown`, `text`, and `latex`
+   set; both complete structural subtrees contain only literal text and
+   recursively trusted renderers; and neither operation is a child of a
+   structural `O` sequencing region.
 
-9. **Benchmarks isolate cost centers.** Benchmarks must report scheduler
-   overhead, evaluator startup, OValue boundary conversion, and backend execution
-   separately. Otherwise parallel speedups could merely hide process startup or
-   serialization overhead.
+If any fact is unknown, the completion dependency remains. Explicit group
+topology does not override resource conflicts: unknown members still share the
+directed `HostWorld` chain.
 
-## Semantic obligations
+## Scheduling and failure
 
-### Persistent process ownership
+`ReadySchedule` builds a producer map over every ordinary and synthetic output.
+An operation's blockers are exactly the producers of its input nodes. There is
+no separately maintained actor or effect blocker in the final scheduler.
 
-The executor must define which component owns each live backend process.
-`ProcessRegistry` currently creates, reuses, and cleans up processes. A graph
-executor can preserve this by giving each actor an owner task that receives
-commands over channels, but ownership must remain singular so pipe ordering,
-cleanup, and restart generation are unambiguous.
+The coordinator owns the mutable evaluator and process registry. It launches
+only verified pure inline renderer tasks on worker threads. After each success,
+it materializes the value, completion, and successor-state outputs and derives a
+fresh frontier. On failure, it emits none of those outputs and admits no later
+dependent operation. Root values and scope writes commit in deterministic source
+order, but commit order is not used to justify early side effects.
 
-### External effects
+## Validation and observability
 
-Shim backends can read files, write files, use the network, spawn processes, or
-observe mutable runtime state. The graph must represent these effects before
-parallelizing them. Until effect fingerprints are complete, effectful shims
-should serialize conservatively or require explicit authority/effect annotations
-that prove independence.
+Graph validation checks node roles, port direction, one producer per output,
+exact value/completion shape, resource version monotonicity, completion-backed
+preserved sequence, and executable acyclicity. `olangc --target dot` renders
+ordinary, resource, actor, completion/control, executable, and constraint nodes
+with distinct styles and directed ports.
 
-### Deterministic error selection
+The integration suite runs graph and serial execution in isolated working
+directories and compares exit status, stdout, normalized stderr, final values,
+persistent Python and SQL state, environment mutation/read behavior, and full
+filesystem snapshots. A test-only rendezvous also proves real worker overlap for
+safe renderer tasks.
 
-Parallel completion order is nondeterministic. User-visible errors should be
-selected by stable schedule order: derive a total order from the HGraph schedule
-and node IDs, report the earliest failed node in that order, and attach later
-failures as secondary diagnostics only if doing so is stable.
+## Deliberately deferred optimization
 
-### Cancellation
-
-Cancellation is a semantic boundary, not just an optimization. The executor
-should stop admitting new work after the deterministic selected failure, cancel
-or drain running actor operations according to backend capability, and always
-clean up ephemeral actors. Persistent actors that might be left in an unknown
-state after cancellation should be generation-bumped or restarted.
-
-### Schedule equivalence
-
-For the effect-safe fragment, graph execution must be observationally equivalent
-to serial OIR execution. Equivalence includes final OValue, root selection,
-scope mutation, lazy/defer forcing behavior, capability failures, and stable
-error choice. Schedule equivalence does not require identical internal trace
-timing.
-
-## Staged implementation outline
-
-1. **Actor identity model.** Extend HGraph actor metadata from `(lang, env)` to a
-   runtime-aware, generation-aware identity. Include ephemeral IDs.
-2. **Actor runtime abstraction.** Wrap `ProcessRegistry` ownership behind an
-   actor interface that can execute one operation at a time and return `OValue`
-   or structured error.
-3. **Effect and authority edges.** Add explicit HGraph edges for backend
-   authority and declared effects. Keep unknown effects serial.
-4. **Ready-queue executor.** Implement a deterministic ready queue over
-   `src/hgraph/schedule.rs` clusters. Launch only nodes whose inputs,
-   actor mailbox, effects, and authority checks are ready.
-5. **Materialization layer.** Store completed OValues on graph nodes and release
-   dependent hyperedges. Preserve current root-result semantics.
-6. **Deterministic failure and cancellation.** Implement first-error-in-schedule
-   order selection, best-effort cancellation, actor cleanup, and generation bump
-   for tainted persistent actors.
-7. **Serial-vs-graph tests.** Start with inline pure backends, then add isolated
-   persistent Python actors, then add deferred Eval requests and groups.
-8. **Benchmarks and regression gates.** Add benchmark suites that separate
-   scheduler, startup, conversion, and backend execution costs before enabling
-   graph execution by default.
+The current resource transition model serializes read/read access. The next safe
+optimization is a read-lease model in which a writer consumes every outstanding
+reader-completion token. Broader parallelism additionally requires verified
+backend-specific resource models. The runtime does not claim complete static
+effect inference, automatic path extraction from arbitrary hosted source, or
+safe arbitrary cross-runtime parallelism.

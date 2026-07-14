@@ -40,7 +40,9 @@ impl TraceSink {
     }
 
     pub fn failed(&mut self, id: PlanNodeId, message: String) {
-        self.trace.events.push(TraceEvent::NodeFailed { id, message });
+        self.trace
+            .events
+            .push(TraceEvent::NodeFailed { id, message });
     }
 
     /// Consume the sink, yielding the accumulated trace.

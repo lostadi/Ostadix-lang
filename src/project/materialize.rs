@@ -49,12 +49,7 @@ fn unique_temp_dir() -> Result<PathBuf> {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = base.join(format!(
-            "olang-ws-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            n
-        ));
+        let candidate = base.join(format!("olang-ws-{}-{}-{}", std::process::id(), nanos, n));
         if !candidate.exists() {
             std::fs::create_dir_all(&candidate)
                 .with_context(|| format!("failed to create {}", candidate.display()))?;

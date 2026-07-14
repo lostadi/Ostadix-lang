@@ -36,7 +36,9 @@ impl EcosystemDiscoverer for CFamilyDiscoverer {
             ];
             route.label = "cmake configure".to_string();
             route.provides = vec!["build".to_string()];
-            route.guards.push(RouteGuard::CommandAvailable("cmake".to_string()));
+            route
+                .guards
+                .push(RouteGuard::CommandAvailable("cmake".to_string()));
             routes.push(route);
         }
         routes

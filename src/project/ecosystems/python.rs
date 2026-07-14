@@ -9,9 +9,7 @@
 use std::path::Path;
 
 use crate::project::discover::{file_text, find_file, slug, EcosystemDiscoverer};
-use crate::project::model::{
-    ResultCodec, RouteKind, RouteProvenance, RouteSpec,
-};
+use crate::project::model::{ResultCodec, RouteKind, RouteProvenance, RouteSpec};
 
 pub struct PythonDiscoverer;
 
@@ -30,7 +28,11 @@ impl EcosystemDiscoverer for PythonDiscoverer {
         "python"
     }
 
-    fn discover(&self, _root: &Path, files: &[crate::project::model::ProjectFile]) -> Vec<RouteSpec> {
+    fn discover(
+        &self,
+        _root: &Path,
+        files: &[crate::project::model::ProjectFile],
+    ) -> Vec<RouteSpec> {
         let mut routes = Vec::new();
 
         // ── pyproject.toml scripts ──────────────────────────────────────────
@@ -55,11 +57,7 @@ impl EcosystemDiscoverer for PythonDiscoverer {
                     format!("{} declares a runnable package", file.path),
                 );
                 route.kind = RouteKind::PackageEntrypoint;
-                route.command = vec![
-                    "python3".to_string(),
-                    "-m".to_string(),
-                    module.clone(),
-                ];
+                route.command = vec!["python3".to_string(), "-m".to_string(), module.clone()];
                 route.entrypoint = Some(file.path.clone());
                 route.label = format!("python -m {module}");
                 route.provides = vec!["main".to_string()];
@@ -72,7 +70,9 @@ impl EcosystemDiscoverer for PythonDiscoverer {
             if !file.path.ends_with(".py") || file.path.ends_with("__main__.py") {
                 continue;
             }
-            let Some(text) = file_text(file) else { continue };
+            let Some(text) = file_text(file) else {
+                continue;
+            };
             if !has_main_guard(text) {
                 continue;
             }
@@ -93,14 +93,17 @@ impl EcosystemDiscoverer for PythonDiscoverer {
             if !file.executable {
                 continue;
             }
-            let Some(text) = file_text(file) else { continue };
+            let Some(text) = file_text(file) else {
+                continue;
+            };
             if !shebang_is_python(text) {
                 continue;
             }
             let id = format!("py-exec-{}", slug(&file.path));
-            if routes.iter().any(|r| {
-                r.entrypoint.as_deref() == Some(file.path.as_str())
-            }) {
+            if routes
+                .iter()
+                .any(|r| r.entrypoint.as_deref() == Some(file.path.as_str()))
+            {
                 continue;
             }
             let mut route = discovered(
@@ -128,9 +131,13 @@ fn collect_scripts(value: &toml::Value, routes: &mut Vec<RouteSpec>) {
             .and_then(|p| p.get("scripts")),
     ];
     for table in script_tables.into_iter().flatten() {
-        let Some(map) = table.as_table() else { continue };
+        let Some(map) = table.as_table() else {
+            continue;
+        };
         for (name, target) in map {
-            let Some(target) = target.as_str() else { continue };
+            let Some(target) = target.as_str() else {
+                continue;
+            };
             let mut route = discovered(
                 format!("py-script-{}", slug(name)),
                 "python",
@@ -158,7 +165,10 @@ fn script_runner(target: &str) -> String {
             module = module.trim(),
             func = func.trim(),
         ),
-        None => format!("import runpy; runpy.run_module({:?}, run_name='__main__')", target.trim()),
+        None => format!(
+            "import runpy; runpy.run_module({:?}, run_name='__main__')",
+            target.trim()
+        ),
     }
 }
 

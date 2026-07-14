@@ -155,8 +155,8 @@ pub fn run_route_cancellable(
     if bundle.route(route_id).is_none() {
         bail!("no route named `{route_id}`");
     }
-    let workspace = materialize_isolated(bundle)
-        .context("failed to materialize an isolated workspace")?;
+    let workspace =
+        materialize_isolated(bundle).context("failed to materialize an isolated workspace")?;
     let mut ctx = RunCtx {
         bundle,
         opts,
@@ -261,7 +261,10 @@ fn spawn_route(
         bail!("route `{}` has an empty command", route.id);
     }
     if cancel.is_cancelled() {
-        bail!("{CANCEL_MARKER} route `{}` canceled before launch", route.id);
+        bail!(
+            "{CANCEL_MARKER} route `{}` canceled before launch",
+            route.id
+        );
     }
 
     let cwd = resolve_cwd(&workspace.root, &route.working_directory)?;
@@ -388,7 +391,9 @@ fn resolve_cwd(root: &Path, working_directory: &str) -> Result<PathBuf> {
         match component {
             Component::CurDir => {}
             Component::Normal(part) => resolved.push(part),
-            Component::ParentDir => bail!("working_directory `{working_directory}` escapes workspace"),
+            Component::ParentDir => {
+                bail!("working_directory `{working_directory}` escapes workspace")
+            }
             Component::Prefix(_) | Component::RootDir => {
                 bail!("working_directory `{working_directory}` must be relative")
             }
@@ -557,7 +562,10 @@ fn resolve_selection(
                 };
                 Ok((vec![name.to_string()], policy))
             } else {
-                bail!("no route or route set named `{name}`\n{}", bundle.route_table())
+                bail!(
+                    "no route or route set named `{name}`\n{}",
+                    bundle.route_table()
+                )
             }
         }
         None => {
@@ -657,8 +665,12 @@ fn execute_policy(
             }
             Ok(results)
         }
-        RoutePolicy::RaceSuccess => race_alternatives(bundle, alternatives, opts, RaceMode::FirstSuccess),
-        RoutePolicy::RaceSettle => race_alternatives(bundle, alternatives, opts, RaceMode::FirstSettle),
+        RoutePolicy::RaceSuccess => {
+            race_alternatives(bundle, alternatives, opts, RaceMode::FirstSuccess)
+        }
+        RoutePolicy::RaceSettle => {
+            race_alternatives(bundle, alternatives, opts, RaceMode::FirstSettle)
+        }
         RoutePolicy::VerifyEquivalent => {
             let results = run_all_parallel(bundle, alternatives, opts)?;
             let failures: Vec<&OExecutionResult> =
@@ -770,7 +782,10 @@ fn run_all_parallel(
                 }
                 // Defensive: unreachable in practice — every scoped thread
                 // sends exactly one message before the channel closes.
-                None => bail!("alternative `{}` never reported a result", alternatives[index]),
+                None => bail!(
+                    "alternative `{}` never reported a result",
+                    alternatives[index]
+                ),
             }
         }
         Ok(results)
