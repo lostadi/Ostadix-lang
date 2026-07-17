@@ -1,0 +1,137 @@
+--- a/src/ocore/typeck.rs
++++ b/src/ocore/typeck.rs
+@@ -1130,6 +1130,14 @@
+                         && matches!(op, ast::BinaryOp::Add | ast::BinaryOp::Sub)
+                     {
+                         Some(self.program.types.primitive("usize").unwrap())
++                    } else if matches!(
++                        op,
++                        ast::BinaryOp::ShiftLeft | ast::BinaryOp::ShiftRight
++                    ) {
++                        // A shift count is an independent integer quantity. The x86-64
++                        // backend consumes its low byte (`cl`), so it need not have the
++                        // same width or signedness as the value being shifted.
++                        Some(self.program.types.primitive("usize").unwrap())
+                     } else {
+                         Some(lhs.ty)
+                     };
+@@ -1163,6 +1171,19 @@
+                         }
+                         bool_ty
+                     }
++                    ast::BinaryOp::ShiftLeft | ast::BinaryOp::ShiftRight => {
++                        if !self.program.types.is_integer(lhs.ty) {
++                            return Err(
++                                self.error(lhs.span, "shifted value must be an integer")
++                            );
++                        }
++                        if !self.program.types.is_integer(rhs.ty) {
++                            return Err(
++                                self.error(rhs.span, "shift count must be an integer")
++                            );
++                        }
++                        lhs.ty
++                    }
+                     _ => {
+                         if matches!(self.program.types.types[lhs.ty], Type::Pointer { .. })
+                             && matches!(op, ast::BinaryOp::Add | ast::BinaryOp::Sub)
+@@ -1193,8 +1214,23 @@
+             ast::ExprKind::Assign { op, target, value } => {
+                 let target = self.check_expr(target, None)?;
+                 self.ensure_place(&target, true)?;
+-                let value = self.check_expr(value, Some(target.ty))?;
+-                self.expect_assignable(value.ty, target.ty, value.span)?;
++                let shift_assignment = matches!(
++                    op,
++                    Some(ast::BinaryOp::ShiftLeft | ast::BinaryOp::ShiftRight)
++                );
++                let value_expected = if shift_assignment {
++                    Some(self.program.types.primitive("usize").unwrap())
++                } else {
++                    Some(target.ty)
++                };
++                let value = self.check_expr(value, value_expected)?;
++                if shift_assignment {
++                    if !self.program.types.is_integer(value.ty) {
++                        return Err(self.error(value.span, "shift count must be an integer"));
++                    }
++                } else {
++                    self.expect_assignable(value.ty, target.ty, value.span)?;
++                }
+                 if let Some(op) = op {
+                     if !self.program.types.is_integer(target.ty) {
+                         return Err(self.error(
+@@ -2286,6 +2322,23 @@
+     }
+ 
+     #[test]
++    fn accepts_integer_shift_counts_with_different_types() {
++        let program = checked(
++            r#"
++module shifts;
++fn right(value: u64, count: usize) -> u64 { return value >> count; }
++fn left(value: u32, count: u8) -> u32 { return value << count; }
++fn compound(value: u64, count: usize) -> u64 {
++    let mut result: u64 = value;
++    result >>= count;
++    return result;
++}
++"#,
++        );
++        assert_eq!(program.functions.len(), 3);
++    }
++
++    #[test]
+     fn rejects_types_that_the_machine_backend_cannot_encode() {
+         let aggregate_abi_error = rejected(
+             r#"
+--- a/src/ocore/codegen.rs
++++ b/src/ocore/codegen.rs
+@@ -504,6 +504,11 @@
+                 self.require_integer_type(rhs_ty, "pointer offset")?;
+                 self.require_same_type(dst_ty, lhs_ty, "pointer arithmetic result")
+             }
++            BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
++                self.require_integer_type(lhs_ty, "shifted value")?;
++                self.require_integer_type(rhs_ty, "shift count")?;
++                self.require_same_type(dst_ty, lhs_ty, "shift result")
++            }
+             BinaryOp::Add
+             | BinaryOp::Sub
+             | BinaryOp::Mul
+@@ -511,9 +516,7 @@
+             | BinaryOp::Rem
+             | BinaryOp::BitAnd
+             | BinaryOp::BitOr
+-            | BinaryOp::BitXor
+-            | BinaryOp::ShiftLeft
+-            | BinaryOp::ShiftRight => {
++            | BinaryOp::BitXor => {
+                 self.require_integer_type(lhs_ty, "binary left operand")?;
+                 self.require_same_type(rhs_ty, lhs_ty, "binary right operand")?;
+                 self.require_same_type(dst_ty, lhs_ty, "binary result")
+@@ -1397,6 +1400,24 @@
+     }
+ 
+     #[test]
++    fn emits_shifts_with_independent_integer_count_types() {
++        let ast = parser::parse(
++            "test.oc",
++            r#"
++module shifts;
++fn shift(value: u64, count: usize) -> u64 {
++    return value >> count;
++}
++"#,
++        )
++        .unwrap();
++        let hir = typeck::check(&[("test.oc".into(), ast)]).unwrap();
++        let mir = mir::lower(&hir).unwrap();
++        let asm = emit_assembly(&hir, &mir).unwrap();
++        assert!(asm.contains("shr rax, cl"));
++    }
++
++    #[test]
+     fn rejects_float_mir_if_type_checking_is_bypassed() {
+         let ast = parser::parse(
+             "test.oc",

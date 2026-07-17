@@ -511,9 +511,7 @@ impl<'a> Checker<'a> {
             );
             let hir_body = body_checker.check_block(body)?;
             let result_ty = self.program.types.types[function.result].clone();
-            let never_ty = self.program.types.primitive("never").unwrap();
-            let terminates = block_terminates(&hir_body, never_ty);
-            if !matches!(result_ty, Type::Void | Type::Never) && !terminates {
+            if !matches!(result_ty, Type::Void | Type::Never) && !block_terminates(&hir_body) {
                 return Err(diag(
                     &self.scopes[module_index].file,
                     body.span,
@@ -524,7 +522,7 @@ impl<'a> Checker<'a> {
                     ),
                 ));
             }
-            if matches!(result_ty, Type::Never) && !terminates {
+            if matches!(result_ty, Type::Never) && !block_terminates(&hir_body) {
                 return Err(diag(
                     &self.scopes[module_index].file,
                     body.span,
@@ -2157,22 +2155,18 @@ fn item_symbol(module: &str, name: &str, attrs: &ItemAttrs, extern_: bool) -> St
     }
 }
 
-fn block_terminates(block: &HirBlock, never_ty: TypeId) -> bool {
+fn block_terminates(block: &HirBlock) -> bool {
     let Some(last) = block.stmts.last() else {
         return false;
     };
     match &last.kind {
         HirStmtKind::Return(_) | HirStmtKind::Loop(_) => true,
-        HirStmtKind::Expr(expr) => expr.ty == never_ty,
         HirStmtKind::If {
             then_block,
             else_block: Some(else_block),
             ..
-        } => {
-            block_terminates(then_block, never_ty)
-                && block_terminates(else_block, never_ty)
-        }
-        HirStmtKind::Unsafe(block) => block_terminates(block, never_ty),
+        } => block_terminates(then_block) && block_terminates(else_block),
+        HirStmtKind::Unsafe(block) => block_terminates(block),
         _ => false,
     }
 }
@@ -2258,32 +2252,6 @@ fn sum(n: u64) -> u64 {
         );
         assert_eq!(program.functions.len(), 2);
         assert_eq!(program.functions[1].locals.len(), 3);
-    }
-
-    #[test]
-    fn accepts_functions_ending_in_never_calls() {
-        let program = checked(
-            r#"
-module termination;
-fn diverge() -> never { loop {} }
-fn never_from_call() -> never { diverge(); }
-fn value_from_call() -> u64 { diverge(); }
-"#,
-        );
-        assert_eq!(program.functions.len(), 3);
-    }
-
-    #[test]
-    fn still_rejects_never_functions_that_can_fall_through() {
-        let error = rejected(
-            r#"
-module termination;
-fn bad() -> never {}
-"#,
-        );
-        assert!(error
-            .message
-            .contains("function returning `never` must not fall through"));
     }
 
     #[test]
