@@ -50,16 +50,23 @@
   `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
 - The bootable O-core proof runs one statically linked `native[0]` process at
-  CPL3. The x86_64 bootstrap installs user/supervisor mappings, NX and write
-  protection, a 64-bit TSS, and `SYSCALL` MSRs. Kernel-owned PCB identity
-  selects the native personality and process cspace; QEMU verifies valid debug
-  output, capability bounds/occupancy/generation/type/right checks,
-  stale-after-reuse and closed-handle denial, complete user-range checks,
-  ELF user-region zero-fill, kernel-pointer denial, hostile-RFLAGS
-  sanitization, unknown-syscall denial, the future scheduler's yield hook, an
-  IRQ0 privilege transition and return, and a later CPL3 heartbeat. This does
-  not claim an executable loader, independent address spaces, scheduling, IPC,
-  Linux compatibility, or foreign root filesystems.
+  CPL3. Its x86_64 bootstrap now uses page-granular supervisor RX, R/NX, and
+  RW/NX mappings; guarded user and kernel stacks; a double-fault IST; CPU-local
+  `SYSCALL` entry state; normalized exception frames; and fault-aware bounded
+  user copies through a kernel bounce buffer. Kernel-owned PCB identity selects
+  the native personality, bootstrap address-space descriptor, and process
+  CSpace. QEMU verifies capability and range denials, ELF zero-fill, complete
+  syscall register preservation, hostile-RFLAGS sanitization, IRQ0 return, and
+  a later CPL3 heartbeat. Eight fresh-boot negative probes cover divide error,
+  invalid opcode, non-present and supervisor reads, guard-stack write, NX RIP,
+  noncanonical target, and an excluded syscall-return RIP. Each marks process 1
+  faulted, clears the current process, and reaches a later kernel timer marker.
+  A ninth boot removes one otherwise valid user PTE and proves that a syscall
+  copy returns `ERR_USER_COPY_FAULT` before a later CPL3 heartbeat.
+  This is controlled one-process fault disposition, not proof that a sibling
+  process survives. It does not claim an executable loader, independent
+  per-process page tables, context switching, IPC, Linux compatibility, or
+  foreign root filesystems.
 
 ## Implemented conservatively
 

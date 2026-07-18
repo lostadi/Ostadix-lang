@@ -1,7 +1,7 @@
 # O-Domain Engineering Plan
 
-Status: draft roadmap. Milestone 0.1 is **complete** by its QEMU runtime
-acceptance gate.
+Status: active roadmap. Milestones 0.1 and 0.2 are **complete** by their QEMU
+runtime acceptance gates.
 
 This document turns the poly-personality kernel brief into a dependency-ordered
 implementation plan for this repository. It is a claim boundary as well as a
@@ -44,8 +44,9 @@ A **capability space**, or **CSpace**, is the process-local table that resolves
 generation-tagged integer handles to kernel objects, types, and rights. The
 table is authority. A serialized `OCapability` is not. The hosted
 `CapabilityBroker` in `src/ocore/capability_bridge.rs` already models the
-required outer boundary by resolving a random session bearer to a live kernel
-handle before transport, but it is not yet connected to the booted kernel.
+required outer boundary by resolving a random session bearer through
+operation-specific policy to a live kernel handle before transport, but it is
+not yet connected to the booted kernel.
 
 A **root filesystem** supplies the files, libraries, package manager, and
 configuration visible in a domain. The scripts under `setup/os/` install and
@@ -93,6 +94,40 @@ bounded user-memory validation, and a linked `native[0]` payload. Separate ELF
 load segments reserve and zero-fill the complete RX image and RW stack ranges.
 The complete image builds and the QEMU smoke gate passes with the required
 negative cases.
+
+Milestone 0.2 replaces the broad supervisor identity mapping and raw
+user-pointer dereference with a hardened bootstrap boundary. Kernel metadata,
+text, read-only data, and mutable state now have page-granular R/NX, RX, R/NX,
+and RW/NX permissions respectively. User and privileged stacks have absent
+guard pages. The linked user payload interval is RX, its zero-fill tail is
+R/NX, and its stack is RW/NX. A concrete bootstrap address-space descriptor
+records the live CR3 and matching region permissions. `SWAPGS` selects
+boot-CPU-local entry state, and assembly exception stubs normalize vectors 0
+through 31 into a kernel-owned
+trap frame. Exact page-fault fixups recover only active user-copy loads and
+stores. `debug_write` uses a bounded kernel bounce buffer.
+
+The default QEMU smoke gate proves the nonfatal path. A second gate performs a
+fresh boot for each fatal probe: divide error, invalid opcode, canonical
+non-present read, supervisor read, guard-stack write, NX instruction fetch,
+noncanonical target, and invalid syscall-return RIP. Each accepted probe marks
+the only PCB `FAULTED`, clears the current process, abandons the user frame, and
+reaches a later kernel timer marker. This is controlled fault disposition for
+one process, not evidence of sibling-process isolation.
+An additional fresh boot removes one test user-image PTE after the software
+region is registered. `debug_write` must recover at the exact copy-load fixup,
+return `ERR_USER_COPY_FAULT`, and reach a later CPL3 heartbeat without changing
+the PCB to `FAULTED`.
+
+Preparation interfaces are intentionally narrow. `process::activate_bootstrap`
+can succeed only once and cannot impersonate a context switch.
+`address_space::install_bootstrap` records the actual CR3 and fixed regions but
+does not expose create, map, unmap, or destroy. The scheduler module counts
+yield requests but has no runnable queue or switch operation. Capability copy
+and page allocation retain stable native ABI numbers but return
+`ERR_NOT_IMPLEMENTED`. `PERSONALITY_NATIVE` names the reusable implementation;
+`native[0]` remains the first domain instance. These boundaries prevent future
+milestone names from being mistaken for implemented mechanisms.
 
 ## 3. Milestone 0.1: native[0] CPL3 and SYSCALL proof
 
@@ -201,23 +236,36 @@ recorded. A passing build is necessary but is not the runtime gate.
 
 ### Milestone 0.2: harden architectural user entry
 
-Implement complete exception gates for faults originating at CPL3, a
-kernel-owned trap frame, full register preservation, bounded `copy_from_user`
-and `copy_to_user`, overflow-safe range checks, guard pages, syscall
-interruption rules, per-CPU entry state, and page-granular kernel RX/R/RW-NX
-permissions. Remove global single-entry scratch before enabling nested
-interrupts or SMP.
+Status: **complete** for the single-CPU bootstrap boundary.
+
+Implemented complete exception gates for faults originating at CPL3, a
+kernel-owned trap frame, full integer-register preservation, bounded
+`copy_from_user` and `copy_to_user`, overflow-safe region checks, user and
+privileged guard pages, CPU-local entry state, a double-fault IST, and
+page-granular kernel RX/R/RW-NX permissions. Global syscall scratch was removed
+in favor of a GS-selected boot-CPU record. The design remains single-core; SMP
+requires one allocated entry record, copy state, TSS, and scheduler transaction
+per CPU.
 
 Acceptance gate:
 
-- deliberate user page fault, divide error, invalid opcode, bad stack, invalid
-  RIP, and oversized/wrapping buffer terminate only the current process;
+- deliberate user page faults, divide error, invalid opcode, bad stack, invalid
+  RIP, and invalid syscall-return RIP fault the current process and leave the
+  kernel timer alive;
+- oversized and wrapping buffers return explicit errors while the process
+  continues;
 - kernel text/data remain inaccessible from CPL3;
 - kernel text is RX, kernel read-only data is R/NX, writable kernel state is
   RW/NX;
 - faults during user copy return a defined error without corrupting kernel
   state; and
 - entry/return tests pass under repeated timer interrupts.
+
+The executable gates are `ocore/kernel/smoke-qemu.sh` and
+`ocore/kernel/smoke-faults-qemu.sh`. The fatal matrix starts a fresh VM for each
+probe and rejects unexpected vectors, CPL0 faults, early VM exit, or a missing
+post-fault timer marker. The accepted claim is controlled disposition of the
+only process. Sibling survival remains a Milestone 1 acceptance property.
 
 ### Milestone 0.3: reclaiming physical memory and memory objects
 
@@ -298,7 +346,30 @@ Acceptance gate:
 - service lookup returns a capability, not an ambient global pointer; and
 - namespace teardown releases mounts, services, and processes transactionally.
 
-### Milestone 5: minimal translated Linux x86-64 personality
+### Milestone 5: personality-service supervision substrate
+
+Move personality policy out of privileged code behind capability-bounded IPC
+before adding a foreign ABI. Define versioned service registration, startup,
+health, cancellation, stop, restart, and dependent-process failure behavior.
+The kernel router may use a direct personality-ID branch while indirect calls
+remain unsupported, but it must forward policy requests through an endpoint
+rather than executing compatibility policy in ring 0. A service receives only
+explicit memory, endpoint, filesystem, timer, network, and device capabilities.
+
+Acceptance gate:
+
+- a minimal native test personality service starts unprivileged and handles a
+  pinned request/reply corpus;
+- stopping or crashing it cannot stop O-core or an unrelated native process;
+- in-flight requests receive one deterministic cancellation or failure result;
+- restart and capability rebind behavior is versioned and logged; and
+- revoking a delegated capability removes that authority without ambient
+  fallback.
+
+This substrate also supports later user-space-kernel components. It does not by
+itself establish any Linux ABI compatibility.
+
+### Milestone 6: minimal translated Linux x86-64 personality
 
 Add a versioned Linux x86-64 personality service over the mechanisms above.
 Begin with static, single-threaded ELF64 programs. Implement only the syscall
@@ -323,7 +394,7 @@ Acceptance gate:
 This milestone is a minimal compatibility slice, not general Linux binary
 compatibility and not a Linux kernel.
 
-### Milestone 6: multiple root filesystems and Linux O-Domains
+### Milestone 7: multiple root filesystems and Linux O-Domains
 
 Define a reproducible rootfs image manifest with architecture, content digest,
 personality ABI version, mount policy, and required capabilities. Instantiate
@@ -340,7 +411,7 @@ Acceptance gate:
 - deleting one overlay cannot damage the other rootfs; and
 - image provenance and hashes are emitted with the runtime evidence.
 
-### Milestone 7: OValue, capability, and native-capsule crossings
+### Milestone 8: OValue, capability, and native-capsule crossings
 
 Provide three explicit cross-domain channels:
 
@@ -370,22 +441,6 @@ Acceptance gate:
 - a capsule cannot be consumed outside its declared affinity; and
 - hostile depth/size/cycle inputs stay within configured CPU and memory bounds.
 
-### Milestone 8: user-space kernel personality mode
-
-Move translated personality policy out of privileged code behind capability-
-bounded IPC. Define a supervisor contract for startup, health, restart, state
-recovery, and process failure when a service disappears. Permit componentized
-foreign-kernel services only through explicit memory, endpoint, filesystem,
-network, timer, and device capabilities.
-
-Acceptance gate:
-
-- the Linux ABI service and one componentized kernel service run unprivileged;
-- revoking a delegated device or network capability immediately removes that
-  authority;
-- service crash/restart does not crash O-core or unrelated domains; and
-- in-flight syscall failure and domain recovery are deterministic and logged.
-
 ### Milestone 9: full-kernel domain mode
 
 Add a subordinate-kernel backend using hardware virtualization when available
@@ -410,13 +465,12 @@ convenience.
 
 ## 5. Cross-cutting invariants
 
-These are the target invariants for the architecture. Milestone 0.1 enforces
-kernel-owned routing, pointer bounds, typed capability lookup, user-image W^X,
-user-stack NX, and validated return state within its fixed single-process
-layout. Its coarse 2 MiB supervisor mappings still make the kernel region RWX;
-U/S blocks CPL3 access, but full kernel W^X remains a hardening requirement.
-Later milestone gates make the remaining invariants executable rather than
-aspirational.
+These are the target invariants for the architecture. Milestone 0.2 enforces
+kernel-owned routing, mapping-aware pointer checks, fault-aware bounded copies,
+typed capability lookup, user and kernel W^X, guarded stacks, normalized fault
+frames, and validated return state within its fixed single-process layout.
+Later milestone gates make independent address spaces, teardown, scheduling,
+IPC, and personality supervision executable rather than aspirational.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are
    distinct types and cannot be substituted by integer coincidence.
@@ -426,11 +480,10 @@ aspirational.
 3. Every authority lookup checks slot bounds, occupancy, generation, object
    type, and requested rights. Delegation can only preserve or reduce rights.
 4. All user pointer checks are overflow-safe and cover the full byte range.
-   Milestone 0.1 bounds a fixed immutable mapping before dereference;
-   Milestone 0.2 replaces that bootstrap rule with fault-aware copy/pin APIs.
+   Milestone 0.2 checks a concrete immutable bootstrap region and copies through
+   exact page-fault fixups. Concurrent unmap and pinning remain future work.
 5. Executable mappings are not writable. Anonymous stacks and data are NX.
-   Milestone 0.1 proves this only for its user image and stack; later page-table
-   work must split kernel text, read-only data, and writable NX state as well.
+   Milestone 0.2 proves this for the bootstrap kernel, user image, and stack.
 6. Syscall and exception return validates user RIP/RSP and sanitizes RFLAGS.
 7. The current address space, PCB, personality, domain, and CSpace switch as one
    scheduler transaction.
@@ -462,24 +515,24 @@ aspirational.
 
 ## 7. Concise feature matrix
 
-| Feature | Pre-0.1 baseline | Milestone 0.1 | First multi-rootfs demo | Long-term |
+| Feature | Pre-0.1 baseline | Current Milestone 0.2 | First multi-rootfs demo | Long-term |
 |---|---|---|---|---|
-| CPU/privilege | x86-64 ring-0 boot | one CPL3 native payload | isolated x86-64 processes | SMP and hardened entry |
+| CPU/privilege | x86-64 ring-0 boot | one contained CPL3 native payload | isolated x86-64 processes | SMP and hardened entry |
 | Domains | none | one fixed `native[0]` registry entry | native, Alpine, Debian instances | persistent lifecycle and quotas |
 | Personalities | none | native-only dispatch | minimal translated Linux x86-64 | user-space and full-kernel backends |
-| Address spaces | one identity map | fixed user RX and RW/NX ranges | per-process page tables | demand paging and shared mappings |
-| Processes | none | one PCB/current process | multiple isolated processes | complete process/thread lifecycle |
+| Address spaces | one identity map | live CR3 descriptor, fixed RX/R/RW-NX regions | per-process page tables | demand paging and shared mappings |
+| Processes | none | one PCB, one-shot activation, `FAULTED` disposition | multiple isolated processes | complete process/thread lifecycle |
 | CSpaces | one small global table | one process-local typed CSpace | one CSpace per process | atomic cross-domain attenuation |
-| Scheduling | timer marker only | syscall hook only; no scheduler | preemptive blocking scheduler | multicore policy and accounting |
+| Scheduling | timer marker only | counted yield hook only; no switch | preemptive blocking scheduler | multicore policy and accounting |
 | IPC | none | none | endpoints, shared memory, transfer | supervised personality RPC |
 | Loading | kernel-linked code | linked user payload | native and static Linux ELF loaders | dynamic loaders per personality |
 | Filesystems | none | none | separate Alpine/Debian roots | versioned overlays and services |
 | Crossings | hosted OValue and broker only | none to booted kernel | OValue, capability, capsule channels | common contract across all modes |
 | Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
 
-The first credible O-Domain demonstration is therefore not the Milestone 0.1
-serial output. It is the later evidence bundle that boots native, Alpine, and
-Debian domains together, runs a pinned unmodified static Linux binary in both
-Linux roots, exchanges one structural OValue, transfers one attenuated file or
-shared-memory capability, and contains a personality-service failure without
-stopping the native domain.
+The first credible multi-domain O-Domain demonstration is therefore not either
+single-process bootstrap gate. It is the later evidence bundle that boots
+native, Alpine, and Debian domains together, runs a pinned unmodified static
+Linux binary in both Linux roots, exchanges one structural OValue, transfers
+one attenuated file or shared-memory capability, and contains a
+personality-service failure without stopping the native domain.

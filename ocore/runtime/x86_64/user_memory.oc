@@ -1,10 +1,32 @@
 module runtime::user_memory;
 
+use runtime::address_space::allows;
+use runtime::address_space::VM_READ;
+use runtime::address_space::VM_USER;
+use runtime::address_space::VM_WRITE;
+
 pub const USER_IMAGE_START: usize = 0x01000000;
+pub const USER_EXEC_END: usize = 0x01010000;
 pub const USER_IMAGE_END: usize = 0x01200000;
-pub const USER_STACK_START: usize = 0x01200000;
+pub const USER_STACK_GUARD_START: usize = 0x01200000;
+pub const USER_STACK_START: usize = 0x01201000;
 pub const USER_ADDRESS_END: usize = 0x01400000;
 pub const USER_STACK_TOP: usize = 0x01400000;
+
+pub const COPY_OK: u64 = 0;
+pub const COPY_FAULT: u64 = 1;
+pub const COPY_RANGE_DENIED: u64 = 2;
+
+extern "sysv64" fn ocore_copy_from_user(
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64;
+extern "sysv64" fn ocore_copy_to_user(
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64;
 
 // Validate before every kernel dereference of a user-supplied range. The
 // subtraction form cannot wrap, unlike checking pointer + length.
@@ -18,12 +40,27 @@ pub fn readable_range_with_bounds(
         return false;
     }
     if length == 0 {
-        return pointer >= lower && pointer <= upper;
-    }
-    if pointer < lower || pointer >= upper {
+        if pointer >= USER_IMAGE_START && pointer <= USER_IMAGE_END {
+            return pointer >= lower && pointer <= upper;
+        }
+        if pointer >= USER_STACK_START && pointer <= USER_STACK_TOP {
+            return pointer >= lower && pointer <= upper;
+        }
         return false;
     }
-    return length <= upper - pointer;
+    if pointer >= USER_IMAGE_START && pointer < USER_IMAGE_END {
+        return pointer >= lower
+            && pointer < upper
+            && length <= USER_IMAGE_END - pointer
+            && length <= upper - pointer;
+    }
+    if pointer >= USER_STACK_START && pointer < USER_STACK_TOP {
+        return pointer >= lower
+            && pointer < upper
+            && length <= USER_STACK_TOP - pointer
+            && length <= upper - pointer;
+    }
+    return false;
 }
 
 pub fn readable_range(pointer: usize, length: usize) -> bool {
@@ -36,7 +73,7 @@ pub fn readable_range(pointer: usize, length: usize) -> bool {
 }
 
 pub fn valid_entry(entry: usize) -> bool {
-    return entry >= USER_IMAGE_START && entry < USER_IMAGE_END;
+    return entry >= USER_IMAGE_START && entry < USER_EXEC_END;
 }
 
 pub fn valid_stack_top(stack_top: usize) -> bool {
@@ -44,4 +81,38 @@ pub fn valid_stack_top(stack_top: usize) -> bool {
         return false;
     }
     return (stack_top & 0xf) == 0;
+}
+
+pub unsafe fn copy_from_user(
+    address_space_id: u64,
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64 {
+    if !allows(
+        address_space_id,
+        source as usize,
+        length,
+        VM_USER | VM_READ
+    ) {
+        return COPY_RANGE_DENIED;
+    }
+    return ocore_copy_from_user(destination, source, length);
+}
+
+pub unsafe fn copy_to_user(
+    address_space_id: u64,
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64 {
+    if !allows(
+        address_space_id,
+        destination as usize,
+        length,
+        VM_USER | VM_WRITE
+    ) {
+        return COPY_RANGE_DENIED;
+    }
+    return ocore_copy_to_user(destination, source, length);
 }

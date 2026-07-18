@@ -7,6 +7,15 @@ use runtime::capability::OBJECT_DEBUG;
 use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::RIGHT_DEBUG_WRITE;
 use runtime::capability::RIGHT_PAGE_ALLOC;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::address_space::allows;
+use runtime::address_space::install_bootstrap as install_address_space;
+use runtime::address_space::root_cr3;
+use runtime::address_space::VM_EXEC;
+use runtime::address_space::VM_READ;
+use runtime::address_space::VM_STACK;
+use runtime::address_space::VM_USER;
+use runtime::address_space::VM_WRITE;
 use runtime::domain::init as domains_init;
 use runtime::domain::DOMAIN_NATIVE_0;
 use runtime::interrupts::init as interrupts_init;
@@ -14,18 +23,35 @@ use runtime::pages::alloc_page;
 use runtime::pages::init as pages_init;
 use runtime::process::init as processes_init;
 use runtime::process::install as install_process;
-use runtime::process::set_current;
+use runtime::process::activate_bootstrap;
 use runtime::serial::init as serial_init;
 use runtime::serial::write;
-use runtime::user::ocore_user_entry;
+use runtime::scheduler::init as scheduler_init;
+use runtime::trap::configure_probe;
+use runtime::user::entry_for_probe;
+use runtime::user_memory::COPY_FAULT;
 use runtime::user_memory::valid_entry;
 use runtime::user_memory::valid_stack_top;
-use runtime::user_memory::USER_ADDRESS_END;
 use runtime::user_memory::USER_IMAGE_START;
+use runtime::user_memory::USER_STACK_GUARD_START;
+use runtime::user_memory::USER_STACK_START;
 use runtime::user_memory::USER_STACK_TOP;
 
 extern "sysv64" fn ocore_syscall_init() -> void;
 extern "sysv64" fn ocore_kernel_stack_top() -> usize;
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_boot_protection_check() -> u64;
+extern "sysv64" fn ocore_boot_probe_mode() -> u64;
+extern "sysv64" fn ocore_copy_from_user(
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64;
+extern "sysv64" fn ocore_copy_to_user(
+    destination: *mut u8,
+    source: *const u8,
+    length: usize
+) -> u64;
 extern "sysv64" fn ocore_enter_user(
     entry: usize,
     stack: usize,
@@ -35,6 +61,12 @@ extern "sysv64" fn ocore_enter_user(
 static START_MESSAGE: [u8; 29] = b"O-core kernel: serial online\n";
 static PAGE_MESSAGE: [u8; 23] = b"page allocator: online\n";
 static CAP_MESSAGE: [u8; 19] = b"capability: online\n";
+static ADDRESS_SPACE_MESSAGE: [u8; 22] = b"address space: online\n";
+static COPY_MESSAGE: [u8; 28] = b"user copy faults: recovered\n";
+static ENTRY_MESSAGE: [u8; 30] = b"entry state: CPU-local online\n";
+static PROBE_MESSAGE: [u8; 22] = b"M02 probe: armed CPL3\n";
+static PROTECTION_MESSAGE: [u8; 29] = b"page protections: W^X online\n";
+static mut COPY_PROBE: [u8; 8] = [0; 8];
 
 const NATIVE_CSPACE: usize = 0;
 
@@ -58,6 +90,10 @@ unsafe fn fail_closed() -> never {
 pub unsafe fn kernel_main(multiboot_info: usize) -> never {
     serial_init();
     write((&START_MESSAGE[0]), 29);
+    if ocore_boot_protection_check() != 1 {
+        fail_closed();
+    }
+    write((&PROTECTION_MESSAGE[0]), 29);
 
     // The bootstrap allocator stops below the dedicated user image at 16 MiB.
     // A later physical-memory manager will reserve arbitrary mapped regions.
@@ -71,10 +107,60 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         fail_closed();
     }
     processes_init();
+    scheduler_init();
     capabilities_init();
 
+    let active_cr3: usize = ocore_current_cr3();
+    let address_space_id: u64 = install_address_space(active_cr3);
+    if address_space_id == 0 || root_cr3(address_space_id) != active_cr3 {
+        fail_closed();
+    }
+    if !allows(
+        address_space_id,
+        USER_IMAGE_START,
+        1,
+        VM_USER | VM_READ | VM_EXEC
+    ) || allows(
+        address_space_id,
+        USER_IMAGE_START,
+        1,
+        VM_USER | VM_WRITE
+    ) || !allows(
+        address_space_id,
+        USER_STACK_START,
+        1,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    ) || allows(
+        address_space_id,
+        USER_STACK_START,
+        1,
+        VM_USER | VM_EXEC
+    ) || allows(
+        address_space_id,
+        USER_STACK_GUARD_START,
+        1,
+        VM_USER | VM_READ
+    ) || allows(
+        address_space_id,
+        0x011ffff8,
+        16,
+        VM_USER | VM_READ
+    ) || allows(
+        address_space_id,
+        USER_IMAGE_START,
+        0xffffffffffffffff,
+        VM_USER | VM_READ
+    ) {
+        fail_closed();
+    }
+    write((&ADDRESS_SPACE_MESSAGE[0]), 22);
+
     let kernel_stack_top: usize = ocore_kernel_stack_top();
-    let user_entry: usize = ocore_user_entry as usize;
+    let probe_mode: u64 = ocore_boot_probe_mode();
+    if configure_probe(probe_mode) == 0 {
+        fail_closed();
+    }
+    let user_entry: usize = entry_for_probe(probe_mode);
     if !valid_entry(user_entry) || !valid_stack_top(USER_STACK_TOP) {
         fail_closed();
     }
@@ -82,13 +168,11 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         0,
         1,
         DOMAIN_NATIVE_0,
-        1,
+        address_space_id,
         NATIVE_CSPACE,
         kernel_stack_top,
         user_entry,
-        USER_STACK_TOP,
-        USER_IMAGE_START,
-        USER_ADDRESS_END
+        USER_STACK_TOP
     ) == 0 {
         fail_closed();
     }
@@ -128,14 +212,14 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         3,
         4,
         OBJECT_DEBUG,
-        RIGHT_PAGE_ALLOC
+        RIGHT_TRANSFER
     );
     let wrong_type_capability: u64 = install_in_cspace(
         NATIVE_CSPACE,
         4,
         5,
         OBJECT_PAGE_POOL,
-        RIGHT_DEBUG_WRITE
+        RIGHT_PAGE_ALLOC
     );
     let close_probe_capability: u64 = install_in_cspace(
         NATIVE_CSPACE,
@@ -153,13 +237,37 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
     }
     // The process becomes current only after its immutable PCB and cspace are
     // complete, so no syscall can observe a partially initialized identity.
-    if set_current(0) == 0 {
+    if activate_bootstrap(0) == 0 {
+        fail_closed();
+    }
+    // A second activation would imply switching PCB/CSpace state without the
+    // matching CR3, TSS, and entry-stack transaction, so it must be rejected.
+    if activate_bootstrap(0) != 0 {
         fail_closed();
     }
     write((&CAP_MESSAGE[0]), 19);
 
     interrupts_init();
     ocore_syscall_init();
+
+    let copy_from_result: u64 = ocore_copy_from_user(
+        (&mut COPY_PROBE[0]),
+        USER_STACK_GUARD_START as *const u8,
+        1
+    );
+    let copy_to_result: u64 = ocore_copy_to_user(
+        USER_STACK_GUARD_START as *mut u8,
+        (&COPY_PROBE[0]),
+        1
+    );
+    if copy_from_result != COPY_FAULT || copy_to_result != COPY_FAULT {
+        fail_closed();
+    }
+    write((&COPY_MESSAGE[0]), 28);
+    write((&ENTRY_MESSAGE[0]), 30);
+    if probe_mode != 0 {
+        write((&PROBE_MESSAGE[0]), 22);
+    }
 
     ocore_enter_user(user_entry, USER_STACK_TOP, report_capability);
 }

@@ -2,15 +2,16 @@ module runtime::process;
 
 use runtime::domain::is_live as domain_is_live;
 use runtime::domain::personality_for;
-use runtime::user_memory::valid_entry;
-use runtime::user_memory::valid_stack_top;
-use runtime::user_memory::USER_ADDRESS_END;
-use runtime::user_memory::USER_IMAGE_START;
+use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::valid_entry;
+use runtime::address_space::valid_stack_top;
+use runtime::capability::valid_cspace_slot;
 
 pub const MAX_PROCESSES: usize = 4;
 const PROCESS_EMPTY: u8 = 0;
 const PROCESS_READY: u8 = 1;
 const PROCESS_RUNNING: u8 = 2;
+const PROCESS_FAULTED: u8 = 3;
 const NO_CURRENT_PROCESS: usize = MAX_PROCESSES;
 
 static mut PROCESS_IDS: [u64; 4] = [0; 4];
@@ -21,8 +22,10 @@ static mut CSPACE_IDS: [usize; 4] = [0; 4];
 static mut KERNEL_STACK_TOPS: [usize; 4] = [0; 4];
 static mut USER_ENTRIES: [usize; 4] = [0; 4];
 static mut USER_STACK_TOPS: [usize; 4] = [0; 4];
-static mut USER_LOWS: [usize; 4] = [0; 4];
-static mut USER_HIGHS: [usize; 4] = [0; 4];
+static mut FAULT_VECTORS: [u64; 4] = [0; 4];
+static mut FAULT_ERRORS: [u64; 4] = [0; 4];
+static mut FAULT_RIPS: [usize; 4] = [0; 4];
+static mut FAULT_ADDRESSES: [usize; 4] = [0; 4];
 static mut STATES: [u8; 4] = [0; 4];
 static mut CURRENT_PROCESS: usize = MAX_PROCESSES;
 
@@ -37,8 +40,10 @@ pub unsafe fn init() -> void {
         KERNEL_STACK_TOPS[slot] = 0;
         USER_ENTRIES[slot] = 0;
         USER_STACK_TOPS[slot] = 0;
-        USER_LOWS[slot] = 0;
-        USER_HIGHS[slot] = 0;
+        FAULT_VECTORS[slot] = 0;
+        FAULT_ERRORS[slot] = 0;
+        FAULT_RIPS[slot] = 0;
+        FAULT_ADDRESSES[slot] = 0;
         STATES[slot] = PROCESS_EMPTY;
         slot += 1;
     }
@@ -55,26 +60,19 @@ pub unsafe fn install(
     cspace_id: usize,
     kernel_stack_top: usize,
     user_entry: usize,
-    user_stack_top: usize,
-    user_low: usize,
-    user_high: usize
+    user_stack_top: usize
 ) -> u64 {
-    if slot >= MAX_PROCESSES || cspace_id >= MAX_PROCESSES {
+    if slot >= MAX_PROCESSES || !valid_cspace_slot(cspace_id) {
         return 0;
     }
     if process_id == 0 || address_space_id == 0 || kernel_stack_top == 0 {
         return 0;
     }
-    if !valid_entry(user_entry) || !valid_stack_top(user_stack_top) {
+    if !address_space_is_live(address_space_id) {
         return 0;
     }
-    if user_low < USER_IMAGE_START || user_high > USER_ADDRESS_END {
-        return 0;
-    }
-    if user_low >= user_high || user_entry < user_low || user_entry >= user_high {
-        return 0;
-    }
-    if user_stack_top <= user_low || user_stack_top > user_high {
+    if !valid_entry(address_space_id, user_entry)
+        || !valid_stack_top(address_space_id, user_stack_top) {
         return 0;
     }
     if STATES[slot] != PROCESS_EMPTY || !domain_is_live(domain_id) {
@@ -83,6 +81,9 @@ pub unsafe fn install(
     let mut other: usize = 0;
     while other < MAX_PROCESSES {
         if STATES[other] != PROCESS_EMPTY {
+            if PROCESS_IDS[other] == process_id {
+                return 0;
+            }
             if CSPACE_IDS[other] == cspace_id {
                 return 0;
             }
@@ -104,25 +105,48 @@ pub unsafe fn install(
     KERNEL_STACK_TOPS[slot] = kernel_stack_top;
     USER_ENTRIES[slot] = user_entry;
     USER_STACK_TOPS[slot] = user_stack_top;
-    USER_LOWS[slot] = user_low;
-    USER_HIGHS[slot] = user_high;
     // Publish readiness only after every immutable PCB field is committed.
     STATES[slot] = PROCESS_READY;
     return process_id;
 }
 
-pub unsafe fn set_current(slot: usize) -> u64 {
-    if slot >= MAX_PROCESSES || STATES[slot] == PROCESS_EMPTY {
+// The bootstrap may activate exactly one READY process. Switching requires an
+// architecture transaction that also updates CR3, TSS.RSP0, entry stack, and
+// CSpace, so no public context-switch-like operation exists yet.
+pub unsafe fn activate_bootstrap(slot: usize) -> u64 {
+    if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_READY {
         return 0;
     }
-    if CURRENT_PROCESS < MAX_PROCESSES {
-        if CURRENT_PROCESS != slot && STATES[CURRENT_PROCESS] == PROCESS_RUNNING {
-            STATES[CURRENT_PROCESS] = PROCESS_READY;
-        }
+    if CURRENT_PROCESS != NO_CURRENT_PROCESS {
+        return 0;
     }
     CURRENT_PROCESS = slot;
     STATES[slot] = PROCESS_RUNNING;
     return PROCESS_IDS[slot];
+}
+
+pub unsafe fn fault_current(
+    vector: u64,
+    error: u64,
+    rip: usize,
+    address: usize
+) -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    let process_id: u64 = PROCESS_IDS[slot];
+    FAULT_VECTORS[slot] = vector;
+    FAULT_ERRORS[slot] = error;
+    FAULT_RIPS[slot] = rip;
+    FAULT_ADDRESSES[slot] = address;
+    STATES[slot] = PROCESS_FAULTED;
+    CURRENT_PROCESS = NO_CURRENT_PROCESS;
+    return process_id;
+}
+
+pub unsafe fn is_faulted(slot: usize) -> bool {
+    return slot < MAX_PROCESSES && STATES[slot] == PROCESS_FAULTED;
 }
 
 pub unsafe fn current_slot() -> usize {
@@ -197,20 +221,4 @@ pub unsafe fn current_user_stack_top() -> usize {
         return 0;
     }
     return USER_STACK_TOPS[slot];
-}
-
-pub unsafe fn current_user_low() -> usize {
-    let slot: usize = current_slot();
-    if slot >= MAX_PROCESSES {
-        return 0;
-    }
-    return USER_LOWS[slot];
-}
-
-pub unsafe fn current_user_high() -> usize {
-    let slot: usize = current_slot();
-    if slot >= MAX_PROCESSES {
-        return 0;
-    }
-    return USER_HIGHS[slot];
 }

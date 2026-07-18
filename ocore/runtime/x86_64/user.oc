@@ -1,13 +1,18 @@
 module runtime::user;
 
 use kernel::main::OCORE_KERNEL_ONLY_MARKER;
-use runtime::syscall::ERR_CAPABILITY_DENIED;
-use runtime::syscall::ERR_UNKNOWN_SYSCALL;
-use runtime::syscall::ERR_USER_POINTER_DENIED;
-use runtime::syscall::SYS_CAP_CLOSE;
-use runtime::syscall::SYS_DEBUG_WRITE;
-use runtime::syscall::SYS_TICKS;
-use runtime::syscall::SYS_YIELD;
+use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
+use runtime::native_abi::ERR_CAPABILITY_DENIED;
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_UNKNOWN_SYSCALL;
+use runtime::native_abi::ERR_USER_POINTER_DENIED;
+use runtime::native_abi::ERR_USER_COPY_FAULT;
+use runtime::native_abi::SYS_CAP_CLOSE;
+use runtime::native_abi::SYS_CAP_COPY;
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_PAGE_ALLOC;
+use runtime::native_abi::SYS_TICKS;
+use runtime::native_abi::SYS_YIELD;
 
 const FORGED_DEBUG_HANDLE: u64 = 0x0000000200000001;
 const STALE_DEBUG_HANDLE: u64 = 0x0000000100000002;
@@ -52,6 +57,57 @@ static TIMER_RETURN_MESSAGE: [u8; 26] = b"timer CPL3 return: online\n";
 static YIELD_MESSAGE: [u8; 19] = b"yield hook: online\n";
 @link_section(".rodata.user")
 static HEARTBEAT_MESSAGE: [u8; 23] = b"CPL3 heartbeat: online\n";
+@link_section(".rodata.user")
+static REGISTER_MESSAGE: [u8; 30] = b"register preservation: online\n";
+@link_section(".rodata.user")
+static RESERVED_MESSAGE: [u8; 26] = b"reserved syscalls: denied\n";
+@link_section(".rodata.user")
+static OVERSIZED_MESSAGE: [u8; 25] = b"oversized buffer: denied\n";
+@link_section(".rodata.user")
+static COPY_SYSCALL_MESSAGE: [u8; 29] = b"user copy syscall: recovered\n";
+@link_section(".rodata.user")
+static COPY_HEARTBEAT_MESSAGE: [u8; 29] = b"copy-fault heartbeat: online\n";
+
+extern "sysv64" fn ocore_user_register_probe() -> u64;
+extern "sysv64" fn ocore_user_probe_divide(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_invalid_opcode(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_nonpresent(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_supervisor(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_guard_stack(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_nx(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_noncanonical(capability: u64) -> never;
+extern "sysv64" fn ocore_user_probe_bad_return(capability: u64) -> never;
+
+pub fn entry_for_probe(mode: u64) -> usize {
+    if mode == 1 {
+        return ocore_user_probe_divide as usize;
+    }
+    if mode == 2 {
+        return ocore_user_probe_invalid_opcode as usize;
+    }
+    if mode == 3 {
+        return ocore_user_probe_nonpresent as usize;
+    }
+    if mode == 4 {
+        return ocore_user_probe_supervisor as usize;
+    }
+    if mode == 5 {
+        return ocore_user_probe_guard_stack as usize;
+    }
+    if mode == 6 {
+        return ocore_user_probe_nx as usize;
+    }
+    if mode == 7 {
+        return ocore_user_probe_noncanonical as usize;
+    }
+    if mode == 8 {
+        return ocore_user_probe_bad_return as usize;
+    }
+    if mode == 9 {
+        return ocore_user_copy_fault_probe as usize;
+    }
+    return ocore_user_entry as usize;
+}
 
 @link_section(".text.user")
 unsafe fn stop() -> never {
@@ -78,6 +134,34 @@ unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
     }
 }
 
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_user_copy_fault_probe(report_capability: u64) -> never {
+    let copy_result: u64 = debug_write(
+        report_capability,
+        0x011ffff0,
+        1
+    );
+    if copy_result != ERR_USER_COPY_FAULT {
+        stop();
+    }
+    emit(report_capability, (&COPY_SYSCALL_MESSAGE[0]), 29);
+
+    let tick_before: u64 = syscall0(SYS_TICKS);
+    let mut tick_after: u64 = tick_before;
+    while tick_after == tick_before {
+        tick_after = syscall0(SYS_TICKS);
+    }
+    emit(report_capability, (&COPY_HEARTBEAT_MESSAGE[0]), 29);
+
+    loop {
+        if syscall0(SYS_YIELD) != 0 {
+            stop();
+        }
+    }
+}
+
 // This is the only first-process entrypoint. Its code and every referenced
 // byte string live in the dedicated user image mapping.
 @export
@@ -95,8 +179,11 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
     }
 
     let image_tail: u64 = volatile_load(0x011ffff0 as *const u64);
-    let stack_bottom: u64 = volatile_load(0x01200000 as *const u64);
+    let stack_bottom: u64 = volatile_load(0x01201000 as *const u64);
     if image_tail != 0 || stack_bottom != 0 {
+        stop();
+    }
+    if ocore_user_register_probe() != 1 {
         stop();
     }
 
@@ -191,6 +278,20 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
     if unknown_result != ERR_UNKNOWN_SYSCALL {
         stop();
     }
+    let reserved_copy_result: u64 = syscall0(SYS_CAP_COPY);
+    let reserved_page_result: u64 = syscall0(SYS_PAGE_ALLOC);
+    if reserved_copy_result != ERR_NOT_IMPLEMENTED
+        || reserved_page_result != ERR_NOT_IMPLEMENTED {
+        stop();
+    }
+    let oversized_result: u64 = debug_write(
+        report_capability,
+        (&CPL3_MESSAGE[0]) as usize,
+        257
+    );
+    if oversized_result != ERR_BUFFER_TOO_LARGE {
+        stop();
+    }
 
     // NT is writable by CPL3 but invalid on the kernel's eventual IRETQ path.
     // A successful syscall return proves IA32_FMASK removed it on entry and
@@ -233,6 +334,9 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
     emit(report_capability, (&USER_RANGES_DENIED_MESSAGE[0]), 20);
     emit(report_capability, (&KERNEL_DENIED_MESSAGE[0]), 23);
     emit(report_capability, (&UNKNOWN_DENIED_MESSAGE[0]), 24);
+    emit(report_capability, (&REGISTER_MESSAGE[0]), 30);
+    emit(report_capability, (&RESERVED_MESSAGE[0]), 26);
+    emit(report_capability, (&OVERSIZED_MESSAGE[0]), 25);
     emit(report_capability, (&RFLAGS_MESSAGE[0]), 28);
     emit(report_capability, (&TIMER_RETURN_MESSAGE[0]), 26);
     emit(report_capability, (&YIELD_MESSAGE[0]), 19);

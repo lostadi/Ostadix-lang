@@ -4,29 +4,39 @@ use runtime::capability::close_in_cspace;
 use runtime::capability::validate_in_cspace;
 use runtime::capability::OBJECT_DEBUG;
 use runtime::capability::RIGHT_DEBUG_WRITE;
-use runtime::personality::PERSONALITY_NATIVE_0;
+use runtime::capability::MAX_CSPACES;
+use runtime::address_space::allows;
+use runtime::address_space::VM_READ;
+use runtime::address_space::VM_USER;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::native_abi::DEBUG_BUFFER_SIZE;
+use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
+use runtime::native_abi::ERR_CAPABILITY_DENIED;
+use runtime::native_abi::ERR_NO_CURRENT_PROCESS;
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_UNKNOWN_PERSONALITY;
+use runtime::native_abi::ERR_UNKNOWN_SYSCALL;
+use runtime::native_abi::ERR_USER_COPY_FAULT;
+use runtime::native_abi::ERR_USER_POINTER_DENIED;
+use runtime::native_abi::SYS_CAP_CLOSE;
+use runtime::native_abi::SYS_CAP_COPY;
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_PAGE_ALLOC;
+use runtime::native_abi::SYS_TICKS;
+use runtime::native_abi::SYS_YIELD;
 use runtime::interrupts::ticks;
 use runtime::process::current_cspace_id;
+use runtime::process::current_address_space_id;
 use runtime::process::current_personality_id;
 use runtime::process::current_slot;
-use runtime::process::current_user_high;
-use runtime::process::current_user_low;
 use runtime::process::MAX_PROCESSES;
 use runtime::serial::write;
-use runtime::user_memory::readable_range_with_bounds;
+use runtime::scheduler::request_yield;
+use runtime::user_memory::copy_from_user;
+use runtime::user_memory::COPY_OK;
+use runtime::user_memory::COPY_RANGE_DENIED;
 
-pub const SYS_DEBUG_WRITE: u64 = 0;
-pub const SYS_CAP_CLOSE: u64 = 1;
-pub const SYS_CAP_COPY: u64 = 2;
-pub const SYS_PAGE_ALLOC: u64 = 3;
-pub const SYS_YIELD: u64 = 4;
-pub const SYS_TICKS: u64 = 5;
-
-pub const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
-pub const ERR_USER_POINTER_DENIED: u64 = 0xffff_ffff_ffff_fff2;
-pub const ERR_UNKNOWN_SYSCALL: u64 = 0xffff_ffff_ffff_fff3;
-pub const ERR_UNKNOWN_PERSONALITY: u64 = 0xffff_ffff_ffff_fff4;
-pub const ERR_NO_CURRENT_PROCESS: u64 = 0xffff_ffff_ffff_fff5;
+static mut DEBUG_BUFFER: [u8; 256] = [0; 256];
 
 unsafe fn dispatch_native_0(
     cspace_id: usize,
@@ -48,17 +58,31 @@ unsafe fn dispatch_native_0(
         if object == 0 {
             return ERR_CAPABILITY_DENIED;
         }
-        let user_low: usize = current_user_low();
-        let user_high: usize = current_user_high();
-        if !readable_range_with_bounds(
+        let address_space_id: u64 = current_address_space_id();
+        if !allows(
+            address_space_id,
             arg0 as usize,
             arg1 as usize,
-            user_low,
-            user_high
+            VM_USER | VM_READ
         ) {
             return ERR_USER_POINTER_DENIED;
         }
-        write(arg0 as *const u8, arg1 as usize);
+        if arg1 > DEBUG_BUFFER_SIZE as u64 {
+            return ERR_BUFFER_TOO_LARGE;
+        }
+        let copied: u64 = copy_from_user(
+            address_space_id,
+            (&mut DEBUG_BUFFER[0]),
+            arg0 as *const u8,
+            arg1 as usize
+        );
+        if copied == COPY_RANGE_DENIED {
+            return ERR_USER_POINTER_DENIED;
+        }
+        if copied != COPY_OK {
+            return ERR_USER_COPY_FAULT;
+        }
+        write((&DEBUG_BUFFER[0]), arg1 as usize);
         return arg1;
     }
     if number == SYS_CAP_CLOSE {
@@ -67,10 +91,11 @@ unsafe fn dispatch_native_0(
         }
         return 1;
     }
+    if number == SYS_CAP_COPY || number == SYS_PAGE_ALLOC {
+        return ERR_NOT_IMPLEMENTED;
+    }
     if number == SYS_YIELD {
-        // This is the stable scheduler hook. Milestone 0.1 has no alternate
-        // runnable process, so accepting the request returns immediately.
-        return 0;
+        return request_yield();
     }
     if number == SYS_TICKS {
         return ticks();
@@ -96,11 +121,11 @@ pub unsafe fn kernel_syscall_dispatch(
         return ERR_NO_CURRENT_PROCESS;
     }
     let cspace_id: usize = current_cspace_id();
-    if cspace_id >= MAX_PROCESSES {
+    if cspace_id >= MAX_CSPACES {
         return ERR_NO_CURRENT_PROCESS;
     }
     let personality_id: u64 = current_personality_id();
-    if personality_id == PERSONALITY_NATIVE_0 {
+    if personality_id == PERSONALITY_NATIVE {
         return dispatch_native_0(
             cspace_id,
             number,

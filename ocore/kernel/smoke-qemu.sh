@@ -39,8 +39,12 @@ except subprocess.TimeoutExpired as timeout:
 
 expected = [
     "O-core kernel: serial online\n",
+    "page protections: W^X online\n",
     "page allocator: online\n",
+    "address space: online\n",
     "capability: online\n",
+    "user copy faults: recovered\n",
+    "entry state: CPU-local online\n",
     "CPL3 native[0]: online\n",
     "user zero-fill: online\n",
     "capability bounds: denied\n",
@@ -52,6 +56,9 @@ expected = [
     "user ranges: denied\n",
     "kernel pointer: denied\n",
     "unknown syscall: denied\n",
+    "register preservation: online\n",
+    "reserved syscalls: denied\n",
+    "oversized buffer: denied\n",
     "RFLAGS sanitization: online\n",
     "timer CPL3 return: online\n",
     "yield hook: online\n",
@@ -76,8 +83,10 @@ if not timer_line < return_line < heartbeat_line:
     print("stderr:", error, file=sys.stderr)
     raise SystemExit(1)
 
-if "LEAKED" in output:
-    print("QEMU smoke failed; a denied payload reached serial output", file=sys.stderr)
+for forbidden in ("LEAKED", "M02 KERNEL FAULT", "M02 unexpected fault"):
+    if forbidden not in output:
+        continue
+    print(f"QEMU smoke failed; forbidden marker reached output: {forbidden}", file=sys.stderr)
     print("stdout:", output, file=sys.stderr)
     print("stderr:", error, file=sys.stderr)
     raise SystemExit(1)

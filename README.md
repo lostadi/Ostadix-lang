@@ -253,17 +253,22 @@ target/debug/ocorec ocore/examples/minimal.oc --emit obj -o target/minimal.o
 # Build the included freestanding kernel.
 ./ocore/kernel/build.sh
 
-# Boot interactively or run the asserted smoke test.
+# Boot interactively or run the asserted normal and fault smoke tests.
 ./ocore/kernel/run-qemu.sh
 ./ocore/kernel/smoke-qemu.sh
+./ocore/kernel/smoke-faults-qemu.sh
 ```
 
 The asserted serial output is:
 
 ```text
 O-core kernel: serial online
+page protections: W^X online
 page allocator: online
+address space: online
 capability: online
+user copy faults: recovered
+entry state: CPU-local online
 T
 CPL3 native[0]: online
 user zero-fill: online
@@ -276,6 +281,9 @@ closed capability: denied
 user ranges: denied
 kernel pointer: denied
 unknown syscall: denied
+register preservation: online
+reserved syscalls: denied
+oversized buffer: denied
 RFLAGS sanitization: online
 timer CPL3 return: online
 yield hook: online
@@ -288,6 +296,16 @@ PIT are installed. The smoke gate requires that standalone timer line before a
 post-interrupt CPL3 return marker and a later CPL3 heartbeat. The remaining
 markers are emitted by the CPL3 task through the architectural syscall path.
 None are printed by the host harness.
+
+The fault gate performs eight fresh QEMU boots. It covers divide error, invalid
+opcode, canonical non-present and supervisor reads, a stack-guard write, NX
+instruction fetch, a noncanonical target, and an excluded syscall-return RIP.
+Each run must mark the only process `FAULTED`, clear the current process, and
+reach a later kernel timer marker. This proves controlled fault disposition and
+continued kernel execution, not survival of an isolated sibling process.
+It also performs a ninth boot with a deliberate leaf-page hole, requires
+`ERR_USER_COPY_FAULT`, and observes a later CPL3 heartbeat without faulting the
+process.
 
 ### Docker
 
@@ -1861,7 +1879,7 @@ The included kernel proves the native path end to end:
 ```text
 Multiboot2 or Xen PVH entry
     -> 32-bit bootstrap
-    -> identity page tables
+    -> bounded bootstrap page tables with kernel W^X
     -> long mode
     -> O-core kernel_main
     -> COM1 serial initialization
@@ -1869,35 +1887,43 @@ Multiboot2 or Xen PVH entry
     -> native[0] domain, PCB, and cspace installation
     -> user/supervisor page split and 64-bit TSS
     -> IDT, PIC, PIT, and SYSCALL MSR setup
+    -> guarded copy-fault recovery and normalized trap frames
     -> CPL3 O-core task
     -> personality-routed capability syscall
     -> user-range and authority denial probes
     -> IRQ0 ring transition and iretq
+    -> fresh-boot CPL3 fault-containment matrix
 ```
 
-The bootstrap assembly builds the initial P4, P3, and P2 page tables, enables
-PAE, NX, supervisor write protection, and long mode, loads a 64-bit GDT and
-TSS, aligns the stack, and calls the O-core `kernel_main`. Kernel mappings stay
-supervisor-only. The linker places one read-only executable user image at
-16 MiB and gives it an adjacent writable NX stack mapping. Separate ELF
-`PT_LOAD` entries reserve the complete two-page ranges and zero-fill bytes not
-present in the linked user payload; the bootstrap page allocator stops below
-those reserved pages.
+The bootstrap assembly builds the initial P4, P3, P2, and 4 KiB leaf tables;
+enables PAE, NX, supervisor write protection, and long mode; loads a 64-bit GDT
+and TSS; and calls the O-core `kernel_main`. Kernel metadata and read-only data
+are R/NX, text is RX, and mutable state is RW/NX. Mappings stop after the
+required 20 MiB bootstrap window. The linker places one user image at 16 MiB
+and an adjacent writable NX stack with a non-present lower guard page. Separate
+ELF `PT_LOAD` entries reserve and zero-fill the image and mapped stack pages;
+the bootstrap page allocator stops below them.
 
 The runtime modules provide:
 
 - COM1 initialization and polled serial writes.
 - A 4 KiB physical-frame bump allocator with an explicit range.
-- A packed 256-entry IDT and IDTR.
+- A packed 256-entry IDT and IDTR with normalized assembly stubs for vectors
+  0 through 31.
 - 8259 PIC remapping and IRQ masks.
 - 8253/8254 PIT programming.
 - A compiler-generated interrupt handler that atomically increments ticks,
   acknowledges the PIC, and returns with `iretq`.
-- A kernel-owned domain and PCB registry with immutable native personality,
-  address-space, cspace, entry, stack, and readable-range identity.
+- A kernel-owned domain and PCB registry with reusable native personality,
+  versioned ABI, one-shot bootstrap activation, and a concrete live-CR3
+  address-space descriptor.
 - Object-typed, generation-tagged process cspaces with occupied-slot checks.
-- An architectural `SYSCALL` entry that immediately leaves the user stack,
-  validates return state, and routes through the current PCB's personality.
+- An architectural `SYSCALL` entry that uses `SWAPGS` CPU-local state,
+  immediately leaves the user stack, preserves tested GPRs, validates return
+  state, and routes through the current PCB's personality.
+- Guarded kernel and user stacks, a dedicated double-fault IST, and exact
+  page-fault fixups for `copy_from_user` and `copy_to_user`.
+- A 256-byte kernel bounce buffer for capability-gated debug output.
 - Checked `debug_write` and `cap_close` operations, a future-scheduler `yield`
   hook, and a diagnostic tick counter used by the privilege-return proof.
 
@@ -1923,8 +1949,8 @@ The initial syscall number contract is:
 |-------:|-----------|
 | 0 | `debug_write(cap, ptr, len)` |
 | 1 | `cap_close(cap)` |
-| 2 | `cap_copy(dst_process, cap, rights)` |
-| 3 | `page_alloc(memory_cap, count, flags)` |
+| 2 | reserved `cap_copy`; returns `ERR_NOT_IMPLEMENTED` |
+| 3 | reserved `page_alloc`; returns `ERR_NOT_IMPLEMENTED` |
 | 4 | `yield()` |
 | 5 | `ticks()` |
 
@@ -1932,19 +1958,22 @@ The exported `kernel_syscall_dispatch` implements checked debug output,
 capability close, the yield hook, and diagnostic ticks today. The generic entry
 reads the current PCB's personality rather than accepting one from the caller.
 Native `debug_write` validates slot bounds, occupancy, object type, generation,
-`RIGHT_DEBUG_WRITE`, and a subtraction-based complete user range before
-touching the serial object. `cap_copy` and `page_alloc` remain reserved syscall
-numbers, not implemented operations. There is no scheduler yet, so `yield`
-exercises only the stable syscall hook and returns when no alternative task
-can run.
+`RIGHT_DEBUG_WRITE`, and one concrete readable address-space region before an
+exact-fixup copy into the bounded kernel buffer. The serial driver never
+receives the raw user pointer. `cap_copy` and `page_alloc` remain reserved
+syscall numbers, not implemented operations. There is no scheduler yet, so
+`yield` increments only the stable hook's request counter and returns when no
+alternative task can run.
 
 On the hosted side, `CapabilityBroker<T>` binds a 256-bit per-session bearer
 identity from the operating system CSPRNG to a kernel-issued handle,
-capability kind, and rights. Before invoking its `KernelSyscallTransport`, the
-broker verifies that the identity belongs to the live session and that the
-kind and rights match. A guessed, deserialized, forged, revoked, or
-cross-session identity never becomes a kernel handle. Serialized metadata is
-descriptive and cannot add rights or choose a kernel slot.
+capability kind, and rights. Its operation-specific methods fix the syscall,
+kind, required rights, and argument layout before invoking a
+`KernelSyscallTransport`. Callers cannot ask a generic authorization method to
+understate policy. A guessed, deserialized, forged, forgotten, or cross-session
+identity never becomes a kernel handle. A kernel close removes its hosted
+bearer only after confirmed success. Serialized metadata is descriptive and
+cannot add rights or choose a kernel slot.
 
 The threat boundary is explicit. The broker prevents identity guessing,
 metadata-based escalation, stale token use, revocation bypass, and
@@ -2210,11 +2239,13 @@ features that are already present:
   bump allocator. One statically linked process has protected user mappings,
   but independent per-process page tables and frame reclamation are absent.
 - The kernel runs one O-core-native CPL3 task through a real x86_64 `SYSCALL`
-  entry and kernel-owned domain/personality route. It does not yet provide an
-  executable loader, preemptive scheduler, IPC, capability transfer, Linux ABI,
-  foreign root filesystem, or nested-kernel mode. The hosted capability bridge
-  remains a tested transport boundary, not a live connection to this QEMU
-  kernel.
+  entry and kernel-owned domain/personality route. Expected fatal probes place
+  that PCB in `FAULTED`, clear the current process, and leave the kernel timer
+  alive. With no sibling process or second CR3, this is not yet cross-process
+  isolation. The kernel does not provide an executable loader, preemptive
+  scheduler, IPC, capability transfer, Linux ABI, foreign root filesystem, or
+  nested-kernel mode. The hosted capability bridge remains a tested transport
+  boundary, not a live connection to this QEMU kernel.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and

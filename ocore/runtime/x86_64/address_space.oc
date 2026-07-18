@@ -1,0 +1,130 @@
+module runtime::address_space;
+
+pub const VM_USER: u64 = 1;
+pub const VM_READ: u64 = 2;
+pub const VM_WRITE: u64 = 4;
+pub const VM_EXEC: u64 = 8;
+pub const VM_STACK: u64 = 16;
+
+const MAX_REGIONS: usize = 4;
+const BOOTSTRAP_ADDRESS_SPACE: u64 = 1;
+const PAGE_SIZE: usize = 4096;
+
+static mut LIVE: u8 = 0;
+static mut ROOT_CR3: usize = 0;
+static mut REGION_STARTS: [usize; 4] = [0; 4];
+static mut REGION_ENDS: [usize; 4] = [0; 4];
+static mut REGION_FLAGS: [u64; 4] = [0; 4];
+static mut REGION_COUNT: usize = 0;
+
+unsafe fn add_region(start: usize, end: usize, flags: u64) -> u64 {
+    if REGION_COUNT >= MAX_REGIONS || start >= end {
+        return 0;
+    }
+    if (start & (PAGE_SIZE - 1)) != 0 || (end & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    if (flags & VM_USER) == 0 || (flags & VM_READ) == 0 {
+        return 0;
+    }
+    if (flags & VM_WRITE) != 0 && (flags & VM_EXEC) != 0 {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < REGION_COUNT {
+        if start < REGION_ENDS[index] && end > REGION_STARTS[index] {
+            return 0;
+        }
+        index += 1;
+    }
+    REGION_STARTS[REGION_COUNT] = start;
+    REGION_ENDS[REGION_COUNT] = end;
+    REGION_FLAGS[REGION_COUNT] = flags;
+    REGION_COUNT += 1;
+    return 1;
+}
+
+// Register the one page table that is already active. This is deliberately not
+// a general create/map API: later milestones must make page-table edits and
+// frame ownership transactional before those operations become public.
+pub unsafe fn install_bootstrap(root: usize) -> u64 {
+    if LIVE != 0 || root == 0 || (root & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    ROOT_CR3 = root;
+    REGION_COUNT = 0;
+    if add_region(0x01000000, 0x01010000, VM_USER | VM_READ | VM_EXEC) == 0 {
+        return 0;
+    }
+    if add_region(0x01010000, 0x01200000, VM_USER | VM_READ) == 0 {
+        return 0;
+    }
+    if add_region(
+        0x01201000,
+        0x01400000,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    ) == 0 {
+        return 0;
+    }
+    LIVE = 1;
+    return BOOTSTRAP_ADDRESS_SPACE;
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    return LIVE != 0 && handle == BOOTSTRAP_ADDRESS_SPACE;
+}
+
+pub unsafe fn root_cr3(handle: u64) -> usize {
+    if !is_live(handle) {
+        return 0;
+    }
+    return ROOT_CR3;
+}
+
+// A non-empty access must fit wholly inside one concrete region. This rejects
+// wrapping arithmetic, the unmapped stack guard, and cross-region ranges.
+pub unsafe fn allows(
+    handle: u64,
+    pointer: usize,
+    length: usize,
+    required: u64
+) -> bool {
+    if !is_live(handle) || required == 0 {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < REGION_COUNT {
+        let start: usize = REGION_STARTS[index];
+        let end: usize = REGION_ENDS[index];
+        let flags: u64 = REGION_FLAGS[index];
+        if (flags & required) == required {
+            if length == 0 {
+                if pointer >= start && pointer <= end {
+                    return true;
+                }
+            } else if pointer >= start && pointer < end {
+                if length <= end - pointer {
+                    return true;
+                }
+            }
+        }
+        index += 1;
+    }
+    return false;
+}
+
+pub unsafe fn valid_entry(handle: u64, entry: usize) -> bool {
+    return allows(handle, entry, 1, VM_USER | VM_READ | VM_EXEC);
+}
+
+pub unsafe fn valid_stack_top(handle: u64, top: usize) -> bool {
+    if top == 0 || (top & 0xf) != 0 {
+        return false;
+    }
+    return allows(
+        handle,
+        top - 1,
+        1,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    );
+}

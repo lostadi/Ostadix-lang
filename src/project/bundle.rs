@@ -113,9 +113,7 @@ fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
         }
     }
 
-    let mut resolved = cursor
-        .canonicalize()
-        .unwrap_or_else(|_| normalize(cursor));
+    let mut resolved = cursor.canonicalize().unwrap_or_else(|_| normalize(cursor));
     for component in tail.iter().rev() {
         resolved.push(component);
     }
@@ -296,8 +294,7 @@ fn is_generated_olink_document(bytes: &[u8]) -> bool {
         .strip_prefix(b"#!/usr/bin/env o\r\n")
         .or_else(|| bytes.strip_prefix(b"#!/usr/bin/env o\n"))
         .unwrap_or(bytes);
-    body.starts_with(b"# Linked by o-link")
-        || body.starts_with(b"# Ostadix-lang lifted project")
+    body.starts_with(b"# Linked by o-link") || body.starts_with(b"# Ostadix-lang lifted project")
 }
 
 fn capture_symlink(root: &Path, path: &Path, out: &mut Vec<ProjectFile>) -> Result<()> {

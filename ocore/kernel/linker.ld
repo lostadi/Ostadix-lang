@@ -18,6 +18,7 @@ SECTIONS
 {
   . = 1M;
 
+  __kernel_meta_start = .;
   .multiboot : ALIGN(8) {
     KEEP(*(.multiboot))
   } :kernel_meta
@@ -25,17 +26,26 @@ SECTIONS
   .note.Xen : ALIGN(4) {
     KEEP(*(.note.Xen))
   } :kernel_meta :xen_note
+  . = ALIGN(4K);
+  __kernel_meta_end = .;
 
+  __kernel_text_start = .;
   .text : ALIGN(4K) {
     *(.text.boot)
     *(.text.kernel)
     *(.text)
   } :kernel_text
+  . = ALIGN(4K);
+  __kernel_text_end = .;
 
+  __kernel_rodata_start = .;
   .rodata : ALIGN(4K) {
     *(.rodata)
   } :kernel_rodata
+  . = ALIGN(4K);
+  __kernel_rodata_end = .;
 
+  __kernel_data_start = .;
   .data : ALIGN(4K) {
     *(.data)
   } :kernel_data
@@ -45,6 +55,8 @@ SECTIONS
     *(.bss)
   } :kernel_data
 
+  . = ALIGN(4K);
+  __kernel_data_end = .;
   __kernel_end = .;
 
   /*
@@ -58,27 +70,37 @@ SECTIONS
     __user_text_start = .;
     KEEP(*(.text.user))
     KEEP(*(.rodata.user))
-    __user_text_end = .;
+    __user_payload_end = .;
+  } :user_text
+
+  /* Test-only architectural SYSCALL at the end of the permitted return-RIP
+   * interval. Its two-byte instruction leaves RCX at the first excluded byte. */
+  .user_return_edge 0x0100fffe : {
+    KEEP(*(.text.user.return_edge))
+    __user_exec_end = .;
   } :user_text
 
   /* Extend the RX PT_LOAD's memory size across the full huge page so the ELF
    * loader reserves and zeros every byte that CPL3 may read. NOLOAD keeps
    * those zeros out of the kernel file. */
-  .user_text_zero __user_text_end (NOLOAD) : {
-    . += 0x01200000 - __user_text_end;
+  .user_text_zero __user_exec_end (NOLOAD) : {
+    . += 0x01200000 - __user_exec_end;
   } :user_text
 
-  /* Represent the complete RW/NX stack as its own zero-fill PT_LOAD. */
-  .user_stack 0x01200000 (NOLOAD) : {
+  /* Leave the first 4 KiB non-present as the user-stack guard. The remaining
+   * pages are represented by an RW PT_LOAD and mapped NX by bootstrap PTEs. */
+  __user_stack_guard_start = 0x01200000;
+  __user_stack_guard_end = 0x01201000;
+  .user_stack 0x01201000 (NOLOAD) : {
     __user_stack_bottom = .;
-    . += 0x00200000;
+    . += 0x001ff000;
     __user_stack_top = .;
   } :user_stack
 
-  ASSERT(__kernel_end <= 0x00400000,
-         "O-core kernel overlaps the bootstrap page allocator")
-  ASSERT(__user_text_end <= 0x01200000,
-         "O-core user image exceeds its dedicated 2 MiB mapping")
+  ASSERT(__kernel_end <= 0x00200000,
+         "O-core bootstrap kernel exceeds its 4 KiB page table")
+  ASSERT(__user_payload_end <= 0x0100fffe,
+         "O-core user payload overlaps the syscall-return edge probe")
 
   /DISCARD/ : {
     *(.comment)

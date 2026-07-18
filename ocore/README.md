@@ -45,14 +45,19 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/build.sh       # build target/ocore-kernel/kernel.elf
 ./ocore/kernel/run-qemu.sh    # interactive serial console
 ./ocore/kernel/smoke-qemu.sh  # four-second asserted smoke test
+./ocore/kernel/smoke-faults-qemu.sh # fault and user-copy recovery matrix
 ```
 
 The asserted output is:
 
 ```text
 O-core kernel: serial online
+page protections: W^X online
 page allocator: online
+address space: online
 capability: online
+user copy faults: recovered
+entry state: CPU-local online
 T
 CPL3 native[0]: online
 user zero-fill: online
@@ -65,6 +70,9 @@ closed capability: denied
 user ranges: denied
 kernel pointer: denied
 unknown syscall: denied
+register preservation: online
+reserved syscalls: denied
+oversized buffer: denied
 RFLAGS sanitization: online
 timer CPL3 return: online
 yield hook: online
@@ -80,13 +88,27 @@ later markers proves the TSS ring-0 transition and `iretq` return.
 The capability runtime uses object-typed, generation-tagged slots selected by
 the current process's kernel-owned cspace identity. Syscall handles do not
 expose kernel pointers, and `kernel_syscall_dispatch` validates object type,
-generation, rights, and the current PCB's complete user range before
-dispatching `debug_write`. The CPL3 probe covers bounds, occupancy, wrong
+generation, rights, and the current PCB's concrete readable region before
+copying into a kernel buffer for `debug_write`. The CPL3 probe covers bounds, occupancy, wrong
 generation, stale-after-reuse, wrong rights, wrong type, close, crossing-end,
 wrapping-length, and kernel-pointer denial. On the hosted side,
 `ocore::capability_bridge::CapabilityBroker` maps live `OCapability` bearer
 tokens to those handles and rejects forged, stale, wrong-kind, or insufficient-
-rights values before invoking a session transport.
+rights values before invoking a session transport. Its public API is
+operation-specific, so callers cannot understate rights or choose a different
+syscall while asking the broker to authorize it.
+
+The bootstrap now uses page-granular RX, R/NX, and RW/NX supervisor mappings,
+real user and privileged stack guards, CPU-local `SWAPGS` entry storage, 32
+normalized exception stubs, and exact page-fault fixups for bounded user copy.
+`debug_write` copies through a 256-byte kernel bounce buffer. The separate
+fault smoke test covers divide error, invalid opcode, non-present read,
+supervisor read, guard-stack write, NX instruction fetch, noncanonical target,
+and an excluded syscall-return RIP. Every run requires process 1 to become
+`FAULTED`, the current process to clear, and a later kernel timer marker.
+The final mode removes one otherwise valid user-image leaf and proves that the
+syscall copy returns `ERR_USER_COPY_FAULT`, then resumes through a later CPL3
+heartbeat without faulting the process.
 
 ## Current boundary
 
@@ -94,16 +116,18 @@ This is the first vertical slice, not yet a self-hosting general-purpose
 compiler. It is x86_64-only, uses a stack-spill backend, and currently requires
 aggregate arguments/returns to travel through pointers. Indirect function
 calls, enum pattern matching, floating-point computation, independent
-per-process address spaces, executable loading, preemptive scheduling, and a
+per-process page tables, executable loading, preemptive scheduling, and a
 reclaiming page allocator remain follow-on work. Float operations, casts, and
 `sysv64` float crossings are rejected during type checking, so the layout-only
 float types cannot reach integer machine operations. The implemented subset is
 enough to compile a freestanding ELF kernel, enter long mode, run one statically
 linked `native[0]` task at CPL3, cross a real `SYSCALL` boundary, service IRQ0,
-allocate page frames, and enforce process-bound capability and user-pointer
-checks. The ELF reserves and zero-fills the complete bootstrap user image and
-stack ranges. It does not yet run Linux binaries or any other foreign OS
-personality.
+contain expected faults from that task, allocate page frames, and enforce
+process-bound capability and mapping-aware user-pointer checks. The ELF
+reserves and zero-fills the complete bootstrap user image and mapped stack
+range. Fault containment proves controlled disposition of the only process,
+not survival of an isolated sibling. It does not yet run Linux binaries or any
+other foreign OS personality.
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of
 falling through to integer-shaped instructions.
