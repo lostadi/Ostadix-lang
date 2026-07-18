@@ -221,8 +221,8 @@ Initial syscall numbers are:
 |---:|---|
 | 0 | `debug_write(cap, ptr, len)` |
 | 1 | `cap_close(cap)` |
-| 2 | `cap_copy(dst_process, cap, rights)` |
-| 3 | `page_alloc(memory_cap, count, flags)` |
+| 2 | reserved `cap_copy` number; returns `ERR_NOT_IMPLEMENTED` |
+| 3 | reserved `page_alloc` number; returns `ERR_NOT_IMPLEMENTED` |
 | 4 | `yield()` |
 | 5 | `ticks()` |
 
@@ -231,12 +231,13 @@ through an authenticated transport endpoint. Its string `identity` is never
 accepted directly as a kernel handle.
 
 The hosted `CapabilityBroker` implements this boundary. It generates 256-bit
-bearer identities from operating-system entropy, keeps a private per-session
-token-to-handle table, verifies capability kind and rights before transport,
-and forwards only the bound generation-tagged u64 handle to a
-`KernelSyscallTransport`. Deserialized identities not already bound in that
-live broker session are rejected as forged or stale. Metadata cannot select a
-slot or add rights.
+bearer identities from operating-system entropy and keeps a private per-session
+token-to-handle table. Callers use operation-specific `debug_write` and
+`cap_close` methods; they cannot select a syscall number, expected kind, or
+required-rights mask. A successful kernel close removes the bearer, while a
+transport failure or kernel rejection preserves it. Deserialized identities
+not already bound in that live broker session are rejected as forged or stale.
+Metadata cannot select a slot or add rights.
 
 This prevents guessing, serialized forgery, metadata-based escalation, stale
 or revoked token use, and cross-session replay. It does not prevent theft of a
@@ -252,7 +253,7 @@ not legal inside `.oc` source and are not linked into freestanding artifacts.
 This preserves O-lang's polyglot model without making Python, Rust, Nix, JSON,
 or subprocess execution part of the kernel trusted computing base.
 
-## 11. Implemented v0.1 boundary
+## 11. Implemented v0.2 boundary
 
 The initial compiler targets only `x86_64-unknown-none` and uses a simple
 stack-spill backend without optimization or register allocation. Direct calls
@@ -267,28 +268,43 @@ operations, calls, control flow, indexed places, atomics, volatile access, and
 assembly. This is a second boundary against malformed or future lowering paths
 silently selecting integer instructions.
 
-The kernel proof uses a physical-page bump allocator and one identity-mapped
-bootstrap address space. Kernel PDEs remain supervisor-only. Two dedicated
-2 MiB user mappings hold a read-only executable image and a writable NX stack;
-separate ELF load segments reserve both complete ranges and zero-fill the image
-tail and stack, and the allocator stops below them. A 64-bit TSS supplies the
-ring-0 interrupt stack, and `EFER.SCE`, `STAR`, `LSTAR`, and `FMASK` establish
-an architectural `SYSCALL` entry that switches away from the user stack before
-calling O-core code. The return path validates the saved user RIP and RSP,
-sanitizes RFLAGS, and returns with `iretq`.
+The kernel proof uses a physical-page bump allocator and one active bootstrap
+CR3. A concrete address-space descriptor records that CR3 plus separate user RX,
+R-only, and guarded RW/NX stack regions. The first 2 MiB supervisor mapping uses
+4 KiB leaves: metadata and read-only data are R/NX, kernel text is RX, and
+mutable state is RW/NX. Remaining required supervisor memory uses RW/NX huge
+pages, and mappings stop at 20 MiB. Separate ELF load segments reserve and
+zero-fill the user image and mapped stack pages. The TSS supplies RSP0 and a
+dedicated double-fault IST1 stack.
+
+`EFER.SCE`, `STAR`, `LSTAR`, and `FMASK` establish an architectural `SYSCALL`
+entry. `SWAPGS` selects boot-CPU-local entry state before saving user RSP, RIP,
+and RFLAGS. The return path validates saved RIP and RSP, sanitizes RFLAGS,
+preserves all tested non-architecturally-clobbered GPRs, and returns with
+`iretq`. Assembly stubs normalize vectors 0 through 31 into a packed trap
+frame. Exact page-fault fixups make `copy_from_user` and `copy_to_user`
+recoverable without treating arbitrary CPL0 faults as recoverable.
 
 The first statically linked process runs at CPL3 as `native[0]`. Its kernel-owned
-PCB records process, domain, personality, address-space, cspace, entry, user
-range, and stack identity. Syscalls route through that immutable personality,
-then through an object-typed, generation-tagged capability table selected by
-the current PCB. `debug_write`, `cap_close`, a scheduler-facing `yield` hook,
-and diagnostic `ticks` are implemented; `debug_write` rejects incomplete or
-wrapping ranges outside the current process's user mapping before dereferencing
-them. The QEMU proof exercises a valid write plus slot-bound, occupancy,
-generation, stale-after-reuse, right, type, closed-handle, user-range,
-kernel-pointer, hostile-RFLAGS, and unknown-syscall cases from real ring 3. It
-also observes a timer transition back to CPL3 and a later heartbeat. `yield`
-does not imply a scheduler in this one-process milestone.
+PCB records process, domain, reusable personality, versioned native ABI,
+address-space, CSpace, entry, and stack identity. Bootstrap activation is
+one-shot; no API can switch only the PCB while leaving CR3, TSS, and entry state
+behind. Syscalls route through the immutable personality and an object-typed,
+generation-tagged capability table selected by the current PCB. `debug_write`
+copies at most 256 bytes into kernel-owned storage after region-permission
+validation. `cap_close`, a counted scheduler-facing `yield` hook, and diagnostic
+`ticks` are implemented. Reserved capability-copy and page-allocation numbers
+return `ERR_NOT_IMPLEMENTED` rather than silently succeeding.
+
+The default QEMU proof covers the capability, pointer, register, flag, timer,
+and heartbeat cases. `smoke-faults-qemu.sh` performs a fresh boot for each fatal
+CPL3 probe and requires an expected trap, a `FAULTED` PCB with no current
+process, and a later kernel timer marker. It also checks the syscall return-RIP
+rejection path. A nonfatal mode omits one test PTE, requires the syscall copy
+to return `ERR_USER_COPY_FAULT`, and reaches a later CPL3 heartbeat. This
+demonstrates controlled disposition of the only process and continued kernel
+execution. It does not demonstrate sibling-process isolation. `yield` remains
+an accounting hook, not a scheduler.
 
 This is still one statically linked process in one bootstrap CR3. It is not an
 ELF loader, preemptive scheduler, multi-address-space kernel, capability

@@ -2168,10 +2168,7 @@ fn block_terminates(block: &HirBlock, never_ty: TypeId) -> bool {
             then_block,
             else_block: Some(else_block),
             ..
-        } => {
-            block_terminates(then_block, never_ty)
-                && block_terminates(else_block, never_ty)
-        }
+        } => block_terminates(then_block, never_ty) && block_terminates(else_block, never_ty),
         HirStmtKind::Unsafe(block) => block_terminates(block, never_ty),
         _ => false,
     }

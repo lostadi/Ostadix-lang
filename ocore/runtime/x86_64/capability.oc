@@ -2,7 +2,7 @@ module runtime::capability;
 
 use runtime::process::current_cspace_id;
 
-const CSPACE_COUNT: usize = 4;
+pub const MAX_CSPACES: usize = 4;
 const TABLE_SIZE: usize = 64;
 const SLOT_EMPTY: u8 = 0;
 const SLOT_LIVE: u8 = 1;
@@ -25,6 +25,20 @@ fn table_index(cspace_id: usize, capability_slot: usize) -> usize {
     return cspace_id * TABLE_SIZE + capability_slot;
 }
 
+pub fn valid_cspace_slot(slot: usize) -> bool {
+    return slot < MAX_CSPACES;
+}
+
+fn allowed_rights(object_type: u64) -> u64 {
+    if object_type == OBJECT_DEBUG {
+        return RIGHT_DEBUG_WRITE | RIGHT_TRANSFER;
+    }
+    if object_type == OBJECT_PAGE_POOL {
+        return RIGHT_PAGE_ALLOC | RIGHT_TRANSFER;
+    }
+    return 0;
+}
+
 pub unsafe fn init() -> void {
     let mut index: usize = 0;
     while index < 256 {
@@ -44,10 +58,14 @@ pub unsafe fn install_in_cspace(
     object_type: u64,
     rights: u64
 ) -> u64 {
-    if cspace_id >= CSPACE_COUNT || capability_slot >= TABLE_SIZE {
+    if !valid_cspace_slot(cspace_id) || capability_slot >= TABLE_SIZE {
         return 0;
     }
     if object_id == 0 || object_type == 0 || rights == 0 {
+        return 0;
+    }
+    let permitted: u64 = allowed_rights(object_type);
+    if permitted == 0 || (rights & permitted) != rights {
         return 0;
     }
     let index: usize = table_index(cspace_id, capability_slot);
@@ -74,7 +92,7 @@ pub unsafe fn validate_in_cspace(
 ) -> u64 {
     let capability_slot: usize = (handle & 0xffff_ffff) as usize;
     let generation: u32 = (handle >> 32) as u32;
-    if cspace_id >= CSPACE_COUNT || capability_slot >= TABLE_SIZE {
+    if !valid_cspace_slot(cspace_id) || capability_slot >= TABLE_SIZE {
         return 0;
     }
     let index: usize = table_index(cspace_id, capability_slot);
@@ -96,7 +114,7 @@ pub unsafe fn validate_in_cspace(
 pub unsafe fn close_in_cspace(cspace_id: usize, handle: u64) -> u64 {
     let capability_slot: usize = (handle & 0xffff_ffff) as usize;
     let generation: u32 = (handle >> 32) as u32;
-    if cspace_id >= CSPACE_COUNT || capability_slot >= TABLE_SIZE {
+    if !valid_cspace_slot(cspace_id) || capability_slot >= TABLE_SIZE {
         return 0;
     }
     let index: usize = table_index(cspace_id, capability_slot);
@@ -127,7 +145,7 @@ pub unsafe fn validate_current(
     required_rights: u64
 ) -> u64 {
     let cspace_id: usize = current_cspace_id();
-    if cspace_id >= CSPACE_COUNT {
+    if !valid_cspace_slot(cspace_id) {
         return 0;
     }
     return validate_in_cspace(
@@ -140,7 +158,7 @@ pub unsafe fn validate_current(
 
 pub unsafe fn close_current(handle: u64) -> u64 {
     let cspace_id: usize = current_cspace_id();
-    if cspace_id >= CSPACE_COUNT {
+    if !valid_cspace_slot(cspace_id) {
         return 0;
     }
     return close_in_cspace(cspace_id, handle);

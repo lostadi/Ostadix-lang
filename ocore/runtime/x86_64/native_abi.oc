@@ -1,0 +1,23 @@
+module runtime::native_abi;
+
+// Versioned scalar ABI shared by the linked native payload and kernel router.
+// Reserved numbers stay stable even while their operations remain unavailable.
+pub const NATIVE_ABI_V1: u64 = 1;
+
+pub const SYS_DEBUG_WRITE: u64 = 0;
+pub const SYS_CAP_CLOSE: u64 = 1;
+pub const SYS_CAP_COPY: u64 = 2;
+pub const SYS_PAGE_ALLOC: u64 = 3;
+pub const SYS_YIELD: u64 = 4;
+pub const SYS_TICKS: u64 = 5;
+
+pub const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+pub const ERR_USER_POINTER_DENIED: u64 = 0xffff_ffff_ffff_fff2;
+pub const ERR_UNKNOWN_SYSCALL: u64 = 0xffff_ffff_ffff_fff3;
+pub const ERR_UNKNOWN_PERSONALITY: u64 = 0xffff_ffff_ffff_fff4;
+pub const ERR_NO_CURRENT_PROCESS: u64 = 0xffff_ffff_ffff_fff5;
+pub const ERR_USER_COPY_FAULT: u64 = 0xffff_ffff_ffff_fff6;
+pub const ERR_BUFFER_TOO_LARGE: u64 = 0xffff_ffff_ffff_fff7;
+pub const ERR_NOT_IMPLEMENTED: u64 = 0xffff_ffff_ffff_fff8;
+
+pub const DEBUG_BUFFER_SIZE: usize = 256;

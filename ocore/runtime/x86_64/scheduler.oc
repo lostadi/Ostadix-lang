@@ -1,0 +1,20 @@
+module runtime::scheduler;
+
+// This is only the accounting boundary for cooperative yield. It deliberately
+// has no runnable queue, saved context, or switch operation. A later scheduler
+// must own the full CR3/TSS/entry-stack/PCB transaction.
+static mut YIELD_REQUESTS: u64 = 0;
+
+pub unsafe fn init() -> void {
+    atomic_store((&mut YIELD_REQUESTS), 0, seq_cst);
+}
+
+pub unsafe fn request_yield() -> u64 {
+    atomic_fetch_add((&mut YIELD_REQUESTS), 1, seq_cst);
+    // There is no alternate runnable thread in the bootstrap.
+    return 0;
+}
+
+pub unsafe fn yield_requests() -> u64 {
+    return atomic_load((&YIELD_REQUESTS), acquire);
+}

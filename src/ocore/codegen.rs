@@ -1113,10 +1113,11 @@ impl<'a> FunctionCodegen<'a> {
     }
 
     fn stack_size(&self) -> u64 {
-        // A same-privilege x86_64 interrupt pushes RIP, CS, and RFLAGS (24
-        // bytes). After saving nine volatile registers plus RBP, the stack is
-        // eight bytes off the SysV call boundary. Reserve one padding slot so
-        // interrupt handlers can safely call ordinary O-core functions.
+        // In 64-bit mode the hardware frame is RIP, CS, RFLAGS, RSP, and SS
+        // (40 bytes), including same-privilege delivery. After saving nine
+        // volatile registers plus RBP, the stack is eight bytes off the SysV
+        // call boundary. Reserve one padding slot so interrupt handlers can
+        // safely call ordinary O-core functions.
         self.frame.size + u64::from(self.source.abi == Abi::Interrupt) * 8
     }
 

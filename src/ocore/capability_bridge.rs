@@ -20,14 +20,10 @@ use crate::capability::fresh_bearer_identity;
 use crate::value::{CapabilityKind, OValue};
 
 pub const RIGHT_DEBUG_WRITE: u64 = 1 << 0;
-pub const RIGHT_PAGE_ALLOC: u64 = 1 << 1;
-pub const RIGHT_TRANSFER: u64 = 1 << 2;
 
-pub const SYS_DEBUG_WRITE: u64 = 0;
-pub const SYS_CAP_CLOSE: u64 = 1;
-pub const SYS_CAP_COPY: u64 = 2;
-pub const SYS_PAGE_ALLOC: u64 = 3;
-pub const SYS_YIELD: u64 = 4;
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_CAP_CLOSE: u64 = 1;
+const CAP_CLOSE_SUCCEEDED: u64 = 1;
 
 /// Transport for one authenticated, live O-core kernel session.
 ///
@@ -67,6 +63,15 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
         rights: u64,
         mut metadata: HashMap<String, OValue>,
     ) -> Result<OValue> {
+        if handle == 0 {
+            bail!("cannot bind a null kernel capability handle");
+        }
+        if handle >> 32 == 0 {
+            bail!("cannot bind a kernel capability with generation zero");
+        }
+        if rights == 0 {
+            bail!("cannot bind a kernel capability with no rights");
+        }
         let identity = loop {
             let identity = fresh_bearer_identity("ocore-live")?;
             if !self.bindings.contains_key(&identity) {
@@ -85,14 +90,57 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
         Ok(OValue::capability(kind, identity, metadata))
     }
 
-    pub fn invoke(
-        &mut self,
-        capability: &OValue,
-        kind: CapabilityKind,
-        required_rights: u64,
-        syscall: u64,
-        args: [u64; 5],
-    ) -> Result<u64> {
+    /// Invoke the native debug-write operation with broker-owned policy.
+    ///
+    /// Callers supply only operation data. The broker fixes the capability
+    /// kind, required right, syscall number, and transport argument layout.
+    pub fn debug_write(&mut self, capability: &OValue, pointer: u64, length: u64) -> Result<u64> {
+        let handle = {
+            let binding = self.resolve_binding(capability)?;
+            if binding.kind != CapabilityKind::Service {
+                bail!("debug-write requires a service capability");
+            }
+            if binding.rights & RIGHT_DEBUG_WRITE != RIGHT_DEBUG_WRITE {
+                bail!("capability lacks required rights 0x{RIGHT_DEBUG_WRITE:x}");
+            }
+            binding.handle
+        };
+        self.transport
+            .invoke(SYS_DEBUG_WRITE, handle, [pointer, length, 0, 0, 0])
+    }
+
+    /// Close the kernel capability and forget its hosted bearer on success.
+    ///
+    /// A transport failure or kernel rejection leaves the binding intact so
+    /// the caller can retry or explicitly forget only the hosted token.
+    pub fn cap_close(&mut self, capability: &OValue) -> Result<u64> {
+        let (identity, handle) = {
+            let (identity, binding) = self.resolve_binding_with_identity(capability)?;
+            (identity.to_owned(), binding.handle)
+        };
+        let result = self.transport.invoke(SYS_CAP_CLOSE, handle, [0; 5])?;
+        if result != CAP_CLOSE_SUCCEEDED {
+            bail!("kernel rejected capability close with status 0x{result:016x}");
+        }
+        self.bindings.remove(&identity);
+        Ok(result)
+    }
+
+    /// Forget only the hosted bearer without changing kernel authority.
+    pub fn forget(&mut self, capability: &OValue) -> Result<()> {
+        let identity = self.resolve_binding_with_identity(capability)?.0.to_owned();
+        self.bindings.remove(&identity);
+        Ok(())
+    }
+
+    fn resolve_binding<'a>(&'a self, capability: &OValue) -> Result<&'a Binding> {
+        Ok(self.resolve_binding_with_identity(capability)?.1)
+    }
+
+    fn resolve_binding_with_identity<'a, 'b>(
+        &'a self,
+        capability: &'b OValue,
+    ) -> Result<(&'b str, &'a Binding)> {
         let OValue::Capability {
             kind: supplied_kind,
             identity,
@@ -101,29 +149,13 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
         else {
             bail!("expected OCapability, got {}", capability.type_name());
         };
-        if *supplied_kind != kind {
-            bail!("capability kind mismatch");
-        }
         let binding = self.bindings.get(identity).ok_or_else(|| {
             anyhow::anyhow!("capability is forged, revoked, or belongs to another session")
         })?;
-        if binding.kind != kind {
+        if binding.kind != *supplied_kind {
             bail!("broker binding kind mismatch");
         }
-        if binding.rights & required_rights != required_rights {
-            bail!("capability lacks required rights 0x{required_rights:x}");
-        }
-        self.transport.invoke(syscall, binding.handle, args)
-    }
-
-    pub fn revoke(&mut self, capability: &OValue) -> Result<()> {
-        let OValue::Capability { identity, .. } = capability else {
-            bail!("expected OCapability, got {}", capability.type_name());
-        };
-        self.bindings
-            .remove(identity)
-            .ok_or_else(|| anyhow::anyhow!("capability is not bound in this session"))?;
-        Ok(())
+        Ok((identity, binding))
     }
 
     pub fn transport(&self) -> &T {
@@ -135,20 +167,50 @@ impl<T: KernelSyscallTransport> CapabilityBroker<T> {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
     struct RecordingTransport {
         calls: Vec<(u64, u64, [u64; 5])>,
+        result: u64,
+    }
+
+    impl Default for RecordingTransport {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                result: 7,
+            }
+        }
+    }
+
+    impl RecordingTransport {
+        fn returning(result: u64) -> Self {
+            Self {
+                calls: Vec::new(),
+                result,
+            }
+        }
     }
 
     impl KernelSyscallTransport for RecordingTransport {
         fn invoke(&mut self, number: u64, capability: u64, args: [u64; 5]) -> Result<u64> {
             self.calls.push((number, capability, args));
-            Ok(7)
+            Ok(self.result)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingTransport {
+        calls: usize,
+    }
+
+    impl KernelSyscallTransport for FailingTransport {
+        fn invoke(&mut self, _number: u64, _capability: u64, _args: [u64; 5]) -> Result<u64> {
+            self.calls += 1;
+            bail!("transport unavailable")
         }
     }
 
     #[test]
-    fn bound_ocapability_resolves_to_kernel_handle() {
+    fn debug_write_fixes_policy_and_resolves_to_kernel_handle() {
         let mut broker = CapabilityBroker::new(RecordingTransport::default());
         let capability = broker
             .bind(
@@ -158,36 +220,35 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
-        let result = broker
-            .invoke(
-                &capability,
-                CapabilityKind::Service,
-                RIGHT_DEBUG_WRITE,
-                SYS_DEBUG_WRITE,
-                [0x1000, 7, 0, 0, 0],
-            )
-            .unwrap();
+        let result = broker.debug_write(&capability, 0x1000, 7).unwrap();
         assert_eq!(result, 7);
-        assert_eq!(broker.transport().calls[0].1, (3u64 << 32) | 9);
+        assert_eq!(
+            broker.transport().calls,
+            vec![(SYS_DEBUG_WRITE, (3u64 << 32) | 9, [0x1000, 7, 0, 0, 0])]
+        );
     }
 
     #[test]
-    fn forged_or_revoked_identity_never_becomes_a_handle() {
+    fn forged_or_forgotten_identity_never_becomes_a_handle() {
         let mut broker = CapabilityBroker::new(RecordingTransport::default());
-        let capability = OValue::capability(
+        let forged = OValue::capability(
             CapabilityKind::Service,
             "ocore-live:0000000000000009",
             HashMap::new(),
         );
-        assert!(broker
-            .invoke(
-                &capability,
+        assert!(broker.debug_write(&forged, 0, 0).is_err());
+
+        let capability = broker
+            .bind(
                 CapabilityKind::Service,
+                (1u64 << 32) | 1,
                 RIGHT_DEBUG_WRITE,
-                SYS_DEBUG_WRITE,
-                [0; 5],
+                HashMap::new(),
             )
-            .is_err());
+            .unwrap();
+        broker.forget(&capability).unwrap();
+        assert!(broker.debug_write(&capability, 0, 0).is_err());
+        assert!(broker.transport().calls.is_empty());
     }
 
     #[test]
@@ -195,22 +256,107 @@ mod tests {
         let mut broker = CapabilityBroker::new(RecordingTransport::default());
         let capability = broker
             .bind(
-                CapabilityKind::MemoryRegion,
+                CapabilityKind::Service,
                 (1u64 << 32) | 2,
-                RIGHT_PAGE_ALLOC,
+                1 << 2,
                 HashMap::new(),
             )
             .unwrap();
-        assert!(broker
-            .invoke(
-                &capability,
+        assert!(broker.debug_write(&capability, 0, 0).is_err());
+        assert!(broker.transport().calls.is_empty());
+    }
+
+    #[test]
+    fn wrong_kind_is_rejected_before_transport() {
+        let mut broker = CapabilityBroker::new(RecordingTransport::default());
+        let capability = broker
+            .bind(
                 CapabilityKind::MemoryRegion,
-                RIGHT_TRANSFER,
-                SYS_CAP_COPY,
-                [0; 5],
+                (1u64 << 32) | 2,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
+        assert!(broker.debug_write(&capability, 0, 0).is_err());
+        assert!(broker.transport().calls.is_empty());
+    }
+
+    #[test]
+    fn bind_rejects_null_generation_zero_and_rights_free_handles() {
+        let mut broker = CapabilityBroker::new(RecordingTransport::default());
+        assert!(broker
+            .bind(
+                CapabilityKind::Service,
+                0,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
             )
             .is_err());
-        assert!(broker.transport().calls.is_empty());
+        assert!(broker
+            .bind(
+                CapabilityKind::Service,
+                9,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .is_err());
+        assert!(broker
+            .bind(CapabilityKind::Service, (1u64 << 32) | 9, 0, HashMap::new(),)
+            .is_err());
+    }
+
+    #[test]
+    fn successful_close_removes_binding_after_kernel_accepts_it() {
+        let mut broker = CapabilityBroker::new(RecordingTransport::returning(1));
+        let capability = broker
+            .bind(
+                CapabilityKind::Service,
+                (4u64 << 32) | 3,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(broker.cap_close(&capability).unwrap(), 1);
+        assert_eq!(
+            broker.transport().calls,
+            vec![(SYS_CAP_CLOSE, (4u64 << 32) | 3, [0; 5])]
+        );
+        assert!(broker.debug_write(&capability, 0, 0).is_err());
+        assert_eq!(broker.transport().calls.len(), 1);
+    }
+
+    #[test]
+    fn rejected_close_keeps_binding_for_retry_or_forget() {
+        let mut broker = CapabilityBroker::new(RecordingTransport::returning(u64::MAX));
+        let capability = broker
+            .bind(
+                CapabilityKind::Service,
+                (5u64 << 32) | 4,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
+        let error = broker.cap_close(&capability).unwrap_err().to_string();
+        assert!(error.contains("kernel rejected capability close"));
+        broker.forget(&capability).unwrap();
+        assert_eq!(broker.transport().calls.len(), 1);
+    }
+
+    #[test]
+    fn transport_failure_keeps_close_binding_for_retry_or_forget() {
+        let mut broker = CapabilityBroker::new(FailingTransport::default());
+        let capability = broker
+            .bind(
+                CapabilityKind::Service,
+                (6u64 << 32) | 5,
+                RIGHT_DEBUG_WRITE,
+                HashMap::new(),
+            )
+            .unwrap();
+        let error = broker.cap_close(&capability).unwrap_err().to_string();
+        assert!(error.contains("transport unavailable"));
+        broker.forget(&capability).unwrap();
+        assert_eq!(broker.transport().calls, 1);
     }
 
     #[test]
@@ -232,16 +378,29 @@ mod tests {
 
         let mut second = CapabilityBroker::new(RecordingTransport::default());
         let err = second
-            .invoke(
-                &capability,
-                CapabilityKind::Service,
-                RIGHT_DEBUG_WRITE,
-                SYS_DEBUG_WRITE,
-                [0; 5],
-            )
+            .debug_write(&capability, 0, 0)
             .unwrap_err()
             .to_string();
         assert!(err.contains("another session"));
         assert!(second.transport().calls.is_empty());
+    }
+
+    #[test]
+    fn hosted_bridge_constants_match_the_freestanding_native_abi() {
+        let native_abi = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ocore/runtime/x86_64/native_abi.oc"
+        ));
+        let capability_abi = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ocore/runtime/x86_64/capability.oc"
+        ));
+        assert!(native_abi.contains(&format!(
+            "pub const SYS_DEBUG_WRITE: u64 = {SYS_DEBUG_WRITE};"
+        )));
+        assert!(native_abi.contains(&format!("pub const SYS_CAP_CLOSE: u64 = {SYS_CAP_CLOSE};")));
+        assert!(capability_abi.contains(&format!(
+            "pub const RIGHT_DEBUG_WRITE: u64 = {RIGHT_DEBUG_WRITE};"
+        )));
     }
 }

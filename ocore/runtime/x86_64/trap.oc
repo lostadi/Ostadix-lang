@@ -1,0 +1,148 @@
+module runtime::trap;
+
+use runtime::interrupts::arm_fault_monitor;
+use runtime::process::fault_current;
+use runtime::process::is_faulted;
+use runtime::serial::write;
+
+@packed
+struct TrapFrame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    vector: u64,
+    error: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+const TRAP_CONTAINED: u64 = 1;
+const VECTOR_PAGE_FAULT: u64 = 14;
+const INVALID_RETURN_VECTOR: u64 = 256;
+
+static mut EXPECTED_PROBE: u64 = 0;
+
+static EXPECTED_TRAP_MESSAGE: [u8; 30] = b"M02 trap: expected CPL3 fault\n";
+static PROCESS_FAULTED_MESSAGE: [u8; 34] = b"M02 process: faulted current=none\n";
+static KERNEL_FAULT_MESSAGE: [u8; 25] = b"M02 KERNEL FAULT: halted\n";
+static UNEXPECTED_FAULT_MESSAGE: [u8; 29] = b"M02 unexpected fault: halted\n";
+static INVALID_RETURN_MESSAGE: [u8; 38] = b"M02 invalid syscall return: contained\n";
+
+extern "sysv64" fn ocore_read_cr2() -> usize;
+extern "sysv64" fn ocore_kernel_probe_address() -> usize;
+
+pub unsafe fn configure_probe(mode: u64) -> u64 {
+    if mode > 9 {
+        return 0;
+    }
+    EXPECTED_PROBE = mode;
+    return 1;
+}
+
+unsafe fn expected_fault(
+    mode: u64,
+    vector: u64,
+    error: u64,
+    address: usize
+) -> bool {
+    if mode == 1 {
+        return vector == 0 && error == 0;
+    }
+    if mode == 2 {
+        return vector == 6 && error == 0;
+    }
+    if mode == 3 {
+        return vector == VECTOR_PAGE_FAULT
+            && error == 0x4
+            && address == 0x40000000;
+    }
+    if mode == 4 {
+        return vector == VECTOR_PAGE_FAULT
+            && error == 0x5
+            && address == ocore_kernel_probe_address();
+    }
+    if mode == 5 {
+        return vector == VECTOR_PAGE_FAULT
+            && error == 0x6
+            && address == 0x01200000;
+    }
+    if mode == 6 {
+        return vector == VECTOR_PAGE_FAULT
+            && error == 0x15
+            && address == 0x01201000;
+    }
+    if mode == 7 {
+        return vector == 13 && error == 0;
+    }
+    return false;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_exception_dispatch(frame: *mut TrapFrame) -> u64 {
+    let vector: u64 = (*frame).vector;
+    let error: u64 = (*frame).error;
+    let rip: usize = (*frame).rip as usize;
+    let cs: u64 = (*frame).cs;
+    let mut address: usize = 0;
+    if vector == VECTOR_PAGE_FAULT {
+        address = ocore_read_cr2();
+    }
+
+    if (cs & 3) != 3 {
+        write((&KERNEL_FAULT_MESSAGE[0]), 25);
+        return 0;
+    }
+    let mode: u64 = EXPECTED_PROBE;
+    if mode == 0 || !expected_fault(mode, vector, error, address) {
+        write((&UNEXPECTED_FAULT_MESSAGE[0]), 29);
+        return 0;
+    }
+    let process_id: u64 = fault_current(vector, error, rip, address);
+    if process_id != 1 || !is_faulted(0) {
+        write((&UNEXPECTED_FAULT_MESSAGE[0]), 29);
+        return 0;
+    }
+    write((&EXPECTED_TRAP_MESSAGE[0]), 30);
+    write((&PROCESS_FAULTED_MESSAGE[0]), 34);
+    arm_fault_monitor(mode);
+    return TRAP_CONTAINED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_invalid_user_return(rip: usize, stack: usize) -> u64 {
+    if EXPECTED_PROBE != 8 || rip != 0x01010000 {
+        write((&KERNEL_FAULT_MESSAGE[0]), 25);
+        return 0;
+    }
+    let process_id: u64 = fault_current(
+        INVALID_RETURN_VECTOR,
+        0,
+        rip,
+        stack
+    );
+    if process_id == 1 && is_faulted(0) {
+        write((&INVALID_RETURN_MESSAGE[0]), 38);
+        write((&PROCESS_FAULTED_MESSAGE[0]), 34);
+        arm_fault_monitor(8);
+        return TRAP_CONTAINED;
+    }
+    write((&KERNEL_FAULT_MESSAGE[0]), 25);
+    return 0;
+}

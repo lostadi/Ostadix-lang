@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
+PROBE_MODE="${OCORE_PROBE_MODE:-0}"
+case "$PROBE_MODE" in
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) ;;
+  *)
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 9" >&2
+    exit 2
+    ;;
+esac
 mkdir -p "$BUILD_DIR"
 
 cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
@@ -12,11 +20,15 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
+  "$ROOT/ocore/runtime/x86_64/address_space.oc" \
+  "$ROOT/ocore/runtime/x86_64/native_abi.oc" \
   "$ROOT/ocore/runtime/x86_64/personality.oc" \
   "$ROOT/ocore/runtime/x86_64/domain.oc" \
   "$ROOT/ocore/runtime/x86_64/process.oc" \
+  "$ROOT/ocore/runtime/x86_64/scheduler.oc" \
   "$ROOT/ocore/runtime/x86_64/capability.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
+  "$ROOT/ocore/runtime/x86_64/trap.oc" \
   "$ROOT/ocore/runtime/x86_64/syscall.oc" \
   "$ROOT/ocore/runtime/x86_64/user.oc" \
   "$KERNEL_DIR/main.oc" \
@@ -25,7 +37,8 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
   --keep-asm \
   -o "$BUILD_DIR/kernel.o"
 
-clang -target x86_64-unknown-none-elf -c -x assembler \
+clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
+  -DOCORE_PROBE_MODE="$PROBE_MODE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
 find_lld() {

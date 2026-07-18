@@ -411,8 +411,8 @@ fn implicit_project_input(cli: &Cli) -> Result<bool> {
         return Ok(false);
     }
 
-    let source = fs::read_to_string(input)
-        .with_context(|| format!("failed to read {}", input.display()))?;
+    let source =
+        fs::read_to_string(input).with_context(|| format!("failed to read {}", input.display()))?;
     Ok(o_lang::project::lower::has_embedded_bundle(&source))
 }
 
@@ -430,7 +430,7 @@ fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
     if cli.no_validate {
         incompatible.push("--no-validate");
     }
-    if cli.shim_dir != PathBuf::from("backends") {
+    if cli.shim_dir != Path::new("backends") {
         incompatible.push("--shim-dir");
     }
     if !cli.backend_grants.is_empty() {
@@ -767,8 +767,7 @@ fn is_generated_olink_output(text: &str) -> bool {
         .strip_prefix("#!/usr/bin/env o\r\n")
         .or_else(|| text.strip_prefix("#!/usr/bin/env o\n"))
         .unwrap_or(text);
-    body.starts_with(O_LINK_GENERATED_HEADER)
-        || body.starts_with("# Ostadix-lang lifted project")
+    body.starts_with(O_LINK_GENERATED_HEADER) || body.starts_with("# Ostadix-lang lifted project")
 }
 
 fn record_excluded_tree(

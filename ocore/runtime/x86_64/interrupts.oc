@@ -30,12 +30,23 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry {
 }; 256];
 
 static mut TICKS: u64 = 0;
+static mut FAULT_MONITOR_MODE: u64 = 0;
+static mut FAULT_MONITOR_REPORTED: u8 = 0;
+static POST_FAULT_TIMER_MESSAGE: [u8; 29] = b"M02 post-fault timer: online\n";
+static FAULT_CONTAINMENT_MESSAGE: [u8; 28] = b"M02 fault containment: PASS\n";
 
-unsafe fn set_gate(vector: usize, handler: usize) -> void {
+extern "sysv64" fn ocore_exception_stub_address(vector: usize) -> usize;
+
+unsafe fn set_gate(
+    vector: usize,
+    handler: usize,
+    ist: u8,
+    attributes: u8
+) -> void {
     IDT[vector].offset_low = handler as u16;
     IDT[vector].selector = 0x08;
-    IDT[vector].ist = 0;
-    IDT[vector].attributes = 0x8e;
+    IDT[vector].ist = ist;
+    IDT[vector].attributes = attributes;
     IDT[vector].offset_mid = (handler >> 16) as u16;
     IDT[vector].offset_high = (handler >> 32) as u32;
     IDT[vector].zero = 0;
@@ -48,6 +59,19 @@ unsafe fn timer_interrupt() -> void {
     if previous == 0 {
         write_byte(b'T');
         write_byte(b'\n');
+    }
+    if FAULT_MONITOR_MODE != 0 && FAULT_MONITOR_REPORTED == 0 {
+        FAULT_MONITOR_REPORTED = 1;
+        let mut index: usize = 0;
+        while index < 29 {
+            write_byte(POST_FAULT_TIMER_MESSAGE[index]);
+            index += 1;
+        }
+        index = 0;
+        while index < 28 {
+            write_byte(FAULT_CONTAINMENT_MESSAGE[index]);
+            index += 1;
+        }
     }
     outb(0x20, 0x20);
 }
@@ -73,7 +97,24 @@ unsafe fn configure_pit() -> void {
 }
 
 pub unsafe fn init() -> void {
-    set_gate(32, timer_interrupt as usize);
+    let mut vector: usize = 0;
+    while vector < 32 {
+        let handler: usize = ocore_exception_stub_address(vector);
+        if handler == 0 {
+            return;
+        }
+        let mut ist: u8 = 0;
+        if vector == 8 {
+            ist = 1;
+        }
+        let mut attributes: u8 = 0x8e;
+        if vector == 3 || vector == 4 {
+            attributes = 0xee;
+        }
+        set_gate(vector, handler, ist, attributes);
+        vector += 1;
+    }
+    set_gate(32, timer_interrupt as usize, 0, 0x8e);
     let idtr: Idtr = Idtr {
         limit: 4095,
         base: (&IDT) as usize,
@@ -81,6 +122,11 @@ pub unsafe fn init() -> void {
     asm!("lidt [rax]", in("rax") (&idtr), options(readonly, nostack));
     remap_pic();
     configure_pit();
+}
+
+pub unsafe fn arm_fault_monitor(mode: u64) -> void {
+    FAULT_MONITOR_REPORTED = 0;
+    FAULT_MONITOR_MODE = mode;
 }
 
 pub unsafe fn ticks() -> u64 {

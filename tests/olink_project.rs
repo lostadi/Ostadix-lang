@@ -257,7 +257,11 @@ fn project_mode_rejects_literal_only_flags_instead_of_ignoring_them() {
 #[test]
 fn olink_execute_all_alias_enters_explicit_legacy_mode() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "bootstrap.sh", b"echo should-not-run-during-link\n");
+    write(
+        dir.path(),
+        "bootstrap.sh",
+        b"echo should-not-run-during-link\n",
+    );
     write(dir.path(), "app.py", b"print('also not run during link')\n");
     let output = dir.path().join("literal.O");
 
@@ -289,11 +293,7 @@ fn olink_multiple_directories_require_literal_opt_in() {
     write(left.path(), "a.py", b"print('a')\n");
     write(right.path(), "b.py", b"print('b')\n");
 
-    let out = olink()
-        .arg(left.path())
-        .arg(right.path())
-        .output()
-        .unwrap();
+    let out = olink().arg(left.path()).arg(right.path()).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--literal"));
 }
