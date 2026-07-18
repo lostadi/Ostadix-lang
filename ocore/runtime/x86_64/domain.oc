@@ -1,0 +1,53 @@
+module runtime::domain;
+
+use runtime::personality::is_supported;
+use runtime::personality::PERSONALITY_NATIVE_0;
+
+pub const MAX_DOMAINS: usize = 4;
+pub const DOMAIN_NATIVE_0: u64 = 1;
+
+static mut DOMAIN_IDS: [u64; 4] = [0; 4];
+static mut PERSONALITY_IDS: [u64; 4] = [0; 4];
+static mut OCCUPIED: [u8; 4] = [0; 4];
+
+unsafe fn install(slot: usize, domain_id: u64, personality_id: u64) -> u64 {
+    if slot >= MAX_DOMAINS {
+        return 0;
+    }
+    if domain_id == 0 || !is_supported(personality_id) {
+        return 0;
+    }
+    if OCCUPIED[slot] != 0 {
+        return 0;
+    }
+    DOMAIN_IDS[slot] = domain_id;
+    PERSONALITY_IDS[slot] = personality_id;
+    OCCUPIED[slot] = 1;
+    return domain_id;
+}
+
+pub unsafe fn init() -> u64 {
+    let mut slot: usize = 0;
+    while slot < MAX_DOMAINS {
+        DOMAIN_IDS[slot] = 0;
+        PERSONALITY_IDS[slot] = 0;
+        OCCUPIED[slot] = 0;
+        slot += 1;
+    }
+    return install(0, DOMAIN_NATIVE_0, PERSONALITY_NATIVE_0);
+}
+
+pub unsafe fn personality_for(domain_id: u64) -> u64 {
+    let mut slot: usize = 0;
+    while slot < MAX_DOMAINS {
+        if OCCUPIED[slot] != 0 && DOMAIN_IDS[slot] == domain_id {
+            return PERSONALITY_IDS[slot];
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn is_live(domain_id: u64) -> bool {
+    return personality_for(domain_id) != 0;
+}

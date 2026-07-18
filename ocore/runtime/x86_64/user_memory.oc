@@ -1,0 +1,47 @@
+module runtime::user_memory;
+
+pub const USER_IMAGE_START: usize = 0x01000000;
+pub const USER_IMAGE_END: usize = 0x01200000;
+pub const USER_STACK_START: usize = 0x01200000;
+pub const USER_ADDRESS_END: usize = 0x01400000;
+pub const USER_STACK_TOP: usize = 0x01400000;
+
+// Validate before every kernel dereference of a user-supplied range. The
+// subtraction form cannot wrap, unlike checking pointer + length.
+pub fn readable_range_with_bounds(
+    pointer: usize,
+    length: usize,
+    lower: usize,
+    upper: usize
+) -> bool {
+    if lower < USER_IMAGE_START || upper > USER_ADDRESS_END || lower >= upper {
+        return false;
+    }
+    if length == 0 {
+        return pointer >= lower && pointer <= upper;
+    }
+    if pointer < lower || pointer >= upper {
+        return false;
+    }
+    return length <= upper - pointer;
+}
+
+pub fn readable_range(pointer: usize, length: usize) -> bool {
+    return readable_range_with_bounds(
+        pointer,
+        length,
+        USER_IMAGE_START,
+        USER_ADDRESS_END
+    );
+}
+
+pub fn valid_entry(entry: usize) -> bool {
+    return entry >= USER_IMAGE_START && entry < USER_IMAGE_END;
+}
+
+pub fn valid_stack_top(stack_top: usize) -> bool {
+    if stack_top <= USER_STACK_START || stack_top > USER_STACK_TOP {
+        return false;
+    }
+    return (stack_top & 0xf) == 0;
+}

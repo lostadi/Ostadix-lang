@@ -265,11 +265,29 @@ O-core kernel: serial online
 page allocator: online
 capability: online
 T
+CPL3 native[0]: online
+user zero-fill: online
+capability bounds: denied
+forged capability: denied
+stale capability: denied
+wrong rights: denied
+wrong type: denied
+closed capability: denied
+user ranges: denied
+kernel pointer: denied
+unknown syscall: denied
+RFLAGS sanitization: online
+timer CPL3 return: online
+yield hook: online
+CPL3 heartbeat: online
 QEMU smoke: PASS
 ```
 
 The `T` is emitted by the actual IRQ0 timer handler after the IDT, PIC, and
-PIT are installed. It is not printed by the host harness.
+PIT are installed. The smoke gate requires that standalone timer line before a
+post-interrupt CPL3 return marker and a later CPL3 heartbeat. The remaining
+markers are emitted by the CPL3 task through the architectural syscall path.
+None are printed by the host harness.
 
 ### Docker
 
@@ -1848,18 +1866,23 @@ Multiboot2 or Xen PVH entry
     -> O-core kernel_main
     -> COM1 serial initialization
     -> physical page allocation
-    -> kernel capability installation
-    -> IDT, PIC, and PIT setup
-    -> IRQ0 timer handler
-    -> atomic tick increment
-    -> iretq
+    -> native[0] domain, PCB, and cspace installation
+    -> user/supervisor page split and 64-bit TSS
+    -> IDT, PIC, PIT, and SYSCALL MSR setup
+    -> CPL3 O-core task
+    -> personality-routed capability syscall
+    -> user-range and authority denial probes
+    -> IRQ0 ring transition and iretq
 ```
 
 The bootstrap assembly builds the initial P4, P3, and P2 page tables, enables
-PAE and long mode, loads a 64-bit GDT, aligns the stack, and calls the O-core
-`kernel_main`. The linker script places the Multiboot header, Xen note, text,
-read-only data, writable data, and BSS into a static ELF image beginning at
-1 MiB.
+PAE, NX, supervisor write protection, and long mode, loads a 64-bit GDT and
+TSS, aligns the stack, and calls the O-core `kernel_main`. Kernel mappings stay
+supervisor-only. The linker places one read-only executable user image at
+16 MiB and gives it an adjacent writable NX stack mapping. Separate ELF
+`PT_LOAD` entries reserve the complete two-page ranges and zero-fill bytes not
+present in the linked user payload; the bootstrap page allocator stops below
+those reserved pages.
 
 The runtime modules provide:
 
@@ -1870,8 +1893,13 @@ The runtime modules provide:
 - 8253/8254 PIT programming.
 - A compiler-generated interrupt handler that atomically increments ticks,
   acknowledges the PIC, and returns with `iretq`.
-- A generation-tagged kernel capability table.
-- A checked syscall dispatch function.
+- A kernel-owned domain and PCB registry with immutable native personality,
+  address-space, cspace, entry, stack, and readable-range identity.
+- Object-typed, generation-tagged process cspaces with occupied-slot checks.
+- An architectural `SYSCALL` entry that immediately leaves the user stack,
+  validates return state, and routes through the current PCB's personality.
+- Checked `debug_write` and `cap_close` operations, a future-scheduler `yield`
+  hook, and a diagnostic tick counter used by the privilege-return proof.
 
 ### Capabilities and syscall ABI
 
@@ -1881,11 +1909,13 @@ Kernel authority is represented by a 64-bit handle:
 handle = (generation << 32) | slot
 ```
 
-The table stores object identifiers, rights, generations, and occupancy in
-kernel-owned arrays. Validation checks the slot bounds, occupied bit,
-generation, and required rights. Closing a capability clears the slot and
-increments its generation, so stale handles cannot silently regain authority
-after reuse. Kernel pointers never cross this ABI.
+Each process cspace stores object identifiers, object types, rights,
+generations, and occupancy in kernel-owned arrays. Validation selects the
+cspace from the current PCB, then checks slot bounds, occupied bit, generation,
+object type, and required rights. Closing clears the slot and increments its
+generation. A slot is retired instead of wrapping its generation, so an old
+handle cannot silently regain authority after reuse. Kernel pointers never
+become capability handles.
 
 The initial syscall number contract is:
 
@@ -1896,10 +1926,17 @@ The initial syscall number contract is:
 | 2 | `cap_copy(dst_process, cap, rights)` |
 | 3 | `page_alloc(memory_cap, count, flags)` |
 | 4 | `yield()` |
+| 5 | `ticks()` |
 
-The exported `kernel_syscall_dispatch` implements checked debug output today.
-It validates the generation-tagged handle and `RIGHT_DEBUG_WRITE` before
-touching the serial object.
+The exported `kernel_syscall_dispatch` implements checked debug output,
+capability close, the yield hook, and diagnostic ticks today. The generic entry
+reads the current PCB's personality rather than accepting one from the caller.
+Native `debug_write` validates slot bounds, occupancy, object type, generation,
+`RIGHT_DEBUG_WRITE`, and a subtraction-based complete user range before
+touching the serial object. `cap_copy` and `page_alloc` remain reserved syscall
+numbers, not implemented operations. There is no scheduler yet, so `yield`
+exercises only the stable syscall hook and returns when no alternative task
+can run.
 
 On the hosted side, `CapabilityBroker<T>` binds a 256-bit per-session bearer
 identity from the operating system CSPRNG to a kernel-issued handle,
@@ -2024,8 +2061,13 @@ bash test_o_lang_examples.sh
 
 The native boot test compiles every O-core runtime module, assembles the boot
 entry, links the kernel, boots it in QEMU, captures serial output, and asserts
-serial initialization, page allocation, capability initialization, and the
-timer interrupt:
+serial/page initialization, CPL3 entry, native personality routing, valid
+capability use, the slot/generation/type/right denial matrix, closed and
+stale-after-reuse handles, user-segment zero-fill, complete user-range checks,
+hostile-RFLAGS
+sanitization, unknown syscall denial, the yield hook, ordered timer return, and
+a later CPL3 heartbeat. It also fails if any payload containing `LEAKED`
+reaches serial:
 
 ```bash
 ./ocore/kernel/smoke-qemu.sh
@@ -2165,14 +2207,20 @@ features that are already present:
   arithmetic, comparisons, casts, and `sysv64` float parameters and returns are
   rejected until SSE lowering and the floating-point ABI are implemented.
 - The kernel uses an identity-mapped bootstrap address space and a physical
-  bump allocator. It allocates frames but does not reclaim them.
-- The kernel exports a checked syscall dispatcher and the hosted capability
-  bridge is real. Ring-3 entry setup and an architectural syscall entry stub
-  are the next layer above that dispatcher.
+  bump allocator. One statically linked process has protected user mappings,
+  but independent per-process page tables and frame reclamation are absent.
+- The kernel runs one O-core-native CPL3 task through a real x86_64 `SYSCALL`
+  entry and kernel-owned domain/personality route. It does not yet provide an
+  executable loader, preemptive scheduler, IPC, capability transfer, Linux ABI,
+  foreign root filesystem, or nested-kernel mode. The hosted capability bridge
+  remains a tested transport boundary, not a live connection to this QEMU
+  kernel.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
-[docs/OCORE.md](docs/OCORE.md) for the native language and ABI contract.
+[docs/OCORE.md](docs/OCORE.md) for the native language and ABI contract. The
+dependency-ordered path from `native[0]` to foreign personalities is tracked in
+[docs/ODOMAIN_PLAN.md](docs/ODOMAIN_PLAN.md).
 
 ---
 
