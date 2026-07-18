@@ -49,6 +49,17 @@
 - Native value crossings are conservative: `Fidelity::NativeCapsule` in
   `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
+- The bootable O-core proof runs one statically linked `native[0]` process at
+  CPL3. The x86_64 bootstrap installs user/supervisor mappings, NX and write
+  protection, a 64-bit TSS, and `SYSCALL` MSRs. Kernel-owned PCB identity
+  selects the native personality and process cspace; QEMU verifies valid debug
+  output, capability bounds/occupancy/generation/type/right checks,
+  stale-after-reuse and closed-handle denial, complete user-range checks,
+  ELF user-region zero-fill, kernel-pointer denial, hostile-RFLAGS
+  sanitization, unknown-syscall denial, the future scheduler's yield hook, an
+  IRQ0 privilege transition and return, and a later CPL3 heartbeat. This does
+  not claim an executable loader, independent address spaces, scheduling, IPC,
+  Linux compatibility, or foreign root filesystems.
 
 ## Implemented conservatively
 
@@ -76,3 +87,7 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
+- O-Domain evolution beyond `native[0]`: independent per-process address
+  spaces, preemptive scheduling, capability transfer, IPC, executable loaders,
+  service discovery, and only then a minimal Linux x86_64 personality. The
+  staged engineering plan is in `docs/ODOMAIN_PLAN.md`.

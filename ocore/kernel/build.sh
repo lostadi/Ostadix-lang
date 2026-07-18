@@ -11,9 +11,14 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
 "$ROOT/target/debug/ocorec" \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
+  "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
+  "$ROOT/ocore/runtime/x86_64/personality.oc" \
+  "$ROOT/ocore/runtime/x86_64/domain.oc" \
+  "$ROOT/ocore/runtime/x86_64/process.oc" \
   "$ROOT/ocore/runtime/x86_64/capability.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/syscall.oc" \
+  "$ROOT/ocore/runtime/x86_64/user.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \
   --emit obj \

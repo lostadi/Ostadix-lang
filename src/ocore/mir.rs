@@ -584,15 +584,31 @@ impl<'a> FunctionBuilder<'a> {
                 } else {
                     Some(self.new_value(expr.ty))
                 };
+                // `lower_expr` returns a ValueId even for an expression that
+                // cannot return. Define its unreachable placeholder before
+                // emitting the diverging call so the MIR invariant that every
+                // ValueId has exactly one definition remains true.
+                let never_value = if expr.ty == never {
+                    Some(self.const_value(0, expr.ty))
+                } else {
+                    None
+                };
                 self.emit(Instruction::Call {
                     dst,
                     function: *function,
                     args,
                 });
+                let value = if let Some(dst) = dst {
+                    dst
+                } else if let Some(never_value) = never_value {
+                    never_value
+                } else {
+                    self.const_value(0, expr.ty)
+                };
                 if expr.ty == never {
                     self.terminate(Terminator::Unreachable);
                 }
-                Ok(dst.unwrap_or_else(|| self.const_value(0, expr.ty)))
+                Ok(value)
             }
             HirExprKind::Intrinsic { intrinsic, args } => {
                 if *intrinsic == Intrinsic::VolatileLoad {
@@ -921,7 +937,7 @@ fn format_terminator(terminator: &Terminator) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ocore::{parser, typeck};
+    use crate::ocore::{codegen, parser, typeck};
 
     #[test]
     fn lowering_produces_ssa_and_control_flow() {
@@ -942,6 +958,38 @@ fn max(a: u64, b: u64) -> u64 {
         let text = mir.to_text(&hir);
         assert!(text.contains("branch"));
         assert!(text.contains("return"));
+    }
+
+    #[test]
+    fn lowers_extern_never_call_as_diverging_statement() {
+        let ast = parser::parse(
+            "test.oc",
+            r#"
+module mir;
+extern "sysv64" fn enter_user() -> never;
+fn boot() -> never {
+    enter_user();
+}
+"#,
+        )
+        .unwrap();
+        let hir = typeck::check(&[("test.oc".into(), ast)]).unwrap();
+        let mir = lower(&hir).unwrap();
+
+        assert_eq!(mir.functions.len(), 1);
+        assert!(matches!(
+            mir.functions[0].blocks[0].instructions.as_slice(),
+            [
+                Instruction::Const { .. },
+                Instruction::Call { dst: None, .. }
+            ]
+        ));
+        assert!(matches!(
+            mir.functions[0].blocks[0].terminator,
+            Terminator::Unreachable
+        ));
+        let assembly = codegen::emit_assembly(&hir, &mir).unwrap();
+        assert!(assembly.contains("call enter_user\n  ud2"));
     }
 
     #[test]

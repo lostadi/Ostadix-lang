@@ -1,0 +1,9 @@
+module runtime::personality;
+
+// Personality identifiers are kernel ABI values, not user-selected labels.
+// This first privilege-boundary slice intentionally installs native[0] only.
+pub const PERSONALITY_NATIVE_0: u64 = 1;
+
+pub fn is_supported(personality_id: u64) -> bool {
+    return personality_id == PERSONALITY_NATIVE_0;
+}

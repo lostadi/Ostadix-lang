@@ -211,7 +211,9 @@ CapabilityHandle = (generation << 32) | slot
 
 Every capability syscall validates slot bounds, occupancy, generation,
 object type, and requested rights. Handles never contain kernel pointers.
-Closing or transferring a slot increments its generation before reuse.
+Closing or transferring a slot increments its generation before reuse. A slot
+is retired when its 32-bit generation space is exhausted rather than wrapping
+to a value that could revive an old handle.
 
 Initial syscall numbers are:
 
@@ -222,6 +224,7 @@ Initial syscall numbers are:
 | 2 | `cap_copy(dst_process, cap, rights)` |
 | 3 | `page_alloc(memory_cap, count, flags)` |
 | 4 | `yield()` |
+| 5 | `ticks()` |
 
 The hosted `OCapability` wire value may refer to a live kernel capability only
 through an authenticated transport endpoint. Its string `identity` is never
@@ -264,8 +267,30 @@ operations, calls, control flow, indexed places, atomics, volatile access, and
 assembly. This is a second boundary against malformed or future lowering paths
 silently selecting integer instructions.
 
-The kernel proof uses a physical-page bump allocator and an identity-mapped
-bootstrap address space. It demonstrates a checked kernel syscall dispatcher
-and a hosted capability bridge, but not a ring-3 transition or an architectural
-`syscall` entry stub. Those are extensions of the specified ABI rather than
-dependencies of the boot proof.
+The kernel proof uses a physical-page bump allocator and one identity-mapped
+bootstrap address space. Kernel PDEs remain supervisor-only. Two dedicated
+2 MiB user mappings hold a read-only executable image and a writable NX stack;
+separate ELF load segments reserve both complete ranges and zero-fill the image
+tail and stack, and the allocator stops below them. A 64-bit TSS supplies the
+ring-0 interrupt stack, and `EFER.SCE`, `STAR`, `LSTAR`, and `FMASK` establish
+an architectural `SYSCALL` entry that switches away from the user stack before
+calling O-core code. The return path validates the saved user RIP and RSP,
+sanitizes RFLAGS, and returns with `iretq`.
+
+The first statically linked process runs at CPL3 as `native[0]`. Its kernel-owned
+PCB records process, domain, personality, address-space, cspace, entry, user
+range, and stack identity. Syscalls route through that immutable personality,
+then through an object-typed, generation-tagged capability table selected by
+the current PCB. `debug_write`, `cap_close`, a scheduler-facing `yield` hook,
+and diagnostic `ticks` are implemented; `debug_write` rejects incomplete or
+wrapping ranges outside the current process's user mapping before dereferencing
+them. The QEMU proof exercises a valid write plus slot-bound, occupancy,
+generation, stale-after-reuse, right, type, closed-handle, user-range,
+kernel-pointer, hostile-RFLAGS, and unknown-syscall cases from real ring 3. It
+also observes a timer transition back to CPL3 and a later heartbeat. `yield`
+does not imply a scheduler in this one-process milestone.
+
+This is still one statically linked process in one bootstrap CR3. It is not an
+ELF loader, preemptive scheduler, multi-address-space kernel, capability
+transfer implementation, Linux ABI personality, root filesystem, IPC system,
+or hosted-broker transport. Those remain dependency-ordered follow-on work.

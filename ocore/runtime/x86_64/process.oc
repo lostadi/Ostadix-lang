@@ -1,0 +1,216 @@
+module runtime::process;
+
+use runtime::domain::is_live as domain_is_live;
+use runtime::domain::personality_for;
+use runtime::user_memory::valid_entry;
+use runtime::user_memory::valid_stack_top;
+use runtime::user_memory::USER_ADDRESS_END;
+use runtime::user_memory::USER_IMAGE_START;
+
+pub const MAX_PROCESSES: usize = 4;
+const PROCESS_EMPTY: u8 = 0;
+const PROCESS_READY: u8 = 1;
+const PROCESS_RUNNING: u8 = 2;
+const NO_CURRENT_PROCESS: usize = MAX_PROCESSES;
+
+static mut PROCESS_IDS: [u64; 4] = [0; 4];
+static mut DOMAIN_IDS: [u64; 4] = [0; 4];
+static mut PERSONALITY_IDS: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACE_IDS: [u64; 4] = [0; 4];
+static mut CSPACE_IDS: [usize; 4] = [0; 4];
+static mut KERNEL_STACK_TOPS: [usize; 4] = [0; 4];
+static mut USER_ENTRIES: [usize; 4] = [0; 4];
+static mut USER_STACK_TOPS: [usize; 4] = [0; 4];
+static mut USER_LOWS: [usize; 4] = [0; 4];
+static mut USER_HIGHS: [usize; 4] = [0; 4];
+static mut STATES: [u8; 4] = [0; 4];
+static mut CURRENT_PROCESS: usize = MAX_PROCESSES;
+
+pub unsafe fn init() -> void {
+    let mut slot: usize = 0;
+    while slot < MAX_PROCESSES {
+        PROCESS_IDS[slot] = 0;
+        DOMAIN_IDS[slot] = 0;
+        PERSONALITY_IDS[slot] = 0;
+        ADDRESS_SPACE_IDS[slot] = 0;
+        CSPACE_IDS[slot] = 0;
+        KERNEL_STACK_TOPS[slot] = 0;
+        USER_ENTRIES[slot] = 0;
+        USER_STACK_TOPS[slot] = 0;
+        USER_LOWS[slot] = 0;
+        USER_HIGHS[slot] = 0;
+        STATES[slot] = PROCESS_EMPTY;
+        slot += 1;
+    }
+    CURRENT_PROCESS = NO_CURRENT_PROCESS;
+}
+
+// The caller supplies a domain but never a personality. The personality is
+// derived once from the kernel-owned domain table and is immutable thereafter.
+pub unsafe fn install(
+    slot: usize,
+    process_id: u64,
+    domain_id: u64,
+    address_space_id: u64,
+    cspace_id: usize,
+    kernel_stack_top: usize,
+    user_entry: usize,
+    user_stack_top: usize,
+    user_low: usize,
+    user_high: usize
+) -> u64 {
+    if slot >= MAX_PROCESSES || cspace_id >= MAX_PROCESSES {
+        return 0;
+    }
+    if process_id == 0 || address_space_id == 0 || kernel_stack_top == 0 {
+        return 0;
+    }
+    if !valid_entry(user_entry) || !valid_stack_top(user_stack_top) {
+        return 0;
+    }
+    if user_low < USER_IMAGE_START || user_high > USER_ADDRESS_END {
+        return 0;
+    }
+    if user_low >= user_high || user_entry < user_low || user_entry >= user_high {
+        return 0;
+    }
+    if user_stack_top <= user_low || user_stack_top > user_high {
+        return 0;
+    }
+    if STATES[slot] != PROCESS_EMPTY || !domain_is_live(domain_id) {
+        return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_PROCESSES {
+        if STATES[other] != PROCESS_EMPTY {
+            if CSPACE_IDS[other] == cspace_id {
+                return 0;
+            }
+            if ADDRESS_SPACE_IDS[other] == address_space_id {
+                return 0;
+            }
+        }
+        other += 1;
+    }
+    let personality_id: u64 = personality_for(domain_id);
+    if personality_id == 0 {
+        return 0;
+    }
+    PROCESS_IDS[slot] = process_id;
+    DOMAIN_IDS[slot] = domain_id;
+    PERSONALITY_IDS[slot] = personality_id;
+    ADDRESS_SPACE_IDS[slot] = address_space_id;
+    CSPACE_IDS[slot] = cspace_id;
+    KERNEL_STACK_TOPS[slot] = kernel_stack_top;
+    USER_ENTRIES[slot] = user_entry;
+    USER_STACK_TOPS[slot] = user_stack_top;
+    USER_LOWS[slot] = user_low;
+    USER_HIGHS[slot] = user_high;
+    // Publish readiness only after every immutable PCB field is committed.
+    STATES[slot] = PROCESS_READY;
+    return process_id;
+}
+
+pub unsafe fn set_current(slot: usize) -> u64 {
+    if slot >= MAX_PROCESSES || STATES[slot] == PROCESS_EMPTY {
+        return 0;
+    }
+    if CURRENT_PROCESS < MAX_PROCESSES {
+        if CURRENT_PROCESS != slot && STATES[CURRENT_PROCESS] == PROCESS_RUNNING {
+            STATES[CURRENT_PROCESS] = PROCESS_READY;
+        }
+    }
+    CURRENT_PROCESS = slot;
+    STATES[slot] = PROCESS_RUNNING;
+    return PROCESS_IDS[slot];
+}
+
+pub unsafe fn current_slot() -> usize {
+    if CURRENT_PROCESS >= MAX_PROCESSES {
+        return NO_CURRENT_PROCESS;
+    }
+    if STATES[CURRENT_PROCESS] != PROCESS_RUNNING {
+        return NO_CURRENT_PROCESS;
+    }
+    return CURRENT_PROCESS;
+}
+
+pub unsafe fn current_process_id() -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return PROCESS_IDS[slot];
+}
+
+pub unsafe fn current_domain_id() -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return DOMAIN_IDS[slot];
+}
+
+pub unsafe fn current_personality_id() -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return PERSONALITY_IDS[slot];
+}
+
+pub unsafe fn current_kernel_stack_top() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return KERNEL_STACK_TOPS[slot];
+}
+
+pub unsafe fn current_address_space_id() -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return ADDRESS_SPACE_IDS[slot];
+}
+
+pub unsafe fn current_cspace_id() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return MAX_PROCESSES;
+    }
+    return CSPACE_IDS[slot];
+}
+
+pub unsafe fn current_user_entry() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return USER_ENTRIES[slot];
+}
+
+pub unsafe fn current_user_stack_top() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return USER_STACK_TOPS[slot];
+}
+
+pub unsafe fn current_user_low() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return USER_LOWS[slot];
+}
+
+pub unsafe fn current_user_high() -> usize {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return USER_HIGHS[slot];
+}

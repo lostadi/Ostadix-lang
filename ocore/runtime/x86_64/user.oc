@@ -1,0 +1,253 @@
+module runtime::user;
+
+use kernel::main::OCORE_KERNEL_ONLY_MARKER;
+use runtime::syscall::ERR_CAPABILITY_DENIED;
+use runtime::syscall::ERR_UNKNOWN_SYSCALL;
+use runtime::syscall::ERR_USER_POINTER_DENIED;
+use runtime::syscall::SYS_CAP_CLOSE;
+use runtime::syscall::SYS_DEBUG_WRITE;
+use runtime::syscall::SYS_TICKS;
+use runtime::syscall::SYS_YIELD;
+
+const FORGED_DEBUG_HANDLE: u64 = 0x0000000200000001;
+const STALE_DEBUG_HANDLE: u64 = 0x0000000100000002;
+const WRONG_RIGHTS_HANDLE: u64 = 0x0000000100000003;
+const WRONG_TYPE_HANDLE: u64 = 0x0000000100000004;
+const CLOSE_PROBE_HANDLE: u64 = 0x0000000100000005;
+const EMPTY_SLOT_HANDLE: u64 = 0x000000010000003f;
+const OUT_OF_BOUNDS_HANDLE: u64 = 0x0000000100000040;
+
+@link_section(".rodata.user")
+static FORGED_LEAK_PAYLOAD: [u8; 25] = b"FORGED CAPABILITY LEAKED\n";
+@link_section(".rodata.user")
+static STALE_LEAK_PAYLOAD: [u8; 24] = b"STALE CAPABILITY LEAKED\n";
+
+@link_section(".rodata.user")
+static CPL3_MESSAGE: [u8; 23] = b"CPL3 native[0]: online\n";
+@link_section(".rodata.user")
+static ZERO_FILL_MESSAGE: [u8; 23] = b"user zero-fill: online\n";
+@link_section(".rodata.user")
+static CAP_BOUNDS_DENIED_MESSAGE: [u8; 26] = b"capability bounds: denied\n";
+@link_section(".rodata.user")
+static FORGED_DENIED_MESSAGE: [u8; 26] = b"forged capability: denied\n";
+@link_section(".rodata.user")
+static STALE_DENIED_MESSAGE: [u8; 25] = b"stale capability: denied\n";
+@link_section(".rodata.user")
+static WRONG_RIGHTS_DENIED_MESSAGE: [u8; 21] = b"wrong rights: denied\n";
+@link_section(".rodata.user")
+static WRONG_TYPE_DENIED_MESSAGE: [u8; 19] = b"wrong type: denied\n";
+@link_section(".rodata.user")
+static CLOSED_DENIED_MESSAGE: [u8; 26] = b"closed capability: denied\n";
+@link_section(".rodata.user")
+static USER_RANGES_DENIED_MESSAGE: [u8; 20] = b"user ranges: denied\n";
+@link_section(".rodata.user")
+static KERNEL_DENIED_MESSAGE: [u8; 23] = b"kernel pointer: denied\n";
+@link_section(".rodata.user")
+static UNKNOWN_DENIED_MESSAGE: [u8; 24] = b"unknown syscall: denied\n";
+@link_section(".rodata.user")
+static RFLAGS_MESSAGE: [u8; 28] = b"RFLAGS sanitization: online\n";
+@link_section(".rodata.user")
+static TIMER_RETURN_MESSAGE: [u8; 26] = b"timer CPL3 return: online\n";
+@link_section(".rodata.user")
+static YIELD_MESSAGE: [u8; 19] = b"yield hook: online\n";
+@link_section(".rodata.user")
+static HEARTBEAT_MESSAGE: [u8; 23] = b"CPL3 heartbeat: online\n";
+
+@link_section(".text.user")
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@link_section(".text.user")
+unsafe fn debug_write(capability: u64, pointer: usize, length: usize) -> u64 {
+    return syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    );
+}
+
+@link_section(".text.user")
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    let result: u64 = debug_write(capability, pointer as usize, length);
+    if result != length as u64 {
+        stop();
+    }
+}
+
+// This is the only first-process entrypoint. Its code and every referenced
+// byte string live in the dedicated user image mapping.
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
+    let mut code_selector: u64 = 0;
+    asm!(
+        "xor rax, rax\nmov ax, cs",
+        out("rax") code_selector,
+        options(nomem, nostack)
+    );
+    if (code_selector & 3) != 3 {
+        stop();
+    }
+
+    let image_tail: u64 = volatile_load(0x011ffff0 as *const u64);
+    let stack_bottom: u64 = volatile_load(0x01200000 as *const u64);
+    if image_tail != 0 || stack_bottom != 0 {
+        stop();
+    }
+
+    let out_of_bounds_result: u64 = debug_write(
+        OUT_OF_BOUNDS_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    let empty_slot_result: u64 = debug_write(
+        EMPTY_SLOT_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    if out_of_bounds_result != ERR_CAPABILITY_DENIED
+        || empty_slot_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let forged_result: u64 = debug_write(
+        FORGED_DEBUG_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    if forged_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let stale_result: u64 = debug_write(
+        STALE_DEBUG_HANDLE,
+        (&STALE_LEAK_PAYLOAD[0]) as usize,
+        24
+    );
+    if stale_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let wrong_rights_result: u64 = debug_write(
+        WRONG_RIGHTS_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    if wrong_rights_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    let wrong_type_result: u64 = debug_write(
+        WRONG_TYPE_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    if wrong_type_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let close_result: u64 = syscall1(SYS_CAP_CLOSE, CLOSE_PROBE_HANDLE);
+    if close_result != 1 {
+        stop();
+    }
+    let closed_result: u64 = debug_write(
+        CLOSE_PROBE_HANDLE,
+        (&FORGED_LEAK_PAYLOAD[0]) as usize,
+        25
+    );
+    if closed_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let crossing_result: u64 = debug_write(
+        report_capability,
+        0x013ffff8,
+        16
+    );
+    let wrapping_result: u64 = debug_write(
+        report_capability,
+        (&CPL3_MESSAGE[0]) as usize,
+        0xffffffffffffffff
+    );
+    if crossing_result != ERR_USER_POINTER_DENIED
+        || wrapping_result != ERR_USER_POINTER_DENIED {
+        stop();
+    }
+
+    let kernel_pointer_result: u64 = debug_write(
+        report_capability,
+        (&OCORE_KERNEL_ONLY_MARKER[0]) as usize,
+        22
+    );
+    if kernel_pointer_result != ERR_USER_POINTER_DENIED {
+        stop();
+    }
+
+    let unknown_result: u64 = syscall0(0xffff);
+    if unknown_result != ERR_UNKNOWN_SYSCALL {
+        stop();
+    }
+
+    // NT is writable by CPL3 but invalid on the kernel's eventual IRETQ path.
+    // A successful syscall return proves IA32_FMASK removed it on entry and
+    // the sanitized return frame removed it from the resumed user state.
+    let mut hostile_flags: u64 = 0;
+    asm!(
+        "pushfq\nor qword ptr [rsp], 0x4000\npopfq\npushfq\npop rax",
+        out("rax") hostile_flags
+    );
+    if (hostile_flags & 0x4000) == 0 {
+        stop();
+    }
+    let flags_tick: u64 = syscall0(SYS_TICKS);
+
+    // Syscalls run with IF masked. A later tick count can therefore advance
+    // only while this loop is back at CPL3. Reaching the marker below proves
+    // both the TSS privilege transition and the timer handler's IRETQ return.
+    let tick_before: u64 = flags_tick;
+    let mut tick_after: u64 = tick_before;
+    while tick_after == tick_before {
+        tick_after = syscall0(SYS_TICKS);
+    }
+
+    let yield_result: u64 = syscall0(SYS_YIELD);
+    if yield_result != 0 {
+        stop();
+    }
+
+    // Nothing is announced until CPL, the complete capability and user-range
+    // matrix, hostile-RFLAGS entry, timer return, personality routing,
+    // unknown-number denial, and the scheduler hook have all passed.
+    emit(report_capability, (&CPL3_MESSAGE[0]), 23);
+    emit(report_capability, (&ZERO_FILL_MESSAGE[0]), 23);
+    emit(report_capability, (&CAP_BOUNDS_DENIED_MESSAGE[0]), 26);
+    emit(report_capability, (&FORGED_DENIED_MESSAGE[0]), 26);
+    emit(report_capability, (&STALE_DENIED_MESSAGE[0]), 25);
+    emit(report_capability, (&WRONG_RIGHTS_DENIED_MESSAGE[0]), 21);
+    emit(report_capability, (&WRONG_TYPE_DENIED_MESSAGE[0]), 19);
+    emit(report_capability, (&CLOSED_DENIED_MESSAGE[0]), 26);
+    emit(report_capability, (&USER_RANGES_DENIED_MESSAGE[0]), 20);
+    emit(report_capability, (&KERNEL_DENIED_MESSAGE[0]), 23);
+    emit(report_capability, (&UNKNOWN_DENIED_MESSAGE[0]), 24);
+    emit(report_capability, (&RFLAGS_MESSAGE[0]), 28);
+    emit(report_capability, (&TIMER_RETURN_MESSAGE[0]), 26);
+    emit(report_capability, (&YIELD_MESSAGE[0]), 19);
+
+    let heartbeat_before: u64 = syscall0(SYS_TICKS);
+    let mut heartbeat_after: u64 = heartbeat_before;
+    while heartbeat_after == heartbeat_before {
+        heartbeat_after = syscall0(SYS_TICKS);
+    }
+    emit(report_capability, (&HEARTBEAT_MESSAGE[0]), 23);
+
+    loop {
+        let yielded: u64 = syscall0(SYS_YIELD);
+        if yielded != 0 {
+            stop();
+        }
+    }
+}

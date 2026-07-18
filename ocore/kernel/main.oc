@@ -1,16 +1,56 @@
 module kernel::main;
 
-use runtime::capability::install;
+use runtime::capability::init as capabilities_init;
+use runtime::capability::close_in_cspace;
+use runtime::capability::install_in_cspace;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_PAGE_ALLOC;
+use runtime::domain::init as domains_init;
+use runtime::domain::DOMAIN_NATIVE_0;
 use runtime::interrupts::init as interrupts_init;
 use runtime::pages::alloc_page;
 use runtime::pages::init as pages_init;
+use runtime::process::init as processes_init;
+use runtime::process::install as install_process;
+use runtime::process::set_current;
 use runtime::serial::init as serial_init;
 use runtime::serial::write;
+use runtime::user::ocore_user_entry;
+use runtime::user_memory::valid_entry;
+use runtime::user_memory::valid_stack_top;
+use runtime::user_memory::USER_ADDRESS_END;
+use runtime::user_memory::USER_IMAGE_START;
+use runtime::user_memory::USER_STACK_TOP;
+
+extern "sysv64" fn ocore_syscall_init() -> void;
+extern "sysv64" fn ocore_kernel_stack_top() -> usize;
+extern "sysv64" fn ocore_enter_user(
+    entry: usize,
+    stack: usize,
+    arg0: u64
+) -> never;
 
 static START_MESSAGE: [u8; 29] = b"O-core kernel: serial online\n";
 static PAGE_MESSAGE: [u8; 23] = b"page allocator: online\n";
 static CAP_MESSAGE: [u8; 19] = b"capability: online\n";
+
+const NATIVE_CSPACE: usize = 0;
+
+// The linked negative CPL3 probe takes this address without reading it and
+// passes the address to SYS_DEBUG_WRITE. Correct user-range validation rejects
+// it before serial::write can dereference the supervisor mapping.
+@export
+@no_mangle
+pub static OCORE_KERNEL_ONLY_MARKER: [u8; 22] = b"KERNEL POINTER LEAKED\n";
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
 
 @export
 @no_mangle
@@ -19,20 +59,107 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
     serial_init();
     write((&START_MESSAGE[0]), 29);
 
-    pages_init(0x00400000, 0x04000000);
+    // The bootstrap allocator stops below the dedicated user image at 16 MiB.
+    // A later physical-memory manager will reserve arbitrary mapped regions.
+    pages_init(0x00400000, 0x01000000);
     let first_page: *mut u8 = alloc_page();
     if (first_page as usize) == 0x00400000 {
         write((&PAGE_MESSAGE[0]), 23);
     }
 
-    let debug_capability: u64 = install(1, 1, RIGHT_DEBUG_WRITE);
-    if debug_capability != 0 {
-        write((&CAP_MESSAGE[0]), 19);
+    if domains_init() != DOMAIN_NATIVE_0 {
+        fail_closed();
+    }
+    processes_init();
+    capabilities_init();
+
+    let kernel_stack_top: usize = ocore_kernel_stack_top();
+    let user_entry: usize = ocore_user_entry as usize;
+    if !valid_entry(user_entry) || !valid_stack_top(USER_STACK_TOP) {
+        fail_closed();
+    }
+    if install_process(
+        0,
+        1,
+        DOMAIN_NATIVE_0,
+        1,
+        NATIVE_CSPACE,
+        kernel_stack_top,
+        user_entry,
+        USER_STACK_TOP,
+        USER_IMAGE_START,
+        USER_ADDRESS_END
+    ) == 0 {
+        fail_closed();
     }
 
-    interrupts_init();
-    enable_interrupts();
-    loop {
-        halt();
+    let report_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        1,
+        1,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    let stale_probe_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        2,
+        2,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    if stale_probe_capability != 0x0000_0001_0000_0002 {
+        fail_closed();
     }
+    if close_in_cspace(NATIVE_CSPACE, stale_probe_capability) == 0 {
+        fail_closed();
+    }
+    // Reuse the same slot with a new generation before CPL3 starts. The user
+    // probe presents the old generation while the replacement is live, which
+    // distinguishes stale-handle rejection from an empty-slot check.
+    let replacement_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        2,
+        3,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    let wrong_rights_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        3,
+        4,
+        OBJECT_DEBUG,
+        RIGHT_PAGE_ALLOC
+    );
+    let wrong_type_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        4,
+        5,
+        OBJECT_PAGE_POOL,
+        RIGHT_DEBUG_WRITE
+    );
+    let close_probe_capability: u64 = install_in_cspace(
+        NATIVE_CSPACE,
+        5,
+        6,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    if report_capability == 0
+        || replacement_capability != 0x0000_0002_0000_0002
+        || wrong_rights_capability != 0x0000_0001_0000_0003
+        || wrong_type_capability != 0x0000_0001_0000_0004
+        || close_probe_capability != 0x0000_0001_0000_0005 {
+        fail_closed();
+    }
+    // The process becomes current only after its immutable PCB and cspace are
+    // complete, so no syscall can observe a partially initialized identity.
+    if set_current(0) == 0 {
+        fail_closed();
+    }
+    write((&CAP_MESSAGE[0]), 19);
+
+    interrupts_init();
+    ocore_syscall_init();
+
+    ocore_enter_user(user_entry, USER_STACK_TOP, report_capability);
 }
