@@ -5,10 +5,12 @@
 //! `.olinkignore`, skipping `.git` and other build/output directories — but,
 //! unlike o-link, it is *lossless*: binary assets, empty and extensionless
 //! files, executable bits, unix modes, and in-root symlinks are all captured.
+//! Generated `o-link` documents are excluded so rerunning the linker with an
+//! output path inside the project cannot recursively bundle its prior output.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use super::model::{FileRole, ProjectBundle, ProjectFile, BUNDLE_FORMAT_VERSION};
@@ -29,17 +31,35 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// relative, `/`-separated string, and `root_fingerprint` is a deterministic
 /// hash of the `(path, content_hash, mode)` triples.
 pub fn bundle_dir(root: &Path, name: &str) -> Result<ProjectBundle> {
+    bundle_dir_excluding(root, name, &[])
+}
+
+/// Bundle a directory while omitting the exact filesystem paths in
+/// `exclusions`.
+///
+/// Exclusions are resolved against the caller's current working directory,
+/// canonicalizing the nearest existing parent so paths continue to compare
+/// correctly through symlinked working directories even when the output file
+/// does not exist yet. Only exact files are omitted; ignore files remain the
+/// mechanism for excluding whole subtrees.
+pub fn bundle_dir_excluding(
+    root: &Path,
+    name: &str,
+    exclusions: &[PathBuf],
+) -> Result<ProjectBundle> {
     if !root.is_dir() {
         bail!("{}: not a directory", root.display());
     }
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", root.display()))?;
+    let exclusions = relative_exclusions(&root, exclusions);
 
     let mut files: Vec<ProjectFile> = Vec::new();
     let mut ignore_stack: Vec<IgnoreRules> = Vec::new();
     walk(&root, &root, &mut ignore_stack, &mut files)?;
 
+    files.retain(|file| !exclusions.contains(&file.path));
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     let root_fingerprint = fingerprint(&files);
@@ -54,6 +74,52 @@ pub fn bundle_dir(root: &Path, name: &str) -> Result<ProjectBundle> {
         default_route: None,
         metadata: BTreeMap::new(),
     })
+}
+
+fn relative_exclusions(root: &Path, exclusions: &[PathBuf]) -> BTreeSet<String> {
+    exclusions
+        .iter()
+        .filter_map(|path| exclusion_relative_path(root, path))
+        .collect()
+}
+
+fn exclusion_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let normalized = canonicalize_with_missing_tail(&absolute);
+    relative_path(root, &normalized).ok()
+}
+
+/// Canonicalize the nearest existing ancestor but preserve the final path
+/// components lexically. In particular, an existing output symlink is treated
+/// as the output path itself rather than silently resolving to its target.
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut cursor = path;
+    let mut tail = Vec::new();
+
+    loop {
+        if let Some(name) = cursor.file_name() {
+            tail.push(name.to_os_string());
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+        if cursor.exists() {
+            break;
+        }
+    }
+
+    let mut resolved = cursor
+        .canonicalize()
+        .unwrap_or_else(|_| normalize(cursor));
+    for component in tail.iter().rev() {
+        resolved.push(component);
+    }
+    normalize(&resolved)
 }
 
 /// Deterministic fingerprint of a sorted file list: sha256 over
@@ -203,6 +269,9 @@ fn capture_file(
     let rel = relative_path(root, path)?;
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if is_generated_olink_document(&bytes) {
+        return Ok(());
+    }
     let unix_mode = mode_of(meta);
     let executable = unix_mode.map(|m| m & 0o111 != 0).unwrap_or(false);
     let content_hash = sha256_hex(&bytes);
@@ -220,6 +289,15 @@ fn capture_file(
         role,
     });
     Ok(())
+}
+
+fn is_generated_olink_document(bytes: &[u8]) -> bool {
+    let body = bytes
+        .strip_prefix(b"#!/usr/bin/env o\r\n")
+        .or_else(|| bytes.strip_prefix(b"#!/usr/bin/env o\n"))
+        .unwrap_or(bytes);
+    body.starts_with(b"# Linked by o-link")
+        || body.starts_with(b"# Ostadix-lang lifted project")
 }
 
 fn capture_symlink(root: &Path, path: &Path, out: &mut Vec<ProjectFile>) -> Result<()> {

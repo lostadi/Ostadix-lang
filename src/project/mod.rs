@@ -13,7 +13,7 @@
 //!   * [`lower`] — lifting a project into a single valid `.O` document.
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub mod bundle;
 pub mod discover;
@@ -47,7 +47,23 @@ pub fn name_from_path(root: &Path) -> String {
 ///
 /// The precedence is: CLI overrides > manifest > discovery.
 pub fn assemble(root: &Path, name: &str, route_decls: &[String]) -> Result<ProjectBundle> {
-    let mut bundle = bundle::bundle_dir(root, name)?;
+    assemble_excluding(root, name, route_decls, &[])
+}
+
+/// Assemble a complete [`ProjectBundle`] while excluding exact filesystem
+/// paths from the captured file set.
+///
+/// This is primarily used by `o-link` when its output path is inside the
+/// project root: an existing non-generated output must not be captured and
+/// then overwritten as part of the new bundle. Relative exclusions are
+/// resolved from the caller's current working directory.
+pub fn assemble_excluding(
+    root: &Path,
+    name: &str,
+    route_decls: &[String],
+    exclusions: &[PathBuf],
+) -> Result<ProjectBundle> {
+    let mut bundle = bundle::bundle_dir_excluding(root, name, exclusions)?;
     discover::apply_discovery(&mut bundle, root);
     manifest::load_and_apply(&mut bundle, root)?;
     manifest::apply_cli_overrides(&mut bundle, route_decls)?;

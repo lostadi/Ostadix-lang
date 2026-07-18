@@ -296,8 +296,8 @@ needs QEMU and the local Rust linker toolchain.
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to x86_64 ELF objects. |
-| `o-link` | `target/release/o-link` | Combines scripts, source trees, and `.O` files into one validated `.O` program. |
-| `o-unlink` | `target/release/o-unlink` | Restores the source files embedded by `o-link`. |
+| `o-link` | `target/release/o-link` | Safely lifts codebases into route-preserving project bundles, or combines explicit scripts in literal mode. |
+| `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
 | `olangc` | `c_cpp/olangc` | Produces a hosted native executable through the C17 edition. |
@@ -828,13 +828,18 @@ cargo run --bin ocorec -- kernel.oc --emit mir -o -
 cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o target/kernel.o
 ```
 
-### Link a source tree into one O document
+### Link source into one O document
 
 ```bash
+# Explicit files retain the sequential typed-block linker.
 cargo run --bin o-link -- calc.py page.html app.O -o target/program.O
 cargo run -- target/program.O
 
-cargo run --bin o-unlink -- target/program.O -o target/restored/
+# One directory is lifted safely as a route-preserving project bundle.
+cargo run --bin o-link -- src/ -o target/project.O
+cargo run --bin o-link -- --list-routes target/project.O
+
+cargo run --bin o-unlink -- target/project.O -o target/restored/
 ```
 
 ---
@@ -1368,85 +1373,114 @@ native hosted binaries as a compatibility hook. Compiled binaries mint fresh
 process-local default backend authority at startup instead of embedding
 serialized authority.
 
-### `o-link`: one O document from a codebase
+### `o-link`: safe projects and explicit sequential programs
 
-`o-link` accepts files and directories, maps extensions to backends, wraps
-each source file in a typed expression, and emits one validated `.O` file.
+`o-link` distinguishes a **codebase** from a **sequence of scripts**. That
+separation matters because recursively wrapping every text file in an arbitrary
+repository can execute setup programs, migrations, test harnesses, installers,
+and obsolete bootstraps merely because they were discovered by a directory
+walk.
+
+A single directory therefore uses safe project mode by default:
+
+```bash
+o-link src/ -o project.O
+o-link --list-routes project.O
+o-link project.O --run --route py-main
+
+# When discovery or a manifest establishes one unambiguous default route:
+o-link src/ --run
+```
+
+Safe project mode captures the selected tree as one lossless project bundle,
+discovers ecosystem and manifest routes, and embeds the bundle as inert text.
+Neither linking the directory nor evaluating the generated document executes a
+source file or route:
+
+```bash
+O project.O
+# Ostadix project bundle loaded safely. No project route was executed.
+```
+
+Execution is an explicit project-runtime operation through `--run`. The legacy
+`--project` spelling remains accepted, and an already-lifted project `.O` file
+is detected automatically.
+
+Project bundles preserve binary assets, empty and extensionless files,
+executable bits, Unix modes, and in-root symlinks. They respect `.gitignore`
+and `.olinkignore`, skip `.git`, `target`, `node_modules`, `__pycache__`, and
+prior generated `o-link` documents, and are deterministic across repeated
+runs. Because this mode is deliberately lossless for non-ignored content,
+secrets should be listed in `.gitignore` or `.olinkignore` before a bundle is
+distributed.
+
+Explicit files still use the sequential typed-block linker:
 
 ```bash
 o-link calc.py page.html app.O -o program.O
-o-link src/ -o project.O
 o-link notes.txt --lang txt=markdown --stdout
 o-link calc.py --run
-o-link src/ -o app.O --shebang
-o-link src/ -o app.O --verbose-skips
 ```
 
-It provides several correctness properties:
+To apply that same behavior recursively to a directory, opt in with
+`--literal` -- also exposed as `--execute-all`:
+
+```bash
+o-link src/ --literal -o sequential.O
+# Equivalent spelling:
+o-link src/ --execute-all -o sequential.O
+```
+
+This flag is intentionally explicit. Running `sequential.O` executes every
+selected executable backend block in dependency order. Multiple or mixed
+directory inputs also require `--literal`. Options that configure per-file
+wrapping -- including `--lang`, `--verbose-skips`, `--no-validate`,
+`--shim-dir`, and `--backend-grant` -- are rejected in project mode rather
+than being silently ignored.
+
+Literal mode retains these correctness properties:
 
 - Recursive directory walks are deterministic.
-- Source markers are always relative to one common root computed across every
-  input. Absolute invocation paths never leak into the linked document, and
-  multiple input trees retain the directory components below their common
-  root.
-- `.gitignore` and `.olinkignore` rules are loaded at each walked directory.
-  Git-compatible negation rules are honored.
-- A linked tree is literal. If you run the resulting `.O` file, every selected
-  executable backend block runs. Use `.olinkignore` to leave out test harnesses,
-  setup scripts, old bundles, generated outputs, and other files that are
-  useful to preserve but not meant to execute as part of the program.
+- Source markers are relative to one common root computed across every input,
+  so absolute invocation paths do not leak into the linked document.
+- `.gitignore` and `.olinkignore` rules, including negation, are honored at
+  each walked directory.
 - Every readable UTF-8 file is selected. Known extensions use their registered
-  backend, while unknown extensions and extensionless files use the inert
-  `text` backend and remain byte-for-byte recoverable through `o-unlink`.
+  backend; unknown and extensionless files use inert `text`.
 - Hidden paths, `target`, `node_modules`, `__pycache__`, `.git`, ignored paths,
-  generated `o-link` outputs, unreadable entries, binary data, duplicates,
-  symlink aliases, and the output file itself are skipped. Default warnings are
-  grouped by reason so a large ignored tree cannot flood the terminal or force
-  a full walk of generated children. `--verbose-skips` descends into excluded
-  trees and prints one warning for every skipped path. A final scan summary
-  always reports the selected and skipped counts.
-- Symlinked directories are visited at most once.
+  generated outputs, unreadable entries, binary data, duplicates, symlink
+  aliases, and the output file itself are skipped. `--verbose-skips` reports
+  each exclusion; the default groups warnings by reason.
 - O openers, matching closers, and `$name` sequences inside source files are
-  escaped and round-trip as literal source.
-- Each section records its exact byte length. Embedded source-path markers,
-  opener text, closer text, final-newline differences, and other source text
-  cannot be mistaken for section boundaries by `o-unlink`.
+  escaped and round-trip literally.
+- Every section records its exact byte length, so embedded marker-like text and
+  final-newline differences cannot be mistaken for section boundaries.
 - Static imports are dependency ordered for Python, JavaScript, Rust, C and
   C++, Java, Haskell, Ruby, OCaml, Racket and Lisp, shell, Nix, C#, MATLAB,
-  and Wolfram Language inputs. Files without a recognized dependency remain
-  in stable walk order.
-- Every wrapped file receives an isolated explicit environment number.
-- Wrapped backends are emitted as plain typed blocks; running linked output uses
-  the default full backend authority.
-- The combined source is parsed again before it is written unless
-  `--no-validate` is requested.
+  and Wolfram Language. Unrecognized dependencies retain stable walk order.
+- Every wrapped file receives an isolated explicit environment number, and the
+  combined source is parsed again before writing unless `--no-validate` is
+  requested.
 
 The built-in extension map includes Python, shell, HTML, LaTeX, Markdown,
 Rust, Racket, Nix, text, C and C++, C#, Haskell, Scheme, Common Lisp, SQL,
 Ruby, MATLAB, Wolfram Language, WAT, Java, JavaScript, and OCaml.
-Extensions outside this map are preserved with the `text` backend unless an
-explicit `--lang EXT=BACKEND` mapping selects another registered backend.
 
-### `o-unlink`: restore the linked source tree
+### `o-unlink`: restore either representation
 
-`o-unlink` reads the source-path markers written by `o-link`, reconstructs the
-escaped body of each typed expression, and writes the original files under an
-output directory:
+`o-unlink` recognizes both formats produced by `o-link`:
 
 ```bash
-o-unlink combined.O -o restored/
-o-unlink combined.O --dry-run
+o-unlink project.O -o restored/
+o-unlink sequential.O -o restored-literal/
+o-unlink project.O --dry-run
 ```
 
-The output path is checked before writing so a linked document cannot escape
-the selected directory through `..` components. For UTF-8 textual source
-trees, `o-link` followed by `o-unlink` round-trips the selected contents. The
-test suite proves this over generated small trees with nested directories,
-registered, unknown, and missing extensions, dollar variables, embedded opener
-and closer text, Unicode, final-newline variations, file aliases, and directory
-symlink loops.
-Each generated case runs both binaries and requires `diff -r` to report an
-empty difference.
+For a lifted project, it extracts the embedded bundle and restores binary
+bytes, empty files, executable modes, and safe in-root symlinks. For a literal
+link document, it reconstructs each escaped typed-block section. All stored
+paths are confined to the selected output directory -- absolute paths,
+parent-directory traversal, and writes through escaping symlinks are rejected.
 
 ### `o-notebook`: local interactive documents
 
