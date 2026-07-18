@@ -76,6 +76,18 @@ pub fn lower_to_o(bundle: &ProjectBundle) -> String {
     out.push_str(")_text\n");
     out.push_str(BUNDLE_END);
     out.push('\n');
+    out.push('\n');
+
+    // Evaluating a lifted project directly must be both inert and intelligible.
+    // The payload block above is inline text, not executable source, and this
+    // final value replaces the otherwise enormous base64 payload as the CLI's
+    // displayed document result.
+    out.push_str("text^(\n");
+    out.push_str("Ostadix project bundle loaded safely. No project route was executed.\n");
+    out.push_str(
+        "Use `o-link --list-routes <bundle.O>` and `o-link <bundle.O> --run --route <id>`.\n",
+    );
+    out.push_str(")_text\n");
 
     out
 }

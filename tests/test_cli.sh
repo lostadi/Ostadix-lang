@@ -221,7 +221,7 @@ check_olink_hardened_round_trip() {
     cp "$source/README" "$expected/README"
     printf '\377\376\000' >"$source/binary.py"
 
-    run_command "$OLINK_BIN" "$source" -o "$combined"
+    run_command "$OLINK_BIN" --literal "$source" -o "$combined"
     if [ "$RUN_EXIT" -ne 0 ]; then
         fail "o-link hardening round-trip" "(o-link failed with exit $RUN_EXIT)"
         return

@@ -146,6 +146,7 @@ proptest! {
 
         let link = run(
             Command::new(env!("CARGO_BIN_EXE_o-link"))
+                .arg("--literal")
                 .arg(&source)
                 .arg("-o")
                 .arg(&combined),

@@ -1,9 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // o-link: the Ostadix-lang linker / combiner compiler
 //
-// Accepts a list of scripts, source files, or whole codebases (directories)
-// and links them into a single .O file. Each input file is wrapped in the
-// typed-expression block of the backend that matches its extension:
+// Accepts explicit scripts/source files or whole codebases and links them into
+// a single .O file. Directory inputs are lifted as lossless project bundles by
+// default, so merely evaluating the resulting document cannot execute every
+// setup, test, migration, or bootstrap script in the tree. The old sequential
+// per-file behavior remains available only through the explicit --literal flag.
+//
+// In literal mode, each input file is wrapped in the typed-expression block of
+// the backend that matches its extension:
 //
 //   hello.py    →  python[N]^( ...file contents... )_python[N]
 //   build.sh    →  bash[N]^( ...file contents... )_bash[N]
@@ -21,9 +26,11 @@
 // their alphabetical order.  For languages without import scanning support,
 // files keep the sorted order from the directory walk.
 //
-// Directories are walked recursively; every UTF-8 text file is included in
-// sorted order so the output is deterministic. Unknown and extensionless
-// files use the inert text backend unless --lang selects another backend.
+// Literal directories are walked recursively; every UTF-8 text file is
+// included in sorted order so the output is deterministic. Unknown and
+// extensionless files use the inert text backend unless --lang selects another
+// backend. Safe project mode instead captures the whole tree losslessly and
+// executes only an explicitly selected discovered/manifest route.
 //
 // Any text inside a wrapped file that would collide with Ostadix-lang syntax:
 // a registered opener like `python^(`, the wrapping block's own closer
@@ -34,12 +41,14 @@
 //
 // Usage:
 //   o-link a.py b.sh c.html -o program.O      # link three scripts
-//   o-link src/ -o project.O                  # link a whole codebase
+//   o-link src/ -o project.O                  # safely lift a whole codebase
+//   o-link src/ --run                          # run its unambiguous project route
+//   o-link src/ --literal -o sequential.O     # legacy: execute every text file
 //   o-link a.py --lang txt=markdown -o out.O  # extra extension mapping
 //   o-link a.py --stdout                      # write to stdout instead
 //   o-link a.py b.sh --run                    # link, then execute in-process
-//   o-link src/ -o app.O --shebang            # emit `#!/usr/bin/env o`, chmod +x
-//   o-link src/ -o app.O --verbose-skips      # report every excluded path
+//   o-link src/ -o app.O --shebang            # safe lifted project + shebang
+//   o-link src/ --literal --verbose-skips      # report literal-mode exclusions
 //
 // Robustness guarantees:
 //   * The combined output is re-parsed with the Ostadix-lang parser before it is
@@ -135,10 +144,11 @@ struct WalkState<'a> {
 #[derive(Debug, ClapParser)]
 #[command(
     name = "o-link",
-    about = "Link scripts and codebases into a single .O file"
+    about = "Link explicit scripts or safely lift codebases into one .O file"
 )]
 struct Cli {
-    /// Input files and/or directories to link, in order.
+    /// Input files and/or directories. A single directory is safely lifted as
+    /// a project bundle unless --literal is given.
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
@@ -182,12 +192,16 @@ struct Cli {
     #[arg(long = "shebang", conflicts_with = "to_stdout")]
     shebang: bool,
 
-    /// Treat a single input directory as a *project*: bundle its files,
-    /// discover + apply manifest routes, and lift it into one .O document
-    /// (instead of wrapping each file independently). Combine with `--run`
-    /// to execute a route via the project runtime.
+    /// Force project mode. This is now the default for a single directory or
+    /// an already-lifted project .O file; the flag remains for compatibility.
     #[arg(long = "project")]
     project: bool,
+
+    /// Use the legacy sequential linker: wrap every selected UTF-8 file as an
+    /// executable backend block. Required for mixed/multiple directory inputs.
+    /// Running the result executes every wrapped source file in order.
+    #[arg(long, visible_alias = "execute-all")]
+    literal: bool,
 
     /// Print the discovered + manifest route table for the input directory or
     /// an existing lifted .O file, then exit without executing anything.
@@ -196,13 +210,13 @@ struct Cli {
 
     /// With `--run`, execute this route (or route set, by its `provides`
     /// token) through the project runtime.
-    #[arg(long = "route", value_name = "ID")]
+    #[arg(long = "route", value_name = "ID", requires = "run")]
     route: Option<String>,
 
     /// With `--run`, apply this policy to the selected route set.
     /// One of: explicit, default, fallback, any_success, race_success,
     /// race_settle, all, verify_equivalent, benchmark_and_select.
-    #[arg(long = "routes-policy", value_name = "POLICY")]
+    #[arg(long = "routes-policy", value_name = "POLICY", requires = "run")]
     routes_policy: Option<String>,
 
     /// Add or override a route from the command line (repeatable). Micro-syntax:
@@ -219,17 +233,61 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let backends = registered_backends();
 
-    // ── Project mode ─────────────────────────────────────────────────────────
-    // `--list-routes`, `--project`, and route selection/override flags route
-    // through the first-class project model instead of per-file wrapping.
+    // ── Safe project mode vs explicit literal mode ───────────────────────────
+    // A codebase is not semantically one sequential program. Treating a whole
+    // directory literally used to execute setup scripts, migrations, test
+    // harnesses, and bootstrap installers simply because they were text files.
+    // Single directories and already-lifted project documents therefore enter
+    // project mode automatically. `--literal` is the explicit opt-in for the
+    // historical per-file sequential behavior.
+    if cli.literal && (cli.project || cli.list_routes) {
+        bail!("--literal/--execute-all cannot be combined with --project or --list-routes");
+    }
+    if cli.list_routes && cli.run {
+        bail!("--list-routes cannot be combined with --run");
+    }
+    if (cli.route.is_some() || cli.routes_policy.is_some()) && !cli.run {
+        bail!("--route and --routes-policy require --run");
+    }
+
     if cli.list_routes {
+        ensure_project_compatible_flags(&cli)?;
         return list_routes_mode(&cli);
     }
-    if cli.project {
+
+    let implicit_project = implicit_project_input(&cli)?;
+    if cli.project || implicit_project {
+        ensure_project_compatible_flags(&cli)?;
+        if implicit_project && !cli.project {
+            eprintln!(
+                "o-link: using safe project mode; direct evaluation will not execute project files"
+            );
+            eprintln!(
+                "o-link: use --run [--route <id>] for one project route, or --literal for legacy sequential wrapping"
+            );
+        }
         return project_mode(&cli);
     }
+
     if cli.route.is_some() || cli.routes_policy.is_some() || !cli.route_decls.is_empty() {
-        bail!("--route/--routes-policy/--route-decl require --project (or --list-routes)");
+        bail!(
+            "--route/--routes-policy/--route-decl require a project directory, a lifted project .O file, or --project"
+        );
+    }
+
+    if !cli.literal && cli.inputs.iter().any(|input| input.is_dir()) {
+        bail!(
+            "multiple or mixed directory inputs require --literal; safe project mode accepts exactly one project directory"
+        );
+    }
+
+    if cli.literal && cli.inputs.iter().any(|input| input.is_dir()) {
+        eprintln!(
+            "warning: --literal/--execute-all directory mode wraps every selected UTF-8 file as executable backend code"
+        );
+        eprintln!(
+            "warning: running the linked document executes all wrapped backend blocks in dependency order"
+        );
     }
 
     let mut ext_map = default_extension_map();
@@ -338,6 +396,56 @@ fn run_combined(
     Ok(())
 }
 
+/// True when the CLI's single input should use the first-class project model
+/// without requiring the legacy `--project` spelling.
+fn implicit_project_input(cli: &Cli) -> Result<bool> {
+    if cli.literal || cli.inputs.len() != 1 {
+        return Ok(false);
+    }
+
+    let input = &cli.inputs[0];
+    if input.is_dir() {
+        return Ok(true);
+    }
+    if !input.is_file() {
+        return Ok(false);
+    }
+
+    let source = fs::read_to_string(input)
+        .with_context(|| format!("failed to read {}", input.display()))?;
+    Ok(o_lang::project::lower::has_embedded_bundle(&source))
+}
+
+/// Project mode has different semantics from literal per-file wrapping. Reject
+/// options that would otherwise be silently ignored rather than surprising the
+/// user or accidentally weakening the safe-directory default.
+fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
+    let mut incompatible = Vec::new();
+    if !cli.lang.is_empty() {
+        incompatible.push("--lang");
+    }
+    if cli.verbose_skips {
+        incompatible.push("--verbose-skips");
+    }
+    if cli.no_validate {
+        incompatible.push("--no-validate");
+    }
+    if cli.shim_dir != PathBuf::from("backends") {
+        incompatible.push("--shim-dir");
+    }
+    if !cli.backend_grants.is_empty() {
+        incompatible.push("--backend-grant");
+    }
+
+    if !incompatible.is_empty() {
+        bail!(
+            "{} configure literal per-file linking and cannot be used in project mode; add --literal to opt into sequential execution",
+            incompatible.join(", ")
+        );
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Project mode
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +464,11 @@ fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
     let input = single_input(cli)?;
     if input.is_dir() {
         let name = o_lang::project::name_from_path(&input);
-        o_lang::project::assemble(&input, &name, &cli.route_decls)
+        let exclusions = (!cli.to_stdout && !cli.run && !cli.list_routes)
+            .then(|| cli.output.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        o_lang::project::assemble_excluding(&input, &name, &cli.route_decls, &exclusions)
     } else if input.is_file() {
         let source = fs::read_to_string(&input)
             .with_context(|| format!("failed to read {}", input.display()))?;
@@ -651,7 +763,12 @@ fn walk_dir(dir: &Path, state: &mut WalkState<'_>) -> Result<()> {
 }
 
 fn is_generated_olink_output(text: &str) -> bool {
-    text.starts_with(O_LINK_GENERATED_HEADER)
+    let body = text
+        .strip_prefix("#!/usr/bin/env o\r\n")
+        .or_else(|| text.strip_prefix("#!/usr/bin/env o\n"))
+        .unwrap_or(text);
+    body.starts_with(O_LINK_GENERATED_HEADER)
+        || body.starts_with("# Ostadix-lang lifted project")
 }
 
 fn record_excluded_tree(
@@ -1672,6 +1789,16 @@ mod tests {
             "# Linked by o-link: single-file .O program\npython^(2)_python\n",
         )
         .unwrap();
+        fs::write(
+            dir.join("project.O"),
+            "# Ostadix-lang lifted project\n# generated bundle\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("executable.O"),
+            "#!/usr/bin/env o\n# Linked by o-link: generated\n",
+        )
+        .unwrap();
 
         let map = default_extension_map();
         let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
@@ -1682,15 +1809,17 @@ mod tests {
             .files
             .iter()
             .any(|path| path.ends_with("ordinary.O")));
-        assert!(!collection
-            .files
-            .iter()
-            .any(|path| path.ends_with("combined.O")));
-        assert!(collection
-            .skipped
-            .iter()
-            .any(|skip| skip.path.ends_with("combined.O")
-                && skip.reason == "generated o-link output"));
+        for generated in ["combined.O", "project.O", "executable.O"] {
+            assert!(!collection
+                .files
+                .iter()
+                .any(|path| path.ends_with(generated)));
+            assert!(collection
+                .skipped
+                .iter()
+                .any(|skip| skip.path.ends_with(generated)
+                    && skip.reason == "generated o-link output"));
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

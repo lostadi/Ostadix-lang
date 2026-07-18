@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use o_lang::project::bundle::{bundle_dir, deserialize, serialize};
+use o_lang::project::bundle::{bundle_dir, bundle_dir_excluding, deserialize, serialize};
 use o_lang::project::lower::{extract_bundle_from_o, has_embedded_bundle, lower_to_o_validated};
 use o_lang::project::manifest::{apply_cli_overrides, apply_manifest, parse_route_decl};
 use o_lang::project::materialize::{materialize, materialize_isolated};
@@ -114,6 +114,49 @@ fn project_bundle_skips_git_and_target() {
     assert!(bundle.files.iter().any(|f| f.path == "keep.txt"));
     assert!(!bundle.files.iter().any(|f| f.path.starts_with(".git")));
     assert!(!bundle.files.iter().any(|f| f.path.starts_with("target")));
+}
+
+#[test]
+fn project_bundle_excludes_requested_existing_output() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "keep.txt", b"keep");
+    write(
+        dir.path(),
+        "combined.O",
+        b"ordinary pre-existing file, not an o-link document\n",
+    );
+
+    let output = dir.path().join("combined.O");
+    let bundle = bundle_dir_excluding(dir.path(), "p", &[output]).unwrap();
+    assert!(bundle.files.iter().any(|file| file.path == "keep.txt"));
+    assert!(!bundle.files.iter().any(|file| file.path == "combined.O"));
+}
+
+#[test]
+fn project_bundle_skips_generated_olink_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "keep.txt", b"keep");
+    write(
+        dir.path(),
+        "combined.O",
+        b"# Ostadix-lang lifted project\n# generated output\n",
+    );
+    write(
+        dir.path(),
+        "legacy.O",
+        b"# Linked by o-link\n# generated output\n",
+    );
+    write(
+        dir.path(),
+        "executable.O",
+        b"#!/usr/bin/env o\n# Ostadix-lang lifted project\n",
+    );
+
+    let bundle = bundle_dir(dir.path(), "p").unwrap();
+    assert!(bundle.files.iter().any(|file| file.path == "keep.txt"));
+    for generated in ["combined.O", "legacy.O", "executable.O"] {
+        assert!(!bundle.files.iter().any(|file| file.path == generated));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -762,8 +805,15 @@ fn project_lower_to_o_reparses_and_round_trips() {
     assert!(has_embedded_bundle(&lifted));
 
     // The lifted document does NOT wrap each source file as an evaluator block.
-    // Only the single text^( ) payload block should be present.
-    assert_eq!(lifted.matches("^(").count(), 1, "exactly one payload block");
+    // It contains one payload block and one inert direct-evaluation notice.
+    assert_eq!(
+        lifted.matches("text^(").count(),
+        2,
+        "payload plus safety notice"
+    );
+    assert!(!lifted.contains("python^(") && !lifted.contains("bash^("));
+    assert!(lifted.contains("Ostadix project bundle loaded safely."));
+    assert!(lifted.contains("No project route was executed."));
 
     let extracted = extract_bundle_from_o(&lifted).unwrap();
     assert_eq!(extracted, bundle);

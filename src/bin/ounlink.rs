@@ -3,6 +3,8 @@
 //
 // Reads a combined `.O` file produced by `o-link` and writes each original
 // source file back to an output directory, reconstructing the pre-link layout.
+// Both legacy literal link sections and safe lifted project bundles are
+// supported. Project bundles restore binary files, modes, and in-root symlinks.
 //
 // `o-link` embeds a path comment before each wrapped file:
 //
@@ -20,10 +22,11 @@
 // well: their raw text (everything between the path comment and the next
 // recognised block or path comment) is written back to the output file.
 //
-// Round-trip property:
-//   o-link src/ -o combined.O && o-unlink combined.O -o src2/ && diff -r src/ src2/
-// should produce an empty diff for any source tree that contains only files
-// with extensions recognised by the default extension map.
+// Round-trip properties:
+//   o-link src/ -o project.O && o-unlink project.O -o src2/ && diff -r src/ src2/
+// restores the safe project bundle losslessly, including binary bytes, empty
+// files, modes, and in-root symlinks. `o-link src/ --literal` retains the
+// older UTF-8 section format.
 //
 // Usage:
 //   o-unlink combined.O -o src/             # restore into src/
@@ -38,6 +41,8 @@ use std::fs;
 use std::path::{Component, PathBuf};
 
 use o_lang::parser::{reconstruct_source, ONode, Parser};
+use o_lang::project::lower::{extract_bundle_from_o, has_embedded_bundle};
+use o_lang::project::materialize::materialize;
 
 const SECTION_LENGTH_PREFIX: &str = "# o-link-section-bytes: ";
 
@@ -45,7 +50,7 @@ const SECTION_LENGTH_PREFIX: &str = "# o-link-section-bytes: ";
 #[derive(Debug, ClapParser)]
 #[command(
     name = "o-unlink",
-    about = "Restore source files from a combined .O file produced by o-link"
+    about = "Restore files from a literal or safely lifted .O file produced by o-link"
 )]
 struct Cli {
     /// The combined .O file to unlink.
@@ -66,6 +71,10 @@ fn main() -> Result<()> {
 
     let source = fs::read_to_string(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
+
+    if has_embedded_bundle(&source) {
+        return unlink_project_bundle(&cli, &source);
+    }
 
     let entries =
         unlink_source(&source).context("failed to extract files from combined .O source")?;
@@ -104,6 +113,31 @@ fn main() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Restore a safe lifted project bundle. Unlike the legacy text-section
+/// format, the project model is lossless for binary data, executable modes, and
+/// in-root symlinks, so delegate to its hardened materializer.
+fn unlink_project_bundle(cli: &Cli, source: &str) -> Result<()> {
+    let bundle = extract_bundle_from_o(source)
+        .context("failed to extract lifted project bundle from .O source")?;
+
+    if cli.dry_run {
+        for file in &bundle.files {
+            println!("{}", cli.output_dir.join(&file.path).display());
+        }
+        return Ok(());
+    }
+
+    let _workspace = materialize(&bundle, &cli.output_dir)
+        .context("failed to materialize lifted project bundle")?;
+    eprintln!(
+        "unlinked lifted project '{}' ({} file(s)) into {}",
+        bundle.name,
+        bundle.files.len(),
+        cli.output_dir.display()
+    );
     Ok(())
 }
 
