@@ -411,7 +411,7 @@ the prepared TCB to the FIFO. The million-iteration transaction stress does not
 enter CPL3; the IRQ/SYSCALL phase is the real frame-save and IRETQ evidence.
 
 `ocore/kernel/smoke-scheduler-qemu.sh` is the executable acceptance gate. It
-requires the million-switch proof, all four CPL3 progress markers, cooperative
+requires the million-transaction proof, all four CPL3 progress markers, cooperative
 yield, cross-thread hostile-RFLAGS sanitization, exactly-once timer wakes,
 preemptive process exit, sibling progress, stale TCB rejection, frame
 reclamation, and a post-lifecycle timer.
