@@ -5,69 +5,193 @@ use runtime::personality::PERSONALITY_NATIVE;
 use runtime::native_abi::NATIVE_ABI_V1;
 
 pub const MAX_DOMAINS: usize = 4;
-pub const DOMAIN_NATIVE_0: u64 = 1;
+pub const DOMAIN_NATIVE_0: u64 = 0x0000_0001_d100_0000;
+
+const DOMAIN_EMPTY: u8 = 0;
+const DOMAIN_LIVE: u8 = 1;
+const DOMAIN_RETIRED: u8 = 2;
+const DOMAIN_HANDLE_TAG: u64 = 0xd100_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 
 static mut DOMAIN_IDS: [u64; 4] = [0; 4];
 static mut PERSONALITY_IDS: [u64; 4] = [0; 4];
 static mut ABI_VERSIONS: [u64; 4] = [0; 4];
-static mut OCCUPIED: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut CHILD_REFS: [u32; 4] = [0; 4];
+static mut STATES: [u8; 4] = [0; 4];
+static mut INITIALIZED: u8 = 0;
 
-unsafe fn install(
+fn domain_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn domain_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | DOMAIN_HANDLE_TAG
+        | (slot as u64);
+}
+
+unsafe fn checked_domain(handle: u64) -> usize {
+    if INITIALIZED == 0 || (handle & HANDLE_TAG_MASK) != DOMAIN_HANDLE_TAG {
+        return MAX_DOMAINS;
+    }
+    let slot: usize = domain_index(handle);
+    if slot >= MAX_DOMAINS || STATES[slot] != DOMAIN_LIVE {
+        return MAX_DOMAINS;
+    }
+    if GENERATIONS[slot] != domain_generation(handle) {
+        return MAX_DOMAINS;
+    }
+    return slot;
+}
+
+pub unsafe fn domain_handle_for_slot(slot: usize) -> u64 {
+    if INITIALIZED == 0 || slot >= MAX_DOMAINS || STATES[slot] != DOMAIN_LIVE {
+        return 0;
+    }
+    return make_handle(slot);
+}
+
+pub unsafe fn domain_id_for(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS {
+        return 0;
+    }
+    return DOMAIN_IDS[slot];
+}
+
+pub unsafe fn create_domain(
     slot: usize,
     domain_id: u64,
     personality_id: u64,
     abi_version: u64
 ) -> u64 {
-    if slot >= MAX_DOMAINS {
+    if INITIALIZED == 0 || slot >= MAX_DOMAINS {
         return 0;
     }
     if domain_id == 0 || abi_version == 0 || !is_supported(personality_id) {
         return 0;
     }
-    if OCCUPIED[slot] != 0 {
+    if STATES[slot] != DOMAIN_EMPTY || GENERATIONS[slot] == 0 {
         return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_DOMAINS {
+        if STATES[other] == DOMAIN_LIVE && DOMAIN_IDS[other] == domain_id {
+            return 0;
+        }
+        other += 1;
     }
     DOMAIN_IDS[slot] = domain_id;
     PERSONALITY_IDS[slot] = personality_id;
     ABI_VERSIONS[slot] = abi_version;
-    OCCUPIED[slot] = 1;
-    return domain_id;
+    CHILD_REFS[slot] = 0;
+    STATES[slot] = DOMAIN_LIVE;
+    return make_handle(slot);
+}
+
+// Compatibility spelling for the original internal installer.
+pub unsafe fn install(
+    slot: usize,
+    domain_id: u64,
+    personality_id: u64,
+    abi_version: u64
+) -> u64 {
+    return create_domain(slot, domain_id, personality_id, abi_version);
 }
 
 pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
     let mut slot: usize = 0;
     while slot < MAX_DOMAINS {
         DOMAIN_IDS[slot] = 0;
         PERSONALITY_IDS[slot] = 0;
         ABI_VERSIONS[slot] = 0;
-        OCCUPIED[slot] = 0;
+        GENERATIONS[slot] = 1;
+        CHILD_REFS[slot] = 0;
+        STATES[slot] = DOMAIN_EMPTY;
         slot += 1;
     }
-    return install(0, DOMAIN_NATIVE_0, PERSONALITY_NATIVE, NATIVE_ABI_V1);
+    INITIALIZED = 1;
+    return create_domain(
+        0,
+        1,
+        PERSONALITY_NATIVE,
+        NATIVE_ABI_V1
+    );
 }
 
-pub unsafe fn abi_version_for(domain_id: u64) -> u64 {
-    let mut slot: usize = 0;
-    while slot < MAX_DOMAINS {
-        if OCCUPIED[slot] != 0 && DOMAIN_IDS[slot] == domain_id {
-            return ABI_VERSIONS[slot];
-        }
-        slot += 1;
+pub unsafe fn abi_version_for(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS {
+        return 0;
     }
-    return 0;
+    return ABI_VERSIONS[slot];
 }
 
-pub unsafe fn personality_for(domain_id: u64) -> u64 {
-    let mut slot: usize = 0;
-    while slot < MAX_DOMAINS {
-        if OCCUPIED[slot] != 0 && DOMAIN_IDS[slot] == domain_id {
-            return PERSONALITY_IDS[slot];
-        }
-        slot += 1;
+pub unsafe fn personality_for(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS {
+        return 0;
     }
-    return 0;
+    return PERSONALITY_IDS[slot];
 }
 
-pub unsafe fn is_live(domain_id: u64) -> bool {
-    return personality_for(domain_id) != 0;
+pub unsafe fn is_live(handle: u64) -> bool {
+    return checked_domain(handle) < MAX_DOMAINS;
+}
+
+pub unsafe fn retain_child(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS || CHILD_REFS[slot] == 0xffff_ffff {
+        return 0;
+    }
+    CHILD_REFS[slot] += 1;
+    return 1;
+}
+
+pub unsafe fn release_child(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS || CHILD_REFS[slot] == 0 {
+        return 0;
+    }
+    CHILD_REFS[slot] -= 1;
+    return 1;
+}
+
+pub unsafe fn child_refs(handle: u64) -> u32 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS {
+        return 0;
+    }
+    return CHILD_REFS[slot];
+}
+
+pub unsafe fn destroy_domain(handle: u64) -> u64 {
+    let slot: usize = checked_domain(handle);
+    if slot >= MAX_DOMAINS || CHILD_REFS[slot] != 0 {
+        return 0;
+    }
+    DOMAIN_IDS[slot] = 0;
+    PERSONALITY_IDS[slot] = 0;
+    ABI_VERSIONS[slot] = 0;
+    CHILD_REFS[slot] = 0;
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = DOMAIN_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = DOMAIN_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn destroy(handle: u64) -> u64 {
+    return destroy_domain(handle);
 }

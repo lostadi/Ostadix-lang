@@ -1,24 +1,209 @@
 module runtime::address_space;
 
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_slot_for_handle;
+use runtime::capability::validate_for_owner;
+use runtime::capability::valid_cspace_slot;
+use runtime::capability::MAX_CSPACES;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::memory_object::allocate_kernel_object_for_owner;
+use runtime::memory_object::object_kind;
+use runtime::memory_object::release_object;
+use runtime::memory_object::MEMORY_ANONYMOUS;
+use runtime::memory_object::MEMORY_SHARED;
+use runtime::mapping::create_owned as create_owned_mapping;
+use runtime::mapping::destroy_for_owner as destroy_owned_mapping;
+use runtime::mapping::is_live as mapping_is_live;
+use runtime::mapping::matches as mapping_matches;
+use runtime::mapping::physical_address as mapping_physical_address;
+use runtime::pages::alloc_frame;
+use runtime::pages::frame_address;
+use runtime::pages::release_frame;
+use runtime::pages::FRAME_KIND_PAGE_TABLE;
+
 pub const VM_USER: u64 = 1;
 pub const VM_READ: u64 = 2;
 pub const VM_WRITE: u64 = 4;
 pub const VM_EXEC: u64 = 8;
 pub const VM_STACK: u64 = 16;
 
-const MAX_REGIONS: usize = 4;
-const BOOTSTRAP_ADDRESS_SPACE: u64 = 1;
+pub const MAX_ADDRESS_SPACES: usize = 4;
+const MAX_BOOTSTRAP_REGIONS: usize = 4;
+const MAX_NATIVE_REGIONS: usize = 5;
 const PAGE_SIZE: usize = 4096;
+const HUGE_PAGE_SIZE: usize = 0x00200000;
 
-static mut LIVE: u8 = 0;
-static mut ROOT_CR3: usize = 0;
-static mut REGION_STARTS: [usize; 4] = [0; 4];
-static mut REGION_ENDS: [usize; 4] = [0; 4];
-static mut REGION_FLAGS: [u64; 4] = [0; 4];
-static mut REGION_COUNT: usize = 0;
+// Handle 1 remains the exact bootstrap identity expected by the Milestone
+// 0.2/0.3 kernel. Dynamically created address spaces use a disjoint kind-tagged
+// namespace so an equal generation and slot from another registry cannot name
+// an address space by integer coincidence.
+const BOOTSTRAP_ADDRESS_SPACE: u64 = 1;
+const ADDRESS_SPACE_HANDLE_TAG: u64 = 0xa200_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 
-unsafe fn add_region(start: usize, end: usize, flags: u64) -> u64 {
-    if REGION_COUNT >= MAX_REGIONS || start >= end {
+const ADDRESS_SPACE_EMPTY: u8 = 0;
+const ADDRESS_SPACE_LIVE: u8 = 1;
+const ADDRESS_SPACE_RETIRED: u8 = 2;
+
+const PTE_PRESENT: u64 = 1;
+const PTE_WRITE: u64 = 2;
+const PTE_USER: u64 = 4;
+const PTE_HUGE: u64 = 0x80;
+const PTE_NX: u64 = 0x8000_0000_0000_0000;
+// The processor may set Accessed and Dirty while a present mapping is active.
+// Permission inspection must ignore only those two hardware-owned bits.
+const PTE_STABLE_MASK: u64 = 0xffff_ffff_ffff_ff9f;
+
+const USER_TEXT_START: usize = 0x01000000;
+const USER_TEXT_END: usize = 0x01010000;
+const USER_ISOLATION_VA: usize = 0x01201000;
+const USER_ISOLATION_END: usize = 0x01202000;
+const USER_SHARED_VA: usize = 0x01202000;
+const USER_SHARED_END: usize = 0x01203000;
+const USER_STACK_GUARD: usize = 0x013fb000;
+const USER_STACK_ONE_START: usize = 0x013fc000;
+const USER_STACK_ONE_TOP: usize = 0x013fd000;
+const USER_STACK_INTERNAL_GUARD: usize = 0x013fd000;
+const USER_STACK_ZERO_START: usize = 0x013fe000;
+const USER_STACK_ZERO_TOP: usize = 0x01400000;
+const NATIVE_STACK_PAGES: usize = 3;
+
+static mut BOOTSTRAP_LIVE: u8 = 0;
+static mut BOOTSTRAP_ROOT_CR3: usize = 0;
+static mut BOOTSTRAP_REGION_STARTS: [usize; 4] = [0; 4];
+static mut BOOTSTRAP_REGION_ENDS: [usize; 4] = [0; 4];
+static mut BOOTSTRAP_REGION_FLAGS: [u64; 4] = [0; 4];
+static mut BOOTSTRAP_REGION_COUNT: usize = 0;
+static mut BOOTSTRAP_CHILD_REFS: u32 = 0;
+
+static mut INITIALIZED: u8 = 0;
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut OWNERS: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACE_CHILD_REFS: [u32; 4] = [0; 4];
+static mut ROOT_CR3S: [usize; 4] = [0; 4];
+static mut REGION_STARTS: [usize; 20] = [0; 20];
+static mut REGION_ENDS: [usize; 20] = [0; 20];
+static mut REGION_FLAGS: [u64; 20] = [0; 20];
+static mut REGION_COUNTS: [usize; 4] = [0; 4];
+
+// Page-table frames are kernel-internal typed frame handles. Anonymous leaves
+// are memory objects with an owner reference plus a distinct mapping reference.
+static mut ROOT_TABLE_FRAMES: [u64; 4] = [0; 4];
+static mut LEVEL3_TABLE_FRAMES: [u64; 4] = [0; 4];
+static mut LEVEL2_TABLE_FRAMES: [u64; 4] = [0; 4];
+static mut TEXT_TABLE_FRAMES: [u64; 4] = [0; 4];
+static mut STACK_TABLE_FRAMES: [u64; 4] = [0; 4];
+static mut ISOLATION_OBJECTS: [u64; 4] = [0; 4];
+static mut ISOLATION_PHYSICAL: [usize; 4] = [0; 4];
+static mut ISOLATION_MAPPINGS: [u64; 4] = [0; 4];
+static mut SHARED_OBJECTS: [u64; 4] = [0; 4];
+static mut SHARED_PHYSICAL: [usize; 4] = [0; 4];
+static mut SHARED_MAPPINGS: [u64; 4] = [0; 4];
+static mut STACK_OBJECTS: [u64; 16] = [0; 16];
+static mut STACK_PHYSICAL: [usize; 16] = [0; 16];
+static mut STACK_MAPPINGS: [u64; 16] = [0; 16];
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_kernel_p1_address() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+
+fn region_index(slot: usize, region: usize) -> usize {
+    return slot * MAX_NATIVE_REGIONS + region;
+}
+
+fn stack_index(slot: usize, page: usize) -> usize {
+    return slot * 4 + page;
+}
+
+fn stack_virtual_address(page: usize) -> usize {
+    if page < 2 {
+        return USER_STACK_ZERO_START + page * PAGE_SIZE;
+    }
+    if page == 2 {
+        return USER_STACK_ONE_START;
+    }
+    return 0;
+}
+
+fn present_pte_matches(actual: u64, expected: u64) -> bool {
+    return (actual & PTE_STABLE_MASK) == expected;
+}
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | ADDRESS_SPACE_HANDLE_TAG
+        | (slot as u64);
+}
+
+unsafe fn checked_slot(handle: u64) -> usize {
+    if (handle & HANDLE_TAG_MASK) != ADDRESS_SPACE_HANDLE_TAG {
+        return MAX_ADDRESS_SPACES;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_ADDRESS_SPACES || STATES[slot] != ADDRESS_SPACE_LIVE {
+        return MAX_ADDRESS_SPACES;
+    }
+    if GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_ADDRESS_SPACES;
+    }
+    return slot;
+}
+
+unsafe fn initialize_registry() -> void {
+    let mut slot: usize = 0;
+    while slot < MAX_ADDRESS_SPACES {
+        STATES[slot] = ADDRESS_SPACE_EMPTY;
+        GENERATIONS[slot] = 1;
+        OWNERS[slot] = 0;
+        ADDRESS_SPACE_CHILD_REFS[slot] = 0;
+        ROOT_CR3S[slot] = 0;
+        REGION_COUNTS[slot] = 0;
+        ROOT_TABLE_FRAMES[slot] = 0;
+        LEVEL3_TABLE_FRAMES[slot] = 0;
+        LEVEL2_TABLE_FRAMES[slot] = 0;
+        TEXT_TABLE_FRAMES[slot] = 0;
+        STACK_TABLE_FRAMES[slot] = 0;
+        ISOLATION_OBJECTS[slot] = 0;
+        ISOLATION_PHYSICAL[slot] = 0;
+        ISOLATION_MAPPINGS[slot] = 0;
+        SHARED_OBJECTS[slot] = 0;
+        SHARED_PHYSICAL[slot] = 0;
+        SHARED_MAPPINGS[slot] = 0;
+        let mut region: usize = 0;
+        while region < MAX_NATIVE_REGIONS {
+            let index: usize = region_index(slot, region);
+            REGION_STARTS[index] = 0;
+            REGION_ENDS[index] = 0;
+            REGION_FLAGS[index] = 0;
+            region += 1;
+        }
+        let mut page: usize = 0;
+        while page < 4 {
+            let index: usize = stack_index(slot, page);
+            STACK_OBJECTS[index] = 0;
+            STACK_PHYSICAL[index] = 0;
+            STACK_MAPPINGS[index] = 0;
+            page += 1;
+        }
+        slot += 1;
+    }
+    INITIALIZED = 1;
+}
+
+unsafe fn add_bootstrap_region(start: usize, end: usize, flags: u64) -> u64 {
+    if BOOTSTRAP_REGION_COUNT >= MAX_BOOTSTRAP_REGIONS || start >= end {
         return 0;
     }
     if (start & (PAGE_SIZE - 1)) != 0 || (end & (PAGE_SIZE - 1)) != 0 {
@@ -31,84 +216,1376 @@ unsafe fn add_region(start: usize, end: usize, flags: u64) -> u64 {
         return 0;
     }
     let mut index: usize = 0;
-    while index < REGION_COUNT {
-        if start < REGION_ENDS[index] && end > REGION_STARTS[index] {
+    while index < BOOTSTRAP_REGION_COUNT {
+        if start < BOOTSTRAP_REGION_ENDS[index]
+            && end > BOOTSTRAP_REGION_STARTS[index] {
             return 0;
         }
         index += 1;
     }
-    REGION_STARTS[REGION_COUNT] = start;
-    REGION_ENDS[REGION_COUNT] = end;
-    REGION_FLAGS[REGION_COUNT] = flags;
-    REGION_COUNT += 1;
+    BOOTSTRAP_REGION_STARTS[BOOTSTRAP_REGION_COUNT] = start;
+    BOOTSTRAP_REGION_ENDS[BOOTSTRAP_REGION_COUNT] = end;
+    BOOTSTRAP_REGION_FLAGS[BOOTSTRAP_REGION_COUNT] = flags;
+    BOOTSTRAP_REGION_COUNT += 1;
     return 1;
 }
 
-// Register the one page table that is already active. This is deliberately not
-// a general create/map API: later milestones must make page-table edits and
-// frame ownership transactional before those operations become public.
+unsafe fn add_native_region(
+    slot: usize,
+    start: usize,
+    end: usize,
+    flags: u64
+) -> u64 {
+    if slot >= MAX_ADDRESS_SPACES
+        || REGION_COUNTS[slot] >= MAX_NATIVE_REGIONS
+        || start >= end {
+        return 0;
+    }
+    if (start & (PAGE_SIZE - 1)) != 0 || (end & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    if (flags & VM_USER) == 0 || (flags & VM_READ) == 0 {
+        return 0;
+    }
+    if (flags & VM_WRITE) != 0 && (flags & VM_EXEC) != 0 {
+        return 0;
+    }
+    let mut region: usize = 0;
+    while region < REGION_COUNTS[slot] {
+        let index: usize = region_index(slot, region);
+        if start < REGION_ENDS[index] && end > REGION_STARTS[index] {
+            return 0;
+        }
+        region += 1;
+    }
+    let index: usize = region_index(slot, REGION_COUNTS[slot]);
+    REGION_STARTS[index] = start;
+    REGION_ENDS[index] = end;
+    REGION_FLAGS[index] = flags;
+    REGION_COUNTS[slot] += 1;
+    return 1;
+}
+
+unsafe fn native_region_matches(
+    slot: usize,
+    start: usize,
+    end: usize,
+    flags: u64
+) -> bool {
+    if slot >= MAX_ADDRESS_SPACES {
+        return false;
+    }
+    let mut region: usize = 0;
+    while region < REGION_COUNTS[slot] {
+        let index: usize = region_index(slot, region);
+        if REGION_STARTS[index] == start
+            && REGION_ENDS[index] == end
+            && REGION_FLAGS[index] == flags {
+            return true;
+        }
+        region += 1;
+    }
+    return false;
+}
+
+unsafe fn remove_native_region(
+    slot: usize,
+    start: usize,
+    end: usize,
+    flags: u64
+) -> u64 {
+    if slot >= MAX_ADDRESS_SPACES || REGION_COUNTS[slot] == 0 {
+        return 0;
+    }
+    let mut region: usize = 0;
+    while region < REGION_COUNTS[slot] {
+        let index: usize = region_index(slot, region);
+        if REGION_STARTS[index] == start
+            && REGION_ENDS[index] == end
+            && REGION_FLAGS[index] == flags {
+            let mut next: usize = region + 1;
+            while next < REGION_COUNTS[slot] {
+                let from: usize = region_index(slot, next);
+                let to: usize = region_index(slot, next - 1);
+                REGION_STARTS[to] = REGION_STARTS[from];
+                REGION_ENDS[to] = REGION_ENDS[from];
+                REGION_FLAGS[to] = REGION_FLAGS[from];
+                next += 1;
+            }
+            let last: usize = region_index(slot, REGION_COUNTS[slot] - 1);
+            REGION_STARTS[last] = 0;
+            REGION_ENDS[last] = 0;
+            REGION_FLAGS[last] = 0;
+            REGION_COUNTS[slot] -= 1;
+            return 1;
+        }
+        region += 1;
+    }
+    return 0;
+}
+
+unsafe fn page_table_address(handle: u64) -> usize {
+    return frame_address(handle, FRAME_KIND_PAGE_TABLE);
+}
+
+unsafe fn allocate_table(slot: usize, table_kind: usize) -> u64 {
+    let handle: u64 = alloc_frame(FRAME_KIND_PAGE_TABLE);
+    if handle == 0 || page_table_address(handle) == 0 {
+        if handle != 0 {
+            release_frame(handle, FRAME_KIND_PAGE_TABLE);
+        }
+        return 0;
+    }
+    if table_kind == 0 {
+        ROOT_TABLE_FRAMES[slot] = handle;
+        return handle;
+    }
+    if table_kind == 1 {
+        LEVEL3_TABLE_FRAMES[slot] = handle;
+        return handle;
+    }
+    if table_kind == 2 {
+        LEVEL2_TABLE_FRAMES[slot] = handle;
+        return handle;
+    }
+    if table_kind == 3 {
+        TEXT_TABLE_FRAMES[slot] = handle;
+        return handle;
+    }
+    if table_kind == 4 {
+        STACK_TABLE_FRAMES[slot] = handle;
+        return handle;
+    }
+    release_frame(handle, FRAME_KIND_PAGE_TABLE);
+    return 0;
+}
+
+unsafe fn allocate_anonymous_leaf(
+    owner: u64,
+    address_space: u64,
+    object_slot: *mut u64,
+    physical_slot: *mut usize,
+    mapping_slot: *mut u64,
+    virtual_address: usize,
+    flags: u64
+) -> u64 {
+    let object: u64 = allocate_kernel_object_for_owner(
+        owner,
+        MEMORY_ANONYMOUS
+    );
+    if object == 0 {
+        return 0;
+    }
+    volatile_store(object_slot, object);
+    let mut physical: usize = 0;
+    let mapping: u64 = create_owned_mapping(
+        address_space,
+        object,
+        MEMORY_ANONYMOUS,
+        virtual_address,
+        PAGE_SIZE,
+        flags,
+        (&mut physical)
+    );
+    if mapping == 0 {
+        release_object(object);
+        volatile_store(object_slot, 0);
+        return 0;
+    }
+    if physical == 0 || (physical & (PAGE_SIZE - 1)) != 0 {
+        destroy_owned_mapping(mapping, address_space, object);
+        release_object(object);
+        volatile_store(object_slot, 0);
+        return 0;
+    }
+    volatile_store(physical_slot, physical);
+    volatile_store(mapping_slot, mapping);
+    return 1;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    OWNERS[slot] = 0;
+    ADDRESS_SPACE_CHILD_REFS[slot] = 0;
+    ROOT_CR3S[slot] = 0;
+    REGION_COUNTS[slot] = 0;
+    ROOT_TABLE_FRAMES[slot] = 0;
+    LEVEL3_TABLE_FRAMES[slot] = 0;
+    LEVEL2_TABLE_FRAMES[slot] = 0;
+    TEXT_TABLE_FRAMES[slot] = 0;
+    STACK_TABLE_FRAMES[slot] = 0;
+    ISOLATION_OBJECTS[slot] = 0;
+    ISOLATION_PHYSICAL[slot] = 0;
+    ISOLATION_MAPPINGS[slot] = 0;
+    SHARED_OBJECTS[slot] = 0;
+    SHARED_PHYSICAL[slot] = 0;
+    SHARED_MAPPINGS[slot] = 0;
+    let mut region: usize = 0;
+    while region < MAX_NATIVE_REGIONS {
+        let index: usize = region_index(slot, region);
+        REGION_STARTS[index] = 0;
+        REGION_ENDS[index] = 0;
+        REGION_FLAGS[index] = 0;
+        region += 1;
+    }
+    let mut page: usize = 0;
+    while page < 4 {
+        let index: usize = stack_index(slot, page);
+        STACK_OBJECTS[index] = 0;
+        STACK_PHYSICAL[index] = 0;
+        STACK_MAPPINGS[index] = 0;
+        page += 1;
+    }
+}
+
+unsafe fn release_slot_resources(slot: usize) -> bool {
+    let address_space: u64 = make_handle(slot);
+    // Validate the complete mapping ownership set before releasing the first
+    // reference. This keeps teardown all-or-nothing for stale or mismatched
+    // identities; the subsequent releases are infallible under these checked
+    // object and mapping invariants.
+    let mut page: usize = 0;
+    while page < NATIVE_STACK_PAGES {
+        let index: usize = stack_index(slot, page);
+        if STACK_MAPPINGS[index] != 0
+            || STACK_OBJECTS[index] != 0
+            || STACK_PHYSICAL[index] != 0 {
+            if STACK_MAPPINGS[index] == 0
+                || STACK_OBJECTS[index] == 0
+                || STACK_PHYSICAL[index] == 0
+                || !mapping_matches(
+                    STACK_MAPPINGS[index],
+                    address_space,
+                    STACK_OBJECTS[index],
+                    MEMORY_ANONYMOUS,
+                    stack_virtual_address(page),
+                    PAGE_SIZE,
+                    VM_USER | VM_READ | VM_WRITE | VM_STACK
+                ) {
+                return false;
+            }
+        }
+        page += 1;
+    }
+    if ISOLATION_MAPPINGS[slot] != 0
+        || ISOLATION_OBJECTS[slot] != 0
+        || ISOLATION_PHYSICAL[slot] != 0 {
+        if ISOLATION_MAPPINGS[slot] == 0
+            || ISOLATION_OBJECTS[slot] == 0
+            || ISOLATION_PHYSICAL[slot] == 0
+            || !mapping_matches(
+                ISOLATION_MAPPINGS[slot],
+                address_space,
+                ISOLATION_OBJECTS[slot],
+                MEMORY_ANONYMOUS,
+                USER_ISOLATION_VA,
+                PAGE_SIZE,
+                VM_USER | VM_READ | VM_WRITE
+            ) {
+            return false;
+        }
+    }
+    if SHARED_MAPPINGS[slot] != 0
+        || SHARED_OBJECTS[slot] != 0
+        || SHARED_PHYSICAL[slot] != 0 {
+        if SHARED_MAPPINGS[slot] == 0
+            || SHARED_OBJECTS[slot] == 0
+            || SHARED_PHYSICAL[slot] == 0
+            || (SHARED_PHYSICAL[slot] & (PAGE_SIZE - 1)) != 0
+            || object_kind(SHARED_OBJECTS[slot]) != MEMORY_SHARED
+            || mapping_physical_address(SHARED_MAPPINGS[slot])
+                != SHARED_PHYSICAL[slot]
+            || !mapping_matches(
+                SHARED_MAPPINGS[slot],
+                address_space,
+                SHARED_OBJECTS[slot],
+                MEMORY_SHARED,
+                USER_SHARED_VA,
+                PAGE_SIZE,
+                VM_USER | VM_READ | VM_WRITE
+            ) {
+            return false;
+        }
+    }
+
+    // The caller owns the shared object's original reference. Address-space
+    // teardown releases only the extra reference held by this mapping.
+    if SHARED_MAPPINGS[slot] != 0 {
+        if destroy_owned_mapping(
+            SHARED_MAPPINGS[slot],
+            address_space,
+            SHARED_OBJECTS[slot]
+        ) == 0 {
+            return false;
+        }
+        SHARED_MAPPINGS[slot] = 0;
+        SHARED_OBJECTS[slot] = 0;
+        SHARED_PHYSICAL[slot] = 0;
+    }
+
+    page = 0;
+    while page < NATIVE_STACK_PAGES {
+        let index: usize = stack_index(slot, page);
+        if STACK_MAPPINGS[index] != 0 {
+            if destroy_owned_mapping(
+                STACK_MAPPINGS[index],
+                address_space,
+                STACK_OBJECTS[index]
+            ) == 0 || release_object(STACK_OBJECTS[index]) == 0 {
+                return false;
+            }
+            STACK_MAPPINGS[index] = 0;
+            STACK_OBJECTS[index] = 0;
+            STACK_PHYSICAL[index] = 0;
+        }
+        page += 1;
+    }
+    if ISOLATION_MAPPINGS[slot] != 0 {
+        if destroy_owned_mapping(
+            ISOLATION_MAPPINGS[slot],
+            address_space,
+            ISOLATION_OBJECTS[slot]
+        ) == 0 || release_object(ISOLATION_OBJECTS[slot]) == 0 {
+            return false;
+        }
+        ISOLATION_MAPPINGS[slot] = 0;
+        ISOLATION_OBJECTS[slot] = 0;
+    }
+    ISOLATION_PHYSICAL[slot] = 0;
+
+    if STACK_TABLE_FRAMES[slot] != 0 {
+        if release_frame(STACK_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        STACK_TABLE_FRAMES[slot] = 0;
+    }
+    if TEXT_TABLE_FRAMES[slot] != 0 {
+        if release_frame(TEXT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        TEXT_TABLE_FRAMES[slot] = 0;
+    }
+    if LEVEL2_TABLE_FRAMES[slot] != 0 {
+        if release_frame(LEVEL2_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        LEVEL2_TABLE_FRAMES[slot] = 0;
+    }
+    if LEVEL3_TABLE_FRAMES[slot] != 0 {
+        if release_frame(LEVEL3_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        LEVEL3_TABLE_FRAMES[slot] = 0;
+    }
+    if ROOT_TABLE_FRAMES[slot] != 0 {
+        if release_frame(ROOT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        ROOT_TABLE_FRAMES[slot] = 0;
+    }
+    return true;
+}
+
+unsafe fn build_page_tables(slot: usize) -> u64 {
+    let root: usize = page_table_address(ROOT_TABLE_FRAMES[slot]);
+    let level3: usize = page_table_address(LEVEL3_TABLE_FRAMES[slot]);
+    let level2: usize = page_table_address(LEVEL2_TABLE_FRAMES[slot]);
+    let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    let kernel_p1: usize = ocore_kernel_p1_address();
+    if root == 0 || level3 == 0 || level2 == 0 || text == 0 || stack == 0 {
+        return 0;
+    }
+    if (root & (PAGE_SIZE - 1)) != 0
+        || (level3 & (PAGE_SIZE - 1)) != 0
+        || (level2 & (PAGE_SIZE - 1)) != 0
+        || (text & (PAGE_SIZE - 1)) != 0
+        || (stack & (PAGE_SIZE - 1)) != 0
+        || kernel_p1 == 0
+        || (kernel_p1 & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+
+    let root_entries: *mut u64 = root as *mut u64;
+    let level3_entries: *mut u64 = level3 as *mut u64;
+    let level2_entries: *mut u64 = level2 as *mut u64;
+    let text_entries: *mut u64 = text as *mut u64;
+    let stack_entries: *mut u64 = stack as *mut u64;
+
+    // U/S must be set on upper levels for traversal to the explicit user
+    // leaves. Kernel entries below remain supervisor-only.
+    volatile_store(root_entries, (level3 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    volatile_store(level3_entries, (level2 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    volatile_store(level2_entries, (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE);
+
+    // Preserve the allocator's complete 4..16 MiB supervisor RW/NX direct map
+    // in every process root. This is required by frame zeroing and teardown.
+    let mut p2_index: usize = 2;
+    while p2_index < 8 {
+        let physical: u64 = (p2_index * HUGE_PAGE_SIZE) as u64;
+        volatile_store(
+            level2_entries + p2_index,
+            physical | PTE_PRESENT | PTE_WRITE | PTE_HUGE | PTE_NX
+        );
+        p2_index += 1;
+    }
+
+    volatile_store(
+        level2_entries + 8,
+        (text as u64) | PTE_PRESENT | PTE_USER
+    );
+    volatile_store(
+        level2_entries + 9,
+        (stack as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+    );
+
+    let mut text_page: usize = 0;
+    while text_page < 16 {
+        let physical: u64 = (USER_TEXT_START + text_page * PAGE_SIZE) as u64;
+        volatile_store(
+            text_entries + text_page,
+            physical | PTE_PRESENT | PTE_USER
+        );
+        text_page += 1;
+    }
+
+    volatile_store(
+        stack_entries + 1,
+        (ISOLATION_PHYSICAL[slot] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX
+    );
+    // Stack ordinal 1 gets one page at 0x13fc000. Stack ordinal 0 gets the two
+    // top pages at 0x13fe000..0x1400000. PTE 509 is an internal guard between
+    // them, while PTE 507 remains the lower guard.
+    let secondary_index: usize = stack_index(slot, 2);
+    volatile_store(
+        stack_entries + 508,
+        (STACK_PHYSICAL[secondary_index] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX
+    );
+    let mut stack_page: usize = 0;
+    while stack_page < 2 {
+        let index: usize = stack_index(slot, stack_page);
+        volatile_store(
+            stack_entries + 510 + stack_page,
+            (STACK_PHYSICAL[index] as u64)
+                | PTE_PRESENT
+                | PTE_WRITE
+                | PTE_USER
+                | PTE_NX
+        );
+        stack_page += 1;
+    }
+
+    if volatile_load(stack_entries + 507) != 0
+        || volatile_load(stack_entries + 509) != 0
+        || volatile_load(stack_entries) != 0 {
+        return 0;
+    }
+    ROOT_CR3S[slot] = root;
+    return 1;
+}
+
+// Register the one page table that is already active. The legacy handle and
+// fixed broad regions remain unchanged so all M0.2/M0.3 probes retain their
+// exact syscall and fault behavior.
 pub unsafe fn install_bootstrap(root: usize) -> u64 {
-    if LIVE != 0 || root == 0 || (root & (PAGE_SIZE - 1)) != 0 {
+    if BOOTSTRAP_LIVE != 0 || root == 0 || (root & (PAGE_SIZE - 1)) != 0 {
         return 0;
     }
-    ROOT_CR3 = root;
-    REGION_COUNT = 0;
-    if add_region(0x01000000, 0x01010000, VM_USER | VM_READ | VM_EXEC) == 0 {
+    if INITIALIZED == 0 {
+        initialize_registry();
+    }
+    BOOTSTRAP_ROOT_CR3 = root;
+    BOOTSTRAP_REGION_COUNT = 0;
+    BOOTSTRAP_CHILD_REFS = 0;
+    if add_bootstrap_region(
+        0x01000000,
+        0x01010000,
+        VM_USER | VM_READ | VM_EXEC
+    ) == 0 {
         return 0;
     }
-    if add_region(0x01010000, 0x01200000, VM_USER | VM_READ) == 0 {
+    if add_bootstrap_region(
+        0x01010000,
+        0x01200000,
+        VM_USER | VM_READ
+    ) == 0 {
         return 0;
     }
-    if add_region(
+    if add_bootstrap_region(
         0x01201000,
         0x01400000,
         VM_USER | VM_READ | VM_WRITE | VM_STACK
     ) == 0 {
         return 0;
     }
-    LIVE = 1;
+    BOOTSTRAP_LIVE = 1;
     return BOOTSTRAP_ADDRESS_SPACE;
 }
 
+// Create an inactive native address space. No handle becomes live until every
+// allocation, mapping reference, page-table leaf, and VM-region descriptor is
+// committed. All partial paths release in reverse ownership order.
+pub unsafe fn create_native_for_owner(owner_cspace: u64) -> u64 {
+    if BOOTSTRAP_LIVE == 0
+        || INITIALIZED == 0
+        || !cspace_is_live(owner_cspace)
+        || BOOTSTRAP_ROOT_CR3 != ocore_management_cr3()
+        || ocore_current_cr3() != BOOTSTRAP_ROOT_CR3 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_ADDRESS_SPACES && STATES[slot] != ADDRESS_SPACE_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    clear_slot(slot);
+    OWNERS[slot] = owner_cspace;
+    let address_space: u64 = make_handle(slot);
+
+    if allocate_table(slot, 0) == 0
+        || allocate_table(slot, 1) == 0
+        || allocate_table(slot, 2) == 0
+        || allocate_table(slot, 3) == 0
+        || allocate_table(slot, 4) == 0 {
+        if !release_slot_resources(slot) {
+            STATES[slot] = ADDRESS_SPACE_RETIRED;
+            return 0;
+        }
+        clear_slot(slot);
+        return 0;
+    }
+
+    if allocate_anonymous_leaf(
+        owner_cspace,
+        address_space,
+        (&mut ISOLATION_OBJECTS[slot]),
+        (&mut ISOLATION_PHYSICAL[slot]),
+        (&mut ISOLATION_MAPPINGS[slot]),
+        USER_ISOLATION_VA,
+        VM_USER | VM_READ | VM_WRITE
+    ) == 0 {
+        if !release_slot_resources(slot) {
+            STATES[slot] = ADDRESS_SPACE_RETIRED;
+            return 0;
+        }
+        clear_slot(slot);
+        return 0;
+    }
+    let mut page: usize = 0;
+    while page < NATIVE_STACK_PAGES {
+        let index: usize = stack_index(slot, page);
+        if allocate_anonymous_leaf(
+            owner_cspace,
+            address_space,
+            (&mut STACK_OBJECTS[index]),
+            (&mut STACK_PHYSICAL[index]),
+            (&mut STACK_MAPPINGS[index]),
+            stack_virtual_address(page),
+            VM_USER | VM_READ | VM_WRITE | VM_STACK
+        ) == 0 {
+            if !release_slot_resources(slot) {
+                STATES[slot] = ADDRESS_SPACE_RETIRED;
+                return 0;
+            }
+            clear_slot(slot);
+            return 0;
+        }
+        page += 1;
+    }
+
+    if build_page_tables(slot) == 0
+        || add_native_region(
+            slot,
+            USER_TEXT_START,
+            USER_TEXT_END,
+            VM_USER | VM_READ | VM_EXEC
+        ) == 0
+        || add_native_region(
+            slot,
+            USER_ISOLATION_VA,
+            USER_ISOLATION_END,
+            VM_USER | VM_READ | VM_WRITE
+        ) == 0
+        || add_native_region(
+            slot,
+            USER_STACK_ONE_START,
+            USER_STACK_ONE_TOP,
+            VM_USER | VM_READ | VM_WRITE | VM_STACK
+        ) == 0
+        || add_native_region(
+            slot,
+            USER_STACK_ZERO_START,
+            USER_STACK_ZERO_TOP,
+            VM_USER | VM_READ | VM_WRITE | VM_STACK
+        ) == 0 {
+        if !release_slot_resources(slot) {
+            STATES[slot] = ADDRESS_SPACE_RETIRED;
+            return 0;
+        }
+        clear_slot(slot);
+        return 0;
+    }
+
+    // Publish last. Readers can never observe a partial CR3 or VM map.
+    STATES[slot] = ADDRESS_SPACE_LIVE;
+    return address_space;
+}
+
+// Raw-slot compatibility is retained only for the fixed bootstrap boot path.
+// Dynamic callers should carry the exact generation-tagged owner handle.
+pub unsafe fn create_native(owner_cspace: usize) -> u64 {
+    if !valid_cspace_slot(owner_cspace) {
+        return 0;
+    }
+    return create_native_for_owner(cspace_handle_for_slot(owner_cspace));
+}
+
+// The raw object operation remains private. Public callers must prove authority
+// with a capability in the exact CSpace generation that owns the address space.
+unsafe fn map_shared_object(handle: u64, object: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES || object_kind(object) != MEMORY_SHARED {
+        return 0;
+    }
+    let current: usize = ocore_current_cr3();
+    if BOOTSTRAP_LIVE == 0
+        || current != BOOTSTRAP_ROOT_CR3
+        || current != ocore_management_cr3()
+        || current == ROOT_CR3S[slot]
+        || SHARED_MAPPINGS[slot] != 0
+        || SHARED_OBJECTS[slot] != 0
+        || SHARED_PHYSICAL[slot] != 0
+        || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1 {
+        return 0;
+    }
+
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    if stack == 0 || (stack & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    let stack_entries: *mut u64 = stack as *mut u64;
+    if volatile_load(stack_entries + 2) != 0 {
+        return 0;
+    }
+    let mut region: usize = 0;
+    while region < REGION_COUNTS[slot] {
+        let index: usize = region_index(slot, region);
+        if USER_SHARED_VA < REGION_ENDS[index]
+            && USER_SHARED_END > REGION_STARTS[index] {
+            return 0;
+        }
+        region += 1;
+    }
+
+    let flags: u64 = VM_USER | VM_READ | VM_WRITE;
+    let mut physical: usize = 0;
+    let mapping: u64 = create_owned_mapping(
+        handle,
+        object,
+        MEMORY_SHARED,
+        USER_SHARED_VA,
+        PAGE_SIZE,
+        flags,
+        (&mut physical)
+    );
+    if mapping == 0
+        || physical == 0
+        || (physical & (PAGE_SIZE - 1)) != 0 {
+        if mapping != 0 {
+            destroy_owned_mapping(mapping, handle, object);
+        }
+        return 0;
+    }
+    if add_native_region(
+        slot,
+        USER_SHARED_VA,
+        USER_SHARED_END,
+        flags
+    ) == 0 {
+        destroy_owned_mapping(mapping, handle, object);
+        return 0;
+    }
+
+    volatile_store(
+        stack_entries + 2,
+        (physical as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX
+    );
+    SHARED_OBJECTS[slot] = object;
+    SHARED_PHYSICAL[slot] = physical;
+    SHARED_MAPPINGS[slot] = mapping;
+    return mapping;
+}
+
+// Install one optional 4 KiB shared-memory leaf in an inactive native address
+// space. The caller supplies its exact owner generation and a MEMORY_USE
+// capability from that CSpace; raw object handles and foreign CSpaces fail.
+// The mapping registry takes a distinct object reference, so the authorizing
+// capability may be closed immediately after this transaction succeeds.
+pub unsafe fn map_shared(
+    handle: u64,
+    owner_cspace: u64,
+    capability: u64
+) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || owner_cspace == 0
+        || OWNERS[slot] != owner_cspace
+        || !cspace_is_live(owner_cspace)
+        || capability == 0 {
+        return 0;
+    }
+    let object: u64 = validate_for_owner(
+        owner_cspace,
+        capability,
+        OBJECT_MEMORY,
+        RIGHT_MEMORY_USE
+    );
+    if object == 0 || object_kind(object) != MEMORY_SHARED {
+        return 0;
+    }
+    return map_shared_object(handle, object);
+}
+
+// Remove exactly the generation-tagged shared mapping published by map_shared.
+// The target root must be inactive, so no TLB entry can survive the mutation.
+pub unsafe fn unmap_shared(handle: u64, mapping: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || mapping == 0
+        || mapping != SHARED_MAPPINGS[slot]
+        || SHARED_OBJECTS[slot] == 0
+        || SHARED_PHYSICAL[slot] == 0
+        || object_kind(SHARED_OBJECTS[slot]) != MEMORY_SHARED
+        || mapping_physical_address(mapping) != SHARED_PHYSICAL[slot]
+        || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+        || !mapping_matches(
+            mapping,
+            handle,
+            SHARED_OBJECTS[slot],
+            MEMORY_SHARED,
+            USER_SHARED_VA,
+            PAGE_SIZE,
+            VM_USER | VM_READ | VM_WRITE
+        )
+        || !native_region_matches(
+            slot,
+            USER_SHARED_VA,
+            USER_SHARED_END,
+            VM_USER | VM_READ | VM_WRITE
+        ) {
+        return 0;
+    }
+    let current: usize = ocore_current_cr3();
+    if BOOTSTRAP_LIVE == 0
+        || current != BOOTSTRAP_ROOT_CR3
+        || current != ocore_management_cr3()
+        || current == ROOT_CR3S[slot] {
+        return 0;
+    }
+
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    if stack == 0 || (stack & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    let stack_entries: *mut u64 = stack as *mut u64;
+    let expected: u64 = (SHARED_PHYSICAL[slot] as u64)
+        | PTE_PRESENT
+        | PTE_WRITE
+        | PTE_USER
+        | PTE_NX;
+    if !present_pte_matches(volatile_load(stack_entries + 2), expected) {
+        return 0;
+    }
+
+    volatile_store(stack_entries + 2, 0);
+    if remove_native_region(
+        slot,
+        USER_SHARED_VA,
+        USER_SHARED_END,
+        VM_USER | VM_READ | VM_WRITE
+    ) == 0 {
+        volatile_store(stack_entries + 2, expected);
+        return 0;
+    }
+    if destroy_owned_mapping(
+        mapping,
+        handle,
+        SHARED_OBJECTS[slot]
+    ) == 0 {
+        add_native_region(
+            slot,
+            USER_SHARED_VA,
+            USER_SHARED_END,
+            VM_USER | VM_READ | VM_WRITE
+        );
+        volatile_store(stack_entries + 2, expected);
+        return 0;
+    }
+
+    SHARED_MAPPINGS[slot] = 0;
+    SHARED_OBJECTS[slot] = 0;
+    SHARED_PHYSICAL[slot] = 0;
+    return 1;
+}
+
+pub unsafe fn destroy(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    // Teardown is legal only from the pinned no-process management CR3. In
+    // particular, the target root can never be zeroed while CR3 names it.
+    let current: usize = ocore_current_cr3();
+    if BOOTSTRAP_LIVE == 0
+        || current != BOOTSTRAP_ROOT_CR3
+        || current != ocore_management_cr3()
+        || current == ROOT_CR3S[slot]
+        || ADDRESS_SPACE_CHILD_REFS[slot] != 0 {
+        return 0;
+    }
+    if !mapping_is_live(ISOLATION_MAPPINGS[slot])
+        || !mapping_matches(
+            ISOLATION_MAPPINGS[slot],
+            handle,
+            ISOLATION_OBJECTS[slot],
+            MEMORY_ANONYMOUS,
+            USER_ISOLATION_VA,
+            PAGE_SIZE,
+            VM_USER | VM_READ | VM_WRITE
+        )
+        || ISOLATION_PHYSICAL[slot] == 0
+        || object_kind(ISOLATION_OBJECTS[slot]) != MEMORY_ANONYMOUS {
+        return 0;
+    }
+    if SHARED_MAPPINGS[slot] != 0
+        || SHARED_OBJECTS[slot] != 0
+        || SHARED_PHYSICAL[slot] != 0 {
+        if SHARED_MAPPINGS[slot] == 0
+            || SHARED_OBJECTS[slot] == 0
+            || SHARED_PHYSICAL[slot] == 0
+            || (SHARED_PHYSICAL[slot] & (PAGE_SIZE - 1)) != 0
+            || !mapping_is_live(SHARED_MAPPINGS[slot])
+            || mapping_physical_address(SHARED_MAPPINGS[slot])
+                != SHARED_PHYSICAL[slot]
+            || !mapping_matches(
+                SHARED_MAPPINGS[slot],
+                handle,
+                SHARED_OBJECTS[slot],
+                MEMORY_SHARED,
+                USER_SHARED_VA,
+                PAGE_SIZE,
+                VM_USER | VM_READ | VM_WRITE
+            )
+            || object_kind(SHARED_OBJECTS[slot]) != MEMORY_SHARED {
+            return 0;
+        }
+    }
+    let mut page: usize = 0;
+    while page < NATIVE_STACK_PAGES {
+        let index: usize = stack_index(slot, page);
+        if !mapping_is_live(STACK_MAPPINGS[index])
+            || !mapping_matches(
+                STACK_MAPPINGS[index],
+                handle,
+                STACK_OBJECTS[index],
+                MEMORY_ANONYMOUS,
+                stack_virtual_address(page),
+                PAGE_SIZE,
+                VM_USER | VM_READ | VM_WRITE | VM_STACK
+            )
+            || STACK_PHYSICAL[index] == 0
+            || object_kind(STACK_OBJECTS[index]) != MEMORY_ANONYMOUS {
+            return 0;
+        }
+        page += 1;
+    }
+    let unused_stack_index: usize = stack_index(slot, 3);
+    if STACK_MAPPINGS[unused_stack_index] != 0
+        || STACK_OBJECTS[unused_stack_index] != 0
+        || STACK_PHYSICAL[unused_stack_index] != 0 {
+        return 0;
+    }
+    if page_table_address(ROOT_TABLE_FRAMES[slot]) != ROOT_CR3S[slot]
+        || page_table_address(LEVEL3_TABLE_FRAMES[slot]) == 0
+        || page_table_address(LEVEL2_TABLE_FRAMES[slot]) == 0
+        || page_table_address(TEXT_TABLE_FRAMES[slot]) == 0
+        || page_table_address(STACK_TABLE_FRAMES[slot]) == 0 {
+        return 0;
+    }
+    let stack_entries: *const u64 =
+        page_table_address(STACK_TABLE_FRAMES[slot]) as *const u64;
+    if SHARED_MAPPINGS[slot] != 0 {
+        let expected: u64 = (SHARED_PHYSICAL[slot] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX;
+        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+            || !native_region_matches(
+                slot,
+                USER_SHARED_VA,
+                USER_SHARED_END,
+                VM_USER | VM_READ | VM_WRITE
+            )
+            || !present_pte_matches(
+                volatile_load(stack_entries + 2),
+                expected
+            ) {
+            return 0;
+        }
+    } else {
+        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1
+            || volatile_load(stack_entries + 2) != 0 {
+            return 0;
+        }
+    }
+
+    STATES[slot] = ADDRESS_SPACE_RETIRED;
+    if !release_slot_resources(slot) {
+        return 0;
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = ADDRESS_SPACE_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = ADDRESS_SPACE_EMPTY;
+    }
+    return 1;
+}
+
+// A PCB takes a counted child reference before publishing READY and drops it
+// during reap. The legacy bootstrap handle participates in the same contract.
+pub unsafe fn retain_owner(handle: u64) -> u64 {
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        if BOOTSTRAP_LIVE == 0 || BOOTSTRAP_CHILD_REFS == 0xffff_ffff {
+            return 0;
+        }
+        BOOTSTRAP_CHILD_REFS += 1;
+        return 1;
+    }
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES || ADDRESS_SPACE_CHILD_REFS[slot] == 0xffff_ffff {
+        return 0;
+    }
+    ADDRESS_SPACE_CHILD_REFS[slot] += 1;
+    return 1;
+}
+
+pub unsafe fn release_owner(handle: u64) -> u64 {
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        if BOOTSTRAP_LIVE == 0 || BOOTSTRAP_CHILD_REFS == 0 {
+            return 0;
+        }
+        BOOTSTRAP_CHILD_REFS -= 1;
+        return 1;
+    }
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES || ADDRESS_SPACE_CHILD_REFS[slot] == 0 {
+        return 0;
+    }
+    ADDRESS_SPACE_CHILD_REFS[slot] -= 1;
+    return 1;
+}
+
+pub unsafe fn owner_refs(handle: u64) -> u64 {
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        if BOOTSTRAP_LIVE == 0 {
+            return 0;
+        }
+        return BOOTSTRAP_CHILD_REFS as u64;
+    }
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return ADDRESS_SPACE_CHILD_REFS[slot] as u64;
+}
+
 pub unsafe fn is_live(handle: u64) -> bool {
-    return LIVE != 0 && handle == BOOTSTRAP_ADDRESS_SPACE;
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        return BOOTSTRAP_LIVE != 0;
+    }
+    return checked_slot(handle) < MAX_ADDRESS_SPACES;
 }
 
 pub unsafe fn root_cr3(handle: u64) -> usize {
-    if !is_live(handle) {
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        if BOOTSTRAP_LIVE != 0 {
+            return BOOTSTRAP_ROOT_CR3;
+        }
         return 0;
     }
-    return ROOT_CR3;
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return ROOT_CR3S[slot];
+}
+
+// Trusted inspection of the concrete dynamic page tables. This is deliberately
+// independent of the descriptive VM-region registry so M1 proves that the
+// hardware-visible leaves enforce the advertised supervisor/user and W^X
+// boundaries, including both native thread-stack guards.
+pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES || !cspace_is_live(OWNERS[slot]) {
+        return false;
+    }
+    let root: usize = page_table_address(ROOT_TABLE_FRAMES[slot]);
+    let level3: usize = page_table_address(LEVEL3_TABLE_FRAMES[slot]);
+    let level2: usize = page_table_address(LEVEL2_TABLE_FRAMES[slot]);
+    let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    let kernel_p1: usize = ocore_kernel_p1_address();
+    if root == 0
+        || root != ROOT_CR3S[slot]
+        || level3 == 0
+        || level2 == 0
+        || text == 0
+        || stack == 0
+        || kernel_p1 == 0 {
+        return false;
+    }
+
+    let root_entries: *const u64 = root as *const u64;
+    let level3_entries: *const u64 = level3 as *const u64;
+    let level2_entries: *const u64 = level2 as *const u64;
+    let text_entries: *const u64 = text as *const u64;
+    let stack_entries: *const u64 = stack as *const u64;
+    if !present_pte_matches(
+            volatile_load(root_entries),
+            (level3 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level3_entries),
+            (level2 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries),
+            (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE
+        )
+        || volatile_load(level2_entries + 1) != 0
+        || !present_pte_matches(
+            volatile_load(level2_entries + 8),
+            (text as u64) | PTE_PRESENT | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries + 9),
+            (stack as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        ) {
+        return false;
+    }
+
+    let mut p2_index: usize = 2;
+    while p2_index < 8 {
+        let expected: u64 = ((p2_index * HUGE_PAGE_SIZE) as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_HUGE
+            | PTE_NX;
+        if !present_pte_matches(
+            volatile_load(level2_entries + p2_index),
+            expected
+        ) {
+            return false;
+        }
+        p2_index += 1;
+    }
+
+    let mut text_page: usize = 0;
+    while text_page < 16 {
+        let expected: u64 = ((USER_TEXT_START + text_page * PAGE_SIZE) as u64)
+            | PTE_PRESENT
+            | PTE_USER;
+        if !present_pte_matches(volatile_load(text_entries + text_page), expected) {
+            return false;
+        }
+        text_page += 1;
+    }
+
+    let shared_flags: u64 = VM_USER | VM_READ | VM_WRITE;
+    let mut shared_expected: u64 = 0;
+    if SHARED_MAPPINGS[slot] != 0
+        || SHARED_OBJECTS[slot] != 0
+        || SHARED_PHYSICAL[slot] != 0 {
+        if SHARED_MAPPINGS[slot] == 0
+            || SHARED_OBJECTS[slot] == 0
+            || SHARED_PHYSICAL[slot] == 0
+            || (SHARED_PHYSICAL[slot] & (PAGE_SIZE - 1)) != 0
+            || !mapping_is_live(SHARED_MAPPINGS[slot])
+            || object_kind(SHARED_OBJECTS[slot]) != MEMORY_SHARED
+            || mapping_physical_address(SHARED_MAPPINGS[slot])
+                != SHARED_PHYSICAL[slot]
+            || !mapping_matches(
+                SHARED_MAPPINGS[slot],
+                handle,
+                SHARED_OBJECTS[slot],
+                MEMORY_SHARED,
+                USER_SHARED_VA,
+                PAGE_SIZE,
+                shared_flags
+            )
+            || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+            || !native_region_matches(
+                slot,
+                USER_SHARED_VA,
+                USER_SHARED_END,
+                shared_flags
+            ) {
+            return false;
+        }
+        shared_expected = (SHARED_PHYSICAL[slot] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX;
+    } else {
+        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1
+            || native_region_matches(
+                slot,
+                USER_SHARED_VA,
+                USER_SHARED_END,
+                shared_flags
+            ) {
+            return false;
+        }
+    }
+
+    let isolation_expected: u64 = (ISOLATION_PHYSICAL[slot] as u64)
+        | PTE_PRESENT
+        | PTE_WRITE
+        | PTE_USER
+        | PTE_NX;
+    let secondary_index: usize = stack_index(slot, 2);
+    let secondary_expected: u64 = (STACK_PHYSICAL[secondary_index] as u64)
+        | PTE_PRESENT
+        | PTE_WRITE
+        | PTE_USER
+        | PTE_NX;
+    if volatile_load(stack_entries) != 0
+        || !present_pte_matches(
+            volatile_load(stack_entries + 1),
+            isolation_expected
+        )
+        || (shared_expected == 0 && volatile_load(stack_entries + 2) != 0)
+        || (shared_expected != 0
+            && !present_pte_matches(
+                volatile_load(stack_entries + 2),
+                shared_expected
+            ))
+        || volatile_load(stack_entries + 507) != 0
+        || !present_pte_matches(
+            volatile_load(stack_entries + 508),
+            secondary_expected
+        )
+        || volatile_load(stack_entries + 509) != 0 {
+        return false;
+    }
+    let mut primary_page: usize = 0;
+    while primary_page < 2 {
+        let index: usize = stack_index(slot, primary_page);
+        let expected: u64 = (STACK_PHYSICAL[index] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX;
+        if !present_pte_matches(
+            volatile_load(stack_entries + 510 + primary_page),
+            expected
+        ) {
+            return false;
+        }
+        primary_page += 1;
+    }
+
+    let shared_descriptions_hold: bool =
+        (shared_expected != 0
+            && allows(handle, USER_SHARED_VA, PAGE_SIZE, shared_flags)
+            && !allows(handle, USER_SHARED_VA, 1, VM_EXEC))
+        || (shared_expected == 0
+            && !allows(handle, USER_SHARED_VA, 1, VM_READ));
+    return shared_descriptions_hold
+        && allows(handle, USER_TEXT_START, 1, VM_USER | VM_READ | VM_EXEC)
+        && !allows(handle, USER_TEXT_START, 1, VM_WRITE)
+        && allows(handle, USER_ISOLATION_VA, 1, VM_USER | VM_READ | VM_WRITE)
+        && !allows(handle, USER_ISOLATION_VA, 1, VM_EXEC)
+        && stack_allows(handle, 0, USER_STACK_ZERO_TOP)
+        && stack_allows(handle, 1, USER_STACK_ONE_TOP)
+        && !allows(handle, USER_STACK_GUARD, 1, VM_READ)
+        && !allows(handle, USER_STACK_INTERNAL_GUARD, 1, VM_READ);
+}
+
+pub unsafe fn owner_cspace_handle(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return OWNERS[slot];
+}
+
+// Compatibility query for code that still exposes the legacy raw CSpace slot.
+pub unsafe fn owner_cspace(handle: u64) -> usize {
+    let owner: u64 = owner_cspace_handle(handle);
+    if owner == 0 {
+        return MAX_CSPACES;
+    }
+    return cspace_slot_for_handle(owner);
+}
+
+pub unsafe fn isolation_physical(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return ISOLATION_PHYSICAL[slot];
+}
+
+pub unsafe fn isolation_mapping(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return ISOLATION_MAPPINGS[slot];
+}
+
+pub fn isolation_virtual() -> usize {
+    return USER_ISOLATION_VA;
+}
+
+pub unsafe fn shared_mapping(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return SHARED_MAPPINGS[slot];
+}
+
+pub unsafe fn shared_object(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return SHARED_OBJECTS[slot];
+}
+
+pub unsafe fn shared_physical(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    return SHARED_PHYSICAL[slot];
+}
+
+pub fn shared_virtual() -> usize {
+    return USER_SHARED_VA;
+}
+
+pub fn native_stack_guard() -> usize {
+    return USER_STACK_GUARD;
+}
+
+pub fn native_stack_top() -> usize {
+    return USER_STACK_ZERO_TOP;
+}
+
+pub fn native_stack_top_for(ordinal: usize) -> usize {
+    if ordinal == 0 {
+        return USER_STACK_ZERO_TOP;
+    }
+    if ordinal == 1 {
+        return USER_STACK_ONE_TOP;
+    }
+    return 0;
+}
+
+pub unsafe fn stack_allows(
+    handle: u64,
+    ordinal: usize,
+    stack_pointer: usize
+) -> bool {
+    let mut start: usize = 0;
+    let mut top: usize = 0;
+    if ordinal == 0 {
+        start = USER_STACK_ZERO_START;
+        top = USER_STACK_ZERO_TOP;
+    } else if ordinal == 1 {
+        start = USER_STACK_ONE_START;
+        top = USER_STACK_ONE_TOP;
+    } else {
+        return false;
+    }
+    if stack_pointer <= start || stack_pointer > top {
+        return false;
+    }
+    return allows(
+        handle,
+        stack_pointer - 1,
+        1,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    );
 }
 
 // A non-empty access must fit wholly inside one concrete region. This rejects
-// wrapping arithmetic, the unmapped stack guard, and cross-region ranges.
+// wrapping arithmetic, guard pages, sparse gaps, and cross-region ranges.
 pub unsafe fn allows(
     handle: u64,
     pointer: usize,
     length: usize,
     required: u64
 ) -> bool {
-    if !is_live(handle) || required == 0 {
+    if required == 0 {
         return false;
     }
-    let mut index: usize = 0;
-    while index < REGION_COUNT {
-        let start: usize = REGION_STARTS[index];
-        let end: usize = REGION_ENDS[index];
-        let flags: u64 = REGION_FLAGS[index];
+    let mut count: usize = 0;
+    let mut slot: usize = MAX_ADDRESS_SPACES;
+    if handle == BOOTSTRAP_ADDRESS_SPACE {
+        if BOOTSTRAP_LIVE == 0 {
+            return false;
+        }
+        count = BOOTSTRAP_REGION_COUNT;
+    } else {
+        slot = checked_slot(handle);
+        if slot >= MAX_ADDRESS_SPACES {
+            return false;
+        }
+        count = REGION_COUNTS[slot];
+    }
+
+    let mut region: usize = 0;
+    while region < count {
+        let mut start: usize = 0;
+        let mut end: usize = 0;
+        let mut flags: u64 = 0;
+        if handle == BOOTSTRAP_ADDRESS_SPACE {
+            start = BOOTSTRAP_REGION_STARTS[region];
+            end = BOOTSTRAP_REGION_ENDS[region];
+            flags = BOOTSTRAP_REGION_FLAGS[region];
+        } else {
+            let index: usize = region_index(slot, region);
+            start = REGION_STARTS[index];
+            end = REGION_ENDS[index];
+            flags = REGION_FLAGS[index];
+        }
         if (flags & required) == required {
             if length == 0 {
                 if pointer >= start && pointer <= end {
                     return true;
                 }
-            } else if pointer >= start && pointer < end {
-                if length <= end - pointer {
-                    return true;
-                }
+            } else if pointer >= start && pointer < end && length <= end - pointer {
+                return true;
             }
         }
-        index += 1;
+        region += 1;
     }
     return false;
 }

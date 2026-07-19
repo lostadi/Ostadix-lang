@@ -4,6 +4,8 @@ use kernel::main::OCORE_KERNEL_ONLY_MARKER;
 use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
 use runtime::native_abi::ERR_CAPABILITY_DENIED;
 use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_QUOTA_EXCEEDED;
+use runtime::native_abi::ERR_INVALID_MEMORY_KIND;
 use runtime::native_abi::ERR_UNKNOWN_SYSCALL;
 use runtime::native_abi::ERR_USER_POINTER_DENIED;
 use runtime::native_abi::ERR_USER_COPY_FAULT;
@@ -13,11 +15,16 @@ use runtime::native_abi::SYS_DEBUG_WRITE;
 use runtime::native_abi::SYS_PAGE_ALLOC;
 use runtime::native_abi::SYS_TICKS;
 use runtime::native_abi::SYS_YIELD;
+use runtime::native_abi::SYS_EXIT;
+use runtime::memory_object::MEMORY_ANONYMOUS;
+use runtime::memory_object::MEMORY_DEVICE;
+use runtime::memory_object::MEMORY_EXECUTABLE;
 
 const FORGED_DEBUG_HANDLE: u64 = 0x0000000200000001;
 const STALE_DEBUG_HANDLE: u64 = 0x0000000100000002;
 const WRONG_RIGHTS_HANDLE: u64 = 0x0000000100000003;
 const WRONG_TYPE_HANDLE: u64 = 0x0000000100000004;
+const PAGE_POOL_HANDLE: u64 = 0x0000000100000004;
 const CLOSE_PROBE_HANDLE: u64 = 0x0000000100000005;
 const EMPTY_SLOT_HANDLE: u64 = 0x000000010000003f;
 const OUT_OF_BOUNDS_HANDLE: u64 = 0x0000000100000040;
@@ -60,13 +67,23 @@ static HEARTBEAT_MESSAGE: [u8; 23] = b"CPL3 heartbeat: online\n";
 @link_section(".rodata.user")
 static REGISTER_MESSAGE: [u8; 30] = b"register preservation: online\n";
 @link_section(".rodata.user")
-static RESERVED_MESSAGE: [u8; 26] = b"reserved syscalls: denied\n";
+static CAP_COPY_RESERVED_MESSAGE: [u8; 26] = b"cap_copy reserved: denied\n";
+@link_section(".rodata.user")
+static EXIT_GATED_MESSAGE: [u8; 27] = b"process exit gated: denied\n";
 @link_section(".rodata.user")
 static OVERSIZED_MESSAGE: [u8; 25] = b"oversized buffer: denied\n";
 @link_section(".rodata.user")
 static COPY_SYSCALL_MESSAGE: [u8; 29] = b"user copy syscall: recovered\n";
 @link_section(".rodata.user")
 static COPY_HEARTBEAT_MESSAGE: [u8; 29] = b"copy-fault heartbeat: online\n";
+@link_section(".rodata.user")
+static PAGE_ALLOC_MESSAGE: [u8; 34] = b"M03 page_alloc: capability online\n";
+@link_section(".rodata.user")
+static QUOTA_MESSAGE: [u8; 30] = b"M03 quota: enforced-recovered\n";
+@link_section(".rodata.user")
+static MEMORY_STALE_MESSAGE: [u8; 31] = b"M03 memory stale close: denied\n";
+@link_section(".rodata.user")
+static MEMORY_LIFECYCLE_MESSAGE: [u8; 27] = b"M03 memory lifecycle: PASS\n";
 
 extern "sysv64" fn ocore_user_register_probe() -> u64;
 extern "sysv64" fn ocore_user_probe_divide(capability: u64) -> never;
@@ -132,6 +149,11 @@ unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
     if result != length as u64 {
         stop();
     }
+}
+
+@link_section(".text.user")
+fn valid_capability_shape(handle: u64) -> bool {
+    return (handle >> 32) != 0 && (handle & 0xffff_ffff) < 64;
 }
 
 @export
@@ -279,9 +301,77 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
         stop();
     }
     let reserved_copy_result: u64 = syscall0(SYS_CAP_COPY);
-    let reserved_page_result: u64 = syscall0(SYS_PAGE_ALLOC);
+    let gated_exit_result: u64 = syscall1(SYS_EXIT, 0);
+    let missing_pool_result: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        0,
+        MEMORY_ANONYMOUS
+    );
     if reserved_copy_result != ERR_NOT_IMPLEMENTED
-        || reserved_page_result != ERR_NOT_IMPLEMENTED {
+        || gated_exit_result != ERR_NOT_IMPLEMENTED
+        || missing_pool_result != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let wrong_pool_result: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        report_capability,
+        MEMORY_ANONYMOUS
+    );
+    let invalid_kind_result: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_DEVICE
+    );
+    let executable_kind_result: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_EXECUTABLE
+    );
+    if wrong_pool_result != ERR_CAPABILITY_DENIED
+        || invalid_kind_result != ERR_INVALID_MEMORY_KIND
+        || executable_kind_result != ERR_INVALID_MEMORY_KIND {
+        stop();
+    }
+
+    let first_memory: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_ANONYMOUS
+    );
+    let second_memory: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_ANONYMOUS
+    );
+    if !valid_capability_shape(first_memory)
+        || !valid_capability_shape(second_memory)
+        || first_memory == second_memory {
+        stop();
+    }
+    let quota_result: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_ANONYMOUS
+    );
+    if quota_result != ERR_QUOTA_EXCEEDED {
+        stop();
+    }
+    if syscall1(SYS_CAP_CLOSE, first_memory) != 1 {
+        stop();
+    }
+    let replacement_memory: u64 = syscall2(
+        SYS_PAGE_ALLOC,
+        PAGE_POOL_HANDLE,
+        MEMORY_ANONYMOUS
+    );
+    if !valid_capability_shape(replacement_memory)
+        || replacement_memory == first_memory
+        || syscall1(SYS_CAP_CLOSE, first_memory) != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    if syscall1(SYS_CAP_CLOSE, second_memory) != 1
+        || syscall1(SYS_CAP_CLOSE, replacement_memory) != 1 {
         stop();
     }
     let oversized_result: u64 = debug_write(
@@ -335,7 +425,12 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
     emit(report_capability, (&KERNEL_DENIED_MESSAGE[0]), 23);
     emit(report_capability, (&UNKNOWN_DENIED_MESSAGE[0]), 24);
     emit(report_capability, (&REGISTER_MESSAGE[0]), 30);
-    emit(report_capability, (&RESERVED_MESSAGE[0]), 26);
+    emit(report_capability, (&CAP_COPY_RESERVED_MESSAGE[0]), 26);
+    emit(report_capability, (&EXIT_GATED_MESSAGE[0]), 27);
+    emit(report_capability, (&PAGE_ALLOC_MESSAGE[0]), 34);
+    emit(report_capability, (&QUOTA_MESSAGE[0]), 30);
+    emit(report_capability, (&MEMORY_STALE_MESSAGE[0]), 31);
+    emit(report_capability, (&MEMORY_LIFECYCLE_MESSAGE[0]), 27);
     emit(report_capability, (&OVERSIZED_MESSAGE[0]), 25);
     emit(report_capability, (&RFLAGS_MESSAGE[0]), 28);
     emit(report_capability, (&TIMER_RETURN_MESSAGE[0]), 26);

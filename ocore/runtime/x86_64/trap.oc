@@ -32,6 +32,7 @@ struct TrapFrame {
 }
 
 const TRAP_CONTAINED: u64 = 1;
+const TRAP_PROCESS_CONTINUE: u64 = 2;
 const VECTOR_PAGE_FAULT: u64 = 14;
 const INVALID_RETURN_VECTOR: u64 = 256;
 
@@ -47,7 +48,7 @@ extern "sysv64" fn ocore_read_cr2() -> usize;
 extern "sysv64" fn ocore_kernel_probe_address() -> usize;
 
 pub unsafe fn configure_probe(mode: u64) -> u64 {
-    if mode > 9 {
+    if mode > 13 {
         return 0;
     }
     EXPECTED_PROBE = mode;
@@ -89,6 +90,9 @@ unsafe fn expected_fault(
     if mode == 7 {
         return vector == 13 && error == 0;
     }
+    if mode == 11 {
+        return vector == 0 && error == 0;
+    }
     return false;
 }
 
@@ -117,6 +121,9 @@ pub unsafe fn kernel_exception_dispatch(frame: *mut TrapFrame) -> u64 {
     if process_id != 1 || !is_faulted(0) {
         write((&UNEXPECTED_FAULT_MESSAGE[0]), 29);
         return 0;
+    }
+    if mode == 11 {
+        return TRAP_PROCESS_CONTINUE;
     }
     write((&EXPECTED_TRAP_MESSAGE[0]), 30);
     write((&PROCESS_FAULTED_MESSAGE[0]), 34);

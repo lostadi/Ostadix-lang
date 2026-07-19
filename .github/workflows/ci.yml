@@ -112,3 +112,44 @@ jobs:
 
       - name: Check active docs for stale claims
         run: bash scripts/check_release_claims.sh
+
+      - name: Test deterministic source-release builder
+        run: python3 -m unittest -v tests.test_source_release
+
+      - name: Build and self-verify source release
+        run: |
+          python3 scripts/build_source_release.py \
+            --output "$RUNNER_TEMP/Ostadix-lang-source.zip"
+          python3 scripts/build_source_release.py \
+            --verify "$RUNNER_TEMP/Ostadix-lang-source.zip"
+
+  # ── O-core architectural and allocator proof ───────────────────────────────
+  ocore-qemu:
+    name: O-core QEMU proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install freestanding build and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang lld qemu-system-x86
+
+      - name: Run native and memory lifecycle smoke
+        run: ./ocore/kernel/smoke-qemu.sh
+
+      - name: Run fault and recovery matrix
+        run: ./ocore/kernel/smoke-faults-qemu.sh
+
+      - name: Run process isolation and teardown matrix
+        run: ./ocore/kernel/smoke-processes-qemu.sh
+
+      - name: Run scheduler lifecycle smoke
+        run: ./ocore/kernel/smoke-scheduler-qemu.sh
+
+      - name: Run IPC foundation lifecycle smoke
+        run: ./ocore/kernel/smoke-ipc-foundation-qemu.sh

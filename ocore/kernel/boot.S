@@ -60,6 +60,30 @@ ring0_stack_bottom:
   .skip 65536
 ring0_stack_top:
 
+// Milestone 1 gives every process slot a distinct guarded privilege-entry
+// stack. Slot 0 deliberately reuses the bootstrap ring0 stack above so the
+// existing single-process entry path and exported helper remain unchanged.
+.balign 4096
+ring0_stack1_guard:
+  .skip 4096
+ring0_stack1_bottom:
+  .skip 65536
+ring0_stack1_top:
+
+.balign 4096
+ring0_stack2_guard:
+  .skip 4096
+ring0_stack2_bottom:
+  .skip 65536
+ring0_stack2_top:
+
+.balign 4096
+ring0_stack3_guard:
+  .skip 4096
+ring0_stack3_bottom:
+  .skip 65536
+ring0_stack3_top:
+
 // IST1 is reserved exclusively for double fault delivery.
 .balign 4096
 double_fault_stack_guard:
@@ -107,6 +131,11 @@ percpu_entry:
 .extern kernel_main
 .extern kernel_exception_dispatch
 .extern kernel_invalid_user_return
+.extern kernel_validate_user_return
+.extern kernel_process_exit_continue
+.extern kernel_timer_dispatch
+.extern kernel_scheduler_complete_continue
+.extern kernel_scheduler_syscall
 _start:
   cli
   mov esi, ebx
@@ -167,6 +196,15 @@ _start:
   cmp eax, edi
   je .next_kernel_page
   lea edi, [ring0_stack_guard]
+  cmp eax, edi
+  je .next_kernel_page
+  lea edi, [ring0_stack1_guard]
+  cmp eax, edi
+  je .next_kernel_page
+  lea edi, [ring0_stack2_guard]
+  cmp eax, edi
+  je .next_kernel_page
+  lea edi, [ring0_stack3_guard]
   cmp eax, edi
   je .next_kernel_page
   lea edi, [double_fault_stack_guard]
@@ -327,12 +365,214 @@ ocore_kernel_stack_top:
   ret
 .size ocore_kernel_stack_top, .-ocore_kernel_stack_top
 
+// Return the guarded ring-0 entry stack assigned to a process registry slot.
+// Invalid slots return zero and therefore cannot be published in a PCB.
+.globl ocore_process_kernel_stack_top
+.type ocore_process_kernel_stack_top, @function
+ocore_process_kernel_stack_top:
+  cmp rdi, 0
+  je .process_stack0
+  cmp rdi, 1
+  je .process_stack1
+  cmp rdi, 2
+  je .process_stack2
+  cmp rdi, 3
+  je .process_stack3
+  xor eax, eax
+  ret
+.process_stack0:
+  lea rax, [rip + ring0_stack_top]
+  ret
+.process_stack1:
+  lea rax, [rip + ring0_stack1_top]
+  ret
+.process_stack2:
+  lea rax, [rip + ring0_stack2_top]
+  ret
+.process_stack3:
+  lea rax, [rip + ring0_stack3_top]
+  ret
+.size ocore_process_kernel_stack_top, .-ocore_process_kernel_stack_top
+
+// Trusted paging-template addresses. These symbols name physical addresses in
+// the identity-mapped bootstrap and process kernel regions; neither is exposed
+// to CPL3.
+.globl ocore_kernel_p1_address
+.type ocore_kernel_p1_address, @function
+ocore_kernel_p1_address:
+  lea rax, [rip + p1_kernel_table]
+  ret
+.size ocore_kernel_p1_address, .-ocore_kernel_p1_address
+
+.globl ocore_management_cr3
+.type ocore_management_cr3, @function
+ocore_management_cr3:
+  lea rax, [rip + p4_table]
+  ret
+.size ocore_management_cr3, .-ocore_management_cr3
+
+.globl ocore_management_stack_top
+.type ocore_management_stack_top, @function
+ocore_management_stack_top:
+  lea rax, [rip + stack_top]
+  ret
+.size ocore_management_stack_top, .-ocore_management_stack_top
+
 .globl ocore_current_cr3
 .type ocore_current_cr3, @function
 ocore_current_cr3:
   mov rax, cr3
   ret
 .size ocore_current_cr3, .-ocore_current_cr3
+
+// Install the complete architectural half of a process identity transaction.
+// RDI is a page-aligned CR3 root and RSI is a 16-byte-aligned guarded entry
+// stack top. The operation deliberately returns with maskable interrupts off;
+// the caller must publish the matching PCB/CSpace before IRET restores IF.
+.globl ocore_context_install
+.type ocore_context_install, @function
+ocore_context_install:
+  test rdi, rdi
+  jz .context_install_failed
+  test rdi, 0xfff
+  jnz .context_install_failed
+  test rsi, rsi
+  jz .context_install_failed
+  test rsi, 0xf
+  jnz .context_install_failed
+  cli
+  mov qword ptr [rip + percpu_entry], 0
+  mov qword ptr [rip + percpu_entry + 8], 0
+  mov qword ptr [rip + percpu_entry + 16], 0
+  mov qword ptr [rip + percpu_entry + 32], 0
+  mov qword ptr [rip + tss64 + 4], rsi
+  mov qword ptr [rip + percpu_entry + 24], rsi
+  mov cr3, rdi
+  mov eax, 1
+  ret
+.context_install_failed:
+  xor eax, eax
+  ret
+.size ocore_context_install, .-ocore_context_install
+
+// Return to the pinned no-process address space. Like process installation,
+// this leaves interrupts disabled so teardown cannot observe a mixed context.
+.globl ocore_restore_management_context
+.type ocore_restore_management_context, @function
+ocore_restore_management_context:
+  cli
+  mov qword ptr [rip + percpu_entry], 0
+  mov qword ptr [rip + percpu_entry + 8], 0
+  mov qword ptr [rip + percpu_entry + 16], 0
+  mov qword ptr [rip + percpu_entry + 32], 0
+  lea rdx, [rip + stack_top]
+  mov qword ptr [rip + tss64 + 4], rdx
+  mov qword ptr [rip + percpu_entry + 24], rdx
+  lea rax, [rip + p4_table]
+  mov cr3, rax
+  mov eax, 1
+  ret
+.size ocore_restore_management_context, .-ocore_restore_management_context
+
+.globl ocore_tss_rsp0
+.type ocore_tss_rsp0, @function
+ocore_tss_rsp0:
+  mov rax, qword ptr [rip + tss64 + 4]
+  ret
+.size ocore_tss_rsp0, .-ocore_tss_rsp0
+
+.globl ocore_entry_stack_top
+.type ocore_entry_stack_top, @function
+ocore_entry_stack_top:
+  mov rax, qword ptr [rip + percpu_entry + 24]
+  ret
+.size ocore_entry_stack_top, .-ocore_entry_stack_top
+
+.globl ocore_context_matches
+.type ocore_context_matches, @function
+ocore_context_matches:
+  mov rax, cr3
+  cmp rax, rdi
+  jne .context_mismatch
+  cmp qword ptr [rip + tss64 + 4], rsi
+  jne .context_mismatch
+  cmp qword ptr [rip + percpu_entry + 24], rsi
+  jne .context_mismatch
+  mov eax, 1
+  ret
+.context_mismatch:
+  xor eax, eax
+  ret
+.size ocore_context_matches, .-ocore_context_matches
+
+// Deterministic scheduler stress primitive. Each half-iteration performs the
+// architectural CR3, TSS.RSP0, and GS-entry-stack transaction and verifies it
+// immediately. The caller separately validates saved register frames and PCB,
+// domain, address-space, and CSpace identity under real timer preemption.
+.globl ocore_forced_context_stress
+.type ocore_forced_context_stress, @function
+ocore_forced_context_stress:
+  test rdi, rdi
+  jz .context_stress_failed_early
+  test rdi, 0xfff
+  jnz .context_stress_failed_early
+  test rdx, rdx
+  jz .context_stress_failed_early
+  test rdx, 0xfff
+  jnz .context_stress_failed_early
+  test rsi, rsi
+  jz .context_stress_failed_early
+  test rsi, 0xf
+  jnz .context_stress_failed_early
+  test rcx, rcx
+  jz .context_stress_failed_early
+  test rcx, 0xf
+  jnz .context_stress_failed_early
+  test r8, r8
+  jz .context_stress_failed_early
+  cli
+  push rbx
+  xor ebx, ebx
+.context_stress_loop:
+  mov qword ptr [rip + tss64 + 4], rsi
+  mov qword ptr [rip + percpu_entry + 24], rsi
+  mov cr3, rdi
+  mov r9, cr3
+  cmp r9, rdi
+  jne .context_stress_failed
+  cmp qword ptr [rip + tss64 + 4], rsi
+  jne .context_stress_failed
+  cmp qword ptr [rip + percpu_entry + 24], rsi
+  jne .context_stress_failed
+  inc rbx
+
+  mov qword ptr [rip + tss64 + 4], rcx
+  mov qword ptr [rip + percpu_entry + 24], rcx
+  mov cr3, rdx
+  mov r9, cr3
+  cmp r9, rdx
+  jne .context_stress_failed
+  cmp qword ptr [rip + tss64 + 4], rcx
+  jne .context_stress_failed
+  cmp qword ptr [rip + percpu_entry + 24], rcx
+  jne .context_stress_failed
+  inc rbx
+  dec r8
+  jnz .context_stress_loop
+
+  call ocore_restore_management_context
+  mov rax, rbx
+  pop rbx
+  ret
+.context_stress_failed:
+  call ocore_restore_management_context
+  xor eax, eax
+  pop rbx
+  ret
+.context_stress_failed_early:
+  xor eax, eax
+  ret
+.size ocore_forced_context_stress, .-ocore_forced_context_stress
 
 .globl ocore_read_cr2
 .type ocore_read_cr2, @function
@@ -401,6 +641,18 @@ ocore_boot_protection_check:
   cmp qword ptr [rcx + rax * 8], 0
   jne .protection_check_failed
   lea rax, [rip + ring0_stack_guard]
+  shr rax, 12
+  cmp qword ptr [rcx + rax * 8], 0
+  jne .protection_check_failed
+  lea rax, [rip + ring0_stack1_guard]
+  shr rax, 12
+  cmp qword ptr [rcx + rax * 8], 0
+  jne .protection_check_failed
+  lea rax, [rip + ring0_stack2_guard]
+  shr rax, 12
+  cmp qword ptr [rcx + rax * 8], 0
+  jne .protection_check_failed
+  lea rax, [rip + ring0_stack3_guard]
   shr rax, 12
   cmp qword ptr [rcx + rax * 8], 0
   jne .protection_check_failed
@@ -543,57 +795,114 @@ ocore_syscall_entry:
   mov qword ptr gs:[16], r11
   mov rsp, qword ptr gs:[24]
 
-  // Preserve every user argument register. The architectural SYSCALL
-  // instruction defines RCX and R11 as clobbered and returns its result in
-  // RAX; the remaining registers keep their call-side values.
-  sub rsp, 64
-  mov qword ptr [rsp], r9
-  mov qword ptr [rsp + 16], rdi
-  mov qword ptr [rsp + 24], rsi
-  mov qword ptr [rsp + 32], rdx
+  // Materialize the same canonical 22-word frame used by IRQ and exception
+  // entry. Synchronous yield/sleep can therefore return through a different
+  // saved TCB without a second register representation.
+  sub rsp, 176
+  mov qword ptr [rsp], r15
+  mov qword ptr [rsp + 8], r14
+  mov qword ptr [rsp + 16], r13
+  mov qword ptr [rsp + 24], r12
+  mov qword ptr [rsp + 32], r11
   mov qword ptr [rsp + 40], r10
-  mov qword ptr [rsp + 48], r8
-  mov qword ptr [rsp + 56], r9
-  mov r9, r8
-  mov r8, r10
-  mov rcx, rdx
-  mov rdx, rsi
-  mov rsi, rdi
-  mov rdi, rax
-  call kernel_syscall_dispatch
-  mov qword ptr [rsp + 8], rax
-  mov rdi, qword ptr [rsp + 16]
-  mov rsi, qword ptr [rsp + 24]
-  mov rdx, qword ptr [rsp + 32]
-  mov r10, qword ptr [rsp + 40]
-  mov r8, qword ptr [rsp + 48]
+  mov qword ptr [rsp + 48], r9
+  mov qword ptr [rsp + 56], r8
+  mov qword ptr [rsp + 64], rdi
+  mov qword ptr [rsp + 72], rsi
+  mov qword ptr [rsp + 80], rbp
+  mov qword ptr [rsp + 88], rdx
+  mov qword ptr [rsp + 96], rcx
+  mov qword ptr [rsp + 104], rbx
+  mov qword ptr [rsp + 112], rax
+  mov qword ptr [rsp + 120], 0x100
+  mov qword ptr [rsp + 128], 0
+  mov qword ptr [rsp + 136], rcx
+  mov qword ptr [rsp + 144], 0x23
+  mov qword ptr [rsp + 152], r11
+  mov rax, qword ptr gs:[0]
+  mov qword ptr [rsp + 160], rax
+  mov qword ptr [rsp + 168], 0x1b
+
+  mov rax, qword ptr [rsp + 48]
+  mov rdi, qword ptr [rsp + 112]
+  mov rsi, qword ptr [rsp + 64]
+  mov rdx, qword ptr [rsp + 72]
+  mov rcx, qword ptr [rsp + 88]
+  mov r8, qword ptr [rsp + 40]
   mov r9, qword ptr [rsp + 56]
-  mov rax, qword ptr [rsp + 8]
-  add rsp, 64
+  sub rsp, 16
+  mov qword ptr [rsp], rax
+  call kernel_syscall_dispatch
+  add rsp, 16
+  // SYS_EXIT is a kernel-private control transfer, not a value that can be
+  // observed at CPL3. Keep the saved process frame on its guarded stack until
+  // the management CR3 is active, then abandon it permanently.
+  cmp rax, -32
+  je .abandon_process_context
+  cmp rax, -31
+  je .schedule_from_syscall
 
-  // Fail closed if the saved return frame is outside the dedicated process
-  // mappings. A later scheduler will store this state in per-CPU/thread data.
-  mov rcx, qword ptr gs:[8]
-  cmp rcx, 0x01000000
-  jb .invalid_user_return
-  cmp rcx, 0x01010000
-  jae .invalid_user_return
-  mov r11, qword ptr gs:[0]
-  cmp r11, 0x01201000
-  jb .invalid_user_return
-  cmp r11, 0x01400000
-  jae .invalid_user_return
+  mov qword ptr [rsp + 112], rax
 
-  push 0x1b
-  push r11
-  // The bootstrap restores only the architectural reserved bit and IF. This
-  // clears IOPL, NT, VM, TF, and DF instead of trusting user-supplied flags.
-  push 0x202
-  push 0x23
-  push rcx
+  mov rdi, qword ptr [rsp + 136]
+  mov rsi, qword ptr [rsp + 160]
+  call kernel_validate_user_return
+  test rax, rax
+  jz .invalid_user_return_saved
+
+  // Restore only the architectural reserved bit and IF. This clears IOPL,
+  // NT, VM, TF, DF, AC, and every other user-controlled return hazard.
+  mov qword ptr [rsp + 152], 0x202
+  mov qword ptr [rsp + 32], 0x202
+  mov rax, qword ptr [rsp + 136]
+  mov qword ptr [rsp + 96], rax
+  jmp .restore_syscall_frame
+
+.schedule_from_syscall:
+  mov qword ptr [rsp + 112], 0
+  mov qword ptr [rsp + 152], 0x202
+  mov qword ptr [rsp + 32], 0x202
+  mov rax, qword ptr [rsp + 136]
+  mov qword ptr [rsp + 96], rax
+  mov rdi, rsp
+  call kernel_scheduler_syscall
+  test rax, rax
+  jz .timer_scheduler_complete
+  mov rbx, rax
+  mov rdi, qword ptr [rbx + 136]
+  mov rsi, qword ptr [rbx + 160]
+  call kernel_validate_user_return
+  test rax, rax
+  jz .fatal_exception
+  // The scheduler may select a different TCB whose frame was saved by IRQ0.
+  // Sanitize that exact frame just as the timer-return path does below; the
+  // caller frame sanitized above is no longer the frame IRETQ will consume.
+  mov qword ptr [rbx + 152], 0x202
+  mov rsp, rbx
+
+.restore_syscall_frame:
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop r11
+  pop r10
+  pop r9
+  pop r8
+  pop rdi
+  pop rsi
+  pop rbp
+  pop rdx
+  pop rcx
+  pop rbx
+  pop rax
+  add rsp, 16
   swapgs
   iretq
 
+.invalid_user_return_saved:
+  mov rcx, qword ptr [rsp + 136]
+  mov r11, qword ptr [rsp + 160]
 .invalid_user_return:
   mov rdi, rcx
   mov rsi, r11
@@ -601,7 +910,106 @@ ocore_syscall_entry:
   cmp rax, 1
   jne .fatal_exception
   jmp ocore_fault_idle
+
+// Both a successful process exit and a contained M1 process fault arrive here
+// with kernel GS active and interrupts masked. Switch every architectural
+// identity component back to the pinned management context before discarding
+// the process's guarded entry stack.
+.abandon_process_context:
+  call ocore_restore_management_context
+  lea rsp, [rip + stack_top]
+  and rsp, -16
+  xor rbp, rbp
+  call kernel_process_exit_continue
+  jmp .fatal_exception
 .size ocore_syscall_entry, .-ocore_syscall_entry
+
+// Timer entry uses the same normalized 22-word frame as exception dispatch,
+// but its dispatcher may return a different saved thread frame. This makes an
+// IRQ0 preemption a complete register/IRET context switch while preserving the
+// legacy same-frame behavior when the scheduler is not armed.
+.globl ocore_timer_interrupt_entry
+.type ocore_timer_interrupt_entry, @function
+ocore_timer_interrupt_entry:
+  push 0
+  push 32
+  push rax
+  push rbx
+  push rcx
+  push rdx
+  push rbp
+  push rsi
+  push rdi
+  push r8
+  push r9
+  push r10
+  push r11
+  push r12
+  push r13
+  push r14
+  push r15
+  cld
+
+  mov rax, qword ptr [rsp + 144]
+  test al, 3
+  jz .timer_kernel_gs_active
+  swapgs
+.timer_kernel_gs_active:
+  mov rdi, rsp
+  call kernel_timer_dispatch
+  test rax, rax
+  jz .timer_scheduler_complete
+  mov rbx, rax
+
+  // Validate and sanitize every selected CPL3 frame, including a different
+  // TCB returned by the scheduler. A hostile user RFLAGS value interrupted by
+  // IRQ0 must not survive merely because this return uses IRETQ rather than
+  // the SYSCALL return path.
+  mov rax, qword ptr [rbx + 144]
+  test al, 3
+  jz .timer_frame_validated
+  mov rdi, qword ptr [rbx + 136]
+  mov rsi, qword ptr [rbx + 160]
+  call kernel_validate_user_return
+  test rax, rax
+  jz .fatal_exception
+  mov qword ptr [rbx + 152], 0x202
+.timer_frame_validated:
+  mov rsp, rbx
+
+  // The selected frame, rather than the interrupted frame, decides whether
+  // return crosses to CPL3 and therefore requires SWAPGS.
+  mov rax, qword ptr [rsp + 144]
+  test al, 3
+  jz .restore_timer_frame
+  swapgs
+.restore_timer_frame:
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop r11
+  pop r10
+  pop r9
+  pop r8
+  pop rdi
+  pop rsi
+  pop rbp
+  pop rdx
+  pop rcx
+  pop rbx
+  pop rax
+  add rsp, 16
+  iretq
+
+.timer_scheduler_complete:
+  call ocore_restore_management_context
+  lea rsp, [rip + stack_top]
+  and rsp, -16
+  xor rbp, rbp
+  call kernel_scheduler_complete_continue
+  jmp .fatal_exception
+.size ocore_timer_interrupt_entry, .-ocore_timer_interrupt_entry
 
 // Exception entry -----------------------------------------------------------
 // Each stub normalizes the architectural frame to vector,error before the
@@ -736,8 +1144,10 @@ ocore_exception_common:
   mov rdi, rsp
   call kernel_exception_dispatch
   cmp rax, 1
-  jne .fatal_exception
-  jmp ocore_fault_idle
+  je ocore_fault_idle
+  cmp rax, 2
+  je .abandon_process_context
+  jmp .fatal_exception
 
 .dispatch_kernel_exception:
   mov rdi, rsp
@@ -914,6 +1324,19 @@ ocore_user_register_probe:
   pop rbx
   ret
 .size ocore_user_register_probe, .-ocore_user_register_probe
+
+// M2 scheduler containment probe. SYSCALL does not consume the user stack, so
+// this reaches the trusted entry stack with a deliberately unmapped guard-page
+// RSP. The scheduler must retire this TCB and select a sibling; returning here
+// would mean the hostile frame escaped validation.
+.globl ocore_m2_hostile_rsp_yield
+.type ocore_m2_hostile_rsp_yield, @function
+ocore_m2_hostile_rsp_yield:
+  mov rsp, 0x01200000
+  mov eax, 4
+  syscall
+  ud2
+.size ocore_m2_hostile_rsp_yield, .-ocore_m2_hostile_rsp_yield
 
 .globl ocore_user_probe_divide
 .type ocore_user_probe_divide, @function

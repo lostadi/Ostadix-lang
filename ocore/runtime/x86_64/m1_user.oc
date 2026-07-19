@@ -1,0 +1,101 @@
+module runtime::m1_user;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_EXIT;
+
+const ISOLATION_VA: usize = 0x01201000;
+const PROCESS_ONE_VALUE: u64 = 0x1111_1111_aaaa_aaaa;
+const PROCESS_TWO_VALUE: u64 = 0x2222_2222_bbbb_bbbb;
+
+@link_section(".rodata.user")
+static PROCESS_ONE_MESSAGE: [u8; 26] = b"M1 process 1 CPL3: online\n";
+@link_section(".rodata.user")
+static PROCESS_TWO_MESSAGE: [u8; 26] = b"M1 process 2 CPL3: online\n";
+@link_section(".rodata.user")
+static SIBLING_MESSAGE: [u8; 26] = b"M1 sibling survival: PASS\n";
+@link_section(".rodata.user")
+static ISOLATION_LEAK_MESSAGE: [u8; 18] = b"M1 ISOLATION LEAK\n";
+
+extern "sysv64" fn ocore_user_probe_divide(capability: u64) -> never;
+
+@link_section(".text.user")
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@link_section(".text.user")
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    let result: u64 = syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    );
+    if result != length as u64 {
+        stop();
+    }
+}
+
+@link_section(".text.user")
+unsafe fn exit(exit_code: u64) -> never {
+    let result: u64 = syscall1(SYS_EXIT, exit_code);
+    // Architectural glue diverts every successful exit to a trusted
+    // management continuation. Returning here would be a kernel bug.
+    if result != 0 {
+        stop();
+    }
+    stop();
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m1_process_one_entry(report_capability: u64) -> never {
+    volatile_store(ISOLATION_VA as *mut u64, PROCESS_ONE_VALUE);
+    if volatile_load(ISOLATION_VA as *const u64) != PROCESS_ONE_VALUE {
+        stop();
+    }
+    emit(report_capability, (&PROCESS_ONE_MESSAGE[0]), 26);
+    exit(0);
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m1_process_one_fault_entry(
+    report_capability: u64
+) -> never {
+    volatile_store(ISOLATION_VA as *mut u64, PROCESS_ONE_VALUE);
+    if volatile_load(ISOLATION_VA as *const u64) != PROCESS_ONE_VALUE {
+        stop();
+    }
+    emit(report_capability, (&PROCESS_ONE_MESSAGE[0]), 26);
+    ocore_user_probe_divide(report_capability);
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m1_process_two_entry(report_capability: u64) -> never {
+    if volatile_load(ISOLATION_VA as *const u64) != 0 {
+        emit(report_capability, (&ISOLATION_LEAK_MESSAGE[0]), 18);
+        stop();
+    }
+    volatile_store(ISOLATION_VA as *mut u64, PROCESS_TWO_VALUE);
+    if volatile_load(ISOLATION_VA as *const u64) != PROCESS_TWO_VALUE {
+        stop();
+    }
+    emit(report_capability, (&PROCESS_TWO_MESSAGE[0]), 26);
+    emit(report_capability, (&SIBLING_MESSAGE[0]), 26);
+    exit(0);
+}
+
+pub fn process_one_value() -> u64 {
+    return PROCESS_ONE_VALUE;
+}
+
+pub fn process_two_value() -> u64 {
+    return PROCESS_TWO_VALUE;
+}

@@ -1,128 +1,369 @@
 module runtime::process;
 
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::domain_id_for;
 use runtime::domain::is_live as domain_is_live;
 use runtime::domain::personality_for;
+use runtime::domain::release_child as release_domain_child;
+use runtime::domain::retain_child as retain_domain_child;
 use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::owner_cspace_handle as address_space_owner_cspace_handle;
+use runtime::address_space::owner_refs as address_space_owner_refs;
+use runtime::address_space::release_owner as release_address_space_owner;
+use runtime::address_space::retain_owner as retain_address_space_owner;
 use runtime::address_space::valid_entry;
 use runtime::address_space::valid_stack_top;
-use runtime::capability::valid_cspace_slot;
+use runtime::capability::cspace_child_refs;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::cspace_slot_for_handle;
+use runtime::capability::release_cspace;
+use runtime::capability::retain_cspace;
+use runtime::capability::live_slots_for_owner;
+use runtime::capability::MAX_CSPACES;
 
 pub const MAX_PROCESSES: usize = 4;
+pub const PROCESS_STATE_READY: u64 = 1;
+pub const PROCESS_STATE_RUNNING: u64 = 2;
+pub const PROCESS_STATE_EXITED: u64 = 3;
+pub const PROCESS_STATE_FAULTED: u64 = 4;
+pub const PROCESS_STATE_REAPABLE: u64 = 5;
+pub const PROCESS_STATE_TEARDOWN: u64 = 6;
+
 const PROCESS_EMPTY: u8 = 0;
 const PROCESS_READY: u8 = 1;
 const PROCESS_RUNNING: u8 = 2;
-const PROCESS_FAULTED: u8 = 3;
+const PROCESS_EXITED: u8 = 3;
+const PROCESS_FAULTED: u8 = 4;
+const PROCESS_REAPABLE: u8 = 5;
+const PROCESS_TEARDOWN: u8 = 6;
+const PROCESS_RETIRED: u8 = 7;
+const PROCESS_HANDLE_TAG: u64 = 0xe100_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 const NO_CURRENT_PROCESS: usize = MAX_PROCESSES;
 
 static mut PROCESS_IDS: [u64; 4] = [0; 4];
-static mut DOMAIN_IDS: [u64; 4] = [0; 4];
+static mut DOMAIN_HANDLES: [u64; 4] = [0; 4];
 static mut PERSONALITY_IDS: [u64; 4] = [0; 4];
-static mut ADDRESS_SPACE_IDS: [u64; 4] = [0; 4];
-static mut CSPACE_IDS: [usize; 4] = [0; 4];
+static mut ADDRESS_SPACE_HANDLES: [u64; 4] = [0; 4];
+static mut CSPACE_HANDLES: [u64; 4] = [0; 4];
 static mut KERNEL_STACK_TOPS: [usize; 4] = [0; 4];
 static mut USER_ENTRIES: [usize; 4] = [0; 4];
 static mut USER_STACK_TOPS: [usize; 4] = [0; 4];
+static mut EXIT_CODES: [u64; 4] = [0; 4];
 static mut FAULT_VECTORS: [u64; 4] = [0; 4];
 static mut FAULT_ERRORS: [u64; 4] = [0; 4];
 static mut FAULT_RIPS: [usize; 4] = [0; 4];
 static mut FAULT_ADDRESSES: [usize; 4] = [0; 4];
+static mut THREAD_REFS: [u32; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
 static mut STATES: [u8; 4] = [0; 4];
-static mut CURRENT_PROCESS: usize = MAX_PROCESSES;
+static mut CURRENT_PROCESS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
 
-pub unsafe fn init() -> void {
+fn process_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn process_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | PROCESS_HANDLE_TAG
+        | (slot as u64);
+}
+
+unsafe fn checked_process(handle: u64) -> usize {
+    if INITIALIZED == 0 || (handle & HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG {
+        return MAX_PROCESSES;
+    }
+    let slot: usize = process_index(handle);
+    if slot >= MAX_PROCESSES
+        || STATES[slot] == PROCESS_EMPTY
+        || STATES[slot] == PROCESS_RETIRED {
+        return MAX_PROCESSES;
+    }
+    if GENERATIONS[slot] != process_generation(handle) {
+        return MAX_PROCESSES;
+    }
+    return slot;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
     let mut slot: usize = 0;
     while slot < MAX_PROCESSES {
         PROCESS_IDS[slot] = 0;
-        DOMAIN_IDS[slot] = 0;
+        DOMAIN_HANDLES[slot] = 0;
         PERSONALITY_IDS[slot] = 0;
-        ADDRESS_SPACE_IDS[slot] = 0;
-        CSPACE_IDS[slot] = 0;
+        ADDRESS_SPACE_HANDLES[slot] = 0;
+        CSPACE_HANDLES[slot] = 0;
         KERNEL_STACK_TOPS[slot] = 0;
         USER_ENTRIES[slot] = 0;
         USER_STACK_TOPS[slot] = 0;
+        EXIT_CODES[slot] = 0;
         FAULT_VECTORS[slot] = 0;
         FAULT_ERRORS[slot] = 0;
         FAULT_RIPS[slot] = 0;
         FAULT_ADDRESSES[slot] = 0;
+        THREAD_REFS[slot] = 0;
+        GENERATIONS[slot] = 1;
         STATES[slot] = PROCESS_EMPTY;
         slot += 1;
     }
-    CURRENT_PROCESS = NO_CURRENT_PROCESS;
+    CURRENT_PROCESS = 0;
+    INITIALIZED = 1;
+    return 1;
 }
 
-// The caller supplies a domain but never a personality. The personality is
-// derived once from the kernel-owned domain table and is immutable thereafter.
-pub unsafe fn install(
+pub unsafe fn process_handle_for_slot(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || slot >= MAX_PROCESSES
+        || STATES[slot] == PROCESS_EMPTY
+        || STATES[slot] == PROCESS_RETIRED {
+        return 0;
+    }
+    return make_handle(slot);
+}
+
+pub unsafe fn process_id_for(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return PROCESS_IDS[slot];
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    return checked_process(handle) < MAX_PROCESSES;
+}
+
+// A generation-valid PCB remains structurally live throughout teardown so its
+// retained children can be unwound safely.  That structural lifetime is not
+// authority to initiate new work.  Only processes that have not exited or
+// faulted may create IPC messages or capability-transfer escrows.
+pub unsafe fn can_issue_operations(handle: u64) -> bool {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return false;
+    }
+    return STATES[slot] == PROCESS_READY || STATES[slot] == PROCESS_RUNNING;
+}
+
+pub unsafe fn process_state(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return STATES[slot] as u64;
+}
+
+// The caller supplies a domain handle but never a personality. The process
+// retains both its generation-safe domain and CSpace owner identities.
+pub unsafe fn install_for_owner(
     slot: usize,
     process_id: u64,
-    domain_id: u64,
-    address_space_id: u64,
-    cspace_id: usize,
+    domain_handle: u64,
+    address_space_handle: u64,
+    cspace_handle: u64,
     kernel_stack_top: usize,
     user_entry: usize,
     user_stack_top: usize
 ) -> u64 {
-    if slot >= MAX_PROCESSES || !valid_cspace_slot(cspace_id) {
+    if INITIALIZED == 0 || slot >= MAX_PROCESSES {
         return 0;
     }
-    if process_id == 0 || address_space_id == 0 || kernel_stack_top == 0 {
+    if process_id == 0 || address_space_handle == 0 || kernel_stack_top == 0 {
         return 0;
     }
-    if !address_space_is_live(address_space_id) {
+    if !domain_is_live(domain_handle) || !address_space_is_live(address_space_handle) {
         return 0;
     }
-    if !valid_entry(address_space_id, user_entry)
-        || !valid_stack_top(address_space_id, user_stack_top) {
+    if !valid_entry(address_space_handle, user_entry)
+        || !valid_stack_top(address_space_handle, user_stack_top) {
         return 0;
     }
-    if STATES[slot] != PROCESS_EMPTY || !domain_is_live(domain_id) {
+    if STATES[slot] != PROCESS_EMPTY || GENERATIONS[slot] == 0 {
+        return 0;
+    }
+    if !cspace_is_live(cspace_handle)
+        || live_slots_for_owner(cspace_handle) != 0 {
+        return 0;
+    }
+    let address_owner: u64 = address_space_owner_cspace_handle(
+        address_space_handle
+    );
+    if address_owner != 0 && address_owner != cspace_handle {
         return 0;
     }
     let mut other: usize = 0;
     while other < MAX_PROCESSES {
-        if STATES[other] != PROCESS_EMPTY {
+        if STATES[other] != PROCESS_EMPTY && STATES[other] != PROCESS_RETIRED {
             if PROCESS_IDS[other] == process_id {
                 return 0;
             }
-            if CSPACE_IDS[other] == cspace_id {
+            if CSPACE_HANDLES[other] == cspace_handle {
                 return 0;
             }
-            if ADDRESS_SPACE_IDS[other] == address_space_id {
+            if ADDRESS_SPACE_HANDLES[other] == address_space_handle {
                 return 0;
             }
         }
         other += 1;
     }
-    let personality_id: u64 = personality_for(domain_id);
-    if personality_id == 0 {
+    let personality_id: u64 = personality_for(domain_handle);
+    if personality_id == 0 || retain_domain_child(domain_handle) == 0 {
+        return 0;
+    }
+    if retain_cspace(cspace_handle) == 0 {
+        release_domain_child(domain_handle);
+        return 0;
+    }
+    if retain_address_space_owner(address_space_handle) == 0 {
+        release_cspace(cspace_handle);
+        release_domain_child(domain_handle);
         return 0;
     }
     PROCESS_IDS[slot] = process_id;
-    DOMAIN_IDS[slot] = domain_id;
+    DOMAIN_HANDLES[slot] = domain_handle;
     PERSONALITY_IDS[slot] = personality_id;
-    ADDRESS_SPACE_IDS[slot] = address_space_id;
-    CSPACE_IDS[slot] = cspace_id;
+    ADDRESS_SPACE_HANDLES[slot] = address_space_handle;
+    CSPACE_HANDLES[slot] = cspace_handle;
     KERNEL_STACK_TOPS[slot] = kernel_stack_top;
     USER_ENTRIES[slot] = user_entry;
     USER_STACK_TOPS[slot] = user_stack_top;
-    // Publish readiness only after every immutable PCB field is committed.
+    EXIT_CODES[slot] = 0;
+    FAULT_VECTORS[slot] = 0;
+    FAULT_ERRORS[slot] = 0;
+    FAULT_RIPS[slot] = 0;
+    FAULT_ADDRESSES[slot] = 0;
+    THREAD_REFS[slot] = 0;
     STATES[slot] = PROCESS_READY;
-    return process_id;
+    return make_handle(slot);
 }
 
-// The bootstrap may activate exactly one READY process. Switching requires an
-// architecture transaction that also updates CR3, TSS.RSP0, entry stack, and
-// CSpace, so no public context-switch-like operation exists yet.
-pub unsafe fn activate_bootstrap(slot: usize) -> u64 {
+// Raw-slot compatibility is reserved for the fixed bootstrap process. Native
+// dynamic process construction must carry the exact CSpace generation handle.
+pub unsafe fn install(
+    slot: usize,
+    process_id: u64,
+    domain_handle: u64,
+    address_space_handle: u64,
+    cspace_id: usize,
+    kernel_stack_top: usize,
+    user_entry: usize,
+    user_stack_top: usize
+) -> u64 {
+    if cspace_id >= MAX_CSPACES {
+        return 0;
+    }
+    return install_for_owner(
+        slot,
+        process_id,
+        domain_handle,
+        address_space_handle,
+        cspace_handle_for_slot(cspace_id),
+        kernel_stack_top,
+        user_entry,
+        user_stack_top
+    );
+}
+
+pub unsafe fn activate_process(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
     if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_READY {
         return 0;
     }
-    if CURRENT_PROCESS != NO_CURRENT_PROCESS {
+    if CURRENT_PROCESS != 0 {
         return 0;
     }
-    CURRENT_PROCESS = slot;
+    CURRENT_PROCESS = handle;
     STATES[slot] = PROCESS_RUNNING;
     return PROCESS_IDS[slot];
+}
+
+// Single-CPU scheduler transaction. Interrupts are already masked by the
+// architectural caller, so no syscall or exception can observe the brief
+// interval between this PCB publication and the matching CR3/TSS update.
+pub unsafe fn scheduler_switch_to(handle: u64) -> u64 {
+    let next: usize = checked_process(handle);
+    if next >= MAX_PROCESSES {
+        return 0;
+    }
+    if CURRENT_PROCESS == handle {
+        if STATES[next] != PROCESS_RUNNING {
+            return 0;
+        }
+        return PROCESS_IDS[next];
+    }
+    if STATES[next] != PROCESS_READY {
+        return 0;
+    }
+    let prior: usize = current_slot();
+    if prior < MAX_PROCESSES {
+        STATES[prior] = PROCESS_READY;
+    } else if CURRENT_PROCESS != 0 {
+        return 0;
+    }
+    CURRENT_PROCESS = handle;
+    STATES[next] = PROCESS_RUNNING;
+    return PROCESS_IDS[next];
+}
+
+pub unsafe fn scheduler_deschedule_current() -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    let handle: u64 = CURRENT_PROCESS;
+    STATES[slot] = PROCESS_READY;
+    CURRENT_PROCESS = 0;
+    return handle;
+}
+
+// Thread handles retain their owning PCB. Process reap is rejected until the
+// scheduler has made every thread unreachable from runnable/blocked state.
+pub unsafe fn retain_thread(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES
+        || STATES[slot] == PROCESS_TEARDOWN
+        || THREAD_REFS[slot] == 0xffff_ffff {
+        return 0;
+    }
+    THREAD_REFS[slot] += 1;
+    return 1;
+}
+
+pub unsafe fn release_thread(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES || THREAD_REFS[slot] == 0 {
+        return 0;
+    }
+    THREAD_REFS[slot] -= 1;
+    return 1;
+}
+
+pub unsafe fn thread_refs(handle: u64) -> u32 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return THREAD_REFS[slot];
+}
+
+// Compatibility entrypoint for the fixed bootstrap caller.
+pub unsafe fn activate_bootstrap(slot: usize) -> u64 {
+    let handle: u64 = process_handle_for_slot(slot);
+    if handle == 0 {
+        return 0;
+    }
+    return activate_process(handle);
 }
 
 pub unsafe fn fault_current(
@@ -141,8 +382,154 @@ pub unsafe fn fault_current(
     FAULT_RIPS[slot] = rip;
     FAULT_ADDRESSES[slot] = address;
     STATES[slot] = PROCESS_FAULTED;
-    CURRENT_PROCESS = NO_CURRENT_PROCESS;
+    CURRENT_PROCESS = 0;
     return process_id;
+}
+
+pub unsafe fn exit_current(exit_code: u64) -> u64 {
+    let slot: usize = current_slot();
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    let process_id: u64 = PROCESS_IDS[slot];
+    EXIT_CODES[slot] = exit_code;
+    STATES[slot] = PROCESS_EXITED;
+    CURRENT_PROCESS = 0;
+    return process_id;
+}
+
+// Management code may cancel a process that was fully constructed but never
+// activated. It becomes directly reapable without manufacturing a RUNNING
+// transition or installing any architectural context.
+pub unsafe fn stop_process(handle: u64, exit_code: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_READY {
+        return 0;
+    }
+    if CURRENT_PROCESS == handle {
+        return 0;
+    }
+    EXIT_CODES[slot] = exit_code;
+    STATES[slot] = PROCESS_REAPABLE;
+    return 1;
+}
+
+pub unsafe fn mark_reapable(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    if STATES[slot] != PROCESS_EXITED && STATES[slot] != PROCESS_FAULTED {
+        return 0;
+    }
+    STATES[slot] = PROCESS_REAPABLE;
+    return 1;
+}
+
+// Phase one drops the three registry ownership references but deliberately
+// retains every PCB handle in a non-runnable tombstone. Management code can
+// now destroy the address space and type-drain the CSpace without losing the
+// identities needed to recover or diagnose a teardown failure.
+pub unsafe fn begin_reap(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_REAPABLE {
+        return 0;
+    }
+    if CURRENT_PROCESS == handle {
+        return 0;
+    }
+    let domain_handle: u64 = DOMAIN_HANDLES[slot];
+    let address_space_handle: u64 = ADDRESS_SPACE_HANDLES[slot];
+    let cspace_handle: u64 = CSPACE_HANDLES[slot];
+    if domain_child_refs(domain_handle) == 0
+        || address_space_owner_refs(address_space_handle) == 0
+        || !cspace_is_live(cspace_handle)
+        || cspace_child_refs(cspace_handle) == 0
+        || THREAD_REFS[slot] != 0 {
+        return 0;
+    }
+    if release_address_space_owner(address_space_handle) == 0 {
+        return 0;
+    }
+    if release_domain_child(domain_handle) == 0 {
+        retain_address_space_owner(address_space_handle);
+        return 0;
+    }
+    if release_cspace(cspace_handle) == 0 {
+        retain_domain_child(domain_handle);
+        retain_address_space_owner(address_space_handle);
+        return 0;
+    }
+    STATES[slot] = PROCESS_TEARDOWN;
+    return 1;
+}
+
+// Phase two is legal only after external resource teardown has completed.
+// Stale process handles fail after the generation advances below.
+pub unsafe fn finalize_reap(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_TEARDOWN {
+        return 0;
+    }
+    if address_space_is_live(ADDRESS_SPACE_HANDLES[slot])
+        || cspace_is_valid_owner(CSPACE_HANDLES[slot]) {
+        return 0;
+    }
+    PROCESS_IDS[slot] = 0;
+    DOMAIN_HANDLES[slot] = 0;
+    PERSONALITY_IDS[slot] = 0;
+    ADDRESS_SPACE_HANDLES[slot] = 0;
+    CSPACE_HANDLES[slot] = 0;
+    KERNEL_STACK_TOPS[slot] = 0;
+    USER_ENTRIES[slot] = 0;
+    USER_STACK_TOPS[slot] = 0;
+    EXIT_CODES[slot] = 0;
+    FAULT_VECTORS[slot] = 0;
+    FAULT_ERRORS[slot] = 0;
+    FAULT_RIPS[slot] = 0;
+    FAULT_ADDRESSES[slot] = 0;
+    THREAD_REFS[slot] = 0;
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = PROCESS_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = PROCESS_EMPTY;
+    }
+    return 1;
+}
+
+// Compatibility helpers are finalize-only. They cannot silently collapse the
+// management-context AS destroy and typed CSpace drain into a partial reap.
+pub unsafe fn reap_process(handle: u64) -> u64 {
+    return finalize_reap(handle);
+}
+
+pub unsafe fn reap(handle: u64) -> u64 {
+    return finalize_reap(handle);
+}
+
+pub unsafe fn domain_for(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return DOMAIN_HANDLES[slot];
+}
+
+pub unsafe fn address_space_for(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return ADDRESS_SPACE_HANDLES[slot];
+}
+
+pub unsafe fn cspace_for(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return CSPACE_HANDLES[slot];
 }
 
 pub unsafe fn is_faulted(slot: usize) -> bool {
@@ -150,11 +537,16 @@ pub unsafe fn is_faulted(slot: usize) -> bool {
 }
 
 pub unsafe fn current_slot() -> usize {
-    if CURRENT_PROCESS >= MAX_PROCESSES {
+    let slot: usize = checked_process(CURRENT_PROCESS);
+    if slot >= MAX_PROCESSES || STATES[slot] != PROCESS_RUNNING {
         return NO_CURRENT_PROCESS;
     }
-    if STATES[CURRENT_PROCESS] != PROCESS_RUNNING {
-        return NO_CURRENT_PROCESS;
+    return slot;
+}
+
+pub unsafe fn current_process_handle() -> u64 {
+    if current_slot() >= MAX_PROCESSES {
+        return 0;
     }
     return CURRENT_PROCESS;
 }
@@ -167,12 +559,16 @@ pub unsafe fn current_process_id() -> u64 {
     return PROCESS_IDS[slot];
 }
 
-pub unsafe fn current_domain_id() -> u64 {
+pub unsafe fn current_domain_handle() -> u64 {
     let slot: usize = current_slot();
     if slot >= MAX_PROCESSES {
         return 0;
     }
-    return DOMAIN_IDS[slot];
+    return DOMAIN_HANDLES[slot];
+}
+
+pub unsafe fn current_domain_id() -> u64 {
+    return domain_id_for(current_domain_handle());
 }
 
 pub unsafe fn current_personality_id() -> u64 {
@@ -191,20 +587,33 @@ pub unsafe fn current_kernel_stack_top() -> usize {
     return KERNEL_STACK_TOPS[slot];
 }
 
-pub unsafe fn current_address_space_id() -> u64 {
+pub unsafe fn current_address_space_handle() -> u64 {
     let slot: usize = current_slot();
     if slot >= MAX_PROCESSES {
         return 0;
     }
-    return ADDRESS_SPACE_IDS[slot];
+    return ADDRESS_SPACE_HANDLES[slot];
 }
 
-pub unsafe fn current_cspace_id() -> usize {
+pub unsafe fn current_address_space_id() -> u64 {
+    return current_address_space_handle();
+}
+
+pub unsafe fn current_cspace_handle() -> u64 {
     let slot: usize = current_slot();
     if slot >= MAX_PROCESSES {
-        return MAX_PROCESSES;
+        return 0;
     }
-    return CSPACE_IDS[slot];
+    return CSPACE_HANDLES[slot];
+}
+
+// Raw-slot compatibility remains only for the existing syscall dispatch ABI.
+pub unsafe fn current_cspace_id() -> usize {
+    let handle: u64 = current_cspace_handle();
+    if handle == 0 {
+        return MAX_CSPACES;
+    }
+    return cspace_slot_for_handle(handle);
 }
 
 pub unsafe fn current_user_entry() -> usize {

@@ -41,6 +41,11 @@ expected = [
     "O-core kernel: serial online\n",
     "page protections: W^X online\n",
     "page allocator: online\n",
+    "M03 frames: reclaim PASS\n",
+    "M03 frames: zero-reuse PASS\n",
+    "M03 frames: stale-double-free denied\n",
+    "M03 frames: injected-failure rollback PASS\n",
+    "M03 memory objects: typed-generation PASS\n",
     "address space: online\n",
     "capability: online\n",
     "user copy faults: recovered\n",
@@ -57,7 +62,12 @@ expected = [
     "kernel pointer: denied\n",
     "unknown syscall: denied\n",
     "register preservation: online\n",
-    "reserved syscalls: denied\n",
+    "cap_copy reserved: denied\n",
+    "process exit gated: denied\n",
+    "M03 page_alloc: capability online\n",
+    "M03 quota: enforced-recovered\n",
+    "M03 memory stale close: denied\n",
+    "M03 memory lifecycle: PASS\n",
     "oversized buffer: denied\n",
     "RFLAGS sanitization: online\n",
     "timer CPL3 return: online\n",
@@ -70,6 +80,24 @@ if "T" not in lines:
     missing.append("standalone timer marker T")
 if missing:
     print("QEMU smoke failed; missing:", repr(missing), file=sys.stderr)
+    print("stdout:", output, file=sys.stderr)
+    print("stderr:", error, file=sys.stderr)
+    raise SystemExit(1)
+
+m03_markers = [
+    "M03 frames: reclaim PASS\n",
+    "M03 frames: zero-reuse PASS\n",
+    "M03 frames: stale-double-free denied\n",
+    "M03 frames: injected-failure rollback PASS\n",
+    "M03 memory objects: typed-generation PASS\n",
+    "M03 page_alloc: capability online\n",
+    "M03 quota: enforced-recovered\n",
+    "M03 memory stale close: denied\n",
+    "M03 memory lifecycle: PASS\n",
+]
+m03_positions = [output.find(marker) for marker in m03_markers]
+if m03_positions != sorted(m03_positions):
+    print("QEMU smoke failed; M03 marker order is invalid", file=sys.stderr)
     print("stdout:", output, file=sys.stderr)
     print("stderr:", error, file=sys.stderr)
     raise SystemExit(1)

@@ -253,18 +253,26 @@ target/debug/ocorec ocore/examples/minimal.oc --emit obj -o target/minimal.o
 # Build the included freestanding kernel.
 ./ocore/kernel/build.sh
 
-# Boot interactively or run the asserted normal and fault smoke tests.
+# Boot interactively or run the asserted bootstrap and milestone smoke gates.
 ./ocore/kernel/run-qemu.sh
 ./ocore/kernel/smoke-qemu.sh
 ./ocore/kernel/smoke-faults-qemu.sh
+./ocore/kernel/smoke-processes-qemu.sh
+./ocore/kernel/smoke-scheduler-qemu.sh
+./ocore/kernel/smoke-ipc-foundation-qemu.sh
 ```
 
-The asserted serial output is:
+The asserted default `smoke-qemu.sh` output is:
 
 ```text
 O-core kernel: serial online
 page protections: W^X online
 page allocator: online
+M03 frames: reclaim PASS
+M03 frames: zero-reuse PASS
+M03 frames: stale-double-free denied
+M03 frames: injected-failure rollback PASS
+M03 memory objects: typed-generation PASS
 address space: online
 capability: online
 user copy faults: recovered
@@ -282,7 +290,12 @@ user ranges: denied
 kernel pointer: denied
 unknown syscall: denied
 register preservation: online
-reserved syscalls: denied
+cap_copy reserved: denied
+process exit gated: denied
+M03 page_alloc: capability online
+M03 quota: enforced-recovered
+M03 memory stale close: denied
+M03 memory lifecycle: PASS
 oversized buffer: denied
 RFLAGS sanitization: online
 timer CPL3 return: online
@@ -293,19 +306,49 @@ QEMU smoke: PASS
 
 The `T` is emitted by the actual IRQ0 timer handler after the IDT, PIC, and
 PIT are installed. The smoke gate requires that standalone timer line before a
-post-interrupt CPL3 return marker and a later CPL3 heartbeat. The remaining
-markers are emitted by the CPL3 task through the architectural syscall path.
-None are printed by the host harness.
+post-interrupt CPL3 return marker and a later CPL3 heartbeat. User-boundary
+markers are emitted by the CPL3 task through the architectural syscall path;
+the M0.3 allocator/object markers come from kernel self-tests. Only the final
+`QEMU smoke: PASS` line is added by the host harness.
 
-The fault gate performs eight fresh QEMU boots. It covers divide error, invalid
-opcode, canonical non-present and supervisor reads, a stack-guard write, NX
-instruction fetch, a noncanonical target, and an excluded syscall-return RIP.
-Each run must mark the only process `FAULTED`, clear the current process, and
-reach a later kernel timer marker. This proves controlled fault disposition and
-continued kernel execution, not survival of an isolated sibling process.
-It also performs a ninth boot with a deliberate leaf-page hole, requires
-`ERR_USER_COPY_FAULT`, and observes a later CPL3 heartbeat without faulting the
-process.
+The Milestone 0.2 fault gate performs eight fresh QEMU boots. It covers divide
+error, invalid opcode, canonical non-present and supervisor reads, a stack-guard
+write, NX instruction fetch, a noncanonical target, and an excluded syscall
+return RIP. Each run must mark the scenario's only process `FAULTED`, clear the
+current process, and reach a later kernel timer marker. It also performs a ninth
+boot with a deliberate leaf-page hole, requires `ERR_USER_COPY_FAULT`, and
+observes a later CPL3 heartbeat without faulting the process. This wording is
+specific to that bootstrap gate and is not the current kernel ceiling.
+
+Milestone 1 is complete for two bounded native processes on one CPU.
+`smoke-processes-qemu.sh` boots independent normal-exit and contained-fault
+scenarios and proves separate CR3s, same-VA physical isolation, atomic
+PCB/domain/address-space/CSpace switching, split teardown, stale identity
+denial, sibling survival, complete dynamic-frame reclamation, and a later timer.
+
+Milestone 2 is complete for four TCBs across two processes on one CPU.
+`smoke-scheduler-qemu.sh` proves one million forced identity transactions, FIFO
+runnable and blocked queues, two CPU-bound and two sleeping CPL3 threads,
+cooperative yield, timer preemption, cross-thread hostile-RFLAGS sanitization,
+wake-once sleep, priority/accounting, hostile saved-RSP TCB containment, idle
+entry, exit during preemption, sibling progress, stale TCB denial, frame
+reclamation, and a post-lifecycle timer. The million-iteration stress installs
+and verifies CR3/TSS/GS plus PCB/domain/address-space/CSpace identity and a saved
+frame canary without entering CPL3; the separate IRQ/SYSCALL phase proves real
+save/IRET context switching.
+
+Milestone 3 has a verified foundation, not a completed IPC gate.
+`smoke-ipc-foundation-qemu.sh` proves generation-tagged endpoints with bounded
+FIFO/cancellation and waiter-record cleanup, invisible destination reservations,
+exact-generation queued-capability escrow, shared-memory-only attenuating
+transfers, and an optional fixed RW/NX shared page authorized by each address
+space's exact owner CSpace. It proves cross-CR3 visibility, exact attenuation,
+failed re-transfer, generation reuse, stale-ticket denial, rejection of new
+work from a dead sender, explicit management-harness cancellation of that
+sender's earlier queue item and ticket, resource reclamation, and later timer
+survival. It does not expose endpoint operations to CPL3 or prove real blocked
+IPC, preemptive request/reply, the complete death matrix, or personality-service
+crash containment.
 
 ### Docker
 
@@ -1874,7 +1917,7 @@ libc, or Rust standard library.
 
 ### Freestanding kernel proof
 
-The included kernel proves the native path end to end:
+The included kernel gates prove the native path in dependency order:
 
 ```text
 Multiboot2 or Xen PVH entry
@@ -1884,15 +1927,17 @@ Multiboot2 or Xen PVH entry
     -> O-core kernel_main
     -> COM1 serial initialization
     -> physical page allocation
-    -> native[0] domain, PCB, and cspace installation
+    -> generation-tagged domain, process, address-space, and CSpace registries
     -> user/supervisor page split and 64-bit TSS
     -> IDT, PIC, PIT, and SYSCALL MSR setup
     -> guarded copy-fault recovery and normalized trap frames
-    -> CPL3 O-core task
+    -> M0 linked native[0] CPL3 task and fault/memory gates
     -> personality-routed capability syscall
     -> user-range and authority denial probes
     -> IRQ0 ring transition and iretq
-    -> fresh-boot CPL3 fault-containment matrix
+    -> M1 independent CR3/process teardown gates
+    -> M2 preemptive and blocking four-TCB scheduler gate
+    -> M3 kernel-side endpoint/transfer/shared-mapping foundation gate
 ```
 
 The bootstrap assembly builds the initial P4, P3, P2, and 4 KiB leaf tables;
@@ -1907,25 +1952,36 @@ the bootstrap page allocator stops below them.
 The runtime modules provide:
 
 - COM1 initialization and polled serial writes.
-- A 4 KiB physical-frame bump allocator with an explicit range.
+- A reclaiming registry for the 3,072 physical frames in the fixed 4..16 MiB
+  supervisor-only QEMU window, with typed generation handles, reference counts,
+  zero-before-reuse, quotas, and checked rollback.
 - A packed 256-entry IDT and IDTR with normalized assembly stubs for vectors
   0 through 31.
 - 8259 PIC remapping and IRQ masks.
 - 8253/8254 PIT programming.
 - A compiler-generated interrupt handler that atomically increments ticks,
   acknowledges the PIC, and returns with `iretq`.
-- A kernel-owned domain and PCB registry with reusable native personality,
-  versioned ABI, one-shot bootstrap activation, and a concrete live-CR3
-  address-space descriptor.
-- Object-typed, generation-tagged process cspaces with occupied-slot checks.
+- Generation-tagged domain, process, address-space, mapping, CSpace, and TCB
+  registries. Dynamic process roots combine shared RX text and supervisor-only
+  kernel mappings with private RW/NX data and guarded stacks.
+- Object-typed process CSpaces with live, reserved, closing, empty, and retired
+  slot states, exact owner identities, and type-aware drain.
 - An architectural `SYSCALL` entry that uses `SWAPGS` CPU-local state,
   immediately leaves the user stack, preserves tested GPRs, validates return
   state, and routes through the current PCB's personality.
 - Guarded kernel and user stacks, a dedicated double-fault IST, and exact
   page-fault fixups for `copy_from_user` and `copy_to_user`.
 - A 256-byte kernel bounce buffer for capability-gated debug output.
-- Checked `debug_write` and `cap_close` operations, a future-scheduler `yield`
-  hook, and a diagnostic tick counter used by the privilege-return proof.
+- Checked `debug_write`, `cap_close`, capability-returning `page_alloc`,
+  cooperative `yield`, lifecycle-gated `exit`, scheduler-gated `sleep`, and a
+  diagnostic tick counter.
+- Canonical 22-word thread frames, FIFO runnable and blocked queues, timer
+  preemption, sleep deadlines, wake reasons, bounded priority quanta,
+  accounting, and a ring-0 idle path for the single-CPU M2 gate.
+- Kernel-only M3 foundation primitives for bounded endpoint queues,
+  cancellation/waiter-record cleanup, exact queued-capability escrow,
+  shared-memory-only attenuating transfer tickets, and one optional
+  capability-authorized fixed RW/NX shared mapping per dynamic address space.
 
 ### Capabilities and syscall ABI
 
@@ -1950,20 +2006,28 @@ The initial syscall number contract is:
 | 0 | `debug_write(cap, ptr, len)` |
 | 1 | `cap_close(cap)` |
 | 2 | reserved `cap_copy`; returns `ERR_NOT_IMPLEMENTED` |
-| 3 | reserved `page_alloc`; returns `ERR_NOT_IMPLEMENTED` |
+| 3 | `page_alloc(page_pool_cap, kind)`; returns a generated memory capability |
 | 4 | `yield()` |
 | 5 | `ticks()` |
+| 6 | `exit(status)`; enabled only by a trusted lifecycle harness |
+| 7 | `sleep(delta_ticks)`; enabled only while the scheduler is active |
 
 The exported `kernel_syscall_dispatch` implements checked debug output,
-capability close, the yield hook, and diagnostic ticks today. The generic entry
+capability close, anonymous/shared page-object allocation, yield, diagnostic
+ticks, lifecycle-gated exit, and scheduler-gated sleep. The generic entry
 reads the current PCB's personality rather than accepting one from the caller.
 Native `debug_write` validates slot bounds, occupancy, object type, generation,
 `RIGHT_DEBUG_WRITE`, and one concrete readable address-space region before an
 exact-fixup copy into the bounded kernel buffer. The serial driver never
-receives the raw user pointer. `cap_copy` and `page_alloc` remain reserved
-syscall numbers, not implemented operations. There is no scheduler yet, so
-`yield` increments only the stable hook's request counter and returns when no
-alternative task can run.
+receives the raw user pointer. `page_alloc` validates a typed page-pool
+capability, enforces a per-CSpace quota, and returns a kernel-selected CSpace
+capability rather than a frame address. Executable allocation is loader-only,
+device memory is rejected from the RAM pool, and `cap_copy` remains reserved.
+`yield` records a request in every mode and performs an actual scheduler
+transition when M2 is active. `exit` abandons a user frame only after a trusted
+lifecycle continuation is configured. `sleep` is available only to an active
+scheduler. The M3 transfer transaction remains kernel-only and limited to
+shared-memory capabilities, so it does not widen the public syscall claim.
 
 On the hosted side, `CapabilityBroker<T>` binds a 256-bit per-session bearer
 identity from the operating system CSPRNG to a kernel-issued handle,
@@ -2088,18 +2152,32 @@ environment:
 bash test_o_lang_examples.sh
 ```
 
-The native boot test compiles every O-core runtime module, assembles the boot
-entry, links the kernel, boots it in QEMU, captures serial output, and asserts
-serial/page initialization, CPL3 entry, native personality routing, valid
-capability use, the slot/generation/type/right denial matrix, closed and
-stale-after-reuse handles, user-segment zero-fill, complete user-range checks,
-hostile-RFLAGS
-sanitization, unknown syscall denial, the yield hook, ordered timer return, and
-a later CPL3 heartbeat. It also fails if any payload containing `LEAKED`
+The Milestones 0.1 through 0.3 bootstrap gate compiles every O-core runtime
+module, links and boots the kernel, then asserts CPL3 entry, native personality
+routing, capability and range denials, user-segment zero-fill, hostile-RFLAGS
+sanitization, ordered timer return, the reclaiming typed frame/object lifecycle,
+and a later CPL3 heartbeat. It also fails if any payload containing `LEAKED`
 reaches serial:
 
 ```bash
 ./ocore/kernel/smoke-qemu.sh
+```
+
+The later executable gates are separate because each names a narrower proof
+scenario and its non-claims:
+
+```bash
+# M0.2 fresh-boot fatal faults and recoverable user copy
+./ocore/kernel/smoke-faults-qemu.sh
+
+# M1 two-process isolation, exit/fault teardown, and sibling survival
+./ocore/kernel/smoke-processes-qemu.sh
+
+# M2 four-TCB preemption, blocking, lifecycle, and million-switch stress
+./ocore/kernel/smoke-scheduler-qemu.sh
+
+# M3 kernel-side primitives only; this is not a full IPC gate
+./ocore/kernel/smoke-ipc-foundation-qemu.sh
 ```
 
 Additional implementation checks are:
@@ -2110,6 +2188,8 @@ python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+bash scripts/check_release_claims.sh
+python3 -m unittest -v tests.test_source_release
 
 # Parser properties in the ordinary test suite
 cargo test --test parser_proptest
@@ -2177,6 +2257,22 @@ O-core as the freestanding systems language.
 - Generation-tagged kernel capabilities, rights validation, checked syscall
   dispatch, 256-bit live bearer identities, and hosted OCapability broker
   binding.
+- Complete bounded O-core Milestones 0.1 through 0.3 gates for architectural
+  CPL3 entry/return, hardened faults and user copy, and the reclaiming typed
+  frame and memory-object lifecycle in the fixed QEMU window.
+- Complete bounded Milestone 1 gate for two independent native address spaces,
+  same-VA isolation, atomic full-identity switching, split process/CSpace
+  teardown, stale-handle denial, sibling survival, and frame reclamation.
+- Complete bounded Milestone 2 gate for four TCBs on one CPU, with timer
+  preemption, cooperative yield, cross-thread hostile-RFLAGS sanitization,
+  blocking sleep, wake-once timers, priority and accounting checks, idle
+  execution, hostile saved-RSP TCB containment, exit containment, and one
+  million forced identity transactions.
+- A bounded Milestone 3 foundation gate for endpoint queue/cancellation state,
+  waiter-record cleanup, exact queued-capability escrow, shared-memory-only
+  attenuating transfer transactions, dead-sender rejection, and a
+  capability-authorized fixed shared mapping across independent CR3s. This is
+  not a claim of complete IPC.
 - Ambient real NixOS activation through `activate(path[, profile])`, plus
   explicit `dry_activate` and optional profile-scoped embedding guards.
 - Default full backend authority for shim execution, with legacy
@@ -2189,6 +2285,9 @@ O-core as the freestanding systems language.
   directories, enforced by a named test and CI.
 - Raw-byte and structured adversarial parser properties plus a cargo-fuzz
   target.
+- Deterministic allowlisted source-release ZIP construction from an exact Git
+  commit, with dirty-tree refusal, an embedded canonical manifest and
+  checksums, self-verification, and debris/tamper regression tests.
 - Source-only Git tracking with Rust, native, Python, fuzzing, coverage, and
   local compiler products excluded while `.O` source and intentional visual
   assets remain tracked.
@@ -2235,23 +2334,35 @@ features that are already present:
 - Floating-point types have specified x86_64 storage layouts. Float literals,
   arithmetic, comparisons, casts, and `sysv64` float parameters and returns are
   rejected until SSE lowering and the floating-point ABI are implemented.
-- The kernel uses an identity-mapped bootstrap address space and a physical
-  bump allocator. One statically linked process has protected user mappings,
-  but independent per-process page tables and frame reclamation are absent.
-- The kernel runs one O-core-native CPL3 task through a real x86_64 `SYSCALL`
-  entry and kernel-owned domain/personality route. Expected fatal probes place
-  that PCB in `FAULTED`, clear the current process, and leave the kernel timer
-  alive. With no sibling process or second CR3, this is not yet cross-process
-  isolation. The kernel does not provide an executable loader, preemptive
-  scheduler, IPC, capability transfer, Linux ABI, foreign root filesystem, or
-  nested-kernel mode. The hosted capability bridge remains a tested transport
-  boundary, not a live connection to this QEMU kernel.
+- The reclaiming typed allocator covers only the fixed, supervisor-only 4..16
+  MiB QEMU bootstrap window. It does not discover firmware RAM, reserve
+  arbitrary boot modules, register MMIO/device ranges, provide demand paging,
+  or claim concurrent SMP allocation.
+- Milestone 1 is bounded to two native processes on one CPU. It does not provide
+  copy-on-write, ASLR, arbitrary user mapping selection, fork/exec/wait,
+  signals, SMP, or a general process service.
+- Milestone 2 is bounded to four TCBs, two processes, and one CPU. It has no SMP
+  locking, FPU/SIMD context, load balancing, or production fairness and
+  denial-of-service claim.
+- Milestone 3 is foundation-only. Its endpoint, reservation, transfer-ticket,
+  and fixed shared-mapping primitives are exercised by a kernel-side QEMU
+  harness, but there is no CPL3 endpoint ABI, real blocked send/receive,
+  preemptive request/reply ping-pong, complete sender/receiver death matrix, or
+  personality-service crash-containment proof. Public `cap_copy` still returns
+  `ERR_NOT_IMPLEMENTED`.
+- The kernel does not provide an executable loader, complete IPC system, Linux
+  ABI, foreign root filesystem, or nested-kernel mode. The hosted capability
+  bridge remains a tested transport boundary, not a live connection to this
+  QEMU kernel.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
 [docs/OCORE.md](docs/OCORE.md) for the native language and ABI contract. The
 dependency-ordered path from `native[0]` to foreign personalities is tracked in
-[docs/ODOMAIN_PLAN.md](docs/ODOMAIN_PLAN.md).
+[docs/ODOMAIN_PLAN.md](docs/ODOMAIN_PLAN.md), with the native package/REPL
+contract in [docs/LIVE_SYSTEM.md](docs/LIVE_SYSTEM.md) and the bounded foreign
+memory protocol in
+[docs/PERSONALITY_MEMORY_VIEW.md](docs/PERSONALITY_MEMORY_VIEW.md).
 
 ---
 

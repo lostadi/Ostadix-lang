@@ -1,24 +1,405 @@
 module runtime::pages;
 
-const PAGE_SIZE: usize = 4096;
-static mut NEXT_FRAME: usize = 0x00400000;
-static mut FRAME_LIMIT: usize = 0x04000000;
+pub const PAGE_SIZE: usize = 4096;
+pub const FRAME_KIND_KERNEL: u64 = 1;
+pub const FRAME_KIND_PAGE_TABLE: u64 = 2;
+pub const FRAME_KIND_EXECUTABLE: u64 = 3;
+pub const FRAME_KIND_ANONYMOUS: u64 = 4;
+pub const FRAME_KIND_SHARED: u64 = 5;
+pub const FRAME_KIND_DEVICE: u64 = 6;
 
-pub unsafe fn init(start: usize, end: usize) -> void {
-    NEXT_FRAME = start;
-    FRAME_LIMIT = end;
+const MAX_FRAMES: usize = 3072;
+const FRAME_UNUSED: u8 = 0;
+const FRAME_FREE: u8 = 1;
+const FRAME_LIVE: u8 = 2;
+const FRAME_RETIRED: u8 = 3;
+const FRAME_HANDLE_TAG: u64 = 0xf100_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut FRAME_START: usize = 0;
+static mut FRAME_END: usize = 0;
+static mut FRAME_COUNT: usize = 0;
+static mut FREE_COUNT: usize = 0;
+static mut LIVE_COUNT: usize = 0;
+static mut RETIRED_COUNT: usize = 0;
+static mut INITIALIZED: u8 = 0;
+static mut FAIL_AFTER_POP: u8 = 0;
+
+// The current compiler requires literal array lengths. Keeping every table
+// zero-initialized also places the metadata in .bss rather than inflating the
+// kernel image with repeated initializers.
+static mut STATES: [u8; 3072] = [0; 3072];
+static mut KINDS: [u8; 3072] = [0; 3072];
+static mut REFERENCES: [u32; 3072] = [0; 3072];
+static mut GENERATIONS: [u32; 3072] = [0; 3072];
+static mut FREE_STACK: [usize; 3072] = [0; 3072];
+// Zero means absent. A live entry is its free-stack position plus one, which
+// lets the invariant checker prove a one-to-one stack/state correspondence.
+static mut FREE_POSITIONS: [usize; 3072] = [0; 3072];
+static mut TEST_HANDLES: [u64; 3072] = [0; 3072];
+
+fn valid_kind(kind: u64) -> bool {
+    return kind == FRAME_KIND_KERNEL
+        || kind == FRAME_KIND_PAGE_TABLE
+        || kind == FRAME_KIND_EXECUTABLE
+        || kind == FRAME_KIND_ANONYMOUS
+        || kind == FRAME_KIND_SHARED;
 }
 
-pub unsafe fn alloc_page() -> *mut u8 {
-    let frame: usize = NEXT_FRAME;
-    let next: usize = frame + PAGE_SIZE;
-    if next > FRAME_LIMIT {
-        return 0 as *mut u8;
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn checked_index(handle: u64, expected_kind: u64) -> usize {
+    if (handle & HANDLE_TAG_MASK) != FRAME_HANDLE_TAG {
+        return MAX_FRAMES;
     }
-    NEXT_FRAME = next;
-    return frame as *mut u8;
+    let index: usize = handle_index(handle);
+    if INITIALIZED == 0 || index >= FRAME_COUNT {
+        return MAX_FRAMES;
+    }
+    if STATES[index] != FRAME_LIVE || GENERATIONS[index] != handle_generation(handle) {
+        return MAX_FRAMES;
+    }
+    if !valid_kind(expected_kind) || KINDS[index] as u64 != expected_kind {
+        return MAX_FRAMES;
+    }
+    return index;
+}
+
+unsafe fn zero_frame(index: usize) -> void {
+    let base: usize = FRAME_START + index * PAGE_SIZE;
+    let words: *mut u64 = base as *mut u64;
+    let mut word: usize = 0;
+    while word < 512 {
+        volatile_store(words + word, 0);
+        word += 1;
+    }
+}
+
+pub unsafe fn init(start: usize, end: usize) -> u64 {
+    if INITIALIZED != 0 || start >= end {
+        return 0;
+    }
+    if (start & (PAGE_SIZE - 1)) != 0 || (end & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    let count: usize = (end - start) / PAGE_SIZE;
+    if count == 0 || count > MAX_FRAMES {
+        return 0;
+    }
+
+    let mut index: usize = 0;
+    while index < MAX_FRAMES {
+        STATES[index] = FRAME_UNUSED;
+        KINDS[index] = 0;
+        REFERENCES[index] = 0;
+        GENERATIONS[index] = 0;
+        FREE_STACK[index] = 0;
+        FREE_POSITIONS[index] = 0;
+        TEST_HANDLES[index] = 0;
+        index += 1;
+    }
+
+    index = 0;
+    while index < count {
+        STATES[index] = FRAME_FREE;
+        GENERATIONS[index] = 1;
+        let position: usize = count - index - 1;
+        FREE_STACK[position] = index;
+        FREE_POSITIONS[index] = position + 1;
+        index += 1;
+    }
+
+    FRAME_START = start;
+    FRAME_END = end;
+    FRAME_COUNT = count;
+    FREE_COUNT = count;
+    LIVE_COUNT = 0;
+    RETIRED_COUNT = 0;
+    FAIL_AFTER_POP = 0;
+    INITIALIZED = 1;
+    return 1;
+}
+
+pub unsafe fn alloc_frame(kind: u64) -> u64 {
+    if INITIALIZED == 0 || !valid_kind(kind) || FREE_COUNT == 0 {
+        return 0;
+    }
+    let position: usize = FREE_COUNT - 1;
+    let index: usize = FREE_STACK[position];
+    if index >= FRAME_COUNT
+        || STATES[index] != FRAME_FREE
+        || FREE_POSITIONS[index] != FREE_COUNT {
+        return 0;
+    }
+
+    FREE_COUNT = position;
+    FREE_POSITIONS[index] = 0;
+    if FAIL_AFTER_POP != 0 {
+        FAIL_AFTER_POP = 0;
+        FREE_STACK[FREE_COUNT] = index;
+        FREE_COUNT += 1;
+        FREE_POSITIONS[index] = FREE_COUNT;
+        return 0;
+    }
+
+    STATES[index] = FRAME_LIVE;
+    KINDS[index] = kind as u8;
+    REFERENCES[index] = 1;
+    LIVE_COUNT += 1;
+    zero_frame(index);
+    return ((GENERATIONS[index] as u64) << 32) | FRAME_HANDLE_TAG | (index as u64);
+}
+
+pub unsafe fn retain_frame(handle: u64, expected_kind: u64) -> u64 {
+    let index: usize = checked_index(handle, expected_kind);
+    if index >= FRAME_COUNT || REFERENCES[index] == 0xffff_ffff {
+        return 0;
+    }
+    REFERENCES[index] += 1;
+    return 1;
+}
+
+pub unsafe fn release_frame(handle: u64, expected_kind: u64) -> u64 {
+    let index: usize = checked_index(handle, expected_kind);
+    if index >= FRAME_COUNT || REFERENCES[index] == 0 {
+        return 0;
+    }
+    if REFERENCES[index] > 1 {
+        REFERENCES[index] -= 1;
+        return 1;
+    }
+    if LIVE_COUNT == 0
+        || (GENERATIONS[index] != 0xffff_ffff && FREE_COUNT >= FRAME_COUNT) {
+        return 0;
+    }
+
+    zero_frame(index);
+    REFERENCES[index] = 0;
+    KINDS[index] = 0;
+    LIVE_COUNT -= 1;
+    if GENERATIONS[index] == 0xffff_ffff {
+        STATES[index] = FRAME_RETIRED;
+        RETIRED_COUNT += 1;
+    } else {
+        GENERATIONS[index] += 1;
+        STATES[index] = FRAME_FREE;
+        FREE_STACK[FREE_COUNT] = index;
+        FREE_COUNT += 1;
+        FREE_POSITIONS[index] = FREE_COUNT;
+    }
+    return 1;
+}
+
+// Physical addresses remain a kernel-internal implementation detail. No
+// syscall returns this value; user mode receives only a typed CSpace handle.
+pub unsafe fn frame_address(handle: u64, expected_kind: u64) -> usize {
+    let index: usize = checked_index(handle, expected_kind);
+    if index >= FRAME_COUNT {
+        return 0;
+    }
+    return FRAME_START + index * PAGE_SIZE;
+}
+
+pub unsafe fn total_frames() -> usize {
+    return FRAME_COUNT;
+}
+
+pub unsafe fn free_frames() -> usize {
+    return FREE_COUNT;
+}
+
+pub unsafe fn live_frames() -> usize {
+    return LIVE_COUNT;
 }
 
 pub unsafe fn allocated_bytes() -> usize {
-    return NEXT_FRAME - 0x00400000;
+    return LIVE_COUNT * PAGE_SIZE;
+}
+
+pub unsafe fn inject_failure_after_pop_once() -> void {
+    FAIL_AFTER_POP = 1;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || FRAME_START >= FRAME_END || FRAME_COUNT == 0 {
+        return false;
+    }
+    if FRAME_COUNT > MAX_FRAMES || FREE_COUNT > FRAME_COUNT || LIVE_COUNT > FRAME_COUNT {
+        return false;
+    }
+    if FRAME_END - FRAME_START != FRAME_COUNT * PAGE_SIZE {
+        return false;
+    }
+
+    let mut observed_free: usize = 0;
+    let mut observed_live: usize = 0;
+    let mut observed_retired: usize = 0;
+    let mut index: usize = 0;
+    while index < MAX_FRAMES {
+        if index >= FRAME_COUNT {
+            if STATES[index] != FRAME_UNUSED
+                || KINDS[index] != 0
+                || REFERENCES[index] != 0
+                || GENERATIONS[index] != 0
+                || FREE_POSITIONS[index] != 0 {
+                return false;
+            }
+        } else {
+            if STATES[index] == FRAME_FREE {
+                let position_plus_one: usize = FREE_POSITIONS[index];
+                if KINDS[index] != 0
+                    || REFERENCES[index] != 0
+                    || GENERATIONS[index] == 0
+                    || position_plus_one == 0
+                    || position_plus_one > FREE_COUNT
+                    || FREE_STACK[position_plus_one - 1] != index {
+                    return false;
+                }
+                observed_free += 1;
+            } else if STATES[index] == FRAME_LIVE {
+                if !valid_kind(KINDS[index] as u64)
+                    || REFERENCES[index] == 0
+                    || GENERATIONS[index] == 0
+                    || FREE_POSITIONS[index] != 0 {
+                    return false;
+                }
+                observed_live += 1;
+            } else {
+                if STATES[index] != FRAME_RETIRED
+                    || KINDS[index] != 0
+                    || REFERENCES[index] != 0
+                    || GENERATIONS[index] != 0xffff_ffff
+                    || FREE_POSITIONS[index] != 0 {
+                    return false;
+                }
+                observed_retired += 1;
+            }
+        }
+        index += 1;
+    }
+    return observed_free == FREE_COUNT
+        && observed_live == LIVE_COUNT
+        && observed_retired == RETIRED_COUNT
+        && observed_free + observed_live + observed_retired == FRAME_COUNT;
+}
+
+pub unsafe fn test_exhaustion_and_reclaim() -> u64 {
+    if !invariants_hold() || FREE_COUNT != FRAME_COUNT || LIVE_COUNT != 0 {
+        return 0;
+    }
+    let count: usize = FRAME_COUNT;
+    let mut index: usize = 0;
+    while index < count {
+        let handle: u64 = alloc_frame(FRAME_KIND_ANONYMOUS);
+        if handle == 0 {
+            return 0;
+        }
+        TEST_HANDLES[index] = handle;
+        index += 1;
+    }
+    if alloc_frame(FRAME_KIND_ANONYMOUS) != 0
+        || FREE_COUNT != 0
+        || LIVE_COUNT != count
+        || !invariants_hold() {
+        return 0;
+    }
+    index = 0;
+    while index < count {
+        if release_frame(TEST_HANDLES[index], FRAME_KIND_ANONYMOUS) == 0 {
+            return 0;
+        }
+        TEST_HANDLES[index] = 0;
+        index += 1;
+    }
+    if FREE_COUNT != count || LIVE_COUNT != 0 || !invariants_hold() {
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn test_zero_reuse() -> u64 {
+    let first: u64 = alloc_frame(FRAME_KIND_ANONYMOUS);
+    let first_address: usize = frame_address(first, FRAME_KIND_ANONYMOUS);
+    if first == 0 || first_address == 0 {
+        return 0;
+    }
+    let words: *mut u64 = first_address as *mut u64;
+    let mut word: usize = 0;
+    while word < 512 {
+        volatile_store(words + word, 0xa5a5_a5a5_a5a5_a5a5);
+        word += 1;
+    }
+    if release_frame(first, FRAME_KIND_ANONYMOUS) == 0 {
+        return 0;
+    }
+
+    let second: u64 = alloc_frame(FRAME_KIND_ANONYMOUS);
+    let second_address: usize = frame_address(second, FRAME_KIND_ANONYMOUS);
+    if second == 0 || second == first || second_address != first_address {
+        return 0;
+    }
+    let zero_words: *const u64 = second_address as *const u64;
+    word = 0;
+    while word < 512 {
+        if volatile_load(zero_words + word) != 0 {
+            return 0;
+        }
+        word += 1;
+    }
+    return release_frame(second, FRAME_KIND_ANONYMOUS);
+}
+
+pub unsafe fn test_stale_and_double_free() -> u64 {
+    let old: u64 = alloc_frame(FRAME_KIND_SHARED);
+    let old_address: usize = frame_address(old, FRAME_KIND_SHARED);
+    if old == 0
+        || old_address == 0
+        || retain_frame(old, FRAME_KIND_SHARED) == 0
+        || release_frame(old, FRAME_KIND_SHARED) == 0
+        || frame_address(old, FRAME_KIND_SHARED) != old_address
+        || release_frame(old, FRAME_KIND_SHARED) == 0 {
+        return 0;
+    }
+    if release_frame(old, FRAME_KIND_SHARED) != 0 {
+        return 0;
+    }
+    let replacement: u64 = alloc_frame(FRAME_KIND_SHARED);
+    if replacement == 0 || replacement == old {
+        return 0;
+    }
+    if retain_frame(old, FRAME_KIND_SHARED) != 0
+        || frame_address(old, FRAME_KIND_SHARED) != 0
+        || release_frame(old, FRAME_KIND_SHARED) != 0 {
+        return 0;
+    }
+    return release_frame(replacement, FRAME_KIND_SHARED);
+}
+
+pub unsafe fn test_injected_failure() -> u64 {
+    let before_free: usize = FREE_COUNT;
+    let before_live: usize = LIVE_COUNT;
+    inject_failure_after_pop_once();
+    if alloc_frame(FRAME_KIND_EXECUTABLE) != 0 {
+        return 0;
+    }
+    if FREE_COUNT != before_free || LIVE_COUNT != before_live || !invariants_hold() {
+        return 0;
+    }
+    if alloc_frame(FRAME_KIND_DEVICE) != 0
+        || FREE_COUNT != before_free
+        || LIVE_COUNT != before_live {
+        return 0;
+    }
+    let recovered: u64 = alloc_frame(FRAME_KIND_EXECUTABLE);
+    if recovered == 0 || release_frame(recovered, FRAME_KIND_EXECUTABLE) == 0 {
+        return 0;
+    }
+    return (FREE_COUNT == before_free && LIVE_COUNT == before_live && invariants_hold()) as u64;
 }

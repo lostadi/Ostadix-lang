@@ -1,0 +1,156 @@
+module runtime::m2_user;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_SLEEP;
+use runtime::native_abi::SYS_TICKS;
+use runtime::native_abi::SYS_YIELD;
+
+const ISOLATION_VA: usize = 0x01201000;
+
+@link_section(".rodata.user")
+static CPU_ONE_MESSAGE: [u8; 29] = b"M2 cpu thread 1 CPL3: online\n";
+@link_section(".rodata.user")
+static CPU_TWO_MESSAGE: [u8; 29] = b"M2 cpu thread 2 CPL3: online\n";
+@link_section(".rodata.user")
+static YIELD_MESSAGE: [u8; 27] = b"M2 cooperative yield: PASS\n";
+@link_section(".rodata.user")
+static BLOCK_ONE_MESSAGE: [u8; 27] = b"M2 blocking thread 1: woke\n";
+@link_section(".rodata.user")
+static BLOCK_TWO_MESSAGE: [u8; 27] = b"M2 blocking thread 2: woke\n";
+@link_section(".rodata.user")
+static HOSTILE_RFLAGS_MESSAGE: [u8; 37] = b"M2 cross-thread hostile RFLAGS: PASS\n";
+
+const HOSTILE_ARMED_VA: usize = 0x01201010;
+const HOSTILE_RELEASE_VA: usize = 0x01201018;
+
+extern "sysv64" fn ocore_m2_hostile_rsp_yield() -> never;
+
+@link_section(".text.user")
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@link_section(".text.user")
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    let result: u64 = syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    );
+    if result != length as u64 {
+        stop();
+    }
+}
+
+@link_section(".text.user")
+unsafe fn run_counter(pointer: *mut u64) -> never {
+    loop {
+        let value: u64 = volatile_load(pointer as *const u64);
+        volatile_store(pointer, value + 1);
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@link_section(".text.user")
+unsafe fn sleep_ticks(delta: u64) -> void {
+    if syscall1(SYS_SLEEP, delta) != 0 {
+        stop();
+    }
+}
+
+@link_section(".text.user")
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+@link_section(".text.user")
+unsafe fn wait_for_timer_tick() -> void {
+    let before: u64 = syscall0(SYS_TICKS);
+    while syscall0(SYS_TICKS) == before {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+// Arm NT without crossing a syscall boundary, publish that fact to the sibling
+// thread, and spin until it rotates this TCB back in through another thread's
+// scheduling syscall. IRETQ must consume a sanitized selected frame.
+@link_section(".text.user")
+unsafe fn cross_thread_hostile_rflags() -> void {
+    volatile_store(HOSTILE_ARMED_VA as *mut u64, 0);
+    volatile_store(HOSTILE_RELEASE_VA as *mut u64, 0);
+    let mut armed_flags: u64 = 0;
+    let mut resumed_flags: u64 = 0;
+    asm!(
+        "pushfq\nor qword ptr [rsp], 0x4000\npopfq\npushfq\npop rdx\nmov qword ptr [rdi], 1\n2:\ncmp qword ptr [rsi], 0\njne 3f\npause\njmp 2b\n3:\npushfq\npop rax",
+        in("rdi") HOSTILE_ARMED_VA,
+        in("rsi") HOSTILE_RELEASE_VA,
+        out("rdx") armed_flags,
+        out("rax") resumed_flags
+    );
+    if (armed_flags & 0x4000) == 0 || (resumed_flags & 0x4000) != 0 {
+        stop();
+    }
+    emit(
+        volatile_load((ISOLATION_VA + 32) as *const u64),
+        (&HOSTILE_RFLAGS_MESSAGE[0]),
+        37
+    );
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m2_cpu_one_entry(capability: u64) -> never {
+    volatile_store((ISOLATION_VA + 32) as *mut u64, capability);
+    cross_thread_hostile_rflags();
+    emit(capability, (&CPU_ONE_MESSAGE[0]), 29);
+    yield_once();
+    emit(capability, (&YIELD_MESSAGE[0]), 27);
+    run_counter(ISOLATION_VA as *mut u64);
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m2_block_one_entry(capability: u64) -> never {
+    while volatile_load(HOSTILE_ARMED_VA as *const u64) == 0 {
+        // If IRQ0 won the tiny race before the hostile thread published its
+        // armed word, rotate immediately instead of accruing a blocking-thread
+        // run tick while spinning. FIFO order returns the hostile TCB to CPL3.
+        yield_once();
+    }
+    volatile_store(HOSTILE_RELEASE_VA as *mut u64, 1);
+    sleep_ticks(4);
+    emit(capability, (&BLOCK_ONE_MESSAGE[0]), 27);
+    volatile_store((ISOLATION_VA + 8) as *mut u64, 1);
+    // Accrue a post-wake timer tick before deliberately presenting an invalid
+    // saved RSP at a scheduling syscall. The kernel must retire only this TCB.
+    wait_for_timer_tick();
+    ocore_m2_hostile_rsp_yield();
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m2_cpu_two_entry(capability: u64) -> never {
+    emit(capability, (&CPU_TWO_MESSAGE[0]), 29);
+    // Two rotations cover both sides of the armed-before-first-tick race. One
+    // of these syscall selections must choose the NT-bearing sibling TCB.
+    yield_once();
+    yield_once();
+    run_counter(ISOLATION_VA as *mut u64);
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m2_block_two_entry(capability: u64) -> never {
+    sleep_ticks(7);
+    emit(capability, (&BLOCK_TWO_MESSAGE[0]), 27);
+    run_counter((ISOLATION_VA + 8) as *mut u64);
+}

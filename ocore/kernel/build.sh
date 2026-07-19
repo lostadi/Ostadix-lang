@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 9" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 13" >&2
     exit 2
     ;;
 esac
@@ -25,12 +25,22 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
   "$ROOT/ocore/runtime/x86_64/personality.oc" \
   "$ROOT/ocore/runtime/x86_64/domain.oc" \
   "$ROOT/ocore/runtime/x86_64/process.oc" \
+  "$ROOT/ocore/runtime/x86_64/thread.oc" \
   "$ROOT/ocore/runtime/x86_64/scheduler.oc" \
   "$ROOT/ocore/runtime/x86_64/capability.oc" \
+  "$ROOT/ocore/runtime/x86_64/memory_object.oc" \
+  "$ROOT/ocore/runtime/x86_64/endpoint.oc" \
+  "$ROOT/ocore/runtime/x86_64/cap_transfer.oc" \
+  "$ROOT/ocore/runtime/x86_64/mapping.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/trap.oc" \
   "$ROOT/ocore/runtime/x86_64/syscall.oc" \
   "$ROOT/ocore/runtime/x86_64/user.oc" \
+  "$ROOT/ocore/runtime/x86_64/m1_user.oc" \
+  "$ROOT/ocore/runtime/x86_64/m2_user.oc" \
+  "$KERNEL_DIR/m1.oc" \
+  "$KERNEL_DIR/m2.oc" \
+  "$KERNEL_DIR/m3.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \
   --emit obj \

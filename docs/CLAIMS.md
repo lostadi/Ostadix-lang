@@ -20,6 +20,11 @@
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
   (`o_lang/`). It also contains O-core freestanding x86_64 ELF object emission
   through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `src/ocore/driver.rs`).
+- The source-release builder in `scripts/build_source_release.py` reads only
+  allowlisted blobs from a resolved Git commit, rejects dirty worktrees by
+  default, emits a deterministic ZIP with a canonical manifest and checksums,
+  and self-verifies before atomic publication. Its regression suite covers
+  debris exclusion, reproducibility, committed-byte behavior, and tampering.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR
@@ -49,24 +54,44 @@
 - Native value crossings are conservative: `Fidelity::NativeCapsule` in
   `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
-- The bootable O-core proof runs one statically linked `native[0]` process at
-  CPL3. Its x86_64 bootstrap now uses page-granular supervisor RX, R/NX, and
-  RW/NX mappings; guarded user and kernel stacks; a double-fault IST; CPU-local
-  `SYSCALL` entry state; normalized exception frames; and fault-aware bounded
-  user copies through a kernel bounce buffer. Kernel-owned PCB identity selects
-  the native personality, bootstrap address-space descriptor, and process
-  CSpace. QEMU verifies capability and range denials, ELF zero-fill, complete
-  syscall register preservation, hostile-RFLAGS sanitization, IRQ0 return, and
-  a later CPL3 heartbeat. Eight fresh-boot negative probes cover divide error,
-  invalid opcode, non-present and supervisor reads, guard-stack write, NX RIP,
-  noncanonical target, and an excluded syscall-return RIP. Each marks process 1
-  faulted, clears the current process, and reaches a later kernel timer marker.
-  A ninth boot removes one otherwise valid user PTE and proves that a syscall
-  copy returns `ERR_USER_COPY_FAULT` before a later CPL3 heartbeat.
-  This is controlled one-process fault disposition, not proof that a sibling
-  process survives. It does not claim an executable loader, independent
-  per-process page tables, context switching, IPC, Linux compatibility, or
-  foreign root filesystems.
+- O-core Milestones 0.1 through 0.3 are complete for their bounded, single-CPU
+  QEMU bootstrap gates. They prove CPL3 `SYSCALL` and IRQ return, page-granular
+  kernel and user protection, normalized faults, fault-aware bounded user copy,
+  and a reclaiming typed registry for all 3,072 frames in the fixed 4..16 MiB
+  window. The default gate also proves generation-safe memory-object reuse,
+  zero-before-reuse, rollback, per-CSpace quotas, and capability-returning
+  anonymous/shared `page_alloc`. The fresh-boot fault matrix remains evidence
+  about the one-process Milestone 0.2 scenario, not the current upper bound.
+- Milestone 1 is complete for two bounded native processes on one CPU.
+  `smoke-processes-qemu.sh` runs independent exit and fault scenarios and proves
+  separate CR3s, the same private virtual address backed by different frames,
+  atomic PCB/domain/address-space/CSpace switching, split teardown, stale handle
+  denial, sibling survival, complete dynamic-frame reclamation, and a later
+  timer marker.
+- Milestone 2 is complete for four TCBs across two processes on one CPU.
+  `smoke-scheduler-qemu.sh` proves one million forced identity transactions, FIFO
+  runnable and blocked queues, two CPU-bound and two sleeping CPL3 threads,
+  cooperative yield, timer preemption, wake-once sleep, bounded priority
+  accounting, an idle path, cross-thread hostile-RFLAGS sanitization, hostile
+  saved-RSP TCB containment, exit during preemption, sibling progress, stale
+  TCB denial, frame reclamation, and post-lifecycle timer survival. The million
+  transactions do not enter CPL3; real frame save/restore and IRETQ switching
+  are proved separately by the bounded IRQ/SYSCALL phase.
+- Milestone 3 has a verified foundation, not a completed IPC milestone.
+  `smoke-ipc-foundation-qemu.sh` exercises generation-tagged endpoints with a
+  four-message FIFO, cancellation and waiter-record cleanup, invisible
+  destination-slot reservations, shared-memory-only attenuating transfer
+  tickets, exact-generation queued-capability escrow, and one optional fixed
+  RW/NX shared page in each of two address spaces. Shared mapping requires a
+  `RIGHT_MEMORY_USE` capability from the address space's exact owner CSpace. The
+  gate proves cross-CR3 visibility, exact attenuation, failed re-transfer,
+  generation reuse, rejection of new work from a dead sender, explicit
+  management-harness cancellation of its earlier queue item and ticket,
+  reclamation, and later timer survival. The public `cap_copy` number still
+  returns `ERR_NOT_IMPLEMENTED`. The waiter records are registry bookkeeping,
+  not live blocked TCB transitions. No CPL3 endpoint ABI, real blocked IPC,
+  preemptive request/reply ping-pong, complete sender/receiver death matrix, or
+  personality-service crash-containment gate exists yet.
 
 ## Implemented conservatively
 
@@ -94,7 +119,10 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond `native[0]`: independent per-process address
-  spaces, preemptive scheduling, capability transfer, IPC, executable loaders,
-  service discovery, and only then a minimal Linux x86_64 personality. The
-  staged engineering plan is in `docs/ODOMAIN_PLAN.md`.
+- O-Domain evolution beyond the current Milestone 3 foundation: a CPL3 IPC ABI,
+  blocking send/receive, preemptive request/reply and death cleanup, supervised
+  personality services, executable loaders, service discovery, the native live
+  system in `docs/LIVE_SYSTEM.md`, and only then a minimal Linux x86_64
+  personality. The staged engineering plan is in `docs/ODOMAIN_PLAN.md`; its
+  required foreign-process memory boundary is in
+  `docs/PERSONALITY_MEMORY_VIEW.md`.

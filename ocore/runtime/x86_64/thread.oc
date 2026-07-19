@@ -1,0 +1,1319 @@
+module runtime::thread;
+
+use runtime::address_space::native_stack_top_for;
+use runtime::address_space::stack_allows;
+use runtime::address_space::valid_entry;
+use runtime::capability::cspace_is_live;
+use runtime::domain::is_live as domain_is_live;
+use runtime::process::address_space_for;
+use runtime::process::cspace_for;
+use runtime::process::domain_for;
+use runtime::process::is_live as process_is_live;
+use runtime::process::process_state;
+use runtime::process::release_thread as release_process_thread;
+use runtime::process::retain_thread as retain_process_thread;
+use runtime::process::thread_refs as process_thread_refs;
+use runtime::process::PROCESS_STATE_READY;
+use runtime::process::PROCESS_STATE_RUNNING;
+
+pub const MAX_THREADS: usize = 4;
+pub const THREAD_STATE_READY: u64 = 1;
+pub const THREAD_STATE_RUNNING: u64 = 2;
+pub const THREAD_STATE_BLOCKED: u64 = 3;
+pub const THREAD_STATE_EXITED: u64 = 4;
+pub const THREAD_STATE_DISPATCHING: u64 = 5;
+
+pub const THREAD_ROLE_CPU: u64 = 1;
+pub const THREAD_ROLE_BLOCKING: u64 = 2;
+
+pub const WAKE_REASON_NONE: u64 = 0;
+pub const WAKE_REASON_TIMER: u64 = 1;
+pub const WAKE_REASON_IPC: u64 = 2;
+pub const WAKE_REASON_CANCELLED: u64 = 3;
+
+pub const QUEUE_NONE: u64 = 0;
+pub const QUEUE_RUNNABLE: u64 = 1;
+pub const QUEUE_BLOCKED: u64 = 2;
+
+const THREAD_EMPTY: u8 = 0;
+const THREAD_READY: u8 = 1;
+const THREAD_RUNNING: u8 = 2;
+const THREAD_BLOCKED: u8 = 3;
+const THREAD_EXITED: u8 = 4;
+const THREAD_DISPATCHING: u8 = 5;
+const THREAD_RETIRED: u8 = 6;
+
+const QUEUE_KIND_NONE: u8 = 0;
+const QUEUE_KIND_RUNNABLE: u8 = 1;
+const QUEUE_KIND_BLOCKED: u8 = 2;
+
+const THREAD_HANDLE_TAG: u64 = 0xe200_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const INVALID_STACK_ORDINAL: u8 = 0xff;
+
+// Exact normalized frame layout shared with boot.S:
+// r15..r8, rdi,rsi,rbp,rdx,rcx,rbx,rax, vector,error,
+// rip,cs,rflags,rsp,ss.
+pub const FRAME_WORDS: usize = 22;
+const FRAME_RDI: usize = 8;
+const FRAME_RAX: usize = 14;
+const FRAME_VECTOR: usize = 15;
+const FRAME_ERROR: usize = 16;
+const FRAME_RIP: usize = 17;
+const FRAME_CS: usize = 18;
+const FRAME_RFLAGS: usize = 19;
+const FRAME_RSP: usize = 20;
+const FRAME_SS: usize = 21;
+
+static mut THREAD_IDS: [u64; 4] = [0; 4];
+static mut PROCESS_HANDLES: [u64; 4] = [0; 4];
+static mut DOMAIN_HANDLES: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACE_HANDLES: [u64; 4] = [0; 4];
+static mut CSPACE_HANDLES: [u64; 4] = [0; 4];
+static mut KERNEL_STACK_TOPS: [usize; 4] = [0; 4];
+static mut STACK_ORDINALS: [u8; 4] = [0xff; 4];
+static mut USER_STACK_TOPS: [usize; 4] = [0; 4];
+static mut ROLES: [u8; 4] = [0; 4];
+static mut PRIORITIES: [u8; 4] = [0; 4];
+static mut QUANTUM_LEFT: [u8; 4] = [0; 4];
+static mut WAKE_DEADLINES: [u64; 4] = [0; 4];
+static mut WAKE_REASONS: [u8; 4] = [0; 4];
+static mut SLEEP_EPOCHS: [u32; 4] = [0; 4];
+static mut WAKE_EPOCHS: [u32; 4] = [0; 4];
+static mut WAKE_COUNTS: [u32; 4] = [0; 4];
+static mut RUN_TICKS: [u64; 4] = [0; 4];
+static mut SWITCH_COUNTS: [u64; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut STATES: [u8; 4] = [0; 4];
+static mut QUEUE_KINDS: [u8; 4] = [0; 4];
+// 0 means no retained PCB reference, 1 means held. Value 2 exists only during
+// the interrupt-masked terminate transaction after its exact preflight.
+static mut PROCESS_REF_HELD: [u8; 4] = [0; 4];
+static mut FRAMES: [u64; 88] = [0; 88];
+
+// Both queues store full generation-tagged handles. Logical queue order begins
+// at HEAD and wraps across the fixed four-entry ring.
+static mut RUNNABLE_QUEUE: [u64; 4] = [0; 4];
+static mut RUNNABLE_HEAD: usize = 0;
+static mut RUNNABLE_LENGTH: usize = 0;
+static mut BLOCKED_QUEUE: [u64; 4] = [0; 4];
+static mut BLOCKED_HEAD: usize = 0;
+static mut BLOCKED_LENGTH: usize = 0;
+
+static mut CURRENT_THREAD: u64 = 0;
+static mut PREPARED_THREAD: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+
+fn frame_index(slot: usize, word: usize) -> usize {
+    return slot * FRAME_WORDS + word;
+}
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | THREAD_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_thread(handle: u64) -> usize {
+    if INITIALIZED == 0 || (handle & HANDLE_TAG_MASK) != THREAD_HANDLE_TAG {
+        return MAX_THREADS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_THREADS
+        || STATES[slot] == THREAD_EMPTY
+        || STATES[slot] == THREAD_RETIRED
+        || GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_THREADS;
+    }
+    return slot;
+}
+
+fn active_state(state: u8) -> bool {
+    return state == THREAD_READY
+        || state == THREAD_RUNNING
+        || state == THREAD_BLOCKED
+        || state == THREAD_DISPATCHING;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    THREAD_IDS[slot] = 0;
+    PROCESS_HANDLES[slot] = 0;
+    DOMAIN_HANDLES[slot] = 0;
+    ADDRESS_SPACE_HANDLES[slot] = 0;
+    CSPACE_HANDLES[slot] = 0;
+    KERNEL_STACK_TOPS[slot] = 0;
+    STACK_ORDINALS[slot] = INVALID_STACK_ORDINAL;
+    USER_STACK_TOPS[slot] = 0;
+    ROLES[slot] = 0;
+    PRIORITIES[slot] = 0;
+    QUANTUM_LEFT[slot] = 0;
+    WAKE_DEADLINES[slot] = 0;
+    WAKE_REASONS[slot] = WAKE_REASON_NONE as u8;
+    SLEEP_EPOCHS[slot] = 0;
+    WAKE_EPOCHS[slot] = 0;
+    WAKE_COUNTS[slot] = 0;
+    RUN_TICKS[slot] = 0;
+    SWITCH_COUNTS[slot] = 0;
+    QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+    PROCESS_REF_HELD[slot] = 0;
+    let mut word: usize = 0;
+    while word < FRAME_WORDS {
+        FRAMES[frame_index(slot, word)] = 0;
+        word += 1;
+    }
+}
+
+unsafe fn runnable_at(position: usize) -> u64 {
+    if position >= RUNNABLE_LENGTH {
+        return 0;
+    }
+    return RUNNABLE_QUEUE[(RUNNABLE_HEAD + position) % MAX_THREADS];
+}
+
+unsafe fn blocked_at(position: usize) -> u64 {
+    if position >= BLOCKED_LENGTH {
+        return 0;
+    }
+    return BLOCKED_QUEUE[(BLOCKED_HEAD + position) % MAX_THREADS];
+}
+
+unsafe fn runnable_enqueue_tail(handle: u64) -> bool {
+    if handle == 0 || RUNNABLE_LENGTH >= MAX_THREADS {
+        return false;
+    }
+    let tail: usize = (RUNNABLE_HEAD + RUNNABLE_LENGTH) % MAX_THREADS;
+    if RUNNABLE_QUEUE[tail] != 0 {
+        return false;
+    }
+    RUNNABLE_QUEUE[tail] = handle;
+    RUNNABLE_LENGTH += 1;
+    return true;
+}
+
+unsafe fn runnable_enqueue_head(handle: u64) -> bool {
+    if handle == 0 || RUNNABLE_LENGTH >= MAX_THREADS {
+        return false;
+    }
+    if RUNNABLE_LENGTH == 0 {
+        RUNNABLE_HEAD = 0;
+    } else {
+        RUNNABLE_HEAD = (RUNNABLE_HEAD + MAX_THREADS - 1) % MAX_THREADS;
+    }
+    if RUNNABLE_QUEUE[RUNNABLE_HEAD] != 0 {
+        return false;
+    }
+    RUNNABLE_QUEUE[RUNNABLE_HEAD] = handle;
+    RUNNABLE_LENGTH += 1;
+    return true;
+}
+
+unsafe fn blocked_enqueue_tail(handle: u64) -> bool {
+    if handle == 0 || BLOCKED_LENGTH >= MAX_THREADS {
+        return false;
+    }
+    let tail: usize = (BLOCKED_HEAD + BLOCKED_LENGTH) % MAX_THREADS;
+    if BLOCKED_QUEUE[tail] != 0 {
+        return false;
+    }
+    BLOCKED_QUEUE[tail] = handle;
+    BLOCKED_LENGTH += 1;
+    return true;
+}
+
+unsafe fn runnable_remove_at(position: usize) -> u64 {
+    if position >= RUNNABLE_LENGTH {
+        return 0;
+    }
+    let removed: u64 = runnable_at(position);
+    let mut cursor: usize = position;
+    while cursor + 1 < RUNNABLE_LENGTH {
+        let target: usize = (RUNNABLE_HEAD + cursor) % MAX_THREADS;
+        let source: usize = (RUNNABLE_HEAD + cursor + 1) % MAX_THREADS;
+        RUNNABLE_QUEUE[target] = RUNNABLE_QUEUE[source];
+        cursor += 1;
+    }
+    let old_tail: usize = (RUNNABLE_HEAD + RUNNABLE_LENGTH - 1) % MAX_THREADS;
+    RUNNABLE_QUEUE[old_tail] = 0;
+    RUNNABLE_LENGTH -= 1;
+    if RUNNABLE_LENGTH == 0 {
+        RUNNABLE_HEAD = 0;
+    }
+    return removed;
+}
+
+unsafe fn blocked_remove_at(position: usize) -> u64 {
+    if position >= BLOCKED_LENGTH {
+        return 0;
+    }
+    let removed: u64 = blocked_at(position);
+    let mut cursor: usize = position;
+    while cursor + 1 < BLOCKED_LENGTH {
+        let target: usize = (BLOCKED_HEAD + cursor) % MAX_THREADS;
+        let source: usize = (BLOCKED_HEAD + cursor + 1) % MAX_THREADS;
+        BLOCKED_QUEUE[target] = BLOCKED_QUEUE[source];
+        cursor += 1;
+    }
+    let old_tail: usize = (BLOCKED_HEAD + BLOCKED_LENGTH - 1) % MAX_THREADS;
+    BLOCKED_QUEUE[old_tail] = 0;
+    BLOCKED_LENGTH -= 1;
+    if BLOCKED_LENGTH == 0 {
+        BLOCKED_HEAD = 0;
+    }
+    return removed;
+}
+
+unsafe fn runnable_remove(handle: u64) -> bool {
+    let mut position: usize = 0;
+    while position < RUNNABLE_LENGTH {
+        if runnable_at(position) == handle {
+            return runnable_remove_at(position) == handle;
+        }
+        position += 1;
+    }
+    return false;
+}
+
+unsafe fn blocked_remove(handle: u64) -> bool {
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH {
+        if blocked_at(position) == handle {
+            return blocked_remove_at(position) == handle;
+        }
+        position += 1;
+    }
+    return false;
+}
+
+unsafe fn runnable_occurrences(handle: u64) -> usize {
+    let mut found: usize = 0;
+    let mut position: usize = 0;
+    while position < RUNNABLE_LENGTH {
+        if runnable_at(position) == handle {
+            found += 1;
+        }
+        position += 1;
+    }
+    return found;
+}
+
+unsafe fn blocked_occurrences(handle: u64) -> usize {
+    let mut found: usize = 0;
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH {
+        if blocked_at(position) == handle {
+            found += 1;
+        }
+        position += 1;
+    }
+    return found;
+}
+
+unsafe fn runnable_physical_active(index: usize) -> bool {
+    let mut position: usize = 0;
+    while position < RUNNABLE_LENGTH {
+        if (RUNNABLE_HEAD + position) % MAX_THREADS == index {
+            return true;
+        }
+        position += 1;
+    }
+    return false;
+}
+
+unsafe fn blocked_physical_active(index: usize) -> bool {
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH {
+        if (BLOCKED_HEAD + position) % MAX_THREADS == index {
+            return true;
+        }
+        position += 1;
+    }
+    return false;
+}
+
+unsafe fn validate_frame_words(slot: usize, frame: *const u64) -> bool {
+    if slot >= MAX_THREADS
+        || frame as usize == 0
+        || !active_state(STATES[slot]) {
+        return false;
+    }
+    let stack: usize = volatile_load(frame + FRAME_RSP) as usize;
+    let ordinal: usize = STACK_ORDINALS[slot] as usize;
+    if ordinal >= 2
+        || volatile_load(frame + FRAME_CS) != 0x23
+        || volatile_load(frame + FRAME_SS) != 0x1b
+        || (volatile_load(frame + FRAME_RFLAGS) & 2) == 0 {
+        return false;
+    }
+    return valid_entry(
+        ADDRESS_SPACE_HANDLES[slot],
+        volatile_load(frame + FRAME_RIP) as usize
+    ) && stack_allows(ADDRESS_SPACE_HANDLES[slot], ordinal, stack);
+}
+
+unsafe fn validate_frame(slot: usize) -> bool {
+    if slot >= MAX_THREADS {
+        return false;
+    }
+    return validate_frame_words(
+        slot,
+        (&FRAMES[frame_index(slot, 0)]) as *const u64
+    );
+}
+
+// This is deliberately exhaustive rather than probabilistic: there are only
+// four TCBs and two four-entry queues. It proves that every queued identity is
+// generation-valid, appears exactly once, and agrees with its state/kind.
+pub unsafe fn queue_invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || RUNNABLE_LENGTH > MAX_THREADS
+        || BLOCKED_LENGTH > MAX_THREADS
+        || RUNNABLE_LENGTH + BLOCKED_LENGTH > MAX_THREADS {
+        return false;
+    }
+    if (RUNNABLE_LENGTH == 0 && RUNNABLE_HEAD != 0)
+        || (RUNNABLE_LENGTH != 0 && RUNNABLE_HEAD >= MAX_THREADS)
+        || (BLOCKED_LENGTH == 0 && BLOCKED_HEAD != 0)
+        || (BLOCKED_LENGTH != 0 && BLOCKED_HEAD >= MAX_THREADS) {
+        return false;
+    }
+
+    let mut physical: usize = 0;
+    while physical < MAX_THREADS {
+        if runnable_physical_active(physical) {
+            let handle: u64 = RUNNABLE_QUEUE[physical];
+            let slot: usize = checked_thread(handle);
+            if slot >= MAX_THREADS
+                || STATES[slot] != THREAD_READY
+                || QUEUE_KINDS[slot] != QUEUE_KIND_RUNNABLE {
+                return false;
+            }
+        } else if RUNNABLE_QUEUE[physical] != 0 {
+            return false;
+        }
+        if blocked_physical_active(physical) {
+            let handle: u64 = BLOCKED_QUEUE[physical];
+            let slot: usize = checked_thread(handle);
+            if slot >= MAX_THREADS
+                || STATES[slot] != THREAD_BLOCKED
+                || QUEUE_KINDS[slot] != QUEUE_KIND_BLOCKED {
+                return false;
+            }
+        } else if BLOCKED_QUEUE[physical] != 0 {
+            return false;
+        }
+        physical += 1;
+    }
+
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        let state: u8 = STATES[slot];
+        if state == THREAD_EMPTY || state == THREAD_RETIRED {
+            if QUEUE_KINDS[slot] != QUEUE_KIND_NONE
+                || PROCESS_REF_HELD[slot] != 0 {
+                return false;
+            }
+        } else {
+            let handle: u64 = make_handle(slot);
+            let runnable_hits: usize = runnable_occurrences(handle);
+            let blocked_hits: usize = blocked_occurrences(handle);
+            if runnable_hits + blocked_hits > 1 {
+                return false;
+            }
+            if state == THREAD_READY {
+                if QUEUE_KINDS[slot] != QUEUE_KIND_RUNNABLE
+                    || runnable_hits != 1
+                    || blocked_hits != 0
+                    || PROCESS_REF_HELD[slot] != 1 {
+                    return false;
+                }
+            }
+            if state == THREAD_BLOCKED {
+                if QUEUE_KINDS[slot] != QUEUE_KIND_BLOCKED
+                    || blocked_hits != 1
+                    || runnable_hits != 0
+                    || PROCESS_REF_HELD[slot] != 1
+                    || SLEEP_EPOCHS[slot] == 0
+                    || SLEEP_EPOCHS[slot] != (WAKE_EPOCHS[slot] + 1) {
+                    return false;
+                }
+            }
+            if state == THREAD_RUNNING {
+                if QUEUE_KINDS[slot] != QUEUE_KIND_NONE
+                    || runnable_hits != 0
+                    || blocked_hits != 0
+                    || CURRENT_THREAD != handle
+                    || PROCESS_REF_HELD[slot] != 1 {
+                    return false;
+                }
+            }
+            if state == THREAD_DISPATCHING {
+                if QUEUE_KINDS[slot] != QUEUE_KIND_NONE
+                    || runnable_hits != 0
+                    || blocked_hits != 0
+                    || PREPARED_THREAD != handle
+                    || PROCESS_REF_HELD[slot] != 1 {
+                    return false;
+                }
+            }
+            if state == THREAD_EXITED {
+                if QUEUE_KINDS[slot] != QUEUE_KIND_NONE
+                    || runnable_hits != 0
+                    || blocked_hits != 0
+                    || PROCESS_REF_HELD[slot] != 0 {
+                    return false;
+                }
+            }
+            if state != THREAD_READY
+                && state != THREAD_BLOCKED
+                && state != THREAD_RUNNING
+                && state != THREAD_DISPATCHING
+                && state != THREAD_EXITED {
+                return false;
+            }
+            if active_state(state) {
+                if !validate_frame(slot)
+                    || !process_is_live(PROCESS_HANDLES[slot])
+                    || !domain_is_live(DOMAIN_HANDLES[slot])
+                    || !cspace_is_live(CSPACE_HANDLES[slot])
+                    || PRIORITIES[slot] == 0
+                    || PRIORITIES[slot] > 4
+                    || STACK_ORDINALS[slot] >= 2
+                    || USER_STACK_TOPS[slot]
+                        != native_stack_top_for(STACK_ORDINALS[slot] as usize) {
+                    return false;
+                }
+            }
+        }
+        slot += 1;
+    }
+
+    if CURRENT_THREAD == 0 {
+        slot = 0;
+        while slot < MAX_THREADS {
+            if STATES[slot] == THREAD_RUNNING {
+                return false;
+            }
+            slot += 1;
+        }
+    } else {
+        let current: usize = checked_thread(CURRENT_THREAD);
+        if current >= MAX_THREADS || STATES[current] != THREAD_RUNNING {
+            return false;
+        }
+    }
+    if PREPARED_THREAD == 0 {
+        slot = 0;
+        while slot < MAX_THREADS {
+            if STATES[slot] == THREAD_DISPATCHING {
+                return false;
+            }
+            slot += 1;
+        }
+    } else {
+        let prepared: usize = checked_thread(PREPARED_THREAD);
+        if prepared >= MAX_THREADS
+            || STATES[prepared] != THREAD_DISPATCHING
+            || CURRENT_THREAD != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        clear_slot(slot);
+        GENERATIONS[slot] = 1;
+        STATES[slot] = THREAD_EMPTY;
+        RUNNABLE_QUEUE[slot] = 0;
+        BLOCKED_QUEUE[slot] = 0;
+        slot += 1;
+    }
+    RUNNABLE_HEAD = 0;
+    RUNNABLE_LENGTH = 0;
+    BLOCKED_HEAD = 0;
+    BLOCKED_LENGTH = 0;
+    CURRENT_THREAD = 0;
+    PREPARED_THREAD = 0;
+    INITIALIZED = 1;
+    if !queue_invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Every installed TCB begins READY at the runnable FIFO tail. Blocking is a
+// runtime transition performed only by block_current; install cannot publish
+// an artificial pre-blocked thread. stack_ordinal is an exact claim on one of
+// the native address space's two guarded user stacks.
+pub unsafe fn install(
+    slot: usize,
+    thread_id: u64,
+    process_handle: u64,
+    entry: usize,
+    stack_ordinal: usize,
+    kernel_stack_top: usize,
+    arg0: u64,
+    role: u64,
+    priority: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || slot >= MAX_THREADS
+        || thread_id == 0
+        || STATES[slot] != THREAD_EMPTY
+        || GENERATIONS[slot] == 0
+        || !process_is_live(process_handle)
+        || kernel_stack_top == 0
+        || stack_ordinal >= 2
+        || (role != THREAD_ROLE_CPU && role != THREAD_ROLE_BLOCKING)
+        || priority == 0
+        || priority > 4
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    let process_status: u64 = process_state(process_handle);
+    if process_status != PROCESS_STATE_READY
+        && process_status != PROCESS_STATE_RUNNING {
+        return 0;
+    }
+    let domain_handle: u64 = domain_for(process_handle);
+    let address_space_handle: u64 = address_space_for(process_handle);
+    let cspace_handle: u64 = cspace_for(process_handle);
+    let user_stack_top: usize = native_stack_top_for(stack_ordinal);
+    if !domain_is_live(domain_handle)
+        || !cspace_is_live(cspace_handle)
+        || user_stack_top == 0
+        || !valid_entry(address_space_handle, entry)
+        || !stack_allows(address_space_handle, stack_ordinal, user_stack_top)
+        || !stack_allows(address_space_handle, stack_ordinal, user_stack_top - 8) {
+        return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_THREADS {
+        if STATES[other] != THREAD_EMPTY && STATES[other] != THREAD_RETIRED {
+            if THREAD_IDS[other] == thread_id {
+                return 0;
+            }
+            if active_state(STATES[other])
+                && ADDRESS_SPACE_HANDLES[other] == address_space_handle
+                && STACK_ORDINALS[other] as usize == stack_ordinal {
+                return 0;
+            }
+        }
+        other += 1;
+    }
+    if retain_process_thread(process_handle) == 0 {
+        return 0;
+    }
+
+    clear_slot(slot);
+    THREAD_IDS[slot] = thread_id;
+    PROCESS_HANDLES[slot] = process_handle;
+    DOMAIN_HANDLES[slot] = domain_handle;
+    ADDRESS_SPACE_HANDLES[slot] = address_space_handle;
+    CSPACE_HANDLES[slot] = cspace_handle;
+    KERNEL_STACK_TOPS[slot] = kernel_stack_top;
+    STACK_ORDINALS[slot] = stack_ordinal as u8;
+    USER_STACK_TOPS[slot] = user_stack_top;
+    ROLES[slot] = role as u8;
+    PRIORITIES[slot] = priority as u8;
+    QUANTUM_LEFT[slot] = priority as u8;
+    PROCESS_REF_HELD[slot] = 1;
+    FRAMES[frame_index(slot, FRAME_RDI)] = arg0;
+    FRAMES[frame_index(slot, FRAME_VECTOR)] = 0;
+    FRAMES[frame_index(slot, FRAME_ERROR)] = 0;
+    FRAMES[frame_index(slot, FRAME_RIP)] = entry as u64;
+    FRAMES[frame_index(slot, FRAME_CS)] = 0x23;
+    FRAMES[frame_index(slot, FRAME_RFLAGS)] = 0x202;
+    FRAMES[frame_index(slot, FRAME_RSP)] = (user_stack_top - 8) as u64;
+    FRAMES[frame_index(slot, FRAME_SS)] = 0x1b;
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    let handle: u64 = make_handle(slot);
+    if !runnable_enqueue_tail(handle) || !queue_invariants_hold() {
+        runnable_remove(handle);
+        release_process_thread(process_handle);
+        clear_slot(slot);
+        STATES[slot] = THREAD_EMPTY;
+        return 0;
+    }
+    return handle;
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    return checked_thread(handle) < MAX_THREADS;
+}
+
+pub unsafe fn state(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return STATES[slot] as u64;
+}
+
+pub unsafe fn thread_id_for(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return THREAD_IDS[slot];
+}
+
+pub unsafe fn process_for(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return PROCESS_HANDLES[slot];
+}
+
+pub unsafe fn address_space_for_thread(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return ADDRESS_SPACE_HANDLES[slot];
+}
+
+pub unsafe fn cspace_for_thread(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return CSPACE_HANDLES[slot];
+}
+
+pub unsafe fn domain_for_thread(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return DOMAIN_HANDLES[slot];
+}
+
+pub unsafe fn kernel_stack_for(handle: u64) -> usize {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return KERNEL_STACK_TOPS[slot];
+}
+
+pub unsafe fn stack_ordinal_for(handle: u64) -> usize {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS || STACK_ORDINALS[slot] >= 2 {
+        return 2;
+    }
+    return STACK_ORDINALS[slot] as usize;
+}
+
+pub unsafe fn user_stack_top_for_thread(handle: u64) -> usize {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return USER_STACK_TOPS[slot];
+}
+
+pub unsafe fn queue_kind(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return QUEUE_NONE;
+    }
+    return QUEUE_KINDS[slot] as u64;
+}
+
+pub unsafe fn current_handle() -> u64 {
+    let slot: usize = checked_thread(CURRENT_THREAD);
+    if slot >= MAX_THREADS || STATES[slot] != THREAD_RUNNING {
+        return 0;
+    }
+    return CURRENT_THREAD;
+}
+
+pub unsafe fn prepared_handle() -> u64 {
+    let slot: usize = checked_thread(PREPARED_THREAD);
+    if slot >= MAX_THREADS || STATES[slot] != THREAD_DISPATCHING {
+        return 0;
+    }
+    return PREPARED_THREAD;
+}
+
+pub unsafe fn save_current(frame: *const u64) -> u64 {
+    let handle: u64 = current_handle();
+    let slot: usize = checked_thread(handle);
+    // Validate the untrusted architectural return state before overwriting the
+    // last known-good saved frame. A hostile RSP can therefore be contained by
+    // retiring this TCB without corrupting the scheduler's registry invariants.
+    if slot >= MAX_THREADS || !validate_frame_words(slot, frame) {
+        return 0;
+    }
+    let mut word: usize = 0;
+    while word < FRAME_WORDS {
+        FRAMES[frame_index(slot, word)] = volatile_load(frame + word);
+        word += 1;
+    }
+    if !validate_frame(slot) {
+        return 0;
+    }
+    return handle;
+}
+
+// Contain one currently running TCB whose architectural return frame is not
+// safe to resume. The owning process remains structurally live so its sibling
+// TCBs can continue; the scheduler deschedules the PCB in the same masked
+// transaction immediately after this operation succeeds.
+pub unsafe fn terminate_current() -> u64 {
+    let handle: u64 = current_handle();
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || STATES[slot] != THREAD_RUNNING
+        || PROCESS_REF_HELD[slot] != 1
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if release_process_thread(PROCESS_HANDLES[slot]) == 0 {
+        return 0;
+    }
+    CURRENT_THREAD = 0;
+    STATES[slot] = THREAD_EXITED;
+    QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+    PROCESS_REF_HELD[slot] = 0;
+    QUANTUM_LEFT[slot] = 0;
+    WAKE_DEADLINES[slot] = 0;
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+pub unsafe fn frame_pointer(handle: u64) -> usize {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS || !active_state(STATES[slot]) || !validate_frame(slot) {
+        return 0;
+    }
+    return (&mut FRAMES[frame_index(slot, 0)]) as *mut u64 as usize;
+}
+
+// Scheduler control transfers consume the architectural syscall result before
+// choosing another TCB. Blocking operations use this setter to publish the
+// result that the original caller observes when its saved frame is resumed.
+pub unsafe fn set_saved_result(handle: u64, result: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS || !active_state(STATES[slot]) || !validate_frame(slot) {
+        return 0;
+    }
+    FRAMES[frame_index(slot, FRAME_RAX)] = result;
+    return 1;
+}
+
+// Phase one removes the FIFO head and publishes a DISPATCHING tombstone. No
+// running identity or switch accounting changes until commit_next succeeds.
+pub unsafe fn prepare_next() -> u64 {
+    if current_handle() != 0
+        || prepared_handle() != 0
+        || RUNNABLE_LENGTH == 0
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    let handle: u64 = runnable_remove_at(0);
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS || STATES[slot] != THREAD_READY {
+        return 0;
+    }
+    QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+    STATES[slot] = THREAD_DISPATCHING;
+    PREPARED_THREAD = handle;
+    if !queue_invariants_hold() {
+        PREPARED_THREAD = 0;
+        STATES[slot] = THREAD_READY;
+        QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+        runnable_enqueue_head(handle);
+        return 0;
+    }
+    return handle;
+}
+
+pub unsafe fn commit_next(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || PREPARED_THREAD != handle
+        || CURRENT_THREAD != 0
+        || STATES[slot] != THREAD_DISPATCHING
+        || !validate_frame(slot)
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    PREPARED_THREAD = 0;
+    CURRENT_THREAD = handle;
+    STATES[slot] = THREAD_RUNNING;
+    QUANTUM_LEFT[slot] = PRIORITIES[slot];
+    SWITCH_COUNTS[slot] += 1;
+    if !queue_invariants_hold() {
+        STATES[slot] = THREAD_DISPATCHING;
+        CURRENT_THREAD = 0;
+        PREPARED_THREAD = handle;
+        SWITCH_COUNTS[slot] -= 1;
+        return 0;
+    }
+    return handle;
+}
+
+// Abort restores the prepared FIFO head, so a failed architectural context
+// transaction cannot silently reorder runnable work.
+pub unsafe fn abort_next(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || PREPARED_THREAD != handle
+        || STATES[slot] != THREAD_DISPATCHING
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if !runnable_enqueue_head(handle) {
+        return 0;
+    }
+    PREPARED_THREAD = 0;
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+// Compatibility wrapper for callers that intentionally need an indivisible
+// prepare/commit pair. New scheduler paths should use both phases explicitly.
+pub unsafe fn choose_next() -> u64 {
+    let handle: u64 = prepare_next();
+    if handle == 0 {
+        return 0;
+    }
+    if commit_next(handle) == 0 {
+        abort_next(handle);
+        return 0;
+    }
+    return handle;
+}
+
+// Priority is a bounded quantum weight, not queue order. FIFO order changes
+// only at explicit preemption, wake, cancellation, or termination boundaries.
+pub unsafe fn account_current_tick(force_preempt: bool) -> u64 {
+    let slot: usize = checked_thread(current_handle());
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    RUN_TICKS[slot] += 1;
+    if force_preempt || QUANTUM_LEFT[slot] <= 1 {
+        QUANTUM_LEFT[slot] = PRIORITIES[slot];
+        return 1;
+    }
+    QUANTUM_LEFT[slot] -= 1;
+    return 0;
+}
+
+pub unsafe fn preempt_current() -> u64 {
+    let handle: u64 = current_handle();
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if !runnable_enqueue_tail(handle) {
+        return 0;
+    }
+    CURRENT_THREAD = 0;
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+// A successful sleep creates exactly one new epoch and appends the current TCB
+// to the blocked FIFO. The epoch cannot be woken twice because wake_due removes
+// it from that queue before recording the matching wake epoch.
+pub unsafe fn block_current(deadline: u64) -> u64 {
+    let handle: u64 = current_handle();
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || BLOCKED_LENGTH >= MAX_THREADS
+        || SLEEP_EPOCHS[slot] == 0xffff_ffff
+        || SLEEP_EPOCHS[slot] != WAKE_EPOCHS[slot]
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if !blocked_enqueue_tail(handle) {
+        return 0;
+    }
+    CURRENT_THREAD = 0;
+    STATES[slot] = THREAD_BLOCKED;
+    QUEUE_KINDS[slot] = QUEUE_KIND_BLOCKED;
+    SLEEP_EPOCHS[slot] += 1;
+    WAKE_DEADLINES[slot] = deadline;
+    WAKE_REASONS[slot] = WAKE_REASON_NONE as u8;
+    QUANTUM_LEFT[slot] = PRIORITIES[slot];
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+// Returns the number woken. All-ones is a fail-closed invariant error retained
+// for the assembly scheduler ABI.
+pub unsafe fn wake_due(now: u64) -> u64 {
+    if !queue_invariants_hold() {
+        return 0xffff_ffff_ffff_ffff;
+    }
+    let mut due: usize = 0;
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH {
+        let handle: u64 = blocked_at(position);
+        let slot: usize = checked_thread(handle);
+        if slot >= MAX_THREADS
+            || SLEEP_EPOCHS[slot] != (WAKE_EPOCHS[slot] + 1) {
+            return 0xffff_ffff_ffff_ffff;
+        }
+        if WAKE_DEADLINES[slot] <= now {
+            due += 1;
+        }
+        position += 1;
+    }
+    if RUNNABLE_LENGTH + due > MAX_THREADS {
+        return 0xffff_ffff_ffff_ffff;
+    }
+
+    let mut woke: u64 = 0;
+    position = 0;
+    while position < BLOCKED_LENGTH {
+        let handle: u64 = blocked_at(position);
+        let slot: usize = checked_thread(handle);
+        if WAKE_DEADLINES[slot] <= now {
+            if blocked_remove_at(position) != handle {
+                return 0xffff_ffff_ffff_ffff;
+            }
+            STATES[slot] = THREAD_READY;
+            QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+            WAKE_EPOCHS[slot] = SLEEP_EPOCHS[slot];
+            WAKE_REASONS[slot] = WAKE_REASON_TIMER as u8;
+            WAKE_COUNTS[slot] += 1;
+            WAKE_DEADLINES[slot] = 0;
+            if !runnable_enqueue_tail(handle) {
+                return 0xffff_ffff_ffff_ffff;
+            }
+            woke += 1;
+        } else {
+            position += 1;
+        }
+    }
+    if !queue_invariants_hold() {
+        return 0xffff_ffff_ffff_ffff;
+    }
+    return woke;
+}
+
+// Wake one exact generation-tagged blocked TCB for a non-timer event. The
+// blocked epoch is consumed exactly once, just as it is for wake_due().
+pub unsafe fn wake_blocked(handle: u64, reason: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || STATES[slot] != THREAD_BLOCKED
+        || QUEUE_KINDS[slot] != QUEUE_KIND_BLOCKED
+        || reason == WAKE_REASON_NONE
+        || reason > WAKE_REASON_CANCELLED
+        || SLEEP_EPOCHS[slot] != WAKE_EPOCHS[slot] + 1
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH && blocked_at(position) != handle {
+        position += 1;
+    }
+    if position >= BLOCKED_LENGTH || blocked_remove_at(position) != handle {
+        return 0;
+    }
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    WAKE_EPOCHS[slot] = SLEEP_EPOCHS[slot];
+    WAKE_REASONS[slot] = reason as u8;
+    WAKE_COUNTS[slot] += 1;
+    WAKE_DEADLINES[slot] = 0;
+    if !runnable_enqueue_tail(handle) || !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+unsafe fn normalize_runnable_without_process(process_handle: u64) -> void {
+    let mut position: usize = 0;
+    while position < RUNNABLE_LENGTH {
+        let handle: u64 = runnable_at(position);
+        let slot: usize = checked_thread(handle);
+        if slot < MAX_THREADS && PROCESS_HANDLES[slot] == process_handle {
+            runnable_remove_at(position);
+        } else {
+            position += 1;
+        }
+    }
+}
+
+unsafe fn normalize_blocked_without_process(process_handle: u64) -> void {
+    let mut position: usize = 0;
+    while position < BLOCKED_LENGTH {
+        let handle: u64 = blocked_at(position);
+        let slot: usize = checked_thread(handle);
+        if slot < MAX_THREADS && PROCESS_HANDLES[slot] == process_handle {
+            blocked_remove_at(position);
+        } else {
+            position += 1;
+        }
+    }
+}
+
+// Termination is a bounded transaction. The preflight proves that the PCB's
+// authoritative reference count exactly equals the TCB set before anything is
+// unlinked. Reference releases are rollback-capable and all later mutations
+// are deterministic queue filtering with no fallible external operations.
+pub unsafe fn terminate_process(process_handle: u64) -> u64 {
+    if !process_is_live(process_handle) || !queue_invariants_hold() {
+        return 0;
+    }
+    let mut terminated: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        if PROCESS_HANDLES[slot] == process_handle && active_state(STATES[slot]) {
+            if PROCESS_REF_HELD[slot] != 1 {
+                return 0;
+            }
+            terminated += 1;
+        }
+        slot += 1;
+    }
+    if terminated == 0 || process_thread_refs(process_handle) as u64 != terminated {
+        return 0;
+    }
+
+    slot = 0;
+    while slot < MAX_THREADS {
+        if PROCESS_HANDLES[slot] == process_handle && active_state(STATES[slot]) {
+            if release_process_thread(process_handle) == 0 {
+                let mut rollback: usize = 0;
+                while rollback < MAX_THREADS {
+                    if PROCESS_HANDLES[rollback] == process_handle
+                        && PROCESS_REF_HELD[rollback] == 2 {
+                        retain_process_thread(process_handle);
+                        PROCESS_REF_HELD[rollback] = 1;
+                    }
+                    rollback += 1;
+                }
+                return 0;
+            }
+            PROCESS_REF_HELD[slot] = 2;
+        }
+        slot += 1;
+    }
+
+    normalize_runnable_without_process(process_handle);
+    normalize_blocked_without_process(process_handle);
+    if checked_thread(CURRENT_THREAD) < MAX_THREADS
+        && PROCESS_HANDLES[handle_index(CURRENT_THREAD)] == process_handle {
+        CURRENT_THREAD = 0;
+    }
+    if checked_thread(PREPARED_THREAD) < MAX_THREADS
+        && PROCESS_HANDLES[handle_index(PREPARED_THREAD)] == process_handle {
+        PREPARED_THREAD = 0;
+    }
+    slot = 0;
+    while slot < MAX_THREADS {
+        if PROCESS_HANDLES[slot] == process_handle && active_state(STATES[slot]) {
+            STATES[slot] = THREAD_EXITED;
+            QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+            QUANTUM_LEFT[slot] = 0;
+            WAKE_DEADLINES[slot] = 0;
+            PROCESS_REF_HELD[slot] = 0;
+        }
+        slot += 1;
+    }
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return terminated;
+}
+
+pub unsafe fn cancel(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || (STATES[slot] != THREAD_READY && STATES[slot] != THREAD_BLOCKED)
+        || CURRENT_THREAD == handle
+        || PREPARED_THREAD == handle
+        || PROCESS_REF_HELD[slot] != 1
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if release_process_thread(PROCESS_HANDLES[slot]) == 0 {
+        return 0;
+    }
+    PROCESS_REF_HELD[slot] = 2;
+    let mut removed: bool = false;
+    if STATES[slot] == THREAD_READY {
+        removed = runnable_remove(handle);
+    } else {
+        removed = blocked_remove(handle);
+    }
+    if !removed {
+        retain_process_thread(PROCESS_HANDLES[slot]);
+        PROCESS_REF_HELD[slot] = 1;
+        return 0;
+    }
+    STATES[slot] = THREAD_EXITED;
+    QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+    PROCESS_REF_HELD[slot] = 0;
+    QUANTUM_LEFT[slot] = 0;
+    WAKE_DEADLINES[slot] = 0;
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn reap(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || STATES[slot] != THREAD_EXITED
+        || CURRENT_THREAD == handle
+        || PREPARED_THREAD == handle
+        || QUEUE_KINDS[slot] != QUEUE_KIND_NONE
+        || PROCESS_REF_HELD[slot] != 0
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = THREAD_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = THREAD_EMPTY;
+    }
+    if !queue_invariants_hold() {
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn runnable_count() -> usize {
+    let mut count: usize = RUNNABLE_LENGTH;
+    if current_handle() != 0 {
+        count += 1;
+    }
+    if prepared_handle() != 0 {
+        count += 1;
+    }
+    return count;
+}
+
+pub unsafe fn blocked_count() -> usize {
+    return BLOCKED_LENGTH;
+}
+
+pub unsafe fn wake_deadline(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return WAKE_DEADLINES[slot];
+}
+
+pub unsafe fn sleep_epoch(handle: u64) -> u32 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return SLEEP_EPOCHS[slot];
+}
+
+pub unsafe fn wake_epoch(handle: u64) -> u32 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return WAKE_EPOCHS[slot];
+}
+
+pub unsafe fn wake_count(handle: u64) -> u32 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return WAKE_COUNTS[slot];
+}
+
+pub unsafe fn wake_reason(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return WAKE_REASON_NONE;
+    }
+    return WAKE_REASONS[slot] as u64;
+}
+
+pub unsafe fn priority(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return PRIORITIES[slot] as u64;
+}
+
+pub unsafe fn quantum_left(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return QUANTUM_LEFT[slot] as u64;
+}
+
+pub unsafe fn run_ticks(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return RUN_TICKS[slot];
+}
+
+pub unsafe fn switch_count(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS {
+        return 0;
+    }
+    return SWITCH_COUNTS[slot];
+}
+
+pub unsafe fn identity_matches_process(handle: u64) -> bool {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS || STATES[slot] == THREAD_EXITED {
+        return false;
+    }
+    let process_handle: u64 = PROCESS_HANDLES[slot];
+    return process_is_live(process_handle)
+        && domain_for(process_handle) == DOMAIN_HANDLES[slot]
+        && address_space_for(process_handle) == ADDRESS_SPACE_HANDLES[slot]
+        && cspace_for(process_handle) == CSPACE_HANDLES[slot];
+}

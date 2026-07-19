@@ -1,0 +1,459 @@
+module runtime::cap_transfer;
+
+use runtime::capability::abort_reserved_for_owner;
+use runtime::capability::cspace_is_live;
+use runtime::capability::inspect_for_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::publish_reserved_for_owner;
+use runtime::capability::reservation_is_live;
+use runtime::capability::reserve_first_free_for_owner;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::object_kind;
+use runtime::memory_object::release_object;
+use runtime::memory_object::retain_object;
+use runtime::memory_object::MEMORY_SHARED;
+use runtime::process::cspace_for as process_cspace;
+use runtime::process::can_issue_operations as process_can_issue_operations;
+
+pub const MAX_TRANSFER_TICKETS: usize = 16;
+pub const CANCEL_OWNER_FAILURE: u64 = 0xffff_ffff_ffff_ffff;
+
+const TICKET_EMPTY: u8 = 0;
+const TICKET_PREPARED: u8 = 1;
+const TICKET_RETIRED: u8 = 2;
+const TICKET_HANDLE_TAG: u64 = 0xb200_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MEMORY_TRANSFER_RIGHTS: u64 = 12;
+
+static mut STATES: [u8; 16] = [0; 16];
+static mut GENERATIONS: [u32; 16] = [0; 16];
+static mut SOURCE_CSPACES: [u64; 16] = [0; 16];
+static mut DESTINATION_CSPACES: [u64; 16] = [0; 16];
+static mut OBJECTS: [u64; 16] = [0; 16];
+static mut RIGHTS: [u64; 16] = [0; 16];
+static mut RESERVATIONS: [u64; 16] = [0; 16];
+static mut OWNER_PROCESSES: [u64; 16] = [0; 16];
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn ticket_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn ticket_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | TICKET_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_ticket(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != TICKET_HANDLE_TAG {
+        return MAX_TRANSFER_TICKETS;
+    }
+    let slot: usize = ticket_index(handle);
+    if slot >= MAX_TRANSFER_TICKETS
+        || STATES[slot] != TICKET_PREPARED
+        || GENERATIONS[slot] != ticket_generation(handle) {
+        return MAX_TRANSFER_TICKETS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    SOURCE_CSPACES[slot] = 0;
+    DESTINATION_CSPACES[slot] = 0;
+    OBJECTS[slot] = 0;
+    RIGHTS[slot] = 0;
+    RESERVATIONS[slot] = 0;
+    OWNER_PROCESSES[slot] = 0;
+}
+
+unsafe fn retire_or_reuse(slot: usize) -> void {
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = TICKET_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = TICKET_EMPTY;
+    }
+}
+
+// Structural checks deliberately do not require the source CSpace or owning
+// process to remain live. Abort and cancel must still be able to unwind an
+// escrow after process finalization or after the source CSpace starts draining.
+unsafe fn prepared_slot_storage_invariants_hold(slot: usize) -> bool {
+    if slot >= MAX_TRANSFER_TICKETS
+        || STATES[slot] != TICKET_PREPARED
+        || GENERATIONS[slot] == 0
+        || SOURCE_CSPACES[slot] == 0
+        || DESTINATION_CSPACES[slot] == 0
+        || OBJECTS[slot] == 0
+        || RIGHTS[slot] == 0
+        || (RIGHTS[slot] & MEMORY_TRANSFER_RIGHTS) != RIGHTS[slot]
+        || RESERVATIONS[slot] == 0
+        || OWNER_PROCESSES[slot] == 0
+        || !cspace_is_live(DESTINATION_CSPACES[slot])
+        || object_kind(OBJECTS[slot]) != MEMORY_SHARED
+        || !reservation_is_live(
+            DESTINATION_CSPACES[slot],
+            RESERVATIONS[slot]
+        ) {
+        return false;
+    }
+
+    // Every live ticket must own a different hidden destination slot. The
+    // reservation API enforces this at creation; checking it again here makes
+    // registry corruption fail closed before commit or cancellation.
+    let mut other: usize = 0;
+    while other < MAX_TRANSFER_TICKETS {
+        if other != slot
+            && STATES[other] == TICKET_PREPARED
+            && DESTINATION_CSPACES[other] == DESTINATION_CSPACES[slot]
+            && RESERVATIONS[other] == RESERVATIONS[slot] {
+            return false;
+        }
+        other += 1;
+    }
+    return true;
+}
+
+unsafe fn prepared_slot_invariants_hold(slot: usize) -> bool {
+    if !prepared_slot_storage_invariants_hold(slot)
+        || !cspace_is_live(SOURCE_CSPACES[slot])
+        || !process_can_issue_operations(OWNER_PROCESSES[slot])
+        || process_cspace(OWNER_PROCESSES[slot]) != SOURCE_CSPACES[slot] {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn registry_storage_invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        let state: u8 = STATES[slot];
+        if state == TICKET_EMPTY {
+            if GENERATIONS[slot] == 0
+                || SOURCE_CSPACES[slot] != 0
+                || DESTINATION_CSPACES[slot] != 0
+                || OBJECTS[slot] != 0
+                || RIGHTS[slot] != 0
+                || RESERVATIONS[slot] != 0
+                || OWNER_PROCESSES[slot] != 0 {
+                return false;
+            }
+        }
+        if state == TICKET_PREPARED
+            && !prepared_slot_storage_invariants_hold(slot) {
+            return false;
+        }
+        if state == TICKET_RETIRED {
+            if GENERATIONS[slot] != 0xffff_ffff
+                || SOURCE_CSPACES[slot] != 0
+                || DESTINATION_CSPACES[slot] != 0
+                || OBJECTS[slot] != 0
+                || RIGHTS[slot] != 0
+                || RESERVATIONS[slot] != 0
+                || OWNER_PROCESSES[slot] != 0 {
+                return false;
+            }
+        }
+        if state != TICKET_EMPTY
+            && state != TICKET_PREPARED
+            && state != TICKET_RETIRED {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        STATES[slot] = TICKET_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    POISONED = 0;
+    INITIALIZED = 1;
+    return 1;
+}
+
+// Prepare an attenuation-only copy into a kernel-selected destination slot.
+// The reserved slot is not a public capability, and the retained shared-memory
+// reference belongs to this ticket until commit or abort.
+pub unsafe fn prepare_copy(
+    source_cspace: u64,
+    destination_cspace: u64,
+    source_capability: u64,
+    requested_rights: u64,
+    owner_process: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || source_cspace == 0
+        || destination_cspace == 0
+        || source_capability == 0
+        || requested_rights == 0
+        || owner_process == 0
+        || !cspace_is_live(source_cspace)
+        || !cspace_is_live(destination_cspace)
+        || !process_can_issue_operations(owner_process)
+        || process_cspace(owner_process) != source_cspace
+        || !invariants_hold() {
+        return 0;
+    }
+
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS && STATES[slot] != TICKET_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_TRANSFER_TICKETS || GENERATIONS[slot] == 0 {
+        return 0;
+    }
+
+    let mut object: u64 = 0;
+    let mut actual_rights: u64 = 0;
+    let object_type: u64 = inspect_for_owner(
+        source_cspace,
+        source_capability,
+        OBJECT_MEMORY,
+        RIGHT_TRANSFER,
+        (&mut object),
+        (&mut actual_rights)
+    );
+    if object_type != OBJECT_MEMORY
+        || object == 0
+        || object_kind(object) != MEMORY_SHARED
+        || (requested_rights & actual_rights) != requested_rights
+        || (requested_rights & MEMORY_TRANSFER_RIGHTS) != requested_rights {
+        return 0;
+    }
+
+    let reservation: u64 = reserve_first_free_for_owner(destination_cspace);
+    if reservation == 0 {
+        return 0;
+    }
+    if retain_object(object) == 0 {
+        if abort_reserved_for_owner(destination_cspace, reservation) == 0 {
+            POISONED = 1;
+        }
+        return 0;
+    }
+
+    SOURCE_CSPACES[slot] = source_cspace;
+    DESTINATION_CSPACES[slot] = destination_cspace;
+    OBJECTS[slot] = object;
+    RIGHTS[slot] = requested_rights;
+    RESERVATIONS[slot] = reservation;
+    OWNER_PROCESSES[slot] = owner_process;
+    // Publish last. A registry reader never observes a partially initialized
+    // ticket, while the capability reservation remains invisible to users.
+    STATES[slot] = TICKET_PREPARED;
+    return make_handle(slot);
+}
+
+pub unsafe fn commit_copy(
+    ticket: u64,
+    destination_capability: *mut u64
+) -> u64 {
+    if destination_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(destination_capability, 0);
+    let slot: usize = checked_ticket(ticket);
+    if slot >= MAX_TRANSFER_TICKETS {
+        return 0;
+    }
+    if !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !registry_storage_invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    // Source/process liveness is an authorization condition for commit, not a
+    // structural invariant. A sender may die while an escrow is queued; leave
+    // that ticket intact so cancel_owner can still unwind it safely.
+    if !prepared_slot_invariants_hold(slot) {
+        return 0;
+    }
+
+    let capability: u64 = publish_reserved_for_owner(
+        DESTINATION_CSPACES[slot],
+        RESERVATIONS[slot],
+        OBJECTS[slot],
+        OBJECT_MEMORY,
+        RIGHTS[slot]
+    );
+    if capability == 0 {
+        return 0;
+    }
+
+    // Publishing moves the ticket's retained object reference into the live
+    // capability. Do not decrement the memory-object refcount here.
+    retire_or_reuse(slot);
+    volatile_store(destination_capability, capability);
+    return 1;
+}
+
+pub unsafe fn abort_copy(ticket: u64) -> u64 {
+    let slot: usize = checked_ticket(ticket);
+    if slot >= MAX_TRANSFER_TICKETS {
+        return 0;
+    }
+    if !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !registry_storage_invariants_hold()
+        || !prepared_slot_storage_invariants_hold(slot) {
+        POISONED = 1;
+        return 0;
+    }
+
+    // Revoke the invisible destination first. If the subsequent object release
+    // encounters an impossible invariant failure, poisoning quarantines a
+    // retained reference rather than leaving a live ticket that no longer owns
+    // the reference and could double-release it on retry.
+    if abort_reserved_for_owner(
+        DESTINATION_CSPACES[slot],
+        RESERVATIONS[slot]
+    ) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    if release_object(OBJECTS[slot]) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    retire_or_reuse(slot);
+    return 1;
+}
+
+pub unsafe fn copy_atomic(
+    source_cspace: u64,
+    destination_cspace: u64,
+    source_capability: u64,
+    requested_rights: u64,
+    owner_process: u64,
+    destination_capability: *mut u64
+) -> u64 {
+    if destination_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(destination_capability, 0);
+    let ticket: u64 = prepare_copy(
+        source_cspace,
+        destination_cspace,
+        source_capability,
+        requested_rights,
+        owner_process
+    );
+    if ticket == 0 {
+        return 0;
+    }
+    if commit_copy(ticket, destination_capability) == 0 {
+        if POISONED == 0 && abort_copy(ticket) == 0 {
+            POISONED = 1;
+        }
+        volatile_store(destination_capability, 0);
+        return 0;
+    }
+    return 1;
+}
+
+// Cancellation is keyed by the complete generation-tagged process handle.
+// A reused raw process slot therefore cannot cancel or inherit old tickets.
+// This owns PREPARED escrows only; cleanup of already committed destination
+// capabilities belongs to the endpoint/CSpace lifecycle. Zero is a valid
+// count; all-ones denotes an invariant/destructor failure.
+pub unsafe fn cancel_owner(owner_process: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || owner_process == 0
+        || !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !registry_storage_invariants_hold() {
+        return CANCEL_OWNER_FAILURE;
+    }
+
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        if STATES[slot] == TICKET_PREPARED
+            && OWNER_PROCESSES[slot] == owner_process
+            && !prepared_slot_storage_invariants_hold(slot) {
+            POISONED = 1;
+            return CANCEL_OWNER_FAILURE;
+        }
+        slot += 1;
+    }
+
+    let mut cancelled: u64 = 0;
+    slot = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        if STATES[slot] == TICKET_PREPARED
+            && OWNER_PROCESSES[slot] == owner_process {
+            let ticket: u64 = make_handle(slot);
+            if abort_copy(ticket) == 0 {
+                return CANCEL_OWNER_FAILURE;
+            }
+            cancelled += 1;
+        }
+        slot += 1;
+    }
+    return cancelled;
+}
+
+pub unsafe fn is_live(ticket: u64) -> bool {
+    return checked_ticket(ticket) < MAX_TRANSFER_TICKETS;
+}
+
+pub unsafe fn prepared_count() -> usize {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        if STATES[slot] == TICKET_PREPARED {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !registry_storage_invariants_hold() {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_TRANSFER_TICKETS {
+        let state: u8 = STATES[slot];
+        if state == TICKET_PREPARED {
+            if !prepared_slot_invariants_hold(slot) {
+                return false;
+            }
+        }
+        slot += 1;
+    }
+    return true;
+}
