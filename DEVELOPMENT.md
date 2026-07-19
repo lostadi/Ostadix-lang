@@ -91,6 +91,13 @@ cargo check --manifest-path fuzz/Cargo.toml
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
+# O-core executable milestone gates (requires clang, LLD, and QEMU x86_64)
+./ocore/kernel/smoke-qemu.sh
+./ocore/kernel/smoke-faults-qemu.sh
+./ocore/kernel/smoke-processes-qemu.sh
+./ocore/kernel/smoke-scheduler-qemu.sh
+./ocore/kernel/smoke-ipc-foundation-qemu.sh
+
 # Python reference runtime
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
@@ -105,9 +112,17 @@ ctest --test-dir build/c_cpp-cmake
 
 # Documentation/release-claim guard
 bash scripts/check_release_claims.sh
+python3 -m unittest -v tests.test_source_release
 ```
 
-The byte-reproducible O-core object test protects deterministic native object output across source directories. `cargo test --test parser_proptest` runs parser proptest properties, and `cargo check --manifest-path fuzz/Cargo.toml` ensures the parser fuzz target still compiles.
+The byte-reproducible O-core object test protects deterministic native object
+output across source directories. The five QEMU scripts prove the default and
+fault boundaries, M1 process isolation, M2 scheduling, and the explicitly
+partial M3 IPC foundation. `cargo test --test parser_proptest` runs parser
+proptest properties, and `cargo check --manifest-path fuzz/Cargo.toml` ensures
+the parser fuzz target still compiles.
+The source-release tests protect the committed-ref allowlist, deterministic ZIP
+bytes, dirty-worktree boundary, and tamper detection.
 
 ## Conventions
 

@@ -192,10 +192,11 @@ provided by the kernel image. It may not depend on subprocesses, JSON,
 filesystem access, Python, Nix, libc, Rust `std`, environment variables, or a
 host allocator.
 
-The first runtime supplies boot entry glue, zeroing `.bss`, serial I/O, IDT
-installation, a timer interrupt, page-frame bump allocation, syscall entry,
-and panic-to-serial. Allocation in interrupt context is forbidden until a
-separate interrupt-safe allocator exists.
+The runtime supplies boot entry glue, zeroing `.bss`, serial I/O, IDT
+installation, a timer interrupt, fixed-window reclaiming frame allocation,
+syscall entry, and panic-to-serial. Allocation in interrupt context is forbidden
+until a separate interrupt-safe allocator exists. The current allocator is
+single-CPU and relies on boot and syscall entry running with interrupts masked.
 
 ## 9. Capabilities and syscalls
 
@@ -205,15 +206,18 @@ binding. Kernel authority itself is represented by an unforgeable
 `(slot, generation)` handle tied to a per-process capability table:
 
 ```text
-CapabilityEntry = { object_id, object_type, rights, generation, occupied }
+CapabilityEntry = { object_id, object_type, rights, generation, state }
 CapabilityHandle = (generation << 32) | slot
 ```
 
-Every capability syscall validates slot bounds, occupancy, generation,
-object type, and requested rights. Handles never contain kernel pointers.
-Closing or transferring a slot increments its generation before reuse. A slot
-is retired when its 32-bit generation space is exhausted rather than wrapping
-to a value that could revive an old handle.
+Every capability syscall validates slot bounds, live state, generation, object
+type, and requested rights. Handles never contain kernel pointers. Kernel-only
+transfer transactions can reserve a destination slot without exposing it as a
+live capability, then publish or abort that exact reservation. Close similarly
+uses a begin/commit/abort state. Committing a close or aborting an unpublished
+reservation advances its generation before reuse; aborting an in-progress
+close restores the same exact live capability. Exhausted 32-bit generations
+retire instead of wrapping to a value that could revive an old handle.
 
 Initial syscall numbers are:
 
@@ -222,9 +226,27 @@ Initial syscall numbers are:
 | 0 | `debug_write(cap, ptr, len)` |
 | 1 | `cap_close(cap)` |
 | 2 | reserved `cap_copy` number; returns `ERR_NOT_IMPLEMENTED` |
-| 3 | reserved `page_alloc` number; returns `ERR_NOT_IMPLEMENTED` |
+| 3 | `page_alloc(page_pool_cap, kind)`; returns a generated memory capability |
 | 4 | `yield()` |
 | 5 | `ticks()` |
+| 6 | `exit(status)`; enabled only by a trusted lifecycle harness |
+| 7 | `sleep(delta_ticks)`; enabled only while the scheduler is active |
+
+`page_alloc` accepts anonymous or shared memory from a typed page-pool
+capability. It enforces the current CSpace's hard frame quota and distinguishes
+quota exhaustion, physical-frame exhaustion, resource-table exhaustion, and an
+invalid memory kind. Executable memory remains kernel/loader-only; device memory
+is never allocated from the RAM pool. The returned value is a CSpace capability,
+not an internal object handle, frame index, or physical address.
+
+`yield` records a request in every mode. It requests an actual scheduler
+transition when the Milestone 2 scheduler is active and returns directly in the
+bootstrap gate. `exit` abandons a user frame only after the kernel has installed
+a trusted lifecycle continuation. `sleep` rejects zero or out-of-range delays
+and returns `ERR_NOT_IMPLEMENTED` when the scheduler is inactive. `cap_copy`
+retains its stable number but still returns `ERR_NOT_IMPLEMENTED`; the
+Milestone 3 transfer primitive is kernel-only and limited to shared-memory
+capabilities.
 
 The hosted `OCapability` wire value may refer to a live kernel capability only
 through an authenticated transport endpoint. Its string `identity` is never
@@ -253,7 +275,7 @@ not legal inside `.oc` source and are not linked into freestanding artifacts.
 This preserves O-lang's polyglot model without making Python, Rust, Nix, JSON,
 or subprocess execution part of the kernel trusted computing base.
 
-## 11. Implemented v0.2 boundary
+## 11. Implemented bounded O-core milestone boundary
 
 The initial compiler targets only `x86_64-unknown-none` and uses a simple
 stack-spill backend without optimization or register allocation. Direct calls
@@ -268,45 +290,75 @@ operations, calls, control flow, indexed places, atomics, volatile access, and
 assembly. This is a second boundary against malformed or future lowering paths
 silently selecting integer instructions.
 
-The kernel proof uses a physical-page bump allocator and one active bootstrap
-CR3. A concrete address-space descriptor records that CR3 plus separate user RX,
-R-only, and guarded RW/NX stack regions. The first 2 MiB supervisor mapping uses
-4 KiB leaves: metadata and read-only data are R/NX, kernel text is RX, and
-mutable state is RW/NX. Remaining required supervisor memory uses RW/NX huge
-pages, and mappings stop at 20 MiB. Separate ELF load segments reserve and
-zero-fill the user image and mapped stack pages. The TSS supplies RSP0 and a
-dedicated double-fault IST1 stack.
+Milestones 0.1 through 0.3 are complete for the bounded single-CPU bootstrap
+gate. The kernel enters a linked `native[0]` payload at CPL3, crosses an
+architectural `SYSCALL` boundary through CPU-local entry state, validates the
+IRET target and RFLAGS, and survives IRQ0 return. Page-granular supervisor
+mappings enforce RX, R/NX, and RW/NX roles; guarded user and kernel stacks, a
+double-fault IST, normalized exception frames, and exact user-copy fixups bound
+the fault surface. The fixed 4..16 MiB QEMU window contains 3,072 reclaiming,
+typed, reference-counted frames with generation-safe reuse and zeroing.
+Transactional memory objects and per-CSpace quotas back anonymous/shared
+`page_alloc` capabilities without exposing object handles or physical
+addresses.
 
-`EFER.SCE`, `STAR`, `LSTAR`, and `FMASK` establish an architectural `SYSCALL`
-entry. `SWAPGS` selects boot-CPU-local entry state before saving user RSP, RIP,
-and RFLAGS. The return path validates saved RIP and RSP, sanitizes RFLAGS,
-preserves all tested non-architecturally-clobbered GPRs, and returns with
-`iretq`. Assembly stubs normalize vectors 0 through 31 into a packed trap
-frame. Exact page-fault fixups make `copy_from_user` and `copy_to_user`
-recoverable without treating arbitrary CPL0 faults as recoverable.
+`smoke-qemu.sh` is the positive bootstrap and memory-lifecycle gate.
+`smoke-faults-qemu.sh` separately boots each fatal Milestone 0.2 probe, requires
+the expected trap and later timer, and checks a recoverable missing-PTE user
+copy. Its one-process disposition wording applies to that historical bootstrap
+scenario only.
 
-The first statically linked process runs at CPL3 as `native[0]`. Its kernel-owned
-PCB records process, domain, reusable personality, versioned native ABI,
-address-space, CSpace, entry, and stack identity. Bootstrap activation is
-one-shot; no API can switch only the PCB while leaving CR3, TSS, and entry state
-behind. Syscalls route through the immutable personality and an object-typed,
-generation-tagged capability table selected by the current PCB. `debug_write`
-copies at most 256 bytes into kernel-owned storage after region-permission
-validation. `cap_close`, a counted scheduler-facing `yield` hook, and diagnostic
-`ticks` are implemented. Reserved capability-copy and page-allocation numbers
-return `ERR_NOT_IMPLEMENTED` rather than silently succeeding.
+Milestone 1 is complete for two bounded native processes on one CPU. Dynamic
+processes have generation-tagged domain, process, address-space, mapping, and
+CSpace owner identities. Their roots share RX user text and supervisor-only
+kernel mappings while using private RW/NX data and guarded stacks. Context
+installation changes CR3, TSS.RSP0, GS entry state, PCB, domain, address space,
+and CSpace as one transaction. Reap is split across ownership release,
+address-space destruction, type-aware CSpace drain, and final generation
+advance. `smoke-processes-qemu.sh` boots independent normal-exit and
+contained-fault scenarios and requires same-VA physical isolation, stale identity denial,
+sibling survival, complete dynamic-frame reclamation, and a post-lifecycle
+timer.
 
-The default QEMU proof covers the capability, pointer, register, flag, timer,
-and heartbeat cases. `smoke-faults-qemu.sh` performs a fresh boot for each fatal
-CPL3 probe and requires an expected trap, a `FAULTED` PCB with no current
-process, and a later kernel timer marker. It also checks the syscall return-RIP
-rejection path. A nonfatal mode omits one test PTE, requires the syscall copy
-to return `ERR_USER_COPY_FAULT`, and reaches a later CPL3 heartbeat. This
-demonstrates controlled disposition of the only process and continued kernel
-execution. It does not demonstrate sibling-process isolation. `yield` remains
-an accounting hook, not a scheduler.
+Milestone 2 is complete for four TCBs across two processes and one CPU. The
+scheduler uses canonical 22-word saved frames, FIFO runnable and blocked queues,
+timer preemption, cooperative yield, sleep deadlines, wake reasons, bounded
+priority quanta, accounting, and a ring-0 idle path. Its prepare/install/commit
+switch transaction keeps registers and guarded stacks aligned with CR3,
+TSS.RSP0, GS state, PCB, domain, address space, and CSpace.
+`smoke-scheduler-qemu.sh` requires one million forced identity transactions,
+progress from two CPU-bound and two sleeping CPL3 threads, wake-once behavior,
+cross-thread hostile-RFLAGS sanitization on a syscall-selected TCB, exit during
+preemption, hostile saved-RSP TCB containment, sibling progress, stale TCB
+denial, frame reclamation, and a post-lifecycle timer. The million-iteration
+stress verifies identity installation and a saved-frame canary without entering
+CPL3; real frame save/restore and IRETQ switching run in the bounded IRQ/SYSCALL
+phase. Failed context installation rolls architectural and PCB identity back to
+the verified management state before the prepared TCB is returned to the
+runnable queue.
 
-This is still one statically linked process in one bootstrap CR3. It is not an
-ELF loader, preemptive scheduler, multi-address-space kernel, capability
-transfer implementation, Linux ABI personality, root filesystem, IPC system,
-or hosted-broker transport. Those remain dependency-ordered follow-on work.
+Milestone 3 has a verified foundation and is not complete. The kernel-side
+foundation contains eight generation-tagged endpoint objects, four-message FIFO
+queues, correlation cancellation, deterministic waiter-record and capability
+cleanup, invisible generation-tagged destination-slot reservations,
+exact-generation queued-capability escrow, and generation-tagged transfer
+tickets. Transfer is atomic, attenuation-only, and currently restricted to
+shared-memory objects. Each dynamic address space can optionally map one shared
+object at fixed virtual address `0x01202000` as RW/NX, but only through a
+`RIGHT_MEMORY_USE` capability in that address space's exact owner CSpace.
+`smoke-ipc-foundation-qemu.sh` proves cross-CR3 visibility, bounded queue
+backpressure and FIFO order, cancellation and waiter-record cleanup, endpoint
+and destination-capability generation reuse, stale ticket denial, exact
+attenuation and failed re-transfer, rejection of new work from a dead sender,
+explicit management-harness cancellation of its earlier queue item and ticket,
+full resource reclamation, and later timer survival.
+
+The waiter records prove bounded registry bookkeeping, not live blocked TCB
+transitions. The Milestone 3 foundation exposes no CPL3 endpoint operations.
+Empty receive and full send do not yet enter real blocked TCB states.
+Same-domain and cross-domain request/reply do not run under preemption, and the
+full sender and receiver death matrix and personality-service crash-containment
+gate remain unimplemented. The native `cap_copy` syscall therefore remains
+explicitly unavailable. The kernel also does not yet provide an executable
+loader, demand paging, SMP, a foreign ABI personality, a root filesystem, the
+hosted-broker transport, or a complete IPC system.

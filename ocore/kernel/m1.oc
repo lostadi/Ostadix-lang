@@ -1,0 +1,476 @@
+module kernel::m1;
+
+use runtime::address_space::create_native_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::dynamic_protections_hold;
+use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::isolation_mapping;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::native_stack_top_for;
+use runtime::address_space::owner_cspace_handle;
+use runtime::address_space::owner_refs as address_space_owner_refs;
+use runtime::address_space::root_cr3;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::cspace_is_live;
+use runtime::capability::create_cspace;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::create_domain;
+use runtime::domain::destroy_domain;
+use runtime::domain::is_live as domain_is_live;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::quota_used_for_owner;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::mapping::is_live as mapping_is_live;
+use runtime::mapping::registry_slot as mapping_registry_slot;
+use runtime::mapping::MAX_MAPPINGS;
+use runtime::native_abi::NATIVE_ABI_V1;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::process::activate_process;
+use runtime::process::current_address_space_handle;
+use runtime::process::current_cspace_handle;
+use runtime::process::current_domain_handle;
+use runtime::process::current_process_handle;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::is_live as process_is_live;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::mark_reapable;
+use runtime::process::process_state;
+use runtime::process::stop_process;
+use runtime::process::PROCESS_STATE_EXITED;
+use runtime::process::PROCESS_STATE_FAULTED;
+use runtime::process::PROCESS_STATE_READY;
+use runtime::serial::write;
+use runtime::interrupts::ticks;
+use runtime::syscall::configure_process_exit;
+use runtime::m1_user::process_one_value;
+use runtime::m1_user::process_two_value;
+
+const MODE_NORMAL: u64 = 10;
+const MODE_FAULT: u64 = 11;
+const QUOTA: usize = 12;
+
+static ADDRESS_SPACES_MESSAGE: [u8; 31] = b"M1 address spaces: independent\n";
+static CONTEXT_ONE_MESSAGE: [u8; 32] = b"M1 context transaction p1: PASS\n";
+static PROCESS_ONE_EXIT_MESSAGE: [u8; 21] = b"M1 process 1: exited\n";
+static PROCESS_ONE_FAULT_MESSAGE: [u8; 30] = b"M1 process 1: fault-contained\n";
+static PRIVATE_MESSAGE: [u8; 32] = b"M1 sibling private VA: isolated\n";
+static PROCESS_ONE_REAP_MESSAGE: [u8; 21] = b"M1 process 1: reaped\n";
+static REAP_BEGIN_MESSAGE: [u8; 29] = b"M1 teardown p1: refs dropped\n";
+static REAP_AS_MESSAGE: [u8; 25] = b"M1 teardown p1: AS freed\n";
+static REAP_CSPACE_MESSAGE: [u8; 29] = b"M1 teardown p1: CSpace freed\n";
+static STALE_MESSAGE: [u8; 25] = b"M1 stale handles: denied\n";
+static CONTEXT_TWO_MESSAGE: [u8; 32] = b"M1 context transaction p2: PASS\n";
+static PROCESS_TWO_EXIT_MESSAGE: [u8; 21] = b"M1 process 2: exited\n";
+static FRAMES_MESSAGE: [u8; 26] = b"M1 frames reclaimed: PASS\n";
+static LIFECYCLE_MESSAGE: [u8; 19] = b"M1 lifecycle: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 32] = b"M1 post-lifecycle timer: online\n";
+static FAULT_CONTINUE_MESSAGE: [u8; 31] = b"M1 faulted sibling: continuing\n";
+
+static mut MODE: u64 = 0;
+static mut PHASE: u64 = 0;
+static mut DOMAIN: u64 = 0;
+static mut ADDRESS_SPACE_ONE: u64 = 0;
+static mut ADDRESS_SPACE_TWO: u64 = 0;
+static mut PROCESS_ONE: u64 = 0;
+static mut PROCESS_TWO: u64 = 0;
+static mut REPORT_ONE: u64 = 0;
+static mut REPORT_TWO: u64 = 0;
+static mut CSPACE_ONE: u64 = 0;
+static mut CSPACE_TWO: u64 = 0;
+static mut PHYSICAL_ONE: usize = 0;
+static mut PHYSICAL_TWO: usize = 0;
+static mut ISOLATION_MAPPING_ONE: u64 = 0;
+static mut BASELINE_FREE: usize = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_context_install(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_context_matches(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_enter_user(
+    entry: usize,
+    stack: usize,
+    arg0: u64
+) -> never;
+extern "sysv64" fn ocore_m1_process_one_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m1_process_one_fault_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m1_process_two_entry(capability: u64) -> never;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn start_process(
+    handle: u64,
+    expected_id: u64,
+    address_space: u64,
+    cspace: u64,
+    kernel_stack: usize,
+    entry: usize,
+    report: u64,
+    marker: *const u8
+) -> never {
+    disable_interrupts();
+    let root: usize = root_cr3(address_space);
+    if root == 0
+        || kernel_stack == 0
+        || ocore_context_install(root, kernel_stack) == 0
+        || activate_process(handle) != expected_id
+        || ocore_context_matches(root, kernel_stack) == 0
+        || current_process_handle() != handle
+        || current_domain_handle() != DOMAIN
+        || current_address_space_handle() != address_space
+        || current_cspace_handle() != cspace {
+        fail_closed();
+    }
+    write(marker, 32);
+    ocore_enter_user(entry, native_stack_top_for(0), report);
+}
+
+unsafe fn test_domain_generation() -> u64 {
+    let old: u64 = create_domain(1, 0x100, PERSONALITY_NATIVE, NATIVE_ABI_V1);
+    if old == 0 || destroy_domain(old) == 0 || domain_is_live(old) {
+        return 0;
+    }
+    let replacement: u64 = create_domain(
+        1,
+        0x101,
+        PERSONALITY_NATIVE,
+        NATIVE_ABI_V1
+    );
+    if replacement == 0
+        || replacement == old
+        || domain_is_live(old)
+        || destroy_domain(replacement) == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn cleanup_process_one() -> void {
+    let old_process: u64 = PROCESS_ONE;
+    let old_address_space: u64 = ADDRESS_SPACE_ONE;
+    let old_cspace: u64 = CSPACE_ONE;
+    let old_report: u64 = REPORT_ONE;
+    let old_mapping: u64 = ISOLATION_MAPPING_ONE;
+    let old_mapping_slot: usize = mapping_registry_slot(old_mapping);
+
+    if old_mapping_slot >= MAX_MAPPINGS
+        || mark_reapable(old_process) == 0
+        || begin_reap(old_process) == 0
+        || address_space_owner_refs(old_address_space) != 0 {
+        fail_closed();
+    }
+    write((&REAP_BEGIN_MESSAGE[0]), 29);
+    if destroy_address_space(old_address_space) == 0
+        || address_space_is_live(old_address_space)
+        || mapping_is_live(old_mapping)
+        || quota_used_for_owner(old_cspace) != 0
+        || !page_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold() {
+        fail_closed();
+    }
+    write((&REAP_AS_MESSAGE[0]), 25);
+    if drain_cspace(old_cspace) == 0
+        || cspace_is_live(old_cspace)
+        || !page_invariants_hold()
+        || !memory_invariants_hold() {
+        fail_closed();
+    }
+    write((&REAP_CSPACE_MESSAGE[0]), 29);
+    if finalize_reap(old_process) == 0 || process_is_live(old_process) {
+        fail_closed();
+    }
+    write((&PROCESS_ONE_REAP_MESSAGE[0]), 21);
+
+    let new_cspace: u64 = create_cspace(0);
+    if new_cspace == 0
+        || new_cspace == old_cspace
+        || set_quota_for_owner(new_cspace, QUOTA) == 0
+        || set_quota_for_owner(old_cspace, QUOTA) != 0 {
+        fail_closed();
+    }
+    let replacement_address_space: u64 = create_native_for_owner(new_cspace);
+    let replacement_mapping: u64 = isolation_mapping(replacement_address_space);
+    let replacement_mapping_slot: usize = mapping_registry_slot(
+        replacement_mapping
+    );
+    let stale_owner_process: u64 = install_process_for_owner(
+        0,
+        3,
+        DOMAIN,
+        replacement_address_space,
+        old_cspace,
+        ocore_process_kernel_stack_top(0),
+        ocore_m1_process_one_entry as usize,
+        native_stack_top_for(0)
+    );
+    let replacement_process: u64 = install_process_for_owner(
+        0,
+        3,
+        DOMAIN,
+        replacement_address_space,
+        new_cspace,
+        ocore_process_kernel_stack_top(0),
+        ocore_m1_process_one_entry as usize,
+        native_stack_top_for(0)
+    );
+    if replacement_address_space == 0
+        || replacement_address_space == old_address_space
+        || replacement_mapping == 0
+        || replacement_mapping == old_mapping
+        || replacement_mapping_slot != old_mapping_slot
+        || !mapping_is_live(replacement_mapping)
+        || mapping_is_live(old_mapping)
+        || owner_cspace_handle(replacement_address_space) != new_cspace
+        || !dynamic_protections_hold(replacement_address_space)
+        || create_native_for_owner(old_cspace) != 0
+        || stale_owner_process != 0
+        || replacement_process == 0
+        || replacement_process == old_process
+        || process_is_live(old_process)
+        || address_space_is_live(old_address_space)
+        || cspace_is_live(old_cspace)
+        || validate_for_owner(
+            old_cspace,
+            old_report,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        ) != 0
+        || validate_for_owner(
+            new_cspace,
+            old_report,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        ) != 0
+        || stop_process(replacement_process, 0) == 0
+        || begin_reap(replacement_process) == 0
+        || destroy_address_space(replacement_address_space) == 0
+        || mapping_is_live(replacement_mapping)
+        || quota_used_for_owner(new_cspace) != 0
+        || drain_cspace(new_cspace) == 0
+        || finalize_reap(replacement_process) == 0
+        || !page_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold() {
+        fail_closed();
+    }
+    write((&STALE_MESSAGE[0]), 25);
+}
+
+unsafe fn start_process_two() -> never {
+    PHASE = 2;
+    start_process(
+        PROCESS_TWO,
+        2,
+        ADDRESS_SPACE_TWO,
+        CSPACE_TWO,
+        ocore_process_kernel_stack_top(1),
+        ocore_m1_process_two_entry as usize,
+        REPORT_TWO,
+        (&CONTEXT_TWO_MESSAGE[0])
+    );
+}
+
+// Called only by assembly after it has abandoned the user trap/syscall frame,
+// switched to the pinned management CR3, and selected the management stack.
+@export
+@no_mangle
+pub unsafe fn kernel_process_exit_continue() -> never {
+    if !management_context() {
+        fail_closed();
+    }
+    if PHASE == 1 {
+        let state: u64 = process_state(PROCESS_ONE);
+        if MODE == MODE_NORMAL {
+            if state != PROCESS_STATE_EXITED {
+                fail_closed();
+            }
+            write((&PROCESS_ONE_EXIT_MESSAGE[0]), 21);
+        } else {
+            if MODE != MODE_FAULT || state != PROCESS_STATE_FAULTED {
+                fail_closed();
+            }
+            write((&PROCESS_ONE_FAULT_MESSAGE[0]), 30);
+            write((&FAULT_CONTINUE_MESSAGE[0]), 31);
+        }
+        if volatile_load(PHYSICAL_ONE as *const u64) != process_one_value()
+            || volatile_load(PHYSICAL_TWO as *const u64) != 0 {
+            fail_closed();
+        }
+        write((&PRIVATE_MESSAGE[0]), 32);
+        cleanup_process_one();
+        start_process_two();
+    }
+    if PHASE == 2 {
+        if process_state(PROCESS_TWO) != PROCESS_STATE_EXITED
+            || volatile_load(PHYSICAL_TWO as *const u64) != process_two_value() {
+            fail_closed();
+        }
+        write((&PROCESS_TWO_EXIT_MESSAGE[0]), 21);
+        if mark_reapable(PROCESS_TWO) == 0
+            || begin_reap(PROCESS_TWO) == 0
+            || destroy_address_space(ADDRESS_SPACE_TWO) == 0
+            || quota_used_for_owner(CSPACE_TWO) != 0
+            || !page_invariants_hold()
+            || !memory_invariants_hold()
+            || !mapping_invariants_hold()
+            || drain_cspace(CSPACE_TWO) == 0
+            || finalize_reap(PROCESS_TWO) == 0
+            || process_is_live(PROCESS_TWO)
+            || domain_child_refs(DOMAIN) != 0
+            || !page_invariants_hold()
+            || !memory_invariants_hold()
+            || !mapping_invariants_hold()
+            || free_frames() != BASELINE_FREE {
+            fail_closed();
+        }
+        write((&FRAMES_MESSAGE[0]), 26);
+        write((&LIFECYCLE_MESSAGE[0]), 19);
+        if configure_process_exit(false) == 0 {
+            fail_closed();
+        }
+        let tick_before: u64 = ticks();
+        enable_interrupts();
+        while ticks() == tick_before {
+            halt();
+        }
+        write((&POST_TIMER_MESSAGE[0]), 32);
+        loop {
+            halt();
+        }
+    }
+    fail_closed();
+}
+
+pub unsafe fn start(mode: u64, domain_handle: u64) -> never {
+    if (mode != MODE_NORMAL && mode != MODE_FAULT)
+        || !management_context()
+        || !domain_is_live(domain_handle)
+        || process_state(PROCESS_ONE) != 0
+        || process_state(PROCESS_TWO) != 0 {
+        fail_closed();
+    }
+    MODE = mode;
+    PHASE = 1;
+    DOMAIN = domain_handle;
+    BASELINE_FREE = free_frames();
+    if configure_process_exit(true) == 0 {
+        fail_closed();
+    }
+
+    CSPACE_ONE = cspace_handle_for_slot(0);
+    CSPACE_TWO = cspace_handle_for_slot(1);
+    if CSPACE_ONE == 0
+        || CSPACE_TWO == 0
+        || set_quota_for_owner(CSPACE_ONE, QUOTA) == 0
+        || set_quota_for_owner(CSPACE_TWO, QUOTA) == 0
+        || test_domain_generation() == 0 {
+        fail_closed();
+    }
+
+    ADDRESS_SPACE_ONE = create_native_for_owner(CSPACE_ONE);
+    ADDRESS_SPACE_TWO = create_native_for_owner(CSPACE_TWO);
+    PHYSICAL_ONE = isolation_physical(ADDRESS_SPACE_ONE);
+    PHYSICAL_TWO = isolation_physical(ADDRESS_SPACE_TWO);
+    ISOLATION_MAPPING_ONE = isolation_mapping(ADDRESS_SPACE_ONE);
+    let isolation_mapping_two: u64 = isolation_mapping(ADDRESS_SPACE_TWO);
+    if ADDRESS_SPACE_ONE == 0
+        || ADDRESS_SPACE_TWO == 0
+        || ADDRESS_SPACE_ONE == ADDRESS_SPACE_TWO
+        || owner_cspace_handle(ADDRESS_SPACE_ONE) != CSPACE_ONE
+        || owner_cspace_handle(ADDRESS_SPACE_TWO) != CSPACE_TWO
+        || !dynamic_protections_hold(ADDRESS_SPACE_ONE)
+        || !dynamic_protections_hold(ADDRESS_SPACE_TWO)
+        || root_cr3(ADDRESS_SPACE_ONE) == root_cr3(ADDRESS_SPACE_TWO)
+        || PHYSICAL_ONE == 0
+        || PHYSICAL_TWO == 0
+        || PHYSICAL_ONE == PHYSICAL_TWO
+        || ISOLATION_MAPPING_ONE == 0
+        || isolation_mapping_two == 0
+        || ISOLATION_MAPPING_ONE == isolation_mapping_two
+        || !mapping_is_live(ISOLATION_MAPPING_ONE)
+        || !mapping_is_live(isolation_mapping_two)
+        || !mapping_invariants_hold()
+        || volatile_load(PHYSICAL_ONE as *const u64) != 0
+        || volatile_load(PHYSICAL_TWO as *const u64) != 0 {
+        fail_closed();
+    }
+    write((&ADDRESS_SPACES_MESSAGE[0]), 31);
+
+    let mut entry_one: usize = ocore_m1_process_one_entry as usize;
+    if mode == MODE_FAULT {
+        entry_one = ocore_m1_process_one_fault_entry as usize;
+    }
+    PROCESS_ONE = install_process_for_owner(
+        0,
+        1,
+        DOMAIN,
+        ADDRESS_SPACE_ONE,
+        CSPACE_ONE,
+        ocore_process_kernel_stack_top(0),
+        entry_one,
+        native_stack_top_for(0)
+    );
+    PROCESS_TWO = install_process_for_owner(
+        1,
+        2,
+        DOMAIN,
+        ADDRESS_SPACE_TWO,
+        CSPACE_TWO,
+        ocore_process_kernel_stack_top(1),
+        ocore_m1_process_two_entry as usize,
+        native_stack_top_for(0)
+    );
+    REPORT_ONE = install_capability_for_owner(
+        CSPACE_ONE,
+        1,
+        0x101,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    REPORT_TWO = install_capability_for_owner(
+        CSPACE_TWO,
+        1,
+        0x102,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    if PROCESS_ONE == 0
+        || PROCESS_TWO == 0
+        || process_state(PROCESS_ONE) != PROCESS_STATE_READY
+        || process_state(PROCESS_TWO) != PROCESS_STATE_READY
+        || REPORT_ONE == 0
+        || REPORT_TWO == 0
+        || destroy_address_space(ADDRESS_SPACE_ONE) != 0
+        || finalize_reap(PROCESS_ONE) != 0 {
+        fail_closed();
+    }
+    start_process(
+        PROCESS_ONE,
+        1,
+        ADDRESS_SPACE_ONE,
+        CSPACE_ONE,
+        ocore_process_kernel_stack_top(0),
+        entry_one,
+        REPORT_ONE,
+        (&CONTEXT_ONE_MESSAGE[0])
+    );
+}

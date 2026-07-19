@@ -1,19 +1,30 @@
 module runtime::syscall;
 
 use runtime::capability::close_in_cspace;
+use runtime::capability::object_type_in_cspace;
 use runtime::capability::validate_in_cspace;
 use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_PAGE_ALLOC;
 use runtime::capability::MAX_CSPACES;
 use runtime::address_space::allows;
 use runtime::address_space::VM_READ;
+use runtime::address_space::VM_EXEC;
+use runtime::address_space::VM_STACK;
 use runtime::address_space::VM_USER;
+use runtime::address_space::VM_WRITE;
 use runtime::personality::PERSONALITY_NATIVE;
 use runtime::native_abi::DEBUG_BUFFER_SIZE;
 use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
 use runtime::native_abi::ERR_CAPABILITY_DENIED;
 use runtime::native_abi::ERR_NO_CURRENT_PROCESS;
 use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_OUT_OF_MEMORY;
+use runtime::native_abi::ERR_QUOTA_EXCEEDED;
+use runtime::native_abi::ERR_INVALID_MEMORY_KIND;
+use runtime::native_abi::ERR_RESOURCE_TABLE_FULL;
 use runtime::native_abi::ERR_UNKNOWN_PERSONALITY;
 use runtime::native_abi::ERR_UNKNOWN_SYSCALL;
 use runtime::native_abi::ERR_USER_COPY_FAULT;
@@ -24,19 +35,57 @@ use runtime::native_abi::SYS_DEBUG_WRITE;
 use runtime::native_abi::SYS_PAGE_ALLOC;
 use runtime::native_abi::SYS_TICKS;
 use runtime::native_abi::SYS_YIELD;
+use runtime::native_abi::SYS_EXIT;
+use runtime::native_abi::SYS_SLEEP;
+use runtime::native_abi::SYSCALL_CONTROL_EXIT;
 use runtime::interrupts::ticks;
 use runtime::process::current_cspace_id;
 use runtime::process::current_address_space_id;
+use runtime::process::current_process_handle;
+use runtime::process::exit_current;
 use runtime::process::current_personality_id;
 use runtime::process::current_slot;
 use runtime::process::MAX_PROCESSES;
 use runtime::serial::write;
 use runtime::scheduler::request_yield;
+use runtime::scheduler::request_sleep;
+use runtime::memory_object::allocate_capability as allocate_memory_capability;
+use runtime::memory_object::close_capability as close_memory_capability;
+use runtime::memory_object::MEMORY_OK;
+use runtime::memory_object::MEMORY_INVALID_KIND;
+use runtime::memory_object::MEMORY_QUOTA_EXCEEDED;
+use runtime::memory_object::MEMORY_NO_MEMORY;
+use runtime::memory_object::MEMORY_NO_SLOT;
+use runtime::memory_object::MEMORY_ANONYMOUS;
+use runtime::memory_object::MEMORY_SHARED;
 use runtime::user_memory::copy_from_user;
 use runtime::user_memory::COPY_OK;
 use runtime::user_memory::COPY_RANGE_DENIED;
 
 static mut DEBUG_BUFFER: [u8; 256] = [0; 256];
+static mut PROCESS_EXIT_ENABLED: u8 = 0;
+
+// Exit is enabled only by a kernel lifecycle harness that has installed a
+// matching trusted continuation. A stable syscall number alone must never
+// make the generic native bootstrap abandon its user frame.
+pub unsafe fn configure_process_exit(enabled: bool) -> u64 {
+    if current_process_handle() != 0 {
+        return 0;
+    }
+    if enabled {
+        PROCESS_EXIT_ENABLED = 1;
+    } else {
+        PROCESS_EXIT_ENABLED = 0;
+    }
+    return 1;
+}
+
+unsafe fn fail_kernel_invariant() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
 
 unsafe fn dispatch_native_0(
     cspace_id: usize,
@@ -86,13 +135,59 @@ unsafe fn dispatch_native_0(
         return arg1;
     }
     if number == SYS_CAP_CLOSE {
-        if close_in_cspace(cspace_id, capability) == 0 {
+        let object_type: u64 = object_type_in_cspace(cspace_id, capability);
+        if object_type == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if object_type == OBJECT_MEMORY {
+            if close_memory_capability(cspace_id, capability) != MEMORY_OK {
+                fail_kernel_invariant();
+            }
+        } else if close_in_cspace(cspace_id, capability) == 0 {
             return ERR_CAPABILITY_DENIED;
         }
         return 1;
     }
-    if number == SYS_CAP_COPY || number == SYS_PAGE_ALLOC {
+    if number == SYS_CAP_COPY {
         return ERR_NOT_IMPLEMENTED;
+    }
+    if number == SYS_PAGE_ALLOC {
+        let page_pool: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PAGE_POOL,
+            RIGHT_PAGE_ALLOC
+        );
+        if page_pool == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        // Executable memory remains kernel/loader-only until an executable
+        // loader and W^X mapping transaction exist.
+        if arg0 != MEMORY_ANONYMOUS && arg0 != MEMORY_SHARED {
+            return ERR_INVALID_MEMORY_KIND;
+        }
+        let mut memory_capability: u64 = 0;
+        let status: u64 = allocate_memory_capability(
+            cspace_id,
+            arg0,
+            (&mut memory_capability)
+        );
+        if status == MEMORY_OK {
+            return memory_capability;
+        }
+        if status == MEMORY_INVALID_KIND {
+            return ERR_INVALID_MEMORY_KIND;
+        }
+        if status == MEMORY_QUOTA_EXCEEDED {
+            return ERR_QUOTA_EXCEEDED;
+        }
+        if status == MEMORY_NO_MEMORY {
+            return ERR_OUT_OF_MEMORY;
+        }
+        if status == MEMORY_NO_SLOT {
+            return ERR_RESOURCE_TABLE_FULL;
+        }
+        fail_kernel_invariant();
     }
     if number == SYS_YIELD {
         return request_yield();
@@ -100,7 +195,43 @@ unsafe fn dispatch_native_0(
     if number == SYS_TICKS {
         return ticks();
     }
+    if number == SYS_SLEEP {
+        return request_sleep(capability);
+    }
+    if number == SYS_EXIT {
+        if PROCESS_EXIT_ENABLED == 0 {
+            return ERR_NOT_IMPLEMENTED;
+        }
+        if exit_current(capability) == 0 {
+            return ERR_NO_CURRENT_PROCESS;
+        }
+        return SYSCALL_CONTROL_EXIT;
+    }
     return ERR_UNKNOWN_SYSCALL;
+}
+
+// Validate the exact saved IRET target against the current address-space
+// descriptors. The stack pointer names the next free byte, so validate the
+// byte immediately below it as readable, writable user stack storage.
+@export
+@no_mangle
+pub unsafe fn kernel_validate_user_return(rip: usize, stack: usize) -> u64 {
+    let address_space: u64 = current_address_space_id();
+    if address_space == 0 || stack == 0 {
+        return 0;
+    }
+    if !allows(address_space, rip, 1, VM_USER | VM_READ | VM_EXEC) {
+        return 0;
+    }
+    if !allows(
+        address_space,
+        stack - 1,
+        1,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    ) {
+        return 0;
+    }
+    return 1;
 }
 
 // Architectural entry glue calls only this generic router. The active PCB,

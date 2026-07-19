@@ -1,0 +1,312 @@
+module runtime::mapping;
+
+use runtime::memory_object::object_kind as memory_object_kind;
+use runtime::memory_object::release_mapping;
+use runtime::memory_object::retain_for_mapping;
+
+// A deliberately bounded registry for anonymous and shared leaves installed by
+// native address spaces. A mapping is a first-class generation-tagged identity:
+// the virtual extent and both exact owners are immutable for its full lifetime.
+pub const MAX_MAPPINGS: usize = 32;
+
+pub const MAP_USER: u64 = 1;
+pub const MAP_READ: u64 = 2;
+pub const MAP_WRITE: u64 = 4;
+pub const MAP_EXEC: u64 = 8;
+pub const MAP_STACK: u64 = 16;
+
+const PAGE_SIZE: usize = 4096;
+const MAPPING_EMPTY: u8 = 0;
+const MAPPING_LIVE: u8 = 1;
+const MAPPING_RETIRED: u8 = 2;
+const MAPPING_HANDLE_TAG: u64 = 0xa300_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut INITIALIZED: u8 = 0;
+static mut STATES: [u8; 32] = [0; 32];
+static mut GENERATIONS: [u32; 32] = [0; 32];
+static mut ADDRESS_SPACES: [u64; 32] = [0; 32];
+static mut OBJECTS: [u64; 32] = [0; 32];
+static mut KINDS: [u64; 32] = [0; 32];
+static mut VIRTUAL_ADDRESSES: [usize; 32] = [0; 32];
+static mut LENGTHS: [usize; 32] = [0; 32];
+static mut FLAGS: [u64; 32] = [0; 32];
+static mut PHYSICAL_ADDRESSES: [usize; 32] = [0; 32];
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | MAPPING_HANDLE_TAG
+        | (slot as u64);
+}
+
+unsafe fn checked_slot(handle: u64) -> usize {
+    if (handle & HANDLE_TAG_MASK) != MAPPING_HANDLE_TAG {
+        return MAX_MAPPINGS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_MAPPINGS
+        || STATES[slot] != MAPPING_LIVE
+        || GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_MAPPINGS;
+    }
+    return slot;
+}
+
+fn valid_extent(virtual_address: usize, length: usize, flags: u64) -> bool {
+    if virtual_address == 0
+        || length == 0
+        || (virtual_address & (PAGE_SIZE - 1)) != 0
+        || (length & (PAGE_SIZE - 1)) != 0
+        || virtual_address + length <= virtual_address
+        || flags == 0
+        || flags > (MAP_USER | MAP_READ | MAP_WRITE | MAP_EXEC | MAP_STACK)
+        || (flags & MAP_USER) == 0
+        || (flags & MAP_READ) == 0
+        || ((flags & MAP_WRITE) != 0 && (flags & MAP_EXEC) != 0) {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    ADDRESS_SPACES[slot] = 0;
+    OBJECTS[slot] = 0;
+    KINDS[slot] = 0;
+    VIRTUAL_ADDRESSES[slot] = 0;
+    LENGTHS[slot] = 0;
+    FLAGS[slot] = 0;
+    PHYSICAL_ADDRESSES[slot] = 0;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_MAPPINGS {
+        STATES[slot] = MAPPING_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    INITIALIZED = 1;
+    return 1;
+}
+
+// Retain the mapping reference before publishing registry state. On every
+// failure path the object reference count and registry are exactly unchanged.
+pub unsafe fn create_owned(
+    address_space: u64,
+    object: u64,
+    kind: u64,
+    virtual_address: usize,
+    length: usize,
+    flags: u64,
+    physical_address: *mut usize
+) -> u64 {
+    volatile_store(physical_address, 0);
+    if INITIALIZED == 0
+        || address_space == 0
+        || object == 0
+        || memory_object_kind(object) != kind
+        || !valid_extent(virtual_address, length, flags) {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_MAPPINGS && STATES[slot] != MAPPING_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+
+    let mut physical: usize = 0;
+    if retain_for_mapping(object, kind, (&mut physical)) == 0 {
+        return 0;
+    }
+    if physical == 0 || (physical & (PAGE_SIZE - 1)) != 0 {
+        release_mapping(object, kind);
+        return 0;
+    }
+
+    ADDRESS_SPACES[slot] = address_space;
+    OBJECTS[slot] = object;
+    KINDS[slot] = kind;
+    VIRTUAL_ADDRESSES[slot] = virtual_address;
+    LENGTHS[slot] = length;
+    FLAGS[slot] = flags;
+    PHYSICAL_ADDRESSES[slot] = physical;
+    STATES[slot] = MAPPING_LIVE;
+    volatile_store(physical_address, physical);
+    return make_handle(slot);
+}
+
+// Both owners are required at destruction. A caller holding a valid mapping
+// handle cannot use it to release another address space's or object's ref.
+pub unsafe fn destroy_for_owner(
+    handle: u64,
+    address_space: u64,
+    object: u64
+) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS
+        || ADDRESS_SPACES[slot] != address_space
+        || OBJECTS[slot] != object
+        || memory_object_kind(object) != KINDS[slot] {
+        return 0;
+    }
+    if release_mapping(object, KINDS[slot]) == 0 {
+        return 0;
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = MAPPING_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = MAPPING_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    return checked_slot(handle) < MAX_MAPPINGS;
+}
+
+pub unsafe fn registry_slot(handle: u64) -> usize {
+    return checked_slot(handle);
+}
+
+pub unsafe fn matches(
+    handle: u64,
+    address_space: u64,
+    object: u64,
+    kind: u64,
+    virtual_address: usize,
+    length: usize,
+    flags: u64
+) -> bool {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return false;
+    }
+    return ADDRESS_SPACES[slot] == address_space
+        && OBJECTS[slot] == object
+        && KINDS[slot] == kind
+        && VIRTUAL_ADDRESSES[slot] == virtual_address
+        && LENGTHS[slot] == length
+        && FLAGS[slot] == flags;
+}
+
+pub unsafe fn owner_address_space(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return ADDRESS_SPACES[slot];
+}
+
+pub unsafe fn owner_object(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return OBJECTS[slot];
+}
+
+pub unsafe fn mapping_kind(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return KINDS[slot];
+}
+
+pub unsafe fn virtual_address(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return VIRTUAL_ADDRESSES[slot];
+}
+
+pub unsafe fn length(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return LENGTHS[slot];
+}
+
+pub unsafe fn flags(handle: u64) -> u64 {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return FLAGS[slot];
+}
+
+pub unsafe fn physical_address(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_MAPPINGS {
+        return 0;
+    }
+    return PHYSICAL_ADDRESSES[slot];
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_MAPPINGS {
+        if STATES[slot] == MAPPING_EMPTY {
+            if GENERATIONS[slot] == 0
+                || ADDRESS_SPACES[slot] != 0
+                || OBJECTS[slot] != 0
+                || KINDS[slot] != 0
+                || VIRTUAL_ADDRESSES[slot] != 0
+                || LENGTHS[slot] != 0
+                || FLAGS[slot] != 0
+                || PHYSICAL_ADDRESSES[slot] != 0 {
+                return false;
+            }
+        } else if STATES[slot] == MAPPING_LIVE {
+            if GENERATIONS[slot] == 0
+                || ADDRESS_SPACES[slot] == 0
+                || OBJECTS[slot] == 0
+                || memory_object_kind(OBJECTS[slot]) != KINDS[slot]
+                || !valid_extent(
+                    VIRTUAL_ADDRESSES[slot],
+                    LENGTHS[slot],
+                    FLAGS[slot]
+                )
+                || PHYSICAL_ADDRESSES[slot] == 0
+                || (PHYSICAL_ADDRESSES[slot] & (PAGE_SIZE - 1)) != 0 {
+                return false;
+            }
+        } else {
+            if STATES[slot] != MAPPING_RETIRED
+                || GENERATIONS[slot] != 0xffff_ffff
+                || ADDRESS_SPACES[slot] != 0
+                || OBJECTS[slot] != 0
+                || KINDS[slot] != 0
+                || VIRTUAL_ADDRESSES[slot] != 0
+                || LENGTHS[slot] != 0
+                || FLAGS[slot] != 0
+                || PHYSICAL_ADDRESSES[slot] != 0 {
+                return false;
+            }
+        }
+        slot += 1;
+    }
+    return true;
+}

@@ -18,13 +18,35 @@ cargo test --all-targets --all-features --verbose
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
+./ocore/kernel/smoke-qemu.sh
+./ocore/kernel/smoke-faults-qemu.sh
+./ocore/kernel/smoke-processes-qemu.sh
+./ocore/kernel/smoke-scheduler-qemu.sh
+./ocore/kernel/smoke-ipc-foundation-qemu.sh
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 python3 -m compileall -q o_lang backends tests
 make -C c_cpp clean && make -C c_cpp && make -C c_cpp test && make -C c_cpp olangc-test
 cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/olang-cmake-build --parallel && ctest --test-dir /tmp/olang-cmake-build --output-on-failure
 bash scripts/check_release_claims.sh
+python3 -m unittest -v tests.test_source_release
 ```
+
+Build the public source ZIP from the exact commit or annotated tag that passed
+the gate. The command rejects a dirty worktree by default and reads payload
+bytes from the resolved Git commit, not from local build products:
+
+```bash
+python3 scripts/build_source_release.py \
+  --ref v0.2.0 \
+  --output dist/Ostadix-lang-source-v0.2.0.zip
+python3 scripts/build_source_release.py \
+  --verify dist/Ostadix-lang-source-v0.2.0.zip
+```
+
+The ZIP is deterministic for one commit and prefix. It contains a canonical
+`SOURCE-MANIFEST.json` plus `SHA256SUMS`, and the command prints the digest of
+the complete archive. Rebuilding the same ref must produce identical bytes.
 
 ## Version synchronization points
 
@@ -44,9 +66,10 @@ any one of them disagrees.
 2. Create an annotated version tag, for example `git tag -a v0.2.0 -m "Ostadix-lang v0.2.0"`.
 3. Push the tag only after verifying it points to the intended commit.
 4. Draft a GitHub release for that tag.
-5. Use source archives produced by GitHub/Zenodo; do not attach generated build
-   products as release assets.
-6. Publish the GitHub release when the release notes and metadata are final.
+5. Build and verify the allowlisted source ZIP from that tag. Attach that ZIP,
+   not a recursive worktree archive, as the canonical source-release asset.
+6. Record the printed whole-archive SHA-256 in the release notes.
+7. Publish the GitHub release when the release notes and metadata are final.
 
 ## Zenodo DOI minting
 
@@ -87,6 +110,14 @@ at least:
 - CMake build directories.
 - Python `__pycache__/` and bytecode.
 - Local fuzz, coverage, and compiler outputs.
+- `.DS_Store` and editor metadata.
+- `.ocore-repair-backups/` and one-off repair patches.
+- Generated HTML and intermediate `cvelist*` reports.
+
+The allowlist and forbidden-path rules live in
+`scripts/build_source_release.py`; changing the public release surface requires
+an explicit edit there plus a regression-test update. Do not replace this gate
+with `zip -r` over a development checkout.
 
 ## Manual GitHub settings outside code
 

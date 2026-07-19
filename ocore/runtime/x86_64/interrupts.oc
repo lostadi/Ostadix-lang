@@ -1,6 +1,7 @@
 module runtime::interrupts;
 
 use runtime::serial::write_byte;
+use runtime::scheduler::on_timer as scheduler_on_timer;
 
 @packed
 struct IdtEntry {
@@ -36,6 +37,7 @@ static POST_FAULT_TIMER_MESSAGE: [u8; 29] = b"M02 post-fault timer: online\n";
 static FAULT_CONTAINMENT_MESSAGE: [u8; 28] = b"M02 fault containment: PASS\n";
 
 extern "sysv64" fn ocore_exception_stub_address(vector: usize) -> usize;
+extern "sysv64" fn ocore_timer_interrupt_entry() -> void;
 
 unsafe fn set_gate(
     vector: usize,
@@ -52,9 +54,9 @@ unsafe fn set_gate(
     IDT[vector].zero = 0;
 }
 
-@interrupt
+@export
 @no_mangle
-unsafe fn timer_interrupt() -> void {
+pub unsafe fn kernel_timer_dispatch(frame: *mut u64) -> usize {
     let previous: u64 = atomic_fetch_add((&mut TICKS), 1, seq_cst);
     if previous == 0 {
         write_byte(b'T');
@@ -74,6 +76,11 @@ unsafe fn timer_interrupt() -> void {
         }
     }
     outb(0x20, 0x20);
+    if frame as usize == 0 {
+        return 0;
+    }
+    let from_user: bool = (volatile_load(frame + 18) & 3) == 3;
+    return scheduler_on_timer(frame, previous + 1, from_user);
 }
 
 unsafe fn remap_pic() -> void {
@@ -114,7 +121,7 @@ pub unsafe fn init() -> void {
         set_gate(vector, handler, ist, attributes);
         vector += 1;
     }
-    set_gate(32, timer_interrupt as usize, 0, 0x8e);
+    set_gate(32, ocore_timer_interrupt_entry as usize, 0, 0x8e);
     let idtr: Idtr = Idtr {
         limit: 4095,
         base: (&IDT) as usize,

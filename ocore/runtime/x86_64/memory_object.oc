@@ -1,0 +1,825 @@
+module runtime::memory_object;
+
+use runtime::capability::capability_handle_at;
+use runtime::capability::capability_handle_during_drain;
+use runtime::capability::begin_cspace_drain;
+use runtime::capability::close_during_drain;
+use runtime::capability::close_for_owner;
+use runtime::capability::create_cspace;
+use runtime::capability::cspace_child_refs;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::cspace_owner_slot;
+use runtime::capability::cspace_slot_for_handle;
+use runtime::capability::destroy_cspace as destroy_empty_cspace;
+use runtime::capability::has_free_slot_for_owner;
+use runtime::capability::install_first_free_for_owner;
+use runtime::capability::live_slots_in_cspace;
+use runtime::capability::object_type_for_owner;
+use runtime::capability::object_type_during_drain;
+use runtime::capability::release_cspace;
+use runtime::capability::retain_cspace;
+use runtime::capability::validate_for_owner;
+use runtime::capability::validate_during_drain;
+use runtime::capability::valid_cspace_slot;
+use runtime::capability::CAPABILITIES_PER_CSPACE;
+use runtime::capability::MAX_CSPACES;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::capability::OBJECT_PAGE_POOL;
+use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::pages::alloc_frame;
+use runtime::pages::frame_address;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as frame_invariants_hold;
+use runtime::pages::release_frame;
+use runtime::pages::FRAME_KIND_ANONYMOUS;
+use runtime::pages::FRAME_KIND_EXECUTABLE;
+use runtime::pages::FRAME_KIND_SHARED;
+
+pub const MEMORY_ANONYMOUS: u64 = 1;
+pub const MEMORY_SHARED: u64 = 2;
+pub const MEMORY_EXECUTABLE: u64 = 3;
+pub const MEMORY_DEVICE: u64 = 4;
+
+pub const MEMORY_OK: u64 = 1;
+pub const MEMORY_INVALID_KIND: u64 = 2;
+pub const MEMORY_QUOTA_EXCEEDED: u64 = 3;
+pub const MEMORY_NO_MEMORY: u64 = 4;
+pub const MEMORY_NO_SLOT: u64 = 5;
+pub const MEMORY_INVARIANT_FAILURE: u64 = 6;
+pub const MEMORY_DENIED: u64 = 7;
+
+const MAX_MEMORY_OBJECTS: usize = 64;
+const OBJECT_EMPTY: u8 = 0;
+const OBJECT_LIVE: u8 = 1;
+const OBJECT_RETIRED: u8 = 2;
+const MEMORY_HANDLE_TAG: u64 = 0xa100_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut STATES: [u8; 64] = [0; 64];
+static mut KINDS: [u8; 64] = [0; 64];
+static mut OWNERS: [u64; 64] = [0; 64];
+static mut FRAME_HANDLES: [u64; 64] = [0; 64];
+static mut REFERENCES: [u32; 64] = [0; 64];
+static mut GENERATIONS: [u32; 64] = [0; 64];
+static mut QUOTA_OWNER_HANDLES: [u64; 4] = [0; 4];
+static mut QUOTA_LIMITS: [usize; 4] = [0; 4];
+static mut QUOTA_USED: [usize; 4] = [0; 4];
+static mut INITIALIZED: u8 = 0;
+static mut FAIL_AFTER_OBJECT_PUBLISH: u8 = 0;
+
+fn valid_memory_kind(kind: u64) -> bool {
+    return kind == MEMORY_ANONYMOUS
+        || kind == MEMORY_SHARED
+        || kind == MEMORY_EXECUTABLE;
+}
+
+fn frame_kind_for(kind: u64) -> u64 {
+    if kind == MEMORY_ANONYMOUS {
+        return FRAME_KIND_ANONYMOUS;
+    }
+    if kind == MEMORY_SHARED {
+        return FRAME_KIND_SHARED;
+    }
+    if kind == MEMORY_EXECUTABLE {
+        return FRAME_KIND_EXECUTABLE;
+    }
+    return 0;
+}
+
+fn object_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn object_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_object_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | MEMORY_HANDLE_TAG
+        | (slot as u64);
+}
+
+unsafe fn checked_object(handle: u64, expected_kind: u64) -> usize {
+    if (handle & HANDLE_TAG_MASK) != MEMORY_HANDLE_TAG {
+        return MAX_MEMORY_OBJECTS;
+    }
+    let index: usize = object_index(handle);
+    if index >= MAX_MEMORY_OBJECTS || STATES[index] != OBJECT_LIVE {
+        return MAX_MEMORY_OBJECTS;
+    }
+    if GENERATIONS[index] != object_generation(handle) {
+        return MAX_MEMORY_OBJECTS;
+    }
+    if expected_kind != 0 && KINDS[index] as u64 != expected_kind {
+        return MAX_MEMORY_OBJECTS;
+    }
+    return index;
+}
+
+// Quota state is associated with a CSpace generation, not its reusable raw
+// slot. A fresh CSpace therefore starts with a zero limit and cannot inherit
+// allocation authority or accounting from its predecessor.
+unsafe fn quota_slot_for_owner(owner: u64) -> usize {
+    let slot: usize = cspace_owner_slot(owner);
+    if slot >= MAX_CSPACES {
+        return MAX_CSPACES;
+    }
+    if QUOTA_OWNER_HANDLES[slot] != owner {
+        if QUOTA_USED[slot] != 0 {
+            return MAX_CSPACES;
+        }
+        QUOTA_OWNER_HANDLES[slot] = owner;
+        QUOTA_LIMITS[slot] = 0;
+    }
+    return slot;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < MAX_MEMORY_OBJECTS {
+        STATES[index] = OBJECT_EMPTY;
+        KINDS[index] = 0;
+        OWNERS[index] = 0;
+        FRAME_HANDLES[index] = 0;
+        REFERENCES[index] = 0;
+        GENERATIONS[index] = 1;
+        index += 1;
+    }
+    index = 0;
+    while index < MAX_CSPACES {
+        QUOTA_OWNER_HANDLES[index] = cspace_handle_for_slot(index);
+        if QUOTA_OWNER_HANDLES[index] == 0 {
+            return 0;
+        }
+        QUOTA_LIMITS[index] = 0;
+        QUOTA_USED[index] = 0;
+        index += 1;
+    }
+    FAIL_AFTER_OBJECT_PUBLISH = 0;
+    INITIALIZED = 1;
+    return 1;
+}
+
+pub unsafe fn inject_failure_after_object_publish_once() -> void {
+    FAIL_AFTER_OBJECT_PUBLISH = 1;
+}
+
+pub unsafe fn set_quota_for_owner(owner: u64, limit: usize) -> u64 {
+    if INITIALIZED == 0 || !cspace_is_live(owner) || limit > MAX_MEMORY_OBJECTS {
+        return 0;
+    }
+    let slot: usize = quota_slot_for_owner(owner);
+    if slot >= MAX_CSPACES || QUOTA_USED[slot] > limit {
+        return 0;
+    }
+    QUOTA_LIMITS[slot] = limit;
+    return 1;
+}
+
+pub unsafe fn set_quota(cspace_id: usize, limit: usize) -> u64 {
+    if !valid_cspace_slot(cspace_id) {
+        return 0;
+    }
+    return set_quota_for_owner(cspace_handle_for_slot(cspace_id), limit);
+}
+
+pub unsafe fn quota_used(cspace_id: usize) -> usize {
+    if INITIALIZED == 0 || !valid_cspace_slot(cspace_id) {
+        return 0;
+    }
+    let slot: usize = quota_slot_for_owner(cspace_handle_for_slot(cspace_id));
+    if slot >= MAX_CSPACES {
+        return 0;
+    }
+    return QUOTA_USED[slot];
+}
+
+pub unsafe fn quota_used_for_owner(owner: u64) -> usize {
+    if INITIALIZED == 0 || !cspace_is_valid_owner(owner) {
+        return 0;
+    }
+    let slot: usize = quota_slot_for_owner(owner);
+    if slot >= MAX_CSPACES {
+        return 0;
+    }
+    return QUOTA_USED[slot];
+}
+
+pub unsafe fn quota_limit(cspace_id: usize) -> usize {
+    if INITIALIZED == 0 || !valid_cspace_slot(cspace_id) {
+        return 0;
+    }
+    let slot: usize = quota_slot_for_owner(cspace_handle_for_slot(cspace_id));
+    if slot >= MAX_CSPACES {
+        return 0;
+    }
+    return QUOTA_LIMITS[slot];
+}
+
+unsafe fn allocate_owned_object(
+    owner: u64,
+    kind: u64,
+    result: *mut u64
+) -> u64 {
+    volatile_store(result, 0);
+    if !valid_memory_kind(kind) {
+        return MEMORY_INVALID_KIND;
+    }
+    let owner_slot: usize = quota_slot_for_owner(owner);
+    if owner_slot >= MAX_CSPACES {
+        return MEMORY_DENIED;
+    }
+    if QUOTA_USED[owner_slot] >= QUOTA_LIMITS[owner_slot] {
+        return MEMORY_QUOTA_EXCEEDED;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_MEMORY_OBJECTS && STATES[slot] != OBJECT_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_MEMORY_OBJECTS {
+        return MEMORY_NO_SLOT;
+    }
+
+    let frame_kind: u64 = frame_kind_for(kind);
+    let frame_handle: u64 = alloc_frame(frame_kind);
+    if frame_handle == 0 {
+        return MEMORY_NO_MEMORY;
+    }
+    if retain_cspace(owner) == 0 {
+        if release_frame(frame_handle, frame_kind) == 0 {
+            return MEMORY_INVARIANT_FAILURE;
+        }
+        return MEMORY_DENIED;
+    }
+
+    STATES[slot] = OBJECT_LIVE;
+    KINDS[slot] = kind as u8;
+    OWNERS[slot] = owner;
+    FRAME_HANDLES[slot] = frame_handle;
+    REFERENCES[slot] = 1;
+    if FAIL_AFTER_OBJECT_PUBLISH != 0 {
+        FAIL_AFTER_OBJECT_PUBLISH = 0;
+        STATES[slot] = OBJECT_EMPTY;
+        KINDS[slot] = 0;
+        OWNERS[slot] = 0;
+        FRAME_HANDLES[slot] = 0;
+        REFERENCES[slot] = 0;
+        if release_frame(frame_handle, frame_kind) == 0
+            || release_cspace(owner) == 0 {
+            return MEMORY_INVARIANT_FAILURE;
+        }
+        return MEMORY_NO_MEMORY;
+    }
+
+    QUOTA_USED[owner_slot] += 1;
+    volatile_store(result, make_object_handle(slot));
+    return MEMORY_OK;
+}
+
+pub unsafe fn allocate_capability_for_owner(
+    owner: u64,
+    kind: u64,
+    result: *mut u64
+) -> u64 {
+    volatile_store(result, 0);
+    if !invariants_hold() {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    if !cspace_is_live(owner) || !valid_memory_kind(kind) {
+        return MEMORY_INVALID_KIND;
+    }
+    if !has_free_slot_for_owner(owner) {
+        return MEMORY_NO_SLOT;
+    }
+    let mut object_handle: u64 = 0;
+    let status: u64 = allocate_owned_object(owner, kind, (&mut object_handle));
+    if status != MEMORY_OK {
+        return status;
+    }
+    let mut rights: u64 = RIGHT_MEMORY_USE;
+    if kind == MEMORY_SHARED {
+        rights = rights | RIGHT_TRANSFER;
+    }
+    let capability: u64 = install_first_free_for_owner(
+        owner,
+        object_handle,
+        OBJECT_MEMORY,
+        rights
+    );
+    if capability == 0 {
+        if release_object(object_handle) == 0 {
+            return MEMORY_INVARIANT_FAILURE;
+        }
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    volatile_store(result, capability);
+    return MEMORY_OK;
+}
+
+pub unsafe fn allocate_capability(
+    cspace_id: usize,
+    kind: u64,
+    result: *mut u64
+) -> u64 {
+    volatile_store(result, 0);
+    if !valid_cspace_slot(cspace_id) {
+        return MEMORY_INVALID_KIND;
+    }
+    return allocate_capability_for_owner(
+        cspace_handle_for_slot(cspace_id),
+        kind,
+        result
+    );
+}
+
+// Address-space construction uses this for private owned leaves. The returned
+// internal object handle holds one owner reference, charges the CSpace quota,
+// and installs no public capability. Mapping code must retain/release its own
+// reference and finally release this owner reference during teardown.
+pub unsafe fn allocate_kernel_object_for_owner(owner: u64, kind: u64) -> u64 {
+    if !invariants_hold() {
+        return 0;
+    }
+    if !cspace_is_live(owner) {
+        return 0;
+    }
+    let mut object_handle: u64 = 0;
+    if allocate_owned_object(owner, kind, (&mut object_handle)) != MEMORY_OK {
+        return 0;
+    }
+    return object_handle;
+}
+
+pub unsafe fn allocate_kernel_object(cspace_slot: usize, kind: u64) -> u64 {
+    if !valid_cspace_slot(cspace_slot) {
+        return 0;
+    }
+    return allocate_kernel_object_for_owner(
+        cspace_handle_for_slot(cspace_slot),
+        kind
+    );
+}
+
+pub unsafe fn object_for_capability_owner(owner: u64, capability: u64) -> u64 {
+    return validate_for_owner(
+        owner,
+        capability,
+        OBJECT_MEMORY,
+        0
+    );
+}
+
+unsafe fn object_for_capability_during_drain(
+    owner: u64,
+    capability: u64
+) -> u64 {
+    return validate_during_drain(
+        owner,
+        capability,
+        OBJECT_MEMORY,
+        0
+    );
+}
+
+pub unsafe fn object_for_capability(cspace_id: usize, capability: u64) -> u64 {
+    return object_for_capability_owner(
+        cspace_handle_for_slot(cspace_id),
+        capability
+    );
+}
+
+pub unsafe fn object_kind(handle: u64) -> u64 {
+    let index: usize = checked_object(handle, 0);
+    if index >= MAX_MEMORY_OBJECTS {
+        return 0;
+    }
+    return KINDS[index] as u64;
+}
+
+pub unsafe fn retain_object(handle: u64) -> u64 {
+    let index: usize = checked_object(handle, 0);
+    if index >= MAX_MEMORY_OBJECTS || REFERENCES[index] == 0xffff_ffff {
+        return 0;
+    }
+    REFERENCES[index] += 1;
+    return 1;
+}
+
+pub unsafe fn retain_for_mapping(
+    handle: u64,
+    expected_kind: u64,
+    physical_address: *mut usize
+) -> u64 {
+    volatile_store(physical_address, 0);
+    if !valid_memory_kind(expected_kind) {
+        return 0;
+    }
+    let index: usize = checked_object(handle, expected_kind);
+    if index >= MAX_MEMORY_OBJECTS || REFERENCES[index] == 0xffff_ffff {
+        return 0;
+    }
+    let address: usize = frame_address(
+        FRAME_HANDLES[index],
+        frame_kind_for(expected_kind)
+    );
+    if address == 0 {
+        return 0;
+    }
+    REFERENCES[index] += 1;
+    volatile_store(physical_address, address);
+    return 1;
+}
+
+pub unsafe fn release_mapping(handle: u64, expected_kind: u64) -> u64 {
+    if checked_object(handle, expected_kind) >= MAX_MEMORY_OBJECTS {
+        return 0;
+    }
+    return release_object(handle);
+}
+
+pub unsafe fn release_object(handle: u64) -> u64 {
+    let index: usize = checked_object(handle, 0);
+    if index >= MAX_MEMORY_OBJECTS || REFERENCES[index] == 0 {
+        return 0;
+    }
+    if REFERENCES[index] > 1 {
+        REFERENCES[index] -= 1;
+        return 1;
+    }
+
+    let owner: u64 = OWNERS[index];
+    let owner_slot: usize = quota_slot_for_owner(owner);
+    let kind: u64 = KINDS[index] as u64;
+    let frame_handle: u64 = FRAME_HANDLES[index];
+    if owner_slot >= MAX_CSPACES
+        || QUOTA_USED[owner_slot] == 0
+        || cspace_child_refs(owner) == 0
+        || release_frame(frame_handle, frame_kind_for(kind)) == 0 {
+        return 0;
+    }
+    if release_cspace(owner) == 0 {
+        return 0;
+    }
+
+    QUOTA_USED[owner_slot] -= 1;
+    KINDS[index] = 0;
+    OWNERS[index] = 0;
+    FRAME_HANDLES[index] = 0;
+    REFERENCES[index] = 0;
+    if GENERATIONS[index] == 0xffff_ffff {
+        STATES[index] = OBJECT_RETIRED;
+    } else {
+        GENERATIONS[index] += 1;
+        STATES[index] = OBJECT_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn close_capability_for_owner(owner: u64, capability: u64) -> u64 {
+    if !invariants_hold() {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    if !cspace_is_valid_owner(owner) {
+        return MEMORY_DENIED;
+    }
+    let object_handle: u64 = object_for_capability_owner(owner, capability);
+    let object_slot: usize = checked_object(object_handle, 0);
+    if owner == 0 || object_slot >= MAX_MEMORY_OBJECTS {
+        return MEMORY_DENIED;
+    }
+    if close_for_owner(owner, capability) == 0 {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    if release_object(object_handle) == 0 {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    if !invariants_hold() {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    return MEMORY_OK;
+}
+
+unsafe fn close_capability_during_drain(owner: u64, capability: u64) -> u64 {
+    if !invariants_hold() || !cspace_is_valid_owner(owner) {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    let object_handle: u64 = object_for_capability_during_drain(
+        owner,
+        capability
+    );
+    let object_slot: usize = checked_object(object_handle, 0);
+    if object_slot >= MAX_MEMORY_OBJECTS {
+        return MEMORY_DENIED;
+    }
+    if close_during_drain(owner, capability) == 0
+        || release_object(object_handle) == 0
+        || !invariants_hold() {
+        return MEMORY_INVARIANT_FAILURE;
+    }
+    return MEMORY_OK;
+}
+
+pub unsafe fn close_capability(cspace_id: usize, capability: u64) -> u64 {
+    if !valid_cspace_slot(cspace_id) {
+        return MEMORY_DENIED;
+    }
+    return close_capability_for_owner(
+        cspace_handle_for_slot(cspace_id),
+        capability
+    );
+}
+
+// Direct object-type dispatch keeps destructor ownership explicit without a
+// function-pointer ABI or a capability<->memory module dependency cycle.
+// The final low-level destroy advances every capability generation. Process,
+// mapping, and kernel-object references all keep the CSpace child count nonzero
+// and therefore make this operation fail closed.
+pub unsafe fn drain_cspace(cspace_handle: u64) -> u64 {
+    if !cspace_is_live(cspace_handle) {
+        return 0;
+    }
+    let cspace_id: usize = cspace_slot_for_handle(cspace_handle);
+    let quota_slot: usize = quota_slot_for_owner(cspace_handle);
+    if quota_slot >= MAX_CSPACES {
+        return 0;
+    }
+
+    // Preflight the complete ownership graph before revoking anything. Every
+    // owned object must have exactly its public-capability reference, every
+    // public memory capability must name one distinct owned object, and there
+    // may be no process, mapping, or kernel-object child reference.
+    let mut object_count: usize = 0;
+    let mut object_slot: usize = 0;
+    while object_slot < MAX_MEMORY_OBJECTS {
+        if STATES[object_slot] == OBJECT_LIVE
+            && OWNERS[object_slot] == cspace_handle {
+            if REFERENCES[object_slot] != 1 {
+                return 0;
+            }
+            object_count += 1;
+        }
+        object_slot += 1;
+    }
+    if object_count != QUOTA_USED[quota_slot]
+        || cspace_child_refs(cspace_handle) != object_count as u32 {
+        return 0;
+    }
+
+    let mut owned_memory_capability_count: usize = 0;
+    let mut capability_slot: usize = 0;
+    while capability_slot < CAPABILITIES_PER_CSPACE {
+        let capability: u64 = capability_handle_at(
+            cspace_handle,
+            capability_slot
+        );
+        if capability != 0 {
+            let object_type: u64 = object_type_for_owner(
+                cspace_handle,
+                capability
+            );
+            if object_type == OBJECT_MEMORY {
+                let object_handle: u64 = object_for_capability_owner(
+                    cspace_handle,
+                    capability
+                );
+                let checked_slot: usize = checked_object(object_handle, 0);
+                if checked_slot >= MAX_MEMORY_OBJECTS {
+                    return 0;
+                }
+                if OWNERS[checked_slot] == cspace_handle {
+                    let mut prior_slot: usize = 0;
+                    while prior_slot < capability_slot {
+                        let prior_capability: u64 = capability_handle_at(
+                            cspace_handle,
+                            prior_slot
+                        );
+                        if prior_capability != 0
+                            && object_type_for_owner(cspace_handle, prior_capability) == OBJECT_MEMORY
+                            && object_for_capability_owner(cspace_handle, prior_capability) == object_handle {
+                            return 0;
+                        }
+                        prior_slot += 1;
+                    }
+                    owned_memory_capability_count += 1;
+                }
+            } else if object_type != OBJECT_DEBUG
+                && object_type != OBJECT_PAGE_POOL {
+                return 0;
+            }
+        }
+        capability_slot += 1;
+    }
+    if owned_memory_capability_count != object_count {
+        return 0;
+    }
+
+    // Commit begins only after every fallible ownership check. From this point
+    // normal raw-slot lookup and installation reject the CSpace. An impossible
+    // destructor failure leaves it quarantined in DRAINING rather than making a
+    // partially revoked table live again.
+    if begin_cspace_drain(cspace_handle) == 0 {
+        return 0;
+    }
+
+    capability_slot = 0;
+    while capability_slot < CAPABILITIES_PER_CSPACE {
+        let capability: u64 = capability_handle_during_drain(
+            cspace_handle,
+            capability_slot
+        );
+        if capability != 0 {
+            let object_type: u64 = object_type_during_drain(
+                cspace_handle,
+                capability
+            );
+            if object_type == OBJECT_MEMORY {
+                if close_capability_during_drain(cspace_handle, capability) != MEMORY_OK {
+                    return 0;
+                }
+            } else if close_during_drain(cspace_handle, capability) == 0 {
+                return 0;
+            }
+        }
+        capability_slot += 1;
+    }
+    if QUOTA_USED[quota_slot] != 0 {
+        return 0;
+    }
+    if destroy_empty_cspace(cspace_handle) == 0 {
+        return 0;
+    }
+    QUOTA_OWNER_HANDLES[cspace_id] = 0;
+    QUOTA_LIMITS[cspace_id] = 0;
+    QUOTA_USED[cspace_id] = 0;
+    return 1;
+}
+
+pub unsafe fn drain_and_destroy_cspace(cspace_handle: u64) -> u64 {
+    return drain_cspace(cspace_handle);
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || !frame_invariants_hold() {
+        return false;
+    }
+    let mut observed_by_cspace: [usize; 4] = [0; 4];
+    let mut index: usize = 0;
+    while index < MAX_MEMORY_OBJECTS {
+        if STATES[index] == OBJECT_EMPTY {
+            if KINDS[index] != 0
+                || OWNERS[index] != 0
+                || FRAME_HANDLES[index] != 0
+                || REFERENCES[index] != 0
+                || GENERATIONS[index] == 0 {
+                return false;
+            }
+        } else {
+            if STATES[index] == OBJECT_LIVE {
+                let owner: u64 = OWNERS[index];
+                let owner_slot: usize = cspace_owner_slot(owner);
+                let kind: u64 = KINDS[index] as u64;
+                if owner_slot >= MAX_CSPACES
+                    || QUOTA_OWNER_HANDLES[owner_slot] != owner
+                    || !valid_memory_kind(kind)
+                    || REFERENCES[index] == 0
+                    || GENERATIONS[index] == 0
+                    || frame_address(FRAME_HANDLES[index], frame_kind_for(kind)) == 0 {
+                    return false;
+                }
+                observed_by_cspace[owner_slot] += 1;
+            } else {
+                if STATES[index] != OBJECT_RETIRED
+                    || KINDS[index] != 0
+                    || OWNERS[index] != 0
+                    || FRAME_HANDLES[index] != 0
+                    || REFERENCES[index] != 0
+                    || GENERATIONS[index] != 0xffff_ffff {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < MAX_CSPACES {
+        if observed_by_cspace[index] != QUOTA_USED[index]
+            || QUOTA_USED[index] > QUOTA_LIMITS[index] {
+            return false;
+        }
+        let owner: u64 = QUOTA_OWNER_HANDLES[index];
+        if QUOTA_USED[index] != 0 {
+            if !cspace_is_valid_owner(owner)
+                || cspace_owner_slot(owner) != index
+                || cspace_child_refs(owner) < observed_by_cspace[index] as u32 {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    return true;
+}
+
+// This uses an otherwise-unused CSpace so the default process's stable public
+// capability values are not perturbed by the kernel-side lifecycle proof.
+pub unsafe fn self_test(cspace_id: usize) -> u64 {
+    if !valid_cspace_slot(cspace_id)
+        || cspace_handle_for_slot(cspace_id) == 0
+        || live_slots_in_cspace(cspace_id) != 0
+        || set_quota(cspace_id, 2) == 0 {
+        return 0;
+    }
+    let before_free: usize = free_frames();
+    let mut capability: u64 = 0;
+    if allocate_capability(cspace_id, MEMORY_ANONYMOUS, (&mut capability)) != MEMORY_OK {
+        return 0;
+    }
+    let old_object: u64 = object_for_capability(cspace_id, capability);
+    let old_index: usize = checked_object(old_object, MEMORY_ANONYMOUS);
+    if old_index >= MAX_MEMORY_OBJECTS {
+        return 0;
+    }
+    let old_frame: u64 = FRAME_HANDLES[old_index];
+    let mut mapped_physical: usize = 0;
+    if old_object == 0
+        || object_kind(old_object) != MEMORY_ANONYMOUS
+        || object_kind(old_frame) != 0
+        || frame_address(old_object, FRAME_KIND_ANONYMOUS) != 0
+        || retain_for_mapping(
+            old_object,
+            MEMORY_ANONYMOUS,
+            (&mut mapped_physical)
+        ) == 0
+        || mapped_physical == 0
+        || close_capability(cspace_id, capability) != MEMORY_OK
+        || quota_used(cspace_id) != 1
+        || object_kind(old_object) != MEMORY_ANONYMOUS
+        || release_mapping(old_object, MEMORY_ANONYMOUS) == 0
+        || quota_used(cspace_id) != 0 {
+        return 0;
+    }
+
+    let slots_before_failure: usize = live_slots_in_cspace(cspace_id);
+    inject_failure_after_object_publish_once();
+    capability = 0;
+    if allocate_capability(cspace_id, MEMORY_SHARED, (&mut capability)) != MEMORY_NO_MEMORY
+        || capability != 0
+        || free_frames() != before_free
+        || live_slots_in_cspace(cspace_id) != slots_before_failure
+        || quota_used(cspace_id) != 0
+        || !invariants_hold() {
+        return 0;
+    }
+
+    if allocate_capability(cspace_id, MEMORY_SHARED, (&mut capability)) != MEMORY_OK {
+        return 0;
+    }
+    let replacement_object: u64 = object_for_capability(cspace_id, capability);
+    if replacement_object == 0
+        || replacement_object == old_object
+        || release_object(old_object) != 0
+        || close_capability(cspace_id, capability) != MEMORY_OK {
+        return 0;
+    }
+
+    capability = 0;
+    if allocate_capability(cspace_id, MEMORY_DEVICE, (&mut capability)) != MEMORY_INVALID_KIND
+        || capability != 0
+        || quota_used(cspace_id) != 0
+        || live_slots_in_cspace(cspace_id) != 0
+        || free_frames() != before_free
+        || !invariants_hold() {
+        return 0;
+    }
+
+    let old_owner: u64 = cspace_handle_for_slot(cspace_id);
+    let kernel_object: u64 = allocate_kernel_object(cspace_id, MEMORY_ANONYMOUS);
+    if kernel_object == 0
+        || quota_used(cspace_id) != 1
+        || drain_cspace(old_owner) != 0
+        || !cspace_is_live(old_owner)
+        || release_object(kernel_object) == 0
+        || quota_used(cspace_id) != 0
+        || drain_cspace(old_owner) == 0
+        || cspace_is_live(old_owner) {
+        return 0;
+    }
+    let new_owner: u64 = create_cspace(cspace_id);
+    if new_owner == 0
+        || new_owner == old_owner
+        || cspace_is_live(old_owner)
+        || set_quota(cspace_id, 0) == 0
+        || free_frames() != before_free
+        || !invariants_hold() {
+        return 0;
+    }
+    return 1;
+}

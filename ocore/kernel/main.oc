@@ -1,5 +1,8 @@
 module kernel::main;
 
+use kernel::m1::start as start_m1;
+use kernel::m2::start as start_m2;
+use kernel::m3::start as start_m3;
 use runtime::capability::init as capabilities_init;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
@@ -19,8 +22,19 @@ use runtime::address_space::VM_WRITE;
 use runtime::domain::init as domains_init;
 use runtime::domain::DOMAIN_NATIVE_0;
 use runtime::interrupts::init as interrupts_init;
-use runtime::pages::alloc_page;
 use runtime::pages::init as pages_init;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::pages::test_exhaustion_and_reclaim;
+use runtime::pages::test_injected_failure;
+use runtime::pages::test_stale_and_double_free;
+use runtime::pages::test_zero_reuse;
+use runtime::memory_object::init as memory_objects_init;
+use runtime::memory_object::self_test as memory_objects_self_test;
+use runtime::memory_object::set_quota as set_memory_quota;
+use runtime::mapping::init as mappings_init;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::endpoint::init as endpoints_init;
+use runtime::cap_transfer::init as cap_transfers_init;
 use runtime::process::init as processes_init;
 use runtime::process::install as install_process;
 use runtime::process::activate_bootstrap;
@@ -66,9 +80,15 @@ static COPY_MESSAGE: [u8; 28] = b"user copy faults: recovered\n";
 static ENTRY_MESSAGE: [u8; 30] = b"entry state: CPU-local online\n";
 static PROBE_MESSAGE: [u8; 22] = b"M02 probe: armed CPL3\n";
 static PROTECTION_MESSAGE: [u8; 29] = b"page protections: W^X online\n";
+static FRAME_RECLAIM_MESSAGE: [u8; 25] = b"M03 frames: reclaim PASS\n";
+static FRAME_ZERO_MESSAGE: [u8; 28] = b"M03 frames: zero-reuse PASS\n";
+static FRAME_STALE_MESSAGE: [u8; 37] = b"M03 frames: stale-double-free denied\n";
+static FRAME_FAILURE_MESSAGE: [u8; 43] = b"M03 frames: injected-failure rollback PASS\n";
+static MEMORY_OBJECT_MESSAGE: [u8; 42] = b"M03 memory objects: typed-generation PASS\n";
 static mut COPY_PROBE: [u8; 8] = [0; 8];
 
 const NATIVE_CSPACE: usize = 0;
+const SELF_TEST_CSPACE: usize = 3;
 
 // The linked negative CPL3 probe takes this address without reading it and
 // passes the address to SYS_DEBUG_WRITE. Correct user-range validation rejects
@@ -94,21 +114,70 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         fail_closed();
     }
     write((&PROTECTION_MESSAGE[0]), 29);
+    let probe_mode: u64 = ocore_boot_probe_mode();
 
-    // The bootstrap allocator stops below the dedicated user image at 16 MiB.
-    // A later physical-memory manager will reserve arbitrary mapped regions.
-    pages_init(0x00400000, 0x01000000);
-    let first_page: *mut u8 = alloc_page();
-    if (first_page as usize) == 0x00400000 {
-        write((&PAGE_MESSAGE[0]), 23);
-    }
-
-    if domains_init() != DOMAIN_NATIVE_0 {
+    // This fixed QEMU bootstrap window is mapped supervisor RW/NX and excludes
+    // both the kernel image and linked user regions. General firmware memory
+    // discovery and arbitrary reservation remain outside this bounded slice.
+    if pages_init(0x00400000, 0x01000000) == 0
+        || pages_init(0x00400000, 0x01000000) != 0
+        || !page_invariants_hold() {
         fail_closed();
     }
-    processes_init();
+    write((&PAGE_MESSAGE[0]), 23);
+    if probe_mode == 0 {
+        if test_exhaustion_and_reclaim() == 0 {
+            fail_closed();
+        }
+        write((&FRAME_RECLAIM_MESSAGE[0]), 25);
+        if test_zero_reuse() == 0 {
+            fail_closed();
+        }
+        write((&FRAME_ZERO_MESSAGE[0]), 28);
+        if test_stale_and_double_free() == 0 {
+            fail_closed();
+        }
+        write((&FRAME_STALE_MESSAGE[0]), 37);
+        if test_injected_failure() == 0 {
+            fail_closed();
+        }
+        write((&FRAME_FAILURE_MESSAGE[0]), 43);
+    }
+
+    let domain_handle: u64 = domains_init();
+    if domain_handle != DOMAIN_NATIVE_0 {
+        fail_closed();
+    }
+    if processes_init() == 0 || processes_init() != 0 {
+        fail_closed();
+    }
     scheduler_init();
-    capabilities_init();
+    if capabilities_init() == 0 || capabilities_init() != 0 {
+        fail_closed();
+    }
+    if memory_objects_init() == 0 || memory_objects_init() != 0 {
+        fail_closed();
+    }
+    if mappings_init() == 0
+        || mappings_init() != 0
+        || !mapping_invariants_hold() {
+        fail_closed();
+    }
+    if endpoints_init() == 0
+        || endpoints_init() != 0
+        || cap_transfers_init() == 0
+        || cap_transfers_init() != 0 {
+        fail_closed();
+    }
+    if probe_mode == 0 {
+        if memory_objects_self_test(SELF_TEST_CSPACE) == 0 {
+            fail_closed();
+        }
+        write((&MEMORY_OBJECT_MESSAGE[0]), 42);
+    }
+    if set_memory_quota(NATIVE_CSPACE, 2) == 0 {
+        fail_closed();
+    }
 
     let active_cr3: usize = ocore_current_cr3();
     let address_space_id: u64 = install_address_space(active_cr3);
@@ -155,8 +224,36 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
     }
     write((&ADDRESS_SPACE_MESSAGE[0]), 22);
 
+    // Modes 10 and 11 are the bounded Milestone 1 lifecycle boots. They use
+    // the pinned bootstrap CR3 only as the no-process management context and
+    // install their own generation-safe process, CSpace, and address-space
+    // identities before entering CPL3.
+    if probe_mode == 10 || probe_mode == 11 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m1(probe_mode, domain_handle);
+    }
+    if probe_mode == 12 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m2(probe_mode, domain_handle);
+    }
+    if probe_mode == 13 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m3(probe_mode, domain_handle);
+    }
+
     let kernel_stack_top: usize = ocore_kernel_stack_top();
-    let probe_mode: u64 = ocore_boot_probe_mode();
     if configure_probe(probe_mode) == 0 {
         fail_closed();
     }

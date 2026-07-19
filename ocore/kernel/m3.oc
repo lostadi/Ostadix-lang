@@ -1,0 +1,618 @@
+module kernel::m3;
+
+use runtime::address_space::create_native_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::dynamic_protections_hold;
+use runtime::address_space::map_shared;
+use runtime::address_space::native_stack_top_for;
+use runtime::address_space::root_cr3;
+use runtime::address_space::shared_mapping;
+use runtime::address_space::shared_object;
+use runtime::address_space::shared_physical;
+use runtime::address_space::shared_virtual;
+use runtime::address_space::unmap_shared;
+use runtime::cap_transfer::abort_copy;
+use runtime::cap_transfer::cancel_owner as cancel_transfer_owner;
+use runtime::cap_transfer::commit_copy;
+use runtime::cap_transfer::copy_atomic;
+use runtime::cap_transfer::invariants_hold as transfer_invariants_hold;
+use runtime::cap_transfer::prepare_copy;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::rights_for_owner;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::endpoint::cancel_by_correlation;
+use runtime::endpoint::cancel_by_sender;
+use runtime::endpoint::close as close_endpoint;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::crash as crash_endpoint;
+use runtime::endpoint::dequeue;
+use runtime::endpoint::enqueue;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::message_count;
+use runtime::endpoint::pending_capability_cleanup_count;
+use runtime::endpoint::register_receiver_waiter;
+use runtime::endpoint::register_sender_waiter;
+use runtime::endpoint::release as release_endpoint;
+use runtime::endpoint::take_cancelled_waiter;
+use runtime::endpoint::take_capability_cleanup;
+use runtime::endpoint::ENDPOINT_WAITER_RECEIVER;
+use runtime::endpoint::ENDPOINT_WAITER_SENDER;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::create_domain;
+use runtime::domain::destroy_domain;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::memory_object::allocate_capability_for_owner;
+use runtime::memory_object::close_capability_for_owner;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::object_for_capability_owner;
+use runtime::memory_object::object_kind;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::memory_object::MEMORY_OK;
+use runtime::memory_object::MEMORY_SHARED;
+use runtime::native_abi::NATIVE_ABI_V1;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::stop_process;
+use runtime::serial::write;
+use runtime::interrupts::ticks;
+
+const MODE_FOUNDATION: u64 = 13;
+const QUOTA: usize = 16;
+const SHARED_NONCE: u64 = 0x4f44_4f4d_4149_4e33;
+const THREAD_ZERO: u64 = 0x0000_0001_e200_0000;
+const THREAD_ONE: u64 = 0x0000_0001_e200_0001;
+const THREAD_TWO: u64 = 0x0000_0001_e200_0002;
+
+static ENDPOINT_MESSAGE: [u8; 41] = b"M3 foundation endpoint generations: PASS\n";
+static FIFO_MESSAGE: [u8; 40] = b"M3 foundation bounded FIFO/cancel: PASS\n";
+static WAITER_MESSAGE: [u8; 42] = b"M3 foundation waiter-record cleanup: PASS\n";
+static TRANSFER_MESSAGE: [u8; 41] = b"M3 foundation attenuating transfer: PASS\n";
+static SHARED_MESSAGE: [u8; 35] = b"M3 foundation shared mapping: PASS\n";
+static DEAD_SENDER_MESSAGE: [u8; 42] = b"M3 foundation dead-sender rejection: PASS\n";
+static RECLAIM_MESSAGE: [u8; 40] = b"M3 foundation resources reclaimed: PASS\n";
+static LIFECYCLE_MESSAGE: [u8; 30] = b"M3 foundation lifecycle: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 43] = b"M3 foundation post-lifecycle timer: online\n";
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_context_install(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_context_matches(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_restore_management_context() -> void;
+extern "sysv64" fn ocore_m2_cpu_one_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m2_cpu_two_entry(capability: u64) -> never;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn close_memory(owner: u64, capability: u64) -> bool {
+    return close_capability_for_owner(owner, capability) == MEMORY_OK;
+}
+
+unsafe fn exercise_endpoint(
+    sender_process: u64,
+    receiver_cspace: u64,
+    transferred_capability: u64
+) -> u64 {
+    let endpoint: u64 = create_endpoint(receiver_cspace);
+    if endpoint == 0 || !endpoint_is_live(endpoint) {
+        return 0;
+    }
+    if enqueue(endpoint, sender_process, 10, 0x10, transferred_capability) == 0
+        || enqueue(endpoint, sender_process, 11, 0x11, 0) == 0
+        || enqueue(endpoint, sender_process, 12, 0x12, 0) == 0
+        || enqueue(endpoint, sender_process, 13, 0x13, 0) == 0
+        || enqueue(endpoint, sender_process, 14, 0x14, 0) != 0
+        || message_count(endpoint) != 4
+        || validate_for_owner(
+            receiver_cspace,
+            transferred_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0
+        || close_memory(receiver_cspace, transferred_capability) != false
+        || cancel_by_correlation(endpoint, 11) != 1
+        || message_count(endpoint) != 3 {
+        return 0;
+    }
+
+    let mut sender: u64 = 0;
+    let mut correlation: u64 = 0;
+    let mut payload: u64 = 0;
+    let mut capability: u64 = 0;
+    if dequeue(
+        endpoint,
+        (&mut sender),
+        (&mut correlation),
+        (&mut payload),
+        (&mut capability)
+    ) == 0
+        || sender != sender_process
+        || correlation != 10
+        || payload != 0x10
+        || capability != transferred_capability
+        || validate_for_owner(
+            receiver_cspace,
+            capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) == 0 {
+        return 0;
+    }
+    if dequeue(
+        endpoint,
+        (&mut sender),
+        (&mut correlation),
+        (&mut payload),
+        (&mut capability)
+    ) == 0 || correlation != 12 || payload != 0x12 || capability != 0 {
+        return 0;
+    }
+    if dequeue(
+        endpoint,
+        (&mut sender),
+        (&mut correlation),
+        (&mut payload),
+        (&mut capability)
+    ) == 0 || correlation != 13 || payload != 0x13 || capability != 0 {
+        return 0;
+    }
+    write((&FIFO_MESSAGE[0]), 40);
+
+    if register_receiver_waiter(endpoint, THREAD_ZERO) == 0
+        || crash_endpoint(endpoint) == 0 {
+        return 0;
+    }
+    let mut kind: u64 = 0;
+    if take_cancelled_waiter(endpoint, (&mut kind)) != THREAD_ZERO
+        || kind != ENDPOINT_WAITER_RECEIVER
+        || release_endpoint(endpoint) == 0 {
+        return 0;
+    }
+
+    let sender_endpoint: u64 = create_endpoint(receiver_cspace);
+    if sender_endpoint == 0
+        || enqueue(sender_endpoint, sender_process, 30, 0x30, 0) == 0
+        || enqueue(sender_endpoint, sender_process, 31, 0x31, 0) == 0
+        || enqueue(sender_endpoint, sender_process, 32, 0x32, 0) == 0
+        || enqueue(sender_endpoint, sender_process, 33, 0x33, 0) == 0
+        || register_sender_waiter(sender_endpoint, THREAD_ONE) == 0
+        || register_sender_waiter(sender_endpoint, THREAD_TWO) == 0
+        || crash_endpoint(sender_endpoint) == 0
+        || take_cancelled_waiter(sender_endpoint, (&mut kind)) != THREAD_ONE
+        || kind != ENDPOINT_WAITER_SENDER
+        || take_cancelled_waiter(sender_endpoint, (&mut kind)) != THREAD_TWO
+        || kind != ENDPOINT_WAITER_SENDER
+        || release_endpoint(sender_endpoint) == 0 {
+        return 0;
+    }
+    write((&WAITER_MESSAGE[0]), 42);
+
+    let replacement: u64 = create_endpoint(receiver_cspace);
+    if replacement == 0
+        || replacement == endpoint
+        || endpoint_is_live(endpoint)
+        || !endpoint_is_live(replacement)
+        || close_endpoint(replacement) == 0
+        || release_endpoint(replacement) == 0
+        || !endpoint_invariants_hold() {
+        return 0;
+    }
+    write((&ENDPOINT_MESSAGE[0]), 41);
+    return 1;
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    if mode != MODE_FOUNDATION
+        || native_domain == 0
+        || !management_context()
+        || !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold() {
+        fail_closed();
+    }
+    let baseline_free: usize = free_frames();
+    let foreign_domain: u64 = create_domain(
+        1,
+        3,
+        PERSONALITY_NATIVE,
+        NATIVE_ABI_V1
+    );
+    let cspace_one: u64 = cspace_handle_for_slot(0);
+    let cspace_two: u64 = cspace_handle_for_slot(1);
+    if foreign_domain == 0
+        || cspace_one == 0
+        || cspace_two == 0
+        || set_quota_for_owner(cspace_one, QUOTA) == 0
+        || set_quota_for_owner(cspace_two, QUOTA) == 0 {
+        fail_closed();
+    }
+
+    let address_space_one: u64 = create_native_for_owner(cspace_one);
+    let address_space_two: u64 = create_native_for_owner(cspace_two);
+    if address_space_one == 0
+        || address_space_two == 0
+        || address_space_one == address_space_two {
+        fail_closed();
+    }
+    let process_one: u64 = install_process_for_owner(
+        0,
+        1,
+        native_domain,
+        address_space_one,
+        cspace_one,
+        ocore_process_kernel_stack_top(0),
+        ocore_m2_cpu_one_entry as usize,
+        native_stack_top_for(0)
+    );
+    let process_two: u64 = install_process_for_owner(
+        1,
+        2,
+        foreign_domain,
+        address_space_two,
+        cspace_two,
+        ocore_process_kernel_stack_top(1),
+        ocore_m2_cpu_two_entry as usize,
+        native_stack_top_for(0)
+    );
+    if process_one == 0 || process_two == 0 {
+        fail_closed();
+    }
+
+    let mut source_capability: u64 = 0;
+    if allocate_capability_for_owner(
+        cspace_one,
+        MEMORY_SHARED,
+        (&mut source_capability)
+    ) != MEMORY_OK {
+        fail_closed();
+    }
+    let shared_object_handle: u64 = object_for_capability_owner(
+        cspace_one,
+        source_capability
+    );
+    if shared_object_handle == 0
+        || object_kind(shared_object_handle) != MEMORY_SHARED
+        || rights_for_owner(cspace_one, source_capability)
+            != (RIGHT_MEMORY_USE | RIGHT_TRANSFER)
+        || map_shared(
+            address_space_one,
+            cspace_one,
+            shared_object_handle
+        ) != 0
+        || map_shared(
+            address_space_two,
+            cspace_one,
+            source_capability
+        ) != 0 {
+        fail_closed();
+    }
+    let mapping_one: u64 = map_shared(
+        address_space_one,
+        cspace_one,
+        source_capability
+    );
+    let mut mapping_authority: u64 = 0;
+    if mapping_one == 0
+        || copy_atomic(
+            cspace_one,
+            cspace_two,
+            source_capability,
+            RIGHT_MEMORY_USE,
+            process_one,
+            (&mut mapping_authority)
+        ) == 0
+        || mapping_authority == 0
+        || rights_for_owner(cspace_two, mapping_authority)
+            != RIGHT_MEMORY_USE
+        || validate_for_owner(
+            cspace_two,
+            mapping_authority,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != shared_object_handle {
+        fail_closed();
+    }
+    let mut forbidden_retransfer: u64 = 0;
+    if copy_atomic(
+        cspace_two,
+        cspace_one,
+        mapping_authority,
+        RIGHT_MEMORY_USE,
+        process_two,
+        (&mut forbidden_retransfer)
+    ) != 0 || forbidden_retransfer != 0 {
+        fail_closed();
+    }
+    let mapping_two: u64 = map_shared(
+        address_space_two,
+        cspace_two,
+        mapping_authority
+    );
+    if mapping_two == 0
+        || close_memory(cspace_two, mapping_authority) == false
+        || validate_for_owner(
+            cspace_two,
+            mapping_authority,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0
+        || mapping_one == 0
+        || shared_mapping(address_space_one) != mapping_one
+        || shared_mapping(address_space_two) != mapping_two
+        || shared_object(address_space_one) != shared_object_handle
+        || shared_object(address_space_two) != shared_object_handle
+        || shared_physical(address_space_one) == 0
+        || shared_physical(address_space_one) != shared_physical(address_space_two)
+        || !dynamic_protections_hold(address_space_one)
+        || !dynamic_protections_hold(address_space_two) {
+        fail_closed();
+    }
+
+    let root_one: usize = root_cr3(address_space_one);
+    let root_two: usize = root_cr3(address_space_two);
+    let stack_one: usize = ocore_process_kernel_stack_top(0);
+    let stack_two: usize = ocore_process_kernel_stack_top(1);
+    let shared_address: usize = shared_virtual();
+    disable_interrupts();
+    if ocore_context_install(root_one, stack_one) == 0
+        || ocore_context_matches(root_one, stack_one) == 0 {
+        fail_closed();
+    }
+    volatile_store(shared_address as *mut u64, SHARED_NONCE);
+    ocore_restore_management_context();
+    if !management_context()
+        || ocore_context_install(root_two, stack_two) == 0
+        || ocore_context_matches(root_two, stack_two) == 0
+        || volatile_load(shared_address as *const u64) != SHARED_NONCE {
+        fail_closed();
+    }
+    ocore_restore_management_context();
+    if !management_context() {
+        fail_closed();
+    }
+    write((&SHARED_MESSAGE[0]), 35);
+
+    let mut denied_capability: u64 = 0;
+    if copy_atomic(
+        cspace_one,
+        cspace_two,
+        source_capability,
+        RIGHT_MEMORY_USE | 0x100,
+        process_one,
+        (&mut denied_capability)
+    ) != 0 || denied_capability != 0 {
+        fail_closed();
+    }
+    let ticket: u64 = prepare_copy(
+        cspace_one,
+        cspace_two,
+        source_capability,
+        RIGHT_MEMORY_USE,
+        process_one
+    );
+    let mut stale_result: u64 = 0;
+    if ticket == 0
+        || abort_copy(ticket) == 0
+        || commit_copy(ticket, (&mut stale_result)) != 0
+        || stale_result != 0 {
+        fail_closed();
+    }
+
+    let mut destination_capability: u64 = 0;
+    if copy_atomic(
+        cspace_one,
+        cspace_two,
+        source_capability,
+        RIGHT_MEMORY_USE,
+        process_one,
+        (&mut destination_capability)
+    ) == 0
+        || destination_capability == 0
+        || rights_for_owner(cspace_two, destination_capability)
+            != RIGHT_MEMORY_USE
+        || validate_for_owner(
+            cspace_two,
+            destination_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != shared_object_handle
+        || exercise_endpoint(
+            process_one,
+            cspace_two,
+            destination_capability
+        ) == 0
+        || close_memory(cspace_two, destination_capability) == false {
+        fail_closed();
+    }
+
+    let mut replacement_capability: u64 = 0;
+    if copy_atomic(
+        cspace_one,
+        cspace_two,
+        source_capability,
+        RIGHT_MEMORY_USE,
+        process_one,
+        (&mut replacement_capability)
+    ) == 0
+        || replacement_capability == 0
+        || replacement_capability == destination_capability
+        || rights_for_owner(cspace_two, replacement_capability)
+            != RIGHT_MEMORY_USE
+        || validate_for_owner(
+            cspace_two,
+            destination_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0 {
+        fail_closed();
+    }
+    let endpoint_cleanup: u64 = create_endpoint(cspace_two);
+    if endpoint_cleanup == 0
+        || enqueue(
+            endpoint_cleanup,
+            process_one,
+            20,
+            0x20,
+            replacement_capability
+        ) == 0
+        || validate_for_owner(
+            cspace_two,
+            replacement_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0
+        || close_memory(cspace_two, replacement_capability) != false
+        || cancel_by_correlation(endpoint_cleanup, 20) != 1
+        || pending_capability_cleanup_count(endpoint_cleanup) != 1
+        || validate_for_owner(
+            cspace_two,
+            replacement_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0
+        || take_capability_cleanup(endpoint_cleanup) != replacement_capability
+        || pending_capability_cleanup_count(endpoint_cleanup) != 0
+        || validate_for_owner(
+            cspace_two,
+            replacement_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != shared_object_handle
+        || close_memory(cspace_two, replacement_capability) == false
+        || validate_for_owner(
+            cspace_two,
+            replacement_capability,
+            OBJECT_MEMORY,
+            RIGHT_MEMORY_USE
+        ) != 0
+        || close_endpoint(endpoint_cleanup) == 0
+        || release_endpoint(endpoint_cleanup) == 0
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold()
+        || !capability_invariants_hold()
+        || !memory_invariants_hold() {
+        fail_closed();
+    }
+    write((&TRANSFER_MESSAGE[0]), 41);
+
+    if unmap_shared(address_space_one, mapping_one) == 0
+        || unmap_shared(address_space_two, mapping_two) == 0 {
+        fail_closed();
+    }
+    let pending_ticket: u64 = prepare_copy(
+        cspace_one,
+        cspace_two,
+        source_capability,
+        RIGHT_MEMORY_USE,
+        process_one
+    );
+    let dead_sender_endpoint: u64 = create_endpoint(cspace_two);
+    if pending_ticket == 0
+        || dead_sender_endpoint == 0
+        || enqueue(
+            dead_sender_endpoint,
+            process_one,
+            90,
+            0x90,
+            0
+        ) == 0
+        || stop_process(process_one, 0x31) == 0 {
+        fail_closed();
+    }
+    let mut dead_transfer_result: u64 = 0;
+    let mut cancelled_ticket_result: u64 = 0;
+    if enqueue(
+        dead_sender_endpoint,
+        process_one,
+        91,
+        0x91,
+        0
+    ) != 0
+        || cancel_by_sender(dead_sender_endpoint, process_one) != 1
+        || message_count(dead_sender_endpoint) != 0
+        || cancel_transfer_owner(process_one) != 1
+        || commit_copy(
+            pending_ticket,
+            (&mut cancelled_ticket_result)
+        ) != 0
+        || cancelled_ticket_result != 0
+        || prepare_copy(
+            cspace_one,
+            cspace_two,
+            source_capability,
+            RIGHT_MEMORY_USE,
+            process_one
+        ) != 0
+        || copy_atomic(
+            cspace_one,
+            cspace_two,
+            source_capability,
+            RIGHT_MEMORY_USE,
+            process_one,
+            (&mut dead_transfer_result)
+        ) != 0
+        || dead_transfer_result != 0
+        || close_endpoint(dead_sender_endpoint) == 0
+        || release_endpoint(dead_sender_endpoint) == 0
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold() {
+        fail_closed();
+    }
+    write((&DEAD_SENDER_MESSAGE[0]), 42);
+
+    if close_memory(cspace_one, source_capability) == false
+        || object_kind(shared_object_handle) != 0
+        || stop_process(process_two, 0x32) == 0
+        || begin_reap(process_one) == 0
+        || begin_reap(process_two) == 0
+        || destroy_address_space(address_space_one) == 0
+        || destroy_address_space(address_space_two) == 0
+        || drain_cspace(cspace_one) == 0
+        || drain_cspace(cspace_two) == 0
+        || finalize_reap(process_one) == 0
+        || finalize_reap(process_two) == 0
+        || domain_child_refs(foreign_domain) != 0
+        || destroy_domain(foreign_domain) == 0
+        || free_frames() != baseline_free
+        || !page_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold()
+        || !capability_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECLAIM_MESSAGE[0]), 40);
+    write((&LIFECYCLE_MESSAGE[0]), 30);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 43);
+    loop {
+        halt();
+    }
+}

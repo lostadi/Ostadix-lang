@@ -1,0 +1,388 @@
+module kernel::m2;
+
+use runtime::address_space::create_native_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::native_stack_top_for;
+use runtime::address_space::root_cr3;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::create_domain;
+use runtime::domain::destroy_domain;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::native_abi::NATIVE_ABI_V1;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::mark_reapable;
+use runtime::process::process_state;
+use runtime::process::PROCESS_STATE_EXITED;
+use runtime::scheduler::arm as arm_scheduler;
+use runtime::scheduler::complete as scheduler_complete;
+use runtime::scheduler::context_switches;
+use runtime::scheduler::failed as scheduler_failed;
+use runtime::scheduler::forced_identity_stress;
+use runtime::scheduler::idle_ticks;
+use runtime::scheduler::hostile_frame_containments;
+use runtime::scheduler::hostile_syscall_switches;
+use runtime::scheduler::process_one_terminated;
+use runtime::serial::write;
+use runtime::interrupts::ticks;
+use runtime::thread::blocked_count;
+use runtime::thread::cancel as cancel_thread;
+use runtime::thread::init as threads_init;
+use runtime::thread::install as install_thread;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::reap as reap_thread;
+use runtime::thread::run_ticks;
+use runtime::thread::switch_count;
+use runtime::thread::wake_count;
+use runtime::thread::wake_reason;
+use runtime::thread::THREAD_ROLE_BLOCKING;
+use runtime::thread::THREAD_ROLE_CPU;
+use runtime::thread::WAKE_REASON_TIMER;
+
+const MODE_SCHEDULER: u64 = 12;
+const QUOTA: usize = 12;
+const FORCED_HALF_ITERATIONS: u64 = 500000;
+
+static FORCED_MESSAGE: [u8; 46] = b"M2 forced identity transactions: 1000000 PASS\n";
+static QUEUES_MESSAGE: [u8; 35] = b"M2 runnable/blocked queues: online\n";
+static IDLE_MESSAGE: [u8; 24] = b"M2 idle thread: entered\n";
+static PREEMPT_MESSAGE: [u8; 26] = b"M2 timer preemption: PASS\n";
+static WAKE_MESSAGE: [u8; 27] = b"M2 blocked wake-once: PASS\n";
+static ACCOUNTING_MESSAGE: [u8; 29] = b"M2 priority/accounting: PASS\n";
+static HOSTILE_RSP_MESSAGE: [u8; 30] = b"M2 hostile TCB RSP: contained\n";
+static EXIT_MESSAGE: [u8; 37] = b"M2 exit-during-preemption: contained\n";
+static SIBLING_MESSAGE: [u8; 28] = b"M2 sibling after exit: PASS\n";
+static STALE_MESSAGE: [u8; 32] = b"M2 thread stale handles: denied\n";
+static FRAMES_MESSAGE: [u8; 26] = b"M2 frames reclaimed: PASS\n";
+static LIFECYCLE_MESSAGE: [u8; 29] = b"M2 scheduler lifecycle: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 32] = b"M2 post-lifecycle timer: online\n";
+
+static mut DOMAIN_ONE: u64 = 0;
+static mut DOMAIN_TWO: u64 = 0;
+static mut ADDRESS_SPACE_ONE: u64 = 0;
+static mut ADDRESS_SPACE_TWO: u64 = 0;
+static mut PROCESS_ONE: u64 = 0;
+static mut PROCESS_TWO: u64 = 0;
+static mut CSPACE_ONE: u64 = 0;
+static mut CSPACE_TWO: u64 = 0;
+static mut PHYSICAL_ONE: usize = 0;
+static mut PHYSICAL_TWO: usize = 0;
+static mut THREADS: [u64; 4] = [0; 4];
+static mut STALE_THREAD: u64 = 0;
+static mut BASELINE_FREE: usize = 0;
+static mut FORCED_TRANSACTIONS: u64 = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_syscall_init() -> void;
+extern "sysv64" fn ocore_m2_cpu_one_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m2_block_one_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m2_cpu_two_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m2_block_two_entry(capability: u64) -> never;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn teardown_process(
+    process_handle: u64,
+    address_space: u64,
+    cspace: u64
+) -> u64 {
+    if mark_reapable(process_handle) == 0
+        || begin_reap(process_handle) == 0
+        || destroy_address_space(address_space) == 0
+        || drain_cspace(cspace) == 0
+        || finalize_reap(process_handle) == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// Timer assembly reaches this only after restoring the pinned management CR3,
+// TSS.RSP0, GS entry stack, and management stack.
+@export
+@no_mangle
+pub unsafe fn kernel_scheduler_complete_continue() -> never {
+    if !management_context()
+        || scheduler_failed()
+        || !scheduler_complete()
+        || !process_one_terminated()
+        || process_state(PROCESS_ONE) != PROCESS_STATE_EXITED
+        || process_state(PROCESS_TWO) != PROCESS_STATE_EXITED
+        || context_switches() < 8
+        || idle_ticks() == 0
+        || hostile_syscall_switches() != 1
+        || hostile_frame_containments() != 1
+        || blocked_count() != 0
+        || volatile_load(PHYSICAL_ONE as *const u64) == 0
+        || volatile_load((PHYSICAL_ONE + 8) as *const u64) == 0
+        || volatile_load(PHYSICAL_TWO as *const u64) == 0
+        || volatile_load((PHYSICAL_TWO + 8) as *const u64) == 0 {
+        fail_closed();
+    }
+
+    let mut index: usize = 0;
+    while index < 4 {
+        if run_ticks(THREADS[index]) == 0 || switch_count(THREADS[index]) == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if run_ticks(THREADS[1]) < 2
+        || run_ticks(THREADS[3]) < 2
+        || wake_count(THREADS[0]) != 0
+        || wake_count(THREADS[2]) != 0
+        || wake_count(THREADS[1]) != 1
+        || wake_count(THREADS[3]) != 1
+        || wake_reason(THREADS[1]) != WAKE_REASON_TIMER
+        || wake_reason(THREADS[3]) != WAKE_REASON_TIMER {
+        fail_closed();
+    }
+
+    write((&IDLE_MESSAGE[0]), 24);
+    write((&PREEMPT_MESSAGE[0]), 26);
+    write((&WAKE_MESSAGE[0]), 27);
+    write((&ACCOUNTING_MESSAGE[0]), 29);
+    write((&HOSTILE_RSP_MESSAGE[0]), 30);
+    write((&EXIT_MESSAGE[0]), 37);
+    write((&SIBLING_MESSAGE[0]), 28);
+
+    index = 0;
+    while index < 4 {
+        if reap_thread(THREADS[index]) == 0 || thread_is_live(THREADS[index]) {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if thread_is_live(STALE_THREAD) {
+        fail_closed();
+    }
+    write((&STALE_MESSAGE[0]), 32);
+
+    if teardown_process(PROCESS_ONE, ADDRESS_SPACE_ONE, CSPACE_ONE) == 0
+        || teardown_process(PROCESS_TWO, ADDRESS_SPACE_TWO, CSPACE_TWO) == 0
+        || domain_child_refs(DOMAIN_ONE) != 0
+        || domain_child_refs(DOMAIN_TWO) != 0
+        || destroy_domain(DOMAIN_TWO) == 0
+        || free_frames() != BASELINE_FREE
+        || !page_invariants_hold()
+        || !mapping_invariants_hold()
+        || !memory_invariants_hold() {
+        fail_closed();
+    }
+    write((&FRAMES_MESSAGE[0]), 26);
+    write((&LIFECYCLE_MESSAGE[0]), 29);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 32);
+    loop {
+        halt();
+    }
+}
+
+pub unsafe fn start(mode: u64, domain_handle: u64) -> never {
+    if mode != MODE_SCHEDULER
+        || !management_context()
+        || domain_handle == 0
+        || threads_init() == 0
+        || threads_init() != 0 {
+        fail_closed();
+    }
+    DOMAIN_ONE = domain_handle;
+    DOMAIN_TWO = create_domain(1, 2, PERSONALITY_NATIVE, NATIVE_ABI_V1);
+    if DOMAIN_TWO == 0 || DOMAIN_TWO == DOMAIN_ONE {
+        fail_closed();
+    }
+    BASELINE_FREE = free_frames();
+    CSPACE_ONE = cspace_handle_for_slot(0);
+    CSPACE_TWO = cspace_handle_for_slot(1);
+    if CSPACE_ONE == 0
+        || CSPACE_TWO == 0
+        || set_quota_for_owner(CSPACE_ONE, QUOTA) == 0
+        || set_quota_for_owner(CSPACE_TWO, QUOTA) == 0 {
+        fail_closed();
+    }
+
+    ADDRESS_SPACE_ONE = create_native_for_owner(CSPACE_ONE);
+    ADDRESS_SPACE_TWO = create_native_for_owner(CSPACE_TWO);
+    PHYSICAL_ONE = isolation_physical(ADDRESS_SPACE_ONE);
+    PHYSICAL_TWO = isolation_physical(ADDRESS_SPACE_TWO);
+    if ADDRESS_SPACE_ONE == 0
+        || ADDRESS_SPACE_TWO == 0
+        || ADDRESS_SPACE_ONE == ADDRESS_SPACE_TWO
+        || PHYSICAL_ONE == 0
+        || PHYSICAL_TWO == 0
+        || PHYSICAL_ONE == PHYSICAL_TWO {
+        fail_closed();
+    }
+
+    PROCESS_ONE = install_process_for_owner(
+        0,
+        1,
+        DOMAIN_ONE,
+        ADDRESS_SPACE_ONE,
+        CSPACE_ONE,
+        ocore_process_kernel_stack_top(0),
+        ocore_m2_cpu_one_entry as usize,
+        native_stack_top_for(0)
+    );
+    PROCESS_TWO = install_process_for_owner(
+        1,
+        2,
+        DOMAIN_TWO,
+        ADDRESS_SPACE_TWO,
+        CSPACE_TWO,
+        ocore_process_kernel_stack_top(2),
+        ocore_m2_cpu_two_entry as usize,
+        native_stack_top_for(0)
+    );
+    let report_one: u64 = install_capability_for_owner(
+        CSPACE_ONE,
+        1,
+        0x201,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    let report_two: u64 = install_capability_for_owner(
+        CSPACE_TWO,
+        1,
+        0x202,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    if PROCESS_ONE == 0 || PROCESS_TWO == 0 || report_one == 0 || report_two == 0 {
+        fail_closed();
+    }
+
+    THREADS[0] = install_thread(
+        0,
+        1,
+        PROCESS_ONE,
+        ocore_m2_cpu_one_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(0),
+        report_one,
+        THREAD_ROLE_CPU,
+        1
+    );
+    THREADS[1] = install_thread(
+        1,
+        2,
+        PROCESS_ONE,
+        ocore_m2_block_one_entry as usize,
+        1,
+        ocore_process_kernel_stack_top(1),
+        report_one,
+        THREAD_ROLE_BLOCKING,
+        2
+    );
+    THREADS[2] = install_thread(
+        2,
+        3,
+        PROCESS_TWO,
+        ocore_m2_cpu_two_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(2),
+        report_two,
+        THREAD_ROLE_CPU,
+        1
+    );
+
+    // Reuse slot 3 before the real blocking thread is published. Its old
+    // generation remains stale while the replacement is live.
+    STALE_THREAD = install_thread(
+        3,
+        99,
+        PROCESS_TWO,
+        ocore_m2_block_two_entry as usize,
+        1,
+        ocore_process_kernel_stack_top(3),
+        report_two,
+        THREAD_ROLE_BLOCKING,
+        2
+    );
+    if STALE_THREAD == 0
+        || cancel_thread(STALE_THREAD) == 0
+        || reap_thread(STALE_THREAD) == 0
+        || thread_is_live(STALE_THREAD) {
+        fail_closed();
+    }
+    THREADS[3] = install_thread(
+        3,
+        4,
+        PROCESS_TWO,
+        ocore_m2_block_two_entry as usize,
+        1,
+        ocore_process_kernel_stack_top(3),
+        report_two,
+        THREAD_ROLE_BLOCKING,
+        2
+    );
+    if THREADS[0] == 0
+        || THREADS[1] == 0
+        || THREADS[2] == 0
+        || THREADS[3] == 0
+        || THREADS[3] == STALE_THREAD
+        || thread_is_live(STALE_THREAD) {
+        fail_closed();
+    }
+
+    disable_interrupts();
+    FORCED_TRANSACTIONS = forced_identity_stress(
+        THREADS[0],
+        THREADS[1],
+        THREADS[2],
+        THREADS[3],
+        FORCED_HALF_ITERATIONS * 2
+    );
+    if FORCED_TRANSACTIONS != 1000000 || !management_context() {
+        fail_closed();
+    }
+    write((&FORCED_MESSAGE[0]), 46);
+
+    if arm_scheduler(
+        THREADS[0],
+        THREADS[1],
+        THREADS[2],
+        THREADS[3],
+        PROCESS_ONE,
+        PROCESS_TWO,
+        PHYSICAL_ONE,
+        PHYSICAL_TWO
+    ) == 0 {
+        fail_closed();
+    }
+    write((&QUEUES_MESSAGE[0]), 35);
+
+    // Enter the real ring-0 idle thread. The first timer IRQ selects a saved
+    // CPL3 thread frame, switches CR3/TSS/GS/PCB/CSpace, and IRETQs into it.
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}

@@ -1,7 +1,8 @@
 # O-Domain Engineering Plan
 
-Status: active roadmap. Milestones 0.1 and 0.2 are **complete** by their QEMU
-runtime acceptance gates.
+Status: active roadmap. Milestones 0.1 through 2 are **complete** at their
+documented, single-CPU x86-64 QEMU boundaries. A separately gated Milestone 3
+foundation exists, but the full Milestone 3 acceptance gate remains open.
 
 This document turns the poly-personality kernel brief into a dependency-ordered
 implementation plan for this repository. It is a claim boundary as well as a
@@ -62,6 +63,19 @@ The eventual execution modes are:
 3. **full kernel**: a subordinate kernel runs in a VM or equally strong
    isolation boundary.
 
+Each mode implements the same stateful, authority-aware personality operation
+where its advertised service contract overlaps:
+
+```text
+P_L(operation, arguments, state_L, delegated_capabilities)
+    -> (result, next_state_L, effects)
+```
+
+This common boundary does not flatten native semantics. Linux descriptors, NT
+handles, Lisp objects, and Darwin ports remain personality objects. OValues
+carry structural data, capabilities carry live authority, and native capsules
+preserve objects that cannot be normalized honestly.
+
 CPU architecture emulation is a separate concern. The first personality target
 is x86-64 on the existing `x86_64-unknown-none` compiler and kernel path.
 
@@ -119,15 +133,36 @@ region is registered. `debug_write` must recover at the exact copy-load fixup,
 return `ERR_USER_COPY_FAULT`, and reach a later CPL3 heartbeat without changing
 the PCB to `FAULTED`.
 
-Preparation interfaces are intentionally narrow. `process::activate_bootstrap`
-can succeed only once and cannot impersonate a context switch.
-`address_space::install_bootstrap` records the actual CR3 and fixed regions but
-does not expose create, map, unmap, or destroy. The scheduler module counts
-yield requests but has no runnable queue or switch operation. Capability copy
-and page allocation retain stable native ABI numbers but return
-`ERR_NOT_IMPLEMENTED`. `PERSONALITY_NATIVE` names the reusable implementation;
-`native[0]` remains the first domain instance. These boundaries prevent future
-milestone names from being mistaken for implemented mechanisms.
+Milestone 0.3 replaces the fixed-window bump pointer with a reclaiming frame
+registry over the already mapped supervisor-only 4..16 MiB QEMU bootstrap
+window. Frame and memory-object identities are generation-tagged. Frames carry
+an explicit kernel, page-table, executable, anonymous, or shared RAM type,
+reference count, and free-stack position. Device memory is a distinct rejected
+kind rather than RAM that can be allocated accidentally. Final release zeros a
+frame before reuse, advances its generation, and retires it rather than wrapping.
+
+`page_alloc` now validates a page-pool capability and requested memory kind,
+enforces a per-CSpace frame quota, and returns a freshly selected typed CSpace
+capability. The internal memory-object handle and physical frame address do not
+cross the ABI. Closing the final memory capability releases its object and
+frame. Kernel-side tests exhaust and reclaim all 3,072 managed frames, verify
+zeroing and refcounts, reject double and stale release, and roll back a
+post-free-stack-pop injected failure. CPL3 tests cover capability validation,
+quota denial and recovery, invalid device allocation, stale close, and complete
+lifecycle cleanup.
+
+At the Milestone 0.3 acceptance boundary, preparation interfaces were
+intentionally narrow. `process::activate_bootstrap` could succeed only once and
+could not impersonate a context switch. `address_space::install_bootstrap`
+recorded the actual CR3 and fixed regions but exposed no create, map, unmap, or
+destroy operation. The scheduler counted yield requests but had no runnable
+queue or switch operation. Capability copy retained its stable native ABI
+number but returned `ERR_NOT_IMPLEMENTED`. Memory-object capabilities were not
+mappings, and no public page-table editing or user virtual-address selection
+existed. Milestones 1 and 2 supersede those process and scheduler limits below;
+the general user mapping and capability-copy ABI limits remain. This historical
+boundary is retained so later milestone names are not projected backward into
+the earlier evidence.
 
 ## 3. Milestone 0.1: native[0] CPL3 and SYSCALL proof
 
@@ -269,35 +304,78 @@ only process. Sibling survival remains a Milestone 1 acceptance property.
 
 ### Milestone 0.3: reclaiming physical memory and memory objects
 
-Replace the bump-only allocator with tracked frames, reference counts, typed
-memory objects, deterministic zeroing, allocation quotas, and reclaim paths.
-Separate kernel, page-table, executable, anonymous, shared, and device memory.
+Status: **complete** for the fixed single-CPU QEMU bootstrap window.
+
+The allocator tracks frames, reference counts, types, deterministic zeroing,
+allocation quotas, generation retirement, and reclaim paths. Kernel,
+page-table, executable, anonymous, and shared RAM are distinct allocation types;
+device memory is explicitly rejected from the RAM pool. Memory-object handles
+are generation-tagged from their first public lifecycle API. No raw registry
+slot, physical address, or caller-selected object ID crosses the kernel ABI.
 
 Acceptance gate:
 
 - allocation/exhaustion/reclaim stress returns every non-pinned frame;
-- a reallocated frame contains no prior-process data;
+- a reallocated frame contains no data from its prior allocation or owner;
 - double free and stale memory handles fail closed; and
 - allocator invariants survive injected allocation failures.
 
+`ocore/kernel/smoke-qemu.sh` asserts each kernel and CPL3 acceptance marker in
+order and requires a later timer return and heartbeat. The Milestone 0.2 fault
+matrix remains a separate fresh-boot gate and still passes in full.
+
+This is not a general firmware-discovered physical-memory manager. The managed
+window is the fixed 4..16 MiB range already reserved and identity-mapped by the
+QEMU bootstrap. It contains no pinned frame, so the exhaustion test must return
+all 3,072 frames. Parsing arbitrary firmware maps, reserving modules, MMIO
+registration and concurrent allocator locking remain later work. Milestones 1
+and 2 subsequently replaced the bootstrap-only mapping/owner boundary with
+generation-tagged process, address-space, mapping, CSpace, and thread
+lifecycles. Those later results do not widen this fixed-window allocator claim.
+
 ### Milestone 1: process model, address spaces, and CSpaces
 
+Status: **complete** for two bounded native processes on one CPU.
+
 Give each process its own top-level page table, VM map, user stacks with guard
-pages, kernel entry stack, thread set, state machine, and CSpace. Make domain and
-process handles generation-tagged. Map kernel pages supervisor-only and apply
-W^X and NX at page granularity. Define create, start, stop, exit, reap, and
-domain teardown transactions.
+pages, kernel entry stack, thread set, state machine, and CSpace. Make domain,
+process, address-space, and mapping handles generation-tagged. This transition
+must precede public create/destroy/reuse APIs so raw-slot identity cannot spread
+through later interfaces. Map kernel pages supervisor-only and apply W^X and NX
+at page granularity. Define create, start, stop, exit, reap, and domain teardown
+transactions.
 
 Acceptance gate:
 
 - two native processes use the same virtual address for different physical
   pages and cannot observe or modify each other;
 - switching CR3 and the current PCB also switches the active CSpace;
-- stale process, domain, mapping, and capability handles are rejected; and
+- stale process, domain, address-space, mapping, and capability handles are
+  rejected; and
 - killing one process reclaims its private mappings, stacks, and capability
   references without harming its sibling.
 
+The implementation uses generation-tagged domain, process, address-space,
+mapping, and CSpace owner handles. Each dynamic process root maps shared RX
+user text, private RW/NX data and guarded stacks, and supervisor-only kernel
+pages. Process reap is split into ownership release, address-space destruction,
+type-aware CSpace drain, and final generation advance. Probe modes 10 and 11
+exercise normal exit and contained user fault respectively. Both reuse the
+same private virtual address for distinct physical pages, tear down process 1,
+reject its stale identities after same-slot reuse, and prove process 2 still
+runs before reclaiming every dynamic frame.
+
+`ocore/kernel/smoke-processes-qemu.sh` is the executable acceptance gate. It
+boots both scenarios independently, checks ordered lifecycle markers, rejects
+fault/leak output outside the selected scenario, requires sibling survival,
+and observes a post-lifecycle timer.
+
+This result does not provide demand paging, copy-on-write, ASLR, arbitrary user
+mapping selection, fork/exec/wait, signals, SMP, or a general process service.
+
 ### Milestone 2: threads and scheduler
+
+Status: **complete** for four TCBs, two processes, and one CPU.
 
 Add saved thread contexts, runnable and blocked queues, timer-driven preemption,
 cooperative yield, sleep/timers, wakeup reasons, priorities, accounting, and an
@@ -306,19 +384,74 @@ extension after locking and per-CPU entry state are proved.
 
 Acceptance gate:
 
-- at least two CPU-bound and two blocking threads make progress without manual
-  yields;
+- at least two CPU-bound and two blocking threads make timer-accounted progress
+  after bounded setup yields;
 - register, stack, address-space, domain, and CSpace identity survive at least
-  one million forced context switches;
+  one million forced identity transactions;
 - blocked threads consume no runnable slots and wake exactly once; and
 - process exit during preemption leaves no runnable use-after-free state.
 
+The scheduler now uses exact 22-word normalized register frames, FIFO runnable
+and blocked queues, a staged prepare/install/commit transaction, timer
+preemption, synchronous yield, sleep deadlines, wake reasons, bounded priority
+quanta, accounting, and a ring-0 idle path. Two CPU-bound and two sleeping CPL3
+threads run across two processes and two domains. The stress gate performs one
+million complete forced identity transactions. Every iteration verifies the
+saved register canary and guarded stack identities together with CR3, TSS.RSP0,
+GS entry stack, PCB, domain, address space, and CSpace. The IRQ and SYSCALL
+paths separately prove real save/restore and IRETQ switching. Timer-selected
+CPL3 frames are return-validated and have RFLAGS sanitized. The syscall-switch
+path applies the same rule to a different selected TCB; a CPL3 thread sets NT,
+is preempted, and is later selected by another thread's scheduling syscall
+before proving that the hostile flag was cleared. A separate CPL3 probe presents
+an unmapped saved RSP at yield; the scheduler retires only that TCB and continues
+with a sibling. Failed identity installation restores and verifies the
+management CR3/TSS/GS state and deschedules any published PCB before returning
+the prepared TCB to the FIFO. The million-iteration transaction stress does not
+enter CPL3; the IRQ/SYSCALL phase is the real frame-save and IRETQ evidence.
+
+`ocore/kernel/smoke-scheduler-qemu.sh` is the executable acceptance gate. It
+requires the million-switch proof, all four CPL3 progress markers, cooperative
+yield, cross-thread hostile-RFLAGS sanitization, exactly-once timer wakes,
+preemptive process exit, sibling progress, stale TCB rejection, frame
+reclamation, and a post-lifecycle timer.
+
+The scheduler remains a bounded single-CPU proof. It has four TCB slots, no
+SMP locking, no FPU/SIMD context, no load balancing, and no production fairness
+or denial-of-service claim.
+
 ### Milestone 3: IPC, shared memory, and capability transfer
+
+Status: **foundation implemented; full milestone not complete**.
+
+Probe mode 13 implements and gates the first dependency slice: eight
+generation-tagged endpoint objects with bounded FIFO queues and deterministic
+cancellation cleanup; invisible generation-tagged destination-slot
+reservations; generation-tagged memory-transfer tickets; attenuation-only
+cross-CSpace copies into a kernel-selected slot; exact-generation escrow for
+queued destination capabilities; and one optional RW/NX shared page mapped into
+each of two independent address spaces through its exact owner CSpace. The QEMU
+proof writes the page through one CR3, reads the nonce through the other,
+requires exact attenuation and denies re-transfer, aborts and rejects a stale
+transfer ticket, proves destination capability generation reuse, exercises
+endpoint backpressure/FIFO/correlation cancellation and waiter-record cleanup,
+rejects new work from a dead sender, explicitly cancels that sender's prior
+queue item and ticket from the management harness, and reclaims every resource.
+These waiter records exercise bounded registry
+bookkeeping, not live blocked TCBs.
+
+`ocore/kernel/smoke-ipc-foundation-qemu.sh` is deliberately named and worded as
+a foundation gate. It does not claim the acceptance gate below.
 
 Introduce endpoint objects, bounded message queues, request/reply correlation,
 blocking send/receive, cancellation, and shared-memory objects. Capability
 transfer must be an atomic kernel operation that attenuates rights and creates
 a new destination slot. A sender never writes a destination slot number.
+Endpoint handles are generation-tagged from their first reusable lifecycle.
+Request correlation and cancellation must be sufficient to implement the
+foreign-process protocol in
+[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md); that protocol is not
+claimed merely because general IPC exists.
 
 Acceptance gate:
 
@@ -328,6 +461,13 @@ Acceptance gate:
   kernel pointer;
 - sender death and receiver death have defined cleanup behavior; and
 - a personality-service crash affects only processes bound to that service.
+
+Before this milestone can be marked complete, endpoint operations must be
+exposed to CPL3, empty receive and full send must enter and leave real blocked
+TCB states, same-domain and cross-domain request/reply must run under
+preemption, sender/receiver death must be covered in every request state, and
+an exception-driven service crash must resume an unaffected process. The
+request-scoped foreign memory-view protocol remains a later, separate gate.
 
 ### Milestone 4: native loader, VFS objects, and service namespace
 
@@ -346,7 +486,41 @@ Acceptance gate:
 - service lookup returns a capability, not an ambient global pointer; and
 - namespace teardown releases mounts, services, and processes transactionally.
 
-### Milestone 5: personality-service supervision substrate
+### Milestone 5: native live system and package activation
+
+Build the unprivileged native control plane specified in
+[`LIVE_SYSTEM.md`](LIVE_SYSTEM.md). Load a native `init`, service supervisor,
+package daemon, and serial O control REPL through the Milestone 4 loader. Add a
+content-addressed read-only package store, versioned manifests, explicit
+capability requests, capability-returning service registration, health checks,
+and transactional activation and rollback.
+
+The first compiler-bootstrap stage is hosted: a pinned host `ocorec` builds
+packages and injects an immutable image with source, compiler, and payload
+digests. A later capability-bounded builder endpoint and an eventual compiler
+domain use the same build-request contract. The first usable live system must
+not wait for native self-hosting.
+
+Acceptance gate:
+
+- a fresh QEMU boot loads the live-system services as separate native ELF
+  processes rather than linking them into the kernel;
+- the serial REPL installs two host-built packages by digest and resolves one
+  healthy registered service to an attenuated capability;
+- an undeclared or excessive capability request is denied before process
+  publication;
+- an injected unhealthy upgrade rolls back the complete activation set and
+  leaves prior-generation clients either valid by policy or explicitly stale;
+- crashing and restarting one service does not stop an unrelated native
+  process; and
+- reboot reconstructs the active package roots from versioned metadata and
+  emits source, compiler, package, and activation digests.
+
+This milestone is a native O-core live-system proof. It does not establish a
+Linux ABI, a foreign root filesystem, native self-hosting, framebuffer support,
+or execution of arbitrary hosted O backends inside O-core.
+
+### Milestone 6: personality-service supervision substrate
 
 Move personality policy out of privileged code behind capability-bounded IPC
 before adding a foreign ABI. Define versioned service registration, startup,
@@ -355,6 +529,9 @@ The kernel router may use a direct personality-ID branch while indirect calls
 remain unsupported, but it must forward policy requests through an endpoint
 rather than executing compatibility policy in ring 0. A service receives only
 explicit memory, endpoint, filesystem, timer, network, and device capabilities.
+Pointer-bearing requests use only the bounded, request-scoped capabilities and
+lifecycle in [`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). A
+service never receives a raw pointer in a foreign address space.
 
 Acceptance gate:
 
@@ -362,14 +539,16 @@ Acceptance gate:
   pinned request/reply corpus;
 - stopping or crashing it cannot stop O-core or an unrelated native process;
 - in-flight requests receive one deterministic cancellation or failure result;
-- restart and capability rebind behavior is versioned and logged; and
+- restart and capability rebind behavior is versioned and logged;
 - revoking a delegated capability removes that authority without ambient
-  fallback.
+  fallback; and
+- crash, restart, cancellation, timeout, and stale-reply tests close every
+  temporary memory view and wake each dependent thread at most once.
 
 This substrate also supports later user-space-kernel components. It does not by
 itself establish any Linux ABI compatibility.
 
-### Milestone 6: minimal translated Linux x86-64 personality
+### Milestone 7: minimal translated Linux x86-64 personality
 
 Add a versioned Linux x86-64 personality service over the mechanisms above.
 Begin with static, single-threaded ELF64 programs. Implement only the syscall
@@ -380,6 +559,11 @@ then `clone`/`futex` for threads. Candidate calls include `read`, `write`,
 `openat`, `close`, `mmap`, `munmap`, `brk`, `exit`/`exit_group`,
 `clock_gettime`, `getpid`, `ioctl`, `rt_sigaction`, `rt_sigprocmask`, `clone`,
 and `futex`.
+
+The Linux service is activated as an immutable `personality/linux` package
+through Milestone 5, not compiled into privileged policy. Before the first
+pointer-bearing syscall is enabled, the complete acceptance gate in
+[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md) must pass.
 
 Acceptance gate:
 
@@ -394,13 +578,24 @@ Acceptance gate:
 This milestone is a minimal compatibility slice, not general Linux binary
 compatibility and not a Linux kernel.
 
-### Milestone 7: multiple root filesystems and Linux O-Domains
+### Milestone 8: multiple root filesystems and Linux O-Domains
 
 Define a reproducible rootfs image manifest with architecture, content digest,
 personality ABI version, mount policy, and required capabilities. Instantiate
 at least `linux[alpine]` and `linux[debian]` from separate read-only bases plus
 separate writable overlays. Both use the same Linux personality implementation
-and receive distinct process, service, mount, and capability namespaces.
+and receive distinct process, service, mount, and capability namespaces. The
+personality and root filesystems are separate package kinds. An illustrative
+control flow is:
+
+```text
+o> pkg.install("personality/linux")
+o> pkg.install("rootfs/alpine")
+o> world.create("alpine", personality="linux", rootfs="alpine")
+```
+
+These spellings become public API only when the live-system parser and runtime
+tests pin them.
 
 Acceptance gate:
 
@@ -411,7 +606,7 @@ Acceptance gate:
 - deleting one overlay cannot damage the other rootfs; and
 - image provenance and hashes are emitted with the runtime evidence.
 
-### Milestone 8: OValue, capability, and native-capsule crossings
+### Milestone 9: OValue, capability, and native-capsule crossings
 
 Provide three explicit cross-domain channels:
 
@@ -421,6 +616,12 @@ Provide three explicit cross-domain channels:
    sockets, devices, services, and processes; and
 3. **native capsules** for domain-affine objects whose semantics cannot be
    honestly normalized.
+
+The O-Domain coordinator projects these crossings into one typed computational
+graph. Structural values, live resources, actor state, effects, and completion
+remain distinct nodes. Personality operations are effectful hyperedges, not
+untyped RPC strings, and scheduling never treats a capability value as ordinary
+serializable data.
 
 Reuse the hosted OValue vocabulary where appropriate, but define a versioned,
 bounded kernel transport schema rather than deserializing arbitrary Rust
@@ -434,6 +635,9 @@ Acceptance gate:
 
 - a native domain and both Linux domains exchange a structural OValue without
   losing the tested type/identity properties;
+- one pinned graph routes a value through native and Linux operations, records
+  each personality state/effect transition, and fails downstream operations
+  deterministically when an upstream domain or capability is revoked;
 - a read-only file or shared-memory capability crosses with strictly
   attenuated rights;
 - replayed, forged, stale, cross-session, and metadata-escalated references are
@@ -441,36 +645,66 @@ Acceptance gate:
 - a capsule cannot be consumed outside its declared affinity; and
 - hostile depth/size/cycle inputs stay within configured CPU and memory bounds.
 
-### Milestone 9: full-kernel domain mode
+### Milestone 10: persistent Lisp personality
+
+After the minimal Linux proof establishes compatibility and the three crossing
+channels establish composition, implement Lisp as the preferred second foreign
+personality. The purpose is not to imitate POSIX. It is to preserve a Lisp
+world's native object and control model while making its boundaries explicit.
+
+Acceptance gate:
+
+- `lisp[research]` saves a versioned object image, stops, restores, and
+  preserves the pinned object identities and package state;
+- live compilation replaces one service generation and existing clients
+  observe the documented rebind behavior;
+- a pinned conditions-and-restarts corpus retains its control semantics;
+- the serial environment can inspect live objects without receiving ambient
+  kernel authority;
+- the Lisp domain consumes a structural OValue from a Linux domain and calls
+  one capability-bounded native O-core service; and
+- a Lisp image or service crash leaves the Linux and native domains running.
+
+This milestone is the preferred sequencing decision, not a claim that a Lisp
+personality exists now. NT and Darwin remain later ecosystem projects.
+
+### Milestone 11: full-kernel domain mode
 
 Add a subordinate-kernel backend using hardware virtualization when available
 and a clearly separated software fallback if one is ever implemented. The VM
-boundary owns guest physical memory, vCPUs, interrupt injection, and emulated or
-paravirtual devices. Crossings use the same OValue/capability/capsule contracts
-through a guest agent, never implicit host access.
+boundary owns guest physical memory, vCPUs, interrupt injection, and
+paravirtual devices. Direct device passthrough is forbidden in the initial
+mode. It may be introduced only after IOMMU-backed DMA isolation, reset,
+revocation, and hostile-device tests have their own acceptance evidence.
+Crossings use the same OValue/capability/capsule contracts through a guest
+agent, never implicit host access.
 
 Acceptance gate:
 
 - a pinned Linux kernel and rootfs boot as `linux.kernel[0]`;
 - translated and full-kernel Linux domains expose the same versioned external
   service contract where their supported features overlap;
-- guest compromise tests cannot access another domain or O-core memory; and
-- snapshot, stop, restart, resource quota, and device-revocation behavior are
-  reproducible.
+- guest compromise tests cannot access another domain or O-core memory;
+- snapshot, stop, restart, resource quota, and paravirtual-device revocation
+  behavior are reproducible; and
+- no acceptance result depends on direct hardware passthrough.
 
-Only after these gates should additional personalities such as OpenBSD, Lisp,
-NT, or Darwin be scheduled. Their native object models remain personality-
-specific and must not enlarge the privileged O-core mechanism set merely for
-convenience.
+Only after these gates should additional ecosystem-scale personalities such as
+OpenBSD, NT, or Darwin be scheduled. Their native object models remain
+personality-specific and must not enlarge the privileged O-core mechanism set
+merely for convenience.
 
 ## 5. Cross-cutting invariants
 
-These are the target invariants for the architecture. Milestone 0.2 enforces
+These are the target invariants for the architecture. Milestones 0.2 and 0.3 enforce
 kernel-owned routing, mapping-aware pointer checks, fault-aware bounded copies,
 typed capability lookup, user and kernel W^X, guarded stacks, normalized fault
-frames, and validated return state within its fixed single-process layout.
-Later milestone gates make independent address spaces, teardown, scheduling,
-IPC, and personality supervision executable rather than aspirational.
+frames, validated return state, generation-safe frame and memory-object reuse,
+zero-before-reuse, and per-CSpace allocation quotas within the fixed
+single-process layout. Milestones 1 and 2 make independent address spaces,
+teardown, and scheduling executable. The Milestone 3 foundation proves bounded
+endpoint, transfer-ticket, and shared-mapping primitives, but general IPC and
+personality supervision remain aspirational until their full gates pass.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are
    distinct types and cannot be substituted by integer coincidence.
@@ -502,31 +736,34 @@ IPC, and personality supervision executable rather than aspirational.
 
 | Risk | Engineering control |
 |---|---|
-| x86-64 entry/return bugs compromise ring separation | Small assembly surface, trap-frame tests, negative CPL3 faults, sanitized return state, per-CPU entry data before SMP |
+| x86-64 entry/return bugs compromise ring separation | Mechanism-only assembly, macro-generated trap stubs, trap-frame tests, negative CPL3 faults, sanitized return state, per-CPU entry data before SMP |
 | Linux ABI scope expands without a credible result | Pinned static corpus, syscall-by-syscall conformance oracle, explicit unsupported list |
 | Personality code bloats the trusted kernel | Capability-bounded user-space services after the first proof |
 | Capability confused-deputy or rights amplification | Typed objects, attenuation-only transfer, call provenance, no authority from metadata or names |
-| User-pointer races and fault recursion | Fault-aware copy/pin APIs, bounded copies, no raw personality dereference |
+| User-pointer races and fault recursion | Request-scoped memory views, fault-aware copy/pin APIs, bounded commits, no raw personality dereference |
 | Scheduler and teardown use-after-free | Explicit state machines, reference ownership, cancellation points, forced-switch stress |
 | Rootfs names are mistaken for compatibility proof | Content-addressed image manifests plus execution of pinned unmodified binaries |
+| Package metadata is mistaken for authority | Policy-resolved capability requests, immutable digests, transactional activation, no authority from names or manifests |
 | Native capsules become an untyped escape hatch | Origin affinity, explicit codec/safety/lifetime policy, conservative `never` rehydration |
-| Full-kernel mode bypasses the common security model | Guest-agent crossings, explicit virtual devices, quotas, no ambient host mounts or sockets |
+| Full-kernel mode bypasses the common security model | Guest-agent crossings, paravirtual devices first, quotas, no ambient host mounts or sockets, no passthrough before IOMMU evidence |
 | Demonstrations overstate implementation | Every claim tied to an executable gate, serial trace, corpus hash, and documented non-claims |
 
 ## 7. Concise feature matrix
 
-| Feature | Pre-0.1 baseline | Current Milestone 0.2 | First multi-rootfs demo | Long-term |
+| Feature | Pre-0.1 baseline | Current verified boundary | First multi-rootfs demo | Long-term |
 |---|---|---|---|---|
-| CPU/privilege | x86-64 ring-0 boot | one contained CPL3 native payload | isolated x86-64 processes | SMP and hardened entry |
-| Domains | none | one fixed `native[0]` registry entry | native, Alpine, Debian instances | persistent lifecycle and quotas |
-| Personalities | none | native-only dispatch | minimal translated Linux x86-64 | user-space and full-kernel backends |
-| Address spaces | one identity map | live CR3 descriptor, fixed RX/R/RW-NX regions | per-process page tables | demand paging and shared mappings |
-| Processes | none | one PCB, one-shot activation, `FAULTED` disposition | multiple isolated processes | complete process/thread lifecycle |
-| CSpaces | one small global table | one process-local typed CSpace | one CSpace per process | atomic cross-domain attenuation |
-| Scheduling | timer marker only | counted yield hook only; no switch | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | none | endpoints, shared memory, transfer | supervised personality RPC |
+| CPU/privilege | x86-64 ring-0 boot | one CPU, canonical CPL3 frames, timer/SYSCALL switching | isolated x86-64 processes | SMP and hardened entry |
+| Domains | none | two generation-tagged native instances in the M2 gate | native, Alpine, Debian instances | persistent lifecycle and quotas |
+| Personalities | none | native-only dispatch | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
+| Address spaces | one identity map | independent CR3s, private/guarded leaves, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
+| Processes | none | bounded two-process isolation, exit/fault teardown, stale reuse | multiple isolated processes | complete process/thread lifecycle |
+| CSpaces | one small global table | exact owners plus reserved slots and attenuated memory transfer tickets | one CSpace per process | general atomic cross-domain attenuation |
+| Memory | bump-only frames | typed reclaim plus private and one-page shared mappings | mapped per-process objects | discovered RAM, paging, NUMA policy |
+| Scheduling | timer marker only | four-TCB preemptive/blocking scheduler with yield/sleep | preemptive blocking scheduler | multicore policy and accounting |
+| IPC | none | bounded endpoint/transfer foundation; no CPL3 IPC ABI yet | endpoints, shared memory, transfer | supervised personality RPC |
 | Loading | kernel-linked code | linked user payload | native and static Linux ELF loaders | dynamic loaders per personality |
 | Filesystems | none | none | separate Alpine/Debian roots | versioned overlays and services |
+| Live system | none | none | package store, serial O REPL, activation/rollback | native builds and richer interactive environments |
 | Crossings | hosted OValue and broker only | none to booted kernel | OValue, capability, capsule channels | common contract across all modes |
 | Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
 

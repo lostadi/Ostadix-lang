@@ -1,20 +1,594 @@
 module runtime::scheduler;
 
-// This is only the accounting boundary for cooperative yield. It deliberately
-// has no runnable queue, saved context, or switch operation. A later scheduler
-// must own the full CR3/TSS/entry-stack/PCB transaction.
+use runtime::address_space::root_cr3;
+use runtime::process::current_address_space_handle;
+use runtime::process::current_cspace_handle;
+use runtime::process::current_domain_handle;
+use runtime::process::current_process_handle;
+use runtime::process::exit_current;
+use runtime::process::scheduler_deschedule_current;
+use runtime::process::scheduler_switch_to;
+use runtime::thread::account_current_tick;
+use runtime::thread::address_space_for_thread;
+use runtime::thread::blocked_count;
+use runtime::thread::abort_next;
+use runtime::thread::block_current;
+use runtime::thread::commit_next;
+use runtime::thread::cspace_for_thread;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::domain_for_thread;
+use runtime::thread::frame_pointer;
+use runtime::thread::identity_matches_process;
+use runtime::thread::kernel_stack_for;
+use runtime::thread::preempt_current;
+use runtime::thread::prepare_next;
+use runtime::thread::process_for;
+use runtime::thread::runnable_count;
+use runtime::thread::run_ticks;
+use runtime::thread::save_current;
+use runtime::thread::set_saved_result;
+use runtime::thread::terminate_current;
+use runtime::thread::terminate_process;
+use runtime::thread::wake_count;
+use runtime::thread::wake_due;
+use runtime::thread::WAKE_REASON_TIMER;
+use runtime::thread::wake_reason;
+use runtime::thread::queue_invariants_hold;
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
+
 static mut YIELD_REQUESTS: u64 = 0;
+static mut ACTIVE: u8 = 0;
+static mut COMPLETE: u8 = 0;
+static mut FAILED: u8 = 0;
+static mut THREADS: [u64; 4] = [0; 4];
+static mut PROCESS_ONE: u64 = 0;
+static mut PROCESS_TWO: u64 = 0;
+static mut PHYSICAL_ONE: usize = 0;
+static mut PHYSICAL_TWO: usize = 0;
+static mut PROCESS_ONE_TERMINATED: u8 = 0;
+static mut TERMINATION_TICK: u64 = 0;
+static mut PROCESS_TWO_SNAPSHOT: u64 = 0;
+static mut CONTEXT_SWITCHES: u64 = 0;
+static mut IDLE_TICKS: u64 = 0;
+static mut LAST_TICK: u64 = 0;
+static mut PENDING_ACTION: u8 = 0;
+static mut PENDING_SLEEP_DELTA: u64 = 0;
+static mut PENDING_RESULT: u64 = 0;
+static mut HOSTILE_SYSCALL_SWITCHES: u64 = 0;
+static mut HOSTILE_FRAME_CONTAINMENTS: u64 = 0;
+
+const FRAME_RFLAGS_WORD: usize = 19;
+const RFLAGS_NT: u64 = 0x4000;
+
+extern "sysv64" fn ocore_context_install(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_context_matches(root: usize, stack: usize) -> u64;
+extern "sysv64" fn ocore_restore_management_context() -> void;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_management_stack_top() -> usize;
 
 pub unsafe fn init() -> void {
     atomic_store((&mut YIELD_REQUESTS), 0, seq_cst);
+    ACTIVE = 0;
+    COMPLETE = 0;
+    FAILED = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        THREADS[index] = 0;
+        index += 1;
+    }
+    PROCESS_ONE = 0;
+    PROCESS_TWO = 0;
+    PHYSICAL_ONE = 0;
+    PHYSICAL_TWO = 0;
+    PROCESS_ONE_TERMINATED = 0;
+    TERMINATION_TICK = 0;
+    PROCESS_TWO_SNAPSHOT = 0;
+    CONTEXT_SWITCHES = 0;
+    IDLE_TICKS = 0;
+    LAST_TICK = 0;
+    PENDING_ACTION = 0;
+    PENDING_SLEEP_DELTA = 0;
+    PENDING_RESULT = 0;
+    HOSTILE_SYSCALL_SWITCHES = 0;
+    HOSTILE_FRAME_CONTAINMENTS = 0;
 }
 
 pub unsafe fn request_yield() -> u64 {
     atomic_fetch_add((&mut YIELD_REQUESTS), 1, seq_cst);
-    // There is no alternate runnable thread in the bootstrap.
+    if ACTIVE != 0 {
+        PENDING_ACTION = 1;
+        return SYSCALL_CONTROL_SCHEDULE;
+    }
     return 0;
+}
+
+pub unsafe fn request_sleep(delta: u64) -> u64 {
+    if ACTIVE == 0 {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    if delta == 0
+        || delta > 1000000
+        || current_thread_handle() == 0
+        || PENDING_ACTION != 0
+        || LAST_TICK > 0xffff_ffff_ffff_ffff - delta {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    PENDING_ACTION = 2;
+    PENDING_SLEEP_DELTA = delta;
+    return SYSCALL_CONTROL_SCHEDULE;
+}
+
+pub unsafe fn request_ipc_wait(resume_result: u64) -> u64 {
+    if ACTIVE == 0
+        || resume_result == 0
+        || current_thread_handle() == 0
+        || PENDING_ACTION != 0 {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    PENDING_ACTION = 3;
+    PENDING_RESULT = resume_result;
+    return SYSCALL_CONTROL_SCHEDULE;
+}
+
+unsafe fn clear_pending_action() -> void {
+    PENDING_ACTION = 0;
+    PENDING_SLEEP_DELTA = 0;
+    PENDING_RESULT = 0;
+}
+
+// A malformed user return frame is a fault in the current TCB, not scheduler
+// completion and not a kernel-wide failure. Retire exactly that generation,
+// deschedule its PCB identity, and continue directly with a runnable sibling.
+unsafe fn contain_invalid_current_frame(
+    source_thread: u64,
+    running_process: u64
+) -> usize {
+    clear_pending_action();
+    if source_thread == 0
+        || running_process == 0
+        || HOSTILE_FRAME_CONTAINMENTS == 0xffff_ffff_ffff_ffff
+        || terminate_current() != source_thread
+        || scheduler_deschedule_current() != running_process
+        || !queue_invariants_hold() {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+    HOSTILE_FRAME_CONTAINMENTS += 1;
+    let next_frame: usize = dispatch_next();
+    if next_frame == 0 {
+        FAILED = 1;
+        ACTIVE = 0;
+    }
+    return next_frame;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_scheduler_syscall(frame: *mut u64) -> usize {
+    if ACTIVE == 0
+        || frame as usize == 0
+        || PENDING_ACTION == 0
+        || !queue_invariants_hold()
+        || current_thread_handle() == 0 {
+        return 0;
+    }
+    let source_thread: u64 = current_thread_handle();
+    let running_process: u64 = current_process_handle();
+    if save_current(frame as *const u64) == 0 {
+        return contain_invalid_current_frame(source_thread, running_process);
+    }
+    let mut transitioned: u64 = 0;
+    if PENDING_ACTION == 1 {
+        transitioned = preempt_current();
+    }
+    if PENDING_ACTION == 2 {
+        transitioned = block_current(LAST_TICK + PENDING_SLEEP_DELTA);
+    }
+    if PENDING_ACTION == 3 {
+        if set_saved_result(current_thread_handle(), PENDING_RESULT) != 0 {
+            transitioned = block_current(0xffff_ffff_ffff_ffff);
+        }
+    }
+    clear_pending_action();
+    if transitioned == 0
+        || scheduler_deschedule_current() != running_process
+        || !queue_invariants_hold() {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+    let next_frame: usize = dispatch_next();
+    if next_frame != 0
+        && current_thread_handle() != source_thread
+        && (volatile_load(
+            (next_frame as *const u64) + FRAME_RFLAGS_WORD
+        ) & RFLAGS_NT) != 0 {
+        HOSTILE_SYSCALL_SWITCHES += 1;
+    }
+    return next_frame;
 }
 
 pub unsafe fn yield_requests() -> u64 {
     return atomic_load((&YIELD_REQUESTS), acquire);
+}
+
+pub unsafe fn arm(
+    thread_zero: u64,
+    thread_one: u64,
+    thread_two: u64,
+    thread_three: u64,
+    process_one: u64,
+    process_two: u64,
+    physical_one: usize,
+    physical_two: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE != 0
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || physical_one == 0
+        || physical_two == 0
+        || process_one == 0
+        || process_two == 0
+        || process_one == process_two
+        || runnable_count() != 4
+        || blocked_count() != 0
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    THREADS[0] = thread_zero;
+    THREADS[1] = thread_one;
+    THREADS[2] = thread_two;
+    THREADS[3] = thread_three;
+    let mut index: usize = 0;
+    while index < 4 {
+        if THREADS[index] == 0 || !identity_matches_process(THREADS[index]) {
+            return 0;
+        }
+        index += 1;
+    }
+    PROCESS_ONE = process_one;
+    PROCESS_TWO = process_two;
+    PHYSICAL_ONE = physical_one;
+    PHYSICAL_TWO = physical_two;
+    ACTIVE = 1;
+    return 1;
+}
+
+unsafe fn progress_at(physical: usize) -> u64 {
+    return volatile_load(physical as *const u64)
+        + volatile_load((physical + 8) as *const u64);
+}
+
+unsafe fn all_threads_ran() -> bool {
+    let mut index: usize = 0;
+    while index < 4 {
+        if run_ticks(THREADS[index]) == 0 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn wake_invariants_hold() -> bool {
+    return wake_count(THREADS[0]) == 0
+        && wake_count(THREADS[2]) == 0
+        && wake_count(THREADS[1]) == 1
+        && wake_count(THREADS[3]) == 1
+        && wake_reason(THREADS[1]) == WAKE_REASON_TIMER
+        && wake_reason(THREADS[3]) == WAKE_REASON_TIMER;
+}
+
+// Undo every architectural and PCB publication made while installing a
+// prepared TCB. The prepared thread itself remains DISPATCHING so the caller
+// can restore it to the runnable FIFO only after this rollback is verified.
+unsafe fn rollback_thread_context(expected_process: u64) -> bool {
+    ocore_restore_management_context();
+    let published_process: u64 = current_process_handle();
+    if published_process != 0 {
+        if expected_process == 0
+            || published_process != expected_process
+            || scheduler_deschedule_current() != expected_process {
+            return false;
+        }
+    }
+    return current_process_handle() == 0
+        && ocore_context_matches(
+            ocore_management_cr3(),
+            ocore_management_stack_top()
+        ) != 0;
+}
+
+unsafe fn install_failed(expected_process: u64) -> usize {
+    if !rollback_thread_context(expected_process) {
+        FAILED = 1;
+        ACTIVE = 0;
+    }
+    return 0;
+}
+
+unsafe fn install_thread_context(thread_handle: u64) -> usize {
+    let process_handle: u64 = process_for(thread_handle);
+    let address_space: u64 = address_space_for_thread(thread_handle);
+    let root: usize = root_cr3(address_space);
+    let kernel_stack: usize = kernel_stack_for(thread_handle);
+    if process_handle == 0
+        || root == 0
+        || kernel_stack == 0 {
+        return install_failed(process_handle);
+    }
+    if ocore_context_install(root, kernel_stack) == 0
+        || scheduler_switch_to(process_handle) == 0
+        || ocore_context_matches(root, kernel_stack) == 0
+        || current_process_handle() != process_handle
+        || current_domain_handle() != domain_for_thread(thread_handle)
+        || current_address_space_handle() != address_space
+        || current_cspace_handle() != cspace_for_thread(thread_handle) {
+        return install_failed(process_handle);
+    }
+    let frame: usize = frame_pointer(thread_handle);
+    if frame == 0 {
+        return install_failed(process_handle);
+    }
+    // commit_next is the last fallible publication. It either succeeds with
+    // the exact TCB running or restores the DISPATCHING tombstone internally.
+    if commit_next(thread_handle) == 0 {
+        return install_failed(process_handle);
+    }
+    CONTEXT_SWITCHES += 1;
+    return frame;
+}
+
+unsafe fn dispatch_next() -> usize {
+    let next_thread: u64 = prepare_next();
+    if next_thread == 0 {
+        return 0;
+    }
+    let frame: usize = install_thread_context(next_thread);
+    if frame == 0 {
+        if FAILED == 0 && abort_next(next_thread) == 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+        }
+        return 0;
+    }
+    return frame;
+}
+
+// Exercise the complete single-CPU scheduler identity transaction without
+// entering userspace. Interrupts must remain masked around this proof: the
+// architectural CR3/TSS/GS state is installed first, then the matching PCB
+// publishes its domain, address space, and CSpace. Each thread's saved r15
+// word carries a changing canary so the generation-owned register frame and
+// guarded user/kernel stack identities are checked on every switch as well.
+// The real IRQ/SYSCALL paths below separately prove save/IRET execution.
+pub unsafe fn forced_identity_stress(
+    thread_zero: u64,
+    thread_one: u64,
+    thread_two: u64,
+    thread_three: u64,
+    iterations: u64
+) -> u64 {
+    if ACTIVE != 0
+        || iterations == 0
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || !queue_invariants_hold() {
+        return 0;
+    }
+
+    let mut completed: u64 = 0;
+    while completed < iterations {
+        let lane: u64 = completed % 4;
+        let mut thread_handle: u64 = thread_zero;
+        if lane == 1 {
+            thread_handle = thread_one;
+        }
+        if lane == 2 {
+            thread_handle = thread_two;
+        }
+        if lane == 3 {
+            thread_handle = thread_three;
+        }
+        let process_handle: u64 = process_for(thread_handle);
+        let address_space: u64 = address_space_for_thread(thread_handle);
+        let root: usize = root_cr3(address_space);
+        let kernel_stack: usize = kernel_stack_for(thread_handle);
+        let frame: *mut u64 = frame_pointer(thread_handle) as *mut u64;
+        let mut expected: u64 = 0;
+        if completed >= 4 {
+            expected = completed - 3;
+        }
+        let replacement: u64 = completed + 1;
+        if process_handle == 0
+            || root == 0
+            || kernel_stack == 0
+            || frame as usize == 0
+            || volatile_load(frame as *const u64) != expected {
+            ocore_restore_management_context();
+            return 0;
+        }
+        volatile_store(frame, replacement);
+        if ocore_context_install(root, kernel_stack) == 0
+            || scheduler_switch_to(process_handle) == 0
+            || ocore_context_matches(root, kernel_stack) == 0
+            || current_process_handle() != process_handle
+            || current_domain_handle() != domain_for_thread(thread_handle)
+            || current_address_space_handle() != address_space
+            || current_cspace_handle() != cspace_for_thread(thread_handle)
+            || !identity_matches_process(thread_handle)
+            || frame_pointer(thread_handle) as *mut u64 != frame
+            || volatile_load(frame as *const u64) != replacement
+            || scheduler_deschedule_current() != process_handle
+            || current_process_handle() != 0
+            || !queue_invariants_hold() {
+            ocore_restore_management_context();
+            return 0;
+        }
+        completed += 1;
+    }
+
+    let mut lane: usize = 0;
+    while lane < 4 {
+        let mut thread_handle: u64 = thread_zero;
+        if lane == 1 {
+            thread_handle = thread_one;
+        }
+        if lane == 2 {
+            thread_handle = thread_two;
+        }
+        if lane == 3 {
+            thread_handle = thread_three;
+        }
+        let frame: *mut u64 = frame_pointer(thread_handle) as *mut u64;
+        if frame as usize == 0 {
+            ocore_restore_management_context();
+            return 0;
+        }
+        // Restore the initial r15 value before the first real IRETQ.
+        volatile_store(frame, 0);
+        lane += 1;
+    }
+    ocore_restore_management_context();
+    if current_process_handle() != 0 || !queue_invariants_hold() {
+        return 0;
+    }
+    return completed;
+}
+
+// Called from the assembly timer gate with kernel GS active and interrupts
+// masked. A nonzero return is an exact normalized frame for IRETQ. Zero asks
+// assembly to abandon the current frame and enter the management continuation.
+pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
+    LAST_TICK = now;
+    if ACTIVE == 0 {
+        return frame as usize;
+    }
+    let woke: u64 = wake_due(now);
+    if woke == 0xffff_ffff_ffff_ffff {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+
+    let current_thread: u64 = current_thread_handle();
+    if current_thread == 0 {
+        if from_user || current_process_handle() != 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        IDLE_TICKS += 1;
+    } else {
+        if !from_user || !identity_matches_process(current_thread) {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        let running_process: u64 = process_for(current_thread);
+        if save_current(frame as *const u64) == 0 {
+            return contain_invalid_current_frame(
+                current_thread,
+                running_process
+            );
+        }
+        let quantum_expired: u64 = account_current_tick(false);
+        if quantum_expired == 0 {
+            return frame_pointer(current_thread);
+        }
+
+        if PROCESS_ONE_TERMINATED != 0
+            && running_process == PROCESS_TWO
+            && now >= TERMINATION_TICK + 8
+            && progress_at(PHYSICAL_TWO) > PROCESS_TWO_SNAPSHOT {
+            if exit_current(0x22) == 0
+                || terminate_process(PROCESS_TWO) != 2 {
+                FAILED = 1;
+            } else {
+                COMPLETE = 1;
+            }
+            ACTIVE = 0;
+            return 0;
+        }
+
+        // Once every CPU-bound and initially blocked thread has executed,
+        // terminate process 1 from its timer-preemption boundary. Its sibling
+        // remains the only source of runnable threads.
+        if PROCESS_ONE_TERMINATED == 0
+            && running_process == PROCESS_ONE
+            && now >= 12
+            && HOSTILE_FRAME_CONTAINMENTS == 1
+            && all_threads_ran()
+            && volatile_load(PHYSICAL_ONE as *const u64) != 0
+            && volatile_load((PHYSICAL_ONE + 8) as *const u64) != 0
+            && volatile_load(PHYSICAL_TWO as *const u64) != 0
+            && volatile_load((PHYSICAL_TWO + 8) as *const u64) != 0 {
+            if !wake_invariants_hold()
+                || exit_current(0x21) == 0
+                || terminate_process(PROCESS_ONE) != 1 {
+                FAILED = 1;
+                ACTIVE = 0;
+                return 0;
+            }
+            PROCESS_ONE_TERMINATED = 1;
+            TERMINATION_TICK = now;
+            PROCESS_TWO_SNAPSHOT = progress_at(PHYSICAL_TWO);
+        } else {
+            if preempt_current() == 0
+                || scheduler_deschedule_current() != running_process {
+                FAILED = 1;
+                ACTIVE = 0;
+                return 0;
+            }
+        }
+    }
+
+    let next_frame: usize = dispatch_next();
+    if next_frame == 0 {
+        // A genuine no-runnable interval remains in the kernel idle thread.
+        // The bounded M2 proof begins with two runnable CPU threads, so a user
+        // preemption may never empty the queue.
+        if from_user {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        return frame as usize;
+    }
+    return next_frame;
+}
+
+pub unsafe fn complete() -> bool {
+    return COMPLETE != 0 && FAILED == 0 && ACTIVE == 0;
+}
+
+pub unsafe fn failed() -> bool {
+    return FAILED != 0;
+}
+
+pub unsafe fn process_one_terminated() -> bool {
+    return PROCESS_ONE_TERMINATED != 0;
+}
+
+pub unsafe fn context_switches() -> u64 {
+    return CONTEXT_SWITCHES;
+}
+
+pub unsafe fn idle_ticks() -> u64 {
+    return IDLE_TICKS;
+}
+
+pub unsafe fn last_tick() -> u64 {
+    return LAST_TICK;
+}
+
+pub unsafe fn hostile_syscall_switches() -> u64 {
+    return HOSTILE_SYSCALL_SWITCHES;
+}
+
+pub unsafe fn hostile_frame_containments() -> u64 {
+    return HOSTILE_FRAME_CONTAINMENTS;
 }

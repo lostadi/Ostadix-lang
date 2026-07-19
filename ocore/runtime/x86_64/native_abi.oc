@@ -10,6 +10,13 @@ pub const SYS_CAP_COPY: u64 = 2;
 pub const SYS_PAGE_ALLOC: u64 = 3;
 pub const SYS_YIELD: u64 = 4;
 pub const SYS_TICKS: u64 = 5;
+pub const SYS_EXIT: u64 = 6;
+pub const SYS_SLEEP: u64 = 7;
+
+// Kernel-private dispatcher result. Architectural entry glue consumes this
+// value and abandons the user return frame; it is never returned to CPL3.
+pub const SYSCALL_CONTROL_EXIT: u64 = 0xffff_ffff_ffff_ffe0;
+pub const SYSCALL_CONTROL_SCHEDULE: u64 = 0xffff_ffff_ffff_ffe1;
 
 pub const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
 pub const ERR_USER_POINTER_DENIED: u64 = 0xffff_ffff_ffff_fff2;
@@ -19,5 +26,9 @@ pub const ERR_NO_CURRENT_PROCESS: u64 = 0xffff_ffff_ffff_fff5;
 pub const ERR_USER_COPY_FAULT: u64 = 0xffff_ffff_ffff_fff6;
 pub const ERR_BUFFER_TOO_LARGE: u64 = 0xffff_ffff_ffff_fff7;
 pub const ERR_NOT_IMPLEMENTED: u64 = 0xffff_ffff_ffff_fff8;
+pub const ERR_OUT_OF_MEMORY: u64 = 0xffff_ffff_ffff_fff9;
+pub const ERR_QUOTA_EXCEEDED: u64 = 0xffff_ffff_ffff_fffa;
+pub const ERR_INVALID_MEMORY_KIND: u64 = 0xffff_ffff_ffff_fffb;
+pub const ERR_RESOURCE_TABLE_FULL: u64 = 0xffff_ffff_ffff_fffc;
 
 pub const DEBUG_BUFFER_SIZE: usize = 256;
