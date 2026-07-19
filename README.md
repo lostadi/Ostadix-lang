@@ -2173,7 +2173,7 @@ scenario and its non-claims:
 # M1 two-process isolation, exit/fault teardown, and sibling survival
 ./ocore/kernel/smoke-processes-qemu.sh
 
-# M2 four-TCB preemption, blocking, lifecycle, and million-switch stress
+# M2 four-TCB preemption, blocking, lifecycle, and million-transaction stress
 ./ocore/kernel/smoke-scheduler-qemu.sh
 
 # M3 kernel-side primitives only; this is not a full IPC gate
