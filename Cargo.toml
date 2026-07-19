@@ -39,6 +39,10 @@ required-features = ["notebook"]
 name = "ogit"
 path = "src/bin/ogit.rs"
 
+[[bin]]
+name = "o-live-host"
+path = "src/bin/o-live-host.rs"
+
 [features]
 default = ["graph_executor"]
 # graph_executor: include the readiness-driven operation-hypergraph

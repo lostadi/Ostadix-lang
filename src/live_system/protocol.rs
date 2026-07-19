@@ -48,6 +48,8 @@ pub enum OperationSpec {
     Identity,
     Wrap { field: String },
     Prefix { text: String },
+    IntPair { lhs: i64, rhs: i64 },
+    SumFields { lhs: String, rhs: String },
     Fail { message: String },
 }
 
@@ -100,6 +102,13 @@ impl RuntimeProgram {
                 OperationSpec::Prefix { text } if text.len() > 4096 => {
                     bail!("prefix operation text exceeds 4096 bytes")
                 }
+                OperationSpec::SumFields { lhs, rhs } => {
+                    validate_identifier("sum lhs field", lhs)?;
+                    validate_identifier("sum rhs field", rhs)?;
+                    if lhs == rhs {
+                        bail!("sum operation requires two distinct fields");
+                    }
+                }
                 OperationSpec::Fail { message } if message.is_empty() => {
                     bail!("fail operation requires a non-empty message")
                 }
@@ -123,12 +132,40 @@ impl RuntimeProgram {
                 ]),
             }),
             OperationSpec::Prefix { text } => match input {
-                OValue::Str { v } => Ok(OValue::str_(format!("{text}{v}"))),
+                OValue::Text { v } => Ok(OValue::str_(format!("{text}{}", v.utf8))),
                 other => bail!(
                     "prefix operation requires str input, got {}",
                     other.type_name()
                 ),
             },
+            OperationSpec::IntPair { lhs, rhs } => Ok(OValue::Object {
+                fields: BTreeMap::from([
+                    ("lhs".into(), OValue::int(*lhs)),
+                    ("rhs".into(), OValue::int(*rhs)),
+                    ("world".into(), OValue::str_(self.world.clone())),
+                ]),
+            }),
+            OperationSpec::SumFields { lhs, rhs } => {
+                let fields = match input {
+                    OValue::Object { fields } => fields,
+                    other => bail!(
+                        "sum_fields operation requires object input, got {}",
+                        other.type_name()
+                    ),
+                };
+                let left = fields
+                    .get(lhs)
+                    .with_context(|| format!("sum input is missing `{lhs}`"))?
+                    .as_int()?;
+                let right = fields
+                    .get(rhs)
+                    .with_context(|| format!("sum input is missing `{rhs}`"))?
+                    .as_int()?;
+                let result = left
+                    .checked_add(right)
+                    .context("sum_fields result overflowed i64")?;
+                Ok(OValue::int(result))
+            }
             OperationSpec::Fail { message } => bail!("{message}"),
         }
     }
