@@ -3,7 +3,12 @@ module runtime::personality;
 // Personality identifiers name reusable ABI implementations. The `[0]` in
 // native[0] belongs to the domain instance and is not part of this identity.
 pub const PERSONALITY_NATIVE: u64 = 1;
+// M6A's deliberately tiny non-native personality exercises the generic
+// request router without claiming a Linux or other foreign ABI. Its public
+// surface is the versioned scalar PERSONALITY_RPC_V1 corpus only.
+pub const PERSONALITY_TEST: u64 = 2;
 
 pub fn is_supported(personality_id: u64) -> bool {
-    return personality_id == PERSONALITY_NATIVE;
+    return personality_id == PERSONALITY_NATIVE
+        || personality_id == PERSONALITY_TEST;
 }

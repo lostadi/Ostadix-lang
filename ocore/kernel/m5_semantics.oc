@@ -1,0 +1,177 @@
+module kernel::m5_semantics;
+
+use kernel::m5_selftest::self_test;
+use kernel::m5_selftest::SELF_TEST_PASS;
+use runtime::interrupts::ticks;
+use runtime::live_supervisor::ACTIVATION_ACTIVE;
+use runtime::live_supervisor::activation_count;
+use runtime::live_supervisor::activation_failure_count;
+use runtime::live_supervisor::active_package_count;
+use runtime::live_supervisor::active_root;
+use runtime::live_supervisor::crash_count;
+use runtime::live_supervisor::invariants_hold as supervisor_invariants_hold;
+use runtime::live_supervisor::last_activation_state;
+use runtime::live_supervisor::resolution_count;
+use runtime::live_supervisor::resolve;
+use runtime::live_supervisor::restart_count;
+use runtime::live_supervisor::rollback_count;
+use runtime::live_supervisor::rollback_failure_count;
+use runtime::live_supervisor::rollback_package_count;
+use runtime::live_supervisor::service_is_current;
+use runtime::live_supervisor::service_package_root;
+use runtime::live_supervisor::service_package_version;
+use runtime::live_supervisor::stale_rejection_count;
+use runtime::package_root::denial_count;
+use runtime::package_root::digest_word;
+use runtime::package_root::find_digest;
+use runtime::package_root::install_abort_count;
+use runtime::package_root::install_begin_count;
+use runtime::package_root::install_publish_count;
+use runtime::package_root::invariants_hold as package_invariants_hold;
+use runtime::package_root::is_live;
+use runtime::package_root::package_id;
+use runtime::package_root::version;
+use runtime::serial::write;
+use runtime::serial_control::accepted_count;
+use runtime::serial_control::invariants_hold as serial_invariants_hold;
+use runtime::serial_control::rejected_count;
+
+const MODE_NATIVE_SEMANTICS: u64 = 17;
+const PACKAGE_ID: u64 = 42;
+const SERVICE_PACKAGE: u64 = 1002;
+const PROTOCOL_PACKAGE: u64 = 8;
+
+static ROOTS_MESSAGE: [u8; 37] =
+    b"M5 two immutable package roots: PASS\n";
+static DENIAL_MESSAGE: [u8; 48] =
+    b"M5 overgrant/incomplete activation denial: PASS\n";
+static HEALTH_MESSAGE: [u8; 38] =
+    b"M5 failed health nonpublication: PASS\n";
+static ROLLBACK_MESSAGE: [u8; 44] =
+    b"M5 complete-set rollback + stale refs: PASS\n";
+static RESTART_MESSAGE: [u8; 45] =
+    b"M5 crash/restart with unaffected state: PASS\n";
+static PARSER_MESSAGE: [u8; 37] =
+    b"M5 strict serial parser corpus: PASS\n";
+static SEMANTICS_MESSAGE: [u8; 30] =
+    b"M5 supervisor semantics: PASS\n";
+static POST_TICK_MESSAGE: [u8; 36] =
+    b"M5 semantics post-test tick: online\n";
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn roots_hold(root_v1: u64, root_v2: u64) -> bool {
+    return root_v1 != 0
+        && root_v2 != 0
+        && root_v1 != root_v2
+        && is_live(root_v1)
+        && is_live(root_v2)
+        && package_id(root_v1) == PACKAGE_ID
+        && package_id(root_v2) == PACKAGE_ID
+        && version(root_v1) == 1
+        && version(root_v2) == 2
+        && digest_word(root_v1, 0) == 0x101
+        && digest_word(root_v1, 1) == 0x102
+        && digest_word(root_v1, 2) == 0x103
+        && digest_word(root_v1, 3) == 0x104
+        && digest_word(root_v2, 0) == 0x201
+        && digest_word(root_v2, 1) == 0x202
+        && digest_word(root_v2, 2) == 0x203
+        && digest_word(root_v2, 3) == 0x204
+        && install_begin_count() == 4
+        && install_publish_count() == 2
+        && install_abort_count() == 2
+        && package_invariants_hold();
+}
+
+// Probe mode 17 is deliberately independent of the native serial-live gate.
+// It executes the complete package/supervisor/parser semantics corpus in a
+// freshly booted kernel, then validates the resulting immutable state before
+// making any success claim visible on the serial console.
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_NATIVE_SEMANTICS {
+        fail_closed();
+    }
+    disable_interrupts();
+    if self_test() != SELF_TEST_PASS {
+        fail_closed();
+    }
+
+    let root_v1: u64 = find_digest(0x101, 0x102, 0x103, 0x104);
+    let root_v2: u64 = find_digest(0x201, 0x202, 0x203, 0x204);
+    if !roots_hold(root_v1, root_v2) {
+        fail_closed();
+    }
+    write((&ROOTS_MESSAGE[0]), 37);
+
+    // These exact totals are produced only if both the package-root
+    // overgrant/incomplete-publication checks and the activation overgrant /
+    // incomplete-start checks rejected without mutating active state.
+    if denial_count() != 2
+        || activation_count() != 2
+        || activation_failure_count() != 5 {
+        fail_closed();
+    }
+    write((&DENIAL_MESSAGE[0]), 48);
+
+    // The failed v2 health transaction left v1 published; the later complete
+    // v2 transaction and rollback return to that same immutable v1 root.
+    if active_package_count() != 1
+        || active_root(PACKAGE_ID) != root_v1
+        || last_activation_state() != ACTIVATION_ACTIVE {
+        fail_closed();
+    }
+    write((&HEALTH_MESSAGE[0]), 38);
+
+    if rollback_count() != 1
+        || rollback_failure_count() != 3
+        || rollback_package_count() != 1
+        || stale_rejection_count() != 3 {
+        fail_closed();
+    }
+    write((&ROLLBACK_MESSAGE[0]), 44);
+
+    // The init service was crashed and restarted through a new generation.
+    // Resolve the sibling package service after that cycle to prove unrelated
+    // service state and the active immutable root survived intact.
+    if crash_count() != 1 || restart_count() != 1 || resolution_count() != 3 {
+        fail_closed();
+    }
+    let unaffected: u64 = resolve(SERVICE_PACKAGE, PROTOCOL_PACKAGE);
+    if unaffected == 0
+        || !service_is_current(unaffected)
+        || service_package_root(unaffected) != root_v1
+        || service_package_version(unaffected) != 1
+        || resolution_count() != 4
+        || stale_rejection_count() != 3 {
+        fail_closed();
+    }
+    write((&RESTART_MESSAGE[0]), 45);
+
+    if accepted_count() != 5
+        || rejected_count() != 7
+        || !serial_invariants_hold() {
+        fail_closed();
+    }
+    write((&PARSER_MESSAGE[0]), 37);
+
+    if !package_invariants_hold() || !supervisor_invariants_hold() {
+        fail_closed();
+    }
+    write((&SEMANTICS_MESSAGE[0]), 30);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TICK_MESSAGE[0]), 36);
+    loop {
+        halt();
+    }
+}

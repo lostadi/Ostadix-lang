@@ -1,0 +1,724 @@
+module runtime::personality_supervision;
+
+use runtime::native_abi::ERR_PERSONALITY_BUSY;
+use runtime::native_abi::ERR_PERSONALITY_DUPLICATE;
+use runtime::native_abi::ERR_PERSONALITY_FAILED;
+use runtime::native_abi::ERR_PERSONALITY_STALE;
+use runtime::native_abi::ERR_PERSONALITY_UNAVAILABLE;
+use runtime::native_abi::ERR_PERSONALITY_UNSUPPORTED;
+use runtime::process::is_live as process_is_live;
+
+// This registry records supervision policy and exact process identities. It
+// does not schedule, stop, or restart a process itself. Those effects remain
+// management responsibilities, and each resulting transition must be
+// confirmed here with the exact generation-tagged process and binding handles.
+pub const MAX_PERSONALITY_SUPERVISIONS: usize = 8;
+
+pub const SUPERVISION_STATE_STARTING: u64 = 1;
+pub const SUPERVISION_STATE_ACTIVE: u64 = 2;
+pub const SUPERVISION_STATE_CRASHED: u64 = 3;
+pub const SUPERVISION_STATE_RESTART_REQUESTED: u64 = 4;
+pub const SUPERVISION_STATE_REPLACEMENT_STARTING: u64 = 5;
+pub const SUPERVISION_STATE_STOP_REQUESTED: u64 = 6;
+
+const SUPERVISION_EMPTY: u8 = 0;
+const SUPERVISION_STARTING: u8 = 1;
+const SUPERVISION_ACTIVE: u8 = 2;
+const SUPERVISION_CRASHED: u8 = 3;
+const SUPERVISION_RESTART_REQUESTED: u8 = 4;
+const SUPERVISION_REPLACEMENT_STARTING: u8 = 5;
+const SUPERVISION_STOP_REQUESTED: u8 = 6;
+const SUPERVISION_HANDLE_TAG: u64 = 0xd800_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 8] = [0; 8];
+static mut GENERATIONS: [u32; 8] = [0; 8];
+static mut SUPERVISOR_PROCESSES: [u64; 8] = [0; 8];
+static mut SERVICE_PROCESSES: [u64; 8] = [0; 8];
+static mut LAST_CRASHED_PROCESSES: [u64; 8] = [0; 8];
+static mut SERVICE_IDS: [u64; 8] = [0; 8];
+static mut PROTOCOL_IDS: [u64; 8] = [0; 8];
+
+// Per-binding history makes the state-machine invariants auditable without
+// consulting scheduler state or inferring events from process liveness.
+static mut MONITOR_ARMS_PER_BINDING: [u64; 8] = [0; 8];
+static mut CRASHES_PER_BINDING: [u64; 8] = [0; 8];
+static mut RESTART_REQUESTS_PER_BINDING: [u64; 8] = [0; 8];
+static mut REPLACEMENTS_PER_BINDING: [u64; 8] = [0; 8];
+
+static mut PUBLISHES: u64 = 0;
+static mut MONITOR_ARMS: u64 = 0;
+static mut CRASHES: u64 = 0;
+static mut RESTART_REQUESTS: u64 = 0;
+static mut REPLACEMENT_INSTALLS: u64 = 0;
+static mut STOP_REQUESTS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn supervision_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn supervision_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | SUPERVISION_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_supervision(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != SUPERVISION_HANDLE_TAG {
+        return MAX_PERSONALITY_SUPERVISIONS;
+    }
+    let slot: usize = supervision_index(handle);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS
+        || STATES[slot] == SUPERVISION_EMPTY
+        || GENERATIONS[slot] != supervision_generation(handle) {
+        return MAX_PERSONALITY_SUPERVISIONS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    SUPERVISOR_PROCESSES[slot] = 0;
+    SERVICE_PROCESSES[slot] = 0;
+    LAST_CRASHED_PROCESSES[slot] = 0;
+    SERVICE_IDS[slot] = 0;
+    PROTOCOL_IDS[slot] = 0;
+    MONITOR_ARMS_PER_BINDING[slot] = 0;
+    CRASHES_PER_BINDING[slot] = 0;
+    RESTART_REQUESTS_PER_BINDING[slot] = 0;
+    REPLACEMENTS_PER_BINDING[slot] = 0;
+}
+
+unsafe fn reject(error: u64) -> u64 {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    DENIALS += 1;
+    return error;
+}
+
+unsafe fn preflight_error() -> u64 {
+    if INITIALIZED == 0 {
+        return ERR_PERSONALITY_UNAVAILABLE;
+    }
+    if POISONED != 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    return 0;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    return result;
+}
+
+unsafe fn service_process_is_bound(process: u64) -> bool {
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        if STATES[slot] != SUPERVISION_EMPTY
+            && SERVICE_PROCESSES[slot] == process {
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+unsafe fn identity_is_bound(
+    supervisor_process: u64,
+    service_id: u64,
+    protocol_id: u64
+) -> bool {
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        if STATES[slot] != SUPERVISION_EMPTY
+            && SUPERVISOR_PROCESSES[slot] == supervisor_process
+            && SERVICE_IDS[slot] == service_id
+            && PROTOCOL_IDS[slot] == protocol_id {
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        STATES[slot] = SUPERVISION_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    PUBLISHES = 0;
+    MONITOR_ARMS = 0;
+    CRASHES = 0;
+    RESTART_REQUESTS = 0;
+    REPLACEMENT_INSTALLS = 0;
+    STOP_REQUESTS = 0;
+    DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Publication reserves a stable service identity under one exact supervisor
+// process generation. The service is not active until that same generation is
+// explicitly monitor-armed.
+pub unsafe fn publish(
+    supervisor_process: u64,
+    service_process: u64,
+    service_id: u64,
+    protocol_id: u64
+) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    if supervisor_process == 0
+        || service_process == 0
+        || supervisor_process == service_process
+        || service_id == 0
+        || protocol_id == 0 {
+        return reject(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if !process_is_live(supervisor_process)
+        || !process_is_live(service_process) {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if service_process_is_bound(service_process)
+        || identity_is_bound(supervisor_process, service_id, protocol_id) {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS
+        && STATES[slot] != SUPERVISION_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_PERSONALITY_SUPERVISIONS
+        || PUBLISHES == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    clear_slot(slot);
+    SUPERVISOR_PROCESSES[slot] = supervisor_process;
+    SERVICE_PROCESSES[slot] = service_process;
+    SERVICE_IDS[slot] = service_id;
+    PROTOCOL_IDS[slot] = protocol_id;
+    STATES[slot] = SUPERVISION_STARTING;
+    PUBLISHES += 1;
+    return finish(make_handle(slot));
+}
+
+// STARTING arms the initial instance. REPLACEMENT_STARTING arms the freshly
+// installed binding generation. No stale pre-restart handle can reach the
+// latter transition because install_replacement advances GENERATIONS first.
+pub unsafe fn arm_monitor(
+    supervision: u64,
+    supervisor_process: u64,
+    service_process: u64
+) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if SUPERVISOR_PROCESSES[slot] != supervisor_process
+        || SERVICE_PROCESSES[slot] != service_process {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == SUPERVISION_ACTIVE {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    if STATES[slot] != SUPERVISION_STARTING
+        && STATES[slot] != SUPERVISION_REPLACEMENT_STARTING {
+        return reject(ERR_PERSONALITY_BUSY);
+    }
+    if !process_is_live(supervisor_process)
+        || !process_is_live(service_process) {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if MONITOR_ARMS == MAX_COUNTER
+        || MONITOR_ARMS_PER_BINDING[slot] == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_FAILED);
+    }
+    STATES[slot] = SUPERVISION_ACTIVE;
+    MONITOR_ARMS_PER_BINDING[slot] += 1;
+    MONITOR_ARMS += 1;
+    return finish(1);
+}
+
+// Crash recording is an explicit trusted observation. It deliberately does
+// not infer death from scheduler state, so the exact service generation may be
+// recorded before or after process teardown begins.
+pub unsafe fn record_crash(service_process: u64) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    if service_process == 0 {
+        return reject(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS
+        && SERVICE_PROCESSES[slot] != service_process {
+        slot += 1;
+    }
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        let mut prior: usize = 0;
+        while prior < MAX_PERSONALITY_SUPERVISIONS {
+            if STATES[prior] != SUPERVISION_EMPTY
+                && LAST_CRASHED_PROCESSES[prior] == service_process {
+                return reject(ERR_PERSONALITY_STALE);
+            }
+            prior += 1;
+        }
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if STATES[slot] == SUPERVISION_CRASHED
+        || STATES[slot] == SUPERVISION_RESTART_REQUESTED {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    if STATES[slot] != SUPERVISION_ACTIVE {
+        return reject(ERR_PERSONALITY_BUSY);
+    }
+    if CRASHES == MAX_COUNTER
+        || CRASHES_PER_BINDING[slot] == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_FAILED);
+    }
+    LAST_CRASHED_PROCESSES[slot] = service_process;
+    STATES[slot] = SUPERVISION_CRASHED;
+    CRASHES_PER_BINDING[slot] += 1;
+    CRASHES += 1;
+    return finish(1);
+}
+
+pub unsafe fn request_restart(
+    supervision: u64,
+    supervisor_process: u64,
+    crashed_service_process: u64
+) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if SUPERVISOR_PROCESSES[slot] != supervisor_process
+        || SERVICE_PROCESSES[slot] != crashed_service_process
+        || LAST_CRASHED_PROCESSES[slot] != crashed_service_process {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == SUPERVISION_RESTART_REQUESTED {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    if STATES[slot] != SUPERVISION_CRASHED {
+        return reject(ERR_PERSONALITY_BUSY);
+    }
+    if !process_is_live(supervisor_process) {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if RESTART_REQUESTS == MAX_COUNTER
+        || RESTART_REQUESTS_PER_BINDING[slot] == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_FAILED);
+    }
+    STATES[slot] = SUPERVISION_RESTART_REQUESTED;
+    RESTART_REQUESTS_PER_BINDING[slot] += 1;
+    RESTART_REQUESTS += 1;
+    return finish(1);
+}
+
+// Installing a replacement is the service-generation commit point. The
+// returned handle is the only handle accepted for the replacement monitor arm;
+// the crashed generation's supervision handle becomes stale immediately.
+pub unsafe fn install_replacement(
+    supervision: u64,
+    supervisor_process: u64,
+    crashed_service_process: u64,
+    replacement_service_process: u64
+) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if SUPERVISOR_PROCESSES[slot] != supervisor_process
+        || SERVICE_PROCESSES[slot] != crashed_service_process
+        || LAST_CRASHED_PROCESSES[slot] != crashed_service_process {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] != SUPERVISION_RESTART_REQUESTED {
+        return reject(ERR_PERSONALITY_BUSY);
+    }
+    if replacement_service_process == 0
+        || replacement_service_process == crashed_service_process
+        || replacement_service_process == supervisor_process {
+        return reject(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if !process_is_live(supervisor_process)
+        || !process_is_live(replacement_service_process) {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if service_process_is_bound(replacement_service_process) {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    if GENERATIONS[slot] == 0xffff_ffff
+        || REPLACEMENT_INSTALLS == MAX_COUNTER
+        || REPLACEMENTS_PER_BINDING[slot] == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_FAILED);
+    }
+    SERVICE_PROCESSES[slot] = replacement_service_process;
+    GENERATIONS[slot] += 1;
+    STATES[slot] = SUPERVISION_REPLACEMENT_STARTING;
+    REPLACEMENTS_PER_BINDING[slot] += 1;
+    REPLACEMENT_INSTALLS += 1;
+    return finish(make_handle(slot));
+}
+
+// Stop is a terminal request in this bounded registry version. Keeping the
+// record preserves the exact service generation for teardown auditing; no slot
+// is silently recycled while a stop is outstanding.
+pub unsafe fn request_stop(
+    supervision: u64,
+    supervisor_process: u64,
+    service_process: u64
+) -> u64 {
+    let preflight: u64 = preflight_error();
+    if preflight != 0 {
+        return preflight;
+    }
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if SUPERVISOR_PROCESSES[slot] != supervisor_process
+        || SERVICE_PROCESSES[slot] != service_process {
+        return reject(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == SUPERVISION_STOP_REQUESTED {
+        return reject(ERR_PERSONALITY_DUPLICATE);
+    }
+    if STATES[slot] != SUPERVISION_ACTIVE {
+        return reject(ERR_PERSONALITY_BUSY);
+    }
+    if !process_is_live(supervisor_process) {
+        return reject(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if STOP_REQUESTS == MAX_COUNTER {
+        return reject(ERR_PERSONALITY_FAILED);
+    }
+    STATES[slot] = SUPERVISION_STOP_REQUESTED;
+    STOP_REQUESTS += 1;
+    return finish(1);
+}
+
+pub unsafe fn is_current(supervision: u64) -> bool {
+    return checked_supervision(supervision)
+        < MAX_PERSONALITY_SUPERVISIONS;
+}
+
+pub unsafe fn state(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return STATES[slot] as u64;
+}
+
+pub unsafe fn supervisor_process(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return SUPERVISOR_PROCESSES[slot];
+}
+
+pub unsafe fn service_process(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return SERVICE_PROCESSES[slot];
+}
+
+pub unsafe fn last_crashed_process(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return LAST_CRASHED_PROCESSES[slot];
+}
+
+pub unsafe fn service_id(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return SERVICE_IDS[slot];
+}
+
+pub unsafe fn protocol_id(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return PROTOCOL_IDS[slot];
+}
+
+pub unsafe fn generation(supervision: u64) -> u64 {
+    let slot: usize = checked_supervision(supervision);
+    if slot >= MAX_PERSONALITY_SUPERVISIONS {
+        return 0;
+    }
+    return GENERATIONS[slot] as u64;
+}
+
+pub unsafe fn find(
+    supervisor_process: u64,
+    service_id: u64,
+    protocol_id: u64
+) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        if STATES[slot] != SUPERVISION_EMPTY
+            && SUPERVISOR_PROCESSES[slot] == supervisor_process
+            && SERVICE_IDS[slot] == service_id
+            && PROTOCOL_IDS[slot] == protocol_id {
+            return make_handle(slot);
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn binding_count() -> usize {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        if STATES[slot] != SUPERVISION_EMPTY {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn state_count(required_state: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || required_state < SUPERVISION_STATE_STARTING
+        || required_state > SUPERVISION_STATE_STOP_REQUESTED {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        if STATES[slot] as u64 == required_state {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn publish_count() -> u64 {
+    return PUBLISHES;
+}
+
+pub unsafe fn monitor_arm_count() -> u64 {
+    return MONITOR_ARMS;
+}
+
+pub unsafe fn crash_count() -> u64 {
+    return CRASHES;
+}
+
+pub unsafe fn restart_request_count() -> u64 {
+    return RESTART_REQUESTS;
+}
+
+pub unsafe fn replacement_install_count() -> u64 {
+    return REPLACEMENT_INSTALLS;
+}
+
+pub unsafe fn stop_request_count() -> u64 {
+    return STOP_REQUESTS;
+}
+
+pub unsafe fn denial_count() -> u64 {
+    return DENIALS;
+}
+
+pub unsafe fn is_poisoned() -> u64 {
+    return POISONED as u64;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    let mut occupied: u64 = 0;
+    let mut monitor_arms: u64 = 0;
+    let mut crashes: u64 = 0;
+    let mut restart_requests: u64 = 0;
+    let mut replacements: u64 = 0;
+    let mut stop_requests: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_SUPERVISIONS {
+        let current_state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if current_state == SUPERVISION_EMPTY {
+            if GENERATIONS[slot] != 1
+                || SUPERVISOR_PROCESSES[slot] != 0
+                || SERVICE_PROCESSES[slot] != 0
+                || LAST_CRASHED_PROCESSES[slot] != 0
+                || SERVICE_IDS[slot] != 0
+                || PROTOCOL_IDS[slot] != 0
+                || MONITOR_ARMS_PER_BINDING[slot] != 0
+                || CRASHES_PER_BINDING[slot] != 0
+                || RESTART_REQUESTS_PER_BINDING[slot] != 0
+                || REPLACEMENTS_PER_BINDING[slot] != 0 {
+                return false;
+            }
+        } else {
+            if current_state < SUPERVISION_STARTING
+                || current_state > SUPERVISION_STOP_REQUESTED
+                || SUPERVISOR_PROCESSES[slot] == 0
+                || SERVICE_PROCESSES[slot] == 0
+                || SUPERVISOR_PROCESSES[slot] == SERVICE_PROCESSES[slot]
+                || SERVICE_IDS[slot] == 0
+                || PROTOCOL_IDS[slot] == 0
+                || GENERATIONS[slot] as u64
+                    != REPLACEMENTS_PER_BINDING[slot] + 1 {
+                return false;
+            }
+            let replacement_count: u64 = REPLACEMENTS_PER_BINDING[slot];
+            let monitor_count: u64 = MONITOR_ARMS_PER_BINDING[slot];
+            let crash_count: u64 = CRASHES_PER_BINDING[slot];
+            let restart_count: u64 = RESTART_REQUESTS_PER_BINDING[slot];
+            if current_state == SUPERVISION_STARTING {
+                if replacement_count != 0
+                    || monitor_count != 0
+                    || crash_count != 0
+                    || restart_count != 0
+                    || LAST_CRASHED_PROCESSES[slot] != 0 {
+                    return false;
+                }
+            }
+            if current_state == SUPERVISION_ACTIVE
+                || current_state == SUPERVISION_STOP_REQUESTED {
+                if monitor_count != replacement_count + 1
+                    || crash_count != replacement_count
+                    || restart_count != replacement_count
+                    || (replacement_count == 0
+                        && LAST_CRASHED_PROCESSES[slot] != 0)
+                    || (replacement_count != 0
+                        && (LAST_CRASHED_PROCESSES[slot] == 0
+                            || LAST_CRASHED_PROCESSES[slot]
+                                == SERVICE_PROCESSES[slot])) {
+                    return false;
+                }
+                if current_state == SUPERVISION_STOP_REQUESTED {
+                    stop_requests += 1;
+                }
+            }
+            if current_state == SUPERVISION_CRASHED {
+                if monitor_count != replacement_count + 1
+                    || crash_count != replacement_count + 1
+                    || restart_count != replacement_count
+                    || LAST_CRASHED_PROCESSES[slot]
+                        != SERVICE_PROCESSES[slot] {
+                    return false;
+                }
+            }
+            if current_state == SUPERVISION_RESTART_REQUESTED {
+                if monitor_count != replacement_count + 1
+                    || crash_count != replacement_count + 1
+                    || restart_count != replacement_count + 1
+                    || LAST_CRASHED_PROCESSES[slot]
+                        != SERVICE_PROCESSES[slot] {
+                    return false;
+                }
+            }
+            if current_state == SUPERVISION_REPLACEMENT_STARTING {
+                if replacement_count == 0
+                    || monitor_count != replacement_count
+                    || crash_count != replacement_count
+                    || restart_count != replacement_count
+                    || LAST_CRASHED_PROCESSES[slot] == 0
+                    || LAST_CRASHED_PROCESSES[slot]
+                        == SERVICE_PROCESSES[slot] {
+                    return false;
+                }
+            }
+            let mut other: usize = slot + 1;
+            while other < MAX_PERSONALITY_SUPERVISIONS {
+                if STATES[other] != SUPERVISION_EMPTY
+                    && ((SUPERVISOR_PROCESSES[other]
+                            == SUPERVISOR_PROCESSES[slot]
+                        && SERVICE_IDS[other] == SERVICE_IDS[slot]
+                        && PROTOCOL_IDS[other] == PROTOCOL_IDS[slot])
+                        || SERVICE_PROCESSES[other]
+                            == SERVICE_PROCESSES[slot]) {
+                    return false;
+                }
+                other += 1;
+            }
+            occupied += 1;
+            monitor_arms += monitor_count;
+            crashes += crash_count;
+            restart_requests += restart_count;
+            replacements += replacement_count;
+        }
+        slot += 1;
+    }
+    return occupied == PUBLISHES
+        && monitor_arms == MONITOR_ARMS
+        && crashes == CRASHES
+        && restart_requests == RESTART_REQUESTS
+        && replacements == REPLACEMENT_INSTALLS
+        && stop_requests == STOP_REQUESTS
+        && CRASHES >= RESTART_REQUESTS
+        && RESTART_REQUESTS >= REPLACEMENT_INSTALLS
+        && MONITOR_ARMS >= REPLACEMENT_INSTALLS;
+}

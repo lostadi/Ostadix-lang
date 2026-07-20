@@ -1,0 +1,508 @@
+module runtime::domain_namespace;
+
+use runtime::domain::is_live as domain_is_live;
+use runtime::domain::release_child as release_domain_child;
+use runtime::domain::retain_child as retain_domain_child;
+use runtime::process::domain_for as process_domain_for;
+use runtime::process::is_live as process_is_live;
+use runtime::process::process_state;
+use runtime::process::PROCESS_STATE_EXITED;
+use runtime::process::PROCESS_STATE_FAULTED;
+use runtime::process::PROCESS_STATE_REAPABLE;
+use runtime::process::PROCESS_STATE_TEARDOWN;
+
+pub const MAX_DOMAIN_NAMESPACES: usize = 4;
+pub const MAX_NAMESPACE_PROCESSES: usize = 4;
+
+const NAMESPACE_EMPTY: u8 = 0;
+const NAMESPACE_LIVE: u8 = 1;
+const NAMESPACE_DRAINING: u8 = 2;
+const NAMESPACE_RETIRED: u8 = 3;
+const NAMESPACE_HANDLE_TAG: u64 = 0xd200_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut DOMAIN_HANDLES: [u64; 4] = [0; 4];
+static mut MOUNT_REFS: [u32; 4] = [0; 4];
+static mut SERVICE_REFS: [u32; 4] = [0; 4];
+static mut PROCESS_REFS: [u32; 4] = [0; 4];
+static mut LOAD_REFS: [u32; 4] = [0; 4];
+static mut PROCESS_HANDLES: [u64; 16] = [0; 16];
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn namespace_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn namespace_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn process_index(namespace_slot: usize, process_slot: usize) -> usize {
+    return namespace_slot * MAX_NAMESPACE_PROCESSES + process_slot;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | NAMESPACE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_namespace(handle: u64, allow_draining: bool) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != NAMESPACE_HANDLE_TAG {
+        return MAX_DOMAIN_NAMESPACES;
+    }
+    let slot: usize = namespace_index(handle);
+    if slot >= MAX_DOMAIN_NAMESPACES
+        || GENERATIONS[slot] != namespace_generation(handle) {
+        return MAX_DOMAIN_NAMESPACES;
+    }
+    if STATES[slot] == NAMESPACE_LIVE {
+        return slot;
+    }
+    if allow_draining && STATES[slot] == NAMESPACE_DRAINING {
+        return slot;
+    }
+    return MAX_DOMAIN_NAMESPACES;
+}
+
+unsafe fn clear_processes(slot: usize) -> void {
+    let mut process_slot: usize = 0;
+    while process_slot < MAX_NAMESPACE_PROCESSES {
+        PROCESS_HANDLES[process_index(slot, process_slot)] = 0;
+        process_slot += 1;
+    }
+}
+
+fn quiescent_state(state: u64) -> bool {
+    return state == PROCESS_STATE_EXITED
+        || state == PROCESS_STATE_FAULTED
+        || state == PROCESS_STATE_REAPABLE
+        || state == PROCESS_STATE_TEARDOWN;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_DOMAIN_NAMESPACES {
+        STATES[slot] = NAMESPACE_EMPTY;
+        GENERATIONS[slot] = 1;
+        DOMAIN_HANDLES[slot] = 0;
+        MOUNT_REFS[slot] = 0;
+        SERVICE_REFS[slot] = 0;
+        PROCESS_REFS[slot] = 0;
+        LOAD_REFS[slot] = 0;
+        clear_processes(slot);
+        slot += 1;
+    }
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn create(slot: usize, domain: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_DOMAIN_NAMESPACES
+        || STATES[slot] != NAMESPACE_EMPTY
+        || GENERATIONS[slot] == 0
+        || !domain_is_live(domain)
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_DOMAIN_NAMESPACES {
+        if (STATES[other] == NAMESPACE_LIVE
+                || STATES[other] == NAMESPACE_DRAINING)
+            && DOMAIN_HANDLES[other] == domain {
+            return 0;
+        }
+        other += 1;
+    }
+    if retain_domain_child(domain) == 0 {
+        return 0;
+    }
+    DOMAIN_HANDLES[slot] = domain;
+    MOUNT_REFS[slot] = 0;
+    SERVICE_REFS[slot] = 0;
+    PROCESS_REFS[slot] = 0;
+    LOAD_REFS[slot] = 0;
+    clear_processes(slot);
+    STATES[slot] = NAMESPACE_LIVE;
+    if !invariants_hold() {
+        STATES[slot] = NAMESPACE_EMPTY;
+        DOMAIN_HANDLES[slot] = 0;
+        if release_domain_child(domain) == 0 {
+            POISONED = 1;
+        }
+        return 0;
+    }
+    return make_handle(slot);
+}
+
+pub unsafe fn namespace_handle_for_slot(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_DOMAIN_NAMESPACES
+        || (STATES[slot] != NAMESPACE_LIVE
+            && STATES[slot] != NAMESPACE_DRAINING) {
+        return 0;
+    }
+    return make_handle(slot);
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    return checked_namespace(handle, false) < MAX_DOMAIN_NAMESPACES;
+}
+
+pub unsafe fn is_valid_owner(handle: u64) -> bool {
+    return checked_namespace(handle, true) < MAX_DOMAIN_NAMESPACES;
+}
+
+pub unsafe fn is_draining(handle: u64) -> bool {
+    let slot: usize = checked_namespace(handle, true);
+    return slot < MAX_DOMAIN_NAMESPACES && STATES[slot] == NAMESPACE_DRAINING;
+}
+
+pub unsafe fn domain_for(handle: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    return DOMAIN_HANDLES[slot];
+}
+
+pub unsafe fn bind_process(handle: u64, process: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, false);
+    if slot >= MAX_DOMAIN_NAMESPACES
+        || !process_is_live(process)
+        || process_domain_for(process) != DOMAIN_HANDLES[slot]
+        || PROCESS_REFS[slot] >= MAX_NAMESPACE_PROCESSES as u32
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut namespace_slot: usize = 0;
+    while namespace_slot < MAX_DOMAIN_NAMESPACES {
+        let mut process_slot: usize = 0;
+        while process_slot < MAX_NAMESPACE_PROCESSES {
+            if PROCESS_HANDLES[process_index(namespace_slot, process_slot)]
+                == process {
+                return 0;
+            }
+            process_slot += 1;
+        }
+        namespace_slot += 1;
+    }
+    let mut process_slot: usize = 0;
+    while process_slot < MAX_NAMESPACE_PROCESSES
+        && PROCESS_HANDLES[process_index(slot, process_slot)] != 0 {
+        process_slot += 1;
+    }
+    if process_slot >= MAX_NAMESPACE_PROCESSES {
+        return 0;
+    }
+    PROCESS_HANDLES[process_index(slot, process_slot)] = process;
+    PROCESS_REFS[slot] += 1;
+    return 1;
+}
+
+pub unsafe fn unbind_process(handle: u64, process: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES || process == 0 || PROCESS_REFS[slot] == 0 {
+        return 0;
+    }
+    let mut process_slot: usize = 0;
+    while process_slot < MAX_NAMESPACE_PROCESSES {
+        let index: usize = process_index(slot, process_slot);
+        if PROCESS_HANDLES[index] == process {
+            PROCESS_HANDLES[index] = 0;
+            PROCESS_REFS[slot] -= 1;
+            return 1;
+        }
+        process_slot += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn contains_process(handle: u64, process: u64) -> bool {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES || process == 0 {
+        return false;
+    }
+    let mut process_slot: usize = 0;
+    while process_slot < MAX_NAMESPACE_PROCESSES {
+        if PROCESS_HANDLES[process_index(slot, process_slot)] == process {
+            return true;
+        }
+        process_slot += 1;
+    }
+    return false;
+}
+
+pub unsafe fn processes_quiescent(handle: u64) -> bool {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return false;
+    }
+    let mut process_slot: usize = 0;
+    while process_slot < MAX_NAMESPACE_PROCESSES {
+        let process: u64 = PROCESS_HANDLES[process_index(slot, process_slot)];
+        if process != 0
+            && (!process_is_live(process)
+                || !quiescent_state(process_state(process))) {
+            return false;
+        }
+        process_slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn release_quiescent_processes(handle: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES
+        || STATES[slot] != NAMESPACE_DRAINING
+        || !processes_quiescent(handle) {
+        return 0;
+    }
+    clear_processes(slot);
+    PROCESS_REFS[slot] = 0;
+    return 1;
+}
+
+unsafe fn retain_counter(handle: u64, kind: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, false);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    if kind == 1 {
+        if MOUNT_REFS[slot] == 0xffff_ffff {
+            return 0;
+        }
+        MOUNT_REFS[slot] += 1;
+        return 1;
+    }
+    if kind == 2 {
+        if SERVICE_REFS[slot] == 0xffff_ffff {
+            return 0;
+        }
+        SERVICE_REFS[slot] += 1;
+        return 1;
+    }
+    if kind == 3 {
+        if LOAD_REFS[slot] == 0xffff_ffff {
+            return 0;
+        }
+        LOAD_REFS[slot] += 1;
+        return 1;
+    }
+    return 0;
+}
+
+unsafe fn release_counter(handle: u64, kind: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    if kind == 1 && MOUNT_REFS[slot] != 0 {
+        MOUNT_REFS[slot] -= 1;
+        return 1;
+    }
+    if kind == 2 && SERVICE_REFS[slot] != 0 {
+        SERVICE_REFS[slot] -= 1;
+        return 1;
+    }
+    if kind == 3 && LOAD_REFS[slot] != 0 {
+        LOAD_REFS[slot] -= 1;
+        return 1;
+    }
+    return 0;
+}
+
+pub unsafe fn retain_mount(handle: u64) -> u64 {
+    return retain_counter(handle, 1);
+}
+
+pub unsafe fn release_mount(handle: u64) -> u64 {
+    return release_counter(handle, 1);
+}
+
+pub unsafe fn retain_service(handle: u64) -> u64 {
+    return retain_counter(handle, 2);
+}
+
+pub unsafe fn release_service(handle: u64) -> u64 {
+    return release_counter(handle, 2);
+}
+
+pub unsafe fn retain_load(handle: u64) -> u64 {
+    return retain_counter(handle, 3);
+}
+
+pub unsafe fn release_load(handle: u64) -> u64 {
+    return release_counter(handle, 3);
+}
+
+pub unsafe fn mount_refs(handle: u64) -> u32 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    return MOUNT_REFS[slot];
+}
+
+pub unsafe fn service_refs(handle: u64) -> u32 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    return SERVICE_REFS[slot];
+}
+
+pub unsafe fn process_refs(handle: u64) -> u32 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    return PROCESS_REFS[slot];
+}
+
+pub unsafe fn load_refs(handle: u64) -> u32 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES {
+        return 0;
+    }
+    return LOAD_REFS[slot];
+}
+
+// Teardown is a fail-closed two-phase transaction. Once draining begins no
+// subsystem may acquire a new namespace child. The coordinator removes all
+// loader, service, mount, and quiescent-process records, then calls finish.
+pub unsafe fn begin_teardown(handle: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, false);
+    if slot >= MAX_DOMAIN_NAMESPACES
+        || !processes_quiescent(handle)
+        || !invariants_hold() {
+        return 0;
+    }
+    STATES[slot] = NAMESPACE_DRAINING;
+    return 1;
+}
+
+pub unsafe fn finish_teardown(handle: u64) -> u64 {
+    let slot: usize = checked_namespace(handle, true);
+    if slot >= MAX_DOMAIN_NAMESPACES
+        || STATES[slot] != NAMESPACE_DRAINING
+        || MOUNT_REFS[slot] != 0
+        || SERVICE_REFS[slot] != 0
+        || PROCESS_REFS[slot] != 0
+        || LOAD_REFS[slot] != 0 {
+        return 0;
+    }
+    let domain: u64 = DOMAIN_HANDLES[slot];
+    if release_domain_child(domain) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    DOMAIN_HANDLES[slot] = 0;
+    MOUNT_REFS[slot] = 0;
+    SERVICE_REFS[slot] = 0;
+    PROCESS_REFS[slot] = 0;
+    LOAD_REFS[slot] = 0;
+    clear_processes(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = NAMESPACE_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = NAMESPACE_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_DOMAIN_NAMESPACES {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == NAMESPACE_EMPTY || state == NAMESPACE_RETIRED {
+            if (state == NAMESPACE_RETIRED
+                    && GENERATIONS[slot] != 0xffff_ffff)
+                || DOMAIN_HANDLES[slot] != 0
+                || MOUNT_REFS[slot] != 0
+                || SERVICE_REFS[slot] != 0
+                || PROCESS_REFS[slot] != 0
+                || LOAD_REFS[slot] != 0 {
+                return false;
+            }
+        } else if state == NAMESPACE_LIVE || state == NAMESPACE_DRAINING {
+            if !domain_is_live(DOMAIN_HANDLES[slot])
+                || PROCESS_REFS[slot] > MAX_NAMESPACE_PROCESSES as u32 {
+                return false;
+            }
+            let mut other: usize = slot + 1;
+            while other < MAX_DOMAIN_NAMESPACES {
+                if (STATES[other] == NAMESPACE_LIVE
+                        || STATES[other] == NAMESPACE_DRAINING)
+                    && DOMAIN_HANDLES[other] == DOMAIN_HANDLES[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        let mut counted: u32 = 0;
+        let mut process_slot: usize = 0;
+        while process_slot < MAX_NAMESPACE_PROCESSES {
+            let process: u64 = PROCESS_HANDLES[process_index(slot, process_slot)];
+            if process != 0 {
+                counted += 1;
+                if state != NAMESPACE_LIVE && state != NAMESPACE_DRAINING {
+                    return false;
+                }
+                if !process_is_live(process)
+                    || process_domain_for(process) != DOMAIN_HANDLES[slot] {
+                    return false;
+                }
+                let mut other_namespace: usize = slot;
+                while other_namespace < MAX_DOMAIN_NAMESPACES {
+                    let mut other_process: usize = 0;
+                    if other_namespace == slot {
+                        other_process = process_slot + 1;
+                    }
+                    while other_process < MAX_NAMESPACE_PROCESSES {
+                        if PROCESS_HANDLES[process_index(
+                            other_namespace,
+                            other_process
+                        )] == process {
+                            return false;
+                        }
+                        other_process += 1;
+                    }
+                    other_namespace += 1;
+                }
+            }
+            process_slot += 1;
+        }
+        if counted != PROCESS_REFS[slot] {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}

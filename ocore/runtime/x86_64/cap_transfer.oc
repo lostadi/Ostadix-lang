@@ -312,6 +312,31 @@ pub unsafe fn commit_copy(
     return 1;
 }
 
+// Public IPC may carry a generation-tagged transfer ticket between syscalls,
+// but possession of that scalar is not sufficient authority to redirect it.
+// Commit therefore rebinds the ticket to both the exact creating process and
+// the exact receiver CSpace derived from the authorized endpoint.
+pub unsafe fn commit_copy_for_owner(
+    ticket: u64,
+    owner_process: u64,
+    expected_destination_cspace: u64,
+    destination_capability: *mut u64
+) -> u64 {
+    if destination_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(destination_capability, 0);
+    let slot: usize = checked_ticket(ticket);
+    if slot >= MAX_TRANSFER_TICKETS
+        || owner_process == 0
+        || expected_destination_cspace == 0
+        || OWNER_PROCESSES[slot] != owner_process
+        || DESTINATION_CSPACES[slot] != expected_destination_cspace {
+        return 0;
+    }
+    return commit_copy(ticket, destination_capability);
+}
+
 pub unsafe fn abort_copy(ticket: u64) -> u64 {
     let slot: usize = checked_ticket(ticket);
     if slot >= MAX_TRANSFER_TICKETS {
@@ -342,6 +367,24 @@ pub unsafe fn abort_copy(ticket: u64) -> u64 {
     }
     retire_or_reuse(slot);
     return 1;
+}
+
+// A public abort is authorized by the exact generation-tagged process that
+// created the ticket.  Knowing or guessing the scalar ticket is deliberately
+// insufficient: another live process cannot release the escrow, and a stale
+// ticket cannot target a later occupant of the same registry slot.
+pub unsafe fn abort_copy_for_owner(
+    ticket: u64,
+    owner_process: u64
+) -> u64 {
+    let slot: usize = checked_ticket(ticket);
+    if slot >= MAX_TRANSFER_TICKETS
+        || owner_process == 0
+        || OWNER_PROCESSES[slot] != owner_process
+        || !prepared_slot_invariants_hold(slot) {
+        return 0;
+    }
+    return abort_copy(ticket);
 }
 
 pub unsafe fn copy_atomic(

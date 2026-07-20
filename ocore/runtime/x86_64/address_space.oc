@@ -8,6 +8,20 @@ use runtime::capability::valid_cspace_slot;
 use runtime::capability::MAX_CSPACES;
 use runtime::capability::OBJECT_MEMORY;
 use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::elf_loader::commit_for_process_start as commit_loaded_plan;
+use runtime::elf_loader::entry as loaded_plan_entry;
+use runtime::elf_loader::is_validated as loaded_plan_is_validated;
+use runtime::elf_loader::materialize_segment_range;
+use runtime::elf_loader::materialize_stack_range;
+use runtime::elf_loader::segment_count as loaded_segment_count;
+use runtime::elf_loader::segment_filesz as loaded_segment_filesz;
+use runtime::elf_loader::segment_flags as loaded_segment_flags;
+use runtime::elf_loader::segment_memsz as loaded_segment_memsz;
+use runtime::elf_loader::segment_page_end as loaded_segment_page_end;
+use runtime::elf_loader::segment_page_start as loaded_segment_page_start;
+use runtime::elf_loader::segment_vaddr as loaded_segment_vaddr;
+use runtime::elf_loader::stack_base as loaded_plan_stack_base;
+use runtime::elf_loader::stack_size as loaded_plan_stack_size;
 use runtime::memory_object::allocate_kernel_object_for_owner;
 use runtime::memory_object::object_kind;
 use runtime::memory_object::release_object;
@@ -21,6 +35,8 @@ use runtime::mapping::physical_address as mapping_physical_address;
 use runtime::pages::alloc_frame;
 use runtime::pages::frame_address;
 use runtime::pages::release_frame;
+use runtime::pages::FRAME_KIND_ANONYMOUS;
+use runtime::pages::FRAME_KIND_EXECUTABLE;
 use runtime::pages::FRAME_KIND_PAGE_TABLE;
 
 pub const VM_USER: u64 = 1;
@@ -31,7 +47,8 @@ pub const VM_STACK: u64 = 16;
 
 pub const MAX_ADDRESS_SPACES: usize = 4;
 const MAX_BOOTSTRAP_REGIONS: usize = 4;
-const MAX_NATIVE_REGIONS: usize = 5;
+const LEGACY_NATIVE_REGIONS: usize = 4;
+const MAX_NATIVE_REGIONS: usize = 10;
 const PAGE_SIZE: usize = 4096;
 const HUGE_PAGE_SIZE: usize = 0x00200000;
 
@@ -47,6 +64,11 @@ const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 const ADDRESS_SPACE_EMPTY: u8 = 0;
 const ADDRESS_SPACE_LIVE: u8 = 1;
 const ADDRESS_SPACE_RETIRED: u8 = 2;
+const ADDRESS_SPACE_LOADING: u8 = 3;
+
+const ADDRESS_SPACE_KIND_NONE: u8 = 0;
+const ADDRESS_SPACE_KIND_NATIVE: u8 = 1;
+const ADDRESS_SPACE_KIND_LOADED: u8 = 2;
 
 const PTE_PRESENT: u64 = 1;
 const PTE_WRITE: u64 = 2;
@@ -71,6 +93,20 @@ const USER_STACK_ZERO_START: usize = 0x013fe000;
 const USER_STACK_ZERO_TOP: usize = 0x01400000;
 const NATIVE_STACK_PAGES: usize = 3;
 
+// M4 static native ELFs are independently linked into this bounded window.
+// A dedicated P2 leaf table keeps it disjoint from the M1-M3 linked payload.
+const LOADED_TEXT_START: usize = 0x02000000;
+const LOADED_TEXT_END: usize = 0x02100000;
+const LOADED_TEXT_P2_INDEX: usize = 16;
+const MAX_LOADED_SEGMENTS: usize = 8;
+const MAX_LOADED_PAGES: usize = 256;
+const MAX_LOADED_STACK_PAGES: usize = 16;
+const LOADED_STACK_REQUIRED_BASE: usize = 0x013fc000;
+const LOADED_STACK_REQUIRED_SIZE: usize = 0x00004000;
+const ELF_PF_X: u64 = 1;
+const ELF_PF_W: u64 = 2;
+const ELF_PF_R: u64 = 4;
+
 static mut BOOTSTRAP_LIVE: u8 = 0;
 static mut BOOTSTRAP_ROOT_CR3: usize = 0;
 static mut BOOTSTRAP_REGION_STARTS: [usize; 4] = [0; 4];
@@ -81,13 +117,14 @@ static mut BOOTSTRAP_CHILD_REFS: u32 = 0;
 
 static mut INITIALIZED: u8 = 0;
 static mut STATES: [u8; 4] = [0; 4];
+static mut ADDRESS_SPACE_KINDS: [u8; 4] = [0; 4];
 static mut GENERATIONS: [u32; 4] = [0; 4];
 static mut OWNERS: [u64; 4] = [0; 4];
 static mut ADDRESS_SPACE_CHILD_REFS: [u32; 4] = [0; 4];
 static mut ROOT_CR3S: [usize; 4] = [0; 4];
-static mut REGION_STARTS: [usize; 20] = [0; 20];
-static mut REGION_ENDS: [usize; 20] = [0; 20];
-static mut REGION_FLAGS: [u64; 20] = [0; 20];
+static mut REGION_STARTS: [usize; 40] = [0; 40];
+static mut REGION_ENDS: [usize; 40] = [0; 40];
+static mut REGION_FLAGS: [u64; 40] = [0; 40];
 static mut REGION_COUNTS: [usize; 4] = [0; 4];
 
 // Page-table frames are kernel-internal typed frame handles. Anonymous leaves
@@ -107,6 +144,19 @@ static mut STACK_OBJECTS: [u64; 16] = [0; 16];
 static mut STACK_PHYSICAL: [usize; 16] = [0; 16];
 static mut STACK_MAPPINGS: [u64; 16] = [0; 16];
 
+// Loaded image frames are owned directly by the address-space generation.
+// They never enter a process CSpace and are released on rollback or destroy.
+static mut LOADED_PAGE_COUNTS: [usize; 4] = [0; 4];
+static mut LOADED_PAGE_FRAMES: [u64; 1024] = [0; 1024];
+static mut LOADED_PAGE_VIRTUALS: [usize; 1024] = [0; 1024];
+static mut LOADED_PAGE_FLAGS: [u64; 1024] = [0; 1024];
+static mut LOADED_STACK_COUNTS: [usize; 4] = [0; 4];
+static mut LOADED_STACK_FRAMES: [u64; 64] = [0; 64];
+static mut LOADED_STACK_BASES: [usize; 4] = [0; 4];
+static mut LOADED_STACK_SIZES: [usize; 4] = [0; 4];
+static mut LOADED_ENTRIES: [usize; 4] = [0; 4];
+static mut LOADED_STACK_POINTERS: [usize; 4] = [0; 4];
+
 extern "sysv64" fn ocore_current_cr3() -> usize;
 extern "sysv64" fn ocore_kernel_p1_address() -> usize;
 extern "sysv64" fn ocore_management_cr3() -> usize;
@@ -117,6 +167,14 @@ fn region_index(slot: usize, region: usize) -> usize {
 
 fn stack_index(slot: usize, page: usize) -> usize {
     return slot * 4 + page;
+}
+
+fn loaded_page_index(slot: usize, page: usize) -> usize {
+    return slot * MAX_LOADED_PAGES + page;
+}
+
+fn loaded_stack_index(slot: usize, page: usize) -> usize {
+    return slot * MAX_LOADED_STACK_PAGES + page;
 }
 
 fn stack_virtual_address(page: usize) -> usize {
@@ -165,6 +223,7 @@ unsafe fn initialize_registry() -> void {
     let mut slot: usize = 0;
     while slot < MAX_ADDRESS_SPACES {
         STATES[slot] = ADDRESS_SPACE_EMPTY;
+        ADDRESS_SPACE_KINDS[slot] = ADDRESS_SPACE_KIND_NONE;
         GENERATIONS[slot] = 1;
         OWNERS[slot] = 0;
         ADDRESS_SPACE_CHILD_REFS[slot] = 0;
@@ -181,6 +240,12 @@ unsafe fn initialize_registry() -> void {
         SHARED_OBJECTS[slot] = 0;
         SHARED_PHYSICAL[slot] = 0;
         SHARED_MAPPINGS[slot] = 0;
+        LOADED_PAGE_COUNTS[slot] = 0;
+        LOADED_STACK_COUNTS[slot] = 0;
+        LOADED_STACK_BASES[slot] = 0;
+        LOADED_STACK_SIZES[slot] = 0;
+        LOADED_ENTRIES[slot] = 0;
+        LOADED_STACK_POINTERS[slot] = 0;
         let mut region: usize = 0;
         while region < MAX_NATIVE_REGIONS {
             let index: usize = region_index(slot, region);
@@ -195,6 +260,19 @@ unsafe fn initialize_registry() -> void {
             STACK_OBJECTS[index] = 0;
             STACK_PHYSICAL[index] = 0;
             STACK_MAPPINGS[index] = 0;
+            page += 1;
+        }
+        page = 0;
+        while page < MAX_LOADED_PAGES {
+            let index: usize = loaded_page_index(slot, page);
+            LOADED_PAGE_FRAMES[index] = 0;
+            LOADED_PAGE_VIRTUALS[index] = 0;
+            LOADED_PAGE_FLAGS[index] = 0;
+            page += 1;
+        }
+        page = 0;
+        while page < MAX_LOADED_STACK_PAGES {
+            LOADED_STACK_FRAMES[loaded_stack_index(slot, page)] = 0;
             page += 1;
         }
         slot += 1;
@@ -404,6 +482,7 @@ unsafe fn allocate_anonymous_leaf(
 }
 
 unsafe fn clear_slot(slot: usize) -> void {
+    ADDRESS_SPACE_KINDS[slot] = ADDRESS_SPACE_KIND_NONE;
     OWNERS[slot] = 0;
     ADDRESS_SPACE_CHILD_REFS[slot] = 0;
     ROOT_CR3S[slot] = 0;
@@ -419,6 +498,12 @@ unsafe fn clear_slot(slot: usize) -> void {
     SHARED_OBJECTS[slot] = 0;
     SHARED_PHYSICAL[slot] = 0;
     SHARED_MAPPINGS[slot] = 0;
+    LOADED_PAGE_COUNTS[slot] = 0;
+    LOADED_STACK_COUNTS[slot] = 0;
+    LOADED_STACK_BASES[slot] = 0;
+    LOADED_STACK_SIZES[slot] = 0;
+    LOADED_ENTRIES[slot] = 0;
+    LOADED_STACK_POINTERS[slot] = 0;
     let mut region: usize = 0;
     while region < MAX_NATIVE_REGIONS {
         let index: usize = region_index(slot, region);
@@ -435,9 +520,178 @@ unsafe fn clear_slot(slot: usize) -> void {
         STACK_MAPPINGS[index] = 0;
         page += 1;
     }
+    page = 0;
+    while page < MAX_LOADED_PAGES {
+        let index: usize = loaded_page_index(slot, page);
+        LOADED_PAGE_FRAMES[index] = 0;
+        LOADED_PAGE_VIRTUALS[index] = 0;
+        LOADED_PAGE_FLAGS[index] = 0;
+        page += 1;
+    }
+    page = 0;
+    while page < MAX_LOADED_STACK_PAGES {
+        LOADED_STACK_FRAMES[loaded_stack_index(slot, page)] = 0;
+        page += 1;
+    }
+}
+
+fn loaded_frame_kind(flags: u64) -> u64 {
+    if (flags & VM_EXEC) != 0 {
+        return FRAME_KIND_EXECUTABLE;
+    }
+    return FRAME_KIND_ANONYMOUS;
+}
+
+unsafe fn release_table_frames(slot: usize) -> bool {
+    if STACK_TABLE_FRAMES[slot] != 0 {
+        if release_frame(STACK_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        STACK_TABLE_FRAMES[slot] = 0;
+    }
+    if TEXT_TABLE_FRAMES[slot] != 0 {
+        if release_frame(TEXT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        TEXT_TABLE_FRAMES[slot] = 0;
+    }
+    if LEVEL2_TABLE_FRAMES[slot] != 0 {
+        if release_frame(LEVEL2_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        LEVEL2_TABLE_FRAMES[slot] = 0;
+    }
+    if LEVEL3_TABLE_FRAMES[slot] != 0 {
+        if release_frame(LEVEL3_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        LEVEL3_TABLE_FRAMES[slot] = 0;
+    }
+    if ROOT_TABLE_FRAMES[slot] != 0 {
+        if release_frame(ROOT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
+            return false;
+        }
+        ROOT_TABLE_FRAMES[slot] = 0;
+    }
+    return true;
+}
+
+unsafe fn release_loaded_slot_resources(slot: usize) -> bool {
+    if slot >= MAX_ADDRESS_SPACES
+        || LOADED_PAGE_COUNTS[slot] > MAX_LOADED_PAGES
+        || LOADED_STACK_COUNTS[slot] > MAX_LOADED_STACK_PAGES {
+        return false;
+    }
+
+    // Preflight every generation-owned frame before the first release.
+    let mut page: usize = 0;
+    while page < LOADED_PAGE_COUNTS[slot] {
+        let index: usize = loaded_page_index(slot, page);
+        let kind: u64 = loaded_frame_kind(LOADED_PAGE_FLAGS[index]);
+        if LOADED_PAGE_FRAMES[index] == 0
+            || kind == 0
+            || frame_address(LOADED_PAGE_FRAMES[index], kind) == 0 {
+            return false;
+        }
+        page += 1;
+    }
+    page = 0;
+    while page < LOADED_STACK_COUNTS[slot] {
+        let index: usize = loaded_stack_index(slot, page);
+        if LOADED_STACK_FRAMES[index] == 0
+            || frame_address(
+                LOADED_STACK_FRAMES[index],
+                FRAME_KIND_ANONYMOUS
+            ) == 0 {
+            return false;
+        }
+        page += 1;
+    }
+    let address_space: u64 = make_handle(slot);
+    if ISOLATION_MAPPINGS[slot] != 0
+        || ISOLATION_OBJECTS[slot] != 0
+        || ISOLATION_PHYSICAL[slot] != 0 {
+        if ISOLATION_MAPPINGS[slot] == 0
+            || ISOLATION_OBJECTS[slot] == 0
+            || ISOLATION_PHYSICAL[slot] == 0
+            || object_kind(ISOLATION_OBJECTS[slot]) != MEMORY_ANONYMOUS
+            || mapping_physical_address(ISOLATION_MAPPINGS[slot])
+                != ISOLATION_PHYSICAL[slot]
+            || !mapping_matches(
+                ISOLATION_MAPPINGS[slot],
+                address_space,
+                ISOLATION_OBJECTS[slot],
+                MEMORY_ANONYMOUS,
+                USER_ISOLATION_VA,
+                PAGE_SIZE,
+                VM_USER | VM_READ | VM_WRITE
+            ) {
+            return false;
+        }
+    }
+    if (ROOT_TABLE_FRAMES[slot] != 0
+            && page_table_address(ROOT_TABLE_FRAMES[slot]) == 0)
+        || (LEVEL3_TABLE_FRAMES[slot] != 0
+            && page_table_address(LEVEL3_TABLE_FRAMES[slot]) == 0)
+        || (LEVEL2_TABLE_FRAMES[slot] != 0
+            && page_table_address(LEVEL2_TABLE_FRAMES[slot]) == 0)
+        || (TEXT_TABLE_FRAMES[slot] != 0
+            && page_table_address(TEXT_TABLE_FRAMES[slot]) == 0)
+        || (STACK_TABLE_FRAMES[slot] != 0
+            && page_table_address(STACK_TABLE_FRAMES[slot]) == 0) {
+        return false;
+    }
+
+    page = 0;
+    while page < LOADED_PAGE_COUNTS[slot] {
+        let index: usize = loaded_page_index(slot, page);
+        if release_frame(
+            LOADED_PAGE_FRAMES[index],
+            loaded_frame_kind(LOADED_PAGE_FLAGS[index])
+        ) == 0 {
+            return false;
+        }
+        LOADED_PAGE_FRAMES[index] = 0;
+        LOADED_PAGE_VIRTUALS[index] = 0;
+        LOADED_PAGE_FLAGS[index] = 0;
+        page += 1;
+    }
+    LOADED_PAGE_COUNTS[slot] = 0;
+    page = 0;
+    while page < LOADED_STACK_COUNTS[slot] {
+        let index: usize = loaded_stack_index(slot, page);
+        if release_frame(
+            LOADED_STACK_FRAMES[index],
+            FRAME_KIND_ANONYMOUS
+        ) == 0 {
+            return false;
+        }
+        LOADED_STACK_FRAMES[index] = 0;
+        page += 1;
+    }
+    LOADED_STACK_COUNTS[slot] = 0;
+    if ISOLATION_MAPPINGS[slot] != 0 {
+        if destroy_owned_mapping(
+            ISOLATION_MAPPINGS[slot],
+            address_space,
+            ISOLATION_OBJECTS[slot]
+        ) == 0 || release_object(ISOLATION_OBJECTS[slot]) == 0 {
+            return false;
+        }
+        ISOLATION_MAPPINGS[slot] = 0;
+        ISOLATION_OBJECTS[slot] = 0;
+        ISOLATION_PHYSICAL[slot] = 0;
+    }
+    return release_table_frames(slot);
 }
 
 unsafe fn release_slot_resources(slot: usize) -> bool {
+    if ADDRESS_SPACE_KINDS[slot] == ADDRESS_SPACE_KIND_LOADED {
+        return release_loaded_slot_resources(slot);
+    }
+    if ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_NATIVE {
+        return false;
+    }
     let address_space: u64 = make_handle(slot);
     // Validate the complete mapping ownership set before releasing the first
     // reference. This keeps teardown all-or-nothing for stale or mismatched
@@ -552,37 +806,7 @@ unsafe fn release_slot_resources(slot: usize) -> bool {
     }
     ISOLATION_PHYSICAL[slot] = 0;
 
-    if STACK_TABLE_FRAMES[slot] != 0 {
-        if release_frame(STACK_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
-            return false;
-        }
-        STACK_TABLE_FRAMES[slot] = 0;
-    }
-    if TEXT_TABLE_FRAMES[slot] != 0 {
-        if release_frame(TEXT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
-            return false;
-        }
-        TEXT_TABLE_FRAMES[slot] = 0;
-    }
-    if LEVEL2_TABLE_FRAMES[slot] != 0 {
-        if release_frame(LEVEL2_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
-            return false;
-        }
-        LEVEL2_TABLE_FRAMES[slot] = 0;
-    }
-    if LEVEL3_TABLE_FRAMES[slot] != 0 {
-        if release_frame(LEVEL3_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
-            return false;
-        }
-        LEVEL3_TABLE_FRAMES[slot] = 0;
-    }
-    if ROOT_TABLE_FRAMES[slot] != 0 {
-        if release_frame(ROOT_TABLE_FRAMES[slot], FRAME_KIND_PAGE_TABLE) == 0 {
-            return false;
-        }
-        ROOT_TABLE_FRAMES[slot] = 0;
-    }
-    return true;
+    return release_table_frames(slot);
 }
 
 unsafe fn build_page_tables(slot: usize) -> u64 {
@@ -592,6 +816,9 @@ unsafe fn build_page_tables(slot: usize) -> u64 {
     let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
     let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
     let kernel_p1: usize = ocore_kernel_p1_address();
+    // The bootstrap exports the first of two physically contiguous 4 KiB
+    // kernel leaf tables covering 0..4 MiB.
+    let kernel_p1_high: usize = kernel_p1 + PAGE_SIZE;
     if root == 0 || level3 == 0 || level2 == 0 || text == 0 || stack == 0 {
         return 0;
     }
@@ -601,7 +828,8 @@ unsafe fn build_page_tables(slot: usize) -> u64 {
         || (text & (PAGE_SIZE - 1)) != 0
         || (stack & (PAGE_SIZE - 1)) != 0
         || kernel_p1 == 0
-        || (kernel_p1 & (PAGE_SIZE - 1)) != 0 {
+        || (kernel_p1 & (PAGE_SIZE - 1)) != 0
+        || (kernel_p1_high & (PAGE_SIZE - 1)) != 0 {
         return 0;
     }
 
@@ -616,6 +844,10 @@ unsafe fn build_page_tables(slot: usize) -> u64 {
     volatile_store(root_entries, (level3 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER);
     volatile_store(level3_entries, (level2 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER);
     volatile_store(level2_entries, (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE);
+    volatile_store(
+        level2_entries + 1,
+        (kernel_p1_high as u64) | PTE_PRESENT | PTE_WRITE
+    );
 
     // Preserve the allocator's complete 4..16 MiB supervisor RW/NX direct map
     // in every process root. This is required by frame zeroing and teardown.
@@ -691,6 +923,520 @@ unsafe fn build_page_tables(slot: usize) -> u64 {
     return 1;
 }
 
+unsafe fn build_loaded_page_tables(slot: usize) -> u64 {
+    let root: usize = page_table_address(ROOT_TABLE_FRAMES[slot]);
+    let level3: usize = page_table_address(LEVEL3_TABLE_FRAMES[slot]);
+    let level2: usize = page_table_address(LEVEL2_TABLE_FRAMES[slot]);
+    let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    let kernel_p1: usize = ocore_kernel_p1_address();
+    let kernel_p1_high: usize = kernel_p1 + PAGE_SIZE;
+    if root == 0
+        || level3 == 0
+        || level2 == 0
+        || text == 0
+        || stack == 0
+        || kernel_p1 == 0
+        || (root & (PAGE_SIZE - 1)) != 0
+        || (level3 & (PAGE_SIZE - 1)) != 0
+        || (level2 & (PAGE_SIZE - 1)) != 0
+        || (text & (PAGE_SIZE - 1)) != 0
+        || (stack & (PAGE_SIZE - 1)) != 0
+        || (kernel_p1 & (PAGE_SIZE - 1)) != 0
+        || (kernel_p1_high & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+
+    let root_entries: *mut u64 = root as *mut u64;
+    let level3_entries: *mut u64 = level3 as *mut u64;
+    let level2_entries: *mut u64 = level2 as *mut u64;
+    let stack_entries: *mut u64 = stack as *mut u64;
+    volatile_store(
+        root_entries,
+        (level3 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+    );
+    volatile_store(
+        level3_entries,
+        (level2 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+    );
+    volatile_store(
+        level2_entries,
+        (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE
+    );
+    volatile_store(
+        level2_entries + 1,
+        (kernel_p1_high as u64) | PTE_PRESENT | PTE_WRITE
+    );
+
+    let mut p2_index: usize = 2;
+    while p2_index < 8 {
+        volatile_store(
+            level2_entries + p2_index,
+            ((p2_index * HUGE_PAGE_SIZE) as u64)
+                | PTE_PRESENT
+                | PTE_WRITE
+                | PTE_HUGE
+                | PTE_NX
+        );
+        p2_index += 1;
+    }
+
+    // Writable upper-level entries permit both RX text and RW/NX data or
+    // stack leaves. Leaf PTEs remain the exact W^X authority boundary.
+    volatile_store(
+        level2_entries + LOADED_TEXT_P2_INDEX,
+        (text as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+    );
+    volatile_store(
+        level2_entries + 9,
+        (stack as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+    );
+    if ISOLATION_PHYSICAL[slot] == 0
+        || (ISOLATION_PHYSICAL[slot] & (PAGE_SIZE - 1)) != 0 {
+        return 0;
+    }
+    volatile_store(
+        stack_entries + 1,
+        (ISOLATION_PHYSICAL[slot] as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX
+    );
+    ROOT_CR3S[slot] = root;
+    return 1;
+}
+
+fn elf_flags_to_vm(flags: u64) -> u64 {
+    if (flags & ELF_PF_R) == 0
+        || flags > (ELF_PF_X | ELF_PF_W | ELF_PF_R)
+        || (flags & ELF_PF_X) != 0 && (flags & ELF_PF_W) != 0 {
+        return 0;
+    }
+    let mut result: u64 = VM_USER | VM_READ;
+    if (flags & ELF_PF_W) != 0 {
+        result = result | VM_WRITE;
+    }
+    if (flags & ELF_PF_X) != 0 {
+        result = result | VM_EXEC;
+    }
+    return result;
+}
+
+unsafe fn loaded_plan_preflight(plan: u64) -> bool {
+    if plan == 0 || !loaded_plan_is_validated(plan) {
+        return false;
+    }
+    let count: usize = loaded_segment_count(plan);
+    let plan_entry: usize = loaded_plan_entry(plan);
+    if count == 0
+        || count > MAX_LOADED_SEGMENTS
+        || plan_entry < LOADED_TEXT_START
+        || plan_entry >= LOADED_TEXT_END
+        || loaded_plan_stack_base(plan) != LOADED_STACK_REQUIRED_BASE
+        || loaded_plan_stack_size(plan) != LOADED_STACK_REQUIRED_SIZE {
+        return false;
+    }
+
+    let mut total_pages: usize = 0;
+    let mut entry_is_executable: bool = false;
+    let mut segment: usize = 0;
+    while segment < count {
+        let virtual_address: usize = loaded_segment_vaddr(plan, segment);
+        let memory_size: usize = loaded_segment_memsz(plan, segment);
+        let file_size: usize = loaded_segment_filesz(plan, segment);
+        let page_start: usize = loaded_segment_page_start(plan, segment);
+        let page_end: usize = loaded_segment_page_end(plan, segment);
+        let elf_flags: u64 = loaded_segment_flags(plan, segment);
+        let vm_flags: u64 = elf_flags_to_vm(elf_flags);
+        if virtual_address < LOADED_TEXT_START
+            || virtual_address >= LOADED_TEXT_END
+            || memory_size == 0
+            || file_size > memory_size
+            || memory_size > LOADED_TEXT_END - virtual_address
+            || vm_flags == 0
+            || page_start != virtual_address - (virtual_address & (PAGE_SIZE - 1))
+            || page_end <= page_start
+            || (page_start & (PAGE_SIZE - 1)) != 0
+            || (page_end & (PAGE_SIZE - 1)) != 0
+            || page_start < LOADED_TEXT_START
+            || page_end > LOADED_TEXT_END {
+            return false;
+        }
+        let raw_end: usize = virtual_address + memory_size;
+        let mut expected_page_end: usize = raw_end;
+        let tail: usize = raw_end & (PAGE_SIZE - 1);
+        if tail != 0 {
+            expected_page_end += PAGE_SIZE - tail;
+        }
+        if page_end != expected_page_end {
+            return false;
+        }
+        let pages: usize = (page_end - page_start) / PAGE_SIZE;
+        if pages == 0 || pages > MAX_LOADED_PAGES - total_pages {
+            return false;
+        }
+        total_pages += pages;
+        if (vm_flags & VM_EXEC) != 0
+            && plan_entry >= virtual_address
+            && plan_entry < raw_end {
+            entry_is_executable = true;
+        }
+
+        let mut other: usize = 0;
+        while other < segment {
+            let other_start: usize = loaded_segment_page_start(plan, other);
+            let other_end: usize = loaded_segment_page_end(plan, other);
+            if page_start < other_end && page_end > other_start {
+                return false;
+            }
+            other += 1;
+        }
+        segment += 1;
+    }
+    return entry_is_executable && total_pages != 0;
+}
+
+unsafe fn populate_loaded_segments(slot: usize, plan: u64) -> bool {
+    let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
+    if text == 0 || (text & (PAGE_SIZE - 1)) != 0 {
+        return false;
+    }
+    let text_entries: *mut u64 = text as *mut u64;
+    let count: usize = loaded_segment_count(plan);
+    let mut segment: usize = 0;
+    while segment < count {
+        let virtual_address: usize = loaded_segment_vaddr(plan, segment);
+        let memory_size: usize = loaded_segment_memsz(plan, segment);
+        let page_start: usize = loaded_segment_page_start(plan, segment);
+        let page_end: usize = loaded_segment_page_end(plan, segment);
+        let vm_flags: u64 = elf_flags_to_vm(
+            loaded_segment_flags(plan, segment)
+        );
+        let frame_kind: u64 = loaded_frame_kind(vm_flags);
+        let mut page_virtual: usize = page_start;
+        let mut segment_offset: usize = 0;
+        while page_virtual < page_end {
+            if LOADED_PAGE_COUNTS[slot] >= MAX_LOADED_PAGES {
+                return false;
+            }
+            let frame: u64 = alloc_frame(frame_kind);
+            if frame == 0 {
+                return false;
+            }
+            let record: usize = loaded_page_index(
+                slot,
+                LOADED_PAGE_COUNTS[slot]
+            );
+            LOADED_PAGE_FRAMES[record] = frame;
+            LOADED_PAGE_VIRTUALS[record] = page_virtual;
+            LOADED_PAGE_FLAGS[record] = vm_flags;
+            LOADED_PAGE_COUNTS[slot] += 1;
+            let physical: usize = frame_address(frame, frame_kind);
+            if physical == 0 || (physical & (PAGE_SIZE - 1)) != 0 {
+                return false;
+            }
+
+            let mut data_start: usize = page_virtual;
+            if data_start < virtual_address {
+                data_start = virtual_address;
+            }
+            let mut data_end: usize = page_virtual + PAGE_SIZE;
+            let segment_end: usize = virtual_address + memory_size;
+            if data_end > segment_end {
+                data_end = segment_end;
+            }
+            if data_end <= data_start
+                || materialize_segment_range(
+                    plan,
+                    segment,
+                    segment_offset,
+                    (physical + data_start - page_virtual) as *mut u8,
+                    data_end - data_start
+                ) == 0 {
+                return false;
+            }
+            segment_offset += data_end - data_start;
+
+            let leaf: usize = (page_virtual - LOADED_TEXT_START) / PAGE_SIZE;
+            if leaf >= MAX_LOADED_PAGES || volatile_load(text_entries + leaf) != 0 {
+                return false;
+            }
+            let mut pte: u64 = (physical as u64) | PTE_PRESENT | PTE_USER;
+            if (vm_flags & VM_WRITE) != 0 {
+                pte = pte | PTE_WRITE;
+            }
+            if (vm_flags & VM_EXEC) == 0 {
+                pte = pte | PTE_NX;
+            }
+            volatile_store(text_entries + leaf, pte);
+            page_virtual += PAGE_SIZE;
+        }
+        if segment_offset != memory_size
+            || add_native_region(slot, page_start, page_end, vm_flags) == 0 {
+            return false;
+        }
+        segment += 1;
+    }
+    return true;
+}
+
+unsafe fn populate_loaded_stack(slot: usize, plan: u64) -> bool {
+    let stack_base: usize = loaded_plan_stack_base(plan);
+    let stack_size: usize = loaded_plan_stack_size(plan);
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    if stack == 0
+        || stack_base != LOADED_STACK_REQUIRED_BASE
+        || stack_size != LOADED_STACK_REQUIRED_SIZE
+        || (stack_base & (PAGE_SIZE - 1)) != 0
+        || (stack_size & (PAGE_SIZE - 1)) != 0 {
+        return false;
+    }
+    let stack_entries: *mut u64 = stack as *mut u64;
+    let pages: usize = stack_size / PAGE_SIZE;
+    let mut page: usize = 0;
+    while page < pages {
+        if LOADED_STACK_COUNTS[slot] >= MAX_LOADED_STACK_PAGES {
+            return false;
+        }
+        let frame: u64 = alloc_frame(FRAME_KIND_ANONYMOUS);
+        if frame == 0 {
+            return false;
+        }
+        let record: usize = loaded_stack_index(
+            slot,
+            LOADED_STACK_COUNTS[slot]
+        );
+        LOADED_STACK_FRAMES[record] = frame;
+        LOADED_STACK_COUNTS[slot] += 1;
+        let physical: usize = frame_address(frame, FRAME_KIND_ANONYMOUS);
+        if physical == 0
+            || (physical & (PAGE_SIZE - 1)) != 0
+            || materialize_stack_range(
+                plan,
+                page * PAGE_SIZE,
+                physical as *mut u8,
+                PAGE_SIZE
+            ) == 0 {
+            return false;
+        }
+        let leaf: usize = (stack_base - 0x01200000) / PAGE_SIZE + page;
+        if leaf >= 512 || volatile_load(stack_entries + leaf) != 0 {
+            return false;
+        }
+        volatile_store(
+            stack_entries + leaf,
+            (physical as u64)
+                | PTE_PRESENT
+                | PTE_WRITE
+                | PTE_USER
+                | PTE_NX
+        );
+        page += 1;
+    }
+    LOADED_STACK_BASES[slot] = stack_base;
+    LOADED_STACK_SIZES[slot] = stack_size;
+    return add_native_region(
+        slot,
+        stack_base,
+        stack_base + stack_size,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    ) != 0;
+}
+
+unsafe fn loaded_mapping_protections_hold_for_slot(slot: usize) -> bool {
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED
+        || (STATES[slot] != ADDRESS_SPACE_LOADING
+            && STATES[slot] != ADDRESS_SPACE_LIVE)
+        || LOADED_PAGE_COUNTS[slot] == 0
+        || LOADED_PAGE_COUNTS[slot] > MAX_LOADED_PAGES
+        || LOADED_STACK_COUNTS[slot] == 0
+        || LOADED_STACK_COUNTS[slot] > MAX_LOADED_STACK_PAGES
+        || LOADED_STACK_BASES[slot] != LOADED_STACK_REQUIRED_BASE
+        || LOADED_STACK_SIZES[slot] != LOADED_STACK_REQUIRED_SIZE {
+        return false;
+    }
+    let root: usize = page_table_address(ROOT_TABLE_FRAMES[slot]);
+    let level3: usize = page_table_address(LEVEL3_TABLE_FRAMES[slot]);
+    let level2: usize = page_table_address(LEVEL2_TABLE_FRAMES[slot]);
+    let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
+    let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
+    let kernel_p1: usize = ocore_kernel_p1_address();
+    let kernel_p1_high: usize = kernel_p1 + PAGE_SIZE;
+    if root == 0
+        || root != ROOT_CR3S[slot]
+        || level3 == 0
+        || level2 == 0
+        || text == 0
+        || stack == 0
+        || kernel_p1 == 0 {
+        return false;
+    }
+    let root_entries: *const u64 = root as *const u64;
+    let level3_entries: *const u64 = level3 as *const u64;
+    let level2_entries: *const u64 = level2 as *const u64;
+    let text_entries: *const u64 = text as *const u64;
+    let stack_entries: *const u64 = stack as *const u64;
+    let address_space: u64 = make_handle(slot);
+    if ISOLATION_MAPPINGS[slot] == 0
+        || ISOLATION_OBJECTS[slot] == 0
+        || ISOLATION_PHYSICAL[slot] == 0
+        || object_kind(ISOLATION_OBJECTS[slot]) != MEMORY_ANONYMOUS
+        || !mapping_matches(
+            ISOLATION_MAPPINGS[slot],
+            address_space,
+            ISOLATION_OBJECTS[slot],
+            MEMORY_ANONYMOUS,
+            USER_ISOLATION_VA,
+            PAGE_SIZE,
+            VM_USER | VM_READ | VM_WRITE
+        )
+        || !present_pte_matches(
+            volatile_load(stack_entries + 1),
+            (ISOLATION_PHYSICAL[slot] as u64)
+                | PTE_PRESENT
+                | PTE_WRITE
+                | PTE_USER
+                | PTE_NX
+        ) {
+        return false;
+    }
+    if !present_pte_matches(
+            volatile_load(root_entries),
+            (level3 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level3_entries),
+            (level2 as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries),
+            (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries + 1),
+            (kernel_p1_high as u64) | PTE_PRESENT | PTE_WRITE
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries + 9),
+            (stack as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        )
+        || !present_pte_matches(
+            volatile_load(level2_entries + LOADED_TEXT_P2_INDEX),
+            (text as u64) | PTE_PRESENT | PTE_WRITE | PTE_USER
+        ) {
+        return false;
+    }
+    let mut p2_index: usize = 2;
+    while p2_index < 8 {
+        let expected: u64 = ((p2_index * HUGE_PAGE_SIZE) as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_HUGE
+            | PTE_NX;
+        if !present_pte_matches(
+            volatile_load(level2_entries + p2_index),
+            expected
+        ) {
+            return false;
+        }
+        p2_index += 1;
+    }
+    p2_index = 8;
+    while p2_index < 512 {
+        if p2_index != 9
+            && p2_index != LOADED_TEXT_P2_INDEX
+            && volatile_load(level2_entries + p2_index) != 0 {
+            return false;
+        }
+        p2_index += 1;
+    }
+
+    let mut page: usize = 0;
+    while page < LOADED_PAGE_COUNTS[slot] {
+        let index: usize = loaded_page_index(slot, page);
+        let virtual_address: usize = LOADED_PAGE_VIRTUALS[index];
+        let flags: u64 = LOADED_PAGE_FLAGS[index];
+        let frame_kind: u64 = loaded_frame_kind(flags);
+        let physical: usize = frame_address(
+            LOADED_PAGE_FRAMES[index],
+            frame_kind
+        );
+        if physical == 0
+            || virtual_address < LOADED_TEXT_START
+            || virtual_address >= LOADED_TEXT_END
+            || (virtual_address & (PAGE_SIZE - 1)) != 0
+            || (flags & (VM_USER | VM_READ)) != (VM_USER | VM_READ)
+            || (flags & VM_WRITE) != 0 && (flags & VM_EXEC) != 0 {
+            return false;
+        }
+        let mut expected: u64 = (physical as u64) | PTE_PRESENT | PTE_USER;
+        if (flags & VM_WRITE) != 0 {
+            expected = expected | PTE_WRITE;
+        }
+        if (flags & VM_EXEC) == 0 {
+            expected = expected | PTE_NX;
+        }
+        let leaf: usize = (virtual_address - LOADED_TEXT_START) / PAGE_SIZE;
+        if !present_pte_matches(volatile_load(text_entries + leaf), expected) {
+            return false;
+        }
+        page += 1;
+    }
+    let mut present_pages: usize = 0;
+    page = 0;
+    while page < MAX_LOADED_PAGES {
+        if (volatile_load(text_entries + page) & PTE_PRESENT) != 0 {
+            present_pages += 1;
+        }
+        page += 1;
+    }
+    if present_pages != LOADED_PAGE_COUNTS[slot] {
+        return false;
+    }
+
+    page = 0;
+    while page < LOADED_STACK_COUNTS[slot] {
+        let index: usize = loaded_stack_index(slot, page);
+        let physical: usize = frame_address(
+            LOADED_STACK_FRAMES[index],
+            FRAME_KIND_ANONYMOUS
+        );
+        let leaf: usize = (LOADED_STACK_BASES[slot] - 0x01200000)
+            / PAGE_SIZE
+            + page;
+        let expected: u64 = (physical as u64)
+            | PTE_PRESENT
+            | PTE_WRITE
+            | PTE_USER
+            | PTE_NX;
+        if physical == 0
+            || leaf >= 512
+            || !present_pte_matches(
+                volatile_load(stack_entries + leaf),
+                expected
+            ) {
+            return false;
+        }
+        page += 1;
+    }
+    let guard_leaf: usize = (LOADED_STACK_BASES[slot] - PAGE_SIZE - 0x01200000)
+        / PAGE_SIZE;
+    if volatile_load(stack_entries + guard_leaf) != 0 {
+        return false;
+    }
+    present_pages = 0;
+    page = 0;
+    while page < 512 {
+        if (volatile_load(stack_entries + page) & PTE_PRESENT) != 0 {
+            present_pages += 1;
+        }
+        page += 1;
+    }
+    return present_pages == LOADED_STACK_COUNTS[slot] + 1;
+}
+
 // Register the one page table that is already active. The legacy handle and
 // fixed broad regions remain unchanged so all M0.2/M0.3 probes retain their
 // exact syscall and fault behavior.
@@ -729,6 +1475,101 @@ pub unsafe fn install_bootstrap(root: usize) -> u64 {
     return BOOTSTRAP_ADDRESS_SPACE;
 }
 
+unsafe fn rollback_loaded_creation(slot: usize) -> u64 {
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED {
+        return 0;
+    }
+    if !release_slot_resources(slot) {
+        STATES[slot] = ADDRESS_SPACE_RETIRED;
+        return 0;
+    }
+    clear_slot(slot);
+    STATES[slot] = ADDRESS_SPACE_EMPTY;
+    return 0;
+}
+
+// Materialize one fully validated ELF plan into an unpublished address-space
+// generation. No frame, CR3, region, entry, or stack pointer becomes live
+// until every PT_LOAD byte/BSS byte and the complete SysV argument stack have
+// been written and the loader commits the exact entry/RSP pair.
+pub unsafe fn create_loaded_for_owner(owner_cspace: u64, plan: u64) -> u64 {
+    if BOOTSTRAP_LIVE == 0
+        || INITIALIZED == 0
+        || !cspace_is_live(owner_cspace)
+        || BOOTSTRAP_ROOT_CR3 != ocore_management_cr3()
+        || ocore_current_cr3() != BOOTSTRAP_ROOT_CR3
+        || !loaded_plan_preflight(plan) {
+        return 0;
+    }
+    // Capture the validated identity before commit. The address-space
+    // transaction does not depend on plan getters remaining readable after
+    // the loader transitions VALIDATED -> COMMITTED.
+    let expected_entry: usize = loaded_plan_entry(plan);
+    let mut slot: usize = 0;
+    while slot < MAX_ADDRESS_SPACES && STATES[slot] != ADDRESS_SPACE_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_ADDRESS_SPACES {
+        return 0;
+    }
+    clear_slot(slot);
+    ADDRESS_SPACE_KINDS[slot] = ADDRESS_SPACE_KIND_LOADED;
+    OWNERS[slot] = owner_cspace;
+    STATES[slot] = ADDRESS_SPACE_LOADING;
+    let address_space: u64 = make_handle(slot);
+
+    if allocate_table(slot, 0) == 0
+        || allocate_table(slot, 1) == 0
+        || allocate_table(slot, 2) == 0
+        || allocate_table(slot, 3) == 0
+        || allocate_table(slot, 4) == 0 {
+        return rollback_loaded_creation(slot);
+    }
+    if allocate_anonymous_leaf(
+        owner_cspace,
+        address_space,
+        (&mut ISOLATION_OBJECTS[slot]),
+        (&mut ISOLATION_PHYSICAL[slot]),
+        (&mut ISOLATION_MAPPINGS[slot]),
+        USER_ISOLATION_VA,
+        VM_USER | VM_READ | VM_WRITE
+    ) == 0
+        || build_loaded_page_tables(slot) == 0
+        || add_native_region(
+            slot,
+            USER_ISOLATION_VA,
+            USER_ISOLATION_END,
+            VM_USER | VM_READ | VM_WRITE
+        ) == 0
+        || !populate_loaded_segments(slot, plan)
+        || !populate_loaded_stack(slot, plan)
+        || !loaded_mapping_protections_hold_for_slot(slot) {
+        return rollback_loaded_creation(slot);
+    }
+
+    let mut committed_entry: usize = 0;
+    let mut committed_stack: usize = 0;
+    if commit_loaded_plan(
+        plan,
+        (&mut committed_entry),
+        (&mut committed_stack)
+    ) == 0
+        || committed_entry != expected_entry
+        || committed_stack <= LOADED_STACK_BASES[slot]
+        || committed_stack > LOADED_STACK_BASES[slot] + LOADED_STACK_SIZES[slot]
+        || (committed_stack & 0xf) != 0 {
+        return rollback_loaded_creation(slot);
+    }
+    LOADED_ENTRIES[slot] = committed_entry;
+    LOADED_STACK_POINTERS[slot] = committed_stack;
+
+    // Publish last. The validated plan and every physical ownership record are
+    // already immutable at this point, so no fallible work remains afterward.
+    STATES[slot] = ADDRESS_SPACE_LIVE;
+    return address_space;
+}
+
 // Create an inactive native address space. No handle becomes live until every
 // allocation, mapping reference, page-table leaf, and VM-region descriptor is
 // committed. All partial paths release in reverse ownership order.
@@ -748,6 +1589,7 @@ pub unsafe fn create_native_for_owner(owner_cspace: u64) -> u64 {
         return 0;
     }
     clear_slot(slot);
+    ADDRESS_SPACE_KINDS[slot] = ADDRESS_SPACE_KIND_NATIVE;
     OWNERS[slot] = owner_cspace;
     let address_space: u64 = make_handle(slot);
 
@@ -853,7 +1695,9 @@ pub unsafe fn create_native(owner_cspace: usize) -> u64 {
 // with a capability in the exact CSpace generation that owns the address space.
 unsafe fn map_shared_object(handle: u64, object: u64) -> u64 {
     let slot: usize = checked_slot(handle);
-    if slot >= MAX_ADDRESS_SPACES || object_kind(object) != MEMORY_SHARED {
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_NATIVE
+        || object_kind(object) != MEMORY_SHARED {
         return 0;
     }
     let current: usize = ocore_current_cr3();
@@ -864,7 +1708,7 @@ unsafe fn map_shared_object(handle: u64, object: u64) -> u64 {
         || SHARED_MAPPINGS[slot] != 0
         || SHARED_OBJECTS[slot] != 0
         || SHARED_PHYSICAL[slot] != 0
-        || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1 {
+        || REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS {
         return 0;
     }
 
@@ -960,13 +1804,14 @@ pub unsafe fn map_shared(
 pub unsafe fn unmap_shared(handle: u64, mapping: u64) -> u64 {
     let slot: usize = checked_slot(handle);
     if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_NATIVE
         || mapping == 0
         || mapping != SHARED_MAPPINGS[slot]
         || SHARED_OBJECTS[slot] == 0
         || SHARED_PHYSICAL[slot] == 0
         || object_kind(SHARED_OBJECTS[slot]) != MEMORY_SHARED
         || mapping_physical_address(mapping) != SHARED_PHYSICAL[slot]
-        || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+        || REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS + 1
         || !mapping_matches(
             mapping,
             handle,
@@ -1052,6 +1897,42 @@ pub unsafe fn destroy(handle: u64) -> u64 {
         || ADDRESS_SPACE_CHILD_REFS[slot] != 0 {
         return 0;
     }
+    if ADDRESS_SPACE_KINDS[slot] == ADDRESS_SPACE_KIND_LOADED {
+        if !loaded_mapping_protections_hold_for_slot(slot)
+            || LOADED_ENTRIES[slot] == 0
+            || LOADED_STACK_POINTERS[slot] == 0
+            || !valid_entry(handle, LOADED_ENTRIES[slot])
+            || !valid_stack_top(handle, LOADED_STACK_POINTERS[slot])
+            || !native_region_matches(
+                slot,
+                USER_ISOLATION_VA,
+                USER_ISOLATION_END,
+                VM_USER | VM_READ | VM_WRITE
+            )
+            || !native_region_matches(
+                slot,
+                LOADED_STACK_BASES[slot],
+                LOADED_STACK_BASES[slot] + LOADED_STACK_SIZES[slot],
+                VM_USER | VM_READ | VM_WRITE | VM_STACK
+            ) {
+            return 0;
+        }
+        STATES[slot] = ADDRESS_SPACE_RETIRED;
+        if !release_slot_resources(slot) {
+            return 0;
+        }
+        clear_slot(slot);
+        if GENERATIONS[slot] == 0xffff_ffff {
+            STATES[slot] = ADDRESS_SPACE_RETIRED;
+        } else {
+            GENERATIONS[slot] += 1;
+            STATES[slot] = ADDRESS_SPACE_EMPTY;
+        }
+        return 1;
+    }
+    if ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_NATIVE {
+        return 0;
+    }
     if !mapping_is_live(ISOLATION_MAPPINGS[slot])
         || !mapping_matches(
             ISOLATION_MAPPINGS[slot],
@@ -1129,7 +2010,7 @@ pub unsafe fn destroy(handle: u64) -> u64 {
             | PTE_WRITE
             | PTE_USER
             | PTE_NX;
-        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+        if REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS + 1
             || !native_region_matches(
                 slot,
                 USER_SHARED_VA,
@@ -1143,7 +2024,7 @@ pub unsafe fn destroy(handle: u64) -> u64 {
             return 0;
         }
     } else {
-        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1
+        if REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS
             || volatile_load(stack_entries + 2) != 0 {
             return 0;
         }
@@ -1238,7 +2119,9 @@ pub unsafe fn root_cr3(handle: u64) -> usize {
 // boundaries, including both native thread-stack guards.
 pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
     let slot: usize = checked_slot(handle);
-    if slot >= MAX_ADDRESS_SPACES || !cspace_is_live(OWNERS[slot]) {
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_NATIVE
+        || !cspace_is_live(OWNERS[slot]) {
         return false;
     }
     let root: usize = page_table_address(ROOT_TABLE_FRAMES[slot]);
@@ -1247,13 +2130,16 @@ pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
     let text: usize = page_table_address(TEXT_TABLE_FRAMES[slot]);
     let stack: usize = page_table_address(STACK_TABLE_FRAMES[slot]);
     let kernel_p1: usize = ocore_kernel_p1_address();
+    let kernel_p1_high: usize = kernel_p1 + PAGE_SIZE;
     if root == 0
         || root != ROOT_CR3S[slot]
         || level3 == 0
         || level2 == 0
         || text == 0
         || stack == 0
-        || kernel_p1 == 0 {
+        || kernel_p1 == 0
+        || (kernel_p1 & (PAGE_SIZE - 1)) != 0
+        || (kernel_p1_high & (PAGE_SIZE - 1)) != 0 {
         return false;
     }
 
@@ -1274,7 +2160,10 @@ pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
             volatile_load(level2_entries),
             (kernel_p1 as u64) | PTE_PRESENT | PTE_WRITE
         )
-        || volatile_load(level2_entries + 1) != 0
+        || !present_pte_matches(
+            volatile_load(level2_entries + 1),
+            (kernel_p1_high as u64) | PTE_PRESENT | PTE_WRITE
+        )
         || !present_pte_matches(
             volatile_load(level2_entries + 8),
             (text as u64) | PTE_PRESENT | PTE_USER
@@ -1335,7 +2224,7 @@ pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
                 PAGE_SIZE,
                 shared_flags
             )
-            || REGION_COUNTS[slot] != MAX_NATIVE_REGIONS
+            || REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS + 1
             || !native_region_matches(
                 slot,
                 USER_SHARED_VA,
@@ -1350,7 +2239,7 @@ pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
             | PTE_USER
             | PTE_NX;
     } else {
-        if REGION_COUNTS[slot] != MAX_NATIVE_REGIONS - 1
+        if REGION_COUNTS[slot] != LEGACY_NATIVE_REGIONS
             || native_region_matches(
                 slot,
                 USER_SHARED_VA,
@@ -1423,6 +2312,85 @@ pub unsafe fn dynamic_protections_hold(handle: u64) -> bool {
         && stack_allows(handle, 1, USER_STACK_ONE_TOP)
         && !allows(handle, USER_STACK_GUARD, 1, VM_READ)
         && !allows(handle, USER_STACK_INTERNAL_GUARD, 1, VM_READ);
+}
+
+pub unsafe fn loaded_protections_hold(handle: u64) -> bool {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED
+        || !cspace_is_live(OWNERS[slot])
+        || !loaded_mapping_protections_hold_for_slot(slot)
+        || REGION_COUNTS[slot] < 3
+        || REGION_COUNTS[slot] > MAX_NATIVE_REGIONS
+        || LOADED_ENTRIES[slot] == 0
+        || LOADED_STACK_POINTERS[slot] == 0
+        || !valid_entry(handle, LOADED_ENTRIES[slot])
+        || !valid_stack_top(handle, LOADED_STACK_POINTERS[slot])
+        || !allows(
+            handle,
+            USER_ISOLATION_VA,
+            PAGE_SIZE,
+            VM_USER | VM_READ | VM_WRITE
+        )
+        || allows(handle, USER_ISOLATION_VA, 1, VM_EXEC)
+        || !allows(
+            handle,
+            LOADED_STACK_BASES[slot],
+            LOADED_STACK_SIZES[slot],
+            VM_USER | VM_READ | VM_WRITE | VM_STACK
+        )
+        || allows(handle, LOADED_STACK_BASES[slot], 1, VM_EXEC)
+        || allows(
+            handle,
+            LOADED_STACK_BASES[slot] - PAGE_SIZE,
+            1,
+            VM_READ
+        ) {
+        return false;
+    }
+    let mut region: usize = 0;
+    while region < REGION_COUNTS[slot] {
+        let index: usize = region_index(slot, region);
+        if (REGION_FLAGS[index] & VM_WRITE) != 0
+            && (REGION_FLAGS[index] & VM_EXEC) != 0 {
+            return false;
+        }
+        region += 1;
+    }
+    return true;
+}
+
+pub unsafe fn is_loaded(handle: u64) -> bool {
+    let slot: usize = checked_slot(handle);
+    return slot < MAX_ADDRESS_SPACES
+        && ADDRESS_SPACE_KINDS[slot] == ADDRESS_SPACE_KIND_LOADED;
+}
+
+pub unsafe fn loaded_entry(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED {
+        return 0;
+    }
+    return LOADED_ENTRIES[slot];
+}
+
+pub unsafe fn loaded_stack_pointer(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED {
+        return 0;
+    }
+    return LOADED_STACK_POINTERS[slot];
+}
+
+pub unsafe fn loaded_frame_count(handle: u64) -> usize {
+    let slot: usize = checked_slot(handle);
+    if slot >= MAX_ADDRESS_SPACES
+        || ADDRESS_SPACE_KINDS[slot] != ADDRESS_SPACE_KIND_LOADED {
+        return 0;
+    }
+    return LOADED_PAGE_COUNTS[slot] + LOADED_STACK_COUNTS[slot];
 }
 
 pub unsafe fn owner_cspace_handle(handle: u64) -> u64 {

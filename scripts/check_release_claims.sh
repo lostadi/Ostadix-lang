@@ -172,11 +172,38 @@ check_current_ocore_docs \
     'syscall numbers? (are |remain )?0 through 5|yield[^.]*(only|merely)[^.]*(request|hook) counter|cap_copy and page_alloc remain reserved' \
     "native ABI v1 includes gated exit and sleep, and page_alloc is implemented"
 
-# The inverse claim boundary matters too: only the M3 foundation is verified.
-# Keep this list aligned with the forbidden success markers in the foundation
-# QEMU harness.
+# The public bounded M3 gate now exists. Reject the older foundation-only
+# wording while retaining the narrower fixed-capacity/single-CPU non-claims.
 check_current_ocore_docs \
-    'Milestone 3 (is )?(complete|implemented)|M3 (complete|implemented|IPC: PASS|full IPC: PASS|blocking IPC: PASS|ping-pong: PASS|personality crash containment: PASS)' \
-    "Milestone 3 has a verified foundation but its full IPC gate is incomplete"
+    'Milestone 3 has a verified foundation[^.]*not (a )?(completed|complete)|Milestone 3 is foundation-only|no CPL3 endpoint (ABI|operations)|cap_copy[^.]*(remain|still)[^.]*ERR_NOT_IMPLEMENTED' \
+    "the bounded M3 gate now exposes CPL3 IPC, blocking/wake, transfer, and crash containment"
+check_current_ocore_docs \
+    '(transfer )?ticket[^.]*(bound to|for one validated)[^.]*(destination )?endpoint' \
+    "M3 transfer tickets bind the exact creating process and destination CSpace, not the endpoint object"
+
+# Mode 18 is intentionally the scalar M6A dependency slice. Full Milestone 6
+# still requires the request-scoped foreign-memory protocol, and no foreign ABI
+# follows merely from routing a pinned test-personality corpus.
+check_current_ocore_docs \
+    'Milestone 6 (is )?(complete|implemented)|M6 (complete|implemented|personality[^.]*PASS)' \
+    "only bounded scalar M6A is implemented; full Milestone 6 remains future work"
+check_current_ocore_docs \
+    '(M6A|Milestone 6A)[^.]*(shared|foreign|request-scoped)[^.]*memory view[^.]*(complete|implemented|PASS)' \
+    "M6A has no shared or request-scoped foreign-process memory view"
+check_current_ocore_docs \
+    '(M6A|Milestone 6A)[^.]*(Linux|foreign operating-system) (ABI|personality)[^.]*(implemented|supported|PASS)' \
+    "M6A is a native scalar test personality, not a foreign operating-system ABI"
+check_current_ocore_docs \
+    '(M6A|Milestone 6A)[^.]*(package-managed personality|installable personality|upgradeable personality)' \
+    "M6A package-loads a pinned test personality but does not implement native personality package management"
+check_current_ocore_docs \
+    '(M6A|Milestone 6A)[^.]*supervisor[^.]*(performs|owns)[^.]*capability rebind' \
+    "the M6A supervisor requests policy actions while O-core performs capability rebind"
+
+# HostedSupervisor now rejects stale durable mutations with an active-set
+# revision compare-and-swap. The CLI's wider transaction lock is not the only
+# protection available to callers of the direct API.
+check 'direct [`]*HostedSupervisor[`]* API[^.]*(do(es)? not|has no)[^.]*(revision|stale.writer)|direct supervisor API has no persisted-revision' \
+    "the hosted supervisor API now rejects stale active-set writers by persisted revision"
 
 exit $fail

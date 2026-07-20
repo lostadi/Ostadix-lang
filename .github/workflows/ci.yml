@@ -34,8 +34,14 @@ jobs:
       - name: Build
         run: cargo build --all-targets --all-features --verbose
 
+      - name: Verify every declared binary target
+        run: bash scripts/check_declared_bins.sh
+
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
+
+      - name: Run hosted Live-World reference smoke
+        run: bash scripts/smoke-hosted-live-reference.sh
 
       - name: Run deterministic parser properties
         run: cargo test --test parser_proptest
@@ -134,10 +140,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install freestanding build and QEMU tools
+      - name: Install freestanding build, ELF inspection, and QEMU tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang lld qemu-system-x86
+          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86
+          command -v llvm-objdump
+          command -v nm
 
       - name: Run native and memory lifecycle smoke
         run: ./ocore/kernel/smoke-qemu.sh
@@ -153,3 +161,18 @@ jobs:
 
       - name: Run IPC foundation lifecycle smoke
         run: ./ocore/kernel/smoke-ipc-foundation-qemu.sh
+
+      - name: Run public CPL3 IPC and crash-containment smoke
+        run: ./ocore/kernel/smoke-ipc-qemu.sh
+
+      - name: Run deterministic OVFS and native ELF-loader smoke
+        run: ./ocore/kernel/smoke-loader-qemu.sh
+
+      - name: Run native live-system serial activation smoke
+        run: ./ocore/kernel/smoke-live-qemu.sh
+
+      - name: Run native package and supervisor semantics smoke
+        run: ./ocore/kernel/smoke-live-semantics-qemu.sh
+
+      - name: Run packaged scalar personality supervision smoke
+        run: ./ocore/kernel/smoke-personality-qemu.sh

@@ -1,0 +1,1275 @@
+module runtime::live_supervisor;
+
+use runtime::package_root::digest_word;
+use runtime::package_root::invariants_hold as root_invariants_hold;
+use runtime::package_root::is_live as root_is_live;
+use runtime::package_root::package_id as root_package_id;
+use runtime::package_root::protocol_id_at;
+use runtime::package_root::request_count;
+use runtime::package_root::request_rights_at;
+use runtime::package_root::service_count;
+use runtime::package_root::service_id_at;
+use runtime::package_root::version as root_version;
+use runtime::package_root::MAX_REQUESTS_PER_PACKAGE;
+use runtime::package_root::MAX_SERVICES_PER_PACKAGE;
+
+pub const MAX_ACTIVE_PACKAGES: usize = 4;
+pub const MAX_ACTIVE_SERVICES: usize = 16;
+pub const MAX_ROLLBACK_REQUESTS: usize = 32;
+
+pub const ACTIVATION_NONE: u64 = 0;
+pub const ACTIVATION_STAGED: u64 = 1;
+pub const ACTIVATION_STARTED: u64 = 2;
+pub const ACTIVATION_HEALTHY: u64 = 3;
+pub const ACTIVATION_ACTIVE: u64 = 4;
+
+const SERVICE_EMPTY: u8 = 0;
+const SERVICE_ACTIVE: u8 = 1;
+const SERVICE_CRASHED: u8 = 2;
+const SERVICE_HANDLE_TAG: u64 = 0xc600_0000;
+const ACTIVATION_HANDLE_TAG: u64 = 0xc700_0000;
+const ROLLBACK_HANDLE_TAG: u64 = 0xc800_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut ACTIVE_ROOTS: [u64; 4] = [0; 4];
+static mut ACTIVE_COUNT: usize = 0;
+static mut ROLLBACK_ROOTS: [u64; 4] = [0; 4];
+static mut ROLLBACK_COUNT: usize = 0;
+
+static mut SERVICE_STATES: [u8; 16] = [0; 16];
+static mut SERVICE_GENERATIONS: [u32; 16] = [0; 16];
+static mut SERVICE_PACKAGE_IDS: [u64; 16] = [0; 16];
+static mut SERVICE_PACKAGE_VERSIONS: [u64; 16] = [0; 16];
+static mut SERVICE_IDS: [u64; 16] = [0; 16];
+static mut SERVICE_PROTOCOLS: [u64; 16] = [0; 16];
+static mut SERVICE_ROOTS: [u64; 16] = [0; 16];
+
+static mut TX_GENERATION: u32 = 1;
+static mut TX_STATE: u8 = 0;
+static mut TX_ROOT: u64 = 0;
+static mut TX_GRANTS: [u64; 8] = [0; 8];
+static mut TX_GRANT_DEFINED: [u8; 8] = [0; 8];
+static mut TX_SERVICE_STATES: [u8; 4] = [0; 4];
+static mut LAST_ACTIVATION_STATE: u8 = 0;
+
+static mut ROLLBACK_TX_GENERATION: u32 = 1;
+static mut ROLLBACK_TX_STATE: u8 = 0;
+static mut ROLLBACK_TX_GRANTS: [u64; 32] = [0; 32];
+static mut ROLLBACK_TX_GRANT_DEFINED: [u8; 32] = [0; 32];
+static mut ROLLBACK_TX_SERVICE_STATES: [u8; 16] = [0; 16];
+
+static mut ACTIVATIONS: u64 = 0;
+static mut ACTIVATION_FAILURES: u64 = 0;
+static mut ROLLBACKS: u64 = 0;
+static mut ROLLBACK_FAILURES: u64 = 0;
+static mut CRASHES: u64 = 0;
+static mut RESTARTS: u64 = 0;
+static mut DEACTIVATIONS: u64 = 0;
+static mut RESOLUTIONS: u64 = 0;
+static mut STALE_REJECTIONS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn service_handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_service_handle(index: usize) -> u64 {
+    return ((SERVICE_GENERATIONS[index] as u64) << 32)
+        | SERVICE_HANDLE_TAG
+        | index as u64;
+}
+
+unsafe fn make_activation_handle() -> u64 {
+    return ((TX_GENERATION as u64) << 32) | ACTIVATION_HANDLE_TAG;
+}
+
+unsafe fn checked_activation(handle: u64) -> bool {
+    return INITIALIZED != 0
+        && POISONED == 0
+        && TX_STATE != 0
+        && (handle & HANDLE_TAG_MASK) == ACTIVATION_HANDLE_TAG
+        && (handle & HANDLE_INDEX_MASK) == 0
+        && handle_generation(handle) == TX_GENERATION;
+}
+
+unsafe fn make_rollback_handle() -> u64 {
+    return ((ROLLBACK_TX_GENERATION as u64) << 32) | ROLLBACK_HANDLE_TAG;
+}
+
+unsafe fn checked_rollback(handle: u64) -> bool {
+    return INITIALIZED != 0
+        && POISONED == 0
+        && ROLLBACK_TX_STATE != 0
+        && (handle & HANDLE_TAG_MASK) == ROLLBACK_HANDLE_TAG
+        && (handle & HANDLE_INDEX_MASK) == 0
+        && handle_generation(handle) == ROLLBACK_TX_GENERATION;
+}
+
+unsafe fn checked_service(handle: u64, required_state: u8) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != SERVICE_HANDLE_TAG {
+        return MAX_ACTIVE_SERVICES;
+    }
+    let index: usize = service_handle_index(handle);
+    if index >= MAX_ACTIVE_SERVICES
+        || SERVICE_STATES[index] != required_state
+        || SERVICE_GENERATIONS[index] != handle_generation(handle) {
+        return MAX_ACTIVE_SERVICES;
+    }
+    return index;
+}
+
+unsafe fn clear_transaction() -> void {
+    TX_STATE = 0;
+    TX_ROOT = 0;
+    let mut index: usize = 0;
+    while index < MAX_REQUESTS_PER_PACKAGE {
+        TX_GRANTS[index] = 0;
+        TX_GRANT_DEFINED[index] = 0;
+        index += 1;
+    }
+    index = 0;
+    while index < MAX_SERVICES_PER_PACKAGE {
+        TX_SERVICE_STATES[index] = 0;
+        index += 1;
+    }
+}
+
+unsafe fn retire_transaction() -> void {
+    clear_transaction();
+    if TX_GENERATION != 0xffff_ffff {
+        TX_GENERATION += 1;
+    } else {
+        POISONED = 1;
+    }
+}
+
+unsafe fn clear_rollback_transaction() -> void {
+    ROLLBACK_TX_STATE = 0;
+    let mut index: usize = 0;
+    while index < MAX_ROLLBACK_REQUESTS {
+        ROLLBACK_TX_GRANTS[index] = 0;
+        ROLLBACK_TX_GRANT_DEFINED[index] = 0;
+        index += 1;
+    }
+    index = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        ROLLBACK_TX_SERVICE_STATES[index] = 0;
+        index += 1;
+    }
+}
+
+unsafe fn retire_rollback_transaction() -> void {
+    clear_rollback_transaction();
+    if ROLLBACK_TX_GENERATION != 0xffff_ffff {
+        ROLLBACK_TX_GENERATION += 1;
+    } else {
+        POISONED = 1;
+    }
+}
+
+unsafe fn rollback_total_requests() -> usize {
+    let mut total: usize = 0;
+    let mut package_index: usize = 0;
+    while package_index < ROLLBACK_COUNT {
+        total += request_count(ROLLBACK_ROOTS[package_index]);
+        package_index += 1;
+    }
+    return total;
+}
+
+unsafe fn rollback_total_services() -> usize {
+    let mut total: usize = 0;
+    let mut package_index: usize = 0;
+    while package_index < ROLLBACK_COUNT {
+        total += service_count(ROLLBACK_ROOTS[package_index]);
+        package_index += 1;
+    }
+    return total;
+}
+
+unsafe fn rollback_request_rights(ordinal: usize) -> u64 {
+    let mut remaining: usize = ordinal;
+    let mut package_index: usize = 0;
+    while package_index < ROLLBACK_COUNT {
+        let count: usize = request_count(ROLLBACK_ROOTS[package_index]);
+        if remaining < count {
+            return request_rights_at(
+                ROLLBACK_ROOTS[package_index],
+                remaining
+            );
+        }
+        remaining -= count;
+        package_index += 1;
+    }
+    return 0;
+}
+
+unsafe fn rollback_service_name(ordinal: usize) -> u64 {
+    let mut remaining: usize = ordinal;
+    let mut package_index: usize = 0;
+    while package_index < ROLLBACK_COUNT {
+        let count: usize = service_count(ROLLBACK_ROOTS[package_index]);
+        if remaining < count {
+            return service_id_at(ROLLBACK_ROOTS[package_index], remaining);
+        }
+        remaining -= count;
+        package_index += 1;
+    }
+    return 0;
+}
+
+unsafe fn rollback_service_protocol(ordinal: usize) -> u64 {
+    let mut remaining: usize = ordinal;
+    let mut package_index: usize = 0;
+    while package_index < ROLLBACK_COUNT {
+        let count: usize = service_count(ROLLBACK_ROOTS[package_index]);
+        if remaining < count {
+            return protocol_id_at(ROLLBACK_ROOTS[package_index], remaining);
+        }
+        remaining -= count;
+        package_index += 1;
+    }
+    return 0;
+}
+
+unsafe fn refresh_rollback_transaction_state() -> void {
+    if ROLLBACK_TX_STATE == 0 || ROLLBACK_COUNT == 0 {
+        return;
+    }
+    let services: usize = rollback_total_services();
+    let mut all_started: bool = true;
+    let mut all_healthy: bool = true;
+    let mut ordinal: usize = 0;
+    while ordinal < services {
+        if ROLLBACK_TX_SERVICE_STATES[ordinal]
+            < ACTIVATION_STARTED as u8 {
+            all_started = false;
+        }
+        if ROLLBACK_TX_SERVICE_STATES[ordinal]
+            < ACTIVATION_HEALTHY as u8 {
+            all_healthy = false;
+        }
+        ordinal += 1;
+    }
+    ROLLBACK_TX_STATE = ACTIVATION_STAGED as u8;
+    if all_started {
+        ROLLBACK_TX_STATE = ACTIVATION_STARTED as u8;
+    }
+    if all_healthy {
+        ROLLBACK_TX_STATE = ACTIVATION_HEALTHY as u8;
+    }
+}
+
+unsafe fn all_rollback_requests_granted() -> bool {
+    if ROLLBACK_TX_STATE == 0 || ROLLBACK_COUNT == 0 {
+        return false;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < rollback_total_requests() {
+        if ROLLBACK_TX_GRANT_DEFINED[ordinal] != 1
+            || ROLLBACK_TX_GRANTS[ordinal]
+                != rollback_request_rights(ordinal) {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn no_rollback_service_started() -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < MAX_ACTIVE_SERVICES {
+        if ROLLBACK_TX_SERVICE_STATES[ordinal] != 0 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn refresh_transaction_state() -> void {
+    if TX_STATE == 0 || !root_is_live(TX_ROOT) {
+        return;
+    }
+    let services: usize = service_count(TX_ROOT);
+    let mut all_started: bool = true;
+    let mut all_healthy: bool = true;
+    let mut ordinal: usize = 0;
+    while ordinal < services {
+        if TX_SERVICE_STATES[ordinal] < ACTIVATION_STARTED as u8 {
+            all_started = false;
+        }
+        if TX_SERVICE_STATES[ordinal] < ACTIVATION_HEALTHY as u8 {
+            all_healthy = false;
+        }
+        ordinal += 1;
+    }
+    TX_STATE = ACTIVATION_STAGED as u8;
+    if all_started {
+        TX_STATE = ACTIVATION_STARTED as u8;
+    }
+    if all_healthy {
+        TX_STATE = ACTIVATION_HEALTHY as u8;
+    }
+}
+
+unsafe fn all_transaction_requests_granted() -> bool {
+    if TX_STATE == 0 || !root_is_live(TX_ROOT) {
+        return false;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < request_count(TX_ROOT) {
+        if TX_GRANT_DEFINED[ordinal] != 1
+            || TX_GRANTS[ordinal] != request_rights_at(TX_ROOT, ordinal) {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn no_transaction_service_started() -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < MAX_SERVICES_PER_PACKAGE {
+        if TX_SERVICE_STATES[ordinal] != 0 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn roots_valid_and_services_unique(
+    roots: *const u64,
+    count: usize
+) -> bool {
+    if roots as usize == 0 || count > MAX_ACTIVE_PACKAGES {
+        return false;
+    }
+    let mut package_index: usize = 0;
+    while package_index < count {
+        let root: u64 = volatile_load(roots + package_index);
+        if !root_is_live(root) {
+            return false;
+        }
+        let mut prior_package: usize = 0;
+        while prior_package < package_index {
+            let prior_root: u64 = volatile_load(roots + prior_package);
+            if root_package_id(prior_root) == root_package_id(root) {
+                return false;
+            }
+            prior_package += 1;
+        }
+        let mut service_ordinal: usize = 0;
+        while service_ordinal < service_count(root) {
+            let service: u64 = service_id_at(root, service_ordinal);
+            let mut scan_package: usize = 0;
+            while scan_package <= package_index {
+                let scan_root: u64 = volatile_load(roots + scan_package);
+                let mut scan_ordinal: usize = 0;
+                let mut scan_limit: usize = service_count(scan_root);
+                if scan_package == package_index {
+                    scan_limit = service_ordinal;
+                }
+                while scan_ordinal < scan_limit {
+                    if service_id_at(scan_root, scan_ordinal) == service {
+                        return false;
+                    }
+                    scan_ordinal += 1;
+                }
+                scan_package += 1;
+            }
+            service_ordinal += 1;
+        }
+        package_index += 1;
+    }
+    return true;
+}
+
+unsafe fn can_advance_all_service_generations() -> bool {
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        if SERVICE_GENERATIONS[index] == 0xffff_ffff {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn rebuild_services() -> bool {
+    if !roots_valid_and_services_unique((&ACTIVE_ROOTS[0]), ACTIVE_COUNT)
+        || !can_advance_all_service_generations() {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        SERVICE_GENERATIONS[index] += 1;
+        SERVICE_STATES[index] = SERVICE_EMPTY;
+        SERVICE_PACKAGE_IDS[index] = 0;
+        SERVICE_PACKAGE_VERSIONS[index] = 0;
+        SERVICE_IDS[index] = 0;
+        SERVICE_PROTOCOLS[index] = 0;
+        SERVICE_ROOTS[index] = 0;
+        index += 1;
+    }
+    let mut package_index: usize = 0;
+    while package_index < ACTIVE_COUNT {
+        let root: u64 = ACTIVE_ROOTS[package_index];
+        let mut ordinal: usize = 0;
+        while ordinal < service_count(root) {
+            index = package_index * MAX_SERVICES_PER_PACKAGE + ordinal;
+            SERVICE_STATES[index] = SERVICE_ACTIVE;
+            SERVICE_PACKAGE_IDS[index] = root_package_id(root);
+            SERVICE_PACKAGE_VERSIONS[index] = root_version(root);
+            SERVICE_IDS[index] = service_id_at(root, ordinal);
+            SERVICE_PROTOCOLS[index] = protocol_id_at(root, ordinal);
+            SERVICE_ROOTS[index] = root;
+            ordinal += 1;
+        }
+        package_index += 1;
+    }
+    return true;
+}
+
+unsafe fn service_slot_matches_active(index: usize) -> bool {
+    let package_index: usize = index / MAX_SERVICES_PER_PACKAGE;
+    let ordinal: usize = index % MAX_SERVICES_PER_PACKAGE;
+    if package_index >= ACTIVE_COUNT
+        || ordinal >= service_count(ACTIVE_ROOTS[package_index]) {
+        return SERVICE_STATES[index] == SERVICE_EMPTY
+            && SERVICE_PACKAGE_IDS[index] == 0
+            && SERVICE_PACKAGE_VERSIONS[index] == 0
+            && SERVICE_IDS[index] == 0
+            && SERVICE_PROTOCOLS[index] == 0
+            && SERVICE_ROOTS[index] == 0;
+    }
+    let root: u64 = ACTIVE_ROOTS[package_index];
+    return (SERVICE_STATES[index] == SERVICE_ACTIVE
+            || SERVICE_STATES[index] == SERVICE_CRASHED)
+        && SERVICE_PACKAGE_IDS[index] == root_package_id(root)
+        && SERVICE_PACKAGE_VERSIONS[index] == root_version(root)
+        && SERVICE_IDS[index] == service_id_at(root, ordinal)
+        && SERVICE_PROTOCOLS[index] == protocol_id_at(root, ordinal)
+        && SERVICE_ROOTS[index] == root;
+}
+
+unsafe fn rollback_transaction_invariants_hold() -> bool {
+    if ROLLBACK_TX_GENERATION == 0 {
+        return false;
+    }
+    if ROLLBACK_TX_STATE == 0 {
+        let mut index: usize = 0;
+        while index < MAX_ROLLBACK_REQUESTS {
+            if ROLLBACK_TX_GRANTS[index] != 0
+                || ROLLBACK_TX_GRANT_DEFINED[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        index = 0;
+        while index < MAX_ACTIVE_SERVICES {
+            if ROLLBACK_TX_SERVICE_STATES[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        return true;
+    }
+    if ROLLBACK_TX_STATE < ACTIVATION_STAGED as u8
+        || ROLLBACK_TX_STATE > ACTIVATION_HEALTHY as u8
+        || ROLLBACK_COUNT == 0
+        || rollback_total_requests() > MAX_ROLLBACK_REQUESTS
+        || rollback_total_services() == 0
+        || rollback_total_services() > MAX_ACTIVE_SERVICES {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < MAX_ROLLBACK_REQUESTS {
+        if index < rollback_total_requests() {
+            if ROLLBACK_TX_GRANT_DEFINED[index] > 1
+                || (ROLLBACK_TX_GRANT_DEFINED[index] == 0
+                    && ROLLBACK_TX_GRANTS[index] != 0)
+                || (ROLLBACK_TX_GRANT_DEFINED[index] == 1
+                    && ROLLBACK_TX_GRANTS[index]
+                        != rollback_request_rights(index)) {
+                return false;
+            }
+        } else if ROLLBACK_TX_GRANTS[index] != 0
+            || ROLLBACK_TX_GRANT_DEFINED[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    let mut all_started: bool = true;
+    let mut all_healthy: bool = true;
+    index = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        if index < rollback_total_services() {
+            let service_state: u8 = ROLLBACK_TX_SERVICE_STATES[index];
+            if service_state != 0
+                && service_state != ACTIVATION_STARTED as u8
+                && service_state != ACTIVATION_HEALTHY as u8 {
+                return false;
+            }
+            if service_state < ACTIVATION_STARTED as u8 {
+                all_started = false;
+            }
+            if service_state < ACTIVATION_HEALTHY as u8 {
+                all_healthy = false;
+            }
+        } else if ROLLBACK_TX_SERVICE_STATES[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    let mut expected_state: u8 = ACTIVATION_STAGED as u8;
+    if all_started {
+        expected_state = ACTIVATION_STARTED as u8;
+    }
+    if all_healthy {
+        expected_state = ACTIVATION_HEALTHY as u8;
+    }
+    return ROLLBACK_TX_STATE == expected_state;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !root_invariants_hold()
+        || ACTIVE_COUNT > MAX_ACTIVE_PACKAGES
+        || ROLLBACK_COUNT > MAX_ACTIVE_PACKAGES
+        || !roots_valid_and_services_unique((&ACTIVE_ROOTS[0]), ACTIVE_COUNT)
+        || !rollback_transaction_invariants_hold()
+        || (TX_STATE != 0 && ROLLBACK_TX_STATE != 0) {
+        return false;
+    }
+    if ROLLBACK_COUNT != 0
+        && !roots_valid_and_services_unique(
+            (&ROLLBACK_ROOTS[0]),
+            ROLLBACK_COUNT
+        ) {
+        return false;
+    }
+    let mut package_index: usize = ACTIVE_COUNT;
+    while package_index < MAX_ACTIVE_PACKAGES {
+        if ACTIVE_ROOTS[package_index] != 0 {
+            return false;
+        }
+        package_index += 1;
+    }
+    package_index = ROLLBACK_COUNT;
+    while package_index < MAX_ACTIVE_PACKAGES {
+        if ROLLBACK_ROOTS[package_index] != 0 {
+            return false;
+        }
+        package_index += 1;
+    }
+
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        if SERVICE_GENERATIONS[index] == 0
+            || !service_slot_matches_active(index) {
+            return false;
+        }
+        index += 1;
+    }
+    if TX_STATE == 0 {
+        if TX_ROOT != 0 {
+            return false;
+        }
+        index = 0;
+        while index < MAX_REQUESTS_PER_PACKAGE {
+            if TX_GRANTS[index] != 0 || TX_GRANT_DEFINED[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        index = 0;
+        while index < MAX_SERVICES_PER_PACKAGE {
+            if TX_SERVICE_STATES[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+    } else if TX_STATE < ACTIVATION_STAGED as u8
+        || TX_STATE > ACTIVATION_HEALTHY as u8
+        || !root_is_live(TX_ROOT) {
+        return false;
+    } else {
+        index = 0;
+        while index < MAX_REQUESTS_PER_PACKAGE {
+            if index < request_count(TX_ROOT) {
+                if TX_GRANT_DEFINED[index] > 1
+                    || (TX_GRANT_DEFINED[index] == 0
+                        && TX_GRANTS[index] != 0)
+                    || (TX_GRANT_DEFINED[index] == 1
+                        && TX_GRANTS[index]
+                            != request_rights_at(TX_ROOT, index)) {
+                    return false;
+                }
+            } else if TX_GRANTS[index] != 0
+                || TX_GRANT_DEFINED[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        let mut all_started: bool = true;
+        let mut all_healthy: bool = true;
+        index = 0;
+        while index < MAX_SERVICES_PER_PACKAGE {
+            if index < service_count(TX_ROOT) {
+                let service_state: u8 = TX_SERVICE_STATES[index];
+                if service_state != 0
+                    && service_state != ACTIVATION_STARTED as u8
+                    && service_state != ACTIVATION_HEALTHY as u8 {
+                    return false;
+                }
+                if service_state < ACTIVATION_STARTED as u8 {
+                    all_started = false;
+                }
+                if service_state < ACTIVATION_HEALTHY as u8 {
+                    all_healthy = false;
+                }
+            } else if TX_SERVICE_STATES[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        let mut expected_state: u8 = ACTIVATION_STAGED as u8;
+        if all_started {
+            expected_state = ACTIVATION_STARTED as u8;
+        }
+        if all_healthy {
+            expected_state = ACTIVATION_HEALTHY as u8;
+        }
+        if TX_STATE != expected_state {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !root_invariants_hold() {
+        return 0;
+    }
+    ACTIVE_COUNT = 0;
+    ROLLBACK_COUNT = 0;
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_PACKAGES {
+        ACTIVE_ROOTS[index] = 0;
+        ROLLBACK_ROOTS[index] = 0;
+        index += 1;
+    }
+    index = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        SERVICE_STATES[index] = SERVICE_EMPTY;
+        SERVICE_GENERATIONS[index] = 1;
+        SERVICE_PACKAGE_IDS[index] = 0;
+        SERVICE_PACKAGE_VERSIONS[index] = 0;
+        SERVICE_IDS[index] = 0;
+        SERVICE_PROTOCOLS[index] = 0;
+        SERVICE_ROOTS[index] = 0;
+        index += 1;
+    }
+    TX_GENERATION = 1;
+    clear_transaction();
+    ROLLBACK_TX_GENERATION = 1;
+    clear_rollback_transaction();
+    LAST_ACTIVATION_STATE = ACTIVATION_NONE as u8;
+    ACTIVATIONS = 0;
+    ACTIVATION_FAILURES = 0;
+    ROLLBACKS = 0;
+    ROLLBACK_FAILURES = 0;
+    CRASHES = 0;
+    RESTARTS = 0;
+    DEACTIVATIONS = 0;
+    RESOLUTIONS = 0;
+    STALE_REJECTIONS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn stage_activation(root: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || TX_STATE != 0
+        || ROLLBACK_TX_STATE != 0
+        || !root_is_live(root)
+        || !invariants_hold() {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    let package: u64 = root_package_id(root);
+    let mut found: bool = false;
+    let mut index: usize = 0;
+    while index < ACTIVE_COUNT {
+        if root_package_id(ACTIVE_ROOTS[index]) == package {
+            found = true;
+        }
+        index += 1;
+    }
+    if !found && ACTIVE_COUNT >= MAX_ACTIVE_PACKAGES {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    clear_transaction();
+    TX_ROOT = root;
+    TX_STATE = ACTIVATION_STAGED as u8;
+    LAST_ACTIVATION_STATE = ACTIVATION_STAGED as u8;
+    return make_activation_handle();
+}
+
+pub unsafe fn grant_request(
+    activation: u64,
+    ordinal: usize,
+    granted_rights: u64
+) -> u64 {
+    if !checked_activation(activation)
+        || TX_STATE != ACTIVATION_STAGED as u8
+        || !no_transaction_service_started()
+        || ordinal >= request_count(TX_ROOT)
+        || TX_GRANT_DEFINED[ordinal] != 0
+        || granted_rights == 0
+        || granted_rights != request_rights_at(TX_ROOT, ordinal) {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    TX_GRANTS[ordinal] = granted_rights;
+    TX_GRANT_DEFINED[ordinal] = 1;
+    return 1;
+}
+
+pub unsafe fn start_service(activation: u64, ordinal: usize) -> u64 {
+    if !checked_activation(activation)
+        || !all_transaction_requests_granted()
+        || ordinal >= service_count(TX_ROOT)
+        || TX_SERVICE_STATES[ordinal] != 0 {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    TX_SERVICE_STATES[ordinal] = ACTIVATION_STARTED as u8;
+    refresh_transaction_state();
+    LAST_ACTIVATION_STATE = TX_STATE;
+    return 1;
+}
+
+pub unsafe fn mark_service_healthy(
+    activation: u64,
+    ordinal: usize,
+    healthy: bool
+) -> u64 {
+    if !checked_activation(activation)
+        || ordinal >= service_count(TX_ROOT)
+        || TX_SERVICE_STATES[ordinal] != ACTIVATION_STARTED as u8 {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    if !healthy {
+        ACTIVATION_FAILURES += 1;
+        retire_transaction();
+        return 0;
+    }
+    TX_SERVICE_STATES[ordinal] = ACTIVATION_HEALTHY as u8;
+    refresh_transaction_state();
+    LAST_ACTIVATION_STATE = TX_STATE;
+    return 1;
+}
+
+pub unsafe fn abort_activation(activation: u64) -> u64 {
+    if !checked_activation(activation) {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    ACTIVATION_FAILURES += 1;
+    retire_transaction();
+    return 1;
+}
+
+pub unsafe fn commit_activation(activation: u64) -> u64 {
+    if !checked_activation(activation)
+        || TX_STATE != ACTIVATION_HEALTHY as u8
+        || !invariants_hold()
+        || !can_advance_all_service_generations() {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < request_count(TX_ROOT) {
+        if TX_GRANT_DEFINED[ordinal] != 1
+            || TX_GRANTS[ordinal] != request_rights_at(TX_ROOT, ordinal) {
+            ACTIVATION_FAILURES += 1;
+            return 0;
+        }
+        ordinal += 1;
+    }
+
+    let mut candidate: [u64; 4] = [0; 4];
+    let mut candidate_count: usize = ACTIVE_COUNT;
+    let package: u64 = root_package_id(TX_ROOT);
+    let mut replaced: bool = false;
+    let mut index: usize = 0;
+    while index < ACTIVE_COUNT {
+        candidate[index] = ACTIVE_ROOTS[index];
+        if root_package_id(candidate[index]) == package {
+            candidate[index] = TX_ROOT;
+            replaced = true;
+        }
+        index += 1;
+    }
+    if !replaced {
+        if candidate_count >= MAX_ACTIVE_PACKAGES {
+            ACTIVATION_FAILURES += 1;
+            return 0;
+        }
+        candidate[candidate_count] = TX_ROOT;
+        candidate_count += 1;
+    }
+    if !roots_valid_and_services_unique((&candidate[0]), candidate_count) {
+        ACTIVATION_FAILURES += 1;
+        return 0;
+    }
+
+    index = 0;
+    while index < MAX_ACTIVE_PACKAGES {
+        ROLLBACK_ROOTS[index] = ACTIVE_ROOTS[index];
+        if index < candidate_count {
+            ACTIVE_ROOTS[index] = candidate[index];
+        } else {
+            ACTIVE_ROOTS[index] = 0;
+        }
+        index += 1;
+    }
+    ROLLBACK_COUNT = ACTIVE_COUNT;
+    ACTIVE_COUNT = candidate_count;
+    if !rebuild_services() {
+        POISONED = 1;
+        return 0;
+    }
+    ACTIVATIONS += 1;
+    LAST_ACTIVATION_STATE = ACTIVATION_ACTIVE as u8;
+    retire_transaction();
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn stage_complete_rollback() -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || TX_STATE != 0
+        || ROLLBACK_TX_STATE != 0
+        || ROLLBACK_COUNT == 0
+        || !roots_valid_and_services_unique(
+            (&ROLLBACK_ROOTS[0]),
+            ROLLBACK_COUNT
+        )
+        || !invariants_hold() {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    clear_rollback_transaction();
+    ROLLBACK_TX_STATE = ACTIVATION_STAGED as u8;
+    LAST_ACTIVATION_STATE = ACTIVATION_STAGED as u8;
+    return make_rollback_handle();
+}
+
+pub unsafe fn rollback_request_count(rollback: u64) -> usize {
+    if !checked_rollback(rollback) {
+        return 0;
+    }
+    return rollback_total_requests();
+}
+
+pub unsafe fn rollback_request_rights_at(
+    rollback: u64,
+    ordinal: usize
+) -> u64 {
+    if !checked_rollback(rollback) || ordinal >= rollback_total_requests() {
+        return 0;
+    }
+    return rollback_request_rights(ordinal);
+}
+
+pub unsafe fn rollback_service_count(rollback: u64) -> usize {
+    if !checked_rollback(rollback) {
+        return 0;
+    }
+    return rollback_total_services();
+}
+
+pub unsafe fn rollback_service_name_id(
+    rollback: u64,
+    ordinal: usize
+) -> u64 {
+    if !checked_rollback(rollback) || ordinal >= rollback_total_services() {
+        return 0;
+    }
+    return rollback_service_name(ordinal);
+}
+
+pub unsafe fn rollback_service_protocol_id(
+    rollback: u64,
+    ordinal: usize
+) -> u64 {
+    if !checked_rollback(rollback) || ordinal >= rollback_total_services() {
+        return 0;
+    }
+    return rollback_service_protocol(ordinal);
+}
+
+pub unsafe fn grant_rollback_request(
+    rollback: u64,
+    ordinal: usize,
+    granted_rights: u64
+) -> u64 {
+    if !checked_rollback(rollback)
+        || ROLLBACK_TX_STATE != ACTIVATION_STAGED as u8
+        || !no_rollback_service_started()
+        || ordinal >= rollback_total_requests()
+        || ROLLBACK_TX_GRANT_DEFINED[ordinal] != 0
+        || granted_rights == 0
+        || granted_rights != rollback_request_rights(ordinal) {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    ROLLBACK_TX_GRANTS[ordinal] = granted_rights;
+    ROLLBACK_TX_GRANT_DEFINED[ordinal] = 1;
+    return 1;
+}
+
+pub unsafe fn start_rollback_service(
+    rollback: u64,
+    ordinal: usize
+) -> u64 {
+    if !checked_rollback(rollback)
+        || !all_rollback_requests_granted()
+        || ordinal >= rollback_total_services()
+        || ROLLBACK_TX_SERVICE_STATES[ordinal] != 0 {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    ROLLBACK_TX_SERVICE_STATES[ordinal] = ACTIVATION_STARTED as u8;
+    refresh_rollback_transaction_state();
+    LAST_ACTIVATION_STATE = ROLLBACK_TX_STATE;
+    return 1;
+}
+
+pub unsafe fn mark_rollback_service_healthy(
+    rollback: u64,
+    ordinal: usize,
+    healthy: bool
+) -> u64 {
+    if !checked_rollback(rollback)
+        || ordinal >= rollback_total_services()
+        || ROLLBACK_TX_SERVICE_STATES[ordinal]
+            != ACTIVATION_STARTED as u8 {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    if !healthy {
+        ROLLBACK_FAILURES += 1;
+        retire_rollback_transaction();
+        return 0;
+    }
+    ROLLBACK_TX_SERVICE_STATES[ordinal] = ACTIVATION_HEALTHY as u8;
+    refresh_rollback_transaction_state();
+    LAST_ACTIVATION_STATE = ROLLBACK_TX_STATE;
+    return 1;
+}
+
+pub unsafe fn abort_complete_rollback(rollback: u64) -> u64 {
+    if !checked_rollback(rollback) {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    ROLLBACK_FAILURES += 1;
+    retire_rollback_transaction();
+    return 1;
+}
+
+pub unsafe fn commit_complete_rollback(rollback: u64) -> u64 {
+    if !checked_rollback(rollback)
+        || ROLLBACK_TX_STATE != ACTIVATION_HEALTHY as u8
+        || !all_rollback_requests_granted()
+        || !can_advance_all_service_generations()
+        || !invariants_hold() {
+        ROLLBACK_FAILURES += 1;
+        return 0;
+    }
+    let mut prior_active: [u64; 4] = [0; 4];
+    let prior_active_count: usize = ACTIVE_COUNT;
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_PACKAGES {
+        prior_active[index] = ACTIVE_ROOTS[index];
+        ACTIVE_ROOTS[index] = ROLLBACK_ROOTS[index];
+        ROLLBACK_ROOTS[index] = prior_active[index];
+        index += 1;
+    }
+    ACTIVE_COUNT = ROLLBACK_COUNT;
+    ROLLBACK_COUNT = prior_active_count;
+    if !rebuild_services() {
+        POISONED = 1;
+        return 0;
+    }
+    ROLLBACKS += 1;
+    LAST_ACTIVATION_STATE = ACTIVATION_ACTIVE as u8;
+    retire_rollback_transaction();
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn rollback_transaction_state(rollback: u64) -> u64 {
+    if !checked_rollback(rollback) {
+        return ACTIVATION_NONE;
+    }
+    return ROLLBACK_TX_STATE as u64;
+}
+
+pub unsafe fn resolve(service_id: u64, protocol_id: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || service_id == 0
+        || protocol_id == 0
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        if SERVICE_STATES[index] == SERVICE_ACTIVE
+            && SERVICE_IDS[index] == service_id
+            && SERVICE_PROTOCOLS[index] == protocol_id {
+            RESOLUTIONS += 1;
+            return make_service_handle(index);
+        }
+        index += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn service_is_current(service: u64) -> bool {
+    let current: bool = checked_service(service, SERVICE_ACTIVE)
+        < MAX_ACTIVE_SERVICES;
+    if !current && INITIALIZED != 0 && POISONED == 0 {
+        STALE_REJECTIONS += 1;
+    }
+    return current;
+}
+
+pub unsafe fn service_package_id(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES {
+        return 0;
+    }
+    return SERVICE_PACKAGE_IDS[index];
+}
+
+pub unsafe fn service_package_version(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES {
+        return 0;
+    }
+    return SERVICE_PACKAGE_VERSIONS[index];
+}
+
+pub unsafe fn service_name_id(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES {
+        return 0;
+    }
+    return SERVICE_IDS[index];
+}
+
+pub unsafe fn service_protocol_id(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES {
+        return 0;
+    }
+    return SERVICE_PROTOCOLS[index];
+}
+
+pub unsafe fn service_package_root(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES {
+        return 0;
+    }
+    return SERVICE_ROOTS[index];
+}
+
+pub unsafe fn crash_service(service: u64) -> u64 {
+    let index: usize = checked_service(service, SERVICE_ACTIVE);
+    if index >= MAX_ACTIVE_SERVICES
+        || ROLLBACK_TX_STATE != 0
+        || SERVICE_GENERATIONS[index] == 0xffff_ffff {
+        STALE_REJECTIONS += 1;
+        return 0;
+    }
+    SERVICE_GENERATIONS[index] += 1;
+    SERVICE_STATES[index] = SERVICE_CRASHED;
+    CRASHES += 1;
+    return 1;
+}
+
+pub unsafe fn restart_service(
+    package_id: u64,
+    service_id: u64,
+    healthy: bool
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || ROLLBACK_TX_STATE != 0
+        || package_id == 0
+        || service_id == 0 {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < MAX_ACTIVE_SERVICES {
+        if SERVICE_STATES[index] == SERVICE_CRASHED
+            && SERVICE_PACKAGE_IDS[index] == package_id
+            && SERVICE_IDS[index] == service_id {
+            if !healthy || SERVICE_GENERATIONS[index] == 0xffff_ffff {
+                ACTIVATION_FAILURES += 1;
+                return 0;
+            }
+            SERVICE_GENERATIONS[index] += 1;
+            SERVICE_STATES[index] = SERVICE_ACTIVE;
+            RESTARTS += 1;
+            return make_service_handle(index);
+        }
+        index += 1;
+    }
+    return 0;
+}
+
+// Remove one active package as a complete namespace transaction. Rebuilding
+// the service table advances every service generation, so all handles issued
+// before deactivation become stale before the package root is unpublished.
+pub unsafe fn deactivate_package(package_id: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || package_id == 0
+        || TX_STATE != 0
+        || ROLLBACK_TX_STATE != 0
+        || ROLLBACK_COUNT != 0
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < ACTIVE_COUNT
+        && root_package_id(ACTIVE_ROOTS[index]) != package_id {
+        index += 1;
+    }
+    if index >= ACTIVE_COUNT || !can_advance_all_service_generations() {
+        return 0;
+    }
+    while index + 1 < ACTIVE_COUNT {
+        ACTIVE_ROOTS[index] = ACTIVE_ROOTS[index + 1];
+        index += 1;
+    }
+    ACTIVE_COUNT -= 1;
+    ACTIVE_ROOTS[ACTIVE_COUNT] = 0;
+    if !rebuild_services() {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_ACTIVATION_STATE = ACTIVATION_NONE as u8;
+    DEACTIVATIONS += 1;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn active_root(package_id: u64) -> u64 {
+    let mut index: usize = 0;
+    while index < ACTIVE_COUNT {
+        if root_package_id(ACTIVE_ROOTS[index]) == package_id {
+            return ACTIVE_ROOTS[index];
+        }
+        index += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn active_package_count() -> usize {
+    return ACTIVE_COUNT;
+}
+
+pub unsafe fn rollback_package_count() -> usize {
+    return ROLLBACK_COUNT;
+}
+
+pub unsafe fn activation_state(activation: u64) -> u64 {
+    if !checked_activation(activation) {
+        return ACTIVATION_NONE;
+    }
+    return TX_STATE as u64;
+}
+
+pub unsafe fn last_activation_state() -> u64 {
+    return LAST_ACTIVATION_STATE as u64;
+}
+
+pub unsafe fn activation_count() -> u64 {
+    return ACTIVATIONS;
+}
+
+pub unsafe fn activation_failure_count() -> u64 {
+    return ACTIVATION_FAILURES;
+}
+
+pub unsafe fn rollback_count() -> u64 {
+    return ROLLBACKS;
+}
+
+pub unsafe fn rollback_failure_count() -> u64 {
+    return ROLLBACK_FAILURES;
+}
+
+pub unsafe fn crash_count() -> u64 {
+    return CRASHES;
+}
+
+pub unsafe fn restart_count() -> u64 {
+    return RESTARTS;
+}
+
+pub unsafe fn deactivation_count() -> u64 {
+    return DEACTIVATIONS;
+}
+
+pub unsafe fn resolution_count() -> u64 {
+    return RESOLUTIONS;
+}
+
+pub unsafe fn stale_rejection_count() -> u64 {
+    return STALE_REJECTIONS;
+}
+
+pub unsafe fn active_digest_word(package_id: u64, word: usize) -> u64 {
+    let root: u64 = active_root(package_id);
+    if root == 0 {
+        return 0;
+    }
+    return digest_word(root, word);
+}

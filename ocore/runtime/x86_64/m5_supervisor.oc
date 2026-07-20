@@ -1,0 +1,29 @@
+module runtime::m5_supervisor;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+
+const COMPLETION_VA: usize = 0x0120_1000;
+pub const COMPLETION_VALUE: u64 = 0x4d35_0000_0000_0002;
+
+@link_section(".rodata")
+static ONLINE: [u8; 34] = b"M5 supervisor service ELF: online\n";
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64) -> never {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        report_capability,
+        (&ONLINE[0]) as u64,
+        34
+    ) != 34 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    volatile_store(COMPLETION_VA as *mut u64, COMPLETION_VALUE);
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}

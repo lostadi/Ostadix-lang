@@ -25,10 +25,18 @@ pub const RIGHT_MEMORY_USE: u64 = 8;
 pub const RIGHT_ENDPOINT_SEND: u64 = 16;
 pub const RIGHT_ENDPOINT_RECEIVE: u64 = 32;
 pub const RIGHT_ENDPOINT_CANCEL: u64 = 64;
+pub const RIGHT_CONTROL: u64 = 128;
+pub const RIGHT_PERSONALITY_REPLY: u64 = 256;
+pub const RIGHT_PERSONALITY_SUPERVISE: u64 = 512;
+pub const RIGHT_PERSONALITY_CALL: u64 = 1024;
 pub const OBJECT_DEBUG: u64 = 1;
 pub const OBJECT_PAGE_POOL: u64 = 2;
 pub const OBJECT_MEMORY: u64 = 3;
 pub const OBJECT_ENDPOINT: u64 = 4;
+pub const OBJECT_CONTROL: u64 = 5;
+pub const OBJECT_PERSONALITY_REPLY: u64 = 6;
+pub const OBJECT_PERSONALITY_SUPERVISION: u64 = 7;
+pub const OBJECT_PERSONALITY_CALL: u64 = 8;
 
 // Public capability handles remain `(generation << 32) | capability_slot`.
 // CSpace identity is kernel-only and separately kind tagged so a reusable raw
@@ -219,6 +227,18 @@ fn allowed_rights(object_type: u64) -> u64 {
             | RIGHT_ENDPOINT_RECEIVE
             | RIGHT_ENDPOINT_CANCEL
             | RIGHT_TRANSFER;
+    }
+    if object_type == OBJECT_CONTROL {
+        return RIGHT_CONTROL;
+    }
+    if object_type == OBJECT_PERSONALITY_REPLY {
+        return RIGHT_PERSONALITY_REPLY;
+    }
+    if object_type == OBJECT_PERSONALITY_SUPERVISION {
+        return RIGHT_PERSONALITY_SUPERVISE;
+    }
+    if object_type == OBJECT_PERSONALITY_CALL {
+        return RIGHT_PERSONALITY_CALL;
     }
     return 0;
 }

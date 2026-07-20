@@ -370,6 +370,35 @@ unsafe fn sender_waiter_pop(slot: usize) -> u64 {
     return waiter;
 }
 
+// Remove one logical sender-waiter position without changing the FIFO order of
+// any surviving waiter. The ring is deliberately compacted toward its head so
+// exact cancellation cannot let a younger sender overtake an older one.
+unsafe fn sender_waiter_remove_at(slot: usize, position: usize) -> u64 {
+    if slot >= MAX_ENDPOINTS || position >= SENDER_WAITER_LENGTHS[slot] {
+        return 0;
+    }
+    let removed: u64 = sender_waiter_at(slot, position);
+    let mut cursor: usize = position;
+    while cursor + 1 < SENDER_WAITER_LENGTHS[slot] {
+        let target_physical: usize =
+            (SENDER_WAITER_HEADS[slot] + cursor) % MAX_BLOCKED_SENDERS;
+        let source_physical: usize =
+            (SENDER_WAITER_HEADS[slot] + cursor + 1) % MAX_BLOCKED_SENDERS;
+        SENDER_WAITERS[queue_index(slot, target_physical)] =
+            SENDER_WAITERS[queue_index(slot, source_physical)];
+        cursor += 1;
+    }
+    let old_tail: usize =
+        (SENDER_WAITER_HEADS[slot] + SENDER_WAITER_LENGTHS[slot] - 1)
+            % MAX_BLOCKED_SENDERS;
+    SENDER_WAITERS[queue_index(slot, old_tail)] = 0;
+    SENDER_WAITER_LENGTHS[slot] -= 1;
+    if SENDER_WAITER_LENGTHS[slot] == 0 {
+        SENDER_WAITER_HEADS[slot] = 0;
+    }
+    return removed;
+}
+
 unsafe fn waiter_occurrences(waiter: u64) -> usize {
     let mut found: usize = 0;
     let mut slot: usize = 0;
@@ -658,6 +687,20 @@ pub unsafe fn is_live(handle: u64) -> bool {
     return checked_live_endpoint(handle) < MAX_ENDPOINTS;
 }
 
+// Bounded kernel lifecycle scans use this accessor instead of reconstructing
+// an endpoint identity from a reusable raw slot. Draining generations remain
+// addressable until their final reference, waiter, and cleanup record retire.
+pub unsafe fn handle_for_slot(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_ENDPOINTS
+        || (STATES[slot] != ENDPOINT_LIVE
+            && STATES[slot] != ENDPOINT_DRAINING) {
+        return 0;
+    }
+    return make_handle(slot);
+}
+
 pub unsafe fn is_draining(handle: u64) -> bool {
     let slot: usize = checked_endpoint(handle);
     return slot < MAX_ENDPOINTS && STATES[slot] == ENDPOINT_DRAINING;
@@ -892,13 +935,23 @@ pub unsafe fn enqueue(
     return 1;
 }
 
-pub unsafe fn dequeue(
+// Read the current FIFO head without publishing its escrowed destination
+// capability or mutating queue state. A syscall may therefore copy these four
+// scalar words to user memory first; a recoverable copy fault leaves the exact
+// message queued and the transferred capability inaccessible.
+pub unsafe fn peek_head(
     handle: u64,
     sender_process: *mut u64,
     correlation: *mut u64,
     scalar_payload: *mut u64,
     destination_capability: *mut u64
 ) -> u64 {
+    if sender_process as usize == 0
+        || correlation as usize == 0
+        || scalar_payload as usize == 0
+        || destination_capability as usize == 0 {
+        return 0;
+    }
     volatile_store(sender_process, 0);
     volatile_store(correlation, 0);
     volatile_store(scalar_payload, 0);
@@ -918,6 +971,40 @@ pub unsafe fn dequeue(
     let sender: u64 = MESSAGE_SENDERS[index];
     let request_correlation: u64 = MESSAGE_CORRELATIONS[index];
     let payload: u64 = MESSAGE_PAYLOADS[index];
+    let cap: u64 = MESSAGE_DESTINATION_CAPS[index];
+    if cap != 0 && !escrow_record_valid(
+        RECEIVER_CSPACE_OWNERS[slot],
+        cap,
+        MESSAGE_DESTINATION_OBJECTS[index],
+        MESSAGE_DESTINATION_TYPES[index],
+        MESSAGE_DESTINATION_RIGHTS[index]
+    ) {
+        POISONED = 1;
+        return 0;
+    }
+    volatile_store(sender_process, sender);
+    volatile_store(correlation, request_correlation);
+    volatile_store(scalar_payload, payload);
+    volatile_store(destination_capability, cap);
+    return 1;
+}
+
+// Commit the exact current head after a successful peek/copyout transaction.
+// The kernel is single-CPU with interrupts masked across the syscall, so no
+// other queue mutation can occur between peek_head and this publication step.
+pub unsafe fn commit_head(handle: u64) -> u64 {
+    let slot: usize = checked_live_endpoint(handle);
+    if slot >= MAX_ENDPOINTS
+        || MESSAGE_LENGTHS[slot] == 0
+        || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
+        || !invariants_hold() {
+        return 0;
+    }
+    let physical: usize = message_at(slot, 0);
+    if physical >= ENDPOINT_QUEUE_CAPACITY {
+        return 0;
+    }
+    let index: usize = queue_index(slot, physical);
     let cap: u64 = MESSAGE_DESTINATION_CAPS[index];
     if cap != 0
         && (!escrow_record_valid(
@@ -939,6 +1026,40 @@ pub unsafe fn dequeue(
     }
     if !invariants_hold() {
         POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+// Compatibility wrapper retained for the Milestone 3 foundation harness.
+pub unsafe fn dequeue(
+    handle: u64,
+    sender_process: *mut u64,
+    correlation: *mut u64,
+    scalar_payload: *mut u64,
+    destination_capability: *mut u64
+) -> u64 {
+    if sender_process as usize == 0
+        || correlation as usize == 0
+        || scalar_payload as usize == 0
+        || destination_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(sender_process, 0);
+    volatile_store(correlation, 0);
+    volatile_store(scalar_payload, 0);
+    volatile_store(destination_capability, 0);
+    let mut sender: u64 = 0;
+    let mut request_correlation: u64 = 0;
+    let mut payload: u64 = 0;
+    let mut cap: u64 = 0;
+    if peek_head(
+        handle,
+        (&mut sender),
+        (&mut request_correlation),
+        (&mut payload),
+        (&mut cap)
+    ) == 0 || commit_head(handle) == 0 {
         return 0;
     }
     volatile_store(sender_process, sender);
@@ -1122,6 +1243,83 @@ pub unsafe fn take_sender_waiter(handle: u64) -> u64 {
         return 0;
     }
     return sender_waiter_pop(slot);
+}
+
+pub unsafe fn sender_waiter(handle: u64) -> u64 {
+    let slot: usize = checked_endpoint(handle);
+    if slot >= MAX_ENDPOINTS || SENDER_WAITER_LENGTHS[slot] == 0 {
+        return 0;
+    }
+    return sender_waiter_at(slot, 0);
+}
+
+// Exact waiter lookup is generation-aware because both the endpoint and TCB
+// arguments are complete handles. It is valid during drain so cancellation can
+// prove that it is unlinking the same request that originally blocked.
+pub unsafe fn waiter_matches(
+    handle: u64,
+    kind: u64,
+    thread_handle: u64
+) -> bool {
+    let slot: usize = checked_endpoint(handle);
+    if slot >= MAX_ENDPOINTS
+        || !thread_handle_shape_valid(thread_handle)
+        || (kind != ENDPOINT_WAITER_RECEIVER
+            && kind != ENDPOINT_WAITER_SENDER) {
+        return false;
+    }
+    if kind == ENDPOINT_WAITER_RECEIVER {
+        return RECEIVER_WAITERS[slot] == thread_handle;
+    }
+    let mut position: usize = 0;
+    while position < SENDER_WAITER_LENGTHS[slot] {
+        if sender_waiter_at(slot, position) == thread_handle {
+            return true;
+        }
+        position += 1;
+    }
+    return false;
+}
+
+// Remove one exact waiter while preserving the FIFO order of all other blocked
+// senders. Unlike take_cancelled_waiter this works before or during endpoint
+// drain and never selects a different TCB merely because it is at the head.
+pub unsafe fn remove_waiter(
+    handle: u64,
+    kind: u64,
+    thread_handle: u64
+) -> u64 {
+    let slot: usize = checked_endpoint(handle);
+    if slot >= MAX_ENDPOINTS
+        || !waiter_matches(handle, kind, thread_handle)
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut removed: u64 = 0;
+    if kind == ENDPOINT_WAITER_RECEIVER {
+        RECEIVER_WAITERS[slot] = 0;
+        removed = thread_handle;
+    } else {
+        let mut position: usize = 0;
+        while position < SENDER_WAITER_LENGTHS[slot]
+            && sender_waiter_at(slot, position) != thread_handle {
+            position += 1;
+        }
+        removed = sender_waiter_remove_at(slot, position);
+    }
+    if removed != thread_handle {
+        POISONED = 1;
+        return 0;
+    }
+    if STATES[slot] == ENDPOINT_DRAINING && !try_retire(slot) {
+        POISONED = 1;
+        return 0;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return removed;
 }
 
 pub unsafe fn receiver_waiter(handle: u64) -> u64 {

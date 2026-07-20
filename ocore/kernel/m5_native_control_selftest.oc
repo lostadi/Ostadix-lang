@@ -1,0 +1,89 @@
+module kernel::m5_native_control_selftest;
+
+use runtime::live_supervisor::service_is_current;
+use runtime::native_control::CONTROL_ACTIVE;
+use runtime::native_control::activated;
+use runtime::native_control::activation_count;
+use runtime::native_control::active_service_handle;
+use runtime::native_control::failure_count;
+use runtime::native_control::init;
+use runtime::native_control::install_count;
+use runtime::native_control::installed_root;
+use runtime::native_control::invariants_hold;
+use runtime::native_control::last_resolved_service;
+use runtime::native_control::resolve_count;
+use runtime::native_control::state;
+use runtime::native_control::status_count;
+use runtime::native_control::submission_count;
+use runtime::native_control::submit;
+use runtime::native_control::success_count;
+use runtime::native_control::trusted_digest_word;
+use runtime::serial_control::COMMAND_ACTIVATE;
+use runtime::serial_control::COMMAND_INSTALL;
+use runtime::serial_control::COMMAND_RESOLVE;
+use runtime::serial_control::COMMAND_STATUS;
+
+pub const SELF_TEST_PASS: u64 = 0x4d35_4e43_5452_4c50;
+
+static STATUS: [u8; 6] = b"status";
+static MALFORMED_STATUS: [u8; 7] = b"status\n";
+static INSTALL: [u8; 76] = b"install 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff 5 1";
+static WRONG_PACKAGE: [u8; 76] = b"install 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff 6 1";
+static ACTIVATE: [u8; 73] = b"activate 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff";
+static WRONG_ACTIVATE: [u8; 73] = b"activate 0123456789abcdeffedcba987654321000112233445566778899aabbccddeefe";
+static RESOLVE_MISSING: [u8; 12] = b"resolve 99 1";
+static RESOLVE_REPL: [u8; 11] = b"resolve 4 1";
+static UPGRADE: [u8; 72] = b"upgrade 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff";
+
+pub unsafe fn self_test() -> u64 {
+    if init(
+        0x0123_4567_89ab_cdef,
+        0xfedc_ba98_7654_3210,
+        0x0011_2233_4455_6677,
+        0x8899_aabb_ccdd_eeff
+    ) != 1
+        || submit((&ACTIVATE[0]), 73) != 0
+        || submit((&WRONG_PACKAGE[0]), 76) != 0
+        || submit((&MALFORMED_STATUS[0]), 7) != 0
+        || submit((&STATUS[0]), 6) != COMMAND_STATUS
+        || submit((&INSTALL[0]), 76) != COMMAND_INSTALL
+        || submit((&INSTALL[0]), 76) != 0
+        || submit((&WRONG_ACTIVATE[0]), 73) != 0
+        || submit((&ACTIVATE[0]), 73) != COMMAND_ACTIVATE
+        || submit((&ACTIVATE[0]), 73) != 0
+        || submit((&RESOLVE_MISSING[0]), 12) != 0
+        || submit((&RESOLVE_REPL[0]), 11) != COMMAND_RESOLVE
+        || submit((&UPGRADE[0]), 72) != 0
+        || submit((&STATUS[0]), 6) != COMMAND_STATUS {
+        return 0xe516_0000_0000_0001;
+    }
+    if state() != CONTROL_ACTIVE
+        || activated() != 1
+        || installed_root() == 0
+        || last_resolved_service() != active_service_handle(3)
+        || submission_count() != 13
+        || success_count() != 5
+        || failure_count() != 8
+        || install_count() != 1
+        || activation_count() != 1
+        || status_count() != 2
+        || resolve_count() != 1 {
+        return 0xe516_0000_0000_0002;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < 4 {
+        if active_service_handle(ordinal) == 0
+            || !service_is_current(active_service_handle(ordinal)) {
+            return 0xe516_0000_0000_0003;
+        }
+        ordinal += 1;
+    }
+    if trusted_digest_word(0) != 0x0123_4567_89ab_cdef
+        || trusted_digest_word(1) != 0xfedc_ba98_7654_3210
+        || trusted_digest_word(2) != 0x0011_2233_4455_6677
+        || trusted_digest_word(3) != 0x8899_aabb_ccdd_eeff
+        || !invariants_hold() {
+        return 0xe516_0000_0000_0004;
+    }
+    return SELF_TEST_PASS;
+}

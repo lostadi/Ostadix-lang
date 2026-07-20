@@ -53,7 +53,13 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-faults-qemu.sh # fault and user-copy recovery matrix
 ./ocore/kernel/smoke-processes-qemu.sh # M1 isolation and teardown matrix
 ./ocore/kernel/smoke-scheduler-qemu.sh # M2 thread/scheduler lifecycle
-./ocore/kernel/smoke-ipc-foundation-qemu.sh # M3 foundation, not full IPC
+./ocore/kernel/smoke-ipc-foundation-qemu.sh # M3 mechanism regression
+./ocore/kernel/smoke-ipc-qemu.sh # M3 public CPL3 IPC and containment
+./ocore/kernel/smoke-loader-qemu.sh # M4 OVFS and static ELF lifecycle
+./ocore/kernel/smoke-live-qemu.sh # M5 mode-16 activation and one pkgd restart
+./ocore/kernel/smoke-live-semantics-qemu.sh # M5 mode-17 state-machine corpus
+./ocore/kernel/build-m6-artifacts.sh # deterministic four-ELF M6A OVFS image
+./ocore/kernel/smoke-personality-qemu.sh # M6A mode-18 scalar supervision
 ```
 
 The asserted default `smoke-qemu.sh` output is:
@@ -162,21 +168,44 @@ Native ABI v1 assigns syscall 6 to lifecycle-gated `exit`
 and syscall 7 to scheduler-gated `sleep`; `yield` performs a real scheduling
 transition while the scheduler is active.
 
-Milestone 3 has a passing foundation gate, not a complete IPC gate. The
-kernel-side harness proves generation-tagged endpoints with four-message FIFO
-queues, cancellation and waiter-record cleanup, invisible destination
-reservations, exact-generation queued-capability escrow, shared-memory-only
-attenuating transfer tickets, and one optional fixed RW/NX shared page in each
-of two independent address spaces. Shared mapping requires authority from the
-address space's exact owner CSpace. The waiter records are registry bookkeeping
-rather than live blocked TCBs. The gate also proves cross-CR3 visibility, exact
-attenuation, failed re-transfer, generation reuse, stale-ticket denial,
-rejection of new work from a dead sender, explicit management-harness
-cancellation of its earlier queue item and ticket, resource reclamation, and
-later timer survival. `cap_copy` remains unavailable
-through the public syscall ABI. There are no CPL3 endpoint operations, real
-blocked send/receive paths, preemptive request/reply ping-pong, complete
-sender/receiver death tests, or personality-service crash-containment proof.
+Milestone 3 has a bounded public CPL3 IPC gate. It proves endpoint
+create/send/receive/cancel, real full-FIFO TCB block/wake, preemptive
+cross-domain request/reply, generation-safe attenuated transfer, automatic
+dead-sender cleanup, and a contained personality-service crash with unrelated
+world progress. Transfer tickets bind the exact creating process generation and
+the endpoint-derived destination CSpace, not the endpoint object. The gate also
+exhausts all 16 ticket records, denies abort by another process, proves
+owner-only exact-once abort and stale-ticket denial, and verifies a fresh
+prepare after recovery. The original foundation gate remains as a mechanism
+regression.
+
+Milestone 4 imports a deterministic immutable OVFS image, recomputes its
+SHA-256 in-kernel, rejects malformed/overlapping/W+X static ELF files, and runs
+two independently linked personalities at the same virtual addresses in
+separate W^X CR3 roots. Service lookup returns a capability; namespace teardown
+and complete frame reclamation are part of the gate.
+
+Milestone 5 loads four separately linked native service ELFs into isolated
+CSpaces. A real CPL3 serial REPL owns the only typed control capability and
+drives immutable-digest install and health-gated activation. The mode-16 gate
+then contains a real package-daemon CPL3 fault, withdraws that generation in
+`CONTROL_RECOVERING`, and republishes a freshly loaded generation only after its
+exact health token, before final deactivation and reclamation. The independent
+mode-17 semantics boot covers overgrant denial, failed health, rollback, stale
+service generations, restart, and strict command parsing. Package and
+supervisor policy is still privileged and fixed-capacity rather than
+endpoint-backed user-space daemon policy; the proof is one restart generation,
+not a general retry or backoff system.
+
+M6A loads a test client, native personality daemon, native supervisor daemon,
+and unrelated observer from one deterministic digest-pinned OVFS image into
+four isolated W^X address spaces and CSpaces. The unprivileged supervisor
+health-gates publication and chooses cancellation, one crash-driven restart,
+and cooperative stop; O-core supplies scalar routing, exact terminal
+arbitration, containment, reload, and call-capability rebind as mechanism. The
+mode-18 gate proves stale, late, duplicate, and prior-generation denial plus
+complete reclamation and later timer survival. It is not full Milestone 6: no
+pointer-bearing foreign memory view or foreign operating-system ABI is present.
 
 ## Current boundary
 
@@ -184,18 +213,18 @@ This is the first vertical slice, not yet a self-hosting general-purpose
 compiler. It is x86_64-only, uses a stack-spill backend, and currently requires
 aggregate arguments/returns to travel through pointers. Indirect function
 calls, enum pattern matching, floating-point computation, and executable
-loading remain follow-on work. Float operations, casts, and
+loading beyond the current bounded static-ELF gates remain follow-on work.
+Float operations, casts, and
 `sysv64` float crossings are rejected during type checking, so the layout-only
 float types cannot reach integer machine operations.
 
-The current verified kernel ceiling is Milestone 2 complete plus the bounded
-Milestone 3 foundation described above. It remains single-CPU and fixed-window:
-there is no firmware RAM discovery, demand paging, arbitrary user mapping,
-SMP locking, FPU/SIMD context, production fairness claim, executable loader,
-complete IPC system, foreign ABI personality, root filesystem, or live hosted
-broker transport. The x86_64 bootstrap and legacy fault gate still use a linked
-`native[0]` payload, while the M1 and M2 gates separately prove multi-process
-isolation, teardown, and scheduling.
+The current verified kernel ceiling is the bounded scalar M6A slice in mode 18
+described above. It remains single-CPU, fixed-window, static-ELF, and host-built:
+there is no firmware RAM discovery, demand paging, general user mapping, SMP locking,
+FPU/SIMD context, dynamic linker, writable general filesystem, foreign ABI
+personality, foreign root filesystem, native compiler/self-hosting, or live
+hosted-broker transport into QEMU. The early bootstrap/fault gates still use a
+linked `native[0]` payload; M1 through M5 and M6A have separate lifecycle gates.
 
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of
