@@ -43,6 +43,10 @@ path = "src/bin/ogit.rs"
 name = "o-live-host"
 path = "src/bin/o-live-host.rs"
 
+[[bin]]
+name = "ocore-kernel-world-record"
+path = "src/bin/ocore-kernel-world-record.rs"
+
 [features]
 default = ["graph_executor"]
 # graph_executor: include the readiness-driven operation-hypergraph

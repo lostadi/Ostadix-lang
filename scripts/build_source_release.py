@@ -46,8 +46,17 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
         "README.md",
         "SPEC.md",
         "big_iron_to_my_texas_red.sh",
+        "boot-and-test.sh",
         "setup.sh",
         "test_o_lang_examples.sh",
+    }
+)
+
+# Keep nested exceptions exact so adding the mirrored aggregate launcher does
+# not implicitly publish every file under a new top-level directory.
+ALLOWED_EXACT_PATHS = frozenset(
+    {
+        "okernel-multikernel/boot-and-test.sh",
     }
 )
 
@@ -125,7 +134,14 @@ EXCLUDED_SUFFIXES = (
     ".wasm",
 )
 
-REQUIRED_RELEASE_PATHS = frozenset({"Cargo.toml", "README.md"})
+REQUIRED_RELEASE_PATHS = frozenset(
+    {
+        "Cargo.toml",
+        "README.md",
+        "boot-and-test.sh",
+        "okernel-multikernel/boot-and-test.sh",
+    }
+)
 VALID_GIT_MODES = frozenset({"100644", "100755", "120000"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -223,11 +239,12 @@ def is_allowed_release_path(path: str) -> bool:
     pure = _validate_release_path(path)
     parts = pure.parts
     top = parts[0]
-    if len(parts) == 1:
-        if top not in ALLOWED_TOP_LEVEL_FILES:
+    if path not in ALLOWED_EXACT_PATHS:
+        if len(parts) == 1:
+            if top not in ALLOWED_TOP_LEVEL_FILES:
+                return False
+        elif top not in ALLOWED_TOP_LEVEL_DIRECTORIES:
             return False
-    elif top not in ALLOWED_TOP_LEVEL_DIRECTORIES:
-        return False
 
     if path in EXCLUDED_EXACT_PATHS:
         return False

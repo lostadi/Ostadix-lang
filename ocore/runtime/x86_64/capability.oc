@@ -29,6 +29,13 @@ pub const RIGHT_CONTROL: u64 = 128;
 pub const RIGHT_PERSONALITY_REPLY: u64 = 256;
 pub const RIGHT_PERSONALITY_SUPERVISE: u64 = 512;
 pub const RIGHT_PERSONALITY_CALL: u64 = 1024;
+// M6B view and delegated-resource authority is deliberately nontransferable.
+// A service receives only the operation-specific rights installed by O-core;
+// neither object kind includes RIGHT_TRANSFER in allowed_rights below.
+pub const RIGHT_MEMORY_VIEW_READ: u64 = 2048;
+pub const RIGHT_MEMORY_VIEW_WRITE: u64 = 4096;
+pub const RIGHT_MEMORY_VIEW_COMMIT: u64 = 8192;
+pub const RIGHT_DELEGATED_RESOURCE_USE: u64 = 16384;
 pub const OBJECT_DEBUG: u64 = 1;
 pub const OBJECT_PAGE_POOL: u64 = 2;
 pub const OBJECT_MEMORY: u64 = 3;
@@ -37,6 +44,8 @@ pub const OBJECT_CONTROL: u64 = 5;
 pub const OBJECT_PERSONALITY_REPLY: u64 = 6;
 pub const OBJECT_PERSONALITY_SUPERVISION: u64 = 7;
 pub const OBJECT_PERSONALITY_CALL: u64 = 8;
+pub const OBJECT_PERSONALITY_MEMORY_VIEW: u64 = 9;
+pub const OBJECT_DELEGATED_RESOURCE: u64 = 10;
 
 // Public capability handles remain `(generation << 32) | capability_slot`.
 // CSpace identity is kernel-only and separately kind tagged so a reusable raw
@@ -239,6 +248,14 @@ fn allowed_rights(object_type: u64) -> u64 {
     }
     if object_type == OBJECT_PERSONALITY_CALL {
         return RIGHT_PERSONALITY_CALL;
+    }
+    if object_type == OBJECT_PERSONALITY_MEMORY_VIEW {
+        return RIGHT_MEMORY_VIEW_READ
+            | RIGHT_MEMORY_VIEW_WRITE
+            | RIGHT_MEMORY_VIEW_COMMIT;
+    }
+    if object_type == OBJECT_DELEGATED_RESOURCE {
+        return RIGHT_DELEGATED_RESOURCE_USE;
     }
     return 0;
 }
@@ -621,6 +638,23 @@ pub unsafe fn rights_for_owner(cspace_handle: u64, handle: u64) -> u64 {
     let capability_slot: usize = (handle & 0xffff_ffff) as usize;
     let generation: u32 = (handle >> 32) as u32;
     let cspace_id: usize = checked_cspace(cspace_handle);
+    if cspace_id >= MAX_CSPACES || capability_slot >= CAPABILITIES_PER_CSPACE {
+        return 0;
+    }
+    let index: usize = table_index(cspace_id, capability_slot);
+    if OCCUPIED[index] != SLOT_LIVE || GENERATIONS[index] != generation {
+        return 0;
+    }
+    return RIGHTS[index];
+}
+
+// Teardown code may need to validate the exact rights on capabilities owned by
+// either a live or draining CSpace. Ordinary service operations intentionally
+// continue to use rights_for_owner so a drain removes their authority.
+pub unsafe fn rights_for_valid_owner(cspace_handle: u64, handle: u64) -> u64 {
+    let capability_slot: usize = (handle & 0xffff_ffff) as usize;
+    let generation: u32 = (handle >> 32) as u32;
+    let cspace_id: usize = checked_cspace_owner(cspace_handle);
     if cspace_id >= MAX_CSPACES || capability_slot >= CAPABILITIES_PER_CSPACE {
         return 0;
     }

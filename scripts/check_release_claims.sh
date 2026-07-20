@@ -181,12 +181,12 @@ check_current_ocore_docs \
     '(transfer )?ticket[^.]*(bound to|for one validated)[^.]*(destination )?endpoint' \
     "M3 transfer tickets bind the exact creating process and destination CSpace, not the endpoint object"
 
-# Mode 18 is intentionally the scalar M6A dependency slice. Full Milestone 6
-# still requires the request-scoped foreign-memory protocol, and no foreign ABI
-# follows merely from routing a pinned test-personality corpus.
+# Mode 18 is intentionally the scalar M6A dependency slice, and mode 19 is a
+# bounded-copy M6B mechanism slice. Full Milestone 6 still requires the wider
+# foreign-ABI integration; neither gate alone establishes that ABI.
 check_current_ocore_docs \
     'Milestone 6 (is )?(complete|implemented)|M6 (complete|implemented|personality[^.]*PASS)' \
-    "only bounded scalar M6A is implemented; full Milestone 6 remains future work"
+    "only bounded M6A and M6B mechanism slices are implemented; full Milestone 6 remains future work"
 check_current_ocore_docs \
     '(M6A|Milestone 6A)[^.]*(shared|foreign|request-scoped)[^.]*memory view[^.]*(complete|implemented|PASS)' \
     "M6A has no shared or request-scoped foreign-process memory view"

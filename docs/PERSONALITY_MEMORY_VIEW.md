@@ -1,8 +1,10 @@
 # Personality Foreign-Process Memory-View Protocol
 
-Status: required design contract for the planned personality-service RPC. It
-must be implemented and tested before a translated Linux personality can
-accept pointer-bearing syscalls.
+Status: design contract plus a first bounded-copy native mechanism slice. Mode
+19 implements and QEMU-tests the staging, capability, terminal-revocation, and
+delegated-lease core described below. The complete acceptance gate remains
+required before a translated Linux personality can accept pointer-bearing
+syscalls.
 
 ## 1. Security invariant
 
@@ -173,7 +175,42 @@ Personality services cannot ask the kernel to log arbitrary foreign memory.
 Diagnostics use bounded, redacted metadata unless a separately authorized
 debug capability is present.
 
-## 8. Acceptance gate
+## 8. Implemented bounded native slice
+
+`runtime/x86_64/personality_memory_view.oc` implements four generation-tagged,
+request-scoped views, at most 128 bytes per view and 256 charged bytes in
+aggregate. All payload bytes live in kernel-owned bounded staging. Input is an
+immutable snapshot; output uses a byte-written bitmap and copies only the
+declared written prefix back after exact process, address-space, and foreign
+address revalidation. Service capabilities carry only the direction-appropriate
+`read`, `write`, and `commit` rights and are nontransferable.
+
+The same fixed-capacity mechanism makes reply, explicit cancellation, timeout,
+service-death, process-exit, unmap, and delegated-resource revocation terminal
+hooks. It closes the service capability before recording the terminal result
+and publishes one wake event afterward; stale and duplicate use fails closed.
+If a process-exit or unmap hook follows a reply before exact caller re-entry,
+the undeliverable terminal view is released without a second result or wake.
+`runtime/x86_64/delegated_resource.oc` adds independently revocable,
+generation-tagged lease objects for the memory, filesystem, timer, network, and
+device classes. A lease carries a nonzero request identity and can bind only to
+a view with that same identity; request-wide revocation removes all matching
+leases and their bound live views without disturbing another request. These are
+typed authority/revocation skeletons, not filesystem, network, timer, or device
+implementations, and revocation never falls back to ambient access.
+
+The mode-19 `smoke-m6b-qemu.sh` gate proves pre-dispatch range, generation,
+mapping-rights, and quota denial; bounded input snapshot; attenuated view
+rights; staged-prefix commit; revoke-before-terminal ordering; wake-once paths;
+all five lease classes; same-request bulk revocation; stale authority denial;
+unrelated-request survival; post-reply teardown cleanup; CSpace-drain close;
+complete bounded cleanup; and a later timer. The scenario invokes the native
+mechanism against a real kernel process and address space, but directly calls
+the lifecycle and wake-publication hooks. It does not prove live process/unmap/
+scheduler integration or run through the M6A CPL3 personality daemon or public
+pointer-bearing personality RPC.
+
+## 9. Complete acceptance gate
 
 Before pointer-bearing Linux syscalls are accepted, executable tests must show:
 
@@ -198,9 +235,16 @@ Fuzzing must cover the serialized request/reply schema and state transitions.
 Fault injection must cover allocation failure at every staging, pinning,
 dispatch, reply, and commit step.
 
-## 9. Explicit non-claims
+## 10. Explicit non-claims
 
 This protocol does not make arbitrary device DMA safe, make every syscall
 restartable, provide distributed exactly-once execution, or turn serialized
 capability metadata into authority. Direct device passthrough requires an
 IOMMU-backed isolation design and separate acceptance evidence.
+
+The current mode-19 evidence does not implement pinned windows, streaming
+output, signal delivery/restart integration, a pinned Linux ABI oracle, schema
+fuzzing, allocation-failure injection, or every concurrent teardown race. It
+does not supply a pointer-bearing CPL3 personality daemon, Linux ABI, foreign
+root filesystem, or concrete delegated filesystem, network, timer, or device
+service.

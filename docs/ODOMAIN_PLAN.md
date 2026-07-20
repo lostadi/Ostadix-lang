@@ -606,17 +606,38 @@ Linux or other foreign operating-system ABI.
 
 ### Milestone 6B: request-scoped memory and delegated-resource completion
 
-Status: **planned**.
+Status: **bounded native mechanism slice implemented; complete M6B remains in
+progress**.
 
-Before a pointer-bearing foreign call is admitted, implement the bounded,
-request-scoped capabilities and lifecycle in
-[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). A service must never
-receive a raw pointer in another process. Complete Milestone 6 must add explicit
-memory, filesystem, timer, network, and device delegation and prove revocation
-without ambient fallback. Crash, restart, cancellation, timeout, and stale-reply
-tests must close every temporary view and still wake each dependent thread at
-most once. This completion also supports later user-space-kernel components; it
-does not itself establish Linux ABI compatibility.
+Mode 19 implements the first bounded-copy portion of
+[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). Four
+generation-tagged request views use kernel-owned staging, direction-attenuated
+nontransferable capabilities, a hard 128-byte per-view/256-byte aggregate
+budget, immutable input snapshot, and written-prefix-only output commit after
+exact process/address-space revalidation. Reply, cancellation, timeout,
+service-death, process-exit, unmap, and resource-revocation hooks close the view
+capability before one terminal result and one wake publication. If process-exit
+or unmap makes an already replied view undeliverable, the hook releases its
+staging and quota without a second result or wake. Stale and duplicate use is
+denied.
+
+The same gate adds independently revocable typed lease objects for memory,
+filesystem, timer, network, and device classes. Each lease carries a nonzero
+request identity, may bind only to a view for that exact request, and may be
+revoked with every same-request lease and bound live view while unrelated
+requests survive. It proves no ambient fallback. These lease kinds are
+authority skeletons, not
+implementations of a filesystem, network stack, timer service, or device
+driver. The mode-19 scenario exercises a real native process/address space but
+invokes process-exit/unmap and wake-publication hooks directly; it is not yet
+integrated with real process teardown, mapping mutation, scheduler wake, the
+M6A CPL3 daemon, or a public pointer-bearing personality call.
+
+Complete M6B still requires pinned-window and streaming semantics, actual
+unmap/protection/signal integration, a pinned Linux oracle, full daemon/router
+wiring, schema fuzzing, allocation-failure injection, and the remaining
+concurrent teardown races. It does not itself establish Linux ABI
+compatibility.
 
 ### Milestone 7: minimal translated Linux x86-64 personality
 
@@ -749,6 +770,39 @@ revocation, and hostile-device tests have their own acceptance evidence.
 Crossings use the same OValue/capability/capsule contracts through a guest
 agent, never implicit host access.
 
+The execution-neutral Stage-0 contract for this milestone is implemented in
+`src/kernel_world.rs` and documented in
+[`KERNEL_WORLD_CONTRACT.md`](KERNEL_WORLD_CONTRACT.md). It strictly validates
+`ocore.kernel-world/v1` manifests for both `source_integrated` and
+`binary_contained` providers, then supplies a bounded host-side lifecycle oracle
+for health-gated exports, generation identity, quotas, one-terminal request
+disposition, policy-constrained replacement, and provenance. Its integration
+test is `tests/kernel_world_contract.rs`. The same gate binds the inner world
+declaration to exact name, version, architecture, health, services, capability
+requests, and digest from a verified `ocore.package/v1` object. For a
+`package_payload` image it also verifies the captured image bytes against the
+declared SHA-256. A `user_supplied` image carries an expected-digest constraint;
+this stage does not accept or verify those external bytes.
+
+A bounded native follow-on now encodes that verified object into a deterministic
+hash-pinned `OKWORLD1` normal form and parses the actual embedded record in mode
+20. Native supervisor admission keeps package and manifest digests distinct
+and resolves each capability request through independently registered,
+exact-package and byte-exact kind/purpose policy with default denial; string
+hashes are never authority. The same gate
+constructs generation-bound VM and vCPU identities and aligned guest-page
+attachments backed by anonymous memory objects, checks overlap and quota
+denial, and proves exact-world revocation/reclamation while an unrelated VM
+survives. Sealing the local pilot graph leaves package admission in `ADMITTED`;
+it neither advances provider lifecycle nor claims to fulfill the manifest's
+complete machine or memory declaration.
+
+Those objects are deliberately nonexecuting. Mode 20 does not start or
+health-check a provider, publish an export, boot a guest, enter VMX/SVM, create
+EPT/NPT mappings, execute firmware, inject interrupts, assign a device, map
+DMA, or configure an IOMMU. It therefore does not complete any Milestone 11
+acceptance item.
+
 Acceptance gate:
 
 - a pinned Linux kernel and rootfs boot as `linux.kernel[0]`;
@@ -778,8 +832,11 @@ ELF/OVFS/namespace lifecycles, and Milestone 5 composes four loaded principals
 with capability-gated serial package activation plus one health-gated
 package-daemon replacement. M6A adds a package-loaded scalar test personality,
 an unprivileged endpoint-backed daemon and supervisor, terminal request
-arbitration, and one generation rebind. Every statement remains scoped to its
-fixed-capacity, single-CPU gate.
+arbitration, and one generation rebind. M6B's first slice adds bounded-copy
+request views and typed delegated-resource revocation as a separate native
+mechanism gate. The first KernelWorld native slice adds hash-pinned normal-form
+admission and nonexecuting VM/vCPU/guest-page identities. Every statement
+remains scoped to its fixed-capacity, single-CPU gate.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are
    distinct types and cannot be substituted by integer coincidence.
@@ -790,7 +847,8 @@ fixed-capacity, single-CPU gate.
    type, and requested rights. Delegation can only preserve or reduce rights.
 4. All user pointer checks are overflow-safe and cover the full byte range.
    Milestone 0.2 checks a concrete immutable bootstrap region and copies through
-   exact page-fault fixups. Concurrent unmap and pinning remain future work.
+   exact page-fault fixups. Mode 19 tests an explicit unmap terminal hook;
+   concurrent mapping-change integration and pinning remain future work.
 5. Executable mappings are not writable. Anonymous stacks and data are NX.
    Milestone 0.2 proves this for the bootstrap kernel, user image, and stack.
 6. Syscall and exception return validates user RIP/RSP and sanitizes RFLAGS.
@@ -833,13 +891,13 @@ fixed-capacity, single-CPU gate.
 | Address spaces | one identity map | independent CR3s, guarded loaded stacks, exact W^X ELF mappings, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
 | Processes | none | up to four loaded CPL3 principals in the current gates with teardown and stale denial | multiple isolated processes | complete process/thread lifecycle |
 | CSpaces | one small global table | exact owners, endpoint transfer attenuation, isolated service CSpaces, typed REPL control cap | one CSpace per process | general atomic cross-domain attenuation |
-| Memory | bump-only frames | typed reclaim, private/shared mappings, transactional loaded-image reclamation | mapped per-process objects | discovered RAM, paging, NUMA policy |
+| Memory | bump-only frames | typed reclaim, private/shared mappings, bounded-copy request staging, and nonexecuting guest-page objects | mapped per-process objects | discovered RAM, paging, NUMA policy |
 | Scheduling | timer marker only | bounded preemptive/blocking TCB scheduler with yield, sleep, IPC wake, and loaded-program completion | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | public bounded CPL3 endpoints plus supervised scalar M6A personality RPC; no foreign memory views | personality RPC plus foreign memory views | supervised personality RPC |
+| IPC | none | public bounded CPL3 endpoints and scalar M6A personality RPC; separate mode-19 bounded-copy views are not yet RPC-integrated | personality RPC plus foreign memory views | supervised personality RPC |
 | Loading | kernel-linked code | static native ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | native and static Linux ELF loaders | dynamic loaders per personality |
 | Filesystems | none | fixed-capacity immutable OVFS images and domain-relative root mounts | separate Alpine/Debian roots | versioned overlays and services |
 | Live system | none | M5 package activation plus M6A unprivileged scalar personality supervision and one generation rebind | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
-| Crossings | hosted OValue and broker only | bounded scalar IPC, capability transfer, and personality calls; no native OValue codec or foreign memory view | OValue, capability, capsule channels | common contract across all modes |
+| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus a separate request-view mechanism; no native OValue codec or pointer-bearing daemon path | OValue, capability, capsule channels | common contract across all modes |
 | Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
 
 The first credible multi-domain O-Domain demonstration is therefore not either

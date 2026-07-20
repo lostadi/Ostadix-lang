@@ -15,8 +15,12 @@ boundaries for the current `native[0]` proof, is in
 The planned package manager, serial O control plane, activation transaction,
 and compiler bootstrap are specified in
 [`docs/LIVE_SYSTEM.md`](../docs/LIVE_SYSTEM.md). The security-critical bounded
-memory interface for future personality services is specified separately in
+memory interface, including the first implemented bounded-copy native slice and
+the remaining personality-RPC/pinning gates, is specified separately in
 [`docs/PERSONALITY_MEMORY_VIEW.md`](../docs/PERSONALITY_MEMORY_VIEW.md).
+The host-verified KernelWorld package contract, native normal-form admission,
+and nonexecuting VM object boundary are documented in
+[`docs/KERNEL_WORLD_CONTRACT.md`](../docs/KERNEL_WORLD_CONTRACT.md).
 
 ## Compiler
 
@@ -60,6 +64,8 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-live-semantics-qemu.sh # M5 mode-17 state-machine corpus
 ./ocore/kernel/build-m6-artifacts.sh # deterministic four-ELF M6A OVFS image
 ./ocore/kernel/smoke-personality-qemu.sh # M6A mode-18 scalar supervision
+./ocore/kernel/smoke-m6b-qemu.sh # M6B mode-19 bounded-copy/revocation mechanism
+./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ```
 
 The asserted default `smoke-qemu.sh` output is:
@@ -207,6 +213,38 @@ mode-18 gate proves stale, late, duplicate, and prior-generation denial plus
 complete reclamation and later timer survival. It is not full Milestone 6: no
 pointer-bearing foreign memory view or foreign operating-system ABI is present.
 
+Mode 19 is the first bounded M6B mechanism slice. It creates generation-tagged,
+request-scoped bounded-copy views over a real kernel process/address space, with
+kernel-owned staging, direction-attenuated nontransferable capabilities,
+snapshot input, and written-prefix-only output commit. The fixed limits are
+four views, 128 bytes per view, and 256 charged bytes total. Reply,
+cancellation, timeout, service-death, process-exit, unmap, and resource
+revocation hooks close the capability before one terminal result and one wake
+publication. Post-reply process-exit/unmap cleanup publishes neither again.
+Typed revocable leases carry exact request identities across view binding,
+cover memory, filesystem, timer, network, and device classes without ambient
+fallback, and the gate proves request-wide revocation leaves an unrelated
+request alive.
+This mechanism is not yet wired through the CPL3 personality daemon or a public
+pointer-bearing call. It has no pinned windows, signal/restart integration,
+Linux oracle, or concrete filesystem/network/timer/device services.
+
+Mode 20 carries a host-verified `ocore.kernel-world/v1` package contract into a
+bounded native supervisor-admission gate. The host emits a deterministic,
+hash-pinned `OKWORLD1`
+normal form; O-core verifies its exact record digest before strict parsing,
+preserves distinct package/manifest digests, and admits requests only through
+independently registered exact-package plus byte-exact kind/purpose policy with
+default denial. String hashes are only a fast reject and never authority.
+The resulting generation-bound VM/vCPU/guest-page objects are nonexecuting.
+Their local pilot graph can be sealed while package admission remains
+`ADMITTED`; this is not a provider configuration/start transition or proof of
+full manifest-resource fulfillment. They prove aligned anonymous page backing,
+quota/overlap denial, stale identity,
+exact-world reclamation, unrelated-VM survival, and a later timer, but no guest
+boot, VMX/SVM, EPT/NPT, firmware, interrupt injection, device assignment, DMA,
+or IOMMU behavior.
+
 ## Current boundary
 
 This is the first vertical slice, not yet a self-hosting general-purpose
@@ -218,13 +256,15 @@ Float operations, casts, and
 `sysv64` float crossings are rejected during type checking, so the layout-only
 float types cannot reach integer machine operations.
 
-The current verified kernel ceiling is the bounded scalar M6A slice in mode 18
-described above. It remains single-CPU, fixed-window, static-ELF, and host-built:
-there is no firmware RAM discovery, demand paging, general user mapping, SMP locking,
-FPU/SIMD context, dynamic linker, writable general filesystem, foreign ABI
-personality, foreign root filesystem, native compiler/self-hosting, or live
+The current verified kernel boundary includes M6A's scalar CPL3 supervision in
+mode 18, M6B's separate bounded-copy/revocation mechanism in mode 19, and the
+nonexecuting KernelWorld admission/object slice in mode 20. It remains
+single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
+discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
+dynamic linker, writable general filesystem, foreign ABI personality, foreign
+root filesystem, native compiler/self-hosting, guest execution, or live
 hosted-broker transport into QEMU. The early bootstrap/fault gates still use a
-linked `native[0]` payload; M1 through M5 and M6A have separate lifecycle gates.
+linked `native[0]` payload; later claims have separate bounded gates.
 
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of
