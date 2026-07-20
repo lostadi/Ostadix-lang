@@ -25,17 +25,23 @@ Ostadix-lang/
 │   ├── nix_ops.rs    #   Nix build/realise operations
 │   ├── nixos_ops.rs  #   NixOS-specific operations
 │   ├── scheduler.rs  #   Parallel evaluation scheduler
-│   └── bin/          #   Additional binary targets
+│   ├── ocore/        #   O-core compiler (lexer, typeck, HIR, MIR, codegen)
+│   ├── live_system/  #   Hosted Live-World package/service oracle
+│   ├── kernel_world.rs #  KernelWorld foreign-kernel manifest contract & oracle
+│   ├── project/      #   Route-preserving project bundle lifting
+│   └── bin/          #   Additional binary targets (olangc, ocorec, olink, …)
 ├── ocore/            # Native systems runtime and bootable x86_64 kernel proof
+├── okernel-multikernel/ # Foreign-kernel personality proposal & boot-and-test entrypoint
 ├── backends/         # Language shims (Python, Bash, Nix, Racket, Rust, … — see README backend table)
 ├── examples/         # .O example programs
 ├── c_cpp/            # Complete C17 port (standalone)
 ├── o_lang/           # Legacy Python prototype (reference only)
-├── tests/            # Python-era test suite (legacy, for o_lang/)
+├── tests/            # Rust integration tests plus Python-era legacy tests
+├── fuzz/             # Parser fuzz targets and seed corpus
 ├── setup/            # Cross-platform bootstrap scripts
-├── tools/            # Development utilities (markdown extraction)
 ├── scripts/          # Repository management scripts
 ├── docs/             # Design documents and brainstorms
+├── boot-and-test.sh  # One phased entrypoint over every build/boot/test layer
 ├── SPEC.md           # Language specification
 └── README.md         # Project overview
 ```
