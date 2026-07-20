@@ -25,6 +25,8 @@ bash scripts/smoke-hosted-live-reference.sh
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
+cmp -s boot-and-test.sh okernel-multikernel/boot-and-test.sh
+for script in boot-and-test.sh okernel-multikernel/boot-and-test.sh ocore/kernel/smoke-m6b-qemu.sh ocore/kernel/smoke-kernel-world-qemu.sh; do test -x "$script" && bash -n "$script"; done
 ./ocore/kernel/smoke-qemu.sh
 ./ocore/kernel/smoke-faults-qemu.sh
 ./ocore/kernel/smoke-processes-qemu.sh
@@ -39,6 +41,8 @@ cargo check --manifest-path fuzz/Cargo.toml
 ./ocore/kernel/smoke-live-semantics-qemu.sh
 ./ocore/kernel/build-m6-artifacts.sh
 ./ocore/kernel/smoke-personality-qemu.sh
+./ocore/kernel/smoke-m6b-qemu.sh
+./ocore/kernel/smoke-kernel-world-qemu.sh
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 python3 -m compileall -q o_lang backends tests
@@ -47,6 +51,14 @@ cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --b
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
+
+The mode-19 gate proves the bounded request-scoped copy/revocation mechanism,
+not a complete foreign ABI. The mode-20 gate proves verified world admission
+and nonexecuting VM-object lifecycle only; it does not prove guest execution.
+`./boot-and-test.sh smoke` treats the twelve scripts as an explicit required
+manifest: it fails before execution if one is absent or not executable and
+reports required, present, passed, and failed counts. A directory scan or an
+"all present" result is not release evidence.
 
 Build the public source ZIP from the exact commit or annotated tag that passed
 the gate. The command rejects a dirty worktree by default and reads payload

@@ -1,0 +1,1091 @@
+module runtime::vm_object;
+
+use runtime::capability::cspace_child_refs;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::cspace_owner_slot;
+use runtime::capability::release_cspace;
+use runtime::capability::retain_cspace;
+use runtime::capability::MAX_CSPACES;
+use runtime::kernel_world_admission::generation as admitted_world_generation;
+use runtime::kernel_world_admission::integration as admitted_world_integration;
+use runtime::kernel_world_admission::is_current as admitted_world_is_current;
+use runtime::kernel_world_admission::maximum_memory_mib as admitted_maximum_memory_mib;
+use runtime::kernel_world_admission::maximum_vcpus as admitted_maximum_vcpus;
+use runtime::kernel_world_admission::minimum_memory_mib as admitted_minimum_memory_mib;
+use runtime::kernel_world_admission::minimum_vcpus as admitted_minimum_vcpus;
+use runtime::kernel_world_admission::state as admitted_world_state;
+use runtime::kernel_world_admission::execution as admitted_world_execution;
+use runtime::kernel_world_admission::EXECUTION_HARDWARE_VIRTUALIZED;
+use runtime::kernel_world_admission::INTEGRATION_BINARY_CONTAINED;
+use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::memory_object::allocate_kernel_object_for_owner;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::object_kind as memory_object_kind;
+use runtime::memory_object::release_object as release_memory_object;
+use runtime::memory_object::MEMORY_ANONYMOUS;
+
+// This is deliberately a bounded, non-executing VM object model. It records
+// configuration identity and owns zeroed guest-memory pages, but has no VM
+// entry, instruction execution, interrupt injection, firmware, or device API.
+pub const MAX_VMS: usize = 2;
+pub const MAX_VCPUS: usize = 4;
+pub const MAX_VCPUS_PER_VM: usize = 4;
+pub const MAX_GUEST_PAGES: usize = 8;
+pub const MAX_GUEST_PAGES_PER_VM: usize = 8;
+pub const GUEST_PAGE_SIZE: u64 = 4096;
+
+pub const VM_STATE_CONFIGURING: u64 = 1;
+pub const VM_STATE_CONFIGURED: u64 = 2;
+
+const VM_EMPTY: u8 = 0;
+const VM_CONFIGURING: u8 = 1;
+const VM_CONFIGURED: u8 = 2;
+const VM_REVOKING: u8 = 3;
+const VM_RETIRED: u8 = 4;
+
+const CHILD_EMPTY: u8 = 0;
+const CHILD_LIVE: u8 = 1;
+const CHILD_RETIRED: u8 = 2;
+
+const VM_HANDLE_TAG: u64 = 0xe400_0000;
+const VCPU_HANDLE_TAG: u64 = 0xe500_0000;
+const GUEST_PAGE_HANDLE_TAG: u64 = 0xe600_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+// Requiring an in-range exclusive end rejects a final page whose end would be
+// 2^64, keeping every overlap calculation representable in u64.
+const MAX_GUEST_PAGE_BASE: u64 = 0xffff_ffff_ffff_efff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut VM_STATES: [u8; 2] = [0; 2];
+static mut VM_GENERATIONS: [u32; 2] = [0; 2];
+static mut VM_WORLDS: [u64; 2] = [0; 2];
+static mut VM_WORLD_GENERATIONS: [u64; 2] = [0; 2];
+static mut VM_OWNERS: [u64; 2] = [0; 2];
+static mut VM_MIN_VCPUS: [usize; 2] = [0; 2];
+static mut VM_MAX_VCPUS: [usize; 2] = [0; 2];
+static mut VM_MIN_MEMORY_MIB: [u64; 2] = [0; 2];
+static mut VM_MAX_MEMORY_MIB: [u64; 2] = [0; 2];
+// These are caller-selected pilot resident-page bounds, not a claim that this
+// fixed graph materializes the manifest's full MiB memory range.
+static mut VM_MIN_GUEST_PAGES: [usize; 2] = [0; 2];
+static mut VM_MAX_GUEST_PAGES: [usize; 2] = [0; 2];
+static mut VM_VCPU_COUNTS: [usize; 2] = [0; 2];
+static mut VM_GUEST_PAGE_COUNTS: [usize; 2] = [0; 2];
+
+static mut VCPU_STATES: [u8; 4] = [0; 4];
+static mut VCPU_GENERATIONS: [u32; 4] = [0; 4];
+static mut VCPU_VMS: [u64; 4] = [0; 4];
+static mut VCPU_ORDINALS: [usize; 4] = [0; 4];
+
+static mut GUEST_PAGE_STATES: [u8; 8] = [0; 8];
+static mut GUEST_PAGE_GENERATIONS: [u32; 8] = [0; 8];
+static mut GUEST_PAGE_VMS: [u64; 8] = [0; 8];
+static mut GUEST_PAGE_GPAS: [u64; 8] = [0; 8];
+static mut GUEST_PAGE_MEMORY_OBJECTS: [u64; 8] = [0; 8];
+
+static mut ACTIVE_VMS: usize = 0;
+static mut ACTIVE_VCPUS: usize = 0;
+static mut ACTIVE_GUEST_PAGES: usize = 0;
+static mut CREATED_VMS: u64 = 0;
+static mut CREATED_VCPUS: u64 = 0;
+static mut ATTACHED_GUEST_PAGES: u64 = 0;
+static mut CONFIGURED_VMS: u64 = 0;
+static mut DESTROYED_VMS: u64 = 0;
+static mut REVOKED_WORLDS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_vm_handle(slot: usize) -> u64 {
+    return ((VM_GENERATIONS[slot] as u64) << 32)
+        | VM_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn make_vcpu_handle(slot: usize) -> u64 {
+    return ((VCPU_GENERATIONS[slot] as u64) << 32)
+        | VCPU_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn make_guest_page_handle(slot: usize) -> u64 {
+    return ((GUEST_PAGE_GENERATIONS[slot] as u64) << 32)
+        | GUEST_PAGE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_vm_local(handle: u64, allow_revoking: bool) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != VM_HANDLE_TAG {
+        return MAX_VMS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_VMS
+        || VM_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_VMS;
+    }
+    if VM_STATES[slot] == VM_CONFIGURING
+        || VM_STATES[slot] == VM_CONFIGURED {
+        return slot;
+    }
+    if allow_revoking && VM_STATES[slot] == VM_REVOKING {
+        return slot;
+    }
+    return MAX_VMS;
+}
+
+unsafe fn checked_vcpu_local(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != VCPU_HANDLE_TAG {
+        return MAX_VCPUS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_VCPUS
+        || VCPU_STATES[slot] != CHILD_LIVE
+        || VCPU_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_VCPUS;
+    }
+    return slot;
+}
+
+unsafe fn checked_guest_page_local(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != GUEST_PAGE_HANDLE_TAG {
+        return MAX_GUEST_PAGES;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_GUEST_PAGES
+        || GUEST_PAGE_STATES[slot] != CHILD_LIVE
+        || GUEST_PAGE_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_GUEST_PAGES;
+    }
+    return slot;
+}
+
+unsafe fn world_matches_vm(slot: usize) -> bool {
+    let world: u64 = VM_WORLDS[slot];
+    return admitted_world_is_current(world)
+        && admitted_world_generation(world) == VM_WORLD_GENERATIONS[slot];
+}
+
+unsafe fn vm_is_in_configuration_phase(slot: usize) -> bool {
+    return VM_STATES[slot] == VM_CONFIGURING
+        && world_matches_vm(slot)
+        && admitted_world_state(VM_WORLDS[slot]) == WORLD_STATE_ADMITTED;
+}
+
+unsafe fn clear_vm_slot(slot: usize) -> void {
+    VM_WORLDS[slot] = 0;
+    VM_WORLD_GENERATIONS[slot] = 0;
+    VM_OWNERS[slot] = 0;
+    VM_MIN_VCPUS[slot] = 0;
+    VM_MAX_VCPUS[slot] = 0;
+    VM_MIN_MEMORY_MIB[slot] = 0;
+    VM_MAX_MEMORY_MIB[slot] = 0;
+    VM_MIN_GUEST_PAGES[slot] = 0;
+    VM_MAX_GUEST_PAGES[slot] = 0;
+    VM_VCPU_COUNTS[slot] = 0;
+    VM_GUEST_PAGE_COUNTS[slot] = 0;
+}
+
+unsafe fn clear_vcpu_slot(slot: usize) -> void {
+    VCPU_VMS[slot] = 0;
+    VCPU_ORDINALS[slot] = 0;
+}
+
+unsafe fn clear_guest_page_slot(slot: usize) -> void {
+    GUEST_PAGE_VMS[slot] = 0;
+    GUEST_PAGE_GPAS[slot] = 0;
+    GUEST_PAGE_MEMORY_OBJECTS[slot] = 0;
+}
+
+unsafe fn retire_vm_slot(slot: usize) -> void {
+    clear_vm_slot(slot);
+    if VM_GENERATIONS[slot] == 0xffff_ffff {
+        VM_STATES[slot] = VM_RETIRED;
+    } else {
+        VM_GENERATIONS[slot] += 1;
+        VM_STATES[slot] = VM_EMPTY;
+    }
+}
+
+unsafe fn retire_vcpu_slot(slot: usize) -> void {
+    clear_vcpu_slot(slot);
+    if VCPU_GENERATIONS[slot] == 0xffff_ffff {
+        VCPU_STATES[slot] = CHILD_RETIRED;
+    } else {
+        VCPU_GENERATIONS[slot] += 1;
+        VCPU_STATES[slot] = CHILD_EMPTY;
+    }
+}
+
+unsafe fn retire_guest_page_slot(slot: usize) -> void {
+    clear_guest_page_slot(slot);
+    if GUEST_PAGE_GENERATIONS[slot] == 0xffff_ffff {
+        GUEST_PAGE_STATES[slot] = CHILD_RETIRED;
+    } else {
+        GUEST_PAGE_GENERATIONS[slot] += 1;
+        GUEST_PAGE_STATES[slot] = CHILD_EMPTY;
+    }
+}
+
+unsafe fn reject() -> u64 {
+    if DENIALS != MAX_COUNTER {
+        DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn increment_counter(counter: *mut u64) -> void {
+    let value: u64 = volatile_load(counter as *const u64);
+    if value != MAX_COUNTER {
+        volatile_store(counter, value + 1);
+    }
+}
+
+fn guest_page_base_is_valid(gpa: u64) -> bool {
+    return (gpa & (GUEST_PAGE_SIZE - 1)) == 0
+        && gpa <= MAX_GUEST_PAGE_BASE;
+}
+
+fn guest_pages_overlap(first: u64, second: u64) -> bool {
+    let first_end: u64 = first + GUEST_PAGE_SIZE;
+    let second_end: u64 = second + GUEST_PAGE_SIZE;
+    return first < second_end && second < first_end;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !memory_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_VMS {
+        VM_STATES[slot] = VM_EMPTY;
+        VM_GENERATIONS[slot] = 1;
+        clear_vm_slot(slot);
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_VCPUS {
+        VCPU_STATES[slot] = CHILD_EMPTY;
+        VCPU_GENERATIONS[slot] = 1;
+        clear_vcpu_slot(slot);
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_GUEST_PAGES {
+        GUEST_PAGE_STATES[slot] = CHILD_EMPTY;
+        GUEST_PAGE_GENERATIONS[slot] = 1;
+        clear_guest_page_slot(slot);
+        slot += 1;
+    }
+    ACTIVE_VMS = 0;
+    ACTIVE_VCPUS = 0;
+    ACTIVE_GUEST_PAGES = 0;
+    CREATED_VMS = 0;
+    CREATED_VCPUS = 0;
+    ATTACHED_GUEST_PAGES = 0;
+    CONFIGURED_VMS = 0;
+    DESTROYED_VMS = 0;
+    REVOKED_WORLDS = 0;
+    DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// One exact admitted world generation owns at most one VM. vCPU and MiB bounds
+// come only from admission. The caller selects a separately bounded 1..8 page
+// resident pilot; those pages do not claim to fulfill the admitted MiB range.
+pub unsafe fn create_vm(
+    world: u64,
+    owner: u64,
+    minimum_guest_pages: usize,
+    maximum_guest_pages: usize
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !invariants_hold()
+        || !admitted_world_is_current(world)
+        || admitted_world_state(world) != WORLD_STATE_ADMITTED
+        || admitted_world_integration(world) != INTEGRATION_BINARY_CONTAINED
+        || admitted_world_execution(world) != EXECUTION_HARDWARE_VIRTUALIZED
+        || !cspace_is_live(owner) {
+        return reject();
+    }
+    let world_generation: u64 = admitted_world_generation(world);
+    let minimum_vcpus: usize = admitted_minimum_vcpus(world) as usize;
+    let maximum_vcpus: usize = admitted_maximum_vcpus(world) as usize;
+    let minimum_memory_mib: u64 = admitted_minimum_memory_mib(world);
+    let maximum_memory_mib: u64 = admitted_maximum_memory_mib(world);
+    if world_generation == 0
+        || minimum_vcpus == 0
+        || minimum_vcpus > maximum_vcpus
+        || maximum_vcpus > MAX_VCPUS_PER_VM
+        || minimum_memory_mib == 0
+        || minimum_memory_mib > maximum_memory_mib
+        || minimum_guest_pages == 0
+        || minimum_guest_pages > maximum_guest_pages
+        || maximum_guest_pages > MAX_GUEST_PAGES_PER_VM {
+        return reject();
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_VMS;
+    while slot < MAX_VMS {
+        if VM_STATES[slot] == VM_EMPTY && free_slot == MAX_VMS {
+            free_slot = slot;
+        }
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && VM_WORLDS[slot] == world {
+            return reject();
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_VMS || retain_cspace(owner) == 0 {
+        return reject();
+    }
+    VM_WORLDS[free_slot] = world;
+    VM_WORLD_GENERATIONS[free_slot] = world_generation;
+    VM_OWNERS[free_slot] = owner;
+    VM_MIN_VCPUS[free_slot] = minimum_vcpus;
+    VM_MAX_VCPUS[free_slot] = maximum_vcpus;
+    VM_MIN_MEMORY_MIB[free_slot] = minimum_memory_mib;
+    VM_MAX_MEMORY_MIB[free_slot] = maximum_memory_mib;
+    VM_MIN_GUEST_PAGES[free_slot] = minimum_guest_pages;
+    VM_MAX_GUEST_PAGES[free_slot] = maximum_guest_pages;
+    VM_VCPU_COUNTS[free_slot] = 0;
+    VM_GUEST_PAGE_COUNTS[free_slot] = 0;
+    VM_STATES[free_slot] = VM_CONFIGURING;
+    ACTIVE_VMS += 1;
+    if !invariants_hold() {
+        ACTIVE_VMS -= 1;
+        VM_STATES[free_slot] = VM_EMPTY;
+        clear_vm_slot(free_slot);
+        if release_cspace(owner) == 0 {
+            POISONED = 1;
+        }
+        return reject();
+    }
+    increment_counter((&mut CREATED_VMS));
+    return make_vm_handle(free_slot);
+}
+
+pub unsafe fn create_vcpu(vm: u64, ordinal: usize) -> u64 {
+    let vm_slot: usize = checked_vm_local(vm, false);
+    if vm_slot >= MAX_VMS
+        || !invariants_hold()
+        || !vm_is_in_configuration_phase(vm_slot)
+        || ordinal != VM_VCPU_COUNTS[vm_slot]
+        || ordinal >= VM_MAX_VCPUS[vm_slot]
+        || VM_VCPU_COUNTS[vm_slot] >= VM_MAX_VCPUS[vm_slot]
+        || ACTIVE_VCPUS >= MAX_VCPUS {
+        return reject();
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_VCPUS;
+    while slot < MAX_VCPUS {
+        if VCPU_STATES[slot] == CHILD_EMPTY && free_slot == MAX_VCPUS {
+            free_slot = slot;
+        }
+        if VCPU_STATES[slot] == CHILD_LIVE
+            && VCPU_VMS[slot] == vm
+            && VCPU_ORDINALS[slot] == ordinal {
+            return reject();
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_VCPUS {
+        return reject();
+    }
+    VCPU_VMS[free_slot] = vm;
+    VCPU_ORDINALS[free_slot] = ordinal;
+    VCPU_STATES[free_slot] = CHILD_LIVE;
+    VM_VCPU_COUNTS[vm_slot] += 1;
+    ACTIVE_VCPUS += 1;
+    if !invariants_hold() {
+        ACTIVE_VCPUS -= 1;
+        VM_VCPU_COUNTS[vm_slot] -= 1;
+        VCPU_STATES[free_slot] = CHILD_EMPTY;
+        clear_vcpu_slot(free_slot);
+        return reject();
+    }
+    increment_counter((&mut CREATED_VCPUS));
+    return make_vcpu_handle(free_slot);
+}
+
+// Every attached page is a real, zeroed anonymous memory object. Its owner
+// reference charges the VM owner's memory quota and keeps that CSpace alive.
+pub unsafe fn attach_guest_page(vm: u64, gpa: u64) -> u64 {
+    let vm_slot: usize = checked_vm_local(vm, false);
+    if vm_slot >= MAX_VMS
+        || !invariants_hold()
+        || !vm_is_in_configuration_phase(vm_slot)
+        || !guest_page_base_is_valid(gpa)
+        || VM_GUEST_PAGE_COUNTS[vm_slot] >= VM_MAX_GUEST_PAGES[vm_slot]
+        || ACTIVE_GUEST_PAGES >= MAX_GUEST_PAGES {
+        return reject();
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_GUEST_PAGES;
+    while slot < MAX_GUEST_PAGES {
+        if GUEST_PAGE_STATES[slot] == CHILD_EMPTY
+            && free_slot == MAX_GUEST_PAGES {
+            free_slot = slot;
+        }
+        if GUEST_PAGE_STATES[slot] == CHILD_LIVE
+            && GUEST_PAGE_VMS[slot] == vm
+            && guest_pages_overlap(GUEST_PAGE_GPAS[slot], gpa) {
+            return reject();
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_GUEST_PAGES {
+        return reject();
+    }
+    let object: u64 = allocate_kernel_object_for_owner(
+        VM_OWNERS[vm_slot],
+        MEMORY_ANONYMOUS
+    );
+    if object == 0 {
+        return reject();
+    }
+    GUEST_PAGE_VMS[free_slot] = vm;
+    GUEST_PAGE_GPAS[free_slot] = gpa;
+    GUEST_PAGE_MEMORY_OBJECTS[free_slot] = object;
+    GUEST_PAGE_STATES[free_slot] = CHILD_LIVE;
+    VM_GUEST_PAGE_COUNTS[vm_slot] += 1;
+    ACTIVE_GUEST_PAGES += 1;
+    if !invariants_hold() {
+        ACTIVE_GUEST_PAGES -= 1;
+        VM_GUEST_PAGE_COUNTS[vm_slot] -= 1;
+        GUEST_PAGE_STATES[free_slot] = CHILD_EMPTY;
+        clear_guest_page_slot(free_slot);
+        if release_memory_object(object) == 0 {
+            POISONED = 1;
+        }
+        return reject();
+    }
+    increment_counter((&mut ATTACHED_GUEST_PAGES));
+    return make_guest_page_handle(free_slot);
+}
+
+// Sealing performs no guest entry and does not mutate admission state. It only
+// proves the bounded resident pilot graph exists and seals that local VM
+// object. The verified package remains ADMITTED until explicit revocation.
+pub unsafe fn seal_configuration(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS
+        || !invariants_hold()
+        || !vm_is_in_configuration_phase(slot)
+        || VM_VCPU_COUNTS[slot] < VM_MIN_VCPUS[slot]
+        || VM_GUEST_PAGE_COUNTS[slot] < VM_MIN_GUEST_PAGES[slot] {
+        return reject();
+    }
+    let world: u64 = VM_WORLDS[slot];
+    if !admitted_world_is_current(world)
+        || admitted_world_generation(world) != VM_WORLD_GENERATIONS[slot]
+        || admitted_world_state(world) != WORLD_STATE_ADMITTED {
+        POISONED = 1;
+        return 0;
+    }
+    VM_STATES[slot] = VM_CONFIGURED;
+    increment_counter((&mut CONFIGURED_VMS));
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn preflight_destroy(slot: usize) -> bool {
+    if slot >= MAX_VMS
+        || (VM_STATES[slot] != VM_CONFIGURING
+            && VM_STATES[slot] != VM_CONFIGURED)
+        || !cspace_is_valid_owner(VM_OWNERS[slot]) {
+        return false;
+    }
+    let vm: u64 = make_vm_handle(slot);
+    let mut observed_vcpus: usize = 0;
+    let mut child: usize = 0;
+    while child < MAX_VCPUS {
+        if VCPU_STATES[child] == CHILD_LIVE && VCPU_VMS[child] == vm {
+            observed_vcpus += 1;
+        }
+        child += 1;
+    }
+    let mut observed_pages: usize = 0;
+    child = 0;
+    while child < MAX_GUEST_PAGES {
+        if GUEST_PAGE_STATES[child] == CHILD_LIVE
+            && GUEST_PAGE_VMS[child] == vm {
+            if memory_object_kind(GUEST_PAGE_MEMORY_OBJECTS[child])
+                != MEMORY_ANONYMOUS {
+                return false;
+            }
+            observed_pages += 1;
+        }
+        child += 1;
+    }
+    return observed_vcpus == VM_VCPU_COUNTS[slot]
+        && observed_pages == VM_GUEST_PAGE_COUNTS[slot]
+        && cspace_child_refs(VM_OWNERS[slot])
+            >= (observed_pages + 1) as u32;
+}
+
+unsafe fn destroy_vm_slot(slot: usize) -> u64 {
+    if !preflight_destroy(slot) {
+        return 0;
+    }
+    let vm: u64 = make_vm_handle(slot);
+    let owner: u64 = VM_OWNERS[slot];
+    let old_vcpus: usize = VM_VCPU_COUNTS[slot];
+    let old_pages: usize = VM_GUEST_PAGE_COUNTS[slot];
+    VM_STATES[slot] = VM_REVOKING;
+
+    let mut child: usize = 0;
+    while child < MAX_VCPUS {
+        if VCPU_STATES[child] == CHILD_LIVE && VCPU_VMS[child] == vm {
+            retire_vcpu_slot(child);
+        }
+        child += 1;
+    }
+    child = 0;
+    while child < MAX_GUEST_PAGES {
+        if GUEST_PAGE_STATES[child] == CHILD_LIVE
+            && GUEST_PAGE_VMS[child] == vm {
+            let object: u64 = GUEST_PAGE_MEMORY_OBJECTS[child];
+            if release_memory_object(object) == 0 {
+                POISONED = 1;
+                return 0;
+            }
+            retire_guest_page_slot(child);
+        }
+        child += 1;
+    }
+    if release_cspace(owner) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    ACTIVE_VCPUS -= old_vcpus;
+    ACTIVE_GUEST_PAGES -= old_pages;
+    ACTIVE_VMS -= 1;
+    retire_vm_slot(slot);
+    increment_counter((&mut DESTROYED_VMS));
+    return 1;
+}
+
+// Destruction accepts a locally current handle even if the admission record
+// has just become stale, so a supervisor can still reclaim a failed graph.
+pub unsafe fn destroy_vm(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS || !invariants_hold() || !preflight_destroy(slot) {
+        return reject();
+    }
+    if destroy_vm_slot(slot) == 0 {
+        return 0;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+// The exact generation-tagged world handle is the revocation key. No other
+// world's VM or child objects are touched.
+pub unsafe fn revoke_world(world: u64) -> u64 {
+    if world == 0 || !invariants_hold() {
+        return reject();
+    }
+    let mut found: bool = false;
+    let mut slot: usize = 0;
+    while slot < MAX_VMS {
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && VM_WORLDS[slot] == world {
+            if !preflight_destroy(slot) {
+                return reject();
+            }
+            found = true;
+        }
+        slot += 1;
+    }
+    if !found {
+        return reject();
+    }
+    slot = 0;
+    while slot < MAX_VMS {
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && VM_WORLDS[slot] == world {
+            if destroy_vm_slot(slot) == 0 {
+                return 0;
+            }
+        }
+        slot += 1;
+    }
+    increment_counter((&mut REVOKED_WORLDS));
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn vm_is_current(vm: u64) -> bool {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS || !world_matches_vm(slot) {
+        return false;
+    }
+    return (VM_STATES[slot] == VM_CONFIGURING
+            || VM_STATES[slot] == VM_CONFIGURED)
+        && admitted_world_state(VM_WORLDS[slot]) == WORLD_STATE_ADMITTED;
+}
+
+pub unsafe fn vcpu_is_current(vcpu: u64) -> bool {
+    let slot: usize = checked_vcpu_local(vcpu);
+    return slot < MAX_VCPUS && vm_is_current(VCPU_VMS[slot]);
+}
+
+pub unsafe fn guest_page_is_current(page: u64) -> bool {
+    let slot: usize = checked_guest_page_local(page);
+    return slot < MAX_GUEST_PAGES
+        && vm_is_current(GUEST_PAGE_VMS[slot])
+        && memory_object_kind(GUEST_PAGE_MEMORY_OBJECTS[slot])
+            == MEMORY_ANONYMOUS;
+}
+
+pub unsafe fn vm_handle_at(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_VMS
+        || (VM_STATES[slot] != VM_CONFIGURING
+            && VM_STATES[slot] != VM_CONFIGURED) {
+        return 0;
+    }
+    return make_vm_handle(slot);
+}
+
+pub unsafe fn vcpu_handle_at(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_VCPUS
+        || VCPU_STATES[slot] != CHILD_LIVE {
+        return 0;
+    }
+    return make_vcpu_handle(slot);
+}
+
+pub unsafe fn guest_page_handle_at(slot: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_GUEST_PAGES
+        || GUEST_PAGE_STATES[slot] != CHILD_LIVE {
+        return 0;
+    }
+    return make_guest_page_handle(slot);
+}
+
+pub unsafe fn vm_state(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    if VM_STATES[slot] == VM_CONFIGURING {
+        return VM_STATE_CONFIGURING;
+    }
+    if VM_STATES[slot] == VM_CONFIGURED {
+        return VM_STATE_CONFIGURED;
+    }
+    return 0;
+}
+
+pub unsafe fn vm_world(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_WORLDS[slot];
+}
+
+pub unsafe fn vm_world_generation(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_WORLD_GENERATIONS[slot];
+}
+
+pub unsafe fn vm_owner(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_OWNERS[slot];
+}
+
+pub unsafe fn vm_minimum_vcpus(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MIN_VCPUS[slot];
+}
+
+pub unsafe fn vm_maximum_vcpus(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MAX_VCPUS[slot];
+}
+
+pub unsafe fn vm_minimum_memory_mib(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MIN_MEMORY_MIB[slot];
+}
+
+pub unsafe fn vm_maximum_memory_mib(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MAX_MEMORY_MIB[slot];
+}
+
+// These report the bounded resident-page pilot selected by create_vm, not the
+// complete admitted MiB range exposed by the getters above.
+pub unsafe fn vm_minimum_guest_pages(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MIN_GUEST_PAGES[slot];
+}
+
+pub unsafe fn vm_maximum_guest_pages(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_MAX_GUEST_PAGES[slot];
+}
+
+pub unsafe fn vm_vcpu_count(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_VCPU_COUNTS[slot];
+}
+
+pub unsafe fn vm_guest_page_count(vm: u64) -> usize {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS {
+        return 0;
+    }
+    return VM_GUEST_PAGE_COUNTS[slot];
+}
+
+pub unsafe fn vcpu_vm(vcpu: u64) -> u64 {
+    let slot: usize = checked_vcpu_local(vcpu);
+    if slot >= MAX_VCPUS {
+        return 0;
+    }
+    return VCPU_VMS[slot];
+}
+
+pub unsafe fn vcpu_ordinal(vcpu: u64) -> usize {
+    let slot: usize = checked_vcpu_local(vcpu);
+    if slot >= MAX_VCPUS {
+        return MAX_VCPUS_PER_VM;
+    }
+    return VCPU_ORDINALS[slot];
+}
+
+pub unsafe fn guest_page_vm(page: u64) -> u64 {
+    let slot: usize = checked_guest_page_local(page);
+    if slot >= MAX_GUEST_PAGES {
+        return 0;
+    }
+    return GUEST_PAGE_VMS[slot];
+}
+
+pub unsafe fn guest_page_gpa(page: u64) -> u64 {
+    let slot: usize = checked_guest_page_local(page);
+    if slot >= MAX_GUEST_PAGES {
+        return 0;
+    }
+    return GUEST_PAGE_GPAS[slot];
+}
+
+pub unsafe fn guest_page_memory_object(page: u64) -> u64 {
+    let slot: usize = checked_guest_page_local(page);
+    if slot >= MAX_GUEST_PAGES {
+        return 0;
+    }
+    return GUEST_PAGE_MEMORY_OBJECTS[slot];
+}
+
+pub unsafe fn active_vm_count() -> usize {
+    return ACTIVE_VMS;
+}
+
+pub unsafe fn active_vcpu_count() -> usize {
+    return ACTIVE_VCPUS;
+}
+
+pub unsafe fn active_guest_page_count() -> usize {
+    return ACTIVE_GUEST_PAGES;
+}
+
+pub unsafe fn created_vm_count() -> u64 {
+    return CREATED_VMS;
+}
+
+pub unsafe fn created_vcpu_count() -> u64 {
+    return CREATED_VCPUS;
+}
+
+pub unsafe fn attached_guest_page_count() -> u64 {
+    return ATTACHED_GUEST_PAGES;
+}
+
+pub unsafe fn configured_vm_count() -> u64 {
+    return CONFIGURED_VMS;
+}
+
+pub unsafe fn destroyed_vm_count() -> u64 {
+    return DESTROYED_VMS;
+}
+
+pub unsafe fn revoked_world_count() -> u64 {
+    return REVOKED_WORLDS;
+}
+
+pub unsafe fn denial_count() -> u64 {
+    return DENIALS;
+}
+
+pub unsafe fn is_poisoned() -> bool {
+    return POISONED != 0;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !memory_invariants_hold() {
+        return false;
+    }
+    let mut vcpus_by_vm: [usize; 2] = [0; 2];
+    let mut pages_by_vm: [usize; 2] = [0; 2];
+    let mut required_owner_refs: [usize; 4] = [0; 4];
+    let mut observed_vms: usize = 0;
+    let mut observed_vcpus: usize = 0;
+    let mut observed_pages: usize = 0;
+
+    let mut slot: usize = 0;
+    while slot < MAX_VMS {
+        let state: u8 = VM_STATES[slot];
+        if VM_GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == VM_EMPTY || state == VM_RETIRED {
+            if (state == VM_RETIRED && VM_GENERATIONS[slot] != 0xffff_ffff)
+                || VM_WORLDS[slot] != 0
+                || VM_WORLD_GENERATIONS[slot] != 0
+                || VM_OWNERS[slot] != 0
+                || VM_MIN_VCPUS[slot] != 0
+                || VM_MAX_VCPUS[slot] != 0
+                || VM_MIN_MEMORY_MIB[slot] != 0
+                || VM_MAX_MEMORY_MIB[slot] != 0
+                || VM_MIN_GUEST_PAGES[slot] != 0
+                || VM_MAX_GUEST_PAGES[slot] != 0
+                || VM_VCPU_COUNTS[slot] != 0
+                || VM_GUEST_PAGE_COUNTS[slot] != 0 {
+                return false;
+            }
+        } else if state == VM_CONFIGURING || state == VM_CONFIGURED {
+            let owner_slot: usize = cspace_owner_slot(VM_OWNERS[slot]);
+            if VM_WORLDS[slot] == 0
+                || VM_WORLD_GENERATIONS[slot] == 0
+                || !cspace_is_valid_owner(VM_OWNERS[slot])
+                || owner_slot >= MAX_CSPACES
+                || VM_MIN_VCPUS[slot] == 0
+                || VM_MIN_VCPUS[slot] > VM_MAX_VCPUS[slot]
+                || VM_MAX_VCPUS[slot] > MAX_VCPUS_PER_VM
+                || VM_MIN_MEMORY_MIB[slot] == 0
+                || VM_MIN_MEMORY_MIB[slot] > VM_MAX_MEMORY_MIB[slot]
+                || VM_MIN_GUEST_PAGES[slot] == 0
+                || VM_MIN_GUEST_PAGES[slot] > VM_MAX_GUEST_PAGES[slot]
+                || VM_MAX_GUEST_PAGES[slot] > MAX_GUEST_PAGES_PER_VM
+                || VM_VCPU_COUNTS[slot] > VM_MAX_VCPUS[slot]
+                || VM_GUEST_PAGE_COUNTS[slot] > VM_MAX_GUEST_PAGES[slot] {
+                return false;
+            }
+            if state == VM_CONFIGURED
+                && (VM_VCPU_COUNTS[slot] < VM_MIN_VCPUS[slot]
+                    || VM_GUEST_PAGE_COUNTS[slot]
+                        < VM_MIN_GUEST_PAGES[slot]) {
+                return false;
+            }
+            required_owner_refs[owner_slot] += 1;
+            observed_vms += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_VMS {
+                if (VM_STATES[other] == VM_CONFIGURING
+                        || VM_STATES[other] == VM_CONFIGURED)
+                    && VM_WORLDS[other] == VM_WORLDS[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+
+    slot = 0;
+    while slot < MAX_VCPUS {
+        let state: u8 = VCPU_STATES[slot];
+        if VCPU_GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == CHILD_EMPTY || state == CHILD_RETIRED {
+            if (state == CHILD_RETIRED
+                    && VCPU_GENERATIONS[slot] != 0xffff_ffff)
+                || VCPU_VMS[slot] != 0
+                || VCPU_ORDINALS[slot] != 0 {
+                return false;
+            }
+        } else if state == CHILD_LIVE {
+            let vm_slot: usize = checked_vm_local(VCPU_VMS[slot], false);
+            if vm_slot >= MAX_VMS
+                || VCPU_ORDINALS[slot] >= VM_VCPU_COUNTS[vm_slot]
+                || VCPU_ORDINALS[slot] >= VM_MAX_VCPUS[vm_slot] {
+                return false;
+            }
+            vcpus_by_vm[vm_slot] += 1;
+            observed_vcpus += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_VCPUS {
+                if VCPU_STATES[other] == CHILD_LIVE
+                    && VCPU_VMS[other] == VCPU_VMS[slot]
+                    && VCPU_ORDINALS[other] == VCPU_ORDINALS[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+
+    slot = 0;
+    while slot < MAX_GUEST_PAGES {
+        let state: u8 = GUEST_PAGE_STATES[slot];
+        if GUEST_PAGE_GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == CHILD_EMPTY || state == CHILD_RETIRED {
+            if (state == CHILD_RETIRED
+                    && GUEST_PAGE_GENERATIONS[slot] != 0xffff_ffff)
+                || GUEST_PAGE_VMS[slot] != 0
+                || GUEST_PAGE_GPAS[slot] != 0
+                || GUEST_PAGE_MEMORY_OBJECTS[slot] != 0 {
+                return false;
+            }
+        } else if state == CHILD_LIVE {
+            let vm_slot: usize = checked_vm_local(
+                GUEST_PAGE_VMS[slot],
+                false
+            );
+            if vm_slot >= MAX_VMS
+                || !guest_page_base_is_valid(GUEST_PAGE_GPAS[slot])
+                || memory_object_kind(GUEST_PAGE_MEMORY_OBJECTS[slot])
+                    != MEMORY_ANONYMOUS {
+                return false;
+            }
+            let owner_slot: usize = cspace_owner_slot(VM_OWNERS[vm_slot]);
+            if owner_slot >= MAX_CSPACES {
+                return false;
+            }
+            required_owner_refs[owner_slot] += 1;
+            pages_by_vm[vm_slot] += 1;
+            observed_pages += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_GUEST_PAGES {
+                if GUEST_PAGE_STATES[other] == CHILD_LIVE
+                    && (GUEST_PAGE_MEMORY_OBJECTS[other]
+                            == GUEST_PAGE_MEMORY_OBJECTS[slot]
+                        || (GUEST_PAGE_VMS[other] == GUEST_PAGE_VMS[slot]
+                            && guest_pages_overlap(
+                                GUEST_PAGE_GPAS[other],
+                                GUEST_PAGE_GPAS[slot]
+                            ))) {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+
+    slot = 0;
+    while slot < MAX_VMS {
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && (VM_VCPU_COUNTS[slot] != vcpus_by_vm[slot]
+                || VM_GUEST_PAGE_COUNTS[slot] != pages_by_vm[slot]) {
+            return false;
+        }
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_CSPACES {
+        if required_owner_refs[slot] != 0 {
+            let mut vm_slot: usize = 0;
+            let mut owner: u64 = 0;
+            while vm_slot < MAX_VMS {
+                if (VM_STATES[vm_slot] == VM_CONFIGURING
+                        || VM_STATES[vm_slot] == VM_CONFIGURED)
+                    && cspace_owner_slot(VM_OWNERS[vm_slot]) == slot {
+                    owner = VM_OWNERS[vm_slot];
+                }
+                vm_slot += 1;
+            }
+            if owner == 0
+                || cspace_child_refs(owner)
+                    < required_owner_refs[slot] as u32 {
+                return false;
+            }
+        }
+        slot += 1;
+    }
+    return observed_vms == ACTIVE_VMS
+        && observed_vcpus == ACTIVE_VCPUS
+        && observed_pages == ACTIVE_GUEST_PAGES;
+}

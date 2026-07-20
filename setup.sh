@@ -243,11 +243,14 @@ install_system_deps() {
         echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
         exit 1
       fi
-      brew update
-      brew install --quiet gcc make python@3.12 curl git pkg-config openssl sqlite 2>/dev/null || true
+      # Setup installs only declared prerequisites. Avoid an implicit global
+      # Homebrew update/cleanup of unrelated packages and caches.
+      HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+        brew install --quiet gcc make python@3.12 curl git pkg-config openssl sqlite 2>/dev/null || true
       xcode-select --install 2>/dev/null || true
       if $FULL; then
-        brew install --quiet racket 2>/dev/null || true
+        HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+          brew install --quiet racket 2>/dev/null || true
       fi
       ;;
 
@@ -442,7 +445,8 @@ install_extras() {
   if $MINIMAL || ! $FULL; then return; fi
   echo ">>> Installing extra backend deps (full mode)..."
   case "$PLATFORM" in
-    macos) brew install --quiet racket 2>/dev/null || true ;;
+    macos) HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
+      brew install --quiet racket 2>/dev/null || true ;;
     linux)
       case "$DISTRO" in
         debian) sudo apt-get install -y -qq racket 2>/dev/null || true ;;
@@ -586,7 +590,8 @@ verify_runnable() {
 
   echo "Verification: $ok passed, $fail failed."
   if [[ $fail -gt 0 ]]; then
-    echo "Some verifications failed. Check output above."
+    echo "Some verifications failed. Check output above." >&2
+    return 1
   fi
 }
 

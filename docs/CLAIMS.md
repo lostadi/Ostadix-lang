@@ -46,6 +46,33 @@
   trusted control-plane authority, and arbitrary host syscalls are not fully
   contained. It is a differential semantic oracle, not evidence for any native
   QEMU claim below; those claims have their own gates.
+- `src/kernel_world.rs` implements a strict, bounded
+  `ocore.kernel-world/v1` manifest and a host-side lifecycle oracle shared by
+  source-integrated and binary-contained foreign-kernel provider designs.
+  `tests/kernel_world_contract.rs` proves unknown-field rejection, canonical
+  parsing, exact binding to verified package metadata, byte verification for
+  package-payload images, expected-digest constraints for user-supplied images,
+  execution-mode constraints, explicit VM/device authority declarations,
+  health-gated export resolution, bounded request admission,
+  one-terminal-result behavior, failure fan-out, restart policy, provenance,
+  and stale-generation denial. Its `OKWORLD1` encoder produces a bounded,
+  deterministic native normal form only from a `VerifiedKernelWorld`; the
+  decoder returns a distinct inspection-only type and rejects malformed,
+  noncanonical, all-zero-package, or over-limit records; decoding cannot
+  recreate verified-package authority.
+- Mode 20 carries that contract into a bounded native supervisor-admission/
+  object gate.
+  `kernel_world_record.oc` verifies the embedded record's exact SHA-256 before
+  strict parsing. `kernel_world_admission.oc` preserves separate package and
+  manifest digests and applies independently registered default-deny policy
+  keyed by exact package digest and copied byte-exact request kind/purpose;
+  hashes cannot authorize. `vm_object.oc`
+  creates generation-bound, nonexecuting VM/vCPU identities and aligned guest
+  pages backed by anonymous 4 KiB memory objects. The gate proves quota,
+  overlap, stale-generation, exact-world revoke/reclaim, unrelated-VM survival,
+  and a later timer. It does not execute a foreign kernel, enter VMX/SVM,
+  construct EPT/NPT, run firmware, inject interrupts, publish a provider export,
+  assign a device, map DMA, or provide IOMMU isolation.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR
@@ -175,6 +202,26 @@
   This is M6A rather than full Milestone 6: pointer-bearing calls and foreign
   memory views remain disabled, and it establishes no Linux or other foreign
   ABI.
+- M6B has a separate first native mechanism gate in
+  `ocore/kernel/smoke-m6b-qemu.sh`. Mode 19 implements four
+  generation-tagged, request-scoped bounded-copy views with kernel-owned
+  staging, direction-attenuated nontransferable capabilities, a 128-byte
+  per-view and 256-byte aggregate quota, snapshot input, and written-prefix-only
+  output commit after exact process/address-space revalidation. Reply,
+  cancellation, timeout, service-death, process-exit, unmap, and delegated
+  revocation hooks close capability authority before one terminal disposition
+  and one wake publication. Post-reply process-exit/unmap cleanup releases an
+  undeliverable terminal view without a second disposition or wake. Typed
+  generation-tagged leases carry nonzero request identities, cover memory,
+  filesystem, timer, network, and device classes, and support request-wide
+  revocation without ambient fallback while unrelated requests survive. These
+  are directly exercised terminal hooks, not yet integration with live process
+  teardown, mapping mutation, or scheduler wake. This is not complete M6B: the
+  gate is not wired
+  through the CPL3 personality daemon or public pointer-bearing RPC, and it has
+  no pinned windows, streaming mode, signal/restart integration, Linux oracle,
+  schema fuzzing, allocation-failure matrix, or concrete filesystem, network,
+  timer, or device implementation.
 
 ## Implemented conservatively
 
@@ -202,9 +249,9 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond the current bounded native gates: extend M6A's
-  unprivileged scalar personality and supervision loop with durable reboot
-  reconstruction and a capability-bounded build service, then implement the
-  request-scoped foreign-process memory boundary in
-  `docs/PERSONALITY_MEMORY_VIEW.md`. No Linux ABI or root filesystem is claimed.
-  The staged engineering plan is in `docs/ODOMAIN_PLAN.md`.
+- O-Domain evolution beyond the current bounded native gates: integrate M6B's
+  bounded-copy view and delegated-lease mechanism into the unprivileged
+  personality RPC, complete pinned/signal/race evidence, and extend supervision
+  with durable reboot reconstruction and a capability-bounded build service.
+  No Linux ABI or root filesystem is claimed. The staged engineering plan is in
+  `docs/ODOMAIN_PLAN.md`.

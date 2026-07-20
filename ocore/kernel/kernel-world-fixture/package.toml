@@ -1,0 +1,36 @@
+schema = "ocore.package/v1"
+name = "kernel/pilot-contained"
+version = "1.0.0"
+architecture = "x86_64"
+payload_sha256 = "932af130b29317e60c087694a2d2cbd242236e2be4ef1dc189e66006cd6f569f"
+
+[runtime]
+kind = "kernel-world"
+entry = "/kernel-world.toml"
+abi = "ocore.kernel-world-control/v1"
+
+[[services]]
+name = "linux.exec"
+protocol = "linux.exec/v1"
+
+[[services]]
+name = "network.default"
+protocol = "o.net-port/v1"
+
+[[capability_requests]]
+kind = "device.net"
+rights = ["reset"]
+purpose = "resettable pilot network provider"
+
+[[capability_requests]]
+kind = "vm.machine"
+rights = ["run", "stop"]
+purpose = "contained guest execution"
+
+[health]
+protocol = "ocore.kernel-world-health/v1"
+timeout_ms = 5000
+
+[build]
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+builder = "ocore-kernel-world-record/v1"

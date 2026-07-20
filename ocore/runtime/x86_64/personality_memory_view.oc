@@ -1,0 +1,1309 @@
+module runtime::personality_memory_view;
+
+use runtime::address_space::allows;
+use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::VM_READ;
+use runtime::address_space::VM_USER;
+use runtime::address_space::VM_WRITE;
+use runtime::capability::abort_reserved_for_owner;
+use runtime::capability::close_during_drain;
+use runtime::capability::close_for_owner;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::publish_reserved_for_owner;
+use runtime::capability::reserve_first_free_for_owner;
+use runtime::capability::rights_for_owner;
+use runtime::capability::rights_for_valid_owner;
+use runtime::capability::validate_during_drain;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_PERSONALITY_MEMORY_VIEW;
+use runtime::capability::RIGHT_MEMORY_VIEW_COMMIT;
+use runtime::capability::RIGHT_MEMORY_VIEW_READ;
+use runtime::capability::RIGHT_MEMORY_VIEW_WRITE;
+use runtime::process::address_space_for;
+use runtime::process::current_address_space_handle;
+use runtime::process::current_process_handle;
+use runtime::process::is_live as process_is_live;
+use runtime::user_memory::copy_from_user;
+use runtime::user_memory::copy_to_user;
+use runtime::user_memory::COPY_OK;
+
+// M6B's first native memory boundary is deliberately small. Every byte is
+// kernel-owned staging; a view records the foreign virtual address only as
+// immutable validation metadata and never retains a host or service pointer.
+pub const MAX_PERSONALITY_MEMORY_VIEWS: usize = 4;
+pub const MAX_PERSONALITY_MEMORY_VIEW_BYTES: usize = 128;
+pub const MAX_PERSONALITY_MEMORY_VIEW_TOTAL_BYTES: usize = 256;
+
+pub const MEMORY_VIEW_DIRECTION_IN: u64 = 1;
+pub const MEMORY_VIEW_DIRECTION_OUT: u64 = 2;
+pub const MEMORY_VIEW_DIRECTION_INOUT: u64 = 3;
+
+pub const MEMORY_VIEW_STATE_LIVE: u64 = 1;
+pub const MEMORY_VIEW_STATE_TERMINAL: u64 = 2;
+
+pub const MEMORY_VIEW_TERMINAL_REPLY: u64 = 1;
+pub const MEMORY_VIEW_TERMINAL_CANCELLED: u64 = 2;
+pub const MEMORY_VIEW_TERMINAL_TIMEOUT: u64 = 3;
+pub const MEMORY_VIEW_TERMINAL_SERVICE_DEATH: u64 = 4;
+pub const MEMORY_VIEW_TERMINAL_PROCESS_EXIT: u64 = 5;
+pub const MEMORY_VIEW_TERMINAL_UNMAP: u64 = 6;
+pub const MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED: u64 = 7;
+pub const MEMORY_VIEW_TERMINAL_REQUEST_REVOKED: u64 = 8;
+
+const VIEW_EMPTY: u8 = 0;
+const VIEW_LIVE: u8 = 1;
+const VIEW_TERMINAL: u8 = 2;
+const VIEW_RETIRED: u8 = 3;
+const VIEW_HANDLE_TAG: u64 = 0xb500_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut REQUESTS: [u64; 4] = [0; 4];
+static mut CALLER_PROCESSES: [u64; 4] = [0; 4];
+static mut CALLER_ADDRESS_SPACES: [u64; 4] = [0; 4];
+static mut FOREIGN_ADDRESSES: [usize; 4] = [0; 4];
+static mut LENGTHS: [usize; 4] = [0; 4];
+static mut DIRECTIONS: [u8; 4] = [0; 4];
+static mut SERVICE_CSPACES: [u64; 4] = [0; 4];
+static mut VIEW_CAPABILITIES: [u64; 4] = [0; 4];
+static mut CLOSED_CAPABILITIES: [u64; 4] = [0; 4];
+static mut VIEW_RIGHTS: [u64; 4] = [0; 4];
+static mut DELEGATED_RESOURCES: [u64; 4] = [0; 4];
+static mut TERMINAL_KINDS: [u8; 4] = [0; 4];
+static mut COMMITTED_LENGTHS: [usize; 4] = [0; 4];
+
+// A byte-per-byte written bitmap is intentionally simple and auditable at
+// this 512-byte global ceiling. It prevents commit from exposing any byte the
+// service did not explicitly write.
+static mut STAGING: [u8; 512] = [0; 512];
+static mut OUTPUT_WRITTEN: [u8; 512] = [0; 512];
+
+// These sequences are the handoff contract to the owning request router. A
+// terminal path first closes the service capability, then records disposition,
+// then publishes its single wake event. The request router may translate that
+// publication into its existing scheduler wake without this module importing
+// personality_rpc and creating a dependency cycle.
+static mut CAP_CLOSE_SEQUENCES: [u64; 4] = [0; 4];
+static mut TERMINAL_SEQUENCES: [u64; 4] = [0; 4];
+static mut WAKE_SEQUENCES: [u64; 4] = [0; 4];
+static mut EVENT_SEQUENCE: u64 = 0;
+
+static mut CHARGED_BYTES: usize = 0;
+static mut CREATIONS: u64 = 0;
+static mut TERMINAL_TRANSITIONS: u64 = 0;
+static mut TERMINAL_WAKES: u64 = 0;
+static mut REPLIES: u64 = 0;
+static mut CANCELLATIONS: u64 = 0;
+static mut TIMEOUTS: u64 = 0;
+static mut SERVICE_DEATHS: u64 = 0;
+static mut PROCESS_EXITS: u64 = 0;
+static mut UNMAPS: u64 = 0;
+static mut RESOURCE_REVOCATIONS: u64 = 0;
+static mut REQUEST_REVOCATIONS: u64 = 0;
+static mut ABANDONED_REPLIES: u64 = 0;
+static mut CONSUMED: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut DUPLICATE_DENIALS: u64 = 0;
+static mut STALE_DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn view_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn view_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn staging_index(slot: usize, offset: usize) -> usize {
+    return slot * MAX_PERSONALITY_MEMORY_VIEW_BYTES + offset;
+}
+
+fn direction_valid(direction: u64) -> bool {
+    return direction == MEMORY_VIEW_DIRECTION_IN
+        || direction == MEMORY_VIEW_DIRECTION_OUT
+        || direction == MEMORY_VIEW_DIRECTION_INOUT;
+}
+
+fn direction_has_input(direction: u64) -> bool {
+    return direction == MEMORY_VIEW_DIRECTION_IN
+        || direction == MEMORY_VIEW_DIRECTION_INOUT;
+}
+
+fn direction_has_output(direction: u64) -> bool {
+    return direction == MEMORY_VIEW_DIRECTION_OUT
+        || direction == MEMORY_VIEW_DIRECTION_INOUT;
+}
+
+fn terminal_kind_valid(kind: u64) -> bool {
+    return kind == MEMORY_VIEW_TERMINAL_REPLY
+        || kind == MEMORY_VIEW_TERMINAL_CANCELLED
+        || kind == MEMORY_VIEW_TERMINAL_TIMEOUT
+        || kind == MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+        || kind == MEMORY_VIEW_TERMINAL_PROCESS_EXIT
+        || kind == MEMORY_VIEW_TERMINAL_UNMAP
+        || kind == MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+        || kind == MEMORY_VIEW_TERMINAL_REQUEST_REVOKED;
+}
+
+fn rights_for_direction(direction: u64) -> u64 {
+    if direction == MEMORY_VIEW_DIRECTION_IN {
+        return RIGHT_MEMORY_VIEW_READ;
+    }
+    if direction == MEMORY_VIEW_DIRECTION_OUT {
+        return RIGHT_MEMORY_VIEW_WRITE | RIGHT_MEMORY_VIEW_COMMIT;
+    }
+    if direction == MEMORY_VIEW_DIRECTION_INOUT {
+        return RIGHT_MEMORY_VIEW_READ
+            | RIGHT_MEMORY_VIEW_WRITE
+            | RIGHT_MEMORY_VIEW_COMMIT;
+    }
+    return 0;
+}
+
+fn mapping_rights_for_direction(direction: u64) -> u64 {
+    if direction == MEMORY_VIEW_DIRECTION_IN {
+        return VM_USER | VM_READ;
+    }
+    if direction == MEMORY_VIEW_DIRECTION_OUT {
+        return VM_USER | VM_WRITE;
+    }
+    if direction == MEMORY_VIEW_DIRECTION_INOUT {
+        return VM_USER | VM_READ | VM_WRITE;
+    }
+    return 0;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | VIEW_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_view(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != VIEW_HANDLE_TAG {
+        return MAX_PERSONALITY_MEMORY_VIEWS;
+    }
+    let slot: usize = view_index(handle);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || (STATES[slot] != VIEW_LIVE && STATES[slot] != VIEW_TERMINAL)
+        || GENERATIONS[slot] != view_generation(handle) {
+        return MAX_PERSONALITY_MEMORY_VIEWS;
+    }
+    return slot;
+}
+
+unsafe fn checked_live_view(handle: u64) -> usize {
+    let slot: usize = checked_view(handle);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS || STATES[slot] != VIEW_LIVE {
+        return MAX_PERSONALITY_MEMORY_VIEWS;
+    }
+    return slot;
+}
+
+unsafe fn count_denial() -> void {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIALS += 1;
+    }
+}
+
+unsafe fn deny() -> u64 {
+    count_denial();
+    return 0;
+}
+
+unsafe fn deny_stale() -> u64 {
+    count_denial();
+    if STALE_DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        STALE_DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn deny_duplicate() -> u64 {
+    count_denial();
+    if DUPLICATE_DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DUPLICATE_DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn clear_bytes(slot: usize) -> void {
+    let mut offset: usize = 0;
+    while offset < MAX_PERSONALITY_MEMORY_VIEW_BYTES {
+        let index: usize = staging_index(slot, offset);
+        STAGING[index] = 0;
+        OUTPUT_WRITTEN[index] = 0;
+        offset += 1;
+    }
+}
+
+unsafe fn clear_metadata(slot: usize) -> void {
+    REQUESTS[slot] = 0;
+    CALLER_PROCESSES[slot] = 0;
+    CALLER_ADDRESS_SPACES[slot] = 0;
+    FOREIGN_ADDRESSES[slot] = 0;
+    LENGTHS[slot] = 0;
+    DIRECTIONS[slot] = 0;
+    SERVICE_CSPACES[slot] = 0;
+    VIEW_CAPABILITIES[slot] = 0;
+    CLOSED_CAPABILITIES[slot] = 0;
+    VIEW_RIGHTS[slot] = 0;
+    DELEGATED_RESOURCES[slot] = 0;
+    TERMINAL_KINDS[slot] = 0;
+    COMMITTED_LENGTHS[slot] = 0;
+    CAP_CLOSE_SEQUENCES[slot] = 0;
+    TERMINAL_SEQUENCES[slot] = 0;
+    WAKE_SEQUENCES[slot] = 0;
+    clear_bytes(slot);
+}
+
+unsafe fn bump_event() -> u64 {
+    if EVENT_SEQUENCE == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    EVENT_SEQUENCE += 1;
+    return EVENT_SEQUENCE;
+}
+
+unsafe fn close_view_capability(slot: usize) -> u64 {
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_LIVE
+        || VIEW_CAPABILITIES[slot] == 0
+        || SERVICE_CSPACES[slot] == 0 {
+        return 0;
+    }
+    let owner: u64 = SERVICE_CSPACES[slot];
+    let capability: u64 = VIEW_CAPABILITIES[slot];
+    let mut closed: u64 = 0;
+    if cspace_is_live(owner) {
+        closed = close_for_owner(owner, capability);
+    } else if cspace_is_valid_owner(owner) {
+        closed = close_during_drain(owner, capability);
+    }
+    if closed != 1 {
+        return 0;
+    }
+    CLOSED_CAPABILITIES[slot] = capability;
+    VIEW_CAPABILITIES[slot] = 0;
+    let sequence: u64 = bump_event();
+    if sequence == 0 {
+        return 0;
+    }
+    CAP_CLOSE_SEQUENCES[slot] = sequence;
+    return 1;
+}
+
+unsafe fn live_view_capability_matches(slot: usize) -> bool {
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_LIVE
+        || SERVICE_CSPACES[slot] == 0
+        || VIEW_CAPABILITIES[slot] == 0
+        || !cspace_is_valid_owner(SERVICE_CSPACES[slot]) {
+        return false;
+    }
+    let owner: u64 = SERVICE_CSPACES[slot];
+    let capability: u64 = VIEW_CAPABILITIES[slot];
+    let mut object: u64 = 0;
+    if cspace_is_live(owner) {
+        object = validate_for_owner(
+            owner,
+            capability,
+            OBJECT_PERSONALITY_MEMORY_VIEW,
+            VIEW_RIGHTS[slot]
+        );
+    } else {
+        object = validate_during_drain(
+            owner,
+            capability,
+            OBJECT_PERSONALITY_MEMORY_VIEW,
+            VIEW_RIGHTS[slot]
+        );
+    }
+    return object == make_handle(slot)
+        && rights_for_valid_owner(owner, capability) == VIEW_RIGHTS[slot];
+}
+
+unsafe fn release_slot(slot: usize) -> u64 {
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_TERMINAL
+        || VIEW_CAPABILITIES[slot] != 0
+        || LENGTHS[slot] == 0
+        || LENGTHS[slot] > CHARGED_BYTES {
+        return 0;
+    }
+    CHARGED_BYTES -= LENGTHS[slot];
+    clear_metadata(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = VIEW_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = VIEW_EMPTY;
+    }
+    return 1;
+}
+
+// Reply already won terminal arbitration, but a later caller exit or unmap can
+// make exact re-entry impossible. Teardown may then discard the staged reply
+// without publishing a second terminal result or wake.
+unsafe fn abandon_terminal_reply(slot: usize) -> u64 {
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_TERMINAL
+        || TERMINAL_KINDS[slot] as u64 != MEMORY_VIEW_TERMINAL_REPLY
+        || VIEW_CAPABILITIES[slot] != 0
+        || ABANDONED_REPLIES == MAX_COUNTER {
+        return 0;
+    }
+    if release_slot(slot) != 1 {
+        return 0;
+    }
+    ABANDONED_REPLIES += 1;
+    return 1;
+}
+
+unsafe fn transition_terminal(
+    slot: usize,
+    kind: u64,
+    committed_length: usize
+) -> u64 {
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || !terminal_kind_valid(kind) {
+        return deny_stale();
+    }
+    if STATES[slot] == VIEW_TERMINAL {
+        return deny_duplicate();
+    }
+    if STATES[slot] != VIEW_LIVE {
+        return deny_stale();
+    }
+    if EVENT_SEQUENCE > MAX_COUNTER - 3
+        || TERMINAL_TRANSITIONS == MAX_COUNTER
+        || TERMINAL_WAKES == MAX_COUNTER
+        || (kind == MEMORY_VIEW_TERMINAL_REPLY && REPLIES == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_CANCELLED
+            && CANCELLATIONS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_TIMEOUT && TIMEOUTS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+            && SERVICE_DEATHS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_PROCESS_EXIT
+            && PROCESS_EXITS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_UNMAP && UNMAPS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+            && RESOURCE_REVOCATIONS == MAX_COUNTER)
+        || (kind == MEMORY_VIEW_TERMINAL_REQUEST_REVOKED
+            && REQUEST_REVOCATIONS == MAX_COUNTER) {
+        POISONED = 1;
+        return 0;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_REPLY {
+        let direction: u64 = DIRECTIONS[slot] as u64;
+        if direction_has_output(direction) {
+            if committed_length > LENGTHS[slot] {
+                return deny();
+            }
+            let mut offset: usize = 0;
+            while offset < committed_length {
+                if OUTPUT_WRITTEN[staging_index(slot, offset)] != 1 {
+                    return deny();
+                }
+                offset += 1;
+            }
+        } else if committed_length != 0 {
+            return deny();
+        }
+    } else if committed_length != 0 {
+        return deny();
+    }
+
+    // Closing authority is the first irreversible action. If it cannot be
+    // completed, no terminal disposition and no wake publication occurs.
+    if close_view_capability(slot) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    if kind != MEMORY_VIEW_TERMINAL_REPLY {
+        clear_bytes(slot);
+    }
+    STATES[slot] = VIEW_TERMINAL;
+    TERMINAL_KINDS[slot] = kind as u8;
+    COMMITTED_LENGTHS[slot] = committed_length;
+    TERMINAL_SEQUENCES[slot] = bump_event();
+    WAKE_SEQUENCES[slot] = bump_event();
+    if TERMINAL_SEQUENCES[slot] == 0 || WAKE_SEQUENCES[slot] == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    TERMINAL_TRANSITIONS += 1;
+    TERMINAL_WAKES += 1;
+    if kind == MEMORY_VIEW_TERMINAL_REPLY {
+        REPLIES += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_CANCELLED {
+        CANCELLATIONS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_TIMEOUT {
+        TIMEOUTS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_SERVICE_DEATH {
+        SERVICE_DEATHS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_PROCESS_EXIT {
+        PROCESS_EXITS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_UNMAP {
+        UNMAPS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED {
+        RESOURCE_REVOCATIONS += 1;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_REQUEST_REVOKED {
+        REQUEST_REVOCATIONS += 1;
+    }
+    return 1;
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        STATES[slot] = VIEW_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_metadata(slot);
+        slot += 1;
+    }
+    EVENT_SEQUENCE = 0;
+    CHARGED_BYTES = 0;
+    CREATIONS = 0;
+    TERMINAL_TRANSITIONS = 0;
+    TERMINAL_WAKES = 0;
+    REPLIES = 0;
+    CANCELLATIONS = 0;
+    TIMEOUTS = 0;
+    SERVICE_DEATHS = 0;
+    PROCESS_EXITS = 0;
+    UNMAPS = 0;
+    RESOURCE_REVOCATIONS = 0;
+    REQUEST_REVOCATIONS = 0;
+    ABANDONED_REPLIES = 0;
+    CONSUMED = 0;
+    DENIALS = 0;
+    DUPLICATE_DENIALS = 0;
+    STALE_DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Create one request-scoped view from the exact running caller generation.
+// Input is snapshotted before a capability becomes visible to the service.
+pub unsafe fn create(
+    request: u64,
+    caller_process: u64,
+    caller_address_space: u64,
+    foreign_address: usize,
+    length: usize,
+    direction: u64,
+    service_cspace: u64,
+    capability_out: *mut u64
+) -> u64 {
+    if capability_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(capability_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    if request == 0
+        || foreign_address == 0
+        || !direction_valid(direction)
+        || length == 0
+        || length > MAX_PERSONALITY_MEMORY_VIEW_BYTES
+        || CHARGED_BYTES > MAX_PERSONALITY_MEMORY_VIEW_TOTAL_BYTES - length
+        || foreign_address > 0xffff_ffff_ffff_ffff as usize - length
+        || !process_is_live(caller_process)
+        || !address_space_is_live(caller_address_space)
+        || address_space_for(caller_process) != caller_address_space
+        || current_process_handle() != caller_process
+        || current_address_space_handle() != caller_address_space
+        || !cspace_is_live(service_cspace)
+        || !allows(
+            caller_address_space,
+            foreign_address,
+            length,
+            mapping_rights_for_direction(direction)
+        ) {
+        return deny();
+    }
+    // This bounded normal form admits one view object per request. A request
+    // may still own multiple delegated resources, all keyed by the same ID.
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        if STATES[slot] != VIEW_EMPTY
+            && REQUESTS[slot] == request {
+            return deny_duplicate();
+        }
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS && STATES[slot] != VIEW_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS || CREATIONS == MAX_COUNTER {
+        return deny();
+    }
+    let reservation: u64 = reserve_first_free_for_owner(service_cspace);
+    if reservation == 0 {
+        return deny();
+    }
+    clear_bytes(slot);
+    if direction_has_input(direction) {
+        let copied: u64 = copy_from_user(
+            caller_address_space,
+            (&mut STAGING[staging_index(slot, 0)]),
+            foreign_address as *const u8,
+            length
+        );
+        if copied != COPY_OK {
+            clear_bytes(slot);
+            if abort_reserved_for_owner(service_cspace, reservation) != 1 {
+                POISONED = 1;
+            }
+            return deny();
+        }
+    }
+    let view: u64 = make_handle(slot);
+    let rights: u64 = rights_for_direction(direction);
+    REQUESTS[slot] = request;
+    CALLER_PROCESSES[slot] = caller_process;
+    CALLER_ADDRESS_SPACES[slot] = caller_address_space;
+    FOREIGN_ADDRESSES[slot] = foreign_address;
+    LENGTHS[slot] = length;
+    DIRECTIONS[slot] = direction as u8;
+    SERVICE_CSPACES[slot] = service_cspace;
+    VIEW_RIGHTS[slot] = rights;
+    STATES[slot] = VIEW_LIVE;
+    let capability: u64 = publish_reserved_for_owner(
+        service_cspace,
+        reservation,
+        view,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        rights
+    );
+    if capability == 0 {
+        STATES[slot] = VIEW_EMPTY;
+        clear_metadata(slot);
+        if abort_reserved_for_owner(service_cspace, reservation) != 1 {
+            POISONED = 1;
+        }
+        return deny();
+    }
+    VIEW_CAPABILITIES[slot] = capability;
+    CHARGED_BYTES += length;
+    CREATIONS += 1;
+    volatile_store(capability_out, capability);
+    return finish(view);
+}
+
+// Called only by delegated_resource after it has validated an exact live
+// resource capability. The memory-view layer intentionally does not import
+// the resource module, which keeps revocation dependencies acyclic.
+pub unsafe fn bind_resource(view: u64, resource: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_live_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || resource == 0
+        || DELEGATED_RESOURCES[slot] != 0 {
+        return deny();
+    }
+    DELEGATED_RESOURCES[slot] = resource;
+    return finish(1);
+}
+
+pub unsafe fn read_byte(
+    service_cspace: u64,
+    capability: u64,
+    offset: usize,
+    result: *mut u8
+) -> u64 {
+    if result as usize == 0 {
+        return 0;
+    }
+    volatile_store(result, 0);
+    if !preflight() {
+        return 0;
+    }
+    let view: u64 = validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        RIGHT_MEMORY_VIEW_READ
+    );
+    let slot: usize = checked_live_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || SERVICE_CSPACES[slot] != service_cspace
+        || VIEW_CAPABILITIES[slot] != capability
+        || !direction_has_input(DIRECTIONS[slot] as u64)
+        || offset >= LENGTHS[slot] {
+        return deny();
+    }
+    volatile_store(result, STAGING[staging_index(slot, offset)]);
+    return finish(1);
+}
+
+pub unsafe fn write_byte(
+    service_cspace: u64,
+    capability: u64,
+    offset: usize,
+    value: u8
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let view: u64 = validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        RIGHT_MEMORY_VIEW_WRITE
+    );
+    let slot: usize = checked_live_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || SERVICE_CSPACES[slot] != service_cspace
+        || VIEW_CAPABILITIES[slot] != capability
+        || !direction_has_output(DIRECTIONS[slot] as u64)
+        || offset >= LENGTHS[slot] {
+        return deny();
+    }
+    let index: usize = staging_index(slot, offset);
+    STAGING[index] = value;
+    OUTPUT_WRITTEN[index] = 1;
+    return finish(1);
+}
+
+// A reply closes the service's view capability and records only the declared,
+// fully written prefix. Copy-back remains deferred until exact caller re-entry.
+pub unsafe fn reply(
+    service_cspace: u64,
+    capability: u64,
+    committed_length: usize
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let mut required: u64 = RIGHT_MEMORY_VIEW_READ;
+    let object: u64 = validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_PERSONALITY_MEMORY_VIEW,
+        0
+    );
+    let slot: usize = checked_view(object);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS {
+        let mut terminal_slot: usize = 0;
+        while terminal_slot < MAX_PERSONALITY_MEMORY_VIEWS {
+            if STATES[terminal_slot] == VIEW_TERMINAL
+                && SERVICE_CSPACES[terminal_slot] == service_cspace
+                && CLOSED_CAPABILITIES[terminal_slot] == capability {
+                return deny_duplicate();
+            }
+            terminal_slot += 1;
+        }
+        return deny_stale();
+    }
+    if direction_has_output(DIRECTIONS[slot] as u64) {
+        required = RIGHT_MEMORY_VIEW_COMMIT;
+    }
+    if STATES[slot] == VIEW_TERMINAL {
+        return deny_duplicate();
+    }
+    if SERVICE_CSPACES[slot] != service_cspace
+        || VIEW_CAPABILITIES[slot] != capability
+        || validate_for_owner(
+            service_cspace,
+            capability,
+            OBJECT_PERSONALITY_MEMORY_VIEW,
+            required
+        ) != object {
+        return deny();
+    }
+    let result: u64 = transition_terminal(
+        slot,
+        MEMORY_VIEW_TERMINAL_REPLY,
+        committed_length
+    );
+    return finish(result);
+}
+
+pub unsafe fn cancel(view: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS {
+        return deny_stale();
+    }
+    let result: u64 = transition_terminal(
+        slot,
+        MEMORY_VIEW_TERMINAL_CANCELLED,
+        0
+    );
+    return finish(result);
+}
+
+pub unsafe fn timeout(view: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS {
+        return deny_stale();
+    }
+    let result: u64 = transition_terminal(
+        slot,
+        MEMORY_VIEW_TERMINAL_TIMEOUT,
+        0
+    );
+    return finish(result);
+}
+
+unsafe fn terminalize_matching(
+    match_kind: u64,
+    identity: u64,
+    range_start: usize,
+    range_length: usize,
+    terminal_kind: u64
+) -> u64 {
+    let mut transitioned: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        let mut matches: bool = false;
+        if STATES[slot] == VIEW_LIVE
+            || (STATES[slot] == VIEW_TERMINAL
+                && TERMINAL_KINDS[slot] as u64
+                    == MEMORY_VIEW_TERMINAL_REPLY
+                && (match_kind == 2 || match_kind == 4)) {
+            if match_kind == 1 {
+                matches = SERVICE_CSPACES[slot] == identity;
+            }
+            if match_kind == 2 {
+                matches = CALLER_PROCESSES[slot] == identity;
+            }
+            if match_kind == 3 {
+                matches = DELEGATED_RESOURCES[slot] == identity;
+            }
+            if match_kind == 4
+                && CALLER_ADDRESS_SPACES[slot] == identity {
+                let view_start: usize = FOREIGN_ADDRESSES[slot];
+                let view_length: usize = LENGTHS[slot];
+                let view_end: usize = view_start + view_length;
+                let range_end: usize = range_start + range_length;
+                matches = view_start < range_end && range_start < view_end;
+            }
+            if match_kind == 5 {
+                matches = REQUESTS[slot] == identity;
+            }
+        }
+        if matches {
+            let mut result: u64 = 0;
+            if STATES[slot] == VIEW_LIVE {
+                result = transition_terminal(slot, terminal_kind, 0);
+            } else {
+                result = abandon_terminal_reply(slot);
+            }
+            if result != 1 {
+                POISONED = 1;
+                return 0;
+            }
+            transitioned += 1;
+        }
+        slot += 1;
+    }
+    return transitioned;
+}
+
+pub unsafe fn service_died(service_cspace: u64) -> u64 {
+    if !preflight() || service_cspace == 0 {
+        return 0;
+    }
+    let result: u64 = terminalize_matching(
+        1,
+        service_cspace,
+        0,
+        0,
+        MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+    );
+    return finish(result);
+}
+
+pub unsafe fn process_exited(caller_process: u64) -> u64 {
+    if !preflight() || caller_process == 0 {
+        return 0;
+    }
+    let result: u64 = terminalize_matching(
+        2,
+        caller_process,
+        0,
+        0,
+        MEMORY_VIEW_TERMINAL_PROCESS_EXIT
+    );
+    return finish(result);
+}
+
+pub unsafe fn unmapped(
+    caller_address_space: u64,
+    range_start: usize,
+    range_length: usize
+) -> u64 {
+    if !preflight()
+        || caller_address_space == 0
+        || range_length == 0
+        || range_start > 0xffff_ffff_ffff_ffff as usize - range_length {
+        return 0;
+    }
+    let result: u64 = terminalize_matching(
+        4,
+        caller_address_space,
+        range_start,
+        range_length,
+        MEMORY_VIEW_TERMINAL_UNMAP
+    );
+    return finish(result);
+}
+
+pub unsafe fn revoke_by_resource(resource: u64) -> u64 {
+    if !preflight() || resource == 0 {
+        return 0;
+    }
+    let count: u64 = live_count_bound_to_resource(resource) as u64;
+    if !can_revoke_count(count) {
+        return 0;
+    }
+    let result: u64 = terminalize_matching(
+        3,
+        resource,
+        0,
+        0,
+        MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+    );
+    return finish(result);
+}
+
+// Request arbitration also owns an unbound view. There is deliberately at
+// most one live-or-terminal view per request in this bounded slice, but this
+// scan keeps teardown correct if that bound is raised later.
+pub unsafe fn revoke_request(request: u64) -> u64 {
+    if !preflight() || request == 0 {
+        return 0;
+    }
+    let count: u64 = live_count_for_request(request) as u64;
+    if !can_revoke_count(count) {
+        return 0;
+    }
+    let result: u64 = terminalize_matching(
+        5,
+        request,
+        0,
+        0,
+        MEMORY_VIEW_TERMINAL_REQUEST_REVOKED
+    );
+    return finish(result);
+}
+
+// Consume a terminal result on the exact original caller/process/address-space
+// re-entry. Only a committed reply can copy staged output, and the destination
+// mapping is revalidated immediately before the fault-aware copy.
+pub unsafe fn consume_terminal(
+    view: u64,
+    caller_process: u64,
+    caller_address_space: u64,
+    foreign_address: usize,
+    terminal_kind_out: *mut u64,
+    committed_length_out: *mut usize
+) -> u64 {
+    if terminal_kind_out as usize == 0 || committed_length_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(terminal_kind_out, 0);
+    volatile_store(committed_length_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_TERMINAL {
+        return deny_stale();
+    }
+    if CALLER_PROCESSES[slot] != caller_process
+        || CALLER_ADDRESS_SPACES[slot] != caller_address_space
+        || FOREIGN_ADDRESSES[slot] != foreign_address
+        || !process_is_live(caller_process)
+        || !address_space_is_live(caller_address_space)
+        || address_space_for(caller_process) != caller_address_space
+        || current_process_handle() != caller_process
+        || current_address_space_handle() != caller_address_space {
+        return deny_stale();
+    }
+    let kind: u64 = TERMINAL_KINDS[slot] as u64;
+    let committed: usize = COMMITTED_LENGTHS[slot];
+    if CONSUMED == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    if kind == MEMORY_VIEW_TERMINAL_REPLY
+        && direction_has_output(DIRECTIONS[slot] as u64)
+        && committed != 0 {
+        if !allows(
+            caller_address_space,
+            foreign_address,
+            committed,
+            VM_USER | VM_WRITE
+        ) || copy_to_user(
+            caller_address_space,
+            foreign_address as *mut u8,
+            (&STAGING[staging_index(slot, 0)]),
+            committed
+        ) != COPY_OK {
+            return deny();
+        }
+    }
+    volatile_store(terminal_kind_out, kind);
+    volatile_store(committed_length_out, committed);
+    if release_slot(slot) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    CONSUMED += 1;
+    return finish(1);
+}
+
+// Teardown may discard a non-reply terminal after the caller has exited. A
+// committed reply cannot be silently discarded through this path.
+pub unsafe fn discard_terminal(view: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_TERMINAL
+        || TERMINAL_KINDS[slot] as u64 == MEMORY_VIEW_TERMINAL_REPLY {
+        return deny();
+    }
+    return finish(release_slot(slot));
+}
+
+pub unsafe fn count_bound_to_resource(resource: u64) -> usize {
+    if INITIALIZED == 0 || POISONED != 0 || resource == 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        if (STATES[slot] == VIEW_LIVE || STATES[slot] == VIEW_TERMINAL)
+            && DELEGATED_RESOURCES[slot] == resource {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn live_count_bound_to_resource(resource: u64) -> usize {
+    if INITIALIZED == 0 || POISONED != 0 || resource == 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        if STATES[slot] == VIEW_LIVE
+            && DELEGATED_RESOURCES[slot] == resource {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn live_count_for_request(request: u64) -> usize {
+    if INITIALIZED == 0 || POISONED != 0 || request == 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        if STATES[slot] == VIEW_LIVE && REQUESTS[slot] == request {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+// Batch owners use this before crossing an irreversible outer-layer revoke.
+// Each view consumes exactly three local sequence values (cap close, terminal,
+// wake) and one terminal/reason counter. Checking both revoke-reason counters
+// is conservative and prevents a partial batch at counter exhaustion.
+pub unsafe fn can_revoke_count(count: u64) -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !invariants_hold()
+        || count > MAX_PERSONALITY_MEMORY_VIEWS as u64
+        || EVENT_SEQUENCE > MAX_COUNTER - (count * 3)
+        || TERMINAL_TRANSITIONS > MAX_COUNTER - count
+        || TERMINAL_WAKES > MAX_COUNTER - count
+        || RESOURCE_REVOCATIONS > MAX_COUNTER - count
+        || REQUEST_REVOCATIONS > MAX_COUNTER - count {
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || CHARGED_BYTES > MAX_PERSONALITY_MEMORY_VIEW_TOTAL_BYTES
+        || ABANDONED_REPLIES > REPLIES
+        || TERMINAL_TRANSITIONS != TERMINAL_WAKES
+        || TERMINAL_TRANSITIONS
+            != REPLIES
+                + CANCELLATIONS
+                + TIMEOUTS
+                + SERVICE_DEATHS
+                + PROCESS_EXITS
+                + UNMAPS
+                + RESOURCE_REVOCATIONS
+                + REQUEST_REVOCATIONS {
+        return false;
+    }
+    let mut charged: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == VIEW_EMPTY || state == VIEW_RETIRED {
+            if (state == VIEW_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || REQUESTS[slot] != 0
+                || CALLER_PROCESSES[slot] != 0
+                || CALLER_ADDRESS_SPACES[slot] != 0
+                || FOREIGN_ADDRESSES[slot] != 0
+                || LENGTHS[slot] != 0
+                || DIRECTIONS[slot] != 0
+                || SERVICE_CSPACES[slot] != 0
+                || VIEW_CAPABILITIES[slot] != 0
+                || CLOSED_CAPABILITIES[slot] != 0
+                || VIEW_RIGHTS[slot] != 0
+                || DELEGATED_RESOURCES[slot] != 0
+                || TERMINAL_KINDS[slot] != 0
+                || COMMITTED_LENGTHS[slot] != 0
+                || CAP_CLOSE_SEQUENCES[slot] != 0
+                || TERMINAL_SEQUENCES[slot] != 0
+                || WAKE_SEQUENCES[slot] != 0 {
+                return false;
+            }
+        } else if state == VIEW_LIVE || state == VIEW_TERMINAL {
+            let direction: u64 = DIRECTIONS[slot] as u64;
+            if REQUESTS[slot] == 0
+                || CALLER_PROCESSES[slot] == 0
+                || CALLER_ADDRESS_SPACES[slot] == 0
+                || FOREIGN_ADDRESSES[slot] == 0
+                || LENGTHS[slot] == 0
+                || LENGTHS[slot] > MAX_PERSONALITY_MEMORY_VIEW_BYTES
+                || !direction_valid(direction)
+                || SERVICE_CSPACES[slot] == 0
+                || VIEW_RIGHTS[slot] != rights_for_direction(direction) {
+                return false;
+            }
+            charged += LENGTHS[slot];
+            if state == VIEW_LIVE {
+                if VIEW_CAPABILITIES[slot] == 0
+                    || CLOSED_CAPABILITIES[slot] != 0
+                    || !live_view_capability_matches(slot)
+                    || TERMINAL_KINDS[slot] != 0
+                    || COMMITTED_LENGTHS[slot] != 0
+                    || CAP_CLOSE_SEQUENCES[slot] != 0
+                    || TERMINAL_SEQUENCES[slot] != 0
+                    || WAKE_SEQUENCES[slot] != 0 {
+                    return false;
+                }
+            } else {
+                if VIEW_CAPABILITIES[slot] != 0
+                    || CLOSED_CAPABILITIES[slot] == 0
+                    || !terminal_kind_valid(TERMINAL_KINDS[slot] as u64)
+                    || CAP_CLOSE_SEQUENCES[slot] == 0
+                    || TERMINAL_SEQUENCES[slot] <= CAP_CLOSE_SEQUENCES[slot]
+                    || WAKE_SEQUENCES[slot] <= TERMINAL_SEQUENCES[slot]
+                    || (TERMINAL_KINDS[slot] as u64
+                            != MEMORY_VIEW_TERMINAL_REPLY
+                        && COMMITTED_LENGTHS[slot] != 0) {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        let mut offset: usize = 0;
+        while offset < MAX_PERSONALITY_MEMORY_VIEW_BYTES {
+            let index: usize = staging_index(slot, offset);
+            if (state == VIEW_EMPTY || state == VIEW_RETIRED)
+                && (STAGING[index] != 0 || OUTPUT_WRITTEN[index] != 0) {
+                return false;
+            }
+            if (state == VIEW_LIVE || state == VIEW_TERMINAL)
+                && offset >= LENGTHS[slot]
+                && (STAGING[index] != 0 || OUTPUT_WRITTEN[index] != 0) {
+                return false;
+            }
+            if OUTPUT_WRITTEN[index] > 1 {
+                return false;
+            }
+            if state == VIEW_TERMINAL
+                && TERMINAL_KINDS[slot] as u64 != MEMORY_VIEW_TERMINAL_REPLY
+                && (STAGING[index] != 0 || OUTPUT_WRITTEN[index] != 0) {
+                return false;
+            }
+            offset += 1;
+        }
+        let mut other: usize = slot + 1;
+        while other < MAX_PERSONALITY_MEMORY_VIEWS {
+            if (state == VIEW_LIVE || state == VIEW_TERMINAL)
+                && (STATES[other] == VIEW_LIVE
+                    || STATES[other] == VIEW_TERMINAL)
+                && REQUESTS[slot] == REQUESTS[other] {
+                return false;
+            }
+            other += 1;
+        }
+        slot += 1;
+    }
+    return charged == CHARGED_BYTES;
+}
+
+pub unsafe fn is_initialized() -> bool { return INITIALIZED != 0; }
+pub unsafe fn is_live(view: u64) -> bool {
+    return checked_live_view(view) < MAX_PERSONALITY_MEMORY_VIEWS;
+}
+pub unsafe fn state(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    if STATES[slot] == VIEW_LIVE { return MEMORY_VIEW_STATE_LIVE; }
+    return MEMORY_VIEW_STATE_TERMINAL;
+}
+pub unsafe fn request_for(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return REQUESTS[slot];
+}
+pub unsafe fn service_cspace_for(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return SERVICE_CSPACES[slot];
+}
+pub unsafe fn resource_for(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return DELEGATED_RESOURCES[slot];
+}
+pub unsafe fn capability_for(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return VIEW_CAPABILITIES[slot];
+}
+pub unsafe fn terminal_kind(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS || STATES[slot] != VIEW_TERMINAL {
+        return 0;
+    }
+    return TERMINAL_KINDS[slot] as u64;
+}
+pub unsafe fn committed_length(view: u64) -> usize {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS || STATES[slot] != VIEW_TERMINAL {
+        return 0;
+    }
+    return COMMITTED_LENGTHS[slot];
+}
+pub unsafe fn cap_close_sequence(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return CAP_CLOSE_SEQUENCES[slot];
+}
+pub unsafe fn terminal_sequence(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return TERMINAL_SEQUENCES[slot];
+}
+pub unsafe fn wake_sequence(view: u64) -> u64 {
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS { return 0; }
+    return WAKE_SEQUENCES[slot];
+}
+pub unsafe fn charged_bytes() -> usize { return CHARGED_BYTES; }
+pub unsafe fn active_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_MEMORY_VIEWS {
+        if STATES[slot] == VIEW_LIVE || STATES[slot] == VIEW_TERMINAL {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+pub unsafe fn creation_count() -> u64 { return CREATIONS; }
+pub unsafe fn terminal_transition_count() -> u64 { return TERMINAL_TRANSITIONS; }
+pub unsafe fn terminal_wake_count() -> u64 { return TERMINAL_WAKES; }
+pub unsafe fn reply_count() -> u64 { return REPLIES; }
+pub unsafe fn cancellation_count() -> u64 { return CANCELLATIONS; }
+pub unsafe fn timeout_count() -> u64 { return TIMEOUTS; }
+pub unsafe fn service_death_count() -> u64 { return SERVICE_DEATHS; }
+pub unsafe fn process_exit_count() -> u64 { return PROCESS_EXITS; }
+pub unsafe fn unmap_count() -> u64 { return UNMAPS; }
+pub unsafe fn resource_revocation_count() -> u64 { return RESOURCE_REVOCATIONS; }
+pub unsafe fn request_revocation_count() -> u64 { return REQUEST_REVOCATIONS; }
+pub unsafe fn abandoned_reply_count() -> u64 { return ABANDONED_REPLIES; }
+pub unsafe fn consumed_count() -> u64 { return CONSUMED; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn duplicate_denial_count() -> u64 { return DUPLICATE_DENIALS; }
+pub unsafe fn stale_denial_count() -> u64 { return STALE_DENIALS; }
+pub unsafe fn poisoned() -> bool { return POISONED != 0; }

@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 18" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 20" >&2
     exit 2
     ;;
 esac
@@ -19,6 +19,7 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
 M4_IMAGE_DEFINE='-DOCORE_M4_IMAGE_PATH=""'
 M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
 M6_IMAGE_DEFINE='-DOCORE_M6_IMAGE_PATH=""'
+KERNEL_WORLD_RECORD_DEFINE='-DOCORE_KERNEL_WORLD_RECORD_PATH=""'
 if (( PROBE_MODE == 15 )); then
   M4_ARTIFACT_OUTPUT="$(
     OCORE_M4_BUILD_DIR="$ROOT/target/ocore-m4" \
@@ -64,6 +65,30 @@ if (( PROBE_MODE == 18 )); then
   M6_IMAGE_DEFINE="-DOCORE_M6_IMAGE_PATH=\"$M6_IMAGE_PATH\""
 fi
 
+if (( PROBE_MODE == 20 )); then
+  cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
+    --bin ocore-kernel-world-record
+  RECORD_BUILD_DIR="$BUILD_DIR/kernel-world-record"
+  mkdir -p "$RECORD_BUILD_DIR"
+  RECORD_ONE="$RECORD_BUILD_DIR/kernel-world-one.record"
+  RECORD_TWO="$RECORD_BUILD_DIR/kernel-world-two.record"
+  RECORD_TOOL="$ROOT/target/debug/ocore-kernel-world-record"
+  FIXTURE="$KERNEL_DIR/kernel-world-fixture"
+  "$RECORD_TOOL" \
+    --manifest "$FIXTURE/package.toml" \
+    --payload "$FIXTURE/payload" \
+    --output "$RECORD_ONE" >/dev/null
+  "$RECORD_TOOL" \
+    --manifest "$FIXTURE/package.toml" \
+    --payload "$FIXTURE/payload" \
+    --output "$RECORD_TWO" >/dev/null
+  if ! cmp -s "$RECORD_ONE" "$RECORD_TWO"; then
+    echo "error: native KernelWorld record rebuild was not deterministic" >&2
+    exit 1
+  fi
+  KERNEL_WORLD_RECORD_DEFINE="-DOCORE_KERNEL_WORLD_RECORD_PATH=\"$RECORD_ONE\""
+fi
+
 "$ROOT/target/debug/ocorec" \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
@@ -91,6 +116,11 @@ fi
   "$ROOT/ocore/runtime/x86_64/ipc_lifecycle.oc" \
   "$ROOT/ocore/runtime/x86_64/personality_supervision.oc" \
   "$ROOT/ocore/runtime/x86_64/personality_rpc.oc" \
+  "$ROOT/ocore/runtime/x86_64/personality_memory_view.oc" \
+  "$ROOT/ocore/runtime/x86_64/delegated_resource.oc" \
+  "$ROOT/ocore/runtime/x86_64/kernel_world_record.oc" \
+  "$ROOT/ocore/runtime/x86_64/kernel_world_admission.oc" \
+  "$ROOT/ocore/runtime/x86_64/vm_object.oc" \
   "$ROOT/ocore/runtime/x86_64/mapping.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/trap.oc" \
@@ -108,6 +138,8 @@ fi
   "$KERNEL_DIR/m5_selftest.oc" \
   "$KERNEL_DIR/m5_semantics.oc" \
   "$KERNEL_DIR/m6.oc" \
+  "$KERNEL_DIR/m6b_semantics.oc" \
+  "$KERNEL_DIR/kernel_world_semantics.oc" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \
@@ -120,6 +152,7 @@ clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   "$M4_IMAGE_DEFINE" \
   "$M5_IMAGE_DEFINE" \
   "$M6_IMAGE_DEFINE" \
+  "$KERNEL_WORLD_RECORD_DEFINE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
 find_lld() {

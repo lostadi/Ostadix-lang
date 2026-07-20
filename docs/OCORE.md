@@ -418,3 +418,49 @@ This evidence is deliberately named M6A, not full Milestone 6. It has no shared
 or request-scoped foreign-process memory view, no pointer-bearing personality
 call, no general package dependency resolver or durable reconstruction, no
 unbounded retry policy, and no Linux or other foreign operating-system ABI.
+
+M6B's first native mechanism slice is separate mode 19.
+`personality_memory_view.oc` uses four fixed-capacity generation-tagged request
+views, kernel-owned bounded-copy staging, direction-attenuated nontransferable
+capabilities, snapshot input, and written-prefix-only output commit after exact
+process/address-space revalidation. View size is capped at 128 bytes and total
+charged staging at 256 bytes. Reply, cancellation, timeout, service-death,
+process-exit, unmap, and delegated-resource hooks close the service capability
+before recording one terminal result and publishing one wake. Process-exit and
+unmap hooks also release an undeliverable replied view without publishing a
+second result or wake. `delegated_resource.oc` supplies independently revocable
+typed leases for memory, filesystem, timer, network, and device classes.
+Lease/view binding is exact-request-only, and request-wide revocation leaves
+unrelated requests live without ambient fallback.
+
+`smoke-m6b-qemu.sh` exercises that mechanism against a real kernel process and
+address space, including bounds/generation/mapping-rights/quota denial, staged
+commit, stale/duplicate authority, every implemented terminal hook,
+same-request bulk revocation, unrelated-request survival, post-reply cleanup,
+CSpace-drain close, and a later timer. Lifecycle and wake hooks are invoked
+directly; this is not real process/unmap/scheduler integration. It is not routed
+through the M6A CPL3 daemon and does not add a public pointer-bearing
+personality call.
+Pinned windows, streaming output, actual signal and concurrent mapping-change
+integration, Linux-oracle behavior, fuzzing, allocation-failure injection, and
+concrete filesystem/network/timer/device services remain future M6B work.
+
+Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
+gate. A
+host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` normal form
+that keeps verified package and canonical manifest digests distinct. The
+kernel verifies the exact embedded record SHA-256 before strict parsing, then
+admits at most two worlds through independently registered default-deny policy
+keyed by package digest and copied exact request-kind/purpose bytes; hashes are
+only a fast reject and never authority. Its nonexecuting VM model
+supports at most two VM identities, four vCPU identities, and eight aligned
+guest-page attachments backed by anonymous 4 KiB memory objects. The gate proves
+quota and overlap denial, generation checks, exact-world revoke/reclaim, an
+unrelated surviving VM, and a later timer. The local VM graph may be sealed,
+but package admission deliberately remains `ADMITTED`; no provider configured
+or start lifecycle is claimed.
+
+These are configuration objects, not a hypervisor. Mode 20 does not start or
+health-check a provider, publish exports, boot a guest, enter VMX/SVM, construct
+EPT/NPT, execute firmware, inject interrupts, assign devices, map DMA, or
+configure an IOMMU.

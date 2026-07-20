@@ -147,6 +147,19 @@ jobs:
           command -v llvm-objdump
           command -v nm
 
+      - name: Validate native launch and smoke entrypoints
+        run: |
+          cmp -s boot-and-test.sh okernel-multikernel/boot-and-test.sh
+          for script in \
+            boot-and-test.sh \
+            okernel-multikernel/boot-and-test.sh \
+            ocore/kernel/smoke-m6b-qemu.sh \
+            ocore/kernel/smoke-kernel-world-qemu.sh
+          do
+            test -x "$script"
+            bash -n "$script"
+          done
+
       - name: Run native and memory lifecycle smoke
         run: ./ocore/kernel/smoke-qemu.sh
 
@@ -176,3 +189,9 @@ jobs:
 
       - name: Run packaged scalar personality supervision smoke
         run: ./ocore/kernel/smoke-personality-qemu.sh
+
+      - name: Run request-scoped memory and delegated-resource revocation smoke
+        run: ./ocore/kernel/smoke-m6b-qemu.sh
+
+      - name: Run verified world admission and nonexecuting VM-object smoke
+        run: ./ocore/kernel/smoke-kernel-world-qemu.sh
