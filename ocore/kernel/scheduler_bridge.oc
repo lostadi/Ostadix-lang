@@ -1,0 +1,46 @@
+module kernel::scheduler_bridge;
+
+use kernel::m2::complete_continue as complete_m2;
+use kernel::m3_live::complete_continue as complete_m3;
+use kernel::m4::complete_continue as complete_m4;
+use kernel::m5::complete_continue as complete_m5;
+use kernel::m5::restart_continue as restart_m5;
+use runtime::scheduler::completion_kind;
+
+extern "sysv64" fn kernel_m6_crash_continue() -> never;
+extern "sysv64" fn kernel_m6_complete_continue() -> never;
+
+// Assembly has one terminal scheduler continuation.  The scheduler records
+// which bounded acceptance harness reached its terminal state before it drops
+// ACTIVE and returns zero, so the management stack can route without trusting
+// any CPL3-controlled value.
+@export
+@no_mangle
+pub unsafe fn kernel_scheduler_complete_continue() -> never {
+    let kind: u64 = completion_kind();
+    if kind == 1 {
+        complete_m2();
+    }
+    if kind == 2 {
+        complete_m3();
+    }
+    if kind == 3 {
+        complete_m4();
+    }
+    if kind == 4 {
+        complete_m5();
+    }
+    if kind == 5 {
+        restart_m5();
+    }
+    if kind == 6 {
+        kernel_m6_crash_continue();
+    }
+    if kind == 7 {
+        kernel_m6_complete_continue();
+    }
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}

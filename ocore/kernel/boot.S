@@ -25,6 +25,52 @@ multiboot_header:
   .long 8
 multiboot_header_end:
 
+// The native loader consumes an immutable OVFS image as opaque bytes. The
+// independently linked user ELFs inside it are never linked as kernel code;
+// mode 15 validates and materializes their PT_LOAD segments into private
+// process frames. Earlier modes retain a zero-length image boundary.
+.section .rodata,"a",@progbits
+.balign 16
+.globl ocore_m4_image_bytes_start
+ocore_m4_image_bytes_start:
+#if OCORE_PROBE_MODE == 15
+#ifndef OCORE_M4_IMAGE_PATH
+#error "OCORE_M4_IMAGE_PATH is required for native loader modes"
+#endif
+  .incbin OCORE_M4_IMAGE_PATH
+#endif
+.globl ocore_m4_image_bytes_end
+ocore_m4_image_bytes_end:
+
+// Mode 16 carries the separately content-addressed native control-plane
+// package. It remains opaque read-only data until OVFS and ELF validation.
+.balign 16
+.globl ocore_m5_image_bytes_start
+ocore_m5_image_bytes_start:
+#if OCORE_PROBE_MODE == 16
+#ifndef OCORE_M5_IMAGE_PATH
+#error "OCORE_M5_IMAGE_PATH is required for native live-system mode"
+#endif
+  .incbin OCORE_M5_IMAGE_PATH
+#endif
+.globl ocore_m5_image_bytes_end
+ocore_m5_image_bytes_end:
+
+// Mode 18 carries a separate immutable package for the scalar M6A router,
+// supervisor, test-personality daemon, client, and unrelated observer proof.
+// Keeping it separate preserves the canonical M5 artifact and evidence.
+.balign 16
+.globl ocore_m6_image_bytes_start
+ocore_m6_image_bytes_start:
+#if OCORE_PROBE_MODE == 18
+#ifndef OCORE_M6_IMAGE_PATH
+#error "OCORE_M6_IMAGE_PATH is required for personality supervision mode"
+#endif
+  .incbin OCORE_M6_IMAGE_PATH
+#endif
+.globl ocore_m6_image_bytes_end
+ocore_m6_image_bytes_end:
+
 .section .bss,"aw",@nobits
 .balign 4096
 p4_table:
@@ -34,6 +80,8 @@ p3_table:
 p2_table:
   .skip 4096
 p1_kernel_table:
+  .skip 4096
+p1_kernel_high_table:
   .skip 4096
 p1_user_image_table:
   .skip 4096
@@ -152,12 +200,17 @@ _start:
   mov dword ptr [p3_table], eax
   mov dword ptr [p3_table + 4], 0
 
-  // PDE 0 uses 4 KiB leaves so kernel metadata, text, read-only data, mutable
-  // state, page tables, and stacks can have distinct W^X permissions.
+  // PDEs 0 and 1 use contiguous 4 KiB leaf tables so kernel metadata, text,
+  // read-only data, mutable state, page tables, stacks, and every stack guard
+  // retain distinct W^X/presence permissions across the 2 MiB boundary.
   lea eax, [p1_kernel_table]
   or eax, 0x03
   mov dword ptr [p2_table], eax
   mov dword ptr [p2_table + 4], 0
+  lea eax, [p1_kernel_high_table]
+  or eax, 0x03
+  mov dword ptr [p2_table + 1 * 8], eax
+  mov dword ptr [p2_table + 1 * 8 + 4], 0
 
   // 4..16 MiB: supervisor RW/NX huge pages. This contains the bootstrap page
   // allocator and no executable kernel code.
@@ -251,7 +304,7 @@ _start:
   mov dword ptr [p1_kernel_table + ecx * 8 + 4], ebx
 .next_kernel_page:
   inc ecx
-  cmp ecx, 512
+  cmp ecx, 1024
   jne .map_kernel_page
 
   xor ecx, ecx
@@ -403,6 +456,50 @@ ocore_kernel_p1_address:
   lea rax, [rip + p1_kernel_table]
   ret
 .size ocore_kernel_p1_address, .-ocore_kernel_p1_address
+
+// Trusted immutable image boundary. Callers must still validate the OVFS and
+// nested ELF structures before allocating or publishing a process.
+.globl ocore_m4_image_start
+.type ocore_m4_image_start, @function
+ocore_m4_image_start:
+  lea rax, [rip + ocore_m4_image_bytes_start]
+  ret
+.size ocore_m4_image_start, .-ocore_m4_image_start
+
+.globl ocore_m4_image_end
+.type ocore_m4_image_end, @function
+ocore_m4_image_end:
+  lea rax, [rip + ocore_m4_image_bytes_end]
+  ret
+.size ocore_m4_image_end, .-ocore_m4_image_end
+
+.globl ocore_m5_image_start
+.type ocore_m5_image_start, @function
+ocore_m5_image_start:
+  lea rax, [rip + ocore_m5_image_bytes_start]
+  ret
+.size ocore_m5_image_start, .-ocore_m5_image_start
+
+.globl ocore_m5_image_end
+.type ocore_m5_image_end, @function
+ocore_m5_image_end:
+  lea rax, [rip + ocore_m5_image_bytes_end]
+  ret
+.size ocore_m5_image_end, .-ocore_m5_image_end
+
+.globl ocore_m6_image_start
+.type ocore_m6_image_start, @function
+ocore_m6_image_start:
+  lea rax, [rip + ocore_m6_image_bytes_start]
+  ret
+.size ocore_m6_image_start, .-ocore_m6_image_start
+
+.globl ocore_m6_image_end
+.type ocore_m6_image_end, @function
+ocore_m6_image_end:
+  lea rax, [rip + ocore_m6_image_bytes_end]
+  ret
+.size ocore_m6_image_end, .-ocore_m6_image_end
 
 .globl ocore_management_cr3
 .type ocore_management_cr3, @function
@@ -693,10 +790,17 @@ ocore_boot_protection_check:
   bt rdx, 63
   jnc .protection_check_failed
 
-  // The unused 2..4 MiB gap is absent, bootstrap mappings stop at 20 MiB, and
-  // no residual 1 GiB identity RWX map remains.
-  cmp qword ptr [rip + p2_table + 1 * 8], 0
+  // PDE1 must name the second supervisor-only 4 KiB kernel leaf table. Ignore
+  // only the hardware-owned Accessed and Dirty bits when comparing it.
+  mov rdx, qword ptr [rip + p2_table + 1 * 8]
+  lea rax, [rip + p1_kernel_high_table]
+  or rax, 0x03
+  xor rdx, rax
+  and rdx, -97
   jne .protection_check_failed
+
+  // Bootstrap mappings stop at 20 MiB and no residual 1 GiB identity RWX map
+  // remains.
   cmp qword ptr [rip + p2_table + 10 * 8], 0
   jne .protection_check_failed
   mov eax, 1
@@ -1147,7 +1251,28 @@ ocore_exception_common:
   je ocore_fault_idle
   cmp rax, 2
   je .abandon_process_context
-  jmp .fatal_exception
+  test rax, rax
+  jz .fatal_exception
+  // Mode 14 may contain the faulting service and return a different TCB's
+  // normalized frame. Validate that selected process's user return state after
+  // the scheduler has installed its CR3/TSS/GS/PCB/CSpace identity.
+  mov rbx, rax
+  mov rax, qword ptr [rbx + 144]
+  test al, 3
+  jz .scheduled_exception_frame_validated
+  mov rdi, qword ptr [rbx + 136]
+  mov rsi, qword ptr [rbx + 160]
+  call kernel_validate_user_return
+  test rax, rax
+  jz .fatal_exception
+  mov qword ptr [rbx + 152], 0x202
+.scheduled_exception_frame_validated:
+  mov rsp, rbx
+  mov rax, qword ptr [rsp + 144]
+  test al, 3
+  jz .restore_exception
+  swapgs
+  jmp .restore_exception
 
 .dispatch_kernel_exception:
   mov rdi, rsp

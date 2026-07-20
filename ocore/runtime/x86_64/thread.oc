@@ -1,8 +1,17 @@
 module runtime::thread;
 
+use runtime::address_space::allows as address_space_allows;
+use runtime::address_space::is_loaded as address_space_is_loaded;
+use runtime::address_space::loaded_entry as address_space_loaded_entry;
+use runtime::address_space::loaded_stack_pointer as address_space_loaded_stack;
 use runtime::address_space::native_stack_top_for;
 use runtime::address_space::stack_allows;
 use runtime::address_space::valid_entry;
+use runtime::address_space::valid_stack_top;
+use runtime::address_space::VM_READ;
+use runtime::address_space::VM_STACK;
+use runtime::address_space::VM_USER;
+use runtime::address_space::VM_WRITE;
 use runtime::capability::cspace_is_live;
 use runtime::domain::is_live as domain_is_live;
 use runtime::process::address_space_for;
@@ -50,6 +59,7 @@ const QUEUE_KIND_BLOCKED: u8 = 2;
 const THREAD_HANDLE_TAG: u64 = 0xe200_0000;
 const HANDLE_TAG_MASK: u64 = 0xff00_0000;
 const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const LOADED_STACK_ORDINAL: u8 = 2;
 const INVALID_STACK_ORDINAL: u8 = 0xff;
 
 // Exact normalized frame layout shared with boot.S:
@@ -57,6 +67,7 @@ const INVALID_STACK_ORDINAL: u8 = 0xff;
 // rip,cs,rflags,rsp,ss.
 pub const FRAME_WORDS: usize = 22;
 const FRAME_RDI: usize = 8;
+const FRAME_RSI: usize = 9;
 const FRAME_RAX: usize = 14;
 const FRAME_VECTOR: usize = 15;
 const FRAME_ERROR: usize = 16;
@@ -347,16 +358,31 @@ unsafe fn validate_frame_words(slot: usize, frame: *const u64) -> bool {
     }
     let stack: usize = volatile_load(frame + FRAME_RSP) as usize;
     let ordinal: usize = STACK_ORDINALS[slot] as usize;
-    if ordinal >= 2
-        || volatile_load(frame + FRAME_CS) != 0x23
+    if volatile_load(frame + FRAME_CS) != 0x23
         || volatile_load(frame + FRAME_SS) != 0x1b
         || (volatile_load(frame + FRAME_RFLAGS) & 2) == 0 {
         return false;
     }
-    return valid_entry(
+    if !valid_entry(
         ADDRESS_SPACE_HANDLES[slot],
         volatile_load(frame + FRAME_RIP) as usize
-    ) && stack_allows(ADDRESS_SPACE_HANDLES[slot], ordinal, stack);
+    ) {
+        return false;
+    }
+    if ordinal < 2 {
+        return stack_allows(ADDRESS_SPACE_HANDLES[slot], ordinal, stack);
+    }
+    if ordinal != LOADED_STACK_ORDINAL as usize
+        || !address_space_is_loaded(ADDRESS_SPACE_HANDLES[slot])
+        || stack == 0 {
+        return false;
+    }
+    return address_space_allows(
+        ADDRESS_SPACE_HANDLES[slot],
+        stack - 1,
+        1,
+        VM_USER | VM_READ | VM_WRITE | VM_STACK
+    );
 }
 
 unsafe fn validate_frame(slot: usize) -> bool {
@@ -367,6 +393,22 @@ unsafe fn validate_frame(slot: usize) -> bool {
         slot,
         (&FRAMES[frame_index(slot, 0)]) as *const u64
     );
+}
+
+unsafe fn stack_identity_holds(slot: usize) -> bool {
+    if slot >= MAX_THREADS {
+        return false;
+    }
+    let ordinal: usize = STACK_ORDINALS[slot] as usize;
+    let address_space: u64 = ADDRESS_SPACE_HANDLES[slot];
+    if ordinal < 2 {
+        return !address_space_is_loaded(address_space)
+            && USER_STACK_TOPS[slot] == native_stack_top_for(ordinal);
+    }
+    return ordinal == LOADED_STACK_ORDINAL as usize
+        && address_space_is_loaded(address_space)
+        && USER_STACK_TOPS[slot] != 0
+        && USER_STACK_TOPS[slot] == address_space_loaded_stack(address_space);
 }
 
 // This is deliberately exhaustive rather than probabilistic: there are only
@@ -486,9 +528,7 @@ pub unsafe fn queue_invariants_hold() -> bool {
                     || !cspace_is_live(CSPACE_HANDLES[slot])
                     || PRIORITIES[slot] == 0
                     || PRIORITIES[slot] > 4
-                    || STACK_ORDINALS[slot] >= 2
-                    || USER_STACK_TOPS[slot]
-                        != native_stack_top_for(STACK_ORDINALS[slot] as usize) {
+                    || !stack_identity_holds(slot) {
                     return false;
                 }
             }
@@ -597,6 +637,7 @@ pub unsafe fn install(
     let user_stack_top: usize = native_stack_top_for(stack_ordinal);
     if !domain_is_live(domain_handle)
         || !cspace_is_live(cspace_handle)
+        || address_space_is_loaded(address_space_handle)
         || user_stack_top == 0
         || !valid_entry(address_space_handle, entry)
         || !stack_allows(address_space_handle, stack_ordinal, user_stack_top)
@@ -641,6 +682,112 @@ pub unsafe fn install(
     FRAMES[frame_index(slot, FRAME_CS)] = 0x23;
     FRAMES[frame_index(slot, FRAME_RFLAGS)] = 0x202;
     FRAMES[frame_index(slot, FRAME_RSP)] = (user_stack_top - 8) as u64;
+    FRAMES[frame_index(slot, FRAME_SS)] = 0x1b;
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    let handle: u64 = make_handle(slot);
+    if !runnable_enqueue_tail(handle) || !queue_invariants_hold() {
+        runnable_remove(handle);
+        release_process_thread(process_handle);
+        clear_slot(slot);
+        STATES[slot] = THREAD_EMPTY;
+        return 0;
+    }
+    return handle;
+}
+
+// Install the initial TCB for an address space created from a committed ELF
+// plan. Unlike the legacy native installer, this path preserves the exact
+// SysV RSP built by the loader and never subtracts a synthetic return slot.
+// Both entry and RSP must equal the immutable values published by the loaded
+// address-space generation, so callers cannot substitute another executable
+// address or an arbitrary point in the guarded stack.
+pub unsafe fn install_loaded(
+    slot: usize,
+    thread_id: u64,
+    process_handle: u64,
+    entry: usize,
+    committed_stack_pointer: usize,
+    kernel_stack_top: usize,
+    arg0: u64,
+    arg1: u64,
+    role: u64,
+    priority: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || slot >= MAX_THREADS
+        || thread_id == 0
+        || STATES[slot] != THREAD_EMPTY
+        || GENERATIONS[slot] == 0
+        || !process_is_live(process_handle)
+        || kernel_stack_top == 0
+        || (role != THREAD_ROLE_CPU && role != THREAD_ROLE_BLOCKING)
+        || priority == 0
+        || priority > 4
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    let process_status: u64 = process_state(process_handle);
+    if process_status != PROCESS_STATE_READY
+        && process_status != PROCESS_STATE_RUNNING {
+        return 0;
+    }
+    let domain_handle: u64 = domain_for(process_handle);
+    let address_space_handle: u64 = address_space_for(process_handle);
+    let cspace_handle: u64 = cspace_for(process_handle);
+    if !domain_is_live(domain_handle)
+        || !cspace_is_live(cspace_handle)
+        || !address_space_is_loaded(address_space_handle)
+        || entry == 0
+        || entry != address_space_loaded_entry(address_space_handle)
+        || committed_stack_pointer == 0
+        || committed_stack_pointer
+            != address_space_loaded_stack(address_space_handle)
+        || !valid_entry(address_space_handle, entry)
+        || !valid_stack_top(address_space_handle, committed_stack_pointer) {
+        return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_THREADS {
+        if STATES[other] != THREAD_EMPTY && STATES[other] != THREAD_RETIRED {
+            if THREAD_IDS[other] == thread_id {
+                return 0;
+            }
+            // One committed initial stack belongs to this loaded generation.
+            // It may not be installed into a second active TCB.
+            if active_state(STATES[other])
+                && ADDRESS_SPACE_HANDLES[other] == address_space_handle {
+                return 0;
+            }
+        }
+        other += 1;
+    }
+    if retain_process_thread(process_handle) == 0 {
+        return 0;
+    }
+
+    clear_slot(slot);
+    THREAD_IDS[slot] = thread_id;
+    PROCESS_HANDLES[slot] = process_handle;
+    DOMAIN_HANDLES[slot] = domain_handle;
+    ADDRESS_SPACE_HANDLES[slot] = address_space_handle;
+    CSPACE_HANDLES[slot] = cspace_handle;
+    KERNEL_STACK_TOPS[slot] = kernel_stack_top;
+    STACK_ORDINALS[slot] = LOADED_STACK_ORDINAL;
+    USER_STACK_TOPS[slot] = committed_stack_pointer;
+    ROLES[slot] = role as u8;
+    PRIORITIES[slot] = priority as u8;
+    QUANTUM_LEFT[slot] = priority as u8;
+    PROCESS_REF_HELD[slot] = 1;
+    FRAMES[frame_index(slot, FRAME_RDI)] = arg0;
+    FRAMES[frame_index(slot, FRAME_RSI)] = arg1;
+    FRAMES[frame_index(slot, FRAME_VECTOR)] = 0;
+    FRAMES[frame_index(slot, FRAME_ERROR)] = 0;
+    FRAMES[frame_index(slot, FRAME_RIP)] = entry as u64;
+    FRAMES[frame_index(slot, FRAME_CS)] = 0x23;
+    FRAMES[frame_index(slot, FRAME_RFLAGS)] = 0x202;
+    FRAMES[frame_index(slot, FRAME_RSP)] = committed_stack_pointer as u64;
     FRAMES[frame_index(slot, FRAME_SS)] = 0x1b;
     STATES[slot] = THREAD_READY;
     QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
@@ -893,6 +1040,37 @@ pub unsafe fn abort_next(handle: u64) -> u64 {
     STATES[slot] = THREAD_READY;
     QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
     if !queue_invariants_hold() {
+        return 0;
+    }
+    return handle;
+}
+
+// Deliberately move one prepared FIFO head to the runnable tail without ever
+// publishing it as RUNNING. This is narrower than abort_next: scheduler policy
+// may use it to defer a generation, while failed context installation must
+// continue restoring the original head with abort_next.
+pub unsafe fn defer_next(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || PREPARED_THREAD != handle
+        || CURRENT_THREAD != 0
+        || STATES[slot] != THREAD_DISPATCHING
+        || RUNNABLE_LENGTH >= MAX_THREADS
+        || !queue_invariants_hold() {
+        return 0;
+    }
+    if !runnable_enqueue_tail(handle) {
+        return 0;
+    }
+    PREPARED_THREAD = 0;
+    STATES[slot] = THREAD_READY;
+    QUEUE_KINDS[slot] = QUEUE_KIND_RUNNABLE;
+    if !queue_invariants_hold() {
+        if runnable_remove(handle) {
+            PREPARED_THREAD = handle;
+            STATES[slot] = THREAD_DISPATCHING;
+            QUEUE_KINDS[slot] = QUEUE_KIND_NONE;
+        }
         return 0;
     }
     return handle;

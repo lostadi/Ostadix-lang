@@ -1,8 +1,11 @@
 # O-core Native Live-System Contract
 
-Status: design contract for a planned milestone. Nothing in this document is
-implemented merely because a manifest field, command, or package name is
-specified here.
+Status: a bounded native Milestone 5 slice is implemented and gated by
+`ocore/kernel/smoke-live-qemu.sh`. The separately gated hosted semantic oracle
+in [`HOSTED_LIVE_REFERENCE.md`](HOSTED_LIVE_REFERENCE.md) remains the broader
+package-lifecycle differential oracle. The native gate is host-built,
+fixed-capacity, single-CPU, and kernel-mediated; it is not yet the complete
+unprivileged service architecture described as the target contract below.
 
 This document defines the native live-system layer that must exist after the
 native loader and minimal VFS, and before a foreign personality is presented as
@@ -16,7 +19,7 @@ mechanisms. The kernel continues to own scheduling, IPC, memory protection,
 capability transfer, and process teardown. Package names, manifests, service
 names, hashes, and REPL text are metadata. None of them grant authority.
 
-The first implementation must provide:
+The target architecture provides:
 
 - a native `init` process and crash-isolated service supervisor;
 - a serial O control REPL, with framebuffer support left as a later transport;
@@ -30,6 +33,18 @@ The first implementation must provide:
 The REPL, package daemon, builder endpoint, and service supervisor are separate
 principals with separate CSpaces. Compromise of one must not imply the ambient
 authority of another.
+
+The current executable slice loads `init`, supervisor, package-daemon, and REPL
+ELFs into four separate address spaces and CSpaces from one immutable OVFS
+image. The REPL runs the real serial command loop. After all four principals
+publish their private health tokens and activation commits, the package daemon
+deliberately faults in CPL3. The mode-16 scheduler contains that generation,
+preserves the three unrelated principals, and executes one fresh package-daemon
+generation from the same verified image. Package-root, health-gated activation,
+recovery, and control-submit state machines currently execute in the privileged
+O-core runtime behind the REPL's typed control capability. This is a real
+protection and authority boundary, but not yet four cooperating user-space
+daemons over endpoint RPC.
 
 ## 2. Package identity and storage
 
@@ -78,10 +93,11 @@ source_sha256 = "<64 lowercase hexadecimal characters>"
 builder = "ocorec-host/v1"
 ```
 
-The concrete parser and canonical encoding are Milestone 5 deliverables. The
-example fixes the semantic fields, not a claim that the parser exists today.
-Unknown required fields fail closed. Optional extension fields are namespaced
-and cannot add authority.
+The current native slice uses a fixed-capacity numeric `PACKAGE_SCHEMA_V1`
+record and exact immutable digest words; it does not parse this illustrative
+TOML manifest. The hosted reference implements the richer strict manifest and
+canonical identity. A future native manifest parser must continue to reject
+unknown required fields and prevent optional extensions from adding authority.
 
 ## 3. Capability requests and service registration
 
@@ -126,24 +142,26 @@ are not successful activation.
 
 ## 5. Serial O control REPL
 
-The first REPL is a serial control service using a small, versioned O command
-surface. It is not the hosted polyglot evaluator running in ring 0. Parsing and
-evaluation happen in an unprivileged process, and every operation is limited by
-that process's CSpace.
+The target REPL is a serial control service using a small, versioned O command
+surface; it is not the hosted polyglot evaluator running in ring 0. In the
+current slice, line assembly and command issuance happen in the unprivileged
+REPL, while the bounded parser and activation transaction run in the privileged
+runtime after a typed-capability check and fault-aware copy. Moving that control
+state machine into a user-space daemon is a remaining boundary.
 
-Illustrative commands are:
+The mode-16 gate pins this first command spelling:
 
 ```text
-o> pkg.install("personality/linux")
-o> pkg.install("rootfs/alpine")
-o> world.create("alpine", personality="linux", rootfs="alpine")
-o> service.status("personality.linux")
-o> pkg.rollback("personality/linux")
+o> install <64-lowercase-hex-sha256> 5 1
+o> activate <the-same-64-lowercase-hex-sha256>
 ```
 
-These spellings become public API only when parser, policy, and runtime tests
-pin them. REPL history must not serialize live handles. Inspection may render
-opaque handle metadata, but replay must reacquire authority through policy.
+The 192-byte bounded parser also recognizes canonical `status`, `resolve`, and
+`upgrade` forms, but the QEMU interaction gate sends only malformed input,
+`install`, and `activate`. Both serial byte reads and control submission require
+the exact `OBJECT_CONTROL`/`RIGHT_CONTROL` capability installed only in the
+REPL CSpace. The command buffer crosses through fault-aware bounded user copy;
+text and digest bytes never choose a capability slot.
 
 ## 6. Compiler bootstrap
 
@@ -151,10 +169,17 @@ Self-hosting is a progression, not a prerequisite for the first usable system.
 
 ### Stage 1: host-built image injection
 
-The host runs the pinned `ocorec` toolchain, emits native ELF packages, hashes
-the source and outputs, and constructs the initial read-only package image.
-O-core verifies the manifest and payload digest before loading. Evidence names
-the compiler revision, source digest, target, and produced package digest.
+The host runs the pinned `ocorec` toolchain, emits native ELF packages, and
+constructs the initial read-only package image. The M4 artifact builder builds
+two separately linked personalities and checks deterministic image repacking.
+The M5 builder performs two full service builds and requires byte-identical
+ELFs and images. Both verify image SHA-256 before boot. O-core also runs its
+freestanding NIST-vector-tested SHA-256 implementation over the complete image
+before OVFS import and publication, then validates OVFS and ELF structure. The
+mode-16 artifact is pinned at 62,056 bytes with SHA-256
+`88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`;
+both the smoke harness and kernel require that exact identity. A fuller receipt
+must also name the compiler revision and source digest.
 
 ### Stage 2: capability-bounded build service
 
@@ -189,21 +214,48 @@ Installing `rootfs/alpine` makes an immutable root available. Creating
 overlay, namespace, quotas, and persistent-state version into one domain
 transaction.
 
-## 8. Acceptance gate
+## 8. Implemented acceptance gate
 
-Milestone 5 is complete only when a fresh QEMU boot can:
+`ocore/kernel/smoke-live-qemu.sh` performs a fresh mode-16 build and proves:
 
-- load `init`, the supervisor, package daemon, and serial REPL from native ELF
-  files rather than kernel-linked payloads;
-- install two host-built native packages by immutable digest;
-- deny one undeclared or over-broad capability request;
-- activate a service, resolve it to a capability, and pass a request/reply
-  health probe;
-- inject a failed upgrade and restore the prior healthy service generation
-  without reviving stale handles;
-- restart a crashed service without stopping an unrelated native process;
-- reboot and reconstruct the active package set from versioned metadata; and
-- emit package, source, compiler, and activation digests in the evidence log.
+- the four service ELFs and their OVFS image rebuild identically, the host
+  checks the exact SHA-256, and O-core recomputes it before import;
+- none of the four `_start` symbols is linked into the kernel image;
+- QEMU imports the read-only OVFS object, creates four distinct loaded W^X
+  address spaces and isolated CSpaces, and executes all four ELFs in CPL3;
+- a real serial `o> ` loop rejects malformed install text without publishing
+  state, then accepts an exact-digest install and exact-digest activation;
+- only the REPL's typed control capability authorizes serial read and command
+  submission;
+- the immutable package root publishes all four service-generation records only
+  after exact capability requests are granted and each health gate succeeds;
+- the package daemon deliberately faults in CPL3 after activation; only its
+  process generation is contained while `init`, supervisor, and REPL survive;
+- the old process, thread, CSpace, address-space, debug-capability, and service
+  generations become stale, and the service stays withdrawn throughout
+  `CONTROL_RECOVERING`;
+- a freshly loaded package-daemon generation runs from the verified image and
+  is republished only after its exact restart health token is observed;
+- the control plane reaches `CONTROL_DEACTIVATED`, then control-capability
+  revocation, process and namespace teardown, and complete dynamic-frame
+  reclamation succeed; and
+- a post-lifecycle timer fires and QEMU survives the following observation
+  window.
 
-The gate does not claim a Linux ABI, a foreign rootfs, native self-hosting, a
-graphical environment, or arbitrary hosted O backend execution inside O-core.
+The independent mode-17 `smoke-live-semantics-qemu.sh` boot executes the finite
+package/supervisor corpus without borrowing mode-16 markers: two immutable
+roots, overgrant and incomplete-set denial, failed-health nonpublication,
+complete-set rollback and stale references, abstract crash/restart with
+unaffected state, strict serial parsing, invariant checks, and a later timer.
+
+The gate is deliberately narrower than the eventual live-system contract. It
+does not yet prove two-package dependency resolution, a user-space endpoint
+health RPC, failed-upgrade rollback through the real serial path, general or
+unbounded retry/backoff, or independently operating daemon supervision. The
+real native restart proof covers exactly one package-daemon generation. A
+replacement that faults or omits its exact health token remains withdrawn and
+fails closed; a further recovery attempt is not claimed. The gates also do not
+prove reboot reconstruction or native compiler receipts, and do not claim a
+Linux ABI, foreign rootfs, native compiler/self-hosting, dynamic linker,
+framebuffer, arbitrary hosted O backend execution inside O-core, SMP, or
+unbounded capacity.

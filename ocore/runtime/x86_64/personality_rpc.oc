@@ -1,0 +1,1237 @@
+module runtime::personality_rpc;
+
+use runtime::endpoint::cancel_by_sender_correlation;
+use runtime::endpoint::enqueue;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::receiver_waiter;
+use runtime::endpoint::ENDPOINT_WAITER_RECEIVER;
+use runtime::ipc_wait::abort as abort_ipc_wait;
+use runtime::ipc_wait::begin as begin_ipc_wait;
+use runtime::ipc_wait::complete as complete_ipc_wait;
+use runtime::ipc_wait::invariants_hold as wait_invariants_hold;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::ERR_PERSONALITY_BUSY;
+use runtime::native_abi::ERR_PERSONALITY_CANCELLED;
+use runtime::native_abi::ERR_PERSONALITY_DUPLICATE;
+use runtime::native_abi::ERR_PERSONALITY_FAILED;
+use runtime::native_abi::ERR_PERSONALITY_STALE;
+use runtime::native_abi::ERR_PERSONALITY_TIMEOUT;
+use runtime::native_abi::ERR_PERSONALITY_UNAVAILABLE;
+use runtime::native_abi::ERR_PERSONALITY_UNSUPPORTED;
+use runtime::native_abi::PERSONALITY_RPC_V1;
+use runtime::native_abi::SYSCALL_CONTROL_EXIT;
+use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
+use runtime::process::can_issue_operations;
+use runtime::process::is_live as process_is_live;
+use runtime::process::MAX_PROCESSES;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::process_for;
+use runtime::thread::state as thread_state;
+use runtime::thread::MAX_THREADS;
+use runtime::thread::THREAD_STATE_RUNNING;
+use runtime::thread::WAKE_REASON_CANCELLED;
+use runtime::thread::WAKE_REASON_IPC;
+
+// M6A deliberately carries only one scalar frame per request. The endpoint
+// correlation is the generation-tagged request handle itself; neither a user
+// pointer nor a user-selected correlation is retained across the wait.
+pub const MAX_PERSONALITY_REQUESTS: usize = 4;
+pub const PERSONALITY_FRAME_VALUE_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+pub const RPC_DISPATCHED: u64 = 1;
+pub const RPC_CONSUMED: u64 = 2;
+
+pub const RPC_STATE_DISPATCHED: u64 = 1;
+pub const RPC_STATE_WAIT_PREPARED: u64 = 2;
+pub const RPC_STATE_WAITING: u64 = 3;
+pub const RPC_STATE_TERMINAL: u64 = 4;
+
+pub const RPC_TERMINAL_REPLY: u64 = 1;
+pub const RPC_TERMINAL_SUPERVISOR_CANCEL: u64 = 2;
+pub const RPC_TERMINAL_DEADLINE: u64 = 3;
+pub const RPC_TERMINAL_SERVICE_DEATH: u64 = 4;
+
+const REQUEST_EMPTY: u8 = 0;
+const REQUEST_DISPATCHED: u8 = 1;
+const REQUEST_WAIT_PREPARED: u8 = 2;
+const REQUEST_WAITING: u8 = 3;
+const REQUEST_TERMINAL: u8 = 4;
+const REQUEST_RETIRED: u8 = 5;
+
+const REQUEST_HANDLE_TAG: u64 = 0xb400_0000;
+const PROCESS_HANDLE_TAG: u64 = 0xe100_0000;
+const THREAD_HANDLE_TAG: u64 = 0xe200_0000;
+const ENDPOINT_HANDLE_TAG: u64 = 0xe300_0000;
+const WAIT_HANDLE_TAG: u64 = 0xb300_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut CALLER_PROCESSES: [u64; 4] = [0; 4];
+static mut CALLER_THREADS: [u64; 4] = [0; 4];
+static mut CORRELATIONS: [u64; 4] = [0; 4];
+static mut REQUEST_FRAMES: [u64; 4] = [0; 4];
+static mut DEADLINES: [u64; 4] = [0; 4];
+static mut REQUEST_SERVICE_PROCESSES: [u64; 4] = [0; 4];
+static mut REQUEST_SERVICE_GENERATIONS: [u64; 4] = [0; 4];
+static mut REQUEST_PROTOCOLS: [u64; 4] = [0; 4];
+static mut WAIT_REQUESTS: [u64; 4] = [0; 4];
+static mut TERMINAL_KINDS: [u8; 4] = [0; 4];
+static mut TERMINAL_RESULTS: [u64; 4] = [0; 4];
+// Consumption cannot erase the disposition needed to classify a racing late
+// or duplicate reply. One bounded tombstone per slot keeps that decision
+// stable even after the caller reuses the slot for its next scalar request.
+static mut LAST_TERMINAL_HANDLES: [u64; 4] = [0; 4];
+static mut LAST_TERMINAL_SERVICE_PROCESSES: [u64; 4] = [0; 4];
+static mut LAST_TERMINAL_SERVICE_GENERATIONS: [u64; 4] = [0; 4];
+static mut LAST_TERMINAL_KINDS: [u8; 4] = [0; 4];
+
+static mut SERVICE_PROCESS: u64 = 0;
+static mut SERVICE_GENERATION: u64 = 0;
+static mut PROTOCOL_ID: u64 = 0;
+static mut SERVICE_REQUEST_ENDPOINT: u64 = 0;
+static mut CLIENT_WAIT_ENDPOINT: u64 = 0;
+static mut CONFIGURED: u8 = 0;
+static mut SERVICE_AVAILABLE: u8 = 0;
+
+static mut PUBLISHES: u64 = 0;
+static mut REPLACEMENTS: u64 = 0;
+static mut DISPATCHES: u64 = 0;
+static mut ABORTED_DISPATCHES: u64 = 0;
+static mut WAITS_ARMED: u64 = 0;
+static mut WAITS_COMMITTED: u64 = 0;
+static mut WAITS_ABORTED: u64 = 0;
+static mut PREPARED_WAIT_ABORTS: u64 = 0;
+static mut COMMITTED_WAIT_ABORTS: u64 = 0;
+static mut SERVICE_REQUEST_WAKES: u64 = 0;
+static mut TERMINAL_TRANSITIONS: u64 = 0;
+static mut TERMINAL_WAKES: u64 = 0;
+static mut REPLIES: u64 = 0;
+static mut SUPERVISOR_CANCELS: u64 = 0;
+static mut DEADLINE_EXPIRIES: u64 = 0;
+static mut SERVICE_DEATH_TERMINALS: u64 = 0;
+static mut SERVICE_DEATH_EVENTS: u64 = 0;
+static mut CONSUMED_RESULTS: u64 = 0;
+static mut STALE_REPLIES: u64 = 0;
+static mut DUPLICATE_REPLIES: u64 = 0;
+static mut LATE_REPLIES: u64 = 0;
+static mut DENIED_OPERATIONS: u64 = 0;
+
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn request_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn request_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn process_handle_shape_valid(handle: u64) -> bool {
+    return handle != 0
+        && (handle & HANDLE_TAG_MASK) == PROCESS_HANDLE_TAG
+        && (handle & HANDLE_INDEX_MASK) < MAX_PROCESSES as u64
+        && (handle >> 32) != 0;
+}
+
+fn thread_handle_shape_valid(handle: u64) -> bool {
+    return handle != 0
+        && (handle & HANDLE_TAG_MASK) == THREAD_HANDLE_TAG
+        && (handle & HANDLE_INDEX_MASK) < MAX_THREADS as u64
+        && (handle >> 32) != 0;
+}
+
+fn endpoint_handle_shape_valid(handle: u64) -> bool {
+    return handle != 0
+        && (handle & HANDLE_TAG_MASK) == ENDPOINT_HANDLE_TAG
+        && (handle >> 32) != 0;
+}
+
+fn wait_handle_shape_valid(handle: u64) -> bool {
+    return handle != 0
+        && (handle & HANDLE_TAG_MASK) == WAIT_HANDLE_TAG
+        && (handle & HANDLE_INDEX_MASK) < MAX_THREADS as u64
+        && (handle >> 32) != 0;
+}
+
+fn frame_valid(frame: u64) -> bool {
+    return (frame >> 56) != 0;
+}
+
+fn terminal_kind_valid(kind: u64) -> bool {
+    return kind == RPC_TERMINAL_REPLY
+        || kind == RPC_TERMINAL_SUPERVISOR_CANCEL
+        || kind == RPC_TERMINAL_DEADLINE
+        || kind == RPC_TERMINAL_SERVICE_DEATH;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | REQUEST_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_request(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != REQUEST_HANDLE_TAG {
+        return MAX_PERSONALITY_REQUESTS;
+    }
+    let slot: usize = request_index(handle);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] == REQUEST_EMPTY
+        || STATES[slot] == REQUEST_RETIRED
+        || GENERATIONS[slot] != request_generation(handle) {
+        return MAX_PERSONALITY_REQUESTS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    CALLER_PROCESSES[slot] = 0;
+    CALLER_THREADS[slot] = 0;
+    CORRELATIONS[slot] = 0;
+    REQUEST_FRAMES[slot] = 0;
+    DEADLINES[slot] = 0;
+    REQUEST_SERVICE_PROCESSES[slot] = 0;
+    REQUEST_SERVICE_GENERATIONS[slot] = 0;
+    REQUEST_PROTOCOLS[slot] = 0;
+    WAIT_REQUESTS[slot] = 0;
+    TERMINAL_KINDS[slot] = 0;
+    TERMINAL_RESULTS[slot] = 0;
+}
+
+unsafe fn retire_or_reuse(slot: usize) -> void {
+    if STATES[slot] == REQUEST_TERMINAL {
+        LAST_TERMINAL_HANDLES[slot] = make_handle(slot);
+        LAST_TERMINAL_SERVICE_PROCESSES[slot] =
+            REQUEST_SERVICE_PROCESSES[slot];
+        LAST_TERMINAL_SERVICE_GENERATIONS[slot] =
+            REQUEST_SERVICE_GENERATIONS[slot];
+        LAST_TERMINAL_KINDS[slot] = TERMINAL_KINDS[slot];
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = REQUEST_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = REQUEST_EMPTY;
+    }
+}
+
+unsafe fn count_denial() -> void {
+    if DENIED_OPERATIONS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIED_OPERATIONS += 1;
+    }
+}
+
+unsafe fn deny(result: u64) -> u64 {
+    count_denial();
+    return result;
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    return result;
+}
+
+unsafe fn active_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] != REQUEST_EMPTY
+            && STATES[slot] != REQUEST_RETIRED {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn waiting_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAIT_PREPARED
+            || STATES[slot] == REQUEST_WAITING {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn prepared_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAIT_PREPARED {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn committed_waiting_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAITING {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn terminal_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_TERMINAL {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn abort_dispatched_slot(slot: usize) -> u64 {
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_DISPATCHED
+        || ABORTED_DISPATCHES == MAX_COUNTER {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if cancel_by_sender_correlation(
+        SERVICE_REQUEST_ENDPOINT,
+        CALLER_PROCESSES[slot],
+        CORRELATIONS[slot]
+    ) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    ABORTED_DISPATCHES += 1;
+    retire_or_reuse(slot);
+    return 1;
+}
+
+unsafe fn transition_terminal(
+    slot: usize,
+    kind: u64,
+    result: u64,
+    wake_reason: u64
+) -> u64 {
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_WAITING
+        || !terminal_kind_valid(kind)
+        || (wake_reason != WAKE_REASON_IPC
+            && wake_reason != WAKE_REASON_CANCELLED)
+        || TERMINAL_TRANSITIONS == MAX_COUNTER
+        || TERMINAL_WAKES == MAX_COUNTER
+        || (kind == RPC_TERMINAL_REPLY && REPLIES == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_SUPERVISOR_CANCEL
+            && SUPERVISOR_CANCELS == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_DEADLINE
+            && DEADLINE_EXPIRIES == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_SERVICE_DEATH
+            && SERVICE_DEATH_TERMINALS == MAX_COUNTER) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
+        return ERR_PERSONALITY_BUSY;
+    }
+    if complete_ipc_wait(
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        ERR_IPC_RETRY,
+        wake_reason
+    ) != CALLER_THREADS[slot] {
+        return ERR_PERSONALITY_BUSY;
+    }
+    WAIT_REQUESTS[slot] = 0;
+    TERMINAL_KINDS[slot] = kind as u8;
+    TERMINAL_RESULTS[slot] = result;
+    STATES[slot] = REQUEST_TERMINAL;
+    TERMINAL_TRANSITIONS += 1;
+    TERMINAL_WAKES += 1;
+    if kind == RPC_TERMINAL_REPLY {
+        REPLIES += 1;
+    }
+    if kind == RPC_TERMINAL_SUPERVISOR_CANCEL {
+        SUPERVISOR_CANCELS += 1;
+    }
+    if kind == RPC_TERMINAL_DEADLINE {
+        DEADLINE_EXPIRIES += 1;
+    }
+    if kind == RPC_TERMINAL_SERVICE_DEATH {
+        SERVICE_DEATH_TERMINALS += 1;
+    }
+    return finish(1);
+}
+
+pub fn make_request_frame(operation: u64, input: u64) -> u64 {
+    if operation == 0 || operation > 0xff {
+        return 0;
+    }
+    return (operation << 56) | (input & PERSONALITY_FRAME_VALUE_MASK);
+}
+
+pub fn frame_operation(frame: u64) -> u64 {
+    return frame >> 56;
+}
+
+pub fn frame_input(frame: u64) -> u64 {
+    return frame & PERSONALITY_FRAME_VALUE_MASK;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0
+        || !endpoint_invariants_hold()
+        || !wait_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        STATES[slot] = REQUEST_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        LAST_TERMINAL_HANDLES[slot] = 0;
+        LAST_TERMINAL_SERVICE_PROCESSES[slot] = 0;
+        LAST_TERMINAL_SERVICE_GENERATIONS[slot] = 0;
+        LAST_TERMINAL_KINDS[slot] = 0;
+        slot += 1;
+    }
+    SERVICE_PROCESS = 0;
+    SERVICE_GENERATION = 0;
+    PROTOCOL_ID = 0;
+    SERVICE_REQUEST_ENDPOINT = 0;
+    CLIENT_WAIT_ENDPOINT = 0;
+    CONFIGURED = 0;
+    SERVICE_AVAILABLE = 0;
+    PUBLISHES = 0;
+    REPLACEMENTS = 0;
+    DISPATCHES = 0;
+    ABORTED_DISPATCHES = 0;
+    WAITS_ARMED = 0;
+    WAITS_COMMITTED = 0;
+    WAITS_ABORTED = 0;
+    PREPARED_WAIT_ABORTS = 0;
+    COMMITTED_WAIT_ABORTS = 0;
+    SERVICE_REQUEST_WAKES = 0;
+    TERMINAL_TRANSITIONS = 0;
+    TERMINAL_WAKES = 0;
+    REPLIES = 0;
+    SUPERVISOR_CANCELS = 0;
+    DEADLINE_EXPIRIES = 0;
+    SERVICE_DEATH_TERMINALS = 0;
+    SERVICE_DEATH_EVENTS = 0;
+    CONSUMED_RESULTS = 0;
+    STALE_REPLIES = 0;
+    DUPLICATE_REPLIES = 0;
+    LATE_REPLIES = 0;
+    DENIED_OPERATIONS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Trusted management publishes one exact service generation and two distinct
+// endpoints only after its external health gate has succeeded.
+pub unsafe fn publish(
+    service_process: u64,
+    service_generation: u64,
+    protocol_id: u64,
+    service_request_endpoint: u64,
+    client_wait_endpoint: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if CONFIGURED != 0 {
+        return deny(ERR_PERSONALITY_DUPLICATE);
+    }
+    if protocol_id != PERSONALITY_RPC_V1 {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if service_generation != 1
+        || service_process == 0
+        || !process_is_live(service_process)
+        || !can_issue_operations(service_process)
+        || service_request_endpoint == client_wait_endpoint
+        || !endpoint_is_live(service_request_endpoint)
+        || !endpoint_is_live(client_wait_endpoint)
+        || PUBLISHES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    SERVICE_PROCESS = service_process;
+    SERVICE_GENERATION = service_generation;
+    PROTOCOL_ID = protocol_id;
+    SERVICE_REQUEST_ENDPOINT = service_request_endpoint;
+    CLIENT_WAIT_ENDPOINT = client_wait_endpoint;
+    CONFIGURED = 1;
+    SERVICE_AVAILABLE = 1;
+    PUBLISHES += 1;
+    return finish(1);
+}
+
+// Replacement is an exact compare-and-install. Terminal results from the old
+// generation may remain consumable, but no old in-flight wait may survive the
+// preceding service_died transition.
+pub unsafe fn install_replacement(
+    expected_service_process: u64,
+    expected_service_generation: u64,
+    replacement_service_process: u64,
+    replacement_service_generation: u64,
+    protocol_id: u64,
+    replacement_request_endpoint: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if CONFIGURED == 0 {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if SERVICE_AVAILABLE != 0
+        || SERVICE_PROCESS != expected_service_process
+        || SERVICE_GENERATION != expected_service_generation
+        || PROTOCOL_ID != protocol_id {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if protocol_id != PERSONALITY_RPC_V1 {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if expected_service_generation == MAX_COUNTER
+        || replacement_service_generation != expected_service_generation + 1
+        || replacement_service_process == 0
+        || replacement_service_process == expected_service_process
+        || !process_is_live(replacement_service_process)
+        || !can_issue_operations(replacement_service_process)
+        || replacement_request_endpoint == CLIENT_WAIT_ENDPOINT
+        || !endpoint_is_live(replacement_request_endpoint)
+        || !endpoint_is_live(CLIENT_WAIT_ENDPOINT)
+        || waiting_slot_count() != 0
+        || REPLACEMENTS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    SERVICE_PROCESS = replacement_service_process;
+    SERVICE_GENERATION = replacement_service_generation;
+    SERVICE_REQUEST_ENDPOINT = replacement_request_endpoint;
+    SERVICE_AVAILABLE = 1;
+    REPLACEMENTS += 1;
+    return finish(1);
+}
+
+// On re-entry after ERR_IPC_RETRY, the exact caller thread consumes its one
+// terminal result. Otherwise a fresh slot is published and a scalar request is
+// enqueued with the request handle as its unforgeable correlation.
+pub unsafe fn dispatch_or_consume(
+    caller_process: u64,
+    caller_thread: u64,
+    request_frame: u64,
+    deadline: u64,
+    request_out: *mut u64,
+    result_out: *mut u64
+) -> u64 {
+    if request_out as usize == 0 || result_out as usize == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    volatile_store(request_out, 0);
+    volatile_store(result_out, 0);
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if !frame_valid(request_frame) {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if !process_is_live(caller_process)
+        || !can_issue_operations(caller_process)
+        || !thread_is_live(caller_thread)
+        || current_thread_handle() != caller_thread
+        || thread_state(caller_thread) != THREAD_STATE_RUNNING
+        || process_for(caller_thread) != caller_process {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] != REQUEST_EMPTY
+            && STATES[slot] != REQUEST_RETIRED
+            && CALLER_THREADS[slot] == caller_thread {
+            if CALLER_PROCESSES[slot] != caller_process
+                || REQUEST_FRAMES[slot] != request_frame {
+                return deny(ERR_PERSONALITY_STALE);
+            }
+            if STATES[slot] != REQUEST_TERMINAL {
+                return deny(ERR_PERSONALITY_BUSY);
+            }
+            if CONSUMED_RESULTS == MAX_COUNTER {
+                return deny(ERR_PERSONALITY_FAILED);
+            }
+            let request: u64 = make_handle(slot);
+            let result: u64 = TERMINAL_RESULTS[slot];
+            volatile_store(request_out, request);
+            volatile_store(result_out, result);
+            CONSUMED_RESULTS += 1;
+            retire_or_reuse(slot);
+            return finish(RPC_CONSUMED);
+        }
+        slot += 1;
+    }
+    if CONFIGURED == 0
+        || SERVICE_AVAILABLE == 0
+        || !process_is_live(SERVICE_PROCESS)
+        || !endpoint_is_live(SERVICE_REQUEST_ENDPOINT)
+        || !endpoint_is_live(CLIENT_WAIT_ENDPOINT) {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if waiting_slot_count() != 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    slot = 0;
+    while slot < MAX_PERSONALITY_REQUESTS && STATES[slot] != REQUEST_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_PERSONALITY_REQUESTS || DISPATCHES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    let request: u64 = make_handle(slot);
+    if enqueue(
+        SERVICE_REQUEST_ENDPOINT,
+        caller_process,
+        request,
+        request_frame,
+        0
+    ) == 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    if receiver_waiter(SERVICE_REQUEST_ENDPOINT) != 0 {
+        if SERVICE_REQUEST_WAKES == MAX_COUNTER
+            || complete_ipc_wait(
+                SERVICE_REQUEST_ENDPOINT,
+                ENDPOINT_WAITER_RECEIVER,
+                ERR_IPC_RETRY,
+                WAKE_REASON_IPC
+            ) == 0 {
+            if cancel_by_sender_correlation(
+                SERVICE_REQUEST_ENDPOINT,
+                caller_process,
+                request
+            ) != 1 {
+                POISONED = 1;
+            }
+            return deny(ERR_PERSONALITY_FAILED);
+        }
+        SERVICE_REQUEST_WAKES += 1;
+    }
+    CALLER_PROCESSES[slot] = caller_process;
+    CALLER_THREADS[slot] = caller_thread;
+    CORRELATIONS[slot] = request;
+    REQUEST_FRAMES[slot] = request_frame;
+    DEADLINES[slot] = deadline;
+    REQUEST_SERVICE_PROCESSES[slot] = SERVICE_PROCESS;
+    REQUEST_SERVICE_GENERATIONS[slot] = SERVICE_GENERATION;
+    REQUEST_PROTOCOLS[slot] = PROTOCOL_ID;
+    STATES[slot] = REQUEST_DISPATCHED;
+    DISPATCHES += 1;
+    volatile_store(request_out, request);
+    return finish(RPC_DISPATCHED);
+}
+
+// arm_wait reserves the exact next IPC sleep epoch. commit_wait below commits
+// only the router association; scheduler code still performs ipc_wait::commit
+// after block_current publishes the TCB epoch.
+pub unsafe fn arm_wait(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] != REQUEST_DISPATCHED
+        || SERVICE_AVAILABLE == 0
+        || REQUEST_SERVICE_PROCESSES[slot] != SERVICE_PROCESS
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if WAITS_ARMED == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    let wait: u64 = begin_ipc_wait(
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        CALLER_THREADS[slot],
+        CALLER_PROCESSES[slot]
+    );
+    if wait == 0 {
+        if abort_dispatched_slot(slot) != 1 {
+            return ERR_PERSONALITY_FAILED;
+        }
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    WAIT_REQUESTS[slot] = wait;
+    STATES[slot] = REQUEST_WAIT_PREPARED;
+    WAITS_ARMED += 1;
+    if finish(1) != 1 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    return wait;
+}
+
+pub unsafe fn commit_wait(request: u64, wait: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_WAIT_PREPARED
+        || WAIT_REQUESTS[slot] != wait
+        || !wait_handle_shape_valid(wait)
+        || current_thread_handle() != CALLER_THREADS[slot]
+        || thread_state(CALLER_THREADS[slot]) != THREAD_STATE_RUNNING
+        || process_for(CALLER_THREADS[slot]) != CALLER_PROCESSES[slot]
+        || receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if WAITS_COMMITTED == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    STATES[slot] = REQUEST_WAITING;
+    WAITS_COMMITTED += 1;
+    return finish(request);
+}
+
+// Trusted syscall glue uses this if it cannot hand the prepared wait to the
+// scheduler. It removes both the waiter and the still-queued scalar request.
+pub unsafe fn abort_wait(request: u64, wait: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || (STATES[slot] != REQUEST_WAIT_PREPARED
+            && STATES[slot] != REQUEST_WAITING)
+        || WAIT_REQUESTS[slot] != wait
+        || WAITS_ABORTED == MAX_COUNTER
+        || PREPARED_WAIT_ABORTS == MAX_COUNTER
+        || COMMITTED_WAIT_ABORTS == MAX_COUNTER
+        || ABORTED_DISPATCHES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let was_committed: bool = STATES[slot] == REQUEST_WAITING;
+    if abort_ipc_wait(wait) == 0
+        || cancel_by_sender_correlation(
+            SERVICE_REQUEST_ENDPOINT,
+            CALLER_PROCESSES[slot],
+            CORRELATIONS[slot]
+        ) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    WAITS_ABORTED += 1;
+    if was_committed {
+        COMMITTED_WAIT_ABORTS += 1;
+    } else {
+        PREPARED_WAIT_ABORTS += 1;
+    }
+    ABORTED_DISPATCHES += 1;
+    retire_or_reuse(slot);
+    return finish(1);
+}
+
+pub unsafe fn reply(
+    request: u64,
+    replying_service_process: u64,
+    result: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if result == ERR_IPC_RETRY
+        || result == SYSCALL_CONTROL_EXIT
+        || result == SYSCALL_CONTROL_SCHEDULE {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    let retired_slot: usize = request_index(request);
+    if (request & HANDLE_TAG_MASK) == REQUEST_HANDLE_TAG
+        && retired_slot < MAX_PERSONALITY_REQUESTS
+        && LAST_TERMINAL_HANDLES[retired_slot] == request {
+        if LAST_TERMINAL_SERVICE_PROCESSES[retired_slot]
+                == replying_service_process
+            && LAST_TERMINAL_SERVICE_GENERATIONS[retired_slot]
+                == SERVICE_GENERATION {
+            if LAST_TERMINAL_KINDS[retired_slot] as u64
+                    == RPC_TERMINAL_REPLY {
+                if DUPLICATE_REPLIES == MAX_COUNTER {
+                    POISONED = 1;
+                    return ERR_PERSONALITY_FAILED;
+                }
+                DUPLICATE_REPLIES += 1;
+                return deny(ERR_PERSONALITY_DUPLICATE);
+            }
+            if LATE_REPLIES == MAX_COUNTER {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            LATE_REPLIES += 1;
+            return deny(ERR_PERSONALITY_STALE);
+        }
+        if STALE_REPLIES == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        STALE_REPLIES += 1;
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || REQUEST_SERVICE_PROCESSES[slot] != replying_service_process
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID
+        || SERVICE_PROCESS != replying_service_process {
+        if STALE_REPLIES == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        STALE_REPLIES += 1;
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == REQUEST_TERMINAL {
+        if TERMINAL_KINDS[slot] as u64 == RPC_TERMINAL_REPLY {
+            if DUPLICATE_REPLIES == MAX_COUNTER {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            DUPLICATE_REPLIES += 1;
+            return deny(ERR_PERSONALITY_DUPLICATE);
+        }
+        if LATE_REPLIES == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        LATE_REPLIES += 1;
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] != REQUEST_WAITING
+        || SERVICE_AVAILABLE == 0
+        || !process_is_live(replying_service_process) {
+        if STALE_REPLIES == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        STALE_REPLIES += 1;
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    return transition_terminal(
+        slot,
+        RPC_TERMINAL_REPLY,
+        result,
+        WAKE_REASON_IPC
+    );
+}
+
+pub unsafe fn supervisor_cancel(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == REQUEST_TERMINAL {
+        return deny(ERR_PERSONALITY_DUPLICATE);
+    }
+    if STATES[slot] != REQUEST_WAITING {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    return transition_terminal(
+        slot,
+        RPC_TERMINAL_SUPERVISOR_CANCEL,
+        ERR_PERSONALITY_CANCELLED,
+        WAKE_REASON_CANCELLED
+    );
+}
+
+pub unsafe fn expire(now: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let mut expired: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAITING
+            && DEADLINES[slot] != 0
+            && DEADLINES[slot] <= now {
+            let transitioned: u64 = transition_terminal(
+                slot,
+                RPC_TERMINAL_DEADLINE,
+                ERR_PERSONALITY_TIMEOUT,
+                WAKE_REASON_CANCELLED
+            );
+            if transitioned != 1 {
+                return transitioned;
+            }
+            expired += 1;
+        }
+        slot += 1;
+    }
+    return finish(expired);
+}
+
+pub unsafe fn service_died(service_process: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if CONFIGURED == 0 || SERVICE_AVAILABLE == 0 {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if SERVICE_PROCESS != service_process {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if (STATES[slot] == REQUEST_DISPATCHED
+            || STATES[slot] == REQUEST_WAIT_PREPARED)
+            && REQUEST_SERVICE_PROCESSES[slot] == service_process {
+            return deny(ERR_PERSONALITY_BUSY);
+        }
+        slot += 1;
+    }
+    if SERVICE_DEATH_EVENTS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    let mut failed: u64 = 0;
+    slot = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAITING
+            && REQUEST_SERVICE_PROCESSES[slot] == service_process
+            && REQUEST_SERVICE_GENERATIONS[slot] == SERVICE_GENERATION
+            && REQUEST_PROTOCOLS[slot] == PROTOCOL_ID {
+            let transitioned: u64 = transition_terminal(
+                slot,
+                RPC_TERMINAL_SERVICE_DEATH,
+                ERR_PERSONALITY_FAILED,
+                WAKE_REASON_CANCELLED
+            );
+            if transitioned != 1 {
+                return transitioned;
+            }
+            failed += 1;
+        }
+        slot += 1;
+    }
+    SERVICE_AVAILABLE = 0;
+    SERVICE_DEATH_EVENTS += 1;
+    return finish(failed);
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !endpoint_invariants_hold()
+        || !wait_invariants_hold() {
+        return false;
+    }
+    if CONFIGURED == 0 {
+        if SERVICE_AVAILABLE != 0
+            || SERVICE_PROCESS != 0
+            || SERVICE_GENERATION != 0
+            || PROTOCOL_ID != 0
+            || SERVICE_REQUEST_ENDPOINT != 0
+            || CLIENT_WAIT_ENDPOINT != 0
+            || PUBLISHES != 0
+            || REPLACEMENTS != 0 {
+            return false;
+        }
+    } else {
+        if CONFIGURED != 1
+            || !process_handle_shape_valid(SERVICE_PROCESS)
+            || SERVICE_GENERATION == 0
+            || PROTOCOL_ID != PERSONALITY_RPC_V1
+            || !endpoint_handle_shape_valid(SERVICE_REQUEST_ENDPOINT)
+            || !endpoint_handle_shape_valid(CLIENT_WAIT_ENDPOINT)
+            || SERVICE_REQUEST_ENDPOINT == CLIENT_WAIT_ENDPOINT
+            || !endpoint_is_live(CLIENT_WAIT_ENDPOINT)
+            || PUBLISHES != 1
+            || REPLACEMENTS + 1 != SERVICE_GENERATION {
+            return false;
+        }
+        if SERVICE_AVAILABLE != 0 {
+            if SERVICE_AVAILABLE != 1
+                || !process_is_live(SERVICE_PROCESS)
+                || !endpoint_is_live(SERVICE_REQUEST_ENDPOINT) {
+                return false;
+            }
+        }
+    }
+    if TERMINAL_TRANSITIONS != TERMINAL_WAKES
+        || TERMINAL_TRANSITIONS
+            != REPLIES
+                + SUPERVISOR_CANCELS
+                + DEADLINE_EXPIRIES
+                + SERVICE_DEATH_TERMINALS
+        || WAITS_ABORTED != PREPARED_WAIT_ABORTS + COMMITTED_WAIT_ABORTS
+        || WAITS_ARMED
+            != WAITS_COMMITTED
+                + PREPARED_WAIT_ABORTS
+                + prepared_slot_count() as u64
+        || WAITS_COMMITTED
+            != TERMINAL_TRANSITIONS
+                + COMMITTED_WAIT_ABORTS
+                + committed_waiting_slot_count() as u64
+        || TERMINAL_TRANSITIONS
+            != CONSUMED_RESULTS + terminal_slot_count() as u64
+        || DISPATCHES
+            != ABORTED_DISPATCHES
+                + CONSUMED_RESULTS
+                + active_slot_count() as u64
+        || waiting_slot_count() > 1
+        || SERVICE_REQUEST_WAKES > DISPATCHES {
+        return false;
+    }
+    let mut expected_waiter: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == REQUEST_EMPTY || state == REQUEST_RETIRED {
+            if (state == REQUEST_RETIRED
+                && GENERATIONS[slot] != 0xffff_ffff)
+                || CALLER_PROCESSES[slot] != 0
+                || CALLER_THREADS[slot] != 0
+                || CORRELATIONS[slot] != 0
+                || REQUEST_FRAMES[slot] != 0
+                || DEADLINES[slot] != 0
+                || REQUEST_SERVICE_PROCESSES[slot] != 0
+                || REQUEST_SERVICE_GENERATIONS[slot] != 0
+                || REQUEST_PROTOCOLS[slot] != 0
+                || WAIT_REQUESTS[slot] != 0
+                || TERMINAL_KINDS[slot] != 0
+                || TERMINAL_RESULTS[slot] != 0 {
+                return false;
+            }
+        } else if state == REQUEST_DISPATCHED
+            || state == REQUEST_WAIT_PREPARED
+            || state == REQUEST_WAITING
+            || state == REQUEST_TERMINAL {
+            if !process_handle_shape_valid(CALLER_PROCESSES[slot])
+                || !thread_handle_shape_valid(CALLER_THREADS[slot])
+                || CORRELATIONS[slot] != make_handle(slot)
+                || !frame_valid(REQUEST_FRAMES[slot])
+                || !process_handle_shape_valid(
+                    REQUEST_SERVICE_PROCESSES[slot]
+                )
+                || REQUEST_SERVICE_GENERATIONS[slot] == 0
+                || REQUEST_PROTOCOLS[slot] != PERSONALITY_RPC_V1 {
+                return false;
+            }
+            if state == REQUEST_WAIT_PREPARED || state == REQUEST_WAITING {
+                if !wait_handle_shape_valid(WAIT_REQUESTS[slot])
+                    || TERMINAL_KINDS[slot] != 0
+                    || TERMINAL_RESULTS[slot] != 0
+                    || expected_waiter != 0 {
+                    return false;
+                }
+                expected_waiter = CALLER_THREADS[slot];
+            } else if WAIT_REQUESTS[slot] != 0 {
+                return false;
+            }
+            if state == REQUEST_TERMINAL {
+                if !terminal_kind_valid(TERMINAL_KINDS[slot] as u64) {
+                    return false;
+                }
+                if (TERMINAL_KINDS[slot] as u64
+                        == RPC_TERMINAL_SUPERVISOR_CANCEL
+                    && TERMINAL_RESULTS[slot] != ERR_PERSONALITY_CANCELLED)
+                    || (TERMINAL_KINDS[slot] as u64
+                            == RPC_TERMINAL_DEADLINE
+                        && TERMINAL_RESULTS[slot] != ERR_PERSONALITY_TIMEOUT)
+                    || (TERMINAL_KINDS[slot] as u64
+                            == RPC_TERMINAL_SERVICE_DEATH
+                        && TERMINAL_RESULTS[slot] != ERR_PERSONALITY_FAILED) {
+                    return false;
+                }
+            } else if TERMINAL_KINDS[slot] != 0
+                || TERMINAL_RESULTS[slot] != 0 {
+                return false;
+            }
+            let mut other: usize = slot + 1;
+            while other < MAX_PERSONALITY_REQUESTS {
+                if STATES[other] != REQUEST_EMPTY
+                    && STATES[other] != REQUEST_RETIRED
+                    && CALLER_THREADS[other] == CALLER_THREADS[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        if LAST_TERMINAL_HANDLES[slot] == 0 {
+            if LAST_TERMINAL_SERVICE_PROCESSES[slot] != 0
+                || LAST_TERMINAL_SERVICE_GENERATIONS[slot] != 0
+                || LAST_TERMINAL_KINDS[slot] != 0 {
+                return false;
+            }
+        } else if (LAST_TERMINAL_HANDLES[slot] & HANDLE_TAG_MASK)
+                != REQUEST_HANDLE_TAG
+            || request_index(LAST_TERMINAL_HANDLES[slot]) != slot
+            || request_generation(LAST_TERMINAL_HANDLES[slot]) == 0
+            || request_generation(LAST_TERMINAL_HANDLES[slot])
+                > GENERATIONS[slot]
+            || !process_handle_shape_valid(
+                LAST_TERMINAL_SERVICE_PROCESSES[slot]
+            )
+            || LAST_TERMINAL_SERVICE_GENERATIONS[slot] == 0
+            || !terminal_kind_valid(LAST_TERMINAL_KINDS[slot] as u64) {
+            return false;
+        }
+        slot += 1;
+    }
+    if CONFIGURED != 0
+        && receiver_waiter(CLIENT_WAIT_ENDPOINT) != expected_waiter {
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn is_current(request: u64) -> bool {
+    return checked_request(request) < MAX_PERSONALITY_REQUESTS;
+}
+
+pub unsafe fn state(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS {
+        return 0;
+    }
+    return STATES[slot] as u64;
+}
+
+pub unsafe fn caller_process(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return CALLER_PROCESSES[slot];
+}
+
+pub unsafe fn caller_thread(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return CALLER_THREADS[slot];
+}
+
+pub unsafe fn correlation(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return CORRELATIONS[slot];
+}
+
+pub unsafe fn request_frame(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return REQUEST_FRAMES[slot];
+}
+
+pub unsafe fn deadline(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return DEADLINES[slot];
+}
+
+pub unsafe fn request_service_process(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return REQUEST_SERVICE_PROCESSES[slot];
+}
+
+pub unsafe fn request_service_generation(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return REQUEST_SERVICE_GENERATIONS[slot];
+}
+
+pub unsafe fn request_protocol(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return REQUEST_PROTOCOLS[slot];
+}
+
+pub unsafe fn wait_request(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS { return 0; }
+    return WAIT_REQUESTS[slot];
+}
+
+pub unsafe fn terminal_kind(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS || STATES[slot] != REQUEST_TERMINAL {
+        return 0;
+    }
+    return TERMINAL_KINDS[slot] as u64;
+}
+
+pub unsafe fn terminal_result(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS || STATES[slot] != REQUEST_TERMINAL {
+        return 0;
+    }
+    return TERMINAL_RESULTS[slot];
+}
+
+pub unsafe fn configured_service_process() -> u64 { return SERVICE_PROCESS; }
+pub unsafe fn configured_service_generation() -> u64 { return SERVICE_GENERATION; }
+pub unsafe fn configured_protocol() -> u64 { return PROTOCOL_ID; }
+pub unsafe fn service_request_endpoint() -> u64 { return SERVICE_REQUEST_ENDPOINT; }
+pub unsafe fn client_wait_endpoint() -> u64 { return CLIENT_WAIT_ENDPOINT; }
+pub unsafe fn service_is_available() -> bool { return SERVICE_AVAILABLE != 0; }
+pub unsafe fn request_count() -> usize { return active_slot_count(); }
+pub unsafe fn dispatch_count() -> u64 { return DISPATCHES; }
+pub unsafe fn aborted_dispatch_count() -> u64 { return ABORTED_DISPATCHES; }
+pub unsafe fn wait_arm_count() -> u64 { return WAITS_ARMED; }
+pub unsafe fn wait_commit_count() -> u64 { return WAITS_COMMITTED; }
+pub unsafe fn wait_abort_count() -> u64 { return WAITS_ABORTED; }
+pub unsafe fn prepared_wait_abort_count() -> u64 { return PREPARED_WAIT_ABORTS; }
+pub unsafe fn committed_wait_abort_count() -> u64 { return COMMITTED_WAIT_ABORTS; }
+pub unsafe fn service_request_wake_count() -> u64 { return SERVICE_REQUEST_WAKES; }
+pub unsafe fn terminal_transition_count() -> u64 { return TERMINAL_TRANSITIONS; }
+pub unsafe fn terminal_wake_count() -> u64 { return TERMINAL_WAKES; }
+pub unsafe fn reply_count() -> u64 { return REPLIES; }
+pub unsafe fn supervisor_cancel_count() -> u64 { return SUPERVISOR_CANCELS; }
+pub unsafe fn deadline_expiry_count() -> u64 { return DEADLINE_EXPIRIES; }
+pub unsafe fn service_death_terminal_count() -> u64 { return SERVICE_DEATH_TERMINALS; }
+pub unsafe fn service_death_event_count() -> u64 { return SERVICE_DEATH_EVENTS; }
+pub unsafe fn consumed_result_count() -> u64 { return CONSUMED_RESULTS; }
+pub unsafe fn stale_reply_count() -> u64 { return STALE_REPLIES; }
+pub unsafe fn duplicate_reply_count() -> u64 { return DUPLICATE_REPLIES; }
+pub unsafe fn late_reply_count() -> u64 { return LATE_REPLIES; }
+pub unsafe fn denial_count() -> u64 { return DENIED_OPERATIONS; }
+pub unsafe fn publish_count() -> u64 { return PUBLISHES; }
+pub unsafe fn replacement_count() -> u64 { return REPLACEMENTS; }
+pub unsafe fn is_poisoned() -> bool { return POISONED != 0; }

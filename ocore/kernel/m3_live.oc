@@ -1,0 +1,699 @@
+module kernel::m3_live;
+
+use runtime::address_space::create_native_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::dynamic_protections_hold;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::native_stack_top_for;
+use runtime::address_space::root_cr3;
+use runtime::cap_transfer::invariants_hold as transfer_invariants_hold;
+use runtime::cap_transfer::prepared_count;
+use runtime::capability::close_for_owner as close_capability_for_owner;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_ENDPOINT;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_CANCEL;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::create_domain;
+use runtime::domain::destroy_domain;
+use runtime::endpoint::cancelled_waiter_count;
+use runtime::endpoint::close_reason;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::discarded_message_count;
+use runtime::endpoint::enqueue;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_draining as endpoint_is_draining;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::message_count;
+use runtime::endpoint::pending_capability_cleanup_count;
+use runtime::endpoint::receiver_waiter;
+use runtime::endpoint::reference_count;
+use runtime::endpoint::release as release_endpoint;
+use runtime::endpoint::retain as retain_endpoint;
+use runtime::endpoint::sender_waiter_count;
+use runtime::endpoint::ENDPOINT_CLOSE_CRASH;
+use runtime::interrupts::ticks;
+use runtime::ipc_lifecycle::cancelled_message_count;
+use runtime::ipc_lifecycle::crashed_endpoint_count;
+use runtime::ipc_wait::cancel_wake_count;
+use runtime::ipc_wait::receiver_block_count;
+use runtime::ipc_wait::sender_block_count;
+use runtime::ipc_wait::wake_count as ipc_wake_count;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::memory_object::allocate_capability_for_owner;
+use runtime::memory_object::close_capability_for_owner as close_memory_capability;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::memory_object::MEMORY_OK;
+use runtime::memory_object::MEMORY_SHARED;
+use runtime::native_abi::NATIVE_ABI_V1;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::mark_reapable;
+use runtime::process::process_state;
+use runtime::process::PROCESS_STATE_FAULTED;
+use runtime::process::PROCESS_STATE_REAPABLE;
+use runtime::scheduler::arm_ipc;
+use runtime::scheduler::complete as scheduler_complete;
+use runtime::scheduler::completion_kind;
+use runtime::scheduler::context_switches;
+use runtime::scheduler::failed as scheduler_failed;
+use runtime::scheduler::ipc_fault_containments;
+use runtime::serial::write;
+use runtime::thread::blocked_count;
+use runtime::thread::init as threads_init;
+use runtime::thread::install as install_thread;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::reap as reap_thread;
+use runtime::thread::runnable_count;
+use runtime::thread::THREAD_ROLE_BLOCKING;
+use runtime::thread::THREAD_ROLE_CPU;
+
+const MODE_LIVE_IPC: u64 = 14;
+const QUOTA: usize = 16;
+const PROCESS_COUNT: usize = 4;
+const ENDPOINT_COUNT: usize = 5;
+const ENDPOINT_CAP_COUNT: usize = 10;
+
+const PROCESS_CLIENT: usize = 0;
+const PROCESS_HEALTHY: usize = 1;
+const PROCESS_OBSERVER: usize = 2;
+const PROCESS_CRASH: usize = 3;
+
+const ENDPOINT_CRASH: usize = 0;
+const ENDPOINT_REQUEST: usize = 1;
+const ENDPOINT_REPLY: usize = 2;
+const ENDPOINT_CROSS_REQUEST: usize = 3;
+const ENDPOINT_CROSS_REPLY: usize = 4;
+
+static PUBLIC_MESSAGE: [u8; 39] = b"M3 public CPL3 endpoint syscalls: PASS\n";
+static FIFO_MESSAGE: [u8; 41] = b"M3 bounded blocking FIFO/wake-once: PASS\n";
+static TRANSFER_MESSAGE: [u8; 40] = b"M3 attenuated capability transfer: PASS\n";
+static TRANSFER_ABORT_MESSAGE: [u8; 49] =
+    b"M3 bounded transfer abort/recovery: PASS (16/16)\n";
+static DEATH_MESSAGE: [u8; 40] = b"M3 automatic sender-death cleanup: PASS\n";
+static CRASH_MESSAGE: [u8; 39] = b"M3 personality crash containment: PASS\n";
+static OBSERVER_MESSAGE: [u8; 37] = b"M3 unrelated world after crash: PASS\n";
+static COMPOSE_MESSAGE: [u8; 39] = b"M3 same/cross-domain composition: PASS\n";
+static RECLAIM_MESSAGE: [u8; 29] = b"M3 resources reclaimed: PASS\n";
+static LIVE_MESSAGE: [u8; 31] = b"M3 native live substrate: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 32] = b"M3 post-lifecycle timer: online\n";
+
+static mut DOMAINS: [u64; 3] = [0; 3];
+static mut CSPACES: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACES: [u64; 4] = [0; 4];
+static mut PHYSICALS: [usize; 4] = [0; 4];
+static mut PROCESSES: [u64; 4] = [0; 4];
+// Installation order is deliberately client, crash, healthy, observer.  The
+// scheduler receives the same handles in semantic process order separately.
+static mut THREADS: [u64; 4] = [0; 4];
+static mut DEBUG_CAPS: [u64; 4] = [0; 4];
+static mut ENDPOINTS: [u64; 5] = [0; 5];
+static mut ENDPOINT_CAPS: [u64; 10] = [0; 10];
+static mut ENDPOINT_CAP_OWNERS: [u64; 10] = [0; 10];
+static mut ENDPOINT_CAP_OBJECTS: [u64; 10] = [0; 10];
+static mut SHARED_MEMORY_CAP: u64 = 0;
+static mut BASELINE_FREE: usize = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_m3_client_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m3_service_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m3_observer_entry(capability: u64) -> never;
+extern "sysv64" fn ocore_m3_crash_entry(capability: u64) -> never;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn install_endpoint_cap(
+    record: usize,
+    endpoint: u64,
+    owner: u64,
+    slot: usize,
+    rights: u64,
+    additional_reference: bool
+) -> u64 {
+    if record >= ENDPOINT_CAP_COUNT || endpoint == 0 || owner == 0 {
+        return 0;
+    }
+    if additional_reference && retain_endpoint(endpoint) == 0 {
+        return 0;
+    }
+    let capability: u64 = install_capability_for_owner(
+        owner,
+        slot,
+        endpoint,
+        OBJECT_ENDPOINT,
+        rights
+    );
+    if capability == 0 {
+        if additional_reference {
+            release_endpoint(endpoint);
+        }
+        return 0;
+    }
+    ENDPOINT_CAPS[record] = capability;
+    ENDPOINT_CAP_OWNERS[record] = owner;
+    ENDPOINT_CAP_OBJECTS[record] = endpoint;
+    return capability;
+}
+
+unsafe fn close_all_endpoint_caps() -> u64 {
+    let mut record: usize = 0;
+    while record < ENDPOINT_CAP_COUNT {
+        let capability: u64 = ENDPOINT_CAPS[record];
+        let owner: u64 = ENDPOINT_CAP_OWNERS[record];
+        let endpoint: u64 = ENDPOINT_CAP_OBJECTS[record];
+        if capability == 0
+            || owner == 0
+            || endpoint == 0
+            || validate_for_owner(
+                owner,
+                capability,
+                OBJECT_ENDPOINT,
+                0
+            ) != endpoint
+            || close_capability_for_owner(owner, capability) == 0
+            || release_endpoint(endpoint) == 0 {
+            return 0;
+        }
+        ENDPOINT_CAPS[record] = 0;
+        ENDPOINT_CAP_OWNERS[record] = 0;
+        ENDPOINT_CAP_OBJECTS[record] = 0;
+        record += 1;
+    }
+    let mut endpoint_index: usize = 0;
+    while endpoint_index < ENDPOINT_COUNT {
+        if endpoint_is_live(ENDPOINTS[endpoint_index])
+            || endpoint_is_draining(ENDPOINTS[endpoint_index]) {
+            return 0;
+        }
+        endpoint_index += 1;
+    }
+    return 1;
+}
+
+unsafe fn reap_process(index: usize) -> u64 {
+    if index >= PROCESS_COUNT {
+        return 0;
+    }
+    let process_handle: u64 = PROCESSES[index];
+    let state: u64 = process_state(process_handle);
+    if state == PROCESS_STATE_FAULTED {
+        if mark_reapable(process_handle) == 0 {
+            return 0;
+        }
+    } else if state != PROCESS_STATE_REAPABLE {
+        return 0;
+    }
+    if begin_reap(process_handle) == 0
+        || destroy_address_space(ADDRESS_SPACES[index]) == 0
+        || drain_cspace(CSPACES[index]) == 0
+        || finalize_reap(process_handle) == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// The exported architectural bridge is owned by main/scheduler integration.
+// It dispatches here only when scheduler::completion_kind() names mode 14.
+pub unsafe fn complete_continue() -> never {
+    if !management_context()
+        || scheduler_failed()
+        || !scheduler_complete()
+        || completion_kind() != 2
+        || context_switches() < 8
+        || ipc_fault_containments() != 1
+        || sender_block_count() < 1
+        || receiver_block_count() < 3
+        || ipc_wake_count() < 3
+        || cancel_wake_count() != 1
+        || crashed_endpoint_count() < 1
+        || cancelled_message_count() < 5
+        || blocked_count() != 0
+        || runnable_count() != 0
+        || process_state(PROCESSES[PROCESS_CLIENT]) != PROCESS_STATE_REAPABLE
+        || process_state(PROCESSES[PROCESS_HEALTHY]) != PROCESS_STATE_REAPABLE
+        || process_state(PROCESSES[PROCESS_OBSERVER]) != PROCESS_STATE_REAPABLE
+        || process_state(PROCESSES[PROCESS_CRASH]) != PROCESS_STATE_FAULTED
+        || volatile_load(PHYSICALS[PROCESS_CLIENT] as *const u64) != 5
+        || volatile_load(PHYSICALS[PROCESS_HEALTHY] as *const u64) != 5
+        || volatile_load(PHYSICALS[PROCESS_OBSERVER] as *const u64) == 0
+        || volatile_load(PHYSICALS[PROCESS_CRASH] as *const u64) != 1
+        || prepared_count() != 0
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold()
+        || !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold() {
+        fail_closed();
+    }
+
+    let mut endpoint_index: usize = 0;
+    while endpoint_index < ENDPOINT_COUNT {
+        if message_count(ENDPOINTS[endpoint_index]) != 0
+            || pending_capability_cleanup_count(ENDPOINTS[endpoint_index]) != 0
+            || receiver_waiter(ENDPOINTS[endpoint_index]) != 0
+            || sender_waiter_count(ENDPOINTS[endpoint_index]) != 0
+            || cancelled_waiter_count(ENDPOINTS[endpoint_index]) != 0
+            || reference_count(ENDPOINTS[endpoint_index]) != 2 {
+            fail_closed();
+        }
+        endpoint_index += 1;
+    }
+    if !endpoint_is_draining(ENDPOINTS[ENDPOINT_CRASH])
+        || close_reason(ENDPOINTS[ENDPOINT_CRASH]) != ENDPOINT_CLOSE_CRASH
+        || discarded_message_count(ENDPOINTS[ENDPOINT_CRASH]) != 4 {
+        fail_closed();
+    }
+
+    write((&PUBLIC_MESSAGE[0]), 39);
+    write((&FIFO_MESSAGE[0]), 41);
+    write((&TRANSFER_MESSAGE[0]), 40);
+    write((&TRANSFER_ABORT_MESSAGE[0]), 49);
+    write((&DEATH_MESSAGE[0]), 40);
+    write((&CRASH_MESSAGE[0]), 39);
+    write((&OBSERVER_MESSAGE[0]), 37);
+    write((&COMPOSE_MESSAGE[0]), 39);
+
+    if close_all_endpoint_caps() == 0
+        || close_memory_capability(
+            CSPACES[PROCESS_CLIENT],
+            SHARED_MEMORY_CAP
+        ) != MEMORY_OK
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold()
+        || !capability_invariants_hold()
+        || !memory_invariants_hold() {
+        fail_closed();
+    }
+    SHARED_MEMORY_CAP = 0;
+
+    let mut thread_index: usize = 0;
+    while thread_index < PROCESS_COUNT {
+        if reap_thread(THREADS[thread_index]) == 0
+            || thread_is_live(THREADS[thread_index]) {
+            fail_closed();
+        }
+        thread_index += 1;
+    }
+
+    let mut process_index: usize = 0;
+    while process_index < PROCESS_COUNT {
+        if reap_process(process_index) == 0 {
+            fail_closed();
+        }
+        process_index += 1;
+    }
+    if domain_child_refs(DOMAINS[0]) != 0
+        || domain_child_refs(DOMAINS[1]) != 0
+        || domain_child_refs(DOMAINS[2]) != 0
+        || destroy_domain(DOMAINS[1]) == 0
+        || destroy_domain(DOMAINS[2]) == 0
+        || free_frames() != BASELINE_FREE
+        || !page_invariants_hold()
+        || !mapping_invariants_hold()
+        || !memory_invariants_hold()
+        || !capability_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECLAIM_MESSAGE[0]), 29);
+    write((&LIVE_MESSAGE[0]), 31);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 32);
+    loop {
+        halt();
+    }
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    if mode != MODE_LIVE_IPC
+        || native_domain == 0
+        || !management_context()
+        || threads_init() == 0
+        || threads_init() != 0
+        || !capability_invariants_hold()
+        || !memory_invariants_hold()
+        || !mapping_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !transfer_invariants_hold() {
+        fail_closed();
+    }
+
+    DOMAINS[0] = native_domain;
+    // Client and healthy personality intentionally share D0.  D1 hosts the
+    // cross-domain echo/observer, while D2 owns the faulting personality.
+    DOMAINS[1] = create_domain(1, 2, PERSONALITY_NATIVE, NATIVE_ABI_V1);
+    DOMAINS[2] = create_domain(2, 3, PERSONALITY_NATIVE, NATIVE_ABI_V1);
+    if DOMAINS[1] == 0 || DOMAINS[2] == 0 || DOMAINS[1] == DOMAINS[2] {
+        fail_closed();
+    }
+    BASELINE_FREE = free_frames();
+
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        CSPACES[index] = cspace_handle_for_slot(index);
+        if CSPACES[index] == 0
+            || set_quota_for_owner(CSPACES[index], QUOTA) == 0 {
+            fail_closed();
+        }
+        ADDRESS_SPACES[index] = create_native_for_owner(CSPACES[index]);
+        PHYSICALS[index] = isolation_physical(ADDRESS_SPACES[index]);
+        if ADDRESS_SPACES[index] == 0
+            || PHYSICALS[index] == 0
+            || root_cr3(ADDRESS_SPACES[index]) == ocore_management_cr3()
+            || !dynamic_protections_hold(ADDRESS_SPACES[index]) {
+            fail_closed();
+        }
+        let mut prior: usize = 0;
+        while prior < index {
+            if ADDRESS_SPACES[index] == ADDRESS_SPACES[prior]
+                || PHYSICALS[index] == PHYSICALS[prior] {
+                fail_closed();
+            }
+            prior += 1;
+        }
+        index += 1;
+    }
+
+    PROCESSES[PROCESS_CLIENT] = install_process_for_owner(
+        PROCESS_CLIENT,
+        101,
+        DOMAINS[0],
+        ADDRESS_SPACES[PROCESS_CLIENT],
+        CSPACES[PROCESS_CLIENT],
+        ocore_process_kernel_stack_top(0),
+        ocore_m3_client_entry as usize,
+        native_stack_top_for(0)
+    );
+    PROCESSES[PROCESS_HEALTHY] = install_process_for_owner(
+        PROCESS_HEALTHY,
+        102,
+        DOMAINS[0],
+        ADDRESS_SPACES[PROCESS_HEALTHY],
+        CSPACES[PROCESS_HEALTHY],
+        ocore_process_kernel_stack_top(2),
+        ocore_m3_service_entry as usize,
+        native_stack_top_for(0)
+    );
+    PROCESSES[PROCESS_OBSERVER] = install_process_for_owner(
+        PROCESS_OBSERVER,
+        103,
+        DOMAINS[1],
+        ADDRESS_SPACES[PROCESS_OBSERVER],
+        CSPACES[PROCESS_OBSERVER],
+        ocore_process_kernel_stack_top(3),
+        ocore_m3_observer_entry as usize,
+        native_stack_top_for(0)
+    );
+    PROCESSES[PROCESS_CRASH] = install_process_for_owner(
+        PROCESS_CRASH,
+        104,
+        DOMAINS[2],
+        ADDRESS_SPACES[PROCESS_CRASH],
+        CSPACES[PROCESS_CRASH],
+        ocore_process_kernel_stack_top(1),
+        ocore_m3_crash_entry as usize,
+        native_stack_top_for(0)
+    );
+    index = 0;
+    while index < PROCESS_COUNT {
+        if PROCESSES[index] == 0 {
+            fail_closed();
+        }
+        DEBUG_CAPS[index] = install_capability_for_owner(
+            CSPACES[index],
+            1,
+            0x300 + index as u64,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        );
+        if DEBUG_CAPS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    ENDPOINTS[ENDPOINT_CRASH] = create_endpoint(CSPACES[PROCESS_CRASH]);
+    ENDPOINTS[ENDPOINT_REQUEST] = create_endpoint(CSPACES[PROCESS_HEALTHY]);
+    ENDPOINTS[ENDPOINT_REPLY] = create_endpoint(CSPACES[PROCESS_CLIENT]);
+    ENDPOINTS[ENDPOINT_CROSS_REQUEST] = create_endpoint(
+        CSPACES[PROCESS_OBSERVER]
+    );
+    ENDPOINTS[ENDPOINT_CROSS_REPLY] = create_endpoint(
+        CSPACES[PROCESS_CLIENT]
+    );
+    index = 0;
+    while index < ENDPOINT_COUNT {
+        if ENDPOINTS[index] == 0 || !endpoint_is_live(ENDPOINTS[index]) {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    // The create reference belongs to the first installed capability.  Every
+    // second capability is preceded by exactly one retain, making lifecycle
+    // accounting auditable at completion.
+    if install_endpoint_cap(
+        0,
+        ENDPOINTS[ENDPOINT_CRASH],
+        CSPACES[PROCESS_CRASH],
+        2,
+        RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+        false
+    ) == 0
+        || install_endpoint_cap(
+            1,
+            ENDPOINTS[ENDPOINT_CRASH],
+            CSPACES[PROCESS_CLIENT],
+            2,
+            RIGHT_ENDPOINT_SEND,
+            true
+        ) == 0
+        || install_endpoint_cap(
+            2,
+            ENDPOINTS[ENDPOINT_REQUEST],
+            CSPACES[PROCESS_HEALTHY],
+            2,
+            RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+            false
+        ) == 0
+        || install_endpoint_cap(
+            3,
+            ENDPOINTS[ENDPOINT_REQUEST],
+            CSPACES[PROCESS_CLIENT],
+            3,
+            RIGHT_ENDPOINT_SEND,
+            true
+        ) == 0
+        || install_endpoint_cap(
+            4,
+            ENDPOINTS[ENDPOINT_REPLY],
+            CSPACES[PROCESS_CLIENT],
+            4,
+            RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+            false
+        ) == 0
+        || install_endpoint_cap(
+            5,
+            ENDPOINTS[ENDPOINT_REPLY],
+            CSPACES[PROCESS_HEALTHY],
+            3,
+            RIGHT_ENDPOINT_SEND,
+            true
+        ) == 0
+        || install_endpoint_cap(
+            6,
+            ENDPOINTS[ENDPOINT_CROSS_REQUEST],
+            CSPACES[PROCESS_OBSERVER],
+            2,
+            RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+            false
+        ) == 0
+        || install_endpoint_cap(
+            7,
+            ENDPOINTS[ENDPOINT_CROSS_REQUEST],
+            CSPACES[PROCESS_CLIENT],
+            5,
+            RIGHT_ENDPOINT_SEND,
+            true
+        ) == 0
+        || install_endpoint_cap(
+            8,
+            ENDPOINTS[ENDPOINT_CROSS_REPLY],
+            CSPACES[PROCESS_CLIENT],
+            6,
+            RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+            false
+        ) == 0
+        || install_endpoint_cap(
+            9,
+            ENDPOINTS[ENDPOINT_CROSS_REPLY],
+            CSPACES[PROCESS_OBSERVER],
+            3,
+            RIGHT_ENDPOINT_SEND,
+            true
+        ) == 0 {
+        fail_closed();
+    }
+
+    if allocate_capability_for_owner(
+        CSPACES[PROCESS_CLIENT],
+        MEMORY_SHARED,
+        (&mut SHARED_MEMORY_CAP)
+    ) != MEMORY_OK || SHARED_MEMORY_CAP == 0 {
+        fail_closed();
+    }
+
+    // Seed the four private configuration pages.  The response area begins at
+    // byte 128 and remains a fixed 32-byte copy target for public receive.
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 8) as *mut u64, DEBUG_CAPS[0]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 16) as *mut u64, ENDPOINT_CAPS[1]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 24) as *mut u64, ENDPOINT_CAPS[3]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 32) as *mut u64, ENDPOINT_CAPS[4]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 40) as *mut u64, SHARED_MEMORY_CAP);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 48) as *mut u64, PROCESSES[PROCESS_HEALTHY]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 56) as *mut u64, ENDPOINT_CAPS[7]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 64) as *mut u64, ENDPOINT_CAPS[8]);
+    volatile_store((PHYSICALS[PROCESS_CLIENT] + 72) as *mut u64, PROCESSES[PROCESS_OBSERVER]);
+
+    volatile_store((PHYSICALS[PROCESS_HEALTHY] + 8) as *mut u64, DEBUG_CAPS[1]);
+    volatile_store((PHYSICALS[PROCESS_HEALTHY] + 16) as *mut u64, ENDPOINT_CAPS[2]);
+    volatile_store((PHYSICALS[PROCESS_HEALTHY] + 24) as *mut u64, ENDPOINT_CAPS[5]);
+    volatile_store((PHYSICALS[PROCESS_HEALTHY] + 32) as *mut u64, PROCESSES[PROCESS_CLIENT]);
+
+    volatile_store((PHYSICALS[PROCESS_OBSERVER] + 8) as *mut u64, DEBUG_CAPS[2]);
+    volatile_store((PHYSICALS[PROCESS_OBSERVER] + 16) as *mut u64, ENDPOINT_CAPS[6]);
+    volatile_store((PHYSICALS[PROCESS_OBSERVER] + 24) as *mut u64, ENDPOINT_CAPS[9]);
+    volatile_store((PHYSICALS[PROCESS_OBSERVER] + 32) as *mut u64, PROCESSES[PROCESS_CLIENT]);
+    volatile_store((PHYSICALS[PROCESS_CRASH] + 8) as *mut u64, DEBUG_CAPS[3]);
+
+    // One full endpoint forces a real client block.  The cleanup probe is put
+    // on the client's cross-domain reply endpoint, never the healthy service's
+    // request endpoint: the client cannot receive it until after its send to
+    // the full crash endpoint has blocked, so receiver scheduling order cannot
+    // race the fault that must cancel this dead sender's message.
+    index = 0;
+    while index < 4 {
+        if enqueue(
+            ENDPOINTS[ENDPOINT_CRASH],
+            PROCESSES[PROCESS_CLIENT],
+            0xc000 + index as u64,
+            index as u64,
+            0
+        ) == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if enqueue(
+        ENDPOINTS[ENDPOINT_CROSS_REPLY],
+        PROCESSES[PROCESS_CRASH],
+        0xbad0,
+        0xbad0,
+        0
+    ) == 0 {
+        fail_closed();
+    }
+
+    THREADS[0] = install_thread(
+        0,
+        201,
+        PROCESSES[PROCESS_CLIENT],
+        ocore_m3_client_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(0),
+        DEBUG_CAPS[PROCESS_CLIENT],
+        THREAD_ROLE_BLOCKING,
+        1
+    );
+    THREADS[1] = install_thread(
+        1,
+        204,
+        PROCESSES[PROCESS_CRASH],
+        ocore_m3_crash_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(1),
+        DEBUG_CAPS[PROCESS_CRASH],
+        THREAD_ROLE_CPU,
+        1
+    );
+    THREADS[2] = install_thread(
+        2,
+        202,
+        PROCESSES[PROCESS_HEALTHY],
+        ocore_m3_service_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(2),
+        DEBUG_CAPS[PROCESS_HEALTHY],
+        THREAD_ROLE_BLOCKING,
+        1
+    );
+    THREADS[3] = install_thread(
+        3,
+        203,
+        PROCESSES[PROCESS_OBSERVER],
+        ocore_m3_observer_entry as usize,
+        0,
+        ocore_process_kernel_stack_top(3),
+        DEBUG_CAPS[PROCESS_OBSERVER],
+        THREAD_ROLE_CPU,
+        1
+    );
+    index = 0;
+    while index < PROCESS_COUNT {
+        if THREADS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    disable_interrupts();
+    if arm_ipc(
+        THREADS[0],
+        THREADS[2],
+        THREADS[3],
+        THREADS[1],
+        PROCESSES[PROCESS_CLIENT],
+        PROCESSES[PROCESS_HEALTHY],
+        PROCESSES[PROCESS_OBSERVER],
+        PROCESSES[PROCESS_CRASH],
+        PHYSICALS[PROCESS_CLIENT],
+        PHYSICALS[PROCESS_HEALTHY],
+        PHYSICALS[PROCESS_OBSERVER],
+        PHYSICALS[PROCESS_CRASH]
+    ) == 0 {
+        fail_closed();
+    }
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}

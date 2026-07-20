@@ -1,0 +1,1574 @@
+module runtime::image_vfs;
+
+use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
+use runtime::domain_namespace::is_live as namespace_is_live;
+use runtime::domain_namespace::is_valid_owner as namespace_is_valid_owner;
+use runtime::domain_namespace::mount_refs as namespace_mount_refs;
+use runtime::domain_namespace::namespace_handle_for_slot;
+use runtime::domain_namespace::release_mount as release_namespace_mount;
+use runtime::domain_namespace::retain_mount as retain_namespace_mount;
+use runtime::domain_namespace::MAX_DOMAIN_NAMESPACES;
+
+pub const MAX_READ_ONLY_IMAGES: usize = 2;
+pub const MAX_IMAGE_OBJECTS: usize = 16;
+pub const MAX_ROOT_MOUNTS: usize = 4;
+pub const IMAGE_BYTE_CAPACITY: usize = 65536;
+pub const VFS_OBJECT_FILE: u64 = 1;
+pub const VFS_FLAG_READ: u64 = 1;
+pub const VFS_FLAG_EXEC: u64 = 2;
+pub const VFS_FLAG_CORPUS: u64 = 4;
+
+pub const OVFS_IMPORT_OK: u64 = 1;
+pub const OVFS_IMPORT_STATE: u64 = 2;
+pub const OVFS_IMPORT_HEADER: u64 = 3;
+pub const OVFS_IMPORT_TABLE: u64 = 4;
+pub const OVFS_IMPORT_PATH: u64 = 5;
+pub const OVFS_IMPORT_EXTENT: u64 = 6;
+pub const OVFS_IMPORT_FLAGS: u64 = 7;
+pub const OVFS_IMPORT_PADDING: u64 = 8;
+pub const OVFS_IMPORT_CAPACITY: u64 = 9;
+
+const IMAGE_EMPTY: u8 = 0;
+const IMAGE_BUILDING: u8 = 1;
+const IMAGE_LIVE: u8 = 2;
+const IMAGE_RETIRED: u8 = 3;
+const IMAGE_HANDLE_TAG: u64 = 0xd300_0000;
+
+const OBJECT_EMPTY: u8 = 0;
+const OBJECT_STAGED: u8 = 1;
+const OBJECT_LIVE: u8 = 2;
+const OBJECT_RETIRED: u8 = 3;
+const OBJECT_HANDLE_TAG: u64 = 0xd400_0000;
+
+const MOUNT_EMPTY: u8 = 0;
+const MOUNT_LIVE: u8 = 1;
+const MOUNT_RETIRED: u8 = 2;
+const MOUNT_HANDLE_TAG: u64 = 0xd500_0000;
+
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut IMAGE_STATES: [u8; 2] = [0; 2];
+static mut IMAGE_GENERATIONS: [u32; 2] = [0; 2];
+static mut IMAGE_IDS: [u64; 2] = [0; 2];
+static mut IMAGE_LENGTHS: [usize; 2] = [0; 2];
+static mut IMAGE_WRITTEN: [usize; 2] = [0; 2];
+static mut IMAGE_REFS: [u32; 2] = [0; 2];
+static mut IMAGE_DIGEST_0: [u64; 2] = [0; 2];
+static mut IMAGE_DIGEST_1: [u64; 2] = [0; 2];
+static mut IMAGE_DIGEST_2: [u64; 2] = [0; 2];
+static mut IMAGE_DIGEST_3: [u64; 2] = [0; 2];
+static mut IMAGE_TABLE_DIGESTS: [u64; 8] = [0; 8];
+static mut IMAGE_DATA_DIGESTS: [u64; 8] = [0; 8];
+static mut IMAGE_IMPORTED: [u8; 2] = [0; 2];
+static mut IMAGE_IMPORT_ERRORS: [u64; 2] = [0; 2];
+static mut IMAGE_BYTES: [u8; 131072] = [0; 131072];
+
+static mut OBJECT_STATES: [u8; 16] = [0; 16];
+static mut OBJECT_GENERATIONS: [u32; 16] = [0; 16];
+static mut OBJECT_IMAGES: [u64; 16] = [0; 16];
+static mut OBJECT_PATH_IDS: [u64; 16] = [0; 16];
+static mut OBJECT_PATH_LENGTHS: [u8; 16] = [0; 16];
+static mut OBJECT_PATH_BYTES: [u8; 1024] = [0; 1024];
+static mut OBJECT_KINDS: [u8; 16] = [0; 16];
+static mut OBJECT_FLAGS: [u8; 16] = [0; 16];
+static mut OBJECT_OFFSETS: [usize; 16] = [0; 16];
+static mut OBJECT_LENGTHS: [usize; 16] = [0; 16];
+static mut OBJECT_REFS: [u32; 16] = [0; 16];
+static mut OBJECT_DIGEST_0: [u64; 16] = [0; 16];
+static mut OBJECT_DIGEST_1: [u64; 16] = [0; 16];
+static mut OBJECT_DIGEST_2: [u64; 16] = [0; 16];
+static mut OBJECT_DIGEST_3: [u64; 16] = [0; 16];
+
+static mut MOUNT_STATES: [u8; 4] = [0; 4];
+static mut MOUNT_GENERATIONS: [u32; 4] = [0; 4];
+static mut MOUNT_NAMESPACES: [u64; 4] = [0; 4];
+static mut MOUNT_IMAGES: [u64; 4] = [0; 4];
+
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+// SHA-256 is kept local to the immutable-image boundary so verification does
+// not depend on an allocator, a hosted runtime, or writable caller buffers.
+// Values are represented as u64 while computing, but every SHA-256 operation
+// is explicitly reduced modulo 2^32.
+const SHA256_WORD_MASK: u64 = 0xffff_ffff;
+static SHA256_ROUND_CONSTANTS: [u64; 64] = [
+    0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5,
+    0x3956_c25b, 0x59f1_11f1, 0x923f_82a4, 0xab1c_5ed5,
+    0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
+    0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174,
+    0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc,
+    0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
+    0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
+    0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967,
+    0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
+    0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85,
+    0xa2bf_e8a1, 0xa81a_664b, 0xc24b_8b70, 0xc76c_51a3,
+    0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
+    0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5,
+    0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
+    0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
+    0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+];
+static SHA256_ABC: [u8; 3] = b"abc";
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn image_byte_index(image_slot: usize, offset: usize) -> usize {
+    return image_slot * IMAGE_BYTE_CAPACITY + offset;
+}
+
+fn digest_index(image_slot: usize, word: usize) -> usize {
+    return image_slot * 4 + word;
+}
+
+fn path_byte_index(object_slot: usize, offset: usize) -> usize {
+    return object_slot * 64 + offset;
+}
+
+unsafe fn make_image_handle(slot: usize) -> u64 {
+    return ((IMAGE_GENERATIONS[slot] as u64) << 32)
+        | IMAGE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn make_object_handle(slot: usize) -> u64 {
+    return ((OBJECT_GENERATIONS[slot] as u64) << 32)
+        | OBJECT_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn make_mount_handle(slot: usize) -> u64 {
+    return ((MOUNT_GENERATIONS[slot] as u64) << 32)
+        | MOUNT_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_image(handle: u64, allow_building: bool) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != IMAGE_HANDLE_TAG {
+        return MAX_READ_ONLY_IMAGES;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_READ_ONLY_IMAGES;
+    }
+    if IMAGE_STATES[slot] == IMAGE_LIVE {
+        return slot;
+    }
+    if allow_building && IMAGE_STATES[slot] == IMAGE_BUILDING {
+        return slot;
+    }
+    return MAX_READ_ONLY_IMAGES;
+}
+
+unsafe fn checked_object(handle: u64, allow_staged: bool) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != OBJECT_HANDLE_TAG {
+        return MAX_IMAGE_OBJECTS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_IMAGE_OBJECTS
+        || OBJECT_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_IMAGE_OBJECTS;
+    }
+    if OBJECT_STATES[slot] == OBJECT_LIVE {
+        return slot;
+    }
+    if allow_staged && OBJECT_STATES[slot] == OBJECT_STAGED {
+        return slot;
+    }
+    return MAX_IMAGE_OBJECTS;
+}
+
+unsafe fn checked_mount(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != MOUNT_HANDLE_TAG {
+        return MAX_ROOT_MOUNTS;
+    }
+    let slot: usize = handle_index(handle);
+    if slot >= MAX_ROOT_MOUNTS
+        || MOUNT_STATES[slot] != MOUNT_LIVE
+        || MOUNT_GENERATIONS[slot] != handle_generation(handle) {
+        return MAX_ROOT_MOUNTS;
+    }
+    return slot;
+}
+
+fn digest_valid(d0: u64, d1: u64, d2: u64, d3: u64) -> bool {
+    return d0 != 0 || d1 != 0 || d2 != 0 || d3 != 0;
+}
+
+fn extents_overlap(
+    first_start: usize,
+    first_length: usize,
+    second_start: usize,
+    second_length: usize
+) -> bool {
+    return first_start < second_start + second_length
+        && second_start < first_start + first_length;
+}
+
+unsafe fn clear_object_metadata(slot: usize) -> void {
+    OBJECT_IMAGES[slot] = 0;
+    OBJECT_PATH_IDS[slot] = 0;
+    OBJECT_PATH_LENGTHS[slot] = 0;
+    OBJECT_KINDS[slot] = 0;
+    OBJECT_FLAGS[slot] = 0;
+    OBJECT_OFFSETS[slot] = 0;
+    OBJECT_LENGTHS[slot] = 0;
+    OBJECT_REFS[slot] = 0;
+    OBJECT_DIGEST_0[slot] = 0;
+    OBJECT_DIGEST_1[slot] = 0;
+    OBJECT_DIGEST_2[slot] = 0;
+    OBJECT_DIGEST_3[slot] = 0;
+    let mut path_offset: usize = 0;
+    while path_offset < 64 {
+        OBJECT_PATH_BYTES[path_byte_index(slot, path_offset)] = 0;
+        path_offset += 1;
+    }
+}
+
+unsafe fn retire_or_reuse_object(slot: usize) -> void {
+    clear_object_metadata(slot);
+    if OBJECT_GENERATIONS[slot] == 0xffff_ffff {
+        OBJECT_STATES[slot] = OBJECT_RETIRED;
+    } else {
+        OBJECT_GENERATIONS[slot] += 1;
+        OBJECT_STATES[slot] = OBJECT_EMPTY;
+    }
+}
+
+unsafe fn clear_image_bytes(slot: usize, length: usize) -> void {
+    let mut offset: usize = 0;
+    while offset < length {
+        IMAGE_BYTES[image_byte_index(slot, offset)] = 0;
+        offset += 1;
+    }
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !namespace_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_READ_ONLY_IMAGES {
+        IMAGE_STATES[slot] = IMAGE_EMPTY;
+        IMAGE_GENERATIONS[slot] = 1;
+        IMAGE_IDS[slot] = 0;
+        IMAGE_LENGTHS[slot] = 0;
+        IMAGE_WRITTEN[slot] = 0;
+        IMAGE_REFS[slot] = 0;
+        IMAGE_DIGEST_0[slot] = 0;
+        IMAGE_DIGEST_1[slot] = 0;
+        IMAGE_DIGEST_2[slot] = 0;
+        IMAGE_DIGEST_3[slot] = 0;
+        let mut word: usize = 0;
+        while word < 4 {
+            IMAGE_TABLE_DIGESTS[digest_index(slot, word)] = 0;
+            IMAGE_DATA_DIGESTS[digest_index(slot, word)] = 0;
+            word += 1;
+        }
+        IMAGE_IMPORTED[slot] = 0;
+        IMAGE_IMPORT_ERRORS[slot] = 0;
+        clear_image_bytes(slot, IMAGE_BYTE_CAPACITY);
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        OBJECT_STATES[slot] = OBJECT_EMPTY;
+        OBJECT_GENERATIONS[slot] = 1;
+        clear_object_metadata(slot);
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_ROOT_MOUNTS {
+        MOUNT_STATES[slot] = MOUNT_EMPTY;
+        MOUNT_GENERATIONS[slot] = 1;
+        MOUNT_NAMESPACES[slot] = 0;
+        MOUNT_IMAGES[slot] = 0;
+        slot += 1;
+    }
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Image injection is the sole mutable boundary. Bytes and object metadata are
+// hidden in IMAGE_BUILDING and become immutable together at publish_image.
+pub unsafe fn begin_image(
+    slot: usize,
+    image_id: u64,
+    length: usize,
+    digest_0: u64,
+    digest_1: u64,
+    digest_2: u64,
+    digest_3: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_STATES[slot] != IMAGE_EMPTY
+        || IMAGE_GENERATIONS[slot] == 0
+        || image_id == 0
+        || length == 0
+        || length > IMAGE_BYTE_CAPACITY
+        || !digest_valid(digest_0, digest_1, digest_2, digest_3)
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut other: usize = 0;
+    while other < MAX_READ_ONLY_IMAGES {
+        if IMAGE_STATES[other] != IMAGE_EMPTY
+            && IMAGE_STATES[other] != IMAGE_RETIRED
+            && IMAGE_IDS[other] == image_id {
+            return 0;
+        }
+        other += 1;
+    }
+    clear_image_bytes(slot, IMAGE_BYTE_CAPACITY);
+    IMAGE_IDS[slot] = image_id;
+    IMAGE_LENGTHS[slot] = length;
+    IMAGE_WRITTEN[slot] = 0;
+    IMAGE_REFS[slot] = 0;
+    IMAGE_DIGEST_0[slot] = digest_0;
+    IMAGE_DIGEST_1[slot] = digest_1;
+    IMAGE_DIGEST_2[slot] = digest_2;
+    IMAGE_DIGEST_3[slot] = digest_3;
+    let mut word: usize = 0;
+    while word < 4 {
+        IMAGE_TABLE_DIGESTS[digest_index(slot, word)] = 0;
+        IMAGE_DATA_DIGESTS[digest_index(slot, word)] = 0;
+        word += 1;
+    }
+    IMAGE_IMPORTED[slot] = 0;
+    IMAGE_IMPORT_ERRORS[slot] = 0;
+    IMAGE_STATES[slot] = IMAGE_BUILDING;
+    return make_image_handle(slot);
+}
+
+pub unsafe fn append_image_bytes(
+    image: u64,
+    source: *const u8,
+    length: usize
+) -> u64 {
+    let slot: usize = checked_image(image, true);
+    if slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_STATES[slot] != IMAGE_BUILDING
+        || (length != 0 && source as usize == 0)
+        || length > IMAGE_LENGTHS[slot] - IMAGE_WRITTEN[slot] {
+        return 0;
+    }
+    let mut offset: usize = 0;
+    while offset < length {
+        let value: u8 = volatile_load(
+            (source as usize + offset) as *const u8
+        );
+        IMAGE_BYTES[image_byte_index(
+            slot,
+            IMAGE_WRITTEN[slot] + offset
+        )] = value;
+        offset += 1;
+    }
+    IMAGE_WRITTEN[slot] += length;
+    return 1;
+}
+
+unsafe fn raw_byte(image_slot: usize, offset: usize) -> u64 {
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || offset >= IMAGE_LENGTHS[image_slot] {
+        return 0x100;
+    }
+    return IMAGE_BYTES[image_byte_index(image_slot, offset)] as u64;
+}
+
+fn sha256_rotate_right(value: u64, bits: usize) -> u64 {
+    return ((value >> bits) | (value << (32 - bits)))
+        & SHA256_WORD_MASK;
+}
+
+unsafe fn sha256_source_byte(
+    image_slot: usize,
+    source: *const u8,
+    source_is_image: bool,
+    offset: usize
+) -> u64 {
+    if source_is_image {
+        return IMAGE_BYTES[image_byte_index(image_slot, offset)] as u64;
+    }
+    return volatile_load(source + offset) as u64;
+}
+
+// Compute a SHA-256 digest into four canonical big-endian u64 chunks. The
+// first output word is the first 16 hexadecimal digest characters, not a
+// native-endian reinterpretation of the digest bytes.
+unsafe fn sha256_compute(
+    image_slot: usize,
+    source: *const u8,
+    source_is_image: bool,
+    length: usize,
+    result: *mut u64
+) -> bool {
+    if result as usize == 0
+        || length > IMAGE_BYTE_CAPACITY
+        || (source_is_image && image_slot >= MAX_READ_ONLY_IMAGES)
+        || (!source_is_image && length != 0 && source as usize == 0) {
+        return false;
+    }
+
+    let mut h0: u64 = 0x6a09_e667;
+    let mut h1: u64 = 0xbb67_ae85;
+    let mut h2: u64 = 0x3c6e_f372;
+    let mut h3: u64 = 0xa54f_f53a;
+    let mut h4: u64 = 0x510e_527f;
+    let mut h5: u64 = 0x9b05_688c;
+    let mut h6: u64 = 0x1f83_d9ab;
+    let mut h7: u64 = 0x5be0_cd19;
+    let block_count: usize = (length + 9 + 63) / 64;
+    let padded_length: usize = block_count * 64;
+    let bit_length: u64 = (length as u64) * 8;
+    let mut block: usize = 0;
+    while block < block_count {
+        let mut schedule: [u64; 64] = [0; 64];
+        let mut word: usize = 0;
+        while word < 16 {
+            let mut value: u64 = 0;
+            let mut byte: usize = 0;
+            while byte < 4 {
+                let position: usize = block * 64 + word * 4 + byte;
+                let mut part: u64 = 0;
+                if position < length {
+                    part = sha256_source_byte(
+                        image_slot,
+                        source,
+                        source_is_image,
+                        position
+                    );
+                } else if position == length {
+                    part = 0x80;
+                } else {
+                    if position >= (padded_length - 8) {
+                        let shift: usize = (padded_length - 1 - position) * 8;
+                        part = (bit_length >> shift) & 0xff;
+                    }
+                }
+                value = (value << 8) | part;
+                byte += 1;
+            }
+            schedule[word] = value;
+            word += 1;
+        }
+        while word < 64 {
+            let prior_fifteen: u64 = schedule[word - 15];
+            let prior_two: u64 = schedule[word - 2];
+            let small_sigma_zero: u64 = sha256_rotate_right(
+                prior_fifteen,
+                7
+            ) ^ sha256_rotate_right(
+                prior_fifteen,
+                18
+            ) ^ (prior_fifteen >> 3);
+            let small_sigma_one: u64 = sha256_rotate_right(
+                prior_two,
+                17
+            ) ^ sha256_rotate_right(
+                prior_two,
+                19
+            ) ^ (prior_two >> 10);
+            schedule[word] = (
+                schedule[word - 16]
+                + small_sigma_zero
+                + schedule[word - 7]
+                + small_sigma_one
+            ) & SHA256_WORD_MASK;
+            word += 1;
+        }
+
+        let mut a: u64 = h0;
+        let mut b: u64 = h1;
+        let mut c: u64 = h2;
+        let mut d: u64 = h3;
+        let mut e: u64 = h4;
+        let mut f: u64 = h5;
+        let mut g: u64 = h6;
+        let mut h: u64 = h7;
+        word = 0;
+        while word < 64 {
+            let big_sigma_one: u64 = sha256_rotate_right(e, 6)
+                ^ sha256_rotate_right(e, 11)
+                ^ sha256_rotate_right(e, 25);
+            let choice: u64 = (e & f)
+                ^ ((e ^ SHA256_WORD_MASK) & g);
+            let temporary_one: u64 = (
+                h
+                + big_sigma_one
+                + choice
+                + SHA256_ROUND_CONSTANTS[word]
+                + schedule[word]
+            ) & SHA256_WORD_MASK;
+            let big_sigma_zero: u64 = sha256_rotate_right(a, 2)
+                ^ sha256_rotate_right(a, 13)
+                ^ sha256_rotate_right(a, 22);
+            let majority: u64 = (a & b) ^ (a & c) ^ (b & c);
+            let temporary_two: u64 = (big_sigma_zero + majority)
+                & SHA256_WORD_MASK;
+            h = g;
+            g = f;
+            f = e;
+            e = (d + temporary_one) & SHA256_WORD_MASK;
+            d = c;
+            c = b;
+            b = a;
+            a = (temporary_one + temporary_two) & SHA256_WORD_MASK;
+            word += 1;
+        }
+        h0 = (h0 + a) & SHA256_WORD_MASK;
+        h1 = (h1 + b) & SHA256_WORD_MASK;
+        h2 = (h2 + c) & SHA256_WORD_MASK;
+        h3 = (h3 + d) & SHA256_WORD_MASK;
+        h4 = (h4 + e) & SHA256_WORD_MASK;
+        h5 = (h5 + f) & SHA256_WORD_MASK;
+        h6 = (h6 + g) & SHA256_WORD_MASK;
+        h7 = (h7 + h) & SHA256_WORD_MASK;
+        block += 1;
+    }
+    volatile_store(result, (h0 << 32) | h1);
+    volatile_store(result + 1, (h2 << 32) | h3);
+    volatile_store(result + 2, (h4 << 32) | h5);
+    volatile_store(result + 3, (h6 << 32) | h7);
+    return true;
+}
+
+// Verify a complete immutable-image byte stream. This is available while an
+// image is BUILDING (both before and after OVFS import) and after it is LIVE.
+// Partial appends, stale handles, poisoned state, and mismatches all fail
+// closed. Each expected u64 is one left-to-right 16-hex-digit SHA-256 chunk.
+pub unsafe fn verify_image_sha256(
+    image: u64,
+    digest_0: u64,
+    digest_1: u64,
+    digest_2: u64,
+    digest_3: u64
+) -> u64 {
+    let image_slot: usize = checked_image(image, true);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || (IMAGE_STATES[image_slot] != IMAGE_BUILDING
+            && IMAGE_STATES[image_slot] != IMAGE_LIVE)
+        || IMAGE_LENGTHS[image_slot] == 0
+        || IMAGE_LENGTHS[image_slot] > IMAGE_BYTE_CAPACITY
+        || IMAGE_WRITTEN[image_slot] != IMAGE_LENGTHS[image_slot] {
+        return 0;
+    }
+    let mut actual: [u64; 4] = [0; 4];
+    if !sha256_compute(
+        image_slot,
+        0 as *const u8,
+        true,
+        IMAGE_WRITTEN[image_slot],
+        (&mut actual[0])
+    ) {
+        return 0;
+    }
+    let mismatch: u64 = (actual[0] ^ digest_0)
+        | (actual[1] ^ digest_1)
+        | (actual[2] ^ digest_2)
+        | (actual[3] ^ digest_3);
+    if mismatch != 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// Freestanding algorithm self-test: NIST's empty-string and "abc" vectors.
+// It intentionally does not depend on VFS initialization or mutable images.
+pub unsafe fn sha256_selftest() -> u64 {
+    let mut digest: [u64; 4] = [0; 4];
+    if !sha256_compute(
+        0,
+        0 as *const u8,
+        false,
+        0,
+        (&mut digest[0])
+    )
+        || digest[0] != 0xe3b0_c442_98fc_1c14
+        || digest[1] != 0x9afb_f4c8_996f_b924
+        || digest[2] != 0x27ae_41e4_649b_934c
+        || digest[3] != 0xa495_991b_7852_b855 {
+        return 0;
+    }
+    if !sha256_compute(
+        0,
+        (&SHA256_ABC[0]) as *const u8,
+        false,
+        3,
+        (&mut digest[0])
+    )
+        || digest[0] != 0xba78_16bf_8f01_cfea
+        || digest[1] != 0x4141_40de_5dae_2223
+        || digest[2] != 0xb003_61a3_9617_7a9c
+        || digest[3] != 0xb410_ff61_f200_15ad {
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn raw_u16(image_slot: usize, offset: usize) -> u64 {
+    return raw_byte(image_slot, offset)
+        | (raw_byte(image_slot, offset + 1) << 8);
+}
+
+unsafe fn raw_u32(image_slot: usize, offset: usize) -> u64 {
+    return raw_u16(image_slot, offset)
+        | (raw_u16(image_slot, offset + 2) << 16);
+}
+
+unsafe fn raw_u64(image_slot: usize, offset: usize) -> u64 {
+    return raw_u32(image_slot, offset)
+        | (raw_u32(image_slot, offset + 4) << 32);
+}
+
+unsafe fn import_failure(image_slot: usize, error: u64) -> u64 {
+    if image_slot < MAX_READ_ONLY_IMAGES {
+        IMAGE_IMPORT_ERRORS[image_slot] = error;
+    }
+    return error;
+}
+
+unsafe fn zero_bytes(
+    image_slot: usize,
+    start: usize,
+    end: usize
+) -> bool {
+    if start > end || end > IMAGE_LENGTHS[image_slot] {
+        return false;
+    }
+    let mut offset: usize = start;
+    while offset < end {
+        if raw_byte(image_slot, offset) != 0 {
+            return false;
+        }
+        offset += 1;
+    }
+    return true;
+}
+
+unsafe fn utf8_width(
+    image_slot: usize,
+    path_offset: usize,
+    remaining: usize
+) -> usize {
+    let first: u64 = raw_byte(image_slot, path_offset);
+    if first >= 0xc2 && first <= 0xdf {
+        if remaining < 2 {
+            return 0;
+        }
+        let second: u64 = raw_byte(image_slot, path_offset + 1);
+        if second >= 0x80 && second <= 0xbf {
+            return 2;
+        }
+        return 0;
+    }
+    if first >= 0xe0 && first <= 0xef {
+        if remaining < 3 {
+            return 0;
+        }
+        let second: u64 = raw_byte(image_slot, path_offset + 1);
+        let third: u64 = raw_byte(image_slot, path_offset + 2);
+        if third < 0x80 || third > 0xbf {
+            return 0;
+        }
+        if first == 0xe0 && second >= 0xa0 && second <= 0xbf {
+            return 3;
+        }
+        if first == 0xed && second >= 0x80 && second <= 0x9f {
+            return 3;
+        }
+        if first != 0xe0
+            && first != 0xed
+            && second >= 0x80
+            && second <= 0xbf {
+            return 3;
+        }
+        return 0;
+    }
+    if first >= 0xf0 && first <= 0xf4 {
+        if remaining < 4 {
+            return 0;
+        }
+        let second: u64 = raw_byte(image_slot, path_offset + 1);
+        let third: u64 = raw_byte(image_slot, path_offset + 2);
+        let fourth: u64 = raw_byte(image_slot, path_offset + 3);
+        if third < 0x80 || third > 0xbf
+            || fourth < 0x80 || fourth > 0xbf {
+            return 0;
+        }
+        if first == 0xf0 && second >= 0x90 && second <= 0xbf {
+            return 4;
+        }
+        if first == 0xf4 && second >= 0x80 && second <= 0x8f {
+            return 4;
+        }
+        if first != 0xf0
+            && first != 0xf4
+            && second >= 0x80
+            && second <= 0xbf {
+            return 4;
+        }
+    }
+    return 0;
+}
+
+unsafe fn valid_utf8_path(
+    image_slot: usize,
+    path_offset: usize,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        let first: u64 = raw_byte(image_slot, path_offset + index);
+        if first < 0x20 || first == 0x7f {
+            return false;
+        }
+        if first <= 0x7f {
+            index += 1;
+        } else {
+            let width: usize = utf8_width(
+                image_slot,
+                path_offset + index,
+                length - index
+            );
+            if width == 0 {
+                return false;
+            }
+            index += width;
+        }
+    }
+    return true;
+}
+
+unsafe fn canonical_path(
+    image_slot: usize,
+    path_offset: usize,
+    length: usize
+) -> bool {
+    if length < 2
+        || length > 63
+        || raw_byte(image_slot, path_offset) != 0x2f
+        || raw_byte(image_slot, path_offset + length - 1) == 0x2f
+        || !valid_utf8_path(image_slot, path_offset, length) {
+        return false;
+    }
+    let mut component_start: usize = 1;
+    let mut index: usize = 1;
+    while index <= length {
+        if index == length || raw_byte(image_slot, path_offset + index) == 0x2f {
+            let component_length: usize = index - component_start;
+            if component_length == 0
+                || (component_length == 1
+                    && raw_byte(image_slot, path_offset + component_start) == 0x2e)
+                || (component_length == 2
+                    && raw_byte(image_slot, path_offset + component_start) == 0x2e
+                    && raw_byte(image_slot, path_offset + component_start + 1) == 0x2e) {
+                return false;
+            }
+            component_start = index + 1;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn path_hash(
+    image_slot: usize,
+    path_offset: usize,
+    length: usize
+) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut index: usize = 0;
+    while index < length {
+        hash = hash ^ raw_byte(image_slot, path_offset + index);
+        hash = hash * 0x0000_0100_0000_01b3;
+        index += 1;
+    }
+    return hash;
+}
+
+unsafe fn path_after(
+    image_slot: usize,
+    current_offset: usize,
+    current_length: usize,
+    prior_offset: usize,
+    prior_length: usize
+) -> bool {
+    let mut index: usize = 0;
+    let mut common: usize = current_length;
+    if prior_length < common {
+        common = prior_length;
+    }
+    while index < common {
+        let current: u64 = raw_byte(image_slot, current_offset + index);
+        let prior: u64 = raw_byte(image_slot, prior_offset + index);
+        if current > prior {
+            return true;
+        }
+        if current < prior {
+            return false;
+        }
+        index += 1;
+    }
+    return current_length > prior_length;
+}
+
+unsafe fn entry_offset(index: usize) -> usize {
+    return 128 + index * 128;
+}
+
+unsafe fn stage_imported_file(
+    image: u64,
+    image_slot: usize,
+    entry: usize
+) -> u64 {
+    let base: usize = entry_offset(entry);
+    let path_length: usize = raw_u16(image_slot, base) as usize;
+    let flags: u64 = raw_u32(image_slot, base + 4);
+    let offset: usize = raw_u64(image_slot, base + 8) as usize;
+    let length: usize = raw_u64(image_slot, base + 16) as usize;
+    let path_id: u64 = path_hash(image_slot, base + 56, path_length);
+    let mut slot: usize = 0;
+    while slot < MAX_IMAGE_OBJECTS && OBJECT_STATES[slot] != OBJECT_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_IMAGE_OBJECTS {
+        return 0;
+    }
+    OBJECT_IMAGES[slot] = image;
+    OBJECT_PATH_IDS[slot] = path_id;
+    OBJECT_PATH_LENGTHS[slot] = path_length as u8;
+    OBJECT_KINDS[slot] = VFS_OBJECT_FILE as u8;
+    OBJECT_FLAGS[slot] = flags as u8;
+    OBJECT_OFFSETS[slot] = offset;
+    OBJECT_LENGTHS[slot] = length;
+    OBJECT_REFS[slot] = 0;
+    OBJECT_DIGEST_0[slot] = raw_u64(image_slot, base + 24);
+    OBJECT_DIGEST_1[slot] = raw_u64(image_slot, base + 32);
+    OBJECT_DIGEST_2[slot] = raw_u64(image_slot, base + 40);
+    OBJECT_DIGEST_3[slot] = raw_u64(image_slot, base + 48);
+    let mut path_index: usize = 0;
+    while path_index < path_length {
+        OBJECT_PATH_BYTES[path_byte_index(slot, path_index)] =
+            raw_byte(image_slot, base + 56 + path_index) as u8;
+        path_index += 1;
+    }
+    OBJECT_STATES[slot] = OBJECT_STAGED;
+    return make_object_handle(slot);
+}
+
+// Parse the frozen OVFSIMG1 container in-place. No object becomes visible
+// until every header, path, extent, flag, and padding check has completed.
+// Per-entry SHA-256 bytes are preserved exactly. Whole-image verification is
+// explicit through verify_image_sha256; parsing does not silently substitute
+// container structure checks for a caller-selected trust-root digest.
+pub unsafe fn import_ovfs_image(image: u64) -> u64 {
+    let image_slot: usize = checked_image(image, true);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_STATES[image_slot] != IMAGE_BUILDING
+        || IMAGE_IMPORTED[image_slot] != 0
+        || IMAGE_WRITTEN[image_slot] != IMAGE_LENGTHS[image_slot] {
+        return OVFS_IMPORT_STATE;
+    }
+    IMAGE_IMPORT_ERRORS[image_slot] = 0;
+    if IMAGE_LENGTHS[image_slot] < 4096
+        || raw_byte(image_slot, 0) != 0x4f
+        || raw_byte(image_slot, 1) != 0x56
+        || raw_byte(image_slot, 2) != 0x46
+        || raw_byte(image_slot, 3) != 0x53
+        || raw_byte(image_slot, 4) != 0x49
+        || raw_byte(image_slot, 5) != 0x4d
+        || raw_byte(image_slot, 6) != 0x47
+        || raw_byte(image_slot, 7) != 0x31
+        || raw_u32(image_slot, 8) != 1
+        || raw_u32(image_slot, 12) != 128
+        || raw_u32(image_slot, 16) != 128
+        || raw_u64(image_slot, 24) != 128
+        || raw_u64(image_slot, 40) != IMAGE_LENGTHS[image_slot] as u64
+        || !zero_bytes(image_slot, 112, 128) {
+        return import_failure(image_slot, OVFS_IMPORT_HEADER);
+    }
+    let file_count: usize = raw_u32(image_slot, 20) as usize;
+    let data_offset_value: u64 = raw_u64(image_slot, 32);
+    if file_count == 0
+        || file_count > MAX_IMAGE_OBJECTS
+        || data_offset_value > IMAGE_BYTE_CAPACITY as u64 {
+        return import_failure(image_slot, OVFS_IMPORT_TABLE);
+    }
+    let data_offset: usize = data_offset_value as usize;
+    let table_end: usize = 128 + file_count * 128;
+    if data_offset < table_end
+        || data_offset > IMAGE_LENGTHS[image_slot]
+        || (data_offset & 0xfff) != 0
+        || !zero_bytes(image_slot, table_end, data_offset) {
+        return import_failure(image_slot, OVFS_IMPORT_PADDING);
+    }
+    let mut free_objects: usize = 0;
+    let mut object_slot: usize = 0;
+    while object_slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[object_slot] == OBJECT_EMPTY {
+            free_objects += 1;
+        }
+        object_slot += 1;
+    }
+    if free_objects < file_count {
+        return import_failure(image_slot, OVFS_IMPORT_CAPACITY);
+    }
+    let table_digest_0: u64 = raw_u64(image_slot, 48);
+    let table_digest_1: u64 = raw_u64(image_slot, 56);
+    let table_digest_2: u64 = raw_u64(image_slot, 64);
+    let table_digest_3: u64 = raw_u64(image_slot, 72);
+    let data_digest_0: u64 = raw_u64(image_slot, 80);
+    let data_digest_1: u64 = raw_u64(image_slot, 88);
+    let data_digest_2: u64 = raw_u64(image_slot, 96);
+    let data_digest_3: u64 = raw_u64(image_slot, 104);
+    if !digest_valid(
+        table_digest_0,
+        table_digest_1,
+        table_digest_2,
+        table_digest_3
+    ) || !digest_valid(
+        data_digest_0,
+        data_digest_1,
+        data_digest_2,
+        data_digest_3
+    ) {
+        return import_failure(image_slot, OVFS_IMPORT_HEADER);
+    }
+
+    let mut entry: usize = 0;
+    while entry < file_count {
+        let base: usize = entry_offset(entry);
+        let path_length: usize = raw_u16(image_slot, base) as usize;
+        let kind: u64 = raw_u16(image_slot, base + 2);
+        let flags: u64 = raw_u32(image_slot, base + 4);
+        let payload_value: u64 = raw_u64(image_slot, base + 8);
+        let size_value: u64 = raw_u64(image_slot, base + 16);
+        if kind != VFS_OBJECT_FILE
+            || path_length == 0
+            || path_length > 63
+            || !canonical_path(image_slot, base + 56, path_length)
+            || !zero_bytes(image_slot, base + 56 + path_length, base + 120)
+            || !zero_bytes(image_slot, base + 120, base + 128) {
+            return import_failure(image_slot, OVFS_IMPORT_PATH);
+        }
+        if (flags & VFS_FLAG_READ) == 0
+            || flags > (VFS_FLAG_READ | VFS_FLAG_EXEC | VFS_FLAG_CORPUS)
+            || ((flags & VFS_FLAG_EXEC) != 0
+                && (flags & VFS_FLAG_CORPUS) != 0) {
+            return import_failure(image_slot, OVFS_IMPORT_FLAGS);
+        }
+        if payload_value > IMAGE_BYTE_CAPACITY as u64
+            || size_value > 0x0010_0000
+            || size_value > IMAGE_BYTE_CAPACITY as u64 {
+            return import_failure(image_slot, OVFS_IMPORT_EXTENT);
+        }
+        let payload: usize = payload_value as usize;
+        let size: usize = size_value as usize;
+        if payload < data_offset
+            || (payload & 0xfff) != 0
+            || payload > IMAGE_LENGTHS[image_slot]
+            || size > IMAGE_LENGTHS[image_slot] - payload
+            || !digest_valid(
+                raw_u64(image_slot, base + 24),
+                raw_u64(image_slot, base + 32),
+                raw_u64(image_slot, base + 40),
+                raw_u64(image_slot, base + 48)
+            ) {
+            return import_failure(image_slot, OVFS_IMPORT_EXTENT);
+        }
+        if entry != 0 {
+            let prior: usize = entry_offset(entry - 1);
+            let prior_length: usize = raw_u16(image_slot, prior) as usize;
+            if !path_after(
+                image_slot,
+                base + 56,
+                path_length,
+                prior + 56,
+                prior_length
+            ) {
+                return import_failure(image_slot, OVFS_IMPORT_PATH);
+            }
+        }
+        let current_hash: u64 = path_hash(image_slot, base + 56, path_length);
+        let mut prior_entry: usize = 0;
+        while prior_entry < entry {
+            let prior: usize = entry_offset(prior_entry);
+            let prior_length: usize = raw_u16(image_slot, prior) as usize;
+            let prior_payload: usize = raw_u64(image_slot, prior + 8) as usize;
+            let prior_size: usize = raw_u64(image_slot, prior + 16) as usize;
+            if current_hash == path_hash(
+                image_slot,
+                prior + 56,
+                prior_length
+            ) {
+                return import_failure(image_slot, OVFS_IMPORT_PATH);
+            }
+            if size != 0
+                && prior_size != 0
+                && extents_overlap(payload, size, prior_payload, prior_size) {
+                return import_failure(image_slot, OVFS_IMPORT_EXTENT);
+            }
+            prior_entry += 1;
+        }
+        entry += 1;
+    }
+
+    let mut data_byte: usize = data_offset;
+    while data_byte < IMAGE_LENGTHS[image_slot] {
+        let mut covered: bool = false;
+        entry = 0;
+        while entry < file_count {
+            let base: usize = entry_offset(entry);
+            let payload: usize = raw_u64(image_slot, base + 8) as usize;
+            let size: usize = raw_u64(image_slot, base + 16) as usize;
+            if size != 0 && data_byte >= payload && data_byte - payload < size {
+                covered = true;
+            }
+            entry += 1;
+        }
+        if !covered && raw_byte(image_slot, data_byte) != 0 {
+            return import_failure(image_slot, OVFS_IMPORT_PADDING);
+        }
+        data_byte += 1;
+    }
+
+    entry = 0;
+    while entry < file_count {
+        if stage_imported_file(image, image_slot, entry) == 0 {
+            POISONED = 1;
+            return OVFS_IMPORT_CAPACITY;
+        }
+        entry += 1;
+    }
+    IMAGE_TABLE_DIGESTS[digest_index(image_slot, 0)] = table_digest_0;
+    IMAGE_TABLE_DIGESTS[digest_index(image_slot, 1)] = table_digest_1;
+    IMAGE_TABLE_DIGESTS[digest_index(image_slot, 2)] = table_digest_2;
+    IMAGE_TABLE_DIGESTS[digest_index(image_slot, 3)] = table_digest_3;
+    IMAGE_DATA_DIGESTS[digest_index(image_slot, 0)] = data_digest_0;
+    IMAGE_DATA_DIGESTS[digest_index(image_slot, 1)] = data_digest_1;
+    IMAGE_DATA_DIGESTS[digest_index(image_slot, 2)] = data_digest_2;
+    IMAGE_DATA_DIGESTS[digest_index(image_slot, 3)] = data_digest_3;
+    IMAGE_IMPORTED[image_slot] = 1;
+    IMAGE_IMPORT_ERRORS[image_slot] = OVFS_IMPORT_OK;
+    return OVFS_IMPORT_OK;
+}
+
+pub unsafe fn publish_image(image: u64) -> u64 {
+    let image_slot: usize = checked_image(image, true);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_STATES[image_slot] != IMAGE_BUILDING
+        || IMAGE_IMPORTED[image_slot] == 0
+        || IMAGE_WRITTEN[image_slot] != IMAGE_LENGTHS[image_slot] {
+        return 0;
+    }
+    let mut objects: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_STAGED
+            && OBJECT_IMAGES[slot] == image {
+            objects += 1;
+        }
+        slot += 1;
+    }
+    if objects == 0 {
+        return 0;
+    }
+    slot = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_STAGED
+            && OBJECT_IMAGES[slot] == image {
+            OBJECT_STATES[slot] = OBJECT_LIVE;
+        }
+        slot += 1;
+    }
+    IMAGE_STATES[image_slot] = IMAGE_LIVE;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn abort_image(image: u64) -> u64 {
+    let image_slot: usize = checked_image(image, true);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_STATES[image_slot] != IMAGE_BUILDING
+        || IMAGE_REFS[image_slot] != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_STAGED
+            && OBJECT_IMAGES[slot] == image {
+            retire_or_reuse_object(slot);
+        }
+        slot += 1;
+    }
+    clear_image_bytes(image_slot, IMAGE_LENGTHS[image_slot]);
+    IMAGE_IDS[image_slot] = 0;
+    IMAGE_LENGTHS[image_slot] = 0;
+    IMAGE_WRITTEN[image_slot] = 0;
+    IMAGE_DIGEST_0[image_slot] = 0;
+    IMAGE_DIGEST_1[image_slot] = 0;
+    IMAGE_DIGEST_2[image_slot] = 0;
+    IMAGE_DIGEST_3[image_slot] = 0;
+    if IMAGE_GENERATIONS[image_slot] == 0xffff_ffff {
+        IMAGE_STATES[image_slot] = IMAGE_RETIRED;
+    } else {
+        IMAGE_GENERATIONS[image_slot] += 1;
+        IMAGE_STATES[image_slot] = IMAGE_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn mount_root(namespace: u64, image: u64) -> u64 {
+    let image_slot: usize = checked_image(image, false);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || !namespace_is_live(namespace)
+        || IMAGE_REFS[image_slot] == 0xffff_ffff
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_ROOT_MOUNTS;
+    while slot < MAX_ROOT_MOUNTS {
+        if MOUNT_STATES[slot] == MOUNT_EMPTY && free_slot == MAX_ROOT_MOUNTS {
+            free_slot = slot;
+        }
+        if MOUNT_STATES[slot] == MOUNT_LIVE
+            && MOUNT_NAMESPACES[slot] == namespace {
+            return 0;
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_ROOT_MOUNTS || retain_namespace_mount(namespace) == 0 {
+        return 0;
+    }
+    IMAGE_REFS[image_slot] += 1;
+    MOUNT_NAMESPACES[free_slot] = namespace;
+    MOUNT_IMAGES[free_slot] = image;
+    MOUNT_STATES[free_slot] = MOUNT_LIVE;
+    return make_mount_handle(free_slot);
+}
+
+pub unsafe fn root_mount_for(namespace: u64) -> u64 {
+    if !namespace_is_valid_owner(namespace) {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_ROOT_MOUNTS {
+        if MOUNT_STATES[slot] == MOUNT_LIVE
+            && MOUNT_NAMESPACES[slot] == namespace {
+            return make_mount_handle(slot);
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn unmount_root(namespace: u64, mount: u64) -> u64 {
+    let mount_slot: usize = checked_mount(mount);
+    if mount_slot >= MAX_ROOT_MOUNTS
+        || !namespace_is_valid_owner(namespace)
+        || MOUNT_NAMESPACES[mount_slot] != namespace {
+        return 0;
+    }
+    let image_slot: usize = checked_image(MOUNT_IMAGES[mount_slot], false);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_REFS[image_slot] == 0
+        || namespace_mount_refs(namespace) == 0 {
+        return 0;
+    }
+    if release_namespace_mount(namespace) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    IMAGE_REFS[image_slot] -= 1;
+    MOUNT_NAMESPACES[mount_slot] = 0;
+    MOUNT_IMAGES[mount_slot] = 0;
+    if MOUNT_GENERATIONS[mount_slot] == 0xffff_ffff {
+        MOUNT_STATES[mount_slot] = MOUNT_RETIRED;
+    } else {
+        MOUNT_GENERATIONS[mount_slot] += 1;
+        MOUNT_STATES[mount_slot] = MOUNT_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn lookup(namespace: u64, path_id: u64) -> u64 {
+    if !namespace_is_live(namespace) || path_id == 0 {
+        return 0;
+    }
+    let mount: u64 = root_mount_for(namespace);
+    let mount_slot: usize = checked_mount(mount);
+    if mount_slot >= MAX_ROOT_MOUNTS {
+        return 0;
+    }
+    let image: u64 = MOUNT_IMAGES[mount_slot];
+    let mut slot: usize = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_LIVE
+            && OBJECT_IMAGES[slot] == image
+            && OBJECT_PATH_IDS[slot] == path_id {
+            return make_object_handle(slot);
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+unsafe fn namespace_names_object(namespace: u64, object_slot: usize) -> bool {
+    if object_slot >= MAX_IMAGE_OBJECTS || !namespace_is_live(namespace) {
+        return false;
+    }
+    let mount: u64 = root_mount_for(namespace);
+    let mount_slot: usize = checked_mount(mount);
+    return mount_slot < MAX_ROOT_MOUNTS
+        && MOUNT_IMAGES[mount_slot] == OBJECT_IMAGES[object_slot];
+}
+
+pub unsafe fn retain_object(namespace: u64, object: u64) -> u64 {
+    let object_slot: usize = checked_object(object, false);
+    if object_slot >= MAX_IMAGE_OBJECTS
+        || !namespace_names_object(namespace, object_slot)
+        || OBJECT_REFS[object_slot] == 0xffff_ffff {
+        return 0;
+    }
+    let image_slot: usize = checked_image(OBJECT_IMAGES[object_slot], false);
+    if image_slot >= MAX_READ_ONLY_IMAGES
+        || IMAGE_REFS[image_slot] == 0xffff_ffff {
+        return 0;
+    }
+    OBJECT_REFS[object_slot] += 1;
+    IMAGE_REFS[image_slot] += 1;
+    return 1;
+}
+
+pub unsafe fn release_object(object: u64) -> u64 {
+    let object_slot: usize = checked_object(object, false);
+    if object_slot >= MAX_IMAGE_OBJECTS || OBJECT_REFS[object_slot] == 0 {
+        return 0;
+    }
+    let image_slot: usize = checked_image(OBJECT_IMAGES[object_slot], false);
+    if image_slot >= MAX_READ_ONLY_IMAGES || IMAGE_REFS[image_slot] == 0 {
+        return 0;
+    }
+    OBJECT_REFS[object_slot] -= 1;
+    IMAGE_REFS[image_slot] -= 1;
+    return 1;
+}
+
+pub unsafe fn object_length(object: u64) -> usize {
+    let slot: usize = checked_object(object, false);
+    if slot >= MAX_IMAGE_OBJECTS {
+        return 0;
+    }
+    return OBJECT_LENGTHS[slot];
+}
+
+pub unsafe fn object_path_id(object: u64) -> u64 {
+    let slot: usize = checked_object(object, false);
+    if slot >= MAX_IMAGE_OBJECTS {
+        return 0;
+    }
+    return OBJECT_PATH_IDS[slot];
+}
+
+pub unsafe fn read_retained_byte(
+    object: u64,
+    offset: usize,
+    result: *mut u8
+) -> u64 {
+    if result as usize == 0 {
+        return 0;
+    }
+    volatile_store(result, 0);
+    let object_slot: usize = checked_object(object, false);
+    if object_slot >= MAX_IMAGE_OBJECTS
+        || OBJECT_REFS[object_slot] == 0
+        || offset >= OBJECT_LENGTHS[object_slot] {
+        return 0;
+    }
+    let image_slot: usize = checked_image(OBJECT_IMAGES[object_slot], false);
+    if image_slot >= MAX_READ_ONLY_IMAGES {
+        return 0;
+    }
+    volatile_store(
+        result,
+        IMAGE_BYTES[image_byte_index(
+            image_slot,
+            OBJECT_OFFSETS[object_slot] + offset
+        )]
+    );
+    return 1;
+}
+
+pub unsafe fn image_id_for(image: u64) -> u64 {
+    let slot: usize = checked_image(image, false);
+    if slot >= MAX_READ_ONLY_IMAGES {
+        return 0;
+    }
+    return IMAGE_IDS[slot];
+}
+
+pub unsafe fn object_digest(
+    object: u64,
+    digest_0: *mut u64,
+    digest_1: *mut u64,
+    digest_2: *mut u64,
+    digest_3: *mut u64
+) -> u64 {
+    if digest_0 as usize == 0
+        || digest_1 as usize == 0
+        || digest_2 as usize == 0
+        || digest_3 as usize == 0 {
+        return 0;
+    }
+    volatile_store(digest_0, 0);
+    volatile_store(digest_1, 0);
+    volatile_store(digest_2, 0);
+    volatile_store(digest_3, 0);
+    let slot: usize = checked_object(object, false);
+    if slot >= MAX_IMAGE_OBJECTS {
+        return 0;
+    }
+    volatile_store(digest_0, OBJECT_DIGEST_0[slot]);
+    volatile_store(digest_1, OBJECT_DIGEST_1[slot]);
+    volatile_store(digest_2, OBJECT_DIGEST_2[slot]);
+    volatile_store(digest_3, OBJECT_DIGEST_3[slot]);
+    return 1;
+}
+
+pub unsafe fn destroy_image(image: u64) -> u64 {
+    let image_slot: usize = checked_image(image, false);
+    if image_slot >= MAX_READ_ONLY_IMAGES || IMAGE_REFS[image_slot] != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_LIVE
+            && OBJECT_IMAGES[slot] == image
+            && OBJECT_REFS[slot] != 0 {
+            return 0;
+        }
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_IMAGE_OBJECTS {
+        if OBJECT_STATES[slot] == OBJECT_LIVE
+            && OBJECT_IMAGES[slot] == image {
+            retire_or_reuse_object(slot);
+        }
+        slot += 1;
+    }
+    clear_image_bytes(image_slot, IMAGE_LENGTHS[image_slot]);
+    IMAGE_IDS[image_slot] = 0;
+    IMAGE_LENGTHS[image_slot] = 0;
+    IMAGE_WRITTEN[image_slot] = 0;
+    IMAGE_REFS[image_slot] = 0;
+    IMAGE_DIGEST_0[image_slot] = 0;
+    IMAGE_DIGEST_1[image_slot] = 0;
+    IMAGE_DIGEST_2[image_slot] = 0;
+    IMAGE_DIGEST_3[image_slot] = 0;
+    if IMAGE_GENERATIONS[image_slot] == 0xffff_ffff {
+        IMAGE_STATES[image_slot] = IMAGE_RETIRED;
+    } else {
+        IMAGE_GENERATIONS[image_slot] += 1;
+        IMAGE_STATES[image_slot] = IMAGE_EMPTY;
+    }
+    return 1;
+}
+
+pub unsafe fn can_teardown_namespace(namespace: u64) -> bool {
+    if !namespace_is_valid_owner(namespace) {
+        return false;
+    }
+    let mut mounts: u32 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_ROOT_MOUNTS {
+        if MOUNT_STATES[slot] == MOUNT_LIVE
+            && MOUNT_NAMESPACES[slot] == namespace {
+            mounts += 1;
+        }
+        slot += 1;
+    }
+    return mounts == namespace_mount_refs(namespace) && mounts <= 1;
+}
+
+pub unsafe fn teardown_namespace(namespace: u64) -> u64 {
+    if !namespace_is_valid_owner(namespace)
+        || !can_teardown_namespace(namespace) {
+        return 0;
+    }
+    let mount: u64 = root_mount_for(namespace);
+    if mount != 0 && unmount_root(namespace, mount) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !namespace_invariants_hold() {
+        return false;
+    }
+    let mut image_slot: usize = 0;
+    while image_slot < MAX_READ_ONLY_IMAGES {
+        let state: u8 = IMAGE_STATES[image_slot];
+        if IMAGE_GENERATIONS[image_slot] == 0 {
+            return false;
+        }
+        if state == IMAGE_EMPTY || state == IMAGE_RETIRED {
+            if (state == IMAGE_RETIRED
+                    && IMAGE_GENERATIONS[image_slot] != 0xffff_ffff)
+                || IMAGE_IDS[image_slot] != 0
+                || IMAGE_LENGTHS[image_slot] != 0
+                || IMAGE_WRITTEN[image_slot] != 0
+                || IMAGE_REFS[image_slot] != 0
+                || IMAGE_DIGEST_0[image_slot] != 0
+                || IMAGE_DIGEST_1[image_slot] != 0
+                || IMAGE_DIGEST_2[image_slot] != 0
+                || IMAGE_DIGEST_3[image_slot] != 0 {
+                return false;
+            }
+        } else if state == IMAGE_BUILDING || state == IMAGE_LIVE {
+            if IMAGE_IDS[image_slot] == 0
+                || IMAGE_LENGTHS[image_slot] == 0
+                || IMAGE_LENGTHS[image_slot] > IMAGE_BYTE_CAPACITY
+                || IMAGE_WRITTEN[image_slot] > IMAGE_LENGTHS[image_slot]
+                || !digest_valid(
+                    IMAGE_DIGEST_0[image_slot],
+                    IMAGE_DIGEST_1[image_slot],
+                    IMAGE_DIGEST_2[image_slot],
+                    IMAGE_DIGEST_3[image_slot]
+                ) {
+                return false;
+            }
+            if state == IMAGE_LIVE
+                && IMAGE_WRITTEN[image_slot] != IMAGE_LENGTHS[image_slot] {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        image_slot += 1;
+    }
+
+    let mut computed_image_refs: [u32; 2] = [0; 2];
+    let mut object_slot: usize = 0;
+    while object_slot < MAX_IMAGE_OBJECTS {
+        let state: u8 = OBJECT_STATES[object_slot];
+        if OBJECT_GENERATIONS[object_slot] == 0 {
+            return false;
+        }
+        if state == OBJECT_EMPTY || state == OBJECT_RETIRED {
+            if (state == OBJECT_RETIRED
+                    && OBJECT_GENERATIONS[object_slot] != 0xffff_ffff)
+                || OBJECT_IMAGES[object_slot] != 0
+                || OBJECT_PATH_IDS[object_slot] != 0
+                || OBJECT_KINDS[object_slot] != 0
+                || OBJECT_OFFSETS[object_slot] != 0
+                || OBJECT_LENGTHS[object_slot] != 0
+                || OBJECT_REFS[object_slot] != 0 {
+                return false;
+            }
+        } else if state == OBJECT_STAGED || state == OBJECT_LIVE {
+            let image: u64 = OBJECT_IMAGES[object_slot];
+            let owner: usize = checked_image(image, true);
+            if owner >= MAX_READ_ONLY_IMAGES
+                || OBJECT_PATH_IDS[object_slot] == 0
+                || OBJECT_KINDS[object_slot] as u64 != VFS_OBJECT_FILE
+                || OBJECT_LENGTHS[object_slot] == 0
+                || OBJECT_OFFSETS[object_slot] > IMAGE_LENGTHS[owner]
+                || OBJECT_LENGTHS[object_slot]
+                    > IMAGE_LENGTHS[owner] - OBJECT_OFFSETS[object_slot]
+                || !digest_valid(
+                    OBJECT_DIGEST_0[object_slot],
+                    OBJECT_DIGEST_1[object_slot],
+                    OBJECT_DIGEST_2[object_slot],
+                    OBJECT_DIGEST_3[object_slot]
+                ) {
+                return false;
+            }
+            if (state == OBJECT_STAGED && IMAGE_STATES[owner] != IMAGE_BUILDING)
+                || (state == OBJECT_LIVE && IMAGE_STATES[owner] != IMAGE_LIVE)
+                || (state == OBJECT_STAGED && OBJECT_REFS[object_slot] != 0) {
+                return false;
+            }
+            computed_image_refs[owner] += OBJECT_REFS[object_slot];
+        } else {
+            return false;
+        }
+        object_slot += 1;
+    }
+
+    let mut namespace_counts: [u32; 4] = [0; 4];
+    let mut mount_slot: usize = 0;
+    while mount_slot < MAX_ROOT_MOUNTS {
+        let state: u8 = MOUNT_STATES[mount_slot];
+        if MOUNT_GENERATIONS[mount_slot] == 0 {
+            return false;
+        }
+        if state == MOUNT_EMPTY || state == MOUNT_RETIRED {
+            if (state == MOUNT_RETIRED
+                    && MOUNT_GENERATIONS[mount_slot] != 0xffff_ffff)
+                || MOUNT_NAMESPACES[mount_slot] != 0
+                || MOUNT_IMAGES[mount_slot] != 0 {
+                return false;
+            }
+        } else if state == MOUNT_LIVE {
+            let namespace: u64 = MOUNT_NAMESPACES[mount_slot];
+            let image: usize = checked_image(MOUNT_IMAGES[mount_slot], false);
+            let namespace_slot: usize = handle_index(namespace);
+            if !namespace_is_valid_owner(namespace)
+                || namespace_slot >= MAX_DOMAIN_NAMESPACES
+                || image >= MAX_READ_ONLY_IMAGES {
+                return false;
+            }
+            namespace_counts[namespace_slot] += 1;
+            computed_image_refs[image] += 1;
+        } else {
+            return false;
+        }
+        mount_slot += 1;
+    }
+    image_slot = 0;
+    while image_slot < MAX_READ_ONLY_IMAGES {
+        if computed_image_refs[image_slot] != IMAGE_REFS[image_slot] {
+            return false;
+        }
+        image_slot += 1;
+    }
+    let mut namespace_slot: usize = 0;
+    while namespace_slot < MAX_DOMAIN_NAMESPACES {
+        let namespace: u64 = namespace_handle_for_slot(namespace_slot);
+        if namespace != 0
+            && namespace_counts[namespace_slot] != namespace_mount_refs(namespace) {
+            return false;
+        }
+        namespace_slot += 1;
+    }
+    return true;
+}

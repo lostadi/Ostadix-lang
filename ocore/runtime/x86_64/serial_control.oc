@@ -1,0 +1,362 @@
+module runtime::serial_control;
+
+// This parser consumes one already-delimited serial command. The serial line
+// collector owns CR/LF handling; accepting terminators here would make the
+// signed command bytes ambiguous.
+pub const MAX_COMMAND_BYTES: usize = 192;
+
+pub const COMMAND_NONE: u64 = 0;
+pub const COMMAND_STATUS: u64 = 1;
+pub const COMMAND_INSTALL: u64 = 2;
+pub const COMMAND_ACTIVATE: u64 = 3;
+pub const COMMAND_RESOLVE: u64 = 4;
+pub const COMMAND_UPGRADE: u64 = 5;
+
+static STATUS_TEXT: [u8; 6] = b"status";
+static INSTALL_TEXT: [u8; 8] = b"install ";
+static ACTIVATE_TEXT: [u8; 9] = b"activate ";
+static RESOLVE_TEXT: [u8; 8] = b"resolve ";
+static UPGRADE_TEXT: [u8; 8] = b"upgrade ";
+
+static mut LAST_KIND: u64 = 0;
+static mut LAST_DIGEST: [u64; 4] = [0; 4];
+static mut LAST_ARGUMENT_ZERO: u64 = 0;
+static mut LAST_ARGUMENT_ONE: u64 = 0;
+static mut ACCEPTED: u64 = 0;
+static mut REJECTED: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+unsafe fn clear_result() -> void {
+    LAST_KIND = COMMAND_NONE;
+    let mut word: usize = 0;
+    while word < 4 {
+        LAST_DIGEST[word] = 0;
+        word += 1;
+    }
+    LAST_ARGUMENT_ZERO = 0;
+    LAST_ARGUMENT_ONE = 0;
+}
+
+unsafe fn bytes_match(
+    input: *const u8,
+    input_length: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    if input as usize == 0
+        || expected as usize == 0
+        || input_length < expected_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < expected_length {
+        if volatile_load(input + index) != volatile_load(expected + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+fn hex_value(byte: u8) -> u64 {
+    if byte >= b'0' && byte <= b'9' {
+        return (byte - b'0') as u64;
+    }
+    if byte >= b'a' && byte <= b'f' {
+        return (byte - b'a') as u64 + 10;
+    }
+    return 16;
+}
+
+unsafe fn parse_hex_word(
+    input: *const u8,
+    offset: usize,
+    result: *mut u64
+) -> bool {
+    if input as usize == 0 || result as usize == 0 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 16 {
+        let digit: u64 = hex_value(volatile_load(input + offset + index));
+        if digit >= 16 {
+            return false;
+        }
+        value = (value << 4) | digit;
+        index += 1;
+    }
+    volatile_store(result, value);
+    return true;
+}
+
+unsafe fn parse_digest(
+    input: *const u8,
+    offset: usize,
+    result: *mut u64
+) -> bool {
+    if input as usize == 0 || result as usize == 0 {
+        return false;
+    }
+    let mut word: usize = 0;
+    let mut any_nonzero: bool = false;
+    while word < 4 {
+        let mut value: u64 = 0;
+        if !parse_hex_word(input, offset + word * 16, (&mut value)) {
+            return false;
+        }
+        volatile_store(result + word, value);
+        if value != 0 {
+            any_nonzero = true;
+        }
+        word += 1;
+    }
+    return any_nonzero;
+}
+
+unsafe fn parse_decimal(
+    input: *const u8,
+    start: usize,
+    end: usize,
+    result: *mut u64
+) -> bool {
+    if input as usize == 0 || result as usize == 0 || start >= end {
+        return false;
+    }
+    if volatile_load(input + start) == b'0' && end - start != 1 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    let mut index: usize = start;
+    while index < end {
+        let byte: u8 = volatile_load(input + index);
+        if byte < b'0' || byte > b'9' {
+            return false;
+        }
+        let digit: u64 = (byte - b'0') as u64;
+        if value > (0xffff_ffff_ffff_ffff - digit) / 10 {
+            return false;
+        }
+        value = value * 10 + digit;
+        index += 1;
+    }
+    volatile_store(result, value);
+    return true;
+}
+
+unsafe fn reject() -> u64 {
+    clear_result();
+    if REJECTED == 0xffff_ffff_ffff_ffff {
+        POISONED = 1;
+    } else {
+        REJECTED += 1;
+    }
+    return 0;
+}
+
+unsafe fn accept(
+    kind: u64,
+    digest: *const u64,
+    argument_zero: u64,
+    argument_one: u64
+) -> u64 {
+    if ACCEPTED == 0xffff_ffff_ffff_ffff {
+        POISONED = 1;
+        return 0;
+    }
+    clear_result();
+    LAST_KIND = kind;
+    if digest as usize != 0 {
+        let mut word: usize = 0;
+        while word < 4 {
+            LAST_DIGEST[word] = volatile_load(digest + word);
+            word += 1;
+        }
+    }
+    LAST_ARGUMENT_ZERO = argument_zero;
+    LAST_ARGUMENT_ONE = argument_one;
+    ACCEPTED += 1;
+    return kind;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if LAST_KIND == COMMAND_NONE || LAST_KIND == COMMAND_STATUS {
+        if LAST_ARGUMENT_ZERO != 0 || LAST_ARGUMENT_ONE != 0 {
+            return false;
+        }
+        let mut word: usize = 0;
+        while word < 4 {
+            if LAST_DIGEST[word] != 0 {
+                return false;
+            }
+            word += 1;
+        }
+        return true;
+    }
+    if LAST_KIND == COMMAND_RESOLVE {
+        if LAST_ARGUMENT_ZERO == 0 || LAST_ARGUMENT_ONE == 0 {
+            return false;
+        }
+        let mut word: usize = 0;
+        while word < 4 {
+            if LAST_DIGEST[word] != 0 {
+                return false;
+            }
+            word += 1;
+        }
+        return true;
+    }
+    if LAST_KIND != COMMAND_INSTALL
+        && LAST_KIND != COMMAND_ACTIVATE
+        && LAST_KIND != COMMAND_UPGRADE {
+        return false;
+    }
+    if LAST_KIND == COMMAND_INSTALL
+        && (LAST_ARGUMENT_ZERO == 0 || LAST_ARGUMENT_ONE == 0) {
+        return false;
+    }
+    if (LAST_KIND == COMMAND_ACTIVATE || LAST_KIND == COMMAND_UPGRADE)
+        && (LAST_ARGUMENT_ZERO != 0 || LAST_ARGUMENT_ONE != 0) {
+        return false;
+    }
+    return LAST_DIGEST[0] != 0
+        || LAST_DIGEST[1] != 0
+        || LAST_DIGEST[2] != 0
+        || LAST_DIGEST[3] != 0;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    clear_result();
+    ACCEPTED = 0;
+    REJECTED = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn parse(input: *const u8, input_length: usize) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || input as usize == 0
+        || input_length == 0
+        || input_length > MAX_COMMAND_BYTES
+        || !invariants_hold() {
+        if INITIALIZED != 0 && POISONED == 0 {
+            return reject();
+        }
+        return 0;
+    }
+
+    if input_length == 6
+        && bytes_match(input, input_length, (&STATUS_TEXT[0]), 6) {
+        return accept(COMMAND_STATUS, 0 as *const u64, 0, 0);
+    }
+
+    let mut digest: [u64; 4] = [0; 4];
+    if input_length == 73
+        && bytes_match(input, input_length, (&ACTIVATE_TEXT[0]), 9)
+        && parse_digest(input, 9, (&mut digest[0])) {
+        return accept(COMMAND_ACTIVATE, (&digest[0]), 0, 0);
+    }
+    if input_length == 72
+        && bytes_match(input, input_length, (&UPGRADE_TEXT[0]), 8)
+        && parse_digest(input, 8, (&mut digest[0])) {
+        return accept(COMMAND_UPGRADE, (&digest[0]), 0, 0);
+    }
+    if input_length >= 12
+        && bytes_match(input, input_length, (&RESOLVE_TEXT[0]), 8) {
+        let mut separator: usize = 8;
+        while separator < input_length
+            && volatile_load(input + separator) != b' ' {
+            separator += 1;
+        }
+        let mut service: u64 = 0;
+        let mut protocol: u64 = 0;
+        if separator < input_length
+            && parse_decimal(input, 8, separator, (&mut service))
+            && parse_decimal(
+                input,
+                separator + 1,
+                input_length,
+                (&mut protocol)
+            )
+            && service != 0
+            && protocol != 0 {
+            return accept(
+                COMMAND_RESOLVE,
+                0 as *const u64,
+                service,
+                protocol
+            );
+        }
+        return reject();
+    }
+    if input_length >= 76
+        && bytes_match(input, input_length, (&INSTALL_TEXT[0]), 8)
+        && parse_digest(input, 8, (&mut digest[0]))
+        && volatile_load(input + 72) == b' ' {
+        let mut separator: usize = 73;
+        while separator < input_length
+            && volatile_load(input + separator) != b' ' {
+            separator += 1;
+        }
+        let mut package: u64 = 0;
+        let mut version: u64 = 0;
+        if separator < input_length
+            && parse_decimal(input, 73, separator, (&mut package))
+            && parse_decimal(
+                input,
+                separator + 1,
+                input_length,
+                (&mut version)
+            )
+            && package != 0
+            && version != 0 {
+            return accept(
+                COMMAND_INSTALL,
+                (&digest[0]),
+                package,
+                version
+            );
+        }
+    }
+    return reject();
+}
+
+pub unsafe fn last_command_kind() -> u64 {
+    return LAST_KIND;
+}
+
+pub unsafe fn last_digest_word(word: usize) -> u64 {
+    if word >= 4 {
+        return 0;
+    }
+    return LAST_DIGEST[word];
+}
+
+pub unsafe fn last_argument_zero() -> u64 {
+    return LAST_ARGUMENT_ZERO;
+}
+
+pub unsafe fn last_argument_one() -> u64 {
+    return LAST_ARGUMENT_ONE;
+}
+
+pub unsafe fn accepted_count() -> u64 {
+    return ACCEPTED;
+}
+
+pub unsafe fn rejected_count() -> u64 {
+    return REJECTED;
+}

@@ -10,11 +10,18 @@ workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
 Run these commands from the repository root before creating an archival tag.
 They are the release gate copied from CI plus the local release-claim guard:
 
+The native artifact and QEMU gates require Clang, LLD, `llvm-objdump`, `nm`
+(provided by binutils in CI), and `qemu-system-x86_64`. CI installs each
+dependency explicitly; local runs must make them discoverable on `PATH` (or use
+the documented linker override).
+
 ```bash
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets --all-features --verbose
+bash scripts/check_declared_bins.sh
 cargo test --all-targets --all-features --verbose
+bash scripts/smoke-hosted-live-reference.sh
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
@@ -23,6 +30,15 @@ cargo check --manifest-path fuzz/Cargo.toml
 ./ocore/kernel/smoke-processes-qemu.sh
 ./ocore/kernel/smoke-scheduler-qemu.sh
 ./ocore/kernel/smoke-ipc-foundation-qemu.sh
+./ocore/kernel/smoke-ipc-qemu.sh
+./ocore/kernel/build-m4-artifacts.sh
+./ocore/kernel/smoke-loader-qemu.sh
+./ocore/kernel/check-m5-control.sh
+./ocore/kernel/build-m5-artifacts.sh
+./ocore/kernel/smoke-live-qemu.sh
+./ocore/kernel/smoke-live-semantics-qemu.sh
+./ocore/kernel/build-m6-artifacts.sh
+./ocore/kernel/smoke-personality-qemu.sh
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 python3 -m compileall -q o_lang backends tests

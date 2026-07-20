@@ -3,6 +3,11 @@ module kernel::main;
 use kernel::m1::start as start_m1;
 use kernel::m2::start as start_m2;
 use kernel::m3::start as start_m3;
+use kernel::m3_live::start as start_m3_live;
+use kernel::m4::start as start_m4;
+use kernel::m5::start as start_m5;
+use kernel::m5_semantics::start as start_m5_semantics;
+use kernel::m6::start as start_m6;
 use runtime::capability::init as capabilities_init;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
@@ -35,6 +40,7 @@ use runtime::mapping::init as mappings_init;
 use runtime::mapping::invariants_hold as mapping_invariants_hold;
 use runtime::endpoint::init as endpoints_init;
 use runtime::cap_transfer::init as cap_transfers_init;
+use runtime::ipc_wait::init as ipc_waits_init;
 use runtime::process::init as processes_init;
 use runtime::process::install as install_process;
 use runtime::process::activate_bootstrap;
@@ -166,7 +172,9 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
     if endpoints_init() == 0
         || endpoints_init() != 0
         || cap_transfers_init() == 0
-        || cap_transfers_init() != 0 {
+        || cap_transfers_init() != 0
+        || ipc_waits_init() == 0
+        || ipc_waits_init() != 0 {
         fail_closed();
     }
     if probe_mode == 0 {
@@ -251,6 +259,45 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         interrupts_init();
         ocore_syscall_init();
         start_m3(probe_mode, domain_handle);
+    }
+    if probe_mode == 14 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m3_live(probe_mode, domain_handle);
+    }
+    if probe_mode == 15 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m4(probe_mode, domain_handle);
+    }
+    if probe_mode == 16 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m5(probe_mode, domain_handle);
+    }
+    if probe_mode == 17 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_m5_semantics(probe_mode);
+    }
+    if probe_mode == 18 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m6(probe_mode, domain_handle);
     }
 
     let kernel_stack_top: usize = ocore_kernel_stack_top();

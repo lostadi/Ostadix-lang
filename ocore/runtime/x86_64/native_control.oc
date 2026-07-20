@@ -1,0 +1,941 @@
+module runtime::native_control;
+
+use runtime::capability::RIGHT_CONTROL;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::live_supervisor::abort_activation;
+use runtime::live_supervisor::active_package_count;
+use runtime::live_supervisor::active_root as supervisor_active_root;
+use runtime::live_supervisor::commit_activation;
+use runtime::live_supervisor::deactivate_package;
+use runtime::live_supervisor::grant_request;
+use runtime::live_supervisor::init as supervisor_init;
+use runtime::live_supervisor::invariants_hold as supervisor_invariants_hold;
+use runtime::live_supervisor::mark_service_healthy;
+use runtime::live_supervisor::resolve;
+use runtime::live_supervisor::service_is_current;
+use runtime::live_supervisor::service_name_id;
+use runtime::live_supervisor::service_package_id;
+use runtime::live_supervisor::service_package_root;
+use runtime::live_supervisor::service_package_version;
+use runtime::live_supervisor::service_protocol_id;
+use runtime::live_supervisor::stage_activation;
+use runtime::live_supervisor::start_service;
+use runtime::package_root::PACKAGE_SCHEMA_V1;
+use runtime::package_root::REQUEST_CONTROL;
+use runtime::package_root::REQUEST_DEBUG;
+use runtime::package_root::RUNTIME_NATIVE;
+use runtime::package_root::abort_install;
+use runtime::package_root::begin_install;
+use runtime::package_root::define_request;
+use runtime::package_root::define_service;
+use runtime::package_root::digest_word;
+use runtime::package_root::find_digest;
+use runtime::package_root::init as package_root_init;
+use runtime::package_root::invariants_hold as package_invariants_hold;
+use runtime::package_root::is_live as root_is_live;
+use runtime::package_root::package_id as root_package_id;
+use runtime::package_root::protocol_id_at;
+use runtime::package_root::publish_install;
+use runtime::package_root::request_count;
+use runtime::package_root::request_kind_at;
+use runtime::package_root::request_purpose_at;
+use runtime::package_root::request_rights_at;
+use runtime::package_root::service_count;
+use runtime::package_root::service_id_at;
+use runtime::package_root::version as root_version;
+use runtime::serial_control::COMMAND_ACTIVATE;
+use runtime::serial_control::COMMAND_INSTALL;
+use runtime::serial_control::COMMAND_RESOLVE;
+use runtime::serial_control::COMMAND_STATUS;
+use runtime::serial_control::init as serial_control_init;
+use runtime::serial_control::invariants_hold as serial_invariants_hold;
+use runtime::serial_control::last_argument_one;
+use runtime::serial_control::last_argument_zero;
+use runtime::serial_control::last_digest_word;
+use runtime::serial_control::parse;
+
+pub const CONTROL_EMPTY: u64 = 0;
+pub const CONTROL_INSTALLED: u64 = 1;
+pub const CONTROL_ACTIVE: u64 = 2;
+pub const CONTROL_DEACTIVATED: u64 = 3;
+pub const CONTROL_RECOVERING: u64 = 4;
+
+pub const TRUSTED_PACKAGE_ID: u64 = 5;
+pub const TRUSTED_PACKAGE_VERSION: u64 = 1;
+pub const TRUSTED_ABI_VERSION: u64 = 1;
+
+pub const SERVICE_INIT: u64 = 1;
+pub const SERVICE_SUPERVISOR: u64 = 2;
+pub const SERVICE_PKGD: u64 = 3;
+pub const SERVICE_REPL: u64 = 4;
+pub const SERVICE_PROTOCOL_V1: u64 = 1;
+pub const TRUSTED_SERVICE_COUNT: usize = 4;
+pub const TRUSTED_REQUEST_COUNT: usize = 5;
+
+static SERVICE_IDS: [u64; 4] = [
+    SERVICE_INIT,
+    SERVICE_SUPERVISOR,
+    SERVICE_PKGD,
+    SERVICE_REPL,
+];
+
+static mut TRUSTED_DIGEST: [u64; 4] = [0; 4];
+static mut INSTALLED_ROOT: u64 = 0;
+static mut ACTIVE_SERVICES: [u64; 4] = [0; 4];
+static mut LAST_RESOLVED: u64 = 0;
+static mut CONTROL_STATE: u8 = 0;
+static mut LAST_RESULT: u64 = 0;
+static mut RUNTIME_HEALTH_PROCESSES: [u64; 4] = [0; 4];
+static mut RUNTIME_HEALTH_PHYSICALS: [usize; 4] = [0; 4];
+static mut RUNTIME_HEALTH_EXPECTED: [u64; 4] = [0; 4];
+static mut RUNTIME_HEALTH_REGISTERED: u8 = 0;
+static mut RUNTIME_HEALTH_PASSES: u64 = 0;
+static mut RECOVERING_ORDINAL: usize = 4;
+static mut RECOVERING_OLD_SERVICE: u64 = 0;
+
+static mut SUBMISSIONS: u64 = 0;
+static mut SUCCESSES: u64 = 0;
+static mut FAILURES: u64 = 0;
+static mut INSTALLS: u64 = 0;
+static mut ACTIVATIONS: u64 = 0;
+static mut STATUS_QUERIES: u64 = 0;
+static mut RESOLUTIONS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+extern "sysv64" fn kernel_m5_runtime_process_healthy(process: u64) -> u64;
+extern "sysv64" fn kernel_m5_runtime_process_generation_live(
+    process: u64
+) -> u64;
+
+unsafe fn bump(counter: *mut u64) -> bool {
+    if counter as usize == 0 {
+        POISONED = 1;
+        return false;
+    }
+    let value: u64 = volatile_load(counter as *const u64);
+    if value == 0xffff_ffff_ffff_ffff {
+        POISONED = 1;
+        return false;
+    }
+    volatile_store(counter, value + 1);
+    return true;
+}
+
+unsafe fn clear_active_services() -> void {
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        ACTIVE_SERVICES[ordinal] = 0;
+        ordinal += 1;
+    }
+}
+
+unsafe fn digest_is_trusted(
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64
+) -> bool {
+    return digest_zero == TRUSTED_DIGEST[0]
+        && digest_one == TRUSTED_DIGEST[1]
+        && digest_two == TRUSTED_DIGEST[2]
+        && digest_three == TRUSTED_DIGEST[3];
+}
+
+unsafe fn parser_digest_is_trusted() -> bool {
+    return digest_is_trusted(
+        last_digest_word(0),
+        last_digest_word(1),
+        last_digest_word(2),
+        last_digest_word(3)
+    );
+}
+
+unsafe fn root_manifest_is_trusted(root: u64) -> bool {
+    if !root_is_live(root)
+        || root_package_id(root) != TRUSTED_PACKAGE_ID
+        || root_version(root) != TRUSTED_PACKAGE_VERSION
+        || service_count(root) != TRUSTED_SERVICE_COUNT
+        || request_count(root) != TRUSTED_REQUEST_COUNT {
+        return false;
+    }
+    let mut word: usize = 0;
+    while word < 4 {
+        if digest_word(root, word) != TRUSTED_DIGEST[word] {
+            return false;
+        }
+        word += 1;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if service_id_at(root, ordinal) != SERVICE_IDS[ordinal]
+            || protocol_id_at(root, ordinal) != SERVICE_PROTOCOL_V1
+            || request_kind_at(root, ordinal) != REQUEST_DEBUG
+            || request_purpose_at(root, ordinal) != SERVICE_IDS[ordinal]
+            || request_rights_at(root, ordinal) != RIGHT_DEBUG_WRITE {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return request_kind_at(root, 4) == REQUEST_CONTROL
+        && request_purpose_at(root, 4) == SERVICE_REPL
+        && request_rights_at(root, 4) == RIGHT_CONTROL;
+}
+
+unsafe fn active_services_are_trusted() -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        let service: u64 = ACTIVE_SERVICES[ordinal];
+        if service == 0
+            || !service_is_current(service)
+            || service_name_id(service) != SERVICE_IDS[ordinal]
+            || service_protocol_id(service) != SERVICE_PROTOCOL_V1
+            || service_package_id(service) != TRUSTED_PACKAGE_ID
+            || service_package_version(service) != TRUSTED_PACKAGE_VERSION
+            || service_package_root(service) != INSTALLED_ROOT {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn recovering_services_are_trusted() -> bool {
+    if RECOVERING_ORDINAL >= TRUSTED_SERVICE_COUNT
+        || RECOVERING_OLD_SERVICE == 0 {
+        return false;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        let service: u64 = ACTIVE_SERVICES[ordinal];
+        if ordinal == RECOVERING_ORDINAL {
+            if service != 0 {
+                return false;
+            }
+        } else if service == 0
+            || !service_is_current(service)
+            || service_name_id(service) != SERVICE_IDS[ordinal]
+            || service_protocol_id(service) != SERVICE_PROTOCOL_V1
+            || service_package_id(service) != TRUSTED_PACKAGE_ID
+            || service_package_version(service) != TRUSTED_PACKAGE_VERSION
+            || service_package_root(service) != INSTALLED_ROOT {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn last_resolution_is_trusted() -> bool {
+    if LAST_RESOLVED == 0 {
+        return true;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if ACTIVE_SERVICES[ordinal] == LAST_RESOLVED {
+            return service_is_current(LAST_RESOLVED);
+        }
+        ordinal += 1;
+    }
+    return false;
+}
+
+unsafe fn runtime_health_registration_holds() -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if RUNTIME_HEALTH_REGISTERED == 0 {
+            if RUNTIME_HEALTH_PROCESSES[ordinal] != 0
+                || RUNTIME_HEALTH_PHYSICALS[ordinal] != 0
+                || RUNTIME_HEALTH_EXPECTED[ordinal] != 0 {
+                return false;
+            }
+        } else if RUNTIME_HEALTH_PROCESSES[ordinal] == 0
+            || RUNTIME_HEALTH_PHYSICALS[ordinal] == 0
+            || RUNTIME_HEALTH_EXPECTED[ordinal] == 0 {
+            return false;
+        }
+        let mut prior: usize = 0;
+        while RUNTIME_HEALTH_REGISTERED != 0 && prior < ordinal {
+            if RUNTIME_HEALTH_PROCESSES[prior]
+                    == RUNTIME_HEALTH_PROCESSES[ordinal]
+                || RUNTIME_HEALTH_PHYSICALS[prior]
+                    == RUNTIME_HEALTH_PHYSICALS[ordinal]
+                || RUNTIME_HEALTH_EXPECTED[prior]
+                    == RUNTIME_HEALTH_EXPECTED[ordinal] {
+                return false;
+            }
+            prior += 1;
+        }
+        ordinal += 1;
+    }
+    return RUNTIME_HEALTH_REGISTERED <= 1;
+}
+
+// This is a live observation, deliberately separate from invariants_hold(): a
+// service may crash after activation while its registered identity remains an
+// auditable record of the generation that passed the health gate.
+pub unsafe fn runtime_health_holds() -> bool {
+    if RUNTIME_HEALTH_REGISTERED == 0
+        || !runtime_health_registration_holds() {
+        return false;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if kernel_m5_runtime_process_healthy(
+            RUNTIME_HEALTH_PROCESSES[ordinal]
+        ) == 0
+            || volatile_load(
+                RUNTIME_HEALTH_PHYSICALS[ordinal] as *const u64
+            ) != RUNTIME_HEALTH_EXPECTED[ordinal] {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !package_invariants_hold()
+        || !supervisor_invariants_hold()
+        || !serial_invariants_hold()
+        || !runtime_health_registration_holds()
+        || (TRUSTED_DIGEST[0] == 0
+            && TRUSTED_DIGEST[1] == 0
+            && TRUSTED_DIGEST[2] == 0
+            && TRUSTED_DIGEST[3] == 0)
+        || INSTALLS > 1
+        || ACTIVATIONS > 1
+        || RUNTIME_HEALTH_PASSES > 1
+        || (RUNTIME_HEALTH_REGISTERED == 0
+            && RUNTIME_HEALTH_PASSES != 0)
+        || (RUNTIME_HEALTH_REGISTERED != 0
+            && ACTIVATIONS == 0
+            && RUNTIME_HEALTH_PASSES != 0)
+        || (RUNTIME_HEALTH_REGISTERED != 0
+            && ACTIVATIONS == 1
+            && RUNTIME_HEALTH_PASSES != 1)
+        || SUBMISSIONS != SUCCESSES + FAILURES
+        || SUCCESSES
+            != INSTALLS + ACTIVATIONS + STATUS_QUERIES + RESOLUTIONS {
+        return false;
+    }
+    if LAST_RESULT != 0
+        && LAST_RESULT != COMMAND_STATUS
+        && LAST_RESULT != COMMAND_INSTALL
+        && LAST_RESULT != COMMAND_ACTIVATE
+        && LAST_RESULT != COMMAND_RESOLVE {
+        return false;
+    }
+    if CONTROL_STATE == CONTROL_EMPTY as u8 {
+        if INSTALLED_ROOT != 0
+            || INSTALLS != 0
+            || ACTIVATIONS != 0
+            || active_package_count() != 0
+            || LAST_RESOLVED != 0
+            || RECOVERING_ORDINAL != TRUSTED_SERVICE_COUNT
+            || RECOVERING_OLD_SERVICE != 0 {
+            return false;
+        }
+        let mut ordinal: usize = 0;
+        while ordinal < TRUSTED_SERVICE_COUNT {
+            if ACTIVE_SERVICES[ordinal] != 0 {
+                return false;
+            }
+            ordinal += 1;
+        }
+        return true;
+    }
+    if CONTROL_STATE != CONTROL_INSTALLED as u8
+        && CONTROL_STATE != CONTROL_ACTIVE as u8
+        && CONTROL_STATE != CONTROL_DEACTIVATED as u8
+        && CONTROL_STATE != CONTROL_RECOVERING as u8 {
+        return false;
+    }
+    if INSTALLS != 1 || !root_manifest_is_trusted(INSTALLED_ROOT) {
+        return false;
+    }
+    if CONTROL_STATE == CONTROL_INSTALLED as u8 {
+        if ACTIVATIONS != 0
+            || active_package_count() != 0
+            || LAST_RESOLVED != 0
+            || RECOVERING_ORDINAL != TRUSTED_SERVICE_COUNT
+            || RECOVERING_OLD_SERVICE != 0 {
+            return false;
+        }
+        let mut ordinal: usize = 0;
+        while ordinal < TRUSTED_SERVICE_COUNT {
+            if ACTIVE_SERVICES[ordinal] != 0 {
+                return false;
+            }
+            ordinal += 1;
+        }
+        return true;
+    }
+    if CONTROL_STATE == CONTROL_DEACTIVATED as u8 {
+        if ACTIVATIONS != 1
+            || active_package_count() != 0
+            || supervisor_active_root(TRUSTED_PACKAGE_ID) != 0
+            || LAST_RESOLVED != 0
+            || RECOVERING_ORDINAL != TRUSTED_SERVICE_COUNT
+            || RECOVERING_OLD_SERVICE != 0 {
+            return false;
+        }
+        let mut ordinal: usize = 0;
+        while ordinal < TRUSTED_SERVICE_COUNT {
+            if ACTIVE_SERVICES[ordinal] != 0 {
+                return false;
+            }
+            ordinal += 1;
+        }
+        return true;
+    }
+    if CONTROL_STATE == CONTROL_RECOVERING as u8 {
+        return ACTIVATIONS == 1
+            && active_package_count() == 1
+            && supervisor_active_root(TRUSTED_PACKAGE_ID) == INSTALLED_ROOT
+            && LAST_RESOLVED == 0
+            && recovering_services_are_trusted();
+    }
+    return ACTIVATIONS == 1
+        && active_package_count() == 1
+        && supervisor_active_root(TRUSTED_PACKAGE_ID) == INSTALLED_ROOT
+        && RECOVERING_ORDINAL == TRUSTED_SERVICE_COUNT
+        && RECOVERING_OLD_SERVICE == 0
+        && active_services_are_trusted()
+        && last_resolution_is_trusted();
+}
+
+pub unsafe fn init(
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64
+) -> u64 {
+    if INITIALIZED != 0
+        || (digest_zero == 0
+            && digest_one == 0
+            && digest_two == 0
+            && digest_three == 0) {
+        return 0;
+    }
+    if package_root_init() != 1
+        || supervisor_init() != 1
+        || serial_control_init() != 1 {
+        return 0;
+    }
+    TRUSTED_DIGEST[0] = digest_zero;
+    TRUSTED_DIGEST[1] = digest_one;
+    TRUSTED_DIGEST[2] = digest_two;
+    TRUSTED_DIGEST[3] = digest_three;
+    INSTALLED_ROOT = 0;
+    clear_active_services();
+    LAST_RESOLVED = 0;
+    CONTROL_STATE = CONTROL_EMPTY as u8;
+    LAST_RESULT = 0;
+    let mut health_ordinal: usize = 0;
+    while health_ordinal < TRUSTED_SERVICE_COUNT {
+        RUNTIME_HEALTH_PROCESSES[health_ordinal] = 0;
+        RUNTIME_HEALTH_PHYSICALS[health_ordinal] = 0;
+        RUNTIME_HEALTH_EXPECTED[health_ordinal] = 0;
+        health_ordinal += 1;
+    }
+    RUNTIME_HEALTH_REGISTERED = 0;
+    RUNTIME_HEALTH_PASSES = 0;
+    RECOVERING_ORDINAL = TRUSTED_SERVICE_COUNT;
+    RECOVERING_OLD_SERVICE = 0;
+    SUBMISSIONS = 0;
+    SUCCESSES = 0;
+    FAILURES = 0;
+    INSTALLS = 0;
+    ACTIVATIONS = 0;
+    STATUS_QUERIES = 0;
+    RESOLUTIONS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Kernel management registers the exact four process generations and private
+// isolation cells before any service TCB is armed. Registration is one-shot;
+// the activation syscall later consumes their concrete published health.
+pub unsafe fn register_runtime_health(
+    processes: *const u64,
+    physicals: *const usize,
+    expected: *const u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || RUNTIME_HEALTH_REGISTERED != 0
+        || CONTROL_STATE != CONTROL_EMPTY as u8
+        || processes as usize == 0
+        || physicals as usize == 0
+        || expected as usize == 0
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        let process: u64 = volatile_load(processes + ordinal);
+        let physical: usize = volatile_load(physicals + ordinal);
+        let completion: u64 = volatile_load(expected + ordinal);
+        if process == 0
+            || physical == 0
+            || completion == 0
+            || kernel_m5_runtime_process_healthy(process) == 0
+            || volatile_load(physical as *const u64) != 0
+            || volatile_load((physical + 8) as *const u64) != 0 {
+            return 0;
+        }
+        let mut prior: usize = 0;
+        while prior < ordinal {
+            if volatile_load(processes + prior) == process
+                || volatile_load(physicals + prior) == physical
+                || volatile_load(expected + prior) == completion {
+                return 0;
+            }
+            prior += 1;
+        }
+        ordinal += 1;
+    }
+    // Commit only after the complete set has passed. A rejected ordinal can
+    // therefore never leave registration-shaped residue behind.
+    ordinal = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        RUNTIME_HEALTH_PROCESSES[ordinal] = volatile_load(
+            processes + ordinal
+        );
+        RUNTIME_HEALTH_PHYSICALS[ordinal] = volatile_load(
+            physicals + ordinal
+        );
+        RUNTIME_HEALTH_EXPECTED[ordinal] = volatile_load(
+            expected + ordinal
+        );
+        ordinal += 1;
+    }
+    RUNTIME_HEALTH_REGISTERED = 1;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn reject() -> u64 {
+    LAST_RESULT = 0;
+    if !bump((&mut FAILURES)) {
+        return 0;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+    }
+    return 0;
+}
+
+unsafe fn succeed(kind: u64) -> u64 {
+    if !bump((&mut SUCCESSES)) {
+        return 0;
+    }
+    if kind == COMMAND_INSTALL {
+        if !bump((&mut INSTALLS)) {
+            return 0;
+        }
+    }
+    if kind == COMMAND_ACTIVATE {
+        if !bump((&mut ACTIVATIONS)) {
+            return 0;
+        }
+    }
+    if kind == COMMAND_STATUS {
+        if !bump((&mut STATUS_QUERIES)) {
+            return 0;
+        }
+    }
+    if kind == COMMAND_RESOLVE {
+        if !bump((&mut RESOLUTIONS)) {
+            return 0;
+        }
+    }
+    if kind != COMMAND_INSTALL
+        && kind != COMMAND_ACTIVATE
+        && kind != COMMAND_STATUS
+        && kind != COMMAND_RESOLVE {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_RESULT = kind;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return kind;
+}
+
+unsafe fn submit_install() -> u64 {
+    if CONTROL_STATE != CONTROL_EMPTY as u8
+        || !parser_digest_is_trusted()
+        || last_argument_zero() != TRUSTED_PACKAGE_ID
+        || last_argument_one() != TRUSTED_PACKAGE_VERSION {
+        return reject();
+    }
+    let root: u64 = begin_install(
+        TRUSTED_DIGEST[0],
+        TRUSTED_DIGEST[1],
+        TRUSTED_DIGEST[2],
+        TRUSTED_DIGEST[3],
+        PACKAGE_SCHEMA_V1,
+        TRUSTED_PACKAGE_ID,
+        TRUSTED_PACKAGE_VERSION,
+        RUNTIME_NATIVE,
+        TRUSTED_ABI_VERSION,
+        TRUSTED_SERVICE_COUNT,
+        TRUSTED_REQUEST_COUNT
+    );
+    if root == 0 {
+        return reject();
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if define_service(
+            root,
+            ordinal,
+            SERVICE_IDS[ordinal],
+            SERVICE_PROTOCOL_V1
+        ) != 1
+            || define_request(
+                root,
+                ordinal,
+                REQUEST_DEBUG,
+                SERVICE_IDS[ordinal],
+                RIGHT_DEBUG_WRITE
+            ) != 1 {
+            if abort_install(root) != 1 {
+                POISONED = 1;
+                return 0;
+            }
+            return reject();
+        }
+        ordinal += 1;
+    }
+    if define_request(
+        root,
+        4,
+        REQUEST_CONTROL,
+        SERVICE_REPL,
+        RIGHT_CONTROL
+    ) != 1
+        || publish_install(root) != root
+        || !root_manifest_is_trusted(root) {
+        if root_is_live(root) || abort_install(root) != 1 {
+            POISONED = 1;
+            return 0;
+        }
+        return reject();
+    }
+    INSTALLED_ROOT = root;
+    CONTROL_STATE = CONTROL_INSTALLED as u8;
+    return succeed(COMMAND_INSTALL);
+}
+
+unsafe fn abort_activation_and_reject(activation: u64) -> u64 {
+    if abort_activation(activation) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    return reject();
+}
+
+unsafe fn submit_activate() -> u64 {
+    if CONTROL_STATE != CONTROL_INSTALLED as u8
+        || !parser_digest_is_trusted()
+        || find_digest(
+            TRUSTED_DIGEST[0],
+            TRUSTED_DIGEST[1],
+            TRUSTED_DIGEST[2],
+            TRUSTED_DIGEST[3]
+        ) != INSTALLED_ROOT
+        || !root_manifest_is_trusted(INSTALLED_ROOT)
+        || (RUNTIME_HEALTH_REGISTERED != 0 && !runtime_health_holds()) {
+        return reject();
+    }
+    let activation: u64 = stage_activation(INSTALLED_ROOT);
+    if activation == 0 {
+        return reject();
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < TRUSTED_REQUEST_COUNT {
+        let rights: u64 = request_rights_at(INSTALLED_ROOT, ordinal);
+        if rights == 0 || grant_request(activation, ordinal, rights) != 1 {
+            return abort_activation_and_reject(activation);
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if start_service(activation, ordinal) != 1 {
+            return abort_activation_and_reject(activation);
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        if mark_service_healthy(activation, ordinal, true) != 1 {
+            return abort_activation_and_reject(activation);
+        }
+        ordinal += 1;
+    }
+    if commit_activation(activation) != 1 {
+        return abort_activation_and_reject(activation);
+    }
+    if RUNTIME_HEALTH_REGISTERED != 0 {
+        RUNTIME_HEALTH_PASSES += 1;
+    }
+    ordinal = 0;
+    while ordinal < TRUSTED_SERVICE_COUNT {
+        ACTIVE_SERVICES[ordinal] = resolve(
+            SERVICE_IDS[ordinal],
+            SERVICE_PROTOCOL_V1
+        );
+        if ACTIVE_SERVICES[ordinal] == 0 {
+            POISONED = 1;
+            return 0;
+        }
+        ordinal += 1;
+    }
+    CONTROL_STATE = CONTROL_ACTIVE as u8;
+    let result: u64 = succeed(COMMAND_ACTIVATE);
+    if result != COMMAND_ACTIVATE {
+        return 0;
+    }
+    // pkgd remains parked after commit. The scheduler releases its private
+    // fault flag only after the REPL has returned from this syscall, reported
+    // activation success, and published its post-commit completion word.
+    return result;
+}
+
+// Withdraw the exact crashed service handle before any replacement begins.
+// service_is_current() is expected to reject it because the supervisor has
+// already advanced the service generation; that rejection is itself counted.
+pub unsafe fn record_service_crash(
+    ordinal: usize,
+    old_service: u64
+) -> u64 {
+    if CONTROL_STATE != CONTROL_ACTIVE as u8
+        || ordinal >= TRUSTED_SERVICE_COUNT
+        || RECOVERING_ORDINAL != TRUSTED_SERVICE_COUNT
+        || RECOVERING_OLD_SERVICE != 0
+        || ACTIVE_SERVICES[ordinal] != old_service
+        || old_service == 0
+        || service_is_current(old_service) {
+        return 0;
+    }
+    ACTIVE_SERVICES[ordinal] = 0;
+    RECOVERING_ORDINAL = ordinal;
+    RECOVERING_OLD_SERVICE = old_service;
+    LAST_RESOLVED = 0;
+    CONTROL_STATE = CONTROL_RECOVERING as u8;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+// Publish a replacement only after its concrete process generation has
+// produced the registered private completion token. The process may already
+// be scheduler-quiesced, but its PCB identity must still be structurally live.
+pub unsafe fn record_service_restart(
+    ordinal: usize,
+    old_service: u64,
+    replacement: u64,
+    process: u64,
+    physical: usize,
+    expected: u64
+) -> u64 {
+    if CONTROL_STATE != CONTROL_RECOVERING as u8
+        || ordinal >= TRUSTED_SERVICE_COUNT
+        || RECOVERING_ORDINAL != ordinal
+        || RECOVERING_OLD_SERVICE != old_service
+        || ACTIVE_SERVICES[ordinal] != 0
+        || old_service == 0
+        || replacement == 0
+        || process == 0
+        || physical == 0
+        || expected == 0
+        || kernel_m5_runtime_process_generation_live(process) == 0
+        || volatile_load(physical as *const u64) != expected
+        || volatile_load((physical + 8) as *const u64) != 1
+        || !service_is_current(replacement)
+        || service_name_id(replacement) != SERVICE_IDS[ordinal]
+        || service_protocol_id(replacement) != SERVICE_PROTOCOL_V1
+        || service_package_id(replacement) != TRUSTED_PACKAGE_ID
+        || service_package_version(replacement) != TRUSTED_PACKAGE_VERSION
+        || service_package_root(replacement) != INSTALLED_ROOT {
+        return 0;
+    }
+    ACTIVE_SERVICES[ordinal] = replacement;
+    RUNTIME_HEALTH_PROCESSES[ordinal] = process;
+    RUNTIME_HEALTH_PHYSICALS[ordinal] = physical;
+    RUNTIME_HEALTH_EXPECTED[ordinal] = expected;
+    RECOVERING_ORDINAL = TRUSTED_SERVICE_COUNT;
+    RECOVERING_OLD_SERVICE = 0;
+    CONTROL_STATE = CONTROL_ACTIVE as u8;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn deactivate() -> u64 {
+    if CONTROL_STATE != CONTROL_ACTIVE as u8
+        || deactivate_package(TRUSTED_PACKAGE_ID) != 1 {
+        return 0;
+    }
+    clear_active_services();
+    LAST_RESOLVED = 0;
+    CONTROL_STATE = CONTROL_DEACTIVATED as u8;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn submit_resolve() -> u64 {
+    if CONTROL_STATE != CONTROL_ACTIVE as u8 {
+        return reject();
+    }
+    let service: u64 = resolve(
+        last_argument_zero(),
+        last_argument_one()
+    );
+    if service == 0 || !service_is_current(service) {
+        return reject();
+    }
+    LAST_RESOLVED = service;
+    return succeed(COMMAND_RESOLVE);
+}
+
+pub unsafe fn submit(input: *const u8, input_length: usize) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    if !bump((&mut SUBMISSIONS)) {
+        return 0;
+    }
+    let command: u64 = parse(input, input_length);
+    if command == 0 {
+        return reject();
+    }
+    if command == COMMAND_INSTALL {
+        return submit_install();
+    }
+    if command == COMMAND_ACTIVATE {
+        return submit_activate();
+    }
+    if command == COMMAND_STATUS {
+        return succeed(COMMAND_STATUS);
+    }
+    if command == COMMAND_RESOLVE {
+        return submit_resolve();
+    }
+    return reject();
+}
+
+pub unsafe fn state() -> u64 {
+    return CONTROL_STATE as u64;
+}
+
+pub unsafe fn runtime_health_pass_count() -> u64 {
+    return RUNTIME_HEALTH_PASSES;
+}
+
+pub unsafe fn trusted_digest_word(word: usize) -> u64 {
+    if word >= 4 {
+        return 0;
+    }
+    return TRUSTED_DIGEST[word];
+}
+
+pub unsafe fn installed_root() -> u64 {
+    return INSTALLED_ROOT;
+}
+
+pub unsafe fn activated() -> u64 {
+    if CONTROL_STATE == CONTROL_ACTIVE as u8
+        || CONTROL_STATE == CONTROL_RECOVERING as u8 {
+        return 1;
+    }
+    return 0;
+}
+
+pub unsafe fn active_service_handle(ordinal: usize) -> u64 {
+    if CONTROL_STATE != CONTROL_ACTIVE as u8
+        || ordinal >= TRUSTED_SERVICE_COUNT {
+        return 0;
+    }
+    return ACTIVE_SERVICES[ordinal];
+}
+
+pub unsafe fn active_service_count() -> usize {
+    if CONTROL_STATE == CONTROL_ACTIVE as u8 {
+        return TRUSTED_SERVICE_COUNT;
+    }
+    if CONTROL_STATE == CONTROL_RECOVERING as u8 {
+        return TRUSTED_SERVICE_COUNT - 1;
+    }
+    return 0;
+}
+
+pub unsafe fn last_resolved_service() -> u64 {
+    return LAST_RESOLVED;
+}
+
+pub unsafe fn last_result() -> u64 {
+    return LAST_RESULT;
+}
+
+pub unsafe fn submission_count() -> u64 {
+    return SUBMISSIONS;
+}
+
+pub unsafe fn success_count() -> u64 {
+    return SUCCESSES;
+}
+
+pub unsafe fn failure_count() -> u64 {
+    return FAILURES;
+}
+
+pub unsafe fn install_count() -> u64 {
+    return INSTALLS;
+}
+
+pub unsafe fn activation_count() -> u64 {
+    return ACTIVATIONS;
+}
+
+pub unsafe fn status_count() -> u64 {
+    return STATUS_QUERIES;
+}
+
+pub unsafe fn resolve_count() -> u64 {
+    return RESOLUTIONS;
+}
+
+pub unsafe fn is_poisoned() -> u64 {
+    if POISONED != 0 {
+        return 1;
+    }
+    return 0;
+}

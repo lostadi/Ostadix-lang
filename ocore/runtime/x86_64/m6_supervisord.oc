@@ -1,0 +1,306 @@
+module runtime::m6_supervisord;
+
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_ENDPOINT_SEND: u64 = 9;
+const SYS_ENDPOINT_RECEIVE: u64 = 10;
+const SYS_PERSONALITY_SUPERVISE: u64 = 16;
+
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_ENDPOINT_CLOSED: u64 = 0xffff_ffff_ffff_ffe9;
+const ERR_PERSONALITY_BUSY: u64 = 0xffff_ffff_ffff_ffd6;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const SUPERVISE_CAP_OFFSET: usize = 8;
+const GENERATION_OFFSET: usize = 16;
+const PUBLISHED_GENERATION_OFFSET: usize = 24;
+const INBOX_SEND_CAP_OFFSET: usize = 32;
+const HEALTH_REPLY_CAP_OFFSET: usize = 40;
+const SERVICE_PROCESS_OFFSET: usize = 48;
+const MESSAGE_OFFSET: usize = 128;
+const MESSAGE_SIZE: u64 = 32;
+
+const SUPERVISE_PUBLISH: u64 = 1;
+const SUPERVISE_MONITOR: u64 = 2;
+const SUPERVISE_RESTART: u64 = 3;
+const SUPERVISE_CANCEL: u64 = 4;
+const SUPERVISE_STOP: u64 = 5;
+const MONITOR_CLIENT_G2_COMPLETE: u64 = 0xff;
+
+const OP_HOLD_CANCEL: u64 = 3;
+const OP_HEALTH: u64 = 0x80;
+const OP_HEALTH_WATCH: u64 = 0x81;
+const OP_STOP: u64 = 0x82;
+const HEALTH_CORRELATION_G1: u64 = 0x4d36_0000_0000_0101;
+const WATCH_CORRELATION_G1: u64 = 0x4d36_0000_0000_0102;
+const HEALTH_CORRELATION_G2: u64 = 0x4d36_0000_0000_0201;
+const STOP_CORRELATION_G2: u64 = 0x4d36_0000_0000_0202;
+const HEALTH_OK: u64 = 0x4d36_4148_4541_4c00;
+const STOP_READY: u64 = 0x4d36_4153_544f_5000;
+
+@link_section(".rodata")
+static ONLINE: [u8; 38] = b"M6A supervisor RPC daemon ELF: online\n";
+@link_section(".rodata")
+static PUBLISHED_G1: [u8; 34] = b"M6A supervisor published g1: PASS\n";
+@link_section(".rodata")
+static HEALTH_G1: [u8; 35] = b"M6A supervisor health RPC g1: PASS\n";
+@link_section(".rodata")
+static CANCEL_DECISION: [u8; 45] =
+    b"M6A supervisor cancellation decision: issued\n";
+@link_section(".rodata")
+static CLOSED: [u8; 42] =
+    b"M6A supervisor endpoint-close event: PASS\n";
+@link_section(".rodata")
+static RESTART_DECISION: [u8; 47] =
+    b"M6A supervisor restart decision g1->g2: issued\n";
+@link_section(".rodata")
+static HEALTH_G2: [u8; 35] = b"M6A supervisor health RPC g2: PASS\n";
+@link_section(".rodata")
+static PUBLISHED_G2: [u8; 34] = b"M6A supervisor published g2: PASS\n";
+@link_section(".rodata")
+static STOP_DECISION: [u8; 40] =
+    b"M6A supervisor stop decision g2: issued\n";
+@link_section(".rodata")
+static POLICY_PASS: [u8; 33] = b"M6A supervisor policy loop: PASS\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+unsafe fn supervise(
+    capability: u64,
+    action: u64,
+    generation: u64,
+    subject: u64
+) -> u64 {
+    return syscall4(
+        SYS_PERSONALITY_SUPERVISE,
+        capability,
+        action,
+        generation,
+        subject
+    );
+}
+
+unsafe fn send(
+    capability: u64,
+    correlation: u64,
+    operation: u64
+) -> void {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            capability,
+            correlation,
+            operation << 56,
+            0
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+    }
+}
+
+unsafe fn receive(capability: u64) -> u64 {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            capability,
+            (CONFIG_VA + MESSAGE_OFFSET) as u64,
+            MESSAGE_SIZE
+        );
+        if result != ERR_IPC_RETRY {
+            return result;
+        }
+    }
+}
+
+unsafe fn word(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + MESSAGE_OFFSET + offset) as *const u64);
+}
+
+unsafe fn health(
+    inbox: u64,
+    reply: u64,
+    expected_process: u64,
+    generation: u64,
+    correlation: u64
+) -> bool {
+    send(inbox, correlation, OP_HEALTH);
+    return receive(reply) == 1
+        && word(0) == expected_process
+        && word(8) == correlation
+        && word(16) == (HEALTH_OK | generation)
+        && word(24) == 0;
+}
+
+unsafe fn wait_config_generation(generation: u64) -> void {
+    while config(GENERATION_OFFSET) != generation {
+        yield_once();
+    }
+}
+
+unsafe fn wait_monitor(
+    capability: u64,
+    generation: u64,
+    subject: u64
+) -> u64 {
+    loop {
+        let result: u64 = supervise(
+            capability,
+            SUPERVISE_MONITOR,
+            generation,
+            subject
+        );
+        if result != 0 && result != ERR_PERSONALITY_BUSY {
+            return result;
+        }
+        yield_once();
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(
+    report_capability: u64,
+    bootstrap_supervise_capability: u64
+) -> never {
+    let mut supervise_capability: u64 = config(SUPERVISE_CAP_OFFSET);
+    if supervise_capability == 0 {
+        supervise_capability = bootstrap_supervise_capability;
+    }
+    if report_capability == 0 || supervise_capability == 0 {
+        stop();
+    }
+    emit(report_capability, (&ONLINE[0]), 38);
+
+    wait_config_generation(1);
+    if !health(
+        config(INBOX_SEND_CAP_OFFSET),
+        config(HEALTH_REPLY_CAP_OFFSET),
+        config(SERVICE_PROCESS_OFFSET),
+        1,
+        HEALTH_CORRELATION_G1
+    ) {
+        stop();
+    }
+    emit(report_capability, (&HEALTH_G1[0]), 35);
+    if supervise(supervise_capability, SUPERVISE_PUBLISH, 1, 0) != 1
+        || wait_monitor(supervise_capability, 1, 0) != 1 {
+        stop();
+    }
+    emit(report_capability, (&PUBLISHED_G1[0]), 34);
+
+    let cancel_request: u64 = wait_monitor(
+        supervise_capability,
+        1,
+        OP_HOLD_CANCEL
+    );
+    emit(report_capability, (&CANCEL_DECISION[0]), 45);
+    if supervise(
+        supervise_capability,
+        SUPERVISE_CANCEL,
+        1,
+        cancel_request
+    ) != 1 {
+        stop();
+    }
+
+    let g1_reply: u64 = config(HEALTH_REPLY_CAP_OFFSET);
+    send(
+        config(INBOX_SEND_CAP_OFFSET),
+        WATCH_CORRELATION_G1,
+        OP_HEALTH_WATCH
+    );
+    if receive(g1_reply) != ERR_ENDPOINT_CLOSED {
+        stop();
+    }
+    emit(report_capability, (&CLOSED[0]), 42);
+    emit(report_capability, (&RESTART_DECISION[0]), 47);
+    if supervise(supervise_capability, SUPERVISE_RESTART, 1, 2) != 1 {
+        stop();
+    }
+
+    wait_config_generation(2);
+    let replacement_supervise_capability: u64 = config(
+        SUPERVISE_CAP_OFFSET
+    );
+    if replacement_supervise_capability == 0
+        || replacement_supervise_capability == supervise_capability
+        || config(INBOX_SEND_CAP_OFFSET) == 0
+        || config(HEALTH_REPLY_CAP_OFFSET) == 0
+        || config(HEALTH_REPLY_CAP_OFFSET) == g1_reply
+        || !health(
+            config(INBOX_SEND_CAP_OFFSET),
+            config(HEALTH_REPLY_CAP_OFFSET),
+            config(SERVICE_PROCESS_OFFSET),
+            2,
+            HEALTH_CORRELATION_G2
+    ) {
+        stop();
+    }
+    supervise_capability = replacement_supervise_capability;
+    emit(report_capability, (&HEALTH_G2[0]), 35);
+    if supervise(supervise_capability, SUPERVISE_PUBLISH, 2, 0) != 1 {
+        stop();
+    }
+    while config(PUBLISHED_GENERATION_OFFSET) != 2 {
+        yield_once();
+    }
+    emit(report_capability, (&PUBLISHED_G2[0]), 34);
+
+    if wait_monitor(
+        supervise_capability,
+        2,
+        MONITOR_CLIENT_G2_COMPLETE
+    ) != 1 {
+        stop();
+    }
+    send(
+        config(INBOX_SEND_CAP_OFFSET),
+        STOP_CORRELATION_G2,
+        OP_STOP
+    );
+    if receive(config(HEALTH_REPLY_CAP_OFFSET)) != 1
+        || word(0) != config(SERVICE_PROCESS_OFFSET)
+        || word(8) != STOP_CORRELATION_G2
+        || word(16) != (STOP_READY | 2)
+        || word(24) != 0 {
+        stop();
+    }
+    emit(report_capability, (&STOP_DECISION[0]), 40);
+    if supervise(supervise_capability, SUPERVISE_STOP, 2, 0) != 1 {
+        stop();
+    }
+    emit(report_capability, (&POLICY_PASS[0]), 33);
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, 8);
+    stop();
+}

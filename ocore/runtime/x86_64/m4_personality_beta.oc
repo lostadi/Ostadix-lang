@@ -1,0 +1,44 @@
+module runtime::m4_personality_beta;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+
+const COMPLETION_VA: usize = 0x01201000;
+const BSS_PROBE_VALUE: u64 = 0x4253_535f_5041_5353;
+pub const COMPLETION_VALUE: u64 = 0x4d34_0000_0000_0002;
+
+@link_section(".rodata")
+static ONLINE: [u8; 32] = b"M4 personality beta ELF: online\n";
+
+@link_section(".bss")
+static mut BSS_PROBE: u64 = 0;
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64) -> never {
+    if volatile_load((&BSS_PROBE) as *const u64) != 0 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    volatile_store((&mut BSS_PROBE) as *mut u64, BSS_PROBE_VALUE);
+    if volatile_load((&BSS_PROBE) as *const u64) != BSS_PROBE_VALUE {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        report_capability,
+        (&ONLINE[0]) as u64,
+        32
+    ) != 32 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    volatile_store(COMPLETION_VA as *mut u64, COMPLETION_VALUE);
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}

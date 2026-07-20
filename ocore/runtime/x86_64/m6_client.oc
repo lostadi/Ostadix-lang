@@ -1,0 +1,171 @@
+module runtime::m6_client;
+
+// M6A deliberately pins its provisional ABI locally.  The independently
+// linked package must not acquire authority by importing a privileged runtime
+// module, and integration can change these three numbers mechanically.
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_PERSONALITY_CALL: u64 = 14;
+
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+const ERR_PERSONALITY_CANCELLED: u64 = 0xffff_ffff_ffff_ffd1;
+const ERR_PERSONALITY_TIMEOUT: u64 = 0xffff_ffff_ffff_ffd2;
+const ERR_PERSONALITY_FAILED: u64 = 0xffff_ffff_ffff_ffd3;
+const ERR_PERSONALITY_UNSUPPORTED: u64 = 0xffff_ffff_ffff_ffd7;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const CALL_CAP_OFFSET: usize = 8;
+const GENERATION_OFFSET: usize = 16;
+const PUBLISHED_GENERATION_OFFSET: usize = 24;
+
+const OP_PING: u64 = 1;
+const OP_ADD1: u64 = 2;
+const OP_HOLD_CANCEL: u64 = 3;
+const OP_HOLD_TIMEOUT: u64 = 4;
+const OP_CRASH: u64 = 5;
+const OP_UNSUPPORTED: u64 = 0x7f;
+const PONG: u64 = 0x4d36_4150_4f4e_4701;
+
+@link_section(".rodata")
+static ONLINE: [u8; 23] = b"M6A client ELF: online\n";
+@link_section(".rodata")
+static G1_CORPUS: [u8; 31] = b"M6A g1 scalar RPC corpus: PASS\n";
+@link_section(".rodata")
+static CANCELLED: [u8; 41] =
+    b"M6A supervisor cancellation result: PASS\n";
+@link_section(".rodata")
+static TIMED_OUT: [u8; 25] = b"M6A timeout result: PASS\n";
+@link_section(".rodata")
+static CRASHED: [u8; 31] = b"M6A crash failure result: PASS\n";
+@link_section(".rodata")
+static REBOUND: [u8; 36] = b"M6A client observed g2 rebind: PASS\n";
+@link_section(".rodata")
+static G2_CORPUS: [u8; 31] = b"M6A g2 scalar RPC corpus: PASS\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+unsafe fn call(
+    capability: u64,
+    operation: u64,
+    scalar: u64,
+    timeout_ticks: u64
+) -> u64 {
+    loop {
+        let result: u64 = syscall4(
+            SYS_PERSONALITY_CALL,
+            capability,
+            operation,
+            scalar,
+            timeout_ticks
+        );
+        if result != ERR_IPC_RETRY {
+            return result;
+        }
+    }
+}
+
+unsafe fn wait_for_publication(generation: u64) -> u64 {
+    loop {
+        let capability: u64 = config(CALL_CAP_OFFSET);
+        if capability != 0
+            && config(GENERATION_OFFSET) == generation
+            && config(PUBLISHED_GENERATION_OFFSET) == generation {
+            return capability;
+        }
+        yield_once();
+    }
+}
+
+unsafe fn scalar_corpus(capability: u64) -> bool {
+    return call(capability, OP_PING, 0, 16) == PONG
+        && call(capability, OP_ADD1, 41, 16) == 42
+        && call(capability, OP_UNSUPPORTED, 0, 16)
+            == ERR_PERSONALITY_UNSUPPORTED;
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(
+    report_capability: u64,
+    bootstrap_call_capability: u64
+) -> never {
+    if report_capability == 0 || bootstrap_call_capability != 0 {
+        stop();
+    }
+    emit(report_capability, (&ONLINE[0]), 23);
+    progress(1);
+
+    let g1_capability: u64 = wait_for_publication(1);
+    if !scalar_corpus(g1_capability) {
+        stop();
+    }
+    emit(report_capability, (&G1_CORPUS[0]), 31);
+    progress(2);
+
+    if call(g1_capability, OP_HOLD_CANCEL, 0, 0)
+        != ERR_PERSONALITY_CANCELLED {
+        stop();
+    }
+    emit(report_capability, (&CANCELLED[0]), 41);
+    progress(3);
+
+    if call(g1_capability, OP_HOLD_TIMEOUT, 0, 6)
+        != ERR_PERSONALITY_TIMEOUT {
+        stop();
+    }
+    emit(report_capability, (&TIMED_OUT[0]), 25);
+    progress(4);
+
+    if call(g1_capability, OP_CRASH, 0, 0) != ERR_PERSONALITY_FAILED {
+        stop();
+    }
+    emit(report_capability, (&CRASHED[0]), 31);
+    progress(5);
+
+    let g2_capability: u64 = wait_for_publication(2);
+    if g2_capability == g1_capability
+        || call(g1_capability, OP_PING, 0, 1)
+            != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    emit(report_capability, (&REBOUND[0]), 36);
+    progress(6);
+    if !scalar_corpus(g2_capability) {
+        stop();
+    }
+    emit(report_capability, (&G2_CORPUS[0]), 31);
+    progress(7);
+    stop();
+}

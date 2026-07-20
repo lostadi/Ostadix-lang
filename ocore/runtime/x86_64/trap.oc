@@ -3,6 +3,7 @@ module runtime::trap;
 use runtime::interrupts::arm_fault_monitor;
 use runtime::process::fault_current;
 use runtime::process::is_faulted;
+use runtime::scheduler::contain_current_process_fault;
 use runtime::serial::write;
 
 @packed
@@ -43,12 +44,13 @@ static PROCESS_FAULTED_MESSAGE: [u8; 34] = b"M02 process: faulted current=none\n
 static KERNEL_FAULT_MESSAGE: [u8; 25] = b"M02 KERNEL FAULT: halted\n";
 static UNEXPECTED_FAULT_MESSAGE: [u8; 29] = b"M02 unexpected fault: halted\n";
 static INVALID_RETURN_MESSAGE: [u8; 38] = b"M02 invalid syscall return: contained\n";
+static LIVE_FAULT_MESSAGE: [u8; 25] = b"M5 pkgd fault: contained\n";
 
 extern "sysv64" fn ocore_read_cr2() -> usize;
 extern "sysv64" fn ocore_kernel_probe_address() -> usize;
 
 pub unsafe fn configure_probe(mode: u64) -> u64 {
-    if mode > 13 {
+    if mode > 18 {
         return 0;
     }
     EXPECTED_PROBE = mode;
@@ -93,6 +95,9 @@ unsafe fn expected_fault(
     if mode == 11 {
         return vector == 0 && error == 0;
     }
+    if mode == 14 || mode == 16 || mode == 18 {
+        return vector == 6 && error == 0;
+    }
     return false;
 }
 
@@ -116,6 +121,23 @@ pub unsafe fn kernel_exception_dispatch(frame: *mut TrapFrame) -> u64 {
     if mode == 0 || !expected_fault(mode, vector, error, address) {
         write((&UNEXPECTED_FAULT_MESSAGE[0]), 29);
         return 0;
+    }
+    if mode == 14 || mode == 16 || mode == 18 {
+        let next_frame: usize = contain_current_process_fault(
+            frame as *mut u64,
+            vector,
+            error,
+            rip,
+            address
+        );
+        if next_frame <= 2 {
+            write((&UNEXPECTED_FAULT_MESSAGE[0]), 29);
+            return 0;
+        }
+        if mode == 16 {
+            write((&LIVE_FAULT_MESSAGE[0]), 25);
+        }
+        return next_frame as u64;
     }
     let process_id: u64 = fault_current(vector, error, rip, address);
     if process_id != 1 || !is_faulted(0) {

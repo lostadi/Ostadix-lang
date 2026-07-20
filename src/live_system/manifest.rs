@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -12,6 +12,22 @@ use thiserror::Error;
 pub const PACKAGE_SCHEMA_V1: &str = "ocore.package/v1";
 /// The digest algorithm used for payload and package identities.
 pub const SHA256_ALGORITHM: &str = "sha256";
+
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+pub const MAX_SERVICES: usize = 32;
+pub const MAX_CAPABILITY_REQUESTS: usize = 64;
+pub const MAX_RIGHTS_PER_REQUEST: usize = 16;
+pub const MAX_LOGICAL_NAME_BYTES: usize = 128;
+pub const MAX_IDENTIFIER_BYTES: usize = 64;
+pub const MAX_PROTOCOL_BYTES: usize = 256;
+pub const MAX_PURPOSE_BYTES: usize = 512;
+pub const MAX_RUNTIME_ENTRY_BYTES: usize = 4096;
+pub const MAX_PAYLOAD_FILES: usize = 4096;
+pub const MAX_PAYLOAD_ENTRIES: usize = 8192;
+pub const MAX_PAYLOAD_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_PAYLOAD_PATH_COMPONENTS: usize = 32;
+pub const MAX_PAYLOAD_PATH_COMPONENT_BYTES: usize = 255;
 
 const PAYLOAD_DOMAIN: &[u8] = b"ocore.payload-tree/v1\0";
 const PACKAGE_DOMAIN: &[u8] = b"ocore.package-object/v1\0";
@@ -189,19 +205,20 @@ pub enum PackageError {
     UnsupportedSchema { found: String },
 
     #[error("invalid manifest field `{field}`: {reason}")]
-    InvalidField {
-        field: &'static str,
-        reason: String,
+    InvalidField { field: &'static str, reason: String },
+
+    #[error("{resource} exceeds its limit of {limit} (got {actual})")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: u64,
+        actual: u64,
     },
 
     #[error("invalid SHA-256 in `{field}`: expected 64 lowercase hexadecimal characters")]
     InvalidSha256 { field: &'static str },
 
     #[error("duplicate value `{value}` in manifest field `{field}`")]
-    Duplicate {
-        field: &'static str,
-        value: String,
-    },
+    Duplicate { field: &'static str, value: String },
 
     #[error("payload root is not a directory: {path:?}")]
     PayloadRootNotDirectory { path: PathBuf },
@@ -224,6 +241,12 @@ pub enum PackageError {
     #[error("payload file changed while it was being captured: {path:?}")]
     PayloadChanged { path: PathBuf },
 
+    #[error("payload file {path:?} exceeds the {max}-byte limit (got {size})")]
+    PayloadFileTooLarge { path: PathBuf, size: u64, max: u64 },
+
+    #[error("payload tree exceeds the {max}-byte limit (got at least {size})")]
+    PayloadTreeTooLarge { size: u64, max: u64 },
+
     #[error("could not {operation} payload path {path:?}: {source}")]
     Io {
         operation: &'static str,
@@ -239,6 +262,11 @@ pub enum PackageError {
 impl PackageManifest {
     /// Parse strict TOML and perform semantic validation.
     pub fn parse_toml(input: &str) -> Result<Self, PackageError> {
+        enforce_limit(
+            "manifest bytes",
+            input.len() as u64,
+            MAX_MANIFEST_BYTES as u64,
+        )?;
         let manifest: Self = toml::from_str(input)?;
         manifest.validate()?;
         Ok(manifest)
@@ -262,12 +290,18 @@ impl PackageManifest {
 
         validate_identifier("runtime.kind", &self.runtime.kind)?;
         validate_runtime_entry(&self.runtime.entry)?;
-        validate_text("runtime.abi", &self.runtime.abi)?;
+        validate_bounded_text("runtime.abi", &self.runtime.abi, MAX_PROTOCOL_BYTES)?;
+
+        enforce_limit(
+            "service declarations",
+            self.services.len() as u64,
+            MAX_SERVICES as u64,
+        )?;
 
         let mut service_names = BTreeSet::new();
         for service in &self.services {
             validate_identifier("services.name", &service.name)?;
-            validate_text("services.protocol", &service.protocol)?;
+            validate_bounded_text("services.protocol", &service.protocol, MAX_PROTOCOL_BYTES)?;
             if !service_names.insert(service.name.as_str()) {
                 return Err(PackageError::Duplicate {
                     field: "services.name",
@@ -276,16 +310,31 @@ impl PackageManifest {
             }
         }
 
+        enforce_limit(
+            "capability request declarations",
+            self.capability_requests.len() as u64,
+            MAX_CAPABILITY_REQUESTS as u64,
+        )?;
         let mut requests = BTreeSet::new();
         for request in &self.capability_requests {
             validate_identifier("capability_requests.kind", &request.kind)?;
-            validate_text("capability_requests.purpose", &request.purpose)?;
+            validate_bounded_text(
+                "capability_requests.purpose",
+                &request.purpose,
+                MAX_PURPOSE_BYTES,
+            )?;
             if request.rights.is_empty() {
                 return Err(PackageError::InvalidField {
                     field: "capability_requests.rights",
                     reason: "must contain at least one right".to_owned(),
                 });
             }
+
+            enforce_limit(
+                "rights per capability request",
+                request.rights.len() as u64,
+                MAX_RIGHTS_PER_REQUEST as u64,
+            )?;
 
             let mut rights = BTreeSet::new();
             for right in &request.rights {
@@ -306,16 +355,16 @@ impl PackageManifest {
             }
         }
 
-        validate_text("health.protocol", &self.health.protocol)?;
-        if self.health.timeout_ms == 0 {
+        validate_bounded_text("health.protocol", &self.health.protocol, MAX_PROTOCOL_BYTES)?;
+        if !(1..=60_000).contains(&self.health.timeout_ms) {
             return Err(PackageError::InvalidField {
                 field: "health.timeout_ms",
-                reason: "must be greater than zero".to_owned(),
+                reason: "must be between 1 and 60000 milliseconds".to_owned(),
             });
         }
 
         validate_sha256("build.source_sha256", &self.build.source_sha256)?;
-        validate_text("build.builder", &self.build.builder)?;
+        validate_bounded_text("build.builder", &self.build.builder, MAX_PROTOCOL_BYTES)?;
         Ok(())
     }
 
@@ -367,14 +416,20 @@ impl PackageManifest {
     /// serializer formatting.
     pub fn canonical_toml(&self) -> Result<String, PackageError> {
         self.validate()?;
-        Ok(toml::to_string(&self.canonicalized())?)
+        let encoded = toml::to_string(&self.canonicalized())?;
+        enforce_limit(
+            "canonical manifest bytes",
+            encoded.len() as u64,
+            MAX_MANIFEST_BYTES as u64,
+        )?;
+        Ok(encoded)
     }
 
     fn canonicalized(&self) -> Self {
         let mut manifest = self.clone();
-        manifest
-            .services
-            .sort_by(|left, right| (&left.name, &left.protocol).cmp(&(&right.name, &right.protocol)));
+        manifest.services.sort_by(|left, right| {
+            (&left.name, &left.protocol).cmp(&(&right.name, &right.protocol))
+        });
         for request in &mut manifest.capability_requests {
             request.rights.sort();
         }
@@ -394,10 +449,8 @@ pub fn payload_sha256(payload_root: &Path) -> Result<String, PackageError> {
     Ok(payload_digest(&scan_payload_tree(payload_root)?))
 }
 
-pub(crate) fn validate_logical_name(
-    field: &'static str,
-    value: &str,
-) -> Result<(), PackageError> {
+pub(crate) fn validate_logical_name(field: &'static str, value: &str) -> Result<(), PackageError> {
+    enforce_limit(field, value.len() as u64, MAX_LOGICAL_NAME_BYTES as u64)?;
     if value.is_empty() || value.starts_with('/') || value.ends_with('/') {
         return Err(PackageError::InvalidField {
             field,
@@ -413,8 +466,7 @@ pub(crate) fn validate_logical_name(
             });
         }
         if !component.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '.' | '_' | '-' | '+' | '@')
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '+' | '@')
         }) {
             return Err(PackageError::InvalidField {
                 field,
@@ -441,7 +493,18 @@ pub(crate) fn normalize_relative_payload_path(path: &Path) -> Result<String, Pac
             reason: "backslashes and NUL bytes are forbidden".to_owned(),
         });
     }
-    for component in raw.split('/') {
+    enforce_limit(
+        "payload path bytes",
+        raw.len() as u64,
+        MAX_RUNTIME_ENTRY_BYTES as u64,
+    )?;
+    let components: Vec<_> = raw.split('/').collect();
+    enforce_limit(
+        "payload path components",
+        components.len() as u64,
+        MAX_PAYLOAD_PATH_COMPONENTS as u64,
+    )?;
+    for component in components {
         if component.is_empty() || component == "." || component == ".." {
             return Err(PackageError::InvalidPayloadPath {
                 path: path.to_path_buf(),
@@ -449,11 +512,17 @@ pub(crate) fn normalize_relative_payload_path(path: &Path) -> Result<String, Pac
                     .to_owned(),
             });
         }
+        enforce_limit(
+            "payload path component bytes",
+            component.len() as u64,
+            MAX_PAYLOAD_PATH_COMPONENT_BYTES as u64,
+        )?;
     }
     Ok(raw.to_owned())
 }
 
 fn validate_identifier(field: &'static str, value: &str) -> Result<(), PackageError> {
+    enforce_limit(field, value.len() as u64, MAX_IDENTIFIER_BYTES as u64)?;
     if value.is_empty()
         || !value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '+')
@@ -467,7 +536,12 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), PackageEr
     Ok(())
 }
 
-fn validate_text(field: &'static str, value: &str) -> Result<(), PackageError> {
+fn validate_bounded_text(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), PackageError> {
+    enforce_limit(field, value.len() as u64, max_bytes as u64)?;
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(PackageError::InvalidField {
             field,
@@ -478,20 +552,37 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), PackageError> {
 }
 
 fn validate_runtime_entry(value: &str) -> Result<(), PackageError> {
+    runtime_entry_payload_path(value).map(|_| ())
+}
+
+/// Map a package-internal absolute runtime entry such as `/bin/live` to its
+/// relative payload-tree path (`bin/live`). No filesystem access occurs.
+pub fn runtime_entry_payload_path(value: &str) -> Result<PathBuf, PackageError> {
+    enforce_limit(
+        "runtime.entry bytes",
+        value.len() as u64,
+        MAX_RUNTIME_ENTRY_BYTES as u64,
+    )?;
     if !value.starts_with('/') || value == "/" || value.contains('\\') || value.contains('\0') {
         return Err(PackageError::InvalidField {
             field: "runtime.entry",
             reason: "must be an absolute payload path".to_owned(),
         });
     }
-    if value[1..]
-        .split('/')
-        .any(|component| component.is_empty() || component == "." || component == "..")
-    {
-        return Err(PackageError::InvalidField {
+    normalize_relative_payload_path(Path::new(&value[1..]))
+        .map(PathBuf::from)
+        .map_err(|error| PackageError::InvalidField {
             field: "runtime.entry",
-            reason: "contains an empty, current-directory, or parent-directory component"
-                .to_owned(),
+            reason: error.to_string(),
+        })
+}
+
+fn enforce_limit(resource: &'static str, actual: u64, limit: u64) -> Result<(), PackageError> {
+    if actual > limit {
+        return Err(PackageError::LimitExceeded {
+            resource,
+            limit,
+            actual,
         });
     }
     Ok(())
@@ -509,68 +600,87 @@ fn validate_sha256(field: &'static str, value: &str) -> Result<(), PackageError>
 }
 
 fn scan_payload_tree(payload_root: &Path) -> Result<Vec<PayloadFile>, PackageError> {
-    let root_metadata = fs::symlink_metadata(payload_root).map_err(|source| PackageError::Io {
-        operation: "inspect",
-        path: payload_root.to_path_buf(),
-        source,
-    })?;
-    if root_metadata.file_type().is_symlink() {
-        return Err(PackageError::Symlink {
-            path: payload_root.to_path_buf(),
-        });
-    }
-    if !root_metadata.is_dir() {
-        return Err(PackageError::PayloadRootNotDirectory {
-            path: payload_root.to_path_buf(),
-        });
-    }
+    let root = open_payload_directory_path(payload_root)?;
 
-    let mut payload_files = Vec::new();
+    // Open every payload object during admission and keep each regular-file
+    // descriptor until capture. On Unix, all descendant lookup is relative to
+    // an already-open directory and O_NOFOLLOW is applied at every step. A
+    // rename or symlink swap therefore cannot redirect the bytes that become
+    // the verified package identity.
+    let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
-    scan_directory(payload_root, payload_root, &mut payload_files, &mut seen)?;
-    payload_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut total_bytes = 0_u64;
+    let mut total_entries = 0_usize;
+    scan_directory(
+        payload_root,
+        Path::new(""),
+        &root,
+        &mut candidates,
+        &mut seen,
+        &mut total_bytes,
+        &mut total_entries,
+    )?;
+    candidates.sort_by(|left, right| left.normalized.cmp(&right.normalized));
+
+    let mut payload_files = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        payload_files.push(capture_payload_file(candidate)?);
+    }
     Ok(payload_files)
 }
 
+#[derive(Debug)]
+struct PayloadCandidate {
+    normalized: String,
+    path: PathBuf,
+    expected_size: u64,
+    file: File,
+}
+
+#[cfg(unix)]
 fn scan_directory(
     payload_root: &Path,
-    directory: &Path,
-    payload_files: &mut Vec<PayloadFile>,
+    relative_directory: &Path,
+    directory: &File,
+    candidates: &mut Vec<PayloadCandidate>,
     seen: &mut BTreeSet<String>,
+    total_bytes: &mut u64,
+    total_entries: &mut usize,
 ) -> Result<(), PackageError> {
-    let entries = fs::read_dir(directory).map_err(|source| PackageError::Io {
-        operation: "read directory",
-        path: directory.to_path_buf(),
-        source,
-    })?;
+    let directory_path = payload_root.join(relative_directory);
     let mut children = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| PackageError::Io {
-            operation: "read directory entry",
-            path: directory.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(payload_root)
-            .expect("directory walk stays beneath payload root");
-        let normalized = normalize_relative_payload_path(relative)?;
-        children.push((normalized, path));
+    for name in directory_entry_names(directory, &directory_path)? {
+        *total_entries = total_entries.saturating_add(1);
+        enforce_limit(
+            "payload directory entries",
+            *total_entries as u64,
+            MAX_PAYLOAD_ENTRIES as u64,
+        )?;
+        let relative = relative_directory.join(&name);
+        let normalized = normalize_relative_payload_path(&relative)?;
+        children.push((normalized, relative, name));
     }
     children.sort_by(|left, right| left.0.cmp(&right.0));
 
-    for (normalized, path) in children {
-        let metadata = fs::symlink_metadata(&path).map_err(|source| PackageError::Io {
-            operation: "inspect",
+    for (normalized, relative, name) in children {
+        let path = payload_root.join(&relative);
+        let file = open_child_no_follow(directory, &name, &path)?;
+        let metadata = file.metadata().map_err(|source| PackageError::Io {
+            operation: "inspect opened entry",
             path: path.clone(),
             source,
         })?;
         let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(PackageError::Symlink { path });
-        }
         if file_type.is_dir() {
-            scan_directory(payload_root, &path, payload_files, seen)?;
+            scan_directory(
+                payload_root,
+                &relative,
+                &file,
+                candidates,
+                seen,
+                total_bytes,
+                total_entries,
+            )?;
             continue;
         }
         if !file_type.is_file() {
@@ -579,56 +689,711 @@ fn scan_directory(
         if !seen.insert(normalized.clone()) {
             return Err(PackageError::DuplicatePayloadPath { path: normalized });
         }
-
-        let mut file = open_payload_file(&path).map_err(|source| PackageError::Io {
-            operation: "open",
-            path: path.clone(),
-            source,
-        })?;
-        let opened_metadata = file.metadata().map_err(|source| PackageError::Io {
-            operation: "inspect opened file",
-            path: path.clone(),
-            source,
-        })?;
-        if !opened_metadata.is_file() {
-            return Err(PackageError::UnsupportedFileType { path });
+        enforce_limit(
+            "payload files",
+            (candidates.len() + 1) as u64,
+            MAX_PAYLOAD_FILES as u64,
+        )?;
+        let size = metadata.len();
+        if size > MAX_PAYLOAD_FILE_BYTES {
+            return Err(PackageError::PayloadFileTooLarge {
+                path,
+                size,
+                max: MAX_PAYLOAD_FILE_BYTES,
+            });
         }
-        let executable = is_executable(&opened_metadata);
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .map_err(|source| PackageError::Io {
-                operation: "read",
-                path: path.clone(),
-                source,
-            })?;
-        let closed_metadata = file.metadata().map_err(|source| PackageError::Io {
-            operation: "reinspect opened file",
-            path: path.clone(),
-            source,
-        })?;
-        if opened_metadata.len() != closed_metadata.len()
-            || closed_metadata.len() != contents.len() as u64
-        {
-            return Err(PackageError::PayloadChanged { path });
+        let next_total =
+            total_bytes
+                .checked_add(size)
+                .ok_or(PackageError::PayloadTreeTooLarge {
+                    size: u64::MAX,
+                    max: MAX_PAYLOAD_BYTES,
+                })?;
+        if next_total > MAX_PAYLOAD_BYTES {
+            return Err(PackageError::PayloadTreeTooLarge {
+                size: next_total,
+                max: MAX_PAYLOAD_BYTES,
+            });
         }
-        payload_files.push(PayloadFile {
-            path: normalized,
-            executable,
-            contents,
+        *total_bytes = next_total;
+        candidates.push(PayloadCandidate {
+            normalized,
+            path,
+            expected_size: size,
+            file,
         });
     }
     Ok(())
 }
 
-fn open_payload_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
+#[cfg(not(unix))]
+fn scan_directory(
+    payload_root: &Path,
+    relative_directory: &Path,
+    _directory: &File,
+    candidates: &mut Vec<PayloadCandidate>,
+    seen: &mut BTreeSet<String>,
+    total_bytes: &mut u64,
+    total_entries: &mut usize,
+) -> Result<(), PackageError> {
+    // Rust's portable filesystem API has no openat/O_NOFOLLOW equivalent. The
+    // fallback checks every component immediately before opening it and keeps
+    // regular-file handles for capture, but cannot promise Unix's race-free
+    // descriptor-relative traversal semantics.
+    let directory_path = payload_root.join(relative_directory);
+    let entries = fs::read_dir(&directory_path).map_err(|source| PackageError::Io {
+        operation: "read directory",
+        path: directory_path.clone(),
+        source,
+    })?;
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PackageError::Io {
+            operation: "read directory entry",
+            path: directory_path.clone(),
+            source,
+        })?;
+        *total_entries = total_entries.saturating_add(1);
+        enforce_limit(
+            "payload directory entries",
+            *total_entries as u64,
+            MAX_PAYLOAD_ENTRIES as u64,
+        )?;
+        let relative = relative_directory.join(entry.file_name());
+        let normalized = normalize_relative_payload_path(&relative)?;
+        children.push((normalized, relative));
+    }
+    children.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (normalized, relative) in children {
+        let path = payload_root.join(&relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| PackageError::Io {
+            operation: "inspect",
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PackageError::Symlink { path });
+        }
+        if metadata.is_dir() {
+            let directory = File::open(&path).map_err(|source| PackageError::Io {
+                operation: "open directory",
+                path: path.clone(),
+                source,
+            })?;
+            scan_directory(
+                payload_root,
+                &relative,
+                &directory,
+                candidates,
+                seen,
+                total_bytes,
+                total_entries,
+            )?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(PackageError::UnsupportedFileType { path });
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(PackageError::DuplicatePayloadPath { path: normalized });
+        }
+        enforce_limit(
+            "payload files",
+            (candidates.len() + 1) as u64,
+            MAX_PAYLOAD_FILES as u64,
+        )?;
+        let size = metadata.len();
+        if size > MAX_PAYLOAD_FILE_BYTES {
+            return Err(PackageError::PayloadFileTooLarge {
+                path,
+                size,
+                max: MAX_PAYLOAD_FILE_BYTES,
+            });
+        }
+        let next_total =
+            total_bytes
+                .checked_add(size)
+                .ok_or(PackageError::PayloadTreeTooLarge {
+                    size: u64::MAX,
+                    max: MAX_PAYLOAD_BYTES,
+                })?;
+        if next_total > MAX_PAYLOAD_BYTES {
+            return Err(PackageError::PayloadTreeTooLarge {
+                size: next_total,
+                max: MAX_PAYLOAD_BYTES,
+            });
+        }
+        *total_bytes = next_total;
+        let file = File::open(&path).map_err(|source| PackageError::Io {
+            operation: "open",
+            path: path.clone(),
+            source,
+        })?;
+        candidates.push(PayloadCandidate {
+            normalized,
+            path,
+            expected_size: size,
+            file,
+        });
+    }
+    Ok(())
+}
+
+fn capture_payload_file(candidate: PayloadCandidate) -> Result<PayloadFile, PackageError> {
+    let file = candidate.file;
+    let opened_metadata = file.metadata().map_err(|source| PackageError::Io {
+        operation: "inspect opened file",
+        path: candidate.path.clone(),
+        source,
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(PackageError::UnsupportedFileType {
+            path: candidate.path,
+        });
+    }
+    if opened_metadata.len() > MAX_PAYLOAD_FILE_BYTES {
+        return Err(PackageError::PayloadFileTooLarge {
+            path: candidate.path,
+            size: opened_metadata.len(),
+            max: MAX_PAYLOAD_FILE_BYTES,
+        });
+    }
+    if opened_metadata.len() != candidate.expected_size {
+        return Err(PackageError::PayloadChanged {
+            path: candidate.path,
+        });
+    }
+
+    let executable = is_executable(&opened_metadata);
+    let initial_capacity = usize::try_from(candidate.expected_size)
+        .unwrap_or(usize::MAX)
+        .min(MAX_PAYLOAD_FILE_BYTES as usize);
+    let mut contents = Vec::with_capacity(initial_capacity);
+    let mut limited = file.take(MAX_PAYLOAD_FILE_BYTES + 1);
+    limited
+        .read_to_end(&mut contents)
+        .map_err(|source| PackageError::Io {
+            operation: "read",
+            path: candidate.path.clone(),
+            source,
+        })?;
+    let file = limited.into_inner();
+    if contents.len() as u64 > MAX_PAYLOAD_FILE_BYTES {
+        return Err(PackageError::PayloadFileTooLarge {
+            path: candidate.path,
+            size: contents.len() as u64,
+            max: MAX_PAYLOAD_FILE_BYTES,
+        });
+    }
+    let closed_metadata = file.metadata().map_err(|source| PackageError::Io {
+        operation: "reinspect opened file",
+        path: candidate.path.clone(),
+        source,
+    })?;
+    if closed_metadata.len() != candidate.expected_size
+        || contents.len() as u64 != candidate.expected_size
+    {
+        return Err(PackageError::PayloadChanged {
+            path: candidate.path,
+        });
+    }
+    Ok(PayloadFile {
+        path: candidate.normalized,
+        executable,
+        contents,
+    })
+}
+
+/// Open a regular payload file without permitting any path component to be a
+/// symlink. On Unix, every lookup is relative to a previously opened directory
+/// and the returned descriptor is the authority callers must read.
+pub(crate) fn open_payload_regular_file(
+    payload_root: &Path,
+    relative: &Path,
+) -> Result<File, PackageError> {
+    let normalized = normalize_relative_payload_path(relative)?;
+    let normalized = Path::new(&normalized);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        let mut directory = open_payload_directory_path(payload_root)?;
+        let components: Vec<_> = normalized.components().collect();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                unreachable!("normalized payload paths contain only normal components");
+            };
+            let display_path = payload_root.join(components[..=index].iter().fold(
+                PathBuf::new(),
+                |mut path, component| {
+                    path.push(component.as_os_str());
+                    path
+                },
+            ));
+            let opened = if index + 1 == components.len() {
+                open_child_no_follow(&directory, name, &display_path)?
+            } else {
+                open_directory_child_no_follow(&directory, name, &display_path)?
+            };
+            let metadata = opened.metadata().map_err(|source| PackageError::Io {
+                operation: "inspect opened entry",
+                path: display_path.clone(),
+                source,
+            })?;
+            if index + 1 == components.len() {
+                if !metadata.is_file() {
+                    return Err(PackageError::UnsupportedFileType { path: display_path });
+                }
+                return Ok(opened);
+            }
+            if !metadata.is_dir() {
+                return Err(PackageError::UnsupportedFileType { path: display_path });
+            }
+            directory = opened;
+        }
+        unreachable!("normalized payload paths are non-empty");
     }
-    options.open(path)
+
+    #[cfg(not(unix))]
+    {
+        // Best available portable fallback: reject symlinks component by
+        // component and keep the opened final file. The standard library does
+        // not expose descriptor-relative traversal on non-Unix targets.
+        let _root = open_payload_directory_path(payload_root)?;
+        let mut current = payload_root.to_path_buf();
+        for (index, component) in normalized.components().enumerate() {
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current).map_err(|source| PackageError::Io {
+                operation: "inspect",
+                path: current.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PackageError::Symlink { path: current });
+            }
+            let is_last = index + 1 == normalized.components().count();
+            if (!is_last && !metadata.is_dir()) || (is_last && !metadata.is_file()) {
+                return Err(PackageError::UnsupportedFileType { path: current });
+            }
+        }
+        File::open(&current).map_err(|source| PackageError::Io {
+            operation: "open",
+            path: current,
+            source,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_payload_directory_path(path: &Path) -> Result<File, PackageError> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    if path.as_os_str().is_empty() {
+        return Err(PackageError::PayloadRootNotDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut lexical = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => lexical.push(name),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(PackageError::InvalidPayloadPath {
+                    path: path.to_path_buf(),
+                    reason: "payload root parent traversal components are forbidden".to_owned(),
+                });
+            }
+        }
+    }
+    if lexical.as_os_str().is_empty() {
+        lexical.push(".");
+    }
+    let encoded = CString::new(lexical.as_os_str().as_bytes()).map_err(|_| {
+        PackageError::InvalidPayloadPath {
+            path: path.to_path_buf(),
+            reason: "NUL bytes are forbidden".to_owned(),
+        }
+    })?;
+    let descriptor = unsafe {
+        // SAFETY: `encoded` is NUL-terminated and these flags need no mode.
+        // O_NOFOLLOW protects the payload-root entry itself; all paths beneath
+        // this trusted root are subsequently resolved descriptor-relative.
+        libc::open(
+            encoded.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        let source = io::Error::last_os_error();
+        let leaf_is_symlink = fs::symlink_metadata(&lexical)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if source.raw_os_error() == Some(libc::ELOOP) || leaf_is_symlink {
+            return Err(PackageError::Symlink {
+                path: path.to_path_buf(),
+            });
+        }
+        if source.raw_os_error() == Some(libc::ENOTDIR) {
+            return Err(PackageError::PayloadRootNotDirectory {
+                path: path.to_path_buf(),
+            });
+        }
+        return Err(PackageError::Io {
+            operation: "open payload root without following links",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(unsafe {
+        // SAFETY: `descriptor` is newly owned after a successful open.
+        File::from_raw_fd(descriptor)
+    })
+}
+
+#[cfg(not(unix))]
+fn open_payload_directory_path(path: &Path) -> Result<File, PackageError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| PackageError::Io {
+        operation: "inspect",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(PackageError::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(PackageError::PayloadRootNotDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    File::open(path).map_err(|source| PackageError::Io {
+        operation: "open directory",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_child_no_follow(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<File, PackageError> {
+    preflight_child_type(directory, name, display_path)?;
+    openat_no_follow(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        display_path,
+    )
+}
+
+#[cfg(unix)]
+fn open_child_no_follow(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<File, PackageError> {
+    preflight_child_type(directory, name, display_path)?;
+    openat_no_follow(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        display_path,
+    )
+}
+
+#[cfg(unix)]
+fn preflight_child_type(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<(), PackageError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| PackageError::InvalidPayloadPath {
+        path: display_path.to_path_buf(),
+        reason: "NUL bytes are forbidden".to_owned(),
+    })?;
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        // SAFETY: the directory and C string are valid, and fstatat initializes
+        // `status` on success without following the named entry.
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(PackageError::Io {
+            operation: "inspect entry without following links",
+            path: display_path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+    let status = unsafe {
+        // SAFETY: fstatat returned success, so `status` is initialized.
+        status.assume_init()
+    };
+    let kind = status.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
+        return Err(PackageError::Symlink {
+            path: display_path.to_path_buf(),
+        });
+    }
+    if kind != libc::S_IFDIR && kind != libc::S_IFREG {
+        return Err(PackageError::UnsupportedFileType {
+            path: display_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn openat_no_follow(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+    display_path: &Path,
+) -> Result<File, PackageError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| PackageError::InvalidPayloadPath {
+        path: display_path.to_path_buf(),
+        reason: "NUL bytes are forbidden".to_owned(),
+    })?;
+    let descriptor = unsafe {
+        // SAFETY: the parent descriptor remains open, `name` is NUL-terminated,
+        // and these flags do not require a mode argument.
+        libc::openat(directory.as_raw_fd(), name.as_ptr(), flags)
+    };
+    if descriptor < 0 {
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ELOOP) {
+            return Err(PackageError::Symlink {
+                path: display_path.to_path_buf(),
+            });
+        }
+        return Err(PackageError::Io {
+            operation: "open without following links",
+            path: display_path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(unsafe {
+        // SAFETY: `descriptor` is newly owned after a successful openat.
+        File::from_raw_fd(descriptor)
+    })
+}
+
+#[cfg(unix)]
+fn directory_entry_names(
+    directory: &File,
+    display_path: &Path,
+) -> Result<Vec<std::ffi::OsString>, PackageError> {
+    use std::ffi::CStr;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStringExt;
+
+    let descriptor = directory
+        .try_clone()
+        .map_err(|source| PackageError::Io {
+            operation: "duplicate directory descriptor",
+            path: display_path.to_path_buf(),
+            source,
+        })?
+        .into_raw_fd();
+    let stream = unsafe {
+        // SAFETY: `descriptor` is newly owned. fdopendir consumes it on success.
+        libc::fdopendir(descriptor)
+    };
+    if stream.is_null() {
+        unsafe {
+            // SAFETY: fdopendir failed, so ownership remains with us.
+            drop(File::from_raw_fd(descriptor));
+        }
+        return Err(PackageError::Io {
+            operation: "open directory stream",
+            path: display_path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    let result = (|| {
+        let mut names = Vec::new();
+        loop {
+            clear_readdir_errno();
+            let entry = unsafe {
+                // SAFETY: `stream` remains valid until closed below.
+                libc::readdir(stream)
+            };
+            if entry.is_null() {
+                if let Some(source) = readdir_error() {
+                    return Err(PackageError::Io {
+                        operation: "read directory entry",
+                        path: display_path.to_path_buf(),
+                        source,
+                    });
+                }
+                break;
+            }
+            let bytes = unsafe {
+                // SAFETY: POSIX guarantees d_name is NUL-terminated for a
+                // successfully returned directory entry.
+                CStr::from_ptr((*entry).d_name.as_ptr())
+            }
+            .to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+        Ok(names)
+    })();
+    let close_result = unsafe {
+        // SAFETY: `stream` is a live DIR pointer and closed exactly once.
+        libc::closedir(stream)
+    };
+    if close_result != 0 && result.is_ok() {
+        return Err(PackageError::Io {
+            operation: "close directory stream",
+            path: display_path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+    result
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "l4re"
+))]
+fn clear_readdir_errno() {
+    unsafe {
+        // SAFETY: this writes the calling thread's errno slot.
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+))]
+fn clear_readdir_errno() {
+    unsafe {
+        // SAFETY: this writes the calling thread's errno slot.
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+fn clear_readdir_errno() {
+    unsafe {
+        // SAFETY: this writes the calling thread's errno slot.
+        *libc::__errno() = 0;
+    }
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+fn clear_readdir_errno() {
+    unsafe {
+        // SAFETY: this writes the calling thread's errno slot.
+        *libc::___errno() = 0;
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "l4re",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn clear_readdir_errno() {}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "l4re",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn readdir_error() -> Option<io::Error> {
+    let error = io::Error::last_os_error();
+    (error.raw_os_error() != Some(0)).then_some(error)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "l4re",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+fn readdir_error() -> Option<io::Error> {
+    // libc does not expose one portable errno accessor across all Unix
+    // variants. Traversal remains descriptor-relative and fail-closed for
+    // open/fstat errors; on these less common targets a terminal readdir null
+    // is conservatively treated as end-of-stream.
+    None
 }
 
 #[cfg(unix)]
@@ -698,9 +1463,15 @@ mod tests {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("share/data")).unwrap();
         let files = if reverse {
-            vec![("share/data/value", b"payload\n".as_slice()), ("bin/live", b"runtime\n")]
+            vec![
+                ("share/data/value", b"payload\n".as_slice()),
+                ("bin/live", b"runtime\n"),
+            ]
         } else {
-            vec![("bin/live", b"runtime\n".as_slice()), ("share/data/value", b"payload\n")]
+            vec![
+                ("bin/live", b"runtime\n".as_slice()),
+                ("share/data/value", b"payload\n"),
+            ]
         };
         for (path, contents) in files {
             fs::write(root.join(path), contents).unwrap();
@@ -791,6 +1562,20 @@ name = "z.service"
         )
     }
 
+    fn parsed_manifest() -> PackageManifest {
+        PackageManifest::parse_toml(&manifest_a(&"0".repeat(64))).unwrap()
+    }
+
+    fn assert_limit(error: PackageError, resource: &'static str) {
+        assert!(matches!(
+            error,
+            PackageError::LimitExceeded {
+                resource: actual,
+                ..
+            } if actual == resource
+        ));
+    }
+
     #[test]
     fn package_identity_is_deterministic_across_ordering() {
         let first = TempDir::new().unwrap();
@@ -801,13 +1586,17 @@ name = "z.service"
         let second_payload = payload_sha256(second.path()).unwrap();
         assert_eq!(first_payload, second_payload);
 
-        let first_package = VerifiedPackage::load(&manifest_a(&first_payload), first.path()).unwrap();
+        let first_package =
+            VerifiedPackage::load(&manifest_a(&first_payload), first.path()).unwrap();
         let second_package =
             VerifiedPackage::load(&manifest_b(&second_payload), second.path()).unwrap();
         assert_eq!(first_package.digest(), second_package.digest());
         assert_eq!(
             first_package.manifest().canonical_identity_bytes().unwrap(),
-            second_package.manifest().canonical_identity_bytes().unwrap()
+            second_package
+                .manifest()
+                .canonical_identity_bytes()
+                .unwrap()
         );
     }
 
@@ -865,16 +1654,221 @@ name = "z.service"
         let payload = TempDir::new().unwrap();
         write_payload(payload.path(), false);
         let digest = payload_sha256(payload.path()).unwrap();
-        let duplicated = manifest_a(&digest).replace(
-            "name = \"a.service\"",
-            "name = \"z.service\"",
-        );
+        let duplicated =
+            manifest_a(&digest).replace("name = \"a.service\"", "name = \"z.service\"");
         assert!(matches!(
             PackageManifest::parse_toml(&duplicated),
             Err(PackageError::Duplicate {
                 field: "services.name",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn manifest_size_is_rejected_before_toml_parsing() {
+        let oversized = "x".repeat(MAX_MANIFEST_BYTES + 1);
+        assert_limit(
+            PackageManifest::parse_toml(&oversized).unwrap_err(),
+            "manifest bytes",
+        );
+    }
+
+    #[test]
+    fn declaration_count_limits_are_enforced() {
+        let mut manifest = parsed_manifest();
+        manifest.services = (0..=MAX_SERVICES)
+            .map(|index| ServiceManifest {
+                name: format!("service.{index}"),
+                protocol: "ocore.service/v1".to_owned(),
+            })
+            .collect();
+        assert_limit(manifest.validate().unwrap_err(), "service declarations");
+
+        let mut manifest = parsed_manifest();
+        manifest.capability_requests = (0..=MAX_CAPABILITY_REQUESTS)
+            .map(|index| CapabilityRequestManifest {
+                kind: "endpoint".to_owned(),
+                rights: vec!["send".to_owned()],
+                purpose: format!("request {index}"),
+            })
+            .collect();
+        assert_limit(
+            manifest.validate().unwrap_err(),
+            "capability request declarations",
+        );
+
+        let mut manifest = parsed_manifest();
+        manifest.capability_requests[0].rights = (0..=MAX_RIGHTS_PER_REQUEST)
+            .map(|index| format!("right{index}"))
+            .collect();
+        assert_limit(
+            manifest.validate().unwrap_err(),
+            "rights per capability request",
+        );
+    }
+
+    #[test]
+    fn text_and_health_limits_are_enforced() {
+        let mut manifest = parsed_manifest();
+        manifest.name = "n".repeat(MAX_LOGICAL_NAME_BYTES + 1);
+        assert_limit(manifest.validate().unwrap_err(), "name");
+
+        let mut manifest = parsed_manifest();
+        manifest.architecture = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
+        assert_limit(manifest.validate().unwrap_err(), "architecture");
+
+        let mut manifest = parsed_manifest();
+        manifest.services[0].protocol = "p".repeat(MAX_PROTOCOL_BYTES + 1);
+        assert_limit(manifest.validate().unwrap_err(), "services.protocol");
+
+        let mut manifest = parsed_manifest();
+        manifest.capability_requests[0].purpose = "p".repeat(MAX_PURPOSE_BYTES + 1);
+        assert_limit(
+            manifest.validate().unwrap_err(),
+            "capability_requests.purpose",
+        );
+
+        let mut manifest = parsed_manifest();
+        manifest.runtime.entry = format!("/{}", "p".repeat(MAX_RUNTIME_ENTRY_BYTES));
+        assert_limit(manifest.validate().unwrap_err(), "runtime.entry bytes");
+
+        for invalid_timeout in [0, 60_001] {
+            let mut manifest = parsed_manifest();
+            manifest.health.timeout_ms = invalid_timeout;
+            assert!(matches!(
+                manifest.validate(),
+                Err(PackageError::InvalidField {
+                    field: "health.timeout_ms",
+                    ..
+                })
+            ));
+        }
+
+        let manifest = parsed_manifest();
+        assert!(manifest.canonical_toml().unwrap().len() <= MAX_MANIFEST_BYTES);
+    }
+
+    #[test]
+    fn payload_path_rules_and_runtime_mapping_are_shared() {
+        assert_eq!(
+            runtime_entry_payload_path("/bin/live").unwrap(),
+            PathBuf::from("bin/live")
+        );
+        for invalid in [
+            "",
+            "/absolute",
+            "../escape",
+            "./current",
+            "a/../escape",
+            "a/./current",
+            "a//empty",
+            "a\\portable",
+            "a\0nul",
+        ] {
+            assert!(normalize_relative_payload_path(Path::new(invalid)).is_err());
+        }
+        for invalid in ["bin/live", "/", "/../escape", "/bin//live", "/bin\\live"] {
+            assert!(runtime_entry_payload_path(invalid).is_err());
+        }
+
+        let too_deep = (0..=MAX_PAYLOAD_PATH_COMPONENTS)
+            .map(|_| "d")
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(normalize_relative_payload_path(Path::new(&too_deep)).is_err());
+        assert!(runtime_entry_payload_path(&format!("/{too_deep}")).is_err());
+
+        let long_component = "x".repeat(MAX_PAYLOAD_PATH_COMPONENT_BYTES + 1);
+        assert!(normalize_relative_payload_path(Path::new(&long_component)).is_err());
+        assert!(runtime_entry_payload_path(&format!("/{long_component}")).is_err());
+
+        for invalid_name in [
+            "../escape",
+            "/absolute",
+            "trailing/",
+            "two//parts",
+            "bad name",
+        ] {
+            assert!(validate_logical_name("name", invalid_name).is_err());
+        }
+    }
+
+    #[test]
+    fn payload_file_count_limit_is_preflighted() {
+        let payload = TempDir::new().unwrap();
+        for index in 0..=MAX_PAYLOAD_FILES {
+            File::create(payload.path().join(format!("file-{index:04}"))).unwrap();
+        }
+        assert_limit(payload_sha256(payload.path()).unwrap_err(), "payload files");
+    }
+
+    #[test]
+    fn payload_directory_entry_limit_blocks_empty_directory_bombs() {
+        let payload = TempDir::new().unwrap();
+        for index in 0..=MAX_PAYLOAD_ENTRIES {
+            fs::create_dir(payload.path().join(format!("dir-{index:04}"))).unwrap();
+        }
+        assert_limit(
+            payload_sha256(payload.path()).unwrap_err(),
+            "payload directory entries",
+        );
+    }
+
+    #[test]
+    fn payload_file_and_total_byte_limits_are_preflighted() {
+        let oversized_file = TempDir::new().unwrap();
+        File::create(oversized_file.path().join("large"))
+            .unwrap()
+            .set_len(MAX_PAYLOAD_FILE_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            payload_sha256(oversized_file.path()),
+            Err(PackageError::PayloadFileTooLarge { .. })
+        ));
+
+        let oversized_tree = TempDir::new().unwrap();
+        for index in 0..5 {
+            File::create(oversized_tree.path().join(format!("sparse-{index}")))
+                .unwrap()
+                .set_len(MAX_PAYLOAD_FILE_BYTES)
+                .unwrap();
+        }
+        assert!(matches!(
+            payload_sha256(oversized_tree.path()),
+            Err(PackageError::PayloadTreeTooLarge { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_roots_non_utf8_names_and_special_files_are_rejected() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temporary = TempDir::new().unwrap();
+        let real = temporary.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let linked = temporary.path().join("linked");
+        symlink(&real, &linked).unwrap();
+        assert!(matches!(
+            payload_sha256(&linked),
+            Err(PackageError::Symlink { .. })
+        ));
+
+        let non_utf8 = PathBuf::from(OsString::from_vec(vec![0xff]));
+        assert!(matches!(
+            normalize_relative_payload_path(&non_utf8),
+            Err(PackageError::NonUtf8Path { .. })
+        ));
+
+        let special = TempDir::new().unwrap();
+        let _listener = UnixListener::bind(special.path().join("socket")).unwrap();
+        assert!(matches!(
+            payload_sha256(special.path()),
+            Err(PackageError::UnsupportedFileType { .. })
         ));
     }
 }
