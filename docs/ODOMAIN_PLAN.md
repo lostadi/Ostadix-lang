@@ -1,8 +1,10 @@
 # O-Domain Engineering Plan
 
-Status: active roadmap. Milestones 0.1 through 2 are **complete** at their
-documented, single-CPU x86-64 QEMU boundaries. A separately gated Milestone 3
-foundation exists, but the full Milestone 3 acceptance gate remains open.
+Status: active roadmap. Milestones 0.1 through 5 and the scalar M6A slice now
+have executable evidence at their documented, fixed-capacity, single-CPU x86-64
+QEMU boundaries. These are bounded mechanism and lifecycle proofs, not
+production-scale implementations or evidence for any foreign operating-system
+ABI.
 
 This document turns the poly-personality kernel brief into a dependency-ordered
 implementation plan for this repository. It is a claim boundary as well as a
@@ -422,7 +424,7 @@ or denial-of-service claim.
 
 ### Milestone 3: IPC, shared memory, and capability transfer
 
-Status: **foundation implemented; full milestone not complete**.
+Status: **bounded native IPC gate implemented**.
 
 Probe mode 13 implements and gates the first dependency slice: eight
 generation-tagged endpoint objects with bounded FIFO queues and deterministic
@@ -440,113 +442,181 @@ queue item and ticket from the management harness, and reclaims every resource.
 These waiter records exercise bounded registry
 bookkeeping, not live blocked TCBs.
 
-`ocore/kernel/smoke-ipc-foundation-qemu.sh` is deliberately named and worded as
-a foundation gate. It does not claim the acceptance gate below.
+The mode-13 foundation remains as a narrow regression gate. Mode 14 builds on
+it with public generation-safe endpoint create/send/receive/cancel syscalls,
+real TCB block/wake epochs for empty receive and full send, exact attenuation
+during atomic cross-CSpace transfer, and lifecycle-driven queue cleanup. The
+endpoint capability authorizes derivation of its receiver CSpace; the transfer
+ticket then binds the exact creating process generation and that destination
+CSpace, not the endpoint object. Mode 14 fills all 16 bounded ticket slots,
+denies abort when a different process is handed the raw ticket, lets the owner
+abort all 16 exactly once, rejects a repeated stale abort, and creates a fresh
+ticket to prove exhaustion recovery.
 
-Introduce endpoint objects, bounded message queues, request/reply correlation,
-blocking send/receive, cancellation, and shared-memory objects. Capability
-transfer must be an atomic kernel operation that attenuates rights and creates
-a new destination slot. A sender never writes a destination slot number.
-Endpoint handles are generation-tagged from their first reusable lifecycle.
-Request correlation and cancellation must be sufficient to implement the
-foreign-process protocol in
-[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md); that protocol is not
-claimed merely because general IPC exists.
+`ocore/kernel/smoke-ipc-qemu.sh` boots four CPL3 processes: a client, healthy
+personality service, crashing personality, and unrelated observer. It requires
+cross-domain request/reply, five ordered replies through a bounded FIFO, one
+real full-queue block and wake-once retry, automatic dead-sender cleanup,
+contained exception-driven service failure, continued unrelated-world
+progress, transactional teardown, total resource reclamation, a later timer,
+and one second of survival. The script also rejects foundation-only wording and
+Linux markers, so its transcript cannot be mistaken for either the older gate
+or a foreign-ABI result.
 
-Acceptance gate:
-
-- same-domain and cross-domain ping-pong work under preemption;
-- queue limits produce defined backpressure;
-- transfer cannot amplify rights, revive a stale generation, or smuggle a
-  kernel pointer;
-- sender death and receiver death have defined cleanup behavior; and
-- a personality-service crash affects only processes bound to that service.
-
-Before this milestone can be marked complete, endpoint operations must be
-exposed to CPL3, empty receive and full send must enter and leave real blocked
-TCB states, same-domain and cross-domain request/reply must run under
-preemption, sender/receiver death must be covered in every request state, and
-an exception-driven service crash must resume an unaffected process. The
-request-scoped foreign memory-view protocol remains a later, separate gate.
+This closes the milestone at that fixed one-CPU scenario. It does not establish
+SMP IPC, unbounded queues, a complete interleaving matrix for every possible
+sender/receiver death state, or the request-scoped foreign-memory protocol in
+[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). `cap_copy` now
+uses an authorized endpoint to select its receiver CSpace and prepares an
+attenuation-only ticket bound to the exact creating process generation and
+that CSpace. It is not endpoint-object-bound, and it is not an ambient
+operation that lets a sender choose a destination CSpace slot.
 
 ### Milestone 4: native loader, VFS objects, and service namespace
 
-Implement a kernel-validated x86-64 ELF loader for native O-core executables,
-including `PT_LOAD` validation, page permissions, BSS zeroing, stack/argument
-construction, and rejection of overlapping or malformed segments. Add the
-minimal VFS object model, initramfs or read-only image backend, domain-relative
-root/mount namespace, and capability-addressed service registry.
+Status: **bounded native loader/VFS gate implemented**.
 
-Acceptance gate:
+The implementation validates static x86-64 `ET_EXEC` files, at most eight
+`PT_LOAD` segments, file/memory extents, entry placement, overlap, and W+X; it
+rejects `PT_INTERP` and `PT_DYNAMIC`. It materializes file bytes and zero BSS,
+uses exact RX, R/NX, and RW/NX PTEs, and constructs an aligned minimal SysV
+stack in the fixed `0x02000000..0x02100000` loaded-image window. The immutable
+OVFS backend, domain-relative mount/process namespace, and capability-returning
+service registry are generation-safe and fixed-capacity.
 
-- two separately built native ELF files load from an image rather than being
-  linked into the kernel;
-- malformed ELF and permission-overlap corpus tests fail before process start;
-- no page is writable and executable after load;
-- service lookup returns a capability, not an ambient global pointer; and
-- namespace teardown releases mounts, services, and processes transactionally.
+`ocore/kernel/build-m4-artifacts.sh` builds two separately linked static O-core
+personality ELFs plus malformed, overlapping, and W+X corpus files, then
+requires deterministic `OVFSIMG1` repacking and a host-verified SHA-256.
+`ocore/kernel/smoke-loader-qemu.sh` proves the payloads are image data rather
+than kernel-linked symbols, rejects the corpus before start, executes both
+personality ELFs in separate address spaces at the same preferred virtual
+window, checks BSS and loaded W^X, resolves a service to an attenuated
+consumer-CSpace capability, transactionally tears down services, mounts, and
+processes, reclaims all frames, and reaches a later timer.
+
+The native importer recomputes SHA-256 over the complete embedded artifact
+before validating OVFS structure and publishing the recorded identity. This
+milestone has no dynamic linker, shared-library ABI, writable filesystem,
+demand paging, general path API, or foreign executable format.
 
 ### Milestone 5: native live system and package activation
 
-Build the unprivileged native control plane specified in
-[`LIVE_SYSTEM.md`](LIVE_SYSTEM.md). Load a native `init`, service supervisor,
-package daemon, and serial O control REPL through the Milestone 4 loader. Add a
-content-addressed read-only package store, versioned manifests, explicit
-capability requests, capability-returning service registration, health checks,
-and transactional activation and rollback.
+Status: **bounded native live-system gate implemented**.
 
-The first compiler-bootstrap stage is hosted: a pinned host `ocorec` builds
-packages and injects an immutable image with source, compiler, and payload
-digests. A later capability-bounded builder endpoint and an eventual compiler
-domain use the same build-request contract. The first usable live system must
-not wait for native self-hosting.
+Mode 16 loads native `init`, supervisor, package-daemon, and serial-REPL ELF
+files through the Milestone 4 loader. Each has a separate address space and
+CSpace. A fixed-capacity immutable package-root registry, exact default-deny
+capability requests, health-gated service generations, and transactional
+activation sit behind a typed control capability held only by the REPL.
 
-Acceptance gate:
+The hosted semantic oracle in
+[`HOSTED_LIVE_REFERENCE.md`](HOSTED_LIVE_REFERENCE.md) remains broader: it
+executes failed upgrades, rollback, targeted restart, reconstruction, and
+cross-world OValue composition with host child processes. Those hosted results
+do not substitute for, and are not implied by, the native gate.
 
-- a fresh QEMU boot loads the live-system services as separate native ELF
-  processes rather than linking them into the kernel;
-- the serial REPL installs two host-built packages by digest and resolves one
-  healthy registered service to an attenuated capability;
-- an undeclared or excessive capability request is denied before process
-  publication;
-- an injected unhealthy upgrade rolls back the complete activation set and
-  leaves prior-generation clients either valid by policy or explicitly stale;
-- crashing and restarting one service does not stop an unrelated native
-  process; and
-- reboot reconstructs the active package roots from versioned metadata and
-  emits source, compiler, package, and activation digests.
+The current compiler-bootstrap stage is hosted: a pinned local `ocorec` builds
+packages and injects an immutable image whose payload digest is checked before
+boot. Source and compiler digests belong in the fuller build receipt but are not
+claimed by this gate. A later capability-bounded builder endpoint and eventual
+compiler domain use the same build-request contract. The first usable live
+system does not wait for native self-hosting.
 
-This milestone is a native O-core live-system proof. It does not establish a
-Linux ABI, a foreign root filesystem, native self-hosting, framebuffer support,
-or execution of arbitrary hosted O backends inside O-core.
+`ocore/kernel/build-m5-artifacts.sh` performs two builds of all four static
+service ELFs and the read-only OVFS image, requiring byte identity and the exact
+host-computed image digest. The pinned artifact is 62,056 bytes with SHA-256
+`88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`;
+the kernel recomputes that digest before OVFS import. `smoke-live-qemu.sh`
+verifies the ELF entry symbols are absent from the kernel, boots the four loaded
+CPL3 principals, and drives the real serial `o> ` loop. It submits malformed
+install text, then an exact-digest install, then exact-digest activation. The
+malformed command must publish no state. Installation publishes one immutable
+package root; activation grants only the five declared rights requests,
+health-gates all four service-generation records, and publishes the complete
+set atomically.
 
-### Milestone 6: personality-service supervision substrate
+After activation, the package-daemon ELF deliberately faults in CPL3. Mode 16
+contains only that process generation while all three unrelated services reach
+their own completion publications. It reaps the old process, thread, CSpace,
+address space, and debug capability; withdraws the old service while the native
+control state is `CONTROL_RECOVERING`; rejects every stale generation; and loads
+a replacement package daemon from the same verified image. The replacement is
+not republished until its exact private restart-health token is observed. The
+gate then reaches `CONTROL_DEACTIVATED`, revokes the REPL control capability,
+tears down namespace and process generations, reclaims every dynamic frame,
+reaches a post-lifecycle timer, and survives the following observation window.
 
-Move personality policy out of privileged code behind capability-bounded IPC
-before adding a foreign ABI. Define versioned service registration, startup,
-health, cancellation, stop, restart, and dependent-process failure behavior.
-The kernel router may use a direct personality-ID branch while indirect calls
-remain unsupported, but it must forward policy requests through an endpoint
-rather than executing compatibility policy in ring 0. A service receives only
-explicit memory, endpoint, filesystem, timer, network, and device capabilities.
-Pointer-bearing requests use only the bounded, request-scoped capabilities and
-lifecycle in [`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). A
-service never receives a raw pointer in a foreign address space.
+The separate mode-17 `smoke-live-semantics-qemu.sh` gate proves the broader
+finite state corpus: two immutable roots, overgrant/incomplete-set denial,
+failed-health nonpublication, complete-set rollback, stale references, abstract
+crash/restart with unaffected state, strict parser behavior, invariants, and a
+post-test timer.
 
-Acceptance gate:
+This proves the first host-assisted native live substrate, not the full target
+architecture in [`LIVE_SYSTEM.md`](LIVE_SYSTEM.md). The three non-REPL service
+ELFs are isolated startup/completion principals; package and supervisor state
+machines remain privileged behind the control syscall rather than cooperating
+user-space daemons over endpoint RPC. The native process-level restart proof is
+exactly one package-daemon generation, not general or unbounded retry/backoff.
+A replacement that faults or omits the exact health token remains withdrawn and
+fails closed; a further restart is not proved. The gates also do not yet prove
+two-package dependency resolution, failed-upgrade rollback through real serial
+input, durable reboot reconstruction, compiler receipts, native self-hosting, a
+dynamic linker, framebuffer support, a Linux ABI, a foreign root filesystem, or
+arbitrary hosted O backends inside O-core.
 
-- a minimal native test personality service starts unprivileged and handles a
-  pinned request/reply corpus;
-- stopping or crashing it cannot stop O-core or an unrelated native process;
-- in-flight requests receive one deterministic cancellation or failure result;
-- restart and capability rebind behavior is versioned and logged;
-- revoking a delegated capability removes that authority without ambient
-  fallback; and
-- crash, restart, cancellation, timeout, and stale-reply tests close every
-  temporary memory view and wake each dependent thread at most once.
+### Milestone 6A: package-loaded scalar personality supervision
 
-This substrate also supports later user-space-kernel components. It does not by
-itself establish any Linux ABI compatibility.
+Status: **bounded scalar gate implemented**.
+
+Mode 18 packages four independently linked static ELFs at
+`/sbin/m6-client.elf`, `/sbin/m6-personalityd.elf`,
+`/sbin/m6-supervisord.elf`, and `/sbin/m6-observer.elf`. The deterministic
+62,104-byte OVFS image has SHA-256
+`c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`;
+the host verifies the exact path set, byte identity, and digest, and the kernel
+recomputes the digest before import. The gate rejects any kernel-linked user
+module symbol.
+
+The client runs under a minimal test-personality ID. Its generation-bound call
+capability enters the common syscall router, allocates a bounded request record,
+and forwards one packed operation/scalar pair through an endpoint to the
+unprivileged native personality daemon. The daemon's typed reply capability is
+generation-specific. Reply, unprivileged-supervisor cancellation, deadline
+expiry, and service death compete for exactly one terminal transition and one
+dependent-thread wake; late and duplicate completion cannot change the result.
+
+The independently loaded CPL3 supervisor performs the policy sequence: direct
+health RPC, publish generation 1, cancel a held request, observe the
+service-owned endpoint close after the daemon's deliberate fault, request a
+fresh generation, health-gate generation-2 publication, and request cooperative
+stop. O-core validates authority and performs routing, containment,
+load/reap/rebind, and terminal arbitration as mechanism; it does not choose that
+policy. The executable corpus proves ping, add-one, explicit unsupported,
+cancellation, timeout, service-death failure, stale and duplicate replies,
+denial of the stale generation-1 call capability, unrelated-observer progress,
+complete reclamation, and a later timer.
+
+This is deliberately M6A rather than full Milestone 6. The test-personality
+surface is scalar-only. Pointer-bearing calls and direct endpoint access are
+disabled, so there is no shared or request-scoped foreign memory view. The gate
+also does not establish general package dependency resolution, durable reboot
+reconstruction, unbounded retry/backoff, a foreign executable format, or a
+Linux or other foreign operating-system ABI.
+
+### Milestone 6B: request-scoped memory and delegated-resource completion
+
+Status: **planned**.
+
+Before a pointer-bearing foreign call is admitted, implement the bounded,
+request-scoped capabilities and lifecycle in
+[`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). A service must never
+receive a raw pointer in another process. Complete Milestone 6 must add explicit
+memory, filesystem, timer, network, and device delegation and prove revocation
+without ambient fallback. Crash, restart, cancellation, timeout, and stale-reply
+tests must close every temporary view and still wake each dependent thread at
+most once. This completion also supports later user-space-kernel components; it
+does not itself establish Linux ABI compatibility.
 
 ### Milestone 7: minimal translated Linux x86-64 personality
 
@@ -696,15 +766,20 @@ merely for convenience.
 
 ## 5. Cross-cutting invariants
 
-These are the target invariants for the architecture. Milestones 0.2 and 0.3 enforce
-kernel-owned routing, mapping-aware pointer checks, fault-aware bounded copies,
-typed capability lookup, user and kernel W^X, guarded stacks, normalized fault
-frames, validated return state, generation-safe frame and memory-object reuse,
-zero-before-reuse, and per-CSpace allocation quotas within the fixed
-single-process layout. Milestones 1 and 2 make independent address spaces,
-teardown, and scheduling executable. The Milestone 3 foundation proves bounded
-endpoint, transfer-ticket, and shared-mapping primitives, but general IPC and
-personality supervision remain aspirational until their full gates pass.
+These are the target invariants for the architecture. Milestones 0.2 and 0.3
+enforce kernel-owned routing, mapping-aware pointer checks, fault-aware bounded
+copies, typed capability lookup, user and kernel W^X, guarded stacks, normalized
+fault frames, validated return state, generation-safe frame and memory-object
+reuse, zero-before-reuse, and per-CSpace allocation quotas. Milestones 1 and 2
+make independent address spaces, teardown, and scheduling executable. Milestone
+3 makes public bounded endpoint IPC, real TCB block/wake, attenuated transfer,
+death cleanup, and crash containment executable. Milestone 4 adds static native
+ELF/OVFS/namespace lifecycles, and Milestone 5 composes four loaded principals
+with capability-gated serial package activation plus one health-gated
+package-daemon replacement. M6A adds a package-loaded scalar test personality,
+an unprivileged endpoint-backed daemon and supervisor, terminal request
+arbitration, and one generation rebind. Every statement remains scoped to its
+fixed-capacity, single-CPU gate.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are
    distinct types and cannot be substituted by integer coincidence.
@@ -753,18 +828,18 @@ personality supervision remain aspirational until their full gates pass.
 | Feature | Pre-0.1 baseline | Current verified boundary | First multi-rootfs demo | Long-term |
 |---|---|---|---|---|
 | CPU/privilege | x86-64 ring-0 boot | one CPU, canonical CPL3 frames, timer/SYSCALL switching | isolated x86-64 processes | SMP and hardened entry |
-| Domains | none | two generation-tagged native instances in the M2 gate | native, Alpine, Debian instances | persistent lifecycle and quotas |
-| Personalities | none | native-only dispatch | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
-| Address spaces | one identity map | independent CR3s, private/guarded leaves, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
-| Processes | none | bounded two-process isolation, exit/fault teardown, stale reuse | multiple isolated processes | complete process/thread lifecycle |
-| CSpaces | one small global table | exact owners plus reserved slots and attenuated memory transfer tickets | one CSpace per process | general atomic cross-domain attenuation |
-| Memory | bump-only frames | typed reclaim plus private and one-page shared mappings | mapped per-process objects | discovered RAM, paging, NUMA policy |
-| Scheduling | timer marker only | four-TCB preemptive/blocking scheduler with yield/sleep | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | bounded endpoint/transfer foundation; no CPL3 IPC ABI yet | endpoints, shared memory, transfer | supervised personality RPC |
-| Loading | kernel-linked code | linked user payload | native and static Linux ELF loaders | dynamic loaders per personality |
-| Filesystems | none | none | separate Alpine/Debian roots | versioned overlays and services |
-| Live system | none | none | package store, serial O REPL, activation/rollback | native builds and richer interactive environments |
-| Crossings | hosted OValue and broker only | none to booted kernel | OValue, capability, capsule channels | common contract across all modes |
+| Domains | none | bounded generation-tagged native worlds; four-process IPC and live-system scenarios | native, Alpine, Debian instances | persistent lifecycle and quotas |
+| Personalities | none | native dispatch plus one package-loaded scalar test personality served by an unprivileged M6A daemon | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
+| Address spaces | one identity map | independent CR3s, guarded loaded stacks, exact W^X ELF mappings, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
+| Processes | none | up to four loaded CPL3 principals in the current gates with teardown and stale denial | multiple isolated processes | complete process/thread lifecycle |
+| CSpaces | one small global table | exact owners, endpoint transfer attenuation, isolated service CSpaces, typed REPL control cap | one CSpace per process | general atomic cross-domain attenuation |
+| Memory | bump-only frames | typed reclaim, private/shared mappings, transactional loaded-image reclamation | mapped per-process objects | discovered RAM, paging, NUMA policy |
+| Scheduling | timer marker only | bounded preemptive/blocking TCB scheduler with yield, sleep, IPC wake, and loaded-program completion | preemptive blocking scheduler | multicore policy and accounting |
+| IPC | none | public bounded CPL3 endpoints plus supervised scalar M6A personality RPC; no foreign memory views | personality RPC plus foreign memory views | supervised personality RPC |
+| Loading | kernel-linked code | static native ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | native and static Linux ELF loaders | dynamic loaders per personality |
+| Filesystems | none | fixed-capacity immutable OVFS images and domain-relative root mounts | separate Alpine/Debian roots | versioned overlays and services |
+| Live system | none | M5 package activation plus M6A unprivileged scalar personality supervision and one generation rebind | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
+| Crossings | hosted OValue and broker only | bounded scalar IPC, capability transfer, and personality calls; no native OValue codec or foreign memory view | OValue, capability, capsule channels | common contract across all modes |
 | Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
 
 The first credible multi-domain O-Domain demonstration is therefore not either

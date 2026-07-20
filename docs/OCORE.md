@@ -225,12 +225,21 @@ Initial syscall numbers are:
 |---:|---|
 | 0 | `debug_write(cap, ptr, len)` |
 | 1 | `cap_close(cap)` |
-| 2 | reserved `cap_copy` number; returns `ERR_NOT_IMPLEMENTED` |
+| 2 | `cap_copy(source_cap, destination_endpoint_cap, rights)`; creates an attenuation-only transfer ticket in the M3 scheduler gate |
 | 3 | `page_alloc(page_pool_cap, kind)`; returns a generated memory capability |
 | 4 | `yield()` |
 | 5 | `ticks()` |
 | 6 | `exit(status)`; enabled only by a trusted lifecycle harness |
 | 7 | `sleep(delta_ticks)`; enabled only while the scheduler is active |
+| 8 | `endpoint_create()`; returns a generated endpoint capability |
+| 9 | `endpoint_send(endpoint_cap, word0, correlation, transfer_ticket)` |
+| 10 | `endpoint_receive(endpoint_cap, message_ptr, 32)` |
+| 11 | `endpoint_cancel(endpoint_cap, correlation)` |
+| 12 | `serial_read(control_cap, byte_ptr, 1)`; nonblocking and mode-gated |
+| 13 | `control_submit(control_cap, command_ptr, len)`; bounded to 192 bytes |
+| 14 | `personality_call(call_cap, operation, scalar, timeout_ticks)`; M6A scalar route |
+| 15 | `personality_reply(reply_cap, request, status, scalar)`; M6A daemon completion |
+| 16 | `personality_supervise(supervise_cap, action, generation, subject)`; M6A policy action |
 
 `page_alloc` accepts anonymous or shared memory from a typed page-pool
 capability. It enforces the current CSpace's hard frame quota and distinguishes
@@ -243,10 +252,27 @@ not an internal object handle, frame index, or physical address.
 transition when the Milestone 2 scheduler is active and returns directly in the
 bootstrap gate. `exit` abandons a user frame only after the kernel has installed
 a trusted lifecycle continuation. `sleep` rejects zero or out-of-range delays
-and returns `ERR_NOT_IMPLEMENTED` when the scheduler is inactive. `cap_copy`
-retains its stable number but still returns `ERR_NOT_IMPLEMENTED`; the
-Milestone 3 transfer primitive is kernel-only and limited to shared-memory
-capabilities.
+and returns `ERR_NOT_IMPLEMENTED` when the scheduler is inactive. In the M3
+gate, `cap_copy` validates an endpoint to derive its receiver CSpace, then
+creates an attenuation ticket bound to the exact creating process generation
+and that destination CSpace. It does not bind the endpoint object, and the
+receiver's CSpace slot remains kernel-selected. The public gate exhausts all 16
+ticket records, denies abort by a non-owner process, lets the owner abort each
+once, rejects a stale repeat, and proves a fresh prepare succeeds afterward.
+Endpoint send/receive/cancel are public CPL3 operations with bounded copy and
+real scheduler block/wake behavior. The M5 serial operations require the exact
+typed control object installed only in the loaded REPL CSpace.
+
+Mode 18 adds three M6A-only calls: scalar personality call, personality reply,
+and supervision. A generation-bound call capability routes the test
+personality's scalar operation and input through a kernel request record to an
+endpoint owned by the current unprivileged daemon. A typed reply capability is
+installed only in that daemon; a rotating typed supervision capability is
+installed only in the unprivileged supervisor. The request record arbitrates
+reply, supervisor cancellation, deadline expiry, and service death into one
+terminal state and one dependent wake. The test personality admits only its
+small scalar syscall whitelist; pointer-bearing endpoint operations return
+`ERR_NOT_IMPLEMENTED` rather than bypassing a future memory-view protocol.
 
 The hosted `OCapability` wire value may refer to a live kernel capability only
 through an authenticated transport endpoint. Its string `identity` is never
@@ -337,28 +363,58 @@ phase. Failed context installation rolls architectural and PCB identity back to
 the verified management state before the prepared TCB is returned to the
 runnable queue.
 
-Milestone 3 has a verified foundation and is not complete. The kernel-side
-foundation contains eight generation-tagged endpoint objects, four-message FIFO
-queues, correlation cancellation, deterministic waiter-record and capability
-cleanup, invisible generation-tagged destination-slot reservations,
-exact-generation queued-capability escrow, and generation-tagged transfer
-tickets. Transfer is atomic, attenuation-only, and currently restricted to
-shared-memory objects. Each dynamic address space can optionally map one shared
-object at fixed virtual address `0x01202000` as RW/NX, but only through a
-`RIGHT_MEMORY_USE` capability in that address space's exact owner CSpace.
-`smoke-ipc-foundation-qemu.sh` proves cross-CR3 visibility, bounded queue
-backpressure and FIFO order, cancellation and waiter-record cleanup, endpoint
-and destination-capability generation reuse, stale ticket denial, exact
-attenuation and failed re-transfer, rejection of new work from a dead sender,
-explicit management-harness cancellation of its earlier queue item and ticket,
-full resource reclamation, and later timer survival.
+Milestone 3 has a bounded public IPC gate. The original kernel-mechanism
+regression remains in `smoke-ipc-foundation-qemu.sh`; `smoke-ipc-qemu.sh` adds
+CPL3 endpoint create/send/receive/cancel, real full-queue TCB blocking and
+wake-once retry, preemptive cross-domain request/reply, exact attenuated
+capability transfer, automatic dead-sender cleanup, and containment of a
+deliberately crashing personality while unrelated worlds progress. The gate
+then tears down every process and capability generation, reclaims all frames,
+and reaches a later timer. It is fixed-capacity and single-CPU and does not
+claim every death/cancellation interleaving or the request-scoped foreign-memory
+protocol.
 
-The waiter records prove bounded registry bookkeeping, not live blocked TCB
-transitions. The Milestone 3 foundation exposes no CPL3 endpoint operations.
-Empty receive and full send do not yet enter real blocked TCB states.
-Same-domain and cross-domain request/reply do not run under preemption, and the
-full sender and receiver death matrix and personality-service crash-containment
-gate remain unimplemented. The native `cap_copy` syscall therefore remains
-explicitly unavailable. The kernel also does not yet provide an executable
-loader, demand paging, SMP, a foreign ABI personality, a root filesystem, the
-hosted-broker transport, or a complete IPC system.
+Milestone 4 adds a deterministic read-only OVFS importer, freestanding SHA-256
+verification, strict static x86_64 ELF validation, BSS and minimal SysV stack
+materialization, loaded W^X address spaces, and capability-returning service
+lookup. `smoke-loader-qemu.sh` executes two independently linked personalities
+at the same virtual addresses in different CR3 roots, rejects malformed,
+overlapping, and W+X images, then proves transactional namespace teardown and
+reclamation.
+
+Milestone 5 is a bounded native live-system slice. Four separately linked
+`init`, supervisor, package-daemon, and REPL ELFs load from one immutable OVFS
+image into distinct CSpaces. The REPL owns the sole typed serial/control
+capability and performs real line collection; privileged fixed-capacity package
+and supervisor state machines enforce exact manifests, grants, health-gated
+publication, stale generations, rollback semantics, and targeted restart. In
+mode 16, `smoke-live-qemu.sh` drives the real serial install/activate lifecycle,
+contains one package-daemon CPL3 fault, withdraws the old service in
+`CONTROL_RECOVERING`, health-gates a fresh loaded generation before republication,
+and proves final deactivation. Mode 17's `smoke-live-semantics-qemu.sh`
+independently executes the broader finite state corpus. These gates do not claim
+general retry/backoff, recovery from a replacement fault, unprivileged
+endpoint-backed service policy, durable reboot reconstruction, a native
+compiler, a dynamic linker, a foreign ABI personality, or a foreign root
+filesystem.
+
+M6A is a separate bounded personality-supervision slice in mode 18.
+`build-m6-artifacts.sh` deterministically packages a test client, native
+personality daemon, native supervisor daemon, and unrelated observer at exact
+`/sbin/m6-*.elf` paths in a 62,104-byte immutable OVFS image. Its SHA-256 is
+`c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`.
+`smoke-personality-qemu.sh` checks the artifact identity and absence of the four
+user modules from kernel symbols before boot. In QEMU, the CPL3 supervisor
+performs health-before-publication, cancels one held request, observes the
+daemon-owned endpoint close after a deliberate daemon fault, requests one
+fresh generation, health-gates republication, and requests cooperative stop.
+The client proves the pinned ping/add-one/unsupported scalar corpus, timeout and
+crash results, a rotated call capability, denial of the stale generation-1
+capability, and the generation-2 corpus. Late cancelled, late timed-out,
+prior-generation, and duplicate replies are rejected; an unrelated observer
+continues; all resources are reclaimed; and a later timer remains live.
+
+This evidence is deliberately named M6A, not full Milestone 6. It has no shared
+or request-scoped foreign-process memory view, no pointer-bearing personality
+call, no general package dependency resolver or durable reconstruction, no
+unbounded retry policy, and no Linux or other foreign operating-system ABI.

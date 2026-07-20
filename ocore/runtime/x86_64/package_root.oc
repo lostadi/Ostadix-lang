@@ -1,0 +1,604 @@
+module runtime::package_root;
+
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_CANCEL;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::capability::RIGHT_PAGE_ALLOC;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::capability::RIGHT_CONTROL;
+
+pub const PACKAGE_SCHEMA_V1: u64 = 1;
+pub const RUNTIME_NATIVE: u64 = 1;
+pub const MAX_PACKAGE_ROOTS: usize = 8;
+pub const MAX_SERVICES_PER_PACKAGE: usize = 4;
+pub const MAX_REQUESTS_PER_PACKAGE: usize = 8;
+
+pub const REQUEST_DEBUG: u64 = 1;
+pub const REQUEST_MEMORY: u64 = 2;
+pub const REQUEST_ENDPOINT: u64 = 3;
+pub const REQUEST_PAGE_POOL: u64 = 4;
+pub const REQUEST_CONTROL: u64 = 5;
+
+const ROOT_EMPTY: u8 = 0;
+const ROOT_STAGING: u8 = 1;
+const ROOT_LIVE: u8 = 2;
+const ROOT_RETIRED: u8 = 3;
+const ROOT_HANDLE_TAG: u64 = 0xc500_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut STATES: [u8; 8] = [0; 8];
+static mut GENERATIONS: [u32; 8] = [0; 8];
+static mut DIGESTS: [u64; 32] = [0; 32];
+static mut SCHEMA_VERSIONS: [u64; 8] = [0; 8];
+static mut PACKAGE_IDS: [u64; 8] = [0; 8];
+static mut VERSIONS: [u64; 8] = [0; 8];
+static mut RUNTIME_KINDS: [u64; 8] = [0; 8];
+static mut ABI_VERSIONS: [u64; 8] = [0; 8];
+static mut SERVICE_COUNTS: [usize; 8] = [0; 8];
+static mut REQUEST_COUNTS: [usize; 8] = [0; 8];
+
+static mut SERVICE_IDS: [u64; 32] = [0; 32];
+static mut SERVICE_PROTOCOLS: [u64; 32] = [0; 32];
+static mut SERVICE_DEFINED: [u8; 32] = [0; 32];
+
+static mut REQUEST_KINDS: [u64; 64] = [0; 64];
+static mut REQUEST_PURPOSES: [u64; 64] = [0; 64];
+static mut REQUEST_RIGHTS: [u64; 64] = [0; 64];
+static mut REQUEST_DEFINED: [u8; 64] = [0; 64];
+
+static mut INSTALL_BEGINS: u64 = 0;
+static mut INSTALL_PUBLISHES: u64 = 0;
+static mut INSTALL_ABORTS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn root_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn root_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn digest_index(slot: usize, word: usize) -> usize {
+    return slot * 4 + word;
+}
+
+fn service_index(slot: usize, ordinal: usize) -> usize {
+    return slot * MAX_SERVICES_PER_PACKAGE + ordinal;
+}
+
+fn request_index(slot: usize, ordinal: usize) -> usize {
+    return slot * MAX_REQUESTS_PER_PACKAGE + ordinal;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | ROOT_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_root(handle: u64, required_state: u8) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != ROOT_HANDLE_TAG {
+        return MAX_PACKAGE_ROOTS;
+    }
+    let slot: usize = root_index(handle);
+    if slot >= MAX_PACKAGE_ROOTS
+        || STATES[slot] != required_state
+        || GENERATIONS[slot] != root_generation(handle) {
+        return MAX_PACKAGE_ROOTS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    let mut word: usize = 0;
+    while word < 4 {
+        DIGESTS[digest_index(slot, word)] = 0;
+        word += 1;
+    }
+    SCHEMA_VERSIONS[slot] = 0;
+    PACKAGE_IDS[slot] = 0;
+    VERSIONS[slot] = 0;
+    RUNTIME_KINDS[slot] = 0;
+    ABI_VERSIONS[slot] = 0;
+    SERVICE_COUNTS[slot] = 0;
+    REQUEST_COUNTS[slot] = 0;
+    let mut ordinal: usize = 0;
+    while ordinal < MAX_SERVICES_PER_PACKAGE {
+        let index: usize = service_index(slot, ordinal);
+        SERVICE_IDS[index] = 0;
+        SERVICE_PROTOCOLS[index] = 0;
+        SERVICE_DEFINED[index] = 0;
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < MAX_REQUESTS_PER_PACKAGE {
+        let index: usize = request_index(slot, ordinal);
+        REQUEST_KINDS[index] = 0;
+        REQUEST_PURPOSES[index] = 0;
+        REQUEST_RIGHTS[index] = 0;
+        REQUEST_DEFINED[index] = 0;
+        ordinal += 1;
+    }
+}
+
+fn allowed_rights(kind: u64) -> u64 {
+    if kind == REQUEST_DEBUG {
+        return RIGHT_DEBUG_WRITE;
+    }
+    if kind == REQUEST_MEMORY {
+        return RIGHT_MEMORY_USE | RIGHT_TRANSFER;
+    }
+    if kind == REQUEST_ENDPOINT {
+        return RIGHT_ENDPOINT_SEND
+            | RIGHT_ENDPOINT_RECEIVE
+            | RIGHT_ENDPOINT_CANCEL
+            | RIGHT_TRANSFER;
+    }
+    if kind == REQUEST_PAGE_POOL {
+        return RIGHT_PAGE_ALLOC | RIGHT_TRANSFER;
+    }
+    if kind == REQUEST_CONTROL {
+        return RIGHT_CONTROL;
+    }
+    return 0;
+}
+
+unsafe fn digest_matches(
+    slot: usize,
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64
+) -> bool {
+    return DIGESTS[digest_index(slot, 0)] == digest_zero
+        && DIGESTS[digest_index(slot, 1)] == digest_one
+        && DIGESTS[digest_index(slot, 2)] == digest_two
+        && DIGESTS[digest_index(slot, 3)] == digest_three;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PACKAGE_ROOTS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == ROOT_EMPTY || state == ROOT_RETIRED {
+            if (state == ROOT_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || SCHEMA_VERSIONS[slot] != 0
+                || PACKAGE_IDS[slot] != 0
+                || VERSIONS[slot] != 0
+                || RUNTIME_KINDS[slot] != 0
+                || ABI_VERSIONS[slot] != 0
+                || SERVICE_COUNTS[slot] != 0
+                || REQUEST_COUNTS[slot] != 0 {
+                return false;
+            }
+            let mut word: usize = 0;
+            while word < 4 {
+                if DIGESTS[digest_index(slot, word)] != 0 {
+                    return false;
+                }
+                word += 1;
+            }
+        } else if state == ROOT_STAGING || state == ROOT_LIVE {
+            if SCHEMA_VERSIONS[slot] != PACKAGE_SCHEMA_V1
+                || PACKAGE_IDS[slot] == 0
+                || VERSIONS[slot] == 0
+                || RUNTIME_KINDS[slot] != RUNTIME_NATIVE
+                || ABI_VERSIONS[slot] == 0
+                || SERVICE_COUNTS[slot] == 0
+                || SERVICE_COUNTS[slot] > MAX_SERVICES_PER_PACKAGE
+                || REQUEST_COUNTS[slot] > MAX_REQUESTS_PER_PACKAGE
+                || (DIGESTS[digest_index(slot, 0)] == 0
+                    && DIGESTS[digest_index(slot, 1)] == 0
+                    && DIGESTS[digest_index(slot, 2)] == 0
+                    && DIGESTS[digest_index(slot, 3)] == 0) {
+                return false;
+            }
+            let mut ordinal: usize = 0;
+            while ordinal < MAX_SERVICES_PER_PACKAGE {
+                let index: usize = service_index(slot, ordinal);
+                if ordinal < SERVICE_COUNTS[slot] {
+                    if SERVICE_DEFINED[index] != 0
+                        && (SERVICE_IDS[index] == 0
+                            || SERVICE_PROTOCOLS[index] == 0) {
+                        return false;
+                    }
+                    if state == ROOT_LIVE && SERVICE_DEFINED[index] != 1 {
+                        return false;
+                    }
+                } else if SERVICE_DEFINED[index] != 0
+                    || SERVICE_IDS[index] != 0
+                    || SERVICE_PROTOCOLS[index] != 0 {
+                    return false;
+                }
+                ordinal += 1;
+            }
+            ordinal = 0;
+            while ordinal < MAX_REQUESTS_PER_PACKAGE {
+                let index: usize = request_index(slot, ordinal);
+                if ordinal < REQUEST_COUNTS[slot] {
+                    if REQUEST_DEFINED[index] != 0
+                        && (REQUEST_KINDS[index] == 0
+                            || REQUEST_PURPOSES[index] == 0
+                            || REQUEST_RIGHTS[index] == 0
+                            || (REQUEST_RIGHTS[index]
+                                & allowed_rights(REQUEST_KINDS[index]))
+                                != REQUEST_RIGHTS[index]) {
+                        return false;
+                    }
+                    if state == ROOT_LIVE && REQUEST_DEFINED[index] != 1 {
+                        return false;
+                    }
+                } else if REQUEST_DEFINED[index] != 0
+                    || REQUEST_KINDS[index] != 0
+                    || REQUEST_PURPOSES[index] != 0
+                    || REQUEST_RIGHTS[index] != 0 {
+                    return false;
+                }
+                ordinal += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PACKAGE_ROOTS {
+        GENERATIONS[slot] = 1;
+        STATES[slot] = ROOT_EMPTY;
+        clear_slot(slot);
+        slot += 1;
+    }
+    INSTALL_BEGINS = 0;
+    INSTALL_PUBLISHES = 0;
+    INSTALL_ABORTS = 0;
+    DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn begin_install(
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64,
+    schema_version: u64,
+    package_id: u64,
+    version: u64,
+    runtime_kind: u64,
+    abi_version: u64,
+    service_count: usize,
+    request_count: usize
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (digest_zero == 0
+            && digest_one == 0
+            && digest_two == 0
+            && digest_three == 0)
+        || schema_version != PACKAGE_SCHEMA_V1
+        || package_id == 0
+        || version == 0
+        || runtime_kind != RUNTIME_NATIVE
+        || abi_version == 0
+        || service_count == 0
+        || service_count > MAX_SERVICES_PER_PACKAGE
+        || request_count > MAX_REQUESTS_PER_PACKAGE
+        || !invariants_hold() {
+        DENIALS += 1;
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PACKAGE_ROOTS {
+        if (STATES[slot] == ROOT_STAGING || STATES[slot] == ROOT_LIVE)
+            && digest_matches(
+                slot,
+                digest_zero,
+                digest_one,
+                digest_two,
+                digest_three
+            ) {
+            DENIALS += 1;
+            return 0;
+        }
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_PACKAGE_ROOTS && STATES[slot] != ROOT_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_PACKAGE_ROOTS || INSTALL_BEGINS == 0xffff_ffff_ffff_ffff {
+        DENIALS += 1;
+        return 0;
+    }
+    clear_slot(slot);
+    DIGESTS[digest_index(slot, 0)] = digest_zero;
+    DIGESTS[digest_index(slot, 1)] = digest_one;
+    DIGESTS[digest_index(slot, 2)] = digest_two;
+    DIGESTS[digest_index(slot, 3)] = digest_three;
+    SCHEMA_VERSIONS[slot] = schema_version;
+    PACKAGE_IDS[slot] = package_id;
+    VERSIONS[slot] = version;
+    RUNTIME_KINDS[slot] = runtime_kind;
+    ABI_VERSIONS[slot] = abi_version;
+    SERVICE_COUNTS[slot] = service_count;
+    REQUEST_COUNTS[slot] = request_count;
+    STATES[slot] = ROOT_STAGING;
+    INSTALL_BEGINS += 1;
+    return make_handle(slot);
+}
+
+pub unsafe fn define_service(
+    install: u64,
+    ordinal: usize,
+    service_id: u64,
+    protocol_id: u64
+) -> u64 {
+    let slot: usize = checked_root(install, ROOT_STAGING);
+    if slot >= MAX_PACKAGE_ROOTS
+        || ordinal >= SERVICE_COUNTS[slot]
+        || service_id == 0
+        || protocol_id == 0 {
+        DENIALS += 1;
+        return 0;
+    }
+    let index: usize = service_index(slot, ordinal);
+    if SERVICE_DEFINED[index] != 0 {
+        DENIALS += 1;
+        return 0;
+    }
+    let mut prior: usize = 0;
+    while prior < SERVICE_COUNTS[slot] {
+        let prior_index: usize = service_index(slot, prior);
+        if SERVICE_DEFINED[prior_index] != 0
+            && SERVICE_IDS[prior_index] == service_id {
+            DENIALS += 1;
+            return 0;
+        }
+        prior += 1;
+    }
+    SERVICE_IDS[index] = service_id;
+    SERVICE_PROTOCOLS[index] = protocol_id;
+    SERVICE_DEFINED[index] = 1;
+    return 1;
+}
+
+pub unsafe fn define_request(
+    install: u64,
+    ordinal: usize,
+    kind: u64,
+    purpose_id: u64,
+    rights: u64
+) -> u64 {
+    let slot: usize = checked_root(install, ROOT_STAGING);
+    let permitted: u64 = allowed_rights(kind);
+    if slot >= MAX_PACKAGE_ROOTS
+        || ordinal >= REQUEST_COUNTS[slot]
+        || purpose_id == 0
+        || rights == 0
+        || permitted == 0
+        || (rights & permitted) != rights {
+        DENIALS += 1;
+        return 0;
+    }
+    let index: usize = request_index(slot, ordinal);
+    if REQUEST_DEFINED[index] != 0 {
+        DENIALS += 1;
+        return 0;
+    }
+    let mut prior: usize = 0;
+    while prior < REQUEST_COUNTS[slot] {
+        let prior_index: usize = request_index(slot, prior);
+        if REQUEST_DEFINED[prior_index] != 0
+            && REQUEST_KINDS[prior_index] == kind
+            && REQUEST_PURPOSES[prior_index] == purpose_id {
+            DENIALS += 1;
+            return 0;
+        }
+        prior += 1;
+    }
+    REQUEST_KINDS[index] = kind;
+    REQUEST_PURPOSES[index] = purpose_id;
+    REQUEST_RIGHTS[index] = rights;
+    REQUEST_DEFINED[index] = 1;
+    return 1;
+}
+
+pub unsafe fn publish_install(install: u64) -> u64 {
+    let slot: usize = checked_root(install, ROOT_STAGING);
+    if slot >= MAX_PACKAGE_ROOTS || !invariants_hold() {
+        DENIALS += 1;
+        return 0;
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < SERVICE_COUNTS[slot] {
+        if SERVICE_DEFINED[service_index(slot, ordinal)] != 1 {
+            DENIALS += 1;
+            return 0;
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < REQUEST_COUNTS[slot] {
+        if REQUEST_DEFINED[request_index(slot, ordinal)] != 1 {
+            DENIALS += 1;
+            return 0;
+        }
+        ordinal += 1;
+    }
+    STATES[slot] = ROOT_LIVE;
+    INSTALL_PUBLISHES += 1;
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return install;
+}
+
+pub unsafe fn abort_install(install: u64) -> u64 {
+    let slot: usize = checked_root(install, ROOT_STAGING);
+    if slot >= MAX_PACKAGE_ROOTS || !invariants_hold() {
+        DENIALS += 1;
+        return 0;
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = ROOT_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = ROOT_EMPTY;
+    }
+    INSTALL_ABORTS += 1;
+    return 1;
+}
+
+pub unsafe fn is_live(root: u64) -> bool {
+    return checked_root(root, ROOT_LIVE) < MAX_PACKAGE_ROOTS;
+}
+
+pub unsafe fn find_digest(
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64
+) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PACKAGE_ROOTS {
+        if STATES[slot] == ROOT_LIVE
+            && digest_matches(
+                slot,
+                digest_zero,
+                digest_one,
+                digest_two,
+                digest_three
+            ) {
+            return make_handle(slot);
+        }
+        slot += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn digest_word(root: u64, word: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || word >= 4 {
+        return 0;
+    }
+    return DIGESTS[digest_index(slot, word)];
+}
+
+pub unsafe fn package_id(root: u64) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS {
+        return 0;
+    }
+    return PACKAGE_IDS[slot];
+}
+
+pub unsafe fn version(root: u64) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS {
+        return 0;
+    }
+    return VERSIONS[slot];
+}
+
+pub unsafe fn service_count(root: u64) -> usize {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS {
+        return 0;
+    }
+    return SERVICE_COUNTS[slot];
+}
+
+pub unsafe fn service_id_at(root: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || ordinal >= SERVICE_COUNTS[slot] {
+        return 0;
+    }
+    return SERVICE_IDS[service_index(slot, ordinal)];
+}
+
+pub unsafe fn protocol_id_at(root: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || ordinal >= SERVICE_COUNTS[slot] {
+        return 0;
+    }
+    return SERVICE_PROTOCOLS[service_index(slot, ordinal)];
+}
+
+pub unsafe fn request_count(root: u64) -> usize {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS {
+        return 0;
+    }
+    return REQUEST_COUNTS[slot];
+}
+
+pub unsafe fn request_rights_at(root: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_RIGHTS[request_index(slot, ordinal)];
+}
+
+pub unsafe fn request_kind_at(root: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_KINDS[request_index(slot, ordinal)];
+}
+
+pub unsafe fn request_purpose_at(root: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_root(root, ROOT_LIVE);
+    if slot >= MAX_PACKAGE_ROOTS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_PURPOSES[request_index(slot, ordinal)];
+}
+
+pub unsafe fn install_begin_count() -> u64 {
+    return INSTALL_BEGINS;
+}
+
+pub unsafe fn install_publish_count() -> u64 {
+    return INSTALL_PUBLISHES;
+}
+
+pub unsafe fn install_abort_count() -> u64 {
+    return INSTALL_ABORTS;
+}
+
+pub unsafe fn denial_count() -> u64 {
+    return DENIALS;
+}

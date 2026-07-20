@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 13" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 18" >&2
     exit 2
     ;;
 esac
@@ -16,10 +16,66 @@ mkdir -p "$BUILD_DIR"
 
 cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
 
+M4_IMAGE_DEFINE='-DOCORE_M4_IMAGE_PATH=""'
+M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
+M6_IMAGE_DEFINE='-DOCORE_M6_IMAGE_PATH=""'
+if (( PROBE_MODE == 15 )); then
+  M4_ARTIFACT_OUTPUT="$(
+    OCORE_M4_BUILD_DIR="$ROOT/target/ocore-m4" \
+      "$KERNEL_DIR/build-m4-artifacts.sh"
+  )"
+  M4_IMAGE_PATH="$(
+    printf '%s\n' "$M4_ARTIFACT_OUTPUT" | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M4_IMAGE_PATH" || ! -f "$M4_IMAGE_PATH" ]]; then
+    echo "error: M4 artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M4_IMAGE_DEFINE="-DOCORE_M4_IMAGE_PATH=\"$M4_IMAGE_PATH\""
+fi
+
+if (( PROBE_MODE == 16 )); then
+  M5_ARTIFACT_OUTPUT="$(
+    OCORE_M5_BUILD_DIR="$ROOT/target/ocore-m5-artifacts" \
+      "$KERNEL_DIR/build-m5-artifacts.sh"
+  )"
+  M5_IMAGE_PATH="$(
+    printf '%s\n' "$M5_ARTIFACT_OUTPUT" | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M5_IMAGE_PATH" || ! -f "$M5_IMAGE_PATH" ]]; then
+    echo "error: M5 artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M5_IMAGE_DEFINE="-DOCORE_M5_IMAGE_PATH=\"$M5_IMAGE_PATH\""
+fi
+
+if (( PROBE_MODE == 18 )); then
+  M6_ARTIFACT_OUTPUT="$(
+    OCORE_M6_BUILD_DIR="$ROOT/target/ocore-m6-artifacts" \
+      "$KERNEL_DIR/build-m6-artifacts.sh"
+  )"
+  M6_IMAGE_PATH="$(
+    printf '%s\n' "$M6_ARTIFACT_OUTPUT" | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M6_IMAGE_PATH" || ! -f "$M6_IMAGE_PATH" ]]; then
+    echo "error: M6A artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M6_IMAGE_DEFINE="-DOCORE_M6_IMAGE_PATH=\"$M6_IMAGE_PATH\""
+fi
+
 "$ROOT/target/debug/ocorec" \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
+  "$ROOT/ocore/runtime/x86_64/domain_namespace.oc" \
+  "$ROOT/ocore/runtime/x86_64/image_vfs.oc" \
+  "$ROOT/ocore/runtime/x86_64/elf_loader.oc" \
+  "$ROOT/ocore/runtime/x86_64/service_registry.oc" \
+  "$ROOT/ocore/runtime/x86_64/package_root.oc" \
+  "$ROOT/ocore/runtime/x86_64/live_supervisor.oc" \
+  "$ROOT/ocore/runtime/x86_64/serial_control.oc" \
+  "$ROOT/ocore/runtime/x86_64/native_control.oc" \
   "$ROOT/ocore/runtime/x86_64/address_space.oc" \
   "$ROOT/ocore/runtime/x86_64/native_abi.oc" \
   "$ROOT/ocore/runtime/x86_64/personality.oc" \
@@ -31,6 +87,10 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
   "$ROOT/ocore/runtime/x86_64/memory_object.oc" \
   "$ROOT/ocore/runtime/x86_64/endpoint.oc" \
   "$ROOT/ocore/runtime/x86_64/cap_transfer.oc" \
+  "$ROOT/ocore/runtime/x86_64/ipc_wait.oc" \
+  "$ROOT/ocore/runtime/x86_64/ipc_lifecycle.oc" \
+  "$ROOT/ocore/runtime/x86_64/personality_supervision.oc" \
+  "$ROOT/ocore/runtime/x86_64/personality_rpc.oc" \
   "$ROOT/ocore/runtime/x86_64/mapping.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/trap.oc" \
@@ -38,9 +98,17 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
   "$ROOT/ocore/runtime/x86_64/user.oc" \
   "$ROOT/ocore/runtime/x86_64/m1_user.oc" \
   "$ROOT/ocore/runtime/x86_64/m2_user.oc" \
+  "$ROOT/ocore/runtime/x86_64/m3_user.oc" \
   "$KERNEL_DIR/m1.oc" \
   "$KERNEL_DIR/m2.oc" \
   "$KERNEL_DIR/m3.oc" \
+  "$KERNEL_DIR/m3_live.oc" \
+  "$KERNEL_DIR/m4.oc" \
+  "$KERNEL_DIR/m5.oc" \
+  "$KERNEL_DIR/m5_selftest.oc" \
+  "$KERNEL_DIR/m5_semantics.oc" \
+  "$KERNEL_DIR/m6.oc" \
+  "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \
   --emit obj \
@@ -49,6 +117,9 @@ cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
 
 clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   -DOCORE_PROBE_MODE="$PROBE_MODE" \
+  "$M4_IMAGE_DEFINE" \
+  "$M5_IMAGE_DEFINE" \
+  "$M6_IMAGE_DEFINE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
 find_lld() {

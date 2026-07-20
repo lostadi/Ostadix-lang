@@ -25,6 +25,27 @@
   default, emits a deterministic ZIP with a canonical manifest and checksums,
   and self-verifies before atomic publication. Its regression suite covers
   debris exclusion, reproducibility, committed-byte behavior, and tampering.
+- The hosted Live-World reference in `src/live_system/` and
+  `src/bin/o-live-host.rs` implements strict bounded package ingestion, an
+  immutable verified SHA-256 store, exact default-deny activation policy,
+  per-service child supervision, health-gated transactional publication,
+  generation-bound private service bearers, rollback, targeted restart,
+  active-set reconstruction, and sequential cross-world composition through
+  pure, boot-persistable OValues. `scripts/smoke-hosted-live-reference.sh`
+  exercises the complete hosted scenario. On Unix, each stateful CLI command
+  holds a process-shared advisory lock from before any reconstruction or
+  mutation through its complete operation. Direct supervisor mutations also
+  use a persisted monotonic revision and an active-set-specific process lock:
+  publishing activation, rollback, and service restart compare and advance the
+  observed revision, while a stale API instance is rejected and must
+  reconstruct. `tests/hosted_supervisor_transactions.rs` exercises that
+  two-writer conflict as well as read-only, generation-preserving
+  reconstruction.
+- The hosted Live-World reference is not a native O-core service manager. Its
+  workers use host processes and pipes, its state directory is same-user
+  trusted control-plane authority, and arbitrary host syscalls are not fully
+  contained. It is a differential semantic oracle, not evidence for any native
+  QEMU claim below; those claims have their own gates.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR
@@ -77,21 +98,83 @@
   TCB denial, frame reclamation, and post-lifecycle timer survival. The million
   transactions do not enter CPL3; real frame save/restore and IRETQ switching
   are proved separately by the bounded IRQ/SYSCALL phase.
-- Milestone 3 has a verified foundation, not a completed IPC milestone.
-  `smoke-ipc-foundation-qemu.sh` exercises generation-tagged endpoints with a
-  four-message FIFO, cancellation and waiter-record cleanup, invisible
-  destination-slot reservations, shared-memory-only attenuating transfer
-  tickets, exact-generation queued-capability escrow, and one optional fixed
-  RW/NX shared page in each of two address spaces. Shared mapping requires a
-  `RIGHT_MEMORY_USE` capability from the address space's exact owner CSpace. The
-  gate proves cross-CR3 visibility, exact attenuation, failed re-transfer,
-  generation reuse, rejection of new work from a dead sender, explicit
-  management-harness cancellation of its earlier queue item and ticket,
-  reclamation, and later timer survival. The public `cap_copy` number still
-  returns `ERR_NOT_IMPLEMENTED`. The waiter records are registry bookkeeping,
-  not live blocked TCB transitions. No CPL3 endpoint ABI, real blocked IPC,
-  preemptive request/reply ping-pong, complete sender/receiver death matrix, or
-  personality-service crash-containment gate exists yet.
+- Milestone 3 now has a bounded native IPC gate in
+  `ocore/kernel/smoke-ipc-qemu.sh`. Four CPL3 processes exercise public endpoint
+  create/send/receive/cancel syscalls, cross-domain request/reply, a full
+  four-message FIFO with real TCB blocking and wake-once retry, exact
+  attenuation during capability transfer, automatic dead-sender cleanup, and
+  exception-driven personality crash containment while an unrelated world
+  continues. A ticket is bound to its exact creating process generation and
+  the destination CSpace derived from the authorized endpoint, not to the
+  endpoint object. The gate fills all 16 ticket slots, denies abort by another
+  process, lets the owner unwind them exactly once, rejects the stale ticket,
+  and proves allocation recovers. It also requires transactional teardown,
+  complete resource reclamation, one later timer interrupt, and one second of
+  QEMU survival. The earlier `smoke-ipc-foundation-qemu.sh` remains a narrower
+  regression gate; `cap_copy` is now the attenuation-only transfer-ticket
+  operation, while its legacy all-zero capability probe still returns
+  `ERR_NOT_IMPLEMENTED`.
+- Milestone 4 has a bounded native loader/VFS gate in
+  `ocore/kernel/smoke-loader-qemu.sh`. `build-m4-artifacts.sh` rebuilds two
+  independently linked static O-core ELF personalities and a deterministic
+  read-only `OVFSIMG1` image, checks deterministic repacking and SHA-256 on the
+  host, and includes malformed, overlapping, and W+X ELF corpus entries. A
+  fresh QEMU boot imports the image as data, rejects that corpus before start,
+  and loads both personalities into separate W^X address spaces at the same
+  preferred user window, resolves a service to an attenuated capability, tears down the
+  namespace transactionally, reclaims every dynamic frame, and reaches a later
+  timer. The kernel runs NIST-vector-tested SHA-256 over the complete embedded
+  bytes before import and rejects any mismatch with the canonical artifact
+  identity; the host independently verifies reproducibility and the same digest.
+- Milestone 5 has a bounded native live-system gate in
+  `ocore/kernel/smoke-live-qemu.sh`. `build-m5-artifacts.sh` deterministically
+  builds separate static `init`, supervisor, package-daemon, and REPL ELF files
+  into a 62,056-byte content-addressed read-only OVFS image whose pinned SHA-256
+  is `88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`.
+  The host verifies that identity and the kernel recomputes it before import.
+  The fresh-QEMU gate proves four isolated loaded CSpaces and a real CPL3 serial
+  loop whose only serial-read and control-submit authority is a typed control
+  capability. The host sends a malformed command, an exact immutable-digest
+  install, and activation in that order; the malformed command cannot publish
+  state, while activation publishes all four service records only after exact
+  capability grants and concrete process health tokens. The package daemon then
+  deliberately faults in CPL3. The gate contains that one generation, preserves
+  the three unrelated services, withdraws the stale service while the control
+  state is `CONTROL_RECOVERING`, rejects stale process/thread/CSpace/address-space/
+  capability/service generations, and runs a freshly loaded package-daemon
+  generation. Only its exact restart health token permits republication. The
+  gate then deactivates the control plane, revokes the control capability, tears
+  down its namespace and processes, reclaims all frames, observes a later timer,
+  and requires another second of QEMU survival.
+- The independent mode-17 gate in `smoke-live-semantics-qemu.sh` executes the
+  bounded package/supervisor state corpus: two immutable roots, overgrant and
+  incomplete-set denial, failed-health nonpublication, complete-set rollback,
+  stale references, abstract crash/restart with unaffected state, and strict
+  serial parsing. Neither native gate establishes a general or unbounded retry
+  or backoff policy. A mode-16 replacement that fails before publishing its exact
+  health token remains withdrawn and fails closed; recovery from that second
+  fault is not claimed.
+- M6A has a bounded package-loaded scalar personality-supervision gate in
+  `ocore/kernel/smoke-personality-qemu.sh`. `build-m6-artifacts.sh` rebuilds
+  four static ELFs at `/sbin/m6-client.elf`,
+  `/sbin/m6-personalityd.elf`, `/sbin/m6-supervisord.elf`, and
+  `/sbin/m6-observer.elf`, requires byte identity, and packs exactly those paths
+  into a 62,104-byte read-only OVFS image with SHA-256
+  `c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`.
+  The host gate checks that identity and proves the user modules are not linked
+  as kernel code; the kernel verifies the complete image before import. Mode 18
+  loads all four into isolated W^X address spaces and CSpaces. The unprivileged
+  supervisor health-gates generations 1 and 2, requests publication, selects
+  cancellation, requests one crash-driven restart, and requests cooperative
+  stop. O-core installs and rotates the client call capability. The
+  endpoint-backed scalar router proves the
+  ping/add-one/unsupported corpus plus deterministic cancellation, timeout, and
+  service-death results with one terminal wake. It rejects late, duplicate,
+  prior-generation, and stale-capability use while an unrelated observer keeps
+  progressing, then reclaims every dynamic resource and reaches a later timer.
+  This is M6A rather than full Milestone 6: pointer-bearing calls and foreign
+  memory views remain disabled, and it establishes no Linux or other foreign
+  ABI.
 
 ## Implemented conservatively
 
@@ -119,10 +202,9 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond the current Milestone 3 foundation: a CPL3 IPC ABI,
-  blocking send/receive, preemptive request/reply and death cleanup, supervised
-  personality services, executable loaders, service discovery, the native live
-  system in `docs/LIVE_SYSTEM.md`, and only then a minimal Linux x86_64
-  personality. The staged engineering plan is in `docs/ODOMAIN_PLAN.md`; its
-  required foreign-process memory boundary is in
-  `docs/PERSONALITY_MEMORY_VIEW.md`.
+- O-Domain evolution beyond the current bounded native gates: extend M6A's
+  unprivileged scalar personality and supervision loop with durable reboot
+  reconstruction and a capability-bounded build service, then implement the
+  request-scoped foreign-process memory boundary in
+  `docs/PERSONALITY_MEMORY_VIEW.md`. No Linux ABI or root filesystem is claimed.
+  The staged engineering plan is in `docs/ODOMAIN_PLAN.md`.

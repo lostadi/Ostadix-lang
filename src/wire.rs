@@ -12,6 +12,29 @@ where
     T: Serialize,
 {
     let payload = encode_message(message)?;
+    write_frame_payload(writer, &payload)
+}
+
+pub(crate) fn write_frame_with_max<W, T>(
+    writer: &mut W,
+    message: &T,
+    max_frame_len: usize,
+) -> Result<()>
+where
+    W: Write,
+    T: Serialize,
+{
+    let payload = encode_message(message)?;
+    if payload.len() > max_frame_len {
+        bail!(
+            "wire frame length {} exceeds maximum {max_frame_len}",
+            payload.len()
+        );
+    }
+    write_frame_payload(writer, &payload)
+}
+
+fn write_frame_payload<W: Write>(writer: &mut W, payload: &[u8]) -> Result<()> {
     let len: u32 = payload
         .len()
         .try_into()
@@ -20,7 +43,7 @@ where
         .write_all(&len.to_be_bytes())
         .context("failed to write wire frame length")?;
     writer
-        .write_all(&payload)
+        .write_all(payload)
         .context("failed to write wire frame payload")?;
     writer.flush().context("failed to flush wire frame")?;
     Ok(())
@@ -31,7 +54,15 @@ where
     R: Read,
     T: DeserializeOwned,
 {
-    let Some(payload) = read_frame_payload(reader)? else {
+    read_frame_with_max(reader, MAX_FRAME_LEN)
+}
+
+pub(crate) fn read_frame_with_max<R, T>(reader: &mut R, max_frame_len: usize) -> Result<Option<T>>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
+    let Some(payload) = read_frame_payload(reader, max_frame_len)? else {
         return Ok(None);
     };
     decode_message(&payload).map(Some)
@@ -51,7 +82,7 @@ pub(crate) fn decode_message<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
     serde_json::from_value(value).context("failed to lift wire value into message")
 }
 
-fn read_frame_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+fn read_frame_payload<R: Read>(reader: &mut R, max_frame_len: usize) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0_u8; 4];
     let mut read = 0;
     while read < len_buf.len() {
@@ -68,8 +99,8 @@ fn read_frame_payload<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        bail!("wire frame length {len} exceeds maximum {MAX_FRAME_LEN}");
+    if len > max_frame_len {
+        bail!("wire frame length {len} exceeds maximum {max_frame_len}");
     }
 
     let mut payload = vec![0_u8; len];
@@ -347,5 +378,29 @@ mod tests {
             decoded,
             OWireResponse::EvalRequest { scope: Some(_), .. }
         ));
+    }
+
+    #[test]
+    fn caller_frame_limit_is_checked_before_payload_read() {
+        let header = 9_u32.to_be_bytes();
+        let mut header_only = header.as_slice();
+
+        let error = read_frame_with_max::<_, OWireCommand>(&mut header_only, 8).unwrap_err();
+
+        assert_eq!(error.to_string(), "wire frame length 9 exceeds maximum 8");
+        assert!(
+            header_only.is_empty(),
+            "only the length prefix was consumed"
+        );
+    }
+
+    #[test]
+    fn caller_write_limit_is_checked_before_frame_output() {
+        let mut frame = Vec::new();
+
+        let error = write_frame_with_max(&mut frame, &"too large", 1).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds maximum 1"));
+        assert!(frame.is_empty());
     }
 }

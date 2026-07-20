@@ -26,3 +26,13 @@ pub unsafe fn write(data: *const u8, len: usize) -> void {
         index += 1;
     }
 }
+
+// Bounded nonblocking receive for the native control plane. A zero result
+// means no byte is pending; callers retain no user pointer while waiting.
+pub unsafe fn try_read_byte(result: *mut u8) -> u64 {
+    if result as usize == 0 || (inb(COM1 + 5) & 0x01) == 0 {
+        return 0;
+    }
+    volatile_store(result, inb(COM1));
+    return 1;
+}

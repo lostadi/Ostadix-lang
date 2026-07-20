@@ -300,7 +300,10 @@ pub unsafe fn ocore_user_entry(report_capability: u64) -> never {
     if unknown_result != ERR_UNKNOWN_SYSCALL {
         stop();
     }
-    let reserved_copy_result: u64 = syscall0(SYS_CAP_COPY);
+    // The public M3 ABI uses SYS_CAP_COPY with three arguments. Preserve this
+    // legacy reservation probe by presenting the exact all-zero shape rather
+    // than relying on caller-saved registers left by a prior syscall.
+    let reserved_copy_result: u64 = syscall3(SYS_CAP_COPY, 0, 0, 0);
     let gated_exit_result: u64 = syscall1(SYS_EXIT, 0);
     let missing_pool_result: u64 = syscall2(
         SYS_PAGE_ALLOC,

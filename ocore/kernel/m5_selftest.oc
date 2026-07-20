@@ -1,0 +1,430 @@
+module kernel::m5_selftest;
+
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::capability::RIGHT_TRANSFER;
+use runtime::live_supervisor::ACTIVATION_ACTIVE;
+use runtime::live_supervisor::ACTIVATION_HEALTHY;
+use runtime::live_supervisor::ACTIVATION_STAGED;
+use runtime::live_supervisor::ACTIVATION_STARTED;
+use runtime::live_supervisor::activation_count;
+use runtime::live_supervisor::activation_failure_count;
+use runtime::live_supervisor::activation_state;
+use runtime::live_supervisor::active_digest_word;
+use runtime::live_supervisor::active_package_count;
+use runtime::live_supervisor::active_root;
+use runtime::live_supervisor::abort_activation;
+use runtime::live_supervisor::commit_activation;
+use runtime::live_supervisor::commit_complete_rollback;
+use runtime::live_supervisor::crash_count;
+use runtime::live_supervisor::crash_service;
+use runtime::live_supervisor::grant_request;
+use runtime::live_supervisor::grant_rollback_request;
+use runtime::live_supervisor::init as supervisor_init;
+use runtime::live_supervisor::invariants_hold as supervisor_invariants_hold;
+use runtime::live_supervisor::last_activation_state;
+use runtime::live_supervisor::mark_service_healthy;
+use runtime::live_supervisor::mark_rollback_service_healthy;
+use runtime::live_supervisor::resolve;
+use runtime::live_supervisor::restart_count;
+use runtime::live_supervisor::restart_service;
+use runtime::live_supervisor::rollback_count;
+use runtime::live_supervisor::rollback_failure_count;
+use runtime::live_supervisor::rollback_package_count;
+use runtime::live_supervisor::rollback_request_count;
+use runtime::live_supervisor::rollback_service_count;
+use runtime::live_supervisor::rollback_service_name_id;
+use runtime::live_supervisor::rollback_service_protocol_id;
+use runtime::live_supervisor::rollback_transaction_state;
+use runtime::live_supervisor::service_is_current;
+use runtime::live_supervisor::service_name_id;
+use runtime::live_supervisor::service_package_id;
+use runtime::live_supervisor::service_package_root;
+use runtime::live_supervisor::service_package_version;
+use runtime::live_supervisor::service_protocol_id;
+use runtime::live_supervisor::stage_activation;
+use runtime::live_supervisor::stage_complete_rollback;
+use runtime::live_supervisor::start_rollback_service;
+use runtime::live_supervisor::start_service;
+use runtime::package_root::PACKAGE_SCHEMA_V1;
+use runtime::package_root::REQUEST_DEBUG;
+use runtime::package_root::REQUEST_ENDPOINT;
+use runtime::package_root::RUNTIME_NATIVE;
+use runtime::package_root::abort_install;
+use runtime::package_root::begin_install;
+use runtime::package_root::define_request;
+use runtime::package_root::define_service;
+use runtime::package_root::denial_count;
+use runtime::package_root::find_digest;
+use runtime::package_root::init as package_root_init;
+use runtime::package_root::install_abort_count;
+use runtime::package_root::install_begin_count;
+use runtime::package_root::install_publish_count;
+use runtime::package_root::invariants_hold as package_invariants_hold;
+use runtime::package_root::is_live;
+use runtime::package_root::publish_install;
+use runtime::serial_control::COMMAND_ACTIVATE;
+use runtime::serial_control::COMMAND_INSTALL;
+use runtime::serial_control::COMMAND_RESOLVE;
+use runtime::serial_control::COMMAND_STATUS;
+use runtime::serial_control::COMMAND_UPGRADE;
+use runtime::serial_control::accepted_count;
+use runtime::serial_control::init as serial_control_init;
+use runtime::serial_control::invariants_hold as serial_invariants_hold;
+use runtime::serial_control::last_argument_one;
+use runtime::serial_control::last_argument_zero;
+use runtime::serial_control::last_command_kind;
+use runtime::serial_control::last_digest_word;
+use runtime::serial_control::parse;
+use runtime::serial_control::rejected_count;
+
+pub const SELF_TEST_PASS: u64 = 0x4d35_4350_4c4e_5041;
+
+const PACKAGE_ID: u64 = 42;
+const SERVICE_INIT: u64 = 1001;
+const SERVICE_PACKAGE: u64 = 1002;
+const PROTOCOL_INIT: u64 = 7;
+const PROTOCOL_PACKAGE: u64 = 8;
+
+static STATUS_COMMAND: [u8; 6] = b"status";
+static INSTALL_COMMAND: [u8; 77] = b"install 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff 42 2";
+static ACTIVATE_COMMAND: [u8; 73] = b"activate 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff";
+static UPGRADE_COMMAND: [u8; 72] = b"upgrade 0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff";
+static RESOLVE_COMMAND: [u8; 14] = b"resolve 1001 7";
+
+static INVALID_LEADING_SPACE: [u8; 7] = b" status";
+static INVALID_TERMINATOR: [u8; 7] = b"status\n";
+static INVALID_UPPERCASE: [u8; 73] = b"activate 0123456789Abcdeffedcba987654321000112233445566778899aabbccddeeff";
+static INVALID_DOUBLE_SPACE: [u8; 15] = b"resolve 1001  7";
+static INVALID_LEADING_ZERO: [u8; 15] = b"resolve 01001 7";
+static INVALID_OVERFLOW: [u8; 30] = b"resolve 18446744073709551616 7";
+static INVALID_ZERO_DIGEST: [u8; 73] = b"activate 0000000000000000000000000000000000000000000000000000000000000000";
+
+unsafe fn install_version(
+    digest_zero: u64,
+    digest_one: u64,
+    digest_two: u64,
+    digest_three: u64,
+    version: u64,
+    probe_denials: bool
+) -> u64 {
+    let install: u64 = begin_install(
+        digest_zero,
+        digest_one,
+        digest_two,
+        digest_three,
+        PACKAGE_SCHEMA_V1,
+        PACKAGE_ID,
+        version,
+        RUNTIME_NATIVE,
+        1,
+        2,
+        2
+    );
+    if install == 0
+        || define_service(install, 0, SERVICE_INIT, PROTOCOL_INIT) != 1
+        || define_service(
+            install,
+            1,
+            SERVICE_PACKAGE,
+            PROTOCOL_PACKAGE
+        ) != 1 {
+        return 0;
+    }
+    if probe_denials {
+        if define_request(
+            install,
+            0,
+            REQUEST_DEBUG,
+            5001,
+            RIGHT_DEBUG_WRITE | RIGHT_TRANSFER
+        ) != 0 {
+            return 0;
+        }
+    }
+    if define_request(
+        install,
+        0,
+        REQUEST_DEBUG,
+        5001,
+        RIGHT_DEBUG_WRITE
+    ) != 1 {
+        return 0;
+    }
+    if probe_denials && publish_install(install) != 0 {
+        return 0;
+    }
+    if define_request(
+        install,
+        1,
+        REQUEST_ENDPOINT,
+        5002,
+        RIGHT_ENDPOINT_SEND | RIGHT_ENDPOINT_RECEIVE
+    ) != 1
+        || publish_install(install) != install {
+        return 0;
+    }
+    return install;
+}
+
+unsafe fn activate_root(root: u64, probe_overgrant: bool) -> u64 {
+    let activation: u64 = stage_activation(root);
+    if activation == 0
+        || activation_state(activation) != ACTIVATION_STAGED {
+        return 0;
+    }
+    if probe_overgrant
+        && grant_request(
+            activation,
+            0,
+            RIGHT_DEBUG_WRITE | RIGHT_TRANSFER
+        ) != 0 {
+        return 0;
+    }
+    if grant_request(activation, 0, RIGHT_DEBUG_WRITE) != 1 {
+        return 0;
+    }
+    if probe_overgrant && start_service(activation, 0) != 0 {
+        return 0;
+    }
+    if grant_request(
+            activation,
+            1,
+            RIGHT_ENDPOINT_SEND | RIGHT_ENDPOINT_RECEIVE
+        ) != 1
+        || start_service(activation, 0) != 1
+        || activation_state(activation) != ACTIVATION_STAGED
+        || start_service(activation, 1) != 1
+        || activation_state(activation) != ACTIVATION_STARTED
+        || mark_service_healthy(activation, 0, true) != 1
+        || activation_state(activation) != ACTIVATION_STARTED
+        || mark_service_healthy(activation, 1, true) != 1
+        || activation_state(activation) != ACTIVATION_HEALTHY
+        || commit_activation(activation) != 1
+        || last_activation_state() != ACTIVATION_ACTIVE {
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn parser_self_test() -> bool {
+    if serial_control_init() != 1
+        || parse((&STATUS_COMMAND[0]), 6) != COMMAND_STATUS
+        || parse((&INSTALL_COMMAND[0]), 77) != COMMAND_INSTALL
+        || last_digest_word(0) != 0x0123_4567_89ab_cdef
+        || last_digest_word(1) != 0xfedc_ba98_7654_3210
+        || last_digest_word(2) != 0x0011_2233_4455_6677
+        || last_digest_word(3) != 0x8899_aabb_ccdd_eeff
+        || last_argument_zero() != 42
+        || last_argument_one() != 2
+        || parse((&ACTIVATE_COMMAND[0]), 73) != COMMAND_ACTIVATE
+        || parse((&UPGRADE_COMMAND[0]), 72) != COMMAND_UPGRADE
+        || parse((&RESOLVE_COMMAND[0]), 14) != COMMAND_RESOLVE
+        || last_command_kind() != COMMAND_RESOLVE
+        || last_argument_zero() != SERVICE_INIT
+        || last_argument_one() != PROTOCOL_INIT {
+        return false;
+    }
+    if parse((&INVALID_LEADING_SPACE[0]), 7) != 0
+        || parse((&INVALID_TERMINATOR[0]), 7) != 0
+        || parse((&INVALID_UPPERCASE[0]), 73) != 0
+        || parse((&INVALID_DOUBLE_SPACE[0]), 15) != 0
+        || parse((&INVALID_LEADING_ZERO[0]), 15) != 0
+        || parse((&INVALID_OVERFLOW[0]), 30) != 0
+        || parse((&INVALID_ZERO_DIGEST[0]), 73) != 0
+        || accepted_count() != 5
+        || rejected_count() != 7
+        || !serial_invariants_hold() {
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn self_test() -> u64 {
+    if package_root_init() != 1 || supervisor_init() != 1 {
+        return 0xe500_0000_0000_0001;
+    }
+    let root_v1: u64 = install_version(0x101, 0x102, 0x103, 0x104, 1, true);
+    if root_v1 == 0
+        || !is_live(root_v1)
+        || denial_count() != 2
+        || install_begin_count() != 1
+        || install_publish_count() != 1 {
+        return 0xe500_0000_0000_0002;
+    }
+    if activate_root(root_v1, true) != 1
+        || active_package_count() != 1
+        || rollback_package_count() != 0
+        || active_root(PACKAGE_ID) != root_v1
+        || active_digest_word(PACKAGE_ID, 0) != 0x101 {
+        return 0xe500_0000_0000_0003;
+    }
+    let service_v1: u64 = resolve(SERVICE_INIT, PROTOCOL_INIT);
+    if service_v1 == 0
+        || !service_is_current(service_v1)
+        || service_name_id(service_v1) != SERVICE_INIT
+        || service_protocol_id(service_v1) != PROTOCOL_INIT
+        || service_package_id(service_v1) != PACKAGE_ID
+        || service_package_version(service_v1) != 1
+        || service_package_root(service_v1) != root_v1 {
+        return 0xe500_0000_0000_0004;
+    }
+
+    let root_v2: u64 = install_version(0x201, 0x202, 0x203, 0x204, 2, false);
+    if root_v2 == 0 || find_digest(0x201, 0x202, 0x203, 0x204) != root_v2 {
+        return 0xe500_0000_0000_0005;
+    }
+    let failed: u64 = stage_activation(root_v2);
+    if failed == 0
+        || grant_request(failed, 0, RIGHT_DEBUG_WRITE) != 1
+        || grant_request(
+            failed,
+            1,
+            RIGHT_ENDPOINT_SEND | RIGHT_ENDPOINT_RECEIVE
+        ) != 1
+        || start_service(failed, 0) != 1
+        || start_service(failed, 1) != 1
+        || mark_service_healthy(failed, 0, true) != 1
+        || mark_service_healthy(failed, 1, false) != 0
+        || active_root(PACKAGE_ID) != root_v1
+        || !service_is_current(service_v1) {
+        return 0xe500_0000_0000_0006;
+    }
+    if activate_root(root_v2, false) != 1
+        || active_root(PACKAGE_ID) != root_v2
+        || service_is_current(service_v1) {
+        return 0xe500_0000_0000_0007;
+    }
+    let service_v2: u64 = resolve(SERVICE_INIT, PROTOCOL_INIT);
+    if service_v2 == 0
+        || !service_is_current(service_v2)
+        || rollback_package_count() != 1 {
+        return 0xe500_0000_0000_0008;
+    }
+    let failed_rollback: u64 = stage_complete_rollback();
+    if failed_rollback == 0
+        || rollback_transaction_state(failed_rollback) != ACTIVATION_STAGED
+        || rollback_request_count(failed_rollback) != 2
+        || rollback_service_count(failed_rollback) != 2
+        || rollback_service_name_id(failed_rollback, 0) != SERVICE_INIT
+        || rollback_service_protocol_id(failed_rollback, 0)
+            != PROTOCOL_INIT
+        || grant_rollback_request(
+            failed_rollback,
+            0,
+            RIGHT_DEBUG_WRITE | RIGHT_TRANSFER
+        ) != 0
+        || grant_rollback_request(
+            failed_rollback,
+            0,
+            RIGHT_DEBUG_WRITE
+        ) != 1
+        || start_rollback_service(failed_rollback, 0) != 0
+        || grant_rollback_request(
+            failed_rollback,
+            1,
+            RIGHT_ENDPOINT_SEND | RIGHT_ENDPOINT_RECEIVE
+        ) != 1
+        || start_rollback_service(failed_rollback, 0) != 1
+        || start_rollback_service(failed_rollback, 1) != 1
+        || mark_rollback_service_healthy(
+            failed_rollback,
+            0,
+            true
+        ) != 1
+        || mark_rollback_service_healthy(
+            failed_rollback,
+            1,
+            false
+        ) != 0
+        || active_root(PACKAGE_ID) != root_v2
+        || !service_is_current(service_v2) {
+        return 0xe500_0000_0000_0008;
+    }
+    let rollback: u64 = stage_complete_rollback();
+    if rollback == 0
+        || grant_rollback_request(rollback, 0, RIGHT_DEBUG_WRITE) != 1
+        || grant_rollback_request(
+            rollback,
+            1,
+            RIGHT_ENDPOINT_SEND | RIGHT_ENDPOINT_RECEIVE
+        ) != 1
+        || start_rollback_service(rollback, 0) != 1
+        || start_rollback_service(rollback, 1) != 1
+        || mark_rollback_service_healthy(rollback, 0, true) != 1
+        || mark_rollback_service_healthy(rollback, 1, true) != 1
+        || rollback_transaction_state(rollback) != ACTIVATION_HEALTHY
+        || commit_complete_rollback(rollback) != 1
+        || active_root(PACKAGE_ID) != root_v1
+        || service_is_current(service_v2) {
+        return 0xe500_0000_0000_0008;
+    }
+    let service_after_rollback: u64 = resolve(SERVICE_INIT, PROTOCOL_INIT);
+    if service_after_rollback == 0
+        || crash_service(service_after_rollback) != 1
+        || service_is_current(service_after_rollback)
+        || resolve(SERVICE_INIT, PROTOCOL_INIT) != 0
+        || restart_service(PACKAGE_ID, SERVICE_INIT, false) != 0 {
+        return 0xe500_0000_0000_0009;
+    }
+    let restarted: u64 = restart_service(PACKAGE_ID, SERVICE_INIT, true);
+    if restarted == 0 || !service_is_current(restarted) {
+        return 0xe500_0000_0000_000a;
+    }
+
+    let scratch: u64 = begin_install(
+        0x301,
+        0x302,
+        0x303,
+        0x304,
+        PACKAGE_SCHEMA_V1,
+        99,
+        1,
+        RUNTIME_NATIVE,
+        1,
+        1,
+        0
+    );
+    if scratch == 0
+        || define_service(scratch, 0, 9001, 9) != 1
+        || abort_install(scratch) != 1
+        || is_live(scratch)
+        || find_digest(0x301, 0x302, 0x303, 0x304) != 0 {
+        return 0xe500_0000_0000_000b;
+    }
+    let replacement: u64 = begin_install(
+        0x301,
+        0x302,
+        0x303,
+        0x304,
+        PACKAGE_SCHEMA_V1,
+        99,
+        1,
+        RUNTIME_NATIVE,
+        1,
+        1,
+        0
+    );
+    if replacement == 0
+        || replacement == scratch
+        || abort_install(replacement) != 1
+        || install_abort_count() != 2 {
+        return 0xe500_0000_0000_000c;
+    }
+    if abort_activation(0) != 0
+        || activation_count() != 2
+        || activation_failure_count() != 5
+        || rollback_count() != 1
+        || rollback_failure_count() != 3
+        || crash_count() != 1
+        || restart_count() != 1 {
+        return 0xe500_0000_0000_000d;
+    }
+    if !parser_self_test()
+        || !package_invariants_hold()
+        || !supervisor_invariants_hold() {
+        return 0xe500_0000_0000_000e;
+    }
+    return SELF_TEST_PASS;
+}

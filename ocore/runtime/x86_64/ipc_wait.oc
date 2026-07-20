@@ -1,0 +1,509 @@
+module runtime::ipc_wait;
+
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::receiver_waiter;
+use runtime::endpoint::register_receiver_waiter;
+use runtime::endpoint::register_sender_waiter;
+use runtime::endpoint::remove_waiter;
+use runtime::endpoint::sender_waiter;
+use runtime::endpoint::waiter_matches;
+use runtime::endpoint::ENDPOINT_WAITER_RECEIVER;
+use runtime::endpoint::ENDPOINT_WAITER_SENDER;
+use runtime::process::can_issue_operations;
+use runtime::process::is_live as process_is_live;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::process_for;
+use runtime::thread::set_saved_result;
+use runtime::thread::sleep_epoch;
+use runtime::thread::state as thread_state;
+use runtime::thread::wake_blocked;
+use runtime::thread::wake_deadline;
+use runtime::thread::wake_epoch;
+use runtime::thread::MAX_THREADS;
+use runtime::thread::THREAD_STATE_BLOCKED;
+use runtime::thread::THREAD_STATE_RUNNING;
+use runtime::thread::WAKE_REASON_CANCELLED;
+use runtime::thread::WAKE_REASON_IPC;
+
+pub const IPC_WAIT_FAILURE: u64 = 0xffff_ffff_ffff_ffff;
+
+const WAIT_EMPTY: u8 = 0;
+const WAIT_PREPARED: u8 = 1;
+const WAIT_COMMITTED: u8 = 2;
+const WAIT_RETIRED: u8 = 3;
+const WAIT_HANDLE_TAG: u64 = 0xb300_0000;
+const THREAD_HANDLE_TAG: u64 = 0xe200_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const IPC_DEADLINE: u64 = 0xffff_ffff_ffff_ffff;
+
+// There is exactly one request cell for each possible TCB slot. The cell binds
+// full generation-tagged endpoint, thread, and process identities plus the
+// sleep epoch that block_current must publish before commit is legal.
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut ENDPOINTS: [u64; 4] = [0; 4];
+static mut KINDS: [u8; 4] = [0; 4];
+static mut THREADS: [u64; 4] = [0; 4];
+static mut PROCESSES: [u64; 4] = [0; 4];
+static mut SLEEP_EPOCHS: [u32; 4] = [0; 4];
+
+static mut RECEIVER_BLOCKS: u64 = 0;
+static mut SENDER_BLOCKS: u64 = 0;
+static mut WAKES: u64 = 0;
+static mut CANCEL_WAKES: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn request_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn request_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn thread_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn thread_handle_shape_valid(handle: u64) -> bool {
+    return handle != 0
+        && (handle & HANDLE_TAG_MASK) == THREAD_HANDLE_TAG
+        && thread_index(handle) < MAX_THREADS
+        && (handle >> 32) != 0;
+}
+
+fn wait_kind_valid(kind: u64) -> bool {
+    return kind == ENDPOINT_WAITER_RECEIVER
+        || kind == ENDPOINT_WAITER_SENDER;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | WAIT_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_request(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != WAIT_HANDLE_TAG {
+        return MAX_THREADS;
+    }
+    let slot: usize = request_index(handle);
+    if slot >= MAX_THREADS
+        || (STATES[slot] != WAIT_PREPARED
+            && STATES[slot] != WAIT_COMMITTED)
+        || GENERATIONS[slot] != request_generation(handle) {
+        return MAX_THREADS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    ENDPOINTS[slot] = 0;
+    KINDS[slot] = 0;
+    THREADS[slot] = 0;
+    PROCESSES[slot] = 0;
+    SLEEP_EPOCHS[slot] = 0;
+}
+
+unsafe fn retire_or_reuse(slot: usize) -> void {
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = WAIT_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = WAIT_EMPTY;
+    }
+}
+
+// PREPARED spans the deliberate scheduler boundary. Before block_current it
+// names the next epoch of the running TCB; after block_current it may briefly
+// name that exact blocked epoch until scheduler code calls commit.
+unsafe fn prepared_epoch_matches(slot: usize) -> bool {
+    let thread: u64 = THREADS[slot];
+    let expected: u32 = SLEEP_EPOCHS[slot];
+    let state: u64 = thread_state(thread);
+    if state == THREAD_STATE_RUNNING {
+        return current_thread_handle() == thread
+            && sleep_epoch(thread) != 0xffff_ffff
+            && sleep_epoch(thread) + 1 == expected
+            && wake_epoch(thread) == sleep_epoch(thread);
+    }
+    if state == THREAD_STATE_BLOCKED {
+        return sleep_epoch(thread) == expected
+            && wake_epoch(thread) + 1 == expected
+            && wake_deadline(thread) == IPC_DEADLINE;
+    }
+    return false;
+}
+
+unsafe fn committed_epoch_matches(slot: usize) -> bool {
+    let thread: u64 = THREADS[slot];
+    let expected: u32 = SLEEP_EPOCHS[slot];
+    return thread_state(thread) == THREAD_STATE_BLOCKED
+        && sleep_epoch(thread) == expected
+        && wake_epoch(thread) + 1 == expected
+        && wake_deadline(thread) == IPC_DEADLINE;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !endpoint_invariants_hold() {
+        return false;
+    }
+    if WAKES > RECEIVER_BLOCKS + SENDER_BLOCKS
+        || CANCEL_WAKES > RECEIVER_BLOCKS + SENDER_BLOCKS
+        || WAKES + CANCEL_WAKES > RECEIVER_BLOCKS + SENDER_BLOCKS {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == WAIT_EMPTY || state == WAIT_RETIRED {
+            if (state == WAIT_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || ENDPOINTS[slot] != 0
+                || KINDS[slot] != 0
+                || THREADS[slot] != 0
+                || PROCESSES[slot] != 0
+                || SLEEP_EPOCHS[slot] != 0 {
+                return false;
+            }
+        } else if state == WAIT_PREPARED || state == WAIT_COMMITTED {
+            let endpoint: u64 = ENDPOINTS[slot];
+            let kind: u64 = KINDS[slot] as u64;
+            let thread: u64 = THREADS[slot];
+            let process: u64 = PROCESSES[slot];
+            if endpoint == 0
+                || !wait_kind_valid(kind)
+                || !thread_handle_shape_valid(thread)
+                || thread_index(thread) != slot
+                || !thread_is_live(thread)
+                || !process_is_live(process)
+                || process_for(thread) != process
+                || SLEEP_EPOCHS[slot] == 0
+                || !waiter_matches(endpoint, kind, thread) {
+                return false;
+            }
+            if state == WAIT_PREPARED && !prepared_epoch_matches(slot) {
+                return false;
+            }
+            if state == WAIT_COMMITTED && !committed_epoch_matches(slot) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !endpoint_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        STATES[slot] = WAIT_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    RECEIVER_BLOCKS = 0;
+    SENDER_BLOCKS = 0;
+    WAKES = 0;
+    CANCEL_WAKES = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Register the endpoint waiter and reserve the exact next sleep epoch. The
+// caller must either arrange the scheduler control transfer and later commit,
+// or abort this returned request before returning to user mode.
+pub unsafe fn begin(
+    endpoint: u64,
+    kind: u64,
+    thread: u64,
+    process: u64
+) -> u64 {
+    let slot: usize = thread_index(thread);
+    if INITIALIZED == 0
+        || POISONED != 0
+        || slot >= MAX_THREADS
+        || STATES[slot] != WAIT_EMPTY
+        || !endpoint_is_live(endpoint)
+        || !wait_kind_valid(kind)
+        || !thread_handle_shape_valid(thread)
+        || current_thread_handle() != thread
+        || thread_state(thread) != THREAD_STATE_RUNNING
+        || !can_issue_operations(process)
+        || process_for(thread) != process
+        || sleep_epoch(thread) == 0xffff_ffff
+        || sleep_epoch(thread) != wake_epoch(thread)
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut registered: u64 = 0;
+    if kind == ENDPOINT_WAITER_RECEIVER {
+        registered = register_receiver_waiter(endpoint, thread);
+    } else {
+        registered = register_sender_waiter(endpoint, thread);
+    }
+    if registered == 0 {
+        return 0;
+    }
+    ENDPOINTS[slot] = endpoint;
+    KINDS[slot] = kind as u8;
+    THREADS[slot] = thread;
+    PROCESSES[slot] = process;
+    SLEEP_EPOCHS[slot] = sleep_epoch(thread) + 1;
+    STATES[slot] = WAIT_PREPARED;
+    if !invariants_hold() {
+        STATES[slot] = WAIT_EMPTY;
+        clear_slot(slot);
+        if remove_waiter(endpoint, kind, thread) != thread {
+            POISONED = 1;
+        }
+        return 0;
+    }
+    return make_handle(slot);
+}
+
+// Scheduler code calls commit only after block_current has published the exact
+// infinite-deadline epoch reserved by begin.
+pub unsafe fn commit(request: u64, thread: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_THREADS
+        || STATES[slot] != WAIT_PREPARED
+        || THREADS[slot] != thread
+        || !committed_epoch_matches(slot)
+        || (KINDS[slot] as u64 == ENDPOINT_WAITER_RECEIVER
+            && RECEIVER_BLOCKS == 0xffff_ffff_ffff_ffff)
+        || (KINDS[slot] as u64 == ENDPOINT_WAITER_SENDER
+            && SENDER_BLOCKS == 0xffff_ffff_ffff_ffff)
+        || !invariants_hold() {
+        return 0;
+    }
+    STATES[slot] = WAIT_COMMITTED;
+    if KINDS[slot] as u64 == ENDPOINT_WAITER_RECEIVER {
+        RECEIVER_BLOCKS += 1;
+    } else {
+        SENDER_BLOCKS += 1;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return request;
+}
+
+// Abort is legal only before block_current changes the TCB state. It removes
+// precisely this request's waiter and advances the request generation.
+pub unsafe fn abort(request: u64) -> u64 {
+    let slot: usize = checked_request(request);
+    if slot >= MAX_THREADS
+        || STATES[slot] != WAIT_PREPARED
+        || thread_state(THREADS[slot]) != THREAD_STATE_RUNNING
+        || !prepared_epoch_matches(slot)
+        || !invariants_hold() {
+        return 0;
+    }
+    let endpoint: u64 = ENDPOINTS[slot];
+    let kind: u64 = KINDS[slot] as u64;
+    let thread: u64 = THREADS[slot];
+    if remove_waiter(endpoint, kind, thread) != thread {
+        POISONED = 1;
+        return 0;
+    }
+    retire_or_reuse(slot);
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn finish_committed_slot(
+    slot: usize,
+    result: u64,
+    reason: u64
+) -> u64 {
+    if slot >= MAX_THREADS
+        || STATES[slot] != WAIT_COMMITTED
+        || result == 0
+        || (reason != WAKE_REASON_IPC && reason != WAKE_REASON_CANCELLED)
+        || (reason == WAKE_REASON_IPC && WAKES == 0xffff_ffff_ffff_ffff)
+        || (reason == WAKE_REASON_CANCELLED
+            && CANCEL_WAKES == 0xffff_ffff_ffff_ffff)
+        || !committed_epoch_matches(slot) {
+        return 0;
+    }
+    let endpoint: u64 = ENDPOINTS[slot];
+    let kind: u64 = KINDS[slot] as u64;
+    let thread: u64 = THREADS[slot];
+    if !waiter_matches(endpoint, kind, thread)
+        || set_saved_result(thread, result) == 0
+        || remove_waiter(endpoint, kind, thread) != thread
+        || wake_blocked(thread, reason) != thread {
+        POISONED = 1;
+        return 0;
+    }
+    retire_or_reuse(slot);
+    if reason == WAKE_REASON_IPC {
+        WAKES += 1;
+    } else {
+        CANCEL_WAKES += 1;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return thread;
+}
+
+// Complete the endpoint-selected receiver or oldest sender. Sender FIFO order
+// is inherited from endpoint::sender_waiter and exact removal preserves every
+// surviving waiter's order.
+pub unsafe fn complete(
+    endpoint: u64,
+    kind: u64,
+    result: u64,
+    reason: u64
+) -> u64 {
+    if !wait_kind_valid(kind) || !invariants_hold() {
+        return 0;
+    }
+    let mut thread: u64 = receiver_waiter(endpoint);
+    if kind == ENDPOINT_WAITER_SENDER {
+        thread = sender_waiter(endpoint);
+    }
+    let slot: usize = thread_index(thread);
+    if slot >= MAX_THREADS
+        || STATES[slot] != WAIT_COMMITTED
+        || ENDPOINTS[slot] != endpoint
+        || KINDS[slot] as u64 != kind
+        || THREADS[slot] != thread {
+        return 0;
+    }
+    return finish_committed_slot(slot, result, reason);
+}
+
+// Endpoint shutdown order is deterministic: receiver first, then senders in
+// their FIFO order. A PREPARED request can only belong to the currently running
+// TCB; it is unlinked without manufacturing a wake that never blocked.
+pub unsafe fn cancel_endpoint(endpoint: u64, result: u64) -> u64 {
+    if result == 0 || !invariants_hold() {
+        return IPC_WAIT_FAILURE;
+    }
+    let mut cancelled: u64 = 0;
+    let mut thread: u64 = receiver_waiter(endpoint);
+    if thread != 0 {
+        let slot: usize = thread_index(thread);
+        if slot >= MAX_THREADS || ENDPOINTS[slot] != endpoint {
+            return IPC_WAIT_FAILURE;
+        }
+        if STATES[slot] == WAIT_PREPARED {
+            if abort(make_handle(slot)) == 0 {
+                return IPC_WAIT_FAILURE;
+            }
+        } else if finish_committed_slot(
+            slot,
+            result,
+            WAKE_REASON_CANCELLED
+        ) == 0 {
+            return IPC_WAIT_FAILURE;
+        }
+        cancelled += 1;
+    }
+    thread = sender_waiter(endpoint);
+    while thread != 0 {
+        let slot: usize = thread_index(thread);
+        if slot >= MAX_THREADS || ENDPOINTS[slot] != endpoint {
+            return IPC_WAIT_FAILURE;
+        }
+        if STATES[slot] == WAIT_PREPARED {
+            if abort(make_handle(slot)) == 0 {
+                return IPC_WAIT_FAILURE;
+            }
+        } else if finish_committed_slot(
+            slot,
+            result,
+            WAKE_REASON_CANCELLED
+        ) == 0 {
+            return IPC_WAIT_FAILURE;
+        }
+        cancelled += 1;
+        thread = sender_waiter(endpoint);
+    }
+    return cancelled;
+}
+
+// Remove every exact request owned by a dying process. The TCB itself remains in
+// its current scheduler state for the caller's subsequent terminate_process
+// transaction; only surviving peers are woken by endpoint cancellation. Setting
+// the saved result is harmless diagnostic completion if teardown later fails
+// closed before the TCB is retired.
+pub unsafe fn cancel_process_waits(process: u64, result: u64) -> u64 {
+    if result == 0 || !process_is_live(process) || !invariants_hold() {
+        return IPC_WAIT_FAILURE;
+    }
+    let mut cancelled: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_THREADS {
+        if (STATES[slot] == WAIT_PREPARED || STATES[slot] == WAIT_COMMITTED)
+            && PROCESSES[slot] == process {
+            if STATES[slot] == WAIT_PREPARED {
+                if abort(make_handle(slot)) == 0 {
+                    return IPC_WAIT_FAILURE;
+                }
+            } else {
+                let endpoint: u64 = ENDPOINTS[slot];
+                let kind: u64 = KINDS[slot] as u64;
+                let thread: u64 = THREADS[slot];
+                if !committed_epoch_matches(slot)
+                    || !waiter_matches(endpoint, kind, thread)
+                    || set_saved_result(thread, result) == 0
+                    || remove_waiter(endpoint, kind, thread) != thread {
+                    POISONED = 1;
+                    return IPC_WAIT_FAILURE;
+                }
+                retire_or_reuse(slot);
+                if !invariants_hold() {
+                    POISONED = 1;
+                    return IPC_WAIT_FAILURE;
+                }
+            }
+            cancelled += 1;
+        }
+        slot += 1;
+    }
+    return cancelled;
+}
+
+pub unsafe fn receiver_block_count() -> u64 {
+    return RECEIVER_BLOCKS;
+}
+
+pub unsafe fn sender_block_count() -> u64 {
+    return SENDER_BLOCKS;
+}
+
+pub unsafe fn wake_count() -> u64 {
+    return WAKES;
+}
+
+pub unsafe fn cancel_wake_count() -> u64 {
+    return CANCEL_WAKES;
+}
