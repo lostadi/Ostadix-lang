@@ -1,0 +1,1041 @@
+module kernel::m6b_semantics;
+
+use runtime::capability::begin_cspace_drain;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::destroy_cspace;
+use runtime::capability::live_slots_for_owner;
+use runtime::capability::rights_for_owner;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_PERSONALITY_MEMORY_VIEW;
+use runtime::capability::RIGHT_MEMORY_VIEW_COMMIT;
+use runtime::capability::RIGHT_MEMORY_VIEW_READ;
+use runtime::capability::RIGHT_MEMORY_VIEW_WRITE;
+use runtime::delegated_resource::active_count as active_resource_count;
+use runtime::delegated_resource::bind_view as bind_resource_view;
+use runtime::delegated_resource::cap_close_sequence as resource_cap_close_sequence;
+use runtime::delegated_resource::create as create_resource;
+use runtime::delegated_resource::destroy as destroy_resource;
+use runtime::delegated_resource::init as delegated_resources_init;
+use runtime::delegated_resource::invariants_hold as resource_invariants_hold;
+use runtime::delegated_resource::is_live as resource_is_live;
+use runtime::delegated_resource::revoke as revoke_resource;
+use runtime::delegated_resource::revoke_request;
+use runtime::delegated_resource::request_for as resource_request;
+use runtime::delegated_resource::revocation_sequence as resource_revocation_sequence;
+use runtime::delegated_resource::use_resource;
+use runtime::delegated_resource::DELEGATED_RESOURCE_DEVICE;
+use runtime::delegated_resource::DELEGATED_RESOURCE_FILESYSTEM;
+use runtime::delegated_resource::DELEGATED_RESOURCE_MEMORY;
+use runtime::delegated_resource::DELEGATED_RESOURCE_NETWORK;
+use runtime::delegated_resource::DELEGATED_RESOURCE_TIMER;
+use runtime::interrupts::ticks;
+use runtime::personality_memory_view::active_count as active_view_count;
+use runtime::personality_memory_view::abandoned_reply_count;
+use runtime::personality_memory_view::cancel as cancel_view;
+use runtime::personality_memory_view::cap_close_sequence as view_cap_close_sequence;
+use runtime::personality_memory_view::charged_bytes as view_charged_bytes;
+use runtime::personality_memory_view::consume_terminal;
+use runtime::personality_memory_view::create as create_view;
+use runtime::personality_memory_view::discard_terminal;
+use runtime::personality_memory_view::duplicate_denial_count;
+use runtime::personality_memory_view::init as memory_views_init;
+use runtime::personality_memory_view::invariants_hold as view_invariants_hold;
+use runtime::personality_memory_view::is_live as view_is_live;
+use runtime::personality_memory_view::process_exited;
+use runtime::personality_memory_view::read_byte;
+use runtime::personality_memory_view::reply as reply_view;
+use runtime::personality_memory_view::request_for as view_request;
+use runtime::personality_memory_view::resource_for;
+use runtime::personality_memory_view::service_died;
+use runtime::personality_memory_view::state as view_state;
+use runtime::personality_memory_view::terminal_kind as view_terminal_kind;
+use runtime::personality_memory_view::terminal_sequence as view_terminal_sequence;
+use runtime::personality_memory_view::terminal_transition_count;
+use runtime::personality_memory_view::terminal_wake_count;
+use runtime::personality_memory_view::timeout as timeout_view;
+use runtime::personality_memory_view::unmapped;
+use runtime::personality_memory_view::wake_sequence as view_wake_sequence;
+use runtime::personality_memory_view::write_byte;
+use runtime::personality_memory_view::MEMORY_VIEW_DIRECTION_IN;
+use runtime::personality_memory_view::MEMORY_VIEW_DIRECTION_OUT;
+use runtime::personality_memory_view::MEMORY_VIEW_STATE_LIVE;
+use runtime::personality_memory_view::MEMORY_VIEW_STATE_TERMINAL;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_CANCELLED;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_PROCESS_EXIT;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_REPLY;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_REQUEST_REVOKED;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_SERVICE_DEATH;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_TIMEOUT;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_UNMAP;
+use runtime::process::activate_bootstrap;
+use runtime::process::install as install_process;
+use runtime::serial::write;
+use runtime::user_memory::USER_IMAGE_START;
+use runtime::user_memory::USER_STACK_START;
+use runtime::user_memory::USER_STACK_TOP;
+
+const MODE_M6B_BOUNDED: u64 = 19;
+const CLIENT_CSPACE: usize = 0;
+const SERVICE_CSPACE: usize = 3;
+const CLIENT_PROCESS_ID: u64 = 2601;
+// Inside the bootstrap process's mapped RW/NX user-stack page.
+const OUTPUT_ADDRESS: usize = 0x0120_1100;
+const SNAPSHOT_ADDRESS: usize = 0x0120_1120;
+
+static RESOURCE_KINDS: [u64; 5] = [
+    DELEGATED_RESOURCE_MEMORY,
+    DELEGATED_RESOURCE_FILESYSTEM,
+    DELEGATED_RESOURCE_TIMER,
+    DELEGATED_RESOURCE_NETWORK,
+    DELEGATED_RESOURCE_DEVICE,
+];
+
+static PREFLIGHT_MESSAGE: [u8; 54] =
+    b"M6B pre-dispatch bounds/generation/rights/quota: PASS\n";
+static VIEW_MESSAGE: [u8; 50] =
+    b"M6B bounded snapshot + attenuated view caps: PASS\n";
+static COMMIT_MESSAGE: [u8; 52] =
+    b"M6B staged commit exposes written prefix only: PASS\n";
+static TERMINAL_MESSAGE: [u8; 51] =
+    b"M6B revoke-before-terminal + wake-once paths: PASS\n";
+static RESOURCE_MESSAGE: [u8; 46] =
+    b"M6B five delegated lease classes revoke: PASS\n";
+static ISOLATION_MESSAGE: [u8; 57] =
+    b"M6B request-wide revoke + unrelated-scope survival: PASS\n";
+static TEARDOWN_MESSAGE: [u8; 46] =
+    b"M6B reply cleanup + drain-safe teardown: PASS\n";
+static COMPLETE_MESSAGE: [u8; 41] =
+    b"M6B bounded native mechanism slice: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 33] =
+    b"M6B post-mechanism timer: online\n";
+
+static mut NEXT_REQUEST: u64 = 0x6b00_0000_0000_0001;
+
+extern "sysv64" fn ocore_kernel_stack_top() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn request() -> u64 {
+    let value: u64 = NEXT_REQUEST;
+    NEXT_REQUEST += 1;
+    return value;
+}
+
+unsafe fn new_view(
+    process: u64,
+    address_space: u64,
+    address: usize,
+    length: usize,
+    direction: u64,
+    service_cspace: u64,
+    capability_out: *mut u64
+) -> u64 {
+    return create_view(
+        request(),
+        process,
+        address_space,
+        address,
+        length,
+        direction,
+        service_cspace,
+        capability_out
+    );
+}
+
+unsafe fn scoped_view(
+    scope: u64,
+    process: u64,
+    address_space: u64,
+    address: usize,
+    length: usize,
+    direction: u64,
+    service_cspace: u64,
+    capability_out: *mut u64
+) -> u64 {
+    return create_view(
+        scope,
+        process,
+        address_space,
+        address,
+        length,
+        direction,
+        service_cspace,
+        capability_out
+    );
+}
+
+unsafe fn consume(
+    view: u64,
+    process: u64,
+    address_space: u64,
+    address: usize,
+    expected_kind: u64,
+    expected_length: usize
+) -> bool {
+    let mut kind: u64 = 0;
+    let mut length: usize = 0;
+    return consume_terminal(
+        view,
+        process,
+        address_space,
+        address,
+        (&mut kind),
+        (&mut length)
+    ) == 1
+        && kind == expected_kind
+        && length == expected_length;
+}
+
+unsafe fn ordered_terminal(view: u64, expected_kind: u64) -> bool {
+    return view_state(view) == MEMORY_VIEW_STATE_TERMINAL
+        && view_terminal_kind(view) == expected_kind
+        && view_cap_close_sequence(view) != 0
+        && view_cap_close_sequence(view) < view_terminal_sequence(view)
+        && view_terminal_sequence(view) < view_wake_sequence(view);
+}
+
+unsafe fn quota_and_predispatch_denials(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let mut capability: u64 = 0;
+    if create_view(
+        request(),
+        process,
+        address_space,
+        0,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut capability)
+    ) != 0
+        || create_view(
+        request(),
+        process,
+        address_space,
+        0xffff_ffff_ffff_fff8 as usize,
+        16,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut capability)
+    ) != 0
+        || create_view(
+            request(),
+            process ^ 0x0000_0001_0000_0000,
+            address_space,
+            USER_IMAGE_START,
+            1,
+            MEMORY_VIEW_DIRECTION_IN,
+            service_cspace,
+            (&mut capability)
+        ) != 0
+        || create_view(
+            request(),
+            process,
+            address_space ^ 0x0000_0001_0000_0000,
+            USER_IMAGE_START,
+            1,
+            MEMORY_VIEW_DIRECTION_IN,
+            service_cspace,
+            (&mut capability)
+        ) != 0
+        || new_view(
+            process,
+            address_space,
+            USER_IMAGE_START,
+            1,
+            MEMORY_VIEW_DIRECTION_OUT,
+            service_cspace,
+            (&mut capability)
+        ) != 0
+        || new_view(
+            process,
+            address_space,
+            USER_IMAGE_START,
+            129,
+            MEMORY_VIEW_DIRECTION_IN,
+            service_cspace,
+            (&mut capability)
+        ) != 0 {
+        return false;
+    }
+    let mut first_cap: u64 = 0;
+    let mut second_cap: u64 = 0;
+    let mut third_cap: u64 = 0;
+    let first: u64 = new_view(
+        process,
+        address_space,
+        USER_IMAGE_START,
+        128,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut first_cap)
+    );
+    let second: u64 = new_view(
+        process,
+        address_space,
+        USER_IMAGE_START,
+        128,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut second_cap)
+    );
+    if first == 0
+        || second == 0
+        || new_view(
+            process,
+            address_space,
+            USER_IMAGE_START,
+            1,
+            MEMORY_VIEW_DIRECTION_IN,
+            service_cspace,
+            (&mut third_cap)
+        ) != 0
+        || reply_view(service_cspace, first_cap, 0) != 1
+        || reply_view(service_cspace, second_cap, 0) != 1
+        || !consume(
+            first,
+            process,
+            address_space,
+            USER_IMAGE_START,
+            MEMORY_VIEW_TERMINAL_REPLY,
+            0
+        )
+        || !consume(
+            second,
+            process,
+            address_space,
+            USER_IMAGE_START,
+            MEMORY_VIEW_TERMINAL_REPLY,
+            0
+        ) {
+        return false;
+    }
+    return view_charged_bytes() == 0 && active_view_count() == 0;
+}
+
+unsafe fn view_rights_and_commit(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let saved_input: u8 = volatile_load(SNAPSHOT_ADDRESS as *const u8);
+    volatile_store(SNAPSHOT_ADDRESS as *mut u8, 0x31);
+    let mut input_cap: u64 = 0;
+    let input: u64 = new_view(
+        process,
+        address_space,
+        SNAPSHOT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut input_cap)
+    );
+    // Mutate the caller mapping after create returned. The service must still
+    // observe the kernel-owned snapshot, never the caller's later byte.
+    volatile_store(SNAPSHOT_ADDRESS as *mut u8, 0x42);
+    let mut observed: u8 = 0;
+    if input == 0
+        || rights_for_owner(service_cspace, input_cap)
+            != RIGHT_MEMORY_VIEW_READ
+        || read_byte(service_cspace, input_cap, 0, (&mut observed)) != 1
+        || observed != 0x31
+        || volatile_load(SNAPSHOT_ADDRESS as *const u8) != 0x42
+        || write_byte(service_cspace, input_cap, 0, 0xaa) != 0
+        || reply_view(service_cspace, input_cap, 0) != 1
+        || reply_view(service_cspace, input_cap, 0) != 0
+        || duplicate_denial_count() == 0
+        || validate_for_owner(
+            service_cspace,
+            input_cap,
+            OBJECT_PERSONALITY_MEMORY_VIEW,
+            RIGHT_MEMORY_VIEW_READ
+        ) != 0
+        || !consume(
+            input,
+            process,
+            address_space,
+            SNAPSHOT_ADDRESS,
+            MEMORY_VIEW_TERMINAL_REPLY,
+            0
+        ) {
+        return false;
+    }
+    volatile_store(SNAPSHOT_ADDRESS as *mut u8, saved_input);
+    write((&VIEW_MESSAGE[0]), 50);
+
+    let mut byte: usize = 0;
+    while byte < 4 {
+        volatile_store((OUTPUT_ADDRESS + byte) as *mut u8, 0x5a);
+        byte += 1;
+    }
+    let mut output_cap: u64 = 0;
+    let output: u64 = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        4,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut output_cap)
+    );
+    if output == 0
+        || rights_for_owner(service_cspace, output_cap)
+            != (RIGHT_MEMORY_VIEW_WRITE | RIGHT_MEMORY_VIEW_COMMIT)
+        || read_byte(service_cspace, output_cap, 0, (&mut observed)) != 0
+        || write_byte(service_cspace, output_cap, 4, 0) != 0
+        || write_byte(service_cspace, output_cap, 0, 0x11) != 1
+        || write_byte(service_cspace, output_cap, 1, 0x22) != 1
+        || reply_view(service_cspace, output_cap, 3) != 0
+        || volatile_load(OUTPUT_ADDRESS as *const u8) != 0x5a
+        || view_state(output) != MEMORY_VIEW_STATE_LIVE
+        || write_byte(service_cspace, output_cap, 2, 0x33) != 1
+        || reply_view(service_cspace, output_cap, 3) != 1 {
+        return false;
+    }
+    let mut wrong_kind: u64 = 0;
+    let mut wrong_length: usize = 0;
+    if consume_terminal(
+        output,
+        process,
+        address_space,
+        OUTPUT_ADDRESS + 1,
+        (&mut wrong_kind),
+        (&mut wrong_length)
+    ) != 0
+        || !consume(
+            output,
+            process,
+            address_space,
+            OUTPUT_ADDRESS,
+            MEMORY_VIEW_TERMINAL_REPLY,
+            3
+        )
+        || volatile_load(OUTPUT_ADDRESS as *const u8) != 0x11
+        || volatile_load((OUTPUT_ADDRESS + 1) as *const u8) != 0x22
+        || volatile_load((OUTPUT_ADDRESS + 2) as *const u8) != 0x33
+        || volatile_load((OUTPUT_ADDRESS + 3) as *const u8) != 0x5a {
+        return false;
+    }
+    write((&COMMIT_MESSAGE[0]), 52);
+    return true;
+}
+
+unsafe fn terminal_paths(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let mut capability: u64 = 0;
+    let mut view: u64 = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0
+        || cancel_view(view) != 1
+        || cancel_view(view) != 0
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_CANCELLED)
+        || discard_terminal(view) != 1 {
+        return false;
+    }
+    view = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0
+        || timeout_view(view) != 1
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_TIMEOUT)
+        || discard_terminal(view) != 1 {
+        return false;
+    }
+    view = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0
+        || service_died(service_cspace) != 1
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_SERVICE_DEATH)
+        || discard_terminal(view) != 1 {
+        return false;
+    }
+    view = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0
+        || process_exited(process) != 1
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_PROCESS_EXIT)
+        || discard_terminal(view) != 1 {
+        return false;
+    }
+    view = new_view(
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0
+        || unmapped(address_space, OUTPUT_ADDRESS, 1) != 1
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_UNMAP)
+        || discard_terminal(view) != 1
+        || terminal_transition_count() != terminal_wake_count() {
+        return false;
+    }
+    write((&TERMINAL_MESSAGE[0]), 51);
+    return true;
+}
+
+unsafe fn delegated_resource_classes(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < 5 {
+        let scope: u64 = request();
+        let mut resource_cap: u64 = 0;
+        let resource: u64 = create_resource(
+            scope,
+            RESOURCE_KINDS[ordinal],
+            service_cspace,
+            (&mut resource_cap)
+        );
+        let mut view_cap: u64 = 0;
+        let view: u64 = scoped_view(
+            scope,
+            process,
+            address_space,
+            USER_IMAGE_START,
+            1,
+            MEMORY_VIEW_DIRECTION_IN,
+            service_cspace,
+            (&mut view_cap)
+        );
+        let mut revoked: u64 = 0;
+        if resource == 0
+            || view == 0
+            || resource_request(resource) != scope
+            || view_request(view) != scope
+            || use_resource(
+                service_cspace,
+                resource_cap,
+                RESOURCE_KINDS[ordinal]
+            ) != resource
+            || bind_resource_view(
+                service_cspace,
+                resource_cap,
+                view
+            ) != 1
+            || resource_for(view) != resource
+            || revoke_resource(
+                service_cspace,
+                resource_cap,
+                (&mut revoked)
+            ) != 1
+            || revoked != 1
+            || resource_is_live(resource)
+            || use_resource(
+                service_cspace,
+                resource_cap,
+                RESOURCE_KINDS[ordinal]
+            ) != 0
+            || resource_cap_close_sequence(resource) == 0
+            || resource_cap_close_sequence(resource)
+                >= resource_revocation_sequence(resource)
+            || !ordered_terminal(
+                view,
+                MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+            )
+            || discard_terminal(view) != 1
+            || destroy_resource(resource) != 1 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    write((&RESOURCE_MESSAGE[0]), 46);
+    return true;
+}
+
+unsafe fn unrelated_scope_survives(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let first_scope: u64 = request();
+    let second_scope: u64 = request();
+    let view_only_scope: u64 = request();
+    let mut first_resource_cap: u64 = 0;
+    let mut same_scope_resource_cap: u64 = 0;
+    let mut second_resource_cap: u64 = 0;
+    let first_resource: u64 = create_resource(
+        first_scope,
+        DELEGATED_RESOURCE_NETWORK,
+        service_cspace,
+        (&mut first_resource_cap)
+    );
+    let same_scope_resource: u64 = create_resource(
+        first_scope,
+        DELEGATED_RESOURCE_DEVICE,
+        service_cspace,
+        (&mut same_scope_resource_cap)
+    );
+    let second_resource: u64 = create_resource(
+        second_scope,
+        DELEGATED_RESOURCE_TIMER,
+        service_cspace,
+        (&mut second_resource_cap)
+    );
+    let mut first_view_cap: u64 = 0;
+    let mut second_view_cap: u64 = 0;
+    let mut view_only_cap: u64 = 0;
+    let first_view: u64 = scoped_view(
+        first_scope,
+        process,
+        address_space,
+        USER_IMAGE_START,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut first_view_cap)
+    );
+    let second_view: u64 = scoped_view(
+        second_scope,
+        process,
+        address_space,
+        USER_IMAGE_START,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut second_view_cap)
+    );
+    let view_only: u64 = scoped_view(
+        view_only_scope,
+        process,
+        address_space,
+        USER_IMAGE_START,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut view_only_cap)
+    );
+    let mut revoked_resources: u64 = 0;
+    let mut revoked_views: u64 = 0;
+    if first_resource == 0
+        || same_scope_resource == 0
+        || second_resource == 0
+        || first_view == 0
+        || second_view == 0
+        || view_only == 0
+        || resource_request(first_resource) != first_scope
+        || resource_request(same_scope_resource) != first_scope
+        || resource_request(second_resource) != second_scope
+        || view_request(first_view) != first_scope
+        || view_request(second_view) != second_scope
+        || view_request(view_only) != view_only_scope
+        || bind_resource_view(
+            service_cspace,
+            first_resource_cap,
+            first_view
+        ) != 1
+        || bind_resource_view(
+            service_cspace,
+            second_resource_cap,
+            second_view
+        ) != 1
+        || use_resource(
+            service_cspace,
+            same_scope_resource_cap,
+            DELEGATED_RESOURCE_DEVICE
+        ) != same_scope_resource
+        || revoke_request(
+            first_scope,
+            (&mut revoked_resources),
+            (&mut revoked_views)
+        ) != 1
+        || revoked_resources != 2
+        || revoked_views != 1
+        || resource_is_live(first_resource)
+        || resource_is_live(same_scope_resource)
+        || !ordered_terminal(
+            first_view,
+            MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+        )
+        || !view_is_live(second_view)
+        || !view_is_live(view_only)
+        || use_resource(
+            service_cspace,
+            second_resource_cap,
+            DELEGATED_RESOURCE_TIMER
+        ) != second_resource
+        || use_resource(
+            service_cspace,
+            first_resource_cap,
+            DELEGATED_RESOURCE_NETWORK
+        ) != 0
+        || revoke_request(
+            view_only_scope,
+            (&mut revoked_resources),
+            (&mut revoked_views)
+        ) != 1
+        || revoked_resources != 0
+        || revoked_views != 1
+        || !ordered_terminal(
+            view_only,
+            MEMORY_VIEW_TERMINAL_REQUEST_REVOKED
+        )
+        || !view_is_live(second_view)
+        || discard_terminal(first_view) != 1
+        || discard_terminal(view_only) != 1
+        || destroy_resource(first_resource) != 1
+        || destroy_resource(same_scope_resource) != 1
+        || reply_view(service_cspace, second_view_cap, 0) != 1
+        || !consume(
+            second_view,
+            process,
+            address_space,
+            USER_IMAGE_START,
+            MEMORY_VIEW_TERMINAL_REPLY,
+            0
+        ) {
+        return false;
+    }
+    revoked_resources = 99;
+    revoked_views = 99;
+    if revoke_request(
+        second_scope,
+        (&mut revoked_resources),
+        (&mut revoked_views)
+    ) != 1
+        || revoked_resources != 1
+        || revoked_views != 0
+        || destroy_resource(second_resource) != 1
+        || revoke_request(
+            first_scope,
+            (&mut revoked_resources),
+            (&mut revoked_views)
+        ) != 0
+        || revoked_resources != 0
+        || revoked_views != 0 {
+        return false;
+    }
+    write((&ISOLATION_MESSAGE[0]), 57);
+    return true;
+}
+
+// A reply has already published the request's only terminal result and wake.
+// If exact caller re-entry later becomes impossible, process-exit or unmap
+// teardown must release the view, byte charge, and resource reference without
+// publishing a second terminal event.
+unsafe fn reply_teardown_releases(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let first_scope: u64 = request();
+    let mut resource_cap: u64 = 0;
+    let resource: u64 = create_resource(
+        first_scope,
+        DELEGATED_RESOURCE_MEMORY,
+        service_cspace,
+        (&mut resource_cap)
+    );
+    let mut view_cap: u64 = 0;
+    let view: u64 = scoped_view(
+        first_scope,
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut view_cap)
+    );
+    volatile_store(OUTPUT_ADDRESS as *mut u8, 0x5a);
+    let abandoned_before: u64 = abandoned_reply_count();
+    let mut revoked_views: u64 = 99;
+    if resource == 0
+        || view == 0
+        || bind_resource_view(
+            service_cspace,
+            resource_cap,
+            view
+        ) != 1
+        || write_byte(service_cspace, view_cap, 0, 0x19) != 1
+        || reply_view(service_cspace, view_cap, 1) != 1
+        || revoke_resource(
+            service_cspace,
+            resource_cap,
+            (&mut revoked_views)
+        ) != 1
+        || revoked_views != 0 {
+        return false;
+    }
+    let transitions_after_reply: u64 = terminal_transition_count();
+    let wakes_after_reply: u64 = terminal_wake_count();
+    if process_exited(process) != 1
+        || abandoned_reply_count() != abandoned_before + 1
+        || terminal_transition_count() != transitions_after_reply
+        || terminal_wake_count() != wakes_after_reply
+        || active_view_count() != 0
+        || view_charged_bytes() != 0
+        || volatile_load(OUTPUT_ADDRESS as *const u8) != 0x5a
+        || destroy_resource(resource) != 1 {
+        return false;
+    }
+
+    let second_scope: u64 = request();
+    resource_cap = 0;
+    let second_resource: u64 = create_resource(
+        second_scope,
+        DELEGATED_RESOURCE_FILESYSTEM,
+        service_cspace,
+        (&mut resource_cap)
+    );
+    view_cap = 0;
+    let second_view: u64 = scoped_view(
+        second_scope,
+        process,
+        address_space,
+        OUTPUT_ADDRESS,
+        1,
+        MEMORY_VIEW_DIRECTION_OUT,
+        service_cspace,
+        (&mut view_cap)
+    );
+    volatile_store(OUTPUT_ADDRESS as *mut u8, 0x5a);
+    revoked_views = 99;
+    if second_resource == 0
+        || second_view == 0
+        || bind_resource_view(
+            service_cspace,
+            resource_cap,
+            second_view
+        ) != 1
+        || write_byte(service_cspace, view_cap, 0, 0x20) != 1
+        || reply_view(service_cspace, view_cap, 1) != 1
+        || revoke_resource(
+            service_cspace,
+            resource_cap,
+            (&mut revoked_views)
+        ) != 1
+        || revoked_views != 0 {
+        return false;
+    }
+    let second_transitions: u64 = terminal_transition_count();
+    let second_wakes: u64 = terminal_wake_count();
+    if unmapped(address_space, OUTPUT_ADDRESS, 1) != 1
+        || abandoned_reply_count() != abandoned_before + 2
+        || terminal_transition_count() != second_transitions
+        || terminal_wake_count() != second_wakes
+        || active_view_count() != 0
+        || view_charged_bytes() != 0
+        || volatile_load(OUTPUT_ADDRESS as *const u8) != 0x5a
+        || destroy_resource(second_resource) != 1 {
+        return false;
+    }
+    return true;
+}
+
+// Draining removes normal service authority immediately, but the kernel must
+// still be able to validate and close the exact live generations. This runs
+// last because successful teardown retires the bootstrap service CSpace.
+unsafe fn drain_teardown(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let scope: u64 = request();
+    let mut resource_cap: u64 = 0;
+    let resource: u64 = create_resource(
+        scope,
+        DELEGATED_RESOURCE_DEVICE,
+        service_cspace,
+        (&mut resource_cap)
+    );
+    let mut view_cap: u64 = 0;
+    let view: u64 = scoped_view(
+        scope,
+        process,
+        address_space,
+        USER_IMAGE_START,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut view_cap)
+    );
+    let mut observed: u8 = 0;
+    if resource == 0
+        || view == 0
+        || bind_resource_view(
+            service_cspace,
+            resource_cap,
+            view
+        ) != 1
+        || begin_cspace_drain(service_cspace) != 1
+        || !view_invariants_hold()
+        || !resource_invariants_hold()
+        || use_resource(
+            service_cspace,
+            resource_cap,
+            DELEGATED_RESOURCE_DEVICE
+        ) != 0
+        || read_byte(
+            service_cspace,
+            view_cap,
+            0,
+            (&mut observed)
+        ) != 0 {
+        return false;
+    }
+    let mut revoked_views: u64 = 0;
+    if revoke_resource(
+        service_cspace,
+        resource_cap,
+        (&mut revoked_views)
+    ) != 1
+        || revoked_views != 1
+        || !ordered_terminal(
+            view,
+            MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+        )
+        || discard_terminal(view) != 1
+        || destroy_resource(resource) != 1
+        || live_slots_for_owner(service_cspace) != 0
+        || destroy_cspace(service_cspace) != 1
+        || validate_for_owner(
+            service_cspace,
+            view_cap,
+            OBJECT_PERSONALITY_MEMORY_VIEW,
+            RIGHT_MEMORY_VIEW_READ
+        ) != 0
+        || use_resource(
+            service_cspace,
+            resource_cap,
+            DELEGATED_RESOURCE_DEVICE
+        ) != 0
+        || active_view_count() != 0
+        || active_resource_count() != 0
+        || !view_invariants_hold()
+        || !resource_invariants_hold() {
+        return false;
+    }
+    write((&TEARDOWN_MESSAGE[0]), 46);
+    return true;
+}
+
+pub unsafe fn start(
+    mode: u64,
+    native_domain: u64,
+    address_space: u64
+) -> never {
+    if mode != MODE_M6B_BOUNDED
+        || native_domain == 0
+        || address_space == 0 {
+        fail_closed();
+    }
+    disable_interrupts();
+    let process: u64 = install_process(
+        0,
+        CLIENT_PROCESS_ID,
+        native_domain,
+        address_space,
+        CLIENT_CSPACE,
+        ocore_kernel_stack_top(),
+        USER_IMAGE_START,
+        USER_STACK_TOP
+    );
+    let service_cspace: u64 = cspace_handle_for_slot(SERVICE_CSPACE);
+    if process == 0
+        || service_cspace == 0
+        || activate_bootstrap(0) != CLIENT_PROCESS_ID
+        || memory_views_init() != 1
+        || delegated_resources_init() != 1
+        || !view_invariants_hold()
+        || !resource_invariants_hold() {
+        fail_closed();
+    }
+
+    if !quota_and_predispatch_denials(
+        process,
+        address_space,
+        service_cspace
+    ) {
+        fail_closed();
+    }
+    write((&PREFLIGHT_MESSAGE[0]), 54);
+    if !view_rights_and_commit(process, address_space, service_cspace)
+        || !terminal_paths(process, address_space, service_cspace)
+        || !delegated_resource_classes(
+            process,
+            address_space,
+            service_cspace
+        )
+        || !unrelated_scope_survives(
+            process,
+            address_space,
+            service_cspace
+        )
+        || !reply_teardown_releases(
+            process,
+            address_space,
+            service_cspace
+        )
+        || !drain_teardown(
+            process,
+            address_space,
+            service_cspace
+        ) {
+        fail_closed();
+    }
+
+    if active_view_count() != 0
+        || view_charged_bytes() != 0
+        || active_resource_count() != 0
+        || live_slots_for_owner(service_cspace) != 0
+        || terminal_transition_count() != terminal_wake_count()
+        || !view_invariants_hold()
+        || !resource_invariants_hold() {
+        fail_closed();
+    }
+    write((&COMPLETE_MESSAGE[0]), 41);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 33);
+    loop {
+        halt();
+    }
+}

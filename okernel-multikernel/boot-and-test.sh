@@ -31,7 +31,7 @@
 #   linker, and qemu-system-x86_64. Hosted layer needs: cargo, python3; node for
 #   javascript^, etc. Missing optional tools are reported and skipped.
 # =============================================================================
-set -uo pipefail
+set -Eeuo pipefail
 
 # Locate the repo root robustly: walk up from the script's own directory, then
 # from $PWD, looking for the marker pair (Cargo.toml + ocore/kernel/build.sh).
@@ -134,6 +134,7 @@ phase_kernel() {
 # Each script sets its own OCORE_PROBE_MODE and asserts a fixed serial trace.
 # Probe map:  0 default | 9 user-copy fault | 12 M2 sched | 13 M3 ipc-foundation
 # 14 M3 ipc | 15 M4 loader/OVFS | 16 M5 live | 17 M5 semantics | 18 M6A personality
+# 19 M6B bounded memory/resource revocation | 20 verified world/nonexecuting VM objects
 phase_smoke() {
   say "Layer 4 — smoke gates"
   need cargo; need clang; need qemu-system-x86_64
@@ -148,15 +149,46 @@ phase_smoke() {
     smoke-live-qemu.sh            # M5 activation + one pkgd restart
     smoke-live-semantics-qemu.sh  # M5 state-machine corpus
     smoke-personality-qemu.sh     # M6A scalar personality supervision
+    smoke-m6b-qemu.sh             # M6B bounded-copy views + delegated-resource revocation
+    smoke-kernel-world-qemu.sh    # verified world admission + nonexecuting VM objects
   )
-  local g rc=0
+  local g
+  local required="${#gates[@]}"
+  local present=0
+  local passed=0
+  local failed=0
+
+  # This is a required-gate manifest, not a directory scan.  Fail before
+  # execution if a required proof script has disappeared or lost its execute
+  # bit; otherwise a deleted gate could make the aggregate result greener.
   for g in "${gates[@]}"; do
-    if [ -x "ocore/kernel/$g" ]; then
-      say "gate: $g"
-      if "ocore/kernel/$g"; then ok "$g PASS"; else printf '%s[fail]%s %s\n' "$c_red" "$c_rst" "$g"; rc=1; fi
-    else skip "missing $g"; fi
+    if [ ! -x "ocore/kernel/$g" ]; then
+      printf '%s[fail]%s required gate missing or not executable: %s\n' "$c_red" "$c_rst" "$g" >&2
+      failed=$((failed + 1))
+    else
+      present=$((present + 1))
+    fi
   done
-  [ "$rc" -eq 0 ] && ok "all present smoke gates passed" || die "one or more smoke gates failed"
+  if [ "$failed" -ne 0 ]; then
+    printf 'required: %s\npresent:  %s\npassed:   0\nfailed:   %s\n' \
+      "$required" "$present" "$failed" >&2
+    die "required smoke-gate manifest is incomplete"
+  fi
+
+  for g in "${gates[@]}"; do
+    say "gate: $g"
+    if "ocore/kernel/$g"; then
+      ok "$g PASS"
+      passed=$((passed + 1))
+    else
+      printf '%s[fail]%s %s\n' "$c_red" "$c_rst" "$g" >&2
+      failed=$((failed + 1))
+    fi
+  done
+  printf 'required: %s\npresent:  %s\npassed:   %s\nfailed:   %s\n' \
+    "$required" "$present" "$passed" "$failed"
+  [ "$failed" -eq 0 ] && ok "all $required required OKernel gates passed" \
+    || die "one or more required smoke gates failed"
 }
 
 # ---- layer 5: host test suite ----------------------------------------------

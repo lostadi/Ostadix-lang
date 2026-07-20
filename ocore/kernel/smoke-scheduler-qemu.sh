@@ -6,7 +6,11 @@ BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-m2}"
 # One million CR3/TSS/GS/PCB/CSpace identity transactions are intentionally
 # expensive under software-emulated QEMU. Keep the default comfortably above
 # the observed loaded-host runtime; callers can still tighten it explicitly.
-TIMEOUT_SECONDS="${OCORE_M2_TIMEOUT_SECONDS:-180}"
+# One million forced CR3/TSS/GS identity transactions precede the live
+# scheduler phase. TCG throughput on Apple Silicon varies sharply under host
+# load, so keep the failure deadline generous without weakening any serial
+# marker, ordering, survival, or teardown assertion.
+TIMEOUT_SECONDS="${OCORE_M2_TIMEOUT_SECONDS:-360}"
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   echo "error: qemu-system-x86_64 is not installed" >&2

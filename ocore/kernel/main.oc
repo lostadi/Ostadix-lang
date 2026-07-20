@@ -8,6 +8,8 @@ use kernel::m4::start as start_m4;
 use kernel::m5::start as start_m5;
 use kernel::m5_semantics::start as start_m5_semantics;
 use kernel::m6::start as start_m6;
+use kernel::m6b_semantics::start as start_m6b_semantics;
+use kernel::kernel_world_semantics::start as start_kernel_world_semantics;
 use runtime::capability::init as capabilities_init;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
@@ -298,6 +300,20 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         interrupts_init();
         ocore_syscall_init();
         start_m6(probe_mode, domain_handle);
+    }
+    if probe_mode == 19 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_m6b_semantics(probe_mode, domain_handle, address_space_id);
+    }
+    if probe_mode == 20 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_kernel_world_semantics(probe_mode);
     }
 
     let kernel_stack_top: usize = ocore_kernel_stack_top();

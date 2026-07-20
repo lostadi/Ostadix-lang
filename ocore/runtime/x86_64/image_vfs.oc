@@ -594,6 +594,41 @@ pub unsafe fn verify_image_sha256(
     return 1;
 }
 
+// Verify a bounded immutable byte object that is already retained by trusted
+// kernel code. This shares the image boundary's allocator-free SHA-256 and is
+// used by native KernelWorld admission to pin the exact host-verified normal
+// form before parsing any field. It does not turn arbitrary bytes into package
+// verification authority.
+pub unsafe fn verify_bytes_sha256(
+    source: *const u8,
+    length: usize,
+    digest_0: u64,
+    digest_1: u64,
+    digest_2: u64,
+    digest_3: u64
+) -> u64 {
+    if source as usize == 0 || length == 0 || length > IMAGE_BYTE_CAPACITY {
+        return 0;
+    }
+    let mut actual: [u64; 4] = [0; 4];
+    if !sha256_compute(
+        0,
+        source,
+        false,
+        length,
+        (&mut actual[0])
+    ) {
+        return 0;
+    }
+    if ((actual[0] ^ digest_0)
+        | (actual[1] ^ digest_1)
+        | (actual[2] ^ digest_2)
+        | (actual[3] ^ digest_3)) != 0 {
+        return 0;
+    }
+    return 1;
+}
+
 // Freestanding algorithm self-test: NIST's empty-string and "abc" vectors.
 // It intentionally does not depend on VFS initialization or mutable images.
 pub unsafe fn sha256_selftest() -> u64 {

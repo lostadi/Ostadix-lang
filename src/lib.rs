@@ -15,6 +15,7 @@ pub mod eval;
 pub mod executor;
 pub mod hgraph;
 pub mod ir;
+pub mod kernel_world;
 pub mod live_system;
 pub mod nix_ops;
 pub mod nixos_ops;

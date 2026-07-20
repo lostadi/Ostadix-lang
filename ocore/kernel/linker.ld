@@ -97,8 +97,10 @@ SECTIONS
     __user_stack_top = .;
   } :user_stack
 
-  ASSERT(__kernel_end <= 0x00400000,
-         "O-core bootstrap kernel exceeds its two 4 KiB page tables")
+  /* Keep at least 512 KiB free below the bootstrap's 4 MiB mapping ceiling so
+   * a successful link cannot silently consume all native growth headroom. */
+  ASSERT(__kernel_end <= 0x00380000,
+         "O-core bootstrap kernel leaves less than 512 KiB headroom")
   ASSERT(__user_payload_end <= 0x0100fffe,
          "O-core user payload overlaps the syscall-return edge probe")
 

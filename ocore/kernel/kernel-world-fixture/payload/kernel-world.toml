@@ -1,0 +1,54 @@
+schema = "ocore.kernel-world/v1"
+name = "kernel/pilot-contained"
+version = "1.0.0"
+integration = "binary_contained"
+
+[image]
+kind = "user_supplied"
+expected_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[machine]
+guest_architecture = "x86_64"
+profile = "o-machine-pc/v1"
+execution = "hardware_virtualized"
+firmware = "uefi"
+min_vcpus = 1
+max_vcpus = 2
+min_memory_mib = 64
+max_memory_mib = 128
+requirements = ["vmx"]
+
+[lifecycle]
+health_protocol = "ocore.kernel-world-health/v1"
+health_timeout_ms = 5000
+restart = "on_failure"
+
+[quotas]
+max_outstanding_requests = 4
+max_requests_per_generation = 32
+max_shared_memory_bytes = 16384
+max_devices = 1
+
+[[exports]]
+name = "linux.exec"
+plane = "abi"
+protocol = "linux.exec/v1"
+
+[[exports]]
+name = "network.default"
+plane = "device"
+protocol = "o.net-port/v1"
+
+[[capability_requests]]
+kind = "device.net"
+rights = ["reset"]
+purpose = "resettable pilot network provider"
+
+[[capability_requests]]
+kind = "vm.machine"
+rights = ["run", "stop"]
+purpose = "contained guest execution"
+
+[license]
+redistribution = "user_supplied_only"
+external_acceptance_required = true
