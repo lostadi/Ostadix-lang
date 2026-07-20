@@ -1,0 +1,1498 @@
+module kernel::m6;
+
+use runtime::address_space::create_loaded_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::is_loaded;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::loaded_entry;
+use runtime::address_space::loaded_frame_count;
+use runtime::address_space::loaded_protections_hold;
+use runtime::address_space::loaded_stack_pointer;
+use runtime::address_space::root_cr3;
+use runtime::capability::capability_handle_at;
+use runtime::capability::close_for_owner as close_capability_for_owner;
+use runtime::capability::create_cspace;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::cspace_is_live;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::live_slots_for_owner;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_ENDPOINT;
+use runtime::capability::OBJECT_PERSONALITY_CALL;
+use runtime::capability::OBJECT_PERSONALITY_REPLY;
+use runtime::capability::OBJECT_PERSONALITY_SUPERVISION;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_CANCEL;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::capability::RIGHT_PERSONALITY_CALL;
+use runtime::capability::RIGHT_PERSONALITY_REPLY;
+use runtime::capability::RIGHT_PERSONALITY_SUPERVISE;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain::create_domain;
+use runtime::domain::destroy_domain;
+use runtime::domain_namespace::begin_teardown as begin_namespace_teardown;
+use runtime::domain_namespace::bind_process;
+use runtime::domain_namespace::create as create_namespace;
+use runtime::domain_namespace::finish_teardown as finish_namespace_teardown;
+use runtime::domain_namespace::init as namespaces_init;
+use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
+use runtime::domain_namespace::is_live as namespace_is_live;
+use runtime::domain_namespace::process_refs as namespace_process_refs;
+use runtime::domain_namespace::release_quiescent_processes;
+use runtime::domain_namespace::unbind_process;
+use runtime::elf_loader::commit_count;
+use runtime::elf_loader::init as elf_loader_init;
+use runtime::elf_loader::invariants_hold as elf_invariants_hold;
+use runtime::elf_loader::release_plan;
+use runtime::elf_loader::validate as validate_elf;
+use runtime::elf_loader::validation_count;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_draining as endpoint_is_draining;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::release as release_endpoint;
+use runtime::endpoint::retain as retain_endpoint;
+use runtime::image_vfs::append_image_bytes;
+use runtime::image_vfs::begin_image;
+use runtime::image_vfs::destroy_image;
+use runtime::image_vfs::image_id_for;
+use runtime::image_vfs::import_ovfs_image;
+use runtime::image_vfs::init as image_vfs_init;
+use runtime::image_vfs::invariants_hold as image_invariants_hold;
+use runtime::image_vfs::lookup as vfs_lookup;
+use runtime::image_vfs::mount_root;
+use runtime::image_vfs::publish_image;
+use runtime::image_vfs::retain_object;
+use runtime::image_vfs::root_mount_for;
+use runtime::image_vfs::sha256_selftest;
+use runtime::image_vfs::teardown_namespace as teardown_mount_namespace;
+use runtime::image_vfs::verify_image_sha256;
+use runtime::image_vfs::IMAGE_BYTE_CAPACITY;
+use runtime::image_vfs::OVFS_IMPORT_OK;
+use runtime::interrupts::ticks;
+use runtime::ipc_lifecycle::process_died as ipc_process_died;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::native_abi::ERR_CAPABILITY_DENIED;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_PERSONALITY_BUSY;
+use runtime::native_abi::ERR_PERSONALITY_FAILED;
+use runtime::native_abi::ERR_PERSONALITY_STALE;
+use runtime::native_abi::ERR_PERSONALITY_UNAVAILABLE;
+use runtime::native_abi::ERR_PERSONALITY_UNSUPPORTED;
+use runtime::native_abi::NATIVE_ABI_V1;
+use runtime::native_abi::PERSONALITY_RPC_V1;
+use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::personality::PERSONALITY_NATIVE;
+use runtime::personality::PERSONALITY_TEST;
+use runtime::personality_rpc::abort_wait as abort_personality_wait;
+use runtime::personality_rpc::arm_wait as arm_personality_wait;
+use runtime::personality_rpc::commit_wait as commit_personality_wait;
+use runtime::personality_rpc::dispatch_or_consume as dispatch_personality_call;
+use runtime::personality_rpc::expire as expire_personality_requests;
+use runtime::personality_rpc::init as personality_rpc_init;
+use runtime::personality_rpc::install_replacement as install_rpc_replacement;
+use runtime::personality_rpc::invariants_hold as personality_rpc_invariants_hold;
+use runtime::personality_rpc::publish as publish_personality_rpc;
+use runtime::personality_rpc::reply as reply_personality_request;
+use runtime::personality_rpc::state as personality_request_state;
+use runtime::personality_rpc::service_died as personality_service_died;
+use runtime::personality_rpc::supervisor_cancel as cancel_personality_request;
+use runtime::personality_rpc::consumed_result_count as rpc_consumed_count;
+use runtime::personality_rpc::deadline_expiry_count as rpc_expiry_count;
+use runtime::personality_rpc::dispatch_count as rpc_dispatch_count;
+use runtime::personality_rpc::duplicate_reply_count as rpc_duplicate_count;
+use runtime::personality_rpc::late_reply_count as rpc_late_count;
+use runtime::personality_rpc::reply_count as rpc_reply_count;
+use runtime::personality_rpc::replacement_count as rpc_replacement_count;
+use runtime::personality_rpc::request_count as rpc_request_count;
+use runtime::personality_rpc::service_death_event_count as rpc_death_event_count;
+use runtime::personality_rpc::service_death_terminal_count as rpc_death_terminal_count;
+use runtime::personality_rpc::stale_reply_count as rpc_stale_count;
+use runtime::personality_rpc::supervisor_cancel_count as rpc_cancel_count;
+use runtime::personality_rpc::terminal_transition_count as rpc_terminal_count;
+use runtime::personality_rpc::terminal_wake_count as rpc_terminal_wake_count;
+use runtime::personality_rpc::wait_arm_count as rpc_wait_arm_count;
+use runtime::personality_rpc::wait_commit_count as rpc_wait_commit_count;
+use runtime::personality_rpc::RPC_CONSUMED;
+use runtime::personality_rpc::RPC_DISPATCHED;
+use runtime::personality_rpc::RPC_STATE_WAITING;
+use runtime::personality_supervision::arm_monitor;
+use runtime::personality_supervision::crash_count as supervision_crash_count;
+use runtime::personality_supervision::generation as supervision_generation;
+use runtime::personality_supervision::init as personality_supervision_init;
+use runtime::personality_supervision::install_replacement as install_supervision_replacement;
+use runtime::personality_supervision::invariants_hold as supervision_invariants_hold;
+use runtime::personality_supervision::is_current as supervision_is_current;
+use runtime::personality_supervision::monitor_arm_count;
+use runtime::personality_supervision::publish as publish_supervision;
+use runtime::personality_supervision::publish_count;
+use runtime::personality_supervision::record_crash;
+use runtime::personality_supervision::replacement_install_count;
+use runtime::personality_supervision::request_restart;
+use runtime::personality_supervision::request_stop;
+use runtime::personality_supervision::restart_request_count;
+use runtime::personality_supervision::service_process as supervised_service_process;
+use runtime::personality_supervision::state as supervision_state;
+use runtime::personality_supervision::stop_request_count;
+use runtime::personality_supervision::supervisor_process as supervised_by_process;
+use runtime::personality_supervision::SUPERVISION_STATE_ACTIVE;
+use runtime::personality_supervision::SUPERVISION_STATE_REPLACEMENT_STARTING;
+use runtime::personality_supervision::SUPERVISION_STATE_RESTART_REQUESTED;
+use runtime::personality_supervision::SUPERVISION_STATE_STARTING;
+use runtime::personality_supervision::SUPERVISION_STATE_STOP_REQUESTED;
+use runtime::process::begin_reap;
+use runtime::process::current_process_handle;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::is_live as process_is_live;
+use runtime::process::process_state;
+use runtime::process::PROCESS_STATE_REAPABLE;
+use runtime::scheduler::arm_personality;
+use runtime::scheduler::arm_personality_restart;
+use runtime::scheduler::complete as scheduler_complete;
+use runtime::scheduler::completion_kind;
+use runtime::scheduler::context_switches;
+use runtime::scheduler::failed as scheduler_failed;
+use runtime::scheduler::personality_fault_containments;
+use runtime::scheduler::request_ipc_wait;
+use runtime::scheduler::SCHEDULER_COMPLETION_PERSONALITY;
+use runtime::scheduler::SCHEDULER_COMPLETION_PERSONALITY_CRASH;
+use runtime::serial::write;
+use runtime::thread::blocked_count;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::init as threads_init;
+use runtime::thread::install_loaded as install_loaded_thread;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::queue_invariants_hold as thread_invariants_hold;
+use runtime::thread::reap as reap_thread;
+use runtime::thread::runnable_count;
+use runtime::thread::THREAD_ROLE_BLOCKING;
+use runtime::thread::THREAD_ROLE_CPU;
+
+const MODE_PERSONALITY: u64 = 18;
+const PROCESS_COUNT: usize = 4;
+const CLIENT: usize = 0;
+const SERVICE: usize = 1;
+const SUPERVISOR: usize = 2;
+const OBSERVER: usize = 3;
+const QUOTA: usize = 16;
+const IMAGE_LENGTH: usize = 62104;
+const SCALAR_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+const INFINITE_DEADLINE: u64 = 0xffff_ffff_ffff_ffff;
+
+const SERVICE_ID: u64 = 0x4d36_5045_5253_4f4e;
+const PROTOCOL_ID: u64 = PERSONALITY_RPC_V1;
+
+const OP_HOLD_CANCEL: u64 = 3;
+const OP_CRASH: u64 = 5;
+const MONITOR_CLIENT_G2_COMPLETE: u64 = 0xff;
+
+const SUPERVISE_PUBLISH: u64 = 1;
+const SUPERVISE_MONITOR: u64 = 2;
+const SUPERVISE_RESTART: u64 = 3;
+const SUPERVISE_CANCEL: u64 = 4;
+const SUPERVISE_STOP: u64 = 5;
+
+static PATH_IDS: [u64; 4] = [
+    0x03f6_0895_e2dd_2979,
+    0xb41c_5aa9_4cac_3c0e,
+    0xe20c_0c3c_11c0_1ab2,
+    0xdad8_5f71_3696_c238,
+];
+
+const IMAGE_ID: u64 = 0xc269_9a2e_adae_2b40;
+const IMAGE_DIGEST_0: u64 = 0x402b_aead_2e9a_69c2;
+const IMAGE_DIGEST_1: u64 = 0xda4f_42ec_ec48_0b6a;
+const IMAGE_DIGEST_2: u64 = 0x32c7_caf7_0264_b30c;
+const IMAGE_DIGEST_3: u64 = 0xe7c4_73ff_8ad9_4144;
+const IMAGE_SHA_0: u64 = 0xc269_9a2e_adae_2b40;
+const IMAGE_SHA_1: u64 = 0x6a0b_48ec_ec42_4fda;
+const IMAGE_SHA_2: u64 = 0x0cb3_6402_f7ca_c732;
+const IMAGE_SHA_3: u64 = 0x4441_d98a_ff73_c4e7;
+
+static IMAGE_MESSAGE: [u8; 28] = b"M6A OVFS image import: PASS\n";
+static LOAD_MESSAGE: [u8; 34] = b"M6A four packaged ELF loads: PASS\n";
+static WX_MESSAGE: [u8; 35] = b"M6A loaded address-space W^X: PASS\n";
+static CSPACE_MESSAGE: [u8; 39] =
+    b"M6A isolated personality CSpaces: PASS\n";
+static PRIVATE_MESSAGE: [u8; 44] =
+    b"M6A private-before-health publication: PASS\n";
+static ARMED_MESSAGE: [u8; 34] = b"M6A scalar personality RPC: armed\n";
+static FAULT_MESSAGE: [u8; 40] =
+    b"M6A personality fault containment: PASS\n";
+static TERMINAL_MESSAGE: [u8; 41] =
+    b"M6A terminal arbitration/wake-once: PASS\n";
+static SURVIVOR_MESSAGE: [u8; 35] =
+    b"M6A unrelated world survived: PASS\n";
+static REBIND_MESSAGE: [u8; 32] =
+    b"M6A g2 replacement/rebind: PASS\n";
+static POLICY_MESSAGE: [u8; 37] =
+    b"M6A supervisor-owned lifecycle: PASS\n";
+static STALE_MESSAGE: [u8; 41] =
+    b"M6A stale/late/duplicate rejection: PASS\n";
+static RECLAIM_MESSAGE: [u8; 30] = b"M6A resources reclaimed: PASS\n";
+static LIVE_MESSAGE: [u8; 37] =
+    b"M6A live personality substrate: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 33] =
+    b"M6A post-lifecycle timer: online\n";
+
+static mut ARMED: u8 = 0;
+static mut NAMESPACES: [u64; 4] = [0; 4];
+static mut IMAGE: u64 = 0;
+static mut ROOT_MOUNTS: [u64; 4] = [0; 4];
+static mut DOMAINS: [u64; 4] = [0; 4];
+static mut CSPACES: [u64; 4] = [0; 4];
+static mut PLANS: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACES: [u64; 4] = [0; 4];
+static mut PHYSICALS: [usize; 4] = [0; 4];
+static mut PROCESSES: [u64; 4] = [0; 4];
+static mut THREADS: [u64; 4] = [0; 4];
+static mut DEBUG_CAPS: [u64; 4] = [0; 4];
+
+static mut REQUEST_ENDPOINT: u64 = 0;
+static mut DIRECT_REPLY_ENDPOINT: u64 = 0;
+static mut CLIENT_WAIT_ENDPOINT: u64 = 0;
+static mut REQUEST_RECEIVE_CAP: u64 = 0;
+static mut REQUEST_SEND_CAP: u64 = 0;
+static mut DIRECT_REPLY_SEND_CAP: u64 = 0;
+static mut DIRECT_REPLY_RECEIVE_CAP: u64 = 0;
+static mut PERSONALITY_REPLY_CAP: u64 = 0;
+static mut SUPERVISION_CAP: u64 = 0;
+static mut CALL_CAP: u64 = 0;
+static mut SUPERVISION: u64 = 0;
+
+static mut BASELINE_FREE: usize = 0;
+static mut PRIOR_REQUEST: u64 = 0;
+static mut PENDING_CANCEL_REQUEST: u64 = 0;
+static mut PENDING_CRASH_REQUEST: u64 = 0;
+static mut G1_CALL_CAP: u64 = 0;
+static mut G2_CALL_CAP: u64 = 0;
+static mut STALE_SERVICE_PROCESS: u64 = 0;
+static mut STALE_SERVICE_THREAD: u64 = 0;
+static mut STALE_SERVICE_CSPACE: u64 = 0;
+static mut STALE_SERVICE_ADDRESS_SPACE: u64 = 0;
+static mut OBSERVER_RESTART_SNAPSHOT: u64 = 0;
+static mut SERVICE_FAULT_RECORDED: u8 = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_m6_image_start() -> usize;
+extern "sysv64" fn ocore_m6_image_end() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn distinct_four_u64(values: *const u64) -> bool {
+    let mut outer: usize = 0;
+    while outer < PROCESS_COUNT {
+        if volatile_load(values + outer) == 0 {
+            return false;
+        }
+        let mut inner: usize = outer + 1;
+        while inner < PROCESS_COUNT {
+            if volatile_load(values + outer) == volatile_load(values + inner) {
+                return false;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    return true;
+}
+
+unsafe fn distinct_four_usize(values: *const usize) -> bool {
+    let mut outer: usize = 0;
+    while outer < PROCESS_COUNT {
+        if volatile_load(values + outer) == 0 {
+            return false;
+        }
+        let mut inner: usize = outer + 1;
+        while inner < PROCESS_COUNT {
+            if volatile_load(values + outer) == volatile_load(values + inner) {
+                return false;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    return true;
+}
+
+unsafe fn load_plan(namespace_index: usize, path: u64) -> u64 {
+    if namespace_index >= PROCESS_COUNT {
+        return 0;
+    }
+    let namespace: u64 = NAMESPACES[namespace_index];
+    let object: u64 = vfs_lookup(namespace, path);
+    if object == 0 || retain_object(namespace, object) == 0 {
+        return 0;
+    }
+    return validate_elf(object);
+}
+
+unsafe fn loaded_protections_all_hold() -> bool {
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        if !loaded_protections_hold(ADDRESS_SPACES[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn install_endpoint_cap(
+    endpoint: u64,
+    owner: u64,
+    slot: usize,
+    rights: u64,
+    additional_reference: bool
+) -> u64 {
+    if endpoint == 0 || owner == 0 {
+        return 0;
+    }
+    if additional_reference && retain_endpoint(endpoint) == 0 {
+        return 0;
+    }
+    let capability: u64 = install_capability_for_owner(
+        owner,
+        slot,
+        endpoint,
+        OBJECT_ENDPOINT,
+        rights
+    );
+    if capability == 0 {
+        if additional_reference {
+            release_endpoint(endpoint);
+        }
+        return 0;
+    }
+    return capability;
+}
+
+unsafe fn close_endpoint_cap(
+    owner: u64,
+    capability: u64,
+    endpoint: u64
+) -> bool {
+    return owner != 0
+        && capability != 0
+        && endpoint != 0
+        && validate_for_owner(owner, capability, OBJECT_ENDPOINT, 0)
+            == endpoint
+        && close_capability_for_owner(owner, capability) != 0
+        && release_endpoint(endpoint) != 0;
+}
+
+unsafe fn close_generation_endpoints() -> bool {
+    let request: u64 = REQUEST_ENDPOINT;
+    let direct: u64 = DIRECT_REPLY_ENDPOINT;
+    if PERSONALITY_REPLY_CAP == 0
+        || validate_for_owner(
+            CSPACES[SERVICE],
+            PERSONALITY_REPLY_CAP,
+            OBJECT_PERSONALITY_REPLY,
+            RIGHT_PERSONALITY_REPLY
+        ) != PROCESSES[SERVICE]
+        || close_capability_for_owner(
+            CSPACES[SERVICE],
+            PERSONALITY_REPLY_CAP
+        ) == 0
+        || !close_endpoint_cap(
+        CSPACES[SERVICE],
+        REQUEST_RECEIVE_CAP,
+        request
+    ) || !close_endpoint_cap(
+        CSPACES[SUPERVISOR],
+        REQUEST_SEND_CAP,
+        request
+    ) || !close_endpoint_cap(
+        CSPACES[SUPERVISOR],
+        DIRECT_REPLY_RECEIVE_CAP,
+        direct
+    ) || !close_endpoint_cap(
+        CSPACES[SERVICE],
+        DIRECT_REPLY_SEND_CAP,
+        direct
+    ) || endpoint_is_live(request)
+        || endpoint_is_draining(request)
+        || endpoint_is_live(direct)
+        || endpoint_is_draining(direct) {
+        return false;
+    }
+    REQUEST_ENDPOINT = 0;
+    DIRECT_REPLY_ENDPOINT = 0;
+    REQUEST_RECEIVE_CAP = 0;
+    REQUEST_SEND_CAP = 0;
+    DIRECT_REPLY_SEND_CAP = 0;
+    DIRECT_REPLY_RECEIVE_CAP = 0;
+    PERSONALITY_REPLY_CAP = 0;
+    return true;
+}
+
+unsafe fn create_generation_endpoints() -> bool {
+    REQUEST_ENDPOINT = create_endpoint(CSPACES[SERVICE]);
+    DIRECT_REPLY_ENDPOINT = create_endpoint(CSPACES[SERVICE]);
+    if REQUEST_ENDPOINT == 0
+        || DIRECT_REPLY_ENDPOINT == 0
+        || REQUEST_ENDPOINT == DIRECT_REPLY_ENDPOINT {
+        return false;
+    }
+    REQUEST_RECEIVE_CAP = install_endpoint_cap(
+        REQUEST_ENDPOINT,
+        CSPACES[SERVICE],
+        1,
+        RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+        false
+    );
+    REQUEST_SEND_CAP = install_endpoint_cap(
+        REQUEST_ENDPOINT,
+        CSPACES[SUPERVISOR],
+        2,
+        RIGHT_ENDPOINT_SEND,
+        true
+    );
+    DIRECT_REPLY_RECEIVE_CAP = install_endpoint_cap(
+        DIRECT_REPLY_ENDPOINT,
+        CSPACES[SUPERVISOR],
+        3,
+        RIGHT_ENDPOINT_RECEIVE | RIGHT_ENDPOINT_CANCEL,
+        false
+    );
+    DIRECT_REPLY_SEND_CAP = install_endpoint_cap(
+        DIRECT_REPLY_ENDPOINT,
+        CSPACES[SERVICE],
+        3,
+        RIGHT_ENDPOINT_SEND,
+        true
+    );
+    PERSONALITY_REPLY_CAP = install_capability_for_owner(
+        CSPACES[SERVICE],
+        2,
+        PROCESSES[SERVICE],
+        OBJECT_PERSONALITY_REPLY,
+        RIGHT_PERSONALITY_REPLY
+    );
+    return REQUEST_RECEIVE_CAP != 0
+        && REQUEST_SEND_CAP != 0
+        && DIRECT_REPLY_RECEIVE_CAP != 0
+        && DIRECT_REPLY_SEND_CAP != 0
+        && PERSONALITY_REPLY_CAP != 0
+        && endpoint_invariants_hold()
+        && capability_invariants_hold();
+}
+
+unsafe fn reap_loaded_process(index: usize) -> bool {
+    if index >= PROCESS_COUNT
+        || process_state(PROCESSES[index]) != PROCESS_STATE_REAPABLE
+        || begin_reap(PROCESSES[index]) == 0
+        || destroy_address_space(ADDRESS_SPACES[index]) == 0
+        || drain_cspace(CSPACES[index]) == 0
+        || finalize_reap(PROCESSES[index]) == 0
+        || process_state(PROCESSES[index]) != 0
+        || address_space_is_live(ADDRESS_SPACES[index])
+        || cspace_is_live(CSPACES[index]) {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn seed_generation_config(generation: u64) -> void {
+    volatile_store((PHYSICALS[CLIENT] + 8) as *mut u64, 0);
+    volatile_store((PHYSICALS[CLIENT] + 16) as *mut u64, generation);
+    volatile_store((PHYSICALS[CLIENT] + 24) as *mut u64, 0);
+
+    volatile_store((PHYSICALS[SERVICE] + 16) as *mut u64, generation);
+    volatile_store(
+        (PHYSICALS[SERVICE] + 32) as *mut u64,
+        REQUEST_RECEIVE_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SERVICE] + 40) as *mut u64,
+        PERSONALITY_REPLY_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SERVICE] + 48) as *mut u64,
+        DIRECT_REPLY_SEND_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SERVICE] + 56) as *mut u64,
+        PROCESSES[CLIENT]
+    );
+    volatile_store(
+        (PHYSICALS[SERVICE] + 64) as *mut u64,
+        PROCESSES[SUPERVISOR]
+    );
+    volatile_store(
+        (PHYSICALS[SERVICE] + 72) as *mut u64,
+        PRIOR_REQUEST
+    );
+
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 8) as *mut u64,
+        SUPERVISION_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 16) as *mut u64,
+        generation
+    );
+    volatile_store((PHYSICALS[SUPERVISOR] + 24) as *mut u64, 0);
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 32) as *mut u64,
+        REQUEST_SEND_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 40) as *mut u64,
+        DIRECT_REPLY_RECEIVE_CAP
+    );
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 48) as *mut u64,
+        PROCESSES[SERVICE]
+    );
+}
+
+unsafe fn install_call_capability(generation: u64) -> bool {
+    if CALL_CAP != 0
+        || generation == 0
+        || supervision_generation(SUPERVISION) != generation {
+        return false;
+    }
+    CALL_CAP = install_capability_for_owner(
+        CSPACES[CLIENT],
+        1,
+        PROCESSES[SERVICE],
+        OBJECT_PERSONALITY_CALL,
+        RIGHT_PERSONALITY_CALL
+    );
+    if CALL_CAP == 0
+        || validate_for_owner(
+            CSPACES[CLIENT],
+            CALL_CAP,
+            OBJECT_PERSONALITY_CALL,
+            RIGHT_PERSONALITY_CALL
+        ) != PROCESSES[SERVICE] {
+        return false;
+    }
+    if generation == 1 {
+        G1_CALL_CAP = CALL_CAP;
+    } else {
+        G2_CALL_CAP = CALL_CAP;
+        if G2_CALL_CAP == G1_CALL_CAP {
+            return false;
+        }
+    }
+    volatile_store((PHYSICALS[CLIENT] + 8) as *mut u64, CALL_CAP);
+    volatile_store((PHYSICALS[CLIENT] + 16) as *mut u64, generation);
+    volatile_store((PHYSICALS[CLIENT] + 24) as *mut u64, generation);
+    volatile_store(
+        (PHYSICALS[SUPERVISOR] + 24) as *mut u64,
+        generation
+    );
+    return true;
+}
+
+unsafe fn revoke_call_capability() -> bool {
+    let stale: u64 = CALL_CAP;
+    if stale == 0
+        || close_capability_for_owner(CSPACES[CLIENT], stale) == 0
+        || validate_for_owner(
+            CSPACES[CLIENT],
+            stale,
+            OBJECT_PERSONALITY_CALL,
+            RIGHT_PERSONALITY_CALL
+        ) != 0 {
+        return false;
+    }
+    CALL_CAP = 0;
+    volatile_store((PHYSICALS[CLIENT] + 8) as *mut u64, 0);
+    volatile_store((PHYSICALS[CLIENT] + 24) as *mut u64, 0);
+    return true;
+}
+
+unsafe fn create_replacement_service() -> bool {
+    CSPACES[SERVICE] = create_cspace(SERVICE);
+    if CSPACES[SERVICE] == 0
+        || set_quota_for_owner(CSPACES[SERVICE], QUOTA) == 0 {
+        return false;
+    }
+    PLANS[SERVICE] = load_plan(SERVICE, PATH_IDS[SERVICE]);
+    if PLANS[SERVICE] == 0 {
+        return false;
+    }
+    ADDRESS_SPACES[SERVICE] = create_loaded_for_owner(
+        CSPACES[SERVICE],
+        PLANS[SERVICE]
+    );
+    PHYSICALS[SERVICE] = isolation_physical(ADDRESS_SPACES[SERVICE]);
+    if ADDRESS_SPACES[SERVICE] == 0
+        || PHYSICALS[SERVICE] == 0
+        || !is_loaded(ADDRESS_SPACES[SERVICE])
+        || loaded_entry(ADDRESS_SPACES[SERVICE]) == 0
+        || loaded_stack_pointer(ADDRESS_SPACES[SERVICE]) == 0
+        || loaded_frame_count(ADDRESS_SPACES[SERVICE]) == 0
+        || root_cr3(ADDRESS_SPACES[SERVICE]) == ocore_management_cr3()
+        || !loaded_protections_hold(ADDRESS_SPACES[SERVICE])
+        || release_plan(PLANS[SERVICE]) == 0 {
+        return false;
+    }
+    PROCESSES[SERVICE] = install_process_for_owner(
+        SERVICE,
+        2802,
+        DOMAINS[SERVICE],
+        ADDRESS_SPACES[SERVICE],
+        CSPACES[SERVICE],
+        ocore_process_kernel_stack_top(SERVICE),
+        loaded_entry(ADDRESS_SPACES[SERVICE]),
+        loaded_stack_pointer(ADDRESS_SPACES[SERVICE])
+    );
+    if PROCESSES[SERVICE] == 0
+        || bind_process(NAMESPACES[SERVICE], PROCESSES[SERVICE]) == 0 {
+        return false;
+    }
+    DEBUG_CAPS[SERVICE] = install_capability_for_owner(
+        CSPACES[SERVICE],
+        0,
+        0x660 + SERVICE as u64,
+        OBJECT_DEBUG,
+        RIGHT_DEBUG_WRITE
+    );
+    if DEBUG_CAPS[SERVICE] == 0 || !create_generation_endpoints() {
+        return false;
+    }
+    let replacement: u64 = install_supervision_replacement(
+        SUPERVISION,
+        PROCESSES[SUPERVISOR],
+        STALE_SERVICE_PROCESS,
+        PROCESSES[SERVICE]
+    );
+    if replacement == 0
+        || close_capability_for_owner(
+            CSPACES[SUPERVISOR],
+            SUPERVISION_CAP
+        ) == 0 {
+        return false;
+    }
+    SUPERVISION = replacement;
+    SUPERVISION_CAP = install_capability_for_owner(
+        CSPACES[SUPERVISOR],
+        1,
+        SUPERVISION,
+        OBJECT_PERSONALITY_SUPERVISION,
+        RIGHT_PERSONALITY_SUPERVISE
+    );
+    if SUPERVISION_CAP == 0
+        || supervision_state(SUPERVISION)
+            != SUPERVISION_STATE_REPLACEMENT_STARTING
+        || install_rpc_replacement(
+            STALE_SERVICE_PROCESS,
+            1,
+            PROCESSES[SERVICE],
+            2,
+            PROTOCOL_ID,
+            REQUEST_ENDPOINT
+        ) != 1 {
+        return false;
+    }
+    seed_generation_config(2);
+    THREADS[SERVICE] = install_loaded_thread(
+        SERVICE,
+        2902,
+        PROCESSES[SERVICE],
+        loaded_entry(ADDRESS_SPACES[SERVICE]),
+        loaded_stack_pointer(ADDRESS_SPACES[SERVICE]),
+        ocore_process_kernel_stack_top(SERVICE),
+        DEBUG_CAPS[SERVICE],
+        2,
+        THREAD_ROLE_BLOCKING,
+        1
+    );
+    return THREADS[SERVICE] != 0
+        && namespace_process_refs(NAMESPACES[SERVICE]) == 1
+        && thread_invariants_hold()
+        && capability_invariants_hold()
+        && endpoint_invariants_hold()
+        && supervision_invariants_hold()
+        && personality_rpc_invariants_hold();
+}
+
+// The adapter hooks below are linked for every probe mode. ARMED and exact
+// capability-object checks keep them inert outside the mode-18 package.
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    scalar: u64,
+    timeout_ticks: u64
+) -> u64 {
+    if ARMED == 0 {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    let caller: u64 = current_process_handle();
+    let thread: u64 = current_thread_handle();
+    if caller != PROCESSES[CLIENT]
+        || thread != THREADS[CLIENT]
+        || capability_object != PROCESSES[SERVICE]
+        || CALL_CAP != capability
+        || operation > 0xff
+        || scalar > SCALAR_MASK {
+        return ERR_CAPABILITY_DENIED;
+    }
+    let now: u64 = ticks();
+    let mut deadline: u64 = 0;
+    if timeout_ticks != 0 {
+        if timeout_ticks > 1000000
+            || now > INFINITE_DEADLINE - timeout_ticks {
+            return ERR_PERSONALITY_UNSUPPORTED;
+        }
+        deadline = now + timeout_ticks;
+    }
+    let packed: u64 = (operation << 56) | scalar;
+    let mut request: u64 = 0;
+    let mut result: u64 = 0;
+    let dispatch: u64 = dispatch_personality_call(
+        caller,
+        thread,
+        packed,
+        deadline,
+        (&mut request),
+        (&mut result)
+    );
+    if dispatch == RPC_CONSUMED {
+        if operation == OP_HOLD_CANCEL {
+            PENDING_CANCEL_REQUEST = 0;
+        }
+        return result;
+    }
+    if dispatch != RPC_DISPATCHED {
+        return dispatch;
+    }
+    if operation == OP_HOLD_CANCEL {
+        PENDING_CANCEL_REQUEST = request;
+    }
+    if operation == OP_CRASH {
+        PENDING_CRASH_REQUEST = request;
+    }
+    let wait: u64 = arm_personality_wait(request);
+    if (wait & 0xff00_0000) != 0xb300_0000 {
+        return wait;
+    }
+    if commit_personality_wait(request, wait) != request {
+        fail_closed();
+    }
+    let control: u64 = request_ipc_wait(wait, ERR_IPC_RETRY);
+    if control != SYSCALL_CONTROL_SCHEDULE {
+        if abort_personality_wait(request, wait) == 0 {
+            fail_closed();
+        }
+        return control;
+    }
+    return control;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_reply(
+    capability_object: u64,
+    request: u64,
+    status: u64,
+    scalar: u64
+) -> u64 {
+    let caller: u64 = current_process_handle();
+    if ARMED == 0
+        || caller == 0
+        || caller != PROCESSES[SERVICE]
+        || capability_object != caller
+        || request == 0
+        || (status != 0 && status != ERR_PERSONALITY_UNSUPPORTED)
+        || (status != 0 && scalar != 0) {
+        return ERR_CAPABILITY_DENIED;
+    }
+    let mut result: u64 = scalar;
+    if status != 0 {
+        result = status;
+    }
+    let replied: u64 = reply_personality_request(request, caller, result);
+    return replied;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_supervise(
+    capability_object: u64,
+    action: u64,
+    generation: u64,
+    subject: u64
+) -> u64 {
+    let caller: u64 = current_process_handle();
+    if ARMED == 0
+        || caller != PROCESSES[SUPERVISOR]
+        || capability_object != SUPERVISION
+        || !supervision_is_current(SUPERVISION)
+        || supervised_by_process(SUPERVISION) != caller
+        || supervised_service_process(SUPERVISION) != PROCESSES[SERVICE]
+        || supervision_generation(SUPERVISION) != generation {
+        return ERR_PERSONALITY_STALE;
+    }
+    if action == SUPERVISE_PUBLISH {
+        if subject != 0
+            || (supervision_state(SUPERVISION)
+                    != SUPERVISION_STATE_STARTING
+                && supervision_state(SUPERVISION)
+                    != SUPERVISION_STATE_REPLACEMENT_STARTING)
+            || arm_monitor(
+                SUPERVISION,
+                caller,
+                PROCESSES[SERVICE]
+            ) != 1
+            || (generation == 1
+                && publish_personality_rpc(
+                    PROCESSES[SERVICE],
+                    generation,
+                    PROTOCOL_ID,
+                    REQUEST_ENDPOINT,
+                    CLIENT_WAIT_ENDPOINT
+                ) != 1)
+            || !install_call_capability(generation) {
+            fail_closed();
+        }
+        return 1;
+    }
+    if action == SUPERVISE_MONITOR {
+        if supervision_state(SUPERVISION) != SUPERVISION_STATE_ACTIVE {
+            return ERR_PERSONALITY_BUSY;
+        }
+        if subject == 0 {
+            return 1;
+        }
+        if subject == OP_HOLD_CANCEL {
+            if PENDING_CANCEL_REQUEST != 0
+                && personality_request_state(PENDING_CANCEL_REQUEST)
+                    == RPC_STATE_WAITING {
+                return PENDING_CANCEL_REQUEST;
+            }
+            return ERR_PERSONALITY_BUSY;
+        }
+        if subject == MONITOR_CLIENT_G2_COMPLETE {
+            if generation == 2
+                && volatile_load(PHYSICALS[CLIENT] as *const u64) == 7 {
+                return 1;
+            }
+            return ERR_PERSONALITY_BUSY;
+        }
+        return ERR_PERSONALITY_UNSUPPORTED;
+    }
+    if action == SUPERVISE_CANCEL {
+        if generation != 1 || subject == 0 {
+            return ERR_PERSONALITY_STALE;
+        }
+        return cancel_personality_request(subject);
+    }
+    if action == SUPERVISE_RESTART {
+        if generation != 1 || subject != 2 {
+            return ERR_PERSONALITY_STALE;
+        }
+        return request_restart(
+            SUPERVISION,
+            caller,
+            PROCESSES[SERVICE]
+        );
+    }
+    if action == SUPERVISE_STOP {
+        if generation != 2 || subject != 0 {
+            return ERR_PERSONALITY_STALE;
+        }
+        return request_stop(
+            SUPERVISION,
+            caller,
+            PROCESSES[SERVICE]
+        );
+    }
+    return ERR_PERSONALITY_UNSUPPORTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
+    if ARMED == 0
+        || SERVICE_FAULT_RECORDED != 0
+        || process != PROCESSES[SERVICE]
+        || supervision_state(SUPERVISION) != SUPERVISION_STATE_ACTIVE
+        || volatile_load(PHYSICALS[SERVICE] as *const u64) != 7 {
+        return 0;
+    }
+    PRIOR_REQUEST = PENDING_CRASH_REQUEST;
+    if PRIOR_REQUEST == 0
+        || personality_service_died(process) != 1
+        || ipc_process_died(process) == 0
+        || record_crash(process) != 1
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        return 0;
+    }
+    volatile_store((PHYSICALS[CLIENT] + 24) as *mut u64, 0);
+    volatile_store((PHYSICALS[SUPERVISOR] + 24) as *mut u64, 0);
+    SERVICE_FAULT_RECORDED = 1;
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_expire_requests(now: u64) -> u64 {
+    if ARMED == 0 || now == 0 {
+        return 0;
+    }
+    let result: u64 = expire_personality_requests(now);
+    if result <= 4 {
+        return 1;
+    }
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_phase_one_ready() -> u64 {
+    if ARMED == 0
+        || SERVICE_FAULT_RECORDED != 1
+        || process_state(PROCESSES[SERVICE]) != PROCESS_STATE_REAPABLE
+        || supervision_state(SUPERVISION)
+            != SUPERVISION_STATE_RESTART_REQUESTED
+        || volatile_load(PHYSICALS[CLIENT] as *const u64) != 5
+        || volatile_load(PHYSICALS[OBSERVER] as *const u64) == 0
+        || blocked_count() != 0
+        || supervision_crash_count() != 1
+        || restart_request_count() != 1
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        return 0;
+    }
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_final_ready() -> u64 {
+    if ARMED == 0
+        || SERVICE_FAULT_RECORDED != 1
+        || supervision_generation(SUPERVISION) != 2
+        || supervision_state(SUPERVISION)
+            != SUPERVISION_STATE_STOP_REQUESTED
+        || volatile_load(PHYSICALS[CLIENT] as *const u64) != 7
+        || volatile_load(PHYSICALS[SERVICE] as *const u64) != 7
+        || volatile_load(PHYSICALS[SUPERVISOR] as *const u64) != 8
+        || volatile_load(PHYSICALS[OBSERVER] as *const u64)
+            <= OBSERVER_RESTART_SNAPSHOT
+        || blocked_count() != 0
+        || CALL_CAP == 0
+        || G2_CALL_CAP != CALL_CAP
+        || G2_CALL_CAP == G1_CALL_CAP
+        || supervision_crash_count() != 1
+        || restart_request_count() != 1
+        || replacement_install_count() != 1
+        || stop_request_count() != 1
+        || monitor_arm_count() != 2
+        || rpc_request_count() != 0
+        || rpc_dispatch_count() != 9
+        || rpc_wait_arm_count() != 9
+        || rpc_wait_commit_count() != 9
+        || rpc_terminal_count() != 9
+        || rpc_terminal_wake_count() != 9
+        || rpc_consumed_count() != 9
+        || rpc_reply_count() != 6
+        || rpc_cancel_count() != 1
+        || rpc_expiry_count() != 1
+        || rpc_death_terminal_count() != 1
+        || rpc_death_event_count() != 1
+        || rpc_stale_count() != 1
+        || rpc_late_count() != 2
+        || rpc_duplicate_count() != 1
+        || rpc_replacement_count() != 1
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        return 0;
+    }
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_crash_continue() -> never {
+    if !management_context()
+        || scheduler_failed()
+        || !scheduler_complete()
+        || completion_kind()
+            != SCHEDULER_COMPLETION_PERSONALITY_CRASH
+        || personality_fault_containments() != 1
+        || context_switches() < 4
+        || runnable_count() != 3
+        || blocked_count() != 0
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        fail_closed();
+    }
+    write((&FAULT_MESSAGE[0]), 40);
+    write((&TERMINAL_MESSAGE[0]), 41);
+    write((&SURVIVOR_MESSAGE[0]), 35);
+
+    STALE_SERVICE_PROCESS = PROCESSES[SERVICE];
+    STALE_SERVICE_THREAD = THREADS[SERVICE];
+    STALE_SERVICE_CSPACE = CSPACES[SERVICE];
+    STALE_SERVICE_ADDRESS_SPACE = ADDRESS_SPACES[SERVICE];
+    OBSERVER_RESTART_SNAPSHOT = volatile_load(
+        PHYSICALS[OBSERVER] as *const u64
+    );
+    if !revoke_call_capability() {
+        fail_closed();
+    }
+    if !close_generation_endpoints() {
+        fail_closed();
+    }
+    if reap_thread(STALE_SERVICE_THREAD) == 0
+        || thread_is_live(STALE_SERVICE_THREAD) {
+        fail_closed();
+    }
+    if unbind_process(
+            NAMESPACES[SERVICE],
+            STALE_SERVICE_PROCESS
+        ) == 0 {
+        fail_closed();
+    }
+    if !reap_loaded_process(SERVICE) {
+        fail_closed();
+    }
+    if !create_replacement_service()
+        || PROCESSES[SERVICE] == STALE_SERVICE_PROCESS
+        || THREADS[SERVICE] == STALE_SERVICE_THREAD
+        || CSPACES[SERVICE] == STALE_SERVICE_CSPACE
+        || ADDRESS_SPACES[SERVICE] == STALE_SERVICE_ADDRESS_SPACE
+        || process_state(STALE_SERVICE_PROCESS) != 0
+        || thread_is_live(STALE_SERVICE_THREAD)
+        || cspace_is_live(STALE_SERVICE_CSPACE)
+        || address_space_is_live(STALE_SERVICE_ADDRESS_SPACE)
+        || validation_count() != 5
+        || commit_count() != 5 {
+        fail_closed();
+    }
+
+    disable_interrupts();
+    if arm_personality_restart(
+        THREADS[CLIENT],
+        PROCESSES[CLIENT],
+        PHYSICALS[CLIENT],
+        THREADS[SERVICE],
+        PROCESSES[SERVICE],
+        PHYSICALS[SERVICE],
+        THREADS[SUPERVISOR],
+        PROCESSES[SUPERVISOR],
+        PHYSICALS[SUPERVISOR],
+        THREADS[OBSERVER],
+        PROCESSES[OBSERVER],
+        PHYSICALS[OBSERVER]
+    ) == 0 {
+        fail_closed();
+    }
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_complete_continue() -> never {
+    if !management_context()
+        || scheduler_failed()
+        || !scheduler_complete()
+        || completion_kind() != SCHEDULER_COMPLETION_PERSONALITY
+        || personality_fault_containments() != 1
+        || runnable_count() != 0
+        || blocked_count() != 0
+        || !loaded_protections_all_hold()
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        fail_closed();
+    }
+    write((&REBIND_MESSAGE[0]), 32);
+    write((&POLICY_MESSAGE[0]), 37);
+    write((&STALE_MESSAGE[0]), 41);
+
+    if !revoke_call_capability()
+        || close_capability_for_owner(
+            CSPACES[SUPERVISOR],
+            SUPERVISION_CAP
+        ) == 0
+        || !close_generation_endpoints()
+        || release_endpoint(CLIENT_WAIT_ENDPOINT) == 0
+        || endpoint_is_live(CLIENT_WAIT_ENDPOINT)
+        || endpoint_is_draining(CLIENT_WAIT_ENDPOINT)
+        {
+        fail_closed();
+    }
+    SUPERVISION_CAP = 0;
+    CLIENT_WAIT_ENDPOINT = 0;
+
+    let mut namespace_index: usize = 0;
+    while namespace_index < PROCESS_COUNT {
+        if begin_namespace_teardown(NAMESPACES[namespace_index]) == 0
+            || teardown_mount_namespace(NAMESPACES[namespace_index]) == 0
+            || root_mount_for(NAMESPACES[namespace_index]) != 0
+            || release_quiescent_processes(
+                NAMESPACES[namespace_index]
+            ) == 0
+            || namespace_process_refs(NAMESPACES[namespace_index]) != 0 {
+            fail_closed();
+        }
+        ROOT_MOUNTS[namespace_index] = 0;
+        namespace_index += 1;
+    }
+
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        if reap_thread(THREADS[index]) == 0
+            || thread_is_live(THREADS[index])
+            || !reap_loaded_process(index) {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if destroy_image(IMAGE) == 0 || image_id_for(IMAGE) != 0 {
+        fail_closed();
+    }
+    namespace_index = 0;
+    while namespace_index < PROCESS_COUNT {
+        if finish_namespace_teardown(NAMESPACES[namespace_index]) == 0
+            || namespace_is_live(NAMESPACES[namespace_index]) {
+            fail_closed();
+        }
+        namespace_index += 1;
+    }
+    if domain_child_refs(DOMAINS[CLIENT]) != 0
+        || domain_child_refs(DOMAINS[SERVICE]) != 0
+        || domain_child_refs(DOMAINS[SUPERVISOR]) != 0
+        || domain_child_refs(DOMAINS[OBSERVER]) != 0
+        || destroy_domain(DOMAINS[CLIENT]) == 0
+        || destroy_domain(DOMAINS[SERVICE]) == 0
+        || destroy_domain(DOMAINS[SUPERVISOR]) == 0
+        || free_frames() != BASELINE_FREE
+        || !page_invariants_hold()
+        || !mapping_invariants_hold()
+        || !memory_invariants_hold()
+        || !capability_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !thread_invariants_hold()
+        || !namespace_invariants_hold()
+        || !image_invariants_hold()
+        || !elf_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECLAIM_MESSAGE[0]), 30);
+    write((&LIVE_MESSAGE[0]), 37);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 33);
+    loop {
+        halt();
+    }
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    if mode != MODE_PERSONALITY
+        || native_domain == 0
+        || ARMED != 0
+        || !management_context()
+        || threads_init() == 0
+        || threads_init() != 0
+        || namespaces_init() == 0
+        || namespaces_init() != 0
+        || image_vfs_init() == 0
+        || image_vfs_init() != 0
+        || sha256_selftest() != 1
+        || elf_loader_init() == 0
+        || elf_loader_init() != 0
+        || personality_supervision_init() == 0
+        || !supervision_invariants_hold() {
+        fail_closed();
+    }
+    DOMAINS[CLIENT] = create_domain(
+        1,
+        0x601,
+        PERSONALITY_TEST,
+        PERSONALITY_RPC_V1
+    );
+    DOMAINS[SERVICE] = create_domain(
+        2,
+        0x602,
+        PERSONALITY_NATIVE,
+        NATIVE_ABI_V1
+    );
+    DOMAINS[SUPERVISOR] = create_domain(
+        3,
+        0x603,
+        PERSONALITY_NATIVE,
+        NATIVE_ABI_V1
+    );
+    DOMAINS[OBSERVER] = native_domain;
+    if !distinct_four_u64((&DOMAINS[0])) {
+        fail_closed();
+    }
+
+    let image_start: usize = ocore_m6_image_start();
+    let image_end: usize = ocore_m6_image_end();
+    let mut index: usize = 0;
+    if image_start == 0
+        || image_end <= image_start
+        || image_end - image_start != IMAGE_LENGTH
+        || IMAGE_LENGTH > IMAGE_BYTE_CAPACITY {
+        fail_closed();
+    }
+    IMAGE = begin_image(
+        0,
+        IMAGE_ID,
+        IMAGE_LENGTH,
+        IMAGE_DIGEST_0,
+        IMAGE_DIGEST_1,
+        IMAGE_DIGEST_2,
+        IMAGE_DIGEST_3
+    );
+    if IMAGE == 0
+        || append_image_bytes(
+            IMAGE,
+            image_start as *const u8,
+            IMAGE_LENGTH
+        ) == 0
+        || verify_image_sha256(
+            IMAGE,
+            IMAGE_SHA_0,
+            IMAGE_SHA_1,
+            IMAGE_SHA_2,
+            IMAGE_SHA_3
+        ) != 1
+        || import_ovfs_image(IMAGE) != OVFS_IMPORT_OK
+        || publish_image(IMAGE) == 0 {
+        fail_closed();
+    }
+    index = 0;
+    while index < PROCESS_COUNT {
+        NAMESPACES[index] = create_namespace(index, DOMAINS[index]);
+        ROOT_MOUNTS[index] = mount_root(NAMESPACES[index], IMAGE);
+        if NAMESPACES[index] == 0
+            || ROOT_MOUNTS[index] == 0
+            || root_mount_for(NAMESPACES[index]) != ROOT_MOUNTS[index] {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if image_id_for(IMAGE) != IMAGE_ID || !image_invariants_hold() {
+        fail_closed();
+    }
+    write((&IMAGE_MESSAGE[0]), 28);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        PLANS[index] = load_plan(index, PATH_IDS[index]);
+        if PLANS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if !distinct_four_u64((&PLANS[0]))
+        || validation_count() != PROCESS_COUNT as u64 {
+        fail_closed();
+    }
+
+    BASELINE_FREE = free_frames();
+    index = 0;
+    while index < PROCESS_COUNT {
+        CSPACES[index] = cspace_handle_for_slot(index);
+        if CSPACES[index] == 0
+            || set_quota_for_owner(CSPACES[index], QUOTA) == 0 {
+            fail_closed();
+        }
+        ADDRESS_SPACES[index] = create_loaded_for_owner(
+            CSPACES[index],
+            PLANS[index]
+        );
+        PHYSICALS[index] = isolation_physical(ADDRESS_SPACES[index]);
+        if ADDRESS_SPACES[index] == 0
+            || PHYSICALS[index] == 0
+            || !is_loaded(ADDRESS_SPACES[index])
+            || loaded_entry(ADDRESS_SPACES[index]) == 0
+            || loaded_stack_pointer(ADDRESS_SPACES[index]) == 0
+            || loaded_frame_count(ADDRESS_SPACES[index]) == 0
+            || root_cr3(ADDRESS_SPACES[index]) == ocore_management_cr3()
+            || !loaded_protections_hold(ADDRESS_SPACES[index])
+            || release_plan(PLANS[index]) == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if !distinct_four_u64((&ADDRESS_SPACES[0]))
+        || !distinct_four_usize((&PHYSICALS[0]))
+        || commit_count() != PROCESS_COUNT as u64
+        || !elf_invariants_hold() {
+        fail_closed();
+    }
+    write((&LOAD_MESSAGE[0]), 34);
+    write((&WX_MESSAGE[0]), 35);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        PROCESSES[index] = install_process_for_owner(
+            index,
+            1801 + index as u64,
+            DOMAINS[index],
+            ADDRESS_SPACES[index],
+            CSPACES[index],
+            ocore_process_kernel_stack_top(index),
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index])
+        );
+        if PROCESSES[index] == 0
+            || bind_process(NAMESPACES[index], PROCESSES[index]) == 0 {
+            fail_closed();
+        }
+        DEBUG_CAPS[index] = install_capability_for_owner(
+            CSPACES[index],
+            0,
+            0x660 + index as u64,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        );
+        if DEBUG_CAPS[index] == 0
+            || capability_handle_at(CSPACES[index], 0)
+                != DEBUG_CAPS[index] {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    CLIENT_WAIT_ENDPOINT = create_endpoint(CSPACES[CLIENT]);
+    if CLIENT_WAIT_ENDPOINT == 0 || !create_generation_endpoints() {
+        fail_closed();
+    }
+    SUPERVISION = publish_supervision(
+        PROCESSES[SUPERVISOR],
+        PROCESSES[SERVICE],
+        SERVICE_ID,
+        PROTOCOL_ID
+    );
+    SUPERVISION_CAP = install_capability_for_owner(
+        CSPACES[SUPERVISOR],
+        1,
+        SUPERVISION,
+        OBJECT_PERSONALITY_SUPERVISION,
+        RIGHT_PERSONALITY_SUPERVISE
+    );
+    if SUPERVISION == 0
+        || SUPERVISION_CAP == 0
+        || supervision_state(SUPERVISION) != SUPERVISION_STATE_STARTING
+        || publish_count() != 1
+        || personality_rpc_init() != 1 {
+        fail_closed();
+    }
+    seed_generation_config(1);
+    if capability_handle_at(CSPACES[CLIENT], 1) != 0
+        || volatile_load((PHYSICALS[CLIENT] + 8) as *const u64) != 0
+        || volatile_load((PHYSICALS[CLIENT] + 24) as *const u64) != 0
+        || supervision_state(SUPERVISION) != SUPERVISION_STATE_STARTING
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        fail_closed();
+    }
+    write((&CSPACE_MESSAGE[0]), 39);
+    write((&PRIVATE_MESSAGE[0]), 44);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        let mut argument: u64 = 0;
+        let mut role: u64 = THREAD_ROLE_BLOCKING;
+        if index == SERVICE {
+            argument = 1;
+        }
+        if index == SUPERVISOR {
+            argument = SUPERVISION_CAP;
+        }
+        if index == OBSERVER {
+            role = THREAD_ROLE_CPU;
+        }
+        THREADS[index] = install_loaded_thread(
+            index,
+            1901 + index as u64,
+            PROCESSES[index],
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index]),
+            ocore_process_kernel_stack_top(index),
+            DEBUG_CAPS[index],
+            argument,
+            role,
+            1
+        );
+        if THREADS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < PROCESS_COUNT {
+        if namespace_process_refs(NAMESPACES[index]) != 1 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if !namespace_invariants_hold()
+        || !thread_invariants_hold()
+        || !capability_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !personality_rpc_invariants_hold()
+        || !supervision_invariants_hold() {
+        fail_closed();
+    }
+    ARMED = 1;
+
+    disable_interrupts();
+    if arm_personality(
+        THREADS[CLIENT],
+        PROCESSES[CLIENT],
+        PHYSICALS[CLIENT],
+        THREADS[SERVICE],
+        PROCESSES[SERVICE],
+        PHYSICALS[SERVICE],
+        THREADS[SUPERVISOR],
+        PROCESSES[SUPERVISOR],
+        PHYSICALS[SUPERVISOR],
+        THREADS[OBSERVER],
+        PROCESSES[OBSERVER],
+        PHYSICALS[OBSERVER]
+    ) == 0 {
+        fail_closed();
+    }
+    write((&ARMED_MESSAGE[0]), 34);
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}

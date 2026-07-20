@@ -1,0 +1,205 @@
+module runtime::ipc_lifecycle;
+
+use runtime::capability::object_type_for_owner;
+use runtime::capability::OBJECT_MEMORY;
+use runtime::cap_transfer::cancel_owner as cancel_transfer_owner;
+use runtime::cap_transfer::invariants_hold as transfer_invariants_hold;
+use runtime::cap_transfer::CANCEL_OWNER_FAILURE;
+use runtime::endpoint::cancel_by_sender;
+use runtime::endpoint::crash as crash_endpoint;
+use runtime::endpoint::handle_for_slot as endpoint_handle_for_slot;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::message_count;
+use runtime::endpoint::pending_capability_cleanup_count;
+use runtime::endpoint::receiver_cspace_owner;
+use runtime::endpoint::sender_waiter_count;
+use runtime::endpoint::take_capability_cleanup;
+use runtime::endpoint::ENDPOINT_WAITER_SENDER;
+use runtime::endpoint::MAX_ENDPOINTS;
+use runtime::ipc_wait::cancel_endpoint as cancel_endpoint_waits;
+use runtime::ipc_wait::cancel_process_waits;
+use runtime::ipc_wait::complete as complete_ipc_wait;
+use runtime::ipc_wait::invariants_hold as wait_invariants_hold;
+use runtime::ipc_wait::IPC_WAIT_FAILURE;
+use runtime::memory_object::close_capability_for_owner as close_memory_capability_for_owner;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::MEMORY_OK;
+use runtime::native_abi::ERR_ENDPOINT_CLOSED;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::process::cspace_for as process_cspace;
+use runtime::process::is_live as process_is_live;
+use runtime::thread::WAKE_REASON_IPC;
+
+const LIFECYCLE_FAILURE: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut CRASHED_ENDPOINTS: u64 = 0;
+static mut CANCELLED_MESSAGES: u64 = 0;
+static mut POISONED: u8 = 0;
+
+unsafe fn subsystems_hold() -> bool {
+    return POISONED == 0
+        && endpoint_invariants_hold()
+        && wait_invariants_hold()
+        && transfer_invariants_hold()
+        && memory_invariants_hold();
+}
+
+// Endpoint cancellation moves every transferred receiver capability into a
+// bounded cleanup escrow. Taking one republishes that exact-generation handle;
+// the type-aware memory destructor must then consume it before CSpace teardown.
+unsafe fn drain_memory_cleanup(endpoint: u64) -> u64 {
+    let owner: u64 = receiver_cspace_owner(endpoint);
+    if owner == 0 {
+        return LIFECYCLE_FAILURE;
+    }
+    let mut closed: u64 = 0;
+    while pending_capability_cleanup_count(endpoint) != 0 {
+        let capability: u64 = take_capability_cleanup(endpoint);
+        if capability == 0
+            || object_type_for_owner(owner, capability) != OBJECT_MEMORY
+            || close_memory_capability_for_owner(owner, capability)
+                != MEMORY_OK {
+            POISONED = 1;
+            return LIFECYCLE_FAILURE;
+        }
+        closed += 1;
+    }
+    return closed;
+}
+
+// Wake at most one FIFO sender for each queue cell that became genuinely free.
+// Woken senders return ERR_IPC_RETRY and revalidate their capabilities and
+// transfer ticket rather than retaining user payload or pointer state in ring 0.
+unsafe fn wake_senders_for_capacity(endpoint: u64, capacity: usize) -> u64 {
+    let mut woke: u64 = 0;
+    let mut remaining: usize = capacity;
+    while remaining != 0 && sender_waiter_count(endpoint) != 0 {
+        if complete_ipc_wait(
+            endpoint,
+            ENDPOINT_WAITER_SENDER,
+            ERR_IPC_RETRY,
+            WAKE_REASON_IPC
+        ) == 0 {
+            POISONED = 1;
+            return LIFECYCLE_FAILURE;
+        }
+        woke += 1;
+        remaining -= 1;
+    }
+    return woke;
+}
+
+// Process teardown invokes this while the generation-tagged PCB and its exact
+// CSpace are still structurally live, but before any TCB is terminated or the
+// CSpace begins draining. The function changes no PCB state and does not retire
+// a TCB; dead waits are only unlinked, while surviving peers receive explicit
+// retry or endpoint-closed completions.
+pub unsafe fn process_died(process: u64) -> u64 {
+    if !process_is_live(process) || !subsystems_hold() {
+        return 0;
+    }
+    let dead_cspace: u64 = process_cspace(process);
+    if dead_cspace == 0 {
+        return 0;
+    }
+
+    // A dead TCB must disappear from endpoint wait registries before a peer is
+    // selected for wake. Its scheduler queue state remains for terminate_process.
+    if cancel_process_waits(process, ERR_ENDPOINT_CLOSED)
+        == IPC_WAIT_FAILURE {
+        POISONED = 1;
+        return 0;
+    }
+    if cancel_transfer_owner(process) == CANCEL_OWNER_FAILURE {
+        POISONED = 1;
+        return 0;
+    }
+
+    // First clean requests sent by this process to surviving receivers. Skip
+    // endpoints owned by the dying CSpace: the crash pass below closes them and
+    // every surviving waiter must observe CLOSED, never a premature RETRY.
+    let mut endpoint_slot: usize = 0;
+    while endpoint_slot < MAX_ENDPOINTS {
+        let endpoint: u64 = endpoint_handle_for_slot(endpoint_slot);
+        if endpoint != 0
+            && endpoint_is_live(endpoint)
+            && receiver_cspace_owner(endpoint) != dead_cspace {
+            let before_messages: usize = message_count(endpoint);
+            let before_cleanup: usize =
+                pending_capability_cleanup_count(endpoint);
+            let before_occupancy: usize = before_messages + before_cleanup;
+            let removed: usize = cancel_by_sender(endpoint, process);
+            if removed > before_messages
+                || drain_memory_cleanup(endpoint) == LIFECYCLE_FAILURE {
+                POISONED = 1;
+                return 0;
+            }
+            let after_occupancy: usize = message_count(endpoint)
+                + pending_capability_cleanup_count(endpoint);
+            if after_occupancy > before_occupancy
+                || before_messages - message_count(endpoint) != removed {
+                POISONED = 1;
+                return 0;
+            }
+            let freed: usize = before_occupancy - after_occupancy;
+            if wake_senders_for_capacity(endpoint, freed)
+                == LIFECYCLE_FAILURE {
+                return 0;
+            }
+            if CANCELLED_MESSAGES
+                > 0xffff_ffff_ffff_ffff - removed as u64 {
+                POISONED = 1;
+                return 0;
+            }
+            CANCELLED_MESSAGES += removed as u64;
+        }
+        endpoint_slot += 1;
+    }
+
+    // Receiver death defines the endpoint crash boundary. crash moves all
+    // queued capabilities to cleanup escrow; cleanup completes before every
+    // surviving receiver/sender waiter is woken with ENDPOINT_CLOSED.
+    endpoint_slot = 0;
+    while endpoint_slot < MAX_ENDPOINTS {
+        let endpoint: u64 = endpoint_handle_for_slot(endpoint_slot);
+        if endpoint != 0
+            && endpoint_is_live(endpoint)
+            && receiver_cspace_owner(endpoint) == dead_cspace {
+            let discarded: usize = message_count(endpoint);
+            if CRASHED_ENDPOINTS == 0xffff_ffff_ffff_ffff
+                || CANCELLED_MESSAGES
+                    > 0xffff_ffff_ffff_ffff - discarded as u64
+                || crash_endpoint(endpoint) == 0
+                || drain_memory_cleanup(endpoint) == LIFECYCLE_FAILURE {
+                POISONED = 1;
+                return 0;
+            }
+            let cancelled_waiters: u64 = cancel_endpoint_waits(
+                endpoint,
+                ERR_ENDPOINT_CLOSED
+            );
+            if cancelled_waiters == IPC_WAIT_FAILURE {
+                POISONED = 1;
+                return 0;
+            }
+            CRASHED_ENDPOINTS += 1;
+            CANCELLED_MESSAGES += discarded as u64;
+        }
+        endpoint_slot += 1;
+    }
+
+    if !subsystems_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn crashed_endpoint_count() -> u64 {
+    return CRASHED_ENDPOINTS;
+}
+
+pub unsafe fn cancelled_message_count() -> u64 {
+    return CANCELLED_MESSAGES;
+}

@@ -97,8 +97,8 @@ SECTIONS
     __user_stack_top = .;
   } :user_stack
 
-  ASSERT(__kernel_end <= 0x00200000,
-         "O-core bootstrap kernel exceeds its 4 KiB page table")
+  ASSERT(__kernel_end <= 0x00400000,
+         "O-core bootstrap kernel exceeds its two 4 KiB page tables")
   ASSERT(__user_payload_end <= 0x0100fffe,
          "O-core user payload overlaps the syscall-return edge probe")
 

@@ -1,0 +1,204 @@
+module runtime::m5_repl;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_SERIAL_READ;
+use runtime::native_abi::SYS_CONTROL_SUBMIT;
+
+const COMPLETION_VA: usize = 0x0120_1000;
+pub const COMPLETION_VALUE: u64 = 0x4d35_0000_0000_0004;
+const MAX_LINE_BYTES: usize = 192;
+
+@link_section(".rodata")
+static ONLINE: [u8; 28] = b"M5 repl service ELF: online\n";
+@link_section(".rodata")
+static PROMPT: [u8; 3] = b"o> ";
+@link_section(".rodata")
+static INSTALL_OK: [u8; 32] = b"M5 serial package install: PASS\n";
+@link_section(".rodata")
+static ACTIVATE_OK: [u8; 35] = b"M5 serial package activation: PASS\n";
+@link_section(".rodata")
+static STATUS_OK: [u8; 23] = b"M5 serial status: PASS\n";
+@link_section(".rodata")
+static RESOLVE_OK: [u8; 24] = b"M5 serial resolve: PASS\n";
+@link_section(".rodata")
+static REJECTED: [u8; 28] = b"M5 serial command: rejected\n";
+unsafe fn report(
+    report_capability: u64,
+    message: *const u8,
+    length: usize
+) -> bool {
+    return syscall3(
+        SYS_DEBUG_WRITE,
+        report_capability,
+        message as u64,
+        length as u64
+    ) == length as u64;
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(
+    report_capability: u64,
+    control_capability: u64
+) -> never {
+    if !report(report_capability, (&ONLINE[0]), 28)
+        || !report(report_capability, (&PROMPT[0]), 3) {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+
+    let mut length: usize = 0;
+    let mut drain_rejected_line: bool = false;
+    let mut line: [u8; 192] = [0; 192];
+    loop {
+        let status: u64 = syscall3(
+            SYS_SERIAL_READ,
+            control_capability,
+            ((&mut line[0]) + length) as u64,
+            1
+        );
+        if status == 0 {
+            asm!("pause", options(nomem, nostack));
+        } else {
+            if status != 1 {
+                drain_rejected_line = true;
+            }
+            let mut byte: u8 = b'\n';
+            if status == 1 {
+                byte = volatile_load((&line[0]) + length);
+            }
+            if byte == b'\r' || byte == b'\n' {
+                if drain_rejected_line || length == 0 {
+                    if !report(
+                        report_capability,
+                        (&REJECTED[0]),
+                        28
+                    ) || !report(report_capability, (&PROMPT[0]), 3) {
+                        loop {
+                            asm!("pause", options(nomem, nostack));
+                        }
+                    }
+                } else {
+                    // Publishing on every well-formed submission is
+                    // idempotent. The activation gate consumes this exact
+                    // private token while this process generation executes
+                    // the later activate syscall.
+                    volatile_store(
+                        COMPLETION_VA as *mut u64,
+                        COMPLETION_VALUE
+                    );
+                    let command: u64 = syscall3(
+                        SYS_CONTROL_SUBMIT,
+                        control_capability,
+                        (&line[0]) as u64,
+                        length as u64
+                    );
+                    if command == 2 {
+                        if !report(
+                            report_capability,
+                            (&INSTALL_OK[0]),
+                            32
+                        ) || !report(report_capability, (&PROMPT[0]), 3) {
+                            loop {
+                                asm!("pause", options(nomem, nostack));
+                            }
+                        }
+                    } else {
+                        if command == 3 {
+                            if !report(
+                                report_capability,
+                                (&ACTIVATE_OK[0]),
+                                35
+                            ) {
+                                loop {
+                                    asm!("pause", options(nomem, nostack));
+                                }
+                            }
+                            volatile_store(
+                                (COMPLETION_VA + 8) as *mut u64,
+                                1
+                            );
+                            loop {
+                                asm!("pause", options(nomem, nostack));
+                            }
+                        } else {
+                            if command == 1 {
+                                if !report(
+                                    report_capability,
+                                    (&STATUS_OK[0]),
+                                    23
+                                ) || !report(
+                                    report_capability,
+                                    (&PROMPT[0]),
+                                    3
+                                ) {
+                                    loop {
+                                        asm!(
+                                            "pause",
+                                            options(nomem, nostack)
+                                        );
+                                    }
+                                }
+                            } else {
+                                if command == 4 {
+                                    if !report(
+                                        report_capability,
+                                        (&RESOLVE_OK[0]),
+                                        24
+                                    ) || !report(
+                                        report_capability,
+                                        (&PROMPT[0]),
+                                        3
+                                    ) {
+                                        loop {
+                                            asm!(
+                                                "pause",
+                                                options(nomem, nostack)
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    if !report(
+                                        report_capability,
+                                        (&REJECTED[0]),
+                                        28
+                                    ) || !report(
+                                        report_capability,
+                                        (&PROMPT[0]),
+                                        3
+                                    ) {
+                                        loop {
+                                            asm!(
+                                                "pause",
+                                                options(nomem, nostack)
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                length = 0;
+                drain_rejected_line = false;
+            } else {
+                if drain_rejected_line {
+                    // Consume through the delimiter without admitting any
+                    // suffix as a second command.
+                    length = 0;
+                } else {
+                    if byte < 0x20
+                        || byte > 0x7e
+                        || length + 1 >= MAX_LINE_BYTES {
+                        drain_rejected_line = true;
+                        length = 0;
+                    } else {
+                        length += 1;
+                    }
+                }
+            }
+        }
+    }
+}

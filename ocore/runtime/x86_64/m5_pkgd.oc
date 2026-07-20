@@ -1,0 +1,72 @@
+module runtime::m5_pkgd;
+
+use runtime::native_abi::SYS_DEBUG_WRITE;
+
+const COMPLETION_VA: usize = 0x0120_1000;
+pub const COMPLETION_VALUE: u64 = 0x4d35_0000_0000_0003;
+pub const RESTART_COMPLETION_VALUE: u64 = 0x4d35_0000_0000_1003;
+
+@link_section(".rodata")
+static ONLINE: [u8; 28] = b"M5 pkgd service ELF: online\n";
+
+@link_section(".rodata")
+static DELIBERATE_FAULT: [u8; 38] =
+    b"M5 pkgd service ELF: deliberate fault\n";
+
+@link_section(".rodata")
+static RESTARTED: [u8; 31] = b"M5 pkgd service ELF: restarted\n";
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, restart_flag: u64) -> never {
+    if restart_flag == 1
+        && volatile_load((COMPLETION_VA + 8) as *const u64) == 1 {
+        if syscall3(
+            SYS_DEBUG_WRITE,
+            report_capability,
+            (&RESTARTED[0]) as u64,
+            31
+        ) == 31 {
+            volatile_store(
+                COMPLETION_VA as *mut u64,
+                RESTART_COMPLETION_VALUE
+            );
+        }
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    if restart_flag != 0 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        report_capability,
+        (&ONLINE[0]) as u64,
+        28
+    ) != 28 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    volatile_store(COMPLETION_VA as *mut u64, COMPLETION_VALUE);
+    while volatile_load((COMPLETION_VA + 8) as *const u64)
+        != 0x4d35_0000_0000_ac71 {
+        asm!("pause", options(nomem, nostack));
+    }
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        report_capability,
+        (&DELIBERATE_FAULT[0]) as u64,
+        38
+    ) != 38 {
+        loop {
+            asm!("pause", options(nomem, nostack));
+        }
+    }
+    asm!("ud2", options(nomem, nostack));
+    loop {}
+}

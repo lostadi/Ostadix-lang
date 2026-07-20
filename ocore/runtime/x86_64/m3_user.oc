@@ -1,0 +1,439 @@
+module runtime::m3_user;
+
+use runtime::capability::RIGHT_MEMORY_USE;
+use runtime::native_abi::ERR_CAPABILITY_DENIED;
+use runtime::native_abi::ERR_ENDPOINT_CLOSED;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::SYS_CAP_CLOSE;
+use runtime::native_abi::SYS_CAP_COPY;
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_ENDPOINT_CREATE;
+use runtime::native_abi::SYS_ENDPOINT_RECEIVE;
+use runtime::native_abi::SYS_ENDPOINT_SEND;
+
+// Every native address space maps a different physical page at this virtual
+// address.  The kernel seeds only public capability handles and expected peer
+// identities here; no CPL3 participant receives a raw CSpace or endpoint
+// object handle.
+const ISOLATION_VA: usize = 0x01201000;
+const RESULT_OFFSET: usize = 0;
+const DEBUG_OFFSET: usize = 8;
+const ENDPOINT_ZERO_OFFSET: usize = 16;
+const ENDPOINT_ONE_OFFSET: usize = 24;
+const EXPECTED_PEER_OFFSET: usize = 32;
+const MEMORY_OFFSET: usize = 40;
+const RESPONSE_OFFSET: usize = 128;
+const RESPONSE_BYTES: u64 = 32;
+
+const REQUESTS: u64 = 5;
+const REPLY_BIAS: u64 = 0x1000;
+const TRANSFER_TICKET_COUNT: usize = 16;
+const TRANSFER_AUDIT_CORRELATION: u64 = 0xa601;
+const TRANSFER_AUDIT_REPLY: u64 = 0xa602;
+
+@link_section(".rodata.user")
+static CLIENT_ONLINE: [u8; 37] = b"M3 client CPL3 endpoint path: online\n";
+@link_section(".rodata.user")
+static CLIENT_PASS: [u8; 35] = b"M3 client composed 5 replies: PASS\n";
+@link_section(".rodata.user")
+static TRANSFER_ABORT_PASS: [u8; 44] =
+    b"M3 transfer abort exhaustion recovery: PASS\n";
+@link_section(".rodata.user")
+static CROSS_PASS: [u8; 36] = b"M3 cross-domain request/reply: PASS\n";
+@link_section(".rodata.user")
+static SERVICE_ONLINE: [u8; 36] = b"M3 healthy personality CPL3: online\n";
+@link_section(".rodata.user")
+static SERVICE_PASS: [u8; 34] = b"M3 personality service FIFO: PASS\n";
+@link_section(".rodata.user")
+static OBSERVER_ONLINE: [u8; 35] = b"M3 unrelated observer CPL3: online\n";
+@link_section(".rodata.user")
+static CRASH_ONLINE: [u8; 40] = b"M3 crashing personality CPL3: fault now\n";
+
+@link_section(".text.user")
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@link_section(".text.user")
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((ISOLATION_VA + offset) as *const u64);
+}
+
+@link_section(".text.user")
+unsafe fn emit(
+    capability: u64,
+    pointer: *const u8,
+    length: usize
+) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+@link_section(".text.user")
+unsafe fn send_blocking(
+    endpoint_capability: u64,
+    correlation: u64,
+    payload: u64,
+    transfer_ticket: u64
+) -> void {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            endpoint_capability,
+            correlation,
+            payload,
+            transfer_ticket
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+    }
+}
+
+@link_section(".text.user")
+unsafe fn receive_blocking(endpoint_capability: u64) -> void {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            endpoint_capability,
+            (ISOLATION_VA + RESPONSE_OFFSET) as u64,
+            RESPONSE_BYTES
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+    }
+}
+
+@link_section(".text.user")
+unsafe fn response_word(offset: usize) -> u64 {
+    return volatile_load(
+        (ISOLATION_VA + RESPONSE_OFFSET + offset) as *const u64
+    );
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m3_client_entry(report_capability: u64) -> never {
+    if report_capability == 0 || config(DEBUG_OFFSET) != report_capability {
+        stop();
+    }
+    emit(report_capability, (&CLIENT_ONLINE[0]), 37);
+
+    // Exercise object construction entirely through the public CPL3 ABI.  The
+    // returned capability is the only authority user mode observes; closing
+    // it must consume the endpoint's sole reference and stale the handle.
+    let temporary_endpoint: u64 = syscall0(SYS_ENDPOINT_CREATE);
+    if temporary_endpoint == 0
+        || temporary_endpoint == ERR_CAPABILITY_DENIED
+        || syscall1(SYS_CAP_CLOSE, temporary_endpoint) != 1
+        || syscall1(SYS_CAP_CLOSE, temporary_endpoint) != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    let crash_endpoint: u64 = config(ENDPOINT_ZERO_OFFSET);
+    let request_endpoint: u64 = config(ENDPOINT_ONE_OFFSET);
+    let reply_endpoint: u64 = config(EXPECTED_PEER_OFFSET);
+    let shared_memory: u64 = config(MEMORY_OFFSET);
+    if crash_endpoint == 0
+        || request_endpoint == 0
+        || reply_endpoint == 0
+        || shared_memory == 0 {
+        stop();
+    }
+
+    // Exhaust every bounded transfer-ticket slot without publishing any
+    // destination capability.  The seventeenth prepare must fail closed.
+    let mut transfer_tickets: [u64; 16] = [0; 16];
+    let mut transfer_index: usize = 0;
+    while transfer_index < TRANSFER_TICKET_COUNT {
+        transfer_tickets[transfer_index] = syscall3(
+            SYS_CAP_COPY,
+            shared_memory,
+            request_endpoint,
+            RIGHT_MEMORY_USE
+        );
+        if transfer_tickets[transfer_index] == 0
+            || transfer_tickets[transfer_index] == ERR_CAPABILITY_DENIED {
+            stop();
+        }
+        transfer_index += 1;
+    }
+    if syscall3(
+        SYS_CAP_COPY,
+        shared_memory,
+        request_endpoint,
+        RIGHT_MEMORY_USE
+    ) != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+
+    // The kernel prefilled this bounded endpoint.  This call must genuinely
+    // block in ring 0.  The owning personality faults while we sleep, and the
+    // same syscall frame must resume exactly once with endpoint-closed.
+    let crash_result: u64 = syscall4(
+        SYS_ENDPOINT_SEND,
+        crash_endpoint,
+        0xc100,
+        0xc1,
+        0
+    );
+    if crash_result != ERR_ENDPOINT_CLOSED {
+        stop();
+    }
+
+    // Give a different process the raw live ticket.  It must be unable to
+    // abort an escrow owned by this exact process generation.
+    send_blocking(
+        request_endpoint,
+        TRANSFER_AUDIT_CORRELATION,
+        transfer_tickets[0],
+        0
+    );
+    receive_blocking(reply_endpoint);
+    if response_word(0) != config(48)
+        || response_word(8) != TRANSFER_AUDIT_CORRELATION
+        || response_word(16) != TRANSFER_AUDIT_REPLY
+        || response_word(24) != 0 {
+        stop();
+    }
+
+    // The creating process can unwind every ticket exactly once.  Reusing a
+    // registry slot changes its generation, so the stale handle stays denied;
+    // a fresh prepare then proves the exhausted table recovered.
+    transfer_index = 0;
+    while transfer_index < TRANSFER_TICKET_COUNT {
+        if syscall3(
+            SYS_CAP_COPY,
+            transfer_tickets[transfer_index],
+            0,
+            0
+        ) != 1 {
+            stop();
+        }
+        transfer_index += 1;
+    }
+    if syscall3(SYS_CAP_COPY, transfer_tickets[0], 0, 0)
+        != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    let transfer_ticket: u64 = syscall3(
+        SYS_CAP_COPY,
+        shared_memory,
+        request_endpoint,
+        RIGHT_MEMORY_USE
+    );
+    if transfer_ticket == 0
+        || transfer_ticket == ERR_CAPABILITY_DENIED
+        || transfer_ticket == transfer_tickets[0] {
+        stop();
+    }
+    emit(report_capability, (&TRANSFER_ABORT_PASS[0]), 44);
+
+    // A different domain acts as a live one-shot echo personality before it
+    // becomes the unrelated observer.  This is a real blocked request/reply,
+    // not a kernel-side queue probe.
+    let cross_request_endpoint: u64 = config(56);
+    let cross_reply_endpoint: u64 = config(64);
+    let expected_observer: u64 = config(72);
+    if cross_request_endpoint == 0
+        || cross_reply_endpoint == 0
+        || expected_observer == 0 {
+        stop();
+    }
+    send_blocking(cross_request_endpoint, 0xd001, 0x2a, 0);
+    receive_blocking(cross_reply_endpoint);
+    if response_word(0) != expected_observer
+        || response_word(8) != 0xd001
+        || response_word(16) != 0x2b
+        || response_word(24) != 0 {
+        stop();
+    }
+    emit(report_capability, (&CROSS_PASS[0]), 36);
+
+    let mut request: u64 = 1;
+    while request <= REQUESTS {
+        let mut ticket: u64 = 0;
+        if request == 1 {
+            ticket = transfer_ticket;
+        }
+        send_blocking(
+            request_endpoint,
+            request,
+            request * 10,
+            ticket
+        );
+        request += 1;
+    }
+
+    let expected_service: u64 = config(48);
+    let mut reply: u64 = 1;
+    while reply <= REQUESTS {
+        receive_blocking(reply_endpoint);
+        if response_word(0) != expected_service
+            || response_word(8) != reply
+            || response_word(16) != reply * 10 + REPLY_BIAS
+            || response_word(24) != 0 {
+            stop();
+        }
+        reply += 1;
+    }
+
+    emit(report_capability, (&CLIENT_PASS[0]), 35);
+    // Publish terminal progress only after its serial evidence is complete;
+    // the timer scheduler may terminate this TCB as soon as it sees five.
+    volatile_store(
+        (ISOLATION_VA + RESULT_OFFSET) as *mut u64,
+        REQUESTS
+    );
+    stop();
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m3_service_entry(report_capability: u64) -> never {
+    if report_capability == 0 || config(DEBUG_OFFSET) != report_capability {
+        stop();
+    }
+    emit(report_capability, (&SERVICE_ONLINE[0]), 36);
+    let request_endpoint: u64 = config(ENDPOINT_ZERO_OFFSET);
+    let reply_endpoint: u64 = config(ENDPOINT_ONE_OFFSET);
+    let expected_client: u64 = config(EXPECTED_PEER_OFFSET);
+    if request_endpoint == 0 || reply_endpoint == 0 || expected_client == 0 {
+        stop();
+    }
+
+    // A ticket is an opaque transaction reference, not bearer authority.  A
+    // peer that receives its scalar value cannot abort the creator's escrow.
+    receive_blocking(request_endpoint);
+    if response_word(0) != expected_client
+        || response_word(8) != TRANSFER_AUDIT_CORRELATION
+        || response_word(16) == 0
+        || response_word(24) != 0
+        || syscall3(SYS_CAP_COPY, response_word(16), 0, 0)
+            != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    send_blocking(
+        reply_endpoint,
+        TRANSFER_AUDIT_CORRELATION,
+        TRANSFER_AUDIT_REPLY,
+        0
+    );
+
+    let mut request: u64 = 1;
+    while request <= REQUESTS {
+        receive_blocking(request_endpoint);
+        let transferred_capability: u64 = response_word(24);
+        if response_word(0) != expected_client
+            || response_word(8) != request
+            || response_word(16) != request * 10 {
+            stop();
+        }
+        if request == 1 {
+            if transferred_capability == 0 {
+                stop();
+            }
+            // The client requested MEMORY_USE only.  A recipient cannot add
+            // TRANSFER and therefore cannot prepare a second-hop ticket.
+            if syscall3(
+                SYS_CAP_COPY,
+                transferred_capability,
+                reply_endpoint,
+                RIGHT_MEMORY_USE
+            ) != ERR_CAPABILITY_DENIED
+                || syscall1(SYS_CAP_CLOSE, transferred_capability) != 1
+                || syscall1(
+                    SYS_CAP_CLOSE,
+                    transferred_capability
+                ) != ERR_CAPABILITY_DENIED {
+                stop();
+            }
+        } else if transferred_capability != 0 {
+            stop();
+        }
+
+        send_blocking(
+            reply_endpoint,
+            request,
+            request * 10 + REPLY_BIAS,
+            0
+        );
+        request += 1;
+    }
+
+    emit(report_capability, (&SERVICE_PASS[0]), 34);
+    volatile_store(
+        (ISOLATION_VA + RESULT_OFFSET) as *mut u64,
+        REQUESTS
+    );
+    stop();
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m3_observer_entry(report_capability: u64) -> never {
+    if report_capability == 0 || config(DEBUG_OFFSET) != report_capability {
+        stop();
+    }
+    emit(report_capability, (&OBSERVER_ONLINE[0]), 35);
+    let cross_request_endpoint: u64 = config(ENDPOINT_ZERO_OFFSET);
+    let cross_reply_endpoint: u64 = config(ENDPOINT_ONE_OFFSET);
+    let expected_client: u64 = config(EXPECTED_PEER_OFFSET);
+    if cross_request_endpoint == 0
+        || cross_reply_endpoint == 0
+        || expected_client == 0 {
+        stop();
+    }
+    receive_blocking(cross_request_endpoint);
+    if response_word(0) != expected_client
+        || response_word(8) != 0xd001
+        || response_word(16) != 0x2a
+        || response_word(24) != 0 {
+        stop();
+    }
+    send_blocking(cross_reply_endpoint, 0xd001, 0x2b, 0);
+    loop {
+        let value: u64 = volatile_load(
+            (ISOLATION_VA + RESULT_OFFSET) as *const u64
+        );
+        volatile_store(
+            (ISOLATION_VA + RESULT_OFFSET) as *mut u64,
+            value + 1
+        );
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.user")
+pub unsafe fn ocore_m3_crash_entry(report_capability: u64) -> never {
+    if report_capability == 0 || config(DEBUG_OFFSET) != report_capability {
+        stop();
+    }
+    volatile_store((ISOLATION_VA + RESULT_OFFSET) as *mut u64, 1);
+    emit(report_capability, (&CRASH_ONLINE[0]), 40);
+    // #UD is deliberate.  Native exception entry must fault only this
+    // personality process, crash its owned endpoint, cancel its queued sends,
+    // wake affected peers, and continue scheduling the unrelated observer.
+    asm!("ud2", options(nomem, nostack));
+    stop();
+}

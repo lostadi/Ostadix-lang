@@ -1,13 +1,28 @@
 module runtime::syscall;
 
 use runtime::capability::close_in_cspace;
+use runtime::capability::install_first_free_for_owner;
 use runtime::capability::object_type_in_cspace;
+use runtime::capability::object_type_for_owner;
+use runtime::capability::rights_for_owner;
 use runtime::capability::validate_in_cspace;
 use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_ENDPOINT;
 use runtime::capability::OBJECT_MEMORY;
 use runtime::capability::OBJECT_PAGE_POOL;
+use runtime::capability::OBJECT_CONTROL;
+use runtime::capability::OBJECT_PERSONALITY_CALL;
+use runtime::capability::OBJECT_PERSONALITY_REPLY;
+use runtime::capability::OBJECT_PERSONALITY_SUPERVISION;
 use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_CANCEL;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
 use runtime::capability::RIGHT_PAGE_ALLOC;
+use runtime::capability::RIGHT_CONTROL;
+use runtime::capability::RIGHT_PERSONALITY_CALL;
+use runtime::capability::RIGHT_PERSONALITY_REPLY;
+use runtime::capability::RIGHT_PERSONALITY_SUPERVISE;
 use runtime::capability::MAX_CSPACES;
 use runtime::address_space::allows;
 use runtime::address_space::VM_READ;
@@ -16,6 +31,7 @@ use runtime::address_space::VM_STACK;
 use runtime::address_space::VM_USER;
 use runtime::address_space::VM_WRITE;
 use runtime::personality::PERSONALITY_NATIVE;
+use runtime::personality::PERSONALITY_TEST;
 use runtime::native_abi::DEBUG_BUFFER_SIZE;
 use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
 use runtime::native_abi::ERR_CAPABILITY_DENIED;
@@ -24,6 +40,9 @@ use runtime::native_abi::ERR_NOT_IMPLEMENTED;
 use runtime::native_abi::ERR_OUT_OF_MEMORY;
 use runtime::native_abi::ERR_QUOTA_EXCEEDED;
 use runtime::native_abi::ERR_INVALID_MEMORY_KIND;
+use runtime::native_abi::ERR_INVALID_IPC_MESSAGE;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::ERR_ENDPOINT_CLOSED;
 use runtime::native_abi::ERR_RESOURCE_TABLE_FULL;
 use runtime::native_abi::ERR_UNKNOWN_PERSONALITY;
 use runtime::native_abi::ERR_UNKNOWN_SYSCALL;
@@ -37,9 +56,22 @@ use runtime::native_abi::SYS_TICKS;
 use runtime::native_abi::SYS_YIELD;
 use runtime::native_abi::SYS_EXIT;
 use runtime::native_abi::SYS_SLEEP;
+use runtime::native_abi::SYS_ENDPOINT_CREATE;
+use runtime::native_abi::SYS_ENDPOINT_SEND;
+use runtime::native_abi::SYS_ENDPOINT_RECEIVE;
+use runtime::native_abi::SYS_ENDPOINT_CANCEL;
+use runtime::native_abi::SYS_SERIAL_READ;
+use runtime::native_abi::SYS_CONTROL_SUBMIT;
+use runtime::native_abi::SYS_PERSONALITY_CALL;
+use runtime::native_abi::SYS_PERSONALITY_REPLY;
+use runtime::native_abi::SYS_PERSONALITY_SUPERVISE;
+use runtime::native_abi::NATIVE_CONTROL_OBJECT_ID;
 use runtime::native_abi::SYSCALL_CONTROL_EXIT;
+use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
+use runtime::native_abi::IPC_MESSAGE_V1_SIZE;
 use runtime::interrupts::ticks;
 use runtime::process::current_cspace_id;
+use runtime::process::current_cspace_handle;
 use runtime::process::current_address_space_id;
 use runtime::process::current_process_handle;
 use runtime::process::exit_current;
@@ -47,10 +79,41 @@ use runtime::process::current_personality_id;
 use runtime::process::current_slot;
 use runtime::process::MAX_PROCESSES;
 use runtime::serial::write;
+use runtime::serial::try_read_byte;
+use runtime::native_control::submit as submit_control_command;
 use runtime::scheduler::request_yield;
 use runtime::scheduler::request_sleep;
+use runtime::scheduler::request_ipc_wait;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::WAKE_REASON_IPC;
+use runtime::endpoint::cancel_by_sender_correlation;
+use runtime::endpoint::close as close_endpoint;
+use runtime::endpoint::commit_head as commit_endpoint_head;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::enqueue;
+use runtime::endpoint::has_queue_capacity;
+use runtime::endpoint::is_draining as endpoint_is_draining;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::message_count as endpoint_message_count;
+use runtime::endpoint::peek_head as peek_endpoint_head;
+use runtime::endpoint::pending_capability_cleanup_count;
+use runtime::endpoint::receiver_cspace_owner;
+use runtime::endpoint::receiver_waiter;
+use runtime::endpoint::release as release_endpoint;
+use runtime::endpoint::sender_waiter_count;
+use runtime::endpoint::take_capability_cleanup;
+use runtime::cap_transfer::abort_copy_for_owner;
+use runtime::cap_transfer::commit_copy_for_owner;
+use runtime::cap_transfer::prepare_copy;
+use runtime::ipc_wait::abort as abort_ipc_wait;
+use runtime::ipc_wait::begin as begin_ipc_wait;
+use runtime::ipc_wait::complete as complete_ipc_wait;
+use runtime::ipc_wait::cancel_endpoint as cancel_endpoint_waits;
+use runtime::endpoint::ENDPOINT_WAITER_RECEIVER;
+use runtime::endpoint::ENDPOINT_WAITER_SENDER;
 use runtime::memory_object::allocate_capability as allocate_memory_capability;
 use runtime::memory_object::close_capability as close_memory_capability;
+use runtime::memory_object::close_capability_for_owner as close_memory_capability_for_owner;
 use runtime::memory_object::MEMORY_OK;
 use runtime::memory_object::MEMORY_INVALID_KIND;
 use runtime::memory_object::MEMORY_QUOTA_EXCEEDED;
@@ -59,11 +122,38 @@ use runtime::memory_object::MEMORY_NO_SLOT;
 use runtime::memory_object::MEMORY_ANONYMOUS;
 use runtime::memory_object::MEMORY_SHARED;
 use runtime::user_memory::copy_from_user;
+use runtime::user_memory::copy_to_user;
 use runtime::user_memory::COPY_OK;
 use runtime::user_memory::COPY_RANGE_DENIED;
 
 static mut DEBUG_BUFFER: [u8; 256] = [0; 256];
+static mut IPC_MESSAGE_BUFFER: [u64; 4] = [0; 4];
+static mut CONTROL_COMMAND_BUFFER: [u8; 192] = [0; 192];
+static mut SERIAL_INPUT_BYTE: u8 = 0;
 static mut PROCESS_EXIT_ENABLED: u8 = 0;
+
+// The generic architectural router knows only capability classes and the
+// current PCB's personality.  The active package binding, request generation,
+// and supervisor policy live behind these exact scalar hooks.
+extern "sysv64" fn kernel_m6_personality_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    scalar: u64,
+    timeout_ticks: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_personality_reply(
+    capability_object: u64,
+    request: u64,
+    status: u64,
+    scalar: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_personality_supervise(
+    capability_object: u64,
+    action: u64,
+    generation: u64,
+    subject: u64
+) -> u64;
 
 // Exit is enabled only by a kernel lifecycle harness that has installed a
 // matching trusted continuation. A stable syscall number alone must never
@@ -84,6 +174,79 @@ unsafe fn fail_kernel_invariant() -> never {
     disable_interrupts();
     loop {
         halt();
+    }
+}
+
+// Endpoint queues escrow transferred capabilities in the receiver's CSpace.
+// Cancellation first republishes each exact-generation handle and only then
+// may the type-specific destructor consume it.  M3 transfers shared memory
+// only, so observing any other type here is a kernel invariant failure.
+unsafe fn drain_endpoint_capability_cleanup(endpoint: u64) -> void {
+    let owner: u64 = receiver_cspace_owner(endpoint);
+    while pending_capability_cleanup_count(endpoint) != 0 {
+        let capability: u64 = take_capability_cleanup(endpoint);
+        if capability == 0
+            || object_type_for_owner(owner, capability) != OBJECT_MEMORY
+            || close_memory_capability_for_owner(owner, capability)
+                != MEMORY_OK {
+            fail_kernel_invariant();
+        }
+    }
+}
+
+unsafe fn wake_one_sender_for_capacity(endpoint: u64) -> void {
+    if sender_waiter_count(endpoint) != 0 && has_queue_capacity(endpoint) {
+        if complete_ipc_wait(
+            endpoint,
+            ENDPOINT_WAITER_SENDER,
+            ERR_IPC_RETRY,
+            WAKE_REASON_IPC
+        ) == 0 {
+            fail_kernel_invariant();
+        }
+    }
+}
+
+unsafe fn begin_blocking_ipc(
+    endpoint: u64,
+    kind: u64,
+    process: u64
+) -> u64 {
+    let thread: u64 = current_thread_handle();
+    if thread == 0 || process == 0 {
+        return ERR_NO_CURRENT_PROCESS;
+    }
+    let request: u64 = begin_ipc_wait(endpoint, kind, thread, process);
+    if request == 0 {
+        return ERR_RESOURCE_TABLE_FULL;
+    }
+    let control: u64 = request_ipc_wait(request, ERR_IPC_RETRY);
+    if control != SYSCALL_CONTROL_SCHEDULE {
+        if abort_ipc_wait(request) == 0 {
+            fail_kernel_invariant();
+        }
+        return control;
+    }
+    return control;
+}
+
+unsafe fn finish_endpoint_drain(endpoint: u64) -> void {
+    if !endpoint_is_draining(endpoint) {
+        return;
+    }
+    drain_endpoint_capability_cleanup(endpoint);
+    let mut waiter_count: usize = sender_waiter_count(endpoint);
+    if receiver_waiter(endpoint) != 0 {
+        waiter_count += 1;
+    }
+    if waiter_count != 0 {
+        let cancelled: u64 = cancel_endpoint_waits(
+            endpoint,
+            ERR_ENDPOINT_CLOSED
+        );
+        if cancelled != waiter_count as u64 {
+            fail_kernel_invariant();
+        }
     }
 }
 
@@ -134,6 +297,97 @@ unsafe fn dispatch_native_0(
         write((&DEBUG_BUFFER[0]), arg1 as usize);
         return arg1;
     }
+    if number == SYS_SERIAL_READ {
+        if validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_CONTROL,
+            RIGHT_CONTROL
+        ) != NATIVE_CONTROL_OBJECT_ID {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if arg1 != 1 {
+            return ERR_BUFFER_TOO_LARGE;
+        }
+        let address_space_id: u64 = current_address_space_id();
+        if !allows(
+            address_space_id,
+            arg0 as usize,
+            1,
+            VM_USER | VM_READ | VM_WRITE
+        ) {
+            return ERR_USER_POINTER_DENIED;
+        }
+        if try_read_byte((&mut SERIAL_INPUT_BYTE)) == 0 {
+            return 0;
+        }
+        let copied: u64 = copy_to_user(
+            address_space_id,
+            arg0 as *mut u8,
+            (&SERIAL_INPUT_BYTE) as *const u8,
+            1
+        );
+        if copied == COPY_RANGE_DENIED {
+            return ERR_USER_POINTER_DENIED;
+        }
+        if copied != COPY_OK {
+            return ERR_USER_COPY_FAULT;
+        }
+        return 1;
+    }
+    if number == SYS_CONTROL_SUBMIT {
+        if validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_CONTROL,
+            RIGHT_CONTROL
+        ) != NATIVE_CONTROL_OBJECT_ID {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if arg1 == 0 || arg1 > 192 {
+            return ERR_BUFFER_TOO_LARGE;
+        }
+        let copied: u64 = copy_from_user(
+            current_address_space_id(),
+            (&mut CONTROL_COMMAND_BUFFER[0]),
+            arg0 as *const u8,
+            arg1 as usize
+        );
+        if copied == COPY_RANGE_DENIED {
+            return ERR_USER_POINTER_DENIED;
+        }
+        if copied != COPY_OK {
+            return ERR_USER_COPY_FAULT;
+        }
+        return submit_control_command(
+            (&CONTROL_COMMAND_BUFFER[0]),
+            arg1 as usize
+        );
+    }
+    if number == SYS_PERSONALITY_REPLY {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_REPLY,
+            RIGHT_PERSONALITY_REPLY
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_personality_reply(object, arg0, arg1, arg2);
+    }
+    if number == SYS_PERSONALITY_SUPERVISE {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_SUPERVISION,
+            RIGHT_PERSONALITY_SUPERVISE
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_personality_supervise(object, arg0, arg1, arg2);
+    }
     if number == SYS_CAP_CLOSE {
         let object_type: u64 = object_type_in_cspace(cspace_id, capability);
         if object_type == 0 {
@@ -143,13 +397,81 @@ unsafe fn dispatch_native_0(
             if close_memory_capability(cspace_id, capability) != MEMORY_OK {
                 fail_kernel_invariant();
             }
-        } else if close_in_cspace(cspace_id, capability) == 0 {
-            return ERR_CAPABILITY_DENIED;
+        } else if object_type == OBJECT_ENDPOINT {
+            let owner: u64 = current_cspace_handle();
+            let endpoint: u64 = validate_in_cspace(
+                cspace_id,
+                capability,
+                OBJECT_ENDPOINT,
+                0
+            );
+            let rights: u64 = rights_for_owner(owner, capability);
+            if endpoint == 0 || rights == 0 {
+                return ERR_CAPABILITY_DENIED;
+            }
+            // The receiver authority names the endpoint lifecycle owner.  A
+            // SEND-only alias merely drops its own reference; dropping the
+            // receiver authority closes the object and cancels its waiters.
+            if (rights & RIGHT_ENDPOINT_RECEIVE) != 0
+                && endpoint_is_live(endpoint)
+                && close_endpoint(endpoint) == 0 {
+                fail_kernel_invariant();
+            }
+            if close_in_cspace(cspace_id, capability) == 0
+                || release_endpoint(endpoint) == 0 {
+                fail_kernel_invariant();
+            }
+            finish_endpoint_drain(endpoint);
+        } else {
+            if close_in_cspace(cspace_id, capability) == 0 {
+                return ERR_CAPABILITY_DENIED;
+            }
         }
         return 1;
     }
     if number == SYS_CAP_COPY {
-        return ERR_NOT_IMPLEMENTED;
+        // Preserve the original all-zero capability-probe result while the
+        // public prepare ABI uses an endpoint SEND capability to name the
+        // destination CSpace without exposing that CSpace identity.
+        if capability == 0 && arg0 == 0 && arg1 == 0 {
+            return ERR_NOT_IMPLEMENTED;
+        }
+
+        // Abort is the disjoint `(ticket, 0, 0)` operation shape.  The exact
+        // creating process is rebound inside cap_transfer; possession of a
+        // ticket value alone never grants cancellation authority.
+        if arg0 == 0 && arg1 == 0 {
+            if abort_copy_for_owner(
+                capability,
+                current_process_handle()
+            ) == 0 {
+                return ERR_CAPABILITY_DENIED;
+            }
+            return 1;
+        }
+        let destination_endpoint: u64 = validate_in_cspace(
+            cspace_id,
+            arg0,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        );
+        if destination_endpoint == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if !endpoint_is_live(destination_endpoint) {
+            return ERR_ENDPOINT_CLOSED;
+        }
+        let ticket: u64 = prepare_copy(
+            current_cspace_handle(),
+            receiver_cspace_owner(destination_endpoint),
+            capability,
+            arg1,
+            current_process_handle()
+        );
+        if ticket == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return ticket;
     }
     if number == SYS_PAGE_ALLOC {
         let page_pool: u64 = validate_in_cspace(
@@ -207,6 +529,227 @@ unsafe fn dispatch_native_0(
         }
         return SYSCALL_CONTROL_EXIT;
     }
+    if number == SYS_ENDPOINT_CREATE {
+        let owner: u64 = current_cspace_handle();
+        let endpoint: u64 = create_endpoint(owner);
+        if endpoint == 0 {
+            return ERR_RESOURCE_TABLE_FULL;
+        }
+        let endpoint_capability: u64 = install_first_free_for_owner(
+            owner,
+            endpoint,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+                | RIGHT_ENDPOINT_RECEIVE
+                | RIGHT_ENDPOINT_CANCEL
+        );
+        if endpoint_capability == 0 {
+            if release_endpoint(endpoint) == 0 {
+                fail_kernel_invariant();
+            }
+            return ERR_RESOURCE_TABLE_FULL;
+        }
+        return endpoint_capability;
+    }
+    if number == SYS_ENDPOINT_SEND {
+        let endpoint: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        );
+        let process: u64 = current_process_handle();
+        if endpoint == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if !endpoint_is_live(endpoint) {
+            return ERR_ENDPOINT_CLOSED;
+        }
+        if !has_queue_capacity(endpoint) {
+            return begin_blocking_ipc(
+                endpoint,
+                ENDPOINT_WAITER_SENDER,
+                process
+            );
+        }
+
+        let mut destination_capability: u64 = 0;
+        if arg2 != 0 && commit_copy_for_owner(
+            arg2,
+            process,
+            receiver_cspace_owner(endpoint),
+            (&mut destination_capability)
+        ) == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if enqueue(
+            endpoint,
+            process,
+            arg0,
+            arg1,
+            destination_capability
+        ) == 0 {
+            if destination_capability != 0
+                && close_memory_capability_for_owner(
+                    receiver_cspace_owner(endpoint),
+                    destination_capability
+                ) != MEMORY_OK {
+                fail_kernel_invariant();
+            }
+            return ERR_INVALID_IPC_MESSAGE;
+        }
+        if receiver_waiter(endpoint) != 0
+            && complete_ipc_wait(
+                endpoint,
+                ENDPOINT_WAITER_RECEIVER,
+                ERR_IPC_RETRY,
+                WAKE_REASON_IPC
+            ) == 0 {
+            fail_kernel_invariant();
+        }
+        return 1;
+    }
+    if number == SYS_ENDPOINT_RECEIVE {
+        let endpoint: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_RECEIVE
+        );
+        if endpoint == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if !endpoint_is_live(endpoint) {
+            return ERR_ENDPOINT_CLOSED;
+        }
+        if arg1 != IPC_MESSAGE_V1_SIZE as u64 {
+            return ERR_INVALID_IPC_MESSAGE;
+        }
+        if endpoint_message_count(endpoint) == 0 {
+            return begin_blocking_ipc(
+                endpoint,
+                ENDPOINT_WAITER_RECEIVER,
+                current_process_handle()
+            );
+        }
+
+        if peek_endpoint_head(
+            endpoint,
+            (&mut IPC_MESSAGE_BUFFER[0]),
+            (&mut IPC_MESSAGE_BUFFER[1]),
+            (&mut IPC_MESSAGE_BUFFER[2]),
+            (&mut IPC_MESSAGE_BUFFER[3])
+        ) == 0 {
+            fail_kernel_invariant();
+        }
+        let copied: u64 = copy_to_user(
+            current_address_space_id(),
+            arg0 as *mut u8,
+            (&IPC_MESSAGE_BUFFER[0]) as *const u8,
+            IPC_MESSAGE_V1_SIZE
+        );
+        if copied == COPY_RANGE_DENIED {
+            return ERR_USER_POINTER_DENIED;
+        }
+        if copied != COPY_OK {
+            return ERR_USER_COPY_FAULT;
+        }
+        if commit_endpoint_head(endpoint) == 0 {
+            fail_kernel_invariant();
+        }
+        wake_one_sender_for_capacity(endpoint);
+        return 1;
+    }
+    if number == SYS_ENDPOINT_CANCEL {
+        let endpoint: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_CANCEL
+        );
+        if endpoint == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        if !endpoint_is_live(endpoint) {
+            return ERR_ENDPOINT_CLOSED;
+        }
+        let removed: usize = cancel_by_sender_correlation(
+            endpoint,
+            current_process_handle(),
+            arg0
+        );
+        drain_endpoint_capability_cleanup(endpoint);
+        let mut woke: usize = 0;
+        while woke < removed && sender_waiter_count(endpoint) != 0 {
+            wake_one_sender_for_capacity(endpoint);
+            woke += 1;
+        }
+        return removed as u64;
+    }
+    return ERR_UNKNOWN_SYSCALL;
+}
+
+// M6A's test personality is deliberately scalar-only. It retains the common
+// diagnostic, scheduling, and clock primitives, but every native operation
+// that could carry a user pointer, create an object, transfer authority, or
+// bypass the personality package is explicitly absent from this dispatcher.
+unsafe fn dispatch_test_personality(
+    cspace_id: usize,
+    number: u64,
+    capability: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64
+) -> u64 {
+    if number == SYS_DEBUG_WRITE
+        || number == SYS_YIELD
+        || number == SYS_TICKS {
+        return dispatch_native_0(
+            cspace_id,
+            number,
+            capability,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4
+        );
+    }
+    if number == SYS_PERSONALITY_CALL {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_CALL,
+            RIGHT_PERSONALITY_CALL
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_personality_call(
+            object,
+            capability,
+            arg0,
+            arg1,
+            arg2
+        );
+    }
+    if number == SYS_CAP_CLOSE
+        || number == SYS_CAP_COPY
+        || number == SYS_PAGE_ALLOC
+        || number == SYS_EXIT
+        || number == SYS_SLEEP
+        || number == SYS_ENDPOINT_CREATE
+        || number == SYS_ENDPOINT_SEND
+        || number == SYS_ENDPOINT_RECEIVE
+        || number == SYS_ENDPOINT_CANCEL
+        || number == SYS_SERIAL_READ
+        || number == SYS_CONTROL_SUBMIT
+        || number == SYS_PERSONALITY_REPLY
+        || number == SYS_PERSONALITY_SUPERVISE {
+        return ERR_NOT_IMPLEMENTED;
+    }
     return ERR_UNKNOWN_SYSCALL;
 }
 
@@ -258,6 +801,18 @@ pub unsafe fn kernel_syscall_dispatch(
     let personality_id: u64 = current_personality_id();
     if personality_id == PERSONALITY_NATIVE {
         return dispatch_native_0(
+            cspace_id,
+            number,
+            capability,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4
+        );
+    }
+    if personality_id == PERSONALITY_TEST {
+        return dispatch_test_personality(
             cspace_id,
             number,
             capability,

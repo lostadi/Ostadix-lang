@@ -6,18 +6,23 @@
 //! kernel isolation required by the native live-system milestone.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::live_system::manifest;
 use crate::value::OValue;
 use crate::wire;
 
 pub const RUNTIME_PROGRAM_SCHEMA: &str = "ocore.runtime-program/v1";
 pub const RUNTIME_PROTOCOL: &str = "ocore.runtime-service/v1";
+pub(crate) const RUNTIME_MAX_FRAME_LEN: usize = 1024 * 1024;
+const RUNTIME_MAX_PROGRAM_BYTES: usize = 1024 * 1024;
+const RUNTIME_MAX_OPERATIONS: usize = 256;
+const RUNTIME_MAX_OPERATION_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,15 +51,32 @@ pub enum HealthStatus {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationSpec {
     Identity,
-    Wrap { field: String },
-    Prefix { text: String },
-    IntPair { lhs: i64, rhs: i64 },
-    SumFields { lhs: String, rhs: String },
-    Fail { message: String },
+    Wrap {
+        field: String,
+    },
+    Prefix {
+        text: String,
+    },
+    IntPair {
+        lhs: i64,
+        rhs: i64,
+    },
+    SumFields {
+        lhs: String,
+        rhs: String,
+    },
+    Fail {
+        message: String,
+    },
+    /// Hosted test-runtime primitive used to exercise supervisor recovery.
+    Crash {},
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+// Keeping OValue inline makes the typed request API direct; the protocol's
+// explicit 1 MiB frame ceiling bounds the serialized representation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeRequest {
     Health {
         nonce: u64,
@@ -69,6 +91,8 @@ pub(crate) enum RuntimeRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+// See RuntimeRequest: the fixed wire ceiling is the relevant resource bound.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeResponse {
     Healthy { nonce: u64, world: String },
     Unhealthy { nonce: u64, message: String },
@@ -79,6 +103,7 @@ pub(crate) enum RuntimeResponse {
 
 impl RuntimeProgram {
     pub fn parse(text: &str) -> Result<Self> {
+        enforce_runtime_program_size(text.len() as u64)?;
         let program: Self = toml::from_str(text).context("invalid runtime program TOML")?;
         program.validate()?;
         Ok(program)
@@ -95,12 +120,22 @@ impl RuntimeProgram {
         if self.operations.is_empty() {
             bail!("runtime program must declare at least one operation");
         }
+        if self.operations.len() > RUNTIME_MAX_OPERATIONS {
+            bail!(
+                "runtime program declares {} operations; maximum is {RUNTIME_MAX_OPERATIONS}",
+                self.operations.len()
+            );
+        }
         for (name, operation) in &self.operations {
             validate_identifier("operation", name)?;
             match operation {
                 OperationSpec::Wrap { field } => validate_identifier("wrap field", field)?,
-                OperationSpec::Prefix { text } if text.len() > 4096 => {
-                    bail!("prefix operation text exceeds 4096 bytes")
+                OperationSpec::Prefix { text }
+                    if text.len() > RUNTIME_MAX_OPERATION_MESSAGE_BYTES =>
+                {
+                    bail!(
+                        "prefix operation text exceeds {RUNTIME_MAX_OPERATION_MESSAGE_BYTES} bytes"
+                    )
                 }
                 OperationSpec::SumFields { lhs, rhs } => {
                     validate_identifier("sum lhs field", lhs)?;
@@ -109,8 +144,15 @@ impl RuntimeProgram {
                         bail!("sum operation requires two distinct fields");
                     }
                 }
-                OperationSpec::Fail { message } if message.is_empty() => {
-                    bail!("fail operation requires a non-empty message")
+                OperationSpec::Fail { message } => {
+                    if message.is_empty() {
+                        bail!("fail operation requires a non-empty message");
+                    }
+                    if message.len() > RUNTIME_MAX_OPERATION_MESSAGE_BYTES {
+                        bail!(
+                            "fail operation message exceeds {RUNTIME_MAX_OPERATION_MESSAGE_BYTES} bytes"
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -167,6 +209,9 @@ impl RuntimeProgram {
                 Ok(OValue::int(result))
             }
             OperationSpec::Fail { message } => bail!("{message}"),
+            OperationSpec::Crash {} => {
+                bail!("crash operation is available only through the hosted worker protocol")
+            }
         }
     }
 }
@@ -183,39 +228,66 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn checked_entry(package_root: &Path, entry: &str) -> Result<std::path::PathBuf> {
-    let relative = Path::new(entry);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        bail!("runtime entry must be a normalized relative path");
+fn enforce_runtime_program_size(size: u64) -> Result<()> {
+    if size > RUNTIME_MAX_PROGRAM_BYTES as u64 {
+        bail!("runtime program exceeds {RUNTIME_MAX_PROGRAM_BYTES}-byte limit (got {size})");
     }
-    let root = package_root
-        .canonicalize()
-        .with_context(|| format!("failed to resolve package root {}", package_root.display()))?;
-    let candidate = root.join(relative);
-    let metadata = fs::symlink_metadata(&candidate)
-        .with_context(|| format!("failed to inspect runtime entry {}", candidate.display()))?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    Ok(())
+}
+
+fn read_runtime_program(file: File, display_path: &Path) -> Result<String> {
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened runtime entry {}",
+            display_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
         bail!("runtime entry must be a regular non-symlink file");
     }
-    let candidate = candidate
-        .canonicalize()
-        .with_context(|| format!("failed to resolve runtime entry {}", candidate.display()))?;
-    if !candidate.starts_with(&root) {
-        bail!("runtime entry escapes its immutable package object");
+    enforce_runtime_program_size(metadata.len())?;
+
+    let mut bounded = file.take(RUNTIME_MAX_PROGRAM_BYTES as u64 + 1);
+    let mut text = String::with_capacity(metadata.len() as usize);
+    bounded
+        .read_to_string(&mut text)
+        .with_context(|| format!("failed to read runtime entry {}", display_path.display()))?;
+    enforce_runtime_program_size(text.len() as u64)?;
+    let file = bounded.into_inner();
+    let final_metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to reinspect opened runtime entry {}",
+            display_path.display()
+        )
+    })?;
+    if final_metadata.len() != metadata.len() || text.len() as u64 != metadata.len() {
+        bail!(
+            "runtime entry {} changed while it was being read",
+            display_path.display()
+        );
     }
-    Ok(candidate)
+    Ok(text)
+}
+
+fn checked_entry(package_root: &Path, entry: &str) -> Result<(File, PathBuf)> {
+    let relative = manifest::runtime_entry_payload_path(entry)
+        .with_context(|| format!("invalid package-internal runtime entry `{entry}`"))?;
+    let display_path = package_root.join(&relative);
+    let file = manifest::open_payload_regular_file(package_root, &relative).with_context(|| {
+        format!(
+            "failed to securely open runtime entry {}",
+            display_path.display()
+        )
+    })?;
+    Ok((file, display_path))
 }
 
 pub fn worker_main(package_root: &Path, entry: &str, service: &str) -> Result<()> {
     validate_identifier("service", service)?;
-    let entry = checked_entry(package_root, entry)?;
-    let text = fs::read_to_string(&entry)
-        .with_context(|| format!("failed to read runtime entry {}", entry.display()))?;
+    let (entry, display_path) = checked_entry(package_root, entry)?;
+    // Parse the bytes from the descriptor that passed no-follow traversal.
+    // Never canonicalize and reopen the pathname after verification.
+    let text = read_runtime_program(entry, &display_path)?;
     let program = RuntimeProgram::parse(&text)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -228,7 +300,9 @@ fn serve<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
 ) -> Result<()> {
-    while let Some(request) = wire::read_frame::<_, RuntimeRequest>(reader)? {
+    while let Some(request) =
+        wire::read_frame_with_max::<_, RuntimeRequest>(reader, RUNTIME_MAX_FRAME_LEN)?
+    {
         let response = match request {
             RuntimeRequest::Health { nonce } => match program.health.status {
                 HealthStatus::Healthy => RuntimeResponse::Healthy {
@@ -252,6 +326,12 @@ fn serve<R: Read, W: Write>(
                         ),
                     }
                 } else {
+                    if matches!(
+                        program.operations.get(&operation),
+                        Some(OperationSpec::Crash {})
+                    ) {
+                        bail!("hosted test worker crash requested by operation `{operation}`");
+                    }
                     match program.invoke(&operation, input) {
                         Ok(value) => RuntimeResponse::Result { value },
                         Err(error) => RuntimeResponse::Error {
@@ -261,11 +341,15 @@ fn serve<R: Read, W: Write>(
                 }
             }
             RuntimeRequest::Shutdown => {
-                wire::write_frame(writer, &RuntimeResponse::Stopped)?;
+                wire::write_frame_with_max(
+                    writer,
+                    &RuntimeResponse::Stopped,
+                    RUNTIME_MAX_FRAME_LEN,
+                )?;
                 return Ok(());
             }
         };
-        wire::write_frame(writer, &response)?;
+        wire::write_frame_with_max(writer, &response, RUNTIME_MAX_FRAME_LEN)?;
     }
     Ok(())
 }
@@ -273,6 +357,7 @@ fn serve<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn program() -> RuntimeProgram {
         RuntimeProgram::parse(
@@ -289,6 +374,22 @@ field = "input"
 "#,
         )
         .unwrap()
+    }
+
+    fn identity_program_with_operations(count: usize) -> String {
+        let mut source = format!(
+            "schema = \"{RUNTIME_PROGRAM_SCHEMA}\"\nworld = \"native.limits\"\n\n[health]\nstatus = \"healthy\"\n"
+        );
+        for index in 0..count {
+            source.push_str(&format!("\n[operations.op{index}]\nkind = \"identity\"\n"));
+        }
+        source
+    }
+
+    fn program_with_message_operation(kind: &str, field: &str, value: &str) -> String {
+        format!(
+            "schema = \"{RUNTIME_PROGRAM_SCHEMA}\"\nworld = \"native.limits\"\n\n[health]\nstatus = \"healthy\"\n\n[operations.test]\nkind = \"{kind}\"\n{field} = \"{value}\"\n"
+        )
     }
 
     #[test]
@@ -314,6 +415,75 @@ kind = "identity"
         };
         assert_eq!(fields.get("world"), Some(&OValue::str_("native.alpha")));
         assert_eq!(fields.get("input"), Some(&OValue::str_("payload")));
+    }
+
+    #[test]
+    fn runtime_program_size_is_rejected_before_parse_or_file_read() {
+        let oversized_text = "x".repeat(RUNTIME_MAX_PROGRAM_BYTES + 1);
+        let parse_error = RuntimeProgram::parse(&oversized_text).unwrap_err();
+        assert_eq!(
+            parse_error.to_string(),
+            format!(
+                "runtime program exceeds {RUNTIME_MAX_PROGRAM_BYTES}-byte limit (got {})",
+                RUNTIME_MAX_PROGRAM_BYTES + 1
+            )
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let entry = directory.path().join("oversized-runtime.toml");
+        fs::write(&entry, vec![0xff; RUNTIME_MAX_PROGRAM_BYTES + 1]).unwrap();
+        let file = manifest::open_payload_regular_file(
+            directory.path(),
+            Path::new("oversized-runtime.toml"),
+        )
+        .unwrap();
+        let read_error = read_runtime_program(file, &entry).unwrap_err();
+        assert_eq!(read_error.to_string(), parse_error.to_string());
+    }
+
+    #[test]
+    fn runtime_operation_count_has_an_exact_upper_bound() {
+        let maximum = identity_program_with_operations(RUNTIME_MAX_OPERATIONS);
+        assert_eq!(
+            RuntimeProgram::parse(&maximum).unwrap().operations.len(),
+            RUNTIME_MAX_OPERATIONS
+        );
+
+        let oversized = identity_program_with_operations(RUNTIME_MAX_OPERATIONS + 1);
+        let error = RuntimeProgram::parse(&oversized).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "runtime program declares {} operations; maximum is {RUNTIME_MAX_OPERATIONS}",
+                RUNTIME_MAX_OPERATIONS + 1
+            )
+        );
+    }
+
+    #[test]
+    fn operation_controlled_messages_are_bounded() {
+        let maximum = "m".repeat(RUNTIME_MAX_OPERATION_MESSAGE_BYTES);
+        RuntimeProgram::parse(&program_with_message_operation("prefix", "text", &maximum)).unwrap();
+        RuntimeProgram::parse(&program_with_message_operation("fail", "message", &maximum))
+            .unwrap();
+
+        let oversized = format!("{maximum}x");
+        let prefix_error = RuntimeProgram::parse(&program_with_message_operation(
+            "prefix", "text", &oversized,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            prefix_error.to_string(),
+            format!("prefix operation text exceeds {RUNTIME_MAX_OPERATION_MESSAGE_BYTES} bytes")
+        );
+        let fail_error = RuntimeProgram::parse(&program_with_message_operation(
+            "fail", "message", &oversized,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            fail_error.to_string(),
+            format!("fail operation message exceeds {RUNTIME_MAX_OPERATION_MESSAGE_BYTES} bytes")
+        );
     }
 
     #[test]
@@ -359,5 +529,157 @@ kind = "identity"
                 .unwrap(),
             RuntimeResponse::Stopped
         );
+    }
+
+    #[test]
+    fn package_absolute_entry_resolves_only_beneath_payload_root() {
+        let package = tempfile::tempdir().unwrap();
+        fs::create_dir_all(package.path().join("bin")).unwrap();
+        fs::write(package.path().join("bin/live"), b"runtime program").unwrap();
+
+        let (_, resolved) = checked_entry(package.path(), "/bin/live").unwrap();
+        assert_eq!(resolved, package.path().join("bin/live"));
+
+        assert!(checked_entry(package.path(), "bin/live").is_err());
+        assert!(checked_entry(package.path(), "/../bin/live").is_err());
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let host_absolute = outside.path().to_str().unwrap();
+        assert!(Path::new(host_absolute).is_absolute());
+        let package_relative = manifest::runtime_entry_payload_path(host_absolute).unwrap();
+        let package_local = package.path().join(package_relative);
+        fs::create_dir_all(package_local.parent().unwrap()).unwrap();
+        fs::write(&package_local, b"package-local runtime").unwrap();
+
+        let (_, resolved) = checked_entry(package.path(), host_absolute).unwrap();
+        assert_eq!(resolved, package_local);
+        assert_ne!(resolved, outside.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_entry_rejects_symlinks_in_root_and_entry_components() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let real = temporary.path().join("real");
+        fs::create_dir_all(real.join("payload/bin")).unwrap();
+        fs::write(real.join("payload/bin/live"), b"runtime").unwrap();
+
+        symlink(real.join("payload"), temporary.path().join("payload-link")).unwrap();
+        assert!(checked_entry(&temporary.path().join("payload-link"), "/bin/live").is_err());
+
+        symlink(real.join("payload/bin"), real.join("payload/bin-link")).unwrap();
+        assert!(checked_entry(&real.join("payload"), "/bin-link/live").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_bytes_come_from_the_checked_descriptor() {
+        let package = tempfile::tempdir().unwrap();
+        fs::create_dir_all(package.path().join("bin")).unwrap();
+        let path = package.path().join("bin/live");
+        fs::write(&path, b"verified bytes").unwrap();
+
+        let (opened, display_path) = checked_entry(package.path(), "/bin/live").unwrap();
+        fs::rename(&path, package.path().join("bin/original")).unwrap();
+        fs::write(&path, b"replacement bytes").unwrap();
+
+        assert_eq!(
+            read_runtime_program(opened, &display_path).unwrap(),
+            "verified bytes"
+        );
+    }
+
+    #[test]
+    fn worker_rejects_oversized_frame_from_length_prefix() {
+        let header = ((RUNTIME_MAX_FRAME_LEN + 1) as u32).to_be_bytes();
+        let mut reader = header.as_slice();
+        let mut responses = Vec::new();
+
+        let error = serve(&program(), "world.alpha", &mut reader, &mut responses).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "wire frame length {} exceeds maximum {RUNTIME_MAX_FRAME_LEN}",
+                RUNTIME_MAX_FRAME_LEN + 1
+            )
+        );
+        assert!(reader.is_empty(), "only the length prefix was consumed");
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn worker_does_not_emit_oversized_response_frames() {
+        let mut program = program();
+        program.operations.insert(
+            "compute".into(),
+            OperationSpec::Prefix {
+                text: "p".repeat(4096),
+            },
+        );
+        let request = RuntimeRequest::Invoke {
+            service: "world.alpha".into(),
+            operation: "compute".into(),
+            input: OValue::str_("x".repeat(RUNTIME_MAX_FRAME_LEN - 2048)),
+        };
+        assert!(wire::encode_message(&request).unwrap().len() <= RUNTIME_MAX_FRAME_LEN);
+        let mut requests = Vec::new();
+        wire::write_frame(&mut requests, &request).unwrap();
+        let mut responses = Vec::new();
+
+        let error = serve(&program, "world.alpha", &mut &requests[..], &mut responses).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(&format!("exceeds maximum {RUNTIME_MAX_FRAME_LEN}")));
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn crash_operation_fails_worker_before_any_response() {
+        let crash_source = r#"
+schema = "ocore.runtime-program/v1"
+world = "native.crash-test"
+
+[health]
+status = "healthy"
+
+[operations.crash]
+kind = "crash"
+"#;
+        let crash_program = RuntimeProgram::parse(crash_source).unwrap();
+        assert!(RuntimeProgram::parse(&format!("{crash_source}unexpected = true\n")).is_err());
+        let direct_error = crash_program
+            .invoke("crash", OValue::Null)
+            .unwrap_err()
+            .to_string();
+        assert!(direct_error.contains("only through the hosted worker protocol"));
+
+        let mut request = Vec::new();
+        wire::write_frame(
+            &mut request,
+            &RuntimeRequest::Invoke {
+                service: "world.crash".into(),
+                operation: "crash".into(),
+                input: OValue::Null,
+            },
+        )
+        .unwrap();
+        let mut responses = Vec::new();
+
+        let error = serve(
+            &crash_program,
+            "world.crash",
+            &mut &request[..],
+            &mut responses,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("hosted test worker crash requested"));
+        assert!(responses.is_empty(), "a crashing worker must not reply");
     }
 }

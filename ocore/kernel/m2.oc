@@ -121,9 +121,7 @@ unsafe fn teardown_process(
 
 // Timer assembly reaches this only after restoring the pinned management CR3,
 // TSS.RSP0, GS entry stack, and management stack.
-@export
-@no_mangle
-pub unsafe fn kernel_scheduler_complete_continue() -> never {
+pub unsafe fn complete_continue() -> never {
     if !management_context()
         || scheduler_failed()
         || !scheduler_complete()

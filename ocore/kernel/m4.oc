@@ -1,0 +1,523 @@
+module kernel::m4;
+
+use runtime::address_space::create_loaded_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::is_loaded;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::loaded_entry;
+use runtime::address_space::loaded_frame_count;
+use runtime::address_space::loaded_protections_hold;
+use runtime::address_space::loaded_stack_pointer;
+use runtime::address_space::root_cr3;
+use runtime::capability::close_for_owner as close_capability_for_owner;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_ENDPOINT;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::domain_namespace::begin_teardown as begin_namespace_teardown;
+use runtime::domain_namespace::bind_process;
+use runtime::domain_namespace::create as create_namespace;
+use runtime::domain_namespace::finish_teardown as finish_namespace_teardown;
+use runtime::domain_namespace::init as namespaces_init;
+use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
+use runtime::domain_namespace::process_refs as namespace_process_refs;
+use runtime::domain_namespace::release_quiescent_processes;
+use runtime::elf_loader::commit_count;
+use runtime::elf_loader::ELF_ERROR_MALFORMED;
+use runtime::elf_loader::ELF_ERROR_OVERLAP;
+use runtime::elf_loader::ELF_ERROR_WX;
+use runtime::elf_loader::init as elf_loader_init;
+use runtime::elf_loader::invariants_hold as elf_invariants_hold;
+use runtime::elf_loader::last_error as elf_last_error;
+use runtime::elf_loader::rejection_count;
+use runtime::elf_loader::release_plan;
+use runtime::elf_loader::validate as validate_elf;
+use runtime::elf_loader::validation_count;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::release as release_endpoint;
+use runtime::image_vfs::append_image_bytes;
+use runtime::image_vfs::begin_image;
+use runtime::image_vfs::destroy_image;
+use runtime::image_vfs::import_ovfs_image;
+use runtime::image_vfs::init as image_vfs_init;
+use runtime::image_vfs::invariants_hold as image_invariants_hold;
+use runtime::image_vfs::lookup as vfs_lookup;
+use runtime::image_vfs::mount_root;
+use runtime::image_vfs::publish_image;
+use runtime::image_vfs::retain_object;
+use runtime::image_vfs::sha256_selftest;
+use runtime::image_vfs::teardown_namespace as teardown_mount_namespace;
+use runtime::image_vfs::verify_image_sha256;
+use runtime::image_vfs::IMAGE_BYTE_CAPACITY;
+use runtime::image_vfs::OVFS_IMPORT_OK;
+use runtime::interrupts::ticks;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::process_state;
+use runtime::process::PROCESS_STATE_REAPABLE;
+use runtime::scheduler::arm_loaded;
+use runtime::scheduler::complete as scheduler_complete;
+use runtime::scheduler::completion_kind;
+use runtime::scheduler::context_switches;
+use runtime::scheduler::failed as scheduler_failed;
+use runtime::scheduler::SCHEDULER_COMPLETION_LOADED;
+use runtime::serial::write;
+use runtime::service_registry::denied_lookups;
+use runtime::service_registry::init as service_registry_init;
+use runtime::service_registry::invariants_hold as service_invariants_hold;
+use runtime::service_registry::lookup as service_lookup;
+use runtime::service_registry::publish as publish_service;
+use runtime::service_registry::successful_lookups;
+use runtime::service_registry::teardown_namespace as teardown_service_namespace;
+use runtime::thread::init as threads_init;
+use runtime::thread::install_loaded as install_loaded_thread;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::queue_invariants_hold as thread_invariants_hold;
+use runtime::thread::reap as reap_thread;
+use runtime::thread::THREAD_ROLE_CPU;
+
+const MODE_NATIVE_LOADER: u64 = 15;
+const PROCESS_COUNT: usize = 2;
+const QUOTA: usize = 16;
+
+const PATH_ALPHA: u64 = 0x4e73_5c27_32e8_68ee;
+const PATH_BETA: u64 = 0xa199_7807_8724_d3c2;
+const PATH_MALFORMED: u64 = 0xa6d9_fa94_1d1f_53af;
+const PATH_OVERLAP: u64 = 0x0454_0c48_60b9_8fc9;
+const PATH_WX: u64 = 0x623c_fc3f_424b_8d2f;
+
+const IMAGE_ID: u64 = 0x9f45_44d1_0cad_2f6f;
+const IMAGE_DIGEST_0: u64 = 0x6f2f_ad0c_d144_459f;
+const IMAGE_DIGEST_1: u64 = 0x52ac_7211_e239_ffa5;
+const IMAGE_DIGEST_2: u64 = 0xd841_094d_1130_9545;
+const IMAGE_DIGEST_3: u64 = 0xa708_1477_7f9b_d5a0;
+const IMAGE_SHA_0: u64 = 0x9f45_44d1_0cad_2f6f;
+const IMAGE_SHA_1: u64 = 0xa5ff_39e2_1172_ac52;
+const IMAGE_SHA_2: u64 = 0x4595_3011_4d09_41d8;
+const IMAGE_SHA_3: u64 = 0xa0d5_9b7f_7714_08a7;
+
+const SERVICE_ID: u64 = 0x6d34_2e70_6572_736f;
+const SERVICE_PROTOCOL: u64 = 1;
+const ALPHA_COMPLETE: u64 = 0x4d34_0000_0000_0001;
+const BETA_COMPLETE: u64 = 0x4d34_0000_0000_0002;
+
+static IMAGE_MESSAGE: [u8; 27] = b"M4 OVFS image import: PASS\n";
+static REJECT_MESSAGE: [u8; 30] = b"M4 ELF rejection corpus: PASS\n";
+static LOAD_MESSAGE: [u8; 30] = b"M4 two native ELF loads: PASS\n";
+static WX_MESSAGE: [u8; 34] = b"M4 loaded address-space W^X: PASS\n";
+static SERVICE_MESSAGE: [u8; 35] = b"M4 capability service lookup: PASS\n";
+static NAMESPACE_MESSAGE: [u8; 31] = b"M4 namespace transaction: PASS\n";
+static RECLAIM_MESSAGE: [u8; 29] = b"M4 resources reclaimed: PASS\n";
+static LIVE_MESSAGE: [u8; 27] = b"M4 native loader/VFS: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 32] = b"M4 post-lifecycle timer: online\n";
+
+static mut NAMESPACE: u64 = 0;
+static mut NATIVE_DOMAIN: u64 = 0;
+static mut IMAGE: u64 = 0;
+static mut ROOT_MOUNT: u64 = 0;
+static mut CSPACES: [u64; 2] = [0; 2];
+static mut PLANS: [u64; 2] = [0; 2];
+static mut ADDRESS_SPACES: [u64; 2] = [0; 2];
+static mut PHYSICALS: [usize; 2] = [0; 2];
+static mut PROCESSES: [u64; 2] = [0; 2];
+static mut THREADS: [u64; 2] = [0; 2];
+static mut DEBUG_CAPS: [u64; 2] = [0; 2];
+static mut SERVICE_ENDPOINT: u64 = 0;
+static mut SERVICE_CAP: u64 = 0;
+static mut SERVICE_BINDING: u64 = 0;
+static mut BASELINE_FREE: usize = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_m4_image_start() -> usize;
+extern "sysv64" fn ocore_m4_image_end() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn reject_corpus(namespace: u64, path: u64, error: u64) -> bool {
+    let object: u64 = vfs_lookup(namespace, path);
+    if object == 0 || retain_object(namespace, object) == 0 {
+        return false;
+    }
+    return validate_elf(object) == 0 && elf_last_error() == error;
+}
+
+unsafe fn load_plan(namespace: u64, path: u64) -> u64 {
+    let object: u64 = vfs_lookup(namespace, path);
+    if object == 0 || retain_object(namespace, object) == 0 {
+        return 0;
+    }
+    return validate_elf(object);
+}
+
+unsafe fn reap_loaded_process(index: usize) -> bool {
+    if index >= PROCESS_COUNT
+        || process_state(PROCESSES[index]) != PROCESS_STATE_REAPABLE
+        || begin_reap(PROCESSES[index]) == 0
+        || destroy_address_space(ADDRESS_SPACES[index]) == 0
+        || drain_cspace(CSPACES[index]) == 0
+        || finalize_reap(PROCESSES[index]) == 0 {
+        return false;
+    }
+    return true;
+}
+
+// Entered only from the scheduler's exact loaded-completion continuation with
+// the management CR3 restored and interrupts masked.
+pub unsafe fn complete_continue() -> never {
+    if !management_context()
+        || scheduler_failed()
+        || !scheduler_complete()
+        || completion_kind() != SCHEDULER_COMPLETION_LOADED
+        || context_switches() < 2
+        || process_state(PROCESSES[0]) != PROCESS_STATE_REAPABLE
+        || process_state(PROCESSES[1]) != PROCESS_STATE_REAPABLE
+        || volatile_load(PHYSICALS[0] as *const u64) != ALPHA_COMPLETE
+        || volatile_load(PHYSICALS[1] as *const u64) != BETA_COMPLETE
+        || !loaded_protections_hold(ADDRESS_SPACES[0])
+        || !loaded_protections_hold(ADDRESS_SPACES[1])
+        || !service_invariants_hold()
+        || !image_invariants_hold()
+        || !namespace_invariants_hold()
+        || !elf_invariants_hold() {
+        fail_closed();
+    }
+
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        if reap_thread(THREADS[index]) == 0
+            || thread_is_live(THREADS[index]) {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    // Freeze the namespace before revoking any child. Every following step is
+    // prevalidated and retry-closed: no new mount, service, loader, or process
+    // binding can enter after NAMESPACE_DRAINING becomes visible.
+    if begin_namespace_teardown(NAMESPACE) == 0
+        || teardown_service_namespace(NAMESPACE) == 0
+        || close_capability_for_owner(CSPACES[0], SERVICE_CAP) == 0
+        || release_endpoint(SERVICE_ENDPOINT) == 0
+        || endpoint_is_live(SERVICE_ENDPOINT)
+        || teardown_mount_namespace(NAMESPACE) == 0
+        || release_quiescent_processes(NAMESPACE) == 0
+        || namespace_process_refs(NAMESPACE) != 0 {
+        fail_closed();
+    }
+    SERVICE_BINDING = 0;
+    SERVICE_CAP = 0;
+    SERVICE_ENDPOINT = 0;
+    ROOT_MOUNT = 0;
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        if !reap_loaded_process(index) {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if destroy_image(IMAGE) == 0
+        || finish_namespace_teardown(NAMESPACE) == 0
+        || domain_child_refs(NATIVE_DOMAIN) != 0
+        || free_frames() != BASELINE_FREE
+        || !page_invariants_hold()
+        || !mapping_invariants_hold()
+        || !memory_invariants_hold()
+        || !capability_invariants_hold()
+        || !endpoint_invariants_hold()
+        || !thread_invariants_hold()
+        || !namespace_invariants_hold()
+        || !image_invariants_hold()
+        || !elf_invariants_hold()
+        || !service_invariants_hold() {
+        fail_closed();
+    }
+    write((&NAMESPACE_MESSAGE[0]), 31);
+    write((&RECLAIM_MESSAGE[0]), 29);
+    write((&LIVE_MESSAGE[0]), 27);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 32);
+    loop {
+        halt();
+    }
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    if mode != MODE_NATIVE_LOADER
+        || native_domain == 0
+        || !management_context() {
+        fail_closed();
+    }
+    if threads_init() == 0 || threads_init() != 0 {
+        fail_closed();
+    }
+    if namespaces_init() == 0 || namespaces_init() != 0 {
+        fail_closed();
+    }
+    if image_vfs_init() == 0
+        || image_vfs_init() != 0
+        || sha256_selftest() != 1 {
+        fail_closed();
+    }
+    if elf_loader_init() == 0 || elf_loader_init() != 0 {
+        fail_closed();
+    }
+    if service_registry_init() == 0 || service_registry_init() != 0 {
+        fail_closed();
+    }
+    NATIVE_DOMAIN = native_domain;
+
+    let image_start: usize = ocore_m4_image_start();
+    let image_end: usize = ocore_m4_image_end();
+    if image_start == 0
+        || image_end <= image_start
+        || image_end - image_start > IMAGE_BYTE_CAPACITY {
+        fail_closed();
+    }
+    NAMESPACE = create_namespace(0, native_domain);
+    IMAGE = begin_image(
+        0,
+        IMAGE_ID,
+        image_end - image_start,
+        IMAGE_DIGEST_0,
+        IMAGE_DIGEST_1,
+        IMAGE_DIGEST_2,
+        IMAGE_DIGEST_3
+    );
+    if NAMESPACE == 0
+        || IMAGE == 0
+        || append_image_bytes(
+            IMAGE,
+            image_start as *const u8,
+            image_end - image_start
+        ) == 0
+        || verify_image_sha256(
+            IMAGE,
+            IMAGE_SHA_0,
+            IMAGE_SHA_1,
+            IMAGE_SHA_2,
+            IMAGE_SHA_3
+        ) != 1 {
+        fail_closed();
+    }
+    if import_ovfs_image(IMAGE) != OVFS_IMPORT_OK {
+        fail_closed();
+    }
+    if publish_image(IMAGE) == 0 {
+        fail_closed();
+    }
+    ROOT_MOUNT = mount_root(NAMESPACE, IMAGE);
+    if ROOT_MOUNT == 0 || !image_invariants_hold() {
+        fail_closed();
+    }
+    write((&IMAGE_MESSAGE[0]), 27);
+
+    if !reject_corpus(NAMESPACE, PATH_MALFORMED, ELF_ERROR_MALFORMED)
+        || !reject_corpus(NAMESPACE, PATH_OVERLAP, ELF_ERROR_OVERLAP)
+        || !reject_corpus(NAMESPACE, PATH_WX, ELF_ERROR_WX)
+        || rejection_count() != 3 {
+        fail_closed();
+    }
+    write((&REJECT_MESSAGE[0]), 30);
+
+    PLANS[0] = load_plan(NAMESPACE, PATH_ALPHA);
+    PLANS[1] = load_plan(NAMESPACE, PATH_BETA);
+    if PLANS[0] == 0
+        || PLANS[1] == 0
+        || PLANS[0] == PLANS[1]
+        || validation_count() != 2 {
+        fail_closed();
+    }
+
+    BASELINE_FREE = free_frames();
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        CSPACES[index] = cspace_handle_for_slot(index);
+        if CSPACES[index] == 0
+            || set_quota_for_owner(CSPACES[index], QUOTA) == 0 {
+            fail_closed();
+        }
+        ADDRESS_SPACES[index] = create_loaded_for_owner(
+            CSPACES[index],
+            PLANS[index]
+        );
+        PHYSICALS[index] = isolation_physical(ADDRESS_SPACES[index]);
+        if ADDRESS_SPACES[index] == 0
+            || PHYSICALS[index] == 0
+            || !is_loaded(ADDRESS_SPACES[index])
+            || loaded_entry(ADDRESS_SPACES[index]) == 0
+            || loaded_stack_pointer(ADDRESS_SPACES[index]) == 0
+            || loaded_frame_count(ADDRESS_SPACES[index]) == 0
+            || root_cr3(ADDRESS_SPACES[index]) == ocore_management_cr3()
+            || !loaded_protections_hold(ADDRESS_SPACES[index])
+            || release_plan(PLANS[index]) == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if ADDRESS_SPACES[0] == ADDRESS_SPACES[1]
+        || PHYSICALS[0] == PHYSICALS[1]
+        || commit_count() != 2
+        || !elf_invariants_hold() {
+        fail_closed();
+    }
+    write((&LOAD_MESSAGE[0]), 30);
+    write((&WX_MESSAGE[0]), 34);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        PROCESSES[index] = install_process_for_owner(
+            index,
+            401 + index as u64,
+            native_domain,
+            ADDRESS_SPACES[index],
+            CSPACES[index],
+            ocore_process_kernel_stack_top(index),
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index])
+        );
+        if PROCESSES[index] == 0
+            || bind_process(NAMESPACE, PROCESSES[index]) == 0 {
+            fail_closed();
+        }
+        DEBUG_CAPS[index] = install_capability_for_owner(
+            CSPACES[index],
+            1,
+            0x440 + index as u64,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        );
+        if DEBUG_CAPS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    SERVICE_ENDPOINT = create_endpoint(CSPACES[1]);
+    SERVICE_CAP = install_capability_for_owner(
+        CSPACES[0],
+        2,
+        SERVICE_ENDPOINT,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    SERVICE_BINDING = publish_service(
+        NAMESPACE,
+        SERVICE_ID,
+        SERVICE_PROTOCOL,
+        PROCESSES[1],
+        CSPACES[0],
+        SERVICE_CAP,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    let mut resolved: u64 = 0;
+    let mut denied: u64 = 1;
+    if SERVICE_ENDPOINT == 0
+        || SERVICE_CAP == 0
+        || SERVICE_BINDING == 0
+        || service_lookup(
+            NAMESPACE,
+            SERVICE_ID,
+            SERVICE_PROTOCOL,
+            CSPACES[0],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND,
+            (&mut resolved)
+        ) == 0
+        || resolved != SERVICE_CAP
+        || validate_for_owner(
+            CSPACES[0],
+            resolved,
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        ) != SERVICE_ENDPOINT
+        || service_lookup(
+            NAMESPACE,
+            SERVICE_ID,
+            SERVICE_PROTOCOL,
+            CSPACES[0],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_RECEIVE,
+            (&mut denied)
+        ) != 0
+        || denied != 0
+        || successful_lookups() != 1
+        || denied_lookups() != 1
+        || !service_invariants_hold() {
+        fail_closed();
+    }
+    write((&SERVICE_MESSAGE[0]), 35);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        THREADS[index] = install_loaded_thread(
+            index,
+            501 + index as u64,
+            PROCESSES[index],
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index]),
+            ocore_process_kernel_stack_top(index),
+            DEBUG_CAPS[index],
+            0,
+            THREAD_ROLE_CPU,
+            1
+        );
+        if THREADS[index] == 0 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if namespace_process_refs(NAMESPACE) != 2
+        || !namespace_invariants_hold()
+        || !thread_invariants_hold() {
+        fail_closed();
+    }
+
+    disable_interrupts();
+    if arm_loaded(
+        THREADS[0],
+        THREADS[1],
+        PROCESSES[0],
+        PROCESSES[1],
+        PHYSICALS[0],
+        PHYSICALS[1]
+    ) == 0 {
+        fail_closed();
+    }
+    enable_interrupts();
+    loop {
+        halt();
+    }
+}

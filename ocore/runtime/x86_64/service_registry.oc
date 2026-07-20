@@ -1,0 +1,409 @@
+module runtime::service_registry;
+
+use runtime::capability::cspace_child_refs;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::inspect_for_owner;
+use runtime::capability::release_cspace;
+use runtime::capability::retain_cspace;
+use runtime::domain_namespace::contains_process;
+use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
+use runtime::domain_namespace::is_live as namespace_is_live;
+use runtime::domain_namespace::is_valid_owner as namespace_is_valid_owner;
+use runtime::domain_namespace::namespace_handle_for_slot;
+use runtime::domain_namespace::release_service as release_namespace_service;
+use runtime::domain_namespace::retain_service as retain_namespace_service;
+use runtime::domain_namespace::service_refs as namespace_service_refs;
+use runtime::domain_namespace::MAX_DOMAIN_NAMESPACES;
+use runtime::process::is_live as process_is_live;
+
+pub const MAX_SERVICE_BINDINGS: usize = 16;
+
+const SERVICE_EMPTY: u8 = 0;
+const SERVICE_LIVE: u8 = 1;
+const SERVICE_RETIRED: u8 = 2;
+const SERVICE_HANDLE_TAG: u64 = 0xd700_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+
+static mut STATES: [u8; 16] = [0; 16];
+static mut GENERATIONS: [u32; 16] = [0; 16];
+static mut NAMESPACES: [u64; 16] = [0; 16];
+static mut NAME_IDS: [u64; 16] = [0; 16];
+static mut PROTOCOL_VERSIONS: [u64; 16] = [0; 16];
+static mut PROVIDER_PROCESSES: [u64; 16] = [0; 16];
+static mut CONSUMER_CSPACES: [u64; 16] = [0; 16];
+static mut CAPABILITIES: [u64; 16] = [0; 16];
+static mut OBJECT_IDS: [u64; 16] = [0; 16];
+static mut OBJECT_TYPES: [u64; 16] = [0; 16];
+static mut RIGHTS: [u64; 16] = [0; 16];
+static mut LOOKUPS: u64 = 0;
+static mut DENIED_LOOKUPS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn service_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn service_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | SERVICE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_service(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != SERVICE_HANDLE_TAG {
+        return MAX_SERVICE_BINDINGS;
+    }
+    let slot: usize = service_index(handle);
+    if slot >= MAX_SERVICE_BINDINGS
+        || STATES[slot] != SERVICE_LIVE
+        || GENERATIONS[slot] != service_generation(handle) {
+        return MAX_SERVICE_BINDINGS;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    NAMESPACES[slot] = 0;
+    NAME_IDS[slot] = 0;
+    PROTOCOL_VERSIONS[slot] = 0;
+    PROVIDER_PROCESSES[slot] = 0;
+    CONSUMER_CSPACES[slot] = 0;
+    CAPABILITIES[slot] = 0;
+    OBJECT_IDS[slot] = 0;
+    OBJECT_TYPES[slot] = 0;
+    RIGHTS[slot] = 0;
+}
+
+unsafe fn retire_or_reuse(slot: usize) -> void {
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = SERVICE_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = SERVICE_EMPTY;
+    }
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !namespace_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        STATES[slot] = SERVICE_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    LOOKUPS = 0;
+    DENIED_LOOKUPS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// A binding is consumer-CSpace specific. Publication accepts only a complete
+// already-attenuated capability: cached policy rights must equal the live slot
+// rights, so a name can never return broader authority than was registered.
+pub unsafe fn publish(
+    namespace: u64,
+    name_id: u64,
+    protocol_version: u64,
+    provider_process: u64,
+    consumer_cspace: u64,
+    capability: u64,
+    object_type: u64,
+    rights: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !namespace_is_live(namespace)
+        || name_id == 0
+        || protocol_version == 0
+        || !process_is_live(provider_process)
+        || !contains_process(namespace, provider_process)
+        || !cspace_is_live(consumer_cspace)
+        || capability == 0
+        || object_type == 0
+        || rights == 0
+        || !invariants_hold() {
+        return 0;
+    }
+    let mut object_id: u64 = 0;
+    let mut actual_rights: u64 = 0;
+    let actual_type: u64 = inspect_for_owner(
+        consumer_cspace,
+        capability,
+        object_type,
+        rights,
+        (&mut object_id),
+        (&mut actual_rights)
+    );
+    if actual_type != object_type
+        || object_id == 0
+        || actual_rights != rights {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_SERVICE_BINDINGS;
+    while slot < MAX_SERVICE_BINDINGS {
+        if STATES[slot] == SERVICE_EMPTY && free_slot == MAX_SERVICE_BINDINGS {
+            free_slot = slot;
+        }
+        if STATES[slot] == SERVICE_LIVE
+            && NAMESPACES[slot] == namespace
+            && NAME_IDS[slot] == name_id
+            && PROTOCOL_VERSIONS[slot] == protocol_version
+            && CONSUMER_CSPACES[slot] == consumer_cspace {
+            return 0;
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_SERVICE_BINDINGS
+        || retain_cspace(consumer_cspace) == 0 {
+        return 0;
+    }
+    if retain_namespace_service(namespace) == 0 {
+        if release_cspace(consumer_cspace) == 0 {
+            POISONED = 1;
+        }
+        return 0;
+    }
+    NAMESPACES[free_slot] = namespace;
+    NAME_IDS[free_slot] = name_id;
+    PROTOCOL_VERSIONS[free_slot] = protocol_version;
+    PROVIDER_PROCESSES[free_slot] = provider_process;
+    CONSUMER_CSPACES[free_slot] = consumer_cspace;
+    CAPABILITIES[free_slot] = capability;
+    OBJECT_IDS[free_slot] = object_id;
+    OBJECT_TYPES[free_slot] = object_type;
+    RIGHTS[free_slot] = rights;
+    STATES[free_slot] = SERVICE_LIVE;
+    return make_handle(free_slot);
+}
+
+pub unsafe fn binding_is_live(service: u64) -> bool {
+    let slot: usize = checked_service(service);
+    if slot >= MAX_SERVICE_BINDINGS
+        || !namespace_is_live(NAMESPACES[slot])
+        || !cspace_is_live(CONSUMER_CSPACES[slot]) {
+        return false;
+    }
+    let mut object_id: u64 = 0;
+    let mut actual_rights: u64 = 0;
+    let actual_type: u64 = inspect_for_owner(
+        CONSUMER_CSPACES[slot],
+        CAPABILITIES[slot],
+        OBJECT_TYPES[slot],
+        RIGHTS[slot],
+        (&mut object_id),
+        (&mut actual_rights)
+    );
+    return actual_type == OBJECT_TYPES[slot]
+        && object_id == OBJECT_IDS[slot]
+        && actual_rights == RIGHTS[slot];
+}
+
+// Metadata lookup itself grants no authority. The only success output is the
+// exact generation-tagged capability already installed in the caller's CSpace.
+pub unsafe fn lookup(
+    namespace: u64,
+    name_id: u64,
+    protocol_version: u64,
+    consumer_cspace: u64,
+    required_object_type: u64,
+    required_rights: u64,
+    result_capability: *mut u64
+) -> u64 {
+    if result_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(result_capability, 0);
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !namespace_is_live(namespace)
+        || name_id == 0
+        || protocol_version == 0
+        || !cspace_is_live(consumer_cspace)
+        || required_object_type == 0
+        || required_rights == 0 {
+        DENIED_LOOKUPS += 1;
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        if STATES[slot] == SERVICE_LIVE
+            && NAMESPACES[slot] == namespace
+            && NAME_IDS[slot] == name_id
+            && PROTOCOL_VERSIONS[slot] == protocol_version
+            && CONSUMER_CSPACES[slot] == consumer_cspace {
+            if OBJECT_TYPES[slot] != required_object_type
+                || (RIGHTS[slot] & required_rights) != required_rights
+                || !binding_is_live(make_handle(slot)) {
+                DENIED_LOOKUPS += 1;
+                return 0;
+            }
+            volatile_store(result_capability, CAPABILITIES[slot]);
+            LOOKUPS += 1;
+            return 1;
+        }
+        slot += 1;
+    }
+    DENIED_LOOKUPS += 1;
+    return 0;
+}
+
+pub unsafe fn unpublish(service: u64) -> u64 {
+    let slot: usize = checked_service(service);
+    if slot >= MAX_SERVICE_BINDINGS
+        || !namespace_is_valid_owner(NAMESPACES[slot])
+        || !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
+        || namespace_service_refs(NAMESPACES[slot]) == 0
+        || cspace_child_refs(CONSUMER_CSPACES[slot]) == 0 {
+        return 0;
+    }
+    if release_namespace_service(NAMESPACES[slot]) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    if release_cspace(CONSUMER_CSPACES[slot]) == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    retire_or_reuse(slot);
+    return 1;
+}
+
+pub unsafe fn reap_stale(service: u64) -> u64 {
+    if binding_is_live(service) {
+        return 0;
+    }
+    return unpublish(service);
+}
+
+pub unsafe fn can_teardown_namespace(namespace: u64) -> bool {
+    if !namespace_is_valid_owner(namespace) {
+        return false;
+    }
+    let mut count: u32 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        if STATES[slot] == SERVICE_LIVE && NAMESPACES[slot] == namespace {
+            if !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
+                || cspace_child_refs(CONSUMER_CSPACES[slot]) == 0 {
+                return false;
+            }
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count == namespace_service_refs(namespace);
+}
+
+pub unsafe fn teardown_namespace(namespace: u64) -> u64 {
+    if !can_teardown_namespace(namespace) {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        if STATES[slot] == SERVICE_LIVE && NAMESPACES[slot] == namespace {
+            if unpublish(make_handle(slot)) == 0 {
+                POISONED = 1;
+                return 0;
+            }
+        }
+        slot += 1;
+    }
+    return 1;
+}
+
+pub unsafe fn successful_lookups() -> u64 {
+    return LOOKUPS;
+}
+
+pub unsafe fn denied_lookups() -> u64 {
+    return DENIED_LOOKUPS;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !namespace_invariants_hold() {
+        return false;
+    }
+    let mut namespace_counts: [u32; 4] = [0; 4];
+    let mut slot: usize = 0;
+    while slot < MAX_SERVICE_BINDINGS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == SERVICE_EMPTY || state == SERVICE_RETIRED {
+            if (state == SERVICE_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || NAMESPACES[slot] != 0
+                || NAME_IDS[slot] != 0
+                || PROTOCOL_VERSIONS[slot] != 0
+                || PROVIDER_PROCESSES[slot] != 0
+                || CONSUMER_CSPACES[slot] != 0
+                || CAPABILITIES[slot] != 0
+                || OBJECT_IDS[slot] != 0
+                || OBJECT_TYPES[slot] != 0
+                || RIGHTS[slot] != 0 {
+                return false;
+            }
+        } else if state == SERVICE_LIVE {
+            let namespace: u64 = NAMESPACES[slot];
+            let namespace_slot: usize = service_index(namespace);
+            if !namespace_is_valid_owner(namespace)
+                || namespace_slot >= MAX_DOMAIN_NAMESPACES
+                || NAME_IDS[slot] == 0
+                || PROTOCOL_VERSIONS[slot] == 0
+                || !process_is_live(PROVIDER_PROCESSES[slot])
+                || !contains_process(namespace, PROVIDER_PROCESSES[slot])
+                || !cspace_is_valid_owner(CONSUMER_CSPACES[slot])
+                || CAPABILITIES[slot] == 0
+                || OBJECT_IDS[slot] == 0
+                || OBJECT_TYPES[slot] == 0
+                || RIGHTS[slot] == 0 {
+                return false;
+            }
+            namespace_counts[namespace_slot] += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_SERVICE_BINDINGS {
+                if STATES[other] == SERVICE_LIVE
+                    && NAMESPACES[other] == namespace
+                    && NAME_IDS[other] == NAME_IDS[slot]
+                    && PROTOCOL_VERSIONS[other] == PROTOCOL_VERSIONS[slot]
+                    && CONSUMER_CSPACES[other] == CONSUMER_CSPACES[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    let mut namespace_slot: usize = 0;
+    while namespace_slot < MAX_DOMAIN_NAMESPACES {
+        let namespace: u64 = namespace_handle_for_slot(namespace_slot);
+        if namespace != 0
+            && namespace_counts[namespace_slot]
+                != namespace_service_refs(namespace) {
+            return false;
+        }
+        namespace_slot += 1;
+    }
+    return true;
+}

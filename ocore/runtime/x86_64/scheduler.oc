@@ -1,13 +1,21 @@
 module runtime::scheduler;
 
 use runtime::address_space::root_cr3;
+use runtime::ipc_lifecycle::process_died as ipc_process_died;
+use runtime::ipc_wait::commit as commit_ipc_wait;
+use runtime::ipc_wait::sender_block_count;
 use runtime::process::current_address_space_handle;
 use runtime::process::current_cspace_handle;
 use runtime::process::current_domain_handle;
 use runtime::process::current_process_handle;
 use runtime::process::exit_current;
+use runtime::process::fault_current;
+use runtime::process::mark_reapable;
+use runtime::process::process_state;
 use runtime::process::scheduler_deschedule_current;
 use runtime::process::scheduler_switch_to;
+use runtime::process::stop_process;
+use runtime::process::PROCESS_STATE_REAPABLE;
 use runtime::thread::account_current_tick;
 use runtime::thread::address_space_for_thread;
 use runtime::thread::blocked_count;
@@ -15,6 +23,7 @@ use runtime::thread::abort_next;
 use runtime::thread::block_current;
 use runtime::thread::commit_next;
 use runtime::thread::cspace_for_thread;
+use runtime::thread::defer_next;
 use runtime::thread::current_handle as current_thread_handle;
 use runtime::thread::domain_for_thread;
 use runtime::thread::frame_pointer;
@@ -54,9 +63,48 @@ static mut IDLE_TICKS: u64 = 0;
 static mut LAST_TICK: u64 = 0;
 static mut PENDING_ACTION: u8 = 0;
 static mut PENDING_SLEEP_DELTA: u64 = 0;
+static mut PENDING_REQUEST: u64 = 0;
 static mut PENDING_RESULT: u64 = 0;
 static mut HOSTILE_SYSCALL_SWITCHES: u64 = 0;
 static mut HOSTILE_FRAME_CONTAINMENTS: u64 = 0;
+static mut SCHEDULER_KIND: u8 = 0;
+static mut COMPLETION_KIND: u8 = 0;
+static mut IPC_PROCESSES: [u64; 4] = [0; 4];
+static mut IPC_PHYSICAL: [usize; 4] = [0; 4];
+static mut IPC_FAULT_CONTAINMENTS: u64 = 0;
+static mut LOADED_PROCESSES: [u64; 4] = [0; 4];
+static mut LOADED_PHYSICAL: [usize; 4] = [0; 4];
+static mut LOADED_COUNT: usize = 0;
+static mut LIVE_FAULT_CONTAINMENTS: u64 = 0;
+static mut LIVE_RESTART_ARM_TICK: u64 = 0;
+static mut PERSONALITY_FAULT_CONTAINMENTS: u64 = 0;
+static mut PERSONALITY_RESTART_ARM_TICK: u64 = 0;
+
+pub const SCHEDULER_COMPLETION_NONE: u64 = 0;
+pub const SCHEDULER_COMPLETION_M2: u64 = 1;
+pub const SCHEDULER_COMPLETION_IPC: u64 = 2;
+pub const SCHEDULER_COMPLETION_LOADED: u64 = 3;
+pub const SCHEDULER_COMPLETION_LIVE: u64 = 4;
+pub const SCHEDULER_COMPLETION_LIVE_RESTART: u64 = 5;
+pub const SCHEDULER_COMPLETION_PERSONALITY_CRASH: u64 = 6;
+pub const SCHEDULER_COMPLETION_PERSONALITY: u64 = 7;
+
+const SCHEDULER_KIND_NONE: u8 = 0;
+const SCHEDULER_KIND_M2: u8 = 1;
+const SCHEDULER_KIND_IPC: u8 = 2;
+const SCHEDULER_KIND_LOADED: u8 = 3;
+const SCHEDULER_KIND_LIVE: u8 = 4;
+const SCHEDULER_KIND_LIVE_RESTART: u8 = 5;
+const SCHEDULER_KIND_PERSONALITY: u8 = 6;
+const SCHEDULER_KIND_PERSONALITY_RESTART: u8 = 7;
+
+const LOADED_ALPHA_COMPLETE: u64 = 0x4d34_0000_0000_0001;
+const LOADED_BETA_COMPLETE: u64 = 0x4d34_0000_0000_0002;
+const LIVE_ZERO_COMPLETE: u64 = 0x4d35_0000_0000_0001;
+const LIVE_ONE_COMPLETE: u64 = 0x4d35_0000_0000_0002;
+const LIVE_TWO_COMPLETE: u64 = 0x4d35_0000_0000_0003;
+const LIVE_THREE_COMPLETE: u64 = 0x4d35_0000_0000_0004;
+const LIVE_PKGD_RESTART_COMPLETE: u64 = 0x4d35_0000_0000_1003;
 
 const FRAME_RFLAGS_WORD: usize = 19;
 const RFLAGS_NT: u64 = 0x4000;
@@ -66,6 +114,13 @@ extern "sysv64" fn ocore_context_matches(root: usize, stack: usize) -> u64;
 extern "sysv64" fn ocore_restore_management_context() -> void;
 extern "sysv64" fn ocore_management_cr3() -> usize;
 extern "sysv64" fn ocore_management_stack_top() -> usize;
+// M6A keeps policy and request bookkeeping out of the scheduler. These hooks
+// are implemented by the bounded kernel harness and validate exact service,
+// request, and supervisor generations before returning success.
+extern "sysv64" fn kernel_m6_service_fault(process: u64) -> u64;
+extern "sysv64" fn kernel_m6_expire_requests(now: u64) -> u64;
+extern "sysv64" fn kernel_m6_phase_one_ready() -> u64;
+extern "sysv64" fn kernel_m6_final_ready() -> u64;
 
 pub unsafe fn init() -> void {
     atomic_store((&mut YIELD_REQUESTS), 0, seq_cst);
@@ -89,9 +144,30 @@ pub unsafe fn init() -> void {
     LAST_TICK = 0;
     PENDING_ACTION = 0;
     PENDING_SLEEP_DELTA = 0;
+    PENDING_REQUEST = 0;
     PENDING_RESULT = 0;
     HOSTILE_SYSCALL_SWITCHES = 0;
     HOSTILE_FRAME_CONTAINMENTS = 0;
+    SCHEDULER_KIND = SCHEDULER_KIND_NONE;
+    COMPLETION_KIND = SCHEDULER_COMPLETION_NONE as u8;
+    IPC_FAULT_CONTAINMENTS = 0;
+    index = 0;
+    while index < 4 {
+        IPC_PROCESSES[index] = 0;
+        IPC_PHYSICAL[index] = 0;
+        index += 1;
+    }
+    LOADED_COUNT = 0;
+    LIVE_FAULT_CONTAINMENTS = 0;
+    LIVE_RESTART_ARM_TICK = 0;
+    PERSONALITY_FAULT_CONTAINMENTS = 0;
+    PERSONALITY_RESTART_ARM_TICK = 0;
+    index = 0;
+    while index < 4 {
+        LOADED_PROCESSES[index] = 0;
+        LOADED_PHYSICAL[index] = 0;
+        index += 1;
+    }
 }
 
 pub unsafe fn request_yield() -> u64 {
@@ -119,14 +195,19 @@ pub unsafe fn request_sleep(delta: u64) -> u64 {
     return SYSCALL_CONTROL_SCHEDULE;
 }
 
-pub unsafe fn request_ipc_wait(resume_result: u64) -> u64 {
+pub unsafe fn request_ipc_wait(
+    request_handle: u64,
+    resume_result: u64
+) -> u64 {
     if ACTIVE == 0
+        || request_handle == 0
         || resume_result == 0
         || current_thread_handle() == 0
         || PENDING_ACTION != 0 {
         return ERR_NOT_IMPLEMENTED;
     }
     PENDING_ACTION = 3;
+    PENDING_REQUEST = request_handle;
     PENDING_RESULT = resume_result;
     return SYSCALL_CONTROL_SCHEDULE;
 }
@@ -134,6 +215,7 @@ pub unsafe fn request_ipc_wait(resume_result: u64) -> u64 {
 unsafe fn clear_pending_action() -> void {
     PENDING_ACTION = 0;
     PENDING_SLEEP_DELTA = 0;
+    PENDING_REQUEST = 0;
     PENDING_RESULT = 0;
 }
 
@@ -187,8 +269,12 @@ pub unsafe fn kernel_scheduler_syscall(frame: *mut u64) -> usize {
         transitioned = block_current(LAST_TICK + PENDING_SLEEP_DELTA);
     }
     if PENDING_ACTION == 3 {
-        if set_saved_result(current_thread_handle(), PENDING_RESULT) != 0 {
+        if set_saved_result(source_thread, PENDING_RESULT) != 0 {
             transitioned = block_current(0xffff_ffff_ffff_ffff);
+            if transitioned != 0
+                && commit_ipc_wait(PENDING_REQUEST, source_thread) == 0 {
+                transitioned = 0;
+            }
         }
     }
     clear_pending_action();
@@ -226,6 +312,7 @@ pub unsafe fn arm(
 ) -> u64 {
     if ACTIVE != 0
         || COMPLETE != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_NONE
         || current_thread_handle() != 0
         || current_process_handle() != 0
         || physical_one == 0
@@ -253,6 +340,460 @@ pub unsafe fn arm(
     PROCESS_TWO = process_two;
     PHYSICAL_ONE = physical_one;
     PHYSICAL_TWO = physical_two;
+    SCHEDULER_KIND = SCHEDULER_KIND_M2;
+    ACTIVE = 1;
+    return 1;
+}
+
+// Arm the bounded Milestone 3 proof with one exact TCB per process. The four
+// physical words are management-readable progress cells; no userspace pointer
+// is retained here. Process three is the designated faulting service.
+pub unsafe fn arm_ipc(
+    thread_zero: u64,
+    thread_one: u64,
+    thread_two: u64,
+    thread_three: u64,
+    process_zero: u64,
+    process_one: u64,
+    process_two: u64,
+    process_three: u64,
+    physical_zero: usize,
+    physical_one: usize,
+    physical_two: usize,
+    physical_three: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_NONE
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 4
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_zero == 0
+        || thread_one == 0
+        || thread_two == 0
+        || thread_three == 0
+        || process_zero == 0
+        || process_one == 0
+        || process_two == 0
+        || process_three == 0
+        || process_zero == process_one
+        || process_zero == process_two
+        || process_zero == process_three
+        || process_one == process_two
+        || process_one == process_three
+        || process_two == process_three
+        || physical_zero == 0
+        || physical_one == 0
+        || physical_two == 0
+        || physical_three == 0
+        || physical_zero == physical_one
+        || physical_zero == physical_two
+        || physical_zero == physical_three
+        || physical_one == physical_two
+        || physical_one == physical_three
+        || physical_two == physical_three
+        || process_for(thread_zero) != process_zero
+        || process_for(thread_one) != process_one
+        || process_for(thread_two) != process_two
+        || process_for(thread_three) != process_three
+        || !identity_matches_process(thread_zero)
+        || !identity_matches_process(thread_one)
+        || !identity_matches_process(thread_two)
+        || !identity_matches_process(thread_three) {
+        return 0;
+    }
+
+    THREADS[0] = thread_zero;
+    THREADS[1] = thread_one;
+    THREADS[2] = thread_two;
+    THREADS[3] = thread_three;
+    IPC_PROCESSES[0] = process_zero;
+    IPC_PROCESSES[1] = process_one;
+    IPC_PROCESSES[2] = process_two;
+    IPC_PROCESSES[3] = process_three;
+    IPC_PHYSICAL[0] = physical_zero;
+    IPC_PHYSICAL[1] = physical_one;
+    IPC_PHYSICAL[2] = physical_two;
+    IPC_PHYSICAL[3] = physical_three;
+    SCHEDULER_KIND = SCHEDULER_KIND_IPC;
+    ACTIVE = 1;
+    return 1;
+}
+
+fn distinct_four_u64(zero: u64, one: u64, two: u64, three: u64) -> bool {
+    return zero != one
+        && zero != two
+        && zero != three
+        && one != two
+        && one != three
+        && two != three;
+}
+
+fn distinct_four_usize(
+    zero: usize,
+    one: usize,
+    two: usize,
+    three: usize
+) -> bool {
+    return zero != one
+        && zero != two
+        && zero != three
+        && one != two
+        && one != three
+        && two != three;
+}
+
+// Arm the bounded native-loader proof. Both TCBs execute independently linked
+// ELF images at the same preferred virtual address in distinct CR3 roots.
+// Their private isolation pages are the only management-visible completion
+// cells; no user pointer is retained across the scheduler boundary.
+pub unsafe fn arm_loaded(
+    thread_zero: u64,
+    thread_one: u64,
+    process_zero: u64,
+    process_one: u64,
+    physical_zero: usize,
+    physical_one: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_NONE
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 2
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_zero == 0
+        || thread_one == 0
+        || thread_zero == thread_one
+        || process_zero == 0
+        || process_one == 0
+        || process_zero == process_one
+        || physical_zero == 0
+        || physical_one == 0
+        || physical_zero == physical_one
+        || process_for(thread_zero) != process_zero
+        || process_for(thread_one) != process_one
+        || !identity_matches_process(thread_zero)
+        || !identity_matches_process(thread_one) {
+        return 0;
+    }
+    THREADS[0] = thread_zero;
+    THREADS[1] = thread_one;
+    THREADS[2] = 0;
+    THREADS[3] = 0;
+    LOADED_PROCESSES[0] = process_zero;
+    LOADED_PROCESSES[1] = process_one;
+    LOADED_PHYSICAL[0] = physical_zero;
+    LOADED_PHYSICAL[1] = physical_one;
+    LOADED_PROCESSES[2] = 0;
+    LOADED_PROCESSES[3] = 0;
+    LOADED_PHYSICAL[2] = 0;
+    LOADED_PHYSICAL[3] = 0;
+    LOADED_COUNT = 2;
+    SCHEDULER_KIND = SCHEDULER_KIND_LOADED;
+    ACTIVE = 1;
+    return 1;
+}
+
+// Arm the Milestone 5 native live-system proof as four exact
+// (TCB, PCB, isolation-frame) triples. Every identity is generation-tagged,
+// every completion frame is private, and all four TCBs must already be the
+// complete runnable set before the scheduler publishes this mode.
+pub unsafe fn arm_live(
+    thread_zero: u64,
+    process_zero: u64,
+    physical_zero: usize,
+    thread_one: u64,
+    process_one: u64,
+    physical_one: usize,
+    thread_two: u64,
+    process_two: u64,
+    physical_two: usize,
+    thread_three: u64,
+    process_three: u64,
+    physical_three: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_NONE
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 4
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_zero == 0
+        || thread_one == 0
+        || thread_two == 0
+        || thread_three == 0
+        || !distinct_four_u64(
+            thread_zero,
+            thread_one,
+            thread_two,
+            thread_three
+        )
+        || process_zero == 0
+        || process_one == 0
+        || process_two == 0
+        || process_three == 0
+        || !distinct_four_u64(
+            process_zero,
+            process_one,
+            process_two,
+            process_three
+        )
+        || physical_zero == 0
+        || physical_one == 0
+        || physical_two == 0
+        || physical_three == 0
+        || !distinct_four_usize(
+            physical_zero,
+            physical_one,
+            physical_two,
+            physical_three
+        )
+        || process_for(thread_zero) != process_zero
+        || process_for(thread_one) != process_one
+        || process_for(thread_two) != process_two
+        || process_for(thread_three) != process_three
+        || !identity_matches_process(thread_zero)
+        || !identity_matches_process(thread_one)
+        || !identity_matches_process(thread_two)
+        || !identity_matches_process(thread_three) {
+        return 0;
+    }
+
+    THREADS[0] = thread_zero;
+    THREADS[1] = thread_one;
+    THREADS[2] = thread_two;
+    THREADS[3] = thread_three;
+    LOADED_PROCESSES[0] = process_zero;
+    LOADED_PROCESSES[1] = process_one;
+    LOADED_PROCESSES[2] = process_two;
+    LOADED_PROCESSES[3] = process_three;
+    LOADED_PHYSICAL[0] = physical_zero;
+    LOADED_PHYSICAL[1] = physical_one;
+    LOADED_PHYSICAL[2] = physical_two;
+    LOADED_PHYSICAL[3] = physical_three;
+    LOADED_COUNT = 4;
+    SCHEDULER_KIND = SCHEDULER_KIND_LIVE;
+    ACTIVE = 1;
+    return 1;
+}
+
+// Management reaches this entrypoint only after the first live phase has
+// contained pkgd's deliberate #UD and retired the three unaffected runnable
+// siblings at a timer boundary. COMPLETE is consumed here as an explicit
+// phase token; a fresh, generation-tagged pkgd TCB is the sole runnable work.
+pub unsafe fn arm_live_restart(
+    thread_handle: u64,
+    process_handle: u64,
+    physical: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE == 0
+        || FAILED != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_LIVE
+        || COMPLETION_KIND != SCHEDULER_COMPLETION_LIVE as u8
+        || LIVE_FAULT_CONTAINMENTS != 1
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 1
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_handle == 0
+        || process_handle == 0
+        || physical == 0
+        || process_for(thread_handle) != process_handle
+        || !identity_matches_process(thread_handle) {
+        return 0;
+    }
+    THREADS[0] = thread_handle;
+    THREADS[1] = 0;
+    THREADS[2] = 0;
+    THREADS[3] = 0;
+    LOADED_PROCESSES[0] = process_handle;
+    LOADED_PROCESSES[1] = 0;
+    LOADED_PROCESSES[2] = 0;
+    LOADED_PROCESSES[3] = 0;
+    LOADED_PHYSICAL[0] = physical;
+    LOADED_PHYSICAL[1] = 0;
+    LOADED_PHYSICAL[2] = 0;
+    LOADED_PHYSICAL[3] = 0;
+    LOADED_COUNT = 1;
+    LIVE_RESTART_ARM_TICK = LAST_TICK;
+    COMPLETE = 0;
+    COMPLETION_KIND = SCHEDULER_COMPLETION_NONE as u8;
+    SCHEDULER_KIND = SCHEDULER_KIND_LIVE_RESTART;
+    ACTIVE = 1;
+    return 1;
+}
+
+// Arm the first M6A phase. All four principals are independently loaded ELF
+// generations; slot one is the only personality daemon generation permitted
+// to fault. The remaining client, supervisor, and observer TCBs must survive
+// the transition back to the management stack.
+pub unsafe fn arm_personality(
+    thread_zero: u64,
+    process_zero: u64,
+    physical_zero: usize,
+    thread_one: u64,
+    process_one: u64,
+    physical_one: usize,
+    thread_two: u64,
+    process_two: u64,
+    physical_two: usize,
+    thread_three: u64,
+    process_three: u64,
+    physical_three: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_NONE
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 4
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_zero == 0
+        || thread_one == 0
+        || thread_two == 0
+        || thread_three == 0
+        || !distinct_four_u64(
+            thread_zero,
+            thread_one,
+            thread_two,
+            thread_three
+        )
+        || process_zero == 0
+        || process_one == 0
+        || process_two == 0
+        || process_three == 0
+        || !distinct_four_u64(
+            process_zero,
+            process_one,
+            process_two,
+            process_three
+        )
+        || physical_zero == 0
+        || physical_one == 0
+        || physical_two == 0
+        || physical_three == 0
+        || !distinct_four_usize(
+            physical_zero,
+            physical_one,
+            physical_two,
+            physical_three
+        )
+        || process_for(thread_zero) != process_zero
+        || process_for(thread_one) != process_one
+        || process_for(thread_two) != process_two
+        || process_for(thread_three) != process_three
+        || !identity_matches_process(thread_zero)
+        || !identity_matches_process(thread_one)
+        || !identity_matches_process(thread_two)
+        || !identity_matches_process(thread_three) {
+        return 0;
+    }
+    THREADS[0] = thread_zero;
+    THREADS[1] = thread_one;
+    THREADS[2] = thread_two;
+    THREADS[3] = thread_three;
+    LOADED_PROCESSES[0] = process_zero;
+    LOADED_PROCESSES[1] = process_one;
+    LOADED_PROCESSES[2] = process_two;
+    LOADED_PROCESSES[3] = process_three;
+    LOADED_PHYSICAL[0] = physical_zero;
+    LOADED_PHYSICAL[1] = physical_one;
+    LOADED_PHYSICAL[2] = physical_two;
+    LOADED_PHYSICAL[3] = physical_three;
+    LOADED_COUNT = 4;
+    PERSONALITY_FAULT_CONTAINMENTS = 0;
+    SCHEDULER_KIND = SCHEDULER_KIND_PERSONALITY;
+    ACTIVE = 1;
+    return 1;
+}
+
+// Management calls this only after the unprivileged supervisor requested an
+// exact g1->g2 restart and replaced slot one's process/TCB generations. The
+// other three identities must be byte-for-byte the preserved survivors.
+pub unsafe fn arm_personality_restart(
+    thread_zero: u64,
+    process_zero: u64,
+    physical_zero: usize,
+    thread_one: u64,
+    process_one: u64,
+    physical_one: usize,
+    thread_two: u64,
+    process_two: u64,
+    physical_two: usize,
+    thread_three: u64,
+    process_three: u64,
+    physical_three: usize
+) -> u64 {
+    if ACTIVE != 0
+        || COMPLETE == 0
+        || FAILED != 0
+        || SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY
+        || COMPLETION_KIND
+            != SCHEDULER_COMPLETION_PERSONALITY_CRASH as u8
+        || PERSONALITY_FAULT_CONTAINMENTS != 1
+        || current_thread_handle() != 0
+        || current_process_handle() != 0
+        || runnable_count() != 4
+        || blocked_count() != 0
+        || !queue_invariants_hold()
+        || thread_zero != THREADS[0]
+        || process_zero != LOADED_PROCESSES[0]
+        || physical_zero != LOADED_PHYSICAL[0]
+        || thread_two != THREADS[2]
+        || process_two != LOADED_PROCESSES[2]
+        || physical_two != LOADED_PHYSICAL[2]
+        || thread_three != THREADS[3]
+        || process_three != LOADED_PROCESSES[3]
+        || physical_three != LOADED_PHYSICAL[3]
+        || thread_one == 0
+        || process_one == 0
+        || physical_one == 0
+        || thread_one == THREADS[1]
+        || process_one == LOADED_PROCESSES[1]
+        || !distinct_four_u64(
+            thread_zero,
+            thread_one,
+            thread_two,
+            thread_three
+        )
+        || !distinct_four_u64(
+            process_zero,
+            process_one,
+            process_two,
+            process_three
+        )
+        || !distinct_four_usize(
+            physical_zero,
+            physical_one,
+            physical_two,
+            physical_three
+        )
+        || process_for(thread_zero) != process_zero
+        || process_for(thread_one) != process_one
+        || process_for(thread_two) != process_two
+        || process_for(thread_three) != process_three
+        || !identity_matches_process(thread_zero)
+        || !identity_matches_process(thread_one)
+        || !identity_matches_process(thread_two)
+        || !identity_matches_process(thread_three) {
+        return 0;
+    }
+    THREADS[1] = thread_one;
+    LOADED_PROCESSES[1] = process_one;
+    LOADED_PHYSICAL[1] = physical_one;
+    PERSONALITY_RESTART_ARM_TICK = LAST_TICK;
+    COMPLETE = 0;
+    COMPLETION_KIND = SCHEDULER_COMPLETION_NONE as u8;
+    SCHEDULER_KIND = SCHEDULER_KIND_PERSONALITY_RESTART;
     ACTIVE = 1;
     return 1;
 }
@@ -343,9 +884,36 @@ unsafe fn install_thread_context(thread_handle: u64) -> usize {
 }
 
 unsafe fn dispatch_next() -> usize {
-    let next_thread: u64 = prepare_next();
+    let mut next_thread: u64 = prepare_next();
     if next_thread == 0 {
         return 0;
+    }
+
+    // The faulting personality owns a deliberately full endpoint. It may run
+    // only after the client has committed its sender wait, otherwise a timer
+    // race can close the endpoint before the public send genuinely blocks.
+    // Rotating only the exact mode-14 TCB preserves normal FIFO policy for M2.
+    let mut deferred: usize = 0;
+    while SCHEDULER_KIND == SCHEDULER_KIND_IPC
+        && next_thread == THREADS[3]
+        && sender_block_count() == 0 {
+        if defer_next(next_thread) == 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        deferred += 1;
+        if deferred >= 4 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        next_thread = prepare_next();
+        if next_thread == 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
     }
     let frame: usize = install_thread_context(next_thread);
     if frame == 0 {
@@ -459,6 +1027,295 @@ pub unsafe fn forced_identity_stress(
     return completed;
 }
 
+unsafe fn ipc_completion_ready(now: u64) -> bool {
+    return SCHEDULER_KIND == SCHEDULER_KIND_IPC
+        && IPC_FAULT_CONTAINMENTS == 1
+        && now >= 8
+        && volatile_load(IPC_PHYSICAL[0] as *const u64) == 5
+        && volatile_load(IPC_PHYSICAL[1] as *const u64) == 5
+        && volatile_load(IPC_PHYSICAL[2] as *const u64) > 0
+        && volatile_load(IPC_PHYSICAL[3] as *const u64) == 1;
+}
+
+// The completion boundary runs with interrupts masked. First revoke IPC state
+// while every exact process identity is still structurally live, then retire
+// its sole TCB. Descheduling the one RUNNING PCB makes all three survivors
+// READY, after which stop_process leaves each directly REAPABLE for the
+// management continuation. Process three was already faulted and had its TCB
+// retired by contain_current_process_fault().
+unsafe fn finish_ipc_processes(running_process: u64) -> bool {
+    if running_process == 0
+        || current_process_handle() != running_process
+        || IPC_FAULT_CONTAINMENTS != 1 {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < 3 {
+        if IPC_PROCESSES[index] == 0
+            || ipc_process_died(IPC_PROCESSES[index]) == 0 {
+            return false;
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < 3 {
+        if terminate_process(IPC_PROCESSES[index]) != 1 {
+            return false;
+        }
+        index += 1;
+    }
+    if scheduler_deschedule_current() != running_process {
+        return false;
+    }
+    index = 0;
+    while index < 3 {
+        if stop_process(IPC_PROCESSES[index], 0x30 + index as u64) == 0 {
+            return false;
+        }
+        index += 1;
+    }
+    return queue_invariants_hold();
+}
+
+// Return to the management stack without terminating the three M6A
+// survivors. The running survivor is first returned to the runnable FIFO;
+// blocked dependents must already have received their single terminal wake.
+unsafe fn quiesce_personality_survivors(running_process: u64) -> bool {
+    if running_process == 0
+        || current_process_handle() != running_process
+        || SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY
+        || PERSONALITY_FAULT_CONTAINMENTS != 1
+        || running_process == LOADED_PROCESSES[1]
+        || blocked_count() != 0
+        || preempt_current() == 0
+        || scheduler_deschedule_current() != running_process {
+        return false;
+    }
+    return runnable_count() == 3 && queue_invariants_hold();
+}
+
+unsafe fn expected_loaded_completion(index: usize) -> u64 {
+    if SCHEDULER_KIND == SCHEDULER_KIND_LOADED {
+        if index == 0 {
+            return LOADED_ALPHA_COMPLETE;
+        }
+        if index == 1 {
+            return LOADED_BETA_COMPLETE;
+        }
+        return 0;
+    }
+    if SCHEDULER_KIND == SCHEDULER_KIND_LIVE {
+        if index == 0 {
+            return LIVE_ZERO_COMPLETE;
+        }
+        if index == 1 {
+            return LIVE_ONE_COMPLETE;
+        }
+        if index == 2 {
+            return LIVE_TWO_COMPLETE;
+        }
+        if index == 3 {
+            return LIVE_THREE_COMPLETE;
+        }
+    }
+    if SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART && index == 0 {
+        return LIVE_PKGD_RESTART_COMPLETE;
+    }
+    return 0;
+}
+
+unsafe fn loaded_completion_ready(now: u64) -> bool {
+    let mut expected_count: usize = 0;
+    if SCHEDULER_KIND == SCHEDULER_KIND_LOADED {
+        expected_count = 2;
+    } else if SCHEDULER_KIND == SCHEDULER_KIND_LIVE {
+        expected_count = 4;
+    } else {
+        if SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART {
+            expected_count = 1;
+        } else {
+            return false;
+        }
+    }
+    if now < 4
+        || LOADED_COUNT != expected_count
+        || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+            && LIVE_FAULT_CONTAINMENTS != 1)
+        || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART
+            && (LIVE_FAULT_CONTAINMENTS != 1
+                || now <= LIVE_RESTART_ARM_TICK + 1)) {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < LOADED_COUNT {
+        let expected: u64 = expected_loaded_completion(index);
+        if THREADS[index] == 0
+            || LOADED_PROCESSES[index] == 0
+            || LOADED_PHYSICAL[index] == 0
+            || expected == 0
+            || volatile_load(LOADED_PHYSICAL[index] as *const u64) != expected
+            || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+                && index == 3
+                && volatile_load(
+                    (LOADED_PHYSICAL[index] + 8) as *const u64
+                ) != 1)
+            || ((SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+                    || SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART)
+                && run_ticks(THREADS[index]) == 0) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+// Loaded personalities have no kernel-linked continuation and deliberately
+// spin after publishing completion. Retire the exact counted TCB set at a
+// timer boundary, restore management identity, and leave every process
+// REAPABLE so the namespace transaction can unpublish services, unmount the
+// image, and release address-space frames in dependency order.
+unsafe fn finish_loaded_processes(running_process: u64) -> bool {
+    if running_process == 0
+        || current_process_handle() != running_process
+        || (SCHEDULER_KIND != SCHEDULER_KIND_LOADED
+            && SCHEDULER_KIND != SCHEDULER_KIND_LIVE
+            && SCHEDULER_KIND != SCHEDULER_KIND_LIVE_RESTART
+            && SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY_RESTART)
+        || ((SCHEDULER_KIND == SCHEDULER_KIND_LOADED && LOADED_COUNT != 2)
+            || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE && LOADED_COUNT != 4)
+            || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART
+                && LOADED_COUNT != 1)
+            || (SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART
+                && LOADED_COUNT != 4)) {
+        return false;
+    }
+    let mut running_is_loaded: bool = false;
+    let mut index: usize = 0;
+    while index < LOADED_COUNT {
+        if LOADED_PROCESSES[index] == running_process {
+            running_is_loaded = true;
+        }
+        index += 1;
+    }
+    if !running_is_loaded {
+        return false;
+    }
+    index = 0;
+    while index < LOADED_COUNT {
+        if LOADED_PROCESSES[index] == 0
+            || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+                && index == 2
+                && process_state(LOADED_PROCESSES[index])
+                    != PROCESS_STATE_REAPABLE)
+            || (!(SCHEDULER_KIND == SCHEDULER_KIND_LIVE && index == 2)
+                && terminate_process(LOADED_PROCESSES[index]) != 1) {
+            return false;
+        }
+        index += 1;
+    }
+    if scheduler_deschedule_current() != running_process {
+        return false;
+    }
+    let mut exit_base: u64 = 0x40;
+    if SCHEDULER_KIND == SCHEDULER_KIND_LIVE {
+        exit_base = 0x50;
+    } else if SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART {
+        exit_base = 0x60;
+    } else {
+        if SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART {
+            exit_base = 0x70;
+        }
+    }
+    index = 0;
+    while index < LOADED_COUNT {
+        if (!(SCHEDULER_KIND == SCHEDULER_KIND_LIVE && index == 2)
+                && stop_process(
+                    LOADED_PROCESSES[index],
+                    exit_base + index as u64
+                ) == 0)
+            || process_state(LOADED_PROCESSES[index])
+                != PROCESS_STATE_REAPABLE {
+            return false;
+        }
+        index += 1;
+    }
+    return queue_invariants_hold();
+}
+
+// The designated mode-14 endpoint owner, initial mode-16 pkgd, and initial
+// mode-18 scalar test-personality generation may #UD at their process
+// boundaries. Any other process, vector, or replacement fault fails closed.
+pub unsafe fn contain_current_process_fault(
+    frame: *mut u64,
+    vector: u64,
+    error: u64,
+    rip: usize,
+    address: usize
+) -> usize {
+    let thread_handle: u64 = current_thread_handle();
+    let process_handle: u64 = current_process_handle();
+    if ACTIVE == 0
+        || (SCHEDULER_KIND != SCHEDULER_KIND_IPC
+            && SCHEDULER_KIND != SCHEDULER_KIND_LIVE
+            && SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY)
+        || frame as usize == 0
+        || vector != 6
+        || error != 0
+        || thread_handle == 0
+        || process_handle == 0
+        || process_for(thread_handle) != process_handle
+        || !identity_matches_process(thread_handle)
+        || !queue_invariants_hold()
+        || (SCHEDULER_KIND == SCHEDULER_KIND_IPC
+            && (IPC_FAULT_CONTAINMENTS != 0
+                || process_handle != IPC_PROCESSES[3]
+                || ipc_process_died(process_handle) == 0))
+        || (SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+            && (LIVE_FAULT_CONTAINMENTS != 0
+                || process_handle != LOADED_PROCESSES[2]
+                || thread_handle != THREADS[2]
+                || LOADED_PHYSICAL[2] == 0
+                || volatile_load(LOADED_PHYSICAL[2] as *const u64)
+                    != LIVE_TWO_COMPLETE))
+        || (SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+            && (PERSONALITY_FAULT_CONTAINMENTS != 0
+                || process_handle != LOADED_PROCESSES[1]
+                || thread_handle != THREADS[1]
+                || kernel_m6_service_fault(process_handle) == 0))
+        || fault_current(vector, error, rip, address) == 0
+        || terminate_process(process_handle) != 1 {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+    if SCHEDULER_KIND == SCHEDULER_KIND_IPC {
+        IPC_FAULT_CONTAINMENTS = 1;
+    } else {
+        if mark_reapable(process_handle) == 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        if SCHEDULER_KIND == SCHEDULER_KIND_LIVE {
+            LIVE_FAULT_CONTAINMENTS = 1;
+        } else {
+            PERSONALITY_FAULT_CONTAINMENTS = 1;
+        }
+    }
+    if !queue_invariants_hold() {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+    let next_frame: usize = dispatch_next();
+    if next_frame == 0 {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
+    }
+    return next_frame;
+}
+
 // Called from the assembly timer gate with kernel GS active and interrupts
 // masked. A nonzero return is an exact normalized frame for IRETQ. Zero asks
 // assembly to abandon the current frame and enter the management continuation.
@@ -466,6 +1323,13 @@ pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
     LAST_TICK = now;
     if ACTIVE == 0 {
         return frame as usize;
+    }
+    if (SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+            || SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART)
+        && kernel_m6_expire_requests(now) == 0 {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
     }
     let woke: u64 = wake_due(now);
     if woke == 0xffff_ffff_ffff_ffff {
@@ -496,52 +1360,155 @@ pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
             );
         }
         let quantum_expired: u64 = account_current_tick(false);
-        if quantum_expired == 0 {
-            return frame_pointer(current_thread);
+        if SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+            && LIVE_FAULT_CONTAINMENTS == 0
+            && LOADED_PHYSICAL[2] != 0
+            && LOADED_PHYSICAL[3] != 0
+            && volatile_load((LOADED_PHYSICAL[3] + 8) as *const u64) == 1
+            && volatile_load((LOADED_PHYSICAL[2] + 8) as *const u64) == 0 {
+            // The REPL writes its second private word only after the activate
+            // syscall commits and its PASS report returns. Releasing pkgd here
+            // makes the deliberate #UD observably later than both events.
+            volatile_store(
+                (LOADED_PHYSICAL[2] + 8) as *mut u64,
+                0x4d35_0000_0000_ac71
+            );
         }
-
-        if PROCESS_ONE_TERMINATED != 0
-            && running_process == PROCESS_TWO
-            && now >= TERMINATION_TICK + 8
-            && progress_at(PHYSICAL_TWO) > PROCESS_TWO_SNAPSHOT {
-            if exit_current(0x22) == 0
-                || terminate_process(PROCESS_TWO) != 2 {
-                FAILED = 1;
-            } else {
-                COMPLETE = 1;
-            }
-            ACTIVE = 0;
-            return 0;
-        }
-
-        // Once every CPU-bound and initially blocked thread has executed,
-        // terminate process 1 from its timer-preemption boundary. Its sibling
-        // remains the only source of runnable threads.
-        if PROCESS_ONE_TERMINATED == 0
-            && running_process == PROCESS_ONE
-            && now >= 12
-            && HOSTILE_FRAME_CONTAINMENTS == 1
-            && all_threads_ran()
-            && volatile_load(PHYSICAL_ONE as *const u64) != 0
-            && volatile_load((PHYSICAL_ONE + 8) as *const u64) != 0
-            && volatile_load(PHYSICAL_TWO as *const u64) != 0
-            && volatile_load((PHYSICAL_TWO + 8) as *const u64) != 0 {
-            if !wake_invariants_hold()
-                || exit_current(0x21) == 0
-                || terminate_process(PROCESS_ONE) != 1 {
-                FAILED = 1;
+        if SCHEDULER_KIND == SCHEDULER_KIND_IPC {
+            if ipc_completion_ready(now) {
+                if !finish_ipc_processes(running_process) {
+                    FAILED = 1;
+                } else {
+                    COMPLETE = 1;
+                    COMPLETION_KIND = SCHEDULER_COMPLETION_IPC as u8;
+                }
                 ACTIVE = 0;
                 return 0;
             }
-            PROCESS_ONE_TERMINATED = 1;
-            TERMINATION_TICK = now;
-            PROCESS_TWO_SNAPSHOT = progress_at(PHYSICAL_TWO);
-        } else {
+            if quantum_expired == 0 {
+                return frame_pointer(current_thread);
+            }
             if preempt_current() == 0
                 || scheduler_deschedule_current() != running_process {
                 FAILED = 1;
                 ACTIVE = 0;
                 return 0;
+            }
+        } else {
+            if SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+                && kernel_m6_phase_one_ready() == 1 {
+                if !quiesce_personality_survivors(running_process) {
+                    FAILED = 1;
+                } else {
+                    COMPLETE = 1;
+                    COMPLETION_KIND =
+                        SCHEDULER_COMPLETION_PERSONALITY_CRASH as u8;
+                }
+                ACTIVE = 0;
+                return 0;
+            }
+            if SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART
+                && now > PERSONALITY_RESTART_ARM_TICK + 1
+                && kernel_m6_final_ready() == 1 {
+                if !finish_loaded_processes(running_process) {
+                    FAILED = 1;
+                } else {
+                    COMPLETE = 1;
+                    COMPLETION_KIND =
+                        SCHEDULER_COMPLETION_PERSONALITY as u8;
+                }
+                ACTIVE = 0;
+                return 0;
+            }
+            if SCHEDULER_KIND == SCHEDULER_KIND_LOADED
+                || SCHEDULER_KIND == SCHEDULER_KIND_LIVE
+                || SCHEDULER_KIND == SCHEDULER_KIND_LIVE_RESTART
+                || SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+                || SCHEDULER_KIND
+                    == SCHEDULER_KIND_PERSONALITY_RESTART {
+                if loaded_completion_ready(now) {
+                    if !finish_loaded_processes(running_process) {
+                        FAILED = 1;
+                    } else {
+                        COMPLETE = 1;
+                        if SCHEDULER_KIND == SCHEDULER_KIND_LOADED {
+                            COMPLETION_KIND =
+                                SCHEDULER_COMPLETION_LOADED as u8;
+                        } else if SCHEDULER_KIND == SCHEDULER_KIND_LIVE {
+                            COMPLETION_KIND =
+                                SCHEDULER_COMPLETION_LIVE as u8;
+                        } else {
+                            COMPLETION_KIND =
+                                SCHEDULER_COMPLETION_LIVE_RESTART as u8;
+                        }
+                    }
+                    ACTIVE = 0;
+                    return 0;
+                }
+                if quantum_expired == 0 {
+                    return frame_pointer(current_thread);
+                }
+                if preempt_current() == 0
+                    || scheduler_deschedule_current() != running_process {
+                    FAILED = 1;
+                    ACTIVE = 0;
+                    return 0;
+                }
+            } else {
+                if SCHEDULER_KIND != SCHEDULER_KIND_M2 {
+                    FAILED = 1;
+                    ACTIVE = 0;
+                    return 0;
+                }
+                if quantum_expired == 0 {
+                    return frame_pointer(current_thread);
+                }
+
+                if PROCESS_ONE_TERMINATED != 0
+                && running_process == PROCESS_TWO
+                && now >= TERMINATION_TICK + 8
+                && progress_at(PHYSICAL_TWO) > PROCESS_TWO_SNAPSHOT {
+                    if exit_current(0x22) == 0
+                        || terminate_process(PROCESS_TWO) != 2 {
+                        FAILED = 1;
+                    } else {
+                        COMPLETE = 1;
+                        COMPLETION_KIND = SCHEDULER_COMPLETION_M2 as u8;
+                    }
+                    ACTIVE = 0;
+                    return 0;
+                }
+
+                // Once every CPU-bound and initially blocked thread has
+                // executed, terminate process 1 from its timer-preemption
+                // boundary. Its sibling remains the only runnable source.
+                if PROCESS_ONE_TERMINATED == 0
+                && running_process == PROCESS_ONE
+                && now >= 12
+                && HOSTILE_FRAME_CONTAINMENTS == 1
+                && all_threads_ran()
+                && volatile_load(PHYSICAL_ONE as *const u64) != 0
+                && volatile_load((PHYSICAL_ONE + 8) as *const u64) != 0
+                && volatile_load(PHYSICAL_TWO as *const u64) != 0
+                && volatile_load((PHYSICAL_TWO + 8) as *const u64) != 0 {
+                    if !wake_invariants_hold()
+                        || exit_current(0x21) == 0
+                        || terminate_process(PROCESS_ONE) != 1 {
+                        FAILED = 1;
+                        ACTIVE = 0;
+                        return 0;
+                    }
+                    PROCESS_ONE_TERMINATED = 1;
+                    TERMINATION_TICK = now;
+                    PROCESS_TWO_SNAPSHOT = progress_at(PHYSICAL_TWO);
+                } else {
+                    if preempt_current() == 0
+                        || scheduler_deschedule_current() != running_process {
+                        FAILED = 1;
+                        ACTIVE = 0;
+                        return 0;
+                    }
+                }
             }
         }
     }
@@ -567,6 +1534,22 @@ pub unsafe fn complete() -> bool {
 
 pub unsafe fn failed() -> bool {
     return FAILED != 0;
+}
+
+pub unsafe fn completion_kind() -> u64 {
+    return COMPLETION_KIND as u64;
+}
+
+pub unsafe fn ipc_fault_containments() -> u64 {
+    return IPC_FAULT_CONTAINMENTS;
+}
+
+pub unsafe fn live_fault_containments() -> u64 {
+    return LIVE_FAULT_CONTAINMENTS;
+}
+
+pub unsafe fn personality_fault_containments() -> u64 {
+    return PERSONALITY_FAULT_CONTAINMENTS;
 }
 
 pub unsafe fn process_one_terminated() -> bool {

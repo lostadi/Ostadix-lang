@@ -522,6 +522,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "ignore",
+ "libc",
  "num-bigint",
  "num-traits",
  "petgraph",
