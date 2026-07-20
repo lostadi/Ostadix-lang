@@ -1,0 +1,696 @@
+module runtime::delegated_resource;
+
+use runtime::capability::abort_reserved_for_owner;
+use runtime::capability::close_during_drain;
+use runtime::capability::close_for_owner;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::publish_reserved_for_owner;
+use runtime::capability::reserve_first_free_for_owner;
+use runtime::capability::rights_for_owner;
+use runtime::capability::rights_for_valid_owner;
+use runtime::capability::validate_during_drain;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DELEGATED_RESOURCE;
+use runtime::capability::RIGHT_DELEGATED_RESOURCE_USE;
+use runtime::personality_memory_view::bind_resource as bind_memory_view_resource;
+use runtime::personality_memory_view::can_revoke_count as memory_views_can_revoke_count;
+use runtime::personality_memory_view::count_bound_to_resource;
+use runtime::personality_memory_view::invariants_hold as memory_view_invariants_hold;
+use runtime::personality_memory_view::is_initialized as memory_views_initialized;
+use runtime::personality_memory_view::live_count_bound_to_resource;
+use runtime::personality_memory_view::live_count_for_request as live_memory_views_for_request;
+use runtime::personality_memory_view::request_for as memory_view_request;
+use runtime::personality_memory_view::revoke_by_resource;
+use runtime::personality_memory_view::revoke_request as revoke_memory_request;
+use runtime::personality_memory_view::service_cspace_for as memory_view_service_cspace;
+
+// A delegated resource is a typed, generation-tagged lease. Its service-side
+// capability has USE only and is therefore nontransferable. Names and kinds
+// never imply ambient authority.
+pub const MAX_DELEGATED_RESOURCES: usize = 8;
+
+pub const DELEGATED_RESOURCE_MEMORY: u64 = 1;
+pub const DELEGATED_RESOURCE_FILESYSTEM: u64 = 2;
+pub const DELEGATED_RESOURCE_TIMER: u64 = 3;
+pub const DELEGATED_RESOURCE_NETWORK: u64 = 4;
+pub const DELEGATED_RESOURCE_DEVICE: u64 = 5;
+
+pub const DELEGATED_RESOURCE_STATE_LIVE: u64 = 1;
+pub const DELEGATED_RESOURCE_STATE_REVOKED: u64 = 2;
+
+const RESOURCE_EMPTY: u8 = 0;
+const RESOURCE_LIVE: u8 = 1;
+const RESOURCE_REVOKED: u8 = 2;
+const RESOURCE_RETIRED: u8 = 3;
+const RESOURCE_HANDLE_TAG: u64 = 0xb600_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 8] = [0; 8];
+static mut GENERATIONS: [u32; 8] = [0; 8];
+static mut KINDS: [u8; 8] = [0; 8];
+static mut REQUESTS: [u64; 8] = [0; 8];
+static mut SERVICE_CSPACES: [u64; 8] = [0; 8];
+static mut RESOURCE_CAPABILITIES: [u64; 8] = [0; 8];
+static mut CAP_CLOSE_SEQUENCES: [u64; 8] = [0; 8];
+static mut REVOCATION_SEQUENCES: [u64; 8] = [0; 8];
+
+static mut EVENT_SEQUENCE: u64 = 0;
+static mut CREATIONS: u64 = 0;
+static mut BINDINGS: u64 = 0;
+static mut REVOCATIONS: u64 = 0;
+static mut REQUEST_REVOCATIONS: u64 = 0;
+static mut REVOKED_VIEWS: u64 = 0;
+static mut DESTROYS: u64 = 0;
+static mut USES: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut STALE_DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn resource_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn resource_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn kind_valid(kind: u64) -> bool {
+    return kind == DELEGATED_RESOURCE_MEMORY
+        || kind == DELEGATED_RESOURCE_FILESYSTEM
+        || kind == DELEGATED_RESOURCE_TIMER
+        || kind == DELEGATED_RESOURCE_NETWORK
+        || kind == DELEGATED_RESOURCE_DEVICE;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | RESOURCE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_resource(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != RESOURCE_HANDLE_TAG {
+        return MAX_DELEGATED_RESOURCES;
+    }
+    let slot: usize = resource_index(handle);
+    if slot >= MAX_DELEGATED_RESOURCES
+        || (STATES[slot] != RESOURCE_LIVE
+            && STATES[slot] != RESOURCE_REVOKED)
+        || GENERATIONS[slot] != resource_generation(handle) {
+        return MAX_DELEGATED_RESOURCES;
+    }
+    return slot;
+}
+
+unsafe fn checked_live_resource(handle: u64) -> usize {
+    let slot: usize = checked_resource(handle);
+    if slot >= MAX_DELEGATED_RESOURCES || STATES[slot] != RESOURCE_LIVE {
+        return MAX_DELEGATED_RESOURCES;
+    }
+    return slot;
+}
+
+unsafe fn count_denial() -> void {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIALS += 1;
+    }
+}
+
+unsafe fn deny() -> u64 {
+    count_denial();
+    return 0;
+}
+
+unsafe fn deny_stale() -> u64 {
+    count_denial();
+    if STALE_DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        STALE_DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn bump_event() -> u64 {
+    if EVENT_SEQUENCE == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    EVENT_SEQUENCE += 1;
+    return EVENT_SEQUENCE;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    KINDS[slot] = 0;
+    REQUESTS[slot] = 0;
+    SERVICE_CSPACES[slot] = 0;
+    RESOURCE_CAPABILITIES[slot] = 0;
+    CAP_CLOSE_SEQUENCES[slot] = 0;
+    REVOCATION_SEQUENCES[slot] = 0;
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+unsafe fn close_resource_capability(slot: usize) -> u64 {
+    if slot >= MAX_DELEGATED_RESOURCES
+        || STATES[slot] != RESOURCE_LIVE
+        || SERVICE_CSPACES[slot] == 0
+        || RESOURCE_CAPABILITIES[slot] == 0 {
+        return 0;
+    }
+    let owner: u64 = SERVICE_CSPACES[slot];
+    let capability: u64 = RESOURCE_CAPABILITIES[slot];
+    let mut closed: u64 = 0;
+    if cspace_is_live(owner) {
+        closed = close_for_owner(owner, capability);
+    } else if cspace_is_valid_owner(owner) {
+        closed = close_during_drain(owner, capability);
+    }
+    if closed != 1 {
+        return 0;
+    }
+    RESOURCE_CAPABILITIES[slot] = 0;
+    CAP_CLOSE_SEQUENCES[slot] = bump_event();
+    if CAP_CLOSE_SEQUENCES[slot] == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+unsafe fn validate_resource_for_teardown(
+    service_cspace: u64,
+    capability: u64
+) -> u64 {
+    if cspace_is_live(service_cspace) {
+        return validate_for_owner(
+            service_cspace,
+            capability,
+            OBJECT_DELEGATED_RESOURCE,
+            RIGHT_DELEGATED_RESOURCE_USE
+        );
+    }
+    if cspace_is_valid_owner(service_cspace) {
+        return validate_during_drain(
+            service_cspace,
+            capability,
+            OBJECT_DELEGATED_RESOURCE,
+            RIGHT_DELEGATED_RESOURCE_USE
+        );
+    }
+    return 0;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || !memory_views_initialized() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_DELEGATED_RESOURCES {
+        STATES[slot] = RESOURCE_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    EVENT_SEQUENCE = 0;
+    CREATIONS = 0;
+    BINDINGS = 0;
+    REVOCATIONS = 0;
+    REQUEST_REVOCATIONS = 0;
+    REVOKED_VIEWS = 0;
+    DESTROYS = 0;
+    USES = 0;
+    DENIALS = 0;
+    STALE_DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn create(
+    request: u64,
+    kind: u64,
+    service_cspace: u64,
+    capability_out: *mut u64
+) -> u64 {
+    if capability_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(capability_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    if request == 0
+        || !kind_valid(kind)
+        || !cspace_is_live(service_cspace)
+        || CREATIONS == MAX_COUNTER {
+        return deny();
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_DELEGATED_RESOURCES && STATES[slot] != RESOURCE_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_DELEGATED_RESOURCES {
+        return deny();
+    }
+    let reservation: u64 = reserve_first_free_for_owner(service_cspace);
+    if reservation == 0 {
+        return deny();
+    }
+    let resource: u64 = make_handle(slot);
+    KINDS[slot] = kind as u8;
+    REQUESTS[slot] = request;
+    SERVICE_CSPACES[slot] = service_cspace;
+    STATES[slot] = RESOURCE_LIVE;
+    let capability: u64 = publish_reserved_for_owner(
+        service_cspace,
+        reservation,
+        resource,
+        OBJECT_DELEGATED_RESOURCE,
+        RIGHT_DELEGATED_RESOURCE_USE
+    );
+    if capability == 0 {
+        STATES[slot] = RESOURCE_EMPTY;
+        clear_slot(slot);
+        if abort_reserved_for_owner(service_cspace, reservation) != 1 {
+            POISONED = 1;
+        }
+        return deny();
+    }
+    RESOURCE_CAPABILITIES[slot] = capability;
+    CREATIONS += 1;
+    volatile_store(capability_out, capability);
+    return finish(resource);
+}
+
+// Every operation revalidates the exact service CSpace, capability generation,
+// object kind, and USE right. There is no kind/name fallback.
+pub unsafe fn use_resource(
+    service_cspace: u64,
+    capability: u64,
+    expected_kind: u64
+) -> u64 {
+    if !preflight() || !kind_valid(expected_kind) {
+        return 0;
+    }
+    let resource: u64 = validate_for_owner(
+        service_cspace,
+        capability,
+        OBJECT_DELEGATED_RESOURCE,
+        RIGHT_DELEGATED_RESOURCE_USE
+    );
+    let slot: usize = checked_live_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES
+        || SERVICE_CSPACES[slot] != service_cspace
+        || RESOURCE_CAPABILITIES[slot] != capability
+        || KINDS[slot] as u64 != expected_kind
+        || rights_for_owner(service_cspace, capability)
+            != RIGHT_DELEGATED_RESOURCE_USE {
+        return deny_stale();
+    }
+    if USES == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    USES += 1;
+    return finish(resource);
+}
+
+// Binding is legal only when both nontransferable capabilities belong to the
+// same exact service CSpace. The view records the generation-tagged resource;
+// the resource remains the sole authority that can trigger revocation.
+pub unsafe fn bind_view(
+    service_cspace: u64,
+    resource_capability: u64,
+    view: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let resource: u64 = validate_for_owner(
+        service_cspace,
+        resource_capability,
+        OBJECT_DELEGATED_RESOURCE,
+        RIGHT_DELEGATED_RESOURCE_USE
+    );
+    let slot: usize = checked_live_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES
+        || SERVICE_CSPACES[slot] != service_cspace
+        || RESOURCE_CAPABILITIES[slot] != resource_capability
+        || rights_for_owner(service_cspace, resource_capability)
+            != RIGHT_DELEGATED_RESOURCE_USE
+        || memory_view_service_cspace(view) != service_cspace
+        || memory_view_request(view) != REQUESTS[slot]
+        || BINDINGS == MAX_COUNTER {
+        return deny_stale();
+    }
+    if bind_memory_view_resource(view, resource) != 1 {
+        return deny();
+    }
+    BINDINGS += 1;
+    return finish(1);
+}
+
+// The caller has already selected and authorized this exact live slot. Close
+// its service capability first, publish the resource revocation second, and
+// only then terminalize bound live views. A zero revoked-view count is a valid
+// success, so the return value carries success and the pointer carries count.
+unsafe fn revoke_slot(
+    slot: usize,
+    revoked_views_out: *mut u64
+) -> u64 {
+    if slot >= MAX_DELEGATED_RESOURCES
+        || STATES[slot] != RESOURCE_LIVE
+        || revoked_views_out as usize == 0
+        || EVENT_SEQUENCE > MAX_COUNTER - 2
+        || REVOCATIONS == MAX_COUNTER {
+        return 0;
+    }
+    volatile_store(revoked_views_out, 0);
+    let resource: u64 = make_handle(slot);
+    let live_views: u64 = live_count_bound_to_resource(resource) as u64;
+    if REVOKED_VIEWS > MAX_COUNTER - live_views
+        || !memory_views_can_revoke_count(live_views) {
+        return 0;
+    }
+    if close_resource_capability(slot) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    STATES[slot] = RESOURCE_REVOKED;
+    REVOCATION_SEQUENCES[slot] = bump_event();
+    if REVOCATION_SEQUENCES[slot] == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    let revoked: u64 = revoke_by_resource(resource);
+    if !memory_view_invariants_hold()
+        || live_count_bound_to_resource(resource) != 0
+        || REVOKED_VIEWS > MAX_COUNTER - revoked {
+        POISONED = 1;
+        return 0;
+    }
+    REVOCATIONS += 1;
+    REVOKED_VIEWS += revoked;
+    volatile_store(revoked_views_out, revoked);
+    return 1;
+}
+
+// Exact-capability revocation is also the teardown path while a service CSpace
+// is draining. Normal use still validates only live CSpaces and is denied as
+// soon as drain begins.
+pub unsafe fn revoke(
+    service_cspace: u64,
+    capability: u64,
+    revoked_views_out: *mut u64
+) -> u64 {
+    if revoked_views_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(revoked_views_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    let resource: u64 = validate_resource_for_teardown(
+        service_cspace,
+        capability
+    );
+    let slot: usize = checked_live_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES
+        || SERVICE_CSPACES[slot] != service_cspace
+        || RESOURCE_CAPABILITIES[slot] != capability
+        || rights_for_valid_owner(service_cspace, capability)
+            != RIGHT_DELEGATED_RESOURCE_USE {
+        return deny_stale();
+    }
+    if revoke_slot(slot, revoked_views_out) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    return finish(1);
+}
+
+// Kernel request teardown does not need to retain every service capability.
+// It revokes every still-live resource carrying the exact request identity,
+// including each bound live view, while resources for other requests remain
+// untouched. Outputs are initialized before preflight and report both layers.
+pub unsafe fn revoke_request(
+    request: u64,
+    revoked_resources_out: *mut u64,
+    revoked_views_out: *mut u64
+) -> u64 {
+    if revoked_resources_out as usize == 0
+        || revoked_views_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(revoked_resources_out, 0);
+    volatile_store(revoked_views_out, 0);
+    if !preflight() || request == 0 {
+        return 0;
+    }
+    let mut matches: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_DELEGATED_RESOURCES {
+        if STATES[slot] == RESOURCE_LIVE && REQUESTS[slot] == request {
+            matches += 1;
+        }
+        slot += 1;
+    }
+    let request_views: u64 = live_memory_views_for_request(request) as u64;
+    if matches == 0 && request_views == 0 {
+        return deny_stale();
+    }
+    if REQUEST_REVOCATIONS == MAX_COUNTER
+        || REVOCATIONS > MAX_COUNTER - matches
+        // Delegated-resource sequencing is independent of the memory-view
+        // sequence and consumes exactly close+revoke per matched resource.
+        || EVENT_SEQUENCE > MAX_COUNTER - (matches * 2)
+        || REVOKED_VIEWS > MAX_COUNTER - request_views
+        || !memory_views_can_revoke_count(request_views) {
+        POISONED = 1;
+        return 0;
+    }
+    let mut revoked_resources: u64 = 0;
+    let mut revoked_views: u64 = 0;
+    slot = 0;
+    while slot < MAX_DELEGATED_RESOURCES {
+        if STATES[slot] == RESOURCE_LIVE && REQUESTS[slot] == request {
+            let mut resource_views: u64 = 0;
+            if revoke_slot(slot, (&mut resource_views)) != 1
+                || revoked_views > MAX_COUNTER - resource_views {
+                POISONED = 1;
+                return 0;
+            }
+            revoked_resources += 1;
+            revoked_views += resource_views;
+        }
+        slot += 1;
+    }
+    if revoked_views > request_views {
+        POISONED = 1;
+        return 0;
+    }
+    let remaining_views: u64 = request_views - revoked_views;
+    if remaining_views != 0 {
+        let request_revoked: u64 = revoke_memory_request(request);
+        if request_revoked != remaining_views
+            || revoked_views > MAX_COUNTER - request_revoked {
+            POISONED = 1;
+            return 0;
+        }
+        revoked_views += request_revoked;
+    }
+    if revoked_resources != matches {
+        POISONED = 1;
+        return 0;
+    }
+    REQUEST_REVOCATIONS += 1;
+    volatile_store(revoked_resources_out, revoked_resources);
+    volatile_store(revoked_views_out, revoked_views);
+    return finish(1);
+}
+
+// Reuse is forbidden until every live or terminal view has released its exact
+// resource generation. A revoked name alone can never recreate authority.
+pub unsafe fn destroy(resource: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES {
+        return deny_stale();
+    }
+    if STATES[slot] != RESOURCE_REVOKED
+        || RESOURCE_CAPABILITIES[slot] != 0
+        || count_bound_to_resource(resource) != 0
+        || DESTROYS == MAX_COUNTER {
+        return deny();
+    }
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = RESOURCE_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = RESOURCE_EMPTY;
+    }
+    DESTROYS += 1;
+    return finish(1);
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !memory_views_initialized()
+        || !memory_view_invariants_hold()
+        || REVOKED_VIEWS > BINDINGS
+        || REVOCATIONS > CREATIONS
+        || DESTROYS > REVOCATIONS {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_DELEGATED_RESOURCES {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == RESOURCE_EMPTY || state == RESOURCE_RETIRED {
+            if (state == RESOURCE_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || KINDS[slot] != 0
+                || REQUESTS[slot] != 0
+                || SERVICE_CSPACES[slot] != 0
+                || RESOURCE_CAPABILITIES[slot] != 0
+                || CAP_CLOSE_SEQUENCES[slot] != 0
+                || REVOCATION_SEQUENCES[slot] != 0 {
+                return false;
+            }
+        }
+        if state == RESOURCE_LIVE {
+            if !kind_valid(KINDS[slot] as u64)
+                || REQUESTS[slot] == 0
+                || SERVICE_CSPACES[slot] == 0
+                || !cspace_is_valid_owner(SERVICE_CSPACES[slot])
+                || RESOURCE_CAPABILITIES[slot] == 0
+                || validate_resource_for_teardown(
+                    SERVICE_CSPACES[slot],
+                    RESOURCE_CAPABILITIES[slot]
+                ) != make_handle(slot)
+                || rights_for_valid_owner(
+                    SERVICE_CSPACES[slot],
+                    RESOURCE_CAPABILITIES[slot]
+                ) != RIGHT_DELEGATED_RESOURCE_USE
+                || CAP_CLOSE_SEQUENCES[slot] != 0
+                || REVOCATION_SEQUENCES[slot] != 0 {
+                return false;
+            }
+        }
+        if state == RESOURCE_REVOKED {
+            if !kind_valid(KINDS[slot] as u64)
+                || REQUESTS[slot] == 0
+                || SERVICE_CSPACES[slot] == 0
+                || RESOURCE_CAPABILITIES[slot] != 0
+                || CAP_CLOSE_SEQUENCES[slot] == 0
+                || REVOCATION_SEQUENCES[slot] <= CAP_CLOSE_SEQUENCES[slot]
+                || live_count_bound_to_resource(make_handle(slot)) != 0 {
+                return false;
+            }
+        }
+        if state != RESOURCE_EMPTY
+            && state != RESOURCE_RETIRED
+            && state != RESOURCE_LIVE
+            && state != RESOURCE_REVOKED {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn is_initialized() -> bool { return INITIALIZED != 0; }
+pub unsafe fn is_live(resource: u64) -> bool {
+    return checked_live_resource(resource) < MAX_DELEGATED_RESOURCES;
+}
+pub unsafe fn state(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    if STATES[slot] == RESOURCE_LIVE { return DELEGATED_RESOURCE_STATE_LIVE; }
+    return DELEGATED_RESOURCE_STATE_REVOKED;
+}
+pub unsafe fn kind(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return KINDS[slot] as u64;
+}
+pub unsafe fn request_for(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return REQUESTS[slot];
+}
+pub unsafe fn service_cspace_for(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return SERVICE_CSPACES[slot];
+}
+pub unsafe fn capability_for(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return RESOURCE_CAPABILITIES[slot];
+}
+pub unsafe fn cap_close_sequence(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return CAP_CLOSE_SEQUENCES[slot];
+}
+pub unsafe fn revocation_sequence(resource: u64) -> u64 {
+    let slot: usize = checked_resource(resource);
+    if slot >= MAX_DELEGATED_RESOURCES { return 0; }
+    return REVOCATION_SEQUENCES[slot];
+}
+pub unsafe fn active_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_DELEGATED_RESOURCES {
+        if STATES[slot] == RESOURCE_LIVE || STATES[slot] == RESOURCE_REVOKED {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+pub unsafe fn creation_count() -> u64 { return CREATIONS; }
+pub unsafe fn binding_count() -> u64 { return BINDINGS; }
+pub unsafe fn revocation_count() -> u64 { return REVOCATIONS; }
+pub unsafe fn request_revocation_count() -> u64 { return REQUEST_REVOCATIONS; }
+pub unsafe fn revoked_view_count() -> u64 { return REVOKED_VIEWS; }
+pub unsafe fn destroy_count() -> u64 { return DESTROYS; }
+pub unsafe fn use_count() -> u64 { return USES; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn stale_denial_count() -> u64 { return STALE_DENIALS; }
+pub unsafe fn poisoned() -> bool { return POISONED != 0; }

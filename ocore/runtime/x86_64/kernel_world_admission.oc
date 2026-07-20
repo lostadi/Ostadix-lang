@@ -1,0 +1,1656 @@
+module runtime::kernel_world_admission;
+
+// This is the bounded native normal-form admission surface. It deliberately
+// does not parse TOML, manufacture authority, start a provider, publish an
+// export, or enter a VM. A trusted host-side VerifiedKernelWorld encoder must
+// produce the scalar identifiers and digest words supplied here.
+pub const MAX_KERNEL_WORLDS: usize = 2;
+pub const MAX_EXPORTS_PER_WORLD: usize = 4;
+pub const MAX_REQUESTS_PER_WORLD: usize = 8;
+pub const MAX_POLICY_RULES: usize = 16;
+pub const MAX_POLICY_TEXT_BYTES: usize = 512;
+
+pub const INTEGRATION_SOURCE_INTEGRATED: u64 = 1;
+pub const INTEGRATION_BINARY_CONTAINED: u64 = 2;
+
+pub const EXECUTION_PARAVIRTUAL: u64 = 1;
+pub const EXECUTION_HARDWARE_VIRTUALIZED: u64 = 2;
+
+pub const FIRMWARE_DIRECT: u64 = 1;
+pub const FIRMWARE_UEFI: u64 = 2;
+
+pub const EXPORT_PLANE_DEVICE: u64 = 1;
+pub const EXPORT_PLANE_ABI: u64 = 2;
+pub const EXPORT_PLANE_SEMANTIC: u64 = 3;
+
+pub const RIGHT_VM_RUN: u64 = 1;
+pub const RIGHT_VM_STOP: u64 = 2;
+pub const RIGHT_DEVICE_RESET: u64 = 4;
+pub const RIGHT_DEVICE_DMA: u64 = 8;
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+static VM_MACHINE_TEXT: [u8; 10] = b"vm.machine";
+
+pub const WORLD_STATE_STAGING: u64 = 1;
+pub const WORLD_STATE_ADMITTED: u64 = 2;
+
+// Admission deliberately has no CONFIGURED transition. Downstream supervisor
+// and VM objects may seal their own bounded graphs, but cannot upgrade or
+// otherwise mutate this package authority record; it stays ADMITTED until the
+// exact generation is explicitly revoked.
+
+const WORLD_EMPTY: u8 = 0;
+const WORLD_STAGING: u8 = 1;
+const WORLD_ADMITTED: u8 = 2;
+const WORLD_RETIRED: u8 = 4;
+
+const WORLD_HANDLE_TAG: u64 = 0xc900_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+const MAX_DECLARED_VCPUS: usize = 256;
+const MAX_DECLARED_MEMORY_MIB: u64 = 1_048_576;
+const MAX_HEALTH_TIMEOUT_MS: u64 = 60_000;
+const MAX_OUTSTANDING_REQUESTS: u64 = 65_536;
+const MAX_REQUESTS_PER_GENERATION: u64 = 1_000_000;
+const MAX_SHARED_MEMORY_BYTES: u64 = 1_099_511_627_776;
+const MAX_DECLARED_DEVICES: usize = 256;
+
+static mut STATES: [u8; 2] = [0; 2];
+static mut GENERATIONS: [u32; 2] = [0; 2];
+
+static mut PACKAGE_DIGESTS: [u64; 8] = [0; 8];
+static mut MANIFEST_DIGESTS: [u64; 8] = [0; 8];
+
+static mut INTEGRATIONS: [u64; 2] = [0; 2];
+static mut EXECUTIONS: [u64; 2] = [0; 2];
+static mut FIRMWARES: [u64; 2] = [0; 2];
+
+static mut WORLD_IDS: [u64; 2] = [0; 2];
+static mut NAME_IDS: [u64; 2] = [0; 2];
+static mut VERSION_IDS: [u64; 2] = [0; 2];
+static mut ARCHITECTURE_IDS: [u64; 2] = [0; 2];
+static mut PROFILE_IDS: [u64; 2] = [0; 2];
+static mut HEALTH_PROTOCOL_IDS: [u64; 2] = [0; 2];
+static mut HEALTH_TIMEOUTS_MS: [u64; 2] = [0; 2];
+
+static mut MINIMUM_VCPUS: [usize; 2] = [0; 2];
+static mut MAXIMUM_VCPUS: [usize; 2] = [0; 2];
+static mut MINIMUM_MEMORY_MIB: [u64; 2] = [0; 2];
+static mut MAXIMUM_MEMORY_MIB: [u64; 2] = [0; 2];
+static mut MAXIMUM_OUTSTANDING_REQUESTS: [u64; 2] = [0; 2];
+static mut MAXIMUM_REQUESTS_PER_GENERATION: [u64; 2] = [0; 2];
+static mut MAXIMUM_SHARED_MEMORY_BYTES: [u64; 2] = [0; 2];
+static mut MAXIMUM_DEVICES: [usize; 2] = [0; 2];
+
+static mut EXPORT_COUNTS: [usize; 2] = [0; 2];
+static mut REQUEST_COUNTS: [usize; 2] = [0; 2];
+
+static mut EXPORT_NAME_IDS: [u64; 8] = [0; 8];
+static mut EXPORT_PLANES: [u64; 8] = [0; 8];
+static mut EXPORT_PROTOCOL_IDS: [u64; 8] = [0; 8];
+static mut EXPORT_DEFINED: [u8; 8] = [0; 8];
+
+static mut REQUEST_KINDS: [u64; 16] = [0; 16];
+static mut REQUEST_PURPOSES: [u64; 16] = [0; 16];
+static mut REQUEST_KIND_LENGTHS: [usize; 16] = [0; 16];
+static mut REQUEST_PURPOSE_LENGTHS: [usize; 16] = [0; 16];
+static mut REQUEST_KIND_BYTES: [u8; 8192] = [0; 8192];
+static mut REQUEST_PURPOSE_BYTES: [u8; 8192] = [0; 8192];
+static mut REQUEST_RIGHTS: [u64; 16] = [0; 16];
+static mut REQUEST_GRANTS: [u64; 16] = [0; 16];
+static mut REQUEST_DEFINED: [u8; 16] = [0; 16];
+
+// Policy is independently registered, immutable for this boot, and keyed by
+// exact package digest plus complete bounded request-kind and purpose bytes.
+// The scalar hashes are reject-path accelerators only. An absent rule is denial.
+static mut POLICY_USED: [u8; 16] = [0; 16];
+static mut POLICY_PACKAGE_DIGESTS: [u64; 64] = [0; 64];
+static mut POLICY_KINDS: [u64; 16] = [0; 16];
+static mut POLICY_PURPOSES: [u64; 16] = [0; 16];
+static mut POLICY_KIND_LENGTHS: [usize; 16] = [0; 16];
+static mut POLICY_PURPOSE_LENGTHS: [usize; 16] = [0; 16];
+static mut POLICY_KIND_BYTES: [u8; 8192] = [0; 8192];
+static mut POLICY_PURPOSE_BYTES: [u8; 8192] = [0; 8192];
+static mut POLICY_ALLOWED_RIGHTS: [u64; 16] = [0; 16];
+
+static mut POLICY_REGISTRATIONS: u64 = 0;
+static mut ADMISSION_BEGINS: u64 = 0;
+static mut ADMISSION_SEALS: u64 = 0;
+static mut REVOCATIONS: u64 = 0;
+static mut ABORTS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn world_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn world_generation_from_handle(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn digest_index(slot: usize, word: usize) -> usize {
+    return slot * 4 + word;
+}
+
+fn export_index(slot: usize, ordinal: usize) -> usize {
+    return slot * MAX_EXPORTS_PER_WORLD + ordinal;
+}
+
+fn request_index(slot: usize, ordinal: usize) -> usize {
+    return slot * MAX_REQUESTS_PER_WORLD + ordinal;
+}
+
+fn policy_digest_index(rule: usize, word: usize) -> usize {
+    return rule * 4 + word;
+}
+
+fn request_text_index(request: usize, byte: usize) -> usize {
+    return request * MAX_POLICY_TEXT_BYTES + byte;
+}
+
+fn policy_text_index(rule: usize, byte: usize) -> usize {
+    return rule * MAX_POLICY_TEXT_BYTES + byte;
+}
+
+fn digest_is_nonzero(
+    zero: u64,
+    one: u64,
+    two: u64,
+    three: u64
+) -> bool {
+    return zero != 0 || one != 0 || two != 0 || three != 0;
+}
+
+fn valid_integration(value: u64) -> bool {
+    return value == INTEGRATION_SOURCE_INTEGRATED
+        || value == INTEGRATION_BINARY_CONTAINED;
+}
+
+fn valid_execution(value: u64) -> bool {
+    return value == EXECUTION_PARAVIRTUAL
+        || value == EXECUTION_HARDWARE_VIRTUALIZED;
+}
+
+fn valid_firmware(value: u64) -> bool {
+    return value == FIRMWARE_DIRECT || value == FIRMWARE_UEFI;
+}
+
+fn valid_export_plane(value: u64) -> bool {
+    return value == EXPORT_PLANE_DEVICE
+        || value == EXPORT_PLANE_ABI
+        || value == EXPORT_PLANE_SEMANTIC;
+}
+
+unsafe fn valid_text(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0 || length > MAX_POLICY_TEXT_BYTES {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < length {
+        let value: u8 = volatile_load(source + byte);
+        if value < 0x20 || value > 0x7e {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn text_hash(source: *const u8, length: usize) -> u64 {
+    let mut value: u64 = FNV_OFFSET;
+    let mut byte: usize = 0;
+    while byte < length {
+        value = (value ^ volatile_load(source + byte) as u64) * FNV_PRIME;
+        byte += 1;
+    }
+    return value;
+}
+
+unsafe fn clear_request_text(request: usize) -> void {
+    REQUEST_KIND_LENGTHS[request] = 0;
+    REQUEST_PURPOSE_LENGTHS[request] = 0;
+    let mut byte: usize = 0;
+    while byte < MAX_POLICY_TEXT_BYTES {
+        REQUEST_KIND_BYTES[request_text_index(request, byte)] = 0;
+        REQUEST_PURPOSE_BYTES[request_text_index(request, byte)] = 0;
+        byte += 1;
+    }
+}
+
+unsafe fn copy_request_text(
+    request: usize,
+    kind: *const u8,
+    kind_length: usize,
+    purpose: *const u8,
+    purpose_length: usize
+) -> void {
+    let mut byte: usize = 0;
+    while byte < kind_length {
+        REQUEST_KIND_BYTES[request_text_index(request, byte)] =
+            volatile_load(kind + byte);
+        byte += 1;
+    }
+    byte = 0;
+    while byte < purpose_length {
+        REQUEST_PURPOSE_BYTES[request_text_index(request, byte)] =
+            volatile_load(purpose + byte);
+        byte += 1;
+    }
+    REQUEST_KIND_LENGTHS[request] = kind_length;
+    REQUEST_PURPOSE_LENGTHS[request] = purpose_length;
+}
+
+unsafe fn clear_policy_text(rule: usize) -> void {
+    POLICY_KIND_LENGTHS[rule] = 0;
+    POLICY_PURPOSE_LENGTHS[rule] = 0;
+    let mut byte: usize = 0;
+    while byte < MAX_POLICY_TEXT_BYTES {
+        POLICY_KIND_BYTES[policy_text_index(rule, byte)] = 0;
+        POLICY_PURPOSE_BYTES[policy_text_index(rule, byte)] = 0;
+        byte += 1;
+    }
+}
+
+unsafe fn copy_policy_text(
+    rule: usize,
+    kind: *const u8,
+    kind_length: usize,
+    purpose: *const u8,
+    purpose_length: usize
+) -> void {
+    let mut byte: usize = 0;
+    while byte < kind_length {
+        POLICY_KIND_BYTES[policy_text_index(rule, byte)] =
+            volatile_load(kind + byte);
+        byte += 1;
+    }
+    byte = 0;
+    while byte < purpose_length {
+        POLICY_PURPOSE_BYTES[policy_text_index(rule, byte)] =
+            volatile_load(purpose + byte);
+        byte += 1;
+    }
+    POLICY_KIND_LENGTHS[rule] = kind_length;
+    POLICY_PURPOSE_LENGTHS[rule] = purpose_length;
+}
+
+unsafe fn request_text_matches_policy(request: usize, rule: usize) -> bool {
+    if REQUEST_KIND_LENGTHS[request] != POLICY_KIND_LENGTHS[rule]
+        || REQUEST_PURPOSE_LENGTHS[request] != POLICY_PURPOSE_LENGTHS[rule] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < REQUEST_KIND_LENGTHS[request] {
+        if REQUEST_KIND_BYTES[request_text_index(request, byte)]
+            != POLICY_KIND_BYTES[policy_text_index(rule, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    byte = 0;
+    while byte < REQUEST_PURPOSE_LENGTHS[request] {
+        if REQUEST_PURPOSE_BYTES[request_text_index(request, byte)]
+            != POLICY_PURPOSE_BYTES[policy_text_index(rule, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn requests_have_same_text(left: usize, right: usize) -> bool {
+    if REQUEST_KIND_LENGTHS[left] != REQUEST_KIND_LENGTHS[right]
+        || REQUEST_PURPOSE_LENGTHS[left] != REQUEST_PURPOSE_LENGTHS[right] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < REQUEST_KIND_LENGTHS[left] {
+        if REQUEST_KIND_BYTES[request_text_index(left, byte)]
+            != REQUEST_KIND_BYTES[request_text_index(right, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    byte = 0;
+    while byte < REQUEST_PURPOSE_LENGTHS[left] {
+        if REQUEST_PURPOSE_BYTES[request_text_index(left, byte)]
+            != REQUEST_PURPOSE_BYTES[request_text_index(right, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn policies_have_same_text(left: usize, right: usize) -> bool {
+    if POLICY_KIND_LENGTHS[left] != POLICY_KIND_LENGTHS[right]
+        || POLICY_PURPOSE_LENGTHS[left] != POLICY_PURPOSE_LENGTHS[right] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < POLICY_KIND_LENGTHS[left] {
+        if POLICY_KIND_BYTES[policy_text_index(left, byte)]
+            != POLICY_KIND_BYTES[policy_text_index(right, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    byte = 0;
+    while byte < POLICY_PURPOSE_LENGTHS[left] {
+        if POLICY_PURPOSE_BYTES[policy_text_index(left, byte)]
+            != POLICY_PURPOSE_BYTES[policy_text_index(right, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn request_kind_is_vm_machine(request: usize) -> bool {
+    if REQUEST_KIND_LENGTHS[request] != 10 {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < 10 {
+        if REQUEST_KIND_BYTES[request_text_index(request, byte)]
+            != VM_MACHINE_TEXT[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+fn valid_execution_contract(
+    integration: u64,
+    execution: u64,
+    firmware: u64
+) -> bool {
+    if integration == INTEGRATION_SOURCE_INTEGRATED {
+        return execution == EXECUTION_PARAVIRTUAL
+            && firmware == FIRMWARE_DIRECT;
+    }
+    if integration == INTEGRATION_BINARY_CONTAINED {
+        return execution == EXECUTION_HARDWARE_VIRTUALIZED;
+    }
+    return false;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | WORLD_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_world_any(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != WORLD_HANDLE_TAG {
+        return MAX_KERNEL_WORLDS;
+    }
+    let slot: usize = world_index(handle);
+    if slot >= MAX_KERNEL_WORLDS
+        || (STATES[slot] != WORLD_STAGING
+            && STATES[slot] != WORLD_ADMITTED)
+        || GENERATIONS[slot] != world_generation_from_handle(handle) {
+        return MAX_KERNEL_WORLDS;
+    }
+    return slot;
+}
+
+unsafe fn checked_world_current(handle: u64) -> usize {
+    let slot: usize = checked_world_any(handle);
+    if slot >= MAX_KERNEL_WORLDS || STATES[slot] != WORLD_ADMITTED {
+        return MAX_KERNEL_WORLDS;
+    }
+    return slot;
+}
+
+unsafe fn package_digest_matches(
+    slot: usize,
+    zero: u64,
+    one: u64,
+    two: u64,
+    three: u64
+) -> bool {
+    return PACKAGE_DIGESTS[digest_index(slot, 0)] == zero
+        && PACKAGE_DIGESTS[digest_index(slot, 1)] == one
+        && PACKAGE_DIGESTS[digest_index(slot, 2)] == two
+        && PACKAGE_DIGESTS[digest_index(slot, 3)] == three;
+}
+
+unsafe fn policy_package_digest_matches(
+    rule: usize,
+    zero: u64,
+    one: u64,
+    two: u64,
+    three: u64
+) -> bool {
+    return POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 0)] == zero
+        && POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 1)] == one
+        && POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 2)] == two
+        && POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 3)] == three;
+}
+
+unsafe fn clear_world(slot: usize) -> void {
+    let mut word: usize = 0;
+    while word < 4 {
+        PACKAGE_DIGESTS[digest_index(slot, word)] = 0;
+        MANIFEST_DIGESTS[digest_index(slot, word)] = 0;
+        word += 1;
+    }
+    INTEGRATIONS[slot] = 0;
+    EXECUTIONS[slot] = 0;
+    FIRMWARES[slot] = 0;
+    WORLD_IDS[slot] = 0;
+    NAME_IDS[slot] = 0;
+    VERSION_IDS[slot] = 0;
+    ARCHITECTURE_IDS[slot] = 0;
+    PROFILE_IDS[slot] = 0;
+    HEALTH_PROTOCOL_IDS[slot] = 0;
+    HEALTH_TIMEOUTS_MS[slot] = 0;
+    MINIMUM_VCPUS[slot] = 0;
+    MAXIMUM_VCPUS[slot] = 0;
+    MINIMUM_MEMORY_MIB[slot] = 0;
+    MAXIMUM_MEMORY_MIB[slot] = 0;
+    MAXIMUM_OUTSTANDING_REQUESTS[slot] = 0;
+    MAXIMUM_REQUESTS_PER_GENERATION[slot] = 0;
+    MAXIMUM_SHARED_MEMORY_BYTES[slot] = 0;
+    MAXIMUM_DEVICES[slot] = 0;
+    EXPORT_COUNTS[slot] = 0;
+    REQUEST_COUNTS[slot] = 0;
+
+    let mut ordinal: usize = 0;
+    while ordinal < MAX_EXPORTS_PER_WORLD {
+        let index: usize = export_index(slot, ordinal);
+        EXPORT_NAME_IDS[index] = 0;
+        EXPORT_PLANES[index] = 0;
+        EXPORT_PROTOCOL_IDS[index] = 0;
+        EXPORT_DEFINED[index] = 0;
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < MAX_REQUESTS_PER_WORLD {
+        let index: usize = request_index(slot, ordinal);
+        clear_request_text(index);
+        REQUEST_KINDS[index] = 0;
+        REQUEST_PURPOSES[index] = 0;
+        REQUEST_RIGHTS[index] = 0;
+        REQUEST_GRANTS[index] = 0;
+        REQUEST_DEFINED[index] = 0;
+        ordinal += 1;
+    }
+}
+
+unsafe fn clear_policy(rule: usize) -> void {
+    POLICY_USED[rule] = 0;
+    clear_policy_text(rule);
+    let mut word: usize = 0;
+    while word < 4 {
+        POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, word)] = 0;
+        word += 1;
+    }
+    POLICY_KINDS[rule] = 0;
+    POLICY_PURPOSES[rule] = 0;
+    POLICY_ALLOWED_RIGHTS[rule] = 0;
+}
+
+unsafe fn count_denial() -> void {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIALS += 1;
+    }
+}
+
+unsafe fn deny() -> u64 {
+    count_denial();
+    return 0;
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+unsafe fn find_policy_for_request(slot: usize, ordinal: usize) -> usize {
+    let request: usize = request_index(slot, ordinal);
+    let mut rule: usize = 0;
+    while rule < MAX_POLICY_RULES {
+        if POLICY_USED[rule] == 1
+            // Hash equality is an inexpensive reject path only. Exact copied
+            // bytes are mandatory before a rule can grant authority.
+            && POLICY_KINDS[rule] == REQUEST_KINDS[request]
+            && POLICY_PURPOSES[rule] == REQUEST_PURPOSES[request]
+            && request_text_matches_policy(request, rule)
+            && policy_package_digest_matches(
+                rule,
+                PACKAGE_DIGESTS[digest_index(slot, 0)],
+                PACKAGE_DIGESTS[digest_index(slot, 1)],
+                PACKAGE_DIGESTS[digest_index(slot, 2)],
+                PACKAGE_DIGESTS[digest_index(slot, 3)]
+            ) {
+            return rule;
+        }
+        rule += 1;
+    }
+    return MAX_POLICY_RULES;
+}
+
+unsafe fn binary_run_request_present(slot: usize) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < REQUEST_COUNTS[slot] {
+        let index: usize = request_index(slot, ordinal);
+        if REQUEST_DEFINED[index] == 1
+            && request_kind_is_vm_machine(index)
+            && (REQUEST_RIGHTS[index] & RIGHT_VM_RUN) == RIGHT_VM_RUN {
+            return true;
+        }
+        ordinal += 1;
+    }
+    return false;
+}
+
+unsafe fn has_device_export(slot: usize) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < EXPORT_COUNTS[slot] {
+        let index: usize = export_index(slot, ordinal);
+        if EXPORT_DEFINED[index] == 1
+            && EXPORT_PLANES[index] == EXPORT_PLANE_DEVICE {
+            return true;
+        }
+        ordinal += 1;
+    }
+    return false;
+}
+
+unsafe fn active_worlds_are_unique() -> bool {
+    let mut left: usize = 0;
+    while left < MAX_KERNEL_WORLDS {
+        if STATES[left] == WORLD_STAGING
+            || STATES[left] == WORLD_ADMITTED {
+            let mut right: usize = left + 1;
+            while right < MAX_KERNEL_WORLDS {
+                if STATES[right] == WORLD_STAGING
+                    || STATES[right] == WORLD_ADMITTED {
+                    if package_digest_matches(
+                        right,
+                        PACKAGE_DIGESTS[digest_index(left, 0)],
+                        PACKAGE_DIGESTS[digest_index(left, 1)],
+                        PACKAGE_DIGESTS[digest_index(left, 2)],
+                        PACKAGE_DIGESTS[digest_index(left, 3)]
+                    ) || WORLD_IDS[left] == WORLD_IDS[right] {
+                        return false;
+                    }
+                }
+                right += 1;
+            }
+        }
+        left += 1;
+    }
+    return true;
+}
+
+unsafe fn policy_table_is_valid() -> bool {
+    let mut used_rules: u64 = 0;
+    let mut rule: usize = 0;
+    while rule < MAX_POLICY_RULES {
+        if POLICY_USED[rule] == 0 {
+            let mut word: usize = 0;
+            while word < 4 {
+                if POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, word)] != 0 {
+                    return false;
+                }
+                word += 1;
+            }
+            if POLICY_KINDS[rule] != 0
+                || POLICY_PURPOSES[rule] != 0
+                || POLICY_KIND_LENGTHS[rule] != 0
+                || POLICY_PURPOSE_LENGTHS[rule] != 0
+                || POLICY_ALLOWED_RIGHTS[rule] != 0 {
+                return false;
+            }
+        } else if POLICY_USED[rule] == 1 {
+            used_rules += 1;
+            if !digest_is_nonzero(
+                POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 0)],
+                POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 1)],
+                POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 2)],
+                POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 3)]
+            ) || POLICY_KINDS[rule] == 0
+                || POLICY_PURPOSES[rule] == 0
+                || POLICY_KIND_LENGTHS[rule] == 0
+                || POLICY_KIND_LENGTHS[rule] > MAX_POLICY_TEXT_BYTES
+                || POLICY_PURPOSE_LENGTHS[rule] == 0
+                || POLICY_PURPOSE_LENGTHS[rule] > MAX_POLICY_TEXT_BYTES
+                || POLICY_ALLOWED_RIGHTS[rule] == 0 {
+                return false;
+            }
+            let mut prior: usize = 0;
+            while prior < rule {
+                if POLICY_USED[prior] == 1
+                    && policies_have_same_text(prior, rule)
+                    && policy_package_digest_matches(
+                        prior,
+                        POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 0)],
+                        POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 1)],
+                        POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 2)],
+                        POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 3)]
+                    ) {
+                    return false;
+                }
+                prior += 1;
+            }
+        } else {
+            return false;
+        }
+        rule += 1;
+    }
+    return used_rules == POLICY_REGISTRATIONS;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 || !policy_table_is_valid() {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_KERNEL_WORLDS {
+        let world_state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if world_state == WORLD_EMPTY || world_state == WORLD_RETIRED {
+            if (world_state == WORLD_RETIRED
+                    && GENERATIONS[slot] != 0xffff_ffff)
+                || INTEGRATIONS[slot] != 0
+                || EXECUTIONS[slot] != 0
+                || FIRMWARES[slot] != 0
+                || WORLD_IDS[slot] != 0
+                || NAME_IDS[slot] != 0
+                || VERSION_IDS[slot] != 0
+                || ARCHITECTURE_IDS[slot] != 0
+                || PROFILE_IDS[slot] != 0
+                || HEALTH_PROTOCOL_IDS[slot] != 0
+                || HEALTH_TIMEOUTS_MS[slot] != 0
+                || MINIMUM_VCPUS[slot] != 0
+                || MAXIMUM_VCPUS[slot] != 0
+                || MINIMUM_MEMORY_MIB[slot] != 0
+                || MAXIMUM_MEMORY_MIB[slot] != 0
+                || MAXIMUM_OUTSTANDING_REQUESTS[slot] != 0
+                || MAXIMUM_REQUESTS_PER_GENERATION[slot] != 0
+                || MAXIMUM_SHARED_MEMORY_BYTES[slot] != 0
+                || MAXIMUM_DEVICES[slot] != 0
+                || EXPORT_COUNTS[slot] != 0
+                || REQUEST_COUNTS[slot] != 0 {
+                return false;
+            }
+            let mut word: usize = 0;
+            while word < 4 {
+                if PACKAGE_DIGESTS[digest_index(slot, word)] != 0
+                    || MANIFEST_DIGESTS[digest_index(slot, word)] != 0 {
+                    return false;
+                }
+                word += 1;
+            }
+        } else if world_state == WORLD_STAGING
+            || world_state == WORLD_ADMITTED {
+            if !digest_is_nonzero(
+                PACKAGE_DIGESTS[digest_index(slot, 0)],
+                PACKAGE_DIGESTS[digest_index(slot, 1)],
+                PACKAGE_DIGESTS[digest_index(slot, 2)],
+                PACKAGE_DIGESTS[digest_index(slot, 3)]
+            ) || !digest_is_nonzero(
+                MANIFEST_DIGESTS[digest_index(slot, 0)],
+                MANIFEST_DIGESTS[digest_index(slot, 1)],
+                MANIFEST_DIGESTS[digest_index(slot, 2)],
+                MANIFEST_DIGESTS[digest_index(slot, 3)]
+            ) || !valid_integration(INTEGRATIONS[slot])
+                || !valid_execution(EXECUTIONS[slot])
+                || !valid_firmware(FIRMWARES[slot])
+                || !valid_execution_contract(
+                    INTEGRATIONS[slot],
+                    EXECUTIONS[slot],
+                    FIRMWARES[slot]
+                )
+                || WORLD_IDS[slot] == 0
+                || NAME_IDS[slot] == 0
+                || VERSION_IDS[slot] == 0
+                || ARCHITECTURE_IDS[slot] == 0
+                || PROFILE_IDS[slot] == 0
+                || HEALTH_PROTOCOL_IDS[slot] == 0
+                || HEALTH_TIMEOUTS_MS[slot] == 0
+                || HEALTH_TIMEOUTS_MS[slot] > MAX_HEALTH_TIMEOUT_MS
+                || MINIMUM_VCPUS[slot] == 0
+                || MINIMUM_VCPUS[slot] > MAXIMUM_VCPUS[slot]
+                || MAXIMUM_VCPUS[slot] > MAX_DECLARED_VCPUS
+                || MINIMUM_MEMORY_MIB[slot] == 0
+                || MINIMUM_MEMORY_MIB[slot] > MAXIMUM_MEMORY_MIB[slot]
+                || MAXIMUM_MEMORY_MIB[slot] > MAX_DECLARED_MEMORY_MIB
+                || MAXIMUM_OUTSTANDING_REQUESTS[slot] == 0
+                || MAXIMUM_OUTSTANDING_REQUESTS[slot]
+                    > MAX_OUTSTANDING_REQUESTS
+                || MAXIMUM_REQUESTS_PER_GENERATION[slot]
+                    < MAXIMUM_OUTSTANDING_REQUESTS[slot]
+                || MAXIMUM_REQUESTS_PER_GENERATION[slot]
+                    > MAX_REQUESTS_PER_GENERATION
+                || MAXIMUM_SHARED_MEMORY_BYTES[slot]
+                    > MAX_SHARED_MEMORY_BYTES
+                || MAXIMUM_DEVICES[slot] > MAX_DECLARED_DEVICES
+                || EXPORT_COUNTS[slot] == 0
+                || EXPORT_COUNTS[slot] > MAX_EXPORTS_PER_WORLD
+                || REQUEST_COUNTS[slot] == 0
+                || REQUEST_COUNTS[slot] > MAX_REQUESTS_PER_WORLD {
+                return false;
+            }
+
+            let mut ordinal: usize = 0;
+            while ordinal < MAX_EXPORTS_PER_WORLD {
+                let index: usize = export_index(slot, ordinal);
+                if ordinal < EXPORT_COUNTS[slot] {
+                    if EXPORT_DEFINED[index] != 0
+                        && (EXPORT_NAME_IDS[index] == 0
+                            || !valid_export_plane(EXPORT_PLANES[index])
+                            || EXPORT_PROTOCOL_IDS[index] == 0) {
+                        return false;
+                    }
+                    if world_state != WORLD_STAGING
+                        && EXPORT_DEFINED[index] != 1 {
+                        return false;
+                    }
+                    if EXPORT_DEFINED[index] == 1 {
+                        let mut prior: usize = 0;
+                        while prior < ordinal {
+                            let prior_index: usize = export_index(slot, prior);
+                            if EXPORT_DEFINED[prior_index] == 1
+                                && EXPORT_NAME_IDS[prior_index]
+                                    == EXPORT_NAME_IDS[index] {
+                                return false;
+                            }
+                            prior += 1;
+                        }
+                    }
+                } else if EXPORT_NAME_IDS[index] != 0
+                    || EXPORT_PLANES[index] != 0
+                    || EXPORT_PROTOCOL_IDS[index] != 0
+                    || EXPORT_DEFINED[index] != 0 {
+                    return false;
+                }
+                ordinal += 1;
+            }
+
+            ordinal = 0;
+            while ordinal < MAX_REQUESTS_PER_WORLD {
+                let index: usize = request_index(slot, ordinal);
+                if ordinal < REQUEST_COUNTS[slot] {
+                    if REQUEST_DEFINED[index] != 0
+                        && (REQUEST_KINDS[index] == 0
+                            || REQUEST_PURPOSES[index] == 0
+                            || REQUEST_KIND_LENGTHS[index] == 0
+                            || REQUEST_KIND_LENGTHS[index]
+                                > MAX_POLICY_TEXT_BYTES
+                            || REQUEST_PURPOSE_LENGTHS[index] == 0
+                            || REQUEST_PURPOSE_LENGTHS[index]
+                                > MAX_POLICY_TEXT_BYTES
+                            || REQUEST_RIGHTS[index] == 0) {
+                        return false;
+                    }
+                    if world_state == WORLD_STAGING {
+                        if REQUEST_GRANTS[index] != 0 {
+                            return false;
+                        }
+                    } else if REQUEST_DEFINED[index] != 1
+                        || REQUEST_GRANTS[index] != REQUEST_RIGHTS[index] {
+                        return false;
+                    }
+                    if REQUEST_DEFINED[index] == 1 {
+                        let mut prior: usize = 0;
+                        while prior < ordinal {
+                            let prior_index: usize = request_index(slot, prior);
+                            if REQUEST_DEFINED[prior_index] == 1
+                                && requests_have_same_text(prior_index, index) {
+                                return false;
+                            }
+                            prior += 1;
+                        }
+                    }
+                    if world_state != WORLD_STAGING {
+                        let rule: usize = find_policy_for_request(
+                            slot,
+                            ordinal
+                        );
+                        if rule >= MAX_POLICY_RULES
+                            || (REQUEST_RIGHTS[index]
+                                & POLICY_ALLOWED_RIGHTS[rule])
+                                != REQUEST_RIGHTS[index] {
+                            return false;
+                        }
+                    }
+                } else if REQUEST_KINDS[index] != 0
+                    || REQUEST_PURPOSES[index] != 0
+                    || REQUEST_KIND_LENGTHS[index] != 0
+                    || REQUEST_PURPOSE_LENGTHS[index] != 0
+                    || REQUEST_RIGHTS[index] != 0
+                    || REQUEST_GRANTS[index] != 0
+                    || REQUEST_DEFINED[index] != 0 {
+                    return false;
+                }
+                ordinal += 1;
+            }
+
+            if world_state != WORLD_STAGING {
+                if INTEGRATIONS[slot] == INTEGRATION_BINARY_CONTAINED
+                    && !binary_run_request_present(slot) {
+                    return false;
+                }
+                if has_device_export(slot) && MAXIMUM_DEVICES[slot] == 0 {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return active_worlds_are_unique();
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_KERNEL_WORLDS {
+        STATES[slot] = WORLD_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_world(slot);
+        slot += 1;
+    }
+    let mut rule: usize = 0;
+    while rule < MAX_POLICY_RULES {
+        clear_policy(rule);
+        rule += 1;
+    }
+    POLICY_REGISTRATIONS = 0;
+    ADMISSION_BEGINS = 0;
+    ADMISSION_SEALS = 0;
+    REVOCATIONS = 0;
+    ABORTS = 0;
+    DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn register_policy(
+    package_digest_zero: u64,
+    package_digest_one: u64,
+    package_digest_two: u64,
+    package_digest_three: u64,
+    request_kind: *const u8,
+    request_kind_length: usize,
+    request_purpose: *const u8,
+    request_purpose_length: usize,
+    allowed_rights: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    if !digest_is_nonzero(
+        package_digest_zero,
+        package_digest_one,
+        package_digest_two,
+        package_digest_three
+    ) || !valid_text(request_kind, request_kind_length)
+        || !valid_text(request_purpose, request_purpose_length)
+        || allowed_rights == 0
+        || (allowed_rights
+            & (RIGHT_VM_RUN
+                | RIGHT_VM_STOP
+                | RIGHT_DEVICE_RESET
+                | RIGHT_DEVICE_DMA)) != allowed_rights
+        || POLICY_REGISTRATIONS == MAX_COUNTER {
+        return deny();
+    }
+    let request_kind_id: u64 = text_hash(request_kind, request_kind_length);
+    let request_purpose_id: u64 = text_hash(
+        request_purpose,
+        request_purpose_length
+    );
+    if request_kind_id == 0 || request_purpose_id == 0 {
+        return deny();
+    }
+    let mut rule: usize = 0;
+    while rule < MAX_POLICY_RULES {
+        if POLICY_USED[rule] == 1
+            && POLICY_KIND_LENGTHS[rule] == request_kind_length
+            && POLICY_PURPOSE_LENGTHS[rule] == request_purpose_length
+            && policy_package_digest_matches(
+                rule,
+                package_digest_zero,
+                package_digest_one,
+                package_digest_two,
+                package_digest_three
+            ) {
+            let mut same: bool = true;
+            let mut byte: usize = 0;
+            while byte < request_kind_length {
+                if POLICY_KIND_BYTES[policy_text_index(rule, byte)]
+                    != volatile_load(request_kind + byte) {
+                    same = false;
+                }
+                byte += 1;
+            }
+            byte = 0;
+            while byte < request_purpose_length {
+                if POLICY_PURPOSE_BYTES[policy_text_index(rule, byte)]
+                    != volatile_load(request_purpose + byte) {
+                    same = false;
+                }
+                byte += 1;
+            }
+            if same { return deny(); }
+        }
+        rule += 1;
+    }
+    rule = 0;
+    while rule < MAX_POLICY_RULES && POLICY_USED[rule] != 0 {
+        rule += 1;
+    }
+    if rule >= MAX_POLICY_RULES {
+        return deny();
+    }
+    POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 0)] =
+        package_digest_zero;
+    POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 1)] =
+        package_digest_one;
+    POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 2)] =
+        package_digest_two;
+    POLICY_PACKAGE_DIGESTS[policy_digest_index(rule, 3)] =
+        package_digest_three;
+    copy_policy_text(
+        rule,
+        request_kind,
+        request_kind_length,
+        request_purpose,
+        request_purpose_length
+    );
+    POLICY_KINDS[rule] = request_kind_id;
+    POLICY_PURPOSES[rule] = request_purpose_id;
+    POLICY_ALLOWED_RIGHTS[rule] = allowed_rights;
+    POLICY_USED[rule] = 1;
+    POLICY_REGISTRATIONS += 1;
+    return finish(1);
+}
+
+pub unsafe fn begin(
+    package_digest_zero: u64,
+    package_digest_one: u64,
+    package_digest_two: u64,
+    package_digest_three: u64,
+    manifest_digest_zero: u64,
+    manifest_digest_one: u64,
+    manifest_digest_two: u64,
+    manifest_digest_three: u64,
+    integration: u64,
+    execution: u64,
+    firmware: u64,
+    world_id: u64,
+    name_id: u64,
+    version_id: u64,
+    architecture_id: u64,
+    profile_id: u64,
+    health_protocol_id: u64,
+    health_timeout_ms: u64,
+    minimum_vcpus: usize,
+    maximum_vcpus: usize,
+    minimum_memory_mib: u64,
+    maximum_memory_mib: u64,
+    maximum_outstanding_requests: u64,
+    maximum_requests_per_generation: u64,
+    maximum_shared_memory_bytes: u64,
+    maximum_devices: usize,
+    export_count: usize,
+    request_count: usize
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    if !digest_is_nonzero(
+        package_digest_zero,
+        package_digest_one,
+        package_digest_two,
+        package_digest_three
+    ) || !digest_is_nonzero(
+        manifest_digest_zero,
+        manifest_digest_one,
+        manifest_digest_two,
+        manifest_digest_three
+    ) || !valid_integration(integration)
+        || !valid_execution(execution)
+        || !valid_firmware(firmware)
+        || !valid_execution_contract(integration, execution, firmware)
+        || world_id == 0
+        || name_id == 0
+        || version_id == 0
+        || architecture_id == 0
+        || profile_id == 0
+        || health_protocol_id == 0
+        || health_timeout_ms == 0
+        || health_timeout_ms > MAX_HEALTH_TIMEOUT_MS
+        || minimum_vcpus == 0
+        || minimum_vcpus > maximum_vcpus
+        || maximum_vcpus > MAX_DECLARED_VCPUS
+        || minimum_memory_mib == 0
+        || minimum_memory_mib > maximum_memory_mib
+        || maximum_memory_mib > MAX_DECLARED_MEMORY_MIB
+        || maximum_outstanding_requests == 0
+        || maximum_outstanding_requests > MAX_OUTSTANDING_REQUESTS
+        || maximum_requests_per_generation < maximum_outstanding_requests
+        || maximum_requests_per_generation > MAX_REQUESTS_PER_GENERATION
+        || maximum_shared_memory_bytes > MAX_SHARED_MEMORY_BYTES
+        || maximum_devices > MAX_DECLARED_DEVICES
+        || export_count == 0
+        || export_count > MAX_EXPORTS_PER_WORLD
+        || request_count == 0
+        || request_count > MAX_REQUESTS_PER_WORLD
+        || ADMISSION_BEGINS == MAX_COUNTER {
+        return deny();
+    }
+
+    let mut slot: usize = 0;
+    while slot < MAX_KERNEL_WORLDS {
+        if STATES[slot] == WORLD_STAGING
+            || STATES[slot] == WORLD_ADMITTED {
+            if package_digest_matches(
+                slot,
+                package_digest_zero,
+                package_digest_one,
+                package_digest_two,
+                package_digest_three
+            ) || WORLD_IDS[slot] == world_id {
+                return deny();
+            }
+        }
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_KERNEL_WORLDS && STATES[slot] != WORLD_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_KERNEL_WORLDS {
+        return deny();
+    }
+
+    clear_world(slot);
+    PACKAGE_DIGESTS[digest_index(slot, 0)] = package_digest_zero;
+    PACKAGE_DIGESTS[digest_index(slot, 1)] = package_digest_one;
+    PACKAGE_DIGESTS[digest_index(slot, 2)] = package_digest_two;
+    PACKAGE_DIGESTS[digest_index(slot, 3)] = package_digest_three;
+    MANIFEST_DIGESTS[digest_index(slot, 0)] = manifest_digest_zero;
+    MANIFEST_DIGESTS[digest_index(slot, 1)] = manifest_digest_one;
+    MANIFEST_DIGESTS[digest_index(slot, 2)] = manifest_digest_two;
+    MANIFEST_DIGESTS[digest_index(slot, 3)] = manifest_digest_three;
+    INTEGRATIONS[slot] = integration;
+    EXECUTIONS[slot] = execution;
+    FIRMWARES[slot] = firmware;
+    WORLD_IDS[slot] = world_id;
+    NAME_IDS[slot] = name_id;
+    VERSION_IDS[slot] = version_id;
+    ARCHITECTURE_IDS[slot] = architecture_id;
+    PROFILE_IDS[slot] = profile_id;
+    HEALTH_PROTOCOL_IDS[slot] = health_protocol_id;
+    HEALTH_TIMEOUTS_MS[slot] = health_timeout_ms;
+    MINIMUM_VCPUS[slot] = minimum_vcpus;
+    MAXIMUM_VCPUS[slot] = maximum_vcpus;
+    MINIMUM_MEMORY_MIB[slot] = minimum_memory_mib;
+    MAXIMUM_MEMORY_MIB[slot] = maximum_memory_mib;
+    MAXIMUM_OUTSTANDING_REQUESTS[slot] = maximum_outstanding_requests;
+    MAXIMUM_REQUESTS_PER_GENERATION[slot] =
+        maximum_requests_per_generation;
+    MAXIMUM_SHARED_MEMORY_BYTES[slot] = maximum_shared_memory_bytes;
+    MAXIMUM_DEVICES[slot] = maximum_devices;
+    EXPORT_COUNTS[slot] = export_count;
+    REQUEST_COUNTS[slot] = request_count;
+    STATES[slot] = WORLD_STAGING;
+    ADMISSION_BEGINS += 1;
+    return finish(make_handle(slot));
+}
+
+pub unsafe fn define_export(
+    admission: u64,
+    ordinal: usize,
+    name_id: u64,
+    plane: u64,
+    protocol_id: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_world_any(admission);
+    if slot >= MAX_KERNEL_WORLDS
+        || STATES[slot] != WORLD_STAGING
+        || ordinal >= EXPORT_COUNTS[slot]
+        || name_id == 0
+        || !valid_export_plane(plane)
+        || protocol_id == 0 {
+        return deny();
+    }
+    let index: usize = export_index(slot, ordinal);
+    if EXPORT_DEFINED[index] != 0 {
+        return deny();
+    }
+    let mut prior: usize = 0;
+    while prior < EXPORT_COUNTS[slot] {
+        let prior_index: usize = export_index(slot, prior);
+        if EXPORT_DEFINED[prior_index] == 1
+            && EXPORT_NAME_IDS[prior_index] == name_id {
+            return deny();
+        }
+        prior += 1;
+    }
+    EXPORT_NAME_IDS[index] = name_id;
+    EXPORT_PLANES[index] = plane;
+    EXPORT_PROTOCOL_IDS[index] = protocol_id;
+    EXPORT_DEFINED[index] = 1;
+    return finish(1);
+}
+
+pub unsafe fn define_request(
+    admission: u64,
+    ordinal: usize,
+    kind: *const u8,
+    kind_length: usize,
+    purpose: *const u8,
+    purpose_length: usize,
+    requested_rights: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_world_any(admission);
+    if slot >= MAX_KERNEL_WORLDS
+        || STATES[slot] != WORLD_STAGING
+        || ordinal >= REQUEST_COUNTS[slot]
+        || !valid_text(kind, kind_length)
+        || !valid_text(purpose, purpose_length)
+        || requested_rights == 0
+        || (requested_rights
+            & (RIGHT_VM_RUN
+                | RIGHT_VM_STOP
+                | RIGHT_DEVICE_RESET
+                | RIGHT_DEVICE_DMA)) != requested_rights {
+        return deny();
+    }
+    let kind_id: u64 = text_hash(kind, kind_length);
+    let purpose_id: u64 = text_hash(purpose, purpose_length);
+    if kind_id == 0 || purpose_id == 0 {
+        return deny();
+    }
+    let index: usize = request_index(slot, ordinal);
+    if REQUEST_DEFINED[index] != 0 {
+        return deny();
+    }
+    let mut prior: usize = 0;
+    while prior < REQUEST_COUNTS[slot] {
+        let prior_index: usize = request_index(slot, prior);
+        if REQUEST_DEFINED[prior_index] == 1
+            && REQUEST_KIND_LENGTHS[prior_index] == kind_length
+            && REQUEST_PURPOSE_LENGTHS[prior_index] == purpose_length {
+            let mut same: bool = true;
+            let mut byte: usize = 0;
+            while byte < kind_length {
+                if REQUEST_KIND_BYTES[request_text_index(prior_index, byte)]
+                    != volatile_load(kind + byte) {
+                    same = false;
+                }
+                byte += 1;
+            }
+            byte = 0;
+            while byte < purpose_length {
+                if REQUEST_PURPOSE_BYTES[
+                    request_text_index(prior_index, byte)
+                ] != volatile_load(purpose + byte) {
+                    same = false;
+                }
+                byte += 1;
+            }
+            if same { return deny(); }
+        }
+        prior += 1;
+    }
+    copy_request_text(
+        index,
+        kind,
+        kind_length,
+        purpose,
+        purpose_length
+    );
+    REQUEST_KINDS[index] = kind_id;
+    REQUEST_PURPOSES[index] = purpose_id;
+    REQUEST_RIGHTS[index] = requested_rights;
+    REQUEST_DEFINED[index] = 1;
+    return finish(1);
+}
+
+pub unsafe fn seal(admission: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_world_any(admission);
+    if slot >= MAX_KERNEL_WORLDS
+        || STATES[slot] != WORLD_STAGING
+        || ADMISSION_SEALS == MAX_COUNTER {
+        return deny();
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < EXPORT_COUNTS[slot] {
+        if EXPORT_DEFINED[export_index(slot, ordinal)] != 1 {
+            return deny();
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < REQUEST_COUNTS[slot] {
+        let index: usize = request_index(slot, ordinal);
+        if REQUEST_DEFINED[index] != 1 {
+            return deny();
+        }
+        let rule: usize = find_policy_for_request(slot, ordinal);
+        if rule >= MAX_POLICY_RULES
+            || (REQUEST_RIGHTS[index] & POLICY_ALLOWED_RIGHTS[rule])
+                != REQUEST_RIGHTS[index] {
+            return deny();
+        }
+        ordinal += 1;
+    }
+    if INTEGRATIONS[slot] == INTEGRATION_BINARY_CONTAINED
+        && !binary_run_request_present(slot) {
+        return deny();
+    }
+    if has_device_export(slot) && MAXIMUM_DEVICES[slot] == 0 {
+        return deny();
+    }
+
+    // Only after every rule and cross-field constraint passes are grants
+    // materialized, so failed admission cannot leave partial authority state.
+    ordinal = 0;
+    while ordinal < REQUEST_COUNTS[slot] {
+        let index: usize = request_index(slot, ordinal);
+        REQUEST_GRANTS[index] = REQUEST_RIGHTS[index];
+        ordinal += 1;
+    }
+    STATES[slot] = WORLD_ADMITTED;
+    ADMISSION_SEALS += 1;
+    return finish(admission);
+}
+
+pub unsafe fn abort(admission: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_world_any(admission);
+    if slot >= MAX_KERNEL_WORLDS
+        || STATES[slot] != WORLD_STAGING
+        || ABORTS == MAX_COUNTER {
+        return deny();
+    }
+    clear_world(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = WORLD_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = WORLD_EMPTY;
+    }
+    ABORTS += 1;
+    return finish(1);
+}
+
+// The owner must revoke dependent VM/resource graphs before this transition.
+// Advancing the generation makes every old world handle fail closed.
+pub unsafe fn revoke(world: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || REVOCATIONS == MAX_COUNTER {
+        return deny();
+    }
+    clear_world(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = WORLD_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = WORLD_EMPTY;
+    }
+    REVOCATIONS += 1;
+    return finish(1);
+}
+
+pub unsafe fn is_current(world: u64) -> bool {
+    return checked_world_current(world) < MAX_KERNEL_WORLDS;
+}
+
+pub unsafe fn state(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS {
+        return 0;
+    }
+    if STATES[slot] == WORLD_STAGING {
+        return WORLD_STATE_STAGING;
+    }
+    if STATES[slot] == WORLD_ADMITTED {
+        return WORLD_STATE_ADMITTED;
+    }
+    return 0;
+}
+
+pub unsafe fn generation(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS {
+        return 0;
+    }
+    return GENERATIONS[slot] as u64;
+}
+
+pub unsafe fn package_digest_word(world: u64, word: usize) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS || word >= 4 {
+        return 0;
+    }
+    return PACKAGE_DIGESTS[digest_index(slot, word)];
+}
+
+pub unsafe fn manifest_digest_word(world: u64, word: usize) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS || word >= 4 {
+        return 0;
+    }
+    return MANIFEST_DIGESTS[digest_index(slot, word)];
+}
+
+pub unsafe fn integration(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return INTEGRATIONS[slot];
+}
+
+pub unsafe fn execution(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return EXECUTIONS[slot];
+}
+
+pub unsafe fn firmware(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return FIRMWARES[slot];
+}
+
+pub unsafe fn world_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return WORLD_IDS[slot];
+}
+
+pub unsafe fn name_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return NAME_IDS[slot];
+}
+
+pub unsafe fn version_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return VERSION_IDS[slot];
+}
+
+pub unsafe fn architecture_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return ARCHITECTURE_IDS[slot];
+}
+
+pub unsafe fn profile_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return PROFILE_IDS[slot];
+}
+
+pub unsafe fn health_protocol_id(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return HEALTH_PROTOCOL_IDS[slot];
+}
+
+pub unsafe fn health_timeout_ms(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return HEALTH_TIMEOUTS_MS[slot];
+}
+
+pub unsafe fn minimum_vcpus(world: u64) -> usize {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MINIMUM_VCPUS[slot];
+}
+
+pub unsafe fn maximum_vcpus(world: u64) -> usize {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_VCPUS[slot];
+}
+
+pub unsafe fn minimum_memory_mib(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MINIMUM_MEMORY_MIB[slot];
+}
+
+pub unsafe fn maximum_memory_mib(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_MEMORY_MIB[slot];
+}
+
+pub unsafe fn maximum_outstanding_requests(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_OUTSTANDING_REQUESTS[slot];
+}
+
+pub unsafe fn maximum_requests_per_generation(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_REQUESTS_PER_GENERATION[slot];
+}
+
+pub unsafe fn maximum_shared_memory_bytes(world: u64) -> u64 {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_SHARED_MEMORY_BYTES[slot];
+}
+
+pub unsafe fn maximum_devices(world: u64) -> usize {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return MAXIMUM_DEVICES[slot];
+}
+
+pub unsafe fn export_count(world: u64) -> usize {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return EXPORT_COUNTS[slot];
+}
+
+pub unsafe fn export_name_id_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= EXPORT_COUNTS[slot] {
+        return 0;
+    }
+    return EXPORT_NAME_IDS[export_index(slot, ordinal)];
+}
+
+pub unsafe fn export_plane_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= EXPORT_COUNTS[slot] {
+        return 0;
+    }
+    return EXPORT_PLANES[export_index(slot, ordinal)];
+}
+
+pub unsafe fn export_protocol_id_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= EXPORT_COUNTS[slot] {
+        return 0;
+    }
+    return EXPORT_PROTOCOL_IDS[export_index(slot, ordinal)];
+}
+
+pub unsafe fn request_count(world: u64) -> usize {
+    let slot: usize = checked_world_any(world);
+    if slot >= MAX_KERNEL_WORLDS { return 0; }
+    return REQUEST_COUNTS[slot];
+}
+
+pub unsafe fn request_kind_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_KINDS[request_index(slot, ordinal)];
+}
+
+pub unsafe fn request_purpose_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_PURPOSES[request_index(slot, ordinal)];
+}
+
+pub unsafe fn request_rights_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_RIGHTS[request_index(slot, ordinal)];
+}
+
+pub unsafe fn request_grant_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= REQUEST_COUNTS[slot] {
+        return 0;
+    }
+    return REQUEST_GRANTS[request_index(slot, ordinal)];
+}
+
+pub unsafe fn policy_registration_count() -> u64 {
+    return POLICY_REGISTRATIONS;
+}
+
+pub unsafe fn policy_allowed_rights(
+    package_digest_zero: u64,
+    package_digest_one: u64,
+    package_digest_two: u64,
+    package_digest_three: u64,
+    request_kind: u64,
+    request_purpose: u64
+) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut rule: usize = 0;
+    while rule < MAX_POLICY_RULES {
+        if POLICY_USED[rule] == 1
+            && POLICY_KINDS[rule] == request_kind
+            && POLICY_PURPOSES[rule] == request_purpose
+            && policy_package_digest_matches(
+                rule,
+                package_digest_zero,
+                package_digest_one,
+                package_digest_two,
+                package_digest_three
+            ) {
+            return POLICY_ALLOWED_RIGHTS[rule];
+        }
+        rule += 1;
+    }
+    return 0;
+}
+
+pub unsafe fn admission_begin_count() -> u64 {
+    return ADMISSION_BEGINS;
+}
+
+pub unsafe fn admission_seal_count() -> u64 {
+    return ADMISSION_SEALS;
+}
+
+pub unsafe fn revocation_count() -> u64 {
+    return REVOCATIONS;
+}
+
+pub unsafe fn abort_count() -> u64 {
+    return ABORTS;
+}
+
+pub unsafe fn denial_count() -> u64 {
+    return DENIALS;
+}
+
+pub unsafe fn is_poisoned() -> bool {
+    return POISONED != 0;
+}
+
+pub unsafe fn current_world_count() -> usize {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_KERNEL_WORLDS {
+        if STATES[slot] == WORLD_ADMITTED {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn staging_world_count() -> usize {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_KERNEL_WORLDS {
+        if STATES[slot] == WORLD_STAGING {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}

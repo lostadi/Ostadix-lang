@@ -68,11 +68,21 @@ class SourceReleaseTests(unittest.TestCase):
         contents = {
             "Cargo.toml": "[package]\nname = \"release-fixture\"\nversion = \"0.1.0\"\n",
             "README.md": "committed readme\n",
+            "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "okernel-multikernel/boot-and-test.sh": "#!/bin/sh\nexit 0\n",
         }
         if files:
             contents.update(files)
         for path, data in contents.items():
-            self._write(path, data)
+            self._write(
+                path,
+                data,
+                executable=path
+                in {
+                    "boot-and-test.sh",
+                    "okernel-multikernel/boot-and-test.sh",
+                },
+            )
         self._git("add", "-f", "--all")
         self._git("commit", "-q", "-m", "fixture")
         return self._git("rev-parse", "HEAD")
@@ -105,6 +115,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "fuzz/fuzz_targets/parser.rs": "fn main() {}\n",
                 "ocore/kernel/main.oc": "module kernel::main;\n",
                 "one-off.patch": "diff --git a/a b/a\n",
+                "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md": "not part of the exact launcher exception\n",
                 "scratch.txt": "not an allowlisted top-level surface\n",
                 "scripts/tool.sh": "#!/bin/sh\nexit 0\n",
                 "src/lib.rs": "pub fn fixture() {}\n",
@@ -121,6 +132,8 @@ class SourceReleaseTests(unittest.TestCase):
             included = {
                 "Cargo.toml",
                 "README.md",
+                "boot-and-test.sh",
+                "okernel-multikernel/boot-and-test.sh",
                 ".github/workflows/ci.yml",
                 "assets/logo.bin",
                 "backends/shim.py",
@@ -143,6 +156,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "cvelist-our",
                 "examples/generated.html",
                 "one-off.patch",
+                "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
                 "scratch.txt",
             }
             for path in included:
@@ -153,6 +167,11 @@ class SourceReleaseTests(unittest.TestCase):
             manifest_bytes = archive.read(f"{prefix}/{release.MANIFEST_NAME}")
             embedded = json.loads(manifest_bytes)
             self.assertEqual(embedded["file_count"], len(included))
+            modes = {entry["path"]: entry["mode"] for entry in embedded["files"]}
+            self.assertEqual(modes["boot-and-test.sh"], "100755")
+            self.assertEqual(
+                modes["okernel-multikernel/boot-and-test.sh"], "100755"
+            )
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
             cargo_digest = hashlib.sha256(
                 archive.read(f"{prefix}/Cargo.toml")
@@ -162,6 +181,17 @@ class SourceReleaseTests(unittest.TestCase):
                 f"{hashlib.sha256(manifest_bytes).hexdigest()}  {release.MANIFEST_NAME}\n",
                 checksums,
             )
+
+    def test_aggregate_smoke_wrappers_are_required_release_paths(self) -> None:
+        self._commit()
+        self._git("rm", "boot-and-test.sh")
+        self._git("commit", "-q", "-m", "remove aggregate launcher")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): boot-and-test\.sh",
+        ):
+            self._build("missing-launcher.zip")
 
     def test_same_commit_produces_byte_identical_zip_across_ref_aliases(self) -> None:
         commit = self._commit(

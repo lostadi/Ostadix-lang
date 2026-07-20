@@ -265,6 +265,8 @@ target/debug/ocorec ocore/examples/minimal.oc --emit obj -o target/minimal.o
 ./ocore/kernel/smoke-live-qemu.sh
 ./ocore/kernel/smoke-live-semantics-qemu.sh
 ./ocore/kernel/smoke-personality-qemu.sh
+./ocore/kernel/smoke-m6b-qemu.sh
+./ocore/kernel/smoke-kernel-world-qemu.sh
 ```
 
 The asserted default `smoke-qemu.sh` output is:
@@ -390,6 +392,53 @@ death, supervisor cancellation, stale/late/duplicate reply, and wake-once
 terminal arbitration are asserted. This is a bounded scalar supervision slice,
 not full Milestone 6: pointer-bearing calls and request-scoped foreign memory
 views remain disabled, and no Linux or other foreign ABI is implemented.
+
+M6B's first native mechanism slice is gated separately by
+`smoke-m6b-qemu.sh` in mode 19. It creates generation-tagged request-scoped
+bounded-copy views over a real kernel process/address space, with kernel-owned
+staging, direction-attenuated nontransferable capabilities, snapshot input, and
+written-prefix-only output commit. The fixed limits are four views, 128 bytes
+per view, and 256 charged bytes total. Reply, cancellation, timeout,
+service-death, process-exit, unmap, and delegated-resource terminal hooks close
+the view capability before one terminal result and one wake publication. A
+reply that can no longer be delivered after a later process-exit or unmap hook
+is released without publishing a second result or wake. Typed revocable leases
+carry the same nonzero request identity as any bound view, cover memory,
+filesystem, timer, network, and device classes, and support request-wide
+revocation while unrelated requests survive without ambient fallback.
+
+That gate is a mechanism slice, not complete M6B: it is not routed through the
+M6A CPL3 daemon or a public pointer-bearing personality call. It has no pinned
+windows, streaming output, signal/restart integration, Linux ABI oracle, schema
+fuzzing, allocation-failure matrix, or concrete filesystem, network, timer, or
+device service.
+
+The common foreign-kernel contract begins in `src/kernel_world.rs`. Strict
+`ocore.kernel-world/v1` manifests put
+source-integrated and binary-contained providers behind the same bounded world
+identity, generation, health, export, quota, request, replacement, and
+provenance rules. Verified normal-form encoding requires the inner declaration
+to match package identity, health, services, and capability requests exactly.
+Package-payload image bytes must match their declared SHA-256; a user-supplied
+image records an expected digest and acceptance metadata but this stage does
+not receive or verify those external bytes. `tests/kernel_world_contract.rs`
+executes those semantic rules and the deterministic `OKWORLD1` normal-form
+codec.
+
+Mode 20's `smoke-kernel-world-qemu.sh` parses the actual embedded hash-pinned
+normal form, keeps verified package and canonical manifest digests distinct,
+and applies native default-deny supervisor admission keyed by exact package
+digest plus copied, byte-exact request kind and purpose. It then locally seals
+a generation-bound,
+nonexecuting VM/vCPU/guest-page pilot graph, with aligned anonymous page
+backing, quota and overlap denial, exact-world reclaim, and unrelated-VM
+survival. The package remains in native `ADMITTED` state; this VM-local seal is
+not a provider lifecycle transition or proof that the manifest's complete
+machine and memory declaration has been fulfilled. It
+does not boot a guest, enter VMX/SVM, construct EPT/NPT, execute firmware,
+inject interrupts, publish provider exports, assign a device, map DMA, or
+establish IOMMU isolation; see
+[`docs/KERNEL_WORLD_CONTRACT.md`](docs/KERNEL_WORLD_CONTRACT.md).
 
 ### Hosted Live-World reference
 
@@ -2298,6 +2347,12 @@ scenario and its non-claims:
 
 # M6A packaged scalar personality RPC, supervision, and rebind (mode 18)
 ./ocore/kernel/smoke-personality-qemu.sh
+
+# M6B request-scoped bounded-copy views and delegated revocation (mode 19)
+./ocore/kernel/smoke-m6b-qemu.sh
+
+# KernelWorld verified-record admission and nonexecuting VM objects (mode 20)
+./ocore/kernel/smoke-kernel-world-qemu.sh
 ```
 
 Additional implementation checks are:
@@ -2316,6 +2371,9 @@ bash scripts/smoke-hosted-live-reference.sh
 ./ocore/kernel/smoke-live-semantics-qemu.sh
 ./ocore/kernel/build-m6-artifacts.sh
 ./ocore/kernel/smoke-personality-qemu.sh
+./ocore/kernel/smoke-m6b-qemu.sh
+./ocore/kernel/smoke-kernel-world-qemu.sh
+cargo test --test kernel_world_contract --no-default-features
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 
@@ -2420,11 +2478,33 @@ O-core as the freestanding systems language.
   exactly one terminal wake, one contained daemon fault, generation-2 restart
   and call-capability rebind, stale/late/duplicate reply denial, supervisor-owned
   cooperative stop, complete reclamation, and post-lifecycle timer survival.
+- A separate bounded M6B mechanism gate for generation-tagged request views,
+  kernel-owned snapshot/output staging, direction-attenuated nontransferable
+  view capabilities, written-prefix-only commit, and capability-close-before-
+  terminal-before-wake ordering across reply, cancel, timeout, service-death,
+  process-exit, unmap, and delegated-revocation hooks. Its five typed lease
+  classes carry exact request identities; request-wide revoke has no ambient
+  fallback and leaves an unrelated request alive. Post-reply process-exit/unmap
+  cleanup publishes no second terminal or wake. The lifecycle/wake hooks are
+  directly exercised rather than wired to live teardown/scheduling. The slice
+  is not yet integrated into the CPL3 personality daemon or public
+  pointer-bearing RPC and does not include pinned windows or concrete delegated
+  services.
 - A separately gated hosted Live-World oracle with bounded strict manifests,
   immutable package CAS objects, default-deny activation policy, health-gated
   service generations, rollback, targeted restart, reconstruction, revocable
   private bearers, and cross-package OValue composition. It remains a separate
   hosted differential oracle, not evidence for the native QEMU gates.
+- A strict execution-neutral `KernelWorld` manifest and bounded host-side
+  lifecycle oracle shared by source-integrated and binary-contained provider
+  designs, plus a deterministic verified native normal form. A separate mode-20
+  gate verifies and parses that embedded record, applies exact-package and
+  byte-exact kind/purpose default-deny supervisor admission, and locally seals
+  generation-bound
+  nonexecuting VM/vCPU/guest-page objects with exact-world reclaim while package
+  admission remains `ADMITTED`. No foreign-kernel
+  execution, provider publication, interrupt/device path, DMA, or IOMMU
+  isolation is claimed.
 - Ambient real NixOS activation through `activate(path[, profile])`, plus
   explicit `dry_activate` and optional profile-scoped embedding guards.
 - Default full backend authority for shim execution, with legacy
@@ -2524,13 +2604,21 @@ features that are already present:
   daemon. Its package and registries are fixed-capacity; it proves exactly one
   crash/restart/rebind cycle, not general retry/backoff or durable reboot
   reconstruction. The test-personality syscall surface is scalar-only and
-  explicitly denies pointer-bearing endpoint access. Request-scoped foreign
-  memory views, delegated filesystem/network/device access, shared OValues,
-  foreign executable formats, and full Milestone 6 remain future work.
+  explicitly denies pointer-bearing endpoint access. Mode 19 implements a
+  separate bounded-copy request-view and delegated-lease revocation mechanism,
+  but it is not wired into that daemon/router path. Pinned windows, concrete
+  delegated filesystem/network/timer/device services, shared OValues, foreign
+  executable formats, and full Milestone 6 remain future work.
 - O-core remains fixed-capacity and single-CPU. It provides no Linux ABI,
   foreign root filesystem, native compiler/self-hosting, framebuffer, or
-  nested-kernel mode. The hosted capability bridge remains a tested transport
-  boundary, not a live connection to this QEMU kernel.
+  nested-kernel execution. The hosted capability bridge remains a tested
+  transport boundary, not a live connection to this QEMU kernel.
+- The `KernelWorld` host module validates manifests, binds them to verified
+  package objects, and executes a bounded lifecycle reference state machine.
+  Mode 20 carries only its hash-pinned normal form, default-deny admission, and
+  nonexecuting VM object identities into O-core. It is not a hypervisor,
+  foreign-kernel loader, running provider supervisor, guest agent, interrupt or
+  device path, DMA boundary, or IOMMU implementation.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
@@ -2540,6 +2628,9 @@ dependency-ordered path from `native[0]` to foreign personalities is tracked in
 contract in [docs/LIVE_SYSTEM.md](docs/LIVE_SYSTEM.md) and the bounded foreign
 memory protocol in
 [docs/PERSONALITY_MEMORY_VIEW.md](docs/PERSONALITY_MEMORY_VIEW.md).
+The shared source-integrated/binary-contained world contract and its native
+dependency order are in
+[docs/KERNEL_WORLD_CONTRACT.md](docs/KERNEL_WORLD_CONTRACT.md).
 
 ---
 

@@ -1,0 +1,724 @@
+module runtime::kernel_world_record;
+
+use runtime::image_vfs::verify_bytes_sha256;
+
+// Strict normal form emitted only after the hosted package/world binding has
+// passed VerifiedKernelWorld. Native parsing pins the complete object SHA-256
+// before interpreting fields. The retained package and manifest digests stay
+// separate: neither serialized metadata nor a string hash is authority.
+pub const RECORD_VERSION_V1: u64 = 1;
+pub const MAX_RECORD_BYTES: usize = 16384;
+pub const MAX_RECORD_EXPORTS: usize = 4;
+pub const MAX_RECORD_REQUESTS: usize = 8;
+pub const MAX_RECORD_REQUIREMENTS: usize = 32;
+pub const MAX_RECORD_RIGHTS: usize = 16;
+
+pub const INTEGRATION_SOURCE: u64 = 1;
+pub const INTEGRATION_BINARY: u64 = 2;
+pub const EXECUTION_PARAVIRTUAL: u64 = 1;
+pub const EXECUTION_HARDWARE_VIRTUALIZED: u64 = 2;
+pub const FIRMWARE_DIRECT: u64 = 1;
+pub const FIRMWARE_UEFI: u64 = 2;
+pub const IMAGE_PACKAGE_PAYLOAD: u64 = 1;
+pub const IMAGE_USER_SUPPLIED: u64 = 2;
+pub const PLANE_DEVICE: u64 = 1;
+pub const PLANE_ABI: u64 = 2;
+pub const PLANE_SEMANTIC: u64 = 3;
+
+// Pilot policy-right vocabulary. Unknown right strings fail before admission;
+// later versions may add bits without changing the meaning of these values.
+pub const RIGHT_VM_RUN: u64 = 1;
+pub const RIGHT_VM_STOP: u64 = 2;
+pub const RIGHT_DEVICE_RESET: u64 = 4;
+pub const RIGHT_DEVICE_DMA: u64 = 8;
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+static MAGIC: [u8; 8] = b"OKWORLD1";
+static RIGHT_RUN: [u8; 3] = b"run";
+static RIGHT_STOP: [u8; 4] = b"stop";
+static RIGHT_RESET: [u8; 5] = b"reset";
+static RIGHT_DMA: [u8; 3] = b"dma";
+
+static mut SOURCE: usize = 0;
+static mut LENGTH: usize = 0;
+static mut CURSOR: usize = 0;
+static mut FAILED: u8 = 0;
+static mut PARSED: u8 = 0;
+
+static mut PACKAGE_DIGESTS: [u64; 4] = [0; 4];
+static mut MANIFEST_DIGESTS: [u64; 4] = [0; 4];
+static mut IMAGE_DIGESTS: [u64; 4] = [0; 4];
+static mut RECORD_DIGESTS: [u64; 4] = [0; 4];
+static mut INTEGRATION: u64 = 0;
+static mut EXECUTION: u64 = 0;
+static mut FIRMWARE: u64 = 0;
+static mut IMAGE_KIND: u64 = 0;
+static mut RESTART: u64 = 0;
+static mut REDISTRIBUTION: u64 = 0;
+static mut EXTERNAL_ACCEPTANCE: u64 = 0;
+static mut MIN_VCPUS: u64 = 0;
+static mut MAX_VCPUS: u64 = 0;
+static mut MIN_MEMORY_MIB: u64 = 0;
+static mut MAX_MEMORY_MIB: u64 = 0;
+static mut HEALTH_TIMEOUT_MS: u64 = 0;
+static mut MAX_OUTSTANDING: u64 = 0;
+static mut MAX_REQUESTS_PER_GENERATION: u64 = 0;
+static mut MAX_SHARED_BYTES: u64 = 0;
+static mut MAX_DEVICES: u64 = 0;
+static mut REQUIREMENT_COUNT: usize = 0;
+static mut EXPORT_COUNT: usize = 0;
+static mut REQUEST_COUNT: usize = 0;
+
+static mut WORLD_ID: u64 = 0;
+static mut VERSION_ID: u64 = 0;
+static mut ARCHITECTURE_ID: u64 = 0;
+static mut PROFILE_ID: u64 = 0;
+static mut HEALTH_ID: u64 = 0;
+static mut IMAGE_PATH_ID: u64 = 0;
+static mut REQUIREMENT_IDS: [u64; 32] = [0; 32];
+static mut REQUIREMENT_OFFSETS: [usize; 32] = [0; 32];
+static mut REQUIREMENT_LENGTHS: [usize; 32] = [0; 32];
+static mut EXPORT_NAMES: [u64; 4] = [0; 4];
+static mut EXPORT_PLANES: [u64; 4] = [0; 4];
+static mut EXPORT_PROTOCOLS: [u64; 4] = [0; 4];
+static mut EXPORT_NAME_OFFSETS: [usize; 4] = [0; 4];
+static mut EXPORT_NAME_LENGTHS: [usize; 4] = [0; 4];
+static mut EXPORT_PROTOCOL_OFFSETS: [usize; 4] = [0; 4];
+static mut EXPORT_PROTOCOL_LENGTHS: [usize; 4] = [0; 4];
+static mut REQUEST_KINDS: [u64; 8] = [0; 8];
+static mut REQUEST_PURPOSES: [u64; 8] = [0; 8];
+static mut REQUEST_RIGHTS: [u64; 8] = [0; 8];
+static mut REQUEST_KIND_OFFSETS: [usize; 8] = [0; 8];
+static mut REQUEST_KIND_LENGTHS: [usize; 8] = [0; 8];
+static mut REQUEST_PURPOSE_OFFSETS: [usize; 8] = [0; 8];
+static mut REQUEST_PURPOSE_LENGTHS: [usize; 8] = [0; 8];
+
+static mut LAST_STRING_OFFSET: usize = 0;
+static mut LAST_STRING_LENGTH: usize = 0;
+
+static mut ACCEPTED: u64 = 0;
+static mut DENIED: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+
+unsafe fn clear_record() -> void {
+    SOURCE = 0;
+    LENGTH = 0;
+    CURSOR = 0;
+    FAILED = 0;
+    PARSED = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        PACKAGE_DIGESTS[index] = 0;
+        MANIFEST_DIGESTS[index] = 0;
+        IMAGE_DIGESTS[index] = 0;
+        RECORD_DIGESTS[index] = 0;
+        EXPORT_NAMES[index] = 0;
+        EXPORT_PLANES[index] = 0;
+        EXPORT_PROTOCOLS[index] = 0;
+        EXPORT_NAME_OFFSETS[index] = 0;
+        EXPORT_NAME_LENGTHS[index] = 0;
+        EXPORT_PROTOCOL_OFFSETS[index] = 0;
+        EXPORT_PROTOCOL_LENGTHS[index] = 0;
+        index += 1;
+    }
+    index = 0;
+    while index < 8 {
+        REQUEST_KINDS[index] = 0;
+        REQUEST_PURPOSES[index] = 0;
+        REQUEST_RIGHTS[index] = 0;
+        REQUEST_KIND_OFFSETS[index] = 0;
+        REQUEST_KIND_LENGTHS[index] = 0;
+        REQUEST_PURPOSE_OFFSETS[index] = 0;
+        REQUEST_PURPOSE_LENGTHS[index] = 0;
+        index += 1;
+    }
+    index = 0;
+    while index < 32 {
+        REQUIREMENT_IDS[index] = 0;
+        REQUIREMENT_OFFSETS[index] = 0;
+        REQUIREMENT_LENGTHS[index] = 0;
+        index += 1;
+    }
+    INTEGRATION = 0;
+    EXECUTION = 0;
+    FIRMWARE = 0;
+    IMAGE_KIND = 0;
+    RESTART = 0;
+    REDISTRIBUTION = 0;
+    EXTERNAL_ACCEPTANCE = 0;
+    MIN_VCPUS = 0;
+    MAX_VCPUS = 0;
+    MIN_MEMORY_MIB = 0;
+    MAX_MEMORY_MIB = 0;
+    HEALTH_TIMEOUT_MS = 0;
+    MAX_OUTSTANDING = 0;
+    MAX_REQUESTS_PER_GENERATION = 0;
+    MAX_SHARED_BYTES = 0;
+    MAX_DEVICES = 0;
+    REQUIREMENT_COUNT = 0;
+    EXPORT_COUNT = 0;
+    REQUEST_COUNT = 0;
+    WORLD_ID = 0;
+    VERSION_ID = 0;
+    ARCHITECTURE_ID = 0;
+    PROFILE_ID = 0;
+    HEALTH_ID = 0;
+    IMAGE_PATH_ID = 0;
+    LAST_STRING_OFFSET = 0;
+    LAST_STRING_LENGTH = 0;
+}
+
+unsafe fn deny() -> u64 {
+    clear_record();
+    DENIED += 1;
+    return 0;
+}
+
+unsafe fn raw(offset: usize) -> u64 {
+    if FAILED != 0 || offset >= LENGTH {
+        FAILED = 1;
+        return 0;
+    }
+    return volatile_load((SOURCE + offset) as *const u8) as u64;
+}
+
+unsafe fn take_u8() -> u64 {
+    let value: u64 = raw(CURSOR);
+    CURSOR += 1;
+    return value;
+}
+
+unsafe fn take_u16() -> u64 {
+    let value: u64 = take_u8() | (take_u8() << 8);
+    return value;
+}
+
+unsafe fn take_u32() -> u64 {
+    let value: u64 = take_u16() | (take_u16() << 16);
+    return value;
+}
+
+unsafe fn take_u64() -> u64 {
+    let low: u64 = take_u32();
+    let high: u64 = take_u32();
+    return low | (high << 32);
+}
+
+unsafe fn take_digest(destination: *mut u64) -> void {
+    let mut word: usize = 0;
+    while word < 4 {
+        let mut value: u64 = 0;
+        let mut byte: usize = 0;
+        while byte < 8 {
+            value = (value << 8) | take_u8();
+            byte += 1;
+        }
+        volatile_store(destination + word, value);
+        word += 1;
+    }
+}
+
+unsafe fn string_equals(
+    offset: usize,
+    length: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    if length != expected_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        if raw(offset + index) != volatile_load(expected + index) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn take_string_id(allow_empty: bool) -> u64 {
+    let length: usize = take_u16() as usize;
+    LAST_STRING_OFFSET = 0;
+    LAST_STRING_LENGTH = 0;
+    if FAILED != 0 || length > 512 || (!allow_empty && length == 0) {
+        FAILED = 1;
+        return 0;
+    }
+    if CURSOR > LENGTH || length > LENGTH - CURSOR {
+        FAILED = 1;
+        return 0;
+    }
+    if length == 0 {
+        return 0;
+    }
+    let start: usize = CURSOR;
+    let mut hash: u64 = FNV_OFFSET;
+    let mut index: usize = 0;
+    while index < length {
+        let byte: u64 = raw(start + index);
+        if byte < 0x20 || byte > 0x7e {
+            FAILED = 1;
+            return 0;
+        }
+        hash = (hash ^ byte) * FNV_PRIME;
+        index += 1;
+    }
+    CURSOR += length;
+    LAST_STRING_OFFSET = start;
+    LAST_STRING_LENGTH = length;
+    if hash == 0 {
+        FAILED = 1;
+    }
+    return hash;
+}
+
+// The host encoder orders every declaration using Rust's bytewise String
+// ordering. Native acceptance repeats that rule over the retained ASCII bytes;
+// hashes are never used to decide canonical order.
+unsafe fn string_less(
+    left_offset: usize,
+    left_length: usize,
+    right_offset: usize,
+    right_length: usize
+) -> bool {
+    let mut shared: usize = right_length;
+    if left_length < right_length { shared = left_length; }
+    let mut index: usize = 0;
+    while index < shared {
+        let left: u64 = raw(left_offset + index);
+        let right: u64 = raw(right_offset + index);
+        if left < right {
+            return true;
+        }
+        if left > right {
+            return false;
+        }
+        index += 1;
+    }
+    return left_length < right_length;
+}
+
+unsafe fn request_less(left: usize, right: usize) -> bool {
+    if string_less(
+        REQUEST_KIND_OFFSETS[left],
+        REQUEST_KIND_LENGTHS[left],
+        REQUEST_KIND_OFFSETS[right],
+        REQUEST_KIND_LENGTHS[right]
+    ) {
+        return true;
+    }
+    if string_less(
+        REQUEST_KIND_OFFSETS[right],
+        REQUEST_KIND_LENGTHS[right],
+        REQUEST_KIND_OFFSETS[left],
+        REQUEST_KIND_LENGTHS[left]
+    ) {
+        return false;
+    }
+    return string_less(
+        REQUEST_PURPOSE_OFFSETS[left],
+        REQUEST_PURPOSE_LENGTHS[left],
+        REQUEST_PURPOSE_OFFSETS[right],
+        REQUEST_PURPOSE_LENGTHS[right]
+    );
+}
+
+unsafe fn pointer_string_less(
+    left: *const u8,
+    left_length: usize,
+    right: *const u8,
+    right_length: usize
+) -> bool {
+    if left as usize == 0 || right as usize == 0 {
+        return false;
+    }
+    let mut shared: usize = right_length;
+    if left_length < right_length { shared = left_length; }
+    let mut index: usize = 0;
+    while index < shared {
+        let left_byte: u8 = volatile_load(left + index);
+        let right_byte: u8 = volatile_load(right + index);
+        if left_byte < right_byte { return true; }
+        if left_byte > right_byte { return false; }
+        index += 1;
+    }
+    return left_length < right_length;
+}
+
+unsafe fn take_right() -> u64 {
+    let length: usize = take_u16() as usize;
+    LAST_STRING_OFFSET = 0;
+    LAST_STRING_LENGTH = 0;
+    if FAILED != 0
+        || length == 0
+        || length > 128
+        || CURSOR > LENGTH
+        || length > LENGTH - CURSOR {
+        FAILED = 1;
+        return 0;
+    }
+    let start: usize = CURSOR;
+    CURSOR += length;
+    LAST_STRING_OFFSET = start;
+    LAST_STRING_LENGTH = length;
+    if string_equals(start, length, (&RIGHT_RUN[0]), 3) {
+        return RIGHT_VM_RUN;
+    }
+    if string_equals(start, length, (&RIGHT_STOP[0]), 4) {
+        return RIGHT_VM_STOP;
+    }
+    if string_equals(start, length, (&RIGHT_RESET[0]), 5) {
+        return RIGHT_DEVICE_RESET;
+    }
+    if string_equals(start, length, (&RIGHT_DMA[0]), 3) {
+        return RIGHT_DEVICE_DMA;
+    }
+    FAILED = 1;
+    return 0;
+}
+
+unsafe fn digest_nonzero(digest: *const u64) -> bool {
+    return volatile_load(digest) != 0
+        || volatile_load(digest + 1) != 0
+        || volatile_load(digest + 2) != 0
+        || volatile_load(digest + 3) != 0;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    clear_record();
+    ACCEPTED = 0;
+    DENIED = 0;
+    INITIALIZED = 1;
+    return 1;
+}
+
+pub unsafe fn parse(
+    source: *const u8,
+    length: usize,
+    digest_0: u64,
+    digest_1: u64,
+    digest_2: u64,
+    digest_3: u64
+) -> u64 {
+    if INITIALIZED == 0 || PARSED != 0 {
+        return 0;
+    }
+    clear_record();
+    if source as usize == 0
+        || length < 160
+        || length > MAX_RECORD_BYTES
+        || verify_bytes_sha256(
+            source,
+            length,
+            digest_0,
+            digest_1,
+            digest_2,
+            digest_3
+        ) != 1 {
+        return deny();
+    }
+    SOURCE = source as usize;
+    LENGTH = length;
+    RECORD_DIGESTS[0] = digest_0;
+    RECORD_DIGESTS[1] = digest_1;
+    RECORD_DIGESTS[2] = digest_2;
+    RECORD_DIGESTS[3] = digest_3;
+
+    let mut index: usize = 0;
+    while index < 8 {
+        if take_u8() != MAGIC[index] as u64 {
+            return deny();
+        }
+        index += 1;
+    }
+    if take_u16() != RECORD_VERSION_V1
+        || take_u16() != 0
+        || take_u32() != length as u64 {
+        return deny();
+    }
+    take_digest((&mut PACKAGE_DIGESTS[0]));
+    take_digest((&mut MANIFEST_DIGESTS[0]));
+    INTEGRATION = take_u8();
+    EXECUTION = take_u8();
+    FIRMWARE = take_u8();
+    IMAGE_KIND = take_u8();
+    RESTART = take_u8();
+    REDISTRIBUTION = take_u8();
+    EXTERNAL_ACCEPTANCE = take_u8();
+    if take_u8() != 0 {
+        return deny();
+    }
+    MIN_VCPUS = take_u16();
+    MAX_VCPUS = take_u16();
+    MAX_DEVICES = take_u16();
+    EXPORT_COUNT = take_u16() as usize;
+    REQUEST_COUNT = take_u16() as usize;
+    REQUIREMENT_COUNT = take_u16() as usize;
+    MAX_OUTSTANDING = take_u32();
+    MIN_MEMORY_MIB = take_u64();
+    MAX_MEMORY_MIB = take_u64();
+    HEALTH_TIMEOUT_MS = take_u64();
+    MAX_REQUESTS_PER_GENERATION = take_u64();
+    MAX_SHARED_BYTES = take_u64();
+
+    WORLD_ID = take_string_id(false);
+    VERSION_ID = take_string_id(false);
+    ARCHITECTURE_ID = take_string_id(false);
+    PROFILE_ID = take_string_id(false);
+    HEALTH_ID = take_string_id(false);
+    IMAGE_PATH_ID = take_string_id(true);
+    take_digest((&mut IMAGE_DIGESTS[0]));
+
+    if FAILED != 0
+        || !digest_nonzero((&PACKAGE_DIGESTS[0]))
+        || !digest_nonzero((&MANIFEST_DIGESTS[0]))
+        || EXPORT_COUNT == 0
+        || EXPORT_COUNT > MAX_RECORD_EXPORTS
+        || REQUEST_COUNT == 0
+        || REQUEST_COUNT > MAX_RECORD_REQUESTS
+        || REQUIREMENT_COUNT > MAX_RECORD_REQUIREMENTS
+        || MIN_VCPUS == 0
+        || MAX_VCPUS < MIN_VCPUS
+        || MAX_VCPUS > 256
+        || MIN_MEMORY_MIB == 0
+        || MAX_MEMORY_MIB < MIN_MEMORY_MIB
+        || MAX_OUTSTANDING == 0
+        || MAX_REQUESTS_PER_GENERATION < MAX_OUTSTANDING
+        || HEALTH_TIMEOUT_MS == 0
+        || HEALTH_TIMEOUT_MS > 60000
+        || RESTART == 0
+        || RESTART > 3
+        || REDISTRIBUTION == 0
+        || REDISTRIBUTION > 2
+        || EXTERNAL_ACCEPTANCE > 1 {
+        return deny();
+    }
+    if (INTEGRATION == INTEGRATION_SOURCE
+            && (EXECUTION != EXECUTION_PARAVIRTUAL
+                || FIRMWARE != FIRMWARE_DIRECT
+                || IMAGE_KIND != IMAGE_PACKAGE_PAYLOAD
+                || IMAGE_PATH_ID == 0))
+        || (INTEGRATION == INTEGRATION_BINARY
+            && EXECUTION != EXECUTION_HARDWARE_VIRTUALIZED)
+        || (INTEGRATION != INTEGRATION_SOURCE
+            && INTEGRATION != INTEGRATION_BINARY)
+        || (IMAGE_KIND == IMAGE_USER_SUPPLIED
+            && (IMAGE_PATH_ID != 0
+                || REDISTRIBUTION != 2
+                || EXTERNAL_ACCEPTANCE != 1))
+        || (IMAGE_KIND != IMAGE_PACKAGE_PAYLOAD
+            && IMAGE_KIND != IMAGE_USER_SUPPLIED) {
+        return deny();
+    }
+
+    index = 0;
+    while index < REQUIREMENT_COUNT {
+        REQUIREMENT_IDS[index] = take_string_id(false);
+        REQUIREMENT_OFFSETS[index] = LAST_STRING_OFFSET;
+        REQUIREMENT_LENGTHS[index] = LAST_STRING_LENGTH;
+        if index > 0 && !string_less(
+            REQUIREMENT_OFFSETS[index - 1],
+            REQUIREMENT_LENGTHS[index - 1],
+            REQUIREMENT_OFFSETS[index],
+            REQUIREMENT_LENGTHS[index]
+        ) {
+            return deny();
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < EXPORT_COUNT {
+        EXPORT_NAMES[index] = take_string_id(false);
+        EXPORT_NAME_OFFSETS[index] = LAST_STRING_OFFSET;
+        EXPORT_NAME_LENGTHS[index] = LAST_STRING_LENGTH;
+        EXPORT_PLANES[index] = take_u8();
+        if take_u8() != 0 {
+            return deny();
+        }
+        EXPORT_PROTOCOLS[index] = take_string_id(false);
+        EXPORT_PROTOCOL_OFFSETS[index] = LAST_STRING_OFFSET;
+        EXPORT_PROTOCOL_LENGTHS[index] = LAST_STRING_LENGTH;
+        if EXPORT_PLANES[index] < PLANE_DEVICE
+            || EXPORT_PLANES[index] > PLANE_SEMANTIC {
+            return deny();
+        }
+        // Export names are unique in the verified schema, so strict name
+        // ordering is equivalent to the host's (name, plane, protocol) tuple.
+        if index > 0 && !string_less(
+            EXPORT_NAME_OFFSETS[index - 1],
+            EXPORT_NAME_LENGTHS[index - 1],
+            EXPORT_NAME_OFFSETS[index],
+            EXPORT_NAME_LENGTHS[index]
+        ) {
+            return deny();
+        }
+        index += 1;
+    }
+    let mut has_vm_run: bool = false;
+    index = 0;
+    while index < REQUEST_COUNT {
+        REQUEST_KINDS[index] = take_string_id(false);
+        REQUEST_KIND_OFFSETS[index] = LAST_STRING_OFFSET;
+        REQUEST_KIND_LENGTHS[index] = LAST_STRING_LENGTH;
+        REQUEST_PURPOSES[index] = take_string_id(false);
+        REQUEST_PURPOSE_OFFSETS[index] = LAST_STRING_OFFSET;
+        REQUEST_PURPOSE_LENGTHS[index] = LAST_STRING_LENGTH;
+        let rights_count: usize = take_u16() as usize;
+        if rights_count == 0 || rights_count > MAX_RECORD_RIGHTS {
+            return deny();
+        }
+        let mut right_index: usize = 0;
+        let mut rights: u64 = 0;
+        let mut previous_right_offset: usize = 0;
+        let mut previous_right_length: usize = 0;
+        while right_index < rights_count {
+            let right: u64 = take_right();
+            if right == 0 || (rights & right) != 0 {
+                return deny();
+            }
+            if right_index > 0 && !string_less(
+                previous_right_offset,
+                previous_right_length,
+                LAST_STRING_OFFSET,
+                LAST_STRING_LENGTH
+            ) {
+                return deny();
+            }
+            previous_right_offset = LAST_STRING_OFFSET;
+            previous_right_length = LAST_STRING_LENGTH;
+            rights |= right;
+            right_index += 1;
+        }
+        REQUEST_RIGHTS[index] = rights;
+        // vm.machine and purpose identifiers are interpreted by independent
+        // supervisor policy. At this layer any request carrying RUN is enough
+        // to enforce the binary-contained structural requirement; policy must
+        // still match its exact kind and purpose before admission.
+        if (rights & RIGHT_VM_RUN) != 0 {
+            has_vm_run = true;
+        }
+        // Request (kind, purpose) pairs are unique in the verified schema;
+        // rights are separately required to be strictly byte-sorted above.
+        if index > 0 && !request_less(index - 1, index) {
+            return deny();
+        }
+        index += 1;
+    }
+    if FAILED != 0
+        || CURSOR != LENGTH
+        || (INTEGRATION == INTEGRATION_BINARY && !has_vm_run) {
+        return deny();
+    }
+    PARSED = 1;
+    ACCEPTED += 1;
+    return 1;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0 || FAILED != 0 {
+        return false;
+    }
+    if PARSED == 0 {
+        return SOURCE == 0 && LENGTH == 0 && CURSOR == 0;
+    }
+    return SOURCE != 0
+        && LENGTH >= 160
+        && LENGTH <= MAX_RECORD_BYTES
+        && CURSOR == LENGTH
+        && ACCEPTED == 1
+        && EXPORT_COUNT > 0
+        && EXPORT_COUNT <= MAX_RECORD_EXPORTS
+        && REQUEST_COUNT > 0
+        && REQUEST_COUNT <= MAX_RECORD_REQUESTS
+        && digest_nonzero((&PACKAGE_DIGESTS[0]))
+        && digest_nonzero((&MANIFEST_DIGESTS[0]));
+}
+
+pub unsafe fn package_digest_word(word: usize) -> u64 {
+    if PARSED == 0 || word >= 4 { return 0; }
+    return PACKAGE_DIGESTS[word];
+}
+pub unsafe fn manifest_digest_word(word: usize) -> u64 {
+    if PARSED == 0 || word >= 4 { return 0; }
+    return MANIFEST_DIGESTS[word];
+}
+pub unsafe fn integration() -> u64 { return INTEGRATION; }
+pub unsafe fn execution() -> u64 { return EXECUTION; }
+pub unsafe fn firmware() -> u64 { return FIRMWARE; }
+pub unsafe fn world_id() -> u64 { return WORLD_ID; }
+pub unsafe fn version_id() -> u64 { return VERSION_ID; }
+pub unsafe fn architecture_id() -> u64 { return ARCHITECTURE_ID; }
+pub unsafe fn profile_id() -> u64 { return PROFILE_ID; }
+pub unsafe fn health_id() -> u64 { return HEALTH_ID; }
+pub unsafe fn health_timeout_ms() -> u64 { return HEALTH_TIMEOUT_MS; }
+pub unsafe fn min_vcpus() -> u64 { return MIN_VCPUS; }
+pub unsafe fn max_vcpus() -> u64 { return MAX_VCPUS; }
+pub unsafe fn min_memory_mib() -> u64 { return MIN_MEMORY_MIB; }
+pub unsafe fn max_memory_mib() -> u64 { return MAX_MEMORY_MIB; }
+pub unsafe fn max_outstanding() -> u64 { return MAX_OUTSTANDING; }
+pub unsafe fn max_requests_per_generation() -> u64 {
+    return MAX_REQUESTS_PER_GENERATION;
+}
+pub unsafe fn max_shared_bytes() -> u64 { return MAX_SHARED_BYTES; }
+pub unsafe fn max_devices() -> u64 { return MAX_DEVICES; }
+pub unsafe fn export_count() -> usize { return EXPORT_COUNT; }
+pub unsafe fn request_count() -> usize { return REQUEST_COUNT; }
+pub unsafe fn export_name(ordinal: usize) -> u64 {
+    if ordinal >= EXPORT_COUNT { return 0; }
+    return EXPORT_NAMES[ordinal];
+}
+pub unsafe fn export_plane(ordinal: usize) -> u64 {
+    if ordinal >= EXPORT_COUNT { return 0; }
+    return EXPORT_PLANES[ordinal];
+}
+pub unsafe fn export_protocol(ordinal: usize) -> u64 {
+    if ordinal >= EXPORT_COUNT { return 0; }
+    return EXPORT_PROTOCOLS[ordinal];
+}
+pub unsafe fn request_kind(ordinal: usize) -> u64 {
+    if ordinal >= REQUEST_COUNT { return 0; }
+    return REQUEST_KINDS[ordinal];
+}
+pub unsafe fn request_purpose(ordinal: usize) -> u64 {
+    if ordinal >= REQUEST_COUNT { return 0; }
+    return REQUEST_PURPOSES[ordinal];
+}
+pub unsafe fn request_rights(ordinal: usize) -> u64 {
+    if ordinal >= REQUEST_COUNT { return 0; }
+    return REQUEST_RIGHTS[ordinal];
+}
+pub unsafe fn request_kind_address(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUEST_COUNT { return 0; }
+    return SOURCE + REQUEST_KIND_OFFSETS[ordinal];
+}
+pub unsafe fn request_kind_length(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUEST_COUNT { return 0; }
+    return REQUEST_KIND_LENGTHS[ordinal];
+}
+pub unsafe fn request_purpose_address(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUEST_COUNT { return 0; }
+    return SOURCE + REQUEST_PURPOSE_OFFSETS[ordinal];
+}
+pub unsafe fn request_purpose_length(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUEST_COUNT { return 0; }
+    return REQUEST_PURPOSE_LENGTHS[ordinal];
+}
+
+// Executable comparator unit proof used by mode 20. `run < stop` must hold,
+// while the reversed and equal forms must fail the strict-order predicate.
+pub unsafe fn canonical_order_selftest() -> u64 {
+    if pointer_string_less((&RIGHT_RUN[0]), 3, (&RIGHT_STOP[0]), 4)
+        && !pointer_string_less((&RIGHT_STOP[0]), 4, (&RIGHT_RUN[0]), 3)
+        && !pointer_string_less((&RIGHT_RUN[0]), 3, (&RIGHT_RUN[0]), 3) {
+        return 1;
+    }
+    return 0;
+}
+pub unsafe fn accepted_count() -> u64 { return ACCEPTED; }
+pub unsafe fn denied_count() -> u64 { return DENIED; }

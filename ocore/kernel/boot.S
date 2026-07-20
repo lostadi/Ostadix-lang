@@ -71,6 +71,21 @@ ocore_m6_image_bytes_start:
 .globl ocore_m6_image_bytes_end
 ocore_m6_image_bytes_end:
 
+// Mode 20 embeds the deterministic host-verified KernelWorld normal form.
+// Native admission pins the complete record SHA before parsing it; no foreign
+// kernel image or executable is embedded by this gate.
+.balign 16
+.globl ocore_kernel_world_record_bytes_start
+ocore_kernel_world_record_bytes_start:
+#if OCORE_PROBE_MODE == 20
+#ifndef OCORE_KERNEL_WORLD_RECORD_PATH
+#error "OCORE_KERNEL_WORLD_RECORD_PATH is required for KernelWorld admission mode"
+#endif
+  .incbin OCORE_KERNEL_WORLD_RECORD_PATH
+#endif
+.globl ocore_kernel_world_record_bytes_end
+ocore_kernel_world_record_bytes_end:
+
 .section .bss,"aw",@nobits
 .balign 4096
 p4_table:
@@ -500,6 +515,20 @@ ocore_m6_image_end:
   lea rax, [rip + ocore_m6_image_bytes_end]
   ret
 .size ocore_m6_image_end, .-ocore_m6_image_end
+
+.globl ocore_kernel_world_record_start
+.type ocore_kernel_world_record_start, @function
+ocore_kernel_world_record_start:
+  lea rax, [rip + ocore_kernel_world_record_bytes_start]
+  ret
+.size ocore_kernel_world_record_start, .-ocore_kernel_world_record_start
+
+.globl ocore_kernel_world_record_end
+.type ocore_kernel_world_record_end, @function
+ocore_kernel_world_record_end:
+  lea rax, [rip + ocore_kernel_world_record_bytes_end]
+  ret
+.size ocore_kernel_world_record_end, .-ocore_kernel_world_record_end
 
 .globl ocore_management_cr3
 .type ocore_management_cr3, @function

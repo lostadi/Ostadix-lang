@@ -1,0 +1,612 @@
+module kernel::kernel_world_semantics;
+
+use runtime::capability::cspace_handle_for_slot;
+use runtime::image_vfs::sha256_selftest;
+use runtime::interrupts::ticks;
+use runtime::kernel_world_admission::abort as abort_admission;
+use runtime::kernel_world_admission::admission_begin_count;
+use runtime::kernel_world_admission::admission_seal_count;
+use runtime::kernel_world_admission::begin as begin_admission;
+use runtime::kernel_world_admission::current_world_count;
+use runtime::kernel_world_admission::define_export as define_admission_export;
+use runtime::kernel_world_admission::define_request as define_admission_request;
+use runtime::kernel_world_admission::denial_count as admission_denial_count;
+use runtime::kernel_world_admission::generation as world_generation;
+use runtime::kernel_world_admission::init as admission_init;
+use runtime::kernel_world_admission::invariants_hold as admission_invariants_hold;
+use runtime::kernel_world_admission::is_current as world_is_current;
+use runtime::kernel_world_admission::package_digest_word as admitted_package_digest_word;
+use runtime::kernel_world_admission::register_policy;
+use runtime::kernel_world_admission::request_grant_at;
+use runtime::kernel_world_admission::revoke as revoke_admission;
+use runtime::kernel_world_admission::seal as seal_admission;
+use runtime::kernel_world_admission::state as world_state;
+use runtime::kernel_world_admission::EXECUTION_HARDWARE_VIRTUALIZED;
+use runtime::kernel_world_admission::EXPORT_PLANE_ABI;
+use runtime::kernel_world_admission::FIRMWARE_UEFI;
+use runtime::kernel_world_admission::INTEGRATION_BINARY_CONTAINED;
+use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
+use runtime::kernel_world_admission::RIGHT_VM_RUN;
+use runtime::kernel_world_admission::RIGHT_VM_STOP;
+use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::kernel_world_record::accepted_count as record_accepted_count;
+use runtime::kernel_world_record::canonical_order_selftest as record_canonical_order_selftest;
+use runtime::kernel_world_record::architecture_id as record_architecture_id;
+use runtime::kernel_world_record::denied_count as record_denied_count;
+use runtime::kernel_world_record::execution as record_execution;
+use runtime::kernel_world_record::export_count as record_export_count;
+use runtime::kernel_world_record::export_name as record_export_name;
+use runtime::kernel_world_record::export_plane as record_export_plane;
+use runtime::kernel_world_record::export_protocol as record_export_protocol;
+use runtime::kernel_world_record::firmware as record_firmware;
+use runtime::kernel_world_record::health_id as record_health_id;
+use runtime::kernel_world_record::health_timeout_ms as record_health_timeout;
+use runtime::kernel_world_record::init as record_init;
+use runtime::kernel_world_record::integration as record_integration;
+use runtime::kernel_world_record::invariants_hold as record_invariants_hold;
+use runtime::kernel_world_record::manifest_digest_word as record_manifest_digest_word;
+use runtime::kernel_world_record::max_devices as record_max_devices;
+use runtime::kernel_world_record::max_memory_mib as record_max_memory_mib;
+use runtime::kernel_world_record::max_outstanding as record_max_outstanding;
+use runtime::kernel_world_record::max_requests_per_generation as record_max_requests_per_generation;
+use runtime::kernel_world_record::max_shared_bytes as record_max_shared_bytes;
+use runtime::kernel_world_record::max_vcpus as record_max_vcpus;
+use runtime::kernel_world_record::min_memory_mib as record_min_memory_mib;
+use runtime::kernel_world_record::min_vcpus as record_min_vcpus;
+use runtime::kernel_world_record::package_digest_word as record_package_digest_word;
+use runtime::kernel_world_record::parse as parse_record;
+use runtime::kernel_world_record::profile_id as record_profile_id;
+use runtime::kernel_world_record::request_count as record_request_count;
+use runtime::kernel_world_record::request_kind_address as record_request_kind_address;
+use runtime::kernel_world_record::request_kind_length as record_request_kind_length;
+use runtime::kernel_world_record::request_purpose_address as record_request_purpose_address;
+use runtime::kernel_world_record::request_purpose_length as record_request_purpose_length;
+use runtime::kernel_world_record::request_rights as record_request_rights;
+use runtime::kernel_world_record::version_id as record_version_id;
+use runtime::kernel_world_record::world_id as record_world_id;
+use runtime::memory_object::quota_used;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::pages::free_frames;
+use runtime::serial::write;
+use runtime::vm_object::active_guest_page_count;
+use runtime::vm_object::active_vcpu_count;
+use runtime::vm_object::active_vm_count;
+use runtime::vm_object::attach_guest_page;
+use runtime::vm_object::create_vcpu;
+use runtime::vm_object::create_vm;
+use runtime::vm_object::denial_count as vm_denial_count;
+use runtime::vm_object::guest_page_is_current;
+use runtime::vm_object::guest_page_memory_object;
+use runtime::vm_object::init as vm_init;
+use runtime::vm_object::invariants_hold as vm_invariants_hold;
+use runtime::vm_object::revoke_world as revoke_vm_world;
+use runtime::vm_object::seal_configuration;
+use runtime::vm_object::vcpu_is_current;
+use runtime::vm_object::vm_guest_page_count;
+use runtime::vm_object::vm_is_current;
+use runtime::vm_object::vm_state;
+use runtime::vm_object::vm_vcpu_count;
+use runtime::vm_object::VM_STATE_CONFIGURED;
+
+const MODE_KERNEL_WORLD_OBJECTS: u64 = 20;
+const RECORD_LENGTH: usize = 440;
+const RECORD_SHA_0: u64 = 0x36eb_ffa3_7463_1fc5;
+const RECORD_SHA_1: u64 = 0x1e70_cc20_e051_2fd8;
+const RECORD_SHA_2: u64 = 0x99f3_703f_e15d_200a;
+const RECORD_SHA_3: u64 = 0x33e3_3048_2a70_7671;
+const NONCANONICAL_SHA_0: u64 = 0xc3ae_4028_c4a7_85fa;
+const NONCANONICAL_SHA_1: u64 = 0x3892_7484_5bf5_1d93;
+const NONCANONICAL_SHA_2: u64 = 0xc8a6_8528_4103_f96d;
+const NONCANONICAL_SHA_3: u64 = 0xf13c_a3ec_f935_7d7d;
+const PACKAGE_SHA_0: u64 = 0x7ac7_0524_6383_3144;
+const PACKAGE_SHA_1: u64 = 0x101d_b2ef_7730_1855;
+const PACKAGE_SHA_2: u64 = 0xec70_dd73_dae1_93db;
+const PACKAGE_SHA_3: u64 = 0xb4ab_b0fe_f69a_0e67;
+const MANIFEST_SHA_0: u64 = 0xa89d_b7a5_f132_a093;
+const MANIFEST_SHA_1: u64 = 0x9451_b009_4e91_a1cc;
+const MANIFEST_SHA_2: u64 = 0x07b3_9f6b_e23f_260c;
+const MANIFEST_SHA_3: u64 = 0x72b3_d7ea_a2e8_3933;
+
+const PRIMARY_OWNER_SLOT: usize = 1;
+const UNRELATED_OWNER_SLOT: usize = 2;
+const UNRELATED_DIGEST_0: u64 = 0x9101;
+const UNRELATED_DIGEST_1: u64 = 0x9102;
+const UNRELATED_DIGEST_2: u64 = 0x9103;
+const UNRELATED_DIGEST_3: u64 = 0x9104;
+const UNRELATED_MANIFEST_0: u64 = 0xa101;
+const UNRELATED_MANIFEST_1: u64 = 0xa102;
+const UNRELATED_MANIFEST_2: u64 = 0xa103;
+const UNRELATED_MANIFEST_3: u64 = 0xa104;
+// These exact policy strings are independently compiled kernel policy, not
+// pointers or identifiers copied from the record under admission.
+static POLICY_DEVICE_NET: [u8; 10] = b"device.net";
+static POLICY_RESETTABLE_NETWORK: [u8; 33] =
+    b"resettable pilot network provider";
+static POLICY_VM_MACHINE: [u8; 10] = b"vm.machine";
+static POLICY_CONTAINED_GUEST: [u8; 25] =
+    b"contained guest execution";
+// Same bounded length as the approved purpose, with one different byte.
+static POLICY_WRONG_PURPOSE: [u8; 25] =
+    b"contained guest executioo";
+static UNRELATED_VM_PURPOSE: [u8; 25] =
+    b"unrelated guest execution";
+static CANONICAL_RIGHTS_TAIL: [u8; 11] =
+    [3, 0, b'r', b'u', b'n', 4, 0, b's', b't', b'o', b'p'];
+static NONCANONICAL_RIGHTS_TAIL: [u8; 11] =
+    [4, 0, b's', b't', b'o', b'p', 3, 0, b'r', b'u', b'n'];
+static mut NONCANONICAL_RECORD: [u8; 440] = [0; 440];
+
+static RECORD_MESSAGE: [u8; 59] =
+    b"KW pinned hash/tamper + noncanonical-order rejection: PASS\n";
+static POLICY_MESSAGE: [u8; 59] =
+    b"KW exact-byte policy + package/manifest default-deny: PASS\n";
+static NONEXECUTING_MESSAGE: [u8; 55] =
+    b"KW bounded VM pilot configured without execution: PASS\n";
+static OBJECT_MESSAGE: [u8; 47] =
+    b"KW VM/vCPU/guest-page generation + quota: PASS\n";
+static REVOKE_MESSAGE: [u8; 59] =
+    b"KW exact-world revoke/reclaim; unrelated VM survives: PASS\n";
+static COMPLETE_MESSAGE: [u8; 52] =
+    b"KW native admission + nonexecuting VM objects: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 35] =
+    b"KW post-object-model timer: online\n";
+
+extern "sysv64" fn ocore_kernel_world_record_start() -> usize;
+extern "sysv64" fn ocore_kernel_world_record_end() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn record_text_equals(
+    address: usize,
+    length: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    if address == 0 || expected as usize == 0 || length != expected_length {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < length {
+        if volatile_load((address + byte) as *const u8)
+            != volatile_load(expected + byte) {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn build_noncanonical_record(source: *const u8) -> bool {
+    if source as usize == 0 { return false; }
+    let mut byte: usize = 0;
+    while byte < RECORD_LENGTH {
+        NONCANONICAL_RECORD[byte] = volatile_load(source + byte);
+        byte += 1;
+    }
+    byte = 0;
+    while byte < 11 {
+        if NONCANONICAL_RECORD[RECORD_LENGTH - 11 + byte]
+            != CANONICAL_RIGHTS_TAIL[byte] {
+            return false;
+        }
+        NONCANONICAL_RECORD[RECORD_LENGTH - 11 + byte] =
+            NONCANONICAL_RIGHTS_TAIL[byte];
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn begin_from_record() -> u64 {
+    return begin_admission(
+        record_package_digest_word(0),
+        record_package_digest_word(1),
+        record_package_digest_word(2),
+        record_package_digest_word(3),
+        record_manifest_digest_word(0),
+        record_manifest_digest_word(1),
+        record_manifest_digest_word(2),
+        record_manifest_digest_word(3),
+        record_integration(),
+        record_execution(),
+        record_firmware(),
+        record_world_id(),
+        record_world_id(),
+        record_version_id(),
+        record_architecture_id(),
+        record_profile_id(),
+        record_health_id(),
+        record_health_timeout(),
+        record_min_vcpus() as usize,
+        record_max_vcpus() as usize,
+        record_min_memory_mib(),
+        record_max_memory_mib(),
+        record_max_outstanding(),
+        record_max_requests_per_generation(),
+        record_max_shared_bytes(),
+        record_max_devices() as usize,
+        record_export_count(),
+        record_request_count()
+    );
+}
+
+unsafe fn define_from_record(admission: u64) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < record_export_count() {
+        if define_admission_export(
+            admission,
+            ordinal,
+            record_export_name(ordinal),
+            record_export_plane(ordinal),
+            record_export_protocol(ordinal)
+        ) != 1 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < record_request_count() {
+        if define_admission_request(
+            admission,
+            ordinal,
+            record_request_kind_address(ordinal) as *const u8,
+            record_request_kind_length(ordinal),
+            record_request_purpose_address(ordinal) as *const u8,
+            record_request_purpose_length(ordinal),
+            record_request_rights(ordinal)
+        ) != 1 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn register_fixture_device_policy() -> bool {
+    return register_policy(
+        PACKAGE_SHA_0,
+        PACKAGE_SHA_1,
+        PACKAGE_SHA_2,
+        PACKAGE_SHA_3,
+        (&POLICY_DEVICE_NET[0]),
+        10,
+        (&POLICY_RESETTABLE_NETWORK[0]),
+        33,
+        RIGHT_DEVICE_RESET
+    ) == 1;
+}
+
+unsafe fn register_fixture_vm_policy() -> bool {
+    return register_policy(
+        PACKAGE_SHA_0,
+        PACKAGE_SHA_1,
+        PACKAGE_SHA_2,
+        PACKAGE_SHA_3,
+        (&POLICY_VM_MACHINE[0]),
+        10,
+        (&POLICY_CONTAINED_GUEST[0]),
+        25,
+        RIGHT_VM_RUN | RIGHT_VM_STOP
+    ) == 1;
+}
+
+unsafe fn record_matches_fixture_policy() -> bool {
+    return record_request_count() == 2
+        && record_text_equals(
+            record_request_kind_address(0),
+            record_request_kind_length(0),
+            (&POLICY_DEVICE_NET[0]),
+            10
+        )
+        && record_text_equals(
+            record_request_purpose_address(0),
+            record_request_purpose_length(0),
+            (&POLICY_RESETTABLE_NETWORK[0]),
+            33
+        )
+        && record_request_rights(0) == RIGHT_DEVICE_RESET
+        && record_text_equals(
+            record_request_kind_address(1),
+            record_request_kind_length(1),
+            (&POLICY_VM_MACHINE[0]),
+            10
+        )
+        && record_text_equals(
+            record_request_purpose_address(1),
+            record_request_purpose_length(1),
+            (&POLICY_CONTAINED_GUEST[0]),
+            25
+        )
+        && record_request_rights(1) == (RIGHT_VM_RUN | RIGHT_VM_STOP);
+}
+
+unsafe fn admit_unrelated_world() -> u64 {
+    if register_policy(
+        UNRELATED_DIGEST_0,
+        UNRELATED_DIGEST_1,
+        UNRELATED_DIGEST_2,
+        UNRELATED_DIGEST_3,
+        (&POLICY_VM_MACHINE[0]),
+        10,
+        (&UNRELATED_VM_PURPOSE[0]),
+        25,
+        RIGHT_VM_RUN
+    ) != 1 {
+        return 0;
+    }
+    let world: u64 = begin_admission(
+        UNRELATED_DIGEST_0,
+        UNRELATED_DIGEST_1,
+        UNRELATED_DIGEST_2,
+        UNRELATED_DIGEST_3,
+        UNRELATED_MANIFEST_0,
+        UNRELATED_MANIFEST_1,
+        UNRELATED_MANIFEST_2,
+        UNRELATED_MANIFEST_3,
+        INTEGRATION_BINARY_CONTAINED,
+        EXECUTION_HARDWARE_VIRTUALIZED,
+        FIRMWARE_UEFI,
+        0x9301,
+        0x9301,
+        1,
+        record_architecture_id(),
+        record_profile_id(),
+        record_health_id(),
+        1000,
+        1,
+        1,
+        1,
+        2,
+        1,
+        2,
+        4096,
+        0,
+        1,
+        1
+    );
+    if world == 0
+        || define_admission_export(
+            world,
+            0,
+            0x9401,
+            EXPORT_PLANE_ABI,
+            0x9402
+        ) != 1
+        || define_admission_request(
+            world,
+            0,
+            (&POLICY_VM_MACHINE[0]),
+            10,
+            (&UNRELATED_VM_PURPOSE[0]),
+            25,
+            RIGHT_VM_RUN
+        ) != 1
+        || seal_admission(world) != world {
+        return 0;
+    }
+    return world;
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_KERNEL_WORLD_OBJECTS {
+        fail_closed();
+    }
+    disable_interrupts();
+    let record_start: usize = ocore_kernel_world_record_start();
+    let record_end: usize = ocore_kernel_world_record_end();
+    if record_start == 0
+        || record_end <= record_start
+        || record_end - record_start != RECORD_LENGTH
+        || sha256_selftest() != 1
+        || record_canonical_order_selftest() != 1
+        || !build_noncanonical_record(record_start as *const u8)
+        || record_init() != 1
+        || parse_record(
+            record_start as *const u8,
+            RECORD_LENGTH,
+            RECORD_SHA_0 ^ 1,
+            RECORD_SHA_1,
+            RECORD_SHA_2,
+            RECORD_SHA_3
+        ) != 0
+        // This variant has a correct independently pinned SHA but reverses
+        // only the final [run, stop] vector. Structural parsing must deny it.
+        || parse_record(
+            (&NONCANONICAL_RECORD[0]),
+            RECORD_LENGTH,
+            NONCANONICAL_SHA_0,
+            NONCANONICAL_SHA_1,
+            NONCANONICAL_SHA_2,
+            NONCANONICAL_SHA_3
+        ) != 0
+        || parse_record(
+            record_start as *const u8,
+            RECORD_LENGTH,
+            RECORD_SHA_0,
+            RECORD_SHA_1,
+            RECORD_SHA_2,
+            RECORD_SHA_3
+        ) != 1
+        || record_denied_count() != 2
+        || record_accepted_count() != 1
+        || record_package_digest_word(0) != PACKAGE_SHA_0
+        || record_package_digest_word(1) != PACKAGE_SHA_1
+        || record_package_digest_word(2) != PACKAGE_SHA_2
+        || record_package_digest_word(3) != PACKAGE_SHA_3
+        || record_manifest_digest_word(0) != MANIFEST_SHA_0
+        || record_manifest_digest_word(1) != MANIFEST_SHA_1
+        || record_manifest_digest_word(2) != MANIFEST_SHA_2
+        || record_manifest_digest_word(3) != MANIFEST_SHA_3
+        || !record_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECORD_MESSAGE[0]), 59);
+
+    if admission_init() != 1
+        || !record_matches_fixture_policy()
+        || !register_fixture_device_policy()
+        || register_policy(
+            PACKAGE_SHA_0,
+            PACKAGE_SHA_1,
+            PACKAGE_SHA_2,
+            PACKAGE_SHA_3,
+            (&POLICY_VM_MACHINE[0]),
+            10,
+            (&POLICY_WRONG_PURPOSE[0]),
+            25,
+            RIGHT_VM_RUN | RIGHT_VM_STOP
+        ) != 1 {
+        fail_closed();
+    }
+    let denied: u64 = begin_from_record();
+    if denied == 0
+        || !define_from_record(denied)
+        || seal_admission(denied) != 0
+        || abort_admission(denied) != 1
+        || world_is_current(denied)
+        // Device policy was exact. The denial above is therefore the
+        // one-byte VM-purpose mismatch, not an unrelated absent rule.
+        || !register_fixture_vm_policy() {
+        fail_closed();
+    }
+    let primary_world: u64 = begin_from_record();
+    if primary_world == 0
+        || primary_world == denied
+        || !define_from_record(primary_world)
+        || seal_admission(primary_world) != primary_world
+        || world_state(primary_world) != WORLD_STATE_ADMITTED
+        || world_generation(primary_world) == 0
+        || admitted_package_digest_word(primary_world, 0) != PACKAGE_SHA_0
+        || admission_begin_count() != 2
+        || admission_seal_count() != 1
+        || admission_denial_count() == 0 {
+        fail_closed();
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < record_request_count() {
+        if request_grant_at(primary_world, ordinal)
+            != record_request_rights(ordinal) {
+            fail_closed();
+        }
+        ordinal += 1;
+    }
+    write((&POLICY_MESSAGE[0]), 59);
+
+    let unrelated_world: u64 = admit_unrelated_world();
+    let primary_owner: u64 = cspace_handle_for_slot(PRIMARY_OWNER_SLOT);
+    let unrelated_owner: u64 = cspace_handle_for_slot(UNRELATED_OWNER_SLOT);
+    if unrelated_world == 0
+        || primary_owner == 0
+        || unrelated_owner == 0
+        || set_quota_for_owner(primary_owner, 4) != 1
+        || set_quota_for_owner(unrelated_owner, 1) != 1
+        || vm_init() != 1 {
+        fail_closed();
+    }
+    let baseline_frames: usize = free_frames();
+    // The VM allows a fifth page while the owner quota allows only four, so
+    // the final attachment denial is specifically the memory-object quota.
+    let primary_vm: u64 = create_vm(primary_world, primary_owner, 2, 5);
+    if primary_vm == 0 || create_vcpu(primary_vm, 1) != 0 {
+        fail_closed();
+    }
+    let primary_vcpu_zero: u64 = create_vcpu(primary_vm, 0);
+    let primary_vcpu_one: u64 = create_vcpu(primary_vm, 1);
+    if primary_vcpu_zero == 0
+        || primary_vcpu_one == 0
+        || create_vcpu(primary_vm, 0) != 0
+        || create_vcpu(primary_vm, 2) != 0 {
+        fail_closed();
+    }
+    let primary_page_zero: u64 = attach_guest_page(primary_vm, 0);
+    let primary_page_one: u64 = attach_guest_page(primary_vm, 0x1000);
+    let primary_page_two: u64 = attach_guest_page(primary_vm, 0x2000);
+    let primary_page_three: u64 = attach_guest_page(primary_vm, 0x3000);
+    if primary_page_zero == 0
+        || primary_page_one == 0
+        || primary_page_two == 0
+        || primary_page_three == 0
+        || guest_page_memory_object(primary_page_zero) == 0
+        || attach_guest_page(primary_vm, 1) != 0
+        || attach_guest_page(primary_vm, 0) != 0
+        || attach_guest_page(primary_vm, 0x4000) != 0
+        || seal_configuration(primary_vm) != 1
+        || vm_state(primary_vm) != VM_STATE_CONFIGURED
+        || world_state(primary_world) != WORLD_STATE_ADMITTED
+        || vm_vcpu_count(primary_vm) != 2
+        || vm_guest_page_count(primary_vm) != 4
+        || quota_used(PRIMARY_OWNER_SLOT) != 4
+        || free_frames() + 4 != baseline_frames
+        || vm_denial_count() < 5 {
+        fail_closed();
+    }
+    write((&OBJECT_MESSAGE[0]), 47);
+    write((&NONEXECUTING_MESSAGE[0]), 55);
+
+    let unrelated_vm: u64 = create_vm(
+        unrelated_world,
+        unrelated_owner,
+        1,
+        1
+    );
+    let unrelated_vcpu: u64 = create_vcpu(unrelated_vm, 0);
+    let unrelated_page: u64 = attach_guest_page(unrelated_vm, 0x8000);
+    if unrelated_vm == 0
+        || unrelated_vcpu == 0
+        || unrelated_page == 0
+        || seal_configuration(unrelated_vm) != 1
+        || world_state(primary_world) != WORLD_STATE_ADMITTED
+        || world_state(unrelated_world) != WORLD_STATE_ADMITTED
+        || free_frames() + 5 != baseline_frames
+        || current_world_count() != 2
+        || active_vm_count() != 2
+        || active_vcpu_count() != 3
+        || active_guest_page_count() != 5 {
+        fail_closed();
+    }
+
+    if revoke_vm_world(primary_world) != 1
+        || revoke_admission(primary_world) != 1
+        || world_is_current(primary_world)
+        || vm_is_current(primary_vm)
+        || vcpu_is_current(primary_vcpu_zero)
+        || guest_page_is_current(primary_page_zero)
+        || !vm_is_current(unrelated_vm)
+        || !vcpu_is_current(unrelated_vcpu)
+        || !guest_page_is_current(unrelated_page)
+        || quota_used(PRIMARY_OWNER_SLOT) != 0
+        || quota_used(UNRELATED_OWNER_SLOT) != 1
+        || free_frames() + 1 != baseline_frames {
+        fail_closed();
+    }
+    write((&REVOKE_MESSAGE[0]), 59);
+
+    if revoke_vm_world(unrelated_world) != 1
+        || revoke_admission(unrelated_world) != 1
+        || active_vm_count() != 0
+        || active_vcpu_count() != 0
+        || active_guest_page_count() != 0
+        || current_world_count() != 0
+        || quota_used(UNRELATED_OWNER_SLOT) != 0
+        || free_frames() != baseline_frames
+        || !record_invariants_hold()
+        || !admission_invariants_hold()
+        || !vm_invariants_hold() {
+        fail_closed();
+    }
+    write((&COMPLETE_MESSAGE[0]), 52);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 35);
+    loop {
+        halt();
+    }
+}
