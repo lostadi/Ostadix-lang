@@ -460,6 +460,16 @@ inject interrupts, publish provider exports, assign a device, map DMA, or
 establish IOMMU isolation; see
 [`docs/KERNEL_WORLD_CONTRACT.md`](docs/KERNEL_WORLD_CONTRACT.md).
 
+Mode 21's hardware-only `smoke-kernel-world-execution-qemu.sh` adds the first
+AMD SVM/NPT backend behind those same generation-bound objects. On an x86-64
+host with nested SVM and writable `/dev/kvm`, a two-page real-mode synthetic
+guest receives one injected vector, computes and commits a known result,
+exits through `VMMCALL`, and then faults closed on an unmapped guest-physical
+access. The gate tears down all NPT entries, stops and restarts the vCPU
+context, revokes the world, proves the unrelated VM remains current, and
+observes a host timer afterward. It is not a Linux boot, provider lifecycle,
+guest-agent, service export, virtual-device, or device-assignment proof.
+
 ### Hosted Live-World reference
 
 `o-live-host` closes the package and service control-plane loop as an
@@ -2373,6 +2383,9 @@ scenario and its non-claims:
 
 # KernelWorld verified-record admission and nonexecuting VM objects (mode 20)
 ./ocore/kernel/smoke-kernel-world-qemu.sh
+
+# KernelWorld first AMD SVM/NPT vCPU execution (mode 21; nested SVM + /dev/kvm)
+./ocore/kernel/smoke-kernel-world-execution-qemu.sh
 ```
 
 Additional implementation checks are:
@@ -2393,6 +2406,8 @@ bash scripts/smoke-hosted-live-reference.sh
 ./ocore/kernel/smoke-personality-qemu.sh
 ./ocore/kernel/smoke-m6b-qemu.sh
 ./ocore/kernel/smoke-kernel-world-qemu.sh
+# Hardware-only; requires an AMD host with nested SVM and writable /dev/kvm.
+./ocore/kernel/smoke-kernel-world-execution-qemu.sh
 cargo test --test kernel_world_contract --no-default-features
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
@@ -2635,10 +2650,12 @@ features that are already present:
   transport boundary, not a live connection to this QEMU kernel.
 - The `KernelWorld` host module validates manifests, binds them to verified
   package objects, and executes a bounded lifecycle reference state machine.
-  Mode 20 carries only its hash-pinned normal form, default-deny admission, and
-  nonexecuting VM object identities into O-core. It is not a hypervisor,
-  foreign-kernel loader, running provider supervisor, guest agent, interrupt or
-  device path, DMA boundary, or IOMMU implementation.
+  Mode 20 carries its hash-pinned normal form, default-deny admission, and
+  nonexecuting VM object identities into O-core. Hardware-only Mode 21 adds a
+  single-vCPU AMD SVM/NPT synthetic execution proof with controlled exit,
+  interrupt injection, denied unmapped GPA access, and teardown. It is not a
+  foreign-kernel loader, running provider supervisor, guest agent, service or
+  virtual-device path, DMA boundary, or IOMMU implementation.
 
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
