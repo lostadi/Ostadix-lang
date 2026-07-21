@@ -309,8 +309,8 @@ pub unsafe fn run_to_hypercall() -> u64 {
     // Inject vector 0x20 before the first guest instruction.
     put_u64(vmcb + VMCB_EVENT_INJECTION, 0x8000_0020);
     // ASID 1 is intentionally reused by this bounded single-context backend.
-    // Flush it on every entry so stopped generations retain no translation.
-    put_u8(vmcb + VMCB_TLB_CONTROL, 3);
+    // The architecturally supported full flush avoids requiring FlushByAsid.
+    put_u8(vmcb + VMCB_TLB_CONTROL, 1);
     ENTER_COUNT += 1;
     if ocore_svm_vmrun(vmcb) != 1 {
         return 0;
@@ -328,7 +328,7 @@ pub unsafe fn run_to_isolation_fault() -> u64 {
     let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
     put_u64(vmcb + VMCB_RIP, GUEST_AFTER_VMMCALL);
     put_u64(vmcb + VMCB_EVENT_INJECTION, 0);
-    put_u8(vmcb + VMCB_TLB_CONTROL, 3);
+    put_u8(vmcb + VMCB_TLB_CONTROL, 1);
     ENTER_COUNT += 1;
     if ocore_svm_vmrun(vmcb) != 1 {
         return 0;
