@@ -71,13 +71,13 @@ ocore_m6_image_bytes_start:
 .globl ocore_m6_image_bytes_end
 ocore_m6_image_bytes_end:
 
-// Mode 20 embeds the deterministic host-verified KernelWorld normal form.
+// Modes 20 and 21 embed the deterministic host-verified KernelWorld normal form.
 // Native admission pins the complete record SHA before parsing it; no foreign
 // kernel image or executable is embedded by this gate.
 .balign 16
 .globl ocore_kernel_world_record_bytes_start
 ocore_kernel_world_record_bytes_start:
-#if OCORE_PROBE_MODE == 20
+#if OCORE_PROBE_MODE == 20 || OCORE_PROBE_MODE == 21
 #ifndef OCORE_KERNEL_WORLD_RECORD_PATH
 #error "OCORE_KERNEL_WORLD_RECORD_PATH is required for KernelWorld admission mode"
 #endif
@@ -87,6 +87,13 @@ ocore_kernel_world_record_bytes_start:
 ocore_kernel_world_record_bytes_end:
 
 .section .bss,"aw",@nobits
+.balign 4096
+svm_region:
+  // Mode 21 uses one boot-CPU SVM context: HSAVE, VMCB, four NPT levels,
+  // three contiguous IOPM pages, and two contiguous MSRPM pages.
+  .skip 45056
+svm_region_end:
+
 .balign 4096
 p4_table:
   .skip 4096
@@ -529,6 +536,96 @@ ocore_kernel_world_record_end:
   lea rax, [rip + ocore_kernel_world_record_bytes_end]
   ret
 .size ocore_kernel_world_record_end, .-ocore_kernel_world_record_end
+
+.globl ocore_svm_region
+.type ocore_svm_region, @function
+ocore_svm_region:
+  lea rax, [rip + svm_region]
+  ret
+.size ocore_svm_region, .-ocore_svm_region
+
+.globl ocore_svm_capabilities
+.type ocore_svm_capabilities, @function
+ocore_svm_capabilities:
+  push rbx
+  mov eax, 0x80000000
+  cpuid
+  cmp eax, 0x8000000a
+  jb .svm_capabilities_none
+  mov eax, 0x80000001
+  cpuid
+  bt ecx, 2
+  jnc .svm_capabilities_none
+  mov eax, 0x8000000a
+  cpuid
+  mov eax, 1
+  bt edx, 0
+  jnc .svm_capabilities_done
+  or eax, 2
+  jmp .svm_capabilities_done
+.svm_capabilities_none:
+  xor eax, eax
+.svm_capabilities_done:
+  pop rbx
+  ret
+.size ocore_svm_capabilities, .-ocore_svm_capabilities
+
+.globl ocore_svm_enable
+.type ocore_svm_enable, @function
+ocore_svm_enable:
+  test rdi, 0xfff
+  jnz .svm_enable_failed
+  mov ecx, 0xc0000080
+  rdmsr
+  bts eax, 12
+  wrmsr
+  mov rax, rdi
+  mov rdx, rax
+  shr rdx, 32
+  mov ecx, 0xc0010117
+  wrmsr
+  mov eax, 1
+  ret
+.svm_enable_failed:
+  xor eax, eax
+  ret
+.size ocore_svm_enable, .-ocore_svm_enable
+
+.globl ocore_svm_disable
+.type ocore_svm_disable, @function
+ocore_svm_disable:
+  xor eax, eax
+  xor edx, edx
+  mov ecx, 0xc0010117
+  wrmsr
+  mov ecx, 0xc0000080
+  rdmsr
+  btr eax, 12
+  wrmsr
+  ret
+.size ocore_svm_disable, .-ocore_svm_disable
+
+.globl ocore_svm_vmrun
+.type ocore_svm_vmrun, @function
+ocore_svm_vmrun:
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+  mov rax, rdi
+  vmrun rax
+  stgi
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+  mov eax, 1
+  ret
+.size ocore_svm_vmrun, .-ocore_svm_vmrun
 
 .globl ocore_management_cr3
 .type ocore_management_cr3, @function
