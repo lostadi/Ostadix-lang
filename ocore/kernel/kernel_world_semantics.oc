@@ -664,6 +664,12 @@ pub unsafe fn start(mode: u64) -> never {
         || vm_is_current(primary_vm)
         || vcpu_is_current(primary_vcpu_zero)
         || guest_page_is_current(primary_page_zero)
+        || (mode == MODE_KERNEL_WORLD_EXECUTION
+            && svm_prepare(
+                primary_vcpu_zero,
+                primary_page_zero,
+                primary_page_one
+            ) != 0)
         || !vm_is_current(unrelated_vm)
         || !vcpu_is_current(unrelated_vcpu)
         || !guest_page_is_current(unrelated_page)
