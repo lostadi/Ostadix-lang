@@ -187,7 +187,7 @@
   `/sbin/m6-personalityd.elf`, `/sbin/m6-supervisord.elf`, and
   `/sbin/m6-observer.elf`, requires byte identity, and packs exactly those paths
   into a 62,104-byte read-only OVFS image with SHA-256
-  `c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`.
+  `f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417`.
   The host gate checks that identity and proves the user modules are not linked
   as kernel code; the kernel verifies the complete image before import. Mode 18
   loads all four into isolated W^X address spaces and CSpaces. The unprivileged
@@ -197,8 +197,11 @@
   endpoint-backed scalar router proves the
   ping/add-one/unsupported corpus plus deterministic cancellation, timeout, and
   service-death results with one terminal wake. It rejects late, duplicate,
-  prior-generation, and stale-capability use while an unrelated observer keeps
-  progressing, then reclaims every dynamic resource and reaches a later timer.
+  prior-generation, and stale-capability use while retaining all nine consumed
+  terminals in a 16-record exact-handle history with zero eviction. Its fault
+  watch is FIFO-queued before cancellation releases the client. An unrelated
+  observer keeps progressing, then the gate reclaims every dynamic resource
+  and reaches a later timer.
   This is M6A rather than full Milestone 6: pointer-bearing calls and foreign
   memory views remain disabled, and it establishes no Linux or other foreign
   ABI.

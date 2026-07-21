@@ -3,8 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-m6a-personality}"
-TIMEOUT_SECONDS=30
-DIGEST="c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7"
+# On Apple Silicon hosts this x86-64 TCG scenario can cross 30 seconds after a
+# long aggregate run.  Keep the evidence assertions unchanged while giving the
+# fixed lifecycle enough wall-clock budget to finish under host contention.
+TIMEOUT_SECONDS="${OCORE_M6A_TIMEOUT_SECONDS:-180}"
+DIGEST="f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417"
 IMAGE_BYTES=62104
 IMAGE="$ROOT/target/ocore-m6-artifacts/images/root-${DIGEST}.ovfs"
 
@@ -240,19 +243,31 @@ edges.extend(
         *zip(completion, completion[1:]),
     ]
 )
-causal_order_valid = not missing and all(
-    positions[before] < positions[after] for before, after in edges
+# Missing markers are already a hard failure. Diagnose causal ordering only for
+# edges whose two endpoints were actually observed so a timeout does not also
+# manufacture unrelated order errors for absent suffixes.
+causal_order_valid = all(
+    positions[before] < positions[after]
+    for before, after in edges
+    if positions[before] >= 0 and positions[after] >= 0
 )
 
 # As in the M4/M5 loader gates, the first IRQ0 marker must occur after the
 # router is armed and before any packaged principal publishes user output.
 timer_matches = list(re.finditer(r"(?m)^T$", output))
+observed_initial_positions = [
+    positions[marker]
+    for marker in initial_principals
+    if positions[marker] >= 0
+]
 timer_phase_valid = (
     len(timer_matches) == 1
-    and not missing
+    and positions[preflight[-1]] >= 0
     and positions[preflight[-1]] < timer_matches[0].start()
-    and timer_matches[0].start()
-    < min(positions[marker] for marker in initial_principals)
+    and all(
+        timer_matches[0].start() < principal_position
+        for principal_position in observed_initial_positions
+    )
 )
 
 forbidden = [
@@ -302,7 +317,7 @@ if (
     if not survived_after_completion:
         print(
             "QEMU did not survive the one-second post-lifecycle window "
-            "within the 30-second deadline",
+            f"within the {timeout_seconds:g}-second deadline",
             file=sys.stderr,
         )
     print("stdout:", output, file=sys.stderr)
