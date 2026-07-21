@@ -269,6 +269,21 @@ target/debug/ocorec ocore/examples/minimal.oc --emit obj -o target/minimal.o
 ./ocore/kernel/smoke-kernel-world-qemu.sh
 ```
 
+The repository-root `boot-and-test.sh` script sequences these same layers
+through one entrypoint with tool-presence guards, so a missing optional
+dependency skips rather than aborts:
+
+```bash
+./boot-and-test.sh setup    # ./setup.sh --minimal --verify
+./boot-and-test.sh hosted   # hosted .O runtime + differential + cross-checks
+./boot-and-test.sh ocore    # ocorec build, HIR/MIR dump, freestanding object
+./boot-and-test.sh kernel   # build the kernel ELF and boot it in QEMU
+./boot-and-test.sh smoke    # asserted smoke gate, then the full probe matrix
+./boot-and-test.sh tests    # Rust tests, proptest, reproducibility, examples
+./boot-and-test.sh quick    # hosted + ocore + default smoke (default)
+./boot-and-test.sh full     # everything above
+```
+
 The asserted default `smoke-qemu.sh` output is:
 
 ```text
@@ -2636,6 +2651,11 @@ memory protocol in
 The shared source-integrated/binary-contained world contract and its native
 dependency order are in
 [docs/KERNEL_WORLD_CONTRACT.md](docs/KERNEL_WORLD_CONTRACT.md).
+The design proposal for containing and utilizing foreign kernels — Linux,
+Android, XNU/Darwin, and Windows NT — as O-Domain personalities is in
+[okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md](okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md).
+It is an architecture note against the existing `ocore` runtime and
+`ODOMAIN_PLAN` roadmap; it claims nothing the milestone gates have not proven.
 
 ---
 
