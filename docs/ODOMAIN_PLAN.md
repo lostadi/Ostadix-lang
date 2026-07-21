@@ -573,7 +573,7 @@ Mode 18 packages four independently linked static ELFs at
 `/sbin/m6-client.elf`, `/sbin/m6-personalityd.elf`,
 `/sbin/m6-supervisord.elf`, and `/sbin/m6-observer.elf`. The deterministic
 62,104-byte OVFS image has SHA-256
-`c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`;
+`f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417`;
 the host verifies the exact path set, byte identity, and digest, and the kernel
 recomputes the digest before import. The gate rejects any kernel-linked user
 module symbol.
@@ -585,12 +585,17 @@ unprivileged native personality daemon. The daemon's typed reply capability is
 generation-specific. Reply, unprivileged-supervisor cancellation, deadline
 expiry, and service death compete for exactly one terminal transition and one
 dependent-thread wake; late and duplicate completion cannot change the result.
+Consumed terminals enter a 16-record exact-handle history. The gate requires
+all nine records and zero eviction; replies older than the bounded history stay
+denied and are conservatively classified stale.
 
 The independently loaded CPL3 supervisor performs the policy sequence: direct
 health RPC, publish generation 1, cancel a held request, observe the
 service-owned endpoint close after the daemon's deliberate fault, request a
 fresh generation, health-gate generation-2 publication, and request cooperative
-stop. O-core validates authority and performs routing, containment,
+stop. It queues the fault watch before cancellation releases the client, using
+the shared endpoint FIFO as the watch-before-timeout/crash barrier. O-core
+validates authority and performs routing, containment,
 load/reap/rebind, and terminal arbitration as mechanism; it does not choose that
 policy. The executable corpus proves ping, add-one, explicit unsupported,
 cancellation, timeout, service-death failure, stale and duplicate replies,

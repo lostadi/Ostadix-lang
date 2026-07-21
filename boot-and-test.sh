@@ -12,6 +12,7 @@
 # tool-presence guards so a missing optional dependency skips rather than aborts.
 #
 # USAGE
+#   ./boot-and-test.sh [phase]
 #   ./okernel-multikernel/boot-and-test.sh [phase]
 #
 #   phase (default: quick)
@@ -206,8 +207,33 @@ phase_tests() {
 }
 
 # ---- dispatch ---------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+Usage: boot-and-test.sh [phase]
+
+Phases:
+  setup    Build and verify the Rust, C17, and Python editions
+  hosted   Run hosted runtime and differential checks
+  ocore    Exercise the typed O-core compiler pipeline
+  kernel   Boot the kernel interactively in QEMU
+  smoke    Run all required OKernel QEMU gates
+  tests    Run the host test and reproducibility suite
+  quick    Run hosted, O-core, and the default QEMU smoke (default)
+  full     Run setup, hosted, O-core, all smoke gates, and host tests
+
+Options:
+  -h, --help  Show this help and exit
+USAGE
+}
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  die "expected at most one phase argument"
+fi
+
 phase="${1:-quick}"
 case "$phase" in
+  -h|--help|help) usage ;;
   setup)  phase_setup ;;
   hosted) phase_hosted ;;
   ocore)  phase_ocore ;;
@@ -218,5 +244,5 @@ case "$phase" in
           need cargo; need clang; need qemu-system-x86_64; ./ocore/kernel/smoke-qemu.sh && ok "QEMU smoke: PASS" ;;
   full)   phase_setup; phase_hosted; phase_ocore; phase_smoke; phase_tests; \
           say "ALL PHASES COMPLETE"; ok "Ostadix system booted and tested end to end" ;;
-  *) die "unknown phase '$phase' (use: setup|hosted|ocore|kernel|smoke|tests|quick|full)" ;;
+  *) die "unknown phase '$phase' (use --help for the phase list)" ;;
 esac
