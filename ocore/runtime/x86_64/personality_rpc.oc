@@ -38,6 +38,7 @@ use runtime::thread::WAKE_REASON_IPC;
 // correlation is the generation-tagged request handle itself; neither a user
 // pointer nor a user-selected correlation is retained across the wait.
 pub const MAX_PERSONALITY_REQUESTS: usize = 4;
+pub const MAX_PERSONALITY_TOMBSTONES: usize = 16;
 pub const PERSONALITY_FRAME_VALUE_MASK: u64 = 0x00ff_ffff_ffff_ffff;
 
 pub const RPC_DISPATCHED: u64 = 1;
@@ -83,12 +84,18 @@ static mut WAIT_REQUESTS: [u64; 4] = [0; 4];
 static mut TERMINAL_KINDS: [u8; 4] = [0; 4];
 static mut TERMINAL_RESULTS: [u64; 4] = [0; 4];
 // Consumption cannot erase the disposition needed to classify a racing late
-// or duplicate reply. One bounded tombstone per slot keeps that decision
-// stable even after the caller reuses the slot for its next scalar request.
-static mut LAST_TERMINAL_HANDLES: [u64; 4] = [0; 4];
-static mut LAST_TERMINAL_SERVICE_PROCESSES: [u64; 4] = [0; 4];
-static mut LAST_TERMINAL_SERVICE_GENERATIONS: [u64; 4] = [0; 4];
-static mut LAST_TERMINAL_KINDS: [u8; 4] = [0; 4];
+// or duplicate reply. A slot may be reused more than once before a delayed
+// service reply arrives, so the router retains a bounded history rather than
+// only the most recent terminal generation for each live slot. Once the
+// oldest record is evicted, a still-older reply remains denied and is
+// conservatively classified as stale rather than late or duplicate.
+static mut TERMINAL_HISTORY_HANDLES: [u64; 16] = [0; 16];
+static mut TERMINAL_HISTORY_SERVICE_PROCESSES: [u64; 16] = [0; 16];
+static mut TERMINAL_HISTORY_SERVICE_GENERATIONS: [u64; 16] = [0; 16];
+static mut TERMINAL_HISTORY_KINDS: [u8; 16] = [0; 16];
+static mut TERMINAL_HISTORY_NEXT: usize = 0;
+static mut TERMINAL_HISTORY_COUNT: usize = 0;
+static mut TERMINAL_HISTORY_EVICTIONS: u64 = 0;
 
 static mut SERVICE_PROCESS: u64 = 0;
 static mut SERVICE_GENERATION: u64 = 0;
@@ -208,12 +215,31 @@ unsafe fn clear_slot(slot: usize) -> void {
 
 unsafe fn retire_or_reuse(slot: usize) -> void {
     if STATES[slot] == REQUEST_TERMINAL {
-        LAST_TERMINAL_HANDLES[slot] = make_handle(slot);
-        LAST_TERMINAL_SERVICE_PROCESSES[slot] =
+        if TERMINAL_HISTORY_NEXT >= MAX_PERSONALITY_TOMBSTONES {
+            POISONED = 1;
+            return;
+        }
+        if TERMINAL_HISTORY_COUNT == MAX_PERSONALITY_TOMBSTONES
+            && TERMINAL_HISTORY_EVICTIONS == MAX_COUNTER {
+            POISONED = 1;
+            return;
+        }
+        let history_slot: usize = TERMINAL_HISTORY_NEXT;
+        TERMINAL_HISTORY_HANDLES[history_slot] = make_handle(slot);
+        TERMINAL_HISTORY_SERVICE_PROCESSES[history_slot] =
             REQUEST_SERVICE_PROCESSES[slot];
-        LAST_TERMINAL_SERVICE_GENERATIONS[slot] =
+        TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot] =
             REQUEST_SERVICE_GENERATIONS[slot];
-        LAST_TERMINAL_KINDS[slot] = TERMINAL_KINDS[slot];
+        TERMINAL_HISTORY_KINDS[history_slot] = TERMINAL_KINDS[slot];
+        if TERMINAL_HISTORY_COUNT < MAX_PERSONALITY_TOMBSTONES {
+            TERMINAL_HISTORY_COUNT += 1;
+        } else {
+            TERMINAL_HISTORY_EVICTIONS += 1;
+        }
+        TERMINAL_HISTORY_NEXT += 1;
+        if TERMINAL_HISTORY_NEXT == MAX_PERSONALITY_TOMBSTONES {
+            TERMINAL_HISTORY_NEXT = 0;
+        }
     }
     clear_slot(slot);
     if GENERATIONS[slot] == 0xffff_ffff {
@@ -222,6 +248,21 @@ unsafe fn retire_or_reuse(slot: usize) -> void {
         GENERATIONS[slot] += 1;
         STATES[slot] = REQUEST_EMPTY;
     }
+}
+
+unsafe fn terminal_history_index(request: u64) -> usize {
+    if request == 0
+        || (request & HANDLE_TAG_MASK) != REQUEST_HANDLE_TAG
+        || request_index(request) >= MAX_PERSONALITY_REQUESTS
+        || request_generation(request) == 0 {
+        return MAX_PERSONALITY_TOMBSTONES;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_TOMBSTONES
+        && TERMINAL_HISTORY_HANDLES[slot] != request {
+        slot += 1;
+    }
+    return slot;
 }
 
 unsafe fn count_denial() -> void {
@@ -417,12 +458,19 @@ pub unsafe fn init() -> u64 {
         STATES[slot] = REQUEST_EMPTY;
         GENERATIONS[slot] = 1;
         clear_slot(slot);
-        LAST_TERMINAL_HANDLES[slot] = 0;
-        LAST_TERMINAL_SERVICE_PROCESSES[slot] = 0;
-        LAST_TERMINAL_SERVICE_GENERATIONS[slot] = 0;
-        LAST_TERMINAL_KINDS[slot] = 0;
         slot += 1;
     }
+    slot = 0;
+    while slot < MAX_PERSONALITY_TOMBSTONES {
+        TERMINAL_HISTORY_HANDLES[slot] = 0;
+        TERMINAL_HISTORY_SERVICE_PROCESSES[slot] = 0;
+        TERMINAL_HISTORY_SERVICE_GENERATIONS[slot] = 0;
+        TERMINAL_HISTORY_KINDS[slot] = 0;
+        slot += 1;
+    }
+    TERMINAL_HISTORY_NEXT = 0;
+    TERMINAL_HISTORY_COUNT = 0;
+    TERMINAL_HISTORY_EVICTIONS = 0;
     SERVICE_PROCESS = 0;
     SERVICE_GENERATION = 0;
     PROTOCOL_ID = 0;
@@ -778,15 +826,13 @@ pub unsafe fn reply(
         || result == SYSCALL_CONTROL_SCHEDULE {
         return deny(ERR_PERSONALITY_UNSUPPORTED);
     }
-    let retired_slot: usize = request_index(request);
-    if (request & HANDLE_TAG_MASK) == REQUEST_HANDLE_TAG
-        && retired_slot < MAX_PERSONALITY_REQUESTS
-        && LAST_TERMINAL_HANDLES[retired_slot] == request {
-        if LAST_TERMINAL_SERVICE_PROCESSES[retired_slot]
+    let history_slot: usize = terminal_history_index(request);
+    if history_slot < MAX_PERSONALITY_TOMBSTONES {
+        if TERMINAL_HISTORY_SERVICE_PROCESSES[history_slot]
                 == replying_service_process
-            && LAST_TERMINAL_SERVICE_GENERATIONS[retired_slot]
+            && TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot]
                 == SERVICE_GENERATION {
-            if LAST_TERMINAL_KINDS[retired_slot] as u64
+            if TERMINAL_HISTORY_KINDS[history_slot] as u64
                     == RPC_TERMINAL_REPLY {
                 if DUPLICATE_REPLIES == MAX_COUNTER {
                     POISONED = 1;
@@ -1095,26 +1141,73 @@ pub unsafe fn invariants_hold() -> bool {
         } else {
             return false;
         }
-        if LAST_TERMINAL_HANDLES[slot] == 0 {
-            if LAST_TERMINAL_SERVICE_PROCESSES[slot] != 0
-                || LAST_TERMINAL_SERVICE_GENERATIONS[slot] != 0
-                || LAST_TERMINAL_KINDS[slot] != 0 {
-                return false;
-            }
-        } else if (LAST_TERMINAL_HANDLES[slot] & HANDLE_TAG_MASK)
-                != REQUEST_HANDLE_TAG
-            || request_index(LAST_TERMINAL_HANDLES[slot]) != slot
-            || request_generation(LAST_TERMINAL_HANDLES[slot]) == 0
-            || request_generation(LAST_TERMINAL_HANDLES[slot])
-                > GENERATIONS[slot]
-            || !process_handle_shape_valid(
-                LAST_TERMINAL_SERVICE_PROCESSES[slot]
-            )
-            || LAST_TERMINAL_SERVICE_GENERATIONS[slot] == 0
-            || !terminal_kind_valid(LAST_TERMINAL_KINDS[slot] as u64) {
+        slot += 1;
+    }
+    let expected_history_next: usize = (
+        CONSUMED_RESULTS % MAX_PERSONALITY_TOMBSTONES as u64
+    ) as usize;
+    if TERMINAL_HISTORY_NEXT >= MAX_PERSONALITY_TOMBSTONES
+        || TERMINAL_HISTORY_NEXT != expected_history_next
+        || TERMINAL_HISTORY_COUNT > MAX_PERSONALITY_TOMBSTONES
+        || (CONSUMED_RESULTS < MAX_PERSONALITY_TOMBSTONES as u64
+            && (TERMINAL_HISTORY_COUNT as u64 != CONSUMED_RESULTS
+                || TERMINAL_HISTORY_EVICTIONS != 0))
+        || (CONSUMED_RESULTS >= MAX_PERSONALITY_TOMBSTONES as u64
+            && (TERMINAL_HISTORY_COUNT != MAX_PERSONALITY_TOMBSTONES
+                || TERMINAL_HISTORY_EVICTIONS
+                    != CONSUMED_RESULTS
+                        - MAX_PERSONALITY_TOMBSTONES as u64)) {
+        return false;
+    }
+    let mut history_slot: usize = 0;
+    let mut occupied_history: usize = 0;
+    while history_slot < MAX_PERSONALITY_TOMBSTONES {
+        let history_handle: u64 = TERMINAL_HISTORY_HANDLES[history_slot];
+        if TERMINAL_HISTORY_COUNT < MAX_PERSONALITY_TOMBSTONES
+            && ((history_slot < TERMINAL_HISTORY_COUNT
+                    && history_handle == 0)
+                || (history_slot >= TERMINAL_HISTORY_COUNT
+                    && history_handle != 0)) {
             return false;
         }
-        slot += 1;
+        if history_handle == 0 {
+            if TERMINAL_HISTORY_SERVICE_PROCESSES[history_slot] != 0
+                || TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot] != 0
+                || TERMINAL_HISTORY_KINDS[history_slot] != 0 {
+                return false;
+            }
+        } else {
+            occupied_history += 1;
+            let request_slot: usize = request_index(history_handle);
+            if (history_handle & HANDLE_TAG_MASK) != REQUEST_HANDLE_TAG
+                || request_slot >= MAX_PERSONALITY_REQUESTS
+                || request_generation(history_handle) == 0
+                || request_generation(history_handle)
+                    > GENERATIONS[request_slot]
+                || !process_handle_shape_valid(
+                    TERMINAL_HISTORY_SERVICE_PROCESSES[history_slot]
+                )
+                || TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot] == 0
+                || TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot]
+                    > SERVICE_GENERATION
+                || !terminal_kind_valid(
+                    TERMINAL_HISTORY_KINDS[history_slot] as u64
+                ) {
+                return false;
+            }
+            let mut other_history: usize = history_slot + 1;
+            while other_history < MAX_PERSONALITY_TOMBSTONES {
+                if TERMINAL_HISTORY_HANDLES[other_history]
+                        == history_handle {
+                    return false;
+                }
+                other_history += 1;
+            }
+        }
+        history_slot += 1;
+    }
+    if occupied_history != TERMINAL_HISTORY_COUNT {
+        return false;
     }
     if CONFIGURED != 0
         && receiver_waiter(CLIENT_WAIT_ENDPOINT) != expected_waiter {
@@ -1228,6 +1321,12 @@ pub unsafe fn deadline_expiry_count() -> u64 { return DEADLINE_EXPIRIES; }
 pub unsafe fn service_death_terminal_count() -> u64 { return SERVICE_DEATH_TERMINALS; }
 pub unsafe fn service_death_event_count() -> u64 { return SERVICE_DEATH_EVENTS; }
 pub unsafe fn consumed_result_count() -> u64 { return CONSUMED_RESULTS; }
+pub unsafe fn terminal_history_count() -> usize {
+    return TERMINAL_HISTORY_COUNT;
+}
+pub unsafe fn terminal_history_eviction_count() -> u64 {
+    return TERMINAL_HISTORY_EVICTIONS;
+}
 pub unsafe fn stale_reply_count() -> u64 { return STALE_REPLIES; }
 pub unsafe fn duplicate_reply_count() -> u64 { return DUPLICATE_REPLIES; }
 pub unsafe fn late_reply_count() -> u64 { return LATE_REPLIES; }

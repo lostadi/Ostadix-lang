@@ -119,6 +119,8 @@ use runtime::personality_rpc::service_death_event_count as rpc_death_event_count
 use runtime::personality_rpc::service_death_terminal_count as rpc_death_terminal_count;
 use runtime::personality_rpc::stale_reply_count as rpc_stale_count;
 use runtime::personality_rpc::supervisor_cancel_count as rpc_cancel_count;
+use runtime::personality_rpc::terminal_history_count as rpc_history_count;
+use runtime::personality_rpc::terminal_history_eviction_count as rpc_history_eviction_count;
 use runtime::personality_rpc::terminal_transition_count as rpc_terminal_count;
 use runtime::personality_rpc::terminal_wake_count as rpc_terminal_wake_count;
 use runtime::personality_rpc::wait_arm_count as rpc_wait_arm_count;
@@ -210,15 +212,15 @@ static PATH_IDS: [u64; 4] = [
     0xdad8_5f71_3696_c238,
 ];
 
-const IMAGE_ID: u64 = 0xc269_9a2e_adae_2b40;
-const IMAGE_DIGEST_0: u64 = 0x402b_aead_2e9a_69c2;
-const IMAGE_DIGEST_1: u64 = 0xda4f_42ec_ec48_0b6a;
-const IMAGE_DIGEST_2: u64 = 0x32c7_caf7_0264_b30c;
-const IMAGE_DIGEST_3: u64 = 0xe7c4_73ff_8ad9_4144;
-const IMAGE_SHA_0: u64 = 0xc269_9a2e_adae_2b40;
-const IMAGE_SHA_1: u64 = 0x6a0b_48ec_ec42_4fda;
-const IMAGE_SHA_2: u64 = 0x0cb3_6402_f7ca_c732;
-const IMAGE_SHA_3: u64 = 0x4441_d98a_ff73_c4e7;
+const IMAGE_ID: u64 = 0xf592_4eeb_64b5_a3d3;
+const IMAGE_DIGEST_0: u64 = 0xd3a3_b564_eb4e_92f5;
+const IMAGE_DIGEST_1: u64 = 0x237b_ae0f_5d0b_e232;
+const IMAGE_DIGEST_2: u64 = 0xea72_8bb5_4e71_e23a;
+const IMAGE_DIGEST_3: u64 = 0x1744_3326_4d8a_f007;
+const IMAGE_SHA_0: u64 = 0xf592_4eeb_64b5_a3d3;
+const IMAGE_SHA_1: u64 = 0x32e2_0b5d_0fae_7b23;
+const IMAGE_SHA_2: u64 = 0x3ae2_714e_b58b_72ea;
+const IMAGE_SHA_3: u64 = 0x07f0_8a4d_2633_4417;
 
 static IMAGE_MESSAGE: [u8; 28] = b"M6A OVFS image import: PASS\n";
 static LOAD_MESSAGE: [u8; 34] = b"M6A four packaged ELF loads: PASS\n";
@@ -1018,6 +1020,8 @@ pub unsafe fn kernel_m6_final_ready() -> u64 {
         || rpc_terminal_count() != 9
         || rpc_terminal_wake_count() != 9
         || rpc_consumed_count() != 9
+        || rpc_history_count() != 9
+        || rpc_history_eviction_count() != 0
         || rpc_reply_count() != 6
         || rpc_cancel_count() != 1
         || rpc_expiry_count() != 1

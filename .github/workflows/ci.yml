@@ -159,6 +159,7 @@ jobs:
             test -x "$script"
             bash -n "$script"
           done
+          ./boot-and-test.sh --help | grep -Fq 'smoke    Run all required OKernel QEMU gates'
 
       - name: Run native and memory lifecycle smoke
         run: ./ocore/kernel/smoke-qemu.sh

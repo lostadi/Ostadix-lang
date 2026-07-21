@@ -28,6 +28,13 @@ const OP_CRASH: u64 = 5;
 const OP_UNSUPPORTED: u64 = 0x7f;
 const PONG: u64 = 0x4d36_4150_4f4e_4701;
 
+// The PIT runs at roughly 1 kHz. A 16-tick success-path deadline made ordinary
+// corpus calls depend on the host delivering several TCG context switches in
+// about 16 ms; expiry then made both principals stop before a diagnostic marker.
+// Keep successful calls bounded but leave ample scheduling headroom. The
+// separate OP_HOLD_TIMEOUT request below retains its exact six-tick deadline.
+const CORPUS_TIMEOUT_TICKS: u64 = 10_000;
+
 @link_section(".rodata")
 static ONLINE: [u8; 23] = b"M6A client ELF: online\n";
 @link_section(".rodata")
@@ -108,9 +115,9 @@ unsafe fn wait_for_publication(generation: u64) -> u64 {
 }
 
 unsafe fn scalar_corpus(capability: u64) -> bool {
-    return call(capability, OP_PING, 0, 16) == PONG
-        && call(capability, OP_ADD1, 41, 16) == 42
-        && call(capability, OP_UNSUPPORTED, 0, 16)
+    return call(capability, OP_PING, 0, CORPUS_TIMEOUT_TICKS) == PONG
+        && call(capability, OP_ADD1, 41, CORPUS_TIMEOUT_TICKS) == 42
+        && call(capability, OP_UNSUPPORTED, 0, CORPUS_TIMEOUT_TICKS)
             == ERR_PERSONALITY_UNSUPPORTED;
 }
 

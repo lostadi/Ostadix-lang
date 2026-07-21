@@ -381,7 +381,7 @@ deterministic digest-pinned read-only OVFS image supplies a test client, native
 personality daemon, native supervisor daemon, and unrelated observer as four
 independently loaded CPL3 ELFs. Its canonical image is 62,104 bytes with
 SHA-256
-`c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`;
+`f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417`;
 the gate verifies that identity, the exact four `/sbin/m6-*.elf` paths, and the
 absence of their module symbols from the kernel. The supervisor health-gates
 publication and chooses cancellation, one crash-driven generation restart, and
@@ -389,9 +389,14 @@ cooperative stop policy; O-core performs containment, reload, and capability
 rebind as mechanism. Scalar calls cross the generic
 personality router and endpoint-backed request/reply path; timeout, service
 death, supervisor cancellation, stale/late/duplicate reply, and wake-once
-terminal arbitration are asserted. This is a bounded scalar supervision slice,
-not full Milestone 6: pointer-bearing calls and request-scoped foreign memory
-views remain disabled, and no Linux or other foreign ABI is implemented.
+terminal arbitration are asserted. Consumed terminals enter a 16-record exact-
+handle history; this trace requires all nine records to remain present with zero
+eviction, while an older evicted reply would remain denied as stale. The
+supervisor also queues its fault watch before releasing the cancelled client,
+making watch-before-timeout/crash an endpoint-FIFO contract. This is a bounded
+scalar supervision slice, not full Milestone 6: pointer-bearing calls and
+request-scoped foreign memory views remain disabled, and no Linux or other
+foreign ABI is implemented.
 
 M6B's first native mechanism slice is gated separately by
 `smoke-m6b-qemu.sh` in mode 19. It creates generation-tagged request-scoped

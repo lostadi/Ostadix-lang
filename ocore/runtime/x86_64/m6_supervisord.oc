@@ -225,6 +225,15 @@ pub unsafe fn _start(
         OP_HOLD_CANCEL
     );
     emit(report_capability, (&CANCEL_DECISION[0]), 45);
+    // Queue the fault watch while the client is still blocked on cancellation.
+    // The shared inbox FIFO then makes the watch visible before that client can
+    // enqueue its timeout and crash requests.
+    let g1_reply: u64 = config(HEALTH_REPLY_CAP_OFFSET);
+    send(
+        config(INBOX_SEND_CAP_OFFSET),
+        WATCH_CORRELATION_G1,
+        OP_HEALTH_WATCH
+    );
     if supervise(
         supervise_capability,
         SUPERVISE_CANCEL,
@@ -233,13 +242,6 @@ pub unsafe fn _start(
     ) != 1 {
         stop();
     }
-
-    let g1_reply: u64 = config(HEALTH_REPLY_CAP_OFFSET);
-    send(
-        config(INBOX_SEND_CAP_OFFSET),
-        WATCH_CORRELATION_G1,
-        OP_HEALTH_WATCH
-    );
     if receive(g1_reply) != ERR_ENDPOINT_CLOSED {
         stop();
     }

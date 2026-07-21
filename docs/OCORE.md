@@ -402,7 +402,7 @@ M6A is a separate bounded personality-supervision slice in mode 18.
 `build-m6-artifacts.sh` deterministically packages a test client, native
 personality daemon, native supervisor daemon, and unrelated observer at exact
 `/sbin/m6-*.elf` paths in a 62,104-byte immutable OVFS image. Its SHA-256 is
-`c2699a2eadae2b406a0b48ecec424fda0cb36402f7cac7324441d98aff73c4e7`.
+`f5924eeb64b5a3d332e20b5d0fae7b233ae2714eb58b72ea07f08a4d26334417`.
 `smoke-personality-qemu.sh` checks the artifact identity and absence of the four
 user modules from kernel symbols before boot. In QEMU, the CPL3 supervisor
 performs health-before-publication, cancels one held request, observes the
@@ -411,8 +411,13 @@ fresh generation, health-gates republication, and requests cooperative stop.
 The client proves the pinned ping/add-one/unsupported scalar corpus, timeout and
 crash results, a rotated call capability, denial of the stale generation-1
 capability, and the generation-2 corpus. Late cancelled, late timed-out,
-prior-generation, and duplicate replies are rejected; an unrelated observer
-continues; all resources are reclaimed; and a later timer remains live.
+prior-generation, and duplicate replies are rejected. The router retains a
+16-record bounded terminal history and the gate requires history count 9 with
+zero eviction; an ancient record outside that horizon would still be denied but
+classified conservatively as stale. The supervisor queues the fault watch before
+cancellation wakes the client, so endpoint FIFO orders the watch ahead of the
+timeout/crash sequence. An unrelated observer continues; all resources are
+reclaimed; and a later timer remains live.
 
 This evidence is deliberately named M6A, not full Milestone 6. It has no shared
 or request-scoped foreign-process memory view, no pointer-bearing personality
