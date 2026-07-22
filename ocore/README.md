@@ -66,6 +66,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-personality-qemu.sh # M6A mode-18 scalar supervision
 ./ocore/kernel/smoke-m6b-qemu.sh # M6B mode-19 bounded-copy/revocation mechanism
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
+./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
 
 The asserted default `smoke-qemu.sh` output is:
