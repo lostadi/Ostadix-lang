@@ -206,9 +206,8 @@ The remaining dependency order is:
 2. connect the native normal-form admission surface to the running package
    supervisor's start, health, stop, replacement, and export-publication
    lifecycle;
-3. add an actual paravirtual or hardware-virtualized execution backend,
-   interrupt injection, and virtual devices behind the current nonexecuting
-   VM/vCPU/guest-memory identities;
+3. extend the Mode 21 AMD SVM/NPT synthetic execution backend into a pinned
+   foreign-kernel boot and add capability-backed virtual devices;
 4. carry the same request and export contracts over a bounded guest-agent and
    shared-queue protocol; and
 5. add device assignment only after separate IOMMU isolation, interrupt
@@ -226,7 +225,6 @@ The current native slice does not:
 
 - start, stop, health-check, replace, or publish exports from a provider;
 - boot Linux, BSD, Windows, macOS, or another foreign kernel;
-- enter a VM through VMX or SVM, build EPT/NPT mappings, or execute a vCPU;
 - implement firmware execution, a guest agent, shared queue, UEFI, ACPI, or a
   foreign ABI;
 - assign PCI hardware, configure an IOMMU, map DMA, route interrupts, or reset a
@@ -236,6 +234,11 @@ The current native slice does not:
 - establish source-integrated or binary-contained isolation.
 
 `KernelWorldInstance` is an executable semantic oracle for later native state
-machines. Mode 20 establishes only the bounded native record, admission, and
-nonexecuting object claims above. Separate source, artifact, QEMU, and hardware
-gates remain necessary for provider execution and isolation claims.
+machines. Mode 20 establishes the bounded native record, admission, and
+nonexecuting object claims. Hardware-only Mode 21 enters a real AMD SVM vCPU
+with NPT, executes a two-page synthetic guest, injects one vector, handles a
+controlled hypercall, denies an unmapped GPA, and tears down the exact NPT
+context while another VM survives. It does not boot or supervise a foreign
+kernel or publish a service. Separate source, artifact, guest-agent, device,
+and hardware gates remain necessary for provider execution and isolation
+claims beyond this first instruction-execution substrate.

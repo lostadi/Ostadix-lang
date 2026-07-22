@@ -1,0 +1,371 @@
+module runtime::svm_execution;
+
+use runtime::memory_object::release_mapping;
+use runtime::memory_object::retain_for_mapping;
+use runtime::memory_object::MEMORY_ANONYMOUS;
+use runtime::vm_object::guest_page_gpa;
+use runtime::vm_object::guest_page_is_current;
+use runtime::vm_object::guest_page_memory_object;
+use runtime::vm_object::guest_page_vm;
+use runtime::vm_object::vcpu_is_current;
+use runtime::vm_object::vcpu_vm;
+use runtime::vm_object::vm_state;
+use runtime::vm_object::VM_STATE_CONFIGURED;
+
+extern "sysv64" fn ocore_svm_region() -> usize;
+extern "sysv64" fn ocore_svm_capabilities() -> u64;
+extern "sysv64" fn ocore_svm_enable(hsave: usize) -> u64;
+extern "sysv64" fn ocore_svm_disable() -> void;
+extern "sysv64" fn ocore_svm_vmrun(vmcb: usize) -> u64;
+
+const PAGE_SIZE: usize = 4096;
+const SVM_REGION_PAGES: usize = 11;
+const SVM_CAPABILITY: u64 = 1;
+const NPT_CAPABILITY: u64 = 2;
+
+const HSAVE_OFFSET: usize = 0x0000;
+const VMCB_OFFSET: usize = 0x1000;
+const NPT_PML4_OFFSET: usize = 0x2000;
+const NPT_PDPT_OFFSET: usize = 0x3000;
+const NPT_PD_OFFSET: usize = 0x4000;
+const NPT_PT_OFFSET: usize = 0x5000;
+const IOPM_OFFSET: usize = 0x6000;
+const MSRPM_OFFSET: usize = 0x9000;
+
+const VMCB_INTERCEPT_MISC1: usize = 0x00c;
+const VMCB_INTERCEPT_MISC2: usize = 0x010;
+const VMCB_IOPM_BASE: usize = 0x040;
+const VMCB_MSRPM_BASE: usize = 0x048;
+const VMCB_ASID: usize = 0x058;
+const VMCB_TLB_CONTROL: usize = 0x05c;
+const VMCB_EXIT_CODE: usize = 0x070;
+const VMCB_EXIT_INFO1: usize = 0x078;
+const VMCB_EXIT_INFO2: usize = 0x080;
+const VMCB_NP_ENABLE: usize = 0x090;
+const VMCB_EVENT_INJECTION: usize = 0x0a8;
+const VMCB_N_CR3: usize = 0x0b0;
+
+const VMCB_ES: usize = 0x400;
+const VMCB_CS: usize = 0x410;
+const VMCB_SS: usize = 0x420;
+const VMCB_DS: usize = 0x430;
+const VMCB_FS: usize = 0x440;
+const VMCB_GS: usize = 0x450;
+const VMCB_GDTR: usize = 0x460;
+const VMCB_LDTR: usize = 0x470;
+const VMCB_IDTR: usize = 0x480;
+const VMCB_TR: usize = 0x490;
+const VMCB_CPL: usize = 0x4cb;
+const VMCB_EFER: usize = 0x4d0;
+const VMCB_CR4: usize = 0x548;
+const VMCB_CR3: usize = 0x550;
+const VMCB_CR0: usize = 0x558;
+const VMCB_DR7: usize = 0x560;
+const VMCB_DR6: usize = 0x568;
+const VMCB_RFLAGS: usize = 0x570;
+const VMCB_RIP: usize = 0x578;
+const VMCB_RSP: usize = 0x5d8;
+const VMCB_RAX: usize = 0x5f8;
+const VMCB_GPAT: usize = 0x668;
+
+const SVM_EXIT_VMMCALL: u64 = 0x81;
+const SVM_EXIT_NPF: u64 = 0x400;
+const GUEST_ENTRY: u64 = 0x200;
+const GUEST_AFTER_VMMCALL: u64 = 0x20d;
+const RESULT_GPA: u64 = 0x1000;
+const DENIED_GPA: u64 = 0x3000;
+const EXPECTED_RESULT: u64 = 0x1234_5678;
+const EXPECTED_INTERRUPT: u64 = 0xbeef;
+
+static mut INITIALIZED: u8 = 0;
+static mut ACTIVE: u8 = 0;
+static mut ACTIVE_VCPU: u64 = 0;
+static mut ACTIVE_VM: u64 = 0;
+static mut CODE_OBJECT: u64 = 0;
+static mut RESULT_OBJECT: u64 = 0;
+static mut CODE_ADDRESS: usize = 0;
+static mut RESULT_ADDRESS: usize = 0;
+static mut ENTER_COUNT: u64 = 0;
+static mut EXIT_COUNT: u64 = 0;
+static mut TEARDOWN_COUNT: u64 = 0;
+
+unsafe fn put_u8(address: usize, value: u8) -> void {
+    volatile_store(address as *mut u8, value);
+}
+
+unsafe fn put_u16(address: usize, value: u16) -> void {
+    volatile_store(address as *mut u16, value);
+}
+
+unsafe fn put_u32(address: usize, value: u32) -> void {
+    volatile_store(address as *mut u32, value);
+}
+
+unsafe fn put_u64(address: usize, value: u64) -> void {
+    volatile_store(address as *mut u64, value);
+}
+
+unsafe fn get_u16(address: usize) -> u16 {
+    return volatile_load(address as *const u16);
+}
+
+unsafe fn get_u32(address: usize) -> u32 {
+    return volatile_load(address as *const u32);
+}
+
+unsafe fn get_u64(address: usize) -> u64 {
+    return volatile_load(address as *const u64);
+}
+
+unsafe fn fill(address: usize, length: usize, value: u8) -> void {
+    let mut offset: usize = 0;
+    while offset < length {
+        put_u8(address + offset, value);
+        offset += 1;
+    }
+}
+
+unsafe fn segment(base: usize, attribute: u16) -> void {
+    put_u16(base, 0);
+    put_u16(base + 2, attribute);
+    put_u32(base + 4, 0xffff);
+    put_u64(base + 8, 0);
+}
+
+unsafe fn install_guest_program() -> void {
+    fill(CODE_ADDRESS, PAGE_SIZE, 0);
+    fill(RESULT_ADDRESS, PAGE_SIZE, 0);
+
+    // Real-mode vector 0x20 enters offset 0x0100 in segment zero.
+    put_u16(CODE_ADDRESS + 0x80, 0x0100);
+    put_u16(CODE_ADDRESS + 0x82, 0);
+    // mov word ptr [0x1004], 0xbeef; iret
+    put_u8(CODE_ADDRESS + 0x100, 0xc7);
+    put_u8(CODE_ADDRESS + 0x101, 0x06);
+    put_u8(CODE_ADDRESS + 0x102, 0x04);
+    put_u8(CODE_ADDRESS + 0x103, 0x10);
+    put_u8(CODE_ADDRESS + 0x104, 0xef);
+    put_u8(CODE_ADDRESS + 0x105, 0xbe);
+    put_u8(CODE_ADDRESS + 0x106, 0xcf);
+
+    // mov eax, 0x12345678; mov [0x1000], eax; vmmcall;
+    // mov ax, [0x3000] (an intentionally unmapped GPA); hlt.
+    put_u8(CODE_ADDRESS + 0x200, 0x66);
+    put_u8(CODE_ADDRESS + 0x201, 0xb8);
+    put_u8(CODE_ADDRESS + 0x202, 0x78);
+    put_u8(CODE_ADDRESS + 0x203, 0x56);
+    put_u8(CODE_ADDRESS + 0x204, 0x34);
+    put_u8(CODE_ADDRESS + 0x205, 0x12);
+    put_u8(CODE_ADDRESS + 0x206, 0x66);
+    put_u8(CODE_ADDRESS + 0x207, 0xa3);
+    put_u8(CODE_ADDRESS + 0x208, 0x00);
+    put_u8(CODE_ADDRESS + 0x209, 0x10);
+    put_u8(CODE_ADDRESS + 0x20a, 0x0f);
+    put_u8(CODE_ADDRESS + 0x20b, 0x01);
+    put_u8(CODE_ADDRESS + 0x20c, 0xd9);
+    put_u8(CODE_ADDRESS + 0x20d, 0xa1);
+    put_u8(CODE_ADDRESS + 0x20e, 0x00);
+    put_u8(CODE_ADDRESS + 0x20f, 0x30);
+    put_u8(CODE_ADDRESS + 0x210, 0xf4);
+}
+
+unsafe fn install_npt(region: usize) -> void {
+    let pml4: usize = region + NPT_PML4_OFFSET;
+    let pdpt: usize = region + NPT_PDPT_OFFSET;
+    let pd: usize = region + NPT_PD_OFFSET;
+    let pt: usize = region + NPT_PT_OFFSET;
+    put_u64(pml4, (pdpt as u64) | 7);
+    put_u64(pdpt, (pd as u64) | 7);
+    put_u64(pd, (pt as u64) | 7);
+    put_u64(pt, (CODE_ADDRESS as u64) | 7);
+    put_u64(pt + 8, (RESULT_ADDRESS as u64) | 7);
+}
+
+unsafe fn install_vmcb(region: usize) -> void {
+    let vmcb: usize = region + VMCB_OFFSET;
+    // HLT and VMMCALL are intercepted. NPF exits are supplied by NPT.
+    put_u32(vmcb + VMCB_INTERCEPT_MISC1, 1 << 24);
+    // VMRUN interception is architecturally required for a valid VMCB.
+    put_u32(vmcb + VMCB_INTERCEPT_MISC2, 3);
+    put_u64(vmcb + VMCB_IOPM_BASE, (region + IOPM_OFFSET) as u64);
+    put_u64(vmcb + VMCB_MSRPM_BASE, (region + MSRPM_OFFSET) as u64);
+    put_u32(vmcb + VMCB_ASID, 1);
+    put_u64(vmcb + VMCB_NP_ENABLE, 1);
+    put_u64(vmcb + VMCB_N_CR3, (region + NPT_PML4_OFFSET) as u64);
+
+    segment(vmcb + VMCB_ES, 0x93);
+    segment(vmcb + VMCB_CS, 0x9b);
+    segment(vmcb + VMCB_SS, 0x93);
+    segment(vmcb + VMCB_DS, 0x93);
+    segment(vmcb + VMCB_FS, 0x93);
+    segment(vmcb + VMCB_GS, 0x93);
+    segment(vmcb + VMCB_GDTR, 0);
+    segment(vmcb + VMCB_LDTR, 0x82);
+    segment(vmcb + VMCB_IDTR, 0);
+    segment(vmcb + VMCB_TR, 0x8b);
+    put_u8(vmcb + VMCB_CPL, 0);
+    put_u64(vmcb + VMCB_EFER, 1 << 12);
+    put_u64(vmcb + VMCB_CR4, 0);
+    put_u64(vmcb + VMCB_CR3, 0);
+    put_u64(vmcb + VMCB_CR0, 0x10);
+    put_u64(vmcb + VMCB_DR7, 0x400);
+    put_u64(vmcb + VMCB_DR6, 0xffff_0ff0);
+    put_u64(vmcb + VMCB_RFLAGS, 0x202);
+    put_u64(vmcb + VMCB_RIP, GUEST_ENTRY);
+    put_u64(vmcb + VMCB_RSP, 0x1ff0);
+    put_u64(vmcb + VMCB_RAX, 0);
+    put_u64(vmcb + VMCB_GPAT, 0x0007_0406_0007_0406);
+}
+
+unsafe fn clear_active() -> void {
+    ACTIVE = 0;
+    ACTIVE_VCPU = 0;
+    ACTIVE_VM = 0;
+    CODE_OBJECT = 0;
+    RESULT_OBJECT = 0;
+    CODE_ADDRESS = 0;
+    RESULT_ADDRESS = 0;
+}
+
+pub unsafe fn init() -> u64 {
+    let region: usize = ocore_svm_region();
+    if INITIALIZED != 0
+        || region == 0
+        || (region & (PAGE_SIZE - 1)) != 0
+        || ocore_svm_capabilities() != (SVM_CAPABILITY | NPT_CAPABILITY) {
+        return 0;
+    }
+    fill(region, SVM_REGION_PAGES * PAGE_SIZE, 0);
+    INITIALIZED = 1;
+    return 1;
+}
+
+pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
+    if INITIALIZED == 0
+        || ACTIVE != 0
+        || !vcpu_is_current(vcpu)
+        || !guest_page_is_current(code_page)
+        || !guest_page_is_current(result_page) {
+        return 0;
+    }
+    let vm: u64 = vcpu_vm(vcpu);
+    if vm == 0
+        || vm_state(vm) != VM_STATE_CONFIGURED
+        || guest_page_vm(code_page) != vm
+        || guest_page_vm(result_page) != vm
+        || guest_page_gpa(code_page) != 0
+        || guest_page_gpa(result_page) != RESULT_GPA {
+        return 0;
+    }
+    CODE_OBJECT = guest_page_memory_object(code_page);
+    RESULT_OBJECT = guest_page_memory_object(result_page);
+    if CODE_OBJECT == 0
+        || RESULT_OBJECT == 0
+        || retain_for_mapping(
+            CODE_OBJECT,
+            MEMORY_ANONYMOUS,
+            (&mut CODE_ADDRESS)
+        ) != 1 {
+        clear_active();
+        return 0;
+    }
+    if retain_for_mapping(
+        RESULT_OBJECT,
+        MEMORY_ANONYMOUS,
+        (&mut RESULT_ADDRESS)
+    ) != 1 {
+        release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+        clear_active();
+        return 0;
+    }
+    let region: usize = ocore_svm_region();
+    fill(region, SVM_REGION_PAGES * PAGE_SIZE, 0);
+    fill(region + IOPM_OFFSET, 3 * PAGE_SIZE, 0xff);
+    fill(region + MSRPM_OFFSET, 2 * PAGE_SIZE, 0xff);
+    install_guest_program();
+    install_npt(region);
+    install_vmcb(region);
+    if ocore_svm_enable(region + HSAVE_OFFSET) != 1 {
+        release_mapping(RESULT_OBJECT, MEMORY_ANONYMOUS);
+        release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+        fill(region, SVM_REGION_PAGES * PAGE_SIZE, 0);
+        clear_active();
+        return 0;
+    }
+    // Keep the host PIT IRQ from becoming an unacknowledged L2 interrupt.
+    // Mode 21 injects its own bounded vector through EVENTINJ instead.
+    outb(0x21, 0xff);
+    ACTIVE = 1;
+    ACTIVE_VCPU = vcpu;
+    ACTIVE_VM = vm;
+    return 1;
+}
+
+pub unsafe fn run_to_hypercall() -> u64 {
+    if ACTIVE == 0 || !vcpu_is_current(ACTIVE_VCPU) {
+        return 0;
+    }
+    let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
+    // Inject vector 0x20 before the first guest instruction.
+    put_u64(vmcb + VMCB_EVENT_INJECTION, 0x8000_0020);
+    // ASID 1 is intentionally reused by this bounded single-context backend.
+    // The architecturally supported full flush avoids requiring FlushByAsid.
+    put_u8(vmcb + VMCB_TLB_CONTROL, 1);
+    ENTER_COUNT += 1;
+    if ocore_svm_vmrun(vmcb) != 1 {
+        return 0;
+    }
+    EXIT_COUNT += 1;
+    return (get_u64(vmcb + VMCB_EXIT_CODE) == SVM_EXIT_VMMCALL
+        && get_u32(RESULT_ADDRESS) as u64 == EXPECTED_RESULT
+        && get_u16(RESULT_ADDRESS + 4) as u64 == EXPECTED_INTERRUPT) as u64;
+}
+
+pub unsafe fn run_to_isolation_fault() -> u64 {
+    if ACTIVE == 0 || !vcpu_is_current(ACTIVE_VCPU) {
+        return 0;
+    }
+    let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
+    put_u64(vmcb + VMCB_RIP, GUEST_AFTER_VMMCALL);
+    put_u64(vmcb + VMCB_EVENT_INJECTION, 0);
+    put_u8(vmcb + VMCB_TLB_CONTROL, 1);
+    ENTER_COUNT += 1;
+    if ocore_svm_vmrun(vmcb) != 1 {
+        return 0;
+    }
+    EXIT_COUNT += 1;
+    let fault_gpa: u64 = get_u64(vmcb + VMCB_EXIT_INFO2);
+    return (get_u64(vmcb + VMCB_EXIT_CODE) == SVM_EXIT_NPF
+        && (fault_gpa & 0xffff_ffff_ffff_f000) == DENIED_GPA
+        && get_u64(vmcb + VMCB_EXIT_INFO1) != 0) as u64;
+}
+
+pub unsafe fn stop() -> u64 {
+    if ACTIVE == 0 {
+        return 0;
+    }
+    ocore_svm_disable();
+    outb(0x21, 0xfe);
+    let result_release: u64 = release_mapping(
+        RESULT_OBJECT,
+        MEMORY_ANONYMOUS
+    );
+    let code_release: u64 = release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+    fill(ocore_svm_region(), SVM_REGION_PAGES * PAGE_SIZE, 0);
+    clear_active();
+    TEARDOWN_COUNT += 1;
+    return (result_release == 1 && code_release == 1) as u64;
+}
+
+pub unsafe fn npt_is_torn_down() -> bool {
+    let region: usize = ocore_svm_region();
+    return ACTIVE == 0
+        && get_u64(region + NPT_PML4_OFFSET) == 0
+        && get_u64(region + NPT_PDPT_OFFSET) == 0
+        && get_u64(region + NPT_PD_OFFSET) == 0
+        && get_u64(region + NPT_PT_OFFSET) == 0;
+}
+
+pub unsafe fn enter_count() -> u64 { return ENTER_COUNT; }
+pub unsafe fn exit_count() -> u64 { return EXIT_COUNT; }
+pub unsafe fn teardown_count() -> u64 { return TEARDOWN_COUNT; }

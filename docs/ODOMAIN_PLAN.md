@@ -808,6 +808,17 @@ EPT/NPT mappings, execute firmware, inject interrupts, assign a device, map
 DMA, or configure an IOMMU. It therefore does not complete any Milestone 11
 acceptance item.
 
+Mode 21 adds the first hardware execution slice without changing Mode 20's
+claims. On an AMD x86-64 host with nested SVM and NPT, it maps two existing
+guest-page objects through a private four-level NPT, enters a real-mode
+synthetic guest, injects a bounded interrupt, validates a guest computation,
+handles `VMMCALL`, and receives an NPF for an unmapped GPA. Stop clears the
+entire SVM/NPT context and releases retained page mappings; a second run,
+generation revocation, unrelated-VM survival, and a post-execution host timer
+are asserted by `smoke-kernel-world-execution-qemu.sh`. This is the executable
+VM substrate only: no foreign kernel, firmware, provider health, export,
+guest-agent, virtual device, DMA, or IOMMU claim is made.
+
 Acceptance gate:
 
 - a pinned Linux kernel and rootfs boot as `linux.kernel[0]`;
