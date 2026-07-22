@@ -68,6 +68,15 @@ use runtime::memory_object::quota_used;
 use runtime::memory_object::set_quota_for_owner;
 use runtime::pages::free_frames;
 use runtime::serial::write;
+use runtime::svm_execution::enter_count as svm_enter_count;
+use runtime::svm_execution::exit_count as svm_exit_count;
+use runtime::svm_execution::init as svm_init;
+use runtime::svm_execution::npt_is_torn_down;
+use runtime::svm_execution::prepare as svm_prepare;
+use runtime::svm_execution::run_to_hypercall;
+use runtime::svm_execution::run_to_isolation_fault;
+use runtime::svm_execution::stop as svm_stop;
+use runtime::svm_execution::teardown_count as svm_teardown_count;
 use runtime::vm_object::active_guest_page_count;
 use runtime::vm_object::active_vcpu_count;
 use runtime::vm_object::active_vm_count;
@@ -89,6 +98,7 @@ use runtime::vm_object::vm_vcpu_count;
 use runtime::vm_object::VM_STATE_CONFIGURED;
 
 const MODE_KERNEL_WORLD_OBJECTS: u64 = 20;
+const MODE_KERNEL_WORLD_EXECUTION: u64 = 21;
 const RECORD_LENGTH: usize = 440;
 const RECORD_SHA_0: u64 = 0x36eb_ffa3_7463_1fc5;
 const RECORD_SHA_1: u64 = 0x1e70_cc20_e051_2fd8;
@@ -150,6 +160,30 @@ static COMPLETE_MESSAGE: [u8; 52] =
     b"KW native admission + nonexecuting VM objects: PASS\n";
 static POST_TIMER_MESSAGE: [u8; 35] =
     b"KW post-object-model timer: online\n";
+static VIRTUALIZATION_MESSAGE: [u8; 44] =
+    b"KW virtualization capability detected: PASS\n";
+static NPT_MAPPING_MESSAGE: [u8; 37] =
+    b"KW second-stage guest mappings: PASS\n";
+static VCPU_ENTRY_MESSAGE: [u8; 33] =
+    b"KW vCPU entered guest mode: PASS\n";
+static COMPUTATION_MESSAGE: [u8; 34] =
+    b"KW guest computation result: PASS\n";
+static DENIED_MEMORY_MESSAGE: [u8; 42] =
+    b"KW unauthorized guest memory denied: PASS\n";
+static HYPERCALL_MESSAGE: [u8; 35] =
+    b"KW controlled hypercall exit: PASS\n";
+static INTERRUPT_MESSAGE: [u8; 36] =
+    b"KW virtual interrupt delivery: PASS\n";
+static RESTART_MESSAGE: [u8; 38] =
+    b"KW vCPU stop/restart generation: PASS\n";
+static NPT_TEARDOWN_MESSAGE: [u8; 34] =
+    b"KW exact-world NPT teardown: PASS\n";
+static UNRELATED_SURVIVAL_MESSAGE: [u8; 31] =
+    b"KW unrelated VM survived: PASS\n";
+static EXECUTABLE_MESSAGE: [u8; 39] =
+    b"KW first executable VM substrate: PASS\n";
+static POST_EXECUTION_TIMER_MESSAGE: [u8; 32] =
+    b"KW post-execution timer: online\n";
 
 extern "sysv64" fn ocore_kernel_world_record_start() -> usize;
 extern "sysv64" fn ocore_kernel_world_record_end() -> usize;
@@ -392,7 +426,8 @@ unsafe fn admit_unrelated_world() -> u64 {
 }
 
 pub unsafe fn start(mode: u64) -> never {
-    if mode != MODE_KERNEL_WORLD_OBJECTS {
+    if mode != MODE_KERNEL_WORLD_OBJECTS
+        && mode != MODE_KERNEL_WORLD_EXECUTION {
         fail_closed();
     }
     disable_interrupts();
@@ -545,7 +580,9 @@ pub unsafe fn start(mode: u64) -> never {
         fail_closed();
     }
     write((&OBJECT_MESSAGE[0]), 47);
-    write((&NONEXECUTING_MESSAGE[0]), 55);
+    if mode == MODE_KERNEL_WORLD_OBJECTS {
+        write((&NONEXECUTING_MESSAGE[0]), 55);
+    }
 
     let unrelated_vm: u64 = create_vm(
         unrelated_world,
@@ -569,12 +606,70 @@ pub unsafe fn start(mode: u64) -> never {
         fail_closed();
     }
 
+    if mode == MODE_KERNEL_WORLD_EXECUTION {
+        if svm_init() != 1 {
+            fail_closed();
+        }
+        write((&VIRTUALIZATION_MESSAGE[0]), 44);
+        if svm_prepare(
+            primary_vcpu_zero,
+            primary_page_zero,
+            primary_page_one
+        ) != 1 {
+            fail_closed();
+        }
+        write((&NPT_MAPPING_MESSAGE[0]), 37);
+        if run_to_hypercall() != 1 {
+            fail_closed();
+        }
+        if svm_enter_count() != 1 || svm_exit_count() != 1 {
+            fail_closed();
+        }
+        write((&VCPU_ENTRY_MESSAGE[0]), 33);
+        write((&COMPUTATION_MESSAGE[0]), 34);
+        write((&HYPERCALL_MESSAGE[0]), 35);
+        write((&INTERRUPT_MESSAGE[0]), 36);
+        if run_to_isolation_fault() != 1
+            || svm_enter_count() != 2
+            || svm_exit_count() != 2 {
+            fail_closed();
+        }
+        write((&DENIED_MEMORY_MESSAGE[0]), 42);
+        if svm_stop() != 1
+            || !npt_is_torn_down()
+            || svm_teardown_count() != 1 {
+            fail_closed();
+        }
+        write((&NPT_TEARDOWN_MESSAGE[0]), 34);
+        // A second complete entry/exit cycle proves stop/restart before the
+        // world generation is revoked and its vCPU handle becomes stale.
+        if svm_prepare(
+            primary_vcpu_zero,
+            primary_page_zero,
+            primary_page_one
+        ) != 1
+            || run_to_hypercall() != 1
+            || svm_stop() != 1
+            || !npt_is_torn_down()
+            || svm_enter_count() != 3
+            || svm_exit_count() != 3
+            || svm_teardown_count() != 2 {
+            fail_closed();
+        }
+    }
+
     if revoke_vm_world(primary_world) != 1
         || revoke_admission(primary_world) != 1
         || world_is_current(primary_world)
         || vm_is_current(primary_vm)
         || vcpu_is_current(primary_vcpu_zero)
         || guest_page_is_current(primary_page_zero)
+        || (mode == MODE_KERNEL_WORLD_EXECUTION
+            && svm_prepare(
+                primary_vcpu_zero,
+                primary_page_zero,
+                primary_page_one
+            ) != 0)
         || !vm_is_current(unrelated_vm)
         || !vcpu_is_current(unrelated_vcpu)
         || !guest_page_is_current(unrelated_page)
@@ -583,7 +678,12 @@ pub unsafe fn start(mode: u64) -> never {
         || free_frames() + 1 != baseline_frames {
         fail_closed();
     }
-    write((&REVOKE_MESSAGE[0]), 59);
+    if mode == MODE_KERNEL_WORLD_OBJECTS {
+        write((&REVOKE_MESSAGE[0]), 59);
+    } else {
+        write((&RESTART_MESSAGE[0]), 38);
+        write((&UNRELATED_SURVIVAL_MESSAGE[0]), 31);
+    }
 
     if revoke_vm_world(unrelated_world) != 1
         || revoke_admission(unrelated_world) != 1
@@ -598,14 +698,22 @@ pub unsafe fn start(mode: u64) -> never {
         || !vm_invariants_hold() {
         fail_closed();
     }
-    write((&COMPLETE_MESSAGE[0]), 52);
+    if mode == MODE_KERNEL_WORLD_OBJECTS {
+        write((&COMPLETE_MESSAGE[0]), 52);
+    } else {
+        write((&EXECUTABLE_MESSAGE[0]), 39);
+    }
 
     let tick_before: u64 = ticks();
     enable_interrupts();
     while ticks() == tick_before {
         halt();
     }
-    write((&POST_TIMER_MESSAGE[0]), 35);
+    if mode == MODE_KERNEL_WORLD_OBJECTS {
+        write((&POST_TIMER_MESSAGE[0]), 35);
+    } else {
+        write((&POST_EXECUTION_TIMER_MESSAGE[0]), 32);
+    }
     loop {
         halt();
     }
