@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 20" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 21" >&2
     exit 2
     ;;
 esac
@@ -65,7 +65,7 @@ if (( PROBE_MODE == 18 )); then
   M6_IMAGE_DEFINE="-DOCORE_M6_IMAGE_PATH=\"$M6_IMAGE_PATH\""
 fi
 
-if (( PROBE_MODE == 20 )); then
+if (( PROBE_MODE == 20 || PROBE_MODE == 21 )); then
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     --bin ocore-kernel-world-record
   RECORD_BUILD_DIR="$BUILD_DIR/kernel-world-record"
@@ -121,6 +121,7 @@ fi
   "$ROOT/ocore/runtime/x86_64/kernel_world_record.oc" \
   "$ROOT/ocore/runtime/x86_64/kernel_world_admission.oc" \
   "$ROOT/ocore/runtime/x86_64/vm_object.oc" \
+  "$ROOT/ocore/runtime/x86_64/svm_execution.oc" \
   "$ROOT/ocore/runtime/x86_64/mapping.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/trap.oc" \
