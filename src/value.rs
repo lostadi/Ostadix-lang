@@ -14,7 +14,7 @@
 // old wire tags as compatibility forms for existing shims.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
@@ -153,7 +153,7 @@ pub enum FloatSpecial {
 
 /// A class of information that can be dropped when a native backend value is
 /// projected into O or when an OValue is rendered into another backend.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnnotationKind {
     TypeTag,
@@ -178,15 +178,14 @@ pub enum AnnotationKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fidelity {
     Lossless,
-    Structural { lost: Vec<AnnotationKind> },
+    Structural { lost: BTreeSet<AnnotationKind> },
     NativeCapsule,
     Unsupported,
 }
 
 impl Fidelity {
     pub fn structural(lost: impl IntoIterator<Item = AnnotationKind>) -> Self {
-        let mut lost = lost.into_iter().collect::<Vec<_>>();
-        lost.dedup();
+        let lost = lost.into_iter().collect::<BTreeSet<_>>();
         if lost.is_empty() {
             Self::Lossless
         } else {
@@ -197,15 +196,23 @@ impl Fidelity {
     /// Compose two fidelity judgments along a value path. The result is the
     /// weaker of the two crossings, accumulating structural losses when both
     /// crossings preserve portable structure.
+    ///
+    /// `lost` is a set, not a log: composing the same annotation kind in from
+    /// two crossings must be idempotent, since fixpoint solvers (eg
+    /// `hgraph::solve::solve_types`) recompose an edge's fidelity against
+    /// itself on every pass until nothing changes. A sequence (`Vec` plus
+    /// adjacent-only `dedup`) cannot represent that idempotently: composing
+    /// `{A, B}` with `{A, B}` never yields `{A, B}` back, since `A` and `B`
+    /// are never adjacent to their own repeat, so the accumulator grows every
+    /// pass and the fixpoint never reaches `changed == false`.
     pub fn compose(self, next: Self) -> Self {
         use Fidelity::*;
         match (self, next) {
             (Unsupported, _) | (_, Unsupported) => Unsupported,
             (NativeCapsule, _) | (_, NativeCapsule) => NativeCapsule,
             (Lossless, other) | (other, Lossless) => other,
-            (Structural { mut lost }, Structural { lost: mut more }) => {
-                lost.append(&mut more);
-                lost.dedup();
+            (Structural { mut lost }, Structural { lost: more }) => {
+                lost.extend(more);
                 Structural { lost }
             }
         }
@@ -3377,11 +3384,11 @@ mod tests {
         assert_eq!(
             first.compose(second),
             Fidelity::Structural {
-                lost: vec![
+                lost: BTreeSet::from([
                     AnnotationKind::TypeTag,
                     AnnotationKind::NumericPrecision,
                     AnnotationKind::Encoding,
-                ],
+                ]),
             }
         );
         assert_eq!(
@@ -3391,6 +3398,31 @@ mod tests {
         assert_eq!(
             Fidelity::NativeCapsule.compose(Fidelity::Unsupported),
             Fidelity::Unsupported
+        );
+    }
+
+    #[test]
+    fn fidelity_composition_is_idempotent_under_self_recomposition() {
+        // Regression: a Vec<AnnotationKind> + Vec::dedup() accumulator grows
+        // without bound under repeated self-composition whenever `lost` holds
+        // 2+ distinct kinds, since dedup only drops *adjacent* duplicates and
+        // re-appending the same multi-kind list never produces adjacent runs.
+        // This is exactly what `solve_types`'s fixpoint loop does to any
+        // BackendCrossing edge on every pass. The set-based composition must
+        // converge in one step and stay bounded under many repeats.
+        let loss =
+            Fidelity::structural([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]);
+
+        let mut acc = loss.clone();
+        for _ in 0..64 {
+            acc = acc.compose(loss.clone());
+        }
+
+        assert_eq!(
+            acc,
+            Fidelity::Structural {
+                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
+            }
         );
     }
 
