@@ -23,6 +23,8 @@ pub use schedule::{schedule, try_schedule, ExecutionCluster, ReadyOp, ReadySched
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use num_bigint::BigInt;
 
     use crate::{
@@ -227,7 +229,59 @@ mod tests {
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
             Some(Fidelity::Structural {
-                lost: vec![AnnotationKind::NumericPrecision],
+                lost: BTreeSet::from([AnnotationKind::NumericPrecision]),
+            })
+        );
+    }
+
+    #[test]
+    fn backend_crossing_fixpoint_terminates_for_multi_kind_structural_loss() {
+        // Regression for the non-terminating solve_types case: a crossing
+        // whose loss set has 2+ distinct AnnotationKinds (here a rational
+        // number into a backend without rich-number support) is recomposed
+        // against itself on every pass of solve_types's `while changed` loop.
+        // Under the old Vec<AnnotationKind> + dedup() accumulator this grew
+        // without bound and never terminated. If this test completes at all,
+        // the fixpoint converged; the assertion checks it converged to the
+        // right two-element set rather than some other fixed point.
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode {
+            value: Some(OValue::Number {
+                v: ONumber::Rational {
+                    num: BigInt::from(1),
+                    den: BigInt::from(3),
+                },
+            }),
+            domain: DomainFlags::NUMERIC,
+            rep: RepFlags::BIG,
+            ..HNode::fresh()
+        });
+        let output = graph.add_node(HNode::fresh());
+        graph.add_edge(HEdge::constraint(
+            OpKind::BackendCrossing {
+                from_lang: "O".into(),
+                to_lang: "javascript".into(),
+            },
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        solve::solve_types(&mut graph);
+        assert_eq!(
+            graph.node(output).and_then(|node| node.fidelity.clone()),
+            Some(Fidelity::Structural {
+                lost: BTreeSet::from([
+                    AnnotationKind::NumericExactness,
+                    AnnotationKind::TypeTag
+                ]),
             })
         );
     }
