@@ -86,13 +86,15 @@ run_test() {
     return 0
   fi
 
-  for expected in "${args[@]}"; do
-    if ! grep -Fq -- "$expected" <<<"$output"; then
-      printf '[FAIL] %s (%s): missing %q\n%s\n' "$name" "$(basename "$file")" "$expected" "$output"
-      failed=$((failed + 1))
-      return 0
-    fi
-  done
+  if ((${#args[@]})); then
+    for expected in "${args[@]}"; do
+      if ! grep -Fq -- "$expected" <<<"$output"; then
+        printf '[FAIL] %s (%s): missing %q\n%s\n' "$name" "$(basename "$file")" "$expected" "$output"
+        failed=$((failed + 1))
+        return 0
+      fi
+    done
+  fi
 
   printf '[PASS] %s\n' "$name"
   passed=$((passed + 1))
