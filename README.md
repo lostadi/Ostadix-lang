@@ -2678,7 +2678,7 @@ It is an architecture note against the existing `ocore` runtime and
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+GNU Lesser General Public License v2.1. See [LICENSE](LICENSE) for the full text.
 
 ## Citation and authorship
 
