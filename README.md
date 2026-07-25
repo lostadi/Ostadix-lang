@@ -56,6 +56,26 @@ target, not to hosted `.O` execution.
 
 ---
 
+## Using Ostadix-lang with AI agents
+
+Ostadix-lang is designed to work well as a *primary* language for AI coding
+agents: one `.O` program can delegate each subtask to the best hosted language
+while every result flows through the typed OValue boundary. The `O` CLI has an
+agent-oriented surface:
+
+- `O --json program.O` — run and emit a single-line JSON result or structured
+  error (`{"ok":false,"stage":"parse"|"eval","error":...}`) on stdout.
+- `O --check program.O` — parse-only validation without executing anything
+  (combine with `--json` for a machine-readable verdict).
+- `O --eval '<source>'` / `O -e '<source>'` — evaluate an inline expression
+  without a file.
+
+See [docs/AI_GUIDE.md](docs/AI_GUIDE.md) for the full agent workflow, syntax
+pitfalls, and recipes, and [llms.txt](llms.txt) for an LLM-oriented index of
+this repository.
+
+---
+
 ## Getting Started: Full Setup Guide
 
 There are three implementations of the hosted `.O` language and one native
