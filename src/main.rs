@@ -37,8 +37,10 @@ fn main() -> Result<()> {
             "--json" => json_output = true,
             "--check" => check_only = true,
             "--eval" | "-e" => {
-                eval_source =
-                    Some(args.pop_front().context("--eval requires an O expression")?);
+                eval_source = Some(
+                    args.pop_front()
+                        .context("--eval requires an O expression")?,
+                );
             }
             "--executor" => {
                 let choice = args
