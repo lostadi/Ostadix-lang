@@ -6,8 +6,8 @@
 
 *By Lee Ostadi*
 
-[![CI](https://github.com/lostadi/O-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/ci.yml)
-[![Parser fuzz campaign](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/O-lang/actions/workflows/fuzz.yml)
+[![CI](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml)
+[![Parser fuzz campaign](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml)
 
 > **Every expression carries its own interpreter as part of its syntax.**
 
@@ -109,7 +109,7 @@ runtime dependencies, builds the Rust and C17 editions, prepares the Python
 reference, and creates convenience wrappers:
 
 ```bash
-git clone https://github.com/lostadi/O-lang.git Ostadix-lang
+git clone https://github.com/lostadi/Ostadix-lang.git Ostadix-lang
 cd Ostadix-lang
 ./setup.sh
 ```
@@ -144,7 +144,7 @@ python3 -m o_lang examples/hello.O
 ### Option B: Manual Rust setup
 
 ```bash
-git clone https://github.com/lostadi/O-lang.git Ostadix-lang
+git clone https://github.com/lostadi/Ostadix-lang.git Ostadix-lang
 cd Ostadix-lang
 cargo build --release
 
@@ -2693,7 +2693,7 @@ canonical repository:
 
     Lee Daghlar Ostadi. Ostadix-lang: Recursive Evaluator Composition for
     Whole-Program Polyglot Execution. Version 0.2.0.
-    https://github.com/lostadi/O-lang
+    https://github.com/lostadi/Ostadix-lang
 
 Once the Zenodo DOI exists, prefer citing the DOI of the exact archived
 release you used.

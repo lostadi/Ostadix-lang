@@ -1,6 +1,6 @@
 # Ostadix-lang Developer Guide
 
-Practical notes for contributors to [Ostadix-lang](https://github.com/lostadi/O-lang), short name **O-lang**. The project is a polyglot language system where typed expressions choose their evaluator with `LANG^(...)_LANG`, and O-core is the separate freestanding native systems language.
+Practical notes for contributors to [Ostadix-lang](https://github.com/lostadi/Ostadix-lang), short name **O-lang**. The project is a polyglot language system where typed expressions choose their evaluator with `LANG^(...)_LANG`, and O-core is the separate freestanding native systems language.
 
 ## Implementations in this repository
 
