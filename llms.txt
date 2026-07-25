@@ -1,0 +1,40 @@
+# Ostadix-lang
+
+> Ostadix-lang (O-lang) is a polyglot orchestration language where every
+> expression carries its own interpreter as part of its syntax. A block written
+> as `LANG^( ... )_LANG` is evaluated by that language's backend, and all
+> results flow through one canonical value type, OValue. AI agents can use O as
+> a single primary language while delegating each subtask to whichever hosted
+> language (Python, Bash, SQL, Rust, JavaScript, ...) solves it best.
+
+Key facts for agents:
+
+- File extension: `.O` (hosted orchestration) and `.oc` (O-core native systems language).
+- Run a program: `O program.O` (Rust edition; build with `cargo build --release`).
+- Machine-readable output: `O --json program.O` prints one JSON object on
+  stdout: `{"ok":true,"value":...,"type":...,"elapsed_ms":...}` on success, or
+  `{"ok":false,"stage":"parse"|"eval","error":"..."}` on failure (exit code 1).
+- Syntax check without executing: `O --check program.O` (combine with `--json`).
+- Inline evaluation: `O --eval '<O source>'` or `O -e '<O source>'`.
+- Blocks: `python^( ... )_python`, `bash^( ... )_bash`, `sql^( ... )_sql`, etc.
+  Opener and closer tags must match exactly.
+- Persistent state: `python[0]^( ... )_python[0]` reuses one Python process for
+  every block marked `[0]`; unmarked blocks are ephemeral.
+- Values: a Python block returns whatever it assigns to `__oval_result__`;
+  inline backends (`html`, `markdown`, `text`) return their spliced body.
+- Bindings: `let name = LANG^( ... )_LANG` then reference `$name` inside any
+  later block. Escape a literal dollar sign as `\$`.
+- Quoting: `quote^( ... )_quote` captures unevaluated O source; `O.eval(expr)`
+  inside Python evaluates it (homoiconicity).
+
+## Docs
+
+- [AI agent guide](docs/AI_GUIDE.md): how AI systems should write, check, and run O programs
+- [Language specification](SPEC.md): grammar, evaluation semantics, OValue, backend protocol, registered languages
+- [README](README.md): setup, all editions (Rust, C17, Python reference), tooling
+- [Architecture](ARCHITECTURE.md): runtime and compiler internals
+- [O-core](docs/OCORE.md): the statically typed freestanding native language
+
+## Examples
+
+- [examples/](examples/): runnable `.O` programs (hello, bindings, coordination groups, pipelines)
