@@ -16,7 +16,7 @@ O-core `.oc`, HIR/MIR lowering, and freestanding x86_64 object generation.
 
 Canonical repository:
 
-    https://github.com/lostadi/O-lang
+    https://github.com/lostadi/Ostadix-lang
 
 Canonical phrase:
 
