@@ -306,7 +306,9 @@ check_stdout_contains "O --check validates a valid file" 0 '^ok$' "$O_BIN" --che
 check_stdout_contains "O --json --check reports structured success" 0 '"ok":true' "$O_BIN" --json --check examples/hello.O backends/
 check_stdout_contains "O --json --check reports structured parse errors" 1 '"ok":false.*"stage":"parse"' "$O_BIN" --json --check "$INVALID_SOURCE" backends/
 check_stdout_contains "O --json runs hello.O with structured output" 0 '"ok":true.*"value".*"elapsed_ms"' "$O_BIN" --json examples/hello.O backends/
-check_stdout_contains "O --eval evaluates an inline expression" 0 '^(\[number\] )?2$' "$O_BIN" --eval "$(cat examples/hello.O)" backends/
+check_stdout_contains "O --eval evaluates an inline expression" 0 '^(\[number\] )?2$' "$O_BIN" --eval 'python^(
+__oval_result__ = 1 + 1
+)_python' backends/
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

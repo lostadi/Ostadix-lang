@@ -176,7 +176,8 @@ fn fail_stage(json_output: bool, stage: &str, err: anyhow::Error) -> Result<()> 
     }
     Err(err.context(match stage {
         "parse" => "failed to parse .O source",
-        _ => "failed to evaluate .O document",
+        "eval" => "failed to evaluate .O document",
+        _ => "failed to run .O source",
     }))
 }
 
