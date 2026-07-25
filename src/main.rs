@@ -20,15 +20,26 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1).collect::<VecDeque<_>>();
     let backends = registered_backends();
     let mut backend_grants = Vec::new();
-    while args
-        .front()
-        .is_some_and(|arg| arg == "--backend-grant" || arg == "--executor")
-    {
+    let mut json_output = false;
+    let mut check_only = false;
+    let mut eval_source: Option<String> = None;
+    while args.front().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "--backend-grant" | "--executor" | "--json" | "--check" | "--eval" | "-e"
+        )
+    }) {
         match args.pop_front().unwrap().as_str() {
             "--backend-grant" => backend_grants.push(
                 args.pop_front()
                     .context("--backend-grant requires NAME=LANG[:RIGHT,...]")?,
             ),
+            "--json" => json_output = true,
+            "--check" => check_only = true,
+            "--eval" | "-e" => {
+                eval_source =
+                    Some(args.pop_front().context("--eval requires an O expression")?);
+            }
             "--executor" => {
                 let choice = args
                     .pop_front()
@@ -51,11 +62,14 @@ fn main() -> Result<()> {
             print_usage(&mut io::stdout())?;
             return Ok(());
         }
-        None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+        None if eval_source.is_none()
+            && io::stdin().is_terminal()
+            && io::stderr().is_terminal() =>
+        {
             let (shim_dir, _shim_guard) = resolve_shim_dir(None)?;
             return run_repl(shim_dir, backends, &backend_grants);
         }
-        None => {
+        None if eval_source.is_none() => {
             print_usage(&mut io::stderr())?;
             bail!("missing input file (pass a .O file or use --repl)");
         }
@@ -71,15 +85,20 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let input_path = args.pop_front().unwrap();
+    let (input_path, mut source) = match eval_source {
+        Some(src) => ("<eval>".to_string(), src),
+        None => {
+            let path = args.pop_front().unwrap();
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read input file: {}", path))?;
+            (path, text)
+        }
+    };
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.pop_front().map(PathBuf::from))?;
     if let Some(extra) = args.pop_front() {
         print_usage(&mut io::stderr())?;
         bail!("unexpected extra argument: {}", extra);
     }
-
-    let mut source = fs::read_to_string(&input_path)
-        .with_context(|| format!("failed to read input file: {}", input_path))?;
 
     if source.starts_with("#!") {
         source = source
@@ -90,21 +109,49 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let mut parser = Parser::new(&source, &backends);
-    let nodes = parser.parse().context("failed to parse .O source")?;
+    let nodes = match parser.parse() {
+        Ok(nodes) => nodes,
+        Err(e) => return fail_stage(json_output, "parse", e),
+    };
+
+    if check_only {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({ "ok": true, "stage": "parse", "input": input_path })
+            );
+        } else {
+            println!("ok");
+        }
+        return Ok(());
+    }
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
     let mut scope = HashMap::new();
     for grant in &backend_grants {
         evaluator.install_backend_grant(grant, &mut scope)?;
     }
-    let result = evaluator
-        .eval_document_with_scope(nodes, &mut scope)
-        .context("failed to evaluate .O document")?;
+    let result = match evaluator.eval_document_with_scope(nodes, &mut scope) {
+        Ok(result) => result,
+        Err(e) => return fail_stage(json_output, "eval", e),
+    };
 
     let elapsed = start.elapsed();
-    print_result(&result);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "value": result,
+                "type": result.type_name(),
+                "elapsed_ms": elapsed.as_millis() as u64,
+            })
+        );
+    } else {
+        print_result(&result);
+    }
 
-    if io::stderr().is_terminal() {
+    if !json_output && io::stderr().is_terminal() {
         if elapsed.as_millis() < 1000 {
             eprintln!("\x1b[2m  {} ms\x1b[0m", elapsed.as_millis());
         } else {
@@ -115,10 +162,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Report a parse or eval failure. In `--json` mode a structured error object
+/// is printed to stdout so agents and tooling can consume it; the process
+/// still exits non-zero in both modes.
+fn fail_stage(json_output: bool, stage: &str, err: anyhow::Error) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "stage": stage, "error": format!("{err:#}") })
+        );
+    }
+    Err(err.context(match stage {
+        "parse" => "failed to parse .O source",
+        _ => "failed to evaluate .O document",
+    }))
+}
+
 fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(out, "  O <input.O> [backends_dir]")?;
     writeln!(out, "  O --repl [backends_dir]")?;
+    writeln!(
+        out,
+        "  O --eval '<expr>' | -e '<expr>'      # evaluate an inline O expression"
+    )?;
+    writeln!(
+        out,
+        "  O --json <input.O>                   # machine-readable JSON result/error on stdout"
+    )?;
+    writeln!(
+        out,
+        "  O --check <input.O>                  # parse-only validation (combine with --json)"
+    )?;
     writeln!(
         out,
         "  O --backend-grant NAME=LANG[:RIGHT,...] <input.O> [backends_dir]  # compatibility"
