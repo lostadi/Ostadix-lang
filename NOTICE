@@ -2,7 +2,7 @@ Ostadix-lang / ^Ostadix_
 Copyright 2026 Lee Daghlar Ostadi
 
 Original public implementation:
-https://github.com/lostadi/O-lang
+https://github.com/lostadi/Ostadix-lang
 
 Core contribution:
 Typed expression boundaries, where the evaluator of an expression is part of
