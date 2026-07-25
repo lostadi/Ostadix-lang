@@ -23,8 +23,8 @@ authors:
     orcid: "https://orcid.org/0009-0001-6380-9558"
 version: "0.2.0"
 license: Apache-2.0
-repository-code: "https://github.com/lostadi/O-lang"
-url: "https://github.com/lostadi/O-lang"
+repository-code: "https://github.com/lostadi/Ostadix-lang"
+url: "https://github.com/lostadi/Ostadix-lang"
 keywords:
   - recursive-evaluator-composition
   - polyglot-programming

@@ -102,7 +102,7 @@ any one of them disagrees.
 ## Zenodo DOI minting
 
 1. Enable the repository in Zenodo's GitHub integration.
-2. Confirm Zenodo sees `lostadi/O-lang` and is authorized to archive releases.
+2. Confirm Zenodo sees `lostadi/Ostadix-lang` and is authorized to archive releases.
 3. Publish the GitHub release for the tag.
 4. Wait for Zenodo to archive that exact repository state.
 5. Record the DOI minted by Zenodo for the versioned release, not just the
