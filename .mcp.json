@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ostadix": {
+      "command": "ostadix-mcp",
+      "args": [],
+      "env": {
+        "O_LANG_ROOT": "${O_LANG_ROOT:-$HOME/Ostadix-lang}"
+      }
+    }
+  }
+}
