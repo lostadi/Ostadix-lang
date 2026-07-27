@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md",
+    "~/.config/opencode/instructions/ostadix.md"
+  ],
+  "permission": {
+    "skill": {
+      "*": "allow",
+      "olang*": "allow",
+      "ostadix*": "allow"
+    }
+  }
+}

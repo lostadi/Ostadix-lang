@@ -319,6 +319,50 @@ SELECT value FROM values_table;
     assert_eq!(serial.output.stdout, b"[number] 42\n");
 }
 
+/// `ATTACH DATABASE` is connection-local. The native sql backend must keep one
+/// sqlite3 session across blocks so a later `sql[0]` block still sees `t.*`.
+#[test]
+fn persistent_sql_attach_survives_across_blocks() {
+    if !runtime_available("python3") || !runtime_available("sqlite3") {
+        return;
+    }
+    let source = r#"
+let db = python^(
+import os, sqlite3
+p = os.path.join(os.environ["O_TEST_WORKDIR"], "attach_ext.sqlite")
+c = sqlite3.connect(p)
+c.execute("CREATE TABLE insns(bin TEXT, addr INTEGER)")
+c.execute("INSERT INTO insns VALUES ('SK', 42)")
+c.commit()
+c.close()
+__oval_result__ = p
+)_python
+
+sql[0]^(
+ATTACH DATABASE '$db' AS t
+)_sql[0]
+
+sql[0]^(
+SELECT addr FROM t.insns
+)_sql[0]
+"#;
+
+    let serial = run_source(source, "serial");
+    let graph = run_source(source, "graph");
+    assert_equivalent(&serial, &graph);
+    assert!(
+        serial.output.status.success(),
+        "serial ATTACH failed:\n{}",
+        normalized_stderr(&serial)
+    );
+    assert_eq!(
+        serial.output.stdout, b"[number] 42\n",
+        "expected attached table row; got stdout={:?} stderr={}",
+        String::from_utf8_lossy(&serial.output.stdout),
+        normalized_stderr(&serial)
+    );
+}
+
 #[test]
 fn ephemeral_evaluators_and_coordination_modes_match_serial() {
     if !runtime_available("python3") {
