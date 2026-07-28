@@ -26,6 +26,7 @@ FULL=false
 YES=false
 VERIFY=false
 INSTALL_WRAPPERS=true
+INSTALL_MCP=true
 DRY_RUN=false
 
 RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
@@ -45,6 +46,7 @@ Options:
   -y, --yes            Non-interactive (assume yes for prompts)
   -v, --verify         After build, run verification on key examples (hello, meta, etc.)
   --no-wrappers        Do not create convenience wrappers in ~/.local/bin
+  --no-mcp             Do not build the ostadix-mcp server (mcp/ostadix_lang_mcp_server)
   --dry-run            Print what would be done, do not install or build
 
 Examples:
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     -y|--yes) YES=true; shift ;;
     -v|--verify) VERIFY=true; shift ;;
     --no-wrappers) INSTALL_WRAPPERS=false; shift ;;
+    --no-mcp) INSTALL_MCP=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
@@ -80,7 +83,7 @@ fi
 echo "=== O-lang cross-platform setup ==="
 echo "Project root: $PROJECT_ROOT"
 echo "Host: $(uname -a)"
-echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY wrappers=$INSTALL_WRAPPERS dry_run=$DRY_RUN"
+echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY wrappers=$INSTALL_WRAPPERS mcp=$INSTALL_MCP dry_run=$DRY_RUN"
 echo
 
 # --- OS / Distro Detection ---
@@ -423,6 +426,33 @@ build_c() {
   fi
 }
 
+build_mcp_server() {
+  if ! $INSTALL_MCP; then return; fi
+  local mcp_dir="$PROJECT_ROOT/mcp/ostadix_lang_mcp_server"
+  if [[ ! -f "$mcp_dir/Cargo.toml" ]]; then
+    echo ">>> Skipping ostadix-mcp (no $mcp_dir/Cargo.toml)"
+    return
+  fi
+  echo ">>> Building ostadix-mcp server (--release, --locked)..."
+  # --locked: fail rather than silently re-resolve deps against crates.io, so
+  # a build today and a build in a year off the same commit produce the same
+  # binary modulo toolchain drift. This crate has its own Cargo.lock (rmcp is
+  # pre-1.0 and moves fast) — deliberately not folded into the root
+  # workspace so its dependency set can't bleed into the main O-lang build.
+  run_cmd cargo build --release --locked --manifest-path "$mcp_dir/Cargo.toml"
+  if $INSTALL_WRAPPERS && ! $DRY_RUN; then
+    local mcp_bin="$mcp_dir/target/release/ostadix-mcp"
+    if [[ -f "$mcp_bin" ]]; then
+      mkdir -p "$HOME/.local/bin"
+      remove_managed_file "$HOME/.local/bin/ostadix-mcp"
+      cp "$mcp_bin" "$HOME/.local/bin/ostadix-mcp"
+      chmod +x "$HOME/.local/bin/ostadix-mcp"
+      echo "  wrapper → $HOME/.local/bin/ostadix-mcp"
+    fi
+  fi
+  echo "MCP build done → $mcp_dir/target/release/ostadix-mcp"
+}
+
 setup_python() {
   echo ">>> Setting up Python compatibility bridge / edition..."
   if $DRY_RUN; then
@@ -605,6 +635,7 @@ hash -r 2>/dev/null || true
 install_nix
 build_rust
 build_c
+build_mcp_server
 setup_python
 install_extras
 create_wrappers
@@ -624,6 +655,7 @@ echo "  cargo run -- examples/hello.O"
 echo "  ./c_cpp/O examples/hello.O ./backends"
 echo "  ./c_cpp/olangc examples/hello.O -o /tmp/h && /tmp/h"
 echo "  python3 -m o_lang examples/hello.O"
+echo "  ostadix-mcp                           # MCP stdio server (agent tools: o_env, o_doctor, o_run, o_olangc, o_search_run)"
 echo
 echo "For clean testing in docker (as mentioned in history):"
 echo '  docker run -it -v "$PWD:/ws" -w /ws debian bash -c "apt-get update && apt-get install -y sudo curl && ./setup.sh --minimal --verify"'

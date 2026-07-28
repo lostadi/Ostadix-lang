@@ -1268,6 +1268,14 @@ const BACKEND_SPECS: &[BackendSpec] = &[
         ExecutionMode::Shim,
     ),
     BackendSpec::with_authority(
+        "ubuntu_vm",
+        &["ubuntu"],
+        false,
+        SpliceRenderer::Default,
+        ExecutionMode::Shim,
+        &[BackendAuthority::Process],
+    ),
+    BackendSpec::with_authority(
         "bash",
         &[],
         false,
