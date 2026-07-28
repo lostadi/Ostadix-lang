@@ -33,6 +33,17 @@ static mut PROCESS_HANDLES: [u64; 16] = [0; 16];
 static mut INITIALIZED: u8 = 0;
 static mut POISONED: u8 = 0;
 
+pub const MAX_VFS_ENTRIES: usize = 32;
+
+const VFS_ENTRY_EMPTY: u8 = 0;
+const VFS_ENTRY_LIVE: u8 = 1;
+
+static mut VFS_ENTRY_STATES: [u8; 32] = [0; 32];
+static mut VFS_ENTRY_NAMESPACES: [u64; 32] = [0; 32];
+static mut VFS_ENTRY_PATHS: [u8; 2048] = [0; 2048];
+static mut VFS_ENTRY_PATH_LENS: [usize; 32] = [0; 32];
+static mut VFS_ENTRY_CAPABILITIES: [u64; 32] = [0; 32];
+
 fn namespace_index(handle: u64) -> usize {
     return (handle & HANDLE_INDEX_MASK) as usize;
 }
@@ -79,6 +90,21 @@ unsafe fn clear_processes(slot: usize) -> void {
     }
 }
 
+unsafe fn clear_vfs_entries(slot: usize) -> void {
+    let namespace: u64 = make_handle(slot);
+    let mut vfs_slot: usize = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        if VFS_ENTRY_STATES[vfs_slot] == VFS_ENTRY_LIVE
+            && VFS_ENTRY_NAMESPACES[vfs_slot] == namespace {
+            VFS_ENTRY_STATES[vfs_slot] = VFS_ENTRY_EMPTY;
+            VFS_ENTRY_NAMESPACES[vfs_slot] = 0;
+            VFS_ENTRY_CAPABILITIES[vfs_slot] = 0;
+            VFS_ENTRY_PATH_LENS[vfs_slot] = 0;
+        }
+        vfs_slot += 1;
+    }
+}
+
 fn quiescent_state(state: u64) -> bool {
     return state == PROCESS_STATE_EXITED
         || state == PROCESS_STATE_FAULTED
@@ -101,6 +127,11 @@ pub unsafe fn init() -> u64 {
         LOAD_REFS[slot] = 0;
         clear_processes(slot);
         slot += 1;
+    }
+    let mut vfs_slot: usize = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        VFS_ENTRY_STATES[vfs_slot] = VFS_ENTRY_EMPTY;
+        vfs_slot += 1;
     }
     POISONED = 0;
     INITIALIZED = 1;
@@ -385,6 +416,82 @@ pub unsafe fn load_refs(handle: u64) -> u32 {
     return LOAD_REFS[slot];
 }
 
+pub unsafe fn vfs_bind_path(namespace: u64, path: *const u8, path_len: usize, capability: u64) -> u64 {
+    let slot: usize = checked_namespace(namespace, false);
+    if slot >= MAX_DOMAIN_NAMESPACES || path_len == 0 || path_len > 64 || capability == 0 {
+        return 0;
+    }
+
+    let mut vfs_slot: usize = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        if VFS_ENTRY_STATES[vfs_slot] == VFS_ENTRY_LIVE 
+            && VFS_ENTRY_NAMESPACES[vfs_slot] == namespace
+            && VFS_ENTRY_PATH_LENS[vfs_slot] == path_len {
+            let mut match_found: bool = true;
+            let mut i: usize = 0;
+            while i < path_len {
+                if VFS_ENTRY_PATHS[vfs_slot * 64 + i] != *(path + i) {
+                    match_found = false;
+                    break;
+                }
+                i += 1;
+            }
+            if match_found {
+                return 0;
+            }
+        }
+        vfs_slot += 1;
+    }
+
+    vfs_slot = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        if VFS_ENTRY_STATES[vfs_slot] == VFS_ENTRY_EMPTY {
+            VFS_ENTRY_NAMESPACES[vfs_slot] = namespace;
+            VFS_ENTRY_CAPABILITIES[vfs_slot] = capability;
+            VFS_ENTRY_PATH_LENS[vfs_slot] = path_len;
+            let mut i: usize = 0;
+            while i < path_len {
+                VFS_ENTRY_PATHS[vfs_slot * 64 + i] = *(path + i);
+                i += 1;
+            }
+            VFS_ENTRY_STATES[vfs_slot] = VFS_ENTRY_LIVE;
+            return 1;
+        }
+        vfs_slot += 1;
+    }
+    return 0;
+}
+
+// Define the root namespace resolver that explicitly routes capability tokens based on predictable boundaries
+pub unsafe fn vfs_resolve_path(namespace: u64, path: *const u8, path_len: usize) -> u64 {
+    let slot: usize = checked_namespace(namespace, true);
+    if slot >= MAX_DOMAIN_NAMESPACES || path_len == 0 || path_len > 64 {
+        return 0;
+    }
+
+    let mut vfs_slot: usize = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        if VFS_ENTRY_STATES[vfs_slot] == VFS_ENTRY_LIVE 
+            && VFS_ENTRY_NAMESPACES[vfs_slot] == namespace
+            && VFS_ENTRY_PATH_LENS[vfs_slot] == path_len {
+            let mut match_found: bool = true;
+            let mut i: usize = 0;
+            while i < path_len {
+                if VFS_ENTRY_PATHS[vfs_slot * 64 + i] != *(path + i) {
+                    match_found = false;
+                    break;
+                }
+                i += 1;
+            }
+            if match_found {
+                return VFS_ENTRY_CAPABILITIES[vfs_slot];
+            }
+        }
+        vfs_slot += 1;
+    }
+    return 0;
+}
+
 // Teardown is a fail-closed two-phase transaction. Once draining begins no
 // subsystem may acquire a new namespace child. The coordinator removes all
 // loader, service, mount, and quiescent-process records, then calls finish.
@@ -420,6 +527,7 @@ pub unsafe fn finish_teardown(handle: u64) -> u64 {
     PROCESS_REFS[slot] = 0;
     LOAD_REFS[slot] = 0;
     clear_processes(slot);
+    clear_vfs_entries(slot);
     if GENERATIONS[slot] == 0xffff_ffff {
         STATES[slot] = NAMESPACE_RETIRED;
     } else {
@@ -503,6 +611,26 @@ pub unsafe fn invariants_hold() -> bool {
             return false;
         }
         slot += 1;
+    }
+    let mut vfs_slot: usize = 0;
+    while vfs_slot < MAX_VFS_ENTRIES {
+        let state: u8 = VFS_ENTRY_STATES[vfs_slot];
+        if state == VFS_ENTRY_LIVE {
+            let namespace: u64 = VFS_ENTRY_NAMESPACES[vfs_slot];
+            let namespace_slot: usize = checked_namespace(namespace, true);
+            if namespace_slot >= MAX_DOMAIN_NAMESPACES {
+                return false;
+            }
+            if VFS_ENTRY_CAPABILITIES[vfs_slot] == 0 {
+                return false;
+            }
+            if VFS_ENTRY_PATH_LENS[vfs_slot] == 0 || VFS_ENTRY_PATH_LENS[vfs_slot] > 64 {
+                return false;
+            }
+        } else if state != VFS_ENTRY_EMPTY {
+            return false;
+        }
+        vfs_slot += 1;
     }
     return true;
 }
