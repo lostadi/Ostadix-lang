@@ -22,7 +22,7 @@ authors:
     given-names: Lee Daghlar
     orcid: "https://orcid.org/0009-0001-6380-9558"
 version: "0.2.0"
-license: LGPL-2.1
+license: Apache-2.0
 repository-code: "https://github.com/lostadi/Ostadix-lang"
 url: "https://github.com/lostadi/Ostadix-lang"
 keywords:
@@ -34,9 +34,28 @@ keywords:
   - hypergraph-scheduling
   - metaprogramming
   - research-software
+preferred-citation:
+  type: article
+  title: "The Nesting Is the Interface: Recursive Evaluator Composition for Whole-Program Polyglot Execution"
+  authors:
+    - family-names: Ostadi
+      given-names: Lee Daghlar
+      orcid: "https://orcid.org/0009-0001-6380-9558"
+  doi: "10.5281/zenodo.21544345"
+  url: "https://doi.org/10.5281/zenodo.21544345"
+  year: 2026
+  month: 7
+  publisher:
+    name: Zenodo
 # date-released: intentionally omitted until an actual public release is
 # published. Set it to the real release date when tagging.
 # doi: "10.5281/zenodo.XXXXXXX"
-# ^ Placeholder comment only — uncomment and fill in after Zenodo mints a DOI
-#   for a published GitHub release (see docs/RELEASE_CHECKLIST.md). Once set,
-#   GitHub's "Cite this repository" button will surface this metadata.
+# ^ This slot is reserved for a DIFFERENT, future DOI — the one Zenodo mints
+#   automatically once the GitHub release-integration archives an actual
+#   tagged release of this exact code. It is not the same object as
+#   preferred-citation above, which already points at the existing
+#   paper/software-description record (10.5281/zenodo.21544345) and is live
+#   right now. Once the tagged-release DOI exists, uncomment this and set it
+#   to that one — GitHub's "Cite this repository" button will then surface
+#   both: the paper via preferred-citation, and this exact code snapshot via
+#   the top-level doi.
