@@ -11,12 +11,14 @@ pub const COMMAND_INSTALL: u64 = 2;
 pub const COMMAND_ACTIVATE: u64 = 3;
 pub const COMMAND_RESOLVE: u64 = 4;
 pub const COMMAND_UPGRADE: u64 = 5;
+pub const COMMAND_EVAL: u64 = 6;
 
 static STATUS_TEXT: [u8; 6] = b"status";
 static INSTALL_TEXT: [u8; 8] = b"install ";
 static ACTIVATE_TEXT: [u8; 9] = b"activate ";
 static RESOLVE_TEXT: [u8; 8] = b"resolve ";
 static UPGRADE_TEXT: [u8; 8] = b"upgrade ";
+static EVAL_TEXT: [u8; 5] = b"eval ";
 
 static mut LAST_KIND: u64 = 0;
 static mut LAST_DIGEST: [u64; 4] = [0; 4];
@@ -212,14 +214,15 @@ pub unsafe fn invariants_hold() -> bool {
     }
     if LAST_KIND != COMMAND_INSTALL
         && LAST_KIND != COMMAND_ACTIVATE
-        && LAST_KIND != COMMAND_UPGRADE {
+        && LAST_KIND != COMMAND_UPGRADE
+        && LAST_KIND != COMMAND_EVAL {
         return false;
     }
     if LAST_KIND == COMMAND_INSTALL
         && (LAST_ARGUMENT_ZERO == 0 || LAST_ARGUMENT_ONE == 0) {
         return false;
     }
-    if (LAST_KIND == COMMAND_ACTIVATE || LAST_KIND == COMMAND_UPGRADE)
+    if (LAST_KIND == COMMAND_ACTIVATE || LAST_KIND == COMMAND_UPGRADE || LAST_KIND == COMMAND_EVAL)
         && (LAST_ARGUMENT_ZERO != 0 || LAST_ARGUMENT_ONE != 0) {
         return false;
     }
@@ -273,6 +276,10 @@ pub unsafe fn parse(input: *const u8, input_length: usize) -> u64 {
         && bytes_match(input, input_length, (&UPGRADE_TEXT[0]), 8)
         && parse_digest(input, 8, (&mut digest[0])) {
         return accept(COMMAND_UPGRADE, (&digest[0]), 0, 0);
+    }
+    if input_length > 5
+        && bytes_match(input, input_length, (&EVAL_TEXT[0]), 5) {
+        return accept(COMMAND_EVAL, 0 as *const u64, 0, 0);
     }
     if input_length >= 12
         && bytes_match(input, input_length, (&RESOLVE_TEXT[0]), 8) {
