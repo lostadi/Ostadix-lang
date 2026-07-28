@@ -52,6 +52,10 @@ pub const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
         include_bytes!("../backends/python_shim.py"),
     ),
     (
+        "ubuntu_vm_shim.py",
+        include_bytes!("../backends/ubuntu_vm_shim.py"),
+    ),
+    (
         "racket_shim.py",
         include_bytes!("../backends/racket_shim.py"),
     ),
