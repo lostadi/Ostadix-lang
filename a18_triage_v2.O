@@ -1,0 +1,163 @@
+#!/usr/bin/env O
+A18 Pro guarded-world triage v2 — idiomatic Ostadix-lang
+Run:  chmod +x a18_triage_v2.O && ./a18_triage_v2.O
+Env:  A18_IPSW=/path/to/Restore.ipsw   (optional)
+      A18_WORK=/path/to/a18re          (optional; default ~/a18re)
+      A18_FORCE_EXTRACT=1              (re-run ipsw extract even if present)
+
+stage0_setup = python[0]^(
+import os, pathlib
+ipsw = os.environ.get('A18_IPSW', '/Users/ustad/a18re/iPhone17,1_26.5.2_23F84_Restore.ipsw')
+work = pathlib.Path(os.environ.get('A18_WORK', os.path.expanduser('~/a18re')))
+run = work / 'triage' / pathlib.Path(ipsw).stem
+run.mkdir(parents=True, exist_ok=True)
+open('/tmp/a18_run_dir', 'w').write(str(run))
+open('/tmp/a18_ipsw_path', 'w').write(ipsw)
+__oval_result__ = str(run)
+)_python[0]
+
+stage1_extract = python[0]^(
+import os, pathlib, subprocess
+run = pathlib.Path(open('/tmp/a18_run_dir').read().strip())
+ipsw = open('/tmp/a18_ipsw_path').read().strip()
+
+def find_file(want, parent=None):
+    for p in run.rglob(want):
+        if parent is None or p.parent.name == parent:
+            return p
+    return None
+
+already = (
+    find_file('kernel', 'SYSTEM') is not None
+    and find_file('txm.iphoneos.release') is not None
+)
+force = os.environ.get('A18_FORCE_EXTRACT') == '1'
+if already and not force:
+    __oval_result__ = "skip extract (artifacts present): %s" % run
+else:
+    # SK/TXM triage needs kernel+sptm/exclave; dyld is multi-GB and optional.
+    # Set A18_EXTRACT_DYLD=1 to include it. Never abort the whole pipeline if
+    # optional extracts fail (disk / AEA).
+    required = (["--kernel"], ["--sptm"], ["--exclave"])
+    optional = (["--dyld", "--dyld-arch", "arm64e"],) if os.environ.get("A18_EXTRACT_DYLD") == "1" else ()
+    msgs = []
+    for args in required + optional:
+        r = subprocess.run(["ipsw", "extract", *args, ipsw], cwd=str(run))
+        tag = " ".join(args)
+        if r.returncode != 0:
+            if args in required:
+                raise subprocess.CalledProcessError(r.returncode, r.args)
+            msgs.append("optional-fail:%s" % tag)
+        else:
+            msgs.append("ok:%s" % tag)
+    __oval_result__ = "extracted: %s [%s]" % (run, ", ".join(msgs))
+)_python[0]
+
+stage2_decode = python[0]^(
+import sqlite3
+from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+db = sqlite3.connect(str(run / 'triage_db.sqlite'))
+db.execute("CREATE TABLE IF NOT EXISTS insns(bin TEXT, addr INT, mn TEXT, op TEXT)")
+db.execute("DELETE FROM insns")
+md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+
+def find_file(want, parent=None):
+    for p in run.rglob(want):
+        if parent is None or p.parent.name == parent:
+            return p
+    raise FileNotFoundError(want)
+
+targets = [
+    ("SK", find_file('kernel', 'SYSTEM'), 0x4800, 0x1174c, 0xfffffc0000000800),
+    ("TXM", find_file('txm.iphoneos.release'), 0x1c000, None, 0xfffffff017020000),
+]
+total = 0
+for name, fpath, off, sz, va in targets:
+    d = fpath.read_bytes()
+    if sz is None:
+        sz = len(d) - off
+    rows = []
+    for o in range(off, off + sz - 3, 4):
+        for i in md.disasm(d[o:o + 4], va + o, 1):
+            rows.append((name, o, i.mnemonic, i.op_str))
+    db.executemany("INSERT INTO insns VALUES (?,?,?,?)", rows)
+    total += len(rows)
+db.commit()
+__oval_result__ = total
+)_python[0]
+
+# Dynamic path via $db_path splice (no hardcoded IPSW stem).
+let db_path = python[0]^(
+__oval_result__ = str(run / 'triage_db.sqlite')
+)_python[0]
+
+stage3_attach = sql[0]^(
+ATTACH DATABASE '$db_path' AS t
+)_sql[0]
+
+stage3_q1 = sql[0]^(
+SELECT 'Q1_unbounded_blr' AS pattern, bin, addr FROM t.insns i
+WHERE mn LIKE 'blr%'
+  AND EXISTS (SELECT 1 FROM t.insns p WHERE p.bin=i.bin AND p.addr BETWEEN i.addr-64 AND i.addr
+              AND p.mn='ldr' AND p.op LIKE '%lsl #3%')
+  AND NOT EXISTS (SELECT 1 FROM t.insns c WHERE c.bin=i.bin AND c.addr BETWEEN i.addr-64 AND i.addr
+              AND c.mn IN ('cmp','subs'))
+)_sql[0]
+
+stage3_q1b = sql[0]^(
+SELECT 'Q1b_scaled_add_blr' AS pattern, bin, addr, mn, op FROM t.insns i
+WHERE mn LIKE 'blr%'
+  AND EXISTS (SELECT 1 FROM t.insns p WHERE p.bin=i.bin AND p.addr BETWEEN i.addr-64 AND i.addr
+              AND p.mn='add' AND p.op LIKE '%lsl #3%')
+  AND NOT EXISTS (SELECT 1 FROM t.insns c WHERE c.bin=i.bin AND c.addr BETWEEN i.addr-64 AND i.addr
+              AND c.mn IN ('cmp','subs'))
+)_sql[0]
+
+stage3_q2 = sql[0]^(
+SELECT 'Q2_unchecked_tag' AS pattern, bin, addr FROM t.insns i
+WHERE mn='lsr' AND op LIKE '%#0x3a%'
+  AND NOT EXISTS (SELECT 1 FROM t.insns c WHERE c.bin=i.bin AND c.addr BETWEEN i.addr AND i.addr+16
+              AND (c.mn='cmp' OR c.mn LIKE 'cb%'))
+)_sql[0]
+
+stage3_q3 = sql[0]^(
+SELECT 'Q3_unchecked_advance' AS pattern, bin, addr FROM t.insns i
+WHERE bin='TXM' AND mn='add' AND op LIKE 'x%, x%, x%'
+  AND NOT EXISTS (SELECT 1 FROM t.insns c WHERE c.bin=i.bin AND c.addr BETWEEN i.addr-32 AND i.addr
+              AND c.mn='cmp')
+  AND addr BETWEEN 0x4c000 AND 0x5c000
+)_sql[0]
+
+stage4_report = python[0]^(
+import collections
+insns = db.execute("SELECT bin,addr,mn,op FROM insns").fetchall()
+types = collections.defaultdict(int)
+sk = [r for r in insns if r[0] == 'SK']
+for n, (b, a, m, o) in enumerate(sk):
+    if m == 'lsr' and '#0x3a' in o:
+        for _, _, m2, o2 in sk[n + 1:n + 4]:
+            if m2 == 'cmp' and '#' in o2:
+                types[o2.split('#')[-1]] += 1
+pac = collections.Counter((b, m) for b, a, m, o in insns if m in ('pacibsp', 'retab'))
+out = run / 'findings.md'
+out.write_text(
+    "# A18 triage - %s\n\n## cL4 object enum: %s\n\n## PAC census: %s\n"
+    % (run.name, dict(types), dict(pac))
+)
+__oval_result__ = str(out)
+)_python[0]
+
+stage5_delta = python[0]^(
+prev = sorted(p for p in run.parent.glob('iPhone17,1_*') if p != run)
+
+def shape(dbc):
+    return {(m, o) for (_, _, m, o) in dbc.execute("SELECT 1,bin,mn,op FROM insns")}
+
+if prev:
+    old = sqlite3.connect(str(prev[-1] / 'triage_db.sqlite'))
+    new = shape(db) - shape(old)
+    (run / 'delta.txt').write_text("\n".join("%s %s" % (m, o) for m, o in sorted(new)))
+    __oval_result__ = "%d new instruction shapes vs %s" % (len(new), prev[-1].name)
+else:
+    __oval_result__ = "first run - baseline established"
+)_python[0]

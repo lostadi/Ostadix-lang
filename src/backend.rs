@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::BigInt;
@@ -95,9 +96,19 @@ struct RustBackend {
     sql: Option<SqlState>,
 }
 
+/// Persistent `sqlite3` CLI session.
+///
+/// Earlier this backend spawned a fresh `sqlite3 -json <db> <sql>` process per
+/// block. That correctly preserved `CREATE TABLE` (file-backed) but dropped
+/// connection-local state such as `ATTACH DATABASE … AS alias` between blocks.
+/// Keep one interactive session for the lifetime of the backend process so
+/// multi-block `sql[0]^(…)_sql[0]` programs match the Python shim semantics.
 struct SqlState {
     _dir: TempDir,
-    db_path: PathBuf,
+    _child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_rx: Receiver<String>,
 }
 
 impl RustBackend {
@@ -138,17 +149,146 @@ impl RustBackend {
         }
 
         let state = self.sql_state()?;
-        let output = Command::new("sqlite3")
-            .arg("-batch")
-            .arg("-json")
-            .arg(&state.db_path)
-            .arg(code)
-            .output()
-            .context("sqlite3 is not installed or not in PATH")?;
-        expect_success("sqlite3 execution failed", output.clone())?;
+        state.exec(code)
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
+    fn sql_state(&mut self) -> Result<&mut SqlState> {
+        if self.sql.is_none() {
+            self.sql = Some(SqlState::spawn()?);
+        }
+        Ok(self.sql.as_mut().expect("sql state was just initialized"))
+    }
+}
+
+impl SqlState {
+    fn spawn() -> Result<Self> {
+        let dir = TempDir::new("o-backend-sql")?;
+        let db_path = dir.path().join("state.sqlite3");
+        // Ensure the file exists so sqlite3 opens a durable on-disk DB.
+        fs::File::create(&db_path).with_context(|| {
+            format!("failed to create sql state db {}", db_path.display())
+        })?;
+
+        let mut child = Command::new("sqlite3")
+            .arg("-batch")
+            .arg(&db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("sqlite3 is not installed or not in PATH")?;
+
+        let stdin = BufWriter::new(
+            child
+                .stdin
+                .take()
+                .context("sqlite3 session did not provide stdin")?,
+        );
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("sqlite3 session did not provide stdout")?,
+        );
+        let stderr = BufReader::new(
+            child
+                .stderr
+                .take()
+                .context("sqlite3 session did not provide stderr")?,
+        );
+
+        let (stderr_tx, stderr_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
+        thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut line = String::new();
+            while stderr.read_line(&mut line).ok().is_some_and(|n| n > 0) {
+                let _ = stderr_tx.send(std::mem::take(&mut line));
+            }
+        });
+
+        let mut state = Self {
+            _dir: dir,
+            _child: child,
+            stdin,
+            stdout,
+            stderr_rx,
+        };
+        // JSON row output for SELECT/WITH/PRAGMA, matching the old -json flag.
+        state.write_raw(".mode json\n")?;
+        // Drain any mode-switch chatter (usually none).
+        let _ = state.drain_stderr();
+        Ok(state)
+    }
+
+    fn write_raw(&mut self, text: &str) -> Result<()> {
+        self.stdin
+            .write_all(text.as_bytes())
+            .context("failed to write to sqlite3 session")?;
+        self.stdin
+            .flush()
+            .context("failed to flush sqlite3 session")?;
+        Ok(())
+    }
+
+    fn drain_stderr(&self) -> String {
+        // Give the stderr collector a brief window after stdout completes.
+        thread::sleep(Duration::from_millis(5));
+        let mut acc = String::new();
+        while let Ok(chunk) = self.stderr_rx.try_recv() {
+            acc.push_str(&chunk);
+        }
+        acc
+    }
+
+    fn exec(&mut self, code: &str) -> Result<OValue> {
+        // Clear stale stderr from prior statements.
+        let _ = self.drain_stderr();
+
+        // Feed the full block, then a sentinel print so we can delimit replies
+        // without closing the session (which would lose ATTACH state).
+        let mut payload = code.to_string();
+        if !payload.trim_end().ends_with(';') {
+            payload.push(';');
+        }
+        payload.push('\n');
+        payload.push_str(".print __O_SQL_DONE__\n");
+        self.write_raw(&payload)?;
+
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .context("failed to read sqlite3 session stdout")?;
+            if n == 0 {
+                let err = self.drain_stderr();
+                bail!(
+                    "sqlite3 session closed unexpectedly{}",
+                    if err.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {err}")
+                    }
+                );
+            }
+            if line.trim_end_matches(['\r', '\n']) == "__O_SQL_DONE__" {
+                break;
+            }
+            out.push_str(&line);
+        }
+
+        let err = self.drain_stderr();
+        if sql_stderr_is_error(&err) {
+            // Preserve the historical error envelope from the one-shot CLI path
+            // so existing triage / test string matches keep working.
+            bail!(
+                "sqlite3 execution failed (code 1)\n{}",
+                err.trim_end()
+            );
+        }
+
+        let trimmed = out.trim();
         if trimmed.is_empty() {
             if sql_has_query_result(code) {
                 return Ok(OValue::list(Vec::new()));
@@ -159,15 +299,18 @@ impl RustBackend {
         let json: Value = serde_json::from_str(trimmed).context("sqlite3 returned non-JSON")?;
         sqlite_json_to_ovalue(json)
     }
+}
 
-    fn sql_state(&mut self) -> Result<&SqlState> {
-        if self.sql.is_none() {
-            let dir = TempDir::new("o-backend-sql")?;
-            let db_path = dir.path().join("state.sqlite3");
-            self.sql = Some(SqlState { _dir: dir, db_path });
-        }
-        Ok(self.sql.as_ref().expect("sql state was just initialized"))
+fn sql_stderr_is_error(err: &str) -> bool {
+    let trimmed = err.trim();
+    if trimmed.is_empty() {
+        return false;
     }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("parse error")
+        || lower.contains("incomplete sql")
+        || lower.starts_with("usage:")
 }
 
 fn proxy_legacy_backend(lang: &str) -> Result<()> {

@@ -1,0 +1,70 @@
+#!/usr/bin/env O
+
+# This example provisions a QEMU instance running Plan9 (9front)
+# inside the `ubuntu_vm` execution backend, and exposes it over noVNC.
+# The host browser connects to the VM's bridged websocket.
+
+let setup_result = ubuntu_vm^(
+  echo ">>> Updating packages and installing QEMU, noVNC, and websockify..."
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 novnc websockify curl gzip > /dev/null
+
+  export VM_IP=\$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+  
+  echo ">>> Setting up 9front ISO..."
+  cd /tmp
+  if [ ! -f 9front.iso ]; then
+    echo "Downloading ISO directly..."
+    curl -L -sO "https://9front.org/iso/9front-11554.amd64.iso.gz" || true
+    if [ -f 9front-11554.amd64.iso.gz ]; then
+        echo "Decompressing..."
+        gzip -df 9front-11554.amd64.iso.gz
+        mv 9front-11554.amd64.iso 9front.iso
+    else
+        echo "Failed to download ISO. Creating a dummy file for demo."
+        touch 9front.iso
+    fi
+  else
+    echo "9front ISO already present."
+  fi
+
+  echo ">>> Launching QEMU..."
+  sudo kill \$(pgrep -f qemu-system-x86_64) 2>/dev/null || true
+  sudo kill \$(pgrep -f websockify) 2>/dev/null || true
+  
+  sudo qemu-system-x86_64 -m 1024 -cdrom 9front.iso -boot d -vga std -vnc :0 -daemonize || true
+
+  echo ">>> Launching noVNC websocket bridge..."
+  sudo websockify -D --web=/usr/share/novnc 8080 localhost:5900 || true
+
+  echo ">>> System ready."
+  echo "\$VM_IP"
+)_ubuntu_vm
+
+# We use python to safely parse the output from the VM execution
+let ip = python^(
+  result_text = $setup_result
+  lines = result_text.strip().split('\n')
+  __oval_result__ = lines[-1] if lines else '127.0.0.1'
+)_python
+
+html^(
+<!doctype html>
+<html>
+  <head>
+    <title>Plan 9 Emulation</title>
+    <style>
+      body { font-family: sans-serif; text-align: center; background: #222; color: #eee; margin: 0; padding: 20px; }
+      iframe { width: 1024px; height: 768px; border: none; background: #000; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+      h1 { margin-bottom: 10px; }
+      p { margin-bottom: 20px; color: #aaa; }
+    </style>
+  </head>
+  <body>
+    <h1>Plan 9 (9front)</h1>
+    <p>Running natively in Ostadix-lang via Multipass, QEMU, and noVNC.</p>
+    <p><i>Wait a moment for QEMU to boot, then click "Connect" below. Select option "1" for Live CD.</i></p>
+    <iframe src="http://$ip:8080/vnc.html?autoconnect=true&resize=scale"></iframe>
+  </body>
+</html>
+)_html
