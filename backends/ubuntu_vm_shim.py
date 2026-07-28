@@ -61,7 +61,7 @@ def handle_exec(cmd):
     try:
         result = subprocess.run(
             ["multipass", "exec", VM_NAME, "--", "bash"],
-            input=script, capture_output=True, text=True, timeout=120
+            input=script, capture_output=True, text=True, timeout=600
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
@@ -69,7 +69,7 @@ def handle_exec(cmd):
         else:
             send_ok(stdout_result(result.stdout))
     except subprocess.TimeoutExpired:
-        send_err("ubuntu_vm execution timed out (120s)")
+        send_err("ubuntu_vm execution timed out (600s)")
     except Exception:
         send_err(traceback.format_exc())
 
