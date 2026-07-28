@@ -222,7 +222,7 @@ static int write_shims_to(const char *shim_src_dir, const char *dest_dir) {
                     "import sys, json\n"
                     "print(json.dumps({'status':'ok','value':{'t':'str','v':'(python_shim stub)'}}))\n";
                 FILE *f = fopen(dstp, "w");
-                if (f) { fputs(stub, f); fclose(f); chmod(dstp, 0755); }
+                if (f) { fputs(stub, f); fchmod(fileno(f), 0755); fclose(f); }
             }
         }
     }
