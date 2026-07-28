@@ -39,9 +39,9 @@ const HANDLE_TAG_MASK: u64 = 0xff00_0000;
 const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 const IPC_DEADLINE: u64 = 0xffff_ffff_ffff_ffff;
 
-// There is exactly one request cell for each possible TCB slot. The cell binds
-// full generation-tagged endpoint, thread, and process identities plus the
-// sleep epoch that block_current must publish before commit is legal.
+// In the Delta-contract rendezvous discipline, waiters represent explicit
+// synchrony. A thread blocking here is a channel edge halting until both
+// sender and receiver are present for direct synchronous handover.
 static mut STATES: [u8; 4] = [0; 4];
 static mut GENERATIONS: [u32; 4] = [0; 4];
 static mut ENDPOINTS: [u64; 4] = [0; 4];
@@ -121,9 +121,6 @@ unsafe fn retire_or_reuse(slot: usize) -> void {
     }
 }
 
-// PREPARED spans the deliberate scheduler boundary. Before block_current it
-// names the next epoch of the running TCB; after block_current it may briefly
-// name that exact blocked epoch until scheduler code calls commit.
 unsafe fn prepared_epoch_matches(slot: usize) -> bool {
     let thread: u64 = THREADS[slot];
     let expected: u32 = SLEEP_EPOCHS[slot];
@@ -229,9 +226,6 @@ pub unsafe fn init() -> u64 {
     return 1;
 }
 
-// Register the endpoint waiter and reserve the exact next sleep epoch. The
-// caller must either arrange the scheduler control transfer and later commit,
-// or abort this returned request before returning to user mode.
 pub unsafe fn begin(
     endpoint: u64,
     kind: u64,
@@ -281,8 +275,6 @@ pub unsafe fn begin(
     return make_handle(slot);
 }
 
-// Scheduler code calls commit only after block_current has published the exact
-// infinite-deadline epoch reserved by begin.
 pub unsafe fn commit(request: u64, thread: u64) -> u64 {
     let slot: usize = checked_request(request);
     if slot >= MAX_THREADS
@@ -309,8 +301,6 @@ pub unsafe fn commit(request: u64, thread: u64) -> u64 {
     return request;
 }
 
-// Abort is legal only before block_current changes the TCB state. It removes
-// precisely this request's waiter and advances the request generation.
 pub unsafe fn abort(request: u64) -> u64 {
     let slot: usize = checked_request(request);
     if slot >= MAX_THREADS
@@ -373,9 +363,7 @@ unsafe fn finish_committed_slot(
     return thread;
 }
 
-// Complete the endpoint-selected receiver or oldest sender. Sender FIFO order
-// is inherited from endpoint::sender_waiter and exact removal preserves every
-// surviving waiter's order.
+// Complete the exact synchronous handover by waking the rendezvous partner.
 pub unsafe fn complete(
     endpoint: u64,
     kind: u64,
@@ -400,9 +388,6 @@ pub unsafe fn complete(
     return finish_committed_slot(slot, result, reason);
 }
 
-// Endpoint shutdown order is deterministic: receiver first, then senders in
-// their FIFO order. A PREPARED request can only belong to the currently running
-// TCB; it is unlinked without manufacturing a wake that never blocked.
 pub unsafe fn cancel_endpoint(endpoint: u64, result: u64) -> u64 {
     if result == 0 || !invariants_hold() {
         return IPC_WAIT_FAILURE;
@@ -450,11 +435,6 @@ pub unsafe fn cancel_endpoint(endpoint: u64, result: u64) -> u64 {
     return cancelled;
 }
 
-// Remove every exact request owned by a dying process. The TCB itself remains in
-// its current scheduler state for the caller's subsequent terminate_process
-// transaction; only surviving peers are woken by endpoint cancellation. Setting
-// the saved result is harmless diagnostic completion if teardown later fails
-// closed before the TCB is retired.
 pub unsafe fn cancel_process_waits(process: u64, result: u64) -> u64 {
     if result == 0 || !process_is_live(process) || !invariants_hold() {
         return IPC_WAIT_FAILURE;
