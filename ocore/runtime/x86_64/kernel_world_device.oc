@@ -1,0 +1,490 @@
+module runtime::kernel_world_device;
+
+use runtime::kernel_world_admission::export_authority_request_ordinal_at;
+use runtime::kernel_world_admission::export_count as admitted_export_count;
+use runtime::kernel_world_admission::export_plane_at;
+use runtime::kernel_world_admission::generation as admitted_world_generation;
+use runtime::kernel_world_admission::invariants_hold as admission_invariants_hold;
+use runtime::kernel_world_admission::is_current as admitted_world_is_current;
+use runtime::kernel_world_admission::request_grant_at;
+use runtime::kernel_world_admission::request_rights_at;
+use runtime::kernel_world_admission::state as admitted_world_state;
+use runtime::kernel_world_admission::EXPORT_PLANE_DEVICE;
+use runtime::kernel_world_admission::MAX_EXPORTS_PER_WORLD;
+use runtime::kernel_world_admission::MAX_REQUESTS_PER_WORLD;
+use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
+use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::vm_object::invariants_hold as vm_invariants_hold;
+use runtime::vm_object::vm_is_current;
+use runtime::vm_object::vm_state;
+use runtime::vm_object::vm_world;
+use runtime::vm_object::vm_world_generation;
+use runtime::vm_object::VM_STATE_CONFIGURED;
+
+// This is a bounded kernel-internal virtual PIO assignment mechanism. Its
+// generation-tagged handles are not CSpace capabilities. It performs no port
+// I/O, device assignment, DMA, shared-memory transport, interrupt routing, or
+// physical reset. The Mode 23 coordinator may dispatch the one scalar operation
+// only after independently validating the active guest/vCPU exit.
+pub const MAX_VIRTUAL_PIO_DEVICES: usize = 2;
+pub const VIRTUAL_PIO_PORT: u64 = 0xe0;
+pub const VIRTUAL_PIO_XOR_MASK: u64 = 0x0000_0000_a5a5_5a5a;
+
+const DEVICE_EMPTY: u8 = 0;
+const DEVICE_LIVE: u8 = 1;
+const DEVICE_RETIRED: u8 = 2;
+const DEVICE_HANDLE_TAG: u64 = 0xee00_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 2] = [0; 2];
+static mut GENERATIONS: [u32; 2] = [0; 2];
+static mut BOOTS: [u64; 2] = [0; 2];
+static mut WORLDS: [u64; 2] = [0; 2];
+static mut WORLD_GENERATIONS: [u64; 2] = [0; 2];
+static mut VMS: [u64; 2] = [0; 2];
+static mut EXPORT_ORDINALS: [usize; 2] = [0; 2];
+static mut REQUEST_ORDINALS: [usize; 2] = [0; 2];
+static mut PORTS: [u64; 2] = [0; 2];
+// Per-assignment scalar state is the only state affected by virtual reset.
+// Cumulative evidence counters remain monotonic, and the assignment itself
+// stays live so its owning execution session can later revoke it exactly once.
+static mut LAST_INPUTS: [u64; 2] = [0; 2];
+static mut LAST_OUTPUTS: [u64; 2] = [0; 2];
+static mut SLOT_TRANSACTIONS: [u64; 2] = [0; 2];
+
+static mut ACTIVE: usize = 0;
+static mut ASSIGNMENTS: u64 = 0;
+static mut TRANSACTIONS: u64 = 0;
+static mut RESETS: u64 = 0;
+static mut REVOCATIONS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut STALE_DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | DEVICE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_device(device: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (device & HANDLE_TAG_MASK) != DEVICE_HANDLE_TAG {
+        return MAX_VIRTUAL_PIO_DEVICES;
+    }
+    let slot: usize = handle_index(device);
+    if slot >= MAX_VIRTUAL_PIO_DEVICES
+        || STATES[slot] != DEVICE_LIVE
+        || GENERATIONS[slot] != handle_generation(device) {
+        return MAX_VIRTUAL_PIO_DEVICES;
+    }
+    return slot;
+}
+
+unsafe fn clear_slot(slot: usize) -> void {
+    BOOTS[slot] = 0;
+    WORLDS[slot] = 0;
+    WORLD_GENERATIONS[slot] = 0;
+    VMS[slot] = 0;
+    EXPORT_ORDINALS[slot] = 0;
+    REQUEST_ORDINALS[slot] = 0;
+    PORTS[slot] = 0;
+    LAST_INPUTS[slot] = 0;
+    LAST_OUTPUTS[slot] = 0;
+    SLOT_TRANSACTIONS[slot] = 0;
+}
+
+unsafe fn retire_slot(slot: usize) -> void {
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = DEVICE_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = DEVICE_EMPTY;
+    }
+}
+
+unsafe fn count_denial() -> void {
+    if DENIALS != MAX_COUNTER {
+        DENIALS += 1;
+    }
+}
+
+unsafe fn deny() -> u64 {
+    count_denial();
+    return 0;
+}
+
+unsafe fn deny_stale() -> u64 {
+    count_denial();
+    if STALE_DENIALS != MAX_COUNTER {
+        STALE_DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn request_is_fully_granted(
+    world: u64,
+    request_ordinal: usize
+) -> bool {
+    if request_ordinal >= MAX_REQUESTS_PER_WORLD {
+        return false;
+    }
+    let requested: u64 = request_rights_at(world, request_ordinal);
+    let granted: u64 = request_grant_at(world, request_ordinal);
+    return requested != 0
+        && granted == requested
+        && (granted & RIGHT_DEVICE_RESET) == RIGHT_DEVICE_RESET;
+}
+
+unsafe fn exact_binding_is_current(slot: usize) -> bool {
+    if slot >= MAX_VIRTUAL_PIO_DEVICES
+        || STATES[slot] != DEVICE_LIVE
+        || BOOTS[slot] == 0
+        || WORLDS[slot] == 0
+        || WORLD_GENERATIONS[slot] == 0
+        || VMS[slot] == 0
+        || PORTS[slot] != VIRTUAL_PIO_PORT {
+        return false;
+    }
+    let world: u64 = WORLDS[slot];
+    let vm: u64 = VMS[slot];
+    let export_ordinal: usize = EXPORT_ORDINALS[slot];
+    let request_ordinal: usize = REQUEST_ORDINALS[slot];
+    return admitted_world_is_current(world)
+        && admitted_world_state(world) == WORLD_STATE_ADMITTED
+        && admitted_world_generation(world) == WORLD_GENERATIONS[slot]
+        && export_ordinal < admitted_export_count(world)
+        && export_plane_at(world, export_ordinal) == EXPORT_PLANE_DEVICE
+        && export_authority_request_ordinal_at(world, export_ordinal)
+            == request_ordinal
+        && request_is_fully_granted(world, request_ordinal)
+        && vm_is_current(vm)
+        && vm_state(vm) == VM_STATE_CONFIGURED
+        && vm_world(vm) == world
+        && vm_world_generation(vm) == WORLD_GENERATIONS[slot];
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !admission_invariants_hold()
+        || !vm_invariants_hold()
+        || !invariants_hold() {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0
+        || !admission_invariants_hold()
+        || !vm_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_VIRTUAL_PIO_DEVICES {
+        STATES[slot] = DEVICE_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    ACTIVE = 0;
+    ASSIGNMENTS = 0;
+    TRANSACTIONS = 0;
+    RESETS = 0;
+    REVOCATIONS = 0;
+    DENIALS = 0;
+    STALE_DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Assignment consumes no metadata-derived authority. The export's sealed
+// request ordinal must resolve to the exact fully granted device request, and
+// RESET is mandatory for this disposable virtual endpoint.
+pub unsafe fn assign(
+    boot: u64,
+    world: u64,
+    vm: u64,
+    export_ordinal: usize,
+    port: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    if boot == 0
+        || port != VIRTUAL_PIO_PORT
+        || !admitted_world_is_current(world)
+        || admitted_world_state(world) != WORLD_STATE_ADMITTED
+        || export_ordinal >= admitted_export_count(world)
+        || export_plane_at(world, export_ordinal) != EXPORT_PLANE_DEVICE
+        || !vm_is_current(vm)
+        || vm_state(vm) != VM_STATE_CONFIGURED
+        || vm_world(vm) != world
+        || vm_world_generation(vm) != admitted_world_generation(world)
+        || ASSIGNMENTS == MAX_COUNTER {
+        return deny();
+    }
+    let world_generation: u64 = admitted_world_generation(world);
+    let request_ordinal: usize =
+        export_authority_request_ordinal_at(world, export_ordinal);
+    if world_generation == 0
+        || !request_is_fully_granted(world, request_ordinal) {
+        return deny();
+    }
+
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_VIRTUAL_PIO_DEVICES;
+    while slot < MAX_VIRTUAL_PIO_DEVICES {
+        if STATES[slot] == DEVICE_EMPTY
+            && free_slot == MAX_VIRTUAL_PIO_DEVICES {
+            free_slot = slot;
+        }
+        if STATES[slot] == DEVICE_LIVE
+            && ((WORLDS[slot] == world
+                    && REQUEST_ORDINALS[slot] == request_ordinal)
+                || (BOOTS[slot] == boot && PORTS[slot] == port)
+                || (VMS[slot] == vm && PORTS[slot] == port)) {
+            return deny();
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_VIRTUAL_PIO_DEVICES {
+        return deny();
+    }
+
+    BOOTS[free_slot] = boot;
+    WORLDS[free_slot] = world;
+    WORLD_GENERATIONS[free_slot] = world_generation;
+    VMS[free_slot] = vm;
+    EXPORT_ORDINALS[free_slot] = export_ordinal;
+    REQUEST_ORDINALS[free_slot] = request_ordinal;
+    PORTS[free_slot] = port;
+    STATES[free_slot] = DEVICE_LIVE;
+    ACTIVE += 1;
+    ASSIGNMENTS += 1;
+    return finish(make_handle(free_slot));
+}
+
+pub unsafe fn transact(
+    device: u64,
+    vm: u64,
+    port: u64,
+    input: u64,
+    output: *mut u64
+) -> u64 {
+    if output as usize == 0 {
+        return 0;
+    }
+    volatile_store(output, 0);
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_device(device);
+    if slot >= MAX_VIRTUAL_PIO_DEVICES
+        || !exact_binding_is_current(slot)
+        || VMS[slot] != vm
+        || PORTS[slot] != port
+        || port != VIRTUAL_PIO_PORT {
+        return deny_stale();
+    }
+    if TRANSACTIONS == MAX_COUNTER {
+        return deny();
+    }
+    if SLOT_TRANSACTIONS[slot] == MAX_COUNTER {
+        return deny();
+    }
+    let result: u64 = input ^ VIRTUAL_PIO_XOR_MASK;
+    LAST_INPUTS[slot] = input;
+    LAST_OUTPUTS[slot] = result;
+    SLOT_TRANSACTIONS[slot] += 1;
+    volatile_store(output, result);
+    TRANSACTIONS += 1;
+    return finish(1);
+}
+
+// A virtual reset clears only this software endpoint's scalar transaction
+// state. It does not advance the assignment generation, touch hardware, or
+// consume the assignment; its owning execution session remains responsible for
+// exact revocation before VM teardown.
+pub unsafe fn reset_for_export(
+    boot: u64,
+    world: u64,
+    export_ordinal: usize
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    if boot == 0
+        || !admitted_world_is_current(world)
+        || admitted_world_state(world) != WORLD_STATE_ADMITTED
+        || export_ordinal >= admitted_export_count(world)
+        || export_plane_at(world, export_ordinal) != EXPORT_PLANE_DEVICE
+        || RESETS == MAX_COUNTER {
+        return deny();
+    }
+    let request_ordinal: usize =
+        export_authority_request_ordinal_at(world, export_ordinal);
+    if !request_is_fully_granted(world, request_ordinal) {
+        return deny();
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_VIRTUAL_PIO_DEVICES {
+        if STATES[slot] == DEVICE_LIVE
+            && BOOTS[slot] == boot
+            && WORLDS[slot] == world
+            && WORLD_GENERATIONS[slot] == admitted_world_generation(world)
+            && EXPORT_ORDINALS[slot] == export_ordinal
+            && REQUEST_ORDINALS[slot] == request_ordinal {
+            if !exact_binding_is_current(slot) {
+                return deny_stale();
+            }
+            LAST_INPUTS[slot] = 0;
+            LAST_OUTPUTS[slot] = 0;
+            SLOT_TRANSACTIONS[slot] = 0;
+            RESETS += 1;
+            return finish(1);
+        }
+        slot += 1;
+    }
+    return deny_stale();
+}
+
+// Revocation accepts the exact still-live internal handle. It intentionally
+// does not re-derive authority from an export name or protocol.
+pub unsafe fn revoke(device: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_device(device);
+    if slot >= MAX_VIRTUAL_PIO_DEVICES {
+        return deny_stale();
+    }
+    if REVOCATIONS == MAX_COUNTER {
+        return deny();
+    }
+    retire_slot(slot);
+    ACTIVE -= 1;
+    REVOCATIONS += 1;
+    return finish(1);
+}
+
+pub unsafe fn is_live(device: u64) -> bool {
+    let slot: usize = checked_device(device);
+    return slot < MAX_VIRTUAL_PIO_DEVICES
+        && exact_binding_is_current(slot);
+}
+
+pub unsafe fn dispatch_available() -> bool {
+    return INITIALIZED != 0
+        && POISONED == 0
+        && admission_invariants_hold()
+        && vm_invariants_hold()
+        && invariants_hold();
+}
+
+pub unsafe fn generation(device: u64) -> u64 {
+    let slot: usize = checked_device(device);
+    if slot >= MAX_VIRTUAL_PIO_DEVICES {
+        return 0;
+    }
+    return GENERATIONS[slot] as u64;
+}
+
+pub unsafe fn active_count() -> usize { return ACTIVE; }
+pub unsafe fn assignment_count() -> u64 { return ASSIGNMENTS; }
+pub unsafe fn transaction_count() -> u64 { return TRANSACTIONS; }
+pub unsafe fn reset_count() -> u64 { return RESETS; }
+pub unsafe fn revocation_count() -> u64 { return REVOCATIONS; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn stale_denial_count() -> u64 { return STALE_DENIALS; }
+
+// Structural invariants deliberately retain stale parent identities long
+// enough for exact-handle revoke. Public dispatch and liveness separately
+// require exact_binding_is_current, so a revoked world or VM grants no use.
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || ACTIVE > MAX_VIRTUAL_PIO_DEVICES
+        || REVOCATIONS > ASSIGNMENTS {
+        return false;
+    }
+    let mut observed: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_VIRTUAL_PIO_DEVICES {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == DEVICE_EMPTY || state == DEVICE_RETIRED {
+            if (state == DEVICE_RETIRED && GENERATIONS[slot] != 0xffff_ffff)
+                || BOOTS[slot] != 0
+                || WORLDS[slot] != 0
+                || WORLD_GENERATIONS[slot] != 0
+                || VMS[slot] != 0
+                || EXPORT_ORDINALS[slot] != 0
+                || REQUEST_ORDINALS[slot] != 0
+                || PORTS[slot] != 0
+                || LAST_INPUTS[slot] != 0
+                || LAST_OUTPUTS[slot] != 0
+                || SLOT_TRANSACTIONS[slot] != 0 {
+                return false;
+            }
+        } else if state == DEVICE_LIVE {
+            if BOOTS[slot] == 0
+                || WORLDS[slot] == 0
+                || WORLD_GENERATIONS[slot] == 0
+                || VMS[slot] == 0
+                || EXPORT_ORDINALS[slot] >= MAX_EXPORTS_PER_WORLD
+                || REQUEST_ORDINALS[slot] >= MAX_REQUESTS_PER_WORLD
+                || PORTS[slot] != VIRTUAL_PIO_PORT {
+                return false;
+            }
+            observed += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_VIRTUAL_PIO_DEVICES {
+                if STATES[other] == DEVICE_LIVE
+                    && ((WORLDS[other] == WORLDS[slot]
+                            && REQUEST_ORDINALS[other]
+                                == REQUEST_ORDINALS[slot])
+                        || (BOOTS[other] == BOOTS[slot]
+                            && PORTS[other] == PORTS[slot])
+                        || (VMS[other] == VMS[slot]
+                            && PORTS[other] == PORTS[slot])) {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return observed == ACTIVE;
+}

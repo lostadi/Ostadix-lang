@@ -7,8 +7,11 @@ use runtime::vm_object::guest_page_gpa;
 use runtime::vm_object::guest_page_is_current;
 use runtime::vm_object::guest_page_memory_object;
 use runtime::vm_object::guest_page_vm;
+use runtime::vm_object::release_execution;
+use runtime::vm_object::retain_execution;
 use runtime::vm_object::vcpu_is_current;
 use runtime::vm_object::vcpu_vm;
+use runtime::vm_object::vm_has_execution;
 use runtime::vm_object::vm_state;
 use runtime::vm_object::VM_STATE_CONFIGURED;
 
@@ -68,14 +71,25 @@ const VMCB_RSP: usize = 0x5d8;
 const VMCB_RAX: usize = 0x5f8;
 const VMCB_GPAT: usize = 0x668;
 
+const SVM_EXIT_IOIO: u64 = 0x7b;
 const SVM_EXIT_VMMCALL: u64 = 0x81;
 const SVM_EXIT_NPF: u64 = 0x400;
 const GUEST_ENTRY: u64 = 0x200;
-const GUEST_AFTER_VMMCALL: u64 = 0x20d;
+const GUEST_DEVICE_IO: u64 = 0x20d;
+const GUEST_AFTER_DEVICE_IO: u64 = 0x218;
 const RESULT_GPA: u64 = 0x1000;
 const DENIED_GPA: u64 = 0x3000;
 const EXPECTED_RESULT: u64 = 0x1234_5678;
 const EXPECTED_INTERRUPT: u64 = 0xbeef;
+const EXPECTED_DEVICE_PORT: u64 = 0xe0;
+const EXPECTED_DEVICE_VALUE: u64 = 0x0bad_c0de;
+const IOIO_TYPE_IN: u64 = 1;
+const IOIO_STRING: u64 = 4;
+const IOIO_REP: u64 = 8;
+const IOIO_SIZE_MASK: u64 = 0x70;
+const IOIO_SIZE_32: u64 = 0x40;
+const IOIO_PORT_SHIFT: u64 = 16;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
 
 static mut INITIALIZED: u8 = 0;
 static mut ACTIVE: u8 = 0;
@@ -85,6 +99,9 @@ static mut CODE_OBJECT: u64 = 0;
 static mut RESULT_OBJECT: u64 = 0;
 static mut CODE_ADDRESS: usize = 0;
 static mut RESULT_ADDRESS: usize = 0;
+static mut SAVED_PIC_MASK: u8 = 0;
+static mut PIC_MASK_VALID: u8 = 0;
+static mut DEVICE_IO_PENDING: u8 = 0;
 static mut ENTER_COUNT: u64 = 0;
 static mut EXIT_COUNT: u64 = 0;
 static mut TEARDOWN_COUNT: u64 = 0;
@@ -148,8 +165,7 @@ unsafe fn install_guest_program() -> void {
     put_u8(CODE_ADDRESS + 0x105, 0xbe);
     put_u8(CODE_ADDRESS + 0x106, 0xcf);
 
-    // mov eax, 0x12345678; mov [0x1000], eax; vmmcall;
-    // mov ax, [0x3000] (an intentionally unmapped GPA); hlt.
+    // mov eax, 0x12345678; mov [0x1000], eax; vmmcall.
     put_u8(CODE_ADDRESS + 0x200, 0x66);
     put_u8(CODE_ADDRESS + 0x201, 0xb8);
     put_u8(CODE_ADDRESS + 0x202, 0x78);
@@ -163,10 +179,26 @@ unsafe fn install_guest_program() -> void {
     put_u8(CODE_ADDRESS + 0x20a, 0x0f);
     put_u8(CODE_ADDRESS + 0x20b, 0x01);
     put_u8(CODE_ADDRESS + 0x20c, 0xd9);
-    put_u8(CODE_ADDRESS + 0x20d, 0xa1);
-    put_u8(CODE_ADDRESS + 0x20e, 0x00);
-    put_u8(CODE_ADDRESS + 0x20f, 0x30);
-    put_u8(CODE_ADDRESS + 0x210, 0xf4);
+
+    // mov dx, 0x00e0; mov eax, 0x0badc0de; out dx, eax.
+    // Mode 21 skips this optional device phase; Mode 23 resumes here.
+    put_u8(CODE_ADDRESS + 0x20d, 0xba);
+    put_u8(CODE_ADDRESS + 0x20e, 0xe0);
+    put_u8(CODE_ADDRESS + 0x20f, 0x00);
+    put_u8(CODE_ADDRESS + 0x210, 0x66);
+    put_u8(CODE_ADDRESS + 0x211, 0xb8);
+    put_u8(CODE_ADDRESS + 0x212, 0xde);
+    put_u8(CODE_ADDRESS + 0x213, 0xc0);
+    put_u8(CODE_ADDRESS + 0x214, 0xad);
+    put_u8(CODE_ADDRESS + 0x215, 0x0b);
+    put_u8(CODE_ADDRESS + 0x216, 0x66);
+    put_u8(CODE_ADDRESS + 0x217, 0xef);
+
+    // mov ax, [0x3000] (an intentionally unmapped GPA); hlt.
+    put_u8(CODE_ADDRESS + 0x218, 0xa1);
+    put_u8(CODE_ADDRESS + 0x219, 0x00);
+    put_u8(CODE_ADDRESS + 0x21a, 0x30);
+    put_u8(CODE_ADDRESS + 0x21b, 0xf4);
 }
 
 unsafe fn install_npt(region: usize) -> void {
@@ -183,8 +215,12 @@ unsafe fn install_npt(region: usize) -> void {
 
 unsafe fn install_vmcb(region: usize) -> void {
     let vmcb: usize = region + VMCB_OFFSET;
-    // HLT and VMMCALL are intercepted. NPF exits are supplied by NPT.
-    put_u32(vmcb + VMCB_INTERCEPT_MISC1, 1 << 24);
+    // HLT and I/O are intercepted. VMMCALL is in the next intercept word;
+    // NPF exits are supplied by NPT.
+    put_u32(
+        vmcb + VMCB_INTERCEPT_MISC1,
+        (1 << 24) | (1 << 27)
+    );
     // VMRUN interception is architecturally required for a valid VMCB.
     put_u32(vmcb + VMCB_INTERCEPT_MISC2, 3);
     put_u64(vmcb + VMCB_IOPM_BASE, (region + IOPM_OFFSET) as u64);
@@ -225,6 +261,9 @@ unsafe fn clear_active() -> void {
     RESULT_OBJECT = 0;
     CODE_ADDRESS = 0;
     RESULT_ADDRESS = 0;
+    SAVED_PIC_MASK = 0;
+    PIC_MASK_VALID = 0;
+    DEVICE_IO_PENDING = 0;
 }
 
 pub unsafe fn init() -> u64 {
@@ -236,6 +275,9 @@ pub unsafe fn init() -> u64 {
         return 0;
     }
     fill(region, SVM_REGION_PAGES * PAGE_SIZE, 0);
+    ENTER_COUNT = 0;
+    EXIT_COUNT = 0;
+    TEARDOWN_COUNT = 0;
     INITIALIZED = 1;
     return 1;
 }
@@ -257,6 +299,9 @@ pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
         || guest_page_gpa(result_page) != RESULT_GPA {
         return 0;
     }
+    if retain_execution(vm) != 1 {
+        return 0;
+    }
     CODE_OBJECT = guest_page_memory_object(code_page);
     RESULT_OBJECT = guest_page_memory_object(result_page);
     if CODE_OBJECT == 0
@@ -266,6 +311,7 @@ pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
             MEMORY_ANONYMOUS,
             (&mut CODE_ADDRESS)
         ) != 1 {
+        release_execution(vm);
         clear_active();
         return 0;
     }
@@ -275,6 +321,7 @@ pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
         (&mut RESULT_ADDRESS)
     ) != 1 {
         release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+        release_execution(vm);
         clear_active();
         return 0;
     }
@@ -288,12 +335,15 @@ pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
     if ocore_svm_enable(region + HSAVE_OFFSET) != 1 {
         release_mapping(RESULT_OBJECT, MEMORY_ANONYMOUS);
         release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+        release_execution(vm);
         fill(region, SVM_REGION_PAGES * PAGE_SIZE, 0);
         clear_active();
         return 0;
     }
     // Keep the host PIT IRQ from becoming an unacknowledged L2 interrupt.
     // Mode 21 injects its own bounded vector through EVENTINJ instead.
+    SAVED_PIC_MASK = inb(0x21);
+    PIC_MASK_VALID = 1;
     outb(0x21, 0xff);
     ACTIVE = 1;
     ACTIVE_VCPU = vcpu;
@@ -302,7 +352,12 @@ pub unsafe fn prepare(vcpu: u64, code_page: u64, result_page: u64) -> u64 {
 }
 
 pub unsafe fn run_to_hypercall() -> u64 {
-    if ACTIVE == 0 || !vcpu_is_current(ACTIVE_VCPU) {
+    if ACTIVE == 0
+        || DEVICE_IO_PENDING != 0
+        || !vcpu_is_current(ACTIVE_VCPU)
+        || !vm_has_execution(ACTIVE_VM)
+        || ENTER_COUNT == MAX_COUNTER
+        || EXIT_COUNT == MAX_COUNTER {
         return 0;
     }
     let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
@@ -321,12 +376,81 @@ pub unsafe fn run_to_hypercall() -> u64 {
         && get_u16(RESULT_ADDRESS + 4) as u64 == EXPECTED_INTERRUPT) as u64;
 }
 
-pub unsafe fn run_to_isolation_fault() -> u64 {
-    if ACTIVE == 0 || !vcpu_is_current(ACTIVE_VCPU) {
+// Resume the fixed guest at its 32-bit OUT instruction and return the exact
+// decoded port/value pair. The output parameters are cleared on every denial.
+pub unsafe fn run_to_device_io(
+    port_out: *mut u64,
+    value_out: *mut u64
+) -> u64 {
+    if port_out as usize == 0 || value_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(port_out, 0);
+    volatile_store(value_out, 0);
+    if ACTIVE == 0
+        || DEVICE_IO_PENDING != 0
+        || !vcpu_is_current(ACTIVE_VCPU)
+        || !vm_has_execution(ACTIVE_VM)
+        || ENTER_COUNT == MAX_COUNTER
+        || EXIT_COUNT == MAX_COUNTER {
         return 0;
     }
     let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
-    put_u64(vmcb + VMCB_RIP, GUEST_AFTER_VMMCALL);
+    put_u64(vmcb + VMCB_RIP, GUEST_DEVICE_IO);
+    put_u64(vmcb + VMCB_EVENT_INJECTION, 0);
+    put_u8(vmcb + VMCB_TLB_CONTROL, 1);
+    ENTER_COUNT += 1;
+    if ocore_svm_vmrun(vmcb) != 1 {
+        return 0;
+    }
+    EXIT_COUNT += 1;
+    let info: u64 = get_u64(vmcb + VMCB_EXIT_INFO1);
+    let port: u64 = (info >> IOIO_PORT_SHIFT) & 0xffff;
+    let value: u64 = get_u64(vmcb + VMCB_RAX) & 0xffff_ffff;
+    if get_u64(vmcb + VMCB_EXIT_CODE) != SVM_EXIT_IOIO
+        || (info & IOIO_TYPE_IN) != 0
+        || (info & IOIO_STRING) != 0
+        || (info & IOIO_REP) != 0
+        || (info & IOIO_SIZE_MASK) != IOIO_SIZE_32
+        || port != EXPECTED_DEVICE_PORT
+        || value != EXPECTED_DEVICE_VALUE {
+        return 0;
+    }
+    DEVICE_IO_PENDING = 1;
+    volatile_store(port_out, port);
+    volatile_store(value_out, value);
+    return 1;
+}
+
+// Complete the intercepted synthetic device write. OUT has no architectural
+// input result, but the bounded protocol records a 32-bit broker disposition
+// in guest RAX before advancing beyond the intercepted instruction.
+pub unsafe fn complete_device_io(result: u64) -> u64 {
+    if ACTIVE == 0
+        || DEVICE_IO_PENDING != 1
+        || result > 0xffff_ffff
+        || !vcpu_is_current(ACTIVE_VCPU)
+        || !vm_has_execution(ACTIVE_VM) {
+        return 0;
+    }
+    let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
+    put_u64(vmcb + VMCB_RAX, result);
+    put_u64(vmcb + VMCB_RIP, GUEST_AFTER_DEVICE_IO);
+    DEVICE_IO_PENDING = 0;
+    return 1;
+}
+
+pub unsafe fn run_to_isolation_fault() -> u64 {
+    if ACTIVE == 0
+        || DEVICE_IO_PENDING != 0
+        || !vcpu_is_current(ACTIVE_VCPU)
+        || !vm_has_execution(ACTIVE_VM)
+        || ENTER_COUNT == MAX_COUNTER
+        || EXIT_COUNT == MAX_COUNTER {
+        return 0;
+    }
+    let vmcb: usize = ocore_svm_region() + VMCB_OFFSET;
+    put_u64(vmcb + VMCB_RIP, GUEST_AFTER_DEVICE_IO);
     put_u64(vmcb + VMCB_EVENT_INJECTION, 0);
     put_u8(vmcb + VMCB_TLB_CONTROL, 1);
     ENTER_COUNT += 1;
@@ -344,17 +468,29 @@ pub unsafe fn stop() -> u64 {
     if ACTIVE == 0 {
         return 0;
     }
+    let vm: u64 = ACTIVE_VM;
     ocore_svm_disable();
-    outb(0x21, 0xfe);
+    let pic_ok: bool = PIC_MASK_VALID == 1;
+    if pic_ok {
+        outb(0x21, SAVED_PIC_MASK);
+    }
     let result_release: u64 = release_mapping(
         RESULT_OBJECT,
         MEMORY_ANONYMOUS
     );
     let code_release: u64 = release_mapping(CODE_OBJECT, MEMORY_ANONYMOUS);
+    let execution_release: u64 = release_execution(vm);
     fill(ocore_svm_region(), SVM_REGION_PAGES * PAGE_SIZE, 0);
     clear_active();
-    TEARDOWN_COUNT += 1;
-    return (result_release == 1 && code_release == 1) as u64;
+    let counter_ok: bool = TEARDOWN_COUNT != MAX_COUNTER;
+    if counter_ok {
+        TEARDOWN_COUNT += 1;
+    }
+    return (result_release == 1
+        && code_release == 1
+        && execution_release == 1
+        && pic_ok
+        && counter_ok) as u64;
 }
 
 pub unsafe fn npt_is_torn_down() -> bool {
@@ -369,3 +505,12 @@ pub unsafe fn npt_is_torn_down() -> bool {
 pub unsafe fn enter_count() -> u64 { return ENTER_COUNT; }
 pub unsafe fn exit_count() -> u64 { return EXIT_COUNT; }
 pub unsafe fn teardown_count() -> u64 { return TEARDOWN_COUNT; }
+pub unsafe fn is_active() -> bool { return ACTIVE != 0; }
+pub unsafe fn active_vm() -> u64 {
+    if ACTIVE == 0 { return 0; }
+    return ACTIVE_VM;
+}
+pub unsafe fn active_vcpu() -> u64 {
+    if ACTIVE == 0 { return 0; }
+    return ACTIVE_VCPU;
+}

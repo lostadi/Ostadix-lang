@@ -1,0 +1,52 @@
+module runtime::kernel_world_device;
+
+// Probe modes below the virtual-PIO slice retain a total module surface without
+// carrying assignment state or implying any device authority.
+pub const VIRTUAL_PIO_PORT: u64 = 0xe0;
+
+pub unsafe fn unavailable() -> u64 { return 0; }
+pub unsafe fn init() -> u64 { return 0; }
+
+pub unsafe fn assign(
+    boot: u64,
+    world: u64,
+    vm: u64,
+    export_ordinal: usize,
+    port: u64
+) -> u64 {
+    return 0;
+}
+
+pub unsafe fn transact(
+    device: u64,
+    vm: u64,
+    port: u64,
+    input: u64,
+    output: *mut u64
+) -> u64 {
+    if output as usize != 0 {
+        volatile_store(output, 0);
+    }
+    return 0;
+}
+
+pub unsafe fn reset_for_export(
+    boot: u64,
+    world: u64,
+    export_ordinal: usize
+) -> u64 {
+    return 0;
+}
+
+pub unsafe fn revoke(device: u64) -> u64 { return 0; }
+pub unsafe fn is_live(device: u64) -> bool { return false; }
+pub unsafe fn dispatch_available() -> bool { return false; }
+pub unsafe fn invariants_hold() -> bool { return false; }
+pub unsafe fn active_count() -> usize { return 0; }
+pub unsafe fn assignment_count() -> u64 { return 0; }
+pub unsafe fn transaction_count() -> u64 { return 0; }
+pub unsafe fn reset_count() -> u64 { return 0; }
+pub unsafe fn revocation_count() -> u64 { return 0; }
+pub unsafe fn denial_count() -> u64 { return 0; }
+pub unsafe fn stale_denial_count() -> u64 { return 0; }
+pub unsafe fn generation(device: u64) -> u64 { return 0; }

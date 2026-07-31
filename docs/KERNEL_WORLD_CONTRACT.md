@@ -295,6 +295,72 @@ does not yet enforce `health_timeout_ms`, receive a process/trap/scheduler or
 vCPU-exit death notification, or start and monitor an executable provider.
 Those boundaries are deliberately outside this mechanism claim.
 
+## Mode 23 bounded execution-and-device composition
+
+Mode 23 composes the Mode 21 architectural executor with Mode 22's lifecycle
+and publication machinery under QEMU TCG. QEMU emulates an x86-64 CPU exposing
+AMD SVM and NPT; this gate therefore exercises guest entry and VMEXIT through
+that architectural interface without claiming KVM, physical AMD execution, or
+hardware isolation. It retains the same exact 459-byte V2 record and SHA-256
+`0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232`.
+The portable evidence command is
+`./ocore/kernel/smoke-kernel-world-execution-device-qemu.sh`.
+
+`kernel_world_execution.oc` owns one generation-tagged execution session
+because the current backend has one boot-CPU VMCB/NPT region. Start requires an
+exact live boot in `STARTED`, the boot's admitted-world generation and
+configured VM, one current vCPU, and code and mailbox pages belonging to that
+same VM. It also binds the device-plane export ordinal to the exact sealed,
+fully granted authority request. A cross-world vCPU is denied before device
+assignment or SVM activation. `vm_object.oc` gives the executor one pin on the
+configured VM; graph teardown remains unavailable until SVM has stopped and
+released both retained page mappings and that pin.
+
+The first validated `VMMCALL` VMEXIT is the health event. No guest-supplied
+protocol value is trusted: the coordinator derives the immutable health
+protocol ID from the exact admitted world and advances the bound boot before
+publication. The fixed guest then executes a 32-bit, non-string, non-`REP`
+`OUT` to port `0xE0` with one scalar value. `svm_execution.oc` verifies the
+IOIO exit code, direction, width, port, and value. Only then does the
+coordinator dispatch to the exact generation-tagged kernel-internal virtual
+endpoint. Its one operation computes `input XOR 0xA5A55A5A`, records the
+transaction, and returns a 32-bit broker disposition in guest RAX before the
+guest RIP advances.
+
+The Mode 22 reset-request capability remains status/reset-request authority,
+not the provider's device grant. In Mode 23 its exact boot/world/export binding
+also dispatches to the live virtual endpoint and clears only that endpoint's
+scalar transaction state. The assignment remains live for exact session-owned
+revocation. Mode 22 retains its earlier behavior because its stub dispatcher
+records accepted reset intent only. Neither path resets hardware.
+
+An exact NPF for the deliberately unmapped GPA is Mode 23's one synchronous
+provider-failure notification. The coordinator orders:
+
+1. observe and classify the NPF;
+2. disable SVM, restore the saved host interrupt mask, clear NPT, release both
+   mappings, and drop the VM execution pin;
+3. revoke and generation-retire the kernel-internal virtual endpoint; and
+4. invoke the boot failure transition, which withdraws the published client
+   capability before revoking the exact VM graph.
+
+The unrelated boot, VM graph, binding, capability, and service remain live
+through that failure. The admitted `on_failure` policy authorizes a new
+configured VM and generation-2 boot, execution session, endpoint, and client
+capability. Generation-1 session operations and status authority are denied;
+the replacement repeats VMEXIT-derived health and the virtual operation.
+Orderly replacement stop performs the same SVM/NPT quiesce and endpoint
+revocation before the boot terminal transition, followed by complete
+uninstallation and a later timer.
+
+This is still a fixed synthetic two-page guest. Mode 23 does not load or boot
+Linux, Plan 9, firmware, or a supplied user image. It implements no general
+guest agent, shared queue or ring, asynchronous request protocol, concurrent
+VMEXIT handling, or SMP lock. The port-`0xE0` endpoint is kernel-internal
+virtual PIO, not PCI or physical-device assignment, DMA, IOMMU isolation,
+interrupt remapping, or hardware reset. QEMU-TCG evidence must not be cited as
+KVM or physical-hardware isolation evidence.
+
 ## Next native slices
 
 The remaining dependency order is:
@@ -302,14 +368,12 @@ The remaining dependency order is:
 1. complete the M6B boundary beyond its current bounded-copy mechanism by
    integrating the CPL3 personality RPC, pinned windows, signals, fuzzing, and
    allocation-failure/race gates;
-2. connect Mode 22's administrative lifecycle to an actually executing
-   provider, a timed health protocol, and real process/trap/scheduler or
-   vCPU-exit death notification;
-3. extend the Mode 21 AMD SVM/NPT synthetic execution backend into a pinned
-   foreign-kernel boot and add capability-backed virtual devices;
-4. carry the same request and export contracts over a bounded guest-agent and
-   shared-queue protocol; and
-5. add device assignment only after separate IOMMU isolation, interrupt
+2. replace Mode 23's fixed synthetic program and scalar endpoint with a pinned
+   foreign-kernel image, boot protocol, timed health contract, and bounded
+   guest-agent transport;
+3. carry request and export contracts over generation-tagged shared queues
+   with cancellation, quotas, and hostile descriptor tests; and
+4. add physical-device assignment only after separate IOMMU isolation, interrupt
    revocation, DMA-window teardown, device-reset, and hostile-failure gates.
 
 The first driver-compatibility proof should use a bounded resettable device
@@ -320,17 +384,22 @@ replacement can be rebound.
 
 ## Explicit non-claims
 
-The current native slice does not:
+The current native slices do not:
 
-- start or stop executable provider code, enforce a health deadline, or detect
-  provider failure from a process, trap, scheduler, or vCPU-exit path;
-- install a provider-backed live device service or device capability; Mode 22
-  publishes only kernel-owned status/reset-intent export capabilities;
+- load executable provider artifacts, enforce a health deadline, or detect
+  provider failure from a process, trap, scheduler, or asynchronous vCPU-exit
+  path; Mode 23 executes only its fixed synthetic guest and synchronously
+  classifies one exact VMMCALL and one exact NPF;
+- install a foreign-provider device capability or general device data plane;
+  Mode 23 backs the existing status/reset-request export only with one
+  kernel-internal scalar virtual endpoint;
 - boot Linux, Plan 9, BSD, Windows, macOS, or another foreign kernel;
 - implement firmware execution, a guest agent, shared queue or shared ring,
   UEFI, ACPI, 9P, or another foreign ABI or filesystem protocol;
-- implement a virtual device, assign PCI hardware, configure an IOMMU, map DMA,
-  route device interrupts, or reset a device;
+- assign PCI or another physical device, configure an IOMMU, map DMA, remap
+  device interrupts, or reset hardware;
+- establish asynchronous or SMP-safe execution/device coordination, or prove
+  KVM-backed or physical-hardware isolation;
 - install a public `vm.machine` run capability or convert manifest identifiers
   into ambient authority; or
 - establish source-integrated or binary-contained isolation.
@@ -345,6 +414,8 @@ it does not boot or supervise Linux, Plan 9, or any other foreign kernel, and
 it publishes no service. Mode 22 separately proves bounded administrative
 start/health/publication/failure/restart/stop algebra, client capability
 withdrawal before VM-graph revoke, and stale-generation denial without entering
-a guest. Separate source, artifact, executable-provider, timed-health,
-guest-agent, shared-ring, device, 9P, and hardware gates remain necessary for
-provider execution and isolation claims beyond these mechanisms.
+a guest. Mode 23 composes those mechanisms with QEMU-TCG-emulated SVM/NPT
+guest execution, VMEXIT-derived health and failure, and one exact kernel-owned
+virtual PIO endpoint. Separate source, artifact, foreign-provider,
+timed-health, guest-agent, shared-queue, 9P, physical-device, DMA/IOMMU, and
+hardware-isolation gates remain necessary for broader claims.
