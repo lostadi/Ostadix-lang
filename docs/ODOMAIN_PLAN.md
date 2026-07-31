@@ -1,8 +1,9 @@
 # O-Domain Engineering Plan
 
-Status: active roadmap. Milestones 0.1 through 5 and the scalar M6A slice now
-have executable evidence at their documented, fixed-capacity, single-CPU x86-64
-QEMU boundaries. These are bounded mechanism and lifecycle proofs, not
+Status: active roadmap. Milestones 0.1 through 5, the bounded M6A/M6B slices,
+and KernelWorld Modes 20 through 23 now have executable evidence at their
+documented, fixed-capacity, single-CPU x86-64 QEMU boundaries. These are
+bounded mechanism, lifecycle, and synthetic-execution proofs, not
 production-scale implementations or evidence for any foreign operating-system
 ABI.
 
@@ -867,6 +868,41 @@ enforced, and no process, guest, provider image, guest agent, shared transport,
 device assignment, DMA/IOMMU boundary, physical reset, 9P service, Linux boot,
 or Plan 9 boot is present.
 
+Mode 23 is the next bounded composition slice. It uses QEMU TCG to emulate the
+AMD SVM/NPT architectural interface, then binds the one available execution
+session to an exact generation-tagged boot, admitted world, configured VM,
+vCPU, two guest pages, device-plane export, and granted authority request.
+O-core performs nested guest entry and receives VMEXIT through that emulated
+CPU interface; this is not KVM or physical-hardware isolation. A cross-world
+vCPU is denied before SVM/NPT or the virtual endpoint becomes live, and an
+execution pin prevents VM-graph destruction while the backend owns retained
+page mappings.
+
+The fixed synthetic real-mode guest first performs the exact `VMMCALL` that the
+coordinator treats as health. The health protocol identifier comes from the
+bound admitted world, not from guest data. After publication, the guest issues
+one intercepted 32-bit `OUT` to port `0xE0`. Full IOIO-exit validation precedes
+dispatch to one generation-tagged, kernel-internal XOR endpoint. The endpoint
+returns `input XOR 0xA5A55A5A`; it is not a physical or QEMU-assigned device.
+The client reset-request capability reaches that exact live assignment and
+clears its scalar transaction state, without performing hardware reset.
+
+One exact NPF supplies the bounded synchronous failure event. The coordinator
+first stops SVM, clears NPT, releases mappings and the execution pin, then
+revokes the virtual endpoint, and finally enters boot failure. Boot failure
+withdraws the old client capability before exact VM-graph revocation. An
+independent published service survives. `on_failure` creates generation-2 VM,
+boot, execution-session, endpoint, and client identities; the stale session
+and capability are denied while the replacement repeats health and device
+execution. Orderly teardown reclaims both worlds and reaches a later timer.
+
+Mode 23 does not boot Linux, Plan 9, firmware, or a supplied user image and
+does not implement a general guest agent, shared queue/ring, asynchronous
+request transport, or SMP synchronization. It assigns no PCI or physical
+device and establishes no DMA window, IOMMU isolation, interrupt remapping,
+or hardware reset. Its QEMU-TCG evidence is not an AMD-KVM or hardware
+isolation result.
+
 Acceptance gate:
 
 - a pinned Linux kernel and rootfs boot as `linux.kernel[0]`;
@@ -903,7 +939,10 @@ admission and nonexecuting VM/vCPU/guest-page identities; Mode 21 adds a
 hardware-only synthetic SVM/NPT execution substrate; and Mode 22 separately
 adds bounded administrative health-gated publication, withdrawal before
 VM-graph revocation, policy-constrained replacement, and stale
-client-capability denial.
+client-capability denial. Mode 23 composes those boundaries under
+QEMU-TCG-emulated SVM/NPT with exact boot/world/VM/vCPU execution ownership,
+VMEXIT-derived health and NPF failure, one kernel-internal virtual PIO
+endpoint, reset dispatch, ordered quiesce, and generation-2 rebind.
 Every statement remains scoped to its fixed-capacity, single-CPU gate.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are

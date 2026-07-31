@@ -540,8 +540,53 @@ kernel lock while preserving the same transition boundaries.
 
 Mode 22 does not enforce the declared health timeout, and its failure hook is
 called directly by the bounded semantics gate rather than by a process fault,
-trap, scheduler, or vCPU-exit path. None of Modes 20 through 22 boots Linux or
-Plan 9, starts a foreign provider, supplies a guest agent, shared queue or
-shared ring, implements 9P, assigns PCI or another physical device, establishes
-IOMMU/DMA isolation, or performs physical device reset. Mode 21 alone enters
-the synthetic guest; Mode 22 deliberately does not enter any guest.
+trap, scheduler, or vCPU-exit path.
+
+Mode 23 is a separate bounded execution-and-device composition gate. It runs
+the AMD SVM/NPT architectural path under QEMU TCG: the outer emulator, rather
+than KVM or physical AMD hardware, executes the nested guest entry and VMEXIT
+instructions. One generation-tagged execution session is bound to the exact
+live boot, admitted-world generation, configured VM, current vCPU, code page,
+mailbox page, device-plane export ordinal, and independently granted request.
+A cross-world vCPU is rejected before either SVM state or a virtual endpoint is
+made live. The VM carries one execution pin while SVM owns its page mappings,
+so ordinary boot failure, stop, or graph revocation cannot race that ownership.
+
+The fixed real-mode synthetic guest first exits through the exact `VMMCALL`
+expected by the coordinator. The guest supplies no health protocol identifier:
+the coordinator derives the retained protocol from the bound admitted world
+and only then records health and permits publication. The next guest phase
+executes a non-string, non-`REP`, 32-bit `OUT` to port `0xE0`. O-core validates
+the complete IOIO exit and dispatches its scalar value only to the
+generation-bound kernel-internal endpoint for that session. The sole operation
+returns `input XOR 0xA5A55A5A`; the broker disposition is placed in guest RAX
+before execution advances beyond the intercepted instruction.
+
+Mode 23 also connects the published reset-request capability to the exact live
+virtual endpoint. Reset clears only that endpoint's scalar transaction state
+and leaves the assignment owned by its execution session; it is not physical
+device reset. An exact nested-page fault is the bounded failure notification.
+The coordinator records the NPF, disables SVM and clears NPT while releasing
+the execution pin and retained mappings, revokes the virtual endpoint, and
+then invokes the boot terminal transition. That transition withdraws the
+client capability before revoking the exact VM graph. An unrelated published
+service remains usable. The declared `on_failure` policy then creates fresh
+generation-2 VM, boot, execution-session, endpoint, and client identities;
+the generation-1 session and capability remain stale while the replacement
+repeats health and device execution. Orderly stop and uninstall reclaim both
+worlds and a later timer remains live.
+
+Run the portable evidence gate with:
+
+```bash
+./ocore/kernel/smoke-kernel-world-execution-device-qemu.sh
+```
+
+Mode 23 does not boot Linux, Plan 9, firmware, or a supplied user image; its
+guest program is the fixed synthetic two-page probe. It provides no general
+guest agent, shared queue or ring, asynchronous request processing, or SMP
+coordination. Its virtual PIO endpoint is not PCI or physical-device
+assignment, DMA, an IOMMU boundary, interrupt remapping, or hardware reset.
+The TCG gate is not KVM evidence and establishes no physical-hardware
+isolation. Modes 21 and 23 enter the synthetic guest for their separately
+scoped gates; Mode 22 deliberately does not enter any guest.

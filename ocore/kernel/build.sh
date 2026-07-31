@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 22" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 23" >&2
     exit 2
     ;;
 esac
@@ -65,7 +65,7 @@ if (( PROBE_MODE == 18 )); then
   M6_IMAGE_DEFINE="-DOCORE_M6_IMAGE_PATH=\"$M6_IMAGE_PATH\""
 fi
 
-if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 )); then
+if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     --bin ocore-kernel-world-record
   RECORD_BUILD_DIR="$BUILD_DIR/kernel-world-record"
@@ -90,10 +90,20 @@ if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 )); then
 fi
 
 KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot_stub.oc"
+KERNEL_WORLD_DEVICE_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_device_stub.oc"
+KERNEL_WORLD_EXECUTION_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_execution_stub.oc"
 KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics_stub.oc"
-if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 )); then
+if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot.oc"
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics.oc"
+fi
+if (( PROBE_MODE == 23 )); then
+  KERNEL_WORLD_DEVICE_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_device.oc"
+  KERNEL_WORLD_EXECUTION_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_execution.oc"
+  # Keep the portable execution/device oracle within the bootstrap's fixed
+  # 512 KiB reserve without weakening the linker assertion or inflating the
+  # historical Modes 20-22 contract harness.
+  KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_execution_device_semantics.oc"
 fi
 
 "$ROOT/target/debug/ocorec" \
@@ -127,9 +137,11 @@ fi
   "$ROOT/ocore/runtime/x86_64/delegated_resource.oc" \
   "$ROOT/ocore/runtime/x86_64/kernel_world_record.oc" \
   "$ROOT/ocore/runtime/x86_64/kernel_world_admission.oc" \
+  "$KERNEL_WORLD_DEVICE_SOURCE" \
   "$KERNEL_WORLD_BOOT_SOURCE" \
   "$ROOT/ocore/runtime/x86_64/vm_object.oc" \
   "$ROOT/ocore/runtime/x86_64/svm_execution.oc" \
+  "$KERNEL_WORLD_EXECUTION_SOURCE" \
   "$ROOT/ocore/runtime/x86_64/mapping.oc" \
   "$ROOT/ocore/runtime/x86_64/interrupts.oc" \
   "$ROOT/ocore/runtime/x86_64/trap.oc" \

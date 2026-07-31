@@ -1,0 +1,40 @@
+module runtime::kernel_world_execution;
+
+// Modes below 23 retain the module identity without carrying the supervised
+// SVM/device coordinator or its fixed state.
+pub unsafe fn unavailable() -> u64 {
+    return 0;
+}
+
+pub unsafe fn init() -> u64 { return 0; }
+
+pub unsafe fn start(
+    boot: u64,
+    vcpu: u64,
+    code_page: u64,
+    mailbox_page: u64,
+    export_ordinal: usize
+) -> u64 {
+    return 0;
+}
+
+pub unsafe fn drive_health(session: u64) -> u64 { return 0; }
+pub unsafe fn drive_device(session: u64) -> u64 { return 0; }
+pub unsafe fn drive_failure(session: u64) -> u64 { return 0; }
+pub unsafe fn stop(session: u64) -> u64 { return 0; }
+pub unsafe fn is_live(session: u64) -> bool { return false; }
+pub unsafe fn generation(session: u64) -> u64 { return 0; }
+pub unsafe fn active_count() -> usize { return 0; }
+pub unsafe fn start_count() -> u64 { return 0; }
+pub unsafe fn health_exit_count() -> u64 { return 0; }
+pub unsafe fn device_exit_count() -> u64 { return 0; }
+pub unsafe fn failure_exit_count() -> u64 { return 0; }
+pub unsafe fn orderly_stop_count() -> u64 { return 0; }
+pub unsafe fn denial_count() -> u64 { return 0; }
+pub unsafe fn last_npf_event() -> u64 { return 0; }
+pub unsafe fn last_svm_stop_event() -> u64 { return 0; }
+pub unsafe fn last_device_revoke_event() -> u64 { return 0; }
+pub unsafe fn last_boot_terminal_event() -> u64 { return 0; }
+
+// The unavailable implementation has no state to invalidate.
+pub unsafe fn invariants_hold() -> bool { return true; }

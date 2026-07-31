@@ -112,6 +112,29 @@
   the declared health timeout, and starts no process, guest, or foreign
   provider. It supplies no guest agent, shared ring/queue, 9P, PCI/device
   assignment, IOMMU/DMA isolation, physical reset, Linux boot, or Plan 9 boot.
+- Mode 23 is the bounded execution-and-device composition gate. QEMU TCG
+  emulates an x86-64 CPU exposing AMD SVM/NPT; the result is architectural
+  guest entry and VMEXIT under emulation, not KVM, physical AMD execution, or
+  hardware isolation. One generation-tagged session binds the exact boot,
+  admitted-world generation, configured VM, current vCPU, code/mailbox pages,
+  device export, and independently granted request. A cross-world vCPU is
+  denied before activation, and an execution pin blocks VM-graph teardown
+  while SVM owns retained mappings.
+  An exact `VMMCALL` supplies health, while the coordinator derives the health
+  protocol from the admitted world rather than guest data. The fixed synthetic
+  guest then executes one validated 32-bit `OUT` to port `0xE0`; only its
+  generation-bound kernel-internal endpoint receives the scalar and returns
+  `input XOR 0xA5A55A5A`. The published reset-request capability dispatches to
+  that exact endpoint and clears software transaction state only.
+  A deliberate NPF synchronously orders SVM/NPT stop and mapping/pin release,
+  virtual-endpoint revocation, client withdrawal, and exact VM-graph
+  revocation. An unrelated published service survives. The `on_failure`
+  replacement uses fresh generation-2 VM, boot, session, endpoint, and client
+  identities; generation-1 authority remains stale.
+  Mode 23 does not boot Linux, Plan 9, firmware, or a supplied user image. It
+  has no general guest agent, shared queue/ring, asynchronous or SMP guarantee,
+  physical PCI/device assignment, DMA/IOMMU isolation, interrupt remapping, or
+  hardware reset. Its TCG result is not KVM or physical-hardware evidence.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR
