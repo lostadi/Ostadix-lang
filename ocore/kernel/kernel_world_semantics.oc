@@ -1,12 +1,47 @@
 module kernel::kernel_world_semantics;
 
 use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::RIGHT_KERNEL_WORLD_RESET_REQUEST;
+use runtime::capability::RIGHT_KERNEL_WORLD_STATUS;
 use runtime::image_vfs::sha256_selftest;
 use runtime::interrupts::ticks;
+use runtime::kernel_world_boot::active_boot_count as live_boot_count;
+use runtime::kernel_world_boot::active_service_count as live_service_count;
+use runtime::kernel_world_boot::binding_is_live as live_binding_is_live;
+use runtime::kernel_world_boot::close_export_capability as close_live_export;
+use runtime::kernel_world_boot::denial_count as live_denial_count;
+use runtime::kernel_world_boot::fail as fail_live_boot;
+use runtime::kernel_world_boot::failure_count as live_failure_count;
+use runtime::kernel_world_boot::generation as live_boot_generation;
+use runtime::kernel_world_boot::health_observation_count as live_health_count;
+use runtime::kernel_world_boot::has_terminal_ticket as has_live_terminal;
+use runtime::kernel_world_boot::init as live_boot_init;
+use runtime::kernel_world_boot::invariants_hold as live_boot_invariants_hold;
+use runtime::kernel_world_boot::last_failure_vm_revoke_event;
+use runtime::kernel_world_boot::last_failure_withdrawal_event;
+use runtime::kernel_world_boot::lookup as lookup_live_export;
+use runtime::kernel_world_boot::pending_restart;
+use runtime::kernel_world_boot::pending_restart_count;
+use runtime::kernel_world_boot::publication_count as live_publication_count;
+use runtime::kernel_world_boot::publish_export as publish_live_export;
+use runtime::kernel_world_boot::record_health as record_live_health;
+use runtime::kernel_world_boot::request_reset as request_live_reset;
+use runtime::kernel_world_boot::reset_request_count as live_reset_count;
+use runtime::kernel_world_boot::restart_after_failure;
+use runtime::kernel_world_boot::restart_count as live_restart_count;
+use runtime::kernel_world_boot::stage as stage_live_boot;
+use runtime::kernel_world_boot::stage_count as live_stage_count;
+use runtime::kernel_world_boot::start as start_live_boot;
+use runtime::kernel_world_boot::start_count as live_start_count;
+use runtime::kernel_world_boot::status as live_status;
+use runtime::kernel_world_boot::stop as stop_live_boot;
+use runtime::kernel_world_boot::stop_count as live_stop_count;
+use runtime::kernel_world_boot::uninstall as uninstall_live_world;
+use runtime::kernel_world_boot::withdrawal_count as live_withdrawal_count;
 use runtime::kernel_world_admission::abort as abort_admission;
 use runtime::kernel_world_admission::admission_begin_count;
 use runtime::kernel_world_admission::admission_seal_count;
-use runtime::kernel_world_admission::begin as begin_admission;
+use runtime::kernel_world_admission::begin_with_restart as begin_admission;
 use runtime::kernel_world_admission::current_world_count;
 use runtime::kernel_world_admission::define_export as define_admission_export;
 use runtime::kernel_world_admission::define_request as define_admission_request;
@@ -14,13 +49,19 @@ use runtime::kernel_world_admission::denial_count as admission_denial_count;
 use runtime::kernel_world_admission::export_authority_byte_at as admitted_export_authority_byte_at;
 use runtime::kernel_world_admission::export_authority_id_at as admitted_export_authority_id_at;
 use runtime::kernel_world_admission::export_authority_length_at as admitted_export_authority_length_at;
+use runtime::kernel_world_admission::export_count as admitted_export_count;
+use runtime::kernel_world_admission::export_name_id_at as admitted_export_name_at;
+use runtime::kernel_world_admission::export_plane_at as admitted_export_plane_at;
+use runtime::kernel_world_admission::export_protocol_id_at as admitted_export_protocol_at;
 use runtime::kernel_world_admission::generation as world_generation;
+use runtime::kernel_world_admission::health_protocol_id as admitted_health_protocol;
 use runtime::kernel_world_admission::init as admission_init;
 use runtime::kernel_world_admission::invariants_hold as admission_invariants_hold;
 use runtime::kernel_world_admission::is_current as world_is_current;
 use runtime::kernel_world_admission::package_digest_word as admitted_package_digest_word;
 use runtime::kernel_world_admission::register_policy;
 use runtime::kernel_world_admission::request_grant_at;
+use runtime::kernel_world_admission::restart_policy as admitted_restart_policy;
 use runtime::kernel_world_admission::revoke as revoke_admission;
 use runtime::kernel_world_admission::seal as seal_admission;
 use runtime::kernel_world_admission::state as world_state;
@@ -32,6 +73,8 @@ use runtime::kernel_world_admission::INTEGRATION_BINARY_CONTAINED;
 use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
 use runtime::kernel_world_admission::RIGHT_VM_RUN;
 use runtime::kernel_world_admission::RIGHT_VM_STOP;
+use runtime::kernel_world_admission::RESTART_NEVER;
+use runtime::kernel_world_admission::RESTART_ON_FAILURE;
 use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
 use runtime::kernel_world_record::accepted_count as record_accepted_count;
 use runtime::kernel_world_record::canonical_order_selftest as record_canonical_order_selftest;
@@ -63,6 +106,7 @@ use runtime::kernel_world_record::min_vcpus as record_min_vcpus;
 use runtime::kernel_world_record::package_digest_word as record_package_digest_word;
 use runtime::kernel_world_record::parse as parse_record;
 use runtime::kernel_world_record::profile_id as record_profile_id;
+use runtime::kernel_world_record::restart_policy as record_restart_policy;
 use runtime::kernel_world_record::requirement_address as record_requirement_address;
 use runtime::kernel_world_record::requirement_count as record_requirement_count;
 use runtime::kernel_world_record::requirement_length as record_requirement_length;
@@ -109,6 +153,7 @@ use runtime::vm_object::VM_STATE_CONFIGURED;
 
 const MODE_KERNEL_WORLD_OBJECTS: u64 = 20;
 const MODE_KERNEL_WORLD_EXECUTION: u64 = 21;
+const MODE_KERNEL_WORLD_LIVE: u64 = 22;
 const RECORD_LENGTH: usize = 459;
 const RECORD_SHA_0: u64 = 0x0ece_5f7f_37eb_e203;
 const RECORD_SHA_1: u64 = 0xd03c_c7e5_213d_c8f9;
@@ -202,6 +247,24 @@ static EXECUTABLE_MESSAGE: [u8; 39] =
     b"KW first executable VM substrate: PASS\n";
 static POST_EXECUTION_TIMER_MESSAGE: [u8; 32] =
     b"KW post-execution timer: online\n";
+static LIVE_STAGED_MESSAGE: [u8; 50] =
+    b"KW boot supervisor staged configured worlds: PASS\n";
+static LIVE_HEALTH_MESSAGE: [u8; 57] =
+    b"KW health-before-publication + typed CSpace lookup: PASS\n";
+static LIVE_CAPABILITY_MESSAGE: [u8; 47] =
+    b"KW capability-backed status/reset broker: PASS\n";
+static LIVE_FAILURE_MESSAGE: [u8; 58] =
+    b"KW failure unpublishes before exact VM-graph revoke: PASS\n";
+static LIVE_UNRELATED_MESSAGE: [u8; 57] =
+    b"KW unrelated live service survived primary failure: PASS\n";
+static LIVE_POLICY_MESSAGE: [u8; 53] =
+    b"KW declared on-failure restart policy enforced: PASS\n";
+static LIVE_RESTART_MESSAGE: [u8; 52] =
+    b"KW generation-2 restart/rebind + stale denial: PASS\n";
+static LIVE_COMPLETE_MESSAGE: [u8; 51] =
+    b"KW live boot-service lifecycle + reclamation: PASS\n";
+static POST_LIVE_TIMER_MESSAGE: [u8; 35] =
+    b"KW post-boot-service timer: online\n";
 
 extern "sysv64" fn ocore_kernel_world_record_start() -> usize;
 extern "sysv64" fn ocore_kernel_world_record_end() -> usize;
@@ -299,6 +362,7 @@ unsafe fn begin_from_record() -> u64 {
         record_profile_id(),
         record_health_id(),
         record_health_timeout(),
+        record_restart_policy(),
         record_min_vcpus() as usize,
         record_max_vcpus() as usize,
         record_min_memory_mib(),
@@ -519,6 +583,7 @@ unsafe fn admit_unrelated_world() -> u64 {
         record_profile_id(),
         record_health_id(),
         1000,
+        RESTART_NEVER,
         1,
         1,
         1,
@@ -555,9 +620,396 @@ unsafe fn admit_unrelated_world() -> u64 {
     return world;
 }
 
+unsafe fn run_live_boot_service(
+    primary_world: u64,
+    primary_vm: u64,
+    primary_vcpu: u64,
+    primary_page: u64,
+    unrelated_world: u64,
+    unrelated_vm: u64,
+    unrelated_vcpu: u64,
+    unrelated_page: u64,
+    primary_owner: u64,
+    unrelated_owner: u64,
+    baseline_frames: usize
+) -> never {
+    if live_boot_init() != 1
+        || admitted_restart_policy(primary_world) != RESTART_ON_FAILURE
+        || record_restart_policy() != RESTART_ON_FAILURE
+        || admitted_restart_policy(unrelated_world) != RESTART_NEVER {
+        fail_closed();
+    }
+
+    let mut primary_export: usize = admitted_export_count(primary_world);
+    let mut ordinal: usize = 0;
+    while ordinal < admitted_export_count(primary_world) {
+        if admitted_export_plane_at(primary_world, ordinal)
+            == EXPORT_PLANE_DEVICE {
+            primary_export = ordinal;
+        }
+        ordinal += 1;
+    }
+    if primary_export >= admitted_export_count(primary_world)
+        || admitted_export_count(unrelated_world) != 1
+        || admitted_export_plane_at(unrelated_world, 0)
+            != EXPORT_PLANE_ABI {
+        fail_closed();
+    }
+    let primary_name: u64 =
+        admitted_export_name_at(primary_world, primary_export);
+    let primary_protocol: u64 =
+        admitted_export_protocol_at(primary_world, primary_export);
+    let unrelated_name: u64 = admitted_export_name_at(unrelated_world, 0);
+    let unrelated_protocol: u64 =
+        admitted_export_protocol_at(unrelated_world, 0);
+    let mut result_capability: u64 = 0;
+
+    // A configured VM is bound to its exact admitted world generation. The
+    // supervisor rejects cross-world staging before any state is installed.
+    if stage_live_boot(
+        primary_world,
+        unrelated_vm,
+        primary_owner
+    ) != 0 {
+        fail_closed();
+    }
+    let primary_boot: u64 =
+        stage_live_boot(primary_world, primary_vm, primary_owner);
+    let unrelated_boot: u64 =
+        stage_live_boot(unrelated_world, unrelated_vm, unrelated_owner);
+    if primary_boot == 0
+        || unrelated_boot == 0
+        || primary_boot == unrelated_boot
+        || live_boot_generation(primary_boot) != 1
+        || live_boot_generation(unrelated_boot) != 1
+        || live_stage_count() != 2
+        || live_boot_count() != 2
+        || lookup_live_export(
+            primary_name,
+            primary_protocol,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0 {
+        fail_closed();
+    }
+    write((&LIVE_STAGED_MESSAGE[0]), 50);
+
+    if start_live_boot(primary_boot) != 1
+        || start_live_boot(unrelated_boot) != 1
+        || live_start_count() != 2
+        || publish_live_export(
+            primary_boot,
+            primary_export,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0
+        || record_live_health(
+            primary_boot,
+            admitted_health_protocol(primary_world) ^ 1
+        ) != 0
+        || record_live_health(
+            primary_boot,
+            admitted_health_protocol(primary_world)
+        ) != 1
+        || record_live_health(
+            unrelated_boot,
+            admitted_health_protocol(unrelated_world)
+        ) != 1
+        || live_health_count() != 2 {
+        fail_closed();
+    }
+
+    let mut primary_capability: u64 = 0;
+    let primary_binding: u64 = publish_live_export(
+        primary_boot,
+        primary_export,
+        (&mut primary_capability)
+    );
+    let mut unrelated_capability: u64 = 0;
+    let unrelated_binding: u64 = publish_live_export(
+        unrelated_boot,
+        0,
+        (&mut unrelated_capability)
+    );
+    result_capability = 0;
+    if primary_binding == 0
+        || unrelated_binding == 0
+        || primary_capability == 0
+        || unrelated_capability == 0
+        || !live_binding_is_live(primary_binding)
+        || !live_binding_is_live(unrelated_binding)
+        || live_publication_count() != 2
+        || live_service_count() != 2
+        || lookup_live_export(
+            primary_name,
+            primary_protocol,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS
+                | RIGHT_KERNEL_WORLD_RESET_REQUEST,
+            (&mut result_capability)
+        ) != 1
+        || result_capability != primary_capability
+        || lookup_live_export(
+            primary_name,
+            primary_protocol ^ 1,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0
+        || lookup_live_export(
+            unrelated_name,
+            unrelated_protocol,
+            unrelated_owner,
+            RIGHT_KERNEL_WORLD_RESET_REQUEST,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0 {
+        fail_closed();
+    }
+    write((&LIVE_HEALTH_MESSAGE[0]), 57);
+
+    let forged_primary_capability: u64 =
+        primary_capability + 0x0000_0001_0000_0000;
+    if live_status(primary_owner, primary_capability) != 1
+        || live_status(unrelated_owner, unrelated_capability) != 1
+        || request_live_reset(primary_owner, primary_capability) != 1
+        || request_live_reset(unrelated_owner, unrelated_capability) != 0
+        || live_status(primary_owner, forged_primary_capability) != 0
+        || live_reset_count() != 1 {
+        fail_closed();
+    }
+    write((&LIVE_CAPABILITY_MESSAGE[0]), 47);
+
+    let withdrawals_before_failure: u64 = live_withdrawal_count();
+    if fail_live_boot(primary_boot) != 1
+        || live_failure_count() != 1
+        || live_binding_is_live(primary_binding)
+        || live_status(primary_owner, primary_capability) != 0
+        || lookup_live_export(
+            primary_name,
+            primary_protocol,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0
+        || vm_is_current(primary_vm)
+        || vcpu_is_current(primary_vcpu)
+        || guest_page_is_current(primary_page)
+        || !world_is_current(primary_world)
+        || !pending_restart(primary_world)
+        || !has_live_terminal(primary_world)
+        || live_withdrawal_count() != withdrawals_before_failure + 1
+        || last_failure_withdrawal_event() == 0
+        || last_failure_vm_revoke_event()
+            <= last_failure_withdrawal_event()
+        || live_boot_count() != 1
+        || live_service_count() != 1
+        || pending_restart_count() != 1
+        || quota_used(PRIMARY_OWNER_SLOT) != 0
+        || quota_used(UNRELATED_OWNER_SLOT) != 1
+        || free_frames() + 1 != baseline_frames {
+        fail_closed();
+    }
+    write((&LIVE_FAILURE_MESSAGE[0]), 58);
+
+    if !live_binding_is_live(unrelated_binding)
+        || live_status(unrelated_owner, unrelated_capability) != 1
+        || !vm_is_current(unrelated_vm)
+        || !vcpu_is_current(unrelated_vcpu)
+        || !guest_page_is_current(unrelated_page)
+        || !world_is_current(unrelated_world) {
+        fail_closed();
+    }
+    write((&LIVE_UNRELATED_MESSAGE[0]), 57);
+
+    let replacement_vm: u64 =
+        create_vm(primary_world, primary_owner, 1, 1);
+    let replacement_vcpu: u64 = create_vcpu(replacement_vm, 0);
+    let replacement_page: u64 =
+        attach_guest_page(replacement_vm, 0x10000);
+    if replacement_vm == 0
+        || replacement_vcpu == 0
+        || replacement_page == 0
+        || seal_configuration(replacement_vm) != 1
+        || vm_state(replacement_vm) != VM_STATE_CONFIGURED
+        || free_frames() + 2 != baseline_frames
+        || quota_used(PRIMARY_OWNER_SLOT) != 1
+        // Uninstall must not revoke admission underneath an un-staged
+        // replacement graph. The terminal ticket and graph remain usable.
+        || uninstall_live_world(primary_world) != 0
+        || !world_is_current(primary_world)
+        || !vm_is_current(replacement_vm)
+        || !has_live_terminal(primary_world)
+        // A failure ticket cannot be bypassed through the initial start path.
+        || stage_live_boot(
+            primary_world,
+            replacement_vm,
+            primary_owner
+        ) != 0 {
+        fail_closed();
+    }
+    write((&LIVE_POLICY_MESSAGE[0]), 53);
+
+    let replacement_boot: u64 = restart_after_failure(
+        primary_world,
+        replacement_vm,
+        primary_owner
+    );
+    if replacement_boot == 0
+        || live_boot_generation(replacement_boot) != 2
+        || pending_restart(primary_world)
+        || has_live_terminal(primary_world)
+        || live_restart_count() != 1
+        || live_stage_count() != 3
+        || start_live_boot(replacement_boot) != 1
+        || record_live_health(
+            replacement_boot,
+            admitted_health_protocol(primary_world)
+        ) != 1 {
+        fail_closed();
+    }
+    let mut replacement_capability: u64 = 0;
+    let replacement_binding: u64 = publish_live_export(
+        replacement_boot,
+        primary_export,
+        (&mut replacement_capability)
+    );
+    result_capability = 0;
+    if replacement_binding == 0
+        || replacement_binding == primary_binding
+        || replacement_capability == 0
+        || replacement_capability == primary_capability
+        || live_binding_is_live(primary_binding)
+        || !live_binding_is_live(replacement_binding)
+        || live_status(primary_owner, primary_capability) != 0
+        || live_status(primary_owner, replacement_capability) != 2
+        || request_live_reset(
+            primary_owner,
+            replacement_capability
+        ) != 1
+        || lookup_live_export(
+            primary_name,
+            primary_protocol,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS,
+            (&mut result_capability)
+        ) != 1
+        || result_capability != replacement_capability
+        || live_reset_count() != 2
+        || live_start_count() != 3
+        || live_health_count() != 3
+        || live_publication_count() != 3 {
+        fail_closed();
+    }
+
+    // The generic cap-close syscall routes through this same registry-aware
+    // transition. Closing a client cap cannot orphan SERVICE_LIVE metadata or
+    // block subsequent stop/reclamation.
+    if close_live_export(
+        primary_owner,
+        replacement_capability
+    ) != 1
+        || live_binding_is_live(replacement_binding)
+        || live_status(primary_owner, replacement_capability) != 0
+        || live_service_count() != 1
+        || lookup_live_export(
+            primary_name,
+            primary_protocol,
+            primary_owner,
+            RIGHT_KERNEL_WORLD_STATUS,
+            (&mut result_capability)
+        ) != 0
+        || result_capability != 0 {
+        fail_closed();
+    }
+    let mut final_primary_capability: u64 = 0;
+    let final_primary_binding: u64 = publish_live_export(
+        replacement_boot,
+        primary_export,
+        (&mut final_primary_capability)
+    );
+    if final_primary_binding == 0
+        || final_primary_binding == replacement_binding
+        || final_primary_capability == 0
+        || final_primary_capability == replacement_capability
+        || !live_binding_is_live(final_primary_binding)
+        || live_status(primary_owner, final_primary_capability) != 2
+        || live_publication_count() != 4 {
+        fail_closed();
+    }
+    write((&LIVE_RESTART_MESSAGE[0]), 52);
+
+    // Explicit stop creates a terminal tombstone, so the initial-stage API
+    // cannot reinterpret a stopped on-failure provider as a fresh start.
+    if stop_live_boot(replacement_boot) != 1
+        || live_stop_count() != 1
+        || !has_live_terminal(primary_world)
+        || pending_restart(primary_world)
+        || uninstall_live_world(primary_world) != 1
+        || world_is_current(primary_world)
+        || vm_is_current(replacement_vm)
+        || vcpu_is_current(replacement_vcpu)
+        || guest_page_is_current(replacement_page)
+        || quota_used(PRIMARY_OWNER_SLOT) != 0
+        || free_frames() + 1 != baseline_frames {
+        fail_closed();
+    }
+
+    // A RESTART_NEVER failure also leaves a terminal tombstone. It cannot be
+    // consumed as a restart and must be explicitly abandoned before uninstall.
+    if fail_live_boot(unrelated_boot) != 1
+        || pending_restart(unrelated_world)
+        || !has_live_terminal(unrelated_world)
+        || restart_after_failure(
+            unrelated_world,
+            unrelated_vm,
+            unrelated_owner
+        ) != 0
+        || uninstall_live_world(unrelated_world) != 1
+        || world_is_current(unrelated_world)
+        || vm_is_current(unrelated_vm)
+        || vcpu_is_current(unrelated_vcpu)
+        || guest_page_is_current(unrelated_page)
+        || live_boot_count() != 0
+        || live_service_count() != 0
+        || pending_restart_count() != 0
+        || active_vm_count() != 0
+        || active_vcpu_count() != 0
+        || active_guest_page_count() != 0
+        || current_world_count() != 0
+        || quota_used(PRIMARY_OWNER_SLOT) != 0
+        || quota_used(UNRELATED_OWNER_SLOT) != 0
+        || free_frames() != baseline_frames
+        || live_failure_count() != 2
+        || live_withdrawal_count() != 4
+        || live_denial_count() < 10
+        || !record_invariants_hold()
+        || !admission_invariants_hold()
+        || !vm_invariants_hold()
+        || !live_boot_invariants_hold() {
+        fail_closed();
+    }
+    write((&LIVE_COMPLETE_MESSAGE[0]), 51);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_LIVE_TIMER_MESSAGE[0]), 35);
+    loop {
+        halt();
+    }
+}
+
 pub unsafe fn start(mode: u64) -> never {
     if mode != MODE_KERNEL_WORLD_OBJECTS
-        && mode != MODE_KERNEL_WORLD_EXECUTION {
+        && mode != MODE_KERNEL_WORLD_EXECUTION
+        && mode != MODE_KERNEL_WORLD_LIVE {
         fail_closed();
     }
     disable_interrupts();
@@ -756,6 +1208,22 @@ pub unsafe fn start(mode: u64) -> never {
         || active_vcpu_count() != 3
         || active_guest_page_count() != 5 {
         fail_closed();
+    }
+
+    if mode == MODE_KERNEL_WORLD_LIVE {
+        run_live_boot_service(
+            primary_world,
+            primary_vm,
+            primary_vcpu_zero,
+            primary_page_zero,
+            unrelated_world,
+            unrelated_vm,
+            unrelated_vcpu,
+            unrelated_page,
+            primary_owner,
+            unrelated_owner,
+            baseline_frames
+        );
     }
 
     if mode == MODE_KERNEL_WORLD_EXECUTION {

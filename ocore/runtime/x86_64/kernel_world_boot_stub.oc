@@ -1,0 +1,16 @@
+module runtime::kernel_world_boot;
+
+use runtime::capability::close_for_owner;
+
+// Non-KernelWorld probe builds retain a distinct module identity without
+// carrying the live supervisor's fixed tables and lifecycle code.
+pub unsafe fn unavailable() -> u64 {
+    return 0;
+}
+
+pub unsafe fn close_export_capability(
+    consumer_cspace: u64,
+    capability: u64
+) -> u64 {
+    return close_for_owner(consumer_cspace, capability);
+}
