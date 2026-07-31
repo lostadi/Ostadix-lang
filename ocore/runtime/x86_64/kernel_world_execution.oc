@@ -1,0 +1,460 @@
+module runtime::kernel_world_execution;
+
+use runtime::kernel_world_admission::health_protocol_id;
+use runtime::kernel_world_boot::fail as fail_boot;
+use runtime::kernel_world_boot::matches as boot_matches;
+use runtime::kernel_world_boot::record_health;
+use runtime::kernel_world_boot::state as boot_state;
+use runtime::kernel_world_boot::stop as stop_boot;
+use runtime::kernel_world_boot::BOOT_STATE_ACTIVE;
+use runtime::kernel_world_boot::BOOT_STATE_HEALTHY;
+use runtime::kernel_world_boot::BOOT_STATE_STARTED;
+use runtime::kernel_world_device::active_count as active_device_count;
+use runtime::kernel_world_device::assign as assign_device;
+use runtime::kernel_world_device::generation as device_generation;
+use runtime::kernel_world_device::init as device_init;
+use runtime::kernel_world_device::invariants_hold as device_invariants_hold;
+use runtime::kernel_world_device::is_live as device_is_live;
+use runtime::kernel_world_device::revoke as revoke_device;
+use runtime::kernel_world_device::transact as transact_device;
+use runtime::svm_execution::active_vcpu as svm_active_vcpu;
+use runtime::svm_execution::active_vm as svm_active_vm;
+use runtime::svm_execution::complete_device_io;
+use runtime::svm_execution::init as svm_init;
+use runtime::svm_execution::is_active as svm_is_active;
+use runtime::svm_execution::npt_is_torn_down;
+use runtime::svm_execution::prepare as svm_prepare;
+use runtime::svm_execution::run_to_device_io;
+use runtime::svm_execution::run_to_hypercall;
+use runtime::svm_execution::run_to_isolation_fault;
+use runtime::svm_execution::stop as svm_stop;
+use runtime::vm_object::guest_page_is_current;
+use runtime::vm_object::guest_page_vm;
+use runtime::vm_object::vcpu_is_current;
+use runtime::vm_object::vcpu_vm;
+use runtime::vm_object::vm_is_current;
+use runtime::vm_object::vm_world;
+
+// One fixed execution context is deliberate: svm_execution owns one boot-CPU
+// VMCB/NPT region. The coordinator makes that architectural singleton
+// generation-safe and binds every event to one exact boot/world/VM/vCPU.
+pub const MAX_EXECUTION_SESSIONS: usize = 1;
+pub const VIRTUAL_DEVICE_PORT: u64 = 0xe0;
+
+pub const EXECUTION_STATE_RUNNING: u64 = 1;
+pub const EXECUTION_STATE_HEALTHY: u64 = 2;
+pub const EXECUTION_STATE_DEVICE_COMPLETE: u64 = 3;
+
+const SESSION_EMPTY: u8 = 0;
+const SESSION_RUNNING: u8 = 1;
+const SESSION_HEALTHY: u8 = 2;
+const SESSION_DEVICE_COMPLETE: u8 = 3;
+const SESSION_STOPPING: u8 = 4;
+const SESSION_RETIRED: u8 = 5;
+
+const SESSION_HANDLE_TAG: u64 = 0xef00_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut SESSION_STATE: u8 = 0;
+static mut SESSION_GENERATION: u32 = 0;
+static mut SESSION_BOOT: u64 = 0;
+static mut SESSION_WORLD: u64 = 0;
+static mut SESSION_VM: u64 = 0;
+static mut SESSION_VCPU: u64 = 0;
+static mut SESSION_CODE_PAGE: u64 = 0;
+static mut SESSION_MAILBOX_PAGE: u64 = 0;
+static mut SESSION_DEVICE: u64 = 0;
+static mut SESSION_DEVICE_GENERATION: u64 = 0;
+static mut SESSION_EXPORT: usize = 0;
+static mut LAST_DEVICE_RESULT: u64 = 0;
+
+static mut STARTS: u64 = 0;
+static mut HEALTH_EXITS: u64 = 0;
+static mut DEVICE_EXITS: u64 = 0;
+static mut FAILURE_EXITS: u64 = 0;
+static mut ORDERLY_STOPS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut EVENT_SEQUENCE: u64 = 0;
+static mut LAST_NPF_EVENT: u64 = 0;
+static mut LAST_SVM_STOP_EVENT: u64 = 0;
+static mut LAST_DEVICE_REVOKE_EVENT: u64 = 0;
+static mut LAST_BOOT_TERMINAL_EVENT: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+unsafe fn make_handle() -> u64 {
+    return ((SESSION_GENERATION as u64) << 32) | SESSION_HANDLE_TAG;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn checked_session(session: u64) -> bool {
+    return INITIALIZED != 0
+        && POISONED == 0
+        && (session & HANDLE_TAG_MASK) == SESSION_HANDLE_TAG
+        && (session & HANDLE_INDEX_MASK) == 0
+        && handle_generation(session) == SESSION_GENERATION
+        && (SESSION_STATE == SESSION_RUNNING
+            || SESSION_STATE == SESSION_HEALTHY
+            || SESSION_STATE == SESSION_DEVICE_COMPLETE);
+}
+
+unsafe fn deny() -> u64 {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn advance_event() -> u64 {
+    if EVENT_SEQUENCE == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    EVENT_SEQUENCE += 1;
+    return EVENT_SEQUENCE;
+}
+
+unsafe fn clear_session() -> void {
+    SESSION_BOOT = 0;
+    SESSION_WORLD = 0;
+    SESSION_VM = 0;
+    SESSION_VCPU = 0;
+    SESSION_CODE_PAGE = 0;
+    SESSION_MAILBOX_PAGE = 0;
+    SESSION_DEVICE = 0;
+    SESSION_DEVICE_GENERATION = 0;
+    SESSION_EXPORT = 0;
+    LAST_DEVICE_RESULT = 0;
+}
+
+unsafe fn retire_session() -> void {
+    clear_session();
+    if SESSION_GENERATION == 0xffff_ffff {
+        SESSION_STATE = SESSION_RETIRED;
+    } else {
+        SESSION_GENERATION += 1;
+        SESSION_STATE = SESSION_EMPTY;
+    }
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || device_init() != 1 || svm_init() != 1 {
+        return 0;
+    }
+    SESSION_STATE = SESSION_EMPTY;
+    SESSION_GENERATION = 1;
+    clear_session();
+    STARTS = 0;
+    HEALTH_EXITS = 0;
+    DEVICE_EXITS = 0;
+    FAILURE_EXITS = 0;
+    ORDERLY_STOPS = 0;
+    DENIALS = 0;
+    EVENT_SEQUENCE = 0;
+    LAST_NPF_EVENT = 0;
+    LAST_SVM_STOP_EVENT = 0;
+    LAST_DEVICE_REVOKE_EVENT = 0;
+    LAST_BOOT_TERMINAL_EVENT = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn start(
+    boot: u64,
+    vcpu: u64,
+    code_page: u64,
+    mailbox_page: u64,
+    export_ordinal: usize
+) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 || !invariants_hold() {
+        return 0;
+    }
+    if SESSION_STATE != SESSION_EMPTY
+        || STARTS == MAX_COUNTER
+        || boot_state(boot) != BOOT_STATE_STARTED
+        || !vcpu_is_current(vcpu)
+        || !guest_page_is_current(code_page)
+        || !guest_page_is_current(mailbox_page) {
+        return deny();
+    }
+    let vm: u64 = vcpu_vm(vcpu);
+    let world: u64 = vm_world(vm);
+    if vm == 0
+        || world == 0
+        || !vm_is_current(vm)
+        || guest_page_vm(code_page) != vm
+        || guest_page_vm(mailbox_page) != vm
+        || !boot_matches(boot, world, vm) {
+        return deny();
+    }
+    let device: u64 = assign_device(
+        boot,
+        world,
+        vm,
+        export_ordinal,
+        VIRTUAL_DEVICE_PORT
+    );
+    if device == 0 {
+        return deny();
+    }
+    if svm_prepare(vcpu, code_page, mailbox_page) != 1 {
+        if revoke_device(device) != 1 {
+            POISONED = 1;
+            return 0;
+        }
+        return deny();
+    }
+    SESSION_BOOT = boot;
+    SESSION_WORLD = world;
+    SESSION_VM = vm;
+    SESSION_VCPU = vcpu;
+    SESSION_CODE_PAGE = code_page;
+    SESSION_MAILBOX_PAGE = mailbox_page;
+    SESSION_DEVICE = device;
+    SESSION_DEVICE_GENERATION = device_generation(device);
+    SESSION_EXPORT = export_ordinal;
+    SESSION_STATE = SESSION_RUNNING;
+    STARTS += 1;
+    return finish(make_handle());
+}
+
+// The exact VMMCALL from the bound guest is the health event source. The guest
+// supplies no protocol authority; the coordinator derives the immutable
+// protocol from the exact admitted world before advancing the boot state.
+pub unsafe fn drive_health(session: u64) -> u64 {
+    if !checked_session(session) || SESSION_STATE != SESSION_RUNNING {
+        return deny();
+    }
+    if HEALTH_EXITS == MAX_COUNTER || run_to_hypercall() != 1 {
+        return deny();
+    }
+    if record_health(
+        SESSION_BOOT,
+        health_protocol_id(SESSION_WORLD)
+    ) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    SESSION_STATE = SESSION_HEALTHY;
+    HEALTH_EXITS += 1;
+    return finish(1);
+}
+
+// The guest selects only a port and scalar value. It cannot select an
+// assignment: the exact generation-tagged device bound to this execution
+// session is passed to the virtual-device dispatcher.
+pub unsafe fn drive_device(session: u64) -> u64 {
+    if !checked_session(session)
+        || SESSION_STATE != SESSION_HEALTHY
+        || (boot_state(SESSION_BOOT) != BOOT_STATE_HEALTHY
+            && boot_state(SESSION_BOOT) != BOOT_STATE_ACTIVE)
+        || DEVICE_EXITS == MAX_COUNTER {
+        return deny();
+    }
+    let mut port: u64 = 0;
+    let mut input: u64 = 0;
+    let mut output: u64 = 0;
+    if run_to_device_io((&mut port), (&mut input)) != 1
+        || transact_device(
+            SESSION_DEVICE,
+            SESSION_VM,
+            port,
+            input,
+            (&mut output)
+        ) != 1
+        || complete_device_io(output) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_DEVICE_RESULT = output;
+    SESSION_STATE = SESSION_DEVICE_COMPLETE;
+    DEVICE_EXITS += 1;
+    return finish(output);
+}
+
+// An exact nested-page fault is one terminal provider event. The same trusted
+// call synchronously quiesces SVM/NPT and revokes the virtual endpoint before
+// asking the boot supervisor to withdraw clients and revoke the VM graph.
+pub unsafe fn drive_failure(session: u64) -> u64 {
+    if !checked_session(session)
+        || (SESSION_STATE != SESSION_HEALTHY
+            && SESSION_STATE != SESSION_DEVICE_COMPLETE)
+        || FAILURE_EXITS == MAX_COUNTER {
+        return deny();
+    }
+    if run_to_isolation_fault() != 1 {
+        return deny();
+    }
+    SESSION_STATE = SESSION_STOPPING;
+    LAST_NPF_EVENT = advance_event();
+    if LAST_NPF_EVENT == 0 || svm_stop() != 1 || !npt_is_torn_down() {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_SVM_STOP_EVENT = advance_event();
+    if LAST_SVM_STOP_EVENT == 0 || revoke_device(SESSION_DEVICE) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_DEVICE_REVOKE_EVENT = advance_event();
+    if LAST_DEVICE_REVOKE_EVENT == 0
+        || fail_boot(SESSION_BOOT) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    LAST_BOOT_TERMINAL_EVENT = advance_event();
+    if LAST_BOOT_TERMINAL_EVENT == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    FAILURE_EXITS += 1;
+    retire_session();
+    return finish(1);
+}
+
+pub unsafe fn stop(session: u64) -> u64 {
+    if !checked_session(session)
+        || (SESSION_STATE != SESSION_HEALTHY
+            && SESSION_STATE != SESSION_DEVICE_COMPLETE)
+        || ORDERLY_STOPS == MAX_COUNTER {
+        return deny();
+    }
+    SESSION_STATE = SESSION_STOPPING;
+    if svm_stop() != 1
+        || !npt_is_torn_down()
+        || revoke_device(SESSION_DEVICE) != 1
+        || stop_boot(SESSION_BOOT) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    ORDERLY_STOPS += 1;
+    retire_session();
+    return finish(1);
+}
+
+pub unsafe fn is_live(session: u64) -> bool {
+    return checked_session(session);
+}
+
+pub unsafe fn state(session: u64) -> u64 {
+    if !checked_session(session) {
+        return 0;
+    }
+    if SESSION_STATE == SESSION_RUNNING {
+        return EXECUTION_STATE_RUNNING;
+    }
+    if SESSION_STATE == SESSION_HEALTHY {
+        return EXECUTION_STATE_HEALTHY;
+    }
+    if SESSION_STATE == SESSION_DEVICE_COMPLETE {
+        return EXECUTION_STATE_DEVICE_COMPLETE;
+    }
+    return 0;
+}
+
+pub unsafe fn generation(session: u64) -> u64 {
+    if !checked_session(session) {
+        return 0;
+    }
+    return SESSION_GENERATION as u64;
+}
+
+pub unsafe fn active_count() -> usize {
+    if SESSION_STATE == SESSION_RUNNING
+        || SESSION_STATE == SESSION_HEALTHY
+        || SESSION_STATE == SESSION_DEVICE_COMPLETE
+        || SESSION_STATE == SESSION_STOPPING {
+        return 1;
+    }
+    return 0;
+}
+
+pub unsafe fn start_count() -> u64 { return STARTS; }
+pub unsafe fn health_exit_count() -> u64 { return HEALTH_EXITS; }
+pub unsafe fn device_exit_count() -> u64 { return DEVICE_EXITS; }
+pub unsafe fn failure_exit_count() -> u64 { return FAILURE_EXITS; }
+pub unsafe fn orderly_stop_count() -> u64 { return ORDERLY_STOPS; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn last_device_result() -> u64 { return LAST_DEVICE_RESULT; }
+pub unsafe fn last_npf_event() -> u64 { return LAST_NPF_EVENT; }
+pub unsafe fn last_svm_stop_event() -> u64 { return LAST_SVM_STOP_EVENT; }
+pub unsafe fn last_device_revoke_event() -> u64 {
+    return LAST_DEVICE_REVOKE_EVENT;
+}
+pub unsafe fn last_boot_terminal_event() -> u64 {
+    return LAST_BOOT_TERMINAL_EVENT;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !device_invariants_hold()
+        || FAILURE_EXITS > STARTS
+        || ORDERLY_STOPS > STARTS
+        || ORDERLY_STOPS > STARTS - FAILURE_EXITS {
+        return false;
+    }
+    if SESSION_GENERATION == 0 {
+        return false;
+    }
+    if SESSION_STATE == SESSION_EMPTY || SESSION_STATE == SESSION_RETIRED {
+        return SESSION_BOOT == 0
+            && SESSION_WORLD == 0
+            && SESSION_VM == 0
+            && SESSION_VCPU == 0
+            && SESSION_CODE_PAGE == 0
+            && SESSION_MAILBOX_PAGE == 0
+            && SESSION_DEVICE == 0
+            && SESSION_DEVICE_GENERATION == 0
+            && SESSION_EXPORT == 0
+            && LAST_DEVICE_RESULT == 0
+            && !svm_is_active()
+            && active_device_count() == 0;
+    }
+    if SESSION_STATE != SESSION_RUNNING
+        && SESSION_STATE != SESSION_HEALTHY
+        && SESSION_STATE != SESSION_DEVICE_COMPLETE {
+        return false;
+    }
+    let current_boot_state: u64 = boot_state(SESSION_BOOT);
+    if !boot_matches(SESSION_BOOT, SESSION_WORLD, SESSION_VM)
+        || !vm_is_current(SESSION_VM)
+        || !vcpu_is_current(SESSION_VCPU)
+        || !guest_page_is_current(SESSION_CODE_PAGE)
+        || !guest_page_is_current(SESSION_MAILBOX_PAGE)
+        || guest_page_vm(SESSION_CODE_PAGE) != SESSION_VM
+        || guest_page_vm(SESSION_MAILBOX_PAGE) != SESSION_VM
+        || !device_is_live(SESSION_DEVICE)
+        || device_generation(SESSION_DEVICE) != SESSION_DEVICE_GENERATION
+        || !svm_is_active()
+        || svm_active_vm() != SESSION_VM
+        || svm_active_vcpu() != SESSION_VCPU
+        || active_device_count() != 1 {
+        return false;
+    }
+    if SESSION_STATE == SESSION_RUNNING {
+        return current_boot_state == BOOT_STATE_STARTED;
+    }
+    return current_boot_state == BOOT_STATE_HEALTHY
+        || current_boot_state == BOOT_STATE_ACTIVE;
+}

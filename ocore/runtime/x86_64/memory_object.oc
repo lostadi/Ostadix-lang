@@ -406,6 +406,17 @@ pub unsafe fn object_kind(handle: u64) -> u64 {
     return KINDS[index] as u64;
 }
 
+// Trusted kernel subsystems use this to preflight ownership teardown. A zero
+// result means either a stale/invalid handle or an impossible live zero-ref
+// object; it is never a public capability operation.
+pub unsafe fn reference_count(handle: u64) -> u32 {
+    let index: usize = checked_object(handle, 0);
+    if index >= MAX_MEMORY_OBJECTS {
+        return 0;
+    }
+    return REFERENCES[index];
+}
+
 pub unsafe fn retain_object(handle: u64) -> u64 {
     let index: usize = checked_object(handle, 0);
     if index >= MAX_MEMORY_OBJECTS || REFERENCES[index] == 0xffff_ffff {

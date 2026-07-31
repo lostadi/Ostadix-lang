@@ -22,6 +22,7 @@ use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
 use runtime::memory_object::allocate_kernel_object_for_owner;
 use runtime::memory_object::invariants_hold as memory_invariants_hold;
 use runtime::memory_object::object_kind as memory_object_kind;
+use runtime::memory_object::reference_count as memory_reference_count;
 use runtime::memory_object::release_object as release_memory_object;
 use runtime::memory_object::MEMORY_ANONYMOUS;
 
@@ -73,6 +74,10 @@ static mut VM_MIN_GUEST_PAGES: [usize; 2] = [0; 2];
 static mut VM_MAX_GUEST_PAGES: [usize; 2] = [0; 2];
 static mut VM_VCPU_COUNTS: [usize; 2] = [0; 2];
 static mut VM_GUEST_PAGE_COUNTS: [usize; 2] = [0; 2];
+// The bounded backend permits one exact executor to pin each configured VM.
+// A pin blocks graph destruction until the executor has disabled guest entry,
+// torn down its second-stage tables, and released every retained page mapping.
+static mut VM_EXECUTION_PINS: [u8; 2] = [0; 2];
 
 static mut VCPU_STATES: [u8; 4] = [0; 4];
 static mut VCPU_GENERATIONS: [u32; 4] = [0; 4];
@@ -199,6 +204,7 @@ unsafe fn clear_vm_slot(slot: usize) -> void {
     VM_MAX_GUEST_PAGES[slot] = 0;
     VM_VCPU_COUNTS[slot] = 0;
     VM_GUEST_PAGE_COUNTS[slot] = 0;
+    VM_EXECUTION_PINS[slot] = 0;
 }
 
 unsafe fn clear_vcpu_slot(slot: usize) -> void {
@@ -519,6 +525,7 @@ unsafe fn preflight_destroy(slot: usize) -> bool {
     if slot >= MAX_VMS
         || (VM_STATES[slot] != VM_CONFIGURING
             && VM_STATES[slot] != VM_CONFIGURED)
+        || VM_EXECUTION_PINS[slot] != 0
         || !cspace_is_valid_owner(VM_OWNERS[slot]) {
         return false;
     }
@@ -537,7 +544,10 @@ unsafe fn preflight_destroy(slot: usize) -> bool {
         if GUEST_PAGE_STATES[child] == CHILD_LIVE
             && GUEST_PAGE_VMS[child] == vm {
             if memory_object_kind(GUEST_PAGE_MEMORY_OBJECTS[child])
-                != MEMORY_ANONYMOUS {
+                    != MEMORY_ANONYMOUS
+                || memory_reference_count(
+                    GUEST_PAGE_MEMORY_OBJECTS[child]
+                ) != 1 {
                 return false;
             }
             observed_pages += 1;
@@ -548,6 +558,48 @@ unsafe fn preflight_destroy(slot: usize) -> bool {
         && observed_pages == VM_GUEST_PAGE_COUNTS[slot]
         && cspace_child_refs(VM_OWNERS[slot])
             >= (observed_pages + 1) as u32;
+}
+
+// Acquire the one execution pin for an exact current configured VM. The SVM
+// backend takes this before retaining guest-page mappings and releases it only
+// after guest entry is disabled and all such mappings have been dropped.
+pub unsafe fn retain_execution(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS
+        || !invariants_hold()
+        || VM_STATES[slot] != VM_CONFIGURED
+        || !vm_is_current(vm)
+        || VM_EXECUTION_PINS[slot] != 0 {
+        return reject();
+    }
+    VM_EXECUTION_PINS[slot] = 1;
+    if !invariants_hold() {
+        VM_EXECUTION_PINS[slot] = 0;
+        return reject();
+    }
+    return 1;
+}
+
+pub unsafe fn release_execution(vm: u64) -> u64 {
+    let slot: usize = checked_vm_local(vm, false);
+    if slot >= MAX_VMS
+        || !invariants_hold()
+        || VM_STATES[slot] != VM_CONFIGURED
+        || VM_EXECUTION_PINS[slot] != 1 {
+        return reject();
+    }
+    VM_EXECUTION_PINS[slot] = 0;
+    if !invariants_hold() {
+        VM_EXECUTION_PINS[slot] = 1;
+        POISONED = 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn vm_has_execution(vm: u64) -> bool {
+    let slot: usize = checked_vm_local(vm, false);
+    return slot < MAX_VMS && VM_EXECUTION_PINS[slot] == 1;
 }
 
 unsafe fn destroy_vm_slot(slot: usize) -> u64 {
@@ -668,6 +720,29 @@ pub unsafe fn world_graph_is_present(world: u64) -> bool {
         slot += 1;
     }
     return false;
+}
+
+// Read-only exact-world preflight for supervisors. Presence alone is not
+// revocability: every VM must be unpinned and every guest page must have only
+// its graph-owner reference.
+pub unsafe fn world_graph_can_revoke(world: u64) -> bool {
+    if world == 0 || !invariants_hold() {
+        return false;
+    }
+    let mut found: bool = false;
+    let mut slot: usize = 0;
+    while slot < MAX_VMS {
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && VM_WORLDS[slot] == world {
+            if !preflight_destroy(slot) {
+                return false;
+            }
+            found = true;
+        }
+        slot += 1;
+    }
+    return found;
 }
 
 pub unsafe fn vm_is_current(vm: u64) -> bool {
@@ -941,7 +1016,8 @@ pub unsafe fn invariants_hold() -> bool {
                 || VM_MIN_GUEST_PAGES[slot] != 0
                 || VM_MAX_GUEST_PAGES[slot] != 0
                 || VM_VCPU_COUNTS[slot] != 0
-                || VM_GUEST_PAGE_COUNTS[slot] != 0 {
+                || VM_GUEST_PAGE_COUNTS[slot] != 0
+                || VM_EXECUTION_PINS[slot] != 0 {
                 return false;
             }
         } else if state == VM_CONFIGURING || state == VM_CONFIGURED {
@@ -959,7 +1035,10 @@ pub unsafe fn invariants_hold() -> bool {
                 || VM_MIN_GUEST_PAGES[slot] > VM_MAX_GUEST_PAGES[slot]
                 || VM_MAX_GUEST_PAGES[slot] > MAX_GUEST_PAGES_PER_VM
                 || VM_VCPU_COUNTS[slot] > VM_MAX_VCPUS[slot]
-                || VM_GUEST_PAGE_COUNTS[slot] > VM_MAX_GUEST_PAGES[slot] {
+                || VM_GUEST_PAGE_COUNTS[slot] > VM_MAX_GUEST_PAGES[slot]
+                || VM_EXECUTION_PINS[slot] > 1
+                || (state != VM_CONFIGURED
+                    && VM_EXECUTION_PINS[slot] != 0) {
                 return false;
             }
             if state == VM_CONFIGURED
