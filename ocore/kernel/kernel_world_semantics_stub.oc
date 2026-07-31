@@ -1,0 +1,15 @@
+module kernel::kernel_world_semantics;
+
+// Probe modes below the KernelWorld range do not carry its native lifecycle
+// implementation. main.oc cannot reach this fail-closed link stub for those
+// build-time probe values, but the symbol remains total if routing regresses.
+pub unsafe fn start(mode: u64) -> never {
+    if mode != 0 {
+        loop {
+            halt();
+        }
+    }
+    loop {
+        halt();
+    }
+}

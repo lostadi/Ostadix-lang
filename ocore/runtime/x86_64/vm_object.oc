@@ -650,6 +650,26 @@ pub unsafe fn revoke_world(world: u64) -> u64 {
     return 1;
 }
 
+// Exact, generation-tagged presence check used by the boot supervisor before
+// it revokes admission. This deliberately does not require the graph to be
+// current: a locally live graph must remain reclaimable even if its admission
+// record is about to change.
+pub unsafe fn world_graph_is_present(world: u64) -> bool {
+    if world == 0 || !invariants_hold() {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_VMS {
+        if (VM_STATES[slot] == VM_CONFIGURING
+                || VM_STATES[slot] == VM_CONFIGURED)
+            && VM_WORLDS[slot] == world {
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
 pub unsafe fn vm_is_current(vm: u64) -> bool {
     let slot: usize = checked_vm_local(vm, false);
     if slot >= MAX_VMS || !world_matches_vm(slot) {

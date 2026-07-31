@@ -486,8 +486,62 @@ initialization. It enters only a two-page real-mode synthetic guest through a
 private NPT, proving one bounded interrupt, a controlled `VMMCALL`, denial of
 an unmapped GPA, exact NPT teardown, stop/restart, and unrelated-VM survival.
 
-Neither gate provides a live device service or device capability, guest agent,
-shared queue or shared ring, Linux or Plan 9 boot, a virtual device, PCI
-assignment, IOMMU isolation, DMA mapping, device reset, or 9P. In particular,
-the V2 authority names and `reset`/`dma` requests are validated metadata for
-independent admission policy, not proof that those device operations exist.
+Mode 22 is a separate TCG-compatible native boot-service lifecycle mechanism
+gate. `kernel_world_boot.oc` has fixed capacity for two administrative boot
+instances and four published exports. It stages an admitted world with one
+configured VM identity and one exact consumer CSpace. `start` requires the
+independently materialized `vm.machine:run` grant, but is only an
+administrative state transition: it does not enter the vCPU or start a process,
+guest, or foreign-kernel provider.
+
+Publication requires a trusted observation of the exact health protocol ID
+retained from the admitted record. A published export installs a
+nontransferable `OBJECT_KERNEL_WORLD_EXPORT` capability directly into that
+consumer CSpace. Every export carries a status right. A device-plane export
+also carries only a reset-*request* right, and only when its byte-exact sealed
+authority request received the independently granted `device.*:reset` right.
+Lookup returns that already-installed exact capability and grants no authority.
+Name/protocol resolution compares retained IDs together with the exact consumer
+CSpace and required-right set; the native record does not retain the original
+name/protocol bytes for byte-exact lookup. Authority comes only from the
+already-installed capability. Publication denies a second live binding with the
+same consumer-CSpace/name/protocol ID tuple.
+The status operation reports the native boot generation; reset success means
+only that O-core accepted broker intent for the exact live binding. It does not
+dispatch to a provider or reset hardware.
+
+Generic `SYS_CAP_CLOSE` recognizes a KernelWorld export and routes it through
+the same registry-aware close transition. The binding becomes unavailable,
+the capability is closed, and its service generation advances together.
+Closing the final export returns that boot from `ACTIVE` to `HEALTHY`, so it can
+publish again or proceed through orderly teardown without orphaned live
+metadata.
+
+Failure makes the boot generation unavailable, closes and generation-retires
+all issued client capabilities, and only then revokes the exact VM graph.
+Admission is retained so the declared `on_failure` policy can authorize one
+fresh VM/boot/service generation and rebind; stale capabilities remain denied,
+and an unrelated live service survives. Explicit stop leaves a terminal
+tombstone: only `always` policy can consume it as a restart; otherwise the
+owning uninstall transition first revokes admission and then consumes the
+tombstone, but only after proving that no active boot or exact local VM graph
+remains. A configured, un-staged replacement makes uninstall fail without
+changing its graph, ticket, or admission. There is no separate public
+tombstone-abandon operation, so a failed admission revoke cannot reopen the old
+generation through ordinary staging.
+`smoke-kernel-world-live-qemu.sh` exercises these transitions directly under
+QEMU TCG and observes a later timer.
+
+Every externally callable lifecycle or broker transition is serialized by one
+single-CPU operation owner and completes at a monotonically advancing
+linearization epoch. This rejects re-entry in the current gate; it is not an
+SMP lock. A future SMP port must replace the ownership byte with an atomic
+kernel lock while preserving the same transition boundaries.
+
+Mode 22 does not enforce the declared health timeout, and its failure hook is
+called directly by the bounded semantics gate rather than by a process fault,
+trap, scheduler, or vCPU-exit path. None of Modes 20 through 22 boots Linux or
+Plan 9, starts a foreign provider, supplies a guest agent, shared queue or
+shared ring, implements 9P, assigns PCI or another physical device, establishes
+IOMMU/DMA isolation, or performs physical device reset. Mode 21 alone enters
+the synthetic guest; Mode 22 deliberately does not enter any guest.

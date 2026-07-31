@@ -154,7 +154,8 @@ jobs:
             boot-and-test.sh \
             okernel-multikernel/boot-and-test.sh \
             ocore/kernel/smoke-m6b-qemu.sh \
-            ocore/kernel/smoke-kernel-world-qemu.sh
+            ocore/kernel/smoke-kernel-world-qemu.sh \
+            ocore/kernel/smoke-kernel-world-live-qemu.sh
           do
             test -x "$script"
             bash -n "$script"
@@ -196,3 +197,6 @@ jobs:
 
       - name: Run verified world admission and nonexecuting VM-object smoke
         run: ./ocore/kernel/smoke-kernel-world-qemu.sh
+
+      - name: Run TCG-compatible KernelWorld live lifecycle and service smoke
+        run: ./ocore/kernel/smoke-kernel-world-live-qemu.sh
