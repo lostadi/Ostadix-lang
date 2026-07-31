@@ -322,6 +322,13 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         interrupts_init();
         start_kernel_world_semantics(probe_mode);
     }
+    if probe_mode == 22 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_kernel_world_semantics(probe_mode);
+    }
 
     let kernel_stack_top: usize = ocore_kernel_stack_top();
     if configure_probe(probe_mode) == 0 {

@@ -36,6 +36,12 @@ pub const RIGHT_MEMORY_VIEW_READ: u64 = 2048;
 pub const RIGHT_MEMORY_VIEW_WRITE: u64 = 4096;
 pub const RIGHT_MEMORY_VIEW_COMMIT: u64 = 8192;
 pub const RIGHT_DELEGATED_RESOURCE_USE: u64 = 16384;
+// Client-side KernelWorld export authority is deliberately disjoint from the
+// provider's admitted device.reset/device.dma authority. Both rights are
+// nontransferable: publication installs an already-attenuated capability
+// directly into the consumer's exact CSpace generation; lookup only returns it.
+pub const RIGHT_KERNEL_WORLD_STATUS: u64 = 32768;
+pub const RIGHT_KERNEL_WORLD_RESET_REQUEST: u64 = 65536;
 pub const OBJECT_DEBUG: u64 = 1;
 pub const OBJECT_PAGE_POOL: u64 = 2;
 pub const OBJECT_MEMORY: u64 = 3;
@@ -46,6 +52,7 @@ pub const OBJECT_PERSONALITY_SUPERVISION: u64 = 7;
 pub const OBJECT_PERSONALITY_CALL: u64 = 8;
 pub const OBJECT_PERSONALITY_MEMORY_VIEW: u64 = 9;
 pub const OBJECT_DELEGATED_RESOURCE: u64 = 10;
+pub const OBJECT_KERNEL_WORLD_EXPORT: u64 = 11;
 
 // Public capability handles remain `(generation << 32) | capability_slot`.
 // CSpace identity is kernel-only and separately kind tagged so a reusable raw
@@ -256,6 +263,10 @@ fn allowed_rights(object_type: u64) -> u64 {
     }
     if object_type == OBJECT_DELEGATED_RESOURCE {
         return RIGHT_DELEGATED_RESOURCE_USE;
+    }
+    if object_type == OBJECT_KERNEL_WORLD_EXPORT {
+        return RIGHT_KERNEL_WORLD_STATUS
+            | RIGHT_KERNEL_WORLD_RESET_REQUEST;
     }
     return 0;
 }

@@ -136,6 +136,8 @@ phase_kernel() {
 # Probe map:  0 default | 9 user-copy fault | 12 M2 sched | 13 M3 ipc-foundation
 # 14 M3 ipc | 15 M4 loader/OVFS | 16 M5 live | 17 M5 semantics | 18 M6A personality
 # 19 M6B bounded memory/resource revocation | 20 verified world/nonexecuting VM objects
+# 21 AMD KVM-only execution (not in the portable aggregate) | 22 TCG-compatible
+# KernelWorld live lifecycle/service mechanism
 phase_smoke() {
   say "Layer 4 — smoke gates"
   need cargo; need clang; need qemu-system-x86_64
@@ -152,6 +154,7 @@ phase_smoke() {
     smoke-personality-qemu.sh     # M6A scalar personality supervision
     smoke-m6b-qemu.sh             # M6B bounded-copy views + delegated-resource revocation
     smoke-kernel-world-qemu.sh    # verified world admission + nonexecuting VM objects
+    smoke-kernel-world-live-qemu.sh # TCG-compatible live lifecycle/service mechanism
   )
   local g
   local required="${#gates[@]}"

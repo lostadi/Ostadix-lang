@@ -235,6 +235,66 @@ same-kind, same-length VM rule whose purpose differs by one byte. Sealing is
 denied until the exact device authority and exact VM-purpose bytes are
 registered.
 
+## Mode 22 native administrative lifecycle
+
+Mode 22 adds `runtime::kernel_world_boot` as a fixed-capacity native
+boot-service control plane and runs its separate
+`smoke-kernel-world-live-qemu.sh` gate under QEMU TCG. It supports at most two
+administrative boot instances and four published exports. A staged instance is
+bound to one exact admitted-world generation, one configured VM generation,
+and one retained consumer CSpace. Its `start` transition requires the
+independently granted `vm.machine:run` request. This is an administrative
+transition only; it does not enter a vCPU, load an image, or execute a provider.
+
+`record_health` accepts only the exact protocol ID retained from the admitted
+record. Until that observation, publication and lookup fail. Publication
+installs a new nontransferable `OBJECT_KERNEL_WORLD_EXPORT` capability directly
+into the exact consumer CSpace. The client receives a status right and, for a
+device-plane export only, a reset-request right derived from the byte-exact
+sealed authority request and its independently materialized `device.*:reset`
+grant. The provider's device grant is never transferred. Lookup returns only
+the already-installed exact capability. Resolution compares retained
+name/protocol IDs plus the exact consumer CSpace and required-right set; the
+native record does not retain the original name/protocol bytes for byte-exact
+lookup. Those IDs therefore do not grant authority. Status reports the native
+boot generation. A successful reset request records accepted O-core broker
+intent; there is no provider request transport or hardware reset behind it. A
+second live export with the same consumer-CSpace/name/protocol ID tuple is
+denied, so lookup cannot become ambiguous inside one consumer namespace.
+
+`SYS_CAP_CLOSE` routes `OBJECT_KERNEL_WORLD_EXPORT` through the lifecycle
+registry instead of closing only the raw capability slot. Registry liveness,
+capability closure, and service-generation retirement therefore advance in one
+transition. When the last export for a boot closes, the boot returns from
+`ACTIVE` to `HEALTHY`; a later publish or orderly teardown does not inherit an
+orphaned live binding.
+
+Failure first makes the boot unavailable, then withdraws every binding, closes
+each issued client capability, and advances its generation. Only after that
+withdrawal does it revoke the exact VM graph. It deliberately retains the
+admitted world and a bounded failure ticket so the record's declared
+`on_failure` policy can authorize a replacement configured VM with fresh
+boot/service generations. Old capabilities remain stale, an unrelated active
+instance survives, and explicit stop leaves a terminal tombstone. Only
+`always` policy may consume a stop tombstone as a restart. Otherwise
+`uninstall` first proves that neither an active boot nor an exact local VM graph
+remains, then atomically revokes admission before consuming the tombstone. A
+configured but un-staged replacement therefore makes uninstall fail without
+changing its graph, ticket, or admission. There is no public abandon operation,
+and a failed admission revoke leaves the tombstone intact so ordinary staging
+cannot reopen that generation.
+
+Every externally callable lifecycle and broker transition acquires one
+single-CPU operation owner and releases it through a monotonically advancing
+linearization epoch. Re-entry is denied while an operation owns the state. This
+is sufficient only for the current single-CPU gate; an SMP port requires an
+atomic kernel lock that preserves these linearization boundaries.
+
+The Mode 22 semantics gate invokes health and failure transitions directly. It
+does not yet enforce `health_timeout_ms`, receive a process/trap/scheduler or
+vCPU-exit death notification, or start and monitor an executable provider.
+Those boundaries are deliberately outside this mechanism claim.
+
 ## Next native slices
 
 The remaining dependency order is:
@@ -242,9 +302,9 @@ The remaining dependency order is:
 1. complete the M6B boundary beyond its current bounded-copy mechanism by
    integrating the CPL3 personality RPC, pinned windows, signals, fuzzing, and
    allocation-failure/race gates;
-2. connect the native normal-form admission surface to the running package
-   supervisor's start, health, stop, replacement, and export-publication
-   lifecycle;
+2. connect Mode 22's administrative lifecycle to an actually executing
+   provider, a timed health protocol, and real process/trap/scheduler or
+   vCPU-exit death notification;
 3. extend the Mode 21 AMD SVM/NPT synthetic execution backend into a pinned
    foreign-kernel boot and add capability-backed virtual devices;
 4. carry the same request and export contracts over a bounded guest-agent and
@@ -262,8 +322,10 @@ replacement can be rebound.
 
 The current native slice does not:
 
-- start, stop, health-check, replace, or publish exports from a provider, and
-  it installs no live device service or device capability;
+- start or stop executable provider code, enforce a health deadline, or detect
+  provider failure from a process, trap, scheduler, or vCPU-exit path;
+- install a provider-backed live device service or device capability; Mode 22
+  publishes only kernel-owned status/reset-intent export capabilities;
 - boot Linux, Plan 9, BSD, Windows, macOS, or another foreign kernel;
 - implement firmware execution, a guest agent, shared queue or shared ring,
   UEFI, ACPI, 9P, or another foreign ABI or filesystem protocol;
@@ -280,6 +342,9 @@ with NPT, executes a two-page synthetic guest, injects one vector, handles a
 controlled hypercall, denies an unmapped GPA, and tears down the exact NPT
 context while another VM survives. Mode 21 executes only that synthetic guest;
 it does not boot or supervise Linux, Plan 9, or any other foreign kernel, and
-it publishes no service. Separate source, artifact, guest-agent, shared-ring,
-device, 9P, and hardware gates remain necessary for provider execution and
-isolation claims beyond this first instruction-execution substrate.
+it publishes no service. Mode 22 separately proves bounded administrative
+start/health/publication/failure/restart/stop algebra, client capability
+withdrawal before VM-graph revoke, and stale-generation denial without entering
+a guest. Separate source, artifact, executable-provider, timed-health,
+guest-agent, shared-ring, device, 9P, and hardware gates remain necessary for
+provider execution and isolation claims beyond these mechanisms.
