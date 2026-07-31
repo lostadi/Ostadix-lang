@@ -16,7 +16,7 @@ min_vcpus = 1
 max_vcpus = 2
 min_memory_mib = 64
 max_memory_mib = 128
-requirements = ["vmx"]
+requirements = ["npt", "svm"]
 
 [lifecycle]
 health_protocol = "ocore.kernel-world-health/v1"
@@ -38,6 +38,7 @@ protocol = "linux.exec/v1"
 name = "network.default"
 plane = "device"
 protocol = "o.net-port/v1"
+authority_request = "device.net"
 
 [[capability_requests]]
 kind = "device.net"

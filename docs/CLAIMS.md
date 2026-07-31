@@ -52,18 +52,26 @@
   `tests/kernel_world_contract.rs` proves unknown-field rejection, canonical
   parsing, exact binding to verified package metadata, byte verification for
   package-payload images, expected-digest constraints for user-supplied images,
-  execution-mode constraints, explicit VM/device authority declarations,
-  health-gated export resolution, bounded request admission,
-  one-terminal-result behavior, failure fan-out, restart policy, provenance,
-  and stale-generation denial. Its `OKWORLD1` encoder produces a bounded,
-  deterministic native normal form only from a `VerifiedKernelWorld`; the
-  decoder returns a distinct inspection-only type and rejects malformed,
-  noncanonical, all-zero-package, or over-limit records; decoding cannot
-  recreate verified-package authority.
+  execution-mode constraints, unique request kinds, exact
+  device-export-to-`device.*` authority binding, and distinct-bound-authority
+  `max_devices` accounting. Multiple exports may share one authority request.
+  Reserved rights are kind-typed: `vm.machine` accepts `run|stop`, while
+  `device.*` accepts `reset|dma`. The gate also proves health-gated export
+  resolution, bounded request admission, one-terminal-result behavior, failure
+  fan-out, restart policy, provenance, and stale-generation denial. Its
+  `OKWORLD1` V2 encoder produces a bounded, deterministic native normal form
+  only from a `VerifiedKernelWorld`; the decoder returns a distinct
+  inspection-only type and rejects malformed, noncanonical, V1,
+  all-zero-package, or over-limit records. Decoding cannot recreate
+  verified-package authority.
 - Mode 20 carries that contract into a bounded native supervisor-admission/
-  object gate.
+  object gate. Its V2 fixture record is exactly 459 bytes with SHA-256
+  `0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232`
+  and exact canonical requirements `["npt", "svm"]`.
   `kernel_world_record.oc` verifies the embedded record's exact SHA-256 before
-  strict parsing. `kernel_world_admission.oc` preserves separate package and
+  strict parsing, including exact export-authority keys, unique request kinds,
+  typed rights, distinct-authority quota accounting, and byte-exact backend
+  requirements. `kernel_world_admission.oc` preserves separate package and
   manifest digests and applies independently registered default-deny policy
   keyed by exact package digest and copied byte-exact request kind/purpose;
   hashes cannot authorize. `vm_object.oc`
@@ -73,6 +81,15 @@
   and a later timer. It does not execute a foreign kernel, enter VMX/SVM,
   construct EPT/NPT, run firmware, inject interrupts, publish a provider export,
   assign a device, map DMA, or provide IOMMU isolation.
+- Mode 21 is an AMD-only executable substrate gate. The host requires KVM plus
+  `svm` and `npt`, and the kernel compares every retained requirement byte
+  against exactly `["npt", "svm"]` before SVM initialization. It executes only
+  a two-page real-mode synthetic guest through a private NPT, with bounded
+  interrupt injection, a controlled hypercall, an unmapped-GPA denial, exact
+  teardown, stop/restart, and unrelated-VM survival. Modes 20 and 21 provide no
+  live device service or device capability, guest agent, shared queue or shared
+  ring, Linux or Plan 9 boot, virtual device, PCI assignment, IOMMU isolation,
+  DMA mapping, device reset, or 9P implementation.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR

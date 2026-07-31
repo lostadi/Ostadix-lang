@@ -787,14 +787,25 @@ declaration to exact name, version, architecture, health, services, capability
 requests, and digest from a verified `ocore.package/v1` object. For a
 `package_payload` image it also verifies the captured image bytes against the
 declared SHA-256. A `user_supplied` image carries an expected-digest constraint;
-this stage does not accept or verify those external bytes.
+this stage does not accept or verify those external bytes. Request kinds are
+unique. Each device-plane export names its exact existing `device.*` request
+through `authority_request`, while non-device exports must omit that field;
+export names and protocols never derive authority. Multiple exports may share
+one request, and `max_devices` counts distinct bound authority requests. The
+reserved rights matrix is `vm.machine` -> `run|stop` and `device.*` ->
+`reset|dma`; other kinds cannot borrow those reserved rights.
 
 A bounded native follow-on now encodes that verified object into a deterministic
-hash-pinned `OKWORLD1` normal form and parses the actual embedded record in mode
-20. Native supervisor admission keeps package and manifest digests distinct
-and resolves each capability request through independently registered,
-exact-package and byte-exact kind/purpose policy with default denial; string
-hashes are never authority. The same gate
+hash-pinned `OKWORLD1` V2 normal form and parses the actual embedded record in
+mode 20. The current fixture record is exactly 459 bytes with SHA-256
+`0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232`;
+its complete backend requirement list is exactly the canonical
+`["npt", "svm"]`. V2 retains and validates each exact export-authority key,
+unique request kind, typed right, and distinct device-authority charge. Native
+supervisor admission keeps package and manifest digests distinct and resolves
+each capability request through independently registered, exact-package and
+byte-exact kind/purpose policy with default denial; string hashes are never
+authority. The same gate
 constructs generation-bound VM and vCPU identities and aligned guest-page
 attachments backed by anonymous memory objects, checks overlap and quota
 denial, and proves exact-world revocation/reclamation while an unrelated VM
@@ -809,15 +820,22 @@ DMA, or configure an IOMMU. It therefore does not complete any Milestone 11
 acceptance item.
 
 Mode 21 adds the first hardware execution slice without changing Mode 20's
-claims. On an AMD x86-64 host with nested SVM and NPT, it maps two existing
-guest-page objects through a private four-level NPT, enters a real-mode
-synthetic guest, injects a bounded interrupt, validates a guest computation,
-handles `VMMCALL`, and receives an NPF for an unmapped GPA. Stop clears the
-entire SVM/NPT context and releases retained page mappings; a second run,
-generation revocation, unrelated-VM survival, and a post-execution host timer
-are asserted by `smoke-kernel-world-execution-qemu.sh`. This is the executable
-VM substrate only: no foreign kernel, firmware, provider health, export,
-guest-agent, virtual device, DMA, or IOMMU claim is made.
+claims. Its host gate requires read/write KVM access and the exact CPU features
+`svm` and `npt`; the kernel then byte-compares the hash-pinned V2 record's
+complete requirement vector to exactly `["npt", "svm"]` before initializing
+SVM. On that AMD x86-64 backend it maps two existing guest-page objects through
+a private four-level NPT, enters a real-mode synthetic guest, injects a bounded
+interrupt, validates a guest computation, handles `VMMCALL`, and receives an
+NPF for an unmapped GPA. Stop clears the entire SVM/NPT context and releases
+retained page mappings; a second run, generation revocation, unrelated-VM
+survival, and a post-execution host timer are asserted by
+`smoke-kernel-world-execution-qemu.sh`.
+
+This remains a synthetic-guest VM substrate only. No live device service or
+device capability, guest agent, shared queue or shared ring, Linux or Plan 9
+boot, virtual device, PCI assignment, IOMMU isolation, DMA mapping, device
+reset, or 9P service exists in this slice. It also makes no provider-health or
+export-publication claim.
 
 Acceptance gate:
 
