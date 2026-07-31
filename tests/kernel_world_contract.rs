@@ -5,6 +5,7 @@ use o_lang::kernel_world::{
     RequestTerminal, ResourceQuotas, RestartPolicy, VerifiedKernelWorld, WorldCapabilityRequest,
     WorldExport, KERNEL_WORLD_CONTROL_PROTOCOL_V1, KERNEL_WORLD_RUNTIME_KIND,
     KERNEL_WORLD_SCHEMA_V1, MAX_NATIVE_KERNEL_WORLD_EXPORTS, NATIVE_KERNEL_WORLD_RECORD_V1,
+    NATIVE_KERNEL_WORLD_RECORD_V2,
 };
 use o_lang::live_system::manifest::{
     payload_sha256, BuildManifest, CapabilityRequestManifest, HealthManifest, PackageDigest,
@@ -49,11 +50,13 @@ fn binary_manifest() -> KernelWorldManifest {
                 name: "linux.exec".into(),
                 plane: ExportPlane::Abi,
                 protocol: "linux.exec/v1".into(),
+                authority_request: None,
             },
             WorldExport {
                 name: "network.default".into(),
                 plane: ExportPlane::Device,
                 protocol: "o.net-port/v1".into(),
+                authority_request: Some("device.net".into()),
             },
         ],
         capability_requests: vec![
@@ -86,11 +89,12 @@ fn native_string(value: &str) -> Vec<u8> {
     encoded
 }
 
-fn native_export(name: &str, plane: u8, protocol: &str) -> Vec<u8> {
+fn native_export(name: &str, plane: u8, protocol: &str, authority_request: &str) -> Vec<u8> {
     let mut encoded = native_string(name);
     encoded.push(plane);
     encoded.push(0);
     encoded.extend_from_slice(&native_string(protocol));
+    encoded.extend_from_slice(&native_string(authority_request));
     encoded
 }
 
@@ -185,6 +189,12 @@ fn strict_manifest_round_trips_canonically() {
     assert_eq!(reparsed.canonical_toml().unwrap(), canonical);
     assert_eq!(reparsed.integration, IntegrationMode::BinaryContained);
     assert!(canonical.find("device.net").unwrap() < canonical.find("vm.machine").unwrap());
+    assert!(canonical.contains("authority_request = \"device.net\""));
+    assert_eq!(
+        canonical.matches("authority_request =").count(),
+        1,
+        "non-device exports must omit the optional binding"
+    );
 
     let with_unknown = canonical.replacen(
         "schema = \"ocore.kernel-world/v1\"",
@@ -229,17 +239,40 @@ fn integration_and_authority_rules_fail_closed() {
     let error = unusable_vm.validate().unwrap_err().to_string();
     assert!(error.contains("`vm.machine` `run` authority"), "{error}");
 
-    let mut ambient_device = binary_manifest();
-    ambient_device
-        .capability_requests
-        .retain(|request| !request.kind.starts_with("device."));
-    let error = ambient_device.validate().unwrap_err().to_string();
-    assert!(error.contains("device-plane export"), "{error}");
+    let mut missing_binding = binary_manifest();
+    missing_binding.exports[1].authority_request = None;
+    let error = missing_binding.validate().unwrap_err().to_string();
+    assert!(error.contains("must name an exact `device.*`"), "{error}");
+
+    let mut unknown_binding = binary_manifest();
+    unknown_binding.exports[1].authority_request = Some("device.unknown".into());
+    let error = unknown_binding.validate().unwrap_err().to_string();
+    assert!(error.contains("exact existing `device.*`"), "{error}");
+
+    let mut bare_device_kind = binary_manifest();
+    bare_device_kind.capability_requests[0].kind = "device.".into();
+    let error = bare_device_kind.validate().unwrap_err().to_string();
+    assert!(error.contains("non-empty suffix"), "{error}");
+
+    let mut bare_device_binding = binary_manifest();
+    bare_device_binding.exports[1].authority_request = Some("device.".into());
+    let error = bare_device_binding.validate().unwrap_err().to_string();
+    assert!(error.contains("exact existing `device.*`"), "{error}");
+
+    let mut non_device_binding = binary_manifest();
+    non_device_binding.exports[0].authority_request = Some("device.net".into());
+    let error = non_device_binding.validate().unwrap_err().to_string();
+    assert!(error.contains("non-device export"), "{error}");
+    assert!(error.contains("must omit"), "{error}");
 
     let mut zero_device_quota = binary_manifest();
     zero_device_quota.quotas.max_devices = 0;
     let error = zero_device_quota.validate().unwrap_err().to_string();
-    assert!(error.contains("nonzero device quota"), "{error}");
+    assert!(
+        error.contains("distinct device authority requests"),
+        "{error}"
+    );
+    assert!(error.contains("limit of 0"), "{error}");
 
     let mut unpinned = binary_manifest();
     unpinned.image = KernelImage::UserSupplied {
@@ -247,6 +280,94 @@ fn integration_and_authority_rules_fail_closed() {
     };
     let error = unpinned.validate().unwrap_err().to_string();
     assert!(error.contains("64 lowercase hexadecimal"), "{error}");
+}
+
+#[test]
+fn capability_request_kinds_and_reserved_rights_are_unambiguous() {
+    let mut duplicate_kind = binary_manifest();
+    duplicate_kind
+        .capability_requests
+        .push(WorldCapabilityRequest {
+            kind: "device.net".into(),
+            rights: vec!["reset".into()],
+            purpose: "a different purpose cannot create a second key".into(),
+        });
+    let error = duplicate_kind.validate().unwrap_err().to_string();
+    assert!(error.contains("capability_requests.kind"), "{error}");
+    assert!(error.contains("device.net"), "{error}");
+
+    let mut vm_with_device_right = binary_manifest();
+    vm_with_device_right
+        .capability_requests
+        .iter_mut()
+        .find(|request| request.kind == "vm.machine")
+        .unwrap()
+        .rights
+        .push("dma".into());
+    let error = vm_with_device_right.validate().unwrap_err().to_string();
+    assert!(error.contains("vm.machine"), "{error}");
+    assert!(error.contains("dma"), "{error}");
+
+    let mut device_with_vm_right = binary_manifest();
+    device_with_vm_right
+        .capability_requests
+        .iter_mut()
+        .find(|request| request.kind == "device.net")
+        .unwrap()
+        .rights
+        .push("run".into());
+    let error = device_with_vm_right.validate().unwrap_err().to_string();
+    assert!(error.contains("device.net"), "{error}");
+    assert!(error.contains("run"), "{error}");
+
+    let mut other_with_reserved_right = binary_manifest();
+    other_with_reserved_right
+        .capability_requests
+        .push(WorldCapabilityRequest {
+            kind: "service.audit".into(),
+            rights: vec!["stop".into()],
+            purpose: "reserved rights remain kind-specific".into(),
+        });
+    let error = other_with_reserved_right
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("service.audit"), "{error}");
+    assert!(error.contains("stop"), "{error}");
+}
+
+#[test]
+fn device_quota_counts_distinct_bound_authority_requests() {
+    let mut shared_authority = binary_manifest();
+    shared_authority.exports.push(WorldExport {
+        name: "network.control".into(),
+        plane: ExportPlane::Device,
+        protocol: "o.net-control/v1".into(),
+        authority_request: Some("device.net".into()),
+    });
+    shared_authority.validate().unwrap();
+
+    let mut distinct_authority = shared_authority;
+    distinct_authority
+        .capability_requests
+        .push(WorldCapabilityRequest {
+            kind: "device.storage".into(),
+            rights: vec!["reset".into()],
+            purpose: "exclusive storage provider".into(),
+        });
+    distinct_authority.exports.push(WorldExport {
+        name: "storage.default".into(),
+        plane: ExportPlane::Device,
+        protocol: "o.block/v1".into(),
+        authority_request: Some("device.storage".into()),
+    });
+    let error = distinct_authority.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("distinct device authority requests"),
+        "{error}"
+    );
+    assert!(error.contains("limit of 1"), "{error}");
+    assert!(error.contains("got 2"), "{error}");
 }
 
 #[test]
@@ -432,7 +553,7 @@ fn verified_world_encodes_a_canonical_native_admission_record() {
     assert_eq!(&first.bytes()[0..8], b"OKWORLD1");
     assert_eq!(
         u16::from_le_bytes(first.bytes()[8..10].try_into().unwrap()),
-        NATIVE_KERNEL_WORLD_RECORD_V1
+        NATIVE_KERNEL_WORLD_RECORD_V2
     );
     assert_eq!(
         u32::from_le_bytes(first.bytes()[12..16].try_into().unwrap()) as usize,
@@ -469,11 +590,26 @@ fn native_admission_record_rejects_tamper_and_noncanonical_headers() {
     ));
 
     let mut wrong_version = record.bytes().to_vec();
-    wrong_version[8..10].copy_from_slice(&2u16.to_le_bytes());
+    wrong_version[8..10].copy_from_slice(&NATIVE_KERNEL_WORLD_RECORD_V1.to_le_bytes());
     assert!(matches!(
         InspectedNativeKernelWorldRecord::from_bytes(&wrong_version),
         Err(KernelWorldError::InvalidNativeRecord { .. })
     ));
+
+    let device_export = native_export("network.default", 1, "o.net-port/v1", "device.net");
+    let device_export_offset = find_bytes(record.bytes(), &device_export);
+    let authority_offset = device_export_offset + device_export.len() - "device.net".len();
+    let mut forged_authority = record.bytes().to_vec();
+    forged_authority[authority_offset..authority_offset + "device.net".len()]
+        .copy_from_slice(b"device.bad");
+    let error = InspectedNativeKernelWorldRecord::from_bytes(&forged_authority)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exact existing `device.*`")
+            || error.contains("canonical manifest digest mismatch"),
+        "{error}"
+    );
 
     let mut wrong_length = record.bytes().to_vec();
     wrong_length[12..16].copy_from_slice(&1u32.to_le_bytes());
@@ -499,8 +635,8 @@ fn native_inspection_rejects_zero_digest_and_reordered_canonical_tuples() {
         .to_string();
     assert!(error.contains("all-zero sentinel"), "{error}");
 
-    let first = native_export("linux.exec", 2, "linux.exec/v1");
-    let second = native_export("network.default", 1, "o.net-port/v1");
+    let first = native_export("linux.exec", 2, "linux.exec/v1", "");
+    let second = native_export("network.default", 1, "o.net-port/v1", "device.net");
     let first_offset = find_bytes(record.bytes(), &first);
     let second_offset = find_bytes(record.bytes(), &second);
     assert_eq!(first_offset + first.len(), second_offset);
@@ -576,6 +712,7 @@ fn native_admission_pilot_bounds_reject_without_truncation() {
             name: format!("semantic.extra{ordinal}"),
             plane: ExportPlane::Semantic,
             protocol: format!("o.extra{ordinal}/v1"),
+            authority_request: None,
         });
     }
     manifest.validate().unwrap();
@@ -593,9 +730,13 @@ fn native_admission_pilot_bounds_reject_without_truncation() {
 #[test]
 fn native_admission_rejects_values_outside_the_native_parser_domain() {
     let mut unsupported_right = binary_manifest();
-    unsupported_right.capability_requests[0]
-        .rights
-        .push("audit".into());
+    unsupported_right
+        .capability_requests
+        .push(WorldCapabilityRequest {
+            kind: "service.audit".into(),
+            rights: vec!["audit".into()],
+            purpose: "auditable non-native service".into(),
+        });
     let package = package_for(&unsupported_right, |_| {});
     let error = VerifiedKernelWorld::from_package(&package)
         .unwrap()
@@ -646,14 +787,18 @@ fn native_ocore_fixture_has_a_pinned_cross_language_identity() {
         .encode_native_record()
         .unwrap();
 
-    assert_eq!(record.bytes().len(), 440);
     assert_eq!(
-        record.package_digest().as_hex(),
-        "7ac7052463833144101db2ef77301855ec70dd73dae193dbb4abb0fef69a0e67"
-    );
-    assert_eq!(
-        record.sha256_hex(),
-        "36ebffa374631fc51e70cc20e0512fd899f3703fe15d200a33e330482a707671"
+        (
+            record.bytes().len(),
+            record.package_digest().as_hex(),
+            record.sha256_hex(),
+        ),
+        (
+            459,
+            "be912b0cbd26ac76fb57500399907a1af214e1f7784eee59e5758bc481815a78",
+            "0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232".into(),
+        ),
+        "refresh the native fixture length, package digest, and record digest together"
     );
     InspectedNativeKernelWorldRecord::from_bytes(record.bytes()).unwrap();
 }
