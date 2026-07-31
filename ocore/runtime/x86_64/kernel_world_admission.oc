@@ -31,6 +31,7 @@ pub const RIGHT_DEVICE_DMA: u64 = 8;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 static VM_MACHINE_TEXT: [u8; 10] = b"vm.machine";
+static DEVICE_PREFIX: [u8; 7] = b"device.";
 
 pub const WORLD_STATE_STAGING: u64 = 1;
 pub const WORLD_STATE_ADMITTED: u64 = 2;
@@ -91,6 +92,9 @@ static mut REQUEST_COUNTS: [usize; 2] = [0; 2];
 static mut EXPORT_NAME_IDS: [u64; 8] = [0; 8];
 static mut EXPORT_PLANES: [u64; 8] = [0; 8];
 static mut EXPORT_PROTOCOL_IDS: [u64; 8] = [0; 8];
+static mut EXPORT_AUTHORITY_IDS: [u64; 8] = [0; 8];
+static mut EXPORT_AUTHORITY_LENGTHS: [usize; 8] = [0; 8];
+static mut EXPORT_AUTHORITY_BYTES: [u8; 4096] = [0; 4096];
 static mut EXPORT_DEFINED: [u8; 8] = [0; 8];
 
 static mut REQUEST_KINDS: [u64; 16] = [0; 16];
@@ -153,6 +157,10 @@ fn request_text_index(request: usize, byte: usize) -> usize {
     return request * MAX_POLICY_TEXT_BYTES + byte;
 }
 
+fn export_text_index(export: usize, byte: usize) -> usize {
+    return export * MAX_POLICY_TEXT_BYTES + byte;
+}
+
 fn policy_text_index(rule: usize, byte: usize) -> usize {
     return rule * MAX_POLICY_TEXT_BYTES + byte;
 }
@@ -209,6 +217,120 @@ unsafe fn text_hash(source: *const u8, length: usize) -> u64 {
         byte += 1;
     }
     return value;
+}
+
+unsafe fn pointer_text_equals(
+    source: *const u8,
+    length: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    if source as usize == 0
+        || expected as usize == 0
+        || length != expected_length {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < length {
+        if volatile_load(source + byte) != volatile_load(expected + byte) {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn pointer_has_prefix(
+    source: *const u8,
+    length: usize,
+    prefix: *const u8,
+    prefix_length: usize
+) -> bool {
+    if source as usize == 0
+        || prefix as usize == 0
+        || length < prefix_length {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < prefix_length {
+        if volatile_load(source + byte) != volatile_load(prefix + byte) {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn pointer_kind_is_vm_machine(
+    source: *const u8,
+    length: usize
+) -> bool {
+    return pointer_text_equals(
+        source,
+        length,
+        (&VM_MACHINE_TEXT[0]),
+        10
+    );
+}
+
+unsafe fn pointer_kind_is_device(
+    source: *const u8,
+    length: usize
+) -> bool {
+    return length > 7
+        && pointer_has_prefix(
+        source,
+        length,
+        (&DEVICE_PREFIX[0]),
+        7
+    );
+}
+
+unsafe fn rights_match_pointer_kind(
+    kind: *const u8,
+    kind_length: usize,
+    rights: u64
+) -> bool {
+    if rights == 0 {
+        return false;
+    }
+    if pointer_kind_is_vm_machine(kind, kind_length) {
+        return (rights & (RIGHT_DEVICE_RESET | RIGHT_DEVICE_DMA)) == 0;
+    }
+    if pointer_kind_is_device(kind, kind_length) {
+        return (rights & (RIGHT_VM_RUN | RIGHT_VM_STOP)) == 0;
+    }
+    // The current native vocabulary reserves every defined bit to one of the
+    // two exact request-kind families above.
+    return (rights
+        & (RIGHT_VM_RUN
+            | RIGHT_VM_STOP
+            | RIGHT_DEVICE_RESET
+            | RIGHT_DEVICE_DMA)) == 0;
+}
+
+unsafe fn clear_export_authority(export: usize) -> void {
+    EXPORT_AUTHORITY_IDS[export] = 0;
+    EXPORT_AUTHORITY_LENGTHS[export] = 0;
+    let mut byte: usize = 0;
+    while byte < MAX_POLICY_TEXT_BYTES {
+        EXPORT_AUTHORITY_BYTES[export_text_index(export, byte)] = 0;
+        byte += 1;
+    }
+}
+
+unsafe fn copy_export_authority(
+    export: usize,
+    authority: *const u8,
+    authority_length: usize
+) -> void {
+    let mut byte: usize = 0;
+    while byte < authority_length {
+        EXPORT_AUTHORITY_BYTES[export_text_index(export, byte)] =
+            volatile_load(authority + byte);
+        byte += 1;
+    }
+    EXPORT_AUTHORITY_LENGTHS[export] = authority_length;
 }
 
 unsafe fn clear_request_text(request: usize) -> void {
@@ -303,23 +425,44 @@ unsafe fn request_text_matches_policy(request: usize, rule: usize) -> bool {
     return true;
 }
 
-unsafe fn requests_have_same_text(left: usize, right: usize) -> bool {
-    if REQUEST_KIND_LENGTHS[left] != REQUEST_KIND_LENGTHS[right]
-        || REQUEST_PURPOSE_LENGTHS[left] != REQUEST_PURPOSE_LENGTHS[right] {
+unsafe fn pointer_text_matches_policy(
+    kind: *const u8,
+    kind_length: usize,
+    purpose: *const u8,
+    purpose_length: usize,
+    rule: usize
+) -> bool {
+    if kind_length != POLICY_KIND_LENGTHS[rule]
+        || purpose_length != POLICY_PURPOSE_LENGTHS[rule] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < kind_length {
+        if volatile_load(kind + byte)
+            != POLICY_KIND_BYTES[policy_text_index(rule, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    byte = 0;
+    while byte < purpose_length {
+        if volatile_load(purpose + byte)
+            != POLICY_PURPOSE_BYTES[policy_text_index(rule, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn requests_have_same_kind(left: usize, right: usize) -> bool {
+    if REQUEST_KIND_LENGTHS[left] != REQUEST_KIND_LENGTHS[right] {
         return false;
     }
     let mut byte: usize = 0;
     while byte < REQUEST_KIND_LENGTHS[left] {
         if REQUEST_KIND_BYTES[request_text_index(left, byte)]
             != REQUEST_KIND_BYTES[request_text_index(right, byte)] {
-            return false;
-        }
-        byte += 1;
-    }
-    byte = 0;
-    while byte < REQUEST_PURPOSE_LENGTHS[left] {
-        if REQUEST_PURPOSE_BYTES[request_text_index(left, byte)]
-            != REQUEST_PURPOSE_BYTES[request_text_index(right, byte)] {
             return false;
         }
         byte += 1;
@@ -364,6 +507,87 @@ unsafe fn request_kind_is_vm_machine(request: usize) -> bool {
         byte += 1;
     }
     return true;
+}
+
+unsafe fn request_kind_is_device(request: usize) -> bool {
+    if REQUEST_KIND_LENGTHS[request] <= 7 {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < 7 {
+        if REQUEST_KIND_BYTES[request_text_index(request, byte)]
+            != DEVICE_PREFIX[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn request_rights_match_kind(request: usize) -> bool {
+    let rights: u64 = REQUEST_RIGHTS[request];
+    if rights == 0 {
+        return false;
+    }
+    if request_kind_is_vm_machine(request) {
+        return (rights & (RIGHT_DEVICE_RESET | RIGHT_DEVICE_DMA)) == 0;
+    }
+    if request_kind_is_device(request) {
+        return (rights & (RIGHT_VM_RUN | RIGHT_VM_STOP)) == 0;
+    }
+    return (rights
+        & (RIGHT_VM_RUN
+            | RIGHT_VM_STOP
+            | RIGHT_DEVICE_RESET
+            | RIGHT_DEVICE_DMA)) == 0;
+}
+
+unsafe fn policy_kind_is_vm_machine(rule: usize) -> bool {
+    if POLICY_KIND_LENGTHS[rule] != 10 {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < 10 {
+        if POLICY_KIND_BYTES[policy_text_index(rule, byte)]
+            != VM_MACHINE_TEXT[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn policy_kind_is_device(rule: usize) -> bool {
+    if POLICY_KIND_LENGTHS[rule] <= 7 {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < 7 {
+        if POLICY_KIND_BYTES[policy_text_index(rule, byte)]
+            != DEVICE_PREFIX[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn policy_rights_match_kind(rule: usize) -> bool {
+    let rights: u64 = POLICY_ALLOWED_RIGHTS[rule];
+    if rights == 0 {
+        return false;
+    }
+    if policy_kind_is_vm_machine(rule) {
+        return (rights & (RIGHT_DEVICE_RESET | RIGHT_DEVICE_DMA)) == 0;
+    }
+    if policy_kind_is_device(rule) {
+        return (rights & (RIGHT_VM_RUN | RIGHT_VM_STOP)) == 0;
+    }
+    return (rights
+        & (RIGHT_VM_RUN
+            | RIGHT_VM_STOP
+            | RIGHT_DEVICE_RESET
+            | RIGHT_DEVICE_DMA)) == 0;
 }
 
 fn valid_execution_contract(
@@ -471,6 +695,7 @@ unsafe fn clear_world(slot: usize) -> void {
         EXPORT_NAME_IDS[index] = 0;
         EXPORT_PLANES[index] = 0;
         EXPORT_PROTOCOL_IDS[index] = 0;
+        clear_export_authority(index);
         EXPORT_DEFINED[index] = 0;
         ordinal += 1;
     }
@@ -570,17 +795,153 @@ unsafe fn binary_run_request_present(slot: usize) -> bool {
     return false;
 }
 
-unsafe fn has_device_export(slot: usize) -> bool {
+unsafe fn export_authority_is_device(export: usize) -> bool {
+    if EXPORT_AUTHORITY_LENGTHS[export] <= 7 {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < 7 {
+        if EXPORT_AUTHORITY_BYTES[export_text_index(export, byte)]
+            != DEVICE_PREFIX[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn export_authorities_equal(left: usize, right: usize) -> bool {
+    if EXPORT_AUTHORITY_LENGTHS[left] != EXPORT_AUTHORITY_LENGTHS[right] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < EXPORT_AUTHORITY_LENGTHS[left] {
+        if EXPORT_AUTHORITY_BYTES[export_text_index(left, byte)]
+            != EXPORT_AUTHORITY_BYTES[export_text_index(right, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn export_authority_matches_request(
+    export: usize,
+    request: usize
+) -> bool {
+    if EXPORT_AUTHORITY_IDS[export] != REQUEST_KINDS[request]
+        || EXPORT_AUTHORITY_LENGTHS[export]
+            != REQUEST_KIND_LENGTHS[request] {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < EXPORT_AUTHORITY_LENGTHS[export] {
+        if EXPORT_AUTHORITY_BYTES[export_text_index(export, byte)]
+            != REQUEST_KIND_BYTES[request_text_index(request, byte)] {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn device_export_has_bound_request(
+    slot: usize,
+    export_ordinal: usize
+) -> bool {
+    let export: usize = export_index(slot, export_ordinal);
+    if EXPORT_DEFINED[export] != 1
+        || EXPORT_PLANES[export] != EXPORT_PLANE_DEVICE
+        || !export_authority_is_device(export) {
+        return false;
+    }
+    let mut request_ordinal: usize = 0;
+    while request_ordinal < REQUEST_COUNTS[slot] {
+        let request: usize = request_index(slot, request_ordinal);
+        if REQUEST_DEFINED[request] == 1
+            && request_kind_is_device(request)
+            && export_authority_matches_request(export, request) {
+            return true;
+        }
+        request_ordinal += 1;
+    }
+    return false;
+}
+
+unsafe fn distinct_bound_device_authorities(slot: usize) -> usize {
+    let mut distinct: usize = 0;
     let mut ordinal: usize = 0;
     while ordinal < EXPORT_COUNTS[slot] {
-        let index: usize = export_index(slot, ordinal);
-        if EXPORT_DEFINED[index] == 1
-            && EXPORT_PLANES[index] == EXPORT_PLANE_DEVICE {
-            return true;
+        let export: usize = export_index(slot, ordinal);
+        if EXPORT_DEFINED[export] == 1
+            && EXPORT_PLANES[export] == EXPORT_PLANE_DEVICE {
+            let mut duplicate: bool = false;
+            let mut prior: usize = 0;
+            while prior < ordinal {
+                let prior_export: usize = export_index(slot, prior);
+                if EXPORT_DEFINED[prior_export] == 1
+                    && EXPORT_PLANES[prior_export] == EXPORT_PLANE_DEVICE
+                    && EXPORT_AUTHORITY_IDS[prior_export]
+                        == EXPORT_AUTHORITY_IDS[export]
+                    && export_authorities_equal(prior_export, export) {
+                    duplicate = true;
+                }
+                prior += 1;
+            }
+            if !duplicate {
+                distinct += 1;
+            }
         }
         ordinal += 1;
     }
-    return false;
+    return distinct;
+}
+
+unsafe fn device_export_bindings_valid(slot: usize) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < EXPORT_COUNTS[slot] {
+        let export: usize = export_index(slot, ordinal);
+        if EXPORT_DEFINED[export] != 1 {
+            return false;
+        }
+        if EXPORT_PLANES[export] == EXPORT_PLANE_DEVICE {
+            if !device_export_has_bound_request(slot, ordinal) {
+                return false;
+            }
+        } else if EXPORT_AUTHORITY_IDS[export] != 0
+            || EXPORT_AUTHORITY_LENGTHS[export] != 0 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return distinct_bound_device_authorities(slot) <= MAXIMUM_DEVICES[slot];
+}
+
+unsafe fn export_authority_storage_is_valid(export: usize) -> bool {
+    let length: usize = EXPORT_AUTHORITY_LENGTHS[export];
+    if length > MAX_POLICY_TEXT_BYTES {
+        return false;
+    }
+    let mut hash: u64 = FNV_OFFSET;
+    let mut byte: usize = 0;
+    while byte < MAX_POLICY_TEXT_BYTES {
+        let value: u8 =
+            EXPORT_AUTHORITY_BYTES[export_text_index(export, byte)];
+        if byte < length {
+            if value < 0x20 || value > 0x7e {
+                return false;
+            }
+            hash = (hash ^ value as u64) * FNV_PRIME;
+        } else if value != 0 {
+            return false;
+        }
+        byte += 1;
+    }
+    if length == 0 {
+        return EXPORT_AUTHORITY_IDS[export] == 0;
+    }
+    return EXPORT_AUTHORITY_IDS[export] != 0
+        && EXPORT_AUTHORITY_IDS[export] == hash;
 }
 
 unsafe fn active_worlds_are_unique() -> bool {
@@ -642,7 +1003,14 @@ unsafe fn policy_table_is_valid() -> bool {
                 || POLICY_KIND_LENGTHS[rule] > MAX_POLICY_TEXT_BYTES
                 || POLICY_PURPOSE_LENGTHS[rule] == 0
                 || POLICY_PURPOSE_LENGTHS[rule] > MAX_POLICY_TEXT_BYTES
-                || POLICY_ALLOWED_RIGHTS[rule] == 0 {
+                || POLICY_ALLOWED_RIGHTS[rule] == 0
+                || (POLICY_ALLOWED_RIGHTS[rule]
+                    & (RIGHT_VM_RUN
+                        | RIGHT_VM_STOP
+                        | RIGHT_DEVICE_RESET
+                        | RIGHT_DEVICE_DMA))
+                    != POLICY_ALLOWED_RIGHTS[rule]
+                || !policy_rights_match_kind(rule) {
                 return false;
             }
             let mut prior: usize = 0;
@@ -711,6 +1079,19 @@ pub unsafe fn invariants_hold() -> bool {
                 }
                 word += 1;
             }
+            let mut empty_ordinal: usize = 0;
+            while empty_ordinal < MAX_EXPORTS_PER_WORLD {
+                let empty_export: usize =
+                    export_index(slot, empty_ordinal);
+                if EXPORT_NAME_IDS[empty_export] != 0
+                    || EXPORT_PLANES[empty_export] != 0
+                    || EXPORT_PROTOCOL_IDS[empty_export] != 0
+                    || EXPORT_DEFINED[empty_export] != 0
+                    || !export_authority_storage_is_valid(empty_export) {
+                    return false;
+                }
+                empty_ordinal += 1;
+            }
         } else if world_state == WORLD_STAGING
             || world_state == WORLD_ADMITTED {
             if !digest_is_nonzero(
@@ -766,10 +1147,26 @@ pub unsafe fn invariants_hold() -> bool {
             while ordinal < MAX_EXPORTS_PER_WORLD {
                 let index: usize = export_index(slot, ordinal);
                 if ordinal < EXPORT_COUNTS[slot] {
-                    if EXPORT_DEFINED[index] != 0
-                        && (EXPORT_NAME_IDS[index] == 0
+                    if EXPORT_DEFINED[index] == 0 {
+                        if EXPORT_NAME_IDS[index] != 0
+                            || EXPORT_PLANES[index] != 0
+                            || EXPORT_PROTOCOL_IDS[index] != 0
+                            || !export_authority_storage_is_valid(index) {
+                            return false;
+                        }
+                    } else if EXPORT_DEFINED[index] == 1 {
+                        if EXPORT_NAME_IDS[index] == 0
                             || !valid_export_plane(EXPORT_PLANES[index])
-                            || EXPORT_PROTOCOL_IDS[index] == 0) {
+                            || EXPORT_PROTOCOL_IDS[index] == 0
+                            || !export_authority_storage_is_valid(index)
+                            || (EXPORT_PLANES[index] == EXPORT_PLANE_DEVICE
+                                && !export_authority_is_device(index))
+                            || (EXPORT_PLANES[index] != EXPORT_PLANE_DEVICE
+                                && (EXPORT_AUTHORITY_IDS[index] != 0
+                                    || EXPORT_AUTHORITY_LENGTHS[index] != 0)) {
+                            return false;
+                        }
+                    } else {
                         return false;
                     }
                     if world_state != WORLD_STAGING
@@ -791,6 +1188,9 @@ pub unsafe fn invariants_hold() -> bool {
                 } else if EXPORT_NAME_IDS[index] != 0
                     || EXPORT_PLANES[index] != 0
                     || EXPORT_PROTOCOL_IDS[index] != 0
+                    || EXPORT_AUTHORITY_IDS[index] != 0
+                    || EXPORT_AUTHORITY_LENGTHS[index] != 0
+                    || !export_authority_storage_is_valid(index)
                     || EXPORT_DEFINED[index] != 0 {
                     return false;
                 }
@@ -810,7 +1210,14 @@ pub unsafe fn invariants_hold() -> bool {
                             || REQUEST_PURPOSE_LENGTHS[index] == 0
                             || REQUEST_PURPOSE_LENGTHS[index]
                                 > MAX_POLICY_TEXT_BYTES
-                            || REQUEST_RIGHTS[index] == 0) {
+                            || REQUEST_RIGHTS[index] == 0
+                            || (REQUEST_RIGHTS[index]
+                                & (RIGHT_VM_RUN
+                                    | RIGHT_VM_STOP
+                                    | RIGHT_DEVICE_RESET
+                                    | RIGHT_DEVICE_DMA))
+                                != REQUEST_RIGHTS[index]
+                            || !request_rights_match_kind(index)) {
                         return false;
                     }
                     if world_state == WORLD_STAGING {
@@ -826,7 +1233,7 @@ pub unsafe fn invariants_hold() -> bool {
                         while prior < ordinal {
                             let prior_index: usize = request_index(slot, prior);
                             if REQUEST_DEFINED[prior_index] == 1
-                                && requests_have_same_text(prior_index, index) {
+                                && requests_have_same_kind(prior_index, index) {
                                 return false;
                             }
                             prior += 1;
@@ -861,7 +1268,7 @@ pub unsafe fn invariants_hold() -> bool {
                     && !binary_run_request_present(slot) {
                     return false;
                 }
-                if has_device_export(slot) && MAXIMUM_DEVICES[slot] == 0 {
+                if !device_export_bindings_valid(slot) {
                     return false;
                 }
             }
@@ -931,6 +1338,11 @@ pub unsafe fn register_policy(
                 | RIGHT_VM_STOP
                 | RIGHT_DEVICE_RESET
                 | RIGHT_DEVICE_DMA)) != allowed_rights
+        || !rights_match_pointer_kind(
+            request_kind,
+            request_kind_length,
+            allowed_rights
+        )
         || POLICY_REGISTRATIONS == MAX_COUNTER {
         return deny();
     }
@@ -1144,7 +1556,9 @@ pub unsafe fn define_export(
     ordinal: usize,
     name_id: u64,
     plane: u64,
-    protocol_id: u64
+    protocol_id: u64,
+    authority: *const u8,
+    authority_length: usize
 ) -> u64 {
     if !preflight() {
         return 0;
@@ -1157,6 +1571,20 @@ pub unsafe fn define_export(
         || !valid_export_plane(plane)
         || protocol_id == 0 {
         return deny();
+    }
+    if (plane == EXPORT_PLANE_DEVICE
+            && (!valid_text(authority, authority_length)
+                || !pointer_kind_is_device(authority, authority_length)))
+        || (plane != EXPORT_PLANE_DEVICE
+            && (authority as usize != 0 || authority_length != 0)) {
+        return deny();
+    }
+    let mut authority_id: u64 = 0;
+    if plane == EXPORT_PLANE_DEVICE {
+        authority_id = text_hash(authority, authority_length);
+        if authority_id == 0 {
+            return deny();
+        }
     }
     let index: usize = export_index(slot, ordinal);
     if EXPORT_DEFINED[index] != 0 {
@@ -1174,6 +1602,10 @@ pub unsafe fn define_export(
     EXPORT_NAME_IDS[index] = name_id;
     EXPORT_PLANES[index] = plane;
     EXPORT_PROTOCOL_IDS[index] = protocol_id;
+    if plane == EXPORT_PLANE_DEVICE {
+        copy_export_authority(index, authority, authority_length);
+        EXPORT_AUTHORITY_IDS[index] = authority_id;
+    }
     EXPORT_DEFINED[index] = 1;
     return finish(1);
 }
@@ -1204,6 +1636,9 @@ pub unsafe fn define_request(
                 | RIGHT_DEVICE_DMA)) != requested_rights {
         return deny();
     }
+    if !rights_match_pointer_kind(kind, kind_length, requested_rights) {
+        return deny();
+    }
     let kind_id: u64 = text_hash(kind, kind_length);
     let purpose_id: u64 = text_hash(purpose, purpose_length);
     if kind_id == 0 || purpose_id == 0 {
@@ -1217,22 +1652,12 @@ pub unsafe fn define_request(
     while prior < REQUEST_COUNTS[slot] {
         let prior_index: usize = request_index(slot, prior);
         if REQUEST_DEFINED[prior_index] == 1
-            && REQUEST_KIND_LENGTHS[prior_index] == kind_length
-            && REQUEST_PURPOSE_LENGTHS[prior_index] == purpose_length {
+            && REQUEST_KIND_LENGTHS[prior_index] == kind_length {
             let mut same: bool = true;
             let mut byte: usize = 0;
             while byte < kind_length {
                 if REQUEST_KIND_BYTES[request_text_index(prior_index, byte)]
                     != volatile_load(kind + byte) {
-                    same = false;
-                }
-                byte += 1;
-            }
-            byte = 0;
-            while byte < purpose_length {
-                if REQUEST_PURPOSE_BYTES[
-                    request_text_index(prior_index, byte)
-                ] != volatile_load(purpose + byte) {
                     same = false;
                 }
                 byte += 1;
@@ -1290,7 +1715,7 @@ pub unsafe fn seal(admission: u64) -> u64 {
         && !binary_run_request_present(slot) {
         return deny();
     }
-    if has_device_export(slot) && MAXIMUM_DEVICES[slot] == 0 {
+    if !device_export_bindings_valid(slot) {
         return deny();
     }
 
@@ -1529,6 +1954,41 @@ pub unsafe fn export_protocol_id_at(world: u64, ordinal: usize) -> u64 {
     return EXPORT_PROTOCOL_IDS[export_index(slot, ordinal)];
 }
 
+pub unsafe fn export_authority_id_at(world: u64, ordinal: usize) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= EXPORT_COUNTS[slot] {
+        return 0;
+    }
+    return EXPORT_AUTHORITY_IDS[export_index(slot, ordinal)];
+}
+
+pub unsafe fn export_authority_length_at(
+    world: u64,
+    ordinal: usize
+) -> usize {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS || ordinal >= EXPORT_COUNTS[slot] {
+        return 0;
+    }
+    return EXPORT_AUTHORITY_LENGTHS[export_index(slot, ordinal)];
+}
+
+pub unsafe fn export_authority_byte_at(
+    world: u64,
+    ordinal: usize,
+    byte: usize
+) -> u64 {
+    let slot: usize = checked_world_current(world);
+    if slot >= MAX_KERNEL_WORLDS
+        || ordinal >= EXPORT_COUNTS[slot]
+        || byte >= EXPORT_AUTHORITY_LENGTHS[export_index(slot, ordinal)] {
+        return 0;
+    }
+    return EXPORT_AUTHORITY_BYTES[
+        export_text_index(export_index(slot, ordinal), byte)
+    ] as u64;
+}
+
 pub unsafe fn request_count(world: u64) -> usize {
     let slot: usize = checked_world_any(world);
     if slot >= MAX_KERNEL_WORLDS { return 0; }
@@ -1576,17 +2036,38 @@ pub unsafe fn policy_allowed_rights(
     package_digest_one: u64,
     package_digest_two: u64,
     package_digest_three: u64,
-    request_kind: u64,
-    request_purpose: u64
+    request_kind: *const u8,
+    request_kind_length: usize,
+    request_purpose: *const u8,
+    request_purpose_length: usize
 ) -> u64 {
-    if INITIALIZED == 0 || POISONED != 0 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !valid_text(request_kind, request_kind_length)
+        || !valid_text(request_purpose, request_purpose_length) {
+        return 0;
+    }
+    let request_kind_id: u64 =
+        text_hash(request_kind, request_kind_length);
+    let request_purpose_id: u64 =
+        text_hash(request_purpose, request_purpose_length);
+    if request_kind_id == 0 || request_purpose_id == 0 {
         return 0;
     }
     let mut rule: usize = 0;
     while rule < MAX_POLICY_RULES {
         if POLICY_USED[rule] == 1
-            && POLICY_KINDS[rule] == request_kind
-            && POLICY_PURPOSES[rule] == request_purpose
+            // Hashes reject candidates only. Exact caller bytes are required
+            // before this inspection surface can return policy authority.
+            && POLICY_KINDS[rule] == request_kind_id
+            && POLICY_PURPOSES[rule] == request_purpose_id
+            && pointer_text_matches_policy(
+                request_kind,
+                request_kind_length,
+                request_purpose,
+                request_purpose_length,
+                rule
+            )
             && policy_package_digest_matches(
                 rule,
                 package_digest_zero,

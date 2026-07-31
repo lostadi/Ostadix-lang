@@ -74,6 +74,89 @@ See [docs/AI_GUIDE.md](docs/AI_GUIDE.md) for the full agent workflow, syntax
 pitfalls, and recipes, and [llms.txt](llms.txt) for an LLM-oriented index of
 this repository.
 
+### Local MCP server for AI-agent tools
+
+The repository also includes `ostadix-mcp`, a local stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) server under
+`mcp/ostadix_lang_mcp_server/`. It exposes a small, typed tool surface over the
+existing local `O` and `olangc` binaries so an MCP-capable agent can discover
+the Ostadix environment, run a smoke test, execute a `.O` program, or inspect a
+compiler target without reconstructing the backend path by hand.
+
+| MCP tool | Current behavior |
+|----------|------------------|
+| `o_env` | Reports the resolved Ostadix root, backend directory, `O` and `olangc` paths, and Python shim status. |
+| `o_doctor` | Checks the local toolchain and inventories compatibility shims. |
+| `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
+| `o_run` | Runs one local `.O` file with an explicit working directory and timeout. |
+| `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
+| `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
+
+The normal setup builds this separate, lockfile-pinned Rust crate and, unless
+wrappers are disabled, copies the executable to
+`~/.local/bin/ostadix-mcp`:
+
+```bash
+./setup.sh --minimal --yes
+```
+
+For a build without the rest of setup, build the two Ostadix commands used by
+the server and then the server itself:
+
+```bash
+cargo build --release --bin O --bin olangc
+cargo build --release --locked \
+  --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+```
+
+The second command writes
+`mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp`. The server crate is
+deliberately separate from the root Cargo package, so a root `cargo build` or
+`cargo test` does not build or test it. Use `./setup.sh --no-mcp` when the MCP
+server is not wanted. The deterministic source-release allowlist currently
+omits `mcp/` and `.mcp.json`, so this MCP surface requires a Git checkout.
+
+The checked-in `.mcp.json` registers the server as `ostadix` using the
+`ostadix-mcp` wrapper. MCP clients that support repository-local stdio server
+configuration can load that file after `~/.local/bin` is visible in the
+client's `PATH`. For clients that need an explicit configuration, use absolute
+paths rather than relying on shell expansion inside JSON:
+
+```json
+{
+  "mcpServers": {
+    "ostadix": {
+      "command": "/absolute/path/to/Ostadix-lang/mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp",
+      "args": [],
+      "env": {
+        "O_LANG_ROOT": "/absolute/path/to/Ostadix-lang",
+        "O_BACKENDS_DIR": "/absolute/path/to/Ostadix-lang/backends"
+      }
+    }
+  }
+}
+```
+
+After adding the configuration, reload the client's MCP servers and use a
+short discovery-to-execution workflow such as:
+
+```text
+o_env {}
+o_smoke {}
+o_run {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O"}
+o_olangc {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O","target":"ir"}
+```
+
+These are MCP tool names and argument objects, not shell commands. `o_smoke`
+should return `SMOKE_OK` and show the program result `2`.
+
+`ostadix-mcp` is a local child process, not a hosted service. It has no network
+listener or authentication layer and executes local programs with the
+authority and `PATH` inherited from the MCP client. Its current tool surface
+does not expose `o-link`, `o-unlink`, `ocorec`, kernel boot gates, repository
+editing, or a separate arbitrary-shell tool. A `.O` program run through
+`o_run` can still invoke any configured backend, including shell backends.
+
 ---
 
 ## Getting Started: Full Setup Guide
@@ -126,7 +209,7 @@ into the kernel and is not used after the machine starts executing O-core.
 
 The included `setup.sh` script detects the host, installs the ordinary hosted
 runtime dependencies, builds the Rust and C17 editions, prepares the Python
-reference, and creates convenience wrappers:
+reference, builds the local MCP server, and creates convenience wrappers:
 
 ```bash
 git clone https://github.com/lostadi/Ostadix-lang.git Ostadix-lang
@@ -141,6 +224,7 @@ The script supports several levels of setup:
 ./setup.sh --full --verify
 ./setup.sh --full --yes
 ./setup.sh --no-wrappers
+./setup.sh --no-mcp
 ./setup.sh --dry-run
 ./setup.sh --help
 ```
@@ -148,9 +232,10 @@ The script supports several levels of setup:
 `--minimal` skips optional Nix, matplotlib, and extra backend tools. `--full`
 adds optional runtimes such as Racket when the operating system package
 manager provides them. `--verify` runs the hosted implementations after the
-build. Each setup run removes stale generated Ostadix-lang binaries before rebuilding
-them, refreshes installed Rust copies in `~/.cargo/bin`, and recreates wrappers
-in `~/.local/bin`.
+build. `--no-mcp` skips the separately locked `ostadix-mcp` crate. Each setup
+run removes stale generated Ostadix-lang binaries before rebuilding them,
+refreshes installed Rust copies in `~/.cargo/bin`, and recreates wrappers in
+`~/.local/bin`.
 
 After setup:
 
@@ -551,6 +636,7 @@ needs QEMU and the local Rust linker toolchain.
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
+| `ostadix-mcp` | `mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp` | Exposes the local agent tools above through MCP stdio; normal setup also installs `~/.local/bin/ostadix-mcp`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
 | `olangc` | `c_cpp/olangc` | Produces a hosted native executable through the C17 edition. |
 

@@ -25,6 +25,7 @@ pub const KERNEL_WORLD_RUNTIME_KIND: &str = "kernel-world";
 /// slice. The record is an output of `VerifiedKernelWorld`; decoding bytes is
 /// inspection only and never recreates package-verification authority.
 pub const NATIVE_KERNEL_WORLD_RECORD_V1: u16 = 1;
+pub const NATIVE_KERNEL_WORLD_RECORD_V2: u16 = 2;
 pub const MAX_NATIVE_KERNEL_WORLD_RECORD_BYTES: usize = 16 * 1024;
 pub const MAX_NATIVE_KERNEL_WORLD_EXPORTS: usize = 4;
 pub const MAX_NATIVE_KERNEL_WORLD_CAPABILITY_REQUESTS: usize = 8;
@@ -142,6 +143,8 @@ pub struct WorldExport {
     pub name: String,
     pub plane: ExportPlane,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_request: Option<String>,
 }
 
 /// Foreign kernels may import hardware, ABI, or higher-level semantics.
@@ -440,11 +443,9 @@ impl KernelWorldManifest {
             MAX_KERNEL_WORLD_EXPORTS as u64,
         )?;
         let mut exports = BTreeSet::new();
-        let mut has_device_export = false;
         for export in &self.exports {
             validate_identifier("exports.name", &export.name)?;
             validate_protocol("exports.protocol", &export.protocol)?;
-            has_device_export |= export.plane == ExportPlane::Device;
             if !exports.insert(export.name.as_str()) {
                 return Err(KernelWorldError::Duplicate {
                     field: "exports.name",
@@ -465,11 +466,15 @@ impl KernelWorldManifest {
             MAX_KERNEL_WORLD_CAPABILITY_REQUESTS as u64,
         )?;
         let mut requests = BTreeSet::new();
-        let mut has_device_authority = false;
         for request in &self.capability_requests {
             validate_identifier("capability_requests.kind", &request.kind)?;
+            if request.kind == "device." {
+                return Err(KernelWorldError::InvalidField {
+                    field: "capability_requests.kind",
+                    reason: "a `device.*` request kind must include a non-empty suffix".into(),
+                });
+            }
             validate_text("capability_requests.purpose", &request.purpose)?;
-            has_device_authority |= request.kind.starts_with("device.");
             if request.rights.is_empty() {
                 return Err(KernelWorldError::InvalidField {
                     field: "capability_requests.rights",
@@ -484,6 +489,23 @@ impl KernelWorldManifest {
             let mut rights = BTreeSet::new();
             for right in &request.rights {
                 validate_identifier("capability_requests.rights", right)?;
+                let is_reserved = matches!(right.as_str(), "run" | "stop" | "reset" | "dma");
+                let permitted = if request.kind == "vm.machine" {
+                    matches!(right.as_str(), "run" | "stop")
+                } else if is_device_capability_kind(&request.kind) {
+                    matches!(right.as_str(), "reset" | "dma")
+                } else {
+                    !is_reserved
+                };
+                if !permitted {
+                    return Err(KernelWorldError::InvalidField {
+                        field: "capability_requests.rights",
+                        reason: format!(
+                            "request kind `{}` may not use right `{right}`",
+                            request.kind
+                        ),
+                    });
+                }
                 if !rights.insert(right.as_str()) {
                     return Err(KernelWorldError::Duplicate {
                         field: "capability_requests.rights",
@@ -491,25 +513,58 @@ impl KernelWorldManifest {
                     });
                 }
             }
-            if !requests.insert((request.kind.as_str(), request.purpose.as_str())) {
+            if !requests.insert(request.kind.as_str()) {
                 return Err(KernelWorldError::Duplicate {
-                    field: "capability_requests",
-                    value: format!("{}:{}", request.kind, request.purpose),
+                    field: "capability_requests.kind",
+                    value: request.kind.clone(),
                 });
             }
         }
-        if has_device_export && !has_device_authority {
-            return Err(KernelWorldError::InvalidField {
-                field: "capability_requests",
-                reason: "a device-plane export requires an explicit `device.*` request".into(),
-            });
+
+        let mut device_authorities = BTreeSet::new();
+        for export in &self.exports {
+            match (export.plane, export.authority_request.as_deref()) {
+                (ExportPlane::Device, None) => {
+                    return Err(KernelWorldError::InvalidField {
+                        field: "exports.authority_request",
+                        reason: format!(
+                            "device-plane export `{}` must name an exact `device.*` capability request",
+                            export.name
+                        ),
+                    });
+                }
+                (ExportPlane::Device, Some(authority_request)) => {
+                    validate_identifier("exports.authority_request", authority_request)?;
+                    if !is_device_capability_kind(authority_request)
+                        || !requests.contains(authority_request)
+                    {
+                        return Err(KernelWorldError::InvalidField {
+                            field: "exports.authority_request",
+                            reason: format!(
+                                "device-plane export `{}` must name an exact existing `device.*` capability request; got `{authority_request}`",
+                                export.name
+                            ),
+                        });
+                    }
+                    device_authorities.insert(authority_request);
+                }
+                (_, Some(authority_request)) => {
+                    return Err(KernelWorldError::InvalidField {
+                        field: "exports.authority_request",
+                        reason: format!(
+                            "non-device export `{}` must omit authority request `{authority_request}`",
+                            export.name
+                        ),
+                    });
+                }
+                (_, None) => {}
+            }
         }
-        if has_device_export && self.quotas.max_devices == 0 {
-            return Err(KernelWorldError::InvalidField {
-                field: "quotas.max_devices",
-                reason: "a device-plane export requires a nonzero device quota".into(),
-            });
-        }
+        enforce_limit(
+            "distinct device authority requests",
+            device_authorities.len() as u64,
+            self.quotas.max_devices as u64,
+        )?;
         Ok(())
     }
 
@@ -519,11 +574,18 @@ impl KernelWorldManifest {
         let mut manifest = self.clone();
         manifest.machine.requirements.sort();
         manifest.exports.sort_by(|left, right| {
-            (&left.name, left.plane, &left.protocol).cmp(&(
-                &right.name,
-                right.plane,
-                &right.protocol,
-            ))
+            (
+                &left.name,
+                left.plane,
+                &left.protocol,
+                &left.authority_request,
+            )
+                .cmp(&(
+                    &right.name,
+                    right.plane,
+                    &right.protocol,
+                    &right.authority_request,
+                ))
         });
         for request in &mut manifest.capability_requests {
             request.rights.sort();
@@ -712,7 +774,7 @@ impl NativeKernelWorldRecordData {
 
         let mut bytes = Vec::with_capacity(1024);
         bytes.extend_from_slice(NATIVE_KERNEL_WORLD_MAGIC);
-        push_u16(&mut bytes, NATIVE_KERNEL_WORLD_RECORD_V1);
+        push_u16(&mut bytes, NATIVE_KERNEL_WORLD_RECORD_V2);
         push_u16(&mut bytes, 0);
         push_u32(&mut bytes, 0);
         bytes.extend_from_slice(&decode_sha256(package_digest.as_hex(), "package digest")?);
@@ -820,6 +882,10 @@ impl NativeKernelWorldRecordData {
             });
             bytes.push(0);
             push_string(&mut bytes, &export.protocol)?;
+            push_string(
+                &mut bytes,
+                export.authority_request.as_deref().unwrap_or(""),
+            )?;
         }
         for request in &canonical_manifest.capability_requests {
             push_string(&mut bytes, &request.kind)?;
@@ -914,7 +980,7 @@ impl InspectedNativeKernelWorldRecord {
         if cursor.take(8)? != NATIVE_KERNEL_WORLD_MAGIC {
             return Err(invalid_native_record("bad magic"));
         }
-        if cursor.u16()? != NATIVE_KERNEL_WORLD_RECORD_V1 {
+        if cursor.u16()? != NATIVE_KERNEL_WORLD_RECORD_V2 {
             return Err(invalid_native_record("unsupported version"));
         }
         if cursor.u16()? != 0 {
@@ -1020,10 +1086,15 @@ impl InspectedNativeKernelWorldRecord {
                 return Err(invalid_native_record("reserved export bits are nonzero"));
             }
             let protocol = cursor.string()?;
+            let authority_request = match cursor.string()? {
+                authority_request if authority_request.is_empty() => None,
+                authority_request => Some(authority_request),
+            };
             exports.push(WorldExport {
                 name,
                 plane,
                 protocol,
+                authority_request,
             });
         }
         let mut capability_requests = Vec::with_capacity(request_count);
@@ -1548,6 +1619,10 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), KernelWor
         });
     }
     Ok(())
+}
+
+fn is_device_capability_kind(value: &str) -> bool {
+    value.len() > "device.".len() && value.starts_with("device.")
 }
 
 fn validate_name(field: &'static str, value: &str) -> Result<(), KernelWorldError> {

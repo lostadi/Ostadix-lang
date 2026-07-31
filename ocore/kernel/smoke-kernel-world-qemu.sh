@@ -7,8 +7,8 @@ RECORD_DIR="$BUILD_DIR/kernel-world-record"
 RECORD_ONE="$RECORD_DIR/kernel-world-one.record"
 RECORD_TWO="$RECORD_DIR/kernel-world-two.record"
 TIMEOUT_SECONDS=30
-EXPECTED_RECORD_BYTES=440
-EXPECTED_RECORD_SHA256="36ebffa374631fc51e70cc20e0512fd899f3703fe15d200a33e330482a707671"
+EXPECTED_RECORD_BYTES=459
+EXPECTED_RECORD_SHA256="0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232"
 
 for tool in qemu-system-x86_64 python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -131,7 +131,9 @@ required = [
     "page allocator: online\n",
     "address space: online\n",
     "KW pinned hash/tamper + noncanonical-order rejection: PASS\n",
+    "KW exact SVM/NPT requirement binding: PASS\n",
     "KW exact-byte policy + package/manifest default-deny: PASS\n",
+    "KW exact export authority + typed rights: PASS\n",
     "KW VM/vCPU/guest-page generation + quota: PASS\n",
     "KW bounded VM pilot configured without execution: PASS\n",
     "KW exact-world revoke/reclaim; unrelated VM survives: PASS\n",

@@ -2,7 +2,7 @@ schema = "ocore.package/v1"
 name = "kernel/pilot-contained"
 version = "1.0.0"
 architecture = "x86_64"
-payload_sha256 = "932af130b29317e60c087694a2d2cbd242236e2be4ef1dc189e66006cd6f569f"
+payload_sha256 = "36865b987414027133f79b907676df1547d17907d90cc450ccc878207edab77c"
 
 [runtime]
 kind = "kernel-world"
@@ -33,4 +33,4 @@ timeout_ms = 5000
 
 [build]
 source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-builder = "ocore-kernel-world-record/v1"
+builder = "ocore-kernel-world-record/v2"
