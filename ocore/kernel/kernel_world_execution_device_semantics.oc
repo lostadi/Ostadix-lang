@@ -1,0 +1,888 @@
+module kernel::kernel_world_semantics;
+
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::RIGHT_KERNEL_WORLD_RESET_REQUEST;
+use runtime::capability::RIGHT_KERNEL_WORLD_STATUS;
+use runtime::image_vfs::sha256_selftest;
+use runtime::interrupts::ticks;
+use runtime::kernel_world_boot::active_boot_count as live_boot_count;
+use runtime::kernel_world_boot::active_service_count as live_service_count;
+use runtime::kernel_world_boot::binding_is_live as live_binding_is_live;
+use runtime::kernel_world_boot::fail as fail_live_boot;
+use runtime::kernel_world_boot::failure_count as live_failure_count;
+use runtime::kernel_world_boot::generation as live_boot_generation;
+use runtime::kernel_world_boot::health_observation_count as live_health_count;
+use runtime::kernel_world_boot::has_terminal_ticket as has_live_terminal;
+use runtime::kernel_world_boot::init as live_boot_init;
+use runtime::kernel_world_boot::invariants_hold as live_boot_invariants_hold;
+use runtime::kernel_world_boot::last_failure_vm_revoke_event;
+use runtime::kernel_world_boot::last_failure_withdrawal_event;
+use runtime::kernel_world_boot::pending_restart;
+use runtime::kernel_world_boot::pending_restart_count;
+use runtime::kernel_world_boot::publication_count as live_publication_count;
+use runtime::kernel_world_boot::publish_export as publish_live_export;
+use runtime::kernel_world_boot::record_health as record_live_health;
+use runtime::kernel_world_boot::request_reset as request_live_reset;
+use runtime::kernel_world_boot::reset_request_count as live_reset_count;
+use runtime::kernel_world_boot::restart_after_failure;
+use runtime::kernel_world_boot::restart_count as live_restart_count;
+use runtime::kernel_world_boot::stage as stage_live_boot;
+use runtime::kernel_world_boot::stage_count as live_stage_count;
+use runtime::kernel_world_boot::start as start_live_boot;
+use runtime::kernel_world_boot::start_count as live_start_count;
+use runtime::kernel_world_boot::status as live_status;
+use runtime::kernel_world_boot::stop as stop_live_boot;
+use runtime::kernel_world_boot::stop_count as live_stop_count;
+use runtime::kernel_world_boot::uninstall as uninstall_live_world;
+use runtime::kernel_world_boot::withdrawal_count as live_withdrawal_count;
+use runtime::kernel_world_execution::active_count as supervised_active_count;
+use runtime::kernel_world_execution::denial_count as supervised_denial_count;
+use runtime::kernel_world_execution::device_exit_count as supervised_device_count;
+use runtime::kernel_world_execution::drive_device as drive_supervised_device;
+use runtime::kernel_world_execution::drive_failure as drive_supervised_failure;
+use runtime::kernel_world_execution::drive_health as drive_supervised_health;
+use runtime::kernel_world_execution::failure_exit_count as supervised_failure_count;
+use runtime::kernel_world_execution::generation as supervised_generation;
+use runtime::kernel_world_execution::health_exit_count as supervised_health_count;
+use runtime::kernel_world_execution::init as supervised_execution_init;
+use runtime::kernel_world_execution::invariants_hold as supervised_invariants_hold;
+use runtime::kernel_world_execution::is_live as supervised_is_live;
+use runtime::kernel_world_execution::last_boot_terminal_event as supervised_boot_terminal_event;
+use runtime::kernel_world_execution::last_device_revoke_event as supervised_device_revoke_event;
+use runtime::kernel_world_execution::last_npf_event as supervised_npf_event;
+use runtime::kernel_world_execution::last_svm_stop_event as supervised_svm_stop_event;
+use runtime::kernel_world_execution::orderly_stop_count as supervised_stop_count;
+use runtime::kernel_world_execution::start as start_supervised_execution;
+use runtime::kernel_world_execution::start_count as supervised_start_count;
+use runtime::kernel_world_execution::stop as stop_supervised_execution;
+use runtime::kernel_world_device::active_count as virtual_device_active_count;
+use runtime::kernel_world_device::assignment_count as virtual_device_assignment_count;
+use runtime::kernel_world_device::denial_count as virtual_device_denial_count;
+use runtime::kernel_world_device::invariants_hold as virtual_device_invariants_hold;
+use runtime::kernel_world_device::reset_count as virtual_device_reset_count;
+use runtime::kernel_world_device::revocation_count as virtual_device_revocation_count;
+use runtime::kernel_world_device::transaction_count as virtual_device_transaction_count;
+use runtime::kernel_world_admission::admission_begin_count;
+use runtime::kernel_world_admission::admission_seal_count;
+use runtime::kernel_world_admission::begin_with_restart as begin_admission;
+use runtime::kernel_world_admission::current_world_count;
+use runtime::kernel_world_admission::define_export as define_admission_export;
+use runtime::kernel_world_admission::define_request as define_admission_request;
+use runtime::kernel_world_admission::export_authority_byte_at as admitted_export_authority_byte_at;
+use runtime::kernel_world_admission::export_authority_id_at as admitted_export_authority_id_at;
+use runtime::kernel_world_admission::export_authority_length_at as admitted_export_authority_length_at;
+use runtime::kernel_world_admission::export_count as admitted_export_count;
+use runtime::kernel_world_admission::export_name_id_at as admitted_export_name_at;
+use runtime::kernel_world_admission::export_plane_at as admitted_export_plane_at;
+use runtime::kernel_world_admission::export_protocol_id_at as admitted_export_protocol_at;
+use runtime::kernel_world_admission::generation as world_generation;
+use runtime::kernel_world_admission::health_protocol_id as admitted_health_protocol;
+use runtime::kernel_world_admission::init as admission_init;
+use runtime::kernel_world_admission::invariants_hold as admission_invariants_hold;
+use runtime::kernel_world_admission::is_current as world_is_current;
+use runtime::kernel_world_admission::package_digest_word as admitted_package_digest_word;
+use runtime::kernel_world_admission::register_policy;
+use runtime::kernel_world_admission::request_grant_at;
+use runtime::kernel_world_admission::restart_policy as admitted_restart_policy;
+use runtime::kernel_world_admission::seal as seal_admission;
+use runtime::kernel_world_admission::state as world_state;
+use runtime::kernel_world_admission::EXECUTION_HARDWARE_VIRTUALIZED;
+use runtime::kernel_world_admission::EXPORT_PLANE_ABI;
+use runtime::kernel_world_admission::EXPORT_PLANE_DEVICE;
+use runtime::kernel_world_admission::FIRMWARE_UEFI;
+use runtime::kernel_world_admission::INTEGRATION_BINARY_CONTAINED;
+use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
+use runtime::kernel_world_admission::RIGHT_VM_RUN;
+use runtime::kernel_world_admission::RIGHT_VM_STOP;
+use runtime::kernel_world_admission::RESTART_NEVER;
+use runtime::kernel_world_admission::RESTART_ON_FAILURE;
+use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::kernel_world_record::accepted_count as record_accepted_count;
+use runtime::kernel_world_record::architecture_id as record_architecture_id;
+use runtime::kernel_world_record::denied_count as record_denied_count;
+use runtime::kernel_world_record::execution as record_execution;
+use runtime::kernel_world_record::export_authority as record_export_authority;
+use runtime::kernel_world_record::export_authority_address as record_export_authority_address;
+use runtime::kernel_world_record::export_authority_length as record_export_authority_length;
+use runtime::kernel_world_record::export_count as record_export_count;
+use runtime::kernel_world_record::export_name as record_export_name;
+use runtime::kernel_world_record::export_plane as record_export_plane;
+use runtime::kernel_world_record::export_protocol as record_export_protocol;
+use runtime::kernel_world_record::firmware as record_firmware;
+use runtime::kernel_world_record::health_id as record_health_id;
+use runtime::kernel_world_record::health_timeout_ms as record_health_timeout;
+use runtime::kernel_world_record::init as record_init;
+use runtime::kernel_world_record::integration as record_integration;
+use runtime::kernel_world_record::invariants_hold as record_invariants_hold;
+use runtime::kernel_world_record::manifest_digest_word as record_manifest_digest_word;
+use runtime::kernel_world_record::max_devices as record_max_devices;
+use runtime::kernel_world_record::max_memory_mib as record_max_memory_mib;
+use runtime::kernel_world_record::max_outstanding as record_max_outstanding;
+use runtime::kernel_world_record::max_requests_per_generation as record_max_requests_per_generation;
+use runtime::kernel_world_record::max_shared_bytes as record_max_shared_bytes;
+use runtime::kernel_world_record::max_vcpus as record_max_vcpus;
+use runtime::kernel_world_record::min_memory_mib as record_min_memory_mib;
+use runtime::kernel_world_record::min_vcpus as record_min_vcpus;
+use runtime::kernel_world_record::package_digest_word as record_package_digest_word;
+use runtime::kernel_world_record::parse as parse_record;
+use runtime::kernel_world_record::profile_id as record_profile_id;
+use runtime::kernel_world_record::restart_policy as record_restart_policy;
+use runtime::kernel_world_record::requirement_address as record_requirement_address;
+use runtime::kernel_world_record::requirement_count as record_requirement_count;
+use runtime::kernel_world_record::requirement_length as record_requirement_length;
+use runtime::kernel_world_record::request_count as record_request_count;
+use runtime::kernel_world_record::request_kind_address as record_request_kind_address;
+use runtime::kernel_world_record::request_kind_length as record_request_kind_length;
+use runtime::kernel_world_record::request_purpose_address as record_request_purpose_address;
+use runtime::kernel_world_record::request_purpose_length as record_request_purpose_length;
+use runtime::kernel_world_record::request_rights as record_request_rights;
+use runtime::kernel_world_record::version_id as record_version_id;
+use runtime::kernel_world_record::world_id as record_world_id;
+use runtime::memory_object::quota_used;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::pages::free_frames;
+use runtime::serial::write;
+use runtime::svm_execution::enter_count as svm_enter_count;
+use runtime::svm_execution::exit_count as svm_exit_count;
+use runtime::svm_execution::npt_is_torn_down;
+use runtime::svm_execution::teardown_count as svm_teardown_count;
+use runtime::vm_object::active_guest_page_count;
+use runtime::vm_object::active_vcpu_count;
+use runtime::vm_object::active_vm_count;
+use runtime::vm_object::attach_guest_page;
+use runtime::vm_object::create_vcpu;
+use runtime::vm_object::create_vm;
+use runtime::vm_object::denial_count as vm_denial_count;
+use runtime::vm_object::guest_page_is_current;
+use runtime::vm_object::guest_page_memory_object;
+use runtime::vm_object::init as vm_init;
+use runtime::vm_object::invariants_hold as vm_invariants_hold;
+use runtime::vm_object::seal_configuration;
+use runtime::vm_object::vcpu_is_current;
+use runtime::vm_object::vm_guest_page_count;
+use runtime::vm_object::vm_has_execution;
+use runtime::vm_object::vm_is_current;
+use runtime::vm_object::vm_state;
+use runtime::vm_object::vm_vcpu_count;
+use runtime::vm_object::VM_STATE_CONFIGURED;
+
+const MODE_KERNEL_WORLD_EXECUTION_DEVICE: u64 = 23;
+const RECORD_LENGTH: usize = 459;
+const RECORD_SHA_0: u64 = 0x0ece_5f7f_37eb_e203;
+const RECORD_SHA_1: u64 = 0xd03c_c7e5_213d_c8f9;
+const RECORD_SHA_2: u64 = 0x257a_9a22_5a73_e52d;
+const RECORD_SHA_3: u64 = 0x37d1_f718_424b_9232;
+const PACKAGE_SHA_0: u64 = 0xbe91_2b0c_bd26_ac76;
+const PACKAGE_SHA_1: u64 = 0xfb57_5003_9990_7a1a;
+const PACKAGE_SHA_2: u64 = 0xf214_e1f7_784e_ee59;
+const PACKAGE_SHA_3: u64 = 0xe575_8bc4_8181_5a78;
+const MANIFEST_SHA_0: u64 = 0x5b8a_0cb1_183d_b460;
+const MANIFEST_SHA_1: u64 = 0xd81b_ad97_4837_968f;
+const MANIFEST_SHA_2: u64 = 0xf4e2_f313_1c2f_c1dc;
+const MANIFEST_SHA_3: u64 = 0x02ee_8874_3acd_d590;
+
+const PRIMARY_OWNER_SLOT: usize = 1;
+const UNRELATED_OWNER_SLOT: usize = 2;
+const UNRELATED_DIGEST_0: u64 = 0x9101;
+const UNRELATED_DIGEST_1: u64 = 0x9102;
+const UNRELATED_DIGEST_2: u64 = 0x9103;
+const UNRELATED_DIGEST_3: u64 = 0x9104;
+const UNRELATED_MANIFEST_0: u64 = 0xa101;
+const UNRELATED_MANIFEST_1: u64 = 0xa102;
+const UNRELATED_MANIFEST_2: u64 = 0xa103;
+const UNRELATED_MANIFEST_3: u64 = 0xa104;
+// These exact policy strings are independently compiled kernel policy, not
+// pointers or identifiers copied from the record under admission.
+static POLICY_DEVICE_NET: [u8; 10] = b"device.net";
+static POLICY_RESETTABLE_NETWORK: [u8; 33] =
+    b"resettable pilot network provider";
+static POLICY_VM_MACHINE: [u8; 10] = b"vm.machine";
+static POLICY_CONTAINED_GUEST: [u8; 25] =
+    b"contained guest execution";
+static UNRELATED_VM_PURPOSE: [u8; 25] =
+    b"unrelated guest execution";
+static REQUIREMENT_NPT: [u8; 3] = b"npt";
+static REQUIREMENT_SVM: [u8; 3] = b"svm";
+
+static RECORD_MESSAGE: [u8; 45] =
+    b"KW pinned record hash/tamper rejection: PASS\n";
+static POLICY_MESSAGE: [u8; 54] =
+    b"KW exact-byte policy + package/manifest binding: PASS\n";
+static AUTHORITY_MESSAGE: [u8; 47] =
+    b"KW exact export authority + typed rights: PASS\n";
+static REQUIREMENT_MESSAGE: [u8; 43] =
+    b"KW exact SVM/NPT requirement binding: PASS\n";
+static OBJECT_MESSAGE: [u8; 47] =
+    b"KW VM/vCPU/guest-page generation + quota: PASS\n";
+static SUPERVISED_BIND_MESSAGE: [u8; 42] =
+    b"KW exact boot-to-SVM/device binding: PASS\n";
+static SUPERVISED_HEALTH_MESSAGE: [u8; 43] =
+    b"KW VMEXIT-derived health publication: PASS\n";
+static SUPERVISED_DEVICE_MESSAGE: [u8; 49] =
+    b"KW guest PIO exit + virtual endpoint reply: PASS\n";
+static SUPERVISED_RESET_MESSAGE: [u8; 53] =
+    b"KW client reset dispatched to virtual endpoint: PASS\n";
+static SUPERVISED_FAILURE_MESSAGE: [u8; 54] =
+    b"KW NPF-driven quiesce before supervisor failure: PASS\n";
+static SUPERVISED_UNRELATED_MESSAGE: [u8; 56] =
+    b"KW unrelated live service survived VMEXIT failure: PASS\n";
+static SUPERVISED_RESTART_MESSAGE: [u8; 57] =
+    b"KW generation-2 guest/device rebind + stale denial: PASS\n";
+static SUPERVISED_COMPLETE_MESSAGE: [u8; 49] =
+    b"KW supervised execution-device reclamation: PASS\n";
+static POST_SUPERVISED_TIMER_MESSAGE: [u8; 39] =
+    b"KW post-execution-device timer: online\n";
+
+extern "sysv64" fn ocore_kernel_world_record_start() -> usize;
+extern "sysv64" fn ocore_kernel_world_record_end() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}
+
+unsafe fn record_text_equals(
+    address: usize,
+    length: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    if address == 0 || expected as usize == 0 || length != expected_length {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < length {
+        if volatile_load((address + byte) as *const u8)
+            != volatile_load(expected + byte) {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn record_requirement_equals(
+    ordinal: usize,
+    expected: *const u8,
+    expected_length: usize
+) -> bool {
+    return record_text_equals(
+        record_requirement_address(ordinal),
+        record_requirement_length(ordinal),
+        expected,
+        expected_length
+    );
+}
+
+// Mode 21 is AMD SVM/NPT-specific. The exact hash-pinned record that produced
+// the admitted world must name that backend contract; the prior fixture named
+// VMX even though no VMX executor exists. A hash or requirement count alone is
+// insufficient, so this check compares every retained byte.
+unsafe fn record_matches_svm_npt_backend() -> bool {
+    return record_execution() == EXECUTION_HARDWARE_VIRTUALIZED
+        && record_requirement_count() == 2
+        && record_requirement_equals(0, (&REQUIREMENT_NPT[0]), 3)
+        && record_requirement_equals(1, (&REQUIREMENT_SVM[0]), 3);
+}
+
+unsafe fn begin_from_record() -> u64 {
+    return begin_admission(
+        record_package_digest_word(0),
+        record_package_digest_word(1),
+        record_package_digest_word(2),
+        record_package_digest_word(3),
+        record_manifest_digest_word(0),
+        record_manifest_digest_word(1),
+        record_manifest_digest_word(2),
+        record_manifest_digest_word(3),
+        record_integration(),
+        record_execution(),
+        record_firmware(),
+        record_world_id(),
+        record_world_id(),
+        record_version_id(),
+        record_architecture_id(),
+        record_profile_id(),
+        record_health_id(),
+        record_health_timeout(),
+        record_restart_policy(),
+        record_min_vcpus() as usize,
+        record_max_vcpus() as usize,
+        record_min_memory_mib(),
+        record_max_memory_mib(),
+        record_max_outstanding(),
+        record_max_requests_per_generation(),
+        record_max_shared_bytes(),
+        record_max_devices() as usize,
+        record_export_count(),
+        record_request_count()
+    );
+}
+
+unsafe fn define_from_record(admission: u64) -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < record_export_count() {
+        if define_admission_export(
+            admission,
+            ordinal,
+            record_export_name(ordinal),
+            record_export_plane(ordinal),
+            record_export_protocol(ordinal),
+            record_export_authority_address(ordinal) as *const u8,
+            record_export_authority_length(ordinal)
+        ) != 1 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < record_request_count() {
+        if define_admission_request(
+            admission,
+            ordinal,
+            record_request_kind_address(ordinal) as *const u8,
+            record_request_kind_length(ordinal),
+            record_request_purpose_address(ordinal) as *const u8,
+            record_request_purpose_length(ordinal),
+            record_request_rights(ordinal)
+        ) != 1 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return true;
+}
+
+unsafe fn admitted_authority_matches_record(
+    world: u64,
+    ordinal: usize
+) -> bool {
+    let length: usize = record_export_authority_length(ordinal);
+    if admitted_export_authority_id_at(world, ordinal)
+            != record_export_authority(ordinal)
+        || admitted_export_authority_length_at(world, ordinal) != length {
+        return false;
+    }
+    let mut byte: usize = 0;
+    while byte < length {
+        if admitted_export_authority_byte_at(world, ordinal, byte)
+            != volatile_load(
+                (record_export_authority_address(ordinal) + byte)
+                    as *const u8
+            ) as u64 {
+            return false;
+        }
+        byte += 1;
+    }
+    return true;
+}
+
+unsafe fn register_fixture_device_policy() -> bool {
+    return register_policy(
+        PACKAGE_SHA_0,
+        PACKAGE_SHA_1,
+        PACKAGE_SHA_2,
+        PACKAGE_SHA_3,
+        (&POLICY_DEVICE_NET[0]),
+        10,
+        (&POLICY_RESETTABLE_NETWORK[0]),
+        33,
+        RIGHT_DEVICE_RESET
+    ) == 1;
+}
+
+unsafe fn register_fixture_vm_policy() -> bool {
+    return register_policy(
+        PACKAGE_SHA_0,
+        PACKAGE_SHA_1,
+        PACKAGE_SHA_2,
+        PACKAGE_SHA_3,
+        (&POLICY_VM_MACHINE[0]),
+        10,
+        (&POLICY_CONTAINED_GUEST[0]),
+        25,
+        RIGHT_VM_RUN | RIGHT_VM_STOP
+    ) == 1;
+}
+
+unsafe fn admit_unrelated_world() -> u64 {
+    if register_policy(
+        UNRELATED_DIGEST_0,
+        UNRELATED_DIGEST_1,
+        UNRELATED_DIGEST_2,
+        UNRELATED_DIGEST_3,
+        (&POLICY_VM_MACHINE[0]),
+        10,
+        (&UNRELATED_VM_PURPOSE[0]),
+        25,
+        RIGHT_VM_RUN
+    ) != 1 {
+        return 0;
+    }
+    let world: u64 = begin_admission(
+        UNRELATED_DIGEST_0,
+        UNRELATED_DIGEST_1,
+        UNRELATED_DIGEST_2,
+        UNRELATED_DIGEST_3,
+        UNRELATED_MANIFEST_0,
+        UNRELATED_MANIFEST_1,
+        UNRELATED_MANIFEST_2,
+        UNRELATED_MANIFEST_3,
+        INTEGRATION_BINARY_CONTAINED,
+        EXECUTION_HARDWARE_VIRTUALIZED,
+        FIRMWARE_UEFI,
+        0x9301,
+        0x9301,
+        1,
+        record_architecture_id(),
+        record_profile_id(),
+        record_health_id(),
+        1000,
+        RESTART_NEVER,
+        1,
+        1,
+        1,
+        2,
+        1,
+        2,
+        4096,
+        0,
+        1,
+        1
+    );
+    if world == 0
+        || define_admission_export(
+            world,
+            0,
+            0x9401,
+            EXPORT_PLANE_ABI,
+            0x9402,
+            0 as *const u8,
+            0
+        ) != 1
+        || define_admission_request(
+            world,
+            0,
+            (&POLICY_VM_MACHINE[0]),
+            10,
+            (&UNRELATED_VM_PURPOSE[0]),
+            25,
+            RIGHT_VM_RUN
+        ) != 1
+        || seal_admission(world) != world {
+        return 0;
+    }
+    return world;
+}
+
+unsafe fn run_supervised_execution_device(
+    primary_world: u64,
+    primary_vm: u64,
+    primary_vcpu: u64,
+    primary_code_page: u64,
+    primary_mailbox_page: u64,
+    unrelated_world: u64,
+    unrelated_vm: u64,
+    unrelated_vcpu: u64,
+    unrelated_page: u64,
+    primary_owner: u64,
+    unrelated_owner: u64,
+    baseline_frames: usize
+) -> never {
+    if live_boot_init() != 1
+        || supervised_execution_init() != 1
+        || admitted_restart_policy(primary_world) != RESTART_ON_FAILURE
+        || admitted_restart_policy(unrelated_world) != RESTART_NEVER {
+        fail_closed();
+    }
+
+    let abi_export: usize = 0;
+    let device_export: usize = 1;
+    if admitted_export_count(primary_world) != 2
+        || admitted_export_plane_at(primary_world, abi_export)
+            != EXPORT_PLANE_ABI
+        || admitted_export_plane_at(primary_world, device_export)
+            != EXPORT_PLANE_DEVICE
+        || admitted_export_count(unrelated_world) != 1
+        || admitted_export_plane_at(unrelated_world, 0)
+            != EXPORT_PLANE_ABI {
+        fail_closed();
+    }
+
+    let primary_boot: u64 =
+        stage_live_boot(primary_world, primary_vm, primary_owner);
+    let unrelated_boot: u64 =
+        stage_live_boot(unrelated_world, unrelated_vm, unrelated_owner);
+    if primary_boot == 0
+        || unrelated_boot == 0
+        || live_boot_generation(primary_boot) != 1
+        || start_live_boot(primary_boot) != 1
+        || start_live_boot(unrelated_boot) != 1 {
+        fail_closed();
+    }
+
+    // An admitted ABI export reaches and is denied by the device layer. Exact
+    // cross-world vCPU material is denied independently by the coordinator.
+    if start_supervised_execution(
+            primary_boot,
+            primary_vcpu,
+            primary_code_page,
+            primary_mailbox_page,
+            abi_export
+        ) != 0
+        || virtual_device_denial_count() == 0
+        || start_supervised_execution(
+            primary_boot,
+            unrelated_vcpu,
+            primary_code_page,
+            primary_mailbox_page,
+            device_export
+        ) != 0 {
+        fail_closed();
+    }
+    let primary_session: u64 = start_supervised_execution(
+        primary_boot,
+        primary_vcpu,
+        primary_code_page,
+        primary_mailbox_page,
+        device_export
+    );
+    let mut denied_capability: u64 = 0;
+    if primary_session == 0
+        || supervised_generation(primary_session) != 1
+        || !supervised_is_live(primary_session)
+        || !vm_has_execution(primary_vm)
+        || virtual_device_active_count() != 1
+        || fail_live_boot(primary_boot) != 0
+        || stop_live_boot(primary_boot) != 0
+        || publish_live_export(
+            primary_boot,
+            device_export,
+            (&mut denied_capability)
+        ) != 0
+        || denied_capability != 0 {
+        fail_closed();
+    }
+    write((&SUPERVISED_BIND_MESSAGE[0]), 42);
+
+    if drive_supervised_health(primary_session) != 1 {
+        fail_closed();
+    }
+    let mut primary_capability: u64 = 0;
+    let primary_binding: u64 = publish_live_export(
+        primary_boot,
+        device_export,
+        (&mut primary_capability)
+    );
+    if record_live_health(
+            unrelated_boot,
+            admitted_health_protocol(unrelated_world)
+        ) != 1 {
+        fail_closed();
+    }
+    let mut unrelated_capability: u64 = 0;
+    let unrelated_binding: u64 = publish_live_export(
+        unrelated_boot,
+        0,
+        (&mut unrelated_capability)
+    );
+    if primary_binding == 0
+        || unrelated_binding == 0
+        || primary_capability == 0
+        || unrelated_capability == 0
+        || live_status(primary_owner, primary_capability) != 1
+        || live_status(unrelated_owner, unrelated_capability) != 1 {
+        fail_closed();
+    }
+    write((&SUPERVISED_HEALTH_MESSAGE[0]), 43);
+
+    if drive_supervised_device(primary_session) != 0xae08_9a84
+        || virtual_device_transaction_count() != 1
+        || svm_enter_count() != 2
+        || svm_exit_count() != 2 {
+        fail_closed();
+    }
+    write((&SUPERVISED_DEVICE_MESSAGE[0]), 49);
+
+    if request_live_reset(primary_owner, primary_capability) != 1
+        || request_live_reset(unrelated_owner, unrelated_capability) != 0
+        || virtual_device_reset_count() != 1 {
+        fail_closed();
+    }
+    write((&SUPERVISED_RESET_MESSAGE[0]), 53);
+
+    if drive_supervised_failure(primary_session) != 1
+        || supervised_is_live(primary_session)
+        || supervised_active_count() != 0
+        || virtual_device_active_count() != 0
+        || vm_has_execution(primary_vm)
+        || !npt_is_torn_down()
+        || live_binding_is_live(primary_binding)
+        || live_status(primary_owner, primary_capability) != 0
+        || vm_is_current(primary_vm)
+        || vcpu_is_current(primary_vcpu)
+        || guest_page_is_current(primary_code_page)
+        || !pending_restart(primary_world)
+        || !has_live_terminal(primary_world)
+        || supervised_npf_event() == 0
+        || supervised_svm_stop_event() <= supervised_npf_event()
+        || supervised_device_revoke_event()
+            <= supervised_svm_stop_event()
+        || supervised_boot_terminal_event()
+            <= supervised_device_revoke_event()
+        || free_frames() + 1 != baseline_frames
+        || quota_used(PRIMARY_OWNER_SLOT) != 0 {
+        fail_closed();
+    }
+    write((&SUPERVISED_FAILURE_MESSAGE[0]), 54);
+
+    if !live_binding_is_live(unrelated_binding)
+        || live_status(unrelated_owner, unrelated_capability) != 1
+        || !vm_is_current(unrelated_vm)
+        || !vcpu_is_current(unrelated_vcpu)
+        || !guest_page_is_current(unrelated_page) {
+        fail_closed();
+    }
+    write((&SUPERVISED_UNRELATED_MESSAGE[0]), 56);
+
+    let replacement_vm: u64 =
+        create_vm(primary_world, primary_owner, 1, 2);
+    let replacement_vcpu: u64 = create_vcpu(replacement_vm, 0);
+    let replacement_code_page: u64 =
+        attach_guest_page(replacement_vm, 0);
+    let replacement_mailbox_page: u64 =
+        attach_guest_page(replacement_vm, 0x1000);
+    if replacement_vm == 0
+        || replacement_vcpu == 0
+        || replacement_code_page == 0
+        || replacement_mailbox_page == 0
+        || seal_configuration(replacement_vm) != 1 {
+        fail_closed();
+    }
+    let replacement_boot: u64 = restart_after_failure(
+        primary_world,
+        replacement_vm,
+        primary_owner
+    );
+    if replacement_boot == 0
+        || live_boot_generation(replacement_boot) != 2
+        || start_live_boot(replacement_boot) != 1 {
+        fail_closed();
+    }
+    let replacement_session: u64 = start_supervised_execution(
+        replacement_boot,
+        replacement_vcpu,
+        replacement_code_page,
+        replacement_mailbox_page,
+        device_export
+    );
+    if replacement_session == 0
+        || replacement_session == primary_session
+        || supervised_generation(replacement_session) != 2
+        || drive_supervised_health(primary_session) != 0
+        || drive_supervised_health(replacement_session) != 1 {
+        fail_closed();
+    }
+    let mut replacement_capability: u64 = 0;
+    let replacement_binding: u64 = publish_live_export(
+        replacement_boot,
+        device_export,
+        (&mut replacement_capability)
+    );
+    if replacement_binding == 0
+        || replacement_binding == primary_binding
+        || replacement_capability == 0
+        || replacement_capability == primary_capability
+        || live_status(primary_owner, primary_capability) != 0
+        || live_status(primary_owner, replacement_capability) != 2
+        || drive_supervised_device(replacement_session) != 0xae08_9a84
+        || svm_enter_count() != 5
+        || svm_exit_count() != 5 {
+        fail_closed();
+    }
+    write((&SUPERVISED_RESTART_MESSAGE[0]), 57);
+
+    if stop_supervised_execution(replacement_session) != 1
+        || uninstall_live_world(primary_world) != 1
+        || stop_live_boot(unrelated_boot) != 1
+        || uninstall_live_world(unrelated_world) != 1
+        || live_boot_count() != 0
+        || live_service_count() != 0
+        || pending_restart_count() != 0
+        || active_vm_count() != 0
+        || active_vcpu_count() != 0
+        || active_guest_page_count() != 0
+        || current_world_count() != 0
+        || free_frames() != baseline_frames
+        || quota_used(PRIMARY_OWNER_SLOT) != 0
+        || quota_used(UNRELATED_OWNER_SLOT) != 0
+        || svm_teardown_count() != 2
+        || !record_invariants_hold()
+        || !admission_invariants_hold()
+        || !vm_invariants_hold()
+        || !virtual_device_invariants_hold()
+        || !supervised_invariants_hold()
+        || !live_boot_invariants_hold() {
+        fail_closed();
+    }
+    write((&SUPERVISED_COMPLETE_MESSAGE[0]), 49);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before {
+        halt();
+    }
+    write((&POST_SUPERVISED_TIMER_MESSAGE[0]), 39);
+    loop {
+        halt();
+    }
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_KERNEL_WORLD_EXECUTION_DEVICE {
+        fail_closed();
+    }
+    disable_interrupts();
+    let record_start: usize = ocore_kernel_world_record_start();
+    let record_end: usize = ocore_kernel_world_record_end();
+    if record_start == 0
+        || record_end <= record_start
+        || record_end - record_start != RECORD_LENGTH
+        || sha256_selftest() != 1
+        || record_init() != 1
+        || parse_record(
+            record_start as *const u8,
+            RECORD_LENGTH,
+            RECORD_SHA_0 ^ 1,
+            RECORD_SHA_1,
+            RECORD_SHA_2,
+            RECORD_SHA_3
+        ) != 0
+        || parse_record(
+            record_start as *const u8,
+            RECORD_LENGTH,
+            RECORD_SHA_0,
+            RECORD_SHA_1,
+            RECORD_SHA_2,
+            RECORD_SHA_3
+        ) != 1
+        || record_denied_count() != 1
+        || record_accepted_count() != 1
+        || record_package_digest_word(0) != PACKAGE_SHA_0
+        || record_package_digest_word(3) != PACKAGE_SHA_3
+        || record_manifest_digest_word(0) != MANIFEST_SHA_0
+        || record_manifest_digest_word(3) != MANIFEST_SHA_3
+        || !record_matches_svm_npt_backend()
+        || !record_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECORD_MESSAGE[0]), 45);
+    write((&REQUIREMENT_MESSAGE[0]), 43);
+
+    if admission_init() != 1
+        || !register_fixture_device_policy()
+        || !register_fixture_vm_policy() {
+        fail_closed();
+    }
+    let primary_world: u64 = begin_from_record();
+    if primary_world == 0
+        || !define_from_record(primary_world)
+        || seal_admission(primary_world) != primary_world
+        || world_state(primary_world) != WORLD_STATE_ADMITTED
+        || world_generation(primary_world) == 0
+        || admitted_package_digest_word(primary_world, 0) != PACKAGE_SHA_0
+        || admission_begin_count() != 1
+        || admission_seal_count() != 1 {
+        fail_closed();
+    }
+    let mut ordinal: usize = 0;
+    while ordinal < record_request_count() {
+        if request_grant_at(primary_world, ordinal)
+            != record_request_rights(ordinal) {
+            fail_closed();
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < record_export_count() {
+        if !admitted_authority_matches_record(primary_world, ordinal) {
+            fail_closed();
+        }
+        ordinal += 1;
+    }
+    write((&POLICY_MESSAGE[0]), 54);
+    write((&AUTHORITY_MESSAGE[0]), 47);
+
+    let unrelated_world: u64 = admit_unrelated_world();
+    let primary_owner: u64 = cspace_handle_for_slot(PRIMARY_OWNER_SLOT);
+    let unrelated_owner: u64 = cspace_handle_for_slot(UNRELATED_OWNER_SLOT);
+    if unrelated_world == 0
+        || primary_owner == 0
+        || unrelated_owner == 0
+        || set_quota_for_owner(primary_owner, 2) != 1
+        || set_quota_for_owner(unrelated_owner, 1) != 1
+        || vm_init() != 1 {
+        fail_closed();
+    }
+    let baseline_frames: usize = free_frames();
+
+    // The VM permits a third page while the owner quota permits only two.
+    let primary_vm: u64 = create_vm(primary_world, primary_owner, 1, 3);
+    let primary_vcpu: u64 = create_vcpu(primary_vm, 0);
+    let primary_code_page: u64 = attach_guest_page(primary_vm, 0);
+    let primary_mailbox_page: u64 =
+        attach_guest_page(primary_vm, 0x1000);
+    if primary_vm == 0
+        || primary_vcpu == 0
+        || primary_code_page == 0
+        || primary_mailbox_page == 0
+        || guest_page_memory_object(primary_code_page) == 0
+        || attach_guest_page(primary_vm, 0x2000) != 0
+        || seal_configuration(primary_vm) != 1
+        || vm_state(primary_vm) != VM_STATE_CONFIGURED
+        || vm_vcpu_count(primary_vm) != 1
+        || vm_guest_page_count(primary_vm) != 2
+        || quota_used(PRIMARY_OWNER_SLOT) != 2
+        || free_frames() + 2 != baseline_frames
+        || vm_denial_count() == 0 {
+        fail_closed();
+    }
+    write((&OBJECT_MESSAGE[0]), 47);
+
+    let unrelated_vm: u64 = create_vm(
+        unrelated_world,
+        unrelated_owner,
+        1,
+        1
+    );
+    let unrelated_vcpu: u64 = create_vcpu(unrelated_vm, 0);
+    let unrelated_page: u64 = attach_guest_page(unrelated_vm, 0x8000);
+    if unrelated_vm == 0
+        || unrelated_vcpu == 0
+        || unrelated_page == 0
+        || seal_configuration(unrelated_vm) != 1
+        || current_world_count() != 2
+        || active_vm_count() != 2
+        || active_vcpu_count() != 2
+        || active_guest_page_count() != 3
+        || free_frames() + 3 != baseline_frames {
+        fail_closed();
+    }
+
+    run_supervised_execution_device(
+        primary_world,
+        primary_vm,
+        primary_vcpu,
+        primary_code_page,
+        primary_mailbox_page,
+        unrelated_world,
+        unrelated_vm,
+        unrelated_vcpu,
+        unrelated_page,
+        primary_owner,
+        unrelated_owner,
+        baseline_frames
+    );
+}

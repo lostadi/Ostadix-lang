@@ -35,6 +35,8 @@ use runtime::kernel_world_admission::RESTART_ON_FAILURE;
 use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
 use runtime::kernel_world_admission::RIGHT_VM_RUN;
 use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::kernel_world_device::dispatch_available as virtual_device_dispatch_available;
+use runtime::kernel_world_device::reset_for_export as reset_virtual_device_export;
 use runtime::vm_object::invariants_hold as vm_invariants_hold;
 use runtime::vm_object::revoke_world as revoke_vm_world;
 use runtime::vm_object::vm_is_current;
@@ -42,6 +44,7 @@ use runtime::vm_object::vm_owner;
 use runtime::vm_object::vm_state;
 use runtime::vm_object::vm_world;
 use runtime::vm_object::vm_world_generation;
+use runtime::vm_object::world_graph_can_revoke;
 use runtime::vm_object::world_graph_is_present;
 use runtime::vm_object::VM_STATE_CONFIGURED;
 
@@ -347,8 +350,8 @@ unsafe fn stage_internal(
             return deny();
         }
     } else if find_ticket(world) < MAX_BOOT_INSTANCES {
-        // A failed provider cannot bypass its signed restart policy by using
-        // the initial-stage entry point.
+        // A failed provider cannot bypass its retained, host-verified restart
+        // policy by using the initial-stage entry point.
         return deny();
     }
     let mut slot: usize = 0;
@@ -795,6 +798,18 @@ pub unsafe fn request_reset(
             & RIGHT_DEVICE_RESET) != RIGHT_DEVICE_RESET {
         return end_operation(deny());
     }
+    // Mode 22 has no device backend and therefore records accepted broker
+    // intent only. When Mode 23 installs the exact virtual-device dispatcher,
+    // success additionally requires that this live boot/export assignment was
+    // reset by that dispatcher. This is still not a physical hardware reset.
+    if virtual_device_dispatch_available()
+        && reset_virtual_device_export(
+            SERVICE_BOOTS[service_slot],
+            world,
+            export_ordinal
+        ) != 1 {
+        return end_operation(deny());
+    }
     RESET_REQUESTS += 1;
     return end_operation(1);
 }
@@ -875,7 +890,11 @@ pub unsafe fn fail(boot: u64) -> u64 {
     if ticket_slot >= MAX_BOOT_INSTANCES
         || (policy != RESTART_NEVER
             && policy != RESTART_ON_FAILURE
-            && policy != RESTART_ALWAYS) {
+            && policy != RESTART_ALWAYS)
+        // Refuse before withdrawing any client authority. Active execution or
+        // another retained guest-page mapping must be quiesced by the trusted
+        // execution coordinator before this atomic terminal transition.
+        || !world_graph_can_revoke(world) {
         return end_operation(deny());
     }
 
@@ -988,7 +1007,8 @@ pub unsafe fn stop(boot: u64) -> u64 {
     if ticket_slot >= MAX_BOOT_INSTANCES
         || (policy != RESTART_NEVER
             && policy != RESTART_ON_FAILURE
-            && policy != RESTART_ALWAYS) {
+            && policy != RESTART_ALWAYS)
+        || !world_graph_can_revoke(world) {
         return end_operation(deny());
     }
     BOOT_STATES[slot] = BOOT_STOPPING;
@@ -1099,6 +1119,21 @@ pub unsafe fn state(boot: u64) -> u64 {
         return BOOT_STATE_ACTIVE;
     }
     return 0;
+}
+
+// Trusted execution coordinators use this exact identity predicate before
+// binding a vCPU backend. It grants no new authority and accepts no metadata:
+// all three generation-tagged objects must already be the live boot binding.
+pub unsafe fn matches(boot: u64, world: u64, vm: u64) -> bool {
+    if OPERATION_ACTIVE != 0 {
+        return false;
+    }
+    let slot: usize = checked_boot(boot);
+    return slot < MAX_BOOT_INSTANCES
+        && BOOT_WORLDS[slot] == world
+        && BOOT_WORLD_GENERATIONS[slot] == admitted_world_generation(world)
+        && BOOT_VMS[slot] == vm
+        && valid_world_vm(world, vm, BOOT_CONSUMER_CSPACES[slot]);
 }
 
 pub unsafe fn generation(boot: u64) -> u64 {
