@@ -6,7 +6,7 @@ use runtime::image_vfs::verify_bytes_sha256;
 // passed VerifiedKernelWorld. Native parsing pins the complete object SHA-256
 // before interpreting fields. The retained package and manifest digests stay
 // separate: neither serialized metadata nor a string hash is authority.
-pub const RECORD_VERSION_V1: u64 = 1;
+pub const RECORD_VERSION_V2: u64 = 2;
 pub const MAX_RECORD_BYTES: usize = 16384;
 pub const MAX_RECORD_EXPORTS: usize = 4;
 pub const MAX_RECORD_REQUESTS: usize = 8;
@@ -40,6 +40,8 @@ static RIGHT_RUN: [u8; 3] = b"run";
 static RIGHT_STOP: [u8; 4] = b"stop";
 static RIGHT_RESET: [u8; 5] = b"reset";
 static RIGHT_DMA: [u8; 3] = b"dma";
+static VM_MACHINE_TEXT: [u8; 10] = b"vm.machine";
+static DEVICE_PREFIX: [u8; 7] = b"device.";
 
 static mut SOURCE: usize = 0;
 static mut LENGTH: usize = 0;
@@ -83,10 +85,13 @@ static mut REQUIREMENT_LENGTHS: [usize; 32] = [0; 32];
 static mut EXPORT_NAMES: [u64; 4] = [0; 4];
 static mut EXPORT_PLANES: [u64; 4] = [0; 4];
 static mut EXPORT_PROTOCOLS: [u64; 4] = [0; 4];
+static mut EXPORT_AUTHORITIES: [u64; 4] = [0; 4];
 static mut EXPORT_NAME_OFFSETS: [usize; 4] = [0; 4];
 static mut EXPORT_NAME_LENGTHS: [usize; 4] = [0; 4];
 static mut EXPORT_PROTOCOL_OFFSETS: [usize; 4] = [0; 4];
 static mut EXPORT_PROTOCOL_LENGTHS: [usize; 4] = [0; 4];
+static mut EXPORT_AUTHORITY_OFFSETS: [usize; 4] = [0; 4];
+static mut EXPORT_AUTHORITY_LENGTHS: [usize; 4] = [0; 4];
 static mut REQUEST_KINDS: [u64; 8] = [0; 8];
 static mut REQUEST_PURPOSES: [u64; 8] = [0; 8];
 static mut REQUEST_RIGHTS: [u64; 8] = [0; 8];
@@ -117,10 +122,13 @@ unsafe fn clear_record() -> void {
         EXPORT_NAMES[index] = 0;
         EXPORT_PLANES[index] = 0;
         EXPORT_PROTOCOLS[index] = 0;
+        EXPORT_AUTHORITIES[index] = 0;
         EXPORT_NAME_OFFSETS[index] = 0;
         EXPORT_NAME_LENGTHS[index] = 0;
         EXPORT_PROTOCOL_OFFSETS[index] = 0;
         EXPORT_PROTOCOL_LENGTHS[index] = 0;
+        EXPORT_AUTHORITY_OFFSETS[index] = 0;
+        EXPORT_AUTHORITY_LENGTHS[index] = 0;
         index += 1;
     }
     index = 0;
@@ -239,6 +247,44 @@ unsafe fn string_equals(
     return true;
 }
 
+unsafe fn stored_strings_equal(
+    left_offset: usize,
+    left_length: usize,
+    right_offset: usize,
+    right_length: usize
+) -> bool {
+    if left_length != right_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < left_length {
+        if raw(left_offset + index) != raw(right_offset + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn string_has_prefix(
+    offset: usize,
+    length: usize,
+    prefix: *const u8,
+    prefix_length: usize
+) -> bool {
+    if prefix as usize == 0 || length < prefix_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < prefix_length {
+        if raw(offset + index) != volatile_load(prefix + index) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
 unsafe fn take_string_id(allow_empty: bool) -> u64 {
     let length: usize = take_u16() as usize;
     LAST_STRING_OFFSET = 0;
@@ -275,6 +321,149 @@ unsafe fn take_string_id(allow_empty: bool) -> u64 {
     return hash;
 }
 
+unsafe fn request_kind_is_vm_machine(ordinal: usize) -> bool {
+    return string_equals(
+        REQUEST_KIND_OFFSETS[ordinal],
+        REQUEST_KIND_LENGTHS[ordinal],
+        (&VM_MACHINE_TEXT[0]),
+        10
+    );
+}
+
+unsafe fn request_kind_is_device(ordinal: usize) -> bool {
+    return REQUEST_KIND_LENGTHS[ordinal] > 7
+        && string_has_prefix(
+        REQUEST_KIND_OFFSETS[ordinal],
+        REQUEST_KIND_LENGTHS[ordinal],
+        (&DEVICE_PREFIX[0]),
+        7
+    );
+}
+
+unsafe fn export_authority_is_device(ordinal: usize) -> bool {
+    return EXPORT_AUTHORITY_LENGTHS[ordinal] > 7
+        && string_has_prefix(
+        EXPORT_AUTHORITY_OFFSETS[ordinal],
+        EXPORT_AUTHORITY_LENGTHS[ordinal],
+        (&DEVICE_PREFIX[0]),
+        7
+    );
+}
+
+unsafe fn rights_match_request_kind(ordinal: usize, rights: u64) -> bool {
+    if rights == 0 {
+        return false;
+    }
+    if request_kind_is_vm_machine(ordinal) {
+        return (rights & (RIGHT_DEVICE_RESET | RIGHT_DEVICE_DMA)) == 0;
+    }
+    if request_kind_is_device(ordinal) {
+        return (rights & (RIGHT_VM_RUN | RIGHT_VM_STOP)) == 0;
+    }
+    // All currently defined native bits are reserved to the two exact kind
+    // families above. A later record version may introduce other matrices.
+    return (rights
+        & (RIGHT_VM_RUN
+            | RIGHT_VM_STOP
+            | RIGHT_DEVICE_RESET
+            | RIGHT_DEVICE_DMA)) == 0;
+}
+
+unsafe fn export_authority_matches_request(
+    export_ordinal: usize,
+    request_ordinal: usize
+) -> bool {
+    // Hash equality is a reject accelerator. Exact retained record bytes are
+    // mandatory for the authority binding itself.
+    return EXPORT_AUTHORITIES[export_ordinal]
+            == REQUEST_KINDS[request_ordinal]
+        && EXPORT_AUTHORITY_LENGTHS[export_ordinal]
+            == REQUEST_KIND_LENGTHS[request_ordinal]
+        && stored_strings_equal(
+            EXPORT_AUTHORITY_OFFSETS[export_ordinal],
+            EXPORT_AUTHORITY_LENGTHS[export_ordinal],
+            REQUEST_KIND_OFFSETS[request_ordinal],
+            REQUEST_KIND_LENGTHS[request_ordinal]
+        );
+}
+
+unsafe fn export_has_bound_device_request(export_ordinal: usize) -> bool {
+    if EXPORT_PLANES[export_ordinal] != PLANE_DEVICE
+        || EXPORT_AUTHORITIES[export_ordinal] == 0
+        || !export_authority_is_device(export_ordinal) {
+        return false;
+    }
+    let mut request_ordinal: usize = 0;
+    while request_ordinal < REQUEST_COUNT {
+        if request_kind_is_device(request_ordinal)
+            && export_authority_matches_request(
+                export_ordinal,
+                request_ordinal
+            ) {
+            return true;
+        }
+        request_ordinal += 1;
+    }
+    return false;
+}
+
+unsafe fn distinct_bound_device_authorities() -> usize {
+    let mut distinct: usize = 0;
+    let mut ordinal: usize = 0;
+    while ordinal < EXPORT_COUNT {
+        if EXPORT_PLANES[ordinal] == PLANE_DEVICE {
+            let mut duplicate: bool = false;
+            let mut prior: usize = 0;
+            while prior < ordinal {
+                if EXPORT_PLANES[prior] == PLANE_DEVICE
+                    && EXPORT_AUTHORITIES[prior]
+                        == EXPORT_AUTHORITIES[ordinal]
+                    && stored_strings_equal(
+                        EXPORT_AUTHORITY_OFFSETS[prior],
+                        EXPORT_AUTHORITY_LENGTHS[prior],
+                        EXPORT_AUTHORITY_OFFSETS[ordinal],
+                        EXPORT_AUTHORITY_LENGTHS[ordinal]
+                    ) {
+                    duplicate = true;
+                }
+                prior += 1;
+            }
+            if !duplicate {
+                distinct += 1;
+            }
+        }
+        ordinal += 1;
+    }
+    return distinct;
+}
+
+unsafe fn retained_authority_contract_holds() -> bool {
+    let mut ordinal: usize = 0;
+    while ordinal < EXPORT_COUNT {
+        if EXPORT_PLANES[ordinal] == PLANE_DEVICE {
+            if !export_has_bound_device_request(ordinal) {
+                return false;
+            }
+        } else if EXPORT_AUTHORITIES[ordinal] != 0
+            || EXPORT_AUTHORITY_OFFSETS[ordinal] != 0
+            || EXPORT_AUTHORITY_LENGTHS[ordinal] != 0 {
+            return false;
+        }
+        ordinal += 1;
+    }
+    ordinal = 0;
+    while ordinal < REQUEST_COUNT {
+        if !rights_match_request_kind(
+            ordinal,
+            REQUEST_RIGHTS[ordinal]
+        ) {
+            return false;
+        }
+        ordinal += 1;
+    }
+    return distinct_bound_device_authorities() <= MAX_DEVICES as usize;
+}
+
 // The host encoder orders every declaration using Rust's bytewise String
 // ordering. Native acceptance repeats that rule over the retained ASCII bytes;
 // hashes are never used to decide canonical order.
@@ -302,27 +491,11 @@ unsafe fn string_less(
 }
 
 unsafe fn request_less(left: usize, right: usize) -> bool {
-    if string_less(
+    return string_less(
         REQUEST_KIND_OFFSETS[left],
         REQUEST_KIND_LENGTHS[left],
         REQUEST_KIND_OFFSETS[right],
         REQUEST_KIND_LENGTHS[right]
-    ) {
-        return true;
-    }
-    if string_less(
-        REQUEST_KIND_OFFSETS[right],
-        REQUEST_KIND_LENGTHS[right],
-        REQUEST_KIND_OFFSETS[left],
-        REQUEST_KIND_LENGTHS[left]
-    ) {
-        return false;
-    }
-    return string_less(
-        REQUEST_PURPOSE_OFFSETS[left],
-        REQUEST_PURPOSE_LENGTHS[left],
-        REQUEST_PURPOSE_OFFSETS[right],
-        REQUEST_PURPOSE_LENGTHS[right]
     );
 }
 
@@ -437,7 +610,7 @@ pub unsafe fn parse(
         }
         index += 1;
     }
-    if take_u16() != RECORD_VERSION_V1
+    if take_u16() != RECORD_VERSION_V2
         || take_u16() != 0
         || take_u32() != length as u64 {
         return deny();
@@ -483,6 +656,7 @@ pub unsafe fn parse(
         || REQUEST_COUNT == 0
         || REQUEST_COUNT > MAX_RECORD_REQUESTS
         || REQUIREMENT_COUNT > MAX_RECORD_REQUIREMENTS
+        || MAX_DEVICES > 256
         || MIN_VCPUS == 0
         || MAX_VCPUS < MIN_VCPUS
         || MAX_VCPUS > 256
@@ -544,8 +718,20 @@ pub unsafe fn parse(
         EXPORT_PROTOCOLS[index] = take_string_id(false);
         EXPORT_PROTOCOL_OFFSETS[index] = LAST_STRING_OFFSET;
         EXPORT_PROTOCOL_LENGTHS[index] = LAST_STRING_LENGTH;
+        EXPORT_AUTHORITIES[index] = take_string_id(true);
+        EXPORT_AUTHORITY_OFFSETS[index] = LAST_STRING_OFFSET;
+        EXPORT_AUTHORITY_LENGTHS[index] = LAST_STRING_LENGTH;
         if EXPORT_PLANES[index] < PLANE_DEVICE
             || EXPORT_PLANES[index] > PLANE_SEMANTIC {
+            return deny();
+        }
+        if (EXPORT_PLANES[index] == PLANE_DEVICE
+                && (EXPORT_AUTHORITIES[index] == 0
+                    || !export_authority_is_device(index)))
+            || (EXPORT_PLANES[index] != PLANE_DEVICE
+                && (EXPORT_AUTHORITIES[index] != 0
+                    || EXPORT_AUTHORITY_OFFSETS[index] != 0
+                    || EXPORT_AUTHORITY_LENGTHS[index] != 0)) {
             return deny();
         }
         // Export names are unique in the verified schema, so strict name
@@ -596,22 +782,31 @@ pub unsafe fn parse(
             right_index += 1;
         }
         REQUEST_RIGHTS[index] = rights;
-        // vm.machine and purpose identifiers are interpreted by independent
-        // supervisor policy. At this layer any request carrying RUN is enough
-        // to enforce the binary-contained structural requirement; policy must
-        // still match its exact kind and purpose before admission.
-        if (rights & RIGHT_VM_RUN) != 0 {
+        if !rights_match_request_kind(index, rights) {
+            return deny();
+        }
+        if request_kind_is_vm_machine(index)
+            && (rights & RIGHT_VM_RUN) != 0 {
             has_vm_run = true;
         }
-        // Request (kind, purpose) pairs are unique in the verified schema;
-        // rights are separately required to be strictly byte-sorted above.
+        // Request kinds are unique in the V2 verified schema. Rights are
+        // separately required to be strictly byte-sorted above.
         if index > 0 && !request_less(index - 1, index) {
+            return deny();
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < EXPORT_COUNT {
+        if EXPORT_PLANES[index] == PLANE_DEVICE
+            && !export_has_bound_device_request(index) {
             return deny();
         }
         index += 1;
     }
     if FAILED != 0
         || CURSOR != LENGTH
+        || distinct_bound_device_authorities() > MAX_DEVICES as usize
         || (INTEGRATION == INTEGRATION_BINARY && !has_vm_run) {
         return deny();
     }
@@ -636,6 +831,7 @@ pub unsafe fn invariants_hold() -> bool {
         && EXPORT_COUNT <= MAX_RECORD_EXPORTS
         && REQUEST_COUNT > 0
         && REQUEST_COUNT <= MAX_RECORD_REQUESTS
+        && retained_authority_contract_holds()
         && digest_nonzero((&PACKAGE_DIGESTS[0]))
         && digest_nonzero((&MANIFEST_DIGESTS[0]));
 }
@@ -667,6 +863,19 @@ pub unsafe fn max_requests_per_generation() -> u64 {
 }
 pub unsafe fn max_shared_bytes() -> u64 { return MAX_SHARED_BYTES; }
 pub unsafe fn max_devices() -> u64 { return MAX_DEVICES; }
+pub unsafe fn requirement_count() -> usize { return REQUIREMENT_COUNT; }
+pub unsafe fn requirement_id(ordinal: usize) -> u64 {
+    if PARSED == 0 || ordinal >= REQUIREMENT_COUNT { return 0; }
+    return REQUIREMENT_IDS[ordinal];
+}
+pub unsafe fn requirement_address(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUIREMENT_COUNT { return 0; }
+    return SOURCE + REQUIREMENT_OFFSETS[ordinal];
+}
+pub unsafe fn requirement_length(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= REQUIREMENT_COUNT { return 0; }
+    return REQUIREMENT_LENGTHS[ordinal];
+}
 pub unsafe fn export_count() -> usize { return EXPORT_COUNT; }
 pub unsafe fn request_count() -> usize { return REQUEST_COUNT; }
 pub unsafe fn export_name(ordinal: usize) -> u64 {
@@ -680,6 +889,22 @@ pub unsafe fn export_plane(ordinal: usize) -> u64 {
 pub unsafe fn export_protocol(ordinal: usize) -> u64 {
     if ordinal >= EXPORT_COUNT { return 0; }
     return EXPORT_PROTOCOLS[ordinal];
+}
+pub unsafe fn export_authority(ordinal: usize) -> u64 {
+    if PARSED == 0 || ordinal >= EXPORT_COUNT { return 0; }
+    return EXPORT_AUTHORITIES[ordinal];
+}
+pub unsafe fn export_authority_address(ordinal: usize) -> usize {
+    if PARSED == 0
+        || ordinal >= EXPORT_COUNT
+        || EXPORT_AUTHORITY_LENGTHS[ordinal] == 0 {
+        return 0;
+    }
+    return SOURCE + EXPORT_AUTHORITY_OFFSETS[ordinal];
+}
+pub unsafe fn export_authority_length(ordinal: usize) -> usize {
+    if PARSED == 0 || ordinal >= EXPORT_COUNT { return 0; }
+    return EXPORT_AUTHORITY_LENGTHS[ordinal];
 }
 pub unsafe fn request_kind(ordinal: usize) -> u64 {
     if ordinal >= REQUEST_COUNT { return 0; }

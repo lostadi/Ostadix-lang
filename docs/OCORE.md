@@ -451,21 +451,43 @@ integration, Linux-oracle behavior, fuzzing, allocation-failure injection, and
 concrete filesystem/network/timer/device services remain future M6B work.
 
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
-gate. A
-host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` normal form
-that keeps verified package and canonical manifest digests distinct. The
-kernel verifies the exact embedded record SHA-256 before strict parsing, then
-admits at most two worlds through independently registered default-deny policy
-keyed by package digest and copied exact request-kind/purpose bytes; hashes are
-only a fast reject and never authority. Its nonexecuting VM model
+gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
+normal form that keeps verified package and canonical manifest digests
+distinct. The current fixture is exactly 459 bytes with SHA-256
+`0ece5f7f37ebe203d03cc7e5213dc8f9257a9a225a73e52d37d1f718424b9232`
+and exactly the canonical backend requirements `["npt", "svm"]`. The kernel
+verifies that exact record hash before strict parsing. It requires unique
+request kinds and binds every device export's explicit `authority_request` to
+one exact existing `device.*` request; non-device exports omit the field.
+Several exports may share a request, while `max_devices` charges distinct bound
+device authorities. Reserved rights are typed: `vm.machine` admits only
+`run|stop`, and `device.*` admits only `reset|dma`.
+
+Mode 20 admits at most two worlds through independently registered default-deny
+policy keyed by package digest and copied exact request-kind/purpose bytes;
+hashes are only a fast reject and never authority. Its nonexecuting VM model
 supports at most two VM identities, four vCPU identities, and eight aligned
 guest-page attachments backed by anonymous 4 KiB memory objects. The gate proves
-quota and overlap denial, generation checks, exact-world revoke/reclaim, an
-unrelated surviving VM, and a later timer. The local VM graph may be sealed,
-but package admission deliberately remains `ADMITTED`; no provider configured
-or start lifecycle is claimed.
+exact export-authority and typed-right denial, quota and overlap denial,
+generation checks, exact-world revoke/reclaim, an unrelated surviving VM, and a
+later timer. The local VM graph may be sealed, but package admission
+deliberately remains `ADMITTED`; no provider configured or start lifecycle is
+claimed.
 
 These are configuration objects, not a hypervisor. Mode 20 does not start or
 health-check a provider, publish exports, boot a guest, enter VMX/SVM, construct
 EPT/NPT, execute firmware, inject interrupts, assign devices, map DMA, or
 configure an IOMMU.
+
+Mode 21 is the separate AMD hardware-execution gate. The host requires KVM plus
+the exact `svm` and `npt` CPU features, and the kernel byte-compares the V2
+record's complete requirement vector to exactly `["npt", "svm"]` before SVM
+initialization. It enters only a two-page real-mode synthetic guest through a
+private NPT, proving one bounded interrupt, a controlled `VMMCALL`, denial of
+an unmapped GPA, exact NPT teardown, stop/restart, and unrelated-VM survival.
+
+Neither gate provides a live device service or device capability, guest agent,
+shared queue or shared ring, Linux or Plan 9 boot, a virtual device, PCI
+assignment, IOMMU isolation, DMA mapping, device reset, or 9P. In particular,
+the V2 authority names and `reset`/`dma` requests are validated metadata for
+independent admission policy, not proof that those device operations exist.
