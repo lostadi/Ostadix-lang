@@ -90,6 +90,28 @@
   live device service or device capability, guest agent, shared queue or shared
   ring, Linux or Plan 9 boot, virtual device, PCI assignment, IOMMU isolation,
   DMA mapping, device reset, or 9P implementation.
+- Mode 22 is a separate QEMU-TCG native administrative lifecycle gate.
+  `kernel_world_boot.oc` binds at most two admitted worlds to configured VM
+  identities and exact consumer CSpaces, requires the independently granted
+  `vm.machine:run` authority for administrative start, and health-gates at most
+  four generation-tagged export capabilities by exact protocol ID. Client
+  status returns the native boot generation. A device-plane reset right accepts
+  broker intent only when derived from its exact independently granted
+  `device.*:reset` request; it neither transfers the provider grant nor resets
+  hardware. Failure withdraws bindings and closes capabilities before exact
+  VM-graph revoke, then the declared `on_failure` policy may authorize a fresh
+  VM/boot/service generation while unrelated state survives and stale handles
+  fail. Duplicate consumer-CSpace/name/protocol ID tuples are denied.
+  `SYS_CAP_CLOSE` retires the registry binding with the capability, and closing
+  the last export returns the boot to `HEALTHY`. Terminal uninstall revokes
+  admission before consuming the tombstone only after proving the exact local
+  VM graph is absent; an un-staged replacement makes uninstall fail unchanged.
+  It exposes no separate abandon operation. Lifecycle/broker transitions use
+  single-CPU operation ownership and linearization epochs; future SMP requires
+  an atomic lock. The gate calls health and failure directly, does not enforce
+  the declared health timeout, and starts no process, guest, or foreign
+  provider. It supplies no guest agent, shared ring/queue, 9P, PCI/device
+  assignment, IOMMU/DMA isolation, physical reset, Linux boot, or Plan 9 boot.
 - Hosted evaluation lowers to OIR, builds and validates an `ExecutionPlan`, and
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR

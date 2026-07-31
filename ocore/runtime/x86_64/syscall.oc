@@ -8,6 +8,7 @@ use runtime::capability::rights_for_owner;
 use runtime::capability::validate_in_cspace;
 use runtime::capability::OBJECT_DEBUG;
 use runtime::capability::OBJECT_ENDPOINT;
+use runtime::capability::OBJECT_KERNEL_WORLD_EXPORT;
 use runtime::capability::OBJECT_MEMORY;
 use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::OBJECT_CONTROL;
@@ -24,6 +25,7 @@ use runtime::capability::RIGHT_PERSONALITY_CALL;
 use runtime::capability::RIGHT_PERSONALITY_REPLY;
 use runtime::capability::RIGHT_PERSONALITY_SUPERVISE;
 use runtime::capability::MAX_CSPACES;
+use runtime::kernel_world_boot::close_export_capability;
 use runtime::address_space::allows;
 use runtime::address_space::VM_READ;
 use runtime::address_space::VM_EXEC;
@@ -423,8 +425,17 @@ unsafe fn dispatch_native_0(
             }
             finish_endpoint_drain(endpoint);
         } else {
-            if close_in_cspace(cspace_id, capability) == 0 {
-                return ERR_CAPABILITY_DENIED;
+            if object_type == OBJECT_KERNEL_WORLD_EXPORT {
+                if close_export_capability(
+                    current_cspace_handle(),
+                    capability
+                ) != 1 {
+                    return ERR_CAPABILITY_DENIED;
+                }
+            } else {
+                if close_in_cspace(cspace_id, capability) == 0 {
+                    return ERR_CAPABILITY_DENIED;
+                }
             }
         }
         return 1;

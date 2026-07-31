@@ -26,6 +26,7 @@ use runtime::capability::valid_cspace_slot;
 use runtime::capability::CAPABILITIES_PER_CSPACE;
 use runtime::capability::MAX_CSPACES;
 use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_KERNEL_WORLD_EXPORT;
 use runtime::capability::OBJECT_MEMORY;
 use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::RIGHT_MEMORY_USE;
@@ -612,7 +613,8 @@ pub unsafe fn drain_cspace(cspace_handle: u64) -> u64 {
                     owned_memory_capability_count += 1;
                 }
             } else if object_type != OBJECT_DEBUG
-                && object_type != OBJECT_PAGE_POOL {
+                && object_type != OBJECT_PAGE_POOL
+                && object_type != OBJECT_KERNEL_WORLD_EXPORT {
                 return 0;
             }
         }

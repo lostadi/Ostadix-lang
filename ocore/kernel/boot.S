@@ -71,13 +71,14 @@ ocore_m6_image_bytes_start:
 .globl ocore_m6_image_bytes_end
 ocore_m6_image_bytes_end:
 
-// Modes 20 and 21 embed the deterministic host-verified KernelWorld normal form.
-// Native admission pins the complete record SHA before parsing it; no foreign
-// kernel image or executable is embedded by this gate.
+// Modes 20 through 22 embed the deterministic host-verified KernelWorld normal
+// form. Native admission pins the complete record SHA before parsing it. Mode
+// 22 adds only a TCG-compatible live lifecycle/service mechanism proof; no
+// foreign kernel image or executable is embedded by these gates.
 .balign 16
 .globl ocore_kernel_world_record_bytes_start
 ocore_kernel_world_record_bytes_start:
-#if OCORE_PROBE_MODE == 20 || OCORE_PROBE_MODE == 21
+#if OCORE_PROBE_MODE == 20 || OCORE_PROBE_MODE == 21 || OCORE_PROBE_MODE == 22
 #ifndef OCORE_KERNEL_WORLD_RECORD_PATH
 #error "OCORE_KERNEL_WORLD_RECORD_PATH is required for KernelWorld admission mode"
 #endif

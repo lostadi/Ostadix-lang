@@ -853,6 +853,7 @@ pub unsafe fn architecture_id() -> u64 { return ARCHITECTURE_ID; }
 pub unsafe fn profile_id() -> u64 { return PROFILE_ID; }
 pub unsafe fn health_id() -> u64 { return HEALTH_ID; }
 pub unsafe fn health_timeout_ms() -> u64 { return HEALTH_TIMEOUT_MS; }
+pub unsafe fn restart_policy() -> u64 { return RESTART; }
 pub unsafe fn min_vcpus() -> u64 { return MIN_VCPUS; }
 pub unsafe fn max_vcpus() -> u64 { return MAX_VCPUS; }
 pub unsafe fn min_memory_mib() -> u64 { return MIN_MEMORY_MIB; }

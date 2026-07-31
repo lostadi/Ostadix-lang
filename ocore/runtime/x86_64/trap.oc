@@ -50,7 +50,7 @@ extern "sysv64" fn ocore_read_cr2() -> usize;
 extern "sysv64" fn ocore_kernel_probe_address() -> usize;
 
 pub unsafe fn configure_probe(mode: u64) -> u64 {
-    if mode > 21 {
+    if mode > 22 {
         return 0;
     }
     EXPECTED_PROBE = mode;

@@ -837,6 +837,36 @@ boot, virtual device, PCI assignment, IOMMU isolation, DMA mapping, device
 reset, or 9P service exists in this slice. It also makes no provider-health or
 export-publication claim.
 
+Mode 22 adds a separate TCG-compatible administrative lifecycle slice without
+using Mode 21's SVM path. `kernel_world_boot.oc` binds a hash-pinned admitted
+world to a configured VM identity and an exact consumer CSpace, requires the
+independently granted `vm.machine:run` request for its administrative start,
+gates export publication on an exact observed health-protocol ID, and installs
+generation-tagged nontransferable client capabilities. Its status operation
+reports the native boot generation. Its device-plane reset operation accepts
+only O-core broker intent derived from an exact independently granted
+`device.*:reset` authority; it does not reset a device or dispatch to a
+provider. Duplicate live consumer-CSpace/name/protocol ID tuples are denied.
+Generic capability close is registry-aware; retiring the final export returns
+the administrative boot to `HEALTHY`, permitting clean republish or teardown.
+
+The Mode 22 failure transition withdraws bindings and closes client
+capabilities before revoking the exact VM graph. It retains admission only long
+enough for the declared `on_failure` policy to authorize a fresh VM/boot/service
+generation, while stale capabilities remain denied and an unrelated instance
+survives. Stop/failure tombstones can be removed for uninstall only by one
+serialized transition that first proves the active boot and exact local VM graph
+are absent, then revokes admission; a configured un-staged replacement makes
+uninstall fail unchanged. There is no public abandon operation. Lifecycle and
+broker mutations use a single-CPU operation owner and linearization epochs. A
+future SMP implementation needs an atomic kernel lock.
+
+This is lifecycle algebra, not a running driver domain: start and health/failure
+are invoked directly by the semantics gate, the declared health timeout is not
+enforced, and no process, guest, provider image, guest agent, shared transport,
+device assignment, DMA/IOMMU boundary, physical reset, 9P service, Linux boot,
+or Plan 9 boot is present.
+
 Acceptance gate:
 
 - a pinned Linux kernel and rootfs boot as `linux.kernel[0]`;
@@ -869,8 +899,12 @@ an unprivileged endpoint-backed daemon and supervisor, terminal request
 arbitration, and one generation rebind. M6B's first slice adds bounded-copy
 request views and typed delegated-resource revocation as a separate native
 mechanism gate. The first KernelWorld native slice adds hash-pinned normal-form
-admission and nonexecuting VM/vCPU/guest-page identities. Every statement
-remains scoped to its fixed-capacity, single-CPU gate.
+admission and nonexecuting VM/vCPU/guest-page identities; Mode 21 adds a
+hardware-only synthetic SVM/NPT execution substrate; and Mode 22 separately
+adds bounded administrative health-gated publication, withdrawal before
+VM-graph revocation, policy-constrained replacement, and stale
+client-capability denial.
+Every statement remains scoped to its fixed-capacity, single-CPU gate.
 
 1. Domain, personality, rootfs, process, thread, and CSpace identities are
    distinct types and cannot be substituted by integer coincidence.

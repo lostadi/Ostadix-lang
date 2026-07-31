@@ -1,0 +1,1302 @@
+module runtime::kernel_world_boot;
+
+use runtime::capability::close_for_owner;
+use runtime::capability::cspace_is_live;
+use runtime::capability::cspace_is_valid_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::inspect_for_owner;
+use runtime::capability::install_first_free_for_owner;
+use runtime::capability::release_cspace;
+use runtime::capability::retain_cspace;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_KERNEL_WORLD_EXPORT;
+use runtime::capability::RIGHT_KERNEL_WORLD_RESET_REQUEST;
+use runtime::capability::RIGHT_KERNEL_WORLD_STATUS;
+use runtime::kernel_world_admission::export_authority_request_ordinal_at;
+use runtime::kernel_world_admission::export_count as admitted_export_count;
+use runtime::kernel_world_admission::export_name_id_at;
+use runtime::kernel_world_admission::export_plane_at;
+use runtime::kernel_world_admission::export_protocol_id_at;
+use runtime::kernel_world_admission::generation as admitted_world_generation;
+use runtime::kernel_world_admission::health_protocol_id;
+use runtime::kernel_world_admission::invariants_hold as admission_invariants_hold;
+use runtime::kernel_world_admission::is_current as admitted_world_is_current;
+use runtime::kernel_world_admission::request_grant_at;
+use runtime::kernel_world_admission::request_rights_at;
+use runtime::kernel_world_admission::revoke as revoke_admitted_world;
+use runtime::kernel_world_admission::restart_policy as admitted_restart_policy;
+use runtime::kernel_world_admission::state as admitted_world_state;
+use runtime::kernel_world_admission::vm_machine_grant;
+use runtime::kernel_world_admission::EXPORT_PLANE_DEVICE;
+use runtime::kernel_world_admission::MAX_REQUESTS_PER_WORLD;
+use runtime::kernel_world_admission::RESTART_ALWAYS;
+use runtime::kernel_world_admission::RESTART_NEVER;
+use runtime::kernel_world_admission::RESTART_ON_FAILURE;
+use runtime::kernel_world_admission::RIGHT_DEVICE_RESET;
+use runtime::kernel_world_admission::RIGHT_VM_RUN;
+use runtime::kernel_world_admission::WORLD_STATE_ADMITTED;
+use runtime::vm_object::invariants_hold as vm_invariants_hold;
+use runtime::vm_object::revoke_world as revoke_vm_world;
+use runtime::vm_object::vm_is_current;
+use runtime::vm_object::vm_owner;
+use runtime::vm_object::vm_state;
+use runtime::vm_object::vm_world;
+use runtime::vm_object::vm_world_generation;
+use runtime::vm_object::world_graph_is_present;
+use runtime::vm_object::VM_STATE_CONFIGURED;
+
+// This is O-core's bounded native control plane for a configured KernelWorld
+// provider. "Start" is an administrative lifecycle transition; this module
+// does not enter a vCPU, boot an operating system, create a guest transport,
+// assign a physical device, perform DMA, or reset hardware.
+pub const MAX_BOOT_INSTANCES: usize = 2;
+pub const MAX_PUBLISHED_EXPORTS: usize = 4;
+
+pub const BOOT_STATE_STAGED: u64 = 1;
+pub const BOOT_STATE_STARTED: u64 = 2;
+pub const BOOT_STATE_HEALTHY: u64 = 3;
+pub const BOOT_STATE_ACTIVE: u64 = 4;
+
+const BOOT_EMPTY: u8 = 0;
+const BOOT_STAGED: u8 = 1;
+const BOOT_STARTED: u8 = 2;
+const BOOT_HEALTHY: u8 = 3;
+const BOOT_ACTIVE: u8 = 4;
+const BOOT_STOPPING: u8 = 5;
+const BOOT_RETIRED: u8 = 6;
+
+const SERVICE_EMPTY: u8 = 0;
+const SERVICE_LIVE: u8 = 1;
+const SERVICE_WITHDRAWING: u8 = 2;
+const SERVICE_RETIRED: u8 = 3;
+
+const TICKET_EMPTY: u8 = 0;
+const TICKET_LIVE: u8 = 1;
+const TICKET_CAUSE_FAILURE: u8 = 1;
+const TICKET_CAUSE_STOP: u8 = 2;
+
+const BOOT_HANDLE_TAG: u64 = 0xec00_0000;
+const SERVICE_HANDLE_TAG: u64 = 0xed00_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut BOOT_STATES: [u8; 2] = [0; 2];
+static mut BOOT_GENERATIONS: [u32; 2] = [0; 2];
+static mut BOOT_WORLDS: [u64; 2] = [0; 2];
+static mut BOOT_WORLD_GENERATIONS: [u64; 2] = [0; 2];
+static mut BOOT_VMS: [u64; 2] = [0; 2];
+static mut BOOT_CONSUMER_CSPACES: [u64; 2] = [0; 2];
+static mut BOOT_HEALTH_PROTOCOLS: [u64; 2] = [0; 2];
+
+static mut SERVICE_STATES: [u8; 4] = [0; 4];
+static mut SERVICE_GENERATIONS: [u32; 4] = [0; 4];
+static mut SERVICE_BOOTS: [u64; 4] = [0; 4];
+static mut SERVICE_EXPORT_ORDINALS: [usize; 4] = [0; 4];
+static mut SERVICE_NAMES: [u64; 4] = [0; 4];
+static mut SERVICE_PROTOCOLS: [u64; 4] = [0; 4];
+static mut SERVICE_CSPACES: [u64; 4] = [0; 4];
+static mut SERVICE_CAPABILITIES: [u64; 4] = [0; 4];
+static mut SERVICE_RIGHTS: [u64; 4] = [0; 4];
+
+// Failure tickets preserve the admitted package authority while its exact VM
+// graph is absent. A replacement consumes one ticket and receives a fresh
+// boot/service generation. Admission generation and runtime generation remain
+// intentionally distinct.
+static mut TICKET_STATES: [u8; 2] = [0; 2];
+static mut TICKET_WORLDS: [u64; 2] = [0; 2];
+static mut TICKET_WORLD_GENERATIONS: [u64; 2] = [0; 2];
+static mut TICKET_POLICIES: [u64; 2] = [0; 2];
+static mut TICKET_CAUSES: [u8; 2] = [0; 2];
+
+static mut ACTIVE_BOOTS: usize = 0;
+static mut ACTIVE_SERVICES: usize = 0;
+static mut ACTIVE_TICKETS: usize = 0;
+static mut STAGES: u64 = 0;
+static mut STARTS: u64 = 0;
+static mut HEALTH_OBSERVATIONS: u64 = 0;
+static mut PUBLICATIONS: u64 = 0;
+static mut LOOKUPS: u64 = 0;
+static mut STATUS_REQUESTS: u64 = 0;
+static mut RESET_REQUESTS: u64 = 0;
+static mut FAILURES: u64 = 0;
+static mut RESTARTS: u64 = 0;
+static mut STOPS: u64 = 0;
+static mut WITHDRAWALS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut EVENT_SEQUENCE: u64 = 0;
+static mut LAST_FAILURE_WITHDRAWAL_EVENT: u64 = 0;
+static mut LAST_FAILURE_VM_REVOKE_EVENT: u64 = 0;
+// O-core's current native gate is single-CPU. This ownership byte serializes
+// every externally callable lifecycle/broker transition against interrupt
+// re-entry; a future SMP port must replace it with an atomic kernel lock.
+static mut OPERATION_ACTIVE: u8 = 0;
+static mut LINEARIZATION_EPOCH: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn handle_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn handle_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+unsafe fn make_boot_handle(slot: usize) -> u64 {
+    return ((BOOT_GENERATIONS[slot] as u64) << 32)
+        | BOOT_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn make_service_handle(slot: usize) -> u64 {
+    return ((SERVICE_GENERATIONS[slot] as u64) << 32)
+        | SERVICE_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_boot(boot: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (boot & HANDLE_TAG_MASK) != BOOT_HANDLE_TAG {
+        return MAX_BOOT_INSTANCES;
+    }
+    let slot: usize = handle_index(boot);
+    if slot >= MAX_BOOT_INSTANCES
+        || BOOT_GENERATIONS[slot] != handle_generation(boot) {
+        return MAX_BOOT_INSTANCES;
+    }
+    let state: u8 = BOOT_STATES[slot];
+    if state != BOOT_STAGED
+        && state != BOOT_STARTED
+        && state != BOOT_HEALTHY
+        && state != BOOT_ACTIVE {
+        return MAX_BOOT_INSTANCES;
+    }
+    return slot;
+}
+
+unsafe fn checked_service(service: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (service & HANDLE_TAG_MASK) != SERVICE_HANDLE_TAG {
+        return MAX_PUBLISHED_EXPORTS;
+    }
+    let slot: usize = handle_index(service);
+    if slot >= MAX_PUBLISHED_EXPORTS
+        || SERVICE_STATES[slot] != SERVICE_LIVE
+        || SERVICE_GENERATIONS[slot] != handle_generation(service) {
+        return MAX_PUBLISHED_EXPORTS;
+    }
+    return slot;
+}
+
+unsafe fn deny() -> u64 {
+    if DENIALS != MAX_COUNTER {
+        DENIALS += 1;
+    }
+    return 0;
+}
+
+unsafe fn begin_operation() -> bool {
+    if OPERATION_ACTIVE != 0 {
+        return false;
+    }
+    // Refuse before acquiring ownership so the caller cannot mutate state for
+    // a transition whose linearization point is no longer representable.
+    if LINEARIZATION_EPOCH == MAX_COUNTER {
+        POISONED = 1;
+        return false;
+    }
+    OPERATION_ACTIVE = 1;
+    return true;
+}
+
+unsafe fn end_operation(result: u64) -> u64 {
+    if OPERATION_ACTIVE == 0 || LINEARIZATION_EPOCH == MAX_COUNTER {
+        POISONED = 1;
+        OPERATION_ACTIVE = 0;
+        return 0;
+    }
+    LINEARIZATION_EPOCH += 1;
+    OPERATION_ACTIVE = 0;
+    return result;
+}
+
+unsafe fn clear_boot_slot(slot: usize) -> void {
+    BOOT_WORLDS[slot] = 0;
+    BOOT_WORLD_GENERATIONS[slot] = 0;
+    BOOT_VMS[slot] = 0;
+    BOOT_CONSUMER_CSPACES[slot] = 0;
+    BOOT_HEALTH_PROTOCOLS[slot] = 0;
+}
+
+unsafe fn retire_boot_slot(slot: usize) -> void {
+    clear_boot_slot(slot);
+    if BOOT_GENERATIONS[slot] == 0xffff_ffff {
+        BOOT_STATES[slot] = BOOT_RETIRED;
+    } else {
+        BOOT_GENERATIONS[slot] += 1;
+        BOOT_STATES[slot] = BOOT_EMPTY;
+    }
+}
+
+unsafe fn clear_service_slot(slot: usize) -> void {
+    SERVICE_BOOTS[slot] = 0;
+    SERVICE_EXPORT_ORDINALS[slot] = 0;
+    SERVICE_NAMES[slot] = 0;
+    SERVICE_PROTOCOLS[slot] = 0;
+    SERVICE_CSPACES[slot] = 0;
+    SERVICE_CAPABILITIES[slot] = 0;
+    SERVICE_RIGHTS[slot] = 0;
+}
+
+unsafe fn retire_service_slot(slot: usize) -> void {
+    clear_service_slot(slot);
+    if SERVICE_GENERATIONS[slot] == 0xffff_ffff {
+        SERVICE_STATES[slot] = SERVICE_RETIRED;
+    } else {
+        SERVICE_GENERATIONS[slot] += 1;
+        SERVICE_STATES[slot] = SERVICE_EMPTY;
+    }
+}
+
+unsafe fn clear_ticket(slot: usize) -> void {
+    TICKET_WORLDS[slot] = 0;
+    TICKET_WORLD_GENERATIONS[slot] = 0;
+    TICKET_POLICIES[slot] = 0;
+    TICKET_CAUSES[slot] = 0;
+    TICKET_STATES[slot] = TICKET_EMPTY;
+}
+
+unsafe fn find_ticket(world: u64) -> usize {
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        if TICKET_STATES[slot] == TICKET_LIVE
+            && TICKET_WORLDS[slot] == world
+            && TICKET_WORLD_GENERATIONS[slot]
+                == admitted_world_generation(world) {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_BOOT_INSTANCES;
+}
+
+unsafe fn free_ticket_slot() -> usize {
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        if TICKET_STATES[slot] == TICKET_EMPTY {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_BOOT_INSTANCES;
+}
+
+unsafe fn valid_world_vm(
+    world: u64,
+    vm: u64,
+    consumer_cspace: u64
+) -> bool {
+    return admitted_world_is_current(world)
+        && admitted_world_state(world) == WORLD_STATE_ADMITTED
+        && admitted_world_generation(world) != 0
+        && vm_is_current(vm)
+        && vm_state(vm) == VM_STATE_CONFIGURED
+        && vm_world(vm) == world
+        && vm_world_generation(vm) == admitted_world_generation(world)
+        && vm_owner(vm) != 0
+        && cspace_is_live(consumer_cspace);
+}
+
+unsafe fn active_boot_for_world(world: u64) -> bool {
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        let state: u8 = BOOT_STATES[slot];
+        if (state == BOOT_STAGED
+                || state == BOOT_STARTED
+                || state == BOOT_HEALTHY
+                || state == BOOT_ACTIVE)
+            && BOOT_WORLDS[slot] == world {
+            return true;
+        }
+        slot += 1;
+    }
+    return false;
+}
+
+unsafe fn stage_internal(
+    world: u64,
+    vm: u64,
+    consumer_cspace: u64,
+    ticket_slot: usize
+) -> u64 {
+    if !valid_world_vm(world, vm, consumer_cspace)
+        || active_boot_for_world(world)
+        || STAGES == MAX_COUNTER {
+        return deny();
+    }
+    if ticket_slot < MAX_BOOT_INSTANCES {
+        if TICKET_STATES[ticket_slot] != TICKET_LIVE
+            || TICKET_WORLDS[ticket_slot] != world
+            || TICKET_WORLD_GENERATIONS[ticket_slot]
+                != admitted_world_generation(world)
+            || (TICKET_POLICIES[ticket_slot] != RESTART_ON_FAILURE
+                && TICKET_POLICIES[ticket_slot] != RESTART_ALWAYS) {
+            return deny();
+        }
+    } else if find_ticket(world) < MAX_BOOT_INSTANCES {
+        // A failed provider cannot bypass its signed restart policy by using
+        // the initial-stage entry point.
+        return deny();
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES && BOOT_STATES[slot] != BOOT_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_BOOT_INSTANCES || retain_cspace(consumer_cspace) == 0 {
+        return deny();
+    }
+    BOOT_WORLDS[slot] = world;
+    BOOT_WORLD_GENERATIONS[slot] = admitted_world_generation(world);
+    BOOT_VMS[slot] = vm;
+    BOOT_CONSUMER_CSPACES[slot] = consumer_cspace;
+    BOOT_HEALTH_PROTOCOLS[slot] = 0;
+    BOOT_STATES[slot] = BOOT_STAGED;
+    ACTIVE_BOOTS += 1;
+    STAGES += 1;
+    if ticket_slot < MAX_BOOT_INSTANCES {
+        clear_ticket(ticket_slot);
+        ACTIVE_TICKETS -= 1;
+        RESTARTS += 1;
+    }
+    return make_boot_handle(slot);
+}
+
+unsafe fn service_is_live_slot(slot: usize) -> bool {
+    if slot >= MAX_PUBLISHED_EXPORTS
+        || SERVICE_STATES[slot] != SERVICE_LIVE {
+        return false;
+    }
+    let boot_slot: usize = checked_boot(SERVICE_BOOTS[slot]);
+    if boot_slot >= MAX_BOOT_INSTANCES
+        || BOOT_STATES[boot_slot] != BOOT_ACTIVE
+        || !cspace_is_live(SERVICE_CSPACES[slot]) {
+        return false;
+    }
+    let service: u64 = make_service_handle(slot);
+    let mut object_id: u64 = 0;
+    let mut actual_rights: u64 = 0;
+    let object_type: u64 = inspect_for_owner(
+        SERVICE_CSPACES[slot],
+        SERVICE_CAPABILITIES[slot],
+        OBJECT_KERNEL_WORLD_EXPORT,
+        SERVICE_RIGHTS[slot],
+        (&mut object_id),
+        (&mut actual_rights)
+    );
+    return object_type == OBJECT_KERNEL_WORLD_EXPORT
+        && object_id == service
+        && actual_rights == SERVICE_RIGHTS[slot]
+        && admitted_world_is_current(BOOT_WORLDS[boot_slot])
+        && admitted_world_generation(BOOT_WORLDS[boot_slot])
+            == BOOT_WORLD_GENERATIONS[boot_slot]
+        && vm_is_current(BOOT_VMS[boot_slot]);
+}
+
+unsafe fn withdraw_services_for_boot(boot_slot: usize) -> bool {
+    let boot: u64 = make_boot_handle(boot_slot);
+    let mut slot: usize = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_BOOTS[slot] == boot {
+            // The state transition makes lookup and broker calls fail before
+            // the generation-tagged capability is closed.
+            SERVICE_STATES[slot] = SERVICE_WITHDRAWING;
+            if close_for_owner(
+                SERVICE_CSPACES[slot],
+                SERVICE_CAPABILITIES[slot]
+            ) != 1 {
+                POISONED = 1;
+                return false;
+            }
+            retire_service_slot(slot);
+            ACTIVE_SERVICES -= 1;
+            WITHDRAWALS += 1;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+unsafe fn service_count_for_boot(boot: u64) -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_BOOTS[slot] == boot {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+unsafe fn advance_failure_event() -> u64 {
+    if EVENT_SEQUENCE == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    EVENT_SEQUENCE += 1;
+    return EVENT_SEQUENCE;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0
+        || !admission_invariants_hold()
+        || !vm_invariants_hold()
+        || !capability_invariants_hold() {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        BOOT_STATES[slot] = BOOT_EMPTY;
+        BOOT_GENERATIONS[slot] = 1;
+        clear_boot_slot(slot);
+        clear_ticket(slot);
+        slot += 1;
+    }
+    slot = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        SERVICE_STATES[slot] = SERVICE_EMPTY;
+        SERVICE_GENERATIONS[slot] = 1;
+        clear_service_slot(slot);
+        slot += 1;
+    }
+    ACTIVE_BOOTS = 0;
+    ACTIVE_SERVICES = 0;
+    ACTIVE_TICKETS = 0;
+    STAGES = 0;
+    STARTS = 0;
+    HEALTH_OBSERVATIONS = 0;
+    PUBLICATIONS = 0;
+    LOOKUPS = 0;
+    STATUS_REQUESTS = 0;
+    RESET_REQUESTS = 0;
+    FAILURES = 0;
+    RESTARTS = 0;
+    STOPS = 0;
+    WITHDRAWALS = 0;
+    DENIALS = 0;
+    EVENT_SEQUENCE = 0;
+    LAST_FAILURE_WITHDRAWAL_EVENT = 0;
+    LAST_FAILURE_VM_REVOKE_EVENT = 0;
+    OPERATION_ACTIVE = 0;
+    LINEARIZATION_EPOCH = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn stage(
+    world: u64,
+    vm: u64,
+    consumer_cspace: u64
+) -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() {
+        return end_operation(0);
+    }
+    let result: u64 = stage_internal(
+        world,
+        vm,
+        consumer_cspace,
+        MAX_BOOT_INSTANCES
+    );
+    return end_operation(result);
+}
+
+pub unsafe fn start(boot: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || STARTS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES
+        || BOOT_STATES[slot] != BOOT_STAGED
+        || (vm_machine_grant(BOOT_WORLDS[slot]) & RIGHT_VM_RUN)
+            != RIGHT_VM_RUN {
+        return end_operation(deny());
+    }
+    BOOT_STATES[slot] = BOOT_STARTED;
+    STARTS += 1;
+    return end_operation(1);
+}
+
+// Only the trusted boot path may report this observation. Publication still
+// requires an exact match with the immutable admitted health protocol.
+pub unsafe fn record_health(
+    boot: u64,
+    observed_protocol: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || HEALTH_OBSERVATIONS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES
+        || BOOT_STATES[slot] != BOOT_STARTED
+        || observed_protocol == 0
+        || observed_protocol != health_protocol_id(BOOT_WORLDS[slot]) {
+        return end_operation(deny());
+    }
+    BOOT_HEALTH_PROTOCOLS[slot] = observed_protocol;
+    BOOT_STATES[slot] = BOOT_HEALTHY;
+    HEALTH_OBSERVATIONS += 1;
+    return end_operation(1);
+}
+
+// Publication installs a new, nontransferable client capability. Provider
+// device grants are never handed to the client. The only optional client right
+// is a request to the O-core reset broker, derived from an exact independently
+// granted export-authority request.
+pub unsafe fn publish_export(
+    boot: u64,
+    export_ordinal: usize,
+    result_capability: *mut u64
+) -> u64 {
+    if result_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(result_capability, 0);
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || PUBLICATIONS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let boot_slot: usize = checked_boot(boot);
+    if boot_slot >= MAX_BOOT_INSTANCES
+        || (BOOT_STATES[boot_slot] != BOOT_HEALTHY
+            && BOOT_STATES[boot_slot] != BOOT_ACTIVE)
+        || BOOT_HEALTH_PROTOCOLS[boot_slot]
+            != health_protocol_id(BOOT_WORLDS[boot_slot])
+        || export_ordinal >= admitted_export_count(BOOT_WORLDS[boot_slot]) {
+        return end_operation(deny());
+    }
+    let mut slot: usize = 0;
+    let mut free_slot: usize = MAX_PUBLISHED_EXPORTS;
+    let publish_name: u64 =
+        export_name_id_at(BOOT_WORLDS[boot_slot], export_ordinal);
+    let publish_protocol: u64 =
+        export_protocol_id_at(BOOT_WORLDS[boot_slot], export_ordinal);
+    while slot < MAX_PUBLISHED_EXPORTS {
+        if SERVICE_STATES[slot] == SERVICE_EMPTY
+            && free_slot == MAX_PUBLISHED_EXPORTS {
+            free_slot = slot;
+        }
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_BOOTS[slot] == boot
+            && SERVICE_EXPORT_ORDINALS[slot] == export_ordinal {
+            return end_operation(deny());
+        }
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_CSPACES[slot]
+                == BOOT_CONSUMER_CSPACES[boot_slot]
+            && SERVICE_NAMES[slot] == publish_name
+            && SERVICE_PROTOCOLS[slot] == publish_protocol {
+            return end_operation(deny());
+        }
+        slot += 1;
+    }
+    if free_slot >= MAX_PUBLISHED_EXPORTS {
+        return end_operation(deny());
+    }
+
+    let world: u64 = BOOT_WORLDS[boot_slot];
+    let mut client_rights: u64 = RIGHT_KERNEL_WORLD_STATUS;
+    if export_plane_at(world, export_ordinal) == EXPORT_PLANE_DEVICE {
+        let request_ordinal: usize =
+            export_authority_request_ordinal_at(world, export_ordinal);
+        if request_ordinal >= MAX_REQUESTS_PER_WORLD {
+            return end_operation(deny());
+        }
+        let requested: u64 = request_rights_at(world, request_ordinal);
+        let granted: u64 = request_grant_at(world, request_ordinal);
+        if requested == 0 || granted != requested {
+            return end_operation(deny());
+        }
+        if (granted & RIGHT_DEVICE_RESET) == RIGHT_DEVICE_RESET {
+            client_rights |= RIGHT_KERNEL_WORLD_RESET_REQUEST;
+        }
+    }
+
+    let service: u64 = make_service_handle(free_slot);
+    let consumer: u64 = BOOT_CONSUMER_CSPACES[boot_slot];
+    let capability: u64 = install_first_free_for_owner(
+        consumer,
+        service,
+        OBJECT_KERNEL_WORLD_EXPORT,
+        client_rights
+    );
+    if capability == 0 {
+        return end_operation(deny());
+    }
+    SERVICE_BOOTS[free_slot] = boot;
+    SERVICE_EXPORT_ORDINALS[free_slot] = export_ordinal;
+    SERVICE_NAMES[free_slot] = publish_name;
+    SERVICE_PROTOCOLS[free_slot] = publish_protocol;
+    SERVICE_CSPACES[free_slot] = consumer;
+    SERVICE_CAPABILITIES[free_slot] = capability;
+    SERVICE_RIGHTS[free_slot] = client_rights;
+    SERVICE_STATES[free_slot] = SERVICE_LIVE;
+    BOOT_STATES[boot_slot] = BOOT_ACTIVE;
+    ACTIVE_SERVICES += 1;
+    PUBLICATIONS += 1;
+    volatile_store(result_capability, capability);
+    return end_operation(service);
+}
+
+// Name/protocol lookup is authority-neutral. It returns only the exact
+// generation-tagged capability already installed in this consumer CSpace.
+pub unsafe fn lookup(
+    name_id: u64,
+    protocol_id: u64,
+    consumer_cspace: u64,
+    required_rights: u64,
+    result_capability: *mut u64
+) -> u64 {
+    if result_capability as usize == 0 {
+        return 0;
+    }
+    volatile_store(result_capability, 0);
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if name_id == 0
+        || protocol_id == 0
+        || !cspace_is_live(consumer_cspace)
+        || required_rights == 0
+        || LOOKUPS == MAX_COUNTER {
+        return end_operation(deny());
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_NAMES[slot] == name_id
+            && SERVICE_PROTOCOLS[slot] == protocol_id
+            && SERVICE_CSPACES[slot] == consumer_cspace {
+            if (SERVICE_RIGHTS[slot] & required_rights) != required_rights
+                || !service_is_live_slot(slot) {
+                return end_operation(deny());
+            }
+            volatile_store(
+                result_capability,
+                SERVICE_CAPABILITIES[slot]
+            );
+            LOOKUPS += 1;
+            return end_operation(1);
+        }
+        slot += 1;
+    }
+    return end_operation(deny());
+}
+
+pub unsafe fn status(
+    consumer_cspace: u64,
+    capability: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if STATUS_REQUESTS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let service: u64 = validate_for_owner(
+        consumer_cspace,
+        capability,
+        OBJECT_KERNEL_WORLD_EXPORT,
+        RIGHT_KERNEL_WORLD_STATUS
+    );
+    let service_slot: usize = checked_service(service);
+    if service_slot >= MAX_PUBLISHED_EXPORTS
+        || !service_is_live_slot(service_slot) {
+        return end_operation(deny());
+    }
+    let boot_slot: usize = checked_boot(SERVICE_BOOTS[service_slot]);
+    if boot_slot >= MAX_BOOT_INSTANCES {
+        return end_operation(deny());
+    }
+    STATUS_REQUESTS += 1;
+    return end_operation(BOOT_GENERATIONS[boot_slot] as u64);
+}
+
+// Success means that O-core accepted a reset request for this exact live
+// export. No hardware reset, PCI operation, or device assignment occurs here.
+pub unsafe fn request_reset(
+    consumer_cspace: u64,
+    capability: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if RESET_REQUESTS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let service: u64 = validate_for_owner(
+        consumer_cspace,
+        capability,
+        OBJECT_KERNEL_WORLD_EXPORT,
+        RIGHT_KERNEL_WORLD_RESET_REQUEST
+    );
+    let service_slot: usize = checked_service(service);
+    if service_slot >= MAX_PUBLISHED_EXPORTS
+        || !service_is_live_slot(service_slot) {
+        return end_operation(deny());
+    }
+    let boot_slot: usize = checked_boot(SERVICE_BOOTS[service_slot]);
+    if boot_slot >= MAX_BOOT_INSTANCES {
+        return end_operation(deny());
+    }
+    let world: u64 = BOOT_WORLDS[boot_slot];
+    let export_ordinal: usize = SERVICE_EXPORT_ORDINALS[service_slot];
+    if export_plane_at(world, export_ordinal) != EXPORT_PLANE_DEVICE {
+        return end_operation(deny());
+    }
+    let request_ordinal: usize =
+        export_authority_request_ordinal_at(world, export_ordinal);
+    if request_ordinal >= MAX_REQUESTS_PER_WORLD
+        || request_grant_at(world, request_ordinal)
+            != request_rights_at(world, request_ordinal)
+        || (request_grant_at(world, request_ordinal)
+            & RIGHT_DEVICE_RESET) != RIGHT_DEVICE_RESET {
+        return end_operation(deny());
+    }
+    RESET_REQUESTS += 1;
+    return end_operation(1);
+}
+
+// SYS_CAP_CLOSE routes KernelWorld export caps here so registry liveness and
+// capability liveness advance as one transition. Closing the final export
+// returns the boot to HEALTHY, allowing later republish or orderly teardown.
+pub unsafe fn close_export_capability(
+    consumer_cspace: u64,
+    capability: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if WITHDRAWALS == MAX_COUNTER || !invariants_hold() {
+        return end_operation(0);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        if SERVICE_STATES[slot] == SERVICE_LIVE
+            && SERVICE_CSPACES[slot] == consumer_cspace
+            && SERVICE_CAPABILITIES[slot] == capability {
+            let boot: u64 = SERVICE_BOOTS[slot];
+            let boot_slot: usize = checked_boot(boot);
+            if boot_slot >= MAX_BOOT_INSTANCES
+                || BOOT_STATES[boot_slot] != BOOT_ACTIVE {
+                return end_operation(deny());
+            }
+            SERVICE_STATES[slot] = SERVICE_WITHDRAWING;
+            if close_for_owner(consumer_cspace, capability) != 1 {
+                POISONED = 1;
+                return end_operation(0);
+            }
+            retire_service_slot(slot);
+            ACTIVE_SERVICES -= 1;
+            WITHDRAWALS += 1;
+            if service_count_for_boot(boot) == 0 {
+                BOOT_STATES[boot_slot] = BOOT_HEALTHY;
+            }
+            if !invariants_hold() {
+                POISONED = 1;
+                return end_operation(0);
+            }
+            return end_operation(1);
+        }
+        slot += 1;
+    }
+    return end_operation(deny());
+}
+
+// Failure first makes the boot generation unavailable, then closes every
+// issued consumer capability, then revokes the exact VM graph. Admission is
+// deliberately retained so a policy-authorized replacement can consume the
+// failure ticket.
+pub unsafe fn fail(boot: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || FAILURES == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES
+        || (BOOT_STATES[slot] != BOOT_STARTED
+            && BOOT_STATES[slot] != BOOT_HEALTHY
+            && BOOT_STATES[slot] != BOOT_ACTIVE) {
+        return end_operation(deny());
+    }
+    let world: u64 = BOOT_WORLDS[slot];
+    let vm: u64 = BOOT_VMS[slot];
+    let consumer: u64 = BOOT_CONSUMER_CSPACES[slot];
+    let policy: u64 = admitted_restart_policy(world);
+    let ticket_slot: usize = free_ticket_slot();
+    if ticket_slot >= MAX_BOOT_INSTANCES
+        || (policy != RESTART_NEVER
+            && policy != RESTART_ON_FAILURE
+            && policy != RESTART_ALWAYS) {
+        return end_operation(deny());
+    }
+
+    BOOT_STATES[slot] = BOOT_STOPPING;
+    if !withdraw_services_for_boot(slot) {
+        return end_operation(0);
+    }
+    LAST_FAILURE_WITHDRAWAL_EVENT = advance_failure_event();
+    if LAST_FAILURE_WITHDRAWAL_EVENT == 0
+        || revoke_vm_world(world) != 1 {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    LAST_FAILURE_VM_REVOKE_EVENT = advance_failure_event();
+    if LAST_FAILURE_VM_REVOKE_EVENT == 0
+        || release_cspace(consumer) != 1 {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    retire_boot_slot(slot);
+    ACTIVE_BOOTS -= 1;
+    TICKET_WORLDS[ticket_slot] = world;
+    TICKET_WORLD_GENERATIONS[ticket_slot] =
+        admitted_world_generation(world);
+    TICKET_POLICIES[ticket_slot] = policy;
+    TICKET_CAUSES[ticket_slot] = TICKET_CAUSE_FAILURE;
+    TICKET_STATES[ticket_slot] = TICKET_LIVE;
+    ACTIVE_TICKETS += 1;
+    FAILURES += 1;
+    if vm_is_current(vm) || !invariants_hold() {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    return end_operation(1);
+}
+
+pub unsafe fn restart_after_failure(
+    world: u64,
+    vm: u64,
+    consumer_cspace: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || RESTARTS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let ticket_slot: usize = find_ticket(world);
+    if ticket_slot >= MAX_BOOT_INSTANCES
+        || TICKET_CAUSES[ticket_slot] != TICKET_CAUSE_FAILURE
+        || (TICKET_POLICIES[ticket_slot] != RESTART_ON_FAILURE
+            && TICKET_POLICIES[ticket_slot] != RESTART_ALWAYS)
+        || admitted_restart_policy(world) != TICKET_POLICIES[ticket_slot] {
+        return end_operation(deny());
+    }
+    let result: u64 =
+        stage_internal(world, vm, consumer_cspace, ticket_slot);
+    return end_operation(result);
+}
+
+pub unsafe fn restart_after_stop(
+    world: u64,
+    vm: u64,
+    consumer_cspace: u64
+) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || RESTARTS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let ticket_slot: usize = find_ticket(world);
+    if ticket_slot >= MAX_BOOT_INSTANCES
+        || TICKET_CAUSES[ticket_slot] != TICKET_CAUSE_STOP
+        || TICKET_POLICIES[ticket_slot] != RESTART_ALWAYS
+        || admitted_restart_policy(world) != RESTART_ALWAYS {
+        return end_operation(deny());
+    }
+    let result: u64 =
+        stage_internal(world, vm, consumer_cspace, ticket_slot);
+    return end_operation(result);
+}
+
+// Stop is an explicit administrative shutdown, not a provider exit. A
+// terminal ticket prevents the initial-stage API from bypassing policy;
+// RESTART_ALWAYS may consume it through restart_after_stop, while an uninstall
+// path atomically revokes admission before consuming it.
+pub unsafe fn stop(boot: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold() || STOPS == MAX_COUNTER {
+        return end_operation(0);
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES {
+        return end_operation(deny());
+    }
+    let world: u64 = BOOT_WORLDS[slot];
+    let vm: u64 = BOOT_VMS[slot];
+    let consumer: u64 = BOOT_CONSUMER_CSPACES[slot];
+    let policy: u64 = admitted_restart_policy(world);
+    let ticket_slot: usize = free_ticket_slot();
+    if ticket_slot >= MAX_BOOT_INSTANCES
+        || (policy != RESTART_NEVER
+            && policy != RESTART_ON_FAILURE
+            && policy != RESTART_ALWAYS) {
+        return end_operation(deny());
+    }
+    BOOT_STATES[slot] = BOOT_STOPPING;
+    if !withdraw_services_for_boot(slot)
+        || revoke_vm_world(world) != 1
+        || release_cspace(consumer) != 1 {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    retire_boot_slot(slot);
+    ACTIVE_BOOTS -= 1;
+    TICKET_WORLDS[ticket_slot] = world;
+    TICKET_WORLD_GENERATIONS[ticket_slot] =
+        admitted_world_generation(world);
+    TICKET_POLICIES[ticket_slot] = policy;
+    TICKET_CAUSES[ticket_slot] = TICKET_CAUSE_STOP;
+    TICKET_STATES[ticket_slot] = TICKET_LIVE;
+    ACTIVE_TICKETS += 1;
+    STOPS += 1;
+    if vm_is_current(vm) || !invariants_hold() {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    return end_operation(1);
+}
+
+pub unsafe fn binding_is_live(service: u64) -> bool {
+    if OPERATION_ACTIVE != 0 {
+        return false;
+    }
+    let slot: usize = checked_service(service);
+    return slot < MAX_PUBLISHED_EXPORTS && service_is_live_slot(slot);
+}
+
+pub unsafe fn pending_restart(world: u64) -> bool {
+    if OPERATION_ACTIVE != 0 {
+        return false;
+    }
+    let slot: usize = find_ticket(world);
+    if slot >= MAX_BOOT_INSTANCES {
+        return false;
+    }
+    if TICKET_CAUSES[slot] == TICKET_CAUSE_FAILURE {
+        return TICKET_POLICIES[slot] == RESTART_ON_FAILURE
+            || TICKET_POLICIES[slot] == RESTART_ALWAYS;
+    }
+    return TICKET_CAUSES[slot] == TICKET_CAUSE_STOP
+        && TICKET_POLICIES[slot] == RESTART_ALWAYS;
+}
+
+pub unsafe fn has_terminal_ticket(world: u64) -> bool {
+    if OPERATION_ACTIVE != 0 {
+        return false;
+    }
+    return find_ticket(world) < MAX_BOOT_INSTANCES;
+}
+
+// The caller may uninstall a failed/stopped provider only after its VM graph
+// is absent. Admission revocation and terminal-tombstone consumption are one
+// serialized transition, so ordinary stage cannot reopen the old generation.
+pub unsafe fn uninstall(world: u64) -> u64 {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !begin_operation() {
+        return 0;
+    }
+    if !invariants_hold()
+        || active_boot_for_world(world)
+        || world_graph_is_present(world) {
+        return end_operation(deny());
+    }
+    let slot: usize = find_ticket(world);
+    if slot >= MAX_BOOT_INSTANCES {
+        return end_operation(deny());
+    }
+    // Admission revocation happens first. If it fails, the terminal tombstone
+    // remains and ordinary stage still cannot reinterpret this as a new boot.
+    if revoke_admitted_world(world) != 1 {
+        return end_operation(deny());
+    }
+    clear_ticket(slot);
+    ACTIVE_TICKETS -= 1;
+    if !invariants_hold() {
+        POISONED = 1;
+        return end_operation(0);
+    }
+    return end_operation(1);
+}
+
+pub unsafe fn state(boot: u64) -> u64 {
+    if OPERATION_ACTIVE != 0 {
+        return 0;
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES {
+        return 0;
+    }
+    if BOOT_STATES[slot] == BOOT_STAGED {
+        return BOOT_STATE_STAGED;
+    }
+    if BOOT_STATES[slot] == BOOT_STARTED {
+        return BOOT_STATE_STARTED;
+    }
+    if BOOT_STATES[slot] == BOOT_HEALTHY {
+        return BOOT_STATE_HEALTHY;
+    }
+    if BOOT_STATES[slot] == BOOT_ACTIVE {
+        return BOOT_STATE_ACTIVE;
+    }
+    return 0;
+}
+
+pub unsafe fn generation(boot: u64) -> u64 {
+    if OPERATION_ACTIVE != 0 {
+        return 0;
+    }
+    let slot: usize = checked_boot(boot);
+    if slot >= MAX_BOOT_INSTANCES {
+        return 0;
+    }
+    return BOOT_GENERATIONS[slot] as u64;
+}
+
+pub unsafe fn active_boot_count() -> usize { return ACTIVE_BOOTS; }
+pub unsafe fn active_service_count() -> usize { return ACTIVE_SERVICES; }
+pub unsafe fn pending_restart_count() -> usize { return ACTIVE_TICKETS; }
+pub unsafe fn stage_count() -> u64 { return STAGES; }
+pub unsafe fn start_count() -> u64 { return STARTS; }
+pub unsafe fn health_observation_count() -> u64 {
+    return HEALTH_OBSERVATIONS;
+}
+pub unsafe fn publication_count() -> u64 { return PUBLICATIONS; }
+pub unsafe fn lookup_count() -> u64 { return LOOKUPS; }
+pub unsafe fn status_request_count() -> u64 { return STATUS_REQUESTS; }
+pub unsafe fn reset_request_count() -> u64 { return RESET_REQUESTS; }
+pub unsafe fn failure_count() -> u64 { return FAILURES; }
+pub unsafe fn restart_count() -> u64 { return RESTARTS; }
+pub unsafe fn stop_count() -> u64 { return STOPS; }
+pub unsafe fn withdrawal_count() -> u64 { return WITHDRAWALS; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn last_failure_withdrawal_event() -> u64 {
+    return LAST_FAILURE_WITHDRAWAL_EVENT;
+}
+pub unsafe fn last_failure_vm_revoke_event() -> u64 {
+    return LAST_FAILURE_VM_REVOKE_EVENT;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || OPERATION_ACTIVE > 1
+        || !admission_invariants_hold()
+        || !vm_invariants_hold()
+        || !capability_invariants_hold() {
+        return false;
+    }
+    let mut services_by_boot: [usize; 2] = [0; 2];
+    let mut observed_boots: usize = 0;
+    let mut observed_services: usize = 0;
+    let mut observed_tickets: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        let state: u8 = BOOT_STATES[slot];
+        if BOOT_GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == BOOT_EMPTY || state == BOOT_RETIRED {
+            if (state == BOOT_RETIRED
+                    && BOOT_GENERATIONS[slot] != 0xffff_ffff)
+                || BOOT_WORLDS[slot] != 0
+                || BOOT_WORLD_GENERATIONS[slot] != 0
+                || BOOT_VMS[slot] != 0
+                || BOOT_CONSUMER_CSPACES[slot] != 0
+                || BOOT_HEALTH_PROTOCOLS[slot] != 0 {
+                return false;
+            }
+        } else if state == BOOT_STAGED
+            || state == BOOT_STARTED
+            || state == BOOT_HEALTHY
+            || state == BOOT_ACTIVE {
+            if !valid_world_vm(
+                BOOT_WORLDS[slot],
+                BOOT_VMS[slot],
+                BOOT_CONSUMER_CSPACES[slot]
+            ) || BOOT_WORLD_GENERATIONS[slot]
+                    != admitted_world_generation(BOOT_WORLDS[slot])
+                || ((state == BOOT_STAGED || state == BOOT_STARTED)
+                    && BOOT_HEALTH_PROTOCOLS[slot] != 0)
+                || ((state == BOOT_HEALTHY || state == BOOT_ACTIVE)
+                    && BOOT_HEALTH_PROTOCOLS[slot]
+                        != health_protocol_id(BOOT_WORLDS[slot])) {
+                return false;
+            }
+            observed_boots += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_BOOT_INSTANCES {
+                let other_state: u8 = BOOT_STATES[other];
+                if (other_state == BOOT_STAGED
+                        || other_state == BOOT_STARTED
+                        || other_state == BOOT_HEALTHY
+                        || other_state == BOOT_ACTIVE)
+                    && (BOOT_WORLDS[other] == BOOT_WORLDS[slot]
+                        || BOOT_VMS[other] == BOOT_VMS[slot]) {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+
+        let ticket_state: u8 = TICKET_STATES[slot];
+        if ticket_state == TICKET_EMPTY {
+            if TICKET_WORLDS[slot] != 0
+                || TICKET_WORLD_GENERATIONS[slot] != 0
+                || TICKET_POLICIES[slot] != 0
+                || TICKET_CAUSES[slot] != 0 {
+                return false;
+            }
+        } else if ticket_state == TICKET_LIVE {
+            if !admitted_world_is_current(TICKET_WORLDS[slot])
+                || admitted_world_generation(TICKET_WORLDS[slot])
+                    != TICKET_WORLD_GENERATIONS[slot]
+                || (TICKET_POLICIES[slot] != RESTART_NEVER
+                    && TICKET_POLICIES[slot] != RESTART_ON_FAILURE
+                    && TICKET_POLICIES[slot] != RESTART_ALWAYS)
+                || (TICKET_CAUSES[slot] != TICKET_CAUSE_FAILURE
+                    && TICKET_CAUSES[slot] != TICKET_CAUSE_STOP)
+                || active_boot_for_world(TICKET_WORLDS[slot]) {
+                return false;
+            }
+            observed_tickets += 1;
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+
+    slot = 0;
+    while slot < MAX_PUBLISHED_EXPORTS {
+        let state: u8 = SERVICE_STATES[slot];
+        if SERVICE_GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == SERVICE_EMPTY || state == SERVICE_RETIRED {
+            if (state == SERVICE_RETIRED
+                    && SERVICE_GENERATIONS[slot] != 0xffff_ffff)
+                || SERVICE_BOOTS[slot] != 0
+                || SERVICE_EXPORT_ORDINALS[slot] != 0
+                || SERVICE_NAMES[slot] != 0
+                || SERVICE_PROTOCOLS[slot] != 0
+                || SERVICE_CSPACES[slot] != 0
+                || SERVICE_CAPABILITIES[slot] != 0
+                || SERVICE_RIGHTS[slot] != 0 {
+                return false;
+            }
+        } else if state == SERVICE_LIVE {
+            let boot_slot: usize = checked_boot(SERVICE_BOOTS[slot]);
+            if boot_slot >= MAX_BOOT_INSTANCES
+                || BOOT_STATES[boot_slot] != BOOT_ACTIVE
+                || SERVICE_EXPORT_ORDINALS[slot]
+                    >= admitted_export_count(BOOT_WORLDS[boot_slot])
+                || SERVICE_NAMES[slot] != export_name_id_at(
+                    BOOT_WORLDS[boot_slot],
+                    SERVICE_EXPORT_ORDINALS[slot]
+                )
+                || SERVICE_PROTOCOLS[slot] != export_protocol_id_at(
+                    BOOT_WORLDS[boot_slot],
+                    SERVICE_EXPORT_ORDINALS[slot]
+                )
+                || SERVICE_CSPACES[slot]
+                    != BOOT_CONSUMER_CSPACES[boot_slot]
+                || SERVICE_CAPABILITIES[slot] == 0
+                || (SERVICE_RIGHTS[slot] & RIGHT_KERNEL_WORLD_STATUS) == 0
+                || !service_is_live_slot(slot) {
+                return false;
+            }
+            services_by_boot[boot_slot] += 1;
+            observed_services += 1;
+            let mut other: usize = slot + 1;
+            while other < MAX_PUBLISHED_EXPORTS {
+                if SERVICE_STATES[other] == SERVICE_LIVE
+                    && SERVICE_BOOTS[other] == SERVICE_BOOTS[slot]
+                    && SERVICE_EXPORT_ORDINALS[other]
+                        == SERVICE_EXPORT_ORDINALS[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+
+    slot = 0;
+    while slot < MAX_BOOT_INSTANCES {
+        if BOOT_STATES[slot] == BOOT_ACTIVE
+            && services_by_boot[slot] == 0 {
+            return false;
+        }
+        if BOOT_STATES[slot] == BOOT_HEALTHY
+            && services_by_boot[slot] != 0 {
+            return false;
+        }
+        slot += 1;
+    }
+    return observed_boots == ACTIVE_BOOTS
+        && observed_services == ACTIVE_SERVICES
+        && observed_tickets == ACTIVE_TICKETS;
+}
