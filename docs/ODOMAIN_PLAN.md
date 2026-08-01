@@ -2,8 +2,8 @@
 
 Status: active roadmap. Milestones 0.1 through 5, the bounded M6A/M6B slices
 including Mode 24's live four-byte composition, Mode 25's exact static-Linux
-ELF/minimal-ABI slice, and KernelWorld Modes 20 through 23 now have executable
-evidence at their
+ELF/minimal-ABI slice, Mode 26's exact Linux-to-9P2000 service composition, and
+KernelWorld Modes 20 through 23 now have executable evidence at their
 documented, fixed-capacity, single-CPU x86-64 QEMU boundaries. These are
 bounded mechanism, lifecycle, and synthetic-execution proofs, not
 production-scale implementations or evidence for a general foreign
@@ -13,6 +13,11 @@ This document turns the poly-personality kernel brief into a dependency-ordered
 implementation plan for this repository. It is a claim boundary as well as a
 roadmap. Items described as planned are not implemented merely because their
 types, syscall numbers, setup scripts, or names already exist in source.
+
+The separate distributed-fabric product contract is
+[`OSTADIX_WORLD.md`](OSTADIX_WORLD.md). An O-Domain may later run on a World
+node, but the bounded native gates in this roadmap do not establish a
+distributed Governor, node membership, resource registry, or placement layer.
 
 ## 1. Scope and terminology
 
@@ -677,7 +682,24 @@ generation-2 replacement first denies stale generation-1 lookup, then answers
 health and is published; only afterward does the client consume stdout and
 proceed to stderr before complete reclamation.
 
-This slice intentionally does not complete the broader milestone. Grow it in
+Mode 26 retains that exact Linux ELF and adds an unprivileged native 9P2000
+server, native supervisor, and independently linked native Plan-9-style client.
+The four principals load from one deterministic 92,872-byte immutable OVFS
+image into isolated CPL3 address spaces. The server exposes only the
+generation-bound `/srv/linux/status` path, where the client performs exact
+`version`, `attach`, `walk`, `open`, `read`, and `clunk` exchanges with
+`msize = 128`. One contained server fault withdraws generation 1 before a
+health-gated generation-2 replacement; stale generation-1 call authority is
+denied, both clients survive, resources are reclaimed, and a later timer fires.
+
+Mode 26 is real bounded 9P2000 wire behavior between native O-core principals.
+It is not a Plan 9 kernel or binary, a general 9P server, namespace, mount
+environment, network transport, persistent filesystem, or guest-agent path. It
+does not boot Linux or Plan 9 and adds no general Linux ABI, hardware
+virtualization, PCI/device assignment, DMA/IOMMU isolation, or physical-device
+evidence.
+
+These slices intentionally do not complete the broader milestone. Grow it in
 dependency slices: process identity and exit, console I/O, file descriptors and
 path lookup, virtual memory, time, signals, then `clone`/`futex` for threads.
 Candidate calls include `read`, `write`, `openat`, `close`, `mmap`, `munmap`,
@@ -702,9 +724,9 @@ Acceptance gate:
 - crashing or stopping the Linux personality cannot stop a native O-Domain.
 
 The completed milestone remains a minimal compatibility slice, not general
-Linux binary compatibility and not a Linux kernel. Mode 25 is narrower still
-and does not by itself satisfy the native-oracle, signal, mapping, filesystem,
-or multi-binary acceptance items above.
+Linux binary compatibility and not a Linux kernel. Modes 25 and 26 are narrower
+still and do not by themselves satisfy the native-oracle, signal, mapping,
+filesystem, or multi-binary acceptance items above.
 
 ### Milestone 8: multiple root filesystems and Linux O-Domains
 
@@ -899,7 +921,7 @@ enforced, and no process, guest, provider image, guest agent, shared transport,
 device assignment, DMA/IOMMU boundary, physical reset, 9P service, Linux boot,
 or Plan 9 boot is present.
 
-Mode 23 is the next bounded composition slice. It uses QEMU TCG to emulate the
+Mode 23 is a bounded composition slice. It uses QEMU TCG to emulate the
 AMD SVM/NPT architectural interface, then binds the one available execution
 session to an exact generation-tagged boot, admitted world, configured VM,
 vCPU, two guest pages, device-plane export, and granted authority request.
@@ -970,6 +992,9 @@ CPL3 call shape, a contained daemon fault, one generation rebind, and bounded
 pre-terminal lifecycle dispositions. Mode 25 adds one exact static Linux ELF,
 two bounded input writes, Linux `-ENOSYS`, direct exit status 42, preserved
 terminal consumption across daemon replacement, and stale-generation denial.
+Mode 26 composes that same Linux corpus with one exact native 9P2000 server and
+Plan-9-style client path, namespace withdrawal, health-gated replacement, and
+stale call-capability denial.
 The first KernelWorld native slice adds
 hash-pinned normal-form
 admission and nonexecuting VM/vCPU/guest-page identities; Mode 21 adds a
@@ -1034,18 +1059,18 @@ Every statement remains scoped to its fixed-capacity, single-CPU gate.
 |---|---|---|---|---|
 | CPU/privilege | x86-64 ring-0 boot | one CPU, canonical CPL3 frames, timer/SYSCALL switching | isolated x86-64 processes | SMP and hardened entry |
 | Domains | none | bounded generation-tagged native worlds; four-process IPC and live-system scenarios | native, Alpine, Debian instances | persistent lifecycle and quotas |
-| Personalities | none | native dispatch, package-loaded scalar M6A, exact four-byte Mode 24 test personality, and Mode 25's pinned minimal Linux corpus served by unprivileged daemons | broader translated Linux x86-64 across multiple roots | persistent Lisp plus user-space and full-kernel backends |
+| Personalities | none | native dispatch, package-loaded scalar M6A, exact four-byte Mode 24 test personality, Mode 25's pinned minimal Linux corpus, and Mode 26's native Plan-9-style client/server composition | broader translated Linux x86-64 across multiple roots | persistent Lisp plus user-space and full-kernel backends |
 | Address spaces | one identity map | independent CR3s, guarded loaded stacks, exact W^X ELF mappings, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
 | Processes | none | up to four loaded CPL3 principals in the current gates with teardown and stale denial | multiple isolated processes | complete process/thread lifecycle |
 | CSpaces | one small global table | exact owners, endpoint transfer attenuation, isolated service CSpaces, typed REPL control cap | one CSpace per process | general atomic cross-domain attenuation |
 | Memory | bump-only frames | typed reclaim, private/shared mappings, bounded-copy request staging, and nonexecuting guest-page objects | mapped per-process objects | discovered RAM, paging, NUMA policy |
 | Scheduling | timer marker only | bounded preemptive/blocking TCB scheduler with yield, sleep, IPC wake, and loaded-program completion | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | public bounded CPL3 endpoints, scalar M6A RPC, mode-19 request views, one exact four-byte Mode 24 composition, and two Mode 25 Linux input views | broader personality RPC plus foreign memory views | supervised personality RPC |
+| IPC | none | public bounded CPL3 endpoints, scalar M6A RPC, mode-19 request views, one exact four-byte Mode 24 composition, two Mode 25 Linux input views, and Mode 26's exact 9P2000 corpus | broader personality RPC plus foreign memory views | supervised personality RPC |
 | Loading | kernel-linked code | static native ELF plus one exact static Linux ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | broader native and static Linux ELF corpora | dynamic loaders per personality |
-| Filesystems | none | fixed-capacity immutable OVFS images and domain-relative root mounts | separate Alpine/Debian roots | versioned overlays and services |
-| Live system | none | M5 package activation plus bounded M6A scalar, Mode 24 native, and Mode 25 Linux personality supervision/rebind slices | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
-| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus request views, one exact four-byte native path, and two exact Linux input views; no native OValue codec or general foreign ABI | OValue, capability, capsule channels | common contract across all modes |
-| Compatibility | no foreign OS ABI | one pinned static Linux ELF with write, -ENOSYS, and exit_group only | the same broader pinned corpus across multiple Linux roots | additional personalities by evidence |
+| Filesystems | none | fixed-capacity immutable OVFS images, domain-relative root mounts, and one exact generation-bound `/srv/linux/status` 9P path; no general filesystem | separate Alpine/Debian roots | versioned overlays and services |
+| Live system | none | M5 package activation plus bounded M6A scalar, Mode 24 native, Mode 25 Linux, and Mode 26 9P service supervision/rebind slices | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
+| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus request views, one exact four-byte native path, two exact Linux input views, and one bounded Linux-result-to-9P path; no native OValue codec or general foreign ABI | OValue, capability, capsule channels | common contract across all modes |
+| Compatibility | no foreign OS ABI | one pinned static Linux ELF with write, -ENOSYS, and exit_group only, reused by one exact 9P2000 composition | the same broader pinned corpus across multiple Linux roots | additional personalities by evidence |
 
 The first credible multi-domain O-Domain demonstration is therefore not either
 single-process bootstrap gate. It is the later evidence bundle that boots

@@ -213,4 +213,101 @@ check_current_ocore_docs \
 check 'direct [`]*HostedSupervisor[`]* API[^.]*(do(es)? not|has no)[^.]*(revision|stale.writer)|direct supervisor API has no persisted-revision' \
     "the hosted supervisor API now rejects stale active-set writers by persisted revision"
 
+# Ostadix World v0 has one normative product contract. Keep the public entry
+# points linked to it and pin the contract sections and non-claims that prevent
+# a future distributed demo from being confused with the existing local
+# Live-World oracle, partial PR1 foundation, or bounded native modes.
+require_fixed() {
+    local file="$1" text="$2" why="$3"
+    if [ ! -f "$file" ]; then
+        echo "MISSING WORLD CONTRACT SURFACE: $file ($why)"
+        fail=1
+        return
+    fi
+    if ! grep -Fq -- "$text" "$file"; then
+        echo "WORLD CONTRACT DRIFT: $why"
+        echo "  file: $file"
+        echo "  required text: $text"
+        echo
+        fail=1
+    fi
+}
+
+require_fixed docs/OSTADIX_WORLD.md \
+    'Ostadix World is an elastic, capability-governed computational fabric.' \
+    'the normative product definition is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'A computer is not a box. A computer is a governed membership of' \
+    'the governing statement is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '### Explicit v0 non-goals' \
+    'the explicit World v0 non-goals are missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '- coherent shared RAM across nodes;' \
+    'the coherent-memory v0 non-goal is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '- physical-device passthrough or physical-device reuse across nodes;' \
+    'the physical-device v0 non-goal is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## Vocabulary and identity' \
+    'the generation-bound World vocabulary is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'Names and inventory are descriptive. They do not grant authority.' \
+    'the identity-is-not-authority rule is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '- **lease**: time-bounded authority issued by the Governor.' \
+    'the renewable-lease vocabulary is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## The three crossing categories' \
+    'the OValue/capability/capsule partition is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## Four-plane architecture' \
+    'the namespace/authority/execution/bulk-data separation is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## Membership and partition policy' \
+    'the authoritative-Governor lease and partition policy is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '- stale generation-bound references and capabilities are rejected;' \
+    'the lease-expiry stale-authority rule is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'World v0 does not implement consensus.' \
+    'the single-Governor consensus non-claim is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## State machines' \
+    'the node and task state-machine contract is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '-> Admitted(generation N+1, new lease)' \
+    'the fresh node-generation transition is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'ResultPendingCommit -> FencedLateResult' \
+    'the late task-result fencing transition is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    '## First hosted demo claim boundary' \
+    'the first-demo claims and non-claims are missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'general 9P, Linux or Plan 9 boot, a distributed Linux ABI,' \
+    'the general-9P, OS-boot, and distributed-ABI non-claims are missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'coherent memory, transparent migration, KVM/SVM hardware isolation, PCI or' \
+    'the memory, migration, hardware-virtualization, and PCI non-claims are missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'repository has no completed distributed Governor' \
+    'the current no-Governor implementation boundary is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'No production lowering currently emits' \
+    'the partial PR1 production-lowering boundary is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'Current-snapshot enforcement is absent.' \
+    'the partial PR1 current-snapshot boundary is missing'
+
+for file in README.md docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
+    okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md
+do
+    require_fixed "$file" 'OSTADIX_WORLD.md' \
+        "$file does not link the normative World v0 contract"
+done
+
+check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26) is the next[^.]*slice' \
+    "Modes 24-26 and KernelWorld Mode 23 are bounded implemented gates, not wholly planned next slices"
+
 exit $fail
