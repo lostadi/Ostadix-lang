@@ -8,7 +8,8 @@ its host mode to `0444`.
 
 ## Bounds and canonical form
 
-- Maximum image size: 64 KiB in the native M4 importer.
+- Maximum image size: 64 KiB in historical native probes; Mode 26 selects an
+  isolated 96 KiB backing-store profile for its four-principal image.
 - Maximum files: 16.
 - Maximum file size: 1 MiB.
 - Paths are canonical absolute UTF-8, 1 through 63 bytes: no empty component,

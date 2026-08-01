@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 25" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 26" >&2
     exit 2
     ;;
 esac
@@ -21,6 +21,7 @@ M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
 M6_IMAGE_DEFINE='-DOCORE_M6_IMAGE_PATH=""'
 M6B_LIVE_IMAGE_DEFINE='-DOCORE_M6B_LIVE_IMAGE_PATH=""'
 M6_LINUX_IMAGE_DEFINE='-DOCORE_M6_LINUX_IMAGE_PATH=""'
+M7_LINUX_PLAN9_IMAGE_DEFINE='-DOCORE_M7_LINUX_PLAN9_IMAGE_PATH=""'
 KERNEL_WORLD_RECORD_DEFINE='-DOCORE_KERNEL_WORLD_RECORD_PATH=""'
 if (( PROBE_MODE == 15 )); then
   M4_ARTIFACT_OUTPUT="$(
@@ -98,6 +99,21 @@ if (( PROBE_MODE == 25 )); then
   M6_LINUX_IMAGE_DEFINE="-DOCORE_M6_LINUX_IMAGE_PATH=\"$M6_LINUX_IMAGE_PATH\""
 fi
 
+if (( PROBE_MODE == 26 )); then
+  M7_LINUX_PLAN9_ARTIFACT_OUTPUT="$(
+    OCORE_M7_BUILD_DIR="$ROOT/target/ocore-m7-linux-plan9-artifacts" \
+      "$KERNEL_DIR/build-m7-linux-plan9-artifacts.sh"
+  )"
+  M7_LINUX_PLAN9_IMAGE_PATH="$(
+    printf '%s\n' "$M7_LINUX_PLAN9_ARTIFACT_OUTPUT" | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M7_LINUX_PLAN9_IMAGE_PATH" || ! -f "$M7_LINUX_PLAN9_IMAGE_PATH" ]]; then
+    echo "error: M7 Linux/Plan 9 artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M7_LINUX_PLAN9_IMAGE_DEFINE="-DOCORE_M7_LINUX_PLAN9_IMAGE_PATH=\"$M7_LINUX_PLAN9_IMAGE_PATH\""
+fi
+
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     --bin ocore-kernel-world-record
@@ -157,7 +173,7 @@ if (( PROBE_MODE == 19 )); then
     "$KERNEL_DIR/linux_personality_semantics.oc"
   )
 fi
-if (( PROBE_MODE == 25 )); then
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   LINUX_PERSONALITY_SOURCES=(
     "$ROOT/ocore/runtime/x86_64/linux_fd_table.oc"
     "$ROOT/ocore/runtime/x86_64/linux_personality.oc"
@@ -170,20 +186,25 @@ if (( PROBE_MODE == 19 )); then
   M6B_SEMANTICS_SOURCE="$KERNEL_DIR/m6b_semantics.oc"
 fi
 
+IMAGE_VFS_STORAGE_SOURCE="$ROOT/ocore/runtime/x86_64/image_vfs_storage.oc"
+if (( PROBE_MODE == 26 )); then
+  IMAGE_VFS_STORAGE_SOURCE="$ROOT/ocore/runtime/x86_64/image_vfs_storage_m7.oc"
+fi
+
 M6_SOURCE="$KERNEL_DIR/m6_stub.oc"
 BOUNDED_PERSONALITY_SOURCES=()
 if (( PROBE_MODE == 18 || PROBE_MODE == 24 )); then
   M6_SOURCE="$KERNEL_DIR/m6.oc"
 fi
-if (( PROBE_MODE == 25 )); then
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   M6_SOURCE="$KERNEL_DIR/m6_linux.oc"
 fi
-if (( PROBE_MODE == 18 || PROBE_MODE == 19 || PROBE_MODE == 24 || PROBE_MODE == 25 )); then
+if (( PROBE_MODE == 18 || PROBE_MODE == 19 || PROBE_MODE == 24 || PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   # Mode 19 directly exercises views/resources and its pinned Linux oracle
-  # composes the bounded router. Modes 18 and 24 share m6.oc; Mode 25 selects
-  # the separate m6_linux.oc implementation so the pinned foreign-ABI slice
-  # cannot consume Mode 24's fixed kernel-image headroom. Other probes retain
-  # only the fail-closed M6 adapter surface.
+  # composes the bounded router. Modes 18 and 24 share m6.oc; Modes 25 and 26
+  # select the separate m6_linux.oc implementation so their pinned foreign-ABI
+  # slices cannot consume Mode 24's fixed kernel-image headroom. Other probes
+  # retain only the fail-closed M6 adapter surface.
   BOUNDED_PERSONALITY_SOURCES=(
     "$ROOT/ocore/runtime/x86_64/personality_memory_view.oc"
     "$ROOT/ocore/runtime/x86_64/personality_bounded_rpc.oc"
@@ -207,10 +228,10 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 25 )); then
-  # Mode 25 is compile-time selected and enters only kernel::m6. Keep the
-  # historical probes fail-closed without linking their unreachable harness
-  # bodies, preserving the same hard 512 KiB bootstrap headroom assertion.
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
+  # Modes 25 and 26 are compile-time selected and enter only kernel::m6. Keep
+  # the historical probes fail-closed without linking their unreachable
+  # harness bodies, preserving the hard bootstrap headroom assertion.
   M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
   M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
   M3_SOURCE="$KERNEL_DIR/m3_mode25_stub.oc"
@@ -223,6 +244,7 @@ fi
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
   "$ROOT/ocore/runtime/x86_64/domain_namespace.oc" \
+  "$IMAGE_VFS_STORAGE_SOURCE" \
   "$ROOT/ocore/runtime/x86_64/image_vfs.oc" \
   "$ROOT/ocore/runtime/x86_64/elf_loader.oc" \
   "$ROOT/ocore/runtime/x86_64/service_registry.oc" \
@@ -287,6 +309,7 @@ clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   "$M6_IMAGE_DEFINE" \
   "$M6B_LIVE_IMAGE_DEFINE" \
   "$M6_LINUX_IMAGE_DEFINE" \
+  "$M7_LINUX_PLAN9_IMAGE_DEFINE" \
   "$KERNEL_WORLD_RECORD_DEFINE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
@@ -380,6 +403,9 @@ if (( PROBE_MODE == 25 )); then
   # The live gate hashes this resolved build output rather than a possibly
   # stale artifact that merely has the previously expected filename.
   printf '%s\n' "$M6_LINUX_IMAGE_PATH" > "$BUILD_DIR/m6-linux-image.path"
+fi
+if (( PROBE_MODE == 26 )); then
+  printf '%s\n' "$M7_LINUX_PLAN9_IMAGE_PATH" > "$BUILD_DIR/m7-linux-plan9-image.path"
 fi
 
 file "$BUILD_DIR/kernel.o"

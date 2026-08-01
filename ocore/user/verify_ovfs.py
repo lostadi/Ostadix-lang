@@ -167,6 +167,13 @@ def verify_m5_service_elf(path: str, data: bytes) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path)
+    parser.add_argument(
+        "--max-image-bytes",
+        type=int,
+        choices=(64 * 1024, 96 * 1024),
+        default=64 * 1024,
+        help="select the historical 64 KiB or Mode 26 96 KiB native profile",
+    )
     parser.add_argument("--expect-m4", action="store_true")
     parser.add_argument("--expect-m5", action="store_true")
     args = parser.parse_args()
@@ -197,7 +204,7 @@ def main() -> None:
         or table_offset != 128
         or data_offset % 4096
         or image_size != len(raw)
-        or image_size > 64 * 1024
+        or image_size > args.max_image_bytes
         or reserved != bytes(16)
     ):
         raise SystemExit("OVFS header is noncanonical")

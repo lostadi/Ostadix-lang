@@ -19,6 +19,7 @@ SOURCES=(
   "$ROOT/ocore/runtime/x86_64/pages.oc"
   "$ROOT/ocore/runtime/x86_64/capability.oc"
   "$ROOT/ocore/runtime/x86_64/domain_namespace.oc"
+  "$ROOT/ocore/runtime/x86_64/image_vfs_storage.oc"
   "$ROOT/ocore/runtime/x86_64/image_vfs.oc"
   "$ROOT/ocore/runtime/x86_64/elf_loader.oc"
   "$ROOT/ocore/runtime/x86_64/memory_object.oc"

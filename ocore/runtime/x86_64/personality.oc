@@ -11,9 +11,14 @@ pub const PERSONALITY_TEST: u64 = 2;
 // pinned static x86-64 Linux corpus; it is not a claim of general Linux ABI
 // compatibility.
 pub const PERSONALITY_LINUX_MINIMAL: u64 = 3;
+// Mode 26's Plan-9-style client speaks one pinned 9P2000 wire ABI through a
+// generation-bound bounded call. It is intentionally neither native[0] nor a
+// claim of Plan 9 kernel/syscall compatibility.
+pub const PERSONALITY_PLAN9_9P2000: u64 = 4;
 
 pub fn is_supported(personality_id: u64) -> bool {
     return personality_id == PERSONALITY_NATIVE
         || personality_id == PERSONALITY_TEST
-        || personality_id == PERSONALITY_LINUX_MINIMAL;
+        || personality_id == PERSONALITY_LINUX_MINIMAL
+        || personality_id == PERSONALITY_PLAN9_9P2000;
 }

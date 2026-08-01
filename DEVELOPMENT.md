@@ -115,7 +115,7 @@ python3 -m unittest -v tests.test_source_release
 ```
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 16 required portable QEMU gates in the
+The aggregate executes all 17 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive
