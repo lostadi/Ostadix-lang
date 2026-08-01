@@ -324,6 +324,19 @@
   device authority is one internal typed lease, not a physical device. Mode 24
   is not a Linux or Plan 9 boot, general foreign ABI, general guest agent, KVM,
   PCI/DMA/IOMMU, or physical-device isolation gate.
+- Mode 25 adds the first bounded live foreign-ABI composition gate in
+  `ocore/kernel/smoke-live-linux-personality-qemu.sh`. One exact 8,520-byte
+  static Linux x86-64 ELF and three native service principals are rebuilt into
+  a 60,104-byte OVFS image, pinned independently by SHA-256, loaded as data,
+  and entered at CPL3. The foreign corpus performs exact stdout/stderr writes
+  through request-scoped bounded `IN` views, observes Linux `-ENOSYS`, and
+  exits with status 42. The gate contains one personality-daemon fault,
+  health-publishes generation 2, rejects generation-1 authority as stale,
+  preserves an unrelated observer, reclaims the complete bounded lifecycle,
+  and reaches a later timer. It does not boot Linux or Plan 9 and is not a
+  distribution, root filesystem, dynamic linker, general foreign ABI,
+  KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
+  physical-device evidence.
 
 ## Implemented conservatively
 
@@ -351,10 +364,11 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond the current bounded native gates: extend Mode 24's
-  exact four-byte live bounded-RPC composition with pinned windows, streaming,
-  signals, real mapping/resource events, post-reply lifecycle-race evidence,
-  fuzzing, allocation-failure coverage, and concrete delegated services, then
-  extend supervision with durable reboot reconstruction and a capability-
-  bounded build service. No general Linux ABI or root filesystem is claimed.
+- O-Domain evolution beyond the current bounded Mode 24/25 gates: add pinned
+  windows, streaming, signals, real mapping/resource events, post-reply
+  lifecycle-race evidence, fuzzing, allocation-failure coverage, and concrete
+  delegated services, then broaden the exact Mode 25 Linux corpus only behind
+  equally explicit ABI and lifecycle evidence. Durable reboot reconstruction
+  and a capability-bounded build service also remain future work. No general
+  Linux ABI or root filesystem is claimed.
   The staged engineering plan is in `docs/ODOMAIN_PLAN.md`.

@@ -164,6 +164,14 @@ pub unsafe fn process_state(handle: u64) -> u64 {
     return STATES[slot] as u64;
 }
 
+pub unsafe fn exit_code_for(handle: u64) -> u64 {
+    let slot: usize = checked_process(handle);
+    if slot >= MAX_PROCESSES {
+        return 0;
+    }
+    return EXIT_CODES[slot];
+}
+
 // The caller supplies a domain handle but never a personality. The process
 // retains both its generation-safe domain and CSpace owner identities.
 pub unsafe fn install_for_owner(

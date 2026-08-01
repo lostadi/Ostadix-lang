@@ -486,6 +486,53 @@ Run the live bounded personality evidence gate with:
 ./ocore/kernel/smoke-live-bounded-personality-qemu.sh
 ```
 
+Mode 25 is the next execution-and-personality vertical slice. It reuses the
+Mode 24 bounded request/view terminal path but admits one exact Linux x86-64
+personality instead of broadening the native test ABI. A deterministic builder
+packages exactly `/bin/linux-minimal.elf`, `/sbin/linux-personalityd.elf`,
+`/sbin/linux-supervisord.elf`, and `/sbin/linux-observer.elf` into one immutable
+OVFS image. The foreign payload is independently pinned at 8,520 bytes with
+SHA-256
+`06240b6a840ed4262835aceff64a94f6ebd77838666f05eb7415d9a0d1b5868d`;
+the complete image is 60,104 bytes with SHA-256
+`b380e5cbbe50403bd58bdafb11c54f2201f0cc742fc898487fa08ba26e2886e8`.
+The live gate pins both identities and rejects any of those packaged principals
+linked into the kernel as source modules.
+
+The loaded foreign ELF executes at CPL3. Its required path invokes two bounded
+`write` calls, one deliberately unknown syscall, and `exit_group(42)`; a fifth
+static syscall site is only the failure path's `exit_group(111)`. The write
+bridge snapshots at most 128 bytes through one request-scoped `IN` view,
+authorizes fd 1 or fd 2 against the exact caller and personality-service
+generation, and installs the terminal result directly into saved `RAX` without
+reissuing the syscall. The QEMU transcript must contain each exact stdout and
+stderr line once, observe `-ENOSYS`, and preserve exit status 42. Generation 1
+completes stdout and then faults deliberately. Its view capability is already
+closed by the successful reply; crash handling withdraws generation-1 service
+and fd authority while preserving the committed terminal record and its charge
+until the client can consume it after generation-2 publication. Generation 2
+first rejects generation-1 lookup authority as stale during private startup,
+then answers health and is published. The client subsequently consumes the
+preserved stdout terminal and completes stderr. The gate also keeps the
+unrelated observer schedulable, reclaims every request, view, fd object,
+capability, process, address space, and frame, and reaches a later timer while
+QEMU remains alive.
+
+Run the live Linux-personality evidence gate with:
+
+```bash
+./ocore/kernel/smoke-live-linux-personality-qemu.sh
+```
+
+Mode 25 executes a Linux-ABI ELF; it does not boot Linux, Plan 9, firmware, or
+a distribution and does not provide a dynamic loader, root filesystem, general
+Linux ABI, guest agent, KVM or physical-hardware evidence, PCI/device
+assignment, DMA isolation, IOMMU isolation, interrupt remapping, or hardware
+reset. The exact ELF still awaits an authoritative replay on native x86-64
+Linux. This bounded-copy gate also does not close the broader pinned-window,
+streaming, signal, SMP, or general concurrent mapping-race M7 acceptance
+matrix.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests

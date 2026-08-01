@@ -66,6 +66,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-personality-qemu.sh # M6A mode-18 scalar supervision
 ./ocore/kernel/smoke-m6b-qemu.sh # M6B mode-19 bounded-copy/revocation mechanism
 ./ocore/kernel/smoke-live-bounded-personality-qemu.sh # M6B mode-24 live four-byte bounded personality RPC
+./ocore/kernel/smoke-live-linux-personality-qemu.sh # mode-25 exact static Linux ELF/CPL3 bounded personality
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
@@ -241,6 +242,22 @@ internal delegated lease rather than a physical device. It also does not cover
 the post-reply/pre-consume process-exit or unmap race, pinned windows,
 signal/restart integration, a Linux oracle, or concrete services.
 
+Mode 25 separately packages one exact 8,520-byte static Linux x86-64 ELF with
+three native service principals in a 60,104-byte digest-pinned OVFS image. The
+foreign ELF enters at CPL3, performs exact fd 1/fd 2 writes through
+request-scoped bounded `IN` views, observes Linux `-ENOSYS`, and exits with
+status 42. Its generation-1 daemon completes stdout before faulting; the closed
+view authority and committed terminal result are preserved across
+generation-1 service/fd withdrawal until the client consumes that result after
+generation-2 publication. The replacement first proves stale generation-1
+lookup denial during private startup, then answers health and is published;
+only afterward does the client consume stdout and proceed to stderr. The gate
+also proves unrelated-observer survival, full reclamation, and a later timer.
+It is not Linux or Plan 9 boot, a
+distribution, a root filesystem, a dynamic linker, a general foreign ABI,
+KVM/SVM hardware evidence, PCI/device assignment, DMA/IOMMU isolation, or
+physical-device evidence.
+
 Mode 20 carries a host-verified `ocore.kernel-world/v1` package contract into a
 bounded native supervisor-admission gate. The host emits a deterministic,
 hash-pinned `OKWORLD1`
@@ -270,16 +287,18 @@ float types cannot reach integer machine operations.
 
 The current verified kernel boundary includes M6A's scalar CPL3 supervision in
 mode 18, M6B's bounded-copy/revocation mechanism in mode 19, Mode 24's exact
-four-byte live bounded personality composition, and the nonexecuting
-KernelWorld admission/object slice in mode 20. It remains
+four-byte live bounded personality composition, Mode 25's exact static Linux
+ELF/minimal-ABI composition, and the nonexecuting KernelWorld admission/object
+slice in mode 20. It remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
 dynamic linker, writable general filesystem, general foreign ABI personality,
 foreign root filesystem, native compiler/self-hosting, general guest-agent
-transport, or live hosted-broker transport into QEMU. The Mode 24 native test
-personality does not boot Linux or Plan 9. The early bootstrap/fault gates
-still use a linked `native[0]` payload; later claims have separate bounded
-gates.
+transport, or live hosted-broker transport into QEMU. Neither Mode 24 nor Mode
+25 boots Linux or Plan 9; Mode 25 covers only its pinned four-call success path
+and fifth failure-only exit site.
+The early bootstrap/fault gates still use a linked `native[0]` payload; later
+claims have separate bounded gates.
 
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of

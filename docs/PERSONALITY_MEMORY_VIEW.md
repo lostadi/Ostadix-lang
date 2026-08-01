@@ -3,9 +3,10 @@
 Status: design contract plus bounded native mechanism and live-composition
 slices. Mode 19 QEMU-tests the staging, capability, terminal-revocation, and
 delegated-lease core described below. Mode 24 routes one exact four-byte
-`INOUT` request shape through four packaged CPL3 principals. The complete
-acceptance gate remains required before a translated Linux personality can
-accept pointer-bearing syscalls.
+`INOUT` request shape through four packaged CPL3 principals. Mode 25 admits two
+exact 20-byte Linux `write` inputs from one pinned static ELF through bounded
+`IN` views. The broader acceptance matrix remains required before that exact
+foreign corpus or pointer-bearing syscall surface can expand.
 
 ## 1. Security invariant
 
@@ -236,9 +237,19 @@ device. The caller-exit case terminates and stops the test client, leaving its
 process reapable and its thread exited. The gate does not exercise a
 post-reply/pre-consume process-exit or unmap race.
 
+Mode 25's `smoke-live-linux-personality-qemu.sh` is a separate bounded-copy
+foreign-ABI slice. One exact static Linux x86-64 ELF issues stdout and stderr
+`write` calls through 20-byte `IN` views; a successful generation-1 terminal
+remains charged and consumable across daemon fault/replacement after its view
+authority closes. The gate also covers exact `-ENOSYS`, `exit_group(42)`, stale
+generation-1 lookup denial, unrelated-observer survival, cleanup, and a later
+timer. It does not exercise output views, partial effects, mapping mutation,
+signals, streaming, or an arbitrary executable/syscall corpus.
+
 ## 10. Complete acceptance gate
 
-Before pointer-bearing Linux syscalls are accepted, executable tests must show:
+Before pointer-bearing Linux syscalls broaden beyond Mode 25's exact pinned
+two-write corpus, executable tests must show:
 
 - range overflow, kernel addresses, stale process/address-space generations,
   wrong mapping rights, excessive segments, and excessive bytes fail before
@@ -269,11 +280,13 @@ capability metadata into authority. Direct device passthrough requires an
 IOMMU-backed isolation design and separate acceptance evidence.
 
 The current evidence does not implement pinned windows, streaming output,
-signal delivery/restart integration, a pinned Linux ABI oracle, schema fuzzing,
-allocation-failure injection, or every concurrent teardown race. Mode 24
-supplies only one exact four-byte pointer-bearing native test path; it does not
-supply a general foreign ABI, Linux or Plan 9 boot, foreign root filesystem, or
-concrete delegated filesystem, network, timer, or device service. It also does
+signal delivery/restart integration, an authoritative native x86-64 Linux
+oracle replay, schema fuzzing, allocation-failure injection, or every
+concurrent teardown race. Mode 24
+supplies one exact four-byte pointer-bearing native test path, and Mode 25 adds
+only two exact 20-byte input writes for one pinned Linux ELF. Neither supplies
+a general foreign ABI, Linux or Plan 9 boot, foreign root filesystem, or
+concrete delegated filesystem, network, timer, or device service. They also do
 not prove actual mapping mutation, an external resource event, the
 post-reply/pre-consume process-exit or unmap race, KVM, PCI/DMA/IOMMU, or
 physical-device isolation.
