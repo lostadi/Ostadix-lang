@@ -626,6 +626,38 @@ or live-system claims above. See
 [`docs/HOSTED_LIVE_REFERENCE.md`](docs/HOSTED_LIVE_REFERENCE.md) for its exact
 boundary and lifecycle CLI.
 
+### Ostadix World v0 contract
+
+Ostadix World is defined as an elastic, capability-governed computational
+fabric: nodes contribute typed resources under renewable, generation-bound
+leases, and placement remains separate from the logical HGraph. The normative
+v0 vocabulary, crossing categories, four-plane architecture, partition policy,
+state machines, and first-demo claim boundary are pinned in
+[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md).
+
+The existing hosted Live-World reference above is a local package and service
+semantic oracle, not the distributed World. The current repository does not yet
+provide a distributed Governor, node-membership protocol, networked resource
+registry, generation-bound `/world` tree, remote route dispatch, failure-driven
+rescheduling, or live placement. Names, inventory, and namespace lookup do not
+grant authority, and aggregate node memory is not presented as coherent local
+RAM.
+
+The partial PR1 identity/effect/grounding foundation can be inspected without
+execution:
+
+```bash
+olangc examples/hello.O --target ir --grounding \
+  --world-id desk --world-epoch 4
+```
+
+It reports requested capability rights without treating metadata as authority
+and labels the inspection with the caller-supplied World epoch. It does not
+consult a live World snapshot or enforce freshness. No production lowering
+currently emits the precise governed resource keys, so ordinary hosted `.O`
+plans retain residual `HostWorld` and report `governed-effects none`. This is
+not the later project placement or World-execution surface.
+
 ### Docker
 
 The Dockerfile builds the hosted `O`, `olangc`, and `o-link` binaries and

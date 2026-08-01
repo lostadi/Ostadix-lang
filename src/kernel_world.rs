@@ -7,6 +7,7 @@
 //! foreign kernel, assign a device, or provide DMA isolation.
 
 use crate::live_system::manifest::{runtime_entry_payload_path, PackageDigest, VerifiedPackage};
+use crate::world::identity::{DomainIdentity, KernelWorldBinding, WorldIdentityError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1233,6 +1234,27 @@ impl KernelWorldIdentity {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Bind this verified provider generation beneath a caller-supplied,
+    /// registry-allocated execution domain.
+    ///
+    /// A KernelWorld is an execution domain inside an Ostadix World, not the
+    /// distributed World itself. The domain generation and the provider's
+    /// lifecycle generation are intentionally distinct: restarting or
+    /// reconstructing a provider must not allocate or revive a domain identity.
+    /// The resulting record preserves exact package provenance but contains no
+    /// bearer token and grants no authority.
+    pub fn bind_execution_domain(
+        &self,
+        domain: DomainIdentity,
+    ) -> Result<KernelWorldBinding, WorldIdentityError> {
+        KernelWorldBinding::from_descriptive_parts(
+            domain,
+            self.name.clone(),
+            self.package_digest.as_hex(),
+            self.generation,
+        )
     }
 }
 

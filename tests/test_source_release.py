@@ -36,13 +36,13 @@ EVIDENCE_SPEC.loader.exec_module(evidence_tool)
 def fixture_evidence_manifest() -> str:
     lines = [
         "schema_version = 1",
-        "required_gate_count = 15",
+        "required_gate_count = 17",
         "supplemental_gate_count = 1",
         'portable_command = "./boot-and-test.sh smoke"',
         "",
     ]
-    for index in range(16):
-        required = index < 15
+    for index in range(18):
+        required = index < 17
         evidence_class = "portable_tcg" if required else "hardware_kvm"
         lines.extend(
             [
@@ -180,7 +180,7 @@ class SourceReleaseTests(unittest.TestCase):
         }
         if files:
             contents.update(files)
-        for index in range(16):
+        for index in range(18):
             contents[f"ocore/kernel/fixture-evidence-{index:02}.sh"] = (
                 "#!/bin/sh\n"
                 f"printf 'FIXTURE {index:02} START\\nFIXTURE {index:02} PASS\\n'\n"
@@ -319,7 +319,7 @@ class SourceReleaseTests(unittest.TestCase):
             }
             included.update(
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
-                for index in range(16)
+                for index in range(18)
             )
             excluded = {
                 ".DS_Store",
@@ -642,7 +642,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_zero_gate_evidence_manifest_is_rejected_before_packaging(self) -> None:
         self._commit({"evidence/gates.toml": ZERO_GATE_EVIDENCE_MANIFEST})
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 15"
+            release.ReleaseError, r"required_gate_count must be 17"
         ):
             self._build("zero-gate-evidence.zip")
 
@@ -670,7 +670,7 @@ class SourceReleaseTests(unittest.TestCase):
             result.output, "self-consistent-zero-gate-evidence.zip", remove_gates
         )
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 15"
+            release.ReleaseError, r"required_gate_count must be 17"
         ):
             release.verify_archive(tampered)
 

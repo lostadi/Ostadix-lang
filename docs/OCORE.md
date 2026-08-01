@@ -457,7 +457,7 @@ Pinned windows, streaming output, actual signal and concurrent mapping-change
 integration, Linux-oracle behavior, fuzzing, allocation-failure injection, and
 concrete filesystem/network/timer/device services remain future M6B work.
 
-Mode 24 is the next bounded M6B vertical slice. It composes the mode-19 view
+Mode 24 is a bounded M6B vertical slice. It composes the mode-19 view
 mechanism with the existing M6A request router and four independently packaged
 CPL3 principals. `build-m6b-live-artifacts.sh` deterministically rebuilds a
 client, personality daemon, supervisor, and unrelated observer into a
@@ -486,7 +486,7 @@ Run the live bounded personality evidence gate with:
 ./ocore/kernel/smoke-live-bounded-personality-qemu.sh
 ```
 
-Mode 25 is the next execution-and-personality vertical slice. It reuses the
+Mode 25 is a bounded execution-and-personality vertical slice. It reuses the
 Mode 24 bounded request/view terminal path but admits one exact Linux x86-64
 personality instead of broadening the native test ABI. A deterministic builder
 packages exactly `/bin/linux-minimal.elf`, `/sbin/linux-personalityd.elf`,
@@ -533,7 +533,7 @@ Linux. This bounded-copy gate also does not close the broader pinned-window,
 streaming, signal, SMP, or general concurrent mapping-race M7 acceptance
 matrix.
 
-Mode 26 is the next execution-and-service vertical slice. It retains Mode 25's
+Mode 26 is a bounded execution-and-service vertical slice. It retains Mode 25's
 exact 8,520-byte Linux x86-64 ELF and adds an unprivileged native 9P2000 server,
 native supervisor, and independently linked native Plan-9-style client. The
 deterministic builder packages exactly `/bin/linux-minimal.elf`,

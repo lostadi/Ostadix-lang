@@ -183,7 +183,7 @@ struct Cli {
 
     /// Compatibility hook for --run; normal shim backends already have default
     /// host authority. Format:
-    /// NAME=LANG[:fs_read,fs_write,network,process].
+    /// `NAME=LANG[:fs_read,fs_write,network,process]`.
     #[arg(long = "backend-grant", requires = "run")]
     backend_grants: Vec<String>,
 
@@ -458,7 +458,7 @@ fn single_input(cli: &Cli) -> Result<PathBuf> {
     Ok(cli.inputs[0].clone())
 }
 
-/// Build a [`ProjectBundle`] for the single input, whether it is a directory
+/// Build a `ProjectBundle` for the single input, whether it is a directory
 /// or an already-lifted `.O` file.
 fn load_project_bundle(cli: &Cli) -> Result<o_lang::project::ProjectBundle> {
     let input = single_input(cli)?;

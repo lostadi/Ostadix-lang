@@ -9,6 +9,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::ir::{ExecutionMode, PlanNodeId, PlanNodeKind};
+use crate::world::identity::{
+    ArtifactPublicationIdentity, DomainIdentity, NodeIdentity, ResourceIdentity,
+    TaskAttemptIdentity, WorldIdentity,
+};
 
 /// Stable identity for a persistent evaluator resource.
 ///
@@ -41,6 +45,18 @@ impl fmt::Display for ActorResourceId {
 pub enum ResourceKey {
     /// Conservative umbrella for host-observable state not modeled precisely.
     HostWorld,
+    /// One exact governed World epoch. This is not ambient host authority.
+    WorldState(WorldIdentity),
+    /// One exact governed node generation.
+    NodeState(NodeIdentity),
+    /// One exact governed execution-domain generation.
+    DomainState(DomainIdentity),
+    /// One typed resource beneath an exact governed owner generation.
+    GovernedResource(ResourceIdentity),
+    /// One exact task-attempt generation.
+    TaskState(TaskAttemptIdentity),
+    /// Publication state for one content-addressed artifact in one World epoch.
+    ArtifactState(ArtifactPublicationIdentity),
     /// Mutable state owned by the O evaluator itself.
     EvaluatorState,
     /// One O-level scope binding.
@@ -70,12 +86,37 @@ impl ResourceKey {
                 | Self::Service(_)
         )
     }
+
+    /// Whether this key names state described by explicit World vocabulary.
+    ///
+    /// Governed keys deliberately do not alias [`Self::HostWorld`]. They are
+    /// descriptive vocabulary, not proof of mediation or authority. Current
+    /// source `reads=`/`writes=` declarations cannot construct them; a later
+    /// trusted lowering must keep `HostWorld` until mediation is actually
+    /// established.
+    pub fn is_governed_resource(&self) -> bool {
+        matches!(
+            self,
+            Self::WorldState(_)
+                | Self::NodeState(_)
+                | Self::DomainState(_)
+                | Self::GovernedResource(_)
+                | Self::TaskState(_)
+                | Self::ArtifactState(_)
+        )
+    }
 }
 
 impl fmt::Display for ResourceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HostWorld => f.write_str("HostWorld"),
+            Self::WorldState(world) => write!(f, "world-state:{world}"),
+            Self::NodeState(node) => write!(f, "node-state:{node}"),
+            Self::DomainState(domain) => write!(f, "domain-state:{domain}"),
+            Self::GovernedResource(resource) => write!(f, "governed-resource:{resource}"),
+            Self::TaskState(task) => write!(f, "task-state:{task}"),
+            Self::ArtifactState(artifact) => write!(f, "artifact-state:{artifact}"),
             Self::EvaluatorState => f.write_str("EvaluatorState"),
             Self::ScopeBinding(name) => write!(f, "scope:{name}"),
             Self::ProjectPath(path) => write!(f, "project:{path}"),
