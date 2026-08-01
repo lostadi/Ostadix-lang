@@ -37,6 +37,7 @@ use runtime::address_space::VM_WRITE;
 use runtime::personality::PERSONALITY_NATIVE;
 use runtime::personality::PERSONALITY_TEST;
 use runtime::personality::PERSONALITY_LINUX_MINIMAL;
+use runtime::personality::PERSONALITY_PLAN9_9P2000;
 use runtime::native_abi::DEBUG_BUFFER_SIZE;
 use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
 use runtime::native_abi::ERR_CAPABILITY_DENIED;
@@ -915,6 +916,34 @@ unsafe fn dispatch_test_personality(
     return ERR_UNKNOWN_SYSCALL;
 }
 
+// The Plan 9 client gets the bounded view call and the three common scalar
+// primitives only. In particular, it does not inherit native endpoint,
+// capability, control, or scalar test-personality operations.
+unsafe fn dispatch_plan9_9p2000(
+    cspace_id: usize,
+    number: u64,
+    capability: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64
+) -> u64 {
+    if number == SYS_PERSONALITY_CALL {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_test_personality(
+        cspace_id,
+        number,
+        capability,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4
+    );
+}
+
 // The architectural syscall entry already presents the six Linux x86-64
 // argument registers as capability,arg0..arg4.  Keep this dispatcher entirely
 // scalar: Mode 25's generation binding, bounded pointer validation, and Linux
@@ -1011,6 +1040,18 @@ pub unsafe fn kernel_syscall_dispatch(
     }
     if personality_id == PERSONALITY_LINUX_MINIMAL {
         return dispatch_linux_minimal(
+            number,
+            capability,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4
+        );
+    }
+    if personality_id == PERSONALITY_PLAN9_9P2000 {
+        return dispatch_plan9_9p2000(
+            cspace_id,
             number,
             capability,
             arg0,

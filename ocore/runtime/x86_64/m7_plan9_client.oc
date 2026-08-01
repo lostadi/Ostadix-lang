@@ -1,0 +1,502 @@
+module runtime::m7_plan9_client;
+
+// This independently linked CPL3 principal is Plan-9-style in the precise M7
+// sense: it consumes a Linux-produced file through genuine 9P2000 wire
+// messages.  It receives only a generation-bound bounded-call capability and
+// never imports a privileged kernel or daemon module.
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_PERSONALITY_BOUNDED_CALL: u64 = 17;
+
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const CALL_CAP_OFFSET: usize = 8;
+const GENERATION_OFFSET: usize = 16;
+const PUBLISHED_GENERATION_OFFSET: usize = 24;
+const LINUX_DATA_GENERATION_OFFSET: usize = 32;
+const BUFFER_OFFSET: usize = 128;
+const BUFFER_LENGTH: usize = 128;
+
+const OP_9P: u64 = 0x90;
+const DIRECTION_INOUT: u64 = 3;
+const CORPUS_TIMEOUT_TICKS: u64 = 10_000;
+
+const MSIZE: u64 = 128;
+const NOTAG: u64 = 0xffff;
+const NOFID: u64 = 0xffff_ffff;
+const QTDIR: u64 = 0x80;
+const OREAD: u64 = 0;
+const OWRITE: u64 = 1;
+
+const TVERSION: u64 = 100;
+const RVERSION: u64 = 101;
+const TATTACH: u64 = 104;
+const RATTACH: u64 = 105;
+const RERROR: u64 = 107;
+const TWALK: u64 = 110;
+const RWALK: u64 = 111;
+const TOPEN: u64 = 112;
+const ROPEN: u64 = 113;
+const TREAD: u64 = 116;
+const RREAD: u64 = 117;
+const TCLUNK: u64 = 120;
+const RCLUNK: u64 = 121;
+
+@link_section(".rodata")
+static VERSION: [u8; 6] = b"9P2000";
+@link_section(".rodata")
+static VERSION_U: [u8; 8] = b"9P2000.u";
+@link_section(".rodata")
+static UNKNOWN: [u8; 7] = b"unknown";
+@link_section(".rodata")
+static SEQUENCE: [u8; 8] = b"sequence";
+@link_section(".rodata")
+static PATH: [u8; 4] = b"path";
+@link_section(".rodata")
+static MODE: [u8; 4] = b"mode";
+@link_section(".rodata")
+static COUNT: [u8; 5] = b"count";
+@link_section(".rodata")
+static SRV: [u8; 3] = b"srv";
+@link_section(".rodata")
+static LINUX: [u8; 5] = b"linux";
+@link_section(".rodata")
+static STATUS: [u8; 6] = b"status";
+@link_section(".rodata")
+static MISSING: [u8; 7] = b"missing";
+@link_section(".rodata")
+static G1_DATA: [u8; 20] = b"o-core linux stdout\n";
+@link_section(".rodata")
+static G2_DATA: [u8; 20] = b"o-core linux stderr\n";
+
+@link_section(".rodata")
+static ONLINE: [u8; 29] = b"M7 Plan 9 client ELF: online\n";
+@link_section(".rodata")
+static G1_PASS: [u8; 35] =
+    b"M7 9P2000 Linux namespace g1: PASS\n";
+@link_section(".rodata")
+static STALE_PASS: [u8; 41] =
+    b"M7 stale 9P call capability denial: PASS\n";
+@link_section(".rodata")
+static G2_PASS: [u8; 35] =
+    b"M7 9P2000 Linux namespace g2: PASS\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+unsafe fn wait_for_publication(generation: u64) -> u64 {
+    loop {
+        let capability: u64 = config(CALL_CAP_OFFSET);
+        if capability != 0
+            && config(GENERATION_OFFSET) == generation
+            && config(PUBLISHED_GENERATION_OFFSET) == generation {
+            return capability;
+        }
+        yield_once();
+    }
+}
+
+unsafe fn wait_for_linux_data(generation: u64) -> void {
+    while config(LINUX_DATA_GENERATION_OFFSET) != generation {
+        yield_once();
+    }
+}
+
+unsafe fn buffer() -> *mut u8 {
+    return (CONFIG_VA + BUFFER_OFFSET) as *mut u8;
+}
+
+unsafe fn clear_buffer() -> void {
+    let mut index: usize = 0;
+    while index < BUFFER_LENGTH {
+        volatile_store(buffer() + index, 0);
+        index += 1;
+    }
+}
+
+unsafe fn put_byte(offset: usize, value: u64) -> void {
+    volatile_store(buffer() + offset, (value & 0xff) as u8);
+}
+
+unsafe fn byte(offset: usize) -> u64 {
+    return volatile_load((buffer() + offset) as *const u8) as u64;
+}
+
+unsafe fn put_u16(offset: usize, value: u64) -> void {
+    put_byte(offset, value);
+    put_byte(offset + 1, value >> 8);
+}
+
+unsafe fn get_u16(offset: usize) -> u64 {
+    return byte(offset) | (byte(offset + 1) << 8);
+}
+
+unsafe fn put_u32(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 4 {
+        put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn get_u32(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        value = value | (byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn put_u64(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 8 {
+        put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn get_u64(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = value | (byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn put_bytes(
+    offset: usize,
+    value: *const u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        put_byte(offset + index, volatile_load(value + index) as u64);
+        index += 1;
+    }
+}
+
+unsafe fn bytes_equal(
+    offset: usize,
+    expected: *const u8,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if byte(offset + index)
+            != volatile_load(expected + index) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn put_string(
+    offset: usize,
+    value: *const u8,
+    length: usize
+) -> usize {
+    put_u16(offset, length as u64);
+    put_bytes(offset + 2, value, length);
+    return offset + 2 + length;
+}
+
+unsafe fn begin(kind: u64, tag: u64) -> void {
+    clear_buffer();
+    put_byte(4, kind);
+    put_u16(5, tag);
+}
+
+unsafe fn finish(size: usize) -> usize {
+    put_u32(0, size as u64);
+    return size;
+}
+
+unsafe fn build_version(tag: u64, version: *const u8, length: usize) -> usize {
+    begin(TVERSION, tag);
+    put_u32(7, MSIZE);
+    let end: usize = put_string(11, version, length);
+    return finish(end);
+}
+
+unsafe fn build_attach(tag: u64) -> usize {
+    begin(TATTACH, tag);
+    put_u32(7, 1);
+    put_u32(11, NOFID);
+    put_u16(15, 0);
+    put_u16(17, 0);
+    return finish(19);
+}
+
+unsafe fn build_walk(tag: u64, last: *const u8, last_length: usize) -> usize {
+    begin(TWALK, tag);
+    put_u32(7, 1);
+    put_u32(11, 2);
+    put_u16(15, 3);
+    let mut end: usize = put_string(17, (&SRV[0]), 3);
+    end = put_string(end, (&LINUX[0]), 5);
+    end = put_string(end, last, last_length);
+    return finish(end);
+}
+
+unsafe fn build_open(tag: u64, mode: u64) -> usize {
+    begin(TOPEN, tag);
+    put_u32(7, 2);
+    put_byte(11, mode);
+    return finish(12);
+}
+
+unsafe fn build_read(tag: u64, count: u64) -> usize {
+    begin(TREAD, tag);
+    put_u32(7, 2);
+    put_u64(11, 0);
+    put_u32(19, count);
+    return finish(23);
+}
+
+unsafe fn build_clunk(tag: u64) -> usize {
+    begin(TCLUNK, tag);
+    put_u32(7, 2);
+    return finish(11);
+}
+
+// Exactly one syscall is issued per message.  A provisional ERR_IPC_RETRY
+// escaping to CPL3 would violate the bounded-call saved-RAX contract.
+unsafe fn call_once(capability: u64) -> u64 {
+    let result: u64 = syscall6(
+        SYS_PERSONALITY_BOUNDED_CALL,
+        capability,
+        OP_9P,
+        (CONFIG_VA + BUFFER_OFFSET) as u64,
+        BUFFER_LENGTH as u64,
+        DIRECTION_INOUT,
+        CORPUS_TIMEOUT_TICKS
+    );
+    if result == ERR_IPC_RETRY {
+        stop();
+    }
+    return result;
+}
+
+unsafe fn header(
+    result: u64,
+    expected_size: u64,
+    expected_kind: u64,
+    expected_tag: u64
+) -> bool {
+    return result == expected_size
+        && result >= 7
+        && result <= MSIZE
+        && get_u32(0) == result
+        && byte(4) == expected_kind
+        && get_u16(5) == expected_tag;
+}
+
+unsafe fn expect_error(
+    result: u64,
+    tag: u64,
+    expected: *const u8,
+    length: usize
+) -> bool {
+    return header(result, 9 + length as u64, RERROR, tag)
+        && get_u16(7) == length as u64
+        && bytes_equal(9, expected, length);
+}
+
+unsafe fn expect_version(
+    result: u64,
+    tag: u64,
+    expected: *const u8,
+    length: usize
+) -> bool {
+    return header(result, 13 + length as u64, RVERSION, tag)
+        && get_u32(7) == MSIZE
+        && get_u16(11) == length as u64
+        && bytes_equal(13, expected, length);
+}
+
+unsafe fn expect_qid(
+    offset: usize,
+    kind: u64,
+    version: u64,
+    path: u64
+) -> bool {
+    return byte(offset) == kind
+        && get_u32(offset + 1) == version
+        && get_u64(offset + 5) == path;
+}
+
+unsafe fn expect_attach(result: u64, tag: u64) -> bool {
+    return header(result, 20, RATTACH, tag)
+        && expect_qid(7, QTDIR, config(GENERATION_OFFSET), 1);
+}
+
+unsafe fn expect_walk(result: u64, tag: u64, generation: u64) -> bool {
+    return header(result, 48, RWALK, tag)
+        && get_u16(7) == 3
+        && expect_qid(9, QTDIR, generation, 2)
+        && expect_qid(22, QTDIR, generation, 3)
+        && expect_qid(35, 0, generation, 4);
+}
+
+unsafe fn expect_open(result: u64, tag: u64, generation: u64) -> bool {
+    return header(result, 24, ROPEN, tag)
+        && expect_qid(7, 0, generation, 4)
+        && get_u32(20) == MSIZE;
+}
+
+unsafe fn expect_read(
+    result: u64,
+    tag: u64,
+    expected: *const u8
+) -> bool {
+    return header(result, 31, RREAD, tag)
+        && get_u32(7) == 20
+        && bytes_equal(11, expected, 20);
+}
+
+unsafe fn run_generation_one(capability: u64) -> bool {
+    build_attach(1);
+    if !expect_error(call_once(capability), 1, (&SEQUENCE[0]), 8) {
+        return false;
+    }
+    build_version(NOTAG, (&VERSION_U[0]), 8);
+    if !expect_version(call_once(capability), NOTAG, (&UNKNOWN[0]), 7) {
+        return false;
+    }
+    build_version(NOTAG, (&VERSION[0]), 6);
+    if !expect_version(call_once(capability), NOTAG, (&VERSION[0]), 6) {
+        return false;
+    }
+    build_attach(4);
+    if !expect_attach(call_once(capability), 4) {
+        return false;
+    }
+    build_walk(5, (&MISSING[0]), 7);
+    if !expect_error(call_once(capability), 5, (&PATH[0]), 4) {
+        return false;
+    }
+    build_walk(6, (&STATUS[0]), 6);
+    if !expect_walk(call_once(capability), 6, 1) {
+        return false;
+    }
+    build_open(7, OWRITE);
+    if !expect_error(call_once(capability), 7, (&MODE[0]), 4) {
+        return false;
+    }
+    build_open(8, OREAD);
+    if !expect_open(call_once(capability), 8, 1) {
+        return false;
+    }
+    build_read(9, MSIZE + 1);
+    if !expect_error(call_once(capability), 9, (&COUNT[0]), 5) {
+        return false;
+    }
+    wait_for_linux_data(1);
+    build_read(10, 20);
+    if !expect_read(call_once(capability), 10, (&G1_DATA[0])) {
+        return false;
+    }
+    build_clunk(11);
+    return header(call_once(capability), 7, RCLUNK, 11);
+}
+
+unsafe fn run_generation_two(capability: u64) -> bool {
+    build_version(NOTAG, (&VERSION[0]), 6);
+    if !expect_version(call_once(capability), NOTAG, (&VERSION[0]), 6) {
+        return false;
+    }
+    build_attach(2);
+    if !expect_attach(call_once(capability), 2) {
+        return false;
+    }
+    build_walk(3, (&STATUS[0]), 6);
+    if !expect_walk(call_once(capability), 3, 2) {
+        return false;
+    }
+    build_open(4, OREAD);
+    if !expect_open(call_once(capability), 4, 2) {
+        return false;
+    }
+    wait_for_linux_data(2);
+    build_read(5, 20);
+    if !expect_read(call_once(capability), 5, (&G2_DATA[0])) {
+        return false;
+    }
+    build_clunk(6);
+    return header(call_once(capability), 7, RCLUNK, 6);
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(
+    report_capability: u64,
+    bootstrap_call_capability: u64
+) -> never {
+    if report_capability == 0 || bootstrap_call_capability != 0 {
+        stop();
+    }
+    emit(report_capability, (&ONLINE[0]), 29);
+    progress(1);
+
+    let g1_capability: u64 = wait_for_publication(1);
+    wait_for_linux_data(1);
+    if !run_generation_one(g1_capability) {
+        stop();
+    }
+    emit(report_capability, (&G1_PASS[0]), 35);
+    progress(2);
+
+    let g2_capability: u64 = wait_for_publication(2);
+    build_version(NOTAG, (&VERSION[0]), 6);
+    if g2_capability == g1_capability
+        || call_once(g1_capability) != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    emit(report_capability, (&STALE_PASS[0]), 41);
+    progress(3);
+
+    wait_for_linux_data(2);
+    if !run_generation_two(g2_capability) {
+        stop();
+    }
+    emit(report_capability, (&G2_PASS[0]), 35);
+    progress(4);
+    stop();
+}

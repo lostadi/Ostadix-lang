@@ -324,6 +324,14 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         ocore_syscall_init();
         start_m6(probe_mode, domain_handle);
     }
+    if probe_mode == 26 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        ocore_syscall_init();
+        start_m6(probe_mode, domain_handle);
+    }
     if probe_mode == 20 {
         if configure_probe(probe_mode) == 0 {
             fail_closed();

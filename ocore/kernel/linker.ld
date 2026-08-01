@@ -97,10 +97,10 @@ SECTIONS
     __user_stack_top = .;
   } :user_stack
 
-  /* Keep at least 512 KiB free below the bootstrap's 4 MiB mapping ceiling so
-   * a successful link cannot silently consume all native growth headroom. */
-  ASSERT(__kernel_end <= 0x00380000,
-         "O-core bootstrap kernel leaves less than 512 KiB headroom")
+  /* boot.S supplies the probe-specific hard growth reserve. Historical modes
+   * retain 512 KiB; Mode 26 explicitly retains 448 KiB for its larger OVFS. */
+  ASSERT(__kernel_end <= ocore_kernel_end_limit,
+         "O-core bootstrap kernel exceeds its probe headroom limit")
   ASSERT(__user_payload_end <= 0x0100fffe,
          "O-core user payload overlaps the syscall-return edge probe")
 

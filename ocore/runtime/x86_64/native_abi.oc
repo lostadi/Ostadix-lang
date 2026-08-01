@@ -6,6 +6,10 @@ pub const NATIVE_ABI_V1: u64 = 1;
 // Version of the bounded foreign ABI exercised by Mode 25's pinned ELF.  The
 // surface is intentionally limited to write, exit_group, and ENOSYS fallback.
 pub const LINUX_MINIMAL_ABI_V1: u64 = 1;
+// Version of the bounded 9P2000 client ABI. The wire protocol remains inside
+// the request view; this version names only its three common scalar syscalls
+// plus SYS_PERSONALITY_BOUNDED_CALL.
+pub const PLAN9_9P2000_ABI_V1: u64 = 1;
 
 pub const SYS_DEBUG_WRITE: u64 = 0;
 pub const SYS_CAP_CLOSE: u64 = 1;
