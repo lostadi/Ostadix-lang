@@ -67,6 +67,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-m6b-qemu.sh # M6B mode-19 bounded-copy/revocation mechanism
 ./ocore/kernel/smoke-live-bounded-personality-qemu.sh # M6B mode-24 live four-byte bounded personality RPC
 ./ocore/kernel/smoke-live-linux-personality-qemu.sh # mode-25 exact static Linux ELF/CPL3 bounded personality
+./ocore/kernel/smoke-live-linux-plan9-qemu.sh # mode-26 Linux ELF data through a Plan-9-style 9P2000 CPL3 client/server path
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
@@ -258,6 +259,39 @@ distribution, a root filesystem, a dynamic linker, a general foreign ABI,
 KVM/SVM hardware evidence, PCI/device assignment, DMA/IOMMU isolation, or
 physical-device evidence.
 
+Mode 26 composes that same exact Linux-ABI ELF with an actual bounded 9P2000
+wire path. `build-m7-linux-plan9-artifacts.sh` deterministically packages
+`/bin/linux-minimal.elf`, `/sbin/linux-9pd.elf`,
+`/sbin/linux-supervisord.elf`, and `/bin/plan9-namespace-client.elf` into a
+92,872-byte immutable OVFS image with SHA-256
+`920b014cfb133f033b6761da6fe5b1d22be613bf88112c05ec0af982e1beebd9`.
+All four principals load as data into isolated W^X CPL3 address spaces and
+CSpaces. The Linux ELF produces the exact generation-1 stdout and generation-2
+stderr snapshots; the unprivileged native 9P server exposes only the
+generation-bound `/srv/linux/status` path. An independently linked native
+Plan-9-style client negotiates `9P2000` with `msize = 128` and performs exact
+version, attach, walk, open, read, and clunk exchanges. Its first generation
+also verifies sequence, version, path, mode, and count errors. The server then
+faults deliberately, O-core withdraws the generation-1 namespace and call
+authority, both clients survive, and a health-gated replacement serves
+generation 2 only after stale generation-1 capability denial. The supervisor
+stops the replacement after Linux `-ENOSYS` and `exit_group(42)` complete;
+bounded authority and resources are reclaimed before a later timer fires.
+
+Run this live Linux-to-9P evidence gate with:
+
+```bash
+./ocore/kernel/smoke-live-linux-plan9-qemu.sh
+```
+
+The Plan-9-style client and 9P server are native O-core CPL3 principals, not a
+Plan 9 kernel or Plan 9 binary. Mode 26 does not boot Linux or Plan 9, provide a
+distribution, root filesystem, dynamic linker, general Linux ABI, general 9P
+server, namespace or mount environment, network transport, persistent
+filesystem, or guest-agent framework. QEMU TCG execution is not KVM/SVM or
+physical-hardware evidence, and the gate has no PCI/device assignment, DMA,
+IOMMU, interrupt-remapping, hardware-reset, or physical-device proof.
+
 Mode 20 carries a host-verified `ocore.kernel-world/v1` package contract into a
 bounded native supervisor-admission gate. The host emits a deterministic,
 hash-pinned `OKWORLD1`
@@ -288,15 +322,17 @@ float types cannot reach integer machine operations.
 The current verified kernel boundary includes M6A's scalar CPL3 supervision in
 mode 18, M6B's bounded-copy/revocation mechanism in mode 19, Mode 24's exact
 four-byte live bounded personality composition, Mode 25's exact static Linux
-ELF/minimal-ABI composition, and the nonexecuting KernelWorld admission/object
-slice in mode 20. It remains
+ELF/minimal-ABI composition, Mode 26's bounded Linux-to-9P2000 CPL3 service
+path, and the nonexecuting KernelWorld admission/object slice in mode 20. It
+remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
 dynamic linker, writable general filesystem, general foreign ABI personality,
 foreign root filesystem, native compiler/self-hosting, general guest-agent
-transport, or live hosted-broker transport into QEMU. Neither Mode 24 nor Mode
-25 boots Linux or Plan 9; Mode 25 covers only its pinned four-call success path
-and fifth failure-only exit site.
+transport, or live hosted-broker transport into QEMU. Modes 24 through 26 do
+not boot Linux or Plan 9. Mode 25 covers only its pinned four-call success path
+and fifth failure-only exit site; Mode 26 adds one exact native 9P2000 client
+and server corpus rather than a Plan 9 binary or general namespace.
 The early bootstrap/fault gates still use a linked `native[0]` payload; later
 claims have separate bounded gates.
 

@@ -4,7 +4,7 @@ use runtime::personality::is_supported;
 use runtime::personality::PERSONALITY_NATIVE;
 use runtime::native_abi::NATIVE_ABI_V1;
 
-pub const MAX_DOMAINS: usize = 4;
+pub const MAX_DOMAINS: usize = 5;
 pub const DOMAIN_NATIVE_0: u64 = 0x0000_0001_d100_0000;
 
 const DOMAIN_EMPTY: u8 = 0;
@@ -14,12 +14,12 @@ const DOMAIN_HANDLE_TAG: u64 = 0xd100_0000;
 const HANDLE_TAG_MASK: u64 = 0xff00_0000;
 const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
 
-static mut DOMAIN_IDS: [u64; 4] = [0; 4];
-static mut PERSONALITY_IDS: [u64; 4] = [0; 4];
-static mut ABI_VERSIONS: [u64; 4] = [0; 4];
-static mut GENERATIONS: [u32; 4] = [0; 4];
-static mut CHILD_REFS: [u32; 4] = [0; 4];
-static mut STATES: [u8; 4] = [0; 4];
+static mut DOMAIN_IDS: [u64; 5] = [0; 5];
+static mut PERSONALITY_IDS: [u64; 5] = [0; 5];
+static mut ABI_VERSIONS: [u64; 5] = [0; 5];
+static mut GENERATIONS: [u32; 5] = [0; 5];
+static mut CHILD_REFS: [u32; 5] = [0; 5];
+static mut STATES: [u8; 5] = [0; 5];
 static mut INITIALIZED: u8 = 0;
 
 fn domain_index(handle: u64) -> usize {

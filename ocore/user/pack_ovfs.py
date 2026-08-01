@@ -17,7 +17,8 @@ ENTRY_SIZE = 128
 PAGE_SIZE = 4096
 MAX_FILES = 16
 MAX_FILE_SIZE = 1024 * 1024
-MAX_IMAGE_SIZE = 64 * 1024
+DEFAULT_MAX_IMAGE_SIZE = 64 * 1024
+MODE26_MAX_IMAGE_SIZE = 96 * 1024
 READ = 1
 EXEC = 2
 CORPUS = 4
@@ -48,6 +49,13 @@ def canonical_path(raw: str) -> bytes:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--max-image-bytes",
+        type=int,
+        choices=(DEFAULT_MAX_IMAGE_SIZE, MODE26_MAX_IMAGE_SIZE),
+        default=DEFAULT_MAX_IMAGE_SIZE,
+        help="select the historical 64 KiB or Mode 26 96 KiB native profile",
+    )
     parser.add_argument(
         "--entry",
         action="append",
@@ -85,8 +93,11 @@ def main() -> None:
         payload_offsets.append(cursor)
         cursor += len(payload)
     image_size = cursor
-    if image_size > MAX_IMAGE_SIZE:
-        raise SystemExit("OVFS image exceeds the native 64 KiB bound")
+    if image_size > args.max_image_bytes:
+        raise SystemExit(
+            "OVFS image exceeds the selected native "
+            f"{args.max_image_bytes // 1024} KiB bound"
+        )
 
     table = bytearray()
     for (path, _, flags, payload), offset in zip(inputs, payload_offsets):

@@ -1,5 +1,5 @@
 schema_version = 1
-required_gate_count = 16
+required_gate_count = 17
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -315,6 +315,53 @@ expected_markers = [
   "M6 Linux resources reclaimed: PASS",
   "M6 Linux post-lifecycle timer: online",
   "M6 live Linux personality smoke: PASS",
+]
+
+[[gate]]
+id = "m7-linux-plan9-9p2000-live"
+required = true
+milestone = "M7 Linux/Plan 9 Mode 26 live"
+script = "ocore/kernel/smoke-live-linux-plan9-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "file", "objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "One exact digest-pinned static Linux x86-64 ELF, an unprivileged native Linux 9P2000 server, a native supervisor, and a Plan-9-style native 9P2000 client load from immutable OVFS data into four isolated CPL3 address spaces",
+  "The Linux ELF's bounded stdout/stderr results are read through exact 9P2000 version, attach, walk, open, read, and clunk exchanges at /srv/linux/status across namespace withdrawal, one contained server fault, generation-2 replacement, stale generation-1 denial, and complete resource reclamation",
+]
+nonclaims = [
+  "Mode 26 executes the same bounded Linux-ABI ELF and a native O-core Plan-9-style client; it does not boot Linux or Plan 9, run a Plan 9 binary, provide a distribution, root filesystem, or dynamic linker, or establish a general foreign ABI",
+  "The exact 128-byte 9P2000 corpus exposes only the generation-bound /srv/linux/status path; it is not a general 9P server, Plan 9 namespace or mount environment, network transport, persistent filesystem, or guest-agent framework",
+  "QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence",
+  "The gate has no PCI or physical-device assignment, DMA mapping or isolation, IOMMU isolation, interrupt remapping, or hardware reset",
+]
+expected_markers = [
+  "M7 Linux/9P OVFS image import: PASS",
+  "M7 Linux provider + Plan 9 CPL3 loads: PASS",
+  "M7 Linux/9P address-space W^X: PASS",
+  "M7 Linux/9P isolated principal CSpaces: PASS",
+  "M7 9P private-before-health publication: PASS",
+  "M7 Plan 9 client ELF: online",
+  "M7 Linux-to-9P namespace path: armed",
+  "o-core linux stdout",
+  "M7 Linux 9P snapshot g1: PASS",
+  "M7 Linux 9P service g1: PASS",
+  "M7 9P2000 Linux namespace g1: PASS",
+  "M7 provider fault withdrew 9P namespace: PASS",
+  "M7 Linux and Plan 9 clients survived fault: PASS",
+  "M7 Linux 9P daemon g2: online",
+  "M7 Linux 9P stale g1: PASS",
+  "M7 stale 9P call capability denial: PASS",
+  "o-core linux stderr",
+  "M7 Linux 9P snapshot g2: PASS",
+  "M7 Linux 9P service g2: PASS",
+  "M7 9P2000 Linux namespace g2: PASS",
+  "M7 Linux provider exact -ENOSYS return: PASS",
+  "M7 Linux provider direct exit_group(42): PASS",
+  "M7 Linux supervisor policy loop: PASS",
+  "M7 Linux/9P generation cleanup: PASS",
+  "M7 Linux/9P resources reclaimed: PASS",
+  "M7 Linux/9P post-lifecycle timer: online",
+  "live Linux/Plan 9 9P2000 lifecycle: PASS",
 ]
 
 [[gate]]

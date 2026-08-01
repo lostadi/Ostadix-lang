@@ -89,6 +89,7 @@ use runtime::native_abi::ERR_PERSONALITY_UNAVAILABLE;
 use runtime::native_abi::ERR_PERSONALITY_UNSUPPORTED;
 use runtime::native_abi::NATIVE_ABI_V1;
 use runtime::native_abi::LINUX_MINIMAL_ABI_V1;
+use runtime::native_abi::PLAN9_9P2000_ABI_V1;
 use runtime::native_abi::PERSONALITY_RPC_V1;
 use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
 use runtime::pages::free_frames;
@@ -96,6 +97,7 @@ use runtime::pages::invariants_hold as page_invariants_hold;
 use runtime::personality::PERSONALITY_NATIVE;
 use runtime::personality::PERSONALITY_TEST;
 use runtime::personality::PERSONALITY_LINUX_MINIMAL;
+use runtime::personality::PERSONALITY_PLAN9_9P2000;
 use runtime::linux_fd_table::active_count as linux_fd_active_count;
 use runtime::linux_fd_table::authorize_write as authorize_linux_write;
 use runtime::linux_fd_table::creation_count as linux_fd_creation_count;
@@ -189,6 +191,7 @@ use runtime::personality_bounded_rpc::reply as reply_bounded_request;
 use runtime::personality_bounded_rpc::service_died as bounded_service_died;
 use runtime::personality_bounded_rpc::write_byte as write_bounded_byte;
 use runtime::personality_bounded_rpc::active_count as bounded_active_count;
+use runtime::personality_bounded_rpc::active_count_for_caller as bounded_active_count_for_caller;
 use runtime::personality_bounded_rpc::terminal_count as bounded_terminal_count;
 use runtime::personality_bounded_rpc::charged_bytes as bounded_charged_bytes;
 use runtime::personality_bounded_rpc::consumed_count as bounded_consumed_count;
@@ -277,6 +280,7 @@ use runtime::thread::THREAD_STATE_EXITED;
 const MODE_PERSONALITY: u64 = 18;
 const MODE_BOUNDED_PERSONALITY: u64 = 24;
 const MODE_LINUX_PERSONALITY: u64 = 25;
+const MODE_LINUX_PLAN9: u64 = 26;
 const PROCESS_COUNT: usize = 4;
 const CLIENT: usize = 0;
 const SERVICE: usize = 1;
@@ -296,6 +300,7 @@ const OP_HOLD_UNMAP: u64 = 6;
 const OP_HOLD_REQUEST_REVOKE: u64 = 7;
 const OP_HOLD_RESOURCE_REVOKE: u64 = 8;
 const OP_HOLD_PROCESS_EXIT: u64 = 9;
+const OP_9P: u64 = 0x90;
 const MONITOR_CLIENT_G2_COMPLETE: u64 = 0xff;
 const MONITOR_SERVICE_CRASH: u64 = 0xfe;
 
@@ -321,6 +326,13 @@ static LINUX_PATH_IDS: [u64; 4] = [
     0x7153_7901_651e_a253,
     0x9470_2692_e417_59c5,
     0x052e_90fa_5533_e795,
+];
+
+static M7_PATH_IDS: [u64; 4] = [
+    0xdef3_ba7c_7189_c227,
+    0xee15_d4ff_92bc_7c20,
+    0x9470_2692_e417_59c5,
+    0x8c3e_d9fc_1274_56bf,
 ];
 
 const IMAGE_ID: u64 = 0xf592_4eeb_64b5_a3d3;
@@ -356,6 +368,19 @@ const LINUX_IMAGE_SHA_0: u64 = 0xb380_e5cb_be50_403b;
 const LINUX_IMAGE_SHA_1: u64 = 0xd58b_dafb_11c5_4f22;
 const LINUX_IMAGE_SHA_2: u64 = 0x01f0_cc74_2fc8_9848;
 const LINUX_IMAGE_SHA_3: u64 = 0x7fa0_8ba2_6e28_86e8;
+
+// Filled from the deterministic Mode 26 OVFS build before the live gate is
+// admitted.  Mode 25's immutable package identity above remains unchanged.
+const M7_IMAGE_LENGTH: usize = 92872;
+const M7_IMAGE_ID: u64 = 0x920b_014c_fb13_3f03;
+const M7_IMAGE_DIGEST_0: u64 = 0x033f_13fb_4c01_0b92;
+const M7_IMAGE_DIGEST_1: u64 = 0xd2b1_e56f_da61_673b;
+const M7_IMAGE_DIGEST_2: u64 = 0x052c_1188_bf13_e62b;
+const M7_IMAGE_DIGEST_3: u64 = 0xd9eb_bee1_82f9_0aec;
+const M7_IMAGE_SHA_0: u64 = 0x920b_014c_fb13_3f03;
+const M7_IMAGE_SHA_1: u64 = 0x3b67_61da_6fe5_b1d2;
+const M7_IMAGE_SHA_2: u64 = 0x2be6_13bf_8811_2c05;
+const M7_IMAGE_SHA_3: u64 = 0xec0a_f982_e1be_ebd9;
 
 static IMAGE_MESSAGE: [u8; 28] = b"M6A OVFS image import: PASS\n";
 static LOAD_MESSAGE: [u8; 34] = b"M6A four packaged ELF loads: PASS\n";
@@ -432,6 +457,32 @@ static LINUX_CLEANUP_MESSAGE: [u8; 35] =
     b"M6 Linux resources reclaimed: PASS\n";
 static LINUX_POST_TIMER_MESSAGE: [u8; 38] =
     b"M6 Linux post-lifecycle timer: online\n";
+static M7_IMAGE_MESSAGE: [u8; 36] =
+    b"M7 Linux/9P OVFS image import: PASS\n";
+static M7_LOAD_MESSAGE: [u8; 44] =
+    b"M7 Linux provider + Plan 9 CPL3 loads: PASS\n";
+static M7_WX_MESSAGE: [u8; 36] =
+    b"M7 Linux/9P address-space W^X: PASS\n";
+static M7_CSPACE_MESSAGE: [u8; 45] =
+    b"M7 Linux/9P isolated principal CSpaces: PASS\n";
+static M7_PRIVATE_MESSAGE: [u8; 46] =
+    b"M7 9P private-before-health publication: PASS\n";
+static M7_ARMED_MESSAGE: [u8; 37] =
+    b"M7 Linux-to-9P namespace path: armed\n";
+static M7_FAULT_MESSAGE: [u8; 46] =
+    b"M7 provider fault withdrew 9P namespace: PASS\n";
+static M7_SURVIVOR_MESSAGE: [u8; 49] =
+    b"M7 Linux and Plan 9 clients survived fault: PASS\n";
+static M7_TERMINAL_MESSAGE: [u8; 37] =
+    b"M7 Linux/9P generation cleanup: PASS\n";
+static M7_CLEANUP_MESSAGE: [u8; 38] =
+    b"M7 Linux/9P resources reclaimed: PASS\n";
+static M7_POST_TIMER_MESSAGE: [u8; 41] =
+    b"M7 Linux/9P post-lifecycle timer: online\n";
+static M7_ENOSYS_MESSAGE: [u8; 45] =
+    b"M7 Linux provider exact -ENOSYS return: PASS\n";
+static M7_EXIT_MESSAGE: [u8; 46] =
+    b"M7 Linux provider direct exit_group(42): PASS\n";
 static mut ARMED: u8 = 0;
 static mut ACTIVE_MODE: u64 = 0;
 static mut NAMESPACES: [u64; 4] = [0; 4];
@@ -466,6 +517,9 @@ static mut PENDING_CRASH_REQUEST: u64 = 0;
 static mut CLIENT_EXIT_TEARDOWNS: u64 = 0;
 static mut G1_CALL_CAP: u64 = 0;
 static mut G2_CALL_CAP: u64 = 0;
+static mut PLAN9_CALL_CAP: u64 = 0;
+static mut PLAN9_G1_CALL_CAP: u64 = 0;
+static mut PLAN9_G2_CALL_CAP: u64 = 0;
 static mut STALE_SERVICE_PROCESS: u64 = 0;
 static mut STALE_SERVICE_THREAD: u64 = 0;
 static mut STALE_SERVICE_CSPACE: u64 = 0;
@@ -491,6 +545,8 @@ extern "sysv64" fn ocore_m6b_live_image_start() -> usize;
 extern "sysv64" fn ocore_m6b_live_image_end() -> usize;
 extern "sysv64" fn ocore_m6_linux_image_start() -> usize;
 extern "sysv64" fn ocore_m6_linux_image_end() -> usize;
+extern "sysv64" fn ocore_m7_linux_plan9_image_start() -> usize;
+extern "sysv64" fn ocore_m7_linux_plan9_image_end() -> usize;
 
 unsafe fn fail_closed() -> never {
     disable_interrupts();
@@ -505,12 +561,21 @@ unsafe fn management_context() -> bool {
 
 unsafe fn bounded_mode() -> bool {
     return ACTIVE_MODE == MODE_BOUNDED_PERSONALITY
-        || ACTIVE_MODE == MODE_LINUX_PERSONALITY;
+        || ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        || ACTIVE_MODE == MODE_LINUX_PLAN9;
+}
+
+unsafe fn linux_mode() -> bool {
+    return ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        || ACTIVE_MODE == MODE_LINUX_PLAN9;
 }
 
 unsafe fn path_id(index: usize) -> u64 {
     if index >= PROCESS_COUNT {
         return 0;
+    }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        return M7_PATH_IDS[index];
     }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         return LINUX_PATH_IDS[index];
@@ -765,6 +830,16 @@ unsafe fn seed_generation_config(generation: u64) -> void {
     volatile_store((PHYSICALS[CLIENT] + 16) as *mut u64, generation);
     volatile_store((PHYSICALS[CLIENT] + 24) as *mut u64, 0);
 
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        volatile_store((PHYSICALS[OBSERVER] + 8) as *mut u64, 0);
+        volatile_store(
+            (PHYSICALS[OBSERVER] + 16) as *mut u64,
+            generation
+        );
+        volatile_store((PHYSICALS[OBSERVER] + 24) as *mut u64, 0);
+        volatile_store((PHYSICALS[OBSERVER] + 32) as *mut u64, 0);
+    }
+
     volatile_store((PHYSICALS[SERVICE] + 16) as *mut u64, generation);
     volatile_store((PHYSICALS[SERVICE] + 24) as *mut u64, 0);
     volatile_store(
@@ -791,6 +866,12 @@ unsafe fn seed_generation_config(generation: u64) -> void {
         (PHYSICALS[SERVICE] + 72) as *mut u64,
         PRIOR_REQUEST
     );
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        volatile_store(
+            (PHYSICALS[SERVICE] + 80) as *mut u64,
+            PROCESSES[OBSERVER]
+        );
+    }
 
     volatile_store(
         (PHYSICALS[SUPERVISOR] + 8) as *mut u64,
@@ -837,6 +918,44 @@ unsafe fn install_call_capability(generation: u64) -> bool {
         ) != PROCESSES[SERVICE] {
         return false;
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        PLAN9_CALL_CAP = install_capability_for_owner(
+            CSPACES[OBSERVER],
+            1,
+            PROCESSES[SERVICE],
+            OBJECT_PERSONALITY_CALL,
+            RIGHT_PERSONALITY_CALL
+        );
+        if PLAN9_CALL_CAP == 0
+            || validate_for_owner(
+                CSPACES[OBSERVER],
+                PLAN9_CALL_CAP,
+                OBJECT_PERSONALITY_CALL,
+                RIGHT_PERSONALITY_CALL
+            ) != PROCESSES[SERVICE] {
+            return false;
+        }
+        if generation == 1 {
+            PLAN9_G1_CALL_CAP = PLAN9_CALL_CAP;
+        } else {
+            PLAN9_G2_CALL_CAP = PLAN9_CALL_CAP;
+            if PLAN9_G2_CALL_CAP == PLAN9_G1_CALL_CAP {
+                return false;
+            }
+        }
+        volatile_store(
+            (PHYSICALS[OBSERVER] + 8) as *mut u64,
+            PLAN9_CALL_CAP
+        );
+        volatile_store(
+            (PHYSICALS[OBSERVER] + 16) as *mut u64,
+            generation
+        );
+        volatile_store(
+            (PHYSICALS[OBSERVER] + 24) as *mut u64,
+            generation
+        );
+    }
     if generation == 1 {
         G1_CALL_CAP = CALL_CAP;
     } else {
@@ -853,7 +972,7 @@ unsafe fn install_call_capability(generation: u64) -> bool {
         (PHYSICALS[SUPERVISOR] + 24) as *mut u64,
         generation
     );
-    if ACTIVE_MODE == MODE_LINUX_PERSONALITY && generation == 2 {
+    if linux_mode() && generation == 2 {
         LINUX_REBIND_BARRIER = 0;
     }
     return true;
@@ -870,6 +989,25 @@ unsafe fn revoke_call_capability() -> bool {
             RIGHT_PERSONALITY_CALL
         ) != 0 {
         return false;
+    }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        let plan9_stale: u64 = PLAN9_CALL_CAP;
+        if plan9_stale == 0
+            || close_capability_for_owner(
+                CSPACES[OBSERVER],
+                plan9_stale
+            ) == 0
+            || validate_for_owner(
+                CSPACES[OBSERVER],
+                plan9_stale,
+                OBJECT_PERSONALITY_CALL,
+                RIGHT_PERSONALITY_CALL
+            ) != 0 {
+            return false;
+        }
+        PLAN9_CALL_CAP = 0;
+        volatile_store((PHYSICALS[OBSERVER] + 8) as *mut u64, 0);
+        volatile_store((PHYSICALS[OBSERVER] + 24) as *mut u64, 0);
     }
     CALL_CAP = 0;
     volatile_store((PHYSICALS[CLIENT] + 8) as *mut u64, 0);
@@ -962,7 +1100,7 @@ unsafe fn create_replacement_service() -> bool {
         ) != 1 {
         return false;
     }
-    if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
+    if linux_mode() {
         let mut stdout_object: u64 = 0;
         let mut stderr_object: u64 = 0;
         if provision_linux_process(
@@ -1062,17 +1200,27 @@ pub unsafe fn kernel_m6_bounded_call(
     }
     let caller: u64 = current_process_handle();
     let thread: u64 = current_thread_handle();
-    if caller != PROCESSES[CLIENT]
-        || thread != THREADS[CLIENT]
+    let primary_caller: bool = caller == PROCESSES[CLIENT]
+        && thread == THREADS[CLIENT]
+        && CALL_CAP == capability;
+    let plan9_caller: bool = ACTIVE_MODE == MODE_LINUX_PLAN9
+        && caller == PROCESSES[OBSERVER]
+        && thread == THREADS[OBSERVER]
+        && PLAN9_CALL_CAP == capability;
+    if (!primary_caller && !plan9_caller)
         || capability_object != PROCESSES[SERVICE]
-        || CALL_CAP != capability
         || operation == 0
         || operation > 0xff
         || foreign_address == 0
         || length == 0
         || length > 128
         || direction == 0
-        || direction > 3 {
+        || direction > 3
+        || (ACTIVE_MODE == MODE_LINUX_PLAN9
+            && (!plan9_caller
+                || operation != OP_9P
+                || length != 128
+                || direction != 3)) {
         return ERR_CAPABILITY_DENIED;
     }
     let now: u64 = ticks();
@@ -1244,7 +1392,7 @@ pub unsafe fn kernel_m6_linux_syscall(
     arg5: u64
 ) -> u64 {
     if ARMED == 0
-        || ACTIVE_MODE != MODE_LINUX_PERSONALITY
+        || !linux_mode()
         || current_process_handle() != PROCESSES[CLIENT]
         || current_thread_handle() != THREADS[CLIENT]
         || arg3 != 0
@@ -1264,14 +1412,21 @@ pub unsafe fn kernel_m6_linux_syscall(
     }
     if action == LINUX_ACTION_RETURN {
         if linux_enosys_count() == 1 {
-            write((&LINUX_ENOSYS_MESSAGE[0]), 36);
+            if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+                write((&M7_ENOSYS_MESSAGE[0]), 45);
+            } else {
+                write((&LINUX_ENOSYS_MESSAGE[0]), 36);
+            }
         }
         return result;
     }
     if action == LINUX_ACTION_DIRECT_EXIT_GROUP {
         if result != 42
             || LINUX_EXIT_REQUESTED != 0
-            || bounded_active_count() != 0 {
+            || (ACTIVE_MODE == MODE_LINUX_PLAN9
+                && bounded_active_count_for_caller(PROCESSES[CLIENT]) != 0)
+            || (ACTIVE_MODE != MODE_LINUX_PLAN9
+                && bounded_active_count() != 0) {
             return LINUX_NEG_EFAULT;
         }
         LINUX_EXIT_REQUESTED = result;
@@ -1347,7 +1502,7 @@ pub unsafe fn kernel_m6_linux_complete(
 ) -> u64 {
     let caller: u64 = current_process_handle();
     if ARMED == 0
-        || ACTIVE_MODE != MODE_LINUX_PERSONALITY
+        || !linux_mode()
         || caller != PROCESSES[SERVICE]
         || capability_object != caller
         || request == 0
@@ -1382,13 +1537,19 @@ pub unsafe fn kernel_m6_linux_complete(
         LINUX_G1_REQUEST = request;
         LINUX_REBIND_BARRIER = 1;
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        volatile_store(
+            (PHYSICALS[OBSERVER] + 32) as *mut u64,
+            supervision_generation(SUPERVISION)
+        );
+    }
     return 1;
 }
 
 @export
 @no_mangle
 pub unsafe fn kernel_m6_defer_thread(thread: u64) -> u64 {
-    if ACTIVE_MODE != MODE_LINUX_PERSONALITY || thread != THREADS[CLIENT] {
+    if !linux_mode() || thread != THREADS[CLIENT] {
         return 0;
     }
     let published: u64 = volatile_load(
@@ -1409,19 +1570,26 @@ pub unsafe fn kernel_m6_linux_process_exit(
     status: u64
 ) -> u64 {
     if ARMED == 0
-        || ACTIVE_MODE != MODE_LINUX_PERSONALITY
+        || !linux_mode()
         || process != PROCESSES[CLIENT]
         || status != 42
         || LINUX_EXIT_REQUESTED != status
         || LINUX_EXIT_RECORDED != 0
         || linux_process_exited(process) != 2
         || linux_fd_active_count() != 0
-        || bounded_active_count() != 0
+        || (ACTIVE_MODE == MODE_LINUX_PLAN9
+            && bounded_active_count_for_caller(process) != 0)
+        || (ACTIVE_MODE != MODE_LINUX_PLAN9
+            && bounded_active_count() != 0)
         || !linux_invariants_hold() {
         return 0;
     }
     LINUX_EXIT_RECORDED = status;
-    write((&LINUX_EXIT_MESSAGE[0]), 37);
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        write((&M7_EXIT_MESSAGE[0]), 46);
+    } else {
+        write((&LINUX_EXIT_MESSAGE[0]), 37);
+    }
     return 1;
 }
 
@@ -1569,7 +1737,7 @@ pub unsafe fn kernel_m6_personality_supervise(
         return 1;
     }
     if action == SUPERVISE_MONITOR {
-        if ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        if linux_mode()
             && subject == MONITOR_SERVICE_CRASH {
             if generation == 1
                 && SERVICE_FAULT_RECORDED == 1
@@ -1603,6 +1771,22 @@ pub unsafe fn kernel_m6_personality_supervise(
             return ERR_PERSONALITY_BUSY;
         }
         if subject == MONITOR_CLIENT_G2_COMPLETE {
+            if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+                if generation == 2
+                    && process_state(PROCESSES[CLIENT])
+                        == PROCESS_STATE_REAPABLE
+                    && exit_code_for(PROCESSES[CLIENT]) == 42
+                    && LINUX_EXIT_RECORDED == 42
+                    && linux_write_call_count() == 2
+                    && linux_stdout_length() == 20
+                    && linux_stderr_length() == 20
+                    && volatile_load(
+                        PHYSICALS[OBSERVER] as *const u64
+                    ) == 4 {
+                    return 1;
+                }
+                return ERR_PERSONALITY_BUSY;
+            }
             if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
                 if generation == 2
                     && process_state(PROCESSES[CLIENT])
@@ -1736,7 +1920,7 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
         || volatile_load(PHYSICALS[SERVICE] as *const u64) != 7 {
         return 0;
     }
-    if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
+    if linux_mode() {
         PRIOR_REQUEST = LINUX_G1_REQUEST;
         if PRIOR_REQUEST == 0
             || linux_write_call_count() != 1
@@ -1748,6 +1932,13 @@ pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
             return 0;
         }
         if bounded_terminal_count() != 1 {
+            return 0;
+        }
+        if ACTIVE_MODE == MODE_LINUX_PLAN9
+            && (bounded_dispatch_count() != 12
+                || bounded_lookup_count() != 12
+                || bounded_reply_count() != 12
+                || bounded_consumed_count() != 11) {
             return 0;
         }
         if bounded_charged_bytes() != 20 {
@@ -1811,7 +2002,7 @@ pub unsafe fn kernel_m6_expire_requests(now: u64) -> u64 {
     if bounded_mode() {
         let next: u64 = bounded_next_deadline();
         if next == INFINITE_DEADLINE {
-            if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
+            if linux_mode() {
                 return 1;
             }
             return 0;
@@ -1832,6 +2023,38 @@ pub unsafe fn kernel_m6_expire_requests(now: u64) -> u64 {
 @export
 @no_mangle
 pub unsafe fn kernel_m6_phase_one_ready() -> u64 {
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        if ARMED == 0
+            || SERVICE_FAULT_RECORDED != 1
+            || process_state(PROCESSES[SERVICE])
+                != PROCESS_STATE_REAPABLE
+            || supervision_state(SUPERVISION)
+                != SUPERVISION_STATE_RESTART_REQUESTED
+            || LINUX_G1_REQUEST == 0
+            || LINUX_REBIND_BARRIER != 1
+            || linux_write_call_count() != 1
+            || linux_stdout_length() != 20
+            || linux_stderr_length() != 0
+            || linux_fd_active_count() != 0
+            || bounded_active_count() != 1
+            || bounded_terminal_count() != 1
+            || bounded_dispatch_count() != 12
+            || bounded_lookup_count() != 12
+            || bounded_reply_count() != 12
+            || bounded_consumed_count() != 11
+            || bounded_charged_bytes() != 20
+            || volatile_load(PHYSICALS[OBSERVER] as *const u64) != 2
+            || blocked_count() != 0
+            || supervision_crash_count() != 1
+            || restart_request_count() != 1
+            || !personality_rpc_invariants_hold()
+            || !bounded_rpc_invariants_hold()
+            || !linux_invariants_hold()
+            || !supervision_invariants_hold() {
+            return 0;
+        }
+        return 1;
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         if ARMED == 0
             || SERVICE_FAULT_RECORDED != 1
@@ -1882,6 +2105,84 @@ pub unsafe fn kernel_m6_phase_one_ready() -> u64 {
 @export
 @no_mangle
 pub unsafe fn kernel_m6_final_ready() -> u64 {
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        if ARMED == 0
+            || SERVICE_FAULT_RECORDED != 1
+            || supervision_generation(SUPERVISION) != 2
+            || supervision_state(SUPERVISION)
+                != SUPERVISION_STATE_STOP_REQUESTED
+            || volatile_load(PHYSICALS[SERVICE] as *const u64) != 7
+            || volatile_load(PHYSICALS[SUPERVISOR] as *const u64) != 8
+            || volatile_load(PHYSICALS[OBSERVER] as *const u64) != 4
+            || volatile_load(PHYSICALS[OBSERVER] as *const u64)
+                <= OBSERVER_RESTART_SNAPSHOT
+            || blocked_count() != 0
+            || CALL_CAP == 0
+            || G2_CALL_CAP != CALL_CAP
+            || G2_CALL_CAP == G1_CALL_CAP
+            || PLAN9_CALL_CAP == 0
+            || PLAN9_G2_CALL_CAP != PLAN9_CALL_CAP
+            || PLAN9_G2_CALL_CAP == PLAN9_G1_CALL_CAP
+            || LINUX_REBIND_BARRIER != 0 {
+            return 0;
+        }
+        if LINUX_EXIT_REQUESTED != 42
+            || LINUX_EXIT_RECORDED != 42
+            || process_state(PROCESSES[CLIENT])
+                != PROCESS_STATE_REAPABLE
+            || exit_code_for(PROCESSES[CLIENT]) != 42
+            || thread_state(THREADS[CLIENT]) != THREAD_STATE_EXITED {
+            return 0;
+        }
+        if supervision_crash_count() != 1
+            || restart_request_count() != 1
+            || replacement_install_count() != 1
+            || stop_request_count() != 1
+            || monitor_arm_count() != 2 {
+            return 0;
+        }
+        if rpc_request_count() != 0
+            || rpc_dispatch_count() != 19
+            || rpc_wait_arm_count() != 19
+            || rpc_wait_commit_count() != 19
+            || rpc_terminal_count() != 19
+            || rpc_terminal_wake_count() != 19
+            || rpc_consumed_count() != 19
+            || rpc_history_count() != 16
+            || rpc_history_eviction_count() != 3
+            || rpc_reply_count() != 19
+            || rpc_replacement_count() != 1 {
+            return 0;
+        }
+        if bounded_dispatch_count() != 19
+            || bounded_lookup_count() != 19
+            || bounded_reply_count() != 19
+            || bounded_consumed_count() != 19
+            || bounded_terminal_count() != 0
+            || bounded_active_count() != 0
+            || bounded_charged_bytes() != 0 {
+            return 0;
+        }
+        if linux_write_call_count() != 2
+            || linux_write_byte_count() != 40
+            || linux_stdout_length() != 20
+            || linux_stderr_length() != 20
+            || linux_enosys_count() != 1
+            || linux_exit_group_count() != 1
+            || linux_fd_creation_count() != 4
+            || linux_fd_revocation_count() != 4
+            || linux_fd_stale_denial_count() != 2
+            || linux_fd_active_count() != 0 {
+            return 0;
+        }
+        if !bounded_rpc_invariants_hold()
+            || !personality_rpc_invariants_hold()
+            || !linux_invariants_hold()
+            || !supervision_invariants_hold() {
+            return 0;
+        }
+        return 1;
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         if ARMED == 0
             || SERVICE_FAULT_RECORDED != 1
@@ -2100,23 +2401,36 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
             && (!bounded_rpc_invariants_hold()
                 || bounded_active_count() != 0
                 || bounded_charged_bytes() != 0))
-        || (ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        || (linux_mode()
             && (!bounded_rpc_invariants_hold()
                 || bounded_active_count() != 1
-                || bounded_terminal_count() != 1
+                || (ACTIVE_MODE == MODE_LINUX_PERSONALITY
+                    && bounded_terminal_count() != 1)
+                || (ACTIVE_MODE == MODE_LINUX_PLAN9
+                    && (bounded_terminal_count() != 1
+                        || bounded_dispatch_count() != 12
+                        || bounded_lookup_count() != 12
+                        || bounded_reply_count() != 12
+                        || bounded_consumed_count() != 11))
                 || bounded_charged_bytes() != 20
                 || !linux_invariants_hold()
                 || linux_fd_active_count() != 0))
         || !supervision_invariants_hold() {
         fail_closed();
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        write((&M7_FAULT_MESSAGE[0]), 46);
+        write((&M7_SURVIVOR_MESSAGE[0]), 49);
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         write((&LINUX_FAULT_MESSAGE[0]), 41);
         write((&LINUX_SURVIVOR_MESSAGE[0]), 40);
-    } else if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
+    }
+    if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
         write((&BOUNDED_FAULT_MESSAGE[0]), 41);
         write((&BOUNDED_SURVIVOR_MESSAGE[0]), 40);
-    } else {
+    }
+    if ACTIVE_MODE == MODE_PERSONALITY {
         write((&FAULT_MESSAGE[0]), 40);
         write((&TERMINAL_MESSAGE[0]), 41);
         write((&SURVIVOR_MESSAGE[0]), 35);
@@ -2130,6 +2444,11 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
         PHYSICALS[OBSERVER] as *const u64
     );
     if !revoke_call_capability() {
+        fail_closed();
+    }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9
+        && (PLAN9_CALL_CAP != 0
+            || capability_handle_at(CSPACES[OBSERVER], 1) != 0) {
         fail_closed();
     }
     if !close_generation_endpoints() {
@@ -2159,7 +2478,7 @@ pub unsafe fn kernel_m6_crash_continue() -> never {
         || address_space_is_live(STALE_SERVICE_ADDRESS_SPACE)
         || validation_count() != 5
         || commit_count() != 5
-        || (ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        || (linux_mode()
             && (linux_fd_active_count() != 2
                 || linux_fd_creation_count() != 4
                 || linux_fd_revocation_count() != 2
@@ -2206,19 +2525,24 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
             && (!bounded_rpc_invariants_hold()
                 || bounded_active_count() != 0
                 || bounded_charged_bytes() != 0))
-        || (ACTIVE_MODE == MODE_LINUX_PERSONALITY
+        || (linux_mode()
             && (!linux_invariants_hold()
                 || linux_fd_active_count() != 0
                 || LINUX_EXIT_RECORDED != 42))
         || !supervision_invariants_hold() {
         fail_closed();
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        write((&M7_TERMINAL_MESSAGE[0]), 37);
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         write((&LINUX_TERMINAL_MESSAGE[0]), 44);
-    } else if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
+    }
+    if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
         write((&BOUNDED_TERMINAL_MESSAGE[0]), 51);
         write((&BOUNDED_ADMIN_MESSAGE[0]), 58);
-    } else {
+    }
+    if ACTIVE_MODE == MODE_PERSONALITY {
         write((&REBIND_MESSAGE[0]), 32);
         write((&POLICY_MESSAGE[0]), 37);
         write((&STALE_MESSAGE[0]), 41);
@@ -2281,6 +2605,8 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
         || destroy_domain(DOMAINS[CLIENT]) == 0
         || destroy_domain(DOMAINS[SERVICE]) == 0
         || destroy_domain(DOMAINS[SUPERVISOR]) == 0
+        || (ACTIVE_MODE == MODE_LINUX_PLAN9
+            && destroy_domain(DOMAINS[OBSERVER]) == 0)
         || free_frames() != BASELINE_FREE
         || !page_invariants_hold()
         || !mapping_invariants_hold()
@@ -2293,11 +2619,16 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
         || !elf_invariants_hold() {
         fail_closed();
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        write((&M7_CLEANUP_MESSAGE[0]), 38);
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         write((&LINUX_CLEANUP_MESSAGE[0]), 35);
-    } else if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
+    }
+    if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
         write((&BOUNDED_CLEANUP_MESSAGE[0]), 41);
-    } else {
+    }
+    if ACTIVE_MODE == MODE_PERSONALITY {
         write((&RECLAIM_MESSAGE[0]), 30);
         write((&LIVE_MESSAGE[0]), 37);
     }
@@ -2307,11 +2638,16 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
     while ticks() == tick_before {
         halt();
     }
+    if ACTIVE_MODE == MODE_LINUX_PLAN9 {
+        write((&M7_POST_TIMER_MESSAGE[0]), 41);
+    }
     if ACTIVE_MODE == MODE_LINUX_PERSONALITY {
         write((&LINUX_POST_TIMER_MESSAGE[0]), 38);
-    } else if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
+    }
+    if ACTIVE_MODE == MODE_BOUNDED_PERSONALITY {
         write((&BOUNDED_POST_TIMER_MESSAGE[0]), 38);
-    } else {
+    }
+    if ACTIVE_MODE == MODE_PERSONALITY {
         write((&POST_TIMER_MESSAGE[0]), 33);
     }
     loop {
@@ -2320,7 +2656,7 @@ pub unsafe fn kernel_m6_complete_continue() -> never {
 }
 
 pub unsafe fn start(mode: u64, native_domain: u64) -> never {
-    if mode != MODE_LINUX_PERSONALITY
+    if (mode != MODE_LINUX_PERSONALITY && mode != MODE_LINUX_PLAN9)
         || native_domain == 0
         || ARMED != 0
         || !management_context()
@@ -2351,6 +2687,12 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     LINUX_STDERR_OBJECT = 0;
     LINUX_G1_STDOUT_OBJECT = 0;
     LINUX_G1_STDERR_OBJECT = 0;
+    CALL_CAP = 0;
+    G1_CALL_CAP = 0;
+    G2_CALL_CAP = 0;
+    PLAN9_CALL_CAP = 0;
+    PLAN9_G1_CALL_CAP = 0;
+    PLAN9_G2_CALL_CAP = 0;
     DOMAINS[CLIENT] = create_domain(
         1,
         0x601,
@@ -2369,22 +2711,45 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         PERSONALITY_NATIVE,
         NATIVE_ABI_V1
     );
-    DOMAINS[OBSERVER] = native_domain;
+    if mode == MODE_LINUX_PLAN9 {
+        DOMAINS[OBSERVER] = create_domain(
+            4,
+            0x604,
+            PERSONALITY_PLAN9_9P2000,
+            PLAN9_9P2000_ABI_V1
+        );
+    } else {
+        DOMAINS[OBSERVER] = native_domain;
+    }
     if !distinct_four_u64((&DOMAINS[0])) {
         fail_closed();
     }
-    let image_start: usize = ocore_m6_linux_image_start();
-    let image_end: usize = ocore_m6_linux_image_end();
-    let image_length: usize = LINUX_IMAGE_LENGTH;
-    let image_id: u64 = LINUX_IMAGE_ID;
-    let image_digest_0: u64 = LINUX_IMAGE_DIGEST_0;
-    let image_digest_1: u64 = LINUX_IMAGE_DIGEST_1;
-    let image_digest_2: u64 = LINUX_IMAGE_DIGEST_2;
-    let image_digest_3: u64 = LINUX_IMAGE_DIGEST_3;
-    let image_sha_0: u64 = LINUX_IMAGE_SHA_0;
-    let image_sha_1: u64 = LINUX_IMAGE_SHA_1;
-    let image_sha_2: u64 = LINUX_IMAGE_SHA_2;
-    let image_sha_3: u64 = LINUX_IMAGE_SHA_3;
+    let mut image_start: usize = ocore_m6_linux_image_start();
+    let mut image_end: usize = ocore_m6_linux_image_end();
+    let mut image_length: usize = LINUX_IMAGE_LENGTH;
+    let mut image_id: u64 = LINUX_IMAGE_ID;
+    let mut image_digest_0: u64 = LINUX_IMAGE_DIGEST_0;
+    let mut image_digest_1: u64 = LINUX_IMAGE_DIGEST_1;
+    let mut image_digest_2: u64 = LINUX_IMAGE_DIGEST_2;
+    let mut image_digest_3: u64 = LINUX_IMAGE_DIGEST_3;
+    let mut image_sha_0: u64 = LINUX_IMAGE_SHA_0;
+    let mut image_sha_1: u64 = LINUX_IMAGE_SHA_1;
+    let mut image_sha_2: u64 = LINUX_IMAGE_SHA_2;
+    let mut image_sha_3: u64 = LINUX_IMAGE_SHA_3;
+    if mode == MODE_LINUX_PLAN9 {
+        image_start = ocore_m7_linux_plan9_image_start();
+        image_end = ocore_m7_linux_plan9_image_end();
+        image_length = M7_IMAGE_LENGTH;
+        image_id = M7_IMAGE_ID;
+        image_digest_0 = M7_IMAGE_DIGEST_0;
+        image_digest_1 = M7_IMAGE_DIGEST_1;
+        image_digest_2 = M7_IMAGE_DIGEST_2;
+        image_digest_3 = M7_IMAGE_DIGEST_3;
+        image_sha_0 = M7_IMAGE_SHA_0;
+        image_sha_1 = M7_IMAGE_SHA_1;
+        image_sha_2 = M7_IMAGE_SHA_2;
+        image_sha_3 = M7_IMAGE_SHA_3;
+    }
     let mut index: usize = 0;
     if image_start == 0
         || image_end <= image_start
@@ -2440,7 +2805,11 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     if image_id_for(IMAGE) != image_id || !image_invariants_hold() {
         fail_closed();
     }
-    write((&LINUX_IMAGE_MESSAGE[0]), 33);
+    if mode == MODE_LINUX_PLAN9 {
+        write((&M7_IMAGE_MESSAGE[0]), 36);
+    } else {
+        write((&LINUX_IMAGE_MESSAGE[0]), 33);
+    }
 
     index = 0;
     while index < PROCESS_COUNT {
@@ -2487,8 +2856,13 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         || !elf_invariants_hold() {
         fail_closed();
     }
-    write((&LINUX_LOAD_MESSAGE[0]), 39);
-    write((&LINUX_WX_MESSAGE[0]), 40);
+    if mode == MODE_LINUX_PLAN9 {
+        write((&M7_LOAD_MESSAGE[0]), 44);
+        write((&M7_WX_MESSAGE[0]), 36);
+    } else {
+        write((&LINUX_LOAD_MESSAGE[0]), 39);
+        write((&LINUX_WX_MESSAGE[0]), 40);
+    }
 
     index = 0;
     while index < PROCESS_COUNT {
@@ -2578,8 +2952,23 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         || !supervision_invariants_hold() {
         fail_closed();
     }
-    write((&LINUX_CSPACE_MESSAGE[0]), 44);
-    write((&LINUX_PRIVATE_MESSAGE[0]), 49);
+    if mode == MODE_LINUX_PLAN9
+        && (capability_handle_at(CSPACES[OBSERVER], 1) != 0
+            || volatile_load(
+                (PHYSICALS[OBSERVER] + 8) as *const u64
+            ) != 0
+            || volatile_load(
+                (PHYSICALS[OBSERVER] + 24) as *const u64
+            ) != 0) {
+        fail_closed();
+    }
+    if mode == MODE_LINUX_PLAN9 {
+        write((&M7_CSPACE_MESSAGE[0]), 45);
+        write((&M7_PRIVATE_MESSAGE[0]), 46);
+    } else {
+        write((&LINUX_CSPACE_MESSAGE[0]), 44);
+        write((&LINUX_PRIVATE_MESSAGE[0]), 49);
+    }
 
     index = 0;
     while index < PROCESS_COUNT {
@@ -2591,7 +2980,7 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
         if index == SUPERVISOR {
             argument = SUPERVISION_CAP;
         }
-        if index == OBSERVER {
+        if index == OBSERVER && mode == MODE_LINUX_PERSONALITY {
             role = THREAD_ROLE_CPU;
         }
         THREADS[index] = install_loaded_thread(
@@ -2647,7 +3036,11 @@ pub unsafe fn start(mode: u64, native_domain: u64) -> never {
     ) == 0 {
         fail_closed();
     }
-    write((&LINUX_ARMED_MESSAGE[0]), 42);
+    if mode == MODE_LINUX_PLAN9 {
+        write((&M7_ARMED_MESSAGE[0]), 37);
+    } else {
+        write((&LINUX_ARMED_MESSAGE[0]), 42);
+    }
     enable_interrupts();
     loop {
         halt();

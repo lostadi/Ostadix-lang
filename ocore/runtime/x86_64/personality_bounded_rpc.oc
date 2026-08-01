@@ -1566,6 +1566,20 @@ pub unsafe fn active_count() -> usize {
     return count;
 }
 
+pub unsafe fn active_count_for_caller(process: u64) -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if (STATES[slot] == BOUNDED_LIVE
+                || STATES[slot] == BOUNDED_TERMINAL)
+            && CALLER_PROCESSES[slot] == process {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
 pub unsafe fn terminal_count() -> usize {
     let mut count: usize = 0;
     let mut slot: usize = 0;

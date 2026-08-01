@@ -337,6 +337,19 @@
   distribution, root filesystem, dynamic linker, general foreign ABI,
   KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
   physical-device evidence.
+- Mode 26 adds a bounded live Linux-to-9P2000 service composition gate in
+  `ocore/kernel/smoke-live-linux-plan9-qemu.sh`. The exact Mode 25 Linux ELF,
+  an unprivileged native 9P2000 server, a native supervisor, and an independently
+  linked native Plan-9-style client are rebuilt into a 92,872-byte immutable
+  OVFS image and loaded into isolated CPL3 address spaces. The Linux stdout and
+  stderr results are read at `/srv/linux/status` through exact bounded 9P2000
+  version, attach, walk, open, read, and clunk exchanges across one contained
+  server fault, namespace withdrawal, health-gated generation-2 replacement,
+  stale generation-1 denial, complete reclamation, and a later timer. This is
+  one exact native client/server corpus, not Linux or Plan 9 boot, a Plan 9
+  binary, general Linux ABI, general 9P or namespace environment, guest agent,
+  KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
+  physical-device evidence.
 
 ## Implemented conservatively
 

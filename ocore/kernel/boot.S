@@ -4,6 +4,16 @@
 #define OCORE_PROBE_MODE 0
 #endif
 
+// All historical probes retain the 512 KiB kernel-growth reserve. Mode 26's
+// larger, verified four-principal OVFS backing store has an explicit 448 KiB
+// reserve while remaining below the same 4 MiB bootstrap mapping ceiling.
+.globl ocore_kernel_end_limit
+#if OCORE_PROBE_MODE == 26
+.set ocore_kernel_end_limit, 0x00390000
+#else
+.set ocore_kernel_end_limit, 0x00380000
+#endif
+
 .section .note.Xen,"a",@note
 .balign 4
   .long 4
@@ -99,6 +109,21 @@ ocore_m6_linux_image_bytes_start:
 #endif
 .globl ocore_m6_linux_image_bytes_end
 ocore_m6_linux_image_bytes_end:
+
+// Mode 26 keeps Linux in the translated CPL3 provider role and adds a
+// separately linked native Plan-9-style namespace client.  The package
+// carries real 9P2000 wire endpoints; it is still not a foreign-kernel image.
+.balign 16
+.globl ocore_m7_linux_plan9_image_bytes_start
+ocore_m7_linux_plan9_image_bytes_start:
+#if OCORE_PROBE_MODE == 26
+#ifndef OCORE_M7_LINUX_PLAN9_IMAGE_PATH
+#error "OCORE_M7_LINUX_PLAN9_IMAGE_PATH is required for Linux-to-9P mode"
+#endif
+  .incbin OCORE_M7_LINUX_PLAN9_IMAGE_PATH
+#endif
+.globl ocore_m7_linux_plan9_image_bytes_end
+ocore_m7_linux_plan9_image_bytes_end:
 
 // Modes 20 through 23 embed the deterministic host-verified KernelWorld normal
 // form. Native admission pins the complete record SHA before parsing it. Mode
@@ -580,6 +605,20 @@ ocore_m6_linux_image_end:
   lea rax, [rip + ocore_m6_linux_image_bytes_end]
   ret
 .size ocore_m6_linux_image_end, .-ocore_m6_linux_image_end
+
+.globl ocore_m7_linux_plan9_image_start
+.type ocore_m7_linux_plan9_image_start, @function
+ocore_m7_linux_plan9_image_start:
+  lea rax, [rip + ocore_m7_linux_plan9_image_bytes_start]
+  ret
+.size ocore_m7_linux_plan9_image_start, .-ocore_m7_linux_plan9_image_start
+
+.globl ocore_m7_linux_plan9_image_end
+.type ocore_m7_linux_plan9_image_end, @function
+ocore_m7_linux_plan9_image_end:
+  lea rax, [rip + ocore_m7_linux_plan9_image_bytes_end]
+  ret
+.size ocore_m7_linux_plan9_image_end, .-ocore_m7_linux_plan9_image_end
 
 .globl ocore_kernel_world_record_start
 .type ocore_kernel_world_record_start, @function
