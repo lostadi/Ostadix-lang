@@ -70,5 +70,7 @@ done
 "$ROOT/ocore/kernel/build-linux-minimal-corpus.sh"
 OCORE_BUILD_DIR="$BUILD_DIR/mode19-qemu" \
   "$ROOT/ocore/kernel/smoke-m6b-qemu.sh"
+OCORE_BUILD_DIR="$BUILD_DIR/mode25-qemu" \
+  "$ROOT/ocore/kernel/smoke-live-linux-personality-qemu.sh"
 printf 'minimal Linux isolated compile/oracle + kernel-admin QEMU semantics check: PASS\n'
-printf 'live Linux ELF/CPL3 personality execution: NOT WIRED\n'
+printf 'live Linux ELF/CPL3 bounded-personality execution: PASS\n'

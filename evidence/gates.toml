@@ -1,5 +1,5 @@
 schema_version = 1
-required_gate_count = 15
+required_gate_count = 16
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -281,6 +281,40 @@ expected_markers = [
   "M6B live bounded authority cleanup: PASS",
   "M6B live post-lifecycle timer: online",
   "M6B live bounded personality smoke: PASS",
+]
+
+[[gate]]
+id = "m6-linux-minimal-live"
+required = true
+milestone = "M6 Linux Mode 25 live"
+script = "ocore/kernel/smoke-live-linux-personality-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "file", "objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "One exact digest-pinned static Linux x86-64 ELF and three native service principals load from immutable OVFS data into isolated CPL3 address spaces",
+  "Bounded fd 1/fd 2 writes, exact -ENOSYS, and exit_group(42) survive one contained daemon fault, health-gated generation-2 replacement, stale generation-1 denial, and complete authority/resource reclamation",
+]
+nonclaims = [
+  "The pinned four-call success path, with a fifth failure-only exit site, is not Linux or Plan 9 boot, a distribution, root filesystem, dynamic linker, general foreign ABI, or arbitrary Linux binary compatibility",
+  "QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence",
+  "The gate has no PCI or physical-device assignment, DMA mapping/isolation, IOMMU isolation, interrupt remapping, or hardware reset",
+]
+expected_markers = [
+  "M6 Linux OVFS image import: PASS",
+  "M6 Linux four packaged ELF loads: PASS",
+  "o-core linux stdout",
+  "M6 Linux bounded fault containment: PASS",
+  "M6 Linux unrelated world survived: PASS",
+  "M6 Linux personality daemon ELF g2: online",
+  "M6 Linux prior-generation request rejection: PASS",
+  "o-core linux stderr",
+  "M6 Linux exact -ENOSYS return: PASS",
+  "M6 Linux direct exit_group(42): PASS",
+  "M6 Linux supervisor policy loop: PASS",
+  "M6 Linux bridge/fd generation cleanup: PASS",
+  "M6 Linux resources reclaimed: PASS",
+  "M6 Linux post-lifecycle timer: online",
+  "M6 live Linux personality smoke: PASS",
 ]
 
 [[gate]]

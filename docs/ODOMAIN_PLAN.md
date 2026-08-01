@@ -1,12 +1,13 @@
 # O-Domain Engineering Plan
 
 Status: active roadmap. Milestones 0.1 through 5, the bounded M6A/M6B slices
-including Mode 24's live four-byte composition, and KernelWorld Modes 20
-through 23 now have executable evidence at their
+including Mode 24's live four-byte composition, Mode 25's exact static-Linux
+ELF/minimal-ABI slice, and KernelWorld Modes 20 through 23 now have executable
+evidence at their
 documented, fixed-capacity, single-CPU x86-64 QEMU boundaries. These are
 bounded mechanism, lifecycle, and synthetic-execution proofs, not
-production-scale implementations or evidence for any foreign operating-system
-ABI.
+production-scale implementations or evidence for a general foreign
+operating-system ABI.
 
 This document turns the poly-personality kernel brief into a dependency-ordered
 implementation plan for this repository. It is a claim boundary as well as a
@@ -662,19 +663,32 @@ does not itself establish Linux ABI compatibility.
 
 ### Milestone 7: minimal translated Linux x86-64 personality
 
-Add a versioned Linux x86-64 personality service over the mechanisms above.
-Begin with static, single-threaded ELF64 programs. Implement only the syscall
-surface required by a pinned test corpus, returning Linux-compatible errors for
-unsupported calls. Grow in dependency slices: process identity and exit,
-console I/O, file descriptors and path lookup, virtual memory, time, signals,
-then `clone`/`futex` for threads. Candidate calls include `read`, `write`,
-`openat`, `close`, `mmap`, `munmap`, `brk`, `exit`/`exit_group`,
-`clock_gettime`, `getpid`, `ioctl`, `rt_sigaction`, `rt_sigprocmask`, `clone`,
-and `futex`.
+Status: **first exact bounded slice implemented; complete Milestone 7 remains
+in progress**.
 
-The Linux service is activated as an immutable `personality/linux` package
-through Milestone 5, not compiled into privileged policy. Before the first
-pointer-bearing syscall is enabled, the complete acceptance gate in
+Mode 25 packages one pinned 8,520-byte static, single-threaded Linux x86-64
+ELF with a native personality daemon, supervisor, and unrelated observer. The
+foreign ELF executes at CPL3 and uses exactly two 20-byte `write` calls, one
+unsupported syscall returning Linux `-ENOSYS`, and `exit_group(42)`. Linux fd
+integers are resolved to generation-bound internal objects only after the
+caller and service identities have been validated. A successful stdout
+terminal remains consumable across one contained daemon fault. The private
+generation-2 replacement first denies stale generation-1 lookup, then answers
+health and is published; only afterward does the client consume stdout and
+proceed to stderr before complete reclamation.
+
+This slice intentionally does not complete the broader milestone. Grow it in
+dependency slices: process identity and exit, console I/O, file descriptors and
+path lookup, virtual memory, time, signals, then `clone`/`futex` for threads.
+Candidate calls include `read`, `write`, `openat`, `close`, `mmap`, `munmap`,
+`brk`, `exit`/`exit_group`, `clock_gettime`, `getpid`, `ioctl`,
+`rt_sigaction`, `rt_sigprocmask`, `clone`, and `futex`.
+
+The broader Linux service must be activated as an immutable
+`personality/linux` package through the general Milestone 5 path, not compiled
+into privileged policy. Mode 25 is a deliberate bounded-copy exception for its
+exact two input views; before the pointer-bearing Linux surface or executable
+corpus expands, the remaining acceptance matrix in
 [`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md) must pass.
 
 Acceptance gate:
@@ -687,8 +701,10 @@ Acceptance gate:
   handles; and
 - crashing or stopping the Linux personality cannot stop a native O-Domain.
 
-This milestone is a minimal compatibility slice, not general Linux binary
-compatibility and not a Linux kernel.
+The completed milestone remains a minimal compatibility slice, not general
+Linux binary compatibility and not a Linux kernel. Mode 25 is narrower still
+and does not by itself satisfy the native-oracle, signal, mapping, filesystem,
+or multi-binary acceptance items above.
 
 ### Milestone 8: multiple root filesystems and Linux O-Domains
 
@@ -951,7 +967,10 @@ arbitration, and one generation rebind. M6B's first slice adds bounded-copy
 request views and typed delegated-resource revocation as a separate native
 mechanism gate; Mode 24 composes that mechanism with one exact four-byte live
 CPL3 call shape, a contained daemon fault, one generation rebind, and bounded
-pre-terminal lifecycle dispositions. The first KernelWorld native slice adds
+pre-terminal lifecycle dispositions. Mode 25 adds one exact static Linux ELF,
+two bounded input writes, Linux `-ENOSYS`, direct exit status 42, preserved
+terminal consumption across daemon replacement, and stale-generation denial.
+The first KernelWorld native slice adds
 hash-pinned normal-form
 admission and nonexecuting VM/vCPU/guest-page identities; Mode 21 adds a
 hardware-only synthetic SVM/NPT execution substrate; and Mode 22 separately
@@ -974,8 +993,9 @@ Every statement remains scoped to its fixed-capacity, single-CPU gate.
    Milestone 0.2 checks a concrete immutable bootstrap region and copies through
    exact page-fault fixups. Modes 19 and 24 test explicit unmap dispositions;
    Mode 24's supervisor invokes its disposition before terminal reply and does
-   not mutate the mapping. Concurrent mapping-change integration and pinning
-   remain future work.
+   not mutate the mapping. Mode 25 snapshots two exact 20-byte `IN` views and
+   likewise does not test concurrent mapping mutation. Concurrent mapping-change
+   integration and pinning remain future work.
 5. Executable mappings are not writable. Anonymous stacks and data are NX.
    Milestone 0.2 proves this for the bootstrap kernel, user image, and stack.
 6. Syscall and exception return validates user RIP/RSP and sanitizes RFLAGS.
@@ -1014,18 +1034,18 @@ Every statement remains scoped to its fixed-capacity, single-CPU gate.
 |---|---|---|---|---|
 | CPU/privilege | x86-64 ring-0 boot | one CPU, canonical CPL3 frames, timer/SYSCALL switching | isolated x86-64 processes | SMP and hardened entry |
 | Domains | none | bounded generation-tagged native worlds; four-process IPC and live-system scenarios | native, Alpine, Debian instances | persistent lifecycle and quotas |
-| Personalities | none | native dispatch plus package-loaded scalar M6A and exact four-byte Mode 24 test personalities served by unprivileged daemons | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
+| Personalities | none | native dispatch, package-loaded scalar M6A, exact four-byte Mode 24 test personality, and Mode 25's pinned minimal Linux corpus served by unprivileged daemons | broader translated Linux x86-64 across multiple roots | persistent Lisp plus user-space and full-kernel backends |
 | Address spaces | one identity map | independent CR3s, guarded loaded stacks, exact W^X ELF mappings, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
 | Processes | none | up to four loaded CPL3 principals in the current gates with teardown and stale denial | multiple isolated processes | complete process/thread lifecycle |
 | CSpaces | one small global table | exact owners, endpoint transfer attenuation, isolated service CSpaces, typed REPL control cap | one CSpace per process | general atomic cross-domain attenuation |
 | Memory | bump-only frames | typed reclaim, private/shared mappings, bounded-copy request staging, and nonexecuting guest-page objects | mapped per-process objects | discovered RAM, paging, NUMA policy |
 | Scheduling | timer marker only | bounded preemptive/blocking TCB scheduler with yield, sleep, IPC wake, and loaded-program completion | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | public bounded CPL3 endpoints, scalar M6A RPC, mode-19 request views, and one exact four-byte Mode 24 live bounded-RPC composition | personality RPC plus foreign memory views | supervised personality RPC |
-| Loading | kernel-linked code | static native ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | native and static Linux ELF loaders | dynamic loaders per personality |
+| IPC | none | public bounded CPL3 endpoints, scalar M6A RPC, mode-19 request views, one exact four-byte Mode 24 composition, and two Mode 25 Linux input views | broader personality RPC plus foreign memory views | supervised personality RPC |
+| Loading | kernel-linked code | static native ELF plus one exact static Linux ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | broader native and static Linux ELF corpora | dynamic loaders per personality |
 | Filesystems | none | fixed-capacity immutable OVFS images and domain-relative root mounts | separate Alpine/Debian roots | versioned overlays and services |
-| Live system | none | M5 package activation plus bounded M6A scalar and Mode 24 four-byte personality supervision/rebind slices | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
-| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus request views and one exact four-byte pointer-bearing daemon path; no native OValue codec or general foreign ABI | OValue, capability, capsule channels | common contract across all modes |
-| Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
+| Live system | none | M5 package activation plus bounded M6A scalar, Mode 24 native, and Mode 25 Linux personality supervision/rebind slices | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
+| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus request views, one exact four-byte native path, and two exact Linux input views; no native OValue codec or general foreign ABI | OValue, capability, capsule channels | common contract across all modes |
+| Compatibility | no foreign OS ABI | one pinned static Linux ELF with write, -ENOSYS, and exit_group only | the same broader pinned corpus across multiple Linux roots | additional personalities by evidence |
 
 The first credible multi-domain O-Domain demonstration is therefore not either
 single-process bootstrap gate. It is the later evidence bundle that boots
