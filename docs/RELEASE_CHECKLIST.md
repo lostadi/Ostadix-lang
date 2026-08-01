@@ -25,40 +25,77 @@ bash scripts/smoke-hosted-live-reference.sh
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
-cmp -s boot-and-test.sh okernel-multikernel/boot-and-test.sh
-for script in boot-and-test.sh okernel-multikernel/boot-and-test.sh ocore/kernel/smoke-m6b-qemu.sh ocore/kernel/smoke-kernel-world-qemu.sh; do test -x "$script" && bash -n "$script"; done
-./ocore/kernel/smoke-qemu.sh
-./ocore/kernel/smoke-faults-qemu.sh
-./ocore/kernel/smoke-processes-qemu.sh
-./ocore/kernel/smoke-scheduler-qemu.sh
-./ocore/kernel/smoke-ipc-foundation-qemu.sh
-./ocore/kernel/smoke-ipc-qemu.sh
-./ocore/kernel/build-m4-artifacts.sh
-./ocore/kernel/smoke-loader-qemu.sh
-./ocore/kernel/check-m5-control.sh
-./ocore/kernel/build-m5-artifacts.sh
-./ocore/kernel/smoke-live-qemu.sh
-./ocore/kernel/smoke-live-semantics-qemu.sh
-./ocore/kernel/build-m6-artifacts.sh
-./ocore/kernel/smoke-personality-qemu.sh
-./ocore/kernel/smoke-m6b-qemu.sh
-./ocore/kernel/smoke-kernel-world-qemu.sh
+cargo build --release --locked --bin O --bin olangc
+cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
+cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+python3 scripts/smoke_ostadix_mcp.py
+python3 scripts/release_evidence.py validate
+./boot-and-test.sh smoke
 python3 -m tests.test_parser
+python3 tests/example_manifest.py validate
 python3 -m tests.test_evaluator
 python3 -m compileall -q o_lang backends tests
 make -C c_cpp clean && make -C c_cpp && make -C c_cpp test && make -C c_cpp olangc-test
+make -C c_cpp warnings-as-errors
 cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/olang-cmake-build --parallel && ctest --test-dir /tmp/olang-cmake-build --output-on-failure
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
 
-The mode-19 gate proves the bounded request-scoped copy/revocation mechanism,
-not a complete foreign ABI. The mode-20 gate proves verified world admission
-and nonexecuting VM-object lifecycle only; it does not prove guest execution.
-`./boot-and-test.sh smoke` treats the twelve scripts as an explicit required
-manifest: it fails before execution if one is absent or not executable and
-reports required, present, passed, and failed counts. A directory scan or an
-"all present" result is not release evidence.
+<!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
+The portable native release surface contains exactly **15** required
+QEMU gates. `evidence/gates.toml` is authoritative; the aggregate, CI, this
+checklist, and the README status table are validated projections. After each
+successful gate, the aggregate requires every manifest marker exactly once in
+the captured live stdout/stderr transcript.
+
+```bash
+python3 scripts/release_evidence.py validate
+./boot-and-test.sh smoke
+```
+
+| Order | Gate | Milestone | Class | Script |
+|------:|------|-----------|-------|--------|
+| 1 | `ocore-bootstrap` | M0.1-M0.3 | `portable_tcg` | `ocore/kernel/smoke-qemu.sh` |
+| 2 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
+| 3 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
+| 4 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
+| 5 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
+| 6 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
+| 7 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
+| 8 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
+| 9 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
+| 10 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
+| 11 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
+| 12 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
+| 13 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
+| 14 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
+| 15 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
+
+Supplemental hardware evidence is validated by the same manifest but is not
+executed by the portable aggregate:
+
+| Gate | Milestone | Class | Script |
+|------|-----------|-------|--------|
+| `kernel-world-mode21-svm-kvm` | KernelWorld Mode 21 | `hardware_kvm` | `ocore/kernel/smoke-kernel-world-execution-qemu.sh` |
+
+Explicit supplemental non-claims:
+- Mode 21 is supplemental hardware-dependent evidence and is not part of the portable release aggregate
+- It does not boot Linux, Plan 9, firmware, or a supplied image
+- It has no provider lifecycle, guest agent, service export, virtual device, PCI assignment, DMA mapping, or IOMMU-isolation proof
+
+<!-- END GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
+
+The manifest also records each gate's positive claims, explicit non-claims,
+required tools, and expected transcript markers. Static validation rejects a
+missing or non-executable gate, projection drift, CI bypass, claim-guard bypass,
+or loss of byte identity between the two aggregate entrypoints. During the
+aggregate run, each gate's combined output remains visible and is also captured;
+the gate counts as passed only when it exits successfully and every marker
+declared for that script occurs exactly once in that live transcript. A marker
+left in a source comment or dead string therefore cannot satisfy the release
+gate. A directory scan or an "all present" result is not release evidence.
 
 Build the public source ZIP from the exact commit or annotated tag that passed
 the gate. The command rejects a dirty worktree by default and reads payload
@@ -75,6 +112,18 @@ python3 scripts/build_source_release.py \
 The ZIP is deterministic for one commit and prefix. It contains a canonical
 `SOURCE-MANIFEST.json` plus `SHA256SUMS`, and the command prints the digest of
 the complete archive. Rebuilding the same ref must produce identical bytes.
+Archive verification also checks relative Markdown-link closure: every local
+target referenced outside code or comments by included documentation must be
+present in the release. Git symlinks are refused rather than encoded as archive
+members, and verification requires the writer's canonical ZIP metadata and
+layout. It also parses, without importing or executing released code,
+`.mcp.json`, the MCP crate metadata/license, `examples/manifest.json`, and
+`evidence/gates.toml`, then proves their required archive-local references.
+The allowlisted surface includes the separate `mcp/ostadix_lang_mcp_server`
+crate, the root LGPL-2.1 license, `.mcp.json`, its direct stdio smoke client, and
+the focused MCP/example regression tests. CI tests and lints that crate with its
+own lockfile, builds its release binary separately from the root package, and
+runs `scripts/smoke_ostadix_mcp.py` against the real transport.
 
 ## Version synchronization points
 

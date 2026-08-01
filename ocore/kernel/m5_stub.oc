@@ -1,0 +1,40 @@
+module kernel::m5;
+
+use runtime::process::can_issue_operations;
+use runtime::process::is_live as process_is_live;
+
+// Mode 16 alone links the packaged live-runtime harness.
+@export
+@no_mangle
+pub unsafe fn kernel_m5_runtime_process_healthy(process: u64) -> u64 {
+    if process_is_live(process) && can_issue_operations(process) {
+        return 1;
+    }
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m5_runtime_process_generation_live(
+    process: u64
+) -> u64 {
+    if process_is_live(process) { return 1; }
+    return 0;
+}
+
+pub unsafe fn complete_continue() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+pub unsafe fn restart_continue() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    let _unused_mode: u64 = mode;
+    let _unused_domain: u64 = native_domain;
+    disable_interrupts();
+    loop { halt(); }
+}

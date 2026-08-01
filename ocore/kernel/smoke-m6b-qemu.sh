@@ -95,8 +95,10 @@ mechanism = [
     "M6B staged commit exposes written prefix only: PASS\n",
     "M6B revoke-before-terminal + wake-once paths: PASS\n",
     "M6B five delegated lease classes revoke: PASS\n",
+    "M6B delegated lease bind-failure rollback: PASS\n",
     "M6B request-wide revoke + unrelated-scope survival: PASS\n",
     "M6B reply cleanup + drain-safe teardown: PASS\n",
+    "M6B minimal Linux fd/classification kernel-admin semantics: PASS\n",
     "M6B bounded native mechanism slice: PASS\n",
 ]
 post_tick = "M6B post-mechanism timer: online\n"
@@ -117,9 +119,10 @@ timer_phase_valid = (
     and timer_matches[0].start() < positions[post_tick]
 )
 
-# This is a bounded-copy mechanism gate, not the later pinned-window, signal,
-# Linux-ABI, or user-space personality-service completion. Any such marker
-# would broaden the evidence and therefore fails this run closed.
+# This is a bounded-copy mechanism gate with one kernel-admin Linux fd and
+# syscall-classification oracle. It is not pinned-window, signal, live Linux
+# ELF/CPL3, complete_write, or user-space personality-service completion. Any
+# such marker would broaden the evidence and therefore fails this run closed.
 forbidden = [
     marker
     for marker in (

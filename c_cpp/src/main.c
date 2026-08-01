@@ -44,9 +44,22 @@ int main(int argc, char **argv) {
 
     /* default registered (same as before) */
     StringSet *bs = string_set_new();
-    const char *tags[] = {"O", "python", "html", "latex", "markdown", "bash", "shell",
+    if (!bs) {
+        fprintf(stderr, "failed to create backend set\n");
+        free(source);
+        return 1;
+    }
+    const char *tags[] = {"O", "python", "html", "latex", "markdown", "text", "bash", "shell",
                           "rust", "racket", "nix", "nix_expr", "nix_store", "nixos_test", "quote", NULL};
-    for (int i=0; tags[i]; ++i) string_set_add(bs, tags[i]);
+    for (int i=0; tags[i]; ++i) {
+        string_set_add(bs, tags[i]);
+        if (!string_set_contains(bs, tags[i])) {
+            fprintf(stderr, "failed to register backend tag %s\n", tags[i]);
+            string_set_free(bs);
+            free(source);
+            return 1;
+        }
+    }
 
     OParser p;
     parser_init(&p, source, bs);
@@ -59,7 +72,21 @@ int main(int argc, char **argv) {
     }
 
     OEvaluator *ev = olang_evaluator_new(shim_dir);
-    olang_evaluator_set_registered(ev, bs);
+    if (!ev) {
+        fprintf(stderr, "failed to create evaluator\n");
+        onode_list_free(nodes);
+        string_set_free(bs);
+        free(source);
+        return 1;
+    }
+    if (!olang_evaluator_set_registered(ev, bs)) {
+        fprintf(stderr, "failed to register backends\n");
+        olang_evaluator_free(ev);
+        onode_list_free(nodes);
+        string_set_free(bs);
+        free(source);
+        return 1;
+    }
 
     OValue *result = olang_evaluator_eval_document(ev, nodes);
     /* result may be NULL-ish, but fn returns something */
@@ -77,9 +104,10 @@ int main(int argc, char **argv) {
         oval_release(result);
     }
 
+    int failed = olang_evaluator_had_error(ev) ? 1 : 0;
     onode_list_free(nodes);
     olang_evaluator_free(ev);
     string_set_free(bs);
     free(source);
-    return 0;
+    return failed;
 }

@@ -1,0 +1,190 @@
+module kernel::m6;
+
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+
+// Modes 18 and 24 alone link the packaged personality-supervision harness.
+// Scheduler and syscall code retain total, fail-closed adapter symbols in all
+// other kernels without pulling the M6A/M6B runtime and oracle into unrelated
+// bootstrap images.
+@export
+@no_mangle
+pub unsafe fn kernel_m6_prepare_bounded_resume(
+    thread: u64,
+    result_out: *mut u64
+) -> u64 {
+    let _unused_thread: u64 = thread;
+    if result_out as usize != 0 {
+        volatile_store(result_out, 0);
+    }
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_commit_bounded_resume(thread: u64) -> u64 {
+    let _unused_thread: u64 = thread;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    foreign_address: u64,
+    length: u64,
+    direction: u64,
+    timeout_ticks: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_capability: u64 = capability;
+    let _unused_operation: u64 = operation;
+    let _unused_address: u64 = foreign_address;
+    let _unused_length: u64 = length;
+    let _unused_direction: u64 = direction;
+    let _unused_timeout: u64 = timeout_ticks;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_lookup(
+    capability_object: u64,
+    request: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_read(
+    capability: u64,
+    offset: u64
+) -> u64 {
+    let _unused_capability: u64 = capability;
+    let _unused_offset: u64 = offset;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_write(
+    capability: u64,
+    offset: u64,
+    value: u64
+) -> u64 {
+    let _unused_capability: u64 = capability;
+    let _unused_offset: u64 = offset;
+    let _unused_value: u64 = value;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_reply(
+    capability_object: u64,
+    request: u64,
+    view_capability: u64,
+    committed_length: u64,
+    result: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_view: u64 = view_capability;
+    let _unused_length: u64 = committed_length;
+    let _unused_result: u64 = result;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    scalar: u64,
+    timeout_ticks: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_capability: u64 = capability;
+    let _unused_operation: u64 = operation;
+    let _unused_scalar: u64 = scalar;
+    let _unused_timeout: u64 = timeout_ticks;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_reply(
+    capability_object: u64,
+    request: u64,
+    status: u64,
+    scalar: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_status: u64 = status;
+    let _unused_scalar: u64 = scalar;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_supervise(
+    capability_object: u64,
+    action: u64,
+    generation: u64,
+    subject: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_action: u64 = action;
+    let _unused_generation: u64 = generation;
+    let _unused_subject: u64 = subject;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
+    let _unused_process: u64 = process;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_expire_requests(now: u64) -> u64 {
+    let _unused_now: u64 = now;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_phase_one_ready() -> u64 { return 0; }
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_final_ready() -> u64 { return 0; }
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_crash_continue() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_complete_continue() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    let _unused_mode: u64 = mode;
+    let _unused_domain: u64 = native_domain;
+    disable_interrupts();
+    loop { halt(); }
+}

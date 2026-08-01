@@ -94,6 +94,7 @@ static mut EVENT_SEQUENCE: u64 = 0;
 
 static mut CHARGED_BYTES: usize = 0;
 static mut CREATIONS: u64 = 0;
+static mut ABORTED_CREATIONS: u64 = 0;
 static mut TERMINAL_TRANSITIONS: u64 = 0;
 static mut TERMINAL_WAKES: u64 = 0;
 static mut REPLIES: u64 = 0;
@@ -105,6 +106,7 @@ static mut UNMAPS: u64 = 0;
 static mut RESOURCE_REVOCATIONS: u64 = 0;
 static mut REQUEST_REVOCATIONS: u64 = 0;
 static mut ABANDONED_REPLIES: u64 = 0;
+static mut DISCARDED_TERMINALS: u64 = 0;
 static mut CONSUMED: u64 = 0;
 static mut DENIALS: u64 = 0;
 static mut DUPLICATE_DENIALS: u64 = 0;
@@ -509,6 +511,7 @@ pub unsafe fn init() -> u64 {
     EVENT_SEQUENCE = 0;
     CHARGED_BYTES = 0;
     CREATIONS = 0;
+    ABORTED_CREATIONS = 0;
     TERMINAL_TRANSITIONS = 0;
     TERMINAL_WAKES = 0;
     REPLIES = 0;
@@ -520,6 +523,7 @@ pub unsafe fn init() -> u64 {
     RESOURCE_REVOCATIONS = 0;
     REQUEST_REVOCATIONS = 0;
     ABANDONED_REPLIES = 0;
+    DISCARDED_TERMINALS = 0;
     CONSUMED = 0;
     DENIALS = 0;
     DUPLICATE_DENIALS = 0;
@@ -641,6 +645,40 @@ pub unsafe fn create(
     CREATIONS += 1;
     volatile_store(capability_out, capability);
     return finish(view);
+}
+
+// Roll back a view that was snapshotted but whose outer request was never
+// published.  This closes the still-private service capability and releases
+// staging without manufacturing a terminal disposition or scheduler wake.
+pub unsafe fn abort_create(view: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_live_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || ABORTED_CREATIONS == MAX_COUNTER
+        || LENGTHS[slot] == 0
+        || LENGTHS[slot] > CHARGED_BYTES {
+        return deny_stale();
+    }
+    if EVENT_SEQUENCE == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    if close_view_capability(slot) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    CHARGED_BYTES -= LENGTHS[slot];
+    clear_metadata(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = VIEW_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = VIEW_EMPTY;
+    }
+    ABORTED_CREATIONS += 1;
+    return finish(1);
 }
 
 // Called only by delegated_resource after it has validated an exact live
@@ -952,6 +990,45 @@ pub unsafe fn revoke_request(request: u64) -> u64 {
 // Consume a terminal result on the exact original caller/process/address-space
 // re-entry. Only a committed reply can copy staged output, and the destination
 // mapping is revalidated immediately before the fault-aware copy.
+pub unsafe fn can_consume_terminal(
+    view: u64,
+    caller_process: u64,
+    caller_address_space: u64,
+    foreign_address: usize
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    let slot: usize = checked_view(view);
+    if slot >= MAX_PERSONALITY_MEMORY_VIEWS
+        || STATES[slot] != VIEW_TERMINAL
+        || CALLER_PROCESSES[slot] != caller_process
+        || CALLER_ADDRESS_SPACES[slot] != caller_address_space
+        || FOREIGN_ADDRESSES[slot] != foreign_address
+        || !process_is_live(caller_process)
+        || !address_space_is_live(caller_address_space)
+        || address_space_for(caller_process) != caller_address_space
+        || current_process_handle() != caller_process
+        || current_address_space_handle() != caller_address_space
+        || CONSUMED == MAX_COUNTER {
+        return 0;
+    }
+    let kind: u64 = TERMINAL_KINDS[slot] as u64;
+    let committed: usize = COMMITTED_LENGTHS[slot];
+    if kind == MEMORY_VIEW_TERMINAL_REPLY
+        && direction_has_output(DIRECTIONS[slot] as u64)
+        && committed != 0
+        && !allows(
+            caller_address_space,
+            foreign_address,
+            committed,
+            VM_USER | VM_WRITE
+        ) {
+        return 0;
+    }
+    return 1;
+}
+
 pub unsafe fn consume_terminal(
     view: u64,
     caller_process: u64,
@@ -1025,10 +1102,16 @@ pub unsafe fn discard_terminal(view: u64) -> u64 {
     let slot: usize = checked_view(view);
     if slot >= MAX_PERSONALITY_MEMORY_VIEWS
         || STATES[slot] != VIEW_TERMINAL
-        || TERMINAL_KINDS[slot] as u64 == MEMORY_VIEW_TERMINAL_REPLY {
+        || TERMINAL_KINDS[slot] as u64 == MEMORY_VIEW_TERMINAL_REPLY
+        || DISCARDED_TERMINALS == MAX_COUNTER {
         return deny();
     }
-    return finish(release_slot(slot));
+    if release_slot(slot) != 1 {
+        POISONED = 1;
+        return 0;
+    }
+    DISCARDED_TERMINALS += 1;
+    return finish(1);
 }
 
 pub unsafe fn count_bound_to_resource(resource: u64) -> usize {
@@ -1101,6 +1184,13 @@ pub unsafe fn invariants_hold() -> bool {
     if INITIALIZED == 0
         || POISONED != 0
         || CHARGED_BYTES > MAX_PERSONALITY_MEMORY_VIEW_TOTAL_BYTES
+        || ABORTED_CREATIONS > CREATIONS
+        || CREATIONS
+            != ABORTED_CREATIONS
+                + ABANDONED_REPLIES
+                + DISCARDED_TERMINALS
+                + CONSUMED
+                + active_count() as u64
         || ABANDONED_REPLIES > REPLIES
         || TERMINAL_TRANSITIONS != TERMINAL_WAKES
         || TERMINAL_TRANSITIONS
@@ -1291,6 +1381,7 @@ pub unsafe fn active_count() -> usize {
     return count;
 }
 pub unsafe fn creation_count() -> u64 { return CREATIONS; }
+pub unsafe fn aborted_creation_count() -> u64 { return ABORTED_CREATIONS; }
 pub unsafe fn terminal_transition_count() -> u64 { return TERMINAL_TRANSITIONS; }
 pub unsafe fn terminal_wake_count() -> u64 { return TERMINAL_WAKES; }
 pub unsafe fn reply_count() -> u64 { return REPLIES; }
@@ -1302,6 +1393,9 @@ pub unsafe fn unmap_count() -> u64 { return UNMAPS; }
 pub unsafe fn resource_revocation_count() -> u64 { return RESOURCE_REVOCATIONS; }
 pub unsafe fn request_revocation_count() -> u64 { return REQUEST_REVOCATIONS; }
 pub unsafe fn abandoned_reply_count() -> u64 { return ABANDONED_REPLIES; }
+pub unsafe fn discarded_terminal_count() -> u64 {
+    return DISCARDED_TERMINALS;
+}
 pub unsafe fn consumed_count() -> u64 { return CONSUMED; }
 pub unsafe fn denial_count() -> u64 { return DENIALS; }
 pub unsafe fn duplicate_denial_count() -> u64 { return DUPLICATE_DENIALS; }

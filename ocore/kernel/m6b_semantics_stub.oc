@@ -1,0 +1,18 @@
+module kernel::m6b_semantics;
+
+// Mode 19 alone links the direct bounded-mechanism oracle. Other probe modes
+// retain the symbol expected by main without spending native bootstrap budget
+// on a test harness that cannot be selected in those images.
+pub unsafe fn start(
+    mode: u64,
+    native_domain: u64,
+    address_space: u64
+) -> never {
+    let _unused_mode: u64 = mode;
+    let _unused_domain: u64 = native_domain;
+    let _unused_address_space: u64 = address_space;
+    disable_interrupts();
+    loop {
+        halt();
+    }
+}

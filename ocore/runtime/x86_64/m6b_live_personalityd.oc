@@ -1,0 +1,496 @@
+module runtime::m6b_live_personalityd;
+
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_CAP_CLOSE: u64 = 1;
+const SYS_CAP_COPY: u64 = 2;
+const SYS_YIELD: u64 = 4;
+const SYS_ENDPOINT_SEND: u64 = 9;
+const SYS_ENDPOINT_RECEIVE: u64 = 10;
+const SYS_PERSONALITY_VIEW_LOOKUP: u64 = 18;
+const SYS_PERSONALITY_VIEW_READ: u64 = 19;
+const SYS_PERSONALITY_VIEW_WRITE: u64 = 20;
+const SYS_PERSONALITY_BOUNDED_REPLY: u64 = 21;
+
+const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_PERSONALITY_STALE: u64 = 0xffff_ffff_ffff_ffd4;
+const ERR_PERSONALITY_DUPLICATE: u64 = 0xffff_ffff_ffff_ffd5;
+const ERR_PERSONALITY_UNSUPPORTED: u64 = 0xffff_ffff_ffff_ffd7;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const GENERATION_OFFSET: usize = 16;
+const INBOX_CAP_OFFSET: usize = 32;
+const REPLY_CAP_OFFSET: usize = 40;
+const DIRECT_REPLY_CAP_OFFSET: usize = 48;
+const CLIENT_PROCESS_OFFSET: usize = 56;
+const SUPERVISOR_PROCESS_OFFSET: usize = 64;
+const PRIOR_REQUEST_OFFSET: usize = 72;
+const MESSAGE_OFFSET: usize = 128;
+const MESSAGE_SIZE: u64 = 32;
+
+const OP_SUCCESS_INOUT: u64 = 1;
+const OP_HOLD_CANCEL: u64 = 3;
+const OP_HOLD_TIMEOUT: u64 = 4;
+const OP_CRASH: u64 = 5;
+const OP_HOLD_UNMAP: u64 = 6;
+const OP_HOLD_REQUEST_REVOKE: u64 = 7;
+const OP_HOLD_RESOURCE_REVOKE: u64 = 8;
+const OP_HOLD_PROCESS_EXIT: u64 = 9;
+const OP_UNSUPPORTED: u64 = 0x7f;
+const OP_HEALTH: u64 = 0x80;
+const OP_HEALTH_WATCH: u64 = 0x81;
+const OP_STOP: u64 = 0x82;
+const HEALTH_OK: u64 = 0x4d36_4248_4541_4c00;
+const STOP_READY: u64 = 0x4d36_4253_544f_5000;
+
+@link_section(".rodata")
+static G1_ONLINE: [u8; 47] =
+    b"M6B live personality RPC daemon ELF g1: online\n";
+@link_section(".rodata")
+static G2_ONLINE: [u8; 47] =
+    b"M6B live personality RPC daemon ELF g2: online\n";
+@link_section(".rodata")
+static G1_CORPUS: [u8; 47] =
+    b"M6B live personality g1 bounded RPC loop: PASS\n";
+@link_section(".rodata")
+static VIEW_DENIAL: [u8; 48] =
+    b"M6B live delegated view close/copy denial: PASS\n";
+@link_section(".rodata")
+static LATE_CANCEL: [u8; 46] =
+    b"M6B live late cancelled reply rejection: PASS\n";
+@link_section(".rodata")
+static LATE_TIMEOUT: [u8; 44] =
+    b"M6B live late timeout reply rejection: PASS\n";
+@link_section(".rodata")
+static G1_FAULT: [u8; 57] =
+    b"M6B live personality RPC daemon ELF g1: deliberate fault\n";
+@link_section(".rodata")
+static STALE_G1: [u8; 48] =
+    b"M6B live prior-generation reply rejection: PASS\n";
+@link_section(".rodata")
+static DUPLICATE: [u8; 41] =
+    b"M6B live duplicate reply rejection: PASS\n";
+@link_section(".rodata")
+static G2_CORPUS: [u8; 47] =
+    b"M6B live personality g2 bounded RPC loop: PASS\n";
+@link_section(".rodata")
+static STOPPING: [u8; 48] =
+    b"M6B live personality g2 cooperative stop: ready\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn receive(capability: u64) -> void {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            capability,
+            (CONFIG_VA + MESSAGE_OFFSET) as u64,
+            MESSAGE_SIZE
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+    }
+}
+
+unsafe fn word(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + MESSAGE_OFFSET + offset) as *const u64);
+}
+
+unsafe fn direct_reply(
+    capability: u64,
+    correlation: u64,
+    scalar: u64
+) -> void {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            capability,
+            correlation,
+            scalar,
+            0
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+    }
+}
+
+unsafe fn lookup(reply_capability: u64, request: u64) -> u64 {
+    let view: u64 = syscall2(
+        SYS_PERSONALITY_VIEW_LOOKUP,
+        reply_capability,
+        request
+    );
+    // Capability generations never use the all-ones value reserved by the
+    // native errno range.  Treat every failed lookup as a hard daemon fault;
+    // merely testing for zero would let a stale/failed errno masquerade as a
+    // view handle on timeout and crash paths that do not immediately use it.
+    if view == 0 || (view >> 32) == 0xffff_ffff {
+        stop();
+    }
+    return view;
+}
+
+unsafe fn read_byte(view: u64, offset: u64) -> u64 {
+    return syscall2(SYS_PERSONALITY_VIEW_READ, view, offset);
+}
+
+unsafe fn write_byte(view: u64, offset: u64, value: u64) -> u64 {
+    return syscall3(SYS_PERSONALITY_VIEW_WRITE, view, offset, value);
+}
+
+unsafe fn bounded_reply(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    committed_length: u64,
+    result: u64
+) -> u64 {
+    return syscall5(
+        SYS_PERSONALITY_BOUNDED_REPLY,
+        reply_capability,
+        request,
+        view,
+        committed_length,
+        result
+    );
+}
+
+unsafe fn transform_success(reply_capability: u64, request: u64) -> u64 {
+    let view: u64 = lookup(reply_capability, request);
+    if view == 0
+        || syscall1(SYS_CAP_CLOSE, view) != ERR_CAPABILITY_DENIED
+        || syscall3(SYS_CAP_COPY, view, 0, 0) != ERR_CAPABILITY_DENIED
+        || read_byte(view, 0) != 0x6d
+        || read_byte(view, 1) != 0x36
+        || read_byte(view, 2) != 0x62
+        || read_byte(view, 3) != 0x3f
+        || write_byte(view, 0, 0x4f) != 1
+        || write_byte(view, 1, 0x32) != 1
+        || write_byte(view, 2, 0x34) != 1
+        || write_byte(view, 3, 0x21) != 1
+        || bounded_reply(reply_capability, request, view, 4, 4) != 1 {
+        stop();
+    }
+    return view;
+}
+
+unsafe fn reply_unsupported(reply_capability: u64, request: u64) -> void {
+    let view: u64 = lookup(reply_capability, request);
+    if view == 0
+        || bounded_reply(
+            reply_capability,
+            request,
+            view,
+            0,
+            ERR_PERSONALITY_UNSUPPORTED
+        ) != 1 {
+        stop();
+    }
+}
+
+unsafe fn wait_nonzero(offset: usize) -> u64 {
+    loop {
+        let value: u64 = config(offset);
+        if value != 0 {
+            return value;
+        }
+        if syscall0(SYS_YIELD) != 0 {
+            stop();
+        }
+    }
+}
+
+unsafe fn run_g1(
+    report: u64,
+    inbox: u64,
+    reply: u64,
+    direct: u64,
+    client: u64,
+    supervisor: u64
+) -> never {
+    let mut corpus: u64 = 0;
+    let mut corpus_reported: bool = false;
+    let mut cancelled_request: u64 = 0;
+    let mut cancelled_view: u64 = 0;
+    let mut timeout_request: u64 = 0;
+    let mut timeout_view: u64 = 0;
+    let mut cancelled_checked: bool = false;
+    let mut watch_seen: bool = false;
+    loop {
+        receive(inbox);
+        let sender: u64 = word(0);
+        let request: u64 = word(8);
+        let operation: u64 = word(16) >> 56;
+        if request == 0 || word(24) != 0 {
+            stop();
+        }
+        if sender == supervisor {
+            if operation == OP_HEALTH {
+                direct_reply(direct, request, HEALTH_OK | 1);
+            } else {
+                if operation == OP_HEALTH_WATCH {
+                    watch_seen = true;
+                } else {
+                    stop();
+                }
+            }
+        } else {
+            if sender != client {
+                stop();
+            }
+            if cancelled_request != 0 && !cancelled_checked {
+                if bounded_reply(
+                    reply,
+                    cancelled_request,
+                    cancelled_view,
+                    0,
+                    4
+                ) != ERR_PERSONALITY_STALE {
+                    stop();
+                }
+                cancelled_checked = true;
+                emit(report, (&LATE_CANCEL[0]), 46);
+            }
+            if operation == OP_SUCCESS_INOUT {
+                transform_success(reply, request);
+                if corpus == 0 {
+                    emit(report, (&VIEW_DENIAL[0]), 48);
+                }
+                corpus |= 1;
+            } else {
+                if operation == OP_UNSUPPORTED {
+                    reply_unsupported(reply, request);
+                    corpus |= 2;
+                } else {
+                    if operation == OP_HOLD_CANCEL {
+                        if cancelled_request != 0 {
+                            stop();
+                        }
+                        cancelled_request = request;
+                        cancelled_view = lookup(reply, request);
+                        if cancelled_view == 0 {
+                            stop();
+                        }
+                    } else {
+                        if operation == OP_HOLD_TIMEOUT {
+                            if timeout_request != 0 || !cancelled_checked {
+                                stop();
+                            }
+                            timeout_request = request;
+                            timeout_view = lookup(reply, request);
+                            if timeout_view == 0 {
+                                stop();
+                            }
+                        } else {
+                            if operation != OP_CRASH
+                                || timeout_request == 0
+                                || !watch_seen
+                                || corpus != 3
+                                || !cancelled_checked
+                                || bounded_reply(
+                                    reply,
+                                    timeout_request,
+                                    timeout_view,
+                                    0,
+                                    4
+                                ) != ERR_PERSONALITY_STALE {
+                                stop();
+                            }
+                            // Keep the lookup as an explicit transaction
+                            // before the deliberate fault.  Besides making the
+                            // expected eleventh acquisition auditable, this
+                            // prevents a long short-circuit condition from
+                            // hiding a failed or skipped lookup.
+                            let crash_view: u64 = lookup(reply, request);
+                            if crash_view == 0 {
+                                stop();
+                            }
+                            emit(report, (&LATE_TIMEOUT[0]), 44);
+                            emit(report, (&G1_FAULT[0]), 57);
+                            progress(7);
+                            asm!("ud2", options(nomem, nostack));
+                            stop();
+                        }
+                    }
+                }
+            }
+            if corpus == 3 && !corpus_reported {
+                corpus_reported = true;
+                emit(report, (&G1_CORPUS[0]), 47);
+                progress(3);
+            }
+        }
+    }
+}
+
+unsafe fn run_g2(
+    report: u64,
+    inbox: u64,
+    reply: u64,
+    direct: u64,
+    client: u64,
+    supervisor: u64
+) -> never {
+    let stale_request: u64 = wait_nonzero(PRIOR_REQUEST_OFFSET);
+    if bounded_reply(reply, stale_request, 0, 0, 4)
+        != ERR_PERSONALITY_STALE {
+        stop();
+    }
+    emit(report, (&STALE_G1[0]), 48);
+    progress(2);
+
+    let mut corpus: u64 = 0;
+    let mut holds: u64 = 0;
+    let mut corpus_reported: bool = false;
+    let mut duplicate_checked: bool = false;
+    loop {
+        receive(inbox);
+        let sender: u64 = word(0);
+        let request: u64 = word(8);
+        let operation: u64 = word(16) >> 56;
+        if request == 0 || word(24) != 0 {
+            stop();
+        }
+        if sender == supervisor {
+            if operation == OP_HEALTH {
+                direct_reply(direct, request, HEALTH_OK | 2);
+            } else {
+                if operation != OP_STOP || corpus != 3 || holds != 15 {
+                    stop();
+                }
+                emit(report, (&STOPPING[0]), 48);
+                direct_reply(direct, request, STOP_READY | 2);
+                stop();
+            }
+        } else {
+            if sender != client {
+                stop();
+            }
+            if operation == OP_SUCCESS_INOUT {
+                let view: u64 = transform_success(reply, request);
+                if !duplicate_checked {
+                    if bounded_reply(reply, request, view, 4, 4)
+                        != ERR_PERSONALITY_DUPLICATE {
+                        stop();
+                    }
+                    duplicate_checked = true;
+                    emit(report, (&DUPLICATE[0]), 41);
+                }
+                corpus |= 1;
+            } else {
+                if operation == OP_UNSUPPORTED {
+                    reply_unsupported(reply, request);
+                    corpus |= 2;
+                } else {
+                    let mut bit: u64 = 0;
+                    if operation == OP_HOLD_UNMAP
+                        && corpus == 3
+                        && holds == 0 {
+                        bit = 1;
+                    } else {
+                        if operation == OP_HOLD_REQUEST_REVOKE
+                            && holds == 1 {
+                            bit = 2;
+                        } else {
+                            if operation == OP_HOLD_RESOURCE_REVOKE
+                                && holds == 3 {
+                                bit = 4;
+                            } else {
+                                if operation == OP_HOLD_PROCESS_EXIT
+                                    && holds == 7 {
+                                    bit = 8;
+                                }
+                            }
+                        }
+                    }
+                    if bit == 0 || lookup(reply, request) == 0 {
+                        stop();
+                    }
+                    holds |= bit;
+                    if holds == 15 {
+                        progress(7);
+                    }
+                }
+            }
+            if corpus == 3 && duplicate_checked && !corpus_reported {
+                corpus_reported = true;
+                emit(report, (&G2_CORPUS[0]), 47);
+                progress(6);
+            }
+        }
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, boot_generation: u64) -> never {
+    let generation: u64 = config(GENERATION_OFFSET);
+    let inbox: u64 = wait_nonzero(INBOX_CAP_OFFSET);
+    let reply: u64 = wait_nonzero(REPLY_CAP_OFFSET);
+    let direct: u64 = wait_nonzero(DIRECT_REPLY_CAP_OFFSET);
+    let client: u64 = wait_nonzero(CLIENT_PROCESS_OFFSET);
+    let supervisor: u64 = wait_nonzero(SUPERVISOR_PROCESS_OFFSET);
+    if report_capability == 0
+        || generation == 0
+        || generation != boot_generation {
+        stop();
+    }
+    if generation == 1 {
+        emit(report_capability, (&G1_ONLINE[0]), 47);
+        progress(1);
+        run_g1(
+            report_capability,
+            inbox,
+            reply,
+            direct,
+            client,
+            supervisor
+        );
+    }
+    if generation == 2 {
+        emit(report_capability, (&G2_ONLINE[0]), 47);
+        progress(1);
+        run_g2(
+            report_capability,
+            inbox,
+            reply,
+            direct,
+            client,
+            supervisor
+        );
+    }
+    stop();
+}

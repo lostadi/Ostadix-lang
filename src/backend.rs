@@ -165,9 +165,8 @@ impl SqlState {
         let dir = TempDir::new("o-backend-sql")?;
         let db_path = dir.path().join("state.sqlite3");
         // Ensure the file exists so sqlite3 opens a durable on-disk DB.
-        fs::File::create(&db_path).with_context(|| {
-            format!("failed to create sql state db {}", db_path.display())
-        })?;
+        fs::File::create(&db_path)
+            .with_context(|| format!("failed to create sql state db {}", db_path.display()))?;
 
         let mut child = Command::new("sqlite3")
             .arg("-batch")
@@ -282,10 +281,7 @@ impl SqlState {
         if sql_stderr_is_error(&err) {
             // Preserve the historical error envelope from the one-shot CLI path
             // so existing triage / test string matches keep working.
-            bail!(
-                "sqlite3 execution failed (code 1)\n{}",
-                err.trim_end()
-            );
+            bail!("sqlite3 execution failed (code 1)\n{}", err.trim_end());
         }
 
         let trimmed = out.trim();

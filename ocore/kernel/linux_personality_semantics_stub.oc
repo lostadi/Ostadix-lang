@@ -1,0 +1,9 @@
+module kernel::linux_personality_semantics;
+
+// Non-Mode-19 builds retain a link-complete, fail-closed API without carrying
+// the isolated Linux fd/classification implementation into unrelated images.
+pub const LINUX_MINIMAL_SEMANTICS_PASS: u64 = 0x4c49_4e55_5853_5041;
+
+pub unsafe fn self_test() -> u64 {
+    return 0;
+}

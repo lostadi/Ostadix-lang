@@ -136,21 +136,21 @@ static PATH_IDS: [u64; 4] = [
     0x019b_1ef8_4028_a90f,
 ];
 
-const IMAGE_ID: u64 = 0x88c0_db7b_97f7_4b09;
-const IMAGE_DIGEST_0: u64 = 0x094b_f797_7bdb_c088;
-const IMAGE_DIGEST_1: u64 = 0xbfd9_e80b_1a73_0714;
-const IMAGE_DIGEST_2: u64 = 0x80af_3aa0_0c6f_c825;
-const IMAGE_DIGEST_3: u64 = 0xed9f_cb07_c0b7_b240;
+const IMAGE_ID: u64 = 0x388b_9253_ce6f_92be;
+const IMAGE_DIGEST_0: u64 = 0xbe92_6fce_5392_8b38;
+const IMAGE_DIGEST_1: u64 = 0xbeab_6ab4_86f9_e1f1;
+const IMAGE_DIGEST_2: u64 = 0xd189_35c7_4c60_28b7;
+const IMAGE_DIGEST_3: u64 = 0x0a78_6b5f_1f03_0521;
 
 // The OVFS registry stores the digest's raw bytes in native u64 words. The
 // serial command parser instead consumes the canonical hexadecimal SHA-256
 // spelling as four big-endian numeric chunks. Keep the trust-boundary
 // representations explicit so the same digest cannot be byte-swapped by
 // accident at activation time.
-const COMMAND_DIGEST_0: u64 = 0x88c0_db7b_97f7_4b09;
-const COMMAND_DIGEST_1: u64 = 0x1407_731a_0be8_d9bf;
-const COMMAND_DIGEST_2: u64 = 0x25c8_6f0c_a03a_af80;
-const COMMAND_DIGEST_3: u64 = 0x40b2_b7c0_07cb_9fed;
+const COMMAND_DIGEST_0: u64 = 0x388b_9253_ce6f_92be;
+const COMMAND_DIGEST_1: u64 = 0xf1e1_f986_b46a_abbe;
+const COMMAND_DIGEST_2: u64 = 0xb728_604c_c735_89d1;
+const COMMAND_DIGEST_3: u64 = 0x2105_031f_5f6b_780a;
 
 static COMPLETION_VALUES: [u64; 4] = [
     0x4d35_0000_0000_0001,

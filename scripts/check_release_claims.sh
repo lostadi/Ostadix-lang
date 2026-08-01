@@ -20,6 +20,12 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 cd "$ROOT" || exit 2
 
+# The QEMU evidence manifest is the single source for the aggregate, CI, and
+# public status/checklist projections. Validate its shape, gate scripts, and
+# wiring before scanning prose; the aggregate separately enforces every marker
+# against each gate's captured live transcript.
+python3 scripts/release_evidence.py validate
+
 # Bash 3.2, shipped by macOS, has arrays but not mapfile/readarray.  Keep the
 # NUL-delimited Git path list in a temporary file so spaces and glob characters
 # in tracked paths remain safe on every supported shell.
@@ -181,12 +187,13 @@ check_current_ocore_docs \
     '(transfer )?ticket[^.]*(bound to|for one validated)[^.]*(destination )?endpoint' \
     "M3 transfer tickets bind the exact creating process and destination CSpace, not the endpoint object"
 
-# Mode 18 is intentionally the scalar M6A dependency slice, and mode 19 is a
-# bounded-copy M6B mechanism slice. Full Milestone 6 still requires the wider
-# foreign-ABI integration; neither gate alone establishes that ABI.
+# Mode 18 is the scalar M6A dependency slice, mode 19 is the bounded-copy M6B
+# mechanism slice, and mode 24 composes one exact four-byte live bounded call.
+# Full Milestone 6 still requires the wider foreign-ABI and lifecycle-race
+# evidence; none of these bounded gates establishes that ABI.
 check_current_ocore_docs \
     'Milestone 6 (is )?(complete|implemented)|M6 (complete|implemented|personality[^.]*PASS)' \
-    "only bounded M6A and M6B mechanism slices are implemented; full Milestone 6 remains future work"
+    "only bounded M6A/M6B mechanism and four-byte live slices are implemented; full Milestone 6 remains future work"
 check_current_ocore_docs \
     '(M6A|Milestone 6A)[^.]*(shared|foreign|request-scoped)[^.]*memory view[^.]*(complete|implemented|PASS)' \
     "M6A has no shared or request-scoped foreign-process memory view"

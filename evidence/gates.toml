@@ -1,0 +1,382 @@
+schema_version = 1
+required_gate_count = 15
+supplemental_gate_count = 1
+portable_command = "./boot-and-test.sh smoke"
+
+[[gate]]
+id = "ocore-bootstrap"
+required = true
+milestone = "M0.1-M0.3"
+script = "ocore/kernel/smoke-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "CPL3 entry, SYSCALL return, IRQ0 return, and a later heartbeat execute in QEMU",
+  "W^X pages, frame reclamation, typed memory objects, and capability denials pass the bounded bootstrap corpus",
+]
+nonclaims = [
+  "This one-process bootstrap is not multi-process isolation, IPC, or a foreign ABI",
+  "It is not evidence of Linux, Plan 9, or a foreign-kernel boot",
+]
+expected_markers = [
+  "O-core kernel: serial online",
+  "M03 memory lifecycle: PASS",
+  "timer CPL3 return: online",
+  "CPL3 heartbeat: online",
+  "QEMU smoke: PASS",
+]
+
+[[gate]]
+id = "m02-fault-recovery"
+required = true
+milestone = "M0.2"
+script = "ocore/kernel/smoke-faults-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Eight fresh boots contain the bounded fatal CPL3 fault corpus",
+  "A ninth boot recovers a bounded user-copy fault and reaches a later heartbeat",
+]
+nonclaims = [
+  "The one-process fault corpus is not the current kernel ceiling",
+  "It does not establish arbitrary fault recovery or multi-process scheduling",
+]
+expected_markers = [
+  "M02 divide: PASS",
+  "M02 invalid-opcode: PASS",
+  "M02 recoverable user-copy: PASS",
+  "M02 fault and recovery matrix: PASS",
+]
+
+[[gate]]
+id = "m1-process-isolation"
+required = true
+milestone = "M1"
+script = "ocore/kernel/smoke-processes-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Two bounded native processes use separate CR3s and same-VA physical isolation",
+  "Exit and fault teardown reject stale identities, reclaim frames, and preserve the sibling",
+]
+nonclaims = [
+  "The gate is single-CPU and does not establish SMP isolation",
+  "It is not a general scheduler, IPC, or foreign-process proof",
+]
+expected_markers = [
+  "M1 exit lifecycle: PASS",
+  "M1 fault lifecycle: PASS",
+  "M1 process isolation and teardown matrix: PASS",
+]
+
+[[gate]]
+id = "m2-scheduler"
+required = true
+milestone = "M2"
+script = "ocore/kernel/smoke-scheduler-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Four TCBs across two processes exercise bounded single-CPU yield, sleep, wake-once, and timer preemption",
+  "One million forced identity transactions and lifecycle reclamation pass",
+]
+nonclaims = [
+  "The gate does not establish SMP safety or an unbounded production scheduler",
+  "The million-transaction phase does not itself enter CPL3",
+]
+expected_markers = [
+  "M2 forced identity transactions: 1000000 PASS",
+  "M2 timer preemption: PASS",
+  "M2 scheduler lifecycle: PASS",
+  "M2 post-lifecycle timer: online",
+  "M2 scheduler smoke: PASS",
+]
+
+[[gate]]
+id = "m3-ipc-foundation"
+required = true
+milestone = "M3 foundation"
+script = "ocore/kernel/smoke-ipc-foundation-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Kernel-side shared mapping, bounded FIFO/cancel, waiter cleanup, endpoint generation, and attenuating-transfer mechanisms pass",
+  "The bounded foundation reclaims its resources and reaches a later timer",
+]
+nonclaims = [
+  "This foundation gate is not the public CPL3 IPC gate",
+  "It does not establish a general foreign personality or distributed IPC",
+]
+expected_markers = [
+  "M3 foundation shared mapping: PASS",
+  "M3 foundation attenuating transfer: PASS",
+  "M3 foundation resources reclaimed: PASS",
+  "M3 foundation post-lifecycle timer: online",
+  "M3 IPC foundation smoke: PASS",
+]
+
+[[gate]]
+id = "m3-public-ipc"
+required = true
+milestone = "M3"
+script = "ocore/kernel/smoke-ipc-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Four CPL3 processes exercise public endpoint calls, bounded blocking, request/reply, and exact attenuated capability transfer",
+  "Personality failure is contained while an unrelated world survives and all bounded resources are reclaimed",
+]
+nonclaims = [
+  "The fixed-capacity single-CPU gate is not unbounded or SMP IPC",
+  "It does not implement a Linux or other foreign ABI",
+]
+expected_markers = [
+  "M3 public CPL3 endpoint syscalls: PASS",
+  "M3 personality crash containment: PASS",
+  "M3 unrelated world after crash: PASS",
+  "M3 resources reclaimed: PASS",
+  "M3 native IPC smoke: PASS",
+]
+
+[[gate]]
+id = "m4-native-loader"
+required = true
+milestone = "M4"
+script = "ocore/kernel/smoke-loader-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "llvm-objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "A deterministic OVFS image imports two separately linked native ELF personalities as data",
+  "Malformed and W+X corpus entries are rejected before isolated loads, service lookup, teardown, and frame reclamation",
+]
+nonclaims = [
+  "The bounded read-only OVFS is not a general filesystem or dynamic linker",
+  "The native test personalities are not Linux, Plan 9, or another foreign OS",
+]
+expected_markers = [
+  "M4 OVFS image import: PASS",
+  "M4 ELF rejection corpus: PASS",
+  "M4 loaded address-space W^X: PASS",
+  "M4 resources reclaimed: PASS",
+  "M4 native loader smoke: PASS",
+]
+
+[[gate]]
+id = "m5-native-live"
+required = true
+milestone = "M5"
+script = "ocore/kernel/smoke-live-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Four packaged native ELFs are hash-verified, loaded into isolated CSpaces, and health-gated before publication",
+  "A package-daemon fault withdraws generation 1, preserves unrelated services, and republishes a healthy generation 2 before reclamation",
+]
+nonclaims = [
+  "The bounded control plane is not a general package manager or unbounded retry policy",
+  "It does not boot or supervise a foreign operating system",
+]
+expected_markers = [
+  "M5 serial package activation: PASS",
+  "M5 pkgd fault containment: PASS",
+  "M5 pkgd restart generation: PASS",
+  "M5 resources reclaimed: PASS",
+  "M5 native live smoke: PASS",
+]
+
+[[gate]]
+id = "m5-supervisor-semantics"
+required = true
+milestone = "M5 semantics"
+script = "ocore/kernel/smoke-live-semantics-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "The bounded native state corpus covers immutable roots, overgrant denial, failed-health nonpublication, rollback, stale references, and strict parsing",
+  "Crash and restart preserve explicitly unrelated state and reach a post-test tick",
+]
+nonclaims = [
+  "The self-test corpus is not the separate interactive M5 service-process gate",
+  "It does not establish a general backoff, durability, or foreign-service policy",
+]
+expected_markers = [
+  "M5 overgrant/incomplete activation denial: PASS",
+  "M5 complete-set rollback + stale refs: PASS",
+  "M5 supervisor semantics: PASS",
+  "M5 semantics post-test tick: online",
+  "M5 native semantics smoke: PASS",
+]
+
+[[gate]]
+id = "m6a-scalar-personality"
+required = true
+milestone = "M6A"
+script = "ocore/kernel/smoke-personality-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Four packaged CPL3 ELFs exercise health-gated scalar personality RPC, deterministic terminal arbitration, and one supervised restart",
+  "Generation-1 authority stays stale after generation-2 rebind while an unrelated observer survives and resources return to baseline",
+]
+nonclaims = [
+  "Pointer-bearing calls and request-scoped foreign memory views are disabled",
+  "The native test personality is not a Linux or other foreign operating-system ABI",
+]
+expected_markers = [
+  "M6A g1 scalar RPC corpus: PASS",
+  "M6A g2 replacement/rebind: PASS",
+  "M6A stale/late/duplicate rejection: PASS",
+  "M6A resources reclaimed: PASS",
+  "M6A scalar personality smoke: PASS",
+]
+
+[[gate]]
+id = "m6b-bounded-copy"
+required = true
+milestone = "M6B mechanism"
+script = "ocore/kernel/smoke-m6b-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Generation-tagged bounded-copy request views enforce snapshot input, written-prefix output, typed rights, quotas, and revoke-before-terminal ordering",
+  "Five delegated lease classes support transactional create-bind rollback and request-wide revocation while unrelated scope survives",
+]
+nonclaims = [
+  "The mechanism is not integrated with the live M6A CPL3 RPC path",
+  "It does not establish pinned windows, streaming, signals, a Linux oracle, or concrete delegated services",
+]
+expected_markers = [
+  "M6B bounded snapshot + attenuated view caps: PASS",
+  "M6B revoke-before-terminal + wake-once paths: PASS",
+  "M6B delegated lease bind-failure rollback: PASS",
+  "M6B request-wide revoke + unrelated-scope survival: PASS",
+  "M6B bounded native mechanism slice: PASS",
+  "M6B bounded native mechanism smoke: PASS",
+]
+
+[[gate]]
+id = "m6b-live-bounded-personality"
+required = true
+milestone = "M6B Mode 24 live"
+script = "ocore/kernel/smoke-live-bounded-personality-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "Four digest-pinned CPL3 ELFs exercise one-shot four-byte INOUT bounded personality RPC across health-gated publication, one contained daemon fault, and a generation-2 rebind",
+  "The live terminal corpus covers cancellation, timeout, service death, and supervisor-triggered pre-terminal unmap, request-revoke, delegated-resource-revoke, and caller-exit dispositions with stale and duplicate denial plus bounded cleanup",
+]
+nonclaims = [
+  "Mode 24 is a native test personality, not a Linux or Plan 9 boot, general foreign ABI, or general guest-agent path",
+  "The generation-2 lifecycle operations are supervisor-triggered pre-terminal dispositions; the gate does not mutate a mapping, observe an external resource event, or cover the post-reply/pre-consume process-exit or unmap race",
+  "The delegated device resource is one internal typed lease; this is not KVM, PCI or physical-device assignment, DMA, IOMMU, interrupt-remapping, or physical-device evidence",
+]
+expected_markers = [
+  "M6B live OVFS image import: PASS",
+  "M6B live direct saved-RAX result/no reissue: PASS",
+  "M6B live bounded fault containment: PASS",
+  "M6B live personality g2 cooperative stop: ready",
+  "M6B live supervisor policy loop: PASS",
+  "M6B live bounded terminal matrix + g2 rebind: PASS",
+  "M6B live CPL3 requests/admin lifecycle dispositions: PASS",
+  "M6B live bounded authority cleanup: PASS",
+  "M6B live post-lifecycle timer: online",
+  "M6B live bounded personality smoke: PASS",
+]
+
+[[gate]]
+id = "kernel-world-mode20-objects"
+required = true
+milestone = "KernelWorld Mode 20"
+script = "ocore/kernel/smoke-kernel-world-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "The exact hash-pinned V2 record is parsed under default-deny package, manifest, request, export, and typed-rights binding",
+  "Generation-bound nonexecuting VM, vCPU, and guest-page objects enforce quota, stale denial, exact-world reclaim, and unrelated-VM survival",
+]
+nonclaims = [
+  "Mode 20 does not enter a guest, execute firmware, or publish a provider export",
+  "It does not establish device assignment, DMA mapping, or IOMMU isolation",
+]
+expected_markers = [
+  "KW pinned hash/tamper + noncanonical-order rejection: PASS",
+  "KW bounded VM pilot configured without execution: PASS",
+  "KW exact-world revoke/reclaim; unrelated VM survives: PASS",
+  "KW native admission + nonexecuting VM objects: PASS",
+  "KernelWorld native admission/object-model smoke: PASS",
+]
+
+[[gate]]
+id = "kernel-world-mode21-svm-kvm"
+required = false
+milestone = "KernelWorld Mode 21"
+script = "ocore/kernel/smoke-kernel-world-execution-qemu.sh"
+evidence_class = "hardware_kvm"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "grep", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "On an AMD host with nested SVM/NPT and writable /dev/kvm, KVM enters a bounded synthetic guest and observes controlled hypercall and interrupt exits",
+  "An unmapped guest-physical access fails closed before exact NPT teardown, vCPU restart, and unrelated-VM survival",
+]
+nonclaims = [
+  "Mode 21 is supplemental hardware-dependent evidence and is not part of the portable release aggregate",
+  "It does not boot Linux, Plan 9, firmware, or a supplied image",
+  "It has no provider lifecycle, guest agent, service export, virtual device, PCI assignment, DMA mapping, or IOMMU-isolation proof",
+]
+expected_markers = [
+  "KW virtualization capability detected: PASS",
+  "KW vCPU entered guest mode: PASS",
+  "KW controlled hypercall exit: PASS",
+  "KW unauthorized guest memory denied: PASS",
+  "KW exact-world NPT teardown: PASS",
+  "KW first executable VM substrate: PASS",
+  "KernelWorld first generation-bound vCPU execution smoke: PASS",
+]
+
+[[gate]]
+id = "kernel-world-mode22-live"
+required = true
+milestone = "KernelWorld Mode 22"
+script = "ocore/kernel/smoke-kernel-world-live-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "The TCG-compatible native administrative gate health-publishes exact typed exports and dispatches bounded reset intent",
+  "Failure withdraws clients before exact VM-graph revoke; policy restarts generation 2 while unrelated service survives and generation 1 stays stale",
+]
+nonclaims = [
+  "Mode 22 does not enter a guest or enforce the manifest health timeout",
+  "It has no Linux or Plan 9 boot, guest agent, shared queue, device assignment, DMA/IOMMU isolation, or hardware reset",
+]
+expected_markers = [
+  "KW health-before-publication + typed CSpace lookup: PASS",
+  "KW failure unpublishes before exact VM-graph revoke: PASS",
+  "KW generation-2 restart/rebind + stale denial: PASS",
+  "KW live boot-service lifecycle + reclamation: PASS",
+  "KernelWorld TCG live boot-service smoke: PASS",
+]
+
+[[gate]]
+id = "kernel-world-mode23-execution-device"
+required = true
+milestone = "KernelWorld Mode 23"
+script = "ocore/kernel/smoke-kernel-world-execution-device-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "QEMU TCG emulates SVM/NPT guest entry, VMMCALL-derived health, one validated virtual PIO request/reply, and an NPF VMEXIT",
+  "Quiesce releases execution pins before endpoint and supervisor teardown; generation 2 rebinds while stale generation 1 and cross-world authority fail closed",
+]
+nonclaims = [
+  "Mode 23 does not boot Linux, Plan 9, firmware, or a supplied user image",
+  "It is not KVM, physical-hardware, PCI assignment, DMA/IOMMU, interrupt-remapping, or hardware-reset evidence",
+  "It has no general guest agent, shared queue or ring, asynchronous guarantee, or SMP guarantee",
+]
+expected_markers = [
+  "KW exact boot-to-SVM/device binding: PASS",
+  "KW VMEXIT-derived health publication: PASS",
+  "KW guest PIO exit + virtual endpoint reply: PASS",
+  "KW NPF-driven quiesce before supervisor failure: PASS",
+  "KW generation-2 guest/device rebind + stale denial: PASS",
+  "KW supervised execution-device reclamation: PASS",
+  "KernelWorld TCG supervised execution-device smoke: PASS",
+]

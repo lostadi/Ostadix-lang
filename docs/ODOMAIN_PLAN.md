@@ -1,7 +1,8 @@
 # O-Domain Engineering Plan
 
-Status: active roadmap. Milestones 0.1 through 5, the bounded M6A/M6B slices,
-and KernelWorld Modes 20 through 23 now have executable evidence at their
+Status: active roadmap. Milestones 0.1 through 5, the bounded M6A/M6B slices
+including Mode 24's live four-byte composition, and KernelWorld Modes 20
+through 23 now have executable evidence at their
 documented, fixed-capacity, single-CPU x86-64 QEMU boundaries. These are
 bounded mechanism, lifecycle, and synthetic-execution proofs, not
 production-scale implementations or evidence for any foreign operating-system
@@ -526,7 +527,7 @@ system does not wait for native self-hosting.
 `ocore/kernel/build-m5-artifacts.sh` performs two builds of all four static
 service ELFs and the read-only OVFS image, requiring byte identity and the exact
 host-computed image digest. The pinned artifact is 62,056 bytes with SHA-256
-`88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`;
+`388b9253ce6f92bef1e1f986b46aabbeb728604cc73589d12105031f5f6b780a`;
 the kernel recomputes that digest before OVFS import. `smoke-live-qemu.sh`
 verifies the ELF entry symbols are absent from the kernel, boots the four loaded
 CPL3 principals, and drives the real serial `o> ` loop. It submits malformed
@@ -612,8 +613,8 @@ Linux or other foreign operating-system ABI.
 
 ### Milestone 6B: request-scoped memory and delegated-resource completion
 
-Status: **bounded native mechanism slice implemented; complete M6B remains in
-progress**.
+Status: **bounded native mechanism plus live four-byte vertical slice
+implemented; complete M6B remains in progress**.
 
 Mode 19 implements the first bounded-copy portion of
 [`PERSONALITY_MEMORY_VIEW.md`](PERSONALITY_MEMORY_VIEW.md). Four
@@ -639,11 +640,25 @@ invokes process-exit/unmap and wake-publication hooks directly; it is not yet
 integrated with real process teardown, mapping mutation, scheduler wake, the
 M6A CPL3 daemon, or a public pointer-bearing personality call.
 
+Mode 24 supplies one deliberately narrow live integration. Four independently
+linked, digest-pinned CPL3 ELFs run as client, personality daemon, supervisor,
+and unrelated observer. One exact four-byte `INOUT` shape crosses the public
+bounded-call syscall, M6A router, request-correlated view lookup/read/write,
+and bounded reply without client reissue. After one contained generation-1
+daemon fault, the supervisor health-gates generation 2 and selects
+pre-terminal unmap, request-revoke, delegated-device-resource-revoke, and
+caller-exit dispositions while the matching requests are still waiting. These
+policy-triggered dispositions do not mutate a mapping or observe an external
+resource event. The delegated device resource is one internal typed lease, not
+a physical device. The gate does not exercise the post-reply/pre-consume
+process-exit or unmap race and establishes no Linux or Plan 9 boot, general
+foreign ABI, general guest agent, PCI/DMA/IOMMU, or physical-device boundary.
+
 Complete M6B still requires pinned-window and streaming semantics, actual
-unmap/protection/signal integration, a pinned Linux oracle, full daemon/router
-wiring, schema fuzzing, allocation-failure injection, and the remaining
-concurrent teardown races. It does not itself establish Linux ABI
-compatibility.
+unmap/protection/signal and external-resource integration, a pinned Linux
+oracle, broader request shapes and service adapters, schema fuzzing,
+allocation-failure injection, and the remaining concurrent teardown races. It
+does not itself establish Linux ABI compatibility.
 
 ### Milestone 7: minimal translated Linux x86-64 personality
 
@@ -934,7 +949,10 @@ package-daemon replacement. M6A adds a package-loaded scalar test personality,
 an unprivileged endpoint-backed daemon and supervisor, terminal request
 arbitration, and one generation rebind. M6B's first slice adds bounded-copy
 request views and typed delegated-resource revocation as a separate native
-mechanism gate. The first KernelWorld native slice adds hash-pinned normal-form
+mechanism gate; Mode 24 composes that mechanism with one exact four-byte live
+CPL3 call shape, a contained daemon fault, one generation rebind, and bounded
+pre-terminal lifecycle dispositions. The first KernelWorld native slice adds
+hash-pinned normal-form
 admission and nonexecuting VM/vCPU/guest-page identities; Mode 21 adds a
 hardware-only synthetic SVM/NPT execution substrate; and Mode 22 separately
 adds bounded administrative health-gated publication, withdrawal before
@@ -954,8 +972,10 @@ Every statement remains scoped to its fixed-capacity, single-CPU gate.
    type, and requested rights. Delegation can only preserve or reduce rights.
 4. All user pointer checks are overflow-safe and cover the full byte range.
    Milestone 0.2 checks a concrete immutable bootstrap region and copies through
-   exact page-fault fixups. Mode 19 tests an explicit unmap terminal hook;
-   concurrent mapping-change integration and pinning remain future work.
+   exact page-fault fixups. Modes 19 and 24 test explicit unmap dispositions;
+   Mode 24's supervisor invokes its disposition before terminal reply and does
+   not mutate the mapping. Concurrent mapping-change integration and pinning
+   remain future work.
 5. Executable mappings are not writable. Anonymous stacks and data are NX.
    Milestone 0.2 proves this for the bootstrap kernel, user image, and stack.
 6. Syscall and exception return validates user RIP/RSP and sanitizes RFLAGS.
@@ -994,17 +1014,17 @@ Every statement remains scoped to its fixed-capacity, single-CPU gate.
 |---|---|---|---|---|
 | CPU/privilege | x86-64 ring-0 boot | one CPU, canonical CPL3 frames, timer/SYSCALL switching | isolated x86-64 processes | SMP and hardened entry |
 | Domains | none | bounded generation-tagged native worlds; four-process IPC and live-system scenarios | native, Alpine, Debian instances | persistent lifecycle and quotas |
-| Personalities | none | native dispatch plus one package-loaded scalar test personality served by an unprivileged M6A daemon | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
+| Personalities | none | native dispatch plus package-loaded scalar M6A and exact four-byte Mode 24 test personalities served by unprivileged daemons | minimal translated Linux x86-64 | persistent Lisp plus user-space and full-kernel backends |
 | Address spaces | one identity map | independent CR3s, guarded loaded stacks, exact W^X ELF mappings, optional shared RW/NX page | per-process page tables | demand paging and general shared mappings |
 | Processes | none | up to four loaded CPL3 principals in the current gates with teardown and stale denial | multiple isolated processes | complete process/thread lifecycle |
 | CSpaces | one small global table | exact owners, endpoint transfer attenuation, isolated service CSpaces, typed REPL control cap | one CSpace per process | general atomic cross-domain attenuation |
 | Memory | bump-only frames | typed reclaim, private/shared mappings, bounded-copy request staging, and nonexecuting guest-page objects | mapped per-process objects | discovered RAM, paging, NUMA policy |
 | Scheduling | timer marker only | bounded preemptive/blocking TCB scheduler with yield, sleep, IPC wake, and loaded-program completion | preemptive blocking scheduler | multicore policy and accounting |
-| IPC | none | public bounded CPL3 endpoints and scalar M6A personality RPC; separate mode-19 bounded-copy views are not yet RPC-integrated | personality RPC plus foreign memory views | supervised personality RPC |
+| IPC | none | public bounded CPL3 endpoints, scalar M6A RPC, mode-19 request views, and one exact four-byte Mode 24 live bounded-RPC composition | personality RPC plus foreign memory views | supervised personality RPC |
 | Loading | kernel-linked code | static native ELF from deterministic read-only OVFS; BSS, SysV stack, W^X, rejection corpus | native and static Linux ELF loaders | dynamic loaders per personality |
 | Filesystems | none | fixed-capacity immutable OVFS images and domain-relative root mounts | separate Alpine/Debian roots | versioned overlays and services |
-| Live system | none | M5 package activation plus M6A unprivileged scalar personality supervision and one generation rebind | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
-| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus a separate request-view mechanism; no native OValue codec or pointer-bearing daemon path | OValue, capability, capsule channels | common contract across all modes |
+| Live system | none | M5 package activation plus bounded M6A scalar and Mode 24 four-byte personality supervision/rebind slices | package store, general supervision, reconstruction, richer user-space services | native builds and richer interactive environments |
+| Crossings | hosted OValue and broker only | bounded scalar IPC/capability transfer plus request views and one exact four-byte pointer-bearing daemon path; no native OValue codec or general foreign ABI | OValue, capability, capsule channels | common contract across all modes |
 | Compatibility | no foreign OS ABI | no foreign OS ABI | pinned minimal Linux corpus | additional personalities by evidence |
 
 The first credible multi-domain O-Domain demonstration is therefore not either

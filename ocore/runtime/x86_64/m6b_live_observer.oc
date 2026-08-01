@@ -1,0 +1,35 @@
+module runtime::m6b_live_observer;
+
+const SYS_DEBUG_WRITE: u64 = 0;
+const CONFIG_VA: usize = 0x0120_1000;
+
+@link_section(".rodata")
+static ONLINE: [u8; 40] =
+    b"M6B live unrelated observer ELF: online\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, ignored: u64) -> never {
+    if report_capability == 0
+        || ignored != 0
+        || syscall3(
+            SYS_DEBUG_WRITE,
+            report_capability,
+            (&ONLINE[0]) as u64,
+            40
+        ) != 40 {
+        stop();
+    }
+    loop {
+        let value: u64 = volatile_load(CONFIG_VA as *const u64);
+        volatile_store(CONFIG_VA as *mut u64, value + 1);
+        asm!("pause", options(nomem, nostack));
+    }
+}

@@ -11,6 +11,15 @@ from o_lang import (
     OScope, OStorePath, OStr,
     evaluate_document, parse, run,
 )
+from o_lang.parser import REGISTERED_LANGUAGES
+from tests.example_manifest import (
+    assert_python_expectation,
+    examples_for,
+    fatal_diagnostics,
+    load_manifest,
+    typed_backends,
+    unavailable_requirements,
+)
 
 
 def _nix_available() -> bool:
@@ -143,30 +152,81 @@ def test_backslash_escaped_closer_is_literal_in_python():
     assert v.value == ")_python"
 
 
-def _matplotlib_available() -> bool:
-    try:
-        import matplotlib  # noqa: F401
-        return True
-    except ImportError:
-        return False
+def test_example_manifest_covers_tree_and_classifies_privileged_demo():
+    entries = load_manifest()
+    by_path = {entry["path"]: entry for entry in entries}
+
+    # Regression for the original false-positive/failure: ubuntu_vm is not a
+    # Python reference backend, and this externally privileged demo is manual.
+    plan9 = by_path["plan9_browser.O"]
+    assert plan9["editions"] == ["rust"]
+    assert plan9["classification"] == "manual"
+    assert "ubuntu_vm" in plan9["requirements"]["backends"]
+    assert "network" in plan9["requirements"]["authorities"]
+    assert "elevated" in plan9["requirements"]["authorities"]
+
+    # These examples assert semantics the Python reference does not currently
+    # implement: fresh bare environments, trusted-HTML round trips, and a
+    # scalar document result despite leading prose.  Do not bless their
+    # non-null literal/text output as Python support.
+    for path in (
+        "ephemeral.O",
+        "html_python_html.O",
+        "html_raw_roundtrip.O",
+        "literate_report.O",
+        "trailing_expr.O",
+    ):
+        assert "python" not in by_path[path]["editions"]
+
+    # The C17 runtime currently completes most of this demo but emits a shim
+    # SyntaxError for the explicit-scope case, substitutes null, and exits 0.
+    # The former substring smoke therefore was not whole-example support.
+    assert "c17" not in by_path["meta_eval.O"]["editions"]
 
 
-def test_example_files_parse_and_eval():
+def test_example_runner_rejects_zero_exit_fatal_diagnostics():
+    output = (
+        "nominal expected pattern\n"
+        "shim error: backend failed\n"
+        "Traceback (most recent call last):\n"
+        "SyntaxError: invalid syntax\n"
+    )
+    assert fatal_diagnostics(output) == [
+        "shim error:",
+        "Traceback (most recent call last):",
+        "SyntaxError:",
+    ]
+
+
+def test_python_manifest_entries_only_use_registered_typed_backends():
     root = Path(__file__).resolve().parents[1] / "examples"
-    has_matplotlib = _matplotlib_available()
-    for p in sorted(root.glob("*.O")):
-        if not _nix_available() and (
-            p.name.startswith(("nix_", "nixos_")) or p.name == "instantiate_realise_basic.O"
-        ):
+    for entry in examples_for("python"):
+        source = (root / entry["path"]).read_text(encoding="utf-8")
+        unknown = typed_backends(source) - REGISTERED_LANGUAGES
+        assert not unknown, (
+            f"{entry['path']} claims Python support but uses unregistered "
+            f"typed backends {sorted(unknown)}"
+        )
+
+
+def test_python_unit_examples_match_manifest_expectations():
+    root = Path(__file__).resolve().parents[1] / "examples"
+    for entry in examples_for("python", {"unit"}):
+        source = (root / entry["path"]).read_text(encoding="utf-8")
+        value = run(source)
+        assert_python_expectation(entry, value)
+
+
+def test_available_python_integration_examples_match_manifest_expectations():
+    root = Path(__file__).resolve().parents[1] / "examples"
+    for entry in examples_for("python", {"integration"}):
+        missing = unavailable_requirements(entry)
+        if missing:
+            print(f"  (skipping {entry['path']} -- requires {', '.join(missing)})")
             continue
-        if p.name.startswith("nixos_"):
-            # Heavy multi-machine VM demos — not part of the unit suite.
-            continue
-        if p.name == "computed_plot.O" and not has_matplotlib:
-            continue
-        src = p.read_text(encoding="utf-8")
-        v = run(src)
-        assert v is not None, f"example {p.name} returned None"
+        source = (root / entry["path"]).read_text(encoding="utf-8")
+        value = run(source)
+        assert_python_expectation(entry, value)
 
 
 # ---------------------------------------------------------------------------

@@ -71,6 +71,20 @@ ocore_m6_image_bytes_start:
 .globl ocore_m6_image_bytes_end
 ocore_m6_image_bytes_end:
 
+// Mode 24 carries the independently rebuilt CPL3 bounded-copy personality
+// corpus.  It deliberately reuses no scalar M6A payload code.
+.balign 16
+.globl ocore_m6b_live_image_bytes_start
+ocore_m6b_live_image_bytes_start:
+#if OCORE_PROBE_MODE == 24
+#ifndef OCORE_M6B_LIVE_IMAGE_PATH
+#error "OCORE_M6B_LIVE_IMAGE_PATH is required for live bounded personality mode"
+#endif
+  .incbin OCORE_M6B_LIVE_IMAGE_PATH
+#endif
+.globl ocore_m6b_live_image_bytes_end
+ocore_m6b_live_image_bytes_end:
+
 // Modes 20 through 23 embed the deterministic host-verified KernelWorld normal
 // form. Native admission pins the complete record SHA before parsing it. Mode
 // 22 adds only a TCG-compatible live lifecycle/service mechanism proof; no
@@ -523,6 +537,20 @@ ocore_m6_image_end:
   lea rax, [rip + ocore_m6_image_bytes_end]
   ret
 .size ocore_m6_image_end, .-ocore_m6_image_end
+
+.globl ocore_m6b_live_image_start
+.type ocore_m6b_live_image_start, @function
+ocore_m6b_live_image_start:
+  lea rax, [rip + ocore_m6b_live_image_bytes_start]
+  ret
+.size ocore_m6b_live_image_start, .-ocore_m6b_live_image_start
+
+.globl ocore_m6b_live_image_end
+.type ocore_m6b_live_image_end, @function
+ocore_m6b_live_image_end:
+  lea rax, [rip + ocore_m6b_live_image_bytes_end]
+  ret
+.size ocore_m6b_live_image_end, .-ocore_m6b_live_image_end
 
 .globl ocore_kernel_world_record_start
 .type ocore_kernel_world_record_start, @function

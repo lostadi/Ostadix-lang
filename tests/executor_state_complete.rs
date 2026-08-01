@@ -356,7 +356,8 @@ SELECT addr FROM t.insns
         normalized_stderr(&serial)
     );
     assert_eq!(
-        serial.output.stdout, b"[number] 42\n",
+        serial.output.stdout,
+        b"[number] 42\n",
         "expected attached table row; got stdout={:?} stderr={}",
         String::from_utf8_lossy(&serial.output.stdout),
         normalized_stderr(&serial)

@@ -20,11 +20,29 @@
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
   (`o_lang/`). It also contains O-core freestanding x86_64 ELF object emission
   through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `src/ocore/driver.rs`).
+- `examples/manifest.json` completely classifies the checked-in `.O` example
+  tree by supported edition, unit/integration/manual status, runtime and
+  authority requirements, timeout, and edition-specific oracle. The Rust,
+  Python, and C17 test entrypoints consume it. In particular, an unsupported
+  backend producing literal text or a zero-exit run containing a fatal shim
+  diagnostic is not accepted as example conformance, and an all-skipped sweep
+  fails. Rust/C17 oracles are observable output patterns; exact OValue JSON is
+  supported only by the Python semantic runner. Manifest authorities describe
+  ambient host requirements and do not mint a capability.
 - The source-release builder in `scripts/build_source_release.py` reads only
   allowlisted blobs from a resolved Git commit, rejects dirty worktrees by
   default, emits a deterministic ZIP with a canonical manifest and checksums,
-  and self-verifies before atomic publication. Its regression suite covers
-  debris exclusion, reproducibility, committed-byte behavior, and tampering.
+  and self-verifies before atomic publication. It accepts only regular
+  non-executable or executable Git blobs, so a symlink cannot become an escaping
+  archive member. Relative Markdown links outside code/comments must resolve to
+  files, directories, or the root inside that archive. Verification also checks
+  canonical ZIP metadata/layout and inertly validates the MCP configuration and
+  crate license plus example/evidence manifest schemas and archive-local
+  references; it never imports or executes archive payloads. The supported local
+  MCP crate, its lockfile, LGPL-2.1 license, repository config, and stdio smoke
+  regressions are required release members. The regression suite covers debris
+  exclusion, link closure, reproducibility, committed-byte behavior, required
+  release surfaces, metadata/schema tampering, and symlink denial.
 - The hosted Live-World reference in `src/live_system/` and
   `src/bin/o-live-host.rs` implements strict bounded package ingestion, an
   immutable verified SHA-256 store, exact default-deny activation policy,
@@ -219,7 +237,7 @@
   `ocore/kernel/smoke-live-qemu.sh`. `build-m5-artifacts.sh` deterministically
   builds separate static `init`, supervisor, package-daemon, and REPL ELF files
   into a 62,056-byte content-addressed read-only OVFS image whose pinned SHA-256
-  is `88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`.
+  is `388b9253ce6f92bef1e1f986b46aabbeb728604cc73589d12105031f5f6b780a`.
   The host verifies that identity and the kernel recomputes it before import.
   The fresh-QEMU gate proves four isolated loaded CSpaces and a real CPL3 serial
   loop whose only serial-read and control-submit authority is a typed control
@@ -279,7 +297,9 @@
   undeliverable terminal view without a second disposition or wake. Typed
   generation-tagged leases carry nonzero request identities, cover memory,
   filesystem, timer, network, and device classes, and support request-wide
-  revocation without ambient fallback while unrelated requests survive. These
+  revocation without ambient fallback while unrelated requests survive.
+  Create-plus-bind is transactional, with an injected post-publication bind
+  failure proving capability revocation and exact-generation destruction. These
   are directly exercised terminal hooks, not yet integration with live process
   teardown, mapping mutation, or scheduler wake. This is not complete M6B: the
   gate is not wired
@@ -287,6 +307,23 @@
   no pinned windows, streaming mode, signal/restart integration, Linux oracle,
   schema fuzzing, allocation-failure matrix, or concrete filesystem, network,
   timer, or device implementation.
+- Mode 24 adds a bounded live M6B composition gate in
+  `ocore/kernel/smoke-live-bounded-personality-qemu.sh`. Four independently
+  linked CPL3 principals are rebuilt into a 65,152-byte OVFS image with
+  SHA-256
+  `5b9d2526da2abd75ec90b4770ded5923d856132fad736fb13f241c34f1579887`.
+  One exact four-byte `INOUT` request shape crosses the public bounded-call,
+  view lookup/read/write, and bounded-reply syscalls without client reissue.
+  The gate contains a generation-1 daemon fault, preserves the unrelated
+  observer, health-gates a generation-2 rebind, and covers cancellation,
+  timeout, service death, plus supervisor-triggered pre-terminal unmap,
+  request-revoke, delegated-device-resource-revoke, and caller-exit
+  dispositions. The latter are policy-triggered while requests are waiting:
+  this is not evidence of actual mapping mutation, an external resource event,
+  or the post-reply/pre-consume process-exit or unmap race. The delegated
+  device authority is one internal typed lease, not a physical device. Mode 24
+  is not a Linux or Plan 9 boot, general foreign ABI, general guest agent, KVM,
+  PCI/DMA/IOMMU, or physical-device isolation gate.
 
 ## Implemented conservatively
 
@@ -314,9 +351,10 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond the current bounded native gates: integrate M6B's
-  bounded-copy view and delegated-lease mechanism into the unprivileged
-  personality RPC, complete pinned/signal/race evidence, and extend supervision
-  with durable reboot reconstruction and a capability-bounded build service.
-  No Linux ABI or root filesystem is claimed. The staged engineering plan is in
-  `docs/ODOMAIN_PLAN.md`.
+- O-Domain evolution beyond the current bounded native gates: extend Mode 24's
+  exact four-byte live bounded-RPC composition with pinned windows, streaming,
+  signals, real mapping/resource events, post-reply lifecycle-race evidence,
+  fuzzing, allocation-failure coverage, and concrete delegated services, then
+  extend supervision with durable reboot reconstruction and a capability-
+  bounded build service. No general Linux ABI or root filesystem is claimed.
+  The staged engineering plan is in `docs/ODOMAIN_PLAN.md`.

@@ -34,7 +34,12 @@ static void mkdir_p(const char *path) {
 ODiskCache *olang_disk_cache_new(const char *dir) {
     if (!dir) dir = "/tmp/o-lang-cache";
     ODiskCache *dc = (ODiskCache *)calloc(1, sizeof(*dc));
+    if (!dc) return NULL;
     dc->dir = strdup(dir);
+    if (!dc->dir) {
+        free(dc);
+        return NULL;
+    }
     mkdir_p(dc->dir);
     return dc;
 }
@@ -96,7 +101,7 @@ void olang_disk_cache_put(ODiskCache *dc, const char *fingerprint, OValue *value
 /* ── Minimal AutonomousScheduler (serial, in-mem + optional disk) ─────── */
 
 struct OAutonomousScheduler {
-    OValueMap *mem_cache; /* fp -> OValue (we retain) */
+    OValue *mem_cache; /* OVAL_MAP: fp -> retained OValue */
     ODiskCache *disk;
     size_t parallelism; /* ignored for now; serial */
 };
@@ -107,13 +112,23 @@ OAutonomousScheduler *olang_autonomous_scheduler_new(void) {
 
 OAutonomousScheduler *olang_autonomous_scheduler_new_with_dir(const char *cache_dir) {
     OAutonomousScheduler *s = (OAutonomousScheduler *)calloc(1, sizeof(*s));
-    OValue *mcv = oval_map(); s->mem_cache = mcv ? mcv->data.map : NULL;
+    if (!s) return NULL;
+    s->mem_cache = oval_map();
+    if (!s->mem_cache) {
+        free(s);
+        return NULL;
+    }
     if (cache_dir) {
         s->disk = olang_disk_cache_new(cache_dir);
     } else {
         char *d = olang_disk_cache_default_dir();
-        s->disk = olang_disk_cache_new(d);
+        if (d) s->disk = olang_disk_cache_new(d);
         free(d);
+    }
+    if (!s->disk) {
+        oval_release(s->mem_cache);
+        free(s);
+        return NULL;
     }
     s->parallelism = 1;
     return s;
@@ -121,8 +136,7 @@ OAutonomousScheduler *olang_autonomous_scheduler_new_with_dir(const char *cache_
 
 void olang_autonomous_scheduler_free(OAutonomousScheduler *sch) {
     if (!sch) return;
-    /* Note: we do not release values in mem_cache here (ownership is external via retain) */
-    if (sch->mem_cache) oval_release((OValue *)sch->mem_cache); /* map itself */
+    oval_release(sch->mem_cache);
     if (sch->disk) olang_disk_cache_free(sch->disk);
     free(sch);
 }
@@ -133,12 +147,12 @@ void olang_autonomous_scheduler_set_parallelism(OAutonomousScheduler *sch, size_
 
 OValue *olang_scheduler_cache_get(OAutonomousScheduler *sch, const char *fingerprint) {
     if (!sch || !fingerprint) return NULL;
-    OValue *v = oval_map_get((OValue *)sch->mem_cache, fingerprint);
+    OValue *v = oval_map_get(sch->mem_cache, fingerprint);
     if (v) return oval_retain(v);
     if (sch->disk) {
         v = olang_disk_cache_get(sch->disk, fingerprint);
         if (v) {
-            oval_map_set((OValue *)sch->mem_cache, fingerprint, oval_retain(v));
+            oval_map_set(sch->mem_cache, fingerprint, v);
             return v; /* disk already gave +1 */
         }
     }
@@ -147,7 +161,7 @@ OValue *olang_scheduler_cache_get(OAutonomousScheduler *sch, const char *fingerp
 
 static void scheduler_cache_put(OAutonomousScheduler *sch, const char *fp, OValue *v) {
     if (!sch || !fp || !v) return;
-    oval_map_set((OValue *)sch->mem_cache, fp, oval_retain(v));
+    oval_map_set(sch->mem_cache, fp, v);
     if (sch->disk) olang_disk_cache_put(sch->disk, fp, v);
 }
 
@@ -209,7 +223,7 @@ int olang_scheduler_execute_batch(OAutonomousScheduler *sch,
             out = olang_scheduler_execute(sch, r);
         }
         if (fp && out) {
-            oval_map_set(resv, fp, oval_retain(out));
+            oval_map_set(resv, fp, out);
         }
         if (out) oval_release(out);
         free(fp);
@@ -224,7 +238,7 @@ void olang_collect_transitive_requests(OValue *req, OValueMap *out_map) {
     char *fp = oval_content_identity(req);
     if (fp) {
         if (!oval_map_get((OValue *)out_map, fp)) {
-            oval_map_set((OValue *)out_map, fp, oval_retain(req));
+            oval_map_set((OValue *)out_map, fp, req);
         }
         free(fp);
     }

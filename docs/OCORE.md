@@ -240,6 +240,11 @@ Initial syscall numbers are:
 | 14 | `personality_call(call_cap, operation, scalar, timeout_ticks)`; M6A scalar route |
 | 15 | `personality_reply(reply_cap, request, status, scalar)`; M6A daemon completion |
 | 16 | `personality_supervise(supervise_cap, action, generation, subject)`; M6A policy action |
+| 17 | `personality_bounded_call(call_cap, operation, ptr, len, direction, timeout_ticks)`; mode-24 request-scoped bounded-copy route |
+| 18 | `personality_view_lookup(reply_cap, request)`; mode-24 daemon view discovery |
+| 19 | `personality_view_read(view_cap, offset)`; mode-24 byte read |
+| 20 | `personality_view_write(view_cap, offset, byte)`; mode-24 byte write |
+| 21 | `personality_bounded_reply(reply_cap, request, view_cap, committed_len, result)`; mode-24 completion |
 
 `page_alloc` accepts anonymous or shared memory from a typed page-pool
 capability. It enforces the current CSpace's hard frame quota and distinguishes
@@ -436,7 +441,9 @@ unmap hooks also release an undeliverable replied view without publishing a
 second result or wake. `delegated_resource.oc` supplies independently revocable
 typed leases for memory, filesystem, timer, network, and device classes.
 Lease/view binding is exact-request-only, and request-wide revocation leaves
-unrelated requests live without ambient fallback.
+unrelated requests live without ambient fallback. Create-plus-bind is an
+authority-publication transaction: an injected bind failure must revoke the
+new capability and destroy the exact unbound lease generation.
 
 `smoke-m6b-qemu.sh` exercises that mechanism against a real kernel process and
 address space, including bounds/generation/mapping-rights/quota denial, staged
@@ -449,6 +456,35 @@ personality call.
 Pinned windows, streaming output, actual signal and concurrent mapping-change
 integration, Linux-oracle behavior, fuzzing, allocation-failure injection, and
 concrete filesystem/network/timer/device services remain future M6B work.
+
+Mode 24 is the next bounded M6B vertical slice. It composes the mode-19 view
+mechanism with the existing M6A request router and four independently packaged
+CPL3 principals. `build-m6b-live-artifacts.sh` deterministically rebuilds a
+client, personality daemon, supervisor, and unrelated observer into a
+65,152-byte OVFS image whose SHA-256 is
+`5b9d2526da2abd75ec90b4770ded5923d856132fad736fb13f241c34f1579887`.
+The client issues each call once through syscall 17; the live corpus uses one
+exact four-byte `INOUT` view. The daemon discovers only the view correlated to
+the received request, accesses it through syscalls 18-20, and completes it
+through syscall 21. A generation-1 cancellation and deliberate daemon fault
+are followed by a health-gated generation-2 rebind. Generation 2 then covers
+supervisor-triggered pre-terminal unmap, request-revoke, delegated-device-
+resource-revoke, and caller-exit dispositions while each request is still
+waiting. The caller-exit case also leaves the test client's process reapable
+and its thread exited; the unrelated observer and a later timer survive.
+
+Those lifecycle operations are bounded dispositions, not a claim that the
+gate mutates a mapping or observes an external resource event. The delegated
+device resource is one internal typed lease, not a physical device. Mode 24
+does not cover a post-reply/pre-consume process-exit or unmap race, pinned
+windows, streaming, signals, a general foreign ABI, Linux or Plan 9 boot, a
+general guest agent, KVM, PCI, DMA, IOMMU, or physical-device isolation.
+
+Run the live bounded personality evidence gate with:
+
+```bash
+./ocore/kernel/smoke-live-bounded-personality-qemu.sh
+```
 
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2

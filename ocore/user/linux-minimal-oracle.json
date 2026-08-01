@@ -1,0 +1,37 @@
+{
+  "schema": "ocore.linux-minimal-x86_64/v1",
+  "scope": "one pinned static ET_EXEC; write fd 1/2, unknown -ENOSYS, exit_group only",
+  "architecture": "x86_64",
+  "elf": {
+    "sha256": "06240b6a840ed4262835aceff64a94f6ebd77838666f05eb7415d9a0d1b5868d",
+    "size": 8520,
+    "entry": 33554432,
+    "text_sha256": "bdd4a96c98c3484098f1fcc8e3915a77eaf9c6d408b8533bab7ed981ae6636f6",
+    "rodata_sha256": "7a3aabae23c2cdb90e2d7be1bd576cfa67d2e013aa8417bc8a964983e2bec5ce"
+  },
+  "sources": {
+    "assembly_sha256": "d1b6391d7288bddb2a799296e961f4cb9ffd95a2cca0949de0b29f715ff0d52c",
+    "linker_sha256": "b7e85fd1dc50631dcb4c5ea1196422aa1d075d6bfc713dc13571ebc6f5ce06bc"
+  },
+  "expected": {
+    "stdout_utf8": "o-core linux stdout\n",
+    "stderr_utf8": "o-core linux stderr\n",
+    "exit_status": 42,
+    "syscalls": [
+      {"number": 1, "fd": 1, "length": 20, "return": 20},
+      {"number": 1, "fd": 2, "length": 20, "return": 20},
+      {"number": 2147483647, "return": -38},
+      {"number": 231, "status": 42, "returns": false}
+    ]
+  },
+  "native_linux_confirmation": {
+    "confirmed": false,
+    "status": "pending native x86_64 Linux CI replay of these exact ELF bytes"
+  },
+  "nonclaims": [
+    "not a Linux kernel or distribution boot",
+    "not a general Linux userspace or syscall ABI",
+    "no read, brk, mmap, clock_gettime, signals, threads, dynamic linker, or root filesystem",
+    "no native Linux observation on the Darwin arm64 development host"
+  ]
+}
