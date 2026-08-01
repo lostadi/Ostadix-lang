@@ -175,7 +175,7 @@ EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
 EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
 EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
-EXPECTED_REQUIRED_EVIDENCE_GATES = 15
+EXPECTED_REQUIRED_EVIDENCE_GATES = 17
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 
 

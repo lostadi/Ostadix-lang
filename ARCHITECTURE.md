@@ -28,6 +28,7 @@ Ostadix-lang/
 │   ├── ocore/        #   O-core compiler (lexer, typeck, HIR, MIR, codegen)
 │   ├── live_system/  #   Hosted Live-World package/service oracle
 │   ├── kernel_world.rs #  KernelWorld foreign-kernel manifest contract & oracle
+│   ├── world/        #   Shared governed identities/effects foundation
 │   ├── project/      #   Route-preserving project bundle lifting
 │   └── bin/          #   Additional binary targets (olangc, ocorec, olink, …)
 ├── ocore/            # Native systems runtime and bootable x86_64 kernel proof
@@ -145,6 +146,18 @@ network footprints from arbitrary hosted source. Source `reads=`, `writes=`,
 and `serial=host` declarations can add constraints, but cannot erase an unknown
 fallback. Likewise, `effects=pure` cannot upgrade an arbitrary shim into trusted
 worker-pool work.
+
+The governed-world identity foundation in `src/world/` separates a World
+snapshot epoch from independently generated node, domain, and task-attempt
+identity. Corresponding precise `ResourceKey` states can describe governed
+state without pretending that arbitrary hosted work has become mediated.
+`HostWorld` remains the residual umbrella for ambient host effects. No
+production lowering emits these governed keys yet, and the optional grounding
+identity is caller-supplied rather than checked against a live snapshot. This
+type/effect foundation does not implement a distributed Governor, membership
+transport, resource registry, `/world` namespace, remote execution, placement,
+or current-epoch enforcement; those boundaries are fixed in
+[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md).
 
 Ordinary source sequence is lowered as a predecessor completion-token input.
 That dependency is omitted only for direct members of an explicit concurrent

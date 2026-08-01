@@ -14,6 +14,11 @@ use o_lang::live_system::manifest::{
 use sha2::{Digest, Sha256};
 use std::fs;
 
+use o_lang::world::{
+    DomainGeneration, DomainId, DomainIdentity, NodeGeneration, NodeId, NodeIdentity, WorldId,
+    WorldIdentityError,
+};
+
 fn binary_manifest() -> KernelWorldManifest {
     KernelWorldManifest {
         schema: KERNEL_WORLD_SCHEMA_V1.into(),
@@ -433,6 +438,58 @@ fn health_failure_and_replacement_preserve_one_terminal_result() {
         world.reply(fresh).unwrap().terminal,
         RequestTerminal::Replied
     );
+}
+
+#[test]
+fn kernel_world_binding_requires_explicit_placement_and_preserves_provenance() {
+    let node = NodeIdentity::new(
+        WorldId::new("desk").unwrap(),
+        NodeId::new("node-a").unwrap(),
+        NodeGeneration::new(2).unwrap(),
+    );
+    let domain_id = DomainId::new("foreign-kernel-provider").unwrap();
+    let allocated_domain = DomainIdentity::new(
+        node.clone(),
+        domain_id.clone(),
+        DomainGeneration::new(41).unwrap(),
+    );
+
+    let mut instance = KernelWorldInstance::new(binary_manifest(), package_digest()).unwrap();
+    let generation_one = instance.start_generation().unwrap();
+    let binding_one = generation_one
+        .bind_execution_domain(allocated_domain.clone())
+        .unwrap();
+    assert_eq!(binding_one.domain().node(), &node);
+    assert_eq!(binding_one.domain().domain(), &domain_id);
+    assert_eq!(binding_one.domain().generation().get(), 41);
+    assert_eq!(binding_one.provider_generation(), 1);
+    assert_eq!(binding_one.kernel_world_name(), "kernel/linux-driver");
+    assert_eq!(binding_one.package().as_sha256(), "b".repeat(64));
+
+    instance.fail_generation(1).unwrap();
+    let generation_two = instance.start_generation().unwrap();
+    let binding_two = generation_two
+        .bind_execution_domain(allocated_domain)
+        .unwrap();
+    assert_eq!(binding_two.domain().generation().get(), 41);
+    assert_eq!(binding_two.provider_generation(), 2);
+    assert_eq!(binding_two.domain(), binding_one.domain());
+
+    let replacement_domain =
+        DomainIdentity::new(node, domain_id, DomainGeneration::new(42).unwrap());
+    let replacement_binding = generation_two
+        .bind_execution_domain(replacement_domain)
+        .unwrap();
+    assert!(matches!(
+        replacement_binding
+            .domain()
+            .require_current(binding_one.domain()),
+        Err(WorldIdentityError::StaleGeneration {
+            kind: "domain generation",
+            expected: 42,
+            got: 41
+        })
+    ));
 }
 
 #[test]

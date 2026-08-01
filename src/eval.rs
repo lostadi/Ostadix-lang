@@ -440,7 +440,7 @@ enum BlockEvalPolicy {
 }
 
 #[derive(Debug, Default)]
-struct BlockOptions {
+pub(crate) struct BlockOptions {
     policy: Option<BlockEvalPolicy>,
     capability_binding: Option<String>,
     permissions: Vec<BackendAuthority>,
@@ -456,7 +456,7 @@ fn is_o_identifier(name: &str) -> bool {
 }
 
 impl BlockOptions {
-    fn parse(attr: Option<&str>, lang: &str) -> Result<Self> {
+    pub(crate) fn parse(attr: Option<&str>, lang: &str) -> Result<Self> {
         let mut options = Self::default();
         let mut seen = HashSet::new();
         EffectDeclaration::parse(attr)
@@ -500,6 +500,14 @@ impl BlockOptions {
         }
         options.permissions.sort();
         Ok(options)
+    }
+
+    pub(crate) fn capability_binding(&self) -> Option<&str> {
+        self.capability_binding.as_deref()
+    }
+
+    pub(crate) fn permissions(&self) -> &[BackendAuthority] {
+        &self.permissions
     }
 }
 

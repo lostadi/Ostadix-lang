@@ -9,6 +9,11 @@ use o_lang::executor::{
     EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, ResourceKey,
 };
 use o_lang::ir::{BackendRegistry, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
+use o_lang::world::{
+    ArtifactId, ArtifactPublicationIdentity, AttemptGeneration, DomainGeneration, DomainId,
+    DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceId, ResourceIdentity,
+    ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch, WorldId, WorldIdentity,
+};
 
 fn shim(lang: &str) -> o_lang::ir::BackendInterface {
     BackendRegistry::global().interface_for(lang)
@@ -333,4 +338,63 @@ fn explicit_inline_environment_is_conservatively_actor_stateful() {
     assert!(summary.reads.contains(&resource));
     assert!(summary.writes.contains(&resource));
     assert!(!summary.is_verified_pure_infallible());
+}
+
+#[test]
+fn governed_vocabulary_is_precise_and_does_not_alias_ambient_hostworld() {
+    let world = WorldIdentity::new(WorldId::new("desk").unwrap(), WorldEpoch::new(4).unwrap());
+    let node = NodeIdentity::new(
+        world.world().clone(),
+        NodeId::new("node-a").unwrap(),
+        NodeGeneration::new(2).unwrap(),
+    );
+    let domain = DomainIdentity::new(
+        node.clone(),
+        DomainId::new("linux-provider").unwrap(),
+        DomainGeneration::new(7).unwrap(),
+    );
+    let artifact = ArtifactPublicationIdentity::new(
+        world.clone(),
+        ArtifactId::from_sha256("a".repeat(64)).unwrap(),
+    );
+    let resource = ResourceIdentity::new(
+        ResourceOwner::Node { node: node.clone() },
+        ResourceId::new("cpu/slot-0").unwrap(),
+    );
+    let task = TaskAttemptIdentity::new(
+        world.world().clone(),
+        TaskId::new("build").unwrap(),
+        AttemptGeneration::new(3).unwrap(),
+    );
+    let governed = [
+        ResourceKey::WorldState(world),
+        ResourceKey::NodeState(node),
+        ResourceKey::DomainState(domain),
+        ResourceKey::GovernedResource(resource),
+        ResourceKey::TaskState(task),
+        ResourceKey::ArtifactState(artifact),
+    ];
+
+    for resource in &governed {
+        assert!(resource.is_governed_resource(), "{resource}");
+        assert!(!resource.is_host_resource(), "{resource}");
+    }
+    assert_eq!(governed[0].to_string(), "world-state:desk@4");
+    assert_eq!(governed[1].to_string(), "node-state:desk/node:node-a@2");
+    assert_eq!(
+        governed[2].to_string(),
+        "domain-state:desk/node:node-a@2/domain:linux-provider@7"
+    );
+
+    let mut precise_model = EffectSummary::pure();
+    precise_model.reads.insert(governed[2].clone());
+    precise_model.writes.insert(governed[2].clone());
+    assert!(!precise_model.reads.contains(&ResourceKey::HostWorld));
+    assert!(!precise_model.conflicts_with(&EffectSummary::unknown()));
+
+    let mut same_domain = EffectSummary::pure();
+    same_domain.reads.insert(governed[2].clone());
+    assert!(precise_model.conflicts_with(&same_domain));
+
+    assert!(EffectDeclaration::parse(Some("reads=world:desk@4")).is_err());
 }

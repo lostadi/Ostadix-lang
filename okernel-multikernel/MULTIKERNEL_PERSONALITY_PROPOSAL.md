@@ -4,9 +4,12 @@
 O-Domain personalities — written against the existing `ocore` runtime and the
 `ODOMAIN_PLAN` roadmap.*
 
-Status: proposal / architecture note. It extends the existing plan; it does not
-claim anything the milestone gates have not yet proven. Where it names a target
-kernel, it names the honest strategy and the real blocker rather than a slogan.
+Status: architecture note reconciled with the current bounded evidence. Modes
+19 and 24 implement the first bounded-copy mechanism and live four-byte path;
+Mode 25 executes one exact static Linux ELF corpus; and Mode 26 composes that
+corpus with one exact native 9P2000 client/server path. Full M6B, the broader M7
+acceptance matrix, M8--M11, and a distributed Ostadix World remain planned. No
+type, name, or proposal text expands those executable claim boundaries.
 
 ---
 
@@ -74,7 +77,7 @@ The rest of this document is: a structural framing that says *why* your existing
 primitives are the right substrate (Section 1–2), the crossing membrane that
 delivers "utilize" (Section 3), a per-kernel map with honest blockers
 (Section 4), the composition thesis (Section 5), non-claims (Section 6), and the
-concrete next PR (Section 7).
+reconciled bounded result plus next dependency work (Section 7).
 
 ---
 
@@ -154,7 +157,21 @@ present in `ocore/runtime/x86_64/` and gated in `ocore/kernel/`:
   `personality_rpc.oc` already routes a versioned request corpus with
   cancellation, timeout, and service-death results and rejects late / duplicate
   / prior-generation / stale-capability use while an unrelated observer keeps
-  running. This is the personality **router**, minus real ABIs.
+  running. This is the scalar personality **router** reused by the later bounded
+  modes; M6A alone is not a foreign ABI.
+- **Bounded request views** (M6B mechanism and Mode 24): mode 19 implements
+  generation-tagged request-scoped bounded-copy views and independently
+  revocable typed leases. Mode 24 connects one exact four-byte `INOUT` shape to
+  the live CPL3 router and supervisor across one contained daemon fault and
+  generation-2 rebind. It does not complete pinned-window, streaming, signal,
+  mapping-event, fuzzing, allocation-failure, or concurrent teardown work.
+- **Exact Linux and 9P compositions** (Modes 25 and 26): Mode 25 loads and
+  executes one pinned 8,520-byte static Linux x86-64 ELF at CPL3 for two writes,
+  Linux `-ENOSYS`, and `exit_group(42)`. Mode 26 reuses that exact corpus behind
+  one bounded native 9P2000 server and Plan-9-style client at
+  `/srv/linux/status`, including withdrawal, replacement, and stale-generation
+  denial. Neither gate boots Linux or Plan 9 or establishes a general foreign
+  ABI or namespace.
 
 The ABI seam is already reserved in `native_abi.oc`:
 
@@ -166,12 +183,13 @@ PERSONALITY_RPC_V1         = 1
 ERR_PERSONALITY_{UNAVAILABLE,CANCELLED,TIMEOUT,FAILED,STALE,DUPLICATE,BUSY,UNSUPPORTED}
 ```
 
-In other words: the router, the supervision lifecycle, the memory-view *design*,
-and the crossing *design* exist. What does not exist yet — and this proposal
-does not pretend otherwise — is (a) a real foreign syscall corpus behind
-`SYS_PERSONALITY_CALL`, (b) the *implementation* of the memory-view protocol
-that M6B requires before any pointer-bearing call, and (c) the M9 crossing
-codecs. Those are the work.
+In other words: the router, supervision lifecycle, bounded-copy mechanism, one
+exact live request shape, one exact Linux syscall corpus, and one exact 9P2000
+composition now have executable gates. What does not exist yet -- and this
+proposal does not pretend otherwise -- is the complete M6B memory-view and race
+matrix, the broader native-oracle-backed M7 syscall corpus, general Linux or
+Plan 9 environments, or the M9 OValue/capability/capsule transport codecs.
+Those remain dependency-ordered work.
 
 ---
 
@@ -224,6 +242,11 @@ contract is.
 
 ### 4.1 Linux x86-64 — the correct first personality (M7–M8)
 
+The first exact M7 slice is now Mode 25, with Mode 26 adding its bounded 9P2000
+composition. Their corpus and non-claims are fixed above; the broader Linux
+personality described in this section remains a target, not a projection from
+those four calls.
+
 Linux is easiest for one structural reason: **its userspace ABI is deliberately,
 famously stable** ("we do not break userspace"). The syscall boundary is the
 contract — number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9` — and a static
@@ -248,7 +271,8 @@ already have:
 
 Ship it as an immutable `personality/linux` package (M5), start with a pinned
 static-binary corpus, and validate argument/errno/struct/signal/memory behavior
-against a **native Linux oracle** before enabling the first pointer-bearing call.
+against a **native Linux oracle** before broadening pointer-bearing behavior
+beyond the exact bounded-copy calls already gated by Mode 25.
 M8 then adds multiple root filesystems — `linux[alpine]`, `linux[debian]` — over
 *one* Linux personality with distinct namespaces. Debian vs Alpine are rootfs
 compositions, not different personalities; keep that distinction crisp.
@@ -396,16 +420,15 @@ the exact measure of how much utilization is honestly available.
 
 ## 6. Non-claims and blockers (kept in your CLAIMS register style)
 
-- Nothing here is implemented by virtue of a type, constant, or name existing.
-  `personality.oc` naming `PERSONALITY_NATIVE`/`PERSONALITY_TEST` and
-  `native_abi.oc` reserving `SYS_PERSONALITY_CALL = 14` are *reserved seams*, not
-  Linux support. M7–M11 are all **planned**.
-- No pointer-bearing foreign syscall may be admitted until the **M6B**
-  implementation of `PERSONALITY_MEMORY_VIEW.md` passes its full gate: no service
-  ever receives a raw foreign pointer; every foreign address is interpreted in
-  the target's generation-tagged address space and exposed only as a bounded,
-  request-scoped, revocable view; crash/restart/cancel/timeout/stale-reply close
-  every view and wake each dependent thread at most once.
+- Nothing is implemented by virtue of a type, constant, name, or proposal
+  existing. Modes 25 and 26 are implemented only at their exact executable
+  corpus boundaries; the remainder of M7 and all of M8--M11 remain planned.
+- Modes 19, 24, and 25 establish bounded-copy request views and one exact live
+  four-byte/native and two-write/Linux use. They do not complete the full M6B
+  acceptance matrix. Broader pointer-bearing foreign syscalls remain blocked on
+  pinned windows, actual mapping and signal events, lifecycle-race evidence,
+  fuzzing, allocation-failure coverage, and a native Linux oracle. No service
+  receives a raw foreign pointer.
 - "Compatibility" claims must always name the **binary corpus, architecture,
   syscall slice, and execution mode** tested against a native oracle. "Runs
   Linux" is not a claim; "runs *this* pinned static corpus with *these* syscalls,
@@ -425,46 +448,43 @@ the exact measure of how much utilization is honestly available.
 
 ---
 
-## 7. The next PR — a concrete M7 slice-1 on top of M6A
+## 7. Current bounded result and next dependency work
 
-The smallest change that turns the reserved seam into a real (tiny) foreign
-personality, chosen to reuse everything M4–M6A already gate:
+The former M7 slice-1 proposal has landed in a deliberately narrower form as
+Mode 25. Its evidence names one exact static ELF, two `write` calls, one
+unsupported syscall returning `-ENOSYS`, and `exit_group(42)` across one
+contained daemon replacement. It does not include the proposed `brk`, `mmap`,
+`read`, or `clock_gettime` corpus and has not passed the broader native Linux
+oracle matrix. Mode 26 then adds one exact 9P2000 service composition without
+expanding the Linux syscall corpus.
 
-1. **Identity.** Add `PERSONALITY_LINUX` to `personality.oc` and extend
-   `is_supported`. Do *not* wire it into privileged policy.
-2. **Service.** Fork `m6_personalityd.oc` into a `linux_personalityd` package
-   ELF (built by a `build-m7-artifacts.sh` alongside the M6 artifacts), activated
-   as immutable `personality/linux` through the M5 supervisor.
-3. **Loader.** Reuse the M4 static-ELF/OVFS loader path to load *one pinned
-   static x86-64 Linux binary* into an isolated W^X address space. Freestanding /
-   `-nostdlib` first, so the corpus needs almost no syscalls.
-4. **Object table.** Add a per-process **personality-object table** mapping Linux
-   `fd` → O-core capability. `fd` stays a personality object; the raw handle
-   never crosses the ABI.
-5. **Corpus.** Implement, behind `SYS_PERSONALITY_CALL`, the smallest useful
-   Linux syscall set — `write`, `exit_group`, `brk`, `mmap`(anon), `read`,
-   `clock_gettime` — returning Linux-exact errno for anything off-corpus. Keep
-   every one of these *scalar-or-bounded-copy* so you stay inside current
-   memory-view capabilities and do **not** yet need M6B pins.
-6. **Oracle gate.** Add `smoke-linux-personality-qemu.sh` (next probe mode) that
-   runs the pinned binary load-to-exit and diffs argument/errno/exit behavior
-   against a recorded **native Linux oracle** trace; assert that a
-   personality-service fault cannot stop an unrelated native domain (extend the
-   M6A containment assertion).
+The next native work follows the remaining dependency boundaries rather than
+renaming those two gates as full M7:
 
-That single slice is defensible under your existing claim discipline — it names a
-one-binary corpus and a six-syscall slice — and it exercises the entire spine
-(package activation → loader → personality router → object table → oracle diff →
-containment) that every later kernel reuses. After it lands, the highest-leverage
-follow-ups are, in order: **(a)** implement M6B memory views (unlocks
-pointer-bearing syscalls and thus real programs), **(b)** the Binder `binderd`
-service (unlocks Android and *demonstrates the capability model absorbing a real
-object-IPC system*), and **(c)** the first M9 OValue crossing between a native
-and a Linux domain (unlocks the composition thesis in Section 5).
+1. complete M6B with pinned windows, streaming, signal and actual
+   mapping/resource events, lifecycle-race tests, schema fuzzing, and
+   allocation-failure coverage;
+2. broaden the pinned Linux corpus only behind syscall-by-syscall native-oracle
+   evidence, explicit unsupported behavior, and the same fault/rebind rules;
+3. implement the first versioned, bounded M9 structural OValue crossing while
+   keeping capability authority private and capsules affinity-bound;
+4. add a Binder-style capability service only after those memory and crossing
+   boundaries are executable; and
+5. pursue the KernelWorld guest-agent and physical-device track only in the
+   dependency order documented by
+   [`docs/KERNEL_WORLD_CONTRACT.md`](../docs/KERNEL_WORLD_CONTRACT.md), with no
+   passthrough before IOMMU, DMA-window, interrupt-revocation, reset, and hostile
+   failure evidence.
+
+The immediate product integration cycle is separately defined by
+[`docs/OSTADIX_WORLD.md`](../docs/OSTADIX_WORLD.md). Its hosted Governor,
+membership, registry, route-dispatch, and placement goals are not implemented by
+Modes 25 or 26.
 
 ---
 
 *Written against `ocore/runtime/x86_64/` (`native_abi.oc`, `personality.oc`,
 `personality_rpc.oc`, `cap_transfer.oc`, `endpoint.oc`, `address_space.oc`,
 `memory_object.oc`), `ocore/kernel/` gates, and `docs/ODOMAIN_PLAN.md`,
-`docs/PERSONALITY_MEMORY_VIEW.md`, `docs/CLAIMS.md`.*
+`docs/PERSONALITY_MEMORY_VIEW.md`, `docs/KERNEL_WORLD_CONTRACT.md`,
+`docs/OSTADIX_WORLD.md`, and `docs/CLAIMS.md`.*

@@ -1099,7 +1099,7 @@ pub enum RequestKind {
     /// OValue::Thunk (the captured body + deps).
     ///
     /// `lang` selects which backend shim runs (python, nix, html, ...).
-    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral for bare `lang^(...)` blocks; explicit [N] for named persistent).
+    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral for bare `lang^(...)` blocks; explicit `[N]` for named persistent).
     /// `cacheable` distinguishes {lazy} (true, pure backends only, force-
     /// caches by fingerprint) from {defer} (false, any backend, re-runs on
     /// every force, errors on splice).
@@ -1113,7 +1113,7 @@ pub enum RequestKind {
 
     /// STEP-4: activate a system closure onto a profile.
     ///
-    /// Source must resolve (possibly via a chained Request[Realise]) to an
+    /// Source must resolve (possibly via a chained `Request[Realise]`) to an
     /// OValue::StorePath — the path of a built NixOS system closure. The
     /// activation runs `<store_path>/bin/switch-to-configuration switch`,
     /// updating the profile symlink and starting/stopping services. The
@@ -1420,7 +1420,7 @@ impl OValue {
     }
 
     /// Construct a Thunk — the captured-but-unevaluated payload of a
-    /// `{lazy}` or `{defer}` block. The Thunk is wrapped in a Request[Eval]
+    /// `{lazy}` or `{defer}` block. The Thunk is wrapped in a `Request[Eval]`
     /// by the caller; this constructor just builds the data carrier with
     /// the composed fingerprint.
     ///
@@ -2994,7 +2994,7 @@ pub enum OWireCommand {
     },
 
     /// Clear the backend's environment and release all resources.
-    /// Sent when a persistent env [n] is garbage collected, or on shutdown.
+    /// Sent when a persistent env `[n]` is garbage collected, or on shutdown.
     Cleanup,
 
     /// Optional protocol probe for diagnostics and direct tests.
