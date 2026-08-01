@@ -3,6 +3,9 @@ module runtime::native_abi;
 // Versioned scalar ABI shared by the linked native payload and kernel router.
 // Reserved numbers stay stable even while their operations remain unavailable.
 pub const NATIVE_ABI_V1: u64 = 1;
+// Version of the bounded foreign ABI exercised by Mode 25's pinned ELF.  The
+// surface is intentionally limited to write, exit_group, and ENOSYS fallback.
+pub const LINUX_MINIMAL_ABI_V1: u64 = 1;
 
 pub const SYS_DEBUG_WRITE: u64 = 0;
 pub const SYS_CAP_CLOSE: u64 = 1;
@@ -29,6 +32,9 @@ pub const SYS_PERSONALITY_VIEW_LOOKUP: u64 = 18;
 pub const SYS_PERSONALITY_VIEW_READ: u64 = 19;
 pub const SYS_PERSONALITY_VIEW_WRITE: u64 = 20;
 pub const SYS_PERSONALITY_BOUNDED_REPLY: u64 = 21;
+// Native daemon-only completion adapter for one Linux-minimal write request.
+// The caller must present its exact generation-bound reply capability.
+pub const SYS_LINUX_MINIMAL_COMPLETE: u64 = 22;
 
 pub const PERSONALITY_RPC_V1: u64 = 1;
 

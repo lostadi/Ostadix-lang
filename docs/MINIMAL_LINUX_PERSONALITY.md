@@ -1,10 +1,11 @@
 # Minimal Linux write/exit personality
 
-Status: the deterministic corpus is pinned, and the kernel-admin fd-table and
-syscall-classification semantics execute inside the Mode 19 QEMU gate. Live
-Linux ELF/CPL3 personality wiring is not yet implemented. This document does
-not claim a Linux kernel boot, a Linux distribution, or general Linux binary
-compatibility.
+Status: the deterministic corpus is pinned, the isolated kernel-admin fd-table
+and classifier semantics remain covered by Mode 19, and Mode 25 is the live
+CPL3 acceptance slice. Mode 25 loads the exact foreign ELF from an immutable
+four-file OVFS image and routes only the operations below through the bounded
+personality path. This document does not claim a Linux kernel boot, a Linux
+distribution, or general Linux binary compatibility.
 
 ## Exact bounded surface
 
@@ -13,7 +14,7 @@ success-path operations are:
 
 | Linux x86-64 operation | Result |
 |---|---|
-| `write(1, pointer, length)` | bytes are read only through one live Mode 24 bounded `IN` view; exact length is returned |
+| `write(1, pointer, length)` | bytes are read only through one live Mode 25 bounded `IN` view; exact length is returned |
 | `write(2, pointer, length)` | same, routed to the bounded stderr sink |
 | unknown syscall number | Linux `-ENOSYS` (`-38`) |
 | `exit_group(42)` | classified for direct O-core process exit and cleanup; it does not enter personality RPC |
@@ -28,23 +29,25 @@ These fd objects are trusted internal table tokens, not
 `runtime::capability` entries, and they are never installed in a CSpace. The
 isolated oracle validates token generations and exact stored identity values;
 it does not resolve its `u64` process identities against live
-`runtime::process` generations. A future live adapter must supply identities
-that the process and bounded-RPC layers have already validated.
+`runtime::process` generations. The Mode 25 adapter therefore supplies only
+identities already validated by the process and bounded-RPC layers; the foreign
+program cannot select those identities.
 
-The current QEMU behavioral proof calls
+The Mode 19 kernel-admin proof calls
 `kernel::linux_personality_semantics::self_test` and requires the exact marker
 `M6B minimal Linux fd/classification kernel-admin semantics: PASS`. It covers
 syscall classification, generation-tagged fd lookup/authorization, scoped
 service-generation revocation, stale denial, unrelated-service survival,
-process cleanup, and zero remaining fd objects. It does not call
-`linux_personality::complete_write`, execute the pinned ELF, enter CPL3 as a
-Linux process, or exercise the live Mode 24 bridge.
+process cleanup, and zero remaining fd objects. It deliberately remains
+separate from Mode 25, which calls `linux_personality::complete_write`, executes
+the pinned ELF at CPL3, and exercises the live bounded bridge.
 
 ## Live bridge contract
 
-`linux_personality.oc` assumes Mode 24 has already correlated the caller,
-thread, address space, request frame, service process, service generation,
-pointer, length, and direction. The daemon must obtain the view capability with
+`linux_personality.oc` assumes the Mode 25 composition has already correlated
+the caller, thread, address space, request frame, service process, service
+generation, pointer, length, and direction. The daemon must obtain the view
+capability with
 exactly one `personality_bounded_rpc::lookup_view(request)` call. Linux write
 completion then retrieves the immutable request frame, bounded length, and
 direction through `personality_bounded_rpc::request_metadata(request, view)`.
@@ -62,12 +65,16 @@ bounded stdout/stderr transcript only after the generation-bound bridge reply
 succeeds. A stale request therefore cannot publish new output. The bridge owns
 saved-`RAX` completion; the foreign binary does not retry the syscall.
 
-On daemon crash, the owning lifecycle path must first terminalize its Mode 24
-requests and revoke the exact `(service process, service generation)` fd
-objects. The replacement provisions fresh objects under generation 2. Old
-internal handles remain stale, while objects owned by an unrelated service
-identity survive even if its numeric generation is also 1. `exit_group` must
-invoke process-scoped fd cleanup before the ordinary process reap completes.
+At the generation-1 daemon crash, the successful stdout reply is already
+terminal and its daemon-side view capability is closed. The lifecycle path
+withdraws that service and revokes the exact `(service process, service
+generation)` fd objects without discarding the committed terminal result. Its
+20-byte charge and bounded record remain until the client resumes after
+generation-2 publication and consumes it. The replacement provisions fresh fd
+objects under generation 2. Old internal handles remain stale, while objects
+owned by an unrelated service identity survive even if its numeric generation
+is also 1. `exit_group` invokes process-scoped fd cleanup before the ordinary
+process reap completes.
 
 ## Pinned artifact and oracle
 
@@ -97,14 +104,40 @@ replay. The oracle records that confirmation as pending. A future native
 x86-64 Linux CI job must replay these exact ELF bytes and record kernel/tool
 metadata before that observation is claimed.
 
-## Required live acceptance gate
+## Live acceptance gate
 
-The later QEMU gate must additionally prove real static-ELF load and CPL3
-execution, both exact output streams, unknown `-ENOSYS`, direct exit status 42,
-daemon generation-1 crash, bridge/fd revocation, generation-2 replacement,
-stale generation-1 denial, unrelated observer scheduling progress, and zero
-remaining requests, views, fd objects, capabilities, processes, address spaces,
-and frames after cleanup.
+Run the live slice from the repository root with:
+
+```bash
+./ocore/kernel/smoke-live-linux-personality-qemu.sh
+```
+
+The gate independently pins the complete four-file OVFS image and the embedded
+8,520-byte `/bin/linux-minimal.elf` payload. It rejects user-principal symbols
+linked into the kernel, then requires real static-ELF load and CPL3 execution,
+the exact `o-core linux stdout\n` and `o-core linux stderr\n` streams exactly
+once and in program order, unknown-syscall `-ENOSYS`, and direct
+`exit_group(42)`. Generation 1 completes stdout and then faults deliberately;
+the crash withdraws generation-1 service/fd authority but preserves the
+already-committed terminal for later client consumption. The replacement
+starts privately: generation 2 first proves generation-1 lookup authority
+stale, then answers health and is published. Only then does the
+client consume the preserved stdout terminal and proceed to stderr. The gate
+also requires unrelated-observer progress and zero remaining requests, views,
+fd objects, capabilities, processes, address spaces, and frames, plus a later
+timer and a one-second post-completion survival window.
+
+The complete Mode 25 OVFS image is 60,104 bytes with SHA-256:
+
+```text
+b380e5cbbe50403bd58bdafb11c54f2201f0cc742fc898487fa08ba26e2886e8
+```
+
+This is the smallest honest bounded-copy Linux-personality gate. It does not by
+itself close the broader pinned-window, streaming, partial-effect, signal, SMP,
+or general concurrent mapping-race acceptance matrix described in
+`PERSONALITY_MEMORY_VIEW.md`; it therefore is not evidence that the full M7
+roadmap or a general Linux process environment is complete.
 
 ## Nonclaims
 

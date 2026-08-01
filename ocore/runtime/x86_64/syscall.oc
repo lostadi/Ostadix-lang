@@ -36,6 +36,7 @@ use runtime::address_space::VM_USER;
 use runtime::address_space::VM_WRITE;
 use runtime::personality::PERSONALITY_NATIVE;
 use runtime::personality::PERSONALITY_TEST;
+use runtime::personality::PERSONALITY_LINUX_MINIMAL;
 use runtime::native_abi::DEBUG_BUFFER_SIZE;
 use runtime::native_abi::ERR_BUFFER_TOO_LARGE;
 use runtime::native_abi::ERR_CAPABILITY_DENIED;
@@ -74,6 +75,7 @@ use runtime::native_abi::SYS_PERSONALITY_VIEW_LOOKUP;
 use runtime::native_abi::SYS_PERSONALITY_VIEW_READ;
 use runtime::native_abi::SYS_PERSONALITY_VIEW_WRITE;
 use runtime::native_abi::SYS_PERSONALITY_BOUNDED_REPLY;
+use runtime::native_abi::SYS_LINUX_MINIMAL_COMPLETE;
 use runtime::native_abi::NATIVE_CONTROL_OBJECT_ID;
 use runtime::native_abi::SYSCALL_CONTROL_EXIT;
 use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
@@ -191,6 +193,22 @@ extern "sysv64" fn kernel_m6_bounded_reply(
     view_capability: u64,
     committed_length: u64,
     result: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_linux_complete(
+    capability_object: u64,
+    request: u64,
+    view: u64,
+    fd: u64,
+    count: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_linux_syscall(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64
 ) -> u64;
 
 // Exit is enabled only by a kernel lifecycle harness that has installed a
@@ -455,6 +473,24 @@ unsafe fn dispatch_native_0(
             return ERR_CAPABILITY_DENIED;
         }
         return kernel_m6_bounded_reply(
+            object,
+            arg0,
+            arg1,
+            arg2,
+            arg3
+        );
+    }
+    if number == SYS_LINUX_MINIMAL_COMPLETE {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_REPLY,
+            RIGHT_PERSONALITY_REPLY
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_linux_complete(
             object,
             arg0,
             arg1,
@@ -872,10 +908,35 @@ unsafe fn dispatch_test_personality(
         || number == SYS_PERSONALITY_VIEW_LOOKUP
         || number == SYS_PERSONALITY_VIEW_READ
         || number == SYS_PERSONALITY_VIEW_WRITE
-        || number == SYS_PERSONALITY_BOUNDED_REPLY {
+        || number == SYS_PERSONALITY_BOUNDED_REPLY
+        || number == SYS_LINUX_MINIMAL_COMPLETE {
         return ERR_NOT_IMPLEMENTED;
     }
     return ERR_UNKNOWN_SYSCALL;
+}
+
+// The architectural syscall entry already presents the six Linux x86-64
+// argument registers as capability,arg0..arg4.  Keep this dispatcher entirely
+// scalar: Mode 25's generation binding, bounded pointer validation, and Linux
+// return-value policy live behind the exact kernel harness hook.
+unsafe fn dispatch_linux_minimal(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64
+) -> u64 {
+    return kernel_m6_linux_syscall(
+        number,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5
+    );
 }
 
 // Validate the exact saved IRET target against the current address-space
@@ -939,6 +1000,17 @@ pub unsafe fn kernel_syscall_dispatch(
     if personality_id == PERSONALITY_TEST {
         return dispatch_test_personality(
             cspace_id,
+            number,
+            capability,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4
+        );
+    }
+    if personality_id == PERSONALITY_LINUX_MINIMAL {
+        return dispatch_linux_minimal(
             number,
             capability,
             arg0,

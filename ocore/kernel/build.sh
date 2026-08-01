@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 24" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 25" >&2
     exit 2
     ;;
 esac
@@ -20,6 +20,7 @@ M4_IMAGE_DEFINE='-DOCORE_M4_IMAGE_PATH=""'
 M5_IMAGE_DEFINE='-DOCORE_M5_IMAGE_PATH=""'
 M6_IMAGE_DEFINE='-DOCORE_M6_IMAGE_PATH=""'
 M6B_LIVE_IMAGE_DEFINE='-DOCORE_M6B_LIVE_IMAGE_PATH=""'
+M6_LINUX_IMAGE_DEFINE='-DOCORE_M6_LINUX_IMAGE_PATH=""'
 KERNEL_WORLD_RECORD_DEFINE='-DOCORE_KERNEL_WORLD_RECORD_PATH=""'
 if (( PROBE_MODE == 15 )); then
   M4_ARTIFACT_OUTPUT="$(
@@ -82,6 +83,21 @@ if (( PROBE_MODE == 24 )); then
   M6B_LIVE_IMAGE_DEFINE="-DOCORE_M6B_LIVE_IMAGE_PATH=\"$M6B_LIVE_IMAGE_PATH\""
 fi
 
+if (( PROBE_MODE == 25 )); then
+  M6_LINUX_ARTIFACT_OUTPUT="$(
+    OCORE_M6_LINUX_BUILD_DIR="$ROOT/target/ocore-m6-linux-live-artifacts" \
+      "$KERNEL_DIR/build-m6-linux-live-artifacts.sh"
+  )"
+  M6_LINUX_IMAGE_PATH="$(
+    printf '%s\n' "$M6_LINUX_ARTIFACT_OUTPUT" | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M6_LINUX_IMAGE_PATH" || ! -f "$M6_LINUX_IMAGE_PATH" ]]; then
+    echo "error: M6 Linux live artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M6_LINUX_IMAGE_DEFINE="-DOCORE_M6_LINUX_IMAGE_PATH=\"$M6_LINUX_IMAGE_PATH\""
+fi
+
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     --bin ocore-kernel-world-record
@@ -141,6 +157,13 @@ if (( PROBE_MODE == 19 )); then
     "$KERNEL_DIR/linux_personality_semantics.oc"
   )
 fi
+if (( PROBE_MODE == 25 )); then
+  LINUX_PERSONALITY_SOURCES=(
+    "$ROOT/ocore/runtime/x86_64/linux_fd_table.oc"
+    "$ROOT/ocore/runtime/x86_64/linux_personality.oc"
+    "$KERNEL_DIR/linux_personality_semantics_stub.oc"
+  )
+fi
 
 M6B_SEMANTICS_SOURCE="$KERNEL_DIR/m6b_semantics_stub.oc"
 if (( PROBE_MODE == 19 )); then
@@ -152,12 +175,15 @@ BOUNDED_PERSONALITY_SOURCES=()
 if (( PROBE_MODE == 18 || PROBE_MODE == 24 )); then
   M6_SOURCE="$KERNEL_DIR/m6.oc"
 fi
-if (( PROBE_MODE == 18 || PROBE_MODE == 19 || PROBE_MODE == 24 )); then
+if (( PROBE_MODE == 25 )); then
+  M6_SOURCE="$KERNEL_DIR/m6_linux.oc"
+fi
+if (( PROBE_MODE == 18 || PROBE_MODE == 19 || PROBE_MODE == 24 || PROBE_MODE == 25 )); then
   # Mode 19 directly exercises views/resources and its pinned Linux oracle
-  # composes the bounded router. Modes 18 and 24 share the full m6.oc source,
-  # whose Mode24 branch imports the same modules. Other probes retain only the
-  # fail-closed M6 adapter surface and do not spend bootstrap image headroom on
-  # unreachable personality mechanisms.
+  # composes the bounded router. Modes 18 and 24 share m6.oc; Mode 25 selects
+  # the separate m6_linux.oc implementation so the pinned foreign-ABI slice
+  # cannot consume Mode 24's fixed kernel-image headroom. Other probes retain
+  # only the fail-closed M6 adapter surface.
   BOUNDED_PERSONALITY_SOURCES=(
     "$ROOT/ocore/runtime/x86_64/personality_memory_view.oc"
     "$ROOT/ocore/runtime/x86_64/personality_bounded_rpc.oc"
@@ -174,6 +200,22 @@ M5_SEMANTICS_SOURCE="$KERNEL_DIR/m5_semantics_stub.oc"
 if (( PROBE_MODE == 17 )); then
   M5_SELFTEST_SOURCE="$KERNEL_DIR/m5_selftest.oc"
   M5_SEMANTICS_SOURCE="$KERNEL_DIR/m5_semantics.oc"
+fi
+
+M1_SOURCE="$KERNEL_DIR/m1.oc"
+M2_SOURCE="$KERNEL_DIR/m2.oc"
+M3_SOURCE="$KERNEL_DIR/m3.oc"
+M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
+M4_SOURCE="$KERNEL_DIR/m4.oc"
+if (( PROBE_MODE == 25 )); then
+  # Mode 25 is compile-time selected and enters only kernel::m6. Keep the
+  # historical probes fail-closed without linking their unreachable harness
+  # bodies, preserving the same hard 512 KiB bootstrap headroom assertion.
+  M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
+  M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
+  M3_SOURCE="$KERNEL_DIR/m3_mode25_stub.oc"
+  M3_LIVE_SOURCE="$KERNEL_DIR/m3_live_mode25_stub.oc"
+  M4_SOURCE="$KERNEL_DIR/m4_mode25_stub.oc"
 fi
 
 "$ROOT/target/debug/ocorec" \
@@ -220,11 +262,11 @@ fi
   "$ROOT/ocore/runtime/x86_64/m1_user.oc" \
   "$ROOT/ocore/runtime/x86_64/m2_user.oc" \
   "$ROOT/ocore/runtime/x86_64/m3_user.oc" \
-  "$KERNEL_DIR/m1.oc" \
-  "$KERNEL_DIR/m2.oc" \
-  "$KERNEL_DIR/m3.oc" \
-  "$KERNEL_DIR/m3_live.oc" \
-  "$KERNEL_DIR/m4.oc" \
+  "$M1_SOURCE" \
+  "$M2_SOURCE" \
+  "$M3_SOURCE" \
+  "$M3_LIVE_SOURCE" \
+  "$M4_SOURCE" \
   "$M5_SOURCE" \
   "$M5_SELFTEST_SOURCE" \
   "$M5_SEMANTICS_SOURCE" \
@@ -244,6 +286,7 @@ clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   "$M5_IMAGE_DEFINE" \
   "$M6_IMAGE_DEFINE" \
   "$M6B_LIVE_IMAGE_DEFINE" \
+  "$M6_LINUX_IMAGE_DEFINE" \
   "$KERNEL_WORLD_RECORD_DEFINE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
@@ -331,6 +374,13 @@ case "$(basename "$LLD")" in
       "$BUILD_DIR/boot.o" "$BUILD_DIR/kernel.o"
     ;;
 esac
+
+if (( PROBE_MODE == 25 )); then
+  # Record the exact content-addressed image path passed to boot.S's .incbin.
+  # The live gate hashes this resolved build output rather than a possibly
+  # stale artifact that merely has the previously expected filename.
+  printf '%s\n' "$M6_LINUX_IMAGE_PATH" > "$BUILD_DIR/m6-linux-image.path"
+fi
 
 file "$BUILD_DIR/kernel.o"
 file "$BUILD_DIR/kernel.elf"

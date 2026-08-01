@@ -1,0 +1,9 @@
+module kernel::m4;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+pub unsafe fn complete_continue() -> never { fail_closed(); }
+pub unsafe fn start(mode: u64, native_domain: u64) -> never { fail_closed(); }

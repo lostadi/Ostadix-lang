@@ -2,9 +2,9 @@ module kernel::m6;
 
 use runtime::native_abi::ERR_NOT_IMPLEMENTED;
 
-// Modes 18 and 24 alone link the packaged personality-supervision harness.
+// Modes 18, 24, and 25 link a packaged personality-supervision harness.
 // Scheduler and syscall code retain total, fail-closed adapter symbols in all
-// other kernels without pulling the M6A/M6B runtime and oracle into unrelated
+// other kernels without pulling those runtimes and oracles into unrelated
 // bootstrap images.
 @export
 @no_mangle
@@ -97,6 +97,62 @@ pub unsafe fn kernel_m6_bounded_reply(
     let _unused_length: u64 = committed_length;
     let _unused_result: u64 = result;
     return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_complete(
+    capability_object: u64,
+    request: u64,
+    view: u64,
+    fd: u64,
+    count: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_view: u64 = view;
+    let _unused_fd: u64 = fd;
+    let _unused_count: u64 = count;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_syscall(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64
+) -> u64 {
+    let _unused_number: u64 = number;
+    let _unused_arg0: u64 = arg0;
+    let _unused_arg1: u64 = arg1;
+    let _unused_arg2: u64 = arg2;
+    let _unused_arg3: u64 = arg3;
+    let _unused_arg4: u64 = arg4;
+    let _unused_arg5: u64 = arg5;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_defer_thread(thread: u64) -> u64 {
+    let _unused_thread: u64 = thread;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_process_exit(
+    process: u64,
+    status: u64
+) -> u64 {
+    let _unused_process: u64 = process;
+    let _unused_status: u64 = status;
+    return 0;
 }
 
 @export

@@ -85,6 +85,21 @@ ocore_m6b_live_image_bytes_start:
 .globl ocore_m6b_live_image_bytes_end
 ocore_m6b_live_image_bytes_end:
 
+// Mode 25 carries the exact pinned static Linux x86-64 ELF plus three
+// independently linked O-core service principals.  These bytes remain data
+// until OVFS and ELF validation; the guest is never linked into the kernel.
+.balign 16
+.globl ocore_m6_linux_image_bytes_start
+ocore_m6_linux_image_bytes_start:
+#if OCORE_PROBE_MODE == 25
+#ifndef OCORE_M6_LINUX_IMAGE_PATH
+#error "OCORE_M6_LINUX_IMAGE_PATH is required for live Linux personality mode"
+#endif
+  .incbin OCORE_M6_LINUX_IMAGE_PATH
+#endif
+.globl ocore_m6_linux_image_bytes_end
+ocore_m6_linux_image_bytes_end:
+
 // Modes 20 through 23 embed the deterministic host-verified KernelWorld normal
 // form. Native admission pins the complete record SHA before parsing it. Mode
 // 22 adds only a TCG-compatible live lifecycle/service mechanism proof; no
@@ -551,6 +566,20 @@ ocore_m6b_live_image_end:
   lea rax, [rip + ocore_m6b_live_image_bytes_end]
   ret
 .size ocore_m6b_live_image_end, .-ocore_m6b_live_image_end
+
+.globl ocore_m6_linux_image_start
+.type ocore_m6_linux_image_start, @function
+ocore_m6_linux_image_start:
+  lea rax, [rip + ocore_m6_linux_image_bytes_start]
+  ret
+.size ocore_m6_linux_image_start, .-ocore_m6_linux_image_start
+
+.globl ocore_m6_linux_image_end
+.type ocore_m6_linux_image_end, @function
+ocore_m6_linux_image_end:
+  lea rax, [rip + ocore_m6_linux_image_bytes_end]
+  ret
+.size ocore_m6_linux_image_end, .-ocore_m6_linux_image_end
 
 .globl ocore_kernel_world_record_start
 .type ocore_kernel_world_record_start, @function

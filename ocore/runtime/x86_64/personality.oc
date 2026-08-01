@@ -7,8 +7,13 @@ pub const PERSONALITY_NATIVE: u64 = 1;
 // request router without claiming a Linux or other foreign ABI. Its public
 // surface is the versioned scalar PERSONALITY_RPC_V1 corpus only.
 pub const PERSONALITY_TEST: u64 = 2;
+// Mode 25's deliberately minimal foreign ABI.  This identity names only the
+// pinned static x86-64 Linux corpus; it is not a claim of general Linux ABI
+// compatibility.
+pub const PERSONALITY_LINUX_MINIMAL: u64 = 3;
 
 pub fn is_supported(personality_id: u64) -> bool {
     return personality_id == PERSONALITY_NATIVE
-        || personality_id == PERSONALITY_TEST;
+        || personality_id == PERSONALITY_TEST
+        || personality_id == PERSONALITY_LINUX_MINIMAL;
 }

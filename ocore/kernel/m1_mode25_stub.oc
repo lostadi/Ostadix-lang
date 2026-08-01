@@ -1,0 +1,12 @@
+module kernel::m1;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_process_exit_continue() -> never { fail_closed(); }
+
+pub unsafe fn start(mode: u64, domain_handle: u64) -> never { fail_closed(); }
