@@ -21,6 +21,14 @@ pub const SYS_CONTROL_SUBMIT: u64 = 13;
 pub const SYS_PERSONALITY_CALL: u64 = 14;
 pub const SYS_PERSONALITY_REPLY: u64 = 15;
 pub const SYS_PERSONALITY_SUPERVISE: u64 = 16;
+// M6B live bounded-copy extension.  The client submits one request-scoped
+// range; the native daemon can discover and operate only the exact view
+// correlated with the M6A request received from its endpoint.
+pub const SYS_PERSONALITY_BOUNDED_CALL: u64 = 17;
+pub const SYS_PERSONALITY_VIEW_LOOKUP: u64 = 18;
+pub const SYS_PERSONALITY_VIEW_READ: u64 = 19;
+pub const SYS_PERSONALITY_VIEW_WRITE: u64 = 20;
+pub const SYS_PERSONALITY_BOUNDED_REPLY: u64 = 21;
 
 pub const PERSONALITY_RPC_V1: u64 = 1;
 

@@ -390,6 +390,7 @@ name = "ostadix-mcp-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rmcp",
  "schemars 0.8.22",
  "serde",

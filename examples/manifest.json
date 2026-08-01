@@ -1,0 +1,623 @@
+{
+  "schema_version": 1,
+  "examples": [
+    {
+      "path": "bash_binding.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["bash", "python"],
+        "programs": ["bash", "python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["hello world"]}
+      }
+    },
+    {
+      "path": "bash_exit_code.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["bash"],
+        "programs": ["bash"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["ok"]}
+      }
+    },
+    {
+      "path": "bash_hello.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["bash"],
+        "programs": ["bash"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["hello from bash"]}
+      }
+    },
+    {
+      "path": "bash_multiline.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["bash"],
+        "programs": ["bash"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["10 + 20 = 30"]}
+      }
+    },
+    {
+      "path": "bindings.O",
+      "editions": ["rust", "c17", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["43"]},
+        "c17": {"patterns": ["43"], "modes": ["interpreter", "aot"]},
+        "python": {"result": {"tag": "int", "value": 43}}
+      }
+    },
+    {
+      "path": "computed_plot.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["O", "html", "python"],
+        "programs": ["python3"],
+        "python_packages": ["matplotlib"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {
+          "patterns": [
+            "<title>O computed plot</title>",
+            "Figure 1. Computed at render time",
+            "math is NOT defined in python[1]"
+          ]
+        },
+        "python": {
+          "patterns": [
+            "<title>O computed plot</title>",
+            "Figure 1. Computed at render time",
+            "math is NOT defined in python[1]"
+          ]
+        }
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "coordination_groups.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["markdown", "nix_expr"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {
+          "patterns": ["# Step-4 coordination primitives", "<group:batch n=3", "pkgs.hello"]
+        }
+      }
+    },
+    {
+      "path": "env_split.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["100"]},
+        "python": {"patterns": ["100"]}
+      }
+    },
+    {
+      "path": "ephemeral.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["EPHEMERAL: x from first bare block is NOT visible here"]}
+      }
+    },
+    {
+      "path": "group_pipeline/main.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["markdown", "python"],
+        "programs": ["python3"],
+        "authorities": ["fs_read", "fs_write", "process"],
+        "files": ["examples/group_pipeline/input.txt"],
+        "opt_in": ["RUN_GROUP_PIPELINE_EXAMPLES=1"]
+      },
+      "expected": {
+        "rust": {"patterns": ["# normalize_pipeline", "policy: lazy"]}
+      }
+    },
+    {
+      "path": "group_pipeline/main.eager.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["markdown", "python"],
+        "programs": ["python3"],
+        "authorities": ["fs_read", "fs_write", "process"],
+        "files": ["examples/group_pipeline/input.txt"],
+        "opt_in": ["RUN_GROUP_PIPELINE_EXAMPLES=1"]
+      },
+      "expected": {
+        "rust": {"patterns": ["# normalize_pipeline", "policy: eager"]}
+      }
+    },
+    {
+      "path": "hello.O",
+      "editions": ["rust", "c17", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["2"]},
+        "c17": {"patterns": ["2"], "modes": ["interpreter", "aot"]},
+        "python": {"result": {"tag": "int", "value": 2}}
+      }
+    },
+    {
+      "path": "html_basic.O",
+      "editions": ["rust", "c17", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<h1>O-lang is rendering HTML</h1>", "<p>The answer is 42.</p>"]},
+        "c17": {"patterns": ["<h1>O-lang is rendering HTML</h1>", "<p>The answer is 42.</p>"]},
+        "python": {"patterns": ["<h1>O-lang is rendering HTML</h1>", "<p>The answer is 42.</p>"]}
+      }
+    },
+    {
+      "path": "html_escape.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<p>&lt;O-lang &amp; friends&gt;</p>"]},
+        "python": {"patterns": ["<p>&lt;O-lang &amp; friends&gt;</p>"]}
+      }
+    },
+    {
+      "path": "html_python_html.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<h1>Outer HTML</h1>", "<strong>Hello, Lee.</strong>"]}
+      }
+    },
+    {
+      "path": "html_raw_roundtrip.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<section>", "<strong>Hello, Lee.</strong>"]}
+      }
+    },
+    {
+      "path": "instantiate_realise_basic.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["markdown", "nix_expr"],
+        "programs": ["nix"],
+        "authorities": ["fs_read", "fs_write", "process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["# Step-2 rung climb", "/nix/store/"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "js_binding.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["javascript", "python"],
+        "programs": ["node", "python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["42"]}
+      }
+    },
+    {
+      "path": "js_hello.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["javascript"],
+        "programs": ["node"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["hello from js"]}
+      }
+    },
+    {
+      "path": "js_json.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["javascript"],
+        "programs": ["node"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["\"x\"", "\"y\"", "[number] 1", "[number] 2"]}
+      }
+    },
+    {
+      "path": "js_multiline.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["javascript"],
+        "programs": ["node"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["42"]}
+      }
+    },
+    {
+      "path": "lazy_defer_attrs_basic.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["markdown", "nix", "python", "text"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {"patterns": ["[request] <request eval|python|"]}
+      }
+    },
+    {
+      "path": "lazy_request_basic.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["markdown", "nix_expr"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {"patterns": ["# Step-3 lazy region (call form)", "unresolved Request — no Nix call made"]}
+      }
+    },
+    {
+      "path": "literate_report.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["O", "html", "markdown", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {
+          "patterns": [
+            "# A Literate Report in .O",
+            "The answer is <strong style=\"color: teal\">285</strong>.",
+            "Running it with `--as json` would dump the raw OValue tree."
+          ]
+        }
+      }
+    },
+    {
+      "path": "meta_eval.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["O", "markdown", "python", "quote"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["# Quote / Eval: homoiconic .O", "OExprValue", "333"]},
+        "python": {"patterns": ["# Quote / Eval: homoiconic .O", "\nOExpr\n", "333"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "nested_splice.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["42"]},
+        "python": {"result": {"tag": "int", "value": 42}}
+      }
+    },
+    {
+      "path": "nix_basic.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["O", "html", "nix"],
+        "programs": ["nix"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["Nix inside O-lang", "42"]},
+        "python": {"patterns": ["Nix inside O-lang", "42"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "nix_python_html.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["html", "nix", "python"],
+        "programs": ["nix", "python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["Nix → Python → HTML", "answer=42"]},
+        "python": {"patterns": ["Nix → Python → HTML", "answer=42"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "nix_storepath.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["html", "nix_store"],
+        "programs": ["nix"],
+        "authorities": ["fs_write", "process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["o-store-path", "/nix/store/"]},
+        "python": {"patterns": ["o-store-path", "/nix/store/"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "nix_storepath_python.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["html", "nix_store", "python"],
+        "programs": ["nix", "python3"],
+        "authorities": ["fs_read", "fs_write", "process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["Hello from O-lang + Nix"]},
+        "python": {"patterns": ["Hello from O-lang + Nix"]}
+      },
+      "timeout_seconds": 60
+    },
+    {
+      "path": "nixos_test.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["html", "nixos_test"],
+        "programs": ["nix"],
+        "authorities": ["network", "process", "virtualization"],
+        "opt_in": ["RUN_NIXOS_TESTS=1"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<h1>NixOS test result</h1>", "Success:"]},
+        "python": {"patterns": ["<h1>NixOS test result</h1>", "Success:"]}
+      },
+      "timeout_seconds": 600
+    },
+    {
+      "path": "nixos_test_two_machine.O",
+      "editions": ["rust", "python"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["html", "nixos_test"],
+        "programs": ["nix"],
+        "authorities": ["network", "process", "virtualization"],
+        "opt_in": ["RUN_NIXOS_TESTS=1"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<h1>Two-machine NixOS test</h1>"]},
+        "python": {"patterns": ["<h1>Two-machine NixOS test</h1>"]}
+      },
+      "timeout_seconds": 600
+    },
+    {
+      "path": "os_as_participant_basic.O",
+      "editions": ["rust"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["markdown", "nix_expr"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {"patterns": ["# Step-4 OS-as-participant", "current system reference:  (current_system() builtin)"]}
+      }
+    },
+    {
+      "path": "persist.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["42"]},
+        "python": {"patterns": ["42"]}
+      }
+    },
+    {
+      "path": "plan9_browser.O",
+      "editions": ["rust"],
+      "classification": "manual",
+      "requirements": {
+        "backends": ["html", "python", "ubuntu_vm"],
+        "programs": ["multipass", "python3"],
+        "guest_programs": ["apt-get", "curl", "gzip", "qemu-system-x86_64", "sudo", "websockify"],
+        "authorities": ["elevated", "fs_write", "network", "process", "virtualization"]
+      },
+      "expected": {
+        "rust": {"patterns": ["<title>Plan 9 Emulation</title>", "System ready."]}
+      },
+      "timeout_seconds": 600
+    },
+    {
+      "path": "python_html_python.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html", "python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["PAGE START", "<p>The computed number is 42.</p>", "PAGE END"]},
+        "python": {"patterns": ["PAGE START", "<p>The computed number is 42.</p>", "PAGE END"]}
+      }
+    },
+    {
+      "path": "script.O",
+      "editions": ["rust", "python"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["html"],
+        "programs": [],
+        "authorities": []
+      },
+      "expected": {
+        "rust": {"patterns": ["<h1>Hello from executable O-lang</h1>"]},
+        "python": {"patterns": ["<h1>Hello from executable O-lang</h1>"]}
+      }
+    },
+    {
+      "path": "shell_hello.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["shell"],
+        "programs": ["sh"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["hello from sh"]}
+      }
+    },
+    {
+      "path": "sql_aggregation.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["sql"],
+        "programs": ["sqlite3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["total_rows", "total_points", "[number] 3", "[number] 60"]}
+      }
+    },
+    {
+      "path": "sql_create_insert_select.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["sql"],
+        "programs": ["sqlite3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["\"name\"", "\"age\"", "Ollie", "[number] 3"]}
+      }
+    },
+    {
+      "path": "sql_python_sql.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["python", "sql"],
+        "programs": ["python3", "sqlite3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["[number] 200"]}
+      }
+    },
+    {
+      "path": "sql_select.O",
+      "editions": ["rust"],
+      "classification": "integration",
+      "requirements": {
+        "backends": ["sql"],
+        "programs": ["sqlite3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["[number] 2"]}
+      }
+    },
+    {
+      "path": "trailing_expr.O",
+      "editions": ["rust", "c17"],
+      "classification": "unit",
+      "requirements": {
+        "backends": ["python"],
+        "programs": ["python3"],
+        "authorities": ["process"]
+      },
+      "expected": {
+        "rust": {"patterns": ["42"]},
+        "c17": {"patterns": ["42"]}
+      }
+    }
+  ]
+}

@@ -278,10 +278,7 @@ mod tests {
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
             Some(Fidelity::Structural {
-                lost: BTreeSet::from([
-                    AnnotationKind::NumericExactness,
-                    AnnotationKind::TypeTag
-                ]),
+                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
             })
         );
     }

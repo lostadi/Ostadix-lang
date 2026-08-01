@@ -1,0 +1,5 @@
+module kernel::m5_selftest;
+
+pub const SELF_TEST_PASS: u64 = 0x4d35_4350_4c4e_5041;
+
+pub unsafe fn self_test() -> u64 { return 0; }

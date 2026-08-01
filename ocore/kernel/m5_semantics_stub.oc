@@ -1,0 +1,8 @@
+module kernel::m5_semantics;
+
+// Mode 17 alone links the native-control/package semantics oracle.
+pub unsafe fn start(mode: u64) -> never {
+    let _unused_mode: u64 = mode;
+    disable_interrupts();
+    loop { halt(); }
+}

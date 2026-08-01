@@ -128,8 +128,11 @@ pub unsafe fn ocore_m2_block_one_entry(capability: u64) -> never {
     sleep_ticks(4);
     emit(capability, (&BLOCK_ONE_MESSAGE[0]), 27);
     volatile_store((ISOLATION_VA + 8) as *mut u64, 1);
-    // Accrue a post-wake timer tick before deliberately presenting an invalid
-    // saved RSP at a scheduling syscall. The kernel must retire only this TCB.
+    // Accrue two explicit post-wake timer ticks before deliberately presenting
+    // an invalid saved RSP at a scheduling syscall. Do not rely on a PIT IRQ
+    // becoming pending while the preceding serial syscall happens to run: TCG
+    // host load can otherwise leave this TCB with only one accounted tick.
+    wait_for_timer_tick();
     wait_for_timer_tick();
     ocore_m2_hostile_rsp_yield();
 }

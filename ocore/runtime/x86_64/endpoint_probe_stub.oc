@@ -1,0 +1,238 @@
+module runtime::endpoint;
+
+// KernelWorld probe Modes 20-23 do not exercise the native IPC subsystem.
+// They still pass through the common kernel bootstrap, which requires the
+// endpoint registry's one-shot initialization contract, and the other linked
+// milestone modules still import this public surface.  Keep that contract
+// explicit while rejecting every endpoint operation.  Modes 0-19 link the
+// complete four-message endpoint implementation instead.
+
+pub const MAX_ENDPOINTS: usize = 8;
+pub const ENDPOINT_QUEUE_CAPACITY: usize = 4;
+pub const MAX_BLOCKED_SENDERS: usize = 4;
+
+pub const ENDPOINT_CLOSE_NONE: u64 = 0;
+pub const ENDPOINT_CLOSE_NORMAL: u64 = 1;
+pub const ENDPOINT_CLOSE_CRASH: u64 = 2;
+
+pub const ENDPOINT_WAITER_NONE: u64 = 0;
+pub const ENDPOINT_WAITER_RECEIVER: u64 = 1;
+pub const ENDPOINT_WAITER_SENDER: u64 = 2;
+
+static mut INITIALIZED: u8 = 0;
+static mut REJECTED_OPERATION: u8 = 0;
+
+unsafe fn reject() -> u64 {
+    REJECTED_OPERATION = 1;
+    return 0;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    return INITIALIZED == 1 && REJECTED_OPERATION == 0;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || REJECTED_OPERATION != 0 {
+        return 0;
+    }
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn create(receiver_cspace_owner: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn is_live(handle: u64) -> bool {
+    reject();
+    return false;
+}
+
+pub unsafe fn handle_for_slot(slot: usize) -> u64 {
+    return reject();
+}
+
+pub unsafe fn is_draining(handle: u64) -> bool {
+    reject();
+    return false;
+}
+
+pub unsafe fn receiver_cspace_owner(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn reference_count(handle: u64) -> u32 {
+    reject();
+    return 0;
+}
+
+pub unsafe fn retain(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn release(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn close(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn crash(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn close_reason(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn discarded_message_count(handle: u64) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn message_count(handle: u64) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn pending_capability_cleanup_count(handle: u64) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn has_queue_capacity(handle: u64) -> bool {
+    reject();
+    return false;
+}
+
+pub unsafe fn take_capability_cleanup(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn enqueue(
+    handle: u64,
+    sender_process: u64,
+    correlation: u64,
+    scalar_payload: u64,
+    destination_capability: u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn peek_head(
+    handle: u64,
+    sender_process: *mut u64,
+    correlation: *mut u64,
+    scalar_payload: *mut u64,
+    destination_capability: *mut u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn commit_head(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn dequeue(
+    handle: u64,
+    sender_process: *mut u64,
+    correlation: *mut u64,
+    scalar_payload: *mut u64,
+    destination_capability: *mut u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn cancel_by_sender(
+    handle: u64,
+    sender_process: u64
+) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn cancel_by_correlation(
+    handle: u64,
+    correlation: u64
+) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn cancel_by_sender_correlation(
+    handle: u64,
+    sender_process: u64,
+    correlation: u64
+) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn register_receiver_waiter(
+    handle: u64,
+    thread_handle: u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn take_receiver_waiter(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn register_sender_waiter(
+    handle: u64,
+    thread_handle: u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn take_sender_waiter(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn sender_waiter(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn waiter_matches(
+    handle: u64,
+    kind: u64,
+    thread_handle: u64
+) -> bool {
+    reject();
+    return false;
+}
+
+pub unsafe fn remove_waiter(
+    handle: u64,
+    kind: u64,
+    thread_handle: u64
+) -> u64 {
+    return reject();
+}
+
+pub unsafe fn receiver_waiter(handle: u64) -> u64 {
+    return reject();
+}
+
+pub unsafe fn sender_waiter_count(handle: u64) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn cancelled_waiter_count(handle: u64) -> usize {
+    reject();
+    return 0;
+}
+
+pub unsafe fn take_cancelled_waiter(
+    handle: u64,
+    kind_out: *mut u64
+) -> u64 {
+    return reject();
+}

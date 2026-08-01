@@ -4,19 +4,21 @@
 #   make clean
 #   make test       # smoke tests on core examples (requires python3 + backends/)
 #   ./O ../examples/hello.O ../backends
-#   ./olangc ../examples/hello.O -o /tmp/hello_c && /tmp/hello_c
+#   mkdir -p /tmp/hello-c17
+#   ./olangc ../examples/hello.O -o /tmp/hello-c17/hello && /tmp/hello-c17/hello
 #
 # Requirements: C compiler (cc/clang/gcc), make, python3 (for python^ shims)
 # Optional: nix (for nix_* examples and builtins)
 #
-# The produced ./olangc and ./O are pure C. olangc-produced binaries
-# are self-contained native executables (still need python3/nix on target
-# for the languages the .O program uses).
+# The produced ./olangc and ./O are pure C. Each olangc application is a
+# native executable plus its required <executable>.shims directory (and still
+# needs python3/nix on the target for languages used by the .O program).
 
 CC ?= cc
 CFLAGS = -std=c17 -Wall -Wextra -Wpedantic -O2 -Iinclude \
          -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 LDFLAGS = -pthread
+STRICT_CFLAGS = $(CFLAGS) -Werror
 
 # Core runtime (pure C)
 CORE_SRCS = \
@@ -40,7 +42,7 @@ O: $(CORE_OBJS) src/main.o
 olangc: $(CORE_OBJS) src/olangc.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built ./olangc (AOT compiler)"
-	@echo "Try: ./olangc ../examples/hello.O -o /tmp/hello_c && /tmp/hello_c"
+	@echo "Try: mkdir -p /tmp/hello-c17 && ./olangc ../examples/hello.O -o /tmp/hello-c17/hello && /tmp/hello-c17/hello"
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -53,33 +55,36 @@ src/olangc.o: src/olangc.c
 
 clean:
 	rm -f O olangc src/*.o src/main.o src/olangc.o
-	rm -rf /tmp/o-build-* /tmp/o_shims_* /tmp/hello_c /tmp/meta_c 2>/dev/null || true
 	@echo "Cleaned."
 
 # Smoke test core (no-nix) examples. Adjust path to backends if needed.
 # Run from c_cpp/ dir.
 test: all
-	@echo "=== Testing O (interpreter) on core examples ==="
-	@./O ../examples/hello.O ../backends | grep -q '2' && echo "hello.O: OK"
-	@./O ../examples/bindings.O ../backends | grep -q '43' && echo "bindings.O: OK"
-	@./O ../examples/trailing_expr.O ../backends | grep -q '42' && echo "trailing_expr.O: OK"
-	@./O ../examples/meta_eval.O ../backends > /tmp/meta.out 2>&1 && grep -q '1024\|42' /tmp/meta.out && echo "meta_eval.O (quote/O.eval): OK" || (echo "meta_eval failed; output:"; cat /tmp/meta.out; exit 1)
-	@./O ../examples/html_basic.O ../backends | grep -q 'The answer is 42' && echo "html_basic.O: OK"
-	@echo "=== All core smoke tests passed ==="
+	@echo "=== Testing manifest-selected C17 interpreter examples ==="
+	@python3 ../tests/example_manifest.py run \
+		--edition c17 --runner ./O --backends ../backends
 
-# Test AOT path: compile an example with olangc and run the result.
+# Test AOT path for the manifest entries that declare C17 AOT support.
 olangc-test: all
-	@echo "=== Testing olangc AOT on hello.O ==="
-	@./olangc ../examples/hello.O -o /tmp/hello_c
-	@/tmp/hello_c | grep -q '2' && echo "olangc hello -> /tmp/hello_c: OK"
-	@echo "=== Testing olangc AOT on meta_eval.O (homoiconicity) ==="
-	@./olangc ../examples/meta_eval.O -o /tmp/meta_c
-	@/tmp/meta_c > /tmp/meta_c.out 2>&1 && grep -q '1024\|42' /tmp/meta_c.out && echo "olangc meta_eval: OK" || (echo "AOT meta failed:"; cat /tmp/meta_c.out; exit 1)
-	@echo "AOT smoke OK. Binaries are self-contained C (no cargo)."
+	@echo "=== Testing manifest-selected C17 AOT examples ==="
+	@python3 ../tests/example_manifest.py run-c17-aot \
+		--compiler ./olangc --backends ../backends
+
+# Regression for argv-based compiler launch and literal handling of spaces and
+# shell metacharacters in TMPDIR, input/output/shim paths, and CC.
+path-test: all
+	@sh tests/test_olangc_paths.sh ./olangc "$(CC)" ./O
+
+# Release-clean native + generated-AOT path. OLANGC_WARNINGS_AS_ERRORS makes
+# the compiler apply -Werror to the copied runtime and generated_main.c too.
+warnings-as-errors:
+	@$(MAKE) clean
+	@$(MAKE) CFLAGS="$(STRICT_CFLAGS)" all test
+	@OLANGC_WARNINGS_AS_ERRORS=1 $(MAKE) CFLAGS="$(STRICT_CFLAGS)" olangc-test path-test
 
 # One-shot run helper: make run EX=hello  (uses ../examples/hello.O)
 run:
-	@if [ -z "$(EX)" ]; then echo "Usage: make run EX=hello  (or bindings, meta_eval, html_basic, ...)"; exit 1; fi
+	@if [ -z "$(EX)" ]; then echo "Usage: make run EX=hello  (or bindings, html_basic, ...)"; exit 1; fi
 	@./O ../examples/$(EX).O ../backends
 
-.PHONY: all clean test olangc-test run
+.PHONY: all clean test olangc-test path-test warnings-as-errors run

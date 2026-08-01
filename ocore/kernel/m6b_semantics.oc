@@ -1,5 +1,7 @@
 module kernel::m6b_semantics;
 
+use kernel::linux_personality_semantics::self_test as linux_semantics_self_test;
+use kernel::linux_personality_semantics::LINUX_MINIMAL_SEMANTICS_PASS;
 use runtime::capability::begin_cspace_drain;
 use runtime::capability::cspace_handle_for_slot;
 use runtime::capability::destroy_cspace;
@@ -14,7 +16,11 @@ use runtime::delegated_resource::active_count as active_resource_count;
 use runtime::delegated_resource::bind_view as bind_resource_view;
 use runtime::delegated_resource::cap_close_sequence as resource_cap_close_sequence;
 use runtime::delegated_resource::create as create_resource;
+use runtime::delegated_resource::create_bound as create_bound_resource;
 use runtime::delegated_resource::destroy as destroy_resource;
+use runtime::delegated_resource::bind_failure_arm_count;
+use runtime::delegated_resource::bind_failure_count;
+use runtime::delegated_resource::inject_bind_failure_once;
 use runtime::delegated_resource::init as delegated_resources_init;
 use runtime::delegated_resource::invariants_hold as resource_invariants_hold;
 use runtime::delegated_resource::is_live as resource_is_live;
@@ -101,10 +107,14 @@ static TERMINAL_MESSAGE: [u8; 51] =
     b"M6B revoke-before-terminal + wake-once paths: PASS\n";
 static RESOURCE_MESSAGE: [u8; 46] =
     b"M6B five delegated lease classes revoke: PASS\n";
+static RESOURCE_ROLLBACK_MESSAGE: [u8; 48] =
+    b"M6B delegated lease bind-failure rollback: PASS\n";
 static ISOLATION_MESSAGE: [u8; 57] =
     b"M6B request-wide revoke + unrelated-scope survival: PASS\n";
 static TEARDOWN_MESSAGE: [u8; 46] =
     b"M6B reply cleanup + drain-safe teardown: PASS\n";
+static LINUX_ADMIN_MESSAGE: [u8; 65] =
+    b"M6B minimal Linux fd/classification kernel-admin semantics: PASS\n";
 static COMPLETE_MESSAGE: [u8; 41] =
     b"M6B bounded native mechanism slice: PASS\n";
 static POST_TIMER_MESSAGE: [u8; 33] =
@@ -586,6 +596,56 @@ unsafe fn delegated_resource_classes(
     return true;
 }
 
+unsafe fn delegated_bind_failure_rolls_back(
+    process: u64,
+    address_space: u64,
+    service_cspace: u64
+) -> bool {
+    let scope: u64 = request();
+    let mut view_cap: u64 = 0;
+    let view: u64 = scoped_view(
+        scope,
+        process,
+        address_space,
+        USER_IMAGE_START,
+        1,
+        MEMORY_VIEW_DIRECTION_IN,
+        service_cspace,
+        (&mut view_cap)
+    );
+    if view == 0 || resource_for(view) != 0 {
+        return false;
+    }
+    let resources_before: usize = active_resource_count();
+    let slots_with_view: usize = live_slots_for_owner(service_cspace);
+    let mut resource_cap: u64 = 0xffff_ffff_ffff_ffff;
+    if inject_bind_failure_once() != 1
+        || create_bound_resource(
+            scope,
+            DELEGATED_RESOURCE_DEVICE,
+            service_cspace,
+            view,
+            (&mut resource_cap)
+        ) != 0
+        || resource_cap != 0
+        || bind_failure_arm_count() != 1
+        || bind_failure_count() != 1
+        || active_resource_count() != resources_before
+        || live_slots_for_owner(service_cspace) != slots_with_view
+        || resource_for(view) != 0
+        || !view_is_live(view)
+        || !view_invariants_hold()
+        || !resource_invariants_hold()
+        || cancel_view(view) != 1
+        || !ordered_terminal(view, MEMORY_VIEW_TERMINAL_CANCELLED)
+        || discard_terminal(view) != 1
+        || live_slots_for_owner(service_cspace) != slots_with_view - 1 {
+        return false;
+    }
+    write((&RESOURCE_ROLLBACK_MESSAGE[0]), 48);
+    return true;
+}
+
 unsafe fn unrelated_scope_survives(
     process: u64,
     address_space: u64,
@@ -1000,6 +1060,11 @@ pub unsafe fn start(
             address_space,
             service_cspace
         )
+        || !delegated_bind_failure_rolls_back(
+            process,
+            address_space,
+            service_cspace
+        )
         || !unrelated_scope_survives(
             process,
             address_space,
@@ -1017,6 +1082,11 @@ pub unsafe fn start(
         ) {
         fail_closed();
     }
+
+    if linux_semantics_self_test() != LINUX_MINIMAL_SEMANTICS_PASS {
+        fail_closed();
+    }
+    write((&LINUX_ADMIN_MESSAGE[0]), 65);
 
     if active_view_count() != 0
         || view_charged_bytes() != 0

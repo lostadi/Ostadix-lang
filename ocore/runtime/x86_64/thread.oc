@@ -970,6 +970,16 @@ pub unsafe fn set_saved_result(handle: u64, result: u64) -> u64 {
     return 1;
 }
 
+pub unsafe fn saved_result(handle: u64) -> u64 {
+    let slot: usize = checked_thread(handle);
+    if slot >= MAX_THREADS
+        || !active_state(STATES[slot])
+        || !validate_frame(slot) {
+        return 0;
+    }
+    return FRAMES[frame_index(slot, FRAME_RAX)];
+}
+
 // Phase one removes the FIFO head and publishes a DISPATCHING tombstone. No
 // running identity or switch accounting changes until commit_next succeeds.
 pub unsafe fn prepare_next() -> u64 {
