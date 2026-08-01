@@ -533,6 +533,44 @@ Linux. This bounded-copy gate also does not close the broader pinned-window,
 streaming, signal, SMP, or general concurrent mapping-race M7 acceptance
 matrix.
 
+Mode 26 is the next execution-and-service vertical slice. It retains Mode 25's
+exact 8,520-byte Linux x86-64 ELF and adds an unprivileged native 9P2000 server,
+native supervisor, and independently linked native Plan-9-style client. The
+deterministic builder packages exactly `/bin/linux-minimal.elf`,
+`/sbin/linux-9pd.elf`, `/sbin/linux-supervisord.elf`, and
+`/bin/plan9-namespace-client.elf` into a 92,872-byte OVFS image with SHA-256
+`920b014cfb133f033b6761da6fe5b1d22be613bf88112c05ec0af982e1beebd9`.
+The builder double-compiles each native principal, rejects dynamic or W+X ELF
+profiles, double-packs the image, and runs an independent exact-wire oracle
+before the image is admitted.
+
+The Linux ELF again completes the exact stdout and stderr writes through
+generation-scoped bounded views. The 9P server snapshots only the corresponding
+20-byte result and exposes it at `/srv/linux/status`; the Plan-9-style client
+receives only a generation-bound bounded-call capability. With `msize = 128`,
+it executes exact 9P2000 version, attach, walk, open, read, and clunk messages.
+Generation 1 also proves sequence, unsupported-version, missing-path,
+write-open, and excessive-count errors. After the first read and clunk, the
+server faults deliberately. O-core withdraws the generation-1 namespace and
+call authority, preserves both clients, installs and health-publishes a fresh
+server, and denies the stale generation-1 client capability. Generation 2 then
+serves the exact stderr snapshot before the Linux `-ENOSYS`, `exit_group(42)`,
+supervisor stop, complete reclamation, and later-timer checks finish.
+
+Run the live Linux-to-9P evidence gate with:
+
+```bash
+./ocore/kernel/smoke-live-linux-plan9-qemu.sh
+```
+
+This is real 9P2000 wire behavior between bounded native CPL3 service
+principals; it is not a Plan 9 kernel or binary. Mode 26 does not boot Linux or
+Plan 9, provide a distribution, root filesystem, dynamic linker, general Linux
+ABI, general 9P server, Plan 9 namespace or mount environment, network
+transport, persistent filesystem, or guest-agent framework. QEMU TCG is not
+KVM/SVM or physical-hardware evidence. PCI or physical-device assignment, DMA,
+IOMMU, interrupt remapping, and hardware reset remain outside this gate.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests

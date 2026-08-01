@@ -1,0 +1,23 @@
+module runtime::image_vfs_storage;
+
+// Historical probes retain two 64 KiB image slots and their original kernel
+// growth reserve. Mode 26 selects the larger implementation at build time.
+pub const IMAGE_BYTE_CAPACITY: usize = 65536;
+const STORAGE_BYTE_CAPACITY: usize = 131072;
+
+static mut BYTES: [u8; 131072] = [0; 131072];
+
+pub unsafe fn read(index: usize) -> u64 {
+    if index >= STORAGE_BYTE_CAPACITY {
+        return 0x100;
+    }
+    return BYTES[index] as u64;
+}
+
+pub unsafe fn write(index: usize, value: u64) -> u64 {
+    if index >= STORAGE_BYTE_CAPACITY || value > 0xff {
+        return 0;
+    }
+    BYTES[index] = value as u8;
+    return 1;
+}

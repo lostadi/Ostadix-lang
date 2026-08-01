@@ -1,0 +1,850 @@
+module runtime::m7_linux_9pd;
+
+// M7 keeps the Linux personality completion and the Plan 9 namespace client
+// on the same bounded RPC surface.  Neither foreign integer namespace is
+// treated as an O-core capability: the kernel-side bridge has already checked
+// the sender, request generation, direction, and exact view geometry before a
+// request can reach this native daemon.
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_ENDPOINT_SEND: u64 = 9;
+const SYS_ENDPOINT_RECEIVE: u64 = 10;
+const SYS_PERSONALITY_VIEW_LOOKUP: u64 = 18;
+const SYS_PERSONALITY_VIEW_READ: u64 = 19;
+const SYS_PERSONALITY_VIEW_WRITE: u64 = 20;
+const SYS_PERSONALITY_BOUNDED_REPLY: u64 = 21;
+const SYS_LINUX_MINIMAL_COMPLETE: u64 = 22;
+
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_PERSONALITY_STALE: u64 = 0xffff_ffff_ffff_ffd4;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const GENERATION_OFFSET: usize = 16;
+const INBOX_CAP_OFFSET: usize = 32;
+const PERSONALITY_REPLY_CAP_OFFSET: usize = 40;
+const DIRECT_REPLY_CAP_OFFSET: usize = 48;
+const LINUX_PROCESS_OFFSET: usize = 56;
+const SUPERVISOR_PROCESS_OFFSET: usize = 64;
+const PRIOR_REQUEST_OFFSET: usize = 72;
+const PLAN9_PROCESS_OFFSET: usize = 80;
+const MESSAGE_OFFSET: usize = 128;
+const MESSAGE_SIZE: u64 = 32;
+
+const LINUX_NR_WRITE: u64 = 1;
+const LINUX_FD_STDOUT: u64 = 1;
+const LINUX_FD_STDERR: u64 = 2;
+const LINUX_DATA_LENGTH: usize = 20;
+const WRITE_FRAME_FD_MASK: u64 = 0x0000_ffff_ffff_ffff;
+const WRITE_FRAME_LENGTH_MASK: u64 = 0xff;
+
+const OP_HEALTH: u64 = 0x80;
+const OP_STOP: u64 = 0x82;
+const OP_9P: u64 = 0x90;
+const HEALTH_OK: u64 = 0x4d37_5048_4541_4c00;
+const STOP_READY: u64 = 0x4d37_5053_544f_5000;
+
+const TVERSION: u64 = 100;
+const RVERSION: u64 = 101;
+const TATTACH: u64 = 104;
+const RATTACH: u64 = 105;
+const RERROR: u64 = 107;
+const TWALK: u64 = 110;
+const RWALK: u64 = 111;
+const TOPEN: u64 = 112;
+const ROPEN: u64 = 113;
+const TREAD: u64 = 116;
+const RREAD: u64 = 117;
+const TCLUNK: u64 = 120;
+const RCLUNK: u64 = 121;
+
+const NOTAG: u64 = 0xffff;
+const NOFID: u64 = 0xffff_ffff;
+const ROOT_FID: u64 = 1;
+const FILE_FID: u64 = 2;
+const OREAD: u64 = 0;
+const QTDIR: u64 = 0x80;
+const MAX_9P_MESSAGE: u64 = 128;
+
+const STATE_UNVERSIONED: u64 = 0;
+const STATE_VERSIONED: u64 = 1;
+const STATE_ATTACHED: u64 = 2;
+const STATE_WALKED: u64 = 3;
+const STATE_OPENED: u64 = 4;
+const STATE_READ: u64 = 5;
+const STATE_CLUNKED: u64 = 6;
+
+const ERROR_SEQUENCE: u64 = 1;
+const ERROR_PATH: u64 = 2;
+const ERROR_MODE: u64 = 3;
+const ERROR_COUNT: u64 = 4;
+
+@link_section(".rodata")
+static G1_ONLINE: [u8; 30] =
+    b"M7 Linux 9P daemon g1: online\n";
+@link_section(".rodata")
+static G1_SNAPSHOT: [u8; 30] =
+    b"M7 Linux 9P snapshot g1: PASS\n";
+@link_section(".rodata")
+static G1_SERVICE: [u8; 29] =
+    b"M7 Linux 9P service g1: PASS\n";
+@link_section(".rodata")
+static G1_FAULT: [u8; 40] =
+    b"M7 Linux 9P daemon g1: deliberate fault\n";
+@link_section(".rodata")
+static G2_ONLINE: [u8; 30] =
+    b"M7 Linux 9P daemon g2: online\n";
+@link_section(".rodata")
+static STALE_G1: [u8; 27] =
+    b"M7 Linux 9P stale g1: PASS\n";
+@link_section(".rodata")
+static G2_SNAPSHOT: [u8; 30] =
+    b"M7 Linux 9P snapshot g2: PASS\n";
+@link_section(".rodata")
+static G2_SERVICE: [u8; 29] =
+    b"M7 Linux 9P service g2: PASS\n";
+@link_section(".rodata")
+static STOPPING: [u8; 34] =
+    b"M7 Linux 9P daemon g2: stop ready\n";
+
+@link_section(".rodata")
+static VERSION_9P2000: [u8; 6] = b"9P2000";
+@link_section(".rodata")
+static VERSION_UNKNOWN: [u8; 7] = b"unknown";
+@link_section(".rodata")
+static ENAME_SEQUENCE: [u8; 8] = b"sequence";
+@link_section(".rodata")
+static ENAME_PATH: [u8; 4] = b"path";
+@link_section(".rodata")
+static ENAME_MODE: [u8; 4] = b"mode";
+@link_section(".rodata")
+static ENAME_COUNT: [u8; 5] = b"count";
+@link_section(".rodata")
+static WALK_SRV: [u8; 3] = b"srv";
+@link_section(".rodata")
+static WALK_LINUX: [u8; 5] = b"linux";
+@link_section(".rodata")
+static WALK_STATUS: [u8; 6] = b"status";
+
+// This BSS is mapped privately in each restarted daemon process.  The 9P
+// Tread therefore exposes only the Linux write completed in the same service
+// generation, never bytes retained by a prior generation.
+static mut LINUX_DATA: [u8; 20] = [0; 20];
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+unsafe fn wait_nonzero(offset: usize) -> u64 {
+    loop {
+        let value: u64 = config(offset);
+        if value != 0 {
+            return value;
+        }
+        yield_once();
+    }
+}
+
+unsafe fn receive(capability: u64) -> void {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            capability,
+            (CONFIG_VA + MESSAGE_OFFSET) as u64,
+            MESSAGE_SIZE
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn word(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + MESSAGE_OFFSET + offset) as *const u64);
+}
+
+unsafe fn direct_reply(
+    capability: u64,
+    correlation: u64,
+    scalar: u64
+) -> void {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            capability,
+            correlation,
+            scalar,
+            0
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn lookup(reply_capability: u64, request: u64) -> u64 {
+    let view: u64 = syscall2(
+        SYS_PERSONALITY_VIEW_LOOKUP,
+        reply_capability,
+        request
+    );
+    if view == 0 || (view >> 32) == 0xffff_ffff {
+        stop();
+    }
+    return view;
+}
+
+unsafe fn view_byte(view: u64, offset: u64) -> u64 {
+    let value: u64 = syscall2(SYS_PERSONALITY_VIEW_READ, view, offset);
+    if value > 0xff {
+        stop();
+    }
+    return value;
+}
+
+unsafe fn put_byte(view: u64, offset: u64, value: u64) -> void {
+    if value > 0xff
+        || syscall3(SYS_PERSONALITY_VIEW_WRITE, view, offset, value) != 1 {
+        stop();
+    }
+}
+
+unsafe fn get_u16(view: u64, offset: u64) -> u64 {
+    return view_byte(view, offset)
+        | (view_byte(view, offset + 1) << 8);
+}
+
+unsafe fn get_u32(view: u64, offset: u64) -> u64 {
+    return view_byte(view, offset)
+        | (view_byte(view, offset + 1) << 8)
+        | (view_byte(view, offset + 2) << 16)
+        | (view_byte(view, offset + 3) << 24);
+}
+
+unsafe fn get_u64(view: u64, offset: u64) -> u64 {
+    let low: u64 = get_u32(view, offset);
+    let high: u64 = get_u32(view, offset + 4);
+    return low | (high << 32);
+}
+
+unsafe fn put_u16(view: u64, offset: u64, value: u64) -> void {
+    put_byte(view, offset, value & 0xff);
+    put_byte(view, offset + 1, (value >> 8) & 0xff);
+}
+
+unsafe fn put_u32(view: u64, offset: u64, value: u64) -> void {
+    put_byte(view, offset, value & 0xff);
+    put_byte(view, offset + 1, (value >> 8) & 0xff);
+    put_byte(view, offset + 2, (value >> 16) & 0xff);
+    put_byte(view, offset + 3, (value >> 24) & 0xff);
+}
+
+unsafe fn put_u64(view: u64, offset: u64, value: u64) -> void {
+    put_u32(view, offset, value & 0xffff_ffff);
+    put_u32(view, offset + 4, value >> 32);
+}
+
+unsafe fn literal_byte(pointer: *const u8, index: usize) -> u64 {
+    return volatile_load(
+        (pointer as usize + index) as *const u8
+    ) as u64;
+}
+
+unsafe fn matches_literal(
+    view: u64,
+    offset: u64,
+    pointer: *const u8,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if view_byte(view, offset + index as u64)
+            != literal_byte(pointer, index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn put_literal(
+    view: u64,
+    offset: u64,
+    pointer: *const u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        put_byte(
+            view,
+            offset + index as u64,
+            literal_byte(pointer, index)
+        );
+        index += 1;
+    }
+}
+
+unsafe fn response_header(view: u64, kind: u64, tag: u64) -> void {
+    put_byte(view, 4, kind);
+    put_u16(view, 5, tag);
+}
+
+unsafe fn bounded_reply(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    length: u64
+) -> void {
+    put_u32(view, 0, length);
+    if syscall5(
+        SYS_PERSONALITY_BOUNDED_REPLY,
+        reply_capability,
+        request,
+        view,
+        length,
+        length
+    ) != 1 {
+        stop();
+    }
+}
+
+unsafe fn put_qid(
+    view: u64,
+    offset: u64,
+    qtype: u64,
+    generation: u64,
+    path: u64
+) -> void {
+    put_byte(view, offset, qtype);
+    put_u32(view, offset + 1, generation & 0xffff_ffff);
+    put_u64(view, offset + 5, path);
+}
+
+unsafe fn reply_error(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64,
+    error: u64
+) -> void {
+    response_header(view, RERROR, tag);
+    if error == ERROR_SEQUENCE {
+        put_u16(view, 7, 8);
+        put_literal(view, 9, (&ENAME_SEQUENCE[0]), 8);
+        bounded_reply(reply_capability, request, view, 17);
+        return;
+    }
+    if error == ERROR_PATH {
+        put_u16(view, 7, 4);
+        put_literal(view, 9, (&ENAME_PATH[0]), 4);
+        bounded_reply(reply_capability, request, view, 13);
+        return;
+    }
+    if error == ERROR_MODE {
+        put_u16(view, 7, 4);
+        put_literal(view, 9, (&ENAME_MODE[0]), 4);
+        bounded_reply(reply_capability, request, view, 13);
+        return;
+    }
+    if error == ERROR_COUNT {
+        put_u16(view, 7, 5);
+        put_literal(view, 9, (&ENAME_COUNT[0]), 5);
+        bounded_reply(reply_capability, request, view, 14);
+        return;
+    }
+    stop();
+}
+
+unsafe fn reply_version(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64,
+    supported: bool
+) -> void {
+    response_header(view, RVERSION, tag);
+    put_u32(view, 7, MAX_9P_MESSAGE);
+    if supported {
+        put_u16(view, 11, 6);
+        put_literal(view, 13, (&VERSION_9P2000[0]), 6);
+        bounded_reply(reply_capability, request, view, 19);
+    } else {
+        put_u16(view, 11, 7);
+        put_literal(view, 13, (&VERSION_UNKNOWN[0]), 7);
+        bounded_reply(reply_capability, request, view, 20);
+    }
+}
+
+unsafe fn reply_attach(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64,
+    generation: u64
+) -> void {
+    response_header(view, RATTACH, tag);
+    put_qid(view, 7, QTDIR, generation, 1);
+    bounded_reply(reply_capability, request, view, 20);
+}
+
+unsafe fn reply_walk(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64,
+    generation: u64
+) -> void {
+    response_header(view, RWALK, tag);
+    put_u16(view, 7, 3);
+    put_qid(view, 9, QTDIR, generation, 2);
+    put_qid(view, 22, QTDIR, generation, 3);
+    put_qid(view, 35, 0, generation, 4);
+    bounded_reply(reply_capability, request, view, 48);
+}
+
+unsafe fn reply_open(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64,
+    generation: u64
+) -> void {
+    response_header(view, ROPEN, tag);
+    put_qid(view, 7, 0, generation, 4);
+    put_u32(view, 20, MAX_9P_MESSAGE);
+    bounded_reply(reply_capability, request, view, 24);
+}
+
+unsafe fn reply_read(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64
+) -> void {
+    response_header(view, RREAD, tag);
+    put_u32(view, 7, LINUX_DATA_LENGTH as u64);
+    let mut index: usize = 0;
+    while index < LINUX_DATA_LENGTH {
+        put_byte(view, 11 + index as u64, LINUX_DATA[index] as u64);
+        index += 1;
+    }
+    bounded_reply(
+        reply_capability,
+        request,
+        view,
+        11 + LINUX_DATA_LENGTH as u64
+    );
+}
+
+unsafe fn reply_clunk(
+    reply_capability: u64,
+    request: u64,
+    view: u64,
+    tag: u64
+) -> void {
+    response_header(view, RCLUNK, tag);
+    bounded_reply(reply_capability, request, view, 7);
+}
+
+unsafe fn handle_9p(
+    reply_capability: u64,
+    request: u64,
+    generation: u64,
+    state: u64,
+    linux_ready: bool
+) -> u64 {
+    let view: u64 = lookup(reply_capability, request);
+    let size: u64 = get_u32(view, 0);
+    let kind: u64 = view_byte(view, 4);
+    let tag: u64 = get_u16(view, 5);
+    if size < 7 || size > MAX_9P_MESSAGE {
+        stop();
+    }
+
+    // A syntactically valid attach before Tversion is a protocol sequencing
+    // error.  The state is intentionally unchanged so the caller can recover
+    // with either an unsupported probe or a real 9P2000 negotiation.
+    if state == STATE_UNVERSIONED && kind == TATTACH {
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_SEQUENCE
+        );
+        return state;
+    }
+
+    if kind == TVERSION {
+        if state != STATE_UNVERSIONED
+            || size < 13
+            || size != 13 + get_u16(view, 11) {
+            reply_error(
+                reply_capability,
+                request,
+                view,
+                tag,
+                ERROR_SEQUENCE
+            );
+            return state;
+        }
+        let supported: bool = get_u32(view, 7) == MAX_9P_MESSAGE
+            && get_u16(view, 11) == 6
+            && matches_literal(view, 13, (&VERSION_9P2000[0]), 6);
+        reply_version(
+            reply_capability,
+            request,
+            view,
+            tag,
+            supported
+        );
+        if supported {
+            return STATE_VERSIONED;
+        }
+        return STATE_UNVERSIONED;
+    }
+
+    if state == STATE_VERSIONED && kind == TATTACH {
+        if size == 19
+            && get_u32(view, 7) == ROOT_FID
+            && get_u32(view, 11) == NOFID
+            && get_u16(view, 15) == 0
+            && get_u16(view, 17) == 0 {
+            reply_attach(
+                reply_capability,
+                request,
+                view,
+                tag,
+                generation
+            );
+            return STATE_ATTACHED;
+        }
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_SEQUENCE
+        );
+        return state;
+    }
+
+    if state == STATE_ATTACHED && kind == TWALK {
+        let exact_path: bool = size == 37
+            && get_u32(view, 7) == ROOT_FID
+            && get_u32(view, 11) == FILE_FID
+            && get_u16(view, 15) == 3
+            && get_u16(view, 17) == 3
+            && matches_literal(view, 19, (&WALK_SRV[0]), 3)
+            && get_u16(view, 22) == 5
+            && matches_literal(view, 24, (&WALK_LINUX[0]), 5)
+            && get_u16(view, 29) == 6
+            && matches_literal(view, 31, (&WALK_STATUS[0]), 6);
+        if exact_path {
+            reply_walk(
+                reply_capability,
+                request,
+                view,
+                tag,
+                generation
+            );
+            return STATE_WALKED;
+        }
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_PATH
+        );
+        return state;
+    }
+
+    if state == STATE_WALKED && kind == TOPEN {
+        if size == 12
+            && get_u32(view, 7) == FILE_FID
+            && view_byte(view, 11) == OREAD {
+            reply_open(
+                reply_capability,
+                request,
+                view,
+                tag,
+                generation
+            );
+            return STATE_OPENED;
+        }
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_MODE
+        );
+        return state;
+    }
+
+    if state == STATE_OPENED && kind == TREAD {
+        let count: u64 = get_u32(view, 19);
+        if size == 23
+            && get_u32(view, 7) == FILE_FID
+            && get_u64(view, 11) == 0
+            && count == LINUX_DATA_LENGTH as u64
+            && linux_ready {
+            reply_read(reply_capability, request, view, tag);
+            return STATE_READ;
+        }
+        // The bounded service supports only the pinned 20-byte status read;
+        // the explicit over-msize case is recoverable under the same state.
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_COUNT
+        );
+        return state;
+    }
+
+    if state == STATE_READ && kind == TCLUNK {
+        if size == 11 && get_u32(view, 7) == FILE_FID {
+            reply_clunk(reply_capability, request, view, tag);
+            return STATE_CLUNKED;
+        }
+        reply_error(
+            reply_capability,
+            request,
+            view,
+            tag,
+            ERROR_SEQUENCE
+        );
+        return state;
+    }
+
+    reply_error(
+        reply_capability,
+        request,
+        view,
+        tag,
+        ERROR_SEQUENCE
+    );
+    return state;
+}
+
+unsafe fn snapshot_linux_write(
+    reply_capability: u64,
+    request: u64,
+    frame: u64,
+    expected_fd: u64
+) -> void {
+    let linux_fd: u64 = (frame >> 8) & WRITE_FRAME_FD_MASK;
+    let length: u64 = frame & WRITE_FRAME_LENGTH_MASK;
+    if (frame >> 56) != LINUX_NR_WRITE
+        || linux_fd != expected_fd
+        || length != LINUX_DATA_LENGTH as u64 {
+        stop();
+    }
+    let view: u64 = lookup(reply_capability, request);
+    let mut index: usize = 0;
+    while index < LINUX_DATA_LENGTH {
+        LINUX_DATA[index] = view_byte(view, index as u64) as u8;
+        index += 1;
+    }
+    if syscall5(
+        SYS_LINUX_MINIMAL_COMPLETE,
+        reply_capability,
+        request,
+        view,
+        linux_fd,
+        length
+    ) != 1 {
+        stop();
+    }
+}
+
+unsafe fn run_generation(
+    report: u64,
+    generation: u64,
+    inbox: u64,
+    reply: u64,
+    direct: u64,
+    linux_process: u64,
+    supervisor: u64,
+    plan9_process: u64
+) -> never {
+    let mut linux_ready: bool = false;
+    let mut protocol_state: u64 = STATE_UNVERSIONED;
+    loop {
+        receive(inbox);
+        let sender: u64 = word(0);
+        let request: u64 = word(8);
+        let frame: u64 = word(16);
+        let operation: u64 = frame >> 56;
+        if request == 0 || word(24) != 0 {
+            stop();
+        }
+
+        if sender == supervisor {
+            if operation == OP_HEALTH {
+                direct_reply(direct, request, HEALTH_OK | generation);
+            } else {
+                if generation != 2
+                    || operation != OP_STOP
+                    || !linux_ready
+                    || protocol_state != STATE_CLUNKED {
+                    stop();
+                }
+                emit(report, (&STOPPING[0]), 34);
+                progress(7);
+                direct_reply(direct, request, STOP_READY | generation);
+                stop();
+            }
+        } else {
+            if sender == linux_process {
+                // 9P negotiation is independent of provider scheduling.  The
+                // Plan 9 client may reach an opened fid before Linux writes;
+                // only the successful Tread is gated on generation-local data.
+                if linux_ready || protocol_state >= STATE_READ {
+                    stop();
+                }
+                let mut expected_fd: u64 = LINUX_FD_STDERR;
+                if generation == 1 {
+                    expected_fd = LINUX_FD_STDOUT;
+                }
+                snapshot_linux_write(reply, request, frame, expected_fd);
+                linux_ready = true;
+                if generation == 1 {
+                    emit(report, (&G1_SNAPSHOT[0]), 30);
+                } else {
+                    emit(report, (&G2_SNAPSHOT[0]), 30);
+                }
+                progress(3);
+            } else {
+                if sender != plan9_process
+                    || operation != OP_9P
+                    || (frame & 0x00ff_ffff_ffff_ffff)
+                        != MAX_9P_MESSAGE {
+                    stop();
+                }
+                let prior_state: u64 = protocol_state;
+                protocol_state = handle_9p(
+                    reply,
+                    request,
+                    generation,
+                    protocol_state,
+                    linux_ready
+                );
+                if prior_state != STATE_CLUNKED
+                    && protocol_state == STATE_CLUNKED {
+                    if generation == 1 {
+                        emit(report, (&G1_SERVICE[0]), 29);
+                        progress(6);
+                        // Let the Plan 9 caller consume terminal Rclunk and
+                        // release its view accounting before this generation
+                        // deliberately enters the fault containment path.
+                        yield_once();
+                        emit(report, (&G1_FAULT[0]), 40);
+                        progress(7);
+                        asm!("ud2", options(nomem, nostack));
+                        stop();
+                    }
+                    emit(report, (&G2_SERVICE[0]), 29);
+                    progress(6);
+                }
+            }
+        }
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, boot_generation: u64) -> never {
+    let generation: u64 = config(GENERATION_OFFSET);
+    let inbox: u64 = wait_nonzero(INBOX_CAP_OFFSET);
+    let reply: u64 = wait_nonzero(PERSONALITY_REPLY_CAP_OFFSET);
+    let direct: u64 = wait_nonzero(DIRECT_REPLY_CAP_OFFSET);
+    let linux_process: u64 = wait_nonzero(LINUX_PROCESS_OFFSET);
+    let supervisor: u64 = wait_nonzero(SUPERVISOR_PROCESS_OFFSET);
+    let plan9_process: u64 = wait_nonzero(PLAN9_PROCESS_OFFSET);
+    if report_capability == 0
+        || generation == 0
+        || generation != boot_generation {
+        stop();
+    }
+
+    if generation == 1 {
+        emit(report_capability, (&G1_ONLINE[0]), 30);
+        progress(1);
+        run_generation(
+            report_capability,
+            generation,
+            inbox,
+            reply,
+            direct,
+            linux_process,
+            supervisor,
+            plan9_process
+        );
+    }
+
+    if generation == 2 {
+        emit(report_capability, (&G2_ONLINE[0]), 30);
+        progress(1);
+        let stale_request: u64 = wait_nonzero(PRIOR_REQUEST_OFFSET);
+        if syscall2(
+            SYS_PERSONALITY_VIEW_LOOKUP,
+            reply,
+            stale_request
+        ) != ERR_PERSONALITY_STALE {
+            stop();
+        }
+        emit(report_capability, (&STALE_G1[0]), 27);
+        progress(2);
+        run_generation(
+            report_capability,
+            generation,
+            inbox,
+            reply,
+            direct,
+            linux_process,
+            supervisor,
+            plan9_process
+        );
+    }
+    stop();
+}

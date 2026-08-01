@@ -1,0 +1,23 @@
+module runtime::image_vfs_storage;
+
+// Mode 26 admits one 92,872-byte four-principal OVFS while preserving the
+// two-slot image model and explicit 96 KiB per-image bound.
+pub const IMAGE_BYTE_CAPACITY: usize = 98304;
+const STORAGE_BYTE_CAPACITY: usize = 196608;
+
+static mut BYTES: [u8; 196608] = [0; 196608];
+
+pub unsafe fn read(index: usize) -> u64 {
+    if index >= STORAGE_BYTE_CAPACITY {
+        return 0x100;
+    }
+    return BYTES[index] as u64;
+}
+
+pub unsafe fn write(index: usize, value: u64) -> u64 {
+    if index >= STORAGE_BYTE_CAPACITY || value > 0xff {
+        return 0;
+    }
+    BYTES[index] = value as u8;
+    return 1;
+}

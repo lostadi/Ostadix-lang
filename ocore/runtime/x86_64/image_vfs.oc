@@ -8,11 +8,14 @@ use runtime::domain_namespace::namespace_handle_for_slot;
 use runtime::domain_namespace::release_mount as release_namespace_mount;
 use runtime::domain_namespace::retain_mount as retain_namespace_mount;
 use runtime::domain_namespace::MAX_DOMAIN_NAMESPACES;
+use runtime::image_vfs_storage::IMAGE_BYTE_CAPACITY as STORAGE_IMAGE_BYTE_CAPACITY;
+use runtime::image_vfs_storage::read as read_image_storage;
+use runtime::image_vfs_storage::write as write_image_storage;
 
 pub const MAX_READ_ONLY_IMAGES: usize = 2;
 pub const MAX_IMAGE_OBJECTS: usize = 16;
 pub const MAX_ROOT_MOUNTS: usize = 4;
-pub const IMAGE_BYTE_CAPACITY: usize = 65536;
+pub const IMAGE_BYTE_CAPACITY: usize = STORAGE_IMAGE_BYTE_CAPACITY;
 pub const VFS_OBJECT_FILE: u64 = 1;
 pub const VFS_FLAG_READ: u64 = 1;
 pub const VFS_FLAG_EXEC: u64 = 2;
@@ -62,8 +65,6 @@ static mut IMAGE_TABLE_DIGESTS: [u64; 8] = [0; 8];
 static mut IMAGE_DATA_DIGESTS: [u64; 8] = [0; 8];
 static mut IMAGE_IMPORTED: [u8; 2] = [0; 2];
 static mut IMAGE_IMPORT_ERRORS: [u64; 2] = [0; 2];
-static mut IMAGE_BYTES: [u8; 131072] = [0; 131072];
-
 static mut OBJECT_STATES: [u8; 16] = [0; 16];
 static mut OBJECT_GENERATIONS: [u32; 16] = [0; 16];
 static mut OBJECT_IMAGES: [u64; 16] = [0; 16];
@@ -253,7 +254,10 @@ unsafe fn retire_or_reuse_object(slot: usize) -> void {
 unsafe fn clear_image_bytes(slot: usize, length: usize) -> void {
     let mut offset: usize = 0;
     while offset < length {
-        IMAGE_BYTES[image_byte_index(slot, offset)] = 0;
+        if write_image_storage(image_byte_index(slot, offset), 0) != 1 {
+            POISONED = 1;
+            return;
+        }
         offset += 1;
     }
 }
@@ -379,10 +383,13 @@ pub unsafe fn append_image_bytes(
         let value: u8 = volatile_load(
             (source as usize + offset) as *const u8
         );
-        IMAGE_BYTES[image_byte_index(
-            slot,
-            IMAGE_WRITTEN[slot] + offset
-        )] = value;
+        if write_image_storage(
+            image_byte_index(slot, IMAGE_WRITTEN[slot] + offset),
+            value as u64
+        ) != 1 {
+            POISONED = 1;
+            return 0;
+        }
         offset += 1;
     }
     IMAGE_WRITTEN[slot] += length;
@@ -394,7 +401,7 @@ unsafe fn raw_byte(image_slot: usize, offset: usize) -> u64 {
         || offset >= IMAGE_LENGTHS[image_slot] {
         return 0x100;
     }
-    return IMAGE_BYTES[image_byte_index(image_slot, offset)] as u64;
+    return read_image_storage(image_byte_index(image_slot, offset));
 }
 
 fn sha256_rotate_right(value: u64, bits: usize) -> u64 {
@@ -409,7 +416,7 @@ unsafe fn sha256_source_byte(
     offset: usize
 ) -> u64 {
     if source_is_image {
-        return IMAGE_BYTES[image_byte_index(image_slot, offset)] as u64;
+        return read_image_storage(image_byte_index(image_slot, offset));
     }
     return volatile_load(source + offset) as u64;
 }
@@ -1352,10 +1359,10 @@ pub unsafe fn read_retained_byte(
     }
     volatile_store(
         result,
-        IMAGE_BYTES[image_byte_index(
+        read_image_storage(image_byte_index(
             image_slot,
             OBJECT_OFFSETS[object_slot] + offset
-        )]
+        )) as u8
     );
     return 1;
 }
