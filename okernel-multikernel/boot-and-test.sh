@@ -138,37 +138,33 @@ phase_kernel() {
 # 19 M6B bounded memory/resource revocation | 20 verified world/nonexecuting VM objects
 # 21 historical AMD/KVM execution gate (not in the portable aggregate) | 22
 # TCG-compatible KernelWorld live lifecycle/service mechanism | 23 TCG-emulated
-# SVM execution bound to one exact-authority virtual PIO endpoint
+# SVM execution bound to one exact-authority virtual PIO endpoint | 24 live
+# four-byte bounded personality RPC and pre-terminal lifecycle dispositions
 phase_smoke() {
   say "Layer 4 — smoke gates"
-  need cargo; need clang; need qemu-system-x86_64
-  local gates=(
-    smoke-qemu.sh                 # default gate (M0.1-M0.3 core: CPL3/SYSCALL, W^X, frames, caps)
-    smoke-faults-qemu.sh          # fatal-fault matrix + user-copy recovery
-    smoke-processes-qemu.sh       # M1 isolation + teardown
-    smoke-scheduler-qemu.sh       # M2 thread/scheduler lifecycle
-    smoke-ipc-foundation-qemu.sh  # M3 mechanism regression
-    smoke-ipc-qemu.sh             # M3 public CPL3 IPC + containment
-    smoke-loader-qemu.sh          # M4 OVFS + static ELF lifecycle
-    smoke-live-qemu.sh            # M5 activation + one pkgd restart
-    smoke-live-semantics-qemu.sh  # M5 state-machine corpus
-    smoke-personality-qemu.sh     # M6A scalar personality supervision
-    smoke-m6b-qemu.sh             # M6B bounded-copy views + delegated-resource revocation
-    smoke-kernel-world-qemu.sh    # verified world admission + nonexecuting VM objects
-    smoke-kernel-world-live-qemu.sh # TCG-compatible live lifecycle/service mechanism
-    smoke-kernel-world-execution-device-qemu.sh # TCG SVM execution + virtual PIO endpoint
-  )
-  local g
+  need cargo; need clang; need python3; need qemu-system-x86_64; need tee
+  python3 scripts/release_evidence.py validate \
+    || die "required release-evidence manifest or projection is invalid"
+  local gate_manifest
+  gate_manifest="$(python3 scripts/release_evidence.py list-scripts)" \
+    || die "could not read the required release-evidence manifest"
+  local gates=()
+  local g transcript
+  while IFS= read -r g; do
+    [ -n "$g" ] && gates+=("$g")
+  done <<<"$gate_manifest"
+  [ "${#gates[@]}" -gt 0 ] || die "required release-evidence manifest is empty"
   local required="${#gates[@]}"
   local present=0
   local passed=0
   local failed=0
+  local transcript
 
   # This is a required-gate manifest, not a directory scan.  Fail before
   # execution if a required proof script has disappeared or lost its execute
   # bit; otherwise a deleted gate could make the aggregate result greener.
   for g in "${gates[@]}"; do
-    if [ ! -x "ocore/kernel/$g" ]; then
+    if [ ! -x "$g" ]; then
       printf '%s[fail]%s required gate missing or not executable: %s\n' "$c_red" "$c_rst" "$g" >&2
       failed=$((failed + 1))
     else
@@ -183,13 +179,26 @@ phase_smoke() {
 
   for g in "${gates[@]}"; do
     say "gate: $g"
-    if "ocore/kernel/$g"; then
-      ok "$g PASS"
-      passed=$((passed + 1))
+    transcript="$(mktemp "${TMPDIR:-/tmp}/ostadix-gate-transcript.XXXXXX")" \
+      || die "could not create a gate transcript file"
+    # Stream combined output for operators while retaining the exact bytes that
+    # the central manifest will check. A successful exit alone is not evidence:
+    # every expected marker must occur exactly once in this live transcript.
+    if "$g" 2>&1 | tee "$transcript"; then
+      if python3 scripts/release_evidence.py verify-transcript \
+          --script "$g" --transcript "$transcript"; then
+        ok "$g PASS"
+        passed=$((passed + 1))
+      else
+        printf '%s[fail]%s %s runtime transcript did not satisfy its manifest\n' \
+          "$c_red" "$c_rst" "$g" >&2
+        failed=$((failed + 1))
+      fi
     else
       printf '%s[fail]%s %s\n' "$c_red" "$c_rst" "$g" >&2
       failed=$((failed + 1))
     fi
+    rm -f "$transcript"
   done
   printf 'required: %s\npresent:  %s\npassed:   %s\nfailed:   %s\n' \
     "$required" "$present" "$passed" "$failed"

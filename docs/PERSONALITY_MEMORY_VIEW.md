@@ -1,10 +1,11 @@
 # Personality Foreign-Process Memory-View Protocol
 
-Status: design contract plus a first bounded-copy native mechanism slice. Mode
-19 implements and QEMU-tests the staging, capability, terminal-revocation, and
-delegated-lease core described below. The complete acceptance gate remains
-required before a translated Linux personality can accept pointer-bearing
-syscalls.
+Status: design contract plus bounded native mechanism and live-composition
+slices. Mode 19 QEMU-tests the staging, capability, terminal-revocation, and
+delegated-lease core described below. Mode 24 routes one exact four-byte
+`INOUT` request shape through four packaged CPL3 principals. The complete
+acceptance gate remains required before a translated Linux personality can
+accept pointer-bearing syscalls.
 
 ## 1. Security invariant
 
@@ -195,7 +196,10 @@ the undeliverable terminal view is released without a second result or wake.
 generation-tagged lease objects for the memory, filesystem, timer, network, and
 device classes. A lease carries a nonzero request identity and can bind only to
 a view with that same identity; request-wide revocation removes all matching
-leases and their bound live views without disturbing another request. These are
+leases and their bound live views without disturbing another request. Creation
+and binding form one transaction; the gate injects a bind failure after
+capability publication and requires rollback to close the capability and
+destroy the unbound resource generation. These are
 typed authority/revocation skeletons, not filesystem, network, timer, or device
 implementations, and revocation never falls back to ambient access.
 
@@ -203,14 +207,36 @@ The mode-19 `smoke-m6b-qemu.sh` gate proves pre-dispatch range, generation,
 mapping-rights, and quota denial; bounded input snapshot; attenuated view
 rights; staged-prefix commit; revoke-before-terminal ordering; wake-once paths;
 all five lease classes; same-request bulk revocation; stale authority denial;
-unrelated-request survival; post-reply teardown cleanup; CSpace-drain close;
+injected create-bind rollback; unrelated-request survival; post-reply teardown
+cleanup; CSpace-drain close;
 complete bounded cleanup; and a later timer. The scenario invokes the native
 mechanism against a real kernel process and address space, but directly calls
 the lifecycle and wake-publication hooks. It does not prove live process/unmap/
 scheduler integration or run through the M6A CPL3 personality daemon or public
 pointer-bearing personality RPC.
 
-## 9. Complete acceptance gate
+## 9. Implemented live four-byte composition
+
+Mode 24's `smoke-live-bounded-personality-qemu.sh` packages a client,
+personality daemon, supervisor, and unrelated observer as four independently
+linked CPL3 ELFs. The client issues each request once through the public
+bounded-call syscall. The live corpus fixes the request to one four-byte
+`INOUT` view; the daemon can discover only the view correlated with the request
+received from its endpoint, access its bytes through attenuated view syscalls,
+and submit one bounded reply. The gate contains one generation-1 daemon fault,
+keeps the observer live, rejects late/stale/duplicate authority, and
+health-gates a generation-2 rebind.
+
+Generation 2 also drives supervisor-triggered pre-terminal unmap,
+request-revoke, delegated-device-resource-revoke, and caller-exit dispositions
+while each request remains waiting. These operations reuse the terminalization
+mechanism; they do not mutate a mapping or observe an external resource event.
+The delegated device resource is one internal typed lease, not a physical
+device. The caller-exit case terminates and stops the test client, leaving its
+process reapable and its thread exited. The gate does not exercise a
+post-reply/pre-consume process-exit or unmap race.
+
+## 10. Complete acceptance gate
 
 Before pointer-bearing Linux syscalls are accepted, executable tests must show:
 
@@ -235,16 +261,19 @@ Fuzzing must cover the serialized request/reply schema and state transitions.
 Fault injection must cover allocation failure at every staging, pinning,
 dispatch, reply, and commit step.
 
-## 10. Explicit non-claims
+## 11. Explicit non-claims
 
 This protocol does not make arbitrary device DMA safe, make every syscall
 restartable, provide distributed exactly-once execution, or turn serialized
 capability metadata into authority. Direct device passthrough requires an
 IOMMU-backed isolation design and separate acceptance evidence.
 
-The current mode-19 evidence does not implement pinned windows, streaming
-output, signal delivery/restart integration, a pinned Linux ABI oracle, schema
-fuzzing, allocation-failure injection, or every concurrent teardown race. It
-does not supply a pointer-bearing CPL3 personality daemon, Linux ABI, foreign
-root filesystem, or concrete delegated filesystem, network, timer, or device
-service.
+The current evidence does not implement pinned windows, streaming output,
+signal delivery/restart integration, a pinned Linux ABI oracle, schema fuzzing,
+allocation-failure injection, or every concurrent teardown race. Mode 24
+supplies only one exact four-byte pointer-bearing native test path; it does not
+supply a general foreign ABI, Linux or Plan 9 boot, foreign root filesystem, or
+concrete delegated filesystem, network, timer, or device service. It also does
+not prove actual mapping mutation, an external resource event, the
+post-reply/pre-consume process-exit or unmap race, KVM, PCI/DMA/IOMMU, or
+physical-device isolation.

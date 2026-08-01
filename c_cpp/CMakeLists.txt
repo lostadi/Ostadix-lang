@@ -5,6 +5,7 @@ project(o-lang LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+option(OLANG_WARNINGS_AS_ERRORS "Treat C17 compiler warnings as errors" OFF)
 
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -29,6 +30,9 @@ function(olang_configure_target target)
 
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -O2)
+        if(OLANG_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
     endif()
 endfunction()
 
@@ -57,43 +61,33 @@ add_custom_command(TARGET olangc POST_BUILD
 
 enable_testing()
 
-set(OLANG_EXAMPLES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../examples)
 set(OLANG_BACKENDS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../backends)
+set(OLANG_EXAMPLE_RUNNER ${CMAKE_CURRENT_SOURCE_DIR}/../tests/example_manifest.py)
 
-add_test(NAME interpreter_hello
-    COMMAND $<TARGET_FILE:O> ${OLANG_EXAMPLES_DIR}/hello.O ${OLANG_BACKENDS_DIR}
-)
-set_tests_properties(interpreter_hello PROPERTIES PASS_REGULAR_EXPRESSION "2")
-
-add_test(NAME interpreter_meta_eval
-    COMMAND $<TARGET_FILE:O> ${OLANG_EXAMPLES_DIR}/meta_eval.O ${OLANG_BACKENDS_DIR}
-)
-set_tests_properties(interpreter_meta_eval PROPERTIES PASS_REGULAR_EXPRESSION "1024|42")
-
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/run_aot_test.py ""
-"import re, subprocess, sys\n"
-"compiler, source, backends, output, pattern = sys.argv[1:]\n"
-"subprocess.run([compiler, source, '-o', output, '--shim-dir', backends], check=True)\n"
-"result = subprocess.run([output], check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
-"print(result.stdout, end='')\n"
-"if not re.search(pattern, result.stdout):\n"
-"    raise SystemExit(f'expected /{pattern}/ in output')\n"
+add_test(NAME interpreter_manifest
+    COMMAND ${Python3_EXECUTABLE} ${OLANG_EXAMPLE_RUNNER}
+            run
+            --edition c17
+            --runner $<TARGET_FILE:O>
+            --backends ${OLANG_BACKENDS_DIR}
 )
 
-add_test(NAME aot_hello
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/run_aot_test.py
+add_test(NAME aot_manifest
+    COMMAND ${Python3_EXECUTABLE} ${OLANG_EXAMPLE_RUNNER}
+            run-c17-aot
+            --compiler $<TARGET_FILE:olangc>
+            --backends ${OLANG_BACKENDS_DIR}
+)
+
+add_test(NAME aot_path_safety
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_olangc_paths.sh
             $<TARGET_FILE:olangc>
-            ${OLANG_EXAMPLES_DIR}/hello.O
-            ${OLANG_BACKENDS_DIR}
-            ${CMAKE_CURRENT_BINARY_DIR}/hello_c
-            2
+            ${CMAKE_C_COMPILER}
+            $<TARGET_FILE:O>
 )
 
-add_test(NAME aot_meta_eval
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/run_aot_test.py
-            $<TARGET_FILE:olangc>
-            ${OLANG_EXAMPLES_DIR}/meta_eval.O
-            ${OLANG_BACKENDS_DIR}
-            ${CMAKE_CURRENT_BINARY_DIR}/meta_c
-            "1024|42"
-)
+if(OLANG_WARNINGS_AS_ERRORS)
+    set_tests_properties(aot_manifest aot_path_safety PROPERTIES
+        ENVIRONMENT "OLANGC_WARNINGS_AS_ERRORS=1"
+    )
+endif()

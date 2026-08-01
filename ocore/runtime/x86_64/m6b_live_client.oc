@@ -1,0 +1,278 @@
+module runtime::m6b_live_client;
+
+// Mode 24 pins its public bounded-call ABI in the independently linked
+// package.  The client receives only a generation-bound call capability and
+// never imports a privileged kernel module.
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_PERSONALITY_BOUNDED_CALL: u64 = 17;
+
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+const ERR_PERSONALITY_CANCELLED: u64 = 0xffff_ffff_ffff_ffd1;
+const ERR_PERSONALITY_TIMEOUT: u64 = 0xffff_ffff_ffff_ffd2;
+const ERR_PERSONALITY_FAILED: u64 = 0xffff_ffff_ffff_ffd3;
+const ERR_PERSONALITY_BUSY: u64 = 0xffff_ffff_ffff_ffd6;
+const ERR_PERSONALITY_UNSUPPORTED: u64 = 0xffff_ffff_ffff_ffd7;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const CALL_CAP_OFFSET: usize = 8;
+const GENERATION_OFFSET: usize = 16;
+const PUBLISHED_GENERATION_OFFSET: usize = 24;
+const BUFFER_OFFSET: usize = 128;
+const BUFFER_LENGTH: usize = 4;
+
+const OP_SUCCESS_INOUT: u64 = 1;
+const OP_HOLD_CANCEL: u64 = 3;
+const OP_HOLD_TIMEOUT: u64 = 4;
+const OP_CRASH: u64 = 5;
+const OP_HOLD_UNMAP: u64 = 6;
+const OP_HOLD_REQUEST_REVOKE: u64 = 7;
+const OP_HOLD_RESOURCE_REVOKE: u64 = 8;
+const OP_HOLD_PROCESS_EXIT: u64 = 9;
+const OP_UNSUPPORTED: u64 = 0x7f;
+const DIRECTION_IN: u64 = 1;
+const DIRECTION_INOUT: u64 = 3;
+const CORPUS_TIMEOUT_TICKS: u64 = 10_000;
+// Four runnable principals share the single test CPU.  Give the daemon a
+// bounded scheduling window to acquire the request-scoped view before this
+// corpus deliberately lets the request expire; six ticks was narrower than
+// the observed worst-case wake-to-lookup path under TCG.
+const HOLD_TIMEOUT_TICKS: u64 = 64;
+
+// The client has one immutable transcript string. Keeping it in the readable
+// executable segment avoids a whole otherwise-empty page-aligned LOAD.
+@link_section(".text")
+static DIRECT_RESULT: [u8; 50] =
+    b"M6B live direct saved-RAX result/no reissue: PASS\n";
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+// This wrapper deliberately executes exactly one bounded-call syscall.  A
+// visible ERR_IPC_RETRY is a Mode 24 failure: the scheduler must replace the
+// provisional saved RAX with the terminal result before returning to CPL3.
+unsafe fn call_once(
+    capability: u64,
+    operation: u64,
+    direction: u64,
+    timeout_ticks: u64
+) -> u64 {
+    let result: u64 = syscall6(
+        SYS_PERSONALITY_BOUNDED_CALL,
+        capability,
+        operation,
+        (CONFIG_VA + BUFFER_OFFSET) as u64,
+        BUFFER_LENGTH as u64,
+        direction,
+        timeout_ticks
+    );
+    if result == ERR_IPC_RETRY {
+        stop();
+    }
+    return result;
+}
+
+unsafe fn prepare_input() -> void {
+    volatile_store(
+        (CONFIG_VA + BUFFER_OFFSET) as *mut u32,
+        0x3f62_366d
+    );
+}
+
+unsafe fn success(capability: u64) -> bool {
+    prepare_input();
+    return call_once(
+        capability,
+        OP_SUCCESS_INOUT,
+        DIRECTION_INOUT,
+        CORPUS_TIMEOUT_TICKS
+    ) == BUFFER_LENGTH as u64
+        && volatile_load((CONFIG_VA + BUFFER_OFFSET) as *const u32)
+            == 0x2134_324f;
+}
+
+unsafe fn unsupported(capability: u64) -> bool {
+    prepare_input();
+    return call_once(
+        capability,
+        OP_UNSUPPORTED,
+        DIRECTION_IN,
+        CORPUS_TIMEOUT_TICKS
+    ) == ERR_PERSONALITY_UNSUPPORTED;
+}
+
+unsafe fn wait_for_publication(generation: u64) -> u64 {
+    loop {
+        let capability: u64 = config(CALL_CAP_OFFSET);
+        if capability != 0
+            && config(GENERATION_OFFSET) == generation
+            && config(PUBLISHED_GENERATION_OFFSET) == generation {
+            return capability;
+        }
+        yield_once();
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(
+    report_capability: u64,
+    bootstrap_call_capability: u64
+) -> never {
+    if report_capability == 0 || bootstrap_call_capability != 0 {
+        stop();
+    }
+    progress(1);
+
+    let g1_capability: u64 = wait_for_publication(1);
+    prepare_input();
+    if call_once(
+        g1_capability,
+        OP_SUCCESS_INOUT,
+        DIRECTION_INOUT,
+        CORPUS_TIMEOUT_TICKS
+    ) != ERR_PERSONALITY_FAILED {
+        stop();
+    }
+    prepare_input();
+    if call_once(
+        g1_capability,
+        OP_SUCCESS_INOUT,
+        DIRECTION_INOUT,
+        CORPUS_TIMEOUT_TICKS
+    ) != ERR_PERSONALITY_BUSY {
+        stop();
+    }
+    if !success(g1_capability) {
+        stop();
+    }
+    emit(report_capability, (&DIRECT_RESULT[0]), 50);
+    if !unsupported(g1_capability) {
+        stop();
+    }
+    progress(2);
+
+    prepare_input();
+    if call_once(
+        g1_capability,
+        OP_HOLD_CANCEL,
+        DIRECTION_INOUT,
+        0
+    ) != ERR_PERSONALITY_CANCELLED {
+        stop();
+    }
+    progress(3);
+
+    prepare_input();
+    if call_once(
+        g1_capability,
+        OP_HOLD_TIMEOUT,
+        DIRECTION_INOUT,
+        HOLD_TIMEOUT_TICKS
+    ) != ERR_PERSONALITY_TIMEOUT {
+        stop();
+    }
+    progress(4);
+
+    prepare_input();
+    if call_once(
+        g1_capability,
+        OP_CRASH,
+        DIRECTION_INOUT,
+        0
+    ) != ERR_PERSONALITY_FAILED {
+        stop();
+    }
+    progress(5);
+
+    let g2_capability: u64 = wait_for_publication(2);
+    prepare_input();
+    if g2_capability == g1_capability
+        || call_once(
+            g1_capability,
+            OP_SUCCESS_INOUT,
+            DIRECTION_INOUT,
+            1
+        ) != ERR_CAPABILITY_DENIED {
+        stop();
+    }
+    progress(6);
+    if !success(g2_capability) || !unsupported(g2_capability) {
+        stop();
+    }
+    progress(7);
+
+    prepare_input();
+    if call_once(
+        g2_capability,
+        OP_HOLD_UNMAP,
+        DIRECTION_INOUT,
+        0
+    ) != ERR_PERSONALITY_CANCELLED {
+        stop();
+    }
+    progress(8);
+
+    prepare_input();
+    if call_once(
+        g2_capability,
+        OP_HOLD_REQUEST_REVOKE,
+        DIRECTION_INOUT,
+        0
+    ) != ERR_PERSONALITY_CANCELLED {
+        stop();
+    }
+    progress(9);
+
+    prepare_input();
+    if call_once(
+        g2_capability,
+        OP_HOLD_RESOURCE_REVOKE,
+        DIRECTION_INOUT,
+        0
+    ) != ERR_PERSONALITY_CANCELLED {
+        stop();
+    }
+    progress(10);
+
+    prepare_input();
+    progress(11);
+    call_once(
+        g2_capability,
+        OP_HOLD_PROCESS_EXIT,
+        DIRECTION_INOUT,
+        0
+    );
+    stop();
+}

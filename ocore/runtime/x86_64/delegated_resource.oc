@@ -67,6 +67,9 @@ static mut DESTROYS: u64 = 0;
 static mut USES: u64 = 0;
 static mut DENIALS: u64 = 0;
 static mut STALE_DENIALS: u64 = 0;
+static mut BIND_FAILURE_ARMS: u64 = 0;
+static mut BIND_FAILURES: u64 = 0;
+static mut FAIL_NEXT_BIND_TRANSACTION: u8 = 0;
 static mut INITIALIZED: u8 = 0;
 static mut POISONED: u8 = 0;
 
@@ -246,6 +249,9 @@ pub unsafe fn init() -> u64 {
     USES = 0;
     DENIALS = 0;
     STALE_DENIALS = 0;
+    BIND_FAILURE_ARMS = 0;
+    BIND_FAILURES = 0;
+    FAIL_NEXT_BIND_TRANSACTION = 0;
     POISONED = 0;
     INITIALIZED = 1;
     if !invariants_hold() {
@@ -565,6 +571,78 @@ pub unsafe fn destroy(resource: u64) -> u64 {
     return finish(1);
 }
 
+// Create and bind are one authority-publication transaction.  Callers never
+// observe the resource capability until the request-correlated view has been
+// bound.  If binding fails after create() published the capability, revoke and
+// destroy the exact generation before returning failure.
+pub unsafe fn create_bound(
+    request: u64,
+    kind: u64,
+    service_cspace: u64,
+    view: u64,
+    capability_out: *mut u64
+) -> u64 {
+    if capability_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(capability_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    let mut capability: u64 = 0;
+    let resource: u64 = create(
+        request,
+        kind,
+        service_cspace,
+        (&mut capability)
+    );
+    if resource == 0 || capability == 0 {
+        return 0;
+    }
+
+    let mut bound: u64 = 0;
+    if FAIL_NEXT_BIND_TRANSACTION != 0 {
+        FAIL_NEXT_BIND_TRANSACTION = 0;
+        if BIND_FAILURES == MAX_COUNTER {
+            POISONED = 1;
+            return 0;
+        }
+        BIND_FAILURES += 1;
+    } else {
+        bound = bind_view(service_cspace, capability, view);
+    }
+    if bound != 1 {
+        let mut revoked_views: u64 = 0;
+        if revoke(
+            service_cspace,
+            capability,
+            (&mut revoked_views)
+        ) != 1
+            || revoked_views != 0
+            || destroy(resource) != 1 {
+            POISONED = 1;
+            return 0;
+        }
+        return deny();
+    }
+
+    volatile_store(capability_out, capability);
+    return finish(resource);
+}
+
+// Trusted deterministic failure injection for the create+bind rollback gate.
+// It cannot stack: every arm must be consumed by exactly one transaction.
+pub unsafe fn inject_bind_failure_once() -> u64 {
+    if !preflight()
+        || FAIL_NEXT_BIND_TRANSACTION != 0
+        || BIND_FAILURE_ARMS == MAX_COUNTER {
+        return 0;
+    }
+    BIND_FAILURE_ARMS += 1;
+    FAIL_NEXT_BIND_TRANSACTION = 1;
+    return finish(1);
+}
+
 pub unsafe fn invariants_hold() -> bool {
     if INITIALIZED == 0
         || POISONED != 0
@@ -572,7 +650,9 @@ pub unsafe fn invariants_hold() -> bool {
         || !memory_view_invariants_hold()
         || REVOKED_VIEWS > BINDINGS
         || REVOCATIONS > CREATIONS
-        || DESTROYS > REVOCATIONS {
+        || DESTROYS > REVOCATIONS
+        || BIND_FAILURES > BIND_FAILURE_ARMS
+        || FAIL_NEXT_BIND_TRANSACTION > 1 {
         return false;
     }
     let mut slot: usize = 0;
@@ -693,4 +773,6 @@ pub unsafe fn destroy_count() -> u64 { return DESTROYS; }
 pub unsafe fn use_count() -> u64 { return USES; }
 pub unsafe fn denial_count() -> u64 { return DENIALS; }
 pub unsafe fn stale_denial_count() -> u64 { return STALE_DENIALS; }
+pub unsafe fn bind_failure_arm_count() -> u64 { return BIND_FAILURE_ARMS; }
+pub unsafe fn bind_failure_count() -> u64 { return BIND_FAILURES; }
 pub unsafe fn poisoned() -> bool { return POISONED != 0; }

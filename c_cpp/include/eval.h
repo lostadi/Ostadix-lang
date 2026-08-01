@@ -31,11 +31,16 @@ void olang_evaluator_free(OEvaluator *ev);
 
 /* Register the set of known language tags (used by parser + dispatch).
    Pass a StringSet (from parser.h) or NULL for defaults. The set is copied. */
-void olang_evaluator_set_registered(OEvaluator *ev, const StringSet *backends);
+/* Replace the registered backend set. Returns false on allocation failure. */
+bool olang_evaluator_set_registered(OEvaluator *ev, const StringSet *backends);
 
 /* Evaluate a full parsed document (list of top-level nodes).
    Returns a retained OValue (caller must oval_release). */
 OValue *olang_evaluator_eval_document(OEvaluator *ev, ONodeList *nodes);
+
+/* True when the most recent outermost evaluation hit a parser/backend/runtime
+   error. A legitimate O null value does not set this flag. */
+bool olang_evaluator_had_error(const OEvaluator *ev);
 
 /* Low-level: evaluate a single source fragment (used for O.eval reentrancy).
    Creates a fresh parser + scope for the fragment. */

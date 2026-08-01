@@ -13,8 +13,10 @@ use runtime::capability::OBJECT_MEMORY;
 use runtime::capability::OBJECT_PAGE_POOL;
 use runtime::capability::OBJECT_CONTROL;
 use runtime::capability::OBJECT_PERSONALITY_CALL;
+use runtime::capability::OBJECT_PERSONALITY_MEMORY_VIEW;
 use runtime::capability::OBJECT_PERSONALITY_REPLY;
 use runtime::capability::OBJECT_PERSONALITY_SUPERVISION;
+use runtime::capability::OBJECT_DELEGATED_RESOURCE;
 use runtime::capability::RIGHT_DEBUG_WRITE;
 use runtime::capability::RIGHT_ENDPOINT_CANCEL;
 use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
@@ -67,6 +69,11 @@ use runtime::native_abi::SYS_CONTROL_SUBMIT;
 use runtime::native_abi::SYS_PERSONALITY_CALL;
 use runtime::native_abi::SYS_PERSONALITY_REPLY;
 use runtime::native_abi::SYS_PERSONALITY_SUPERVISE;
+use runtime::native_abi::SYS_PERSONALITY_BOUNDED_CALL;
+use runtime::native_abi::SYS_PERSONALITY_VIEW_LOOKUP;
+use runtime::native_abi::SYS_PERSONALITY_VIEW_READ;
+use runtime::native_abi::SYS_PERSONALITY_VIEW_WRITE;
+use runtime::native_abi::SYS_PERSONALITY_BOUNDED_REPLY;
 use runtime::native_abi::NATIVE_CONTROL_OBJECT_ID;
 use runtime::native_abi::SYSCALL_CONTROL_EXIT;
 use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
@@ -155,6 +162,35 @@ extern "sysv64" fn kernel_m6_personality_supervise(
     action: u64,
     generation: u64,
     subject: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_bounded_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    foreign_address: u64,
+    length: u64,
+    direction: u64,
+    timeout_ticks: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_bounded_lookup(
+    capability_object: u64,
+    request: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_bounded_read(
+    capability: u64,
+    offset: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_bounded_write(
+    capability: u64,
+    offset: u64,
+    value: u64
+) -> u64;
+extern "sysv64" fn kernel_m6_bounded_reply(
+    capability_object: u64,
+    request: u64,
+    view_capability: u64,
+    committed_length: u64,
+    result: u64
 ) -> u64;
 
 // Exit is enabled only by a kernel lifecycle harness that has installed a
@@ -390,9 +426,52 @@ unsafe fn dispatch_native_0(
         }
         return kernel_m6_personality_supervise(object, arg0, arg1, arg2);
     }
+    if number == SYS_PERSONALITY_VIEW_LOOKUP {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_REPLY,
+            RIGHT_PERSONALITY_REPLY
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_bounded_lookup(object, arg0);
+    }
+    if number == SYS_PERSONALITY_VIEW_READ {
+        return kernel_m6_bounded_read(capability, arg0);
+    }
+    if number == SYS_PERSONALITY_VIEW_WRITE {
+        return kernel_m6_bounded_write(capability, arg0, arg1);
+    }
+    if number == SYS_PERSONALITY_BOUNDED_REPLY {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_REPLY,
+            RIGHT_PERSONALITY_REPLY
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_bounded_reply(
+            object,
+            arg0,
+            arg1,
+            arg2,
+            arg3
+        );
+    }
     if number == SYS_CAP_CLOSE {
         let object_type: u64 = object_type_in_cspace(cspace_id, capability);
         if object_type == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        // Request-scoped personality authority is terminalized only by its
+        // owning bridge.  Generic close would detach the CSpace slot without
+        // publishing the paired request disposition or releasing its charge.
+        if object_type == OBJECT_PERSONALITY_MEMORY_VIEW
+            || object_type == OBJECT_DELEGATED_RESOURCE {
             return ERR_CAPABILITY_DENIED;
         }
         if object_type == OBJECT_MEMORY {
@@ -441,6 +520,17 @@ unsafe fn dispatch_native_0(
         return 1;
     }
     if number == SYS_CAP_COPY {
+        let source_type: u64 = object_type_in_cspace(
+            cspace_id,
+            capability
+        );
+        // These capabilities are installed directly into one exact service
+        // CSpace generation and are intentionally non-copyable.  Keep the
+        // denial explicit even though their rights omit RIGHT_TRANSFER.
+        if source_type == OBJECT_PERSONALITY_MEMORY_VIEW
+            || source_type == OBJECT_DELEGATED_RESOURCE {
+            return ERR_CAPABILITY_DENIED;
+        }
         // Preserve the original all-zero capability-probe result while the
         // public prepare ABI uses an endpoint SEND capability to name the
         // destination CSpace without exposing that CSpace identity.
@@ -746,6 +836,26 @@ unsafe fn dispatch_test_personality(
             arg2
         );
     }
+    if number == SYS_PERSONALITY_BOUNDED_CALL {
+        let object: u64 = validate_in_cspace(
+            cspace_id,
+            capability,
+            OBJECT_PERSONALITY_CALL,
+            RIGHT_PERSONALITY_CALL
+        );
+        if object == 0 {
+            return ERR_CAPABILITY_DENIED;
+        }
+        return kernel_m6_bounded_call(
+            object,
+            capability,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4
+        );
+    }
     if number == SYS_CAP_CLOSE
         || number == SYS_CAP_COPY
         || number == SYS_PAGE_ALLOC
@@ -758,7 +868,11 @@ unsafe fn dispatch_test_personality(
         || number == SYS_SERIAL_READ
         || number == SYS_CONTROL_SUBMIT
         || number == SYS_PERSONALITY_REPLY
-        || number == SYS_PERSONALITY_SUPERVISE {
+        || number == SYS_PERSONALITY_SUPERVISE
+        || number == SYS_PERSONALITY_VIEW_LOOKUP
+        || number == SYS_PERSONALITY_VIEW_READ
+        || number == SYS_PERSONALITY_VIEW_WRITE
+        || number == SYS_PERSONALITY_BOUNDED_REPLY {
         return ERR_NOT_IMPLEMENTED;
     }
     return ERR_UNKNOWN_SYSCALL;

@@ -65,6 +65,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/build-m6-artifacts.sh # deterministic four-ELF M6A OVFS image
 ./ocore/kernel/smoke-personality-qemu.sh # M6A mode-18 scalar supervision
 ./ocore/kernel/smoke-m6b-qemu.sh # M6B mode-19 bounded-copy/revocation mechanism
+./ocore/kernel/smoke-live-bounded-personality-qemu.sh # M6B mode-24 live four-byte bounded personality RPC
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
@@ -225,10 +226,20 @@ publication. Post-reply process-exit/unmap cleanup publishes neither again.
 Typed revocable leases carry exact request identities across view binding,
 cover memory, filesystem, timer, network, and device classes without ambient
 fallback, and the gate proves request-wide revocation leaves an unrelated
-request alive.
-This mechanism is not yet wired through the CPL3 personality daemon or a public
-pointer-bearing call. It has no pinned windows, signal/restart integration,
-Linux oracle, or concrete filesystem/network/timer/device services.
+request alive. The gate also injects a bind failure after lease capability
+publication and proves transactional revoke-and-destroy rollback.
+Mode 19 itself remains a directly exercised mechanism gate. Mode 24 separately
+wires one exact four-byte `INOUT` request through the live CPL3 client,
+personality daemon, router, and supervisor. Four digest-pinned ELFs cross the
+public bounded-call/view/reply syscalls, contain one generation-1 daemon fault,
+and health-gate a generation-2 rebind. The generation-2 supervisor then selects
+pre-terminal unmap, request-revoke, delegated-device-resource-revoke, and
+caller-exit dispositions while each request is still waiting. These are
+supervisor-triggered lifecycle dispositions: the gate does not mutate a
+mapping or observe an external resource event, and its device authority is one
+internal delegated lease rather than a physical device. It also does not cover
+the post-reply/pre-consume process-exit or unmap race, pinned windows,
+signal/restart integration, a Linux oracle, or concrete services.
 
 Mode 20 carries a host-verified `ocore.kernel-world/v1` package contract into a
 bounded native supervisor-admission gate. The host emits a deterministic,
@@ -258,14 +269,17 @@ Float operations, casts, and
 float types cannot reach integer machine operations.
 
 The current verified kernel boundary includes M6A's scalar CPL3 supervision in
-mode 18, M6B's separate bounded-copy/revocation mechanism in mode 19, and the
-nonexecuting KernelWorld admission/object slice in mode 20. It remains
+mode 18, M6B's bounded-copy/revocation mechanism in mode 19, Mode 24's exact
+four-byte live bounded personality composition, and the nonexecuting
+KernelWorld admission/object slice in mode 20. It remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
-dynamic linker, writable general filesystem, foreign ABI personality, foreign
-root filesystem, native compiler/self-hosting, guest execution, or live
-hosted-broker transport into QEMU. The early bootstrap/fault gates still use a
-linked `native[0]` payload; later claims have separate bounded gates.
+dynamic linker, writable general filesystem, general foreign ABI personality,
+foreign root filesystem, native compiler/self-hosting, general guest-agent
+transport, or live hosted-broker transport into QEMU. The Mode 24 native test
+personality does not boot Linux or Plan 9. The early bootstrap/fault gates
+still use a linked `native[0]` payload; later claims have separate bounded
+gates.
 
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of

@@ -177,7 +177,7 @@ ELFs and images. Both verify image SHA-256 before boot. O-core also runs its
 freestanding NIST-vector-tested SHA-256 implementation over the complete image
 before OVFS import and publication, then validates OVFS and ELF structure. The
 mode-16 artifact is pinned at 62,056 bytes with SHA-256
-`88c0db7b97f74b091407731a0be8d9bf25c86f0ca03aaf8040b2b7c007cb9fed`;
+`388b9253ce6f92bef1e1f986b46aabbeb728604cc73589d12105031f5f6b780a`;
 both the smoke harness and kernel require that exact identity. A fuller receipt
 must also name the compiler revision and source digest.
 

@@ -10,6 +10,9 @@ use runtime::ipc_wait::abort as abort_ipc_wait;
 use runtime::ipc_wait::begin as begin_ipc_wait;
 use runtime::ipc_wait::complete as complete_ipc_wait;
 use runtime::ipc_wait::invariants_hold as wait_invariants_hold;
+use runtime::ipc_wait::cancel_process_waits;
+use runtime::ipc_wait::IPC_WAIT_FAILURE;
+use runtime::native_abi::ERR_ENDPOINT_CLOSED;
 use runtime::native_abi::ERR_IPC_RETRY;
 use runtime::native_abi::ERR_PERSONALITY_BUSY;
 use runtime::native_abi::ERR_PERSONALITY_CANCELLED;
@@ -48,6 +51,8 @@ pub const RPC_STATE_DISPATCHED: u64 = 1;
 pub const RPC_STATE_WAIT_PREPARED: u64 = 2;
 pub const RPC_STATE_WAITING: u64 = 3;
 pub const RPC_STATE_TERMINAL: u64 = 4;
+pub const RPC_STATE_RESERVED: u64 = 5;
+pub const RPC_STATE_RESERVED_WAIT: u64 = 6;
 
 pub const RPC_TERMINAL_REPLY: u64 = 1;
 pub const RPC_TERMINAL_SUPERVISOR_CANCEL: u64 = 2;
@@ -60,6 +65,8 @@ const REQUEST_WAIT_PREPARED: u8 = 2;
 const REQUEST_WAITING: u8 = 3;
 const REQUEST_TERMINAL: u8 = 4;
 const REQUEST_RETIRED: u8 = 5;
+const REQUEST_RESERVED: u8 = 6;
+const REQUEST_RESERVED_WAIT: u8 = 7;
 
 const REQUEST_HANDLE_TAG: u64 = 0xb400_0000;
 const PROCESS_HANDLE_TAG: u64 = 0xe100_0000;
@@ -107,6 +114,8 @@ static mut SERVICE_AVAILABLE: u8 = 0;
 
 static mut PUBLISHES: u64 = 0;
 static mut REPLACEMENTS: u64 = 0;
+static mut DISPATCH_PREPARES: u64 = 0;
+static mut DISPATCH_PREPARE_ABORTS: u64 = 0;
 static mut DISPATCHES: u64 = 0;
 static mut ABORTED_DISPATCHES: u64 = 0;
 static mut WAITS_ARMED: u64 = 0;
@@ -127,6 +136,10 @@ static mut STALE_REPLIES: u64 = 0;
 static mut DUPLICATE_REPLIES: u64 = 0;
 static mut LATE_REPLIES: u64 = 0;
 static mut DENIED_OPERATIONS: u64 = 0;
+static mut CALLER_EXIT_ABORTS: u64 = 0;
+static mut WAIT_FAILURE_ARMS: u64 = 0;
+static mut WAIT_FAILURES: u64 = 0;
+static mut FAIL_NEXT_WAIT: u8 = 0;
 
 static mut INITIALIZED: u8 = 0;
 static mut POISONED: u8 = 0;
@@ -310,11 +323,25 @@ unsafe fn active_slot_count() -> usize {
     return count;
 }
 
+unsafe fn reserved_slot_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_RESERVED
+            || STATES[slot] == REQUEST_RESERVED_WAIT {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
 unsafe fn waiting_slot_count() -> usize {
     let mut count: usize = 0;
     let mut slot: usize = 0;
     while slot < MAX_PERSONALITY_REQUESTS {
-        if STATES[slot] == REQUEST_WAIT_PREPARED
+        if STATES[slot] == REQUEST_RESERVED_WAIT
+            || STATES[slot] == REQUEST_WAIT_PREPARED
             || STATES[slot] == REQUEST_WAITING {
             count += 1;
         }
@@ -327,7 +354,8 @@ unsafe fn prepared_slot_count() -> usize {
     let mut count: usize = 0;
     let mut slot: usize = 0;
     while slot < MAX_PERSONALITY_REQUESTS {
-        if STATES[slot] == REQUEST_WAIT_PREPARED {
+        if STATES[slot] == REQUEST_RESERVED_WAIT
+            || STATES[slot] == REQUEST_WAIT_PREPARED {
             count += 1;
         }
         slot += 1;
@@ -480,6 +508,8 @@ pub unsafe fn init() -> u64 {
     SERVICE_AVAILABLE = 0;
     PUBLISHES = 0;
     REPLACEMENTS = 0;
+    DISPATCH_PREPARES = 0;
+    DISPATCH_PREPARE_ABORTS = 0;
     DISPATCHES = 0;
     ABORTED_DISPATCHES = 0;
     WAITS_ARMED = 0;
@@ -500,6 +530,10 @@ pub unsafe fn init() -> u64 {
     DUPLICATE_REPLIES = 0;
     LATE_REPLIES = 0;
     DENIED_OPERATIONS = 0;
+    CALLER_EXIT_ABORTS = 0;
+    WAIT_FAILURE_ARMS = 0;
+    WAIT_FAILURES = 0;
+    FAIL_NEXT_WAIT = 0;
     POISONED = 0;
     INITIALIZED = 1;
     if !invariants_hold() {
@@ -584,6 +618,7 @@ pub unsafe fn install_replacement(
         || !endpoint_is_live(replacement_request_endpoint)
         || !endpoint_is_live(CLIENT_WAIT_ENDPOINT)
         || waiting_slot_count() != 0
+        || reserved_slot_count() != 0
         || REPLACEMENTS == MAX_COUNTER {
         return deny(ERR_PERSONALITY_BUSY);
     }
@@ -592,6 +627,246 @@ pub unsafe fn install_replacement(
     SERVICE_REQUEST_ENDPOINT = replacement_request_endpoint;
     SERVICE_AVAILABLE = 1;
     REPLACEMENTS += 1;
+    return finish(1);
+}
+
+// Reserve a generation-tagged request and bind all caller/service metadata,
+// but do not enqueue an endpoint message or wake the service.  Pointer-bearing
+// adapters use this phase to create and snapshot their request-scoped memory
+// view before publish_dispatch makes the scalar request observable.
+pub unsafe fn prepare_dispatch(
+    caller_process: u64,
+    caller_thread: u64,
+    request_frame: u64,
+    deadline: u64,
+    request_out: *mut u64
+) -> u64 {
+    if request_out as usize == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    volatile_store(request_out, 0);
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if !frame_valid(request_frame) {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if !process_is_live(caller_process)
+        || !can_issue_operations(caller_process)
+        || !thread_is_live(caller_thread)
+        || current_thread_handle() != caller_thread
+        || thread_state(caller_thread) != THREAD_STATE_RUNNING
+        || process_for(caller_thread) != caller_process {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] != REQUEST_EMPTY
+            && STATES[slot] != REQUEST_RETIRED
+            && CALLER_THREADS[slot] == caller_thread {
+            return deny(ERR_PERSONALITY_BUSY);
+        }
+        slot += 1;
+    }
+    if CONFIGURED == 0
+        || SERVICE_AVAILABLE == 0
+        || !process_is_live(SERVICE_PROCESS)
+        || !endpoint_is_live(SERVICE_REQUEST_ENDPOINT)
+        || !endpoint_is_live(CLIENT_WAIT_ENDPOINT) {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    if waiting_slot_count() != 0 || reserved_slot_count() != 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    slot = 0;
+    while slot < MAX_PERSONALITY_REQUESTS && STATES[slot] != REQUEST_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || DISPATCH_PREPARES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    let request: u64 = make_handle(slot);
+    CALLER_PROCESSES[slot] = caller_process;
+    CALLER_THREADS[slot] = caller_thread;
+    CORRELATIONS[slot] = request;
+    REQUEST_FRAMES[slot] = request_frame;
+    DEADLINES[slot] = deadline;
+    REQUEST_SERVICE_PROCESSES[slot] = SERVICE_PROCESS;
+    REQUEST_SERVICE_GENERATIONS[slot] = SERVICE_GENERATION;
+    REQUEST_PROTOCOLS[slot] = PROTOCOL_ID;
+    STATES[slot] = REQUEST_RESERVED;
+    DISPATCH_PREPARES += 1;
+    volatile_store(request_out, request);
+    return finish(1);
+}
+
+// Publish the exact reserved request with endpoint word 3 fixed at zero.  The
+// router state becomes DISPATCHED before a sleeping daemon is made runnable.
+pub unsafe fn publish_dispatch(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || (STATES[slot] != REQUEST_RESERVED
+            && STATES[slot] != REQUEST_RESERVED_WAIT)
+        || SERVICE_AVAILABLE == 0
+        || REQUEST_SERVICE_PROCESSES[slot] != SERVICE_PROCESS
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID
+        || !process_is_live(SERVICE_PROCESS)
+        || !endpoint_is_live(SERVICE_REQUEST_ENDPOINT)
+        || DISPATCHES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if enqueue(
+        SERVICE_REQUEST_ENDPOINT,
+        CALLER_PROCESSES[slot],
+        CORRELATIONS[slot],
+        REQUEST_FRAMES[slot],
+        0
+    ) == 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    let had_prepared_wait: bool = STATES[slot] == REQUEST_RESERVED_WAIT;
+    if had_prepared_wait {
+        STATES[slot] = REQUEST_WAIT_PREPARED;
+    } else {
+        STATES[slot] = REQUEST_DISPATCHED;
+    }
+    DISPATCHES += 1;
+    if receiver_waiter(SERVICE_REQUEST_ENDPOINT) != 0 {
+        if SERVICE_REQUEST_WAKES == MAX_COUNTER
+            || complete_ipc_wait(
+                SERVICE_REQUEST_ENDPOINT,
+                ENDPOINT_WAITER_RECEIVER,
+                ERR_IPC_RETRY,
+                WAKE_REASON_IPC
+            ) == 0 {
+            if cancel_by_sender_correlation(
+                SERVICE_REQUEST_ENDPOINT,
+                CALLER_PROCESSES[slot],
+                CORRELATIONS[slot]
+            ) != 1 {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            DISPATCHES -= 1;
+            if had_prepared_wait {
+                STATES[slot] = REQUEST_RESERVED_WAIT;
+            } else {
+                STATES[slot] = REQUEST_RESERVED;
+            }
+            return deny(ERR_PERSONALITY_FAILED);
+        }
+        SERVICE_REQUEST_WAKES += 1;
+    }
+    return finish(RPC_DISPATCHED);
+}
+
+// Abort a reservation before endpoint publication.  This path produces no
+// message, no daemon wake, and no terminal request history entry.
+pub unsafe fn abort_prepared_dispatch(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_RESERVED
+        || DISPATCH_PREPARE_ABORTS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    DISPATCH_PREPARE_ABORTS += 1;
+    retire_or_reuse(slot);
+    return finish(1);
+}
+
+// Reserve the caller's receive wait before endpoint publication. A failed
+// reservation remains completely private: no request message and no service
+// wake have been published yet.
+pub unsafe fn prepare_wait_before_publish(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_RESERVED
+        || SERVICE_AVAILABLE == 0
+        || REQUEST_SERVICE_PROCESSES[slot] != SERVICE_PROCESS
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if FAIL_NEXT_WAIT != 0 {
+        if WAIT_FAILURES == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        FAIL_NEXT_WAIT = 0;
+        WAIT_FAILURES += 1;
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    if WAITS_ARMED == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    let wait: u64 = begin_ipc_wait(
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        CALLER_THREADS[slot],
+        CALLER_PROCESSES[slot]
+    );
+    if wait == 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    WAIT_REQUESTS[slot] = wait;
+    STATES[slot] = REQUEST_RESERVED_WAIT;
+    WAITS_ARMED += 1;
+    if finish(1) != 1 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    return wait;
+}
+
+// Roll back a private request whose wait was reserved but whose endpoint
+// message was never successfully published.
+pub unsafe fn abort_prepared_wait_dispatch(
+    request: u64,
+    wait: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_RESERVED_WAIT
+        || WAIT_REQUESTS[slot] != wait
+        || WAITS_ABORTED == MAX_COUNTER
+        || PREPARED_WAIT_ABORTS == MAX_COUNTER
+        || DISPATCH_PREPARE_ABORTS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if abort_ipc_wait(wait) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    WAITS_ABORTED += 1;
+    PREPARED_WAIT_ABORTS += 1;
+    DISPATCH_PREPARE_ABORTS += 1;
+    retire_or_reuse(slot);
+    return finish(1);
+}
+
+pub unsafe fn inject_wait_failure_once() -> u64 {
+    if !preflight()
+        || current_thread_handle() != 0
+        || active_slot_count() != 0
+        || FAIL_NEXT_WAIT != 0
+        || WAIT_FAILURE_ARMS == MAX_COUNTER {
+        return 0;
+    }
+    FAIL_NEXT_WAIT = 1;
+    WAIT_FAILURE_ARMS += 1;
     return finish(1);
 }
 
@@ -650,64 +925,27 @@ pub unsafe fn dispatch_or_consume(
         }
         slot += 1;
     }
-    if CONFIGURED == 0
-        || SERVICE_AVAILABLE == 0
-        || !process_is_live(SERVICE_PROCESS)
-        || !endpoint_is_live(SERVICE_REQUEST_ENDPOINT)
-        || !endpoint_is_live(CLIENT_WAIT_ENDPOINT) {
-        return deny(ERR_PERSONALITY_UNAVAILABLE);
-    }
-    if waiting_slot_count() != 0 {
-        return deny(ERR_PERSONALITY_BUSY);
-    }
-    slot = 0;
-    while slot < MAX_PERSONALITY_REQUESTS && STATES[slot] != REQUEST_EMPTY {
-        slot += 1;
-    }
-    if slot >= MAX_PERSONALITY_REQUESTS || DISPATCHES == MAX_COUNTER {
-        return deny(ERR_PERSONALITY_BUSY);
-    }
-    let request: u64 = make_handle(slot);
-    if enqueue(
-        SERVICE_REQUEST_ENDPOINT,
+    let mut request: u64 = 0;
+    let prepared: u64 = prepare_dispatch(
         caller_process,
-        request,
+        caller_thread,
         request_frame,
-        0
-    ) == 0 {
-        return deny(ERR_PERSONALITY_BUSY);
+        deadline,
+        (&mut request)
+    );
+    if prepared != 1 {
+        return prepared;
     }
-    if receiver_waiter(SERVICE_REQUEST_ENDPOINT) != 0 {
-        if SERVICE_REQUEST_WAKES == MAX_COUNTER
-            || complete_ipc_wait(
-                SERVICE_REQUEST_ENDPOINT,
-                ENDPOINT_WAITER_RECEIVER,
-                ERR_IPC_RETRY,
-                WAKE_REASON_IPC
-            ) == 0 {
-            if cancel_by_sender_correlation(
-                SERVICE_REQUEST_ENDPOINT,
-                caller_process,
-                request
-            ) != 1 {
-                POISONED = 1;
-            }
-            return deny(ERR_PERSONALITY_FAILED);
+    let published: u64 = publish_dispatch(request);
+    if published != RPC_DISPATCHED {
+        if abort_prepared_dispatch(request) != 1 {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
         }
-        SERVICE_REQUEST_WAKES += 1;
+        return published;
     }
-    CALLER_PROCESSES[slot] = caller_process;
-    CALLER_THREADS[slot] = caller_thread;
-    CORRELATIONS[slot] = request;
-    REQUEST_FRAMES[slot] = request_frame;
-    DEADLINES[slot] = deadline;
-    REQUEST_SERVICE_PROCESSES[slot] = SERVICE_PROCESS;
-    REQUEST_SERVICE_GENERATIONS[slot] = SERVICE_GENERATION;
-    REQUEST_PROTOCOLS[slot] = PROTOCOL_ID;
-    STATES[slot] = REQUEST_DISPATCHED;
-    DISPATCHES += 1;
     volatile_store(request_out, request);
-    return finish(RPC_DISPATCHED);
+    return published;
 }
 
 // arm_wait reserves the exact next IPC sleep epoch. commit_wait below commits
@@ -750,6 +988,60 @@ pub unsafe fn arm_wait(request: u64) -> u64 {
         return ERR_PERSONALITY_FAILED;
     }
     return wait;
+}
+
+// Composed transports must own rollback across their subordinate authority.
+// Unlike arm_wait(), failure to reserve an IPC wait leaves the published base
+// request in DISPATCHED state so the caller can first revoke its view and then
+// abort the exact queued request without an orphaned capability window.
+pub unsafe fn arm_wait_preserving_dispatch(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] != REQUEST_DISPATCHED
+        || SERVICE_AVAILABLE == 0
+        || REQUEST_SERVICE_PROCESSES[slot] != SERVICE_PROCESS
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if WAITS_ARMED == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    let wait: u64 = begin_ipc_wait(
+        CLIENT_WAIT_ENDPOINT,
+        ENDPOINT_WAITER_RECEIVER,
+        CALLER_THREADS[slot],
+        CALLER_PROCESSES[slot]
+    );
+    if wait == 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    WAIT_REQUESTS[slot] = wait;
+    STATES[slot] = REQUEST_WAIT_PREPARED;
+    WAITS_ARMED += 1;
+    if finish(1) != 1 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    return wait;
+}
+
+// Roll back a published request for which no waiter was ever reserved.  The
+// composed caller is responsible for revoking subordinate authority first.
+pub unsafe fn abort_dispatched(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || STATES[slot] != REQUEST_DISPATCHED {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    return finish(abort_dispatched_slot(slot));
 }
 
 pub unsafe fn commit_wait(request: u64, wait: u64) -> u64 {
@@ -811,6 +1103,157 @@ pub unsafe fn abort_wait(request: u64, wait: u64) -> u64 {
     ABORTED_DISPATCHES += 1;
     retire_or_reuse(slot);
     return finish(1);
+}
+
+// Read-only half of the reply transaction.  A composed transport can revoke
+// subordinate authority only after this proves that the outer M6A request has
+// an exact committed waiter and enough counter headroom to complete.  With
+// interrupts masked by syscall entry, reply() cannot observe a different
+// process/service/wait state between this check and its terminal transition.
+pub unsafe fn can_reply(
+    request: u64,
+    replying_service_process: u64,
+    result: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if result == ERR_IPC_RETRY
+        || result == SYSCALL_CONTROL_EXIT
+        || result == SYSCALL_CONTROL_SCHEDULE {
+        return ERR_PERSONALITY_UNSUPPORTED;
+    }
+    let history_slot: usize = terminal_history_index(request);
+    if history_slot < MAX_PERSONALITY_TOMBSTONES {
+        if TERMINAL_HISTORY_SERVICE_PROCESSES[history_slot]
+                == replying_service_process
+            && TERMINAL_HISTORY_SERVICE_GENERATIONS[history_slot]
+                == SERVICE_GENERATION
+            && TERMINAL_HISTORY_KINDS[history_slot] as u64
+                == RPC_TERMINAL_REPLY {
+            return ERR_PERSONALITY_DUPLICATE;
+        }
+        return ERR_PERSONALITY_STALE;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS
+        || REQUEST_SERVICE_PROCESSES[slot] != replying_service_process
+        || REQUEST_SERVICE_GENERATIONS[slot] != SERVICE_GENERATION
+        || REQUEST_PROTOCOLS[slot] != PROTOCOL_ID
+        || SERVICE_PROCESS != replying_service_process {
+        return ERR_PERSONALITY_STALE;
+    }
+    if STATES[slot] == REQUEST_TERMINAL {
+        if TERMINAL_KINDS[slot] as u64 == RPC_TERMINAL_REPLY {
+            return ERR_PERSONALITY_DUPLICATE;
+        }
+        return ERR_PERSONALITY_STALE;
+    }
+    if STATES[slot] != REQUEST_WAITING
+        || SERVICE_AVAILABLE == 0
+        || !process_is_live(replying_service_process)
+        || receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
+        return ERR_PERSONALITY_STALE;
+    }
+    if TERMINAL_TRANSITIONS == MAX_COUNTER
+        || TERMINAL_WAKES == MAX_COUNTER
+        || REPLIES == MAX_COUNTER {
+        return ERR_PERSONALITY_FAILED;
+    }
+    return 1;
+}
+
+// Read-only terminal readiness for composed revocation paths.  This is
+// kernel-internal policy glue, not a userspace authority surface.
+pub unsafe fn can_transition(request: u64, kind: u64) -> u64 {
+    if !preflight() || !terminal_kind_valid(kind) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = checked_request(request);
+    if slot >= MAX_PERSONALITY_REQUESTS {
+        return ERR_PERSONALITY_STALE;
+    }
+    if STATES[slot] == REQUEST_TERMINAL {
+        return ERR_PERSONALITY_DUPLICATE;
+    }
+    if STATES[slot] != REQUEST_WAITING
+        || receiver_waiter(CLIENT_WAIT_ENDPOINT) != CALLER_THREADS[slot] {
+        return ERR_PERSONALITY_BUSY;
+    }
+    if TERMINAL_TRANSITIONS == MAX_COUNTER
+        || TERMINAL_WAKES == MAX_COUNTER
+        || (kind == RPC_TERMINAL_REPLY && REPLIES == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_SUPERVISOR_CANCEL
+            && SUPERVISOR_CANCELS == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_DEADLINE
+            && DEADLINE_EXPIRIES == MAX_COUNTER)
+        || (kind == RPC_TERMINAL_SERVICE_DEATH
+            && SERVICE_DEATH_TERMINALS == MAX_COUNTER) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    return 1;
+}
+
+// Exact caller teardown removes a committed personality wait without waking
+// the dying thread.  The caller PCB remains structurally live while lifecycle
+// cleanup runs, so generation checks and endpoint ownership remain available.
+pub unsafe fn caller_exited(caller_process: u64) -> u64 {
+    if !preflight() || !process_is_live(caller_process) {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let mut matches: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] != REQUEST_EMPTY
+            && STATES[slot] != REQUEST_RETIRED
+            && CALLER_PROCESSES[slot] == caller_process {
+            if STATES[slot] != REQUEST_WAITING {
+                return deny(ERR_PERSONALITY_BUSY);
+            }
+            matches += 1;
+        }
+        slot += 1;
+    }
+    if matches == 0 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if WAITS_ABORTED > MAX_COUNTER - matches
+        || COMMITTED_WAIT_ABORTS > MAX_COUNTER - matches
+        || ABORTED_DISPATCHES > MAX_COUNTER - matches
+        || CALLER_EXIT_ABORTS > MAX_COUNTER - matches {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let unlinked: u64 = cancel_process_waits(
+        caller_process,
+        ERR_ENDPOINT_CLOSED
+    );
+    if unlinked == IPC_WAIT_FAILURE || unlinked < matches {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    slot = 0;
+    while slot < MAX_PERSONALITY_REQUESTS {
+        if STATES[slot] == REQUEST_WAITING
+            && CALLER_PROCESSES[slot] == caller_process {
+            let removed: usize = cancel_by_sender_correlation(
+                SERVICE_REQUEST_ENDPOINT,
+                caller_process,
+                CORRELATIONS[slot]
+            );
+            if removed > 1 {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            WAIT_REQUESTS[slot] = 0;
+            WAITS_ABORTED += 1;
+            COMMITTED_WAIT_ABORTS += 1;
+            ABORTED_DISPATCHES += 1;
+            CALLER_EXIT_ABORTS += 1;
+            retire_or_reuse(slot);
+        }
+        slot += 1;
+    }
+    return finish(matches);
 }
 
 pub unsafe fn reply(
@@ -906,6 +1349,13 @@ pub unsafe fn supervisor_cancel(request: u64) -> u64 {
     if !preflight() {
         return ERR_PERSONALITY_FAILED;
     }
+    // A terminal result may be consumed between two supervisor syscalls.
+    // Preserve the same duplicate classification after retirement that the
+    // resident REQUEST_TERMINAL branch provides, without publishing another
+    // transition/wake or changing the reply-duplicate counter.
+    if terminal_history_index(request) < MAX_PERSONALITY_TOMBSTONES {
+        return deny(ERR_PERSONALITY_DUPLICATE);
+    }
     let slot: usize = checked_request(request);
     if slot >= MAX_PERSONALITY_REQUESTS {
         return deny(ERR_PERSONALITY_STALE);
@@ -962,7 +1412,9 @@ pub unsafe fn service_died(service_process: u64) -> u64 {
     }
     let mut slot: usize = 0;
     while slot < MAX_PERSONALITY_REQUESTS {
-        if (STATES[slot] == REQUEST_DISPATCHED
+        if (STATES[slot] == REQUEST_RESERVED
+            || STATES[slot] == REQUEST_RESERVED_WAIT
+            || STATES[slot] == REQUEST_DISPATCHED
             || STATES[slot] == REQUEST_WAIT_PREPARED)
             && REQUEST_SERVICE_PROCESSES[slot] == service_process {
             return deny(ERR_PERSONALITY_BUSY);
@@ -1053,10 +1505,15 @@ pub unsafe fn invariants_hold() -> bool {
                 + committed_waiting_slot_count() as u64
         || TERMINAL_TRANSITIONS
             != CONSUMED_RESULTS + terminal_slot_count() as u64
+        || DISPATCH_PREPARES
+            != DISPATCH_PREPARE_ABORTS
+                + DISPATCHES
+                + reserved_slot_count() as u64
         || DISPATCHES
             != ABORTED_DISPATCHES
                 + CONSUMED_RESULTS
                 + active_slot_count() as u64
+                - reserved_slot_count() as u64
         || waiting_slot_count() > 1
         || SERVICE_REQUEST_WAKES > DISPATCHES {
         return false;
@@ -1084,7 +1541,9 @@ pub unsafe fn invariants_hold() -> bool {
                 || TERMINAL_RESULTS[slot] != 0 {
                 return false;
             }
-        } else if state == REQUEST_DISPATCHED
+        } else if state == REQUEST_RESERVED
+            || state == REQUEST_RESERVED_WAIT
+            || state == REQUEST_DISPATCHED
             || state == REQUEST_WAIT_PREPARED
             || state == REQUEST_WAITING
             || state == REQUEST_TERMINAL {
@@ -1099,7 +1558,9 @@ pub unsafe fn invariants_hold() -> bool {
                 || REQUEST_PROTOCOLS[slot] != PERSONALITY_RPC_V1 {
                 return false;
             }
-            if state == REQUEST_WAIT_PREPARED || state == REQUEST_WAITING {
+            if state == REQUEST_RESERVED_WAIT
+                || state == REQUEST_WAIT_PREPARED
+                || state == REQUEST_WAITING {
                 if !wait_handle_shape_valid(WAIT_REQUESTS[slot])
                     || TERMINAL_KINDS[slot] != 0
                     || TERMINAL_RESULTS[slot] != 0
@@ -1213,6 +1674,10 @@ pub unsafe fn invariants_hold() -> bool {
         && receiver_waiter(CLIENT_WAIT_ENDPOINT) != expected_waiter {
         return false;
     }
+    if WAIT_FAILURE_ARMS != WAIT_FAILURES + FAIL_NEXT_WAIT as u64
+        || CALLER_EXIT_ABORTS > COMMITTED_WAIT_ABORTS {
+        return false;
+    }
     return true;
 }
 
@@ -1305,6 +1770,10 @@ pub unsafe fn service_request_endpoint() -> u64 { return SERVICE_REQUEST_ENDPOIN
 pub unsafe fn client_wait_endpoint() -> u64 { return CLIENT_WAIT_ENDPOINT; }
 pub unsafe fn service_is_available() -> bool { return SERVICE_AVAILABLE != 0; }
 pub unsafe fn request_count() -> usize { return active_slot_count(); }
+pub unsafe fn dispatch_prepare_count() -> u64 { return DISPATCH_PREPARES; }
+pub unsafe fn dispatch_prepare_abort_count() -> u64 {
+    return DISPATCH_PREPARE_ABORTS;
+}
 pub unsafe fn dispatch_count() -> u64 { return DISPATCHES; }
 pub unsafe fn aborted_dispatch_count() -> u64 { return ABORTED_DISPATCHES; }
 pub unsafe fn wait_arm_count() -> u64 { return WAITS_ARMED; }
@@ -1331,6 +1800,9 @@ pub unsafe fn stale_reply_count() -> u64 { return STALE_REPLIES; }
 pub unsafe fn duplicate_reply_count() -> u64 { return DUPLICATE_REPLIES; }
 pub unsafe fn late_reply_count() -> u64 { return LATE_REPLIES; }
 pub unsafe fn denial_count() -> u64 { return DENIED_OPERATIONS; }
+pub unsafe fn caller_exit_abort_count() -> u64 { return CALLER_EXIT_ABORTS; }
+pub unsafe fn wait_failure_arm_count() -> u64 { return WAIT_FAILURE_ARMS; }
+pub unsafe fn wait_failure_count() -> u64 { return WAIT_FAILURES; }
 pub unsafe fn publish_count() -> u64 { return PUBLISHES; }
 pub unsafe fn replacement_count() -> u64 { return REPLACEMENTS; }
 pub unsafe fn is_poisoned() -> bool { return POISONED != 0; }

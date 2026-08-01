@@ -44,6 +44,7 @@ use runtime::thread::WAKE_REASON_TIMER;
 use runtime::thread::wake_reason;
 use runtime::thread::queue_invariants_hold;
 use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::native_abi::ERR_IPC_RETRY;
 use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
 
 static mut YIELD_REQUESTS: u64 = 0;
@@ -67,6 +68,7 @@ static mut PENDING_REQUEST: u64 = 0;
 static mut PENDING_RESULT: u64 = 0;
 static mut HOSTILE_SYSCALL_SWITCHES: u64 = 0;
 static mut HOSTILE_FRAME_CONTAINMENTS: u64 = 0;
+static mut M2_PENDING_NT_THREAD: u64 = 0;
 static mut SCHEDULER_KIND: u8 = 0;
 static mut COMPLETION_KIND: u8 = 0;
 static mut IPC_PROCESSES: [u64; 4] = [0; 4];
@@ -121,6 +123,11 @@ extern "sysv64" fn kernel_m6_service_fault(process: u64) -> u64;
 extern "sysv64" fn kernel_m6_expire_requests(now: u64) -> u64;
 extern "sysv64" fn kernel_m6_phase_one_ready() -> u64;
 extern "sysv64" fn kernel_m6_final_ready() -> u64;
+extern "sysv64" fn kernel_m6_prepare_bounded_resume(
+    thread: u64,
+    result_out: *mut u64
+) -> u64;
+extern "sysv64" fn kernel_m6_commit_bounded_resume(thread: u64) -> u64;
 
 pub unsafe fn init() -> void {
     atomic_store((&mut YIELD_REQUESTS), 0, seq_cst);
@@ -148,6 +155,7 @@ pub unsafe fn init() -> void {
     PENDING_RESULT = 0;
     HOSTILE_SYSCALL_SWITCHES = 0;
     HOSTILE_FRAME_CONTAINMENTS = 0;
+    M2_PENDING_NT_THREAD = 0;
     SCHEDULER_KIND = SCHEDULER_KIND_NONE;
     COMPLETION_KIND = SCHEDULER_COMPLETION_NONE as u8;
     IPC_FAULT_CONTAINMENTS = 0;
@@ -219,6 +227,32 @@ unsafe fn clear_pending_action() -> void {
     PENDING_RESULT = 0;
 }
 
+// Both syscall scheduler branches use this one-shot transaction. The pending
+// handle is cleared only after the exact different TCB is installed and its
+// still-hostile saved frame is rechecked; assembly sanitizes that frame before
+// IRETQ immediately after this function returns.
+unsafe fn consume_m2_pending_selection(
+    source_thread: u64,
+    next_frame: usize
+) -> bool {
+    if M2_PENDING_NT_THREAD == 0 {
+        return true;
+    }
+    if source_thread == 0
+        || next_frame == 0
+        || current_thread_handle() != M2_PENDING_NT_THREAD
+        || current_thread_handle() == source_thread
+        || (volatile_load(
+            (next_frame as *const u64) + FRAME_RFLAGS_WORD
+        ) & RFLAGS_NT) == 0
+        || HOSTILE_SYSCALL_SWITCHES != 0 {
+        return false;
+    }
+    HOSTILE_SYSCALL_SWITCHES += 1;
+    M2_PENDING_NT_THREAD = 0;
+    return true;
+}
+
 // A malformed user return frame is a fault in the current TCB, not scheduler
 // completion and not a kernel-wide failure. Retire exactly that generation,
 // deschedule its PCB identity, and continue directly with a runnable sibling.
@@ -238,10 +272,12 @@ unsafe fn contain_invalid_current_frame(
         return 0;
     }
     HOSTILE_FRAME_CONTAINMENTS += 1;
-    let next_frame: usize = dispatch_next();
-    if next_frame == 0 {
+    let next_frame: usize = dispatch_next(true);
+    if next_frame == 0
+        || !consume_m2_pending_selection(source_thread, next_frame) {
         FAILED = 1;
         ACTIVE = 0;
+        return 0;
     }
     return next_frame;
 }
@@ -285,13 +321,12 @@ pub unsafe fn kernel_scheduler_syscall(frame: *mut u64) -> usize {
         ACTIVE = 0;
         return 0;
     }
-    let next_frame: usize = dispatch_next();
-    if next_frame != 0
-        && current_thread_handle() != source_thread
-        && (volatile_load(
-            (next_frame as *const u64) + FRAME_RFLAGS_WORD
-        ) & RFLAGS_NT) != 0 {
-        HOSTILE_SYSCALL_SWITCHES += 1;
+    let next_frame: usize = dispatch_next(true);
+    if next_frame == 0
+        || !consume_m2_pending_selection(source_thread, next_frame) {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
     }
     return next_frame;
 }
@@ -313,6 +348,7 @@ pub unsafe fn arm(
     if ACTIVE != 0
         || COMPLETE != 0
         || SCHEDULER_KIND != SCHEDULER_KIND_NONE
+        || M2_PENDING_NT_THREAD != 0
         || current_thread_handle() != 0
         || current_process_handle() != 0
         || physical_one == 0
@@ -874,16 +910,44 @@ unsafe fn install_thread_context(thread_handle: u64) -> usize {
     if frame == 0 {
         return install_failed(process_handle);
     }
-    // commit_next is the last fallible publication. It either succeeds with
-    // the exact TCB running or restores the DISPATCHING tombstone internally.
-    if commit_next(thread_handle) == 0 {
+    // Mode24 prevalidates its exact terminal request after architectural and
+    // PCB identity installation but while this TCB remains DISPATCHING.  Any
+    // failure can therefore still roll back through abort_next.  The final
+    // result replaces the provisional retry value before commit publication.
+    let mut bounded_result: u64 = 0;
+    let bounded_resume: u64 = kernel_m6_prepare_bounded_resume(
+        thread_handle,
+        (&mut bounded_result)
+    );
+    if bounded_resume > 1
+        || (bounded_resume == 1
+            && set_saved_result(thread_handle, bounded_result) == 0) {
         return install_failed(process_handle);
+    }
+    // commit_next is the last fallible scheduler publication. It either
+    // succeeds with the exact TCB running or restores DISPATCHING internally.
+    if commit_next(thread_handle) == 0 {
+        if bounded_resume == 1
+            && set_saved_result(thread_handle, ERR_IPC_RETRY) == 0 {
+            FAILED = 1;
+            ACTIVE = 0;
+        }
+        return install_failed(process_handle);
+    }
+    // All fallible checks and saved-frame mutation are complete.  With
+    // interrupts still masked, consume/copy-back must now complete as one
+    // trusted terminal transaction before this frame can reach IRETQ.
+    if bounded_resume == 1
+        && kernel_m6_commit_bounded_resume(thread_handle) != 1 {
+        FAILED = 1;
+        ACTIVE = 0;
+        return 0;
     }
     CONTEXT_SWITCHES += 1;
     return frame;
 }
 
-unsafe fn dispatch_next() -> usize {
+unsafe fn dispatch_next(from_syscall: bool) -> usize {
     let mut next_thread: u64 = prepare_next();
     if next_thread == 0 {
         return 0;
@@ -892,11 +956,26 @@ unsafe fn dispatch_next() -> usize {
     // The faulting personality owns a deliberately full endpoint. It may run
     // only after the client has committed its sender wait, otherwise a timer
     // race can close the endpoint before the public send genuinely blocks.
-    // Rotating only the exact mode-14 TCB preserves normal FIFO policy for M2.
+    // Mode2 separately requires the NT-bearing CPU-one frame to be selected by
+    // a sibling scheduling syscall. A timer may preempt and save that frame,
+    // but must defer it; the next syscall dispatch rotates directly to that
+    // exact TCB so later counter loops cannot strand it behind the FIFO head.
+    // Both exceptions are bounded test-mode choreography; ordinary FIFO order
+    // resumes after the one hostile-frame proof edge.
     let mut deferred: usize = 0;
-    while SCHEDULER_KIND == SCHEDULER_KIND_IPC
-        && next_thread == THREADS[3]
-        && sender_block_count() == 0 {
+    let prefer_mode2_hostile: bool =
+        SCHEDULER_KIND == SCHEDULER_KIND_M2
+        && from_syscall
+        && M2_PENDING_NT_THREAD != 0;
+    while (SCHEDULER_KIND == SCHEDULER_KIND_IPC
+            && next_thread == THREADS[3]
+            && sender_block_count() == 0)
+        || (SCHEDULER_KIND == SCHEDULER_KIND_M2
+            && !from_syscall
+            && M2_PENDING_NT_THREAD != 0
+            && next_thread == M2_PENDING_NT_THREAD)
+        || (prefer_mode2_hostile
+            && next_thread != M2_PENDING_NT_THREAD) {
         if defer_next(next_thread) == 0 {
             FAILED = 1;
             ACTIVE = 0;
@@ -1207,7 +1286,8 @@ unsafe fn finish_loaded_processes(running_process: u64) -> bool {
                 && index == 2
                 && process_state(LOADED_PROCESSES[index])
                     != PROCESS_STATE_REAPABLE)
-            || (!(SCHEDULER_KIND == SCHEDULER_KIND_LIVE && index == 2)
+            || (process_state(LOADED_PROCESSES[index])
+                    != PROCESS_STATE_REAPABLE
                 && terminate_process(LOADED_PROCESSES[index]) != 1) {
             return false;
         }
@@ -1228,7 +1308,8 @@ unsafe fn finish_loaded_processes(running_process: u64) -> bool {
     }
     index = 0;
     while index < LOADED_COUNT {
-        if (!(SCHEDULER_KIND == SCHEDULER_KIND_LIVE && index == 2)
+        if (process_state(LOADED_PROCESSES[index])
+                != PROCESS_STATE_REAPABLE
                 && stop_process(
                     LOADED_PROCESSES[index],
                     exit_base + index as u64
@@ -1307,7 +1388,7 @@ pub unsafe fn contain_current_process_fault(
         ACTIVE = 0;
         return 0;
     }
-    let next_frame: usize = dispatch_next();
+    let next_frame: usize = dispatch_next(false);
     if next_frame == 0 {
         FAILED = 1;
         ACTIVE = 0;
@@ -1358,6 +1439,22 @@ pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
                 current_thread,
                 running_process
             );
+        }
+        if SCHEDULER_KIND == SCHEDULER_KIND_M2
+            && (volatile_load(
+                (frame as *const u64) + FRAME_RFLAGS_WORD
+            ) & RFLAGS_NT) != 0 {
+            // The hostile frame is a one-shot exact-generation proof. Timer
+            // preemption records its identity, but only a later sibling
+            // scheduling syscall may consume the pending selection edge.
+            if current_thread != THREADS[0]
+                || M2_PENDING_NT_THREAD != 0
+                || HOSTILE_SYSCALL_SWITCHES != 0 {
+                FAILED = 1;
+                ACTIVE = 0;
+                return 0;
+            }
+            M2_PENDING_NT_THREAD = current_thread;
         }
         let quantum_expired: u64 = account_current_tick(false);
         if SCHEDULER_KIND == SCHEDULER_KIND_LIVE
@@ -1485,6 +1582,8 @@ pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
                 if PROCESS_ONE_TERMINATED == 0
                 && running_process == PROCESS_ONE
                 && now >= 12
+                && M2_PENDING_NT_THREAD == 0
+                && HOSTILE_SYSCALL_SWITCHES == 1
                 && HOSTILE_FRAME_CONTAINMENTS == 1
                 && all_threads_ran()
                 && volatile_load(PHYSICAL_ONE as *const u64) != 0
@@ -1513,7 +1612,7 @@ pub unsafe fn on_timer(frame: *mut u64, now: u64, from_user: bool) -> usize {
         }
     }
 
-    let next_frame: usize = dispatch_next();
+    let next_frame: usize = dispatch_next(false);
     if next_frame == 0 {
         // A genuine no-runnable interval remains in the kernel idle thread.
         // The bounded M2 proof begins with two runnable CPU threads, so a user

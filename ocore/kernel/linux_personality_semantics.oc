@@ -1,0 +1,273 @@
+module kernel::linux_personality_semantics;
+
+use runtime::linux_fd_table::active_count as active_fd_count;
+use runtime::linux_fd_table::authorize_write;
+use runtime::linux_fd_table::denial_count as fd_denial_count;
+use runtime::linux_fd_table::invariants_hold as fd_invariants_hold;
+use runtime::linux_fd_table::is_live as fd_is_live;
+use runtime::linux_fd_table::lookup_write_object;
+use runtime::linux_fd_table::stale_denial_count;
+use runtime::linux_fd_table::LINUX_FD_SINK_STDERR;
+use runtime::linux_fd_table::LINUX_FD_SINK_STDOUT;
+use runtime::linux_personality::classify_syscall;
+use runtime::linux_personality::enosys_count;
+use runtime::linux_personality::exit_group_count;
+use runtime::linux_personality::init as linux_init;
+use runtime::linux_personality::invariants_hold as linux_invariants_hold;
+use runtime::linux_personality::make_write_request_frame;
+use runtime::linux_personality::process_exited;
+use runtime::linux_personality::provision_process;
+use runtime::linux_personality::service_generation_died;
+use runtime::linux_personality::stderr_length;
+use runtime::linux_personality::stdout_length;
+use runtime::linux_personality::write_byte_count;
+use runtime::linux_personality::write_call_count;
+use runtime::linux_personality::write_request_metadata_matches;
+use runtime::linux_personality::LINUX_ACTION_BOUNDED_WRITE;
+use runtime::linux_personality::LINUX_ACTION_DIRECT_EXIT_GROUP;
+use runtime::linux_personality::LINUX_ACTION_RETURN;
+use runtime::linux_personality::LINUX_NEG_ENOSYS;
+use runtime::linux_personality::LINUX_X86_64_NR_EXIT_GROUP;
+use runtime::linux_personality::LINUX_X86_64_NR_WRITE;
+use runtime::personality_memory_view::MEMORY_VIEW_DIRECTION_IN;
+use runtime::personality_memory_view::MEMORY_VIEW_DIRECTION_OUT;
+
+// Mode 19 executes this kernel-admin object-table, syscall-classification, and
+// request-metadata matching oracle under QEMU. It does not call complete_write,
+// exercise the Mode 24 daemon/view path, execute the pinned Linux ELF, or claim
+// Linux execution.
+pub const LINUX_MINIMAL_SEMANTICS_PASS: u64 = 0x4c49_4e55_5853_5041;
+
+const GUEST_PROCESS: u64 = 0x0000_0001_e100_0000;
+const OBSERVER_PROCESS: u64 = 0x0000_0001_e100_0003;
+const SERVICE_G1: u64 = 0x0000_0001_e100_0001;
+const SERVICE_G2: u64 = 0x0000_0002_e100_0001;
+const OBSERVER_SERVICE: u64 = 0x0000_0001_e100_0002;
+
+unsafe fn classification_corpus() -> bool {
+    let mut action: u64 = 0;
+    let mut result: u64 = 0;
+    if classify_syscall(
+        LINUX_X86_64_NR_WRITE,
+        1,
+        (&mut action),
+        (&mut result)
+    ) != 1
+        || action != LINUX_ACTION_BOUNDED_WRITE
+        || result != 0 {
+        return false;
+    }
+    if classify_syscall(
+        0,
+        0,
+        (&mut action),
+        (&mut result)
+    ) != 1
+        || action != LINUX_ACTION_RETURN
+        || result != LINUX_NEG_ENOSYS {
+        return false;
+    }
+    if classify_syscall(
+        LINUX_X86_64_NR_EXIT_GROUP,
+        42,
+        (&mut action),
+        (&mut result)
+    ) != 1
+        || action != LINUX_ACTION_DIRECT_EXIT_GROUP
+        || result != 42 {
+        return false;
+    }
+    return enosys_count() == 1 && exit_group_count() == 1;
+}
+
+fn write_request_metadata_corpus() -> bool {
+    let frame: u64 = make_write_request_frame(1, 17);
+    let wrong_operation: u64 = (LINUX_X86_64_NR_EXIT_GROUP << 56)
+        | (1 << 8)
+        | 17;
+    return frame != 0
+        && write_request_metadata_matches(
+            frame,
+            17,
+            MEMORY_VIEW_DIRECTION_IN,
+            1,
+            17
+        )
+        // Daemon-supplied fd and count cannot differ from the immutable frame.
+        && !write_request_metadata_matches(
+            frame,
+            17,
+            MEMORY_VIEW_DIRECTION_IN,
+            2,
+            17
+        )
+        && !write_request_metadata_matches(
+            frame,
+            17,
+            MEMORY_VIEW_DIRECTION_IN,
+            1,
+            16
+        )
+        // Nor can the frame count differ from the bridge-owned view length.
+        && !write_request_metadata_matches(
+            frame,
+            16,
+            MEMORY_VIEW_DIRECTION_IN,
+            1,
+            17
+        )
+        && !write_request_metadata_matches(
+            wrong_operation,
+            17,
+            MEMORY_VIEW_DIRECTION_IN,
+            1,
+            17
+        )
+        && !write_request_metadata_matches(
+            frame,
+            17,
+            MEMORY_VIEW_DIRECTION_OUT,
+            1,
+            17
+        )
+        && make_write_request_frame(1, 129) == 0;
+}
+
+pub unsafe fn self_test() -> u64 {
+    if linux_init() != 1
+        || !write_request_metadata_corpus()
+        || !classification_corpus() {
+        return 0;
+    }
+
+    let mut g1_stdout: u64 = 0;
+    let mut g1_stderr: u64 = 0;
+    let mut observer_stdout: u64 = 0;
+    let mut observer_stderr: u64 = 0;
+    if provision_process(
+        GUEST_PROCESS,
+        SERVICE_G1,
+        1,
+        (&mut g1_stdout),
+        (&mut g1_stderr)
+    ) != 1
+        || provision_process(
+            OBSERVER_PROCESS,
+            OBSERVER_SERVICE,
+            1,
+            (&mut observer_stdout),
+            (&mut observer_stderr)
+        ) != 1
+        || active_fd_count() != 4
+        || g1_stdout == 1
+        || g1_stderr == 2
+        || g1_stdout == g1_stderr
+        || !fd_is_live(g1_stdout)
+        || !fd_is_live(g1_stderr)
+        || authorize_write(
+            g1_stdout,
+            GUEST_PROCESS,
+            SERVICE_G1,
+            1,
+            1
+        ) != LINUX_FD_SINK_STDOUT
+        || authorize_write(
+            g1_stderr,
+            GUEST_PROCESS,
+            SERVICE_G1,
+            1,
+            2
+        ) != LINUX_FD_SINK_STDERR {
+        return 0;
+    }
+
+    // fd 0 is not provisioned; wrong owner/generation and raw foreign fd
+    // integers never become internal authority.
+    if lookup_write_object(GUEST_PROCESS, SERVICE_G1, 1, 0) != 0
+        || authorize_write(
+            g1_stdout,
+            OBSERVER_PROCESS,
+            SERVICE_G1,
+            1,
+            1
+        ) != 0
+        || authorize_write(
+            1,
+            GUEST_PROCESS,
+            SERVICE_G1,
+            1,
+            1
+        ) != 0 {
+        return 0;
+    }
+
+    // Revoke only the crashed daemon identity+generation. An unrelated owner
+    // deliberately uses the same numeric generation and remains valid.
+    if service_generation_died(SERVICE_G1, 1) != 2
+        || active_fd_count() != 2
+        || fd_is_live(g1_stdout)
+        || fd_is_live(g1_stderr)
+        || authorize_write(
+            g1_stdout,
+            GUEST_PROCESS,
+            SERVICE_G1,
+            1,
+            1
+        ) != 0
+        || authorize_write(
+            observer_stdout,
+            OBSERVER_PROCESS,
+            OBSERVER_SERVICE,
+            1,
+            1
+        ) != LINUX_FD_SINK_STDOUT {
+        return 0;
+    }
+
+    let mut g2_stdout: u64 = 0;
+    let mut g2_stderr: u64 = 0;
+    if provision_process(
+        GUEST_PROCESS,
+        SERVICE_G2,
+        2,
+        (&mut g2_stdout),
+        (&mut g2_stderr)
+    ) != 1
+        || g2_stdout == g1_stdout
+        || g2_stderr == g1_stderr
+        || active_fd_count() != 4
+        || authorize_write(
+            g2_stdout,
+            GUEST_PROCESS,
+            SERVICE_G2,
+            2,
+            1
+        ) != LINUX_FD_SINK_STDOUT {
+        return 0;
+    }
+
+    // exit_group's integration hook must perform this exact process-scoped
+    // cleanup before reap. It cannot revoke the unrelated observer.
+    if process_exited(GUEST_PROCESS) != 2
+        || active_fd_count() != 2
+        || authorize_write(
+            observer_stderr,
+            OBSERVER_PROCESS,
+            OBSERVER_SERVICE,
+            1,
+            2
+        ) != LINUX_FD_SINK_STDERR
+        || process_exited(OBSERVER_PROCESS) != 2
+        || active_fd_count() != 0
+        || stdout_length() != 0
+        || stderr_length() != 0
+        || write_call_count() != 0
+        || write_byte_count() != 0
+        || fd_denial_count() < 4
+        || stale_denial_count() < 3
+        || !fd_invariants_hold()
+        || !linux_invariants_hold() {
+        return 0;
+    }
+    return LINUX_MINIMAL_SEMANTICS_PASS;
+}

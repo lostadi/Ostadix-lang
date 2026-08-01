@@ -40,6 +40,9 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
 
+      - name: Run manifest-selected Rust example semantics
+        run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
+
       - name: Run hosted Live-World reference smoke
         run: bash scripts/smoke-hosted-live-reference.sh
 
@@ -73,6 +76,11 @@ jobs:
       - name: Parser tests
         run: python3 -m tests.test_parser
 
+      - name: Validate cross-edition example manifest
+        run: |
+          python3 tests/example_manifest.py validate
+          python3 -m unittest -v tests.test_example_manifest
+
       - name: Evaluator tests
         run: python3 -m tests.test_evaluator
 
@@ -92,22 +100,55 @@ jobs:
       - name: Make build (interpreter + olangc)
         run: make -C c_cpp
 
-      - name: Make interpreter smoke tests (incl. meta_eval quote/O.eval)
+      - name: Make manifest-selected interpreter smoke tests
         run: make -C c_cpp test
 
       - name: Make AOT compiler smoke tests
         run: make -C c_cpp olangc-test
 
+      - name: Warning-clean C17 build and argv/path regression
+        run: make -C c_cpp warnings-as-errors
+
       - name: CMake configure (clean out-of-source build)
         run: |
           rm -rf "${{ runner.temp }}/olang-cmake-build"
-          cmake -S c_cpp -B "${{ runner.temp }}/olang-cmake-build" -DCMAKE_BUILD_TYPE=Release
+          cmake -S c_cpp -B "${{ runner.temp }}/olang-cmake-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOLANG_WARNINGS_AS_ERRORS=ON
 
       - name: CMake build
         run: cmake --build "${{ runner.temp }}/olang-cmake-build" --parallel
 
-      - name: CTest smoke tests (interpreter + AOT, incl. meta_eval quote/O.eval)
+      - name: CTest manifest, AOT, and path-safety smokes
         run: ctest --test-dir "${{ runner.temp }}/olang-cmake-build" --output-on-failure
+
+  # ── Local MCP release surface (separate Cargo package) ─────────────────────
+  mcp:
+    name: Ostadix MCP release surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build root runtime binaries used by MCP
+        run: cargo build --release --locked --bin O --bin olangc
+
+      - name: Test isolated MCP crate
+        run: cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+
+      - name: Test MCP transport reader regressions
+        run: python3 -m unittest -v tests.test_mcp_smoke
+
+      - name: Clippy isolated MCP crate
+        run: cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
+
+      - name: Build isolated MCP release binary
+        run: cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+
+      - name: Run direct stdio JSON-RPC MCP smoke
+        run: python3 scripts/smoke_ostadix_mcp.py
 
   # ── Release-claim regression guard ─────────────────────────────────────────
   release-claims:
@@ -147,60 +188,13 @@ jobs:
           command -v llvm-objdump
           command -v nm
 
-      - name: Validate native launch and smoke entrypoints
-        run: |
-          cmp -s boot-and-test.sh okernel-multikernel/boot-and-test.sh
-          for script in \
-            boot-and-test.sh \
-            okernel-multikernel/boot-and-test.sh \
-            ocore/kernel/smoke-m6b-qemu.sh \
-            ocore/kernel/smoke-kernel-world-qemu.sh \
-            ocore/kernel/smoke-kernel-world-live-qemu.sh \
-            ocore/kernel/smoke-kernel-world-execution-device-qemu.sh
-          do
-            test -x "$script"
-            bash -n "$script"
-          done
-          ./boot-and-test.sh --help | grep -Fq 'smoke    Run all required OKernel QEMU gates'
+      - name: Verify isolated minimal Linux personality corpus
+        run: ocore/kernel/check-linux-minimal-slice.sh
 
-      - name: Run native and memory lifecycle smoke
-        run: ./ocore/kernel/smoke-qemu.sh
+      # BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CI
+      - name: Validate central release-evidence manifest
+        run: python3 scripts/release_evidence.py validate
 
-      - name: Run fault and recovery matrix
-        run: ./ocore/kernel/smoke-faults-qemu.sh
-
-      - name: Run process isolation and teardown matrix
-        run: ./ocore/kernel/smoke-processes-qemu.sh
-
-      - name: Run scheduler lifecycle smoke
-        run: ./ocore/kernel/smoke-scheduler-qemu.sh
-
-      - name: Run IPC foundation lifecycle smoke
-        run: ./ocore/kernel/smoke-ipc-foundation-qemu.sh
-
-      - name: Run public CPL3 IPC and crash-containment smoke
-        run: ./ocore/kernel/smoke-ipc-qemu.sh
-
-      - name: Run deterministic OVFS and native ELF-loader smoke
-        run: ./ocore/kernel/smoke-loader-qemu.sh
-
-      - name: Run native live-system serial activation smoke
-        run: ./ocore/kernel/smoke-live-qemu.sh
-
-      - name: Run native package and supervisor semantics smoke
-        run: ./ocore/kernel/smoke-live-semantics-qemu.sh
-
-      - name: Run packaged scalar personality supervision smoke
-        run: ./ocore/kernel/smoke-personality-qemu.sh
-
-      - name: Run request-scoped memory and delegated-resource revocation smoke
-        run: ./ocore/kernel/smoke-m6b-qemu.sh
-
-      - name: Run verified world admission and nonexecuting VM-object smoke
-        run: ./ocore/kernel/smoke-kernel-world-qemu.sh
-
-      - name: Run TCG-compatible KernelWorld live lifecycle and service smoke
-        run: ./ocore/kernel/smoke-kernel-world-live-qemu.sh
-
-      - name: Run TCG-emulated KernelWorld execution and virtual-device smoke
-        run: ./ocore/kernel/smoke-kernel-world-execution-device-qemu.sh
+      - name: Run all required portable QEMU evidence gates
+        run: ./boot-and-test.sh smoke
+      # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI

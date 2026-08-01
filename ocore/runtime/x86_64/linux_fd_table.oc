@@ -1,0 +1,489 @@
+module runtime::linux_fd_table;
+
+// Minimal Linux descriptor translation for the pinned write/exit corpus.
+// Linux fd integers never contain O-core capabilities or object handles.
+// The personality resolves fd 1/2 through this fixed-capacity table and then
+// validates the returned generation-tagged object on every use.
+pub const MAX_LINUX_FD_OBJECTS: usize = 8;
+
+pub const LINUX_FD_STDOUT: u64 = 1;
+pub const LINUX_FD_STDERR: u64 = 2;
+
+pub const LINUX_FD_SINK_STDOUT: u64 = 1;
+pub const LINUX_FD_SINK_STDERR: u64 = 2;
+
+const FD_EMPTY: u8 = 0;
+const FD_LIVE: u8 = 1;
+const FD_RETIRED: u8 = 2;
+const FD_HANDLE_TAG: u64 = 0xba00_0000;
+const HANDLE_TAG_MASK: u64 = 0xff00_0000;
+const HANDLE_INDEX_MASK: u64 = 0x00ff_ffff;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 8] = [0; 8];
+static mut GENERATIONS: [u32; 8] = [0; 8];
+static mut OWNER_PROCESSES: [u64; 8] = [0; 8];
+static mut SERVICE_PROCESSES: [u64; 8] = [0; 8];
+static mut SERVICE_GENERATIONS: [u64; 8] = [0; 8];
+static mut LINUX_FDS: [u8; 8] = [0; 8];
+static mut SINKS: [u8; 8] = [0; 8];
+
+static mut CREATIONS: u64 = 0;
+static mut REVOCATIONS: u64 = 0;
+static mut LOOKUPS: u64 = 0;
+static mut USES: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut STALE_DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+fn object_index(handle: u64) -> usize {
+    return (handle & HANDLE_INDEX_MASK) as usize;
+}
+
+fn object_generation(handle: u64) -> u32 {
+    return (handle >> 32) as u32;
+}
+
+fn supported_fd(fd: u64) -> bool {
+    return fd == LINUX_FD_STDOUT || fd == LINUX_FD_STDERR;
+}
+
+fn sink_for_fd(fd: u64) -> u64 {
+    if fd == LINUX_FD_STDOUT {
+        return LINUX_FD_SINK_STDOUT;
+    }
+    if fd == LINUX_FD_STDERR {
+        return LINUX_FD_SINK_STDERR;
+    }
+    return 0;
+}
+
+unsafe fn make_handle(slot: usize) -> u64 {
+    return ((GENERATIONS[slot] as u64) << 32)
+        | FD_HANDLE_TAG
+        | slot as u64;
+}
+
+unsafe fn checked_live(handle: u64) -> usize {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || (handle & HANDLE_TAG_MASK) != FD_HANDLE_TAG {
+        return MAX_LINUX_FD_OBJECTS;
+    }
+    let slot: usize = object_index(handle);
+    if slot >= MAX_LINUX_FD_OBJECTS
+        || STATES[slot] != FD_LIVE
+        || GENERATIONS[slot] != object_generation(handle) {
+        return MAX_LINUX_FD_OBJECTS;
+    }
+    return slot;
+}
+
+unsafe fn clear_metadata(slot: usize) -> void {
+    OWNER_PROCESSES[slot] = 0;
+    SERVICE_PROCESSES[slot] = 0;
+    SERVICE_GENERATIONS[slot] = 0;
+    LINUX_FDS[slot] = 0;
+    SINKS[slot] = 0;
+}
+
+unsafe fn count_denial(stale: bool) -> void {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+        return;
+    }
+    DENIALS += 1;
+    if stale {
+        if STALE_DENIALS == MAX_COUNTER {
+            POISONED = 1;
+        } else {
+            STALE_DENIALS += 1;
+        }
+    }
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+unsafe fn first_empty(excluding: usize) -> usize {
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if slot != excluding && STATES[slot] == FD_EMPTY {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_LINUX_FD_OBJECTS;
+}
+
+unsafe fn install_slot(
+    slot: usize,
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    fd: u64
+) -> u64 {
+    if slot >= MAX_LINUX_FD_OBJECTS
+        || STATES[slot] != FD_EMPTY
+        || !supported_fd(fd) {
+        return 0;
+    }
+    OWNER_PROCESSES[slot] = owner_process;
+    SERVICE_PROCESSES[slot] = service_process;
+    SERVICE_GENERATIONS[slot] = service_generation;
+    LINUX_FDS[slot] = fd as u8;
+    SINKS[slot] = sink_for_fd(fd) as u8;
+    STATES[slot] = FD_LIVE;
+    return make_handle(slot);
+}
+
+unsafe fn revoke_slot(slot: usize) -> void {
+    clear_metadata(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = FD_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = FD_EMPTY;
+    }
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        STATES[slot] = FD_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_metadata(slot);
+        slot += 1;
+    }
+    CREATIONS = 0;
+    REVOCATIONS = 0;
+    LOOKUPS = 0;
+    USES = 0;
+    DENIALS = 0;
+    STALE_DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// Atomically create the two personality-internal objects behind Linux fd 1
+// and fd 2. The returned handles are kernel/service metadata only.
+pub unsafe fn open_standard_streams(
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    stdout_object_out: *mut u64,
+    stderr_object_out: *mut u64
+) -> u64 {
+    if stdout_object_out as usize == 0 || stderr_object_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(stdout_object_out, 0);
+    volatile_store(stderr_object_out, 0);
+    if !preflight()
+        || owner_process == 0
+        || service_process == 0
+        || owner_process == service_process
+        || service_generation == 0 {
+        count_denial(false);
+        return 0;
+    }
+    let mut existing: usize = 0;
+    while existing < MAX_LINUX_FD_OBJECTS {
+        if STATES[existing] == FD_LIVE
+            && OWNER_PROCESSES[existing] == owner_process
+            && SERVICE_PROCESSES[existing] == service_process
+            && SERVICE_GENERATIONS[existing] == service_generation {
+            count_denial(false);
+            return 0;
+        }
+        existing += 1;
+    }
+    if CREATIONS > MAX_COUNTER - 2 {
+        POISONED = 1;
+        return 0;
+    }
+    let stdout_slot: usize = first_empty(MAX_LINUX_FD_OBJECTS);
+    let stderr_slot: usize = first_empty(stdout_slot);
+    if stdout_slot >= MAX_LINUX_FD_OBJECTS
+        || stderr_slot >= MAX_LINUX_FD_OBJECTS {
+        count_denial(false);
+        return 0;
+    }
+    let stdout_object: u64 = install_slot(
+        stdout_slot,
+        owner_process,
+        service_process,
+        service_generation,
+        LINUX_FD_STDOUT
+    );
+    let stderr_object: u64 = install_slot(
+        stderr_slot,
+        owner_process,
+        service_process,
+        service_generation,
+        LINUX_FD_STDERR
+    );
+    if stdout_object == 0 || stderr_object == 0 {
+        POISONED = 1;
+        return 0;
+    }
+    CREATIONS += 2;
+    volatile_store(stdout_object_out, stdout_object);
+    volatile_store(stderr_object_out, stderr_object);
+    return finish(1);
+}
+
+// Translate a foreign fd integer into an internal object. This is lookup, not
+// authority: callers must still pass the result to authorize_write().
+pub unsafe fn lookup_write_object(
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    linux_fd: u64
+) -> u64 {
+    if !preflight()
+        || owner_process == 0
+        || service_process == 0
+        || service_generation == 0
+        || !supported_fd(linux_fd) {
+        count_denial(false);
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && OWNER_PROCESSES[slot] == owner_process
+            && SERVICE_PROCESSES[slot] == service_process
+            && SERVICE_GENERATIONS[slot] == service_generation
+            && LINUX_FDS[slot] as u64 == linux_fd {
+            if LOOKUPS == MAX_COUNTER {
+                POISONED = 1;
+                return 0;
+            }
+            LOOKUPS += 1;
+            return finish(make_handle(slot));
+        }
+        slot += 1;
+    }
+    count_denial(true);
+    return 0;
+}
+
+pub unsafe fn authorize_write(
+    object: u64,
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    linux_fd: u64
+) -> u64 {
+    if !preflight() || !supported_fd(linux_fd) {
+        count_denial(false);
+        return 0;
+    }
+    let slot: usize = checked_live(object);
+    if slot >= MAX_LINUX_FD_OBJECTS
+        || OWNER_PROCESSES[slot] != owner_process
+        || SERVICE_PROCESSES[slot] != service_process
+        || SERVICE_GENERATIONS[slot] != service_generation
+        || LINUX_FDS[slot] as u64 != linux_fd
+        || SINKS[slot] as u64 != sink_for_fd(linux_fd) {
+        count_denial(true);
+        return 0;
+    }
+    if USES == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    USES += 1;
+    return finish(SINKS[slot] as u64);
+}
+
+pub unsafe fn revoke_service_generation(
+    service_process: u64,
+    service_generation: u64
+) -> u64 {
+    if !preflight() || service_process == 0 || service_generation == 0 {
+        count_denial(false);
+        return 0;
+    }
+    let mut matches: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && SERVICE_PROCESSES[slot] == service_process
+            && SERVICE_GENERATIONS[slot] == service_generation {
+            matches += 1;
+        }
+        slot += 1;
+    }
+    if matches == 0 {
+        count_denial(true);
+        return 0;
+    }
+    if REVOCATIONS > MAX_COUNTER - matches {
+        POISONED = 1;
+        return 0;
+    }
+    slot = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && SERVICE_PROCESSES[slot] == service_process
+            && SERVICE_GENERATIONS[slot] == service_generation {
+            revoke_slot(slot);
+        }
+        slot += 1;
+    }
+    REVOCATIONS += matches;
+    return finish(matches);
+}
+
+// exit_group cleanup is process-scoped and does not infer a service
+// generation from an fd integer supplied by the foreign program.
+pub unsafe fn revoke_process(owner_process: u64) -> u64 {
+    if !preflight() || owner_process == 0 {
+        count_denial(false);
+        return 0;
+    }
+    let mut matches: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && OWNER_PROCESSES[slot] == owner_process {
+            matches += 1;
+        }
+        slot += 1;
+    }
+    if matches == 0 {
+        count_denial(true);
+        return 0;
+    }
+    if REVOCATIONS > MAX_COUNTER - matches {
+        POISONED = 1;
+        return 0;
+    }
+    slot = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && OWNER_PROCESSES[slot] == owner_process {
+            revoke_slot(slot);
+        }
+        slot += 1;
+    }
+    REVOCATIONS += matches;
+    return finish(matches);
+}
+
+pub unsafe fn active_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn active_for_process(owner_process: u64) -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if STATES[slot] == FD_LIVE
+            && OWNER_PROCESSES[slot] == owner_process {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn is_live(object: u64) -> bool {
+    return checked_live(object) < MAX_LINUX_FD_OBJECTS;
+}
+
+pub unsafe fn creation_count() -> u64 { return CREATIONS; }
+pub unsafe fn revocation_count() -> u64 { return REVOCATIONS; }
+pub unsafe fn lookup_count() -> u64 { return LOOKUPS; }
+pub unsafe fn use_count() -> u64 { return USES; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn stale_denial_count() -> u64 { return STALE_DENIALS; }
+pub unsafe fn poisoned() -> bool { return POISONED != 0; }
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || REVOCATIONS > CREATIONS {
+        return false;
+    }
+    let mut live: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_LINUX_FD_OBJECTS {
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if STATES[slot] == FD_EMPTY || STATES[slot] == FD_RETIRED {
+            if (STATES[slot] == FD_RETIRED
+                    && GENERATIONS[slot] != 0xffff_ffff)
+                || OWNER_PROCESSES[slot] != 0
+                || SERVICE_PROCESSES[slot] != 0
+                || SERVICE_GENERATIONS[slot] != 0
+                || LINUX_FDS[slot] != 0
+                || SINKS[slot] != 0 {
+                return false;
+            }
+        } else if STATES[slot] == FD_LIVE {
+            if OWNER_PROCESSES[slot] == 0
+                || SERVICE_PROCESSES[slot] == 0
+                || SERVICE_PROCESSES[slot] == OWNER_PROCESSES[slot]
+                || SERVICE_GENERATIONS[slot] == 0
+                || !supported_fd(LINUX_FDS[slot] as u64)
+                || SINKS[slot] as u64
+                    != sink_for_fd(LINUX_FDS[slot] as u64) {
+                return false;
+            }
+            let mut other: usize = slot + 1;
+            while other < MAX_LINUX_FD_OBJECTS {
+                if STATES[other] == FD_LIVE
+                    && OWNER_PROCESSES[other] == OWNER_PROCESSES[slot]
+                    && SERVICE_PROCESSES[other] == SERVICE_PROCESSES[slot]
+                    && SERVICE_GENERATIONS[other]
+                        == SERVICE_GENERATIONS[slot]
+                    && LINUX_FDS[other] == LINUX_FDS[slot] {
+                    return false;
+                }
+                other += 1;
+            }
+            live += 1;
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return live == CREATIONS - REVOCATIONS;
+}
