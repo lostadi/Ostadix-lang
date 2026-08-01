@@ -15,12 +15,16 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import string
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+from urllib.parse import unquote, urlsplit
 import zipfile
+import zlib
 
 
 SCHEMA = "ostadix-source-release-v1"
@@ -34,6 +38,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
     {
         ".dockerignore",
         ".gitignore",
+        ".mcp.json",
         "ARCHITECTURE.md",
         "CITATION.cff",
         "Cargo.lock",
@@ -41,6 +46,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
         "DEVELOPMENT.md",
         "Dockerfile",
         "LICENSE",
+        "llms.txt",
         "NOTICE",
         "ORIGIN.md",
         "README.md",
@@ -57,6 +63,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
 ALLOWED_EXACT_PATHS = frozenset(
     {
         "okernel-multikernel/boot-and-test.sh",
+        "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
     }
 )
 
@@ -67,8 +74,10 @@ ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
         "backends",
         "c_cpp",
         "docs",
+        "evidence",
         "examples",
         "fuzz",
+        "mcp",
         "o_lang",
         "ocore",
         "scripts",
@@ -136,16 +145,38 @@ EXCLUDED_SUFFIXES = (
 
 REQUIRED_RELEASE_PATHS = frozenset(
     {
+        ".mcp.json",
         "Cargo.toml",
+        "LICENSE",
+        "llms.txt",
+        "mcp/ostadix_lang_mcp_server/Cargo.lock",
+        "mcp/ostadix_lang_mcp_server/Cargo.toml",
+        "mcp/ostadix_lang_mcp_server/README.md",
+        "mcp/ostadix_lang_mcp_server/src/main.rs",
         "README.md",
         "boot-and-test.sh",
+        "evidence/gates.toml",
+        "examples/manifest.json",
         "okernel-multikernel/boot-and-test.sh",
+        "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
+        "scripts/smoke_ostadix_mcp.py",
+        "scripts/release_evidence.py",
+        "tests/example_manifest.py",
+        "tests/test_example_manifest.py",
+        "tests/test_mcp_smoke.py",
     }
 )
-VALID_GIT_MODES = frozenset({"100644", "100755", "120000"})
+VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40,64}\Z")
+URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
+EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
+EXAMPLE_MODES = frozenset({"interpreter", "aot"})
+EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
+EXPECTED_REQUIRED_EVIDENCE_GATES = 15
+EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 
 
 class ReleaseError(RuntimeError):
@@ -310,10 +341,771 @@ def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
     if len(paths) != len(selected):
         raise ReleaseError("Git tree contains duplicate release paths")
 
-    return [
+    entries = [
         SourceEntry(path=path, mode=mode, data=_git(repo, "cat-file", "blob", oid))
         for path, mode, oid in selected
     ]
+    validate_document_links(entries)
+    validate_release_metadata(entries)
+    return entries
+
+
+def _is_markdown_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
+def _blank_markdown_range(characters: list[str], start: int, end: int) -> None:
+    for index in range(start, end):
+        if characters[index] not in "\r\n":
+            characters[index] = " "
+
+
+def _markdown_fence(line: str) -> tuple[str, int, str] | None:
+    indent = len(line) - len(line.lstrip(" "))
+    if indent > 3 or indent == len(line):
+        return None
+    marker = line[indent]
+    if marker not in {"`", "~"}:
+        return None
+    cursor = indent
+    while cursor < len(line) and line[cursor] == marker:
+        cursor += 1
+    length = cursor - indent
+    if length < 3:
+        return None
+    return marker, length, line[cursor:]
+
+
+def _markdown_visible_text(text: str) -> str:
+    """Blank Markdown code and comments while preserving offsets and newlines."""
+
+    characters = list(text)
+    fence: tuple[str, int] | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        candidate = _markdown_fence(content)
+        if fence is not None:
+            _blank_markdown_range(characters, offset, offset + len(line))
+            if (
+                candidate is not None
+                and candidate[0] == fence[0]
+                and candidate[1] >= fence[1]
+                and not candidate[2].strip(" \t")
+            ):
+                fence = None
+        elif content.startswith(("    ", "\t")):
+            _blank_markdown_range(characters, offset, offset + len(line))
+        elif candidate is not None:
+            marker, length, remainder = candidate
+            # Backticks in a backtick fence's info string make it ordinary text
+            # under CommonMark rather than the start of a fenced code block.
+            if marker != "`" or "`" not in remainder:
+                fence = (marker, length)
+                _blank_markdown_range(characters, offset, offset + len(line))
+        offset += len(line)
+
+    visible = "".join(characters)
+    cursor = 0
+    while cursor < len(visible):
+        if visible[cursor] != "`" or _is_markdown_escaped(visible, cursor):
+            cursor += 1
+            continue
+        run_end = cursor + 1
+        while run_end < len(visible) and visible[run_end] == "`":
+            run_end += 1
+        run_length = run_end - cursor
+        closing = run_end
+        while closing < len(visible):
+            closing = visible.find("`", closing)
+            if closing < 0:
+                break
+            if _is_markdown_escaped(visible, closing):
+                closing += 1
+                continue
+            closing_end = closing + 1
+            while closing_end < len(visible) and visible[closing_end] == "`":
+                closing_end += 1
+            if closing_end - closing == run_length:
+                _blank_markdown_range(characters, cursor, closing_end)
+                cursor = closing_end
+                break
+            closing = closing_end
+        else:
+            closing = -1
+        if closing < 0:
+            cursor = run_end
+
+    visible = "".join(characters)
+    cursor = 0
+    while True:
+        opening = visible.find("<!--", cursor)
+        if opening < 0:
+            break
+        closing = visible.find("-->", opening + 4)
+        end = len(visible) if closing < 0 else closing + 3
+        _blank_markdown_range(characters, opening, end)
+        cursor = end
+    return "".join(characters)
+
+
+def _find_matching_markdown_bracket(
+    text: str, opening: int, end: int | None = None
+) -> int | None:
+    limit = len(text) if end is None else end
+    depth = 1
+    cursor = opening + 1
+    while cursor < limit:
+        if _is_markdown_escaped(text, cursor):
+            cursor += 1
+            continue
+        if text[cursor] == "[":
+            depth += 1
+        elif text[cursor] == "]":
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    return None
+
+
+def _markdown_unescape_destination(value: str) -> str:
+    result: list[str] = []
+    cursor = 0
+    while cursor < len(value):
+        if (
+            value[cursor] == "\\"
+            and cursor + 1 < len(value)
+            and value[cursor + 1] in string.punctuation
+        ):
+            result.append(value[cursor + 1])
+            cursor += 2
+        else:
+            result.append(value[cursor])
+            cursor += 1
+    return "".join(result)
+
+
+def _inline_link_close(text: str, start: int) -> int | None:
+    cursor = start
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor < len(text) and text[cursor] == ")":
+        return cursor
+    if cursor >= len(text) or text[cursor] not in {'"', "'", "("}:
+        return None
+
+    opener = text[cursor]
+    if opener in {'"', "'"}:
+        cursor += 1
+        while cursor < len(text):
+            if text[cursor] == opener and not _is_markdown_escaped(text, cursor):
+                cursor += 1
+                break
+            cursor += 1
+        else:
+            return None
+    else:
+        depth = 1
+        cursor += 1
+        while cursor < len(text) and depth:
+            if _is_markdown_escaped(text, cursor):
+                cursor += 1
+            elif text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            return None
+
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return cursor if cursor < len(text) and text[cursor] == ")" else None
+
+
+def _inline_link_destination(text: str, opening: int) -> tuple[str, int] | None:
+    cursor = opening + 1
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text):
+        return None
+    if text[cursor] == ")":
+        return "", cursor
+
+    if text[cursor] == "<":
+        start = cursor + 1
+        cursor = start
+        while cursor < len(text):
+            if text[cursor] in "\r\n":
+                return None
+            if text[cursor] == ">" and not _is_markdown_escaped(text, cursor):
+                destination = text[start:cursor]
+                closing = _inline_link_close(text, cursor + 1)
+                if closing is None:
+                    return None
+                return _markdown_unescape_destination(destination), closing
+            cursor += 1
+        return None
+
+    start = cursor
+    depth = 0
+    while cursor < len(text):
+        if text[cursor] == "\\" and cursor + 1 < len(text):
+            cursor += 2
+            continue
+        if text[cursor] == "(":
+            depth += 1
+        elif text[cursor] == ")":
+            if depth == 0:
+                return _markdown_unescape_destination(text[start:cursor]), cursor
+            depth -= 1
+        elif text[cursor].isspace() and depth == 0:
+            destination = text[start:cursor]
+            closing = _inline_link_close(text, cursor)
+            if closing is None:
+                return None
+            return _markdown_unescape_destination(destination), closing
+        cursor += 1
+    return None
+
+
+def _reference_destination(text: str, start: int, end: int) -> str | None:
+    cursor = start
+    while cursor < end and text[cursor] in " \t":
+        cursor += 1
+    if cursor >= end:
+        return None
+    if text[cursor] == "<":
+        opening = cursor + 1
+        cursor = opening
+        while cursor < end:
+            if text[cursor] == ">" and not _is_markdown_escaped(text, cursor):
+                return _markdown_unescape_destination(text[opening:cursor])
+            cursor += 1
+        return None
+
+    opening = cursor
+    depth = 0
+    while cursor < end:
+        if text[cursor] == "\\" and cursor + 1 < end:
+            cursor += 2
+            continue
+        if text[cursor] == "(":
+            depth += 1
+        elif text[cursor] == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif text[cursor].isspace() and depth == 0:
+            break
+        cursor += 1
+    if cursor == opening or depth:
+        return None
+    return _markdown_unescape_destination(text[opening:cursor])
+
+
+def _markdown_destinations(text: str) -> list[str]:
+    visible = _markdown_visible_text(text)
+    destinations: list[str] = []
+
+    offset = 0
+    for line in visible.splitlines(keepends=True):
+        content_end = offset + len(line.rstrip("\r\n"))
+        cursor = offset
+        while cursor < content_end and visible[cursor] == " ":
+            cursor += 1
+        if cursor - offset <= 3 and cursor < content_end and visible[cursor] == "[":
+            closing = _find_matching_markdown_bracket(visible, cursor, content_end)
+            if (
+                closing is not None
+                and closing + 1 < content_end
+                and visible[closing + 1] == ":"
+                and visible[cursor + 1 : closing] != ""
+                and not visible[cursor + 1 : closing].startswith("^")
+            ):
+                destination = _reference_destination(
+                    visible, closing + 2, content_end
+                )
+                if destination is not None:
+                    destinations.append(destination)
+        offset += len(line)
+
+    cursor = 0
+    while cursor < len(visible):
+        if visible[cursor] != "[" or _is_markdown_escaped(visible, cursor):
+            cursor += 1
+            continue
+        closing = _find_matching_markdown_bracket(visible, cursor)
+        if closing is None:
+            cursor += 1
+            continue
+        if closing + 1 < len(visible) and visible[closing + 1] == "(":
+            parsed = _inline_link_destination(visible, closing + 1)
+            if parsed is not None:
+                destination, link_end = parsed
+                destinations.append(destination)
+                cursor = link_end + 1
+                continue
+        cursor = closing + 1
+    return destinations
+
+
+def _resolve_document_target(source: str, destination: str) -> str | None:
+    if not destination or destination.startswith(("#", "/", "//")):
+        return None
+    if URI_SCHEME.match(destination):
+        return None
+
+    split = urlsplit(destination)
+    if split.scheme or split.netloc or not split.path:
+        return None
+    decoded = unquote(split.path)
+    if (
+        PurePosixPath(decoded).is_absolute()
+        or "\\" in decoded
+        or "\x00" in decoded
+    ):
+        raise ReleaseError(
+            f"documentation link in {source} has an unsafe target: {destination!r}"
+        )
+
+    parts: list[str] = []
+    for part in (PurePosixPath(source).parent / decoded).parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ReleaseError(
+                    f"documentation link in {source} escapes the release root: "
+                    f"{destination!r}"
+                )
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
+def validate_document_links(entries: Sequence[SourceEntry]) -> None:
+    """Require every relative Markdown link target to exist in the release."""
+
+    paths = {entry.path for entry in entries}
+    directories = {""} | {
+        "/".join(PurePosixPath(path).parts[:index])
+        for path in paths
+        for index in range(1, len(PurePosixPath(path).parts))
+    }
+    broken: list[str] = []
+    for entry in entries:
+        if not entry.path.lower().endswith(".md"):
+            continue
+        try:
+            document = entry.data.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise ReleaseError(
+                f"release documentation is not UTF-8: {entry.path}"
+            ) from error
+        for destination in _markdown_destinations(document):
+            target = _resolve_document_target(entry.path, destination)
+            if target is not None and target not in paths and target not in directories:
+                broken.append(f"{entry.path} -> {destination} (resolved {target})")
+    if broken:
+        raise ReleaseError(
+            "release documentation contains missing relative link target(s): "
+            + "; ".join(sorted(set(broken)))
+        )
+
+
+def _strict_json(data: bytes, path: str) -> object:
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{path} is not valid UTF-8") from error
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ReleaseError(f"{path} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def invalid_constant(value: str) -> object:
+        raise ReleaseError(f"{path} contains non-finite JSON number {value}")
+
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=object_pairs,
+            parse_constant=invalid_constant,
+        )
+    except json.JSONDecodeError as error:
+        raise ReleaseError(f"{path} is not valid JSON: {error}") from error
+
+
+def _strict_toml(data: bytes, path: str) -> dict[str, object]:
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{path} is not valid UTF-8") from error
+    try:
+        value = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise ReleaseError(f"{path} is not valid TOML: {error}") from error
+    if not isinstance(value, dict):  # pragma: no cover - tomllib roots are tables
+        raise ReleaseError(f"{path} root must be a TOML table")
+    return value
+
+
+def _required_string(value: object, owner: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ReleaseError(f"{owner} must be a non-empty trimmed string")
+    if "\x00" in value or "\r" in value or "\n" in value:
+        raise ReleaseError(f"{owner} contains a forbidden control character")
+    return value
+
+
+def _required_string_list(
+    value: object, owner: str, *, minimum: int = 0
+) -> list[str]:
+    if not isinstance(value, list) or len(value) < minimum:
+        raise ReleaseError(f"{owner} must contain at least {minimum} string(s)")
+    result = [
+        _required_string(item, f"{owner}[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if len(result) != len(set(result)):
+        raise ReleaseError(f"{owner} contains a duplicate")
+    return result
+
+
+def _pattern_string_list(value: object, owner: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ReleaseError(f"{owner} must contain at least 1 string")
+    if any(not isinstance(item, str) or not item or "\x00" in item for item in value):
+        raise ReleaseError(f"{owner} must contain non-empty strings without NUL")
+    if len(value) != len(set(value)):
+        raise ReleaseError(f"{owner} contains a duplicate")
+    return value
+
+
+def _normalized_reference(value: object, owner: str) -> str:
+    reference = _required_string(value, owner)
+    try:
+        _validate_release_path(reference)
+    except ReleaseError as error:
+        raise ReleaseError(f"{owner} must be a normalized release-relative path") from error
+    return reference
+
+
+def _validate_mcp_release_surface(
+    files: dict[str, bytes], modes: dict[str, str]
+) -> None:
+    config_path = ".mcp.json"
+    config = _strict_json(files[config_path], config_path)
+    if not isinstance(config, dict) or set(config) != {"mcpServers"}:
+        raise ReleaseError(".mcp.json must contain exactly the mcpServers object")
+    servers = config["mcpServers"]
+    if not isinstance(servers, dict) or set(servers) != {"ostadix"}:
+        raise ReleaseError(".mcp.json mcpServers must contain exactly ostadix")
+    server = servers["ostadix"]
+    if not isinstance(server, dict):
+        raise ReleaseError(".mcp.json must define the ostadix server")
+    if set(server) != {"command", "args"}:
+        raise ReleaseError(".mcp.json ostadix server must contain command and args only")
+    if server["command"] != "ostadix-mcp":
+        raise ReleaseError(".mcp.json ostadix command must be 'ostadix-mcp'")
+    if _required_string_list(server["args"], ".mcp.json ostadix.args"):
+        raise ReleaseError(".mcp.json ostadix.args must be empty")
+
+    cargo_path = "mcp/ostadix_lang_mcp_server/Cargo.toml"
+    cargo = _strict_toml(files[cargo_path], cargo_path)
+    package = cargo.get("package")
+    if not isinstance(package, dict):
+        raise ReleaseError(f"{cargo_path} must contain a package table")
+    if package.get("name") != "ostadix-mcp-server":
+        raise ReleaseError(f"{cargo_path} package name must be 'ostadix-mcp-server'")
+    if package.get("license") != "LGPL-2.1-only":
+        raise ReleaseError(f"{cargo_path} license must be 'LGPL-2.1-only'")
+    if package.get("publish") is not False:
+        raise ReleaseError(f"{cargo_path} package must remain publish = false")
+    binaries = cargo.get("bin")
+    if not isinstance(binaries, list):
+        raise ReleaseError(f"{cargo_path} must contain an ostadix-mcp bin target")
+    matching = [
+        binary
+        for binary in binaries
+        if isinstance(binary, dict) and binary.get("name") == "ostadix-mcp"
+    ]
+    if len(matching) != 1:
+        raise ReleaseError(f"{cargo_path} must define exactly one ostadix-mcp bin target")
+    binary_path = _normalized_reference(
+        matching[0].get("path"), f"{cargo_path} ostadix-mcp.path"
+    )
+    referenced_binary = str(PurePosixPath(cargo_path).parent / binary_path)
+    if referenced_binary not in files:
+        raise ReleaseError(
+            f"{cargo_path} references absent binary source {referenced_binary}"
+        )
+    if modes.get(referenced_binary) not in VALID_GIT_MODES:
+        raise ReleaseError(f"{referenced_binary} has an invalid release mode")
+
+
+def _validate_example_manifest(files: dict[str, bytes]) -> None:
+    path = "examples/manifest.json"
+    manifest = _strict_json(files[path], path)
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version",
+        "examples",
+    }:
+        raise ReleaseError(f"{path} root keys differ from schema")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    examples = manifest["examples"]
+    if not isinstance(examples, list):
+        raise ReleaseError(f"{path} examples must be a list")
+
+    declared: list[str] = []
+    required_entry_keys = {
+        "path",
+        "editions",
+        "classification",
+        "requirements",
+        "expected",
+    }
+    allowed_entry_keys = required_entry_keys | {"timeout_seconds"}
+    allowed_requirement_keys = {
+        "backends",
+        "programs",
+        "guest_programs",
+        "python_packages",
+        "authorities",
+        "opt_in",
+        "files",
+    }
+    for index, entry in enumerate(examples):
+        owner = f"{path} examples[{index}]"
+        if not isinstance(entry, dict):
+            raise ReleaseError(f"{owner} must be an object")
+        if not required_entry_keys <= set(entry) or set(entry) - allowed_entry_keys:
+            raise ReleaseError(f"{owner} has missing or unknown fields")
+
+        relative = _normalized_reference(entry["path"], f"{owner}.path")
+        if "/" in relative and PurePosixPath(relative).parts[0] == "examples":
+            raise ReleaseError(f"{owner}.path must be relative to examples/")
+        if not relative.endswith(".O"):
+            raise ReleaseError(f"{owner}.path must name a .O source")
+        declared.append(relative)
+        source_path = f"examples/{relative}"
+        if source_path not in files:
+            raise ReleaseError(f"{owner}.path references absent {source_path}")
+
+        editions = _required_string_list(
+            entry["editions"], f"{owner}.editions", minimum=1
+        )
+        if not set(editions) <= EXAMPLE_EDITIONS:
+            raise ReleaseError(f"{owner}.editions contains an unknown edition")
+        if entry["classification"] not in EXAMPLE_CLASSIFICATIONS:
+            raise ReleaseError(f"{owner}.classification is invalid")
+
+        requirements = entry["requirements"]
+        if not isinstance(requirements, dict):
+            raise ReleaseError(f"{owner}.requirements must be an object")
+        if set(requirements) - allowed_requirement_keys or not {
+            "backends",
+            "programs",
+            "authorities",
+        } <= set(requirements):
+            raise ReleaseError(f"{owner}.requirements has missing or unknown fields")
+        for field, value in requirements.items():
+            values = _required_string_list(value, f"{owner}.requirements.{field}")
+            if field == "files":
+                for reference in values:
+                    normalized = _normalized_reference(
+                        reference, f"{owner}.requirements.files"
+                    )
+                    if normalized not in files:
+                        raise ReleaseError(
+                            f"{owner}.requirements.files references absent {normalized}"
+                        )
+
+        expected = entry["expected"]
+        if not isinstance(expected, dict) or set(expected) != set(editions):
+            raise ReleaseError(f"{owner}.expected keys must exactly match editions")
+        for edition, expectation in expected.items():
+            expectation_owner = f"{owner}.expected.{edition}"
+            if not isinstance(expectation, dict) or set(expectation) - {
+                "result",
+                "patterns",
+                "modes",
+            }:
+                raise ReleaseError(f"{expectation_owner} has an invalid structure")
+            patterns = expectation.get("patterns")
+            if patterns is not None:
+                _pattern_string_list(patterns, f"{expectation_owner}.patterns")
+            if "result" not in expectation and patterns is None:
+                raise ReleaseError(f"{expectation_owner} needs result or patterns")
+            modes = _required_string_list(
+                expectation.get("modes", ["interpreter"]),
+                f"{expectation_owner}.modes",
+                minimum=1,
+            )
+            if not set(modes) <= EXAMPLE_MODES:
+                raise ReleaseError(f"{expectation_owner}.modes contains an unknown mode")
+            if edition != "c17" and "aot" in modes:
+                raise ReleaseError(f"{expectation_owner}: only c17 supports aot mode")
+
+        timeout = entry.get("timeout_seconds", 10)
+        if type(timeout) is not int or timeout <= 0:
+            raise ReleaseError(f"{owner}.timeout_seconds must be a positive integer")
+
+    if declared != sorted(declared) or len(declared) != len(set(declared)):
+        raise ReleaseError(f"{path} paths must be unique and sorted")
+    actual = sorted(
+        member[len("examples/") :]
+        for member in files
+        if member.startswith("examples/") and member.endswith(".O")
+    )
+    if declared != actual:
+        raise ReleaseError(
+            f"{path} coverage differs from release examples; "
+            f"missing={sorted(set(actual) - set(declared))}, "
+            f"extra={sorted(set(declared) - set(actual))}"
+        )
+
+
+def _validate_evidence_manifest(
+    files: dict[str, bytes], modes: dict[str, str]
+) -> None:
+    path = "evidence/gates.toml"
+    manifest = _strict_toml(files[path], path)
+    expected_root_keys = {
+        "schema_version",
+        "required_gate_count",
+        "supplemental_gate_count",
+        "portable_command",
+        "gate",
+    }
+    if set(manifest) != expected_root_keys:
+        raise ReleaseError(f"{path} root keys differ from schema")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    if type(manifest["required_gate_count"]) is not int or (
+        manifest["required_gate_count"] != EXPECTED_REQUIRED_EVIDENCE_GATES
+    ):
+        raise ReleaseError(
+            f"{path} required_gate_count must be {EXPECTED_REQUIRED_EVIDENCE_GATES}"
+        )
+    if type(manifest["supplemental_gate_count"]) is not int or (
+        manifest["supplemental_gate_count"] != EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES
+    ):
+        raise ReleaseError(
+            f"{path} supplemental_gate_count must be "
+            f"{EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES}"
+        )
+    if manifest["portable_command"] != "./boot-and-test.sh smoke":
+        raise ReleaseError(f"{path} portable_command must be './boot-and-test.sh smoke'")
+    if modes.get("boot-and-test.sh") != "100755":
+        raise ReleaseError(f"{path} portable command must reference executable boot-and-test.sh")
+
+    gates = manifest["gate"]
+    if not isinstance(gates, list):
+        raise ReleaseError(f"{path} gate must be a list of tables")
+    expected_gate_count = (
+        EXPECTED_REQUIRED_EVIDENCE_GATES + EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES
+    )
+    if len(gates) != expected_gate_count:
+        raise ReleaseError(f"{path} must contain exactly {expected_gate_count} gate tables")
+    expected_gate_keys = {
+        "id",
+        "required",
+        "milestone",
+        "script",
+        "evidence_class",
+        "required_tools",
+        "positive_claims",
+        "nonclaims",
+        "expected_markers",
+    }
+    identifiers: set[str] = set()
+    scripts: set[str] = set()
+    required_count = 0
+    for index, gate in enumerate(gates):
+        owner = f"{path} gate[{index}]"
+        if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
+            raise ReleaseError(f"{owner} keys differ from schema")
+        identifier = _required_string(gate["id"], f"{owner}.id")
+        if identifier in identifiers:
+            raise ReleaseError(f"{owner}.id is duplicated")
+        identifiers.add(identifier)
+        required = gate["required"]
+        if not isinstance(required, bool):
+            raise ReleaseError(f"{owner}.required must be a boolean")
+        required_count += int(required)
+        _required_string(gate["milestone"], f"{owner}.milestone")
+        evidence_class = _required_string(
+            gate["evidence_class"], f"{owner}.evidence_class"
+        )
+        if evidence_class not in EVIDENCE_CLASSES:
+            raise ReleaseError(f"{owner}.evidence_class is invalid")
+        if required and evidence_class != "portable_tcg":
+            raise ReleaseError(f"{owner}: required gates must be portable_tcg")
+        if not required and evidence_class != "hardware_kvm":
+            raise ReleaseError(f"{owner}: the supplemental gate must be hardware_kvm")
+        script = _normalized_reference(gate["script"], f"{owner}.script")
+        script_path = PurePosixPath(script)
+        if script_path.parent != PurePosixPath("ocore/kernel") or script_path.suffix != ".sh":
+            raise ReleaseError(f"{owner}.script must name an ocore/kernel shell gate")
+        if script in scripts:
+            raise ReleaseError(f"{owner}.script is duplicated")
+        scripts.add(script)
+        if script not in files:
+            raise ReleaseError(f"{owner}.script references absent {script}")
+        if modes.get(script) != "100755":
+            raise ReleaseError(f"{owner}.script references non-executable {script}")
+        _required_string_list(
+            gate["required_tools"], f"{owner}.required_tools", minimum=1
+        )
+        _required_string_list(
+            gate["positive_claims"], f"{owner}.positive_claims", minimum=1
+        )
+        _required_string_list(gate["nonclaims"], f"{owner}.nonclaims", minimum=1)
+        _required_string_list(
+            gate["expected_markers"], f"{owner}.expected_markers", minimum=2
+        )
+
+    supplemental_count = len(gates) - required_count
+    if required_count != EXPECTED_REQUIRED_EVIDENCE_GATES:
+        raise ReleaseError(
+            f"{path} must contain exactly {EXPECTED_REQUIRED_EVIDENCE_GATES} "
+            "required gate tables"
+        )
+    if supplemental_count != EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES:
+        raise ReleaseError(
+            f"{path} must contain exactly {EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES} "
+            "supplemental gate table"
+        )
+    if required_count != manifest["required_gate_count"]:
+        raise ReleaseError(f"{path} required_gate_count does not match gate tables")
+    if supplemental_count != manifest["supplemental_gate_count"]:
+        raise ReleaseError(f"{path} supplemental_gate_count does not match gate tables")
+
+
+def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:
+    """Validate inert release metadata and every archive-local reference."""
+
+    files = {entry.path: entry.data for entry in entries}
+    modes = {entry.path: entry.mode for entry in entries}
+    if len(files) != len(entries):
+        raise ReleaseError("release contains duplicate metadata paths")
+    _validate_mcp_release_surface(files, modes)
+    _validate_example_manifest(files)
+    _validate_evidence_manifest(files, modes)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -355,6 +1147,71 @@ def _zip_info(name: str, mode: str) -> zipfile.ZipInfo:
     info.external_attr = int(mode, 8) << 16
     info.flag_bits |= 0x800
     return info
+
+
+def _zip_filename_bytes(info: zipfile.ZipInfo) -> bytes:
+    encoding = "utf-8" if info.flag_bits & 0x800 else "cp437"
+    return info.filename.encode(encoding, "strict")
+
+
+def _validate_zip_member_metadata(
+    info: zipfile.ZipInfo, mode: str, payload: bytes
+) -> None:
+    try:
+        info.filename.encode("ascii", "strict")
+        expected_flags = 0
+    except UnicodeEncodeError:
+        expected_flags = 0x800
+    expected = {
+        "date_time": FIXED_ZIP_TIMESTAMP,
+        "compress_type": zipfile.ZIP_DEFLATED,
+        "create_system": 3,
+        "create_version": 20,
+        "extract_version": 20,
+        "reserved": 0,
+        "flag_bits": expected_flags,
+        "volume": 0,
+        "internal_attr": 0,
+        "external_attr": int(mode, 8) << 16,
+        "extra": b"",
+        "comment": b"",
+        "file_size": len(payload),
+        "CRC": zlib.crc32(payload) & 0xFFFFFFFF,
+    }
+    for field, value in expected.items():
+        if getattr(info, field) != value:
+            raise ReleaseError(
+                f"non-canonical ZIP {field} for {info.filename}: "
+                f"expected {value!r}, got {getattr(info, field)!r}"
+            )
+
+
+def _validate_zip_layout(
+    release_path: Path,
+    archive: zipfile.ZipFile,
+    infos: Sequence[zipfile.ZipInfo],
+) -> None:
+    expected_offset = 0
+    for info in infos:
+        if info.header_offset != expected_offset:
+            raise ReleaseError(
+                f"non-canonical ZIP member offset for {info.filename}: "
+                f"expected {expected_offset}, got {info.header_offset}"
+            )
+        expected_offset += 30 + len(_zip_filename_bytes(info)) + info.compress_size
+    if archive.start_dir != expected_offset:
+        raise ReleaseError("non-canonical ZIP local-header layout")
+
+    central_size = sum(46 + len(_zip_filename_bytes(info)) for info in infos)
+    expected_size = archive.start_dir + central_size + 22
+    try:
+        actual_size = release_path.stat().st_size
+    except OSError as error:
+        raise ReleaseError(f"cannot stat release ZIP {release_path}: {error}") from error
+    if actual_size != expected_size:
+        raise ReleaseError(
+            f"non-canonical ZIP total size: expected {expected_size}, got {actual_size}"
+        )
 
 
 def _write_archive(
@@ -469,6 +1326,7 @@ def verify_archive(path: Path | str) -> dict[str, object]:
 
             expected_names: list[str] = []
             expected_checksums: dict[str, str] = {}
+            archive_entries: list[SourceEntry] = []
             previous_path: str | None = None
             info_by_name = {info.filename: info for info in infos}
             for item in raw_files:
@@ -505,28 +1363,43 @@ def verify_archive(path: Path | str) -> dict[str, object]:
                 payload = archive.read(member)
                 if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
                     raise ReleaseError(f"payload does not match manifest: {relative}")
+                archive_entries.append(
+                    SourceEntry(path=relative, mode=mode, data=payload)
+                )
                 zip_mode = f"{(info_by_name[member].external_attr >> 16) & 0xFFFF:06o}"
                 if zip_mode != mode:
                     raise ReleaseError(f"ZIP mode does not match manifest: {relative}")
+
+            archived_paths = {entry.path for entry in archive_entries}
+            missing_required = sorted(REQUIRED_RELEASE_PATHS - archived_paths)
+            if missing_required:
+                raise ReleaseError(
+                    "release ZIP is missing required path(s): "
+                    + ", ".join(missing_required)
+                )
+            validate_document_links(archive_entries)
+            validate_release_metadata(archive_entries)
 
             expected_order = expected_names + [manifest_name, checksums_name]
             if names != expected_order:
                 raise ReleaseError("release ZIP member set or ordering does not match manifest")
 
             expected_checksums[MANIFEST_NAME] = hashlib.sha256(manifest_bytes).hexdigest()
-            actual_checksums = _parse_checksums(archive.read(checksums_name))
+            checksums_bytes = archive.read(checksums_name)
+            actual_checksums = _parse_checksums(checksums_bytes)
             if actual_checksums != expected_checksums:
                 raise ReleaseError("SHA256SUMS does not match the release payload")
 
+            canonical_members = {
+                f"{prefix}/{entry.path}": (entry.mode, entry.data)
+                for entry in archive_entries
+            }
+            canonical_members[manifest_name] = ("100644", manifest_bytes)
+            canonical_members[checksums_name] = ("100644", checksums_bytes)
             for info in infos:
-                if info.date_time != FIXED_ZIP_TIMESTAMP:
-                    raise ReleaseError(f"non-deterministic ZIP timestamp: {info.filename}")
-                if info.create_system != 3:
-                    raise ReleaseError(f"non-Unix ZIP metadata: {info.filename}")
-                if info.compress_type != zipfile.ZIP_DEFLATED:
-                    raise ReleaseError(f"unexpected ZIP compression: {info.filename}")
-                if info.extra or info.comment:
-                    raise ReleaseError(f"non-deterministic ZIP metadata: {info.filename}")
+                mode, payload = canonical_members[info.filename]
+                _validate_zip_member_metadata(info, mode, payload)
+            _validate_zip_layout(release_path, archive, infos)
             return manifest
     except (OSError, zipfile.BadZipFile, KeyError) as error:
         if isinstance(error, ReleaseError):

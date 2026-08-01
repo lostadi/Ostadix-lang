@@ -1,0 +1,1699 @@
+module runtime::personality_bounded_rpc;
+
+use runtime::native_abi::ERR_PERSONALITY_BUSY;
+use runtime::native_abi::ERR_PERSONALITY_CANCELLED;
+use runtime::native_abi::ERR_PERSONALITY_DUPLICATE;
+use runtime::native_abi::ERR_PERSONALITY_FAILED;
+use runtime::native_abi::ERR_PERSONALITY_STALE;
+use runtime::native_abi::ERR_PERSONALITY_TIMEOUT;
+use runtime::native_abi::ERR_PERSONALITY_UNAVAILABLE;
+use runtime::native_abi::ERR_PERSONALITY_UNSUPPORTED;
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::SYSCALL_CONTROL_EXIT;
+use runtime::native_abi::SYSCALL_CONTROL_SCHEDULE;
+use runtime::capability::live_slots_for_owner;
+use runtime::endpoint::message_count as endpoint_message_count;
+use runtime::personality_memory_view::cancel as cancel_view;
+use runtime::personality_memory_view::abort_create as abort_created_view;
+use runtime::personality_memory_view::can_consume_terminal as can_consume_view;
+use runtime::personality_memory_view::cap_close_sequence;
+use runtime::personality_memory_view::capability_for;
+use runtime::personality_memory_view::charged_bytes as view_charged_bytes;
+use runtime::personality_memory_view::committed_length as view_committed_length;
+use runtime::personality_memory_view::consume_terminal as consume_view;
+use runtime::personality_memory_view::create as create_view;
+use runtime::personality_memory_view::discard_terminal as discard_view;
+use runtime::personality_memory_view::init as memory_view_init;
+use runtime::personality_memory_view::invariants_hold as view_invariants_hold;
+use runtime::personality_memory_view::is_live as view_is_live;
+use runtime::personality_memory_view::active_count as view_active_count;
+use runtime::personality_memory_view::read_byte as read_view_byte;
+use runtime::personality_memory_view::reply as reply_view;
+use runtime::personality_memory_view::request_for as view_request;
+use runtime::personality_memory_view::service_cspace_for as view_service_cspace;
+use runtime::personality_memory_view::service_died as views_service_died;
+use runtime::personality_memory_view::process_exited as views_process_exited;
+use runtime::personality_memory_view::unmapped as views_unmapped;
+use runtime::personality_memory_view::state as view_state;
+use runtime::personality_memory_view::terminal_kind as view_terminal_kind;
+use runtime::personality_memory_view::terminal_sequence;
+use runtime::personality_memory_view::timeout as timeout_view;
+use runtime::personality_memory_view::wake_sequence;
+use runtime::personality_memory_view::write_byte as write_view_byte;
+use runtime::personality_memory_view::MEMORY_VIEW_STATE_LIVE;
+use runtime::personality_memory_view::MEMORY_VIEW_STATE_TERMINAL;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_CANCELLED;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_REPLY;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_SERVICE_DEATH;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_TIMEOUT;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_PROCESS_EXIT;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_UNMAP;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED;
+use runtime::personality_memory_view::MEMORY_VIEW_TERMINAL_REQUEST_REVOKED;
+use runtime::personality_rpc::abort_wait as abort_rpc_wait;
+use runtime::personality_rpc::abort_dispatched as abort_published_rpc;
+use runtime::personality_rpc::abort_prepared_dispatch as abort_rpc_dispatch;
+use runtime::personality_rpc::arm_wait as arm_rpc_wait;
+use runtime::personality_rpc::caller_process as rpc_caller_process;
+use runtime::personality_rpc::caller_thread as rpc_caller_thread;
+use runtime::personality_rpc::can_reply as can_reply_rpc;
+use runtime::personality_rpc::can_transition as can_transition_rpc;
+use runtime::personality_rpc::caller_exited as rpc_caller_exited;
+use runtime::personality_rpc::configured_service_generation;
+use runtime::personality_rpc::configured_service_process;
+use runtime::personality_rpc::deadline as rpc_deadline;
+use runtime::personality_rpc::dispatch_or_consume as dispatch_rpc;
+use runtime::personality_rpc::dispatch_count as base_dispatch_count;
+use runtime::personality_rpc::prepare_dispatch as prepare_rpc_dispatch;
+use runtime::personality_rpc::prepare_wait_before_publish as prepare_rpc_wait;
+use runtime::personality_rpc::abort_prepared_wait_dispatch as abort_prepared_rpc_wait;
+use runtime::personality_rpc::publish_dispatch as publish_rpc_dispatch;
+use runtime::personality_rpc::expire as expire_rpc;
+use runtime::personality_rpc::invariants_hold as rpc_invariants_hold;
+use runtime::personality_rpc::is_current as rpc_is_current;
+use runtime::personality_rpc::reply as reply_rpc;
+use runtime::personality_rpc::request_frame as rpc_request_frame;
+use runtime::personality_rpc::request_service_generation;
+use runtime::personality_rpc::request_service_process;
+use runtime::personality_rpc::service_died as rpc_service_died;
+use runtime::personality_rpc::service_is_available;
+use runtime::personality_rpc::service_request_endpoint;
+use runtime::personality_rpc::service_request_wake_count;
+use runtime::personality_rpc::state as rpc_state;
+use runtime::personality_rpc::supervisor_cancel as cancel_rpc;
+use runtime::personality_rpc::terminal_kind as rpc_terminal_kind;
+use runtime::personality_rpc::terminal_result as rpc_terminal_result;
+use runtime::personality_rpc::wait_failure_count as rpc_wait_failure_count;
+use runtime::personality_rpc::RPC_CONSUMED;
+use runtime::personality_rpc::RPC_DISPATCHED;
+use runtime::personality_rpc::RPC_STATE_DISPATCHED;
+use runtime::personality_rpc::RPC_STATE_TERMINAL;
+use runtime::personality_rpc::RPC_STATE_WAITING;
+use runtime::personality_rpc::RPC_STATE_WAIT_PREPARED;
+use runtime::personality_rpc::RPC_TERMINAL_DEADLINE;
+use runtime::personality_rpc::RPC_TERMINAL_REPLY;
+use runtime::personality_rpc::RPC_TERMINAL_SERVICE_DEATH;
+use runtime::personality_rpc::RPC_TERMINAL_SUPERVISOR_CANCEL;
+use runtime::process::address_space_for;
+use runtime::process::cspace_for;
+use runtime::process::current_address_space_handle;
+use runtime::process::current_cspace_handle;
+use runtime::process::current_process_handle;
+use runtime::process::is_live as process_is_live;
+use runtime::thread::current_handle as current_thread_handle;
+use runtime::thread::saved_result as thread_saved_result;
+use runtime::thread::wake_reason as thread_wake_reason;
+use runtime::thread::WAKE_REASON_CANCELLED;
+use runtime::thread::WAKE_REASON_IPC;
+use runtime::delegated_resource::create_bound as create_bound_resource;
+use runtime::delegated_resource::destroy as destroy_resource;
+use runtime::delegated_resource::init as delegated_resource_init;
+use runtime::delegated_resource::invariants_hold as resource_invariants_hold;
+use runtime::delegated_resource::capability_for as resource_capability_for;
+use runtime::delegated_resource::request_for as resource_request_for;
+use runtime::delegated_resource::service_cspace_for as resource_cspace_for;
+use runtime::delegated_resource::state as resource_state;
+use runtime::delegated_resource::revoke as revoke_resource_capability;
+use runtime::delegated_resource::revoke_request as revoke_delegated_request;
+use runtime::delegated_resource::DELEGATED_RESOURCE_STATE_LIVE;
+use runtime::delegated_resource::DELEGATED_RESOURCE_STATE_REVOKED;
+
+// Live M6B deliberately composes the existing M6A request router and scheduler
+// wait with Mode 19's bounded-copy mechanism.  It does not put the view cap in
+// endpoint word 3: endpoint capability-cleanup currently owns only ordinary
+// memory transfers.  The cap is installed directly in the exact service
+// CSpace by personality_memory_view::create and is returned only by the
+// request-correlated daemon lookup below.
+pub const MAX_BOUNDED_PERSONALITY_REQUESTS: usize = 4;
+
+const BOUNDED_EMPTY: u8 = 0;
+const BOUNDED_LIVE: u8 = 1;
+const BOUNDED_TERMINAL: u8 = 2;
+const BOUNDED_RETIRED: u8 = 3;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+static mut STATES: [u8; 4] = [0; 4];
+static mut GENERATIONS: [u32; 4] = [0; 4];
+static mut REQUESTS: [u64; 4] = [0; 4];
+static mut VIEWS: [u64; 4] = [0; 4];
+static mut VIEW_CAPABILITIES: [u64; 4] = [0; 4];
+static mut CALLER_PROCESSES: [u64; 4] = [0; 4];
+static mut CALLER_THREADS: [u64; 4] = [0; 4];
+static mut CALLER_ADDRESS_SPACES: [u64; 4] = [0; 4];
+static mut FOREIGN_ADDRESSES: [usize; 4] = [0; 4];
+static mut LENGTHS: [usize; 4] = [0; 4];
+static mut DIRECTIONS: [u8; 4] = [0; 4];
+static mut REQUEST_FRAMES: [u64; 4] = [0; 4];
+static mut SERVICE_PROCESSES: [u64; 4] = [0; 4];
+static mut SERVICE_GENERATIONS: [u64; 4] = [0; 4];
+static mut SERVICE_CSPACES: [u64; 4] = [0; 4];
+static mut LOOKED_UP: [u8; 4] = [0; 4];
+static mut TERMINAL_KINDS: [u8; 4] = [0; 4];
+static mut RESOURCES: [u64; 4] = [0; 4];
+static mut RESOURCE_CAPABILITIES: [u64; 4] = [0; 4];
+
+static mut DISPATCHES: u64 = 0;
+static mut LOOKUPS: u64 = 0;
+static mut REPLIES: u64 = 0;
+static mut CANCELLATIONS: u64 = 0;
+static mut TIMEOUTS: u64 = 0;
+static mut SERVICE_DEATHS: u64 = 0;
+static mut PROCESS_EXITS: u64 = 0;
+static mut UNMAPS: u64 = 0;
+static mut REQUEST_REVOCATIONS: u64 = 0;
+static mut RESOURCE_REVOCATIONS: u64 = 0;
+static mut CONSUMED: u64 = 0;
+static mut ABORTS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut ALLOCATION_FAILURE_ARMS: u64 = 0;
+static mut ALLOCATION_FAILURES: u64 = 0;
+static mut ALLOCATION_ROLLBACK_PROOFS: u64 = 0;
+static mut WAIT_ROLLBACK_PROOFS: u64 = 0;
+static mut FAIL_NEXT_ALLOCATION: u8 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+
+unsafe fn clear_slot(slot: usize) -> void {
+    REQUESTS[slot] = 0;
+    VIEWS[slot] = 0;
+    VIEW_CAPABILITIES[slot] = 0;
+    CALLER_PROCESSES[slot] = 0;
+    CALLER_THREADS[slot] = 0;
+    CALLER_ADDRESS_SPACES[slot] = 0;
+    FOREIGN_ADDRESSES[slot] = 0;
+    LENGTHS[slot] = 0;
+    DIRECTIONS[slot] = 0;
+    REQUEST_FRAMES[slot] = 0;
+    SERVICE_PROCESSES[slot] = 0;
+    SERVICE_GENERATIONS[slot] = 0;
+    SERVICE_CSPACES[slot] = 0;
+    LOOKED_UP[slot] = 0;
+    TERMINAL_KINDS[slot] = 0;
+    RESOURCES[slot] = 0;
+    RESOURCE_CAPABILITIES[slot] = 0;
+}
+
+unsafe fn release_slot(slot: usize) -> void {
+    clear_slot(slot);
+    if GENERATIONS[slot] == 0xffff_ffff {
+        STATES[slot] = BOUNDED_RETIRED;
+    } else {
+        GENERATIONS[slot] += 1;
+        STATES[slot] = BOUNDED_EMPTY;
+    }
+}
+
+unsafe fn destroy_slot_resource(slot: usize) -> bool {
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        return false;
+    }
+    if RESOURCES[slot] == 0 {
+        return RESOURCE_CAPABILITIES[slot] == 0;
+    }
+    if destroy_resource(RESOURCES[slot]) != 1 {
+        return false;
+    }
+    RESOURCES[slot] = 0;
+    RESOURCE_CAPABILITIES[slot] = 0;
+    return true;
+}
+
+unsafe fn deny(result: u64) -> u64 {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    DENIALS += 1;
+    return result;
+}
+
+unsafe fn record_for_request(request: u64) -> usize {
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] != BOUNDED_EMPTY
+            && STATES[slot] != BOUNDED_RETIRED
+            && REQUESTS[slot] == request {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_BOUNDED_PERSONALITY_REQUESTS;
+}
+
+unsafe fn record_for_thread(thread: u64) -> usize {
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] != BOUNDED_EMPTY
+            && STATES[slot] != BOUNDED_RETIRED
+            && CALLER_THREADS[slot] == thread {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_BOUNDED_PERSONALITY_REQUESTS;
+}
+
+fn terminal_pair_valid(view_kind: u64, request_kind: u64) -> bool {
+    return (view_kind == MEMORY_VIEW_TERMINAL_REPLY
+            && request_kind == RPC_TERMINAL_REPLY)
+        || (view_kind == MEMORY_VIEW_TERMINAL_CANCELLED
+            && request_kind == RPC_TERMINAL_SUPERVISOR_CANCEL)
+        || (view_kind == MEMORY_VIEW_TERMINAL_TIMEOUT
+            && request_kind == RPC_TERMINAL_DEADLINE)
+        || (view_kind == MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+            && request_kind == RPC_TERMINAL_SERVICE_DEATH)
+        || ((view_kind == MEMORY_VIEW_TERMINAL_UNMAP
+                || view_kind == MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+                || view_kind == MEMORY_VIEW_TERMINAL_REQUEST_REVOKED)
+            && request_kind == RPC_TERMINAL_SUPERVISOR_CANCEL);
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    return result;
+}
+
+unsafe fn terminalize_record(slot: usize, kind: u64) -> bool {
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE {
+        return false;
+    }
+    let view: u64 = VIEWS[slot];
+    if view_state(view) != MEMORY_VIEW_STATE_TERMINAL
+        || view_terminal_kind(view) != kind
+        || cap_close_sequence(view) == 0
+        || terminal_sequence(view) <= cap_close_sequence(view)
+        || wake_sequence(view) <= terminal_sequence(view) {
+        return false;
+    }
+    STATES[slot] = BOUNDED_TERMINAL;
+    TERMINAL_KINDS[slot] = kind as u8;
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0
+        || !rpc_invariants_hold()
+        || memory_view_init() != 1 {
+        return 0;
+    }
+    if delegated_resource_init() != 1 {
+        return 0;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        STATES[slot] = BOUNDED_EMPTY;
+        GENERATIONS[slot] = 1;
+        clear_slot(slot);
+        slot += 1;
+    }
+    DISPATCHES = 0;
+    LOOKUPS = 0;
+    REPLIES = 0;
+    CANCELLATIONS = 0;
+    TIMEOUTS = 0;
+    SERVICE_DEATHS = 0;
+    PROCESS_EXITS = 0;
+    UNMAPS = 0;
+    REQUEST_REVOCATIONS = 0;
+    RESOURCE_REVOCATIONS = 0;
+    CONSUMED = 0;
+    ABORTS = 0;
+    DENIALS = 0;
+    ALLOCATION_FAILURE_ARMS = 0;
+    ALLOCATION_FAILURES = 0;
+    ALLOCATION_ROLLBACK_PROOFS = 0;
+    WAIT_ROLLBACK_PROOFS = 0;
+    FAIL_NEXT_ALLOCATION = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// On the first entry, M6A allocates and enqueues the scalar request with
+// endpoint word 3 fixed at zero.  Before the thread is handed to the scheduler,
+// this bridge snapshots the user range and installs the exact view cap directly
+// in the configured daemon's CSpace.  On the retry entry, copy-back is consumed
+// before M6A retires its terminal request record.
+pub unsafe fn dispatch_or_consume(
+    caller_process: u64,
+    caller_thread: u64,
+    caller_address_space: u64,
+    request_frame: u64,
+    deadline: u64,
+    foreign_address: usize,
+    length: usize,
+    direction: u64,
+    request_out: *mut u64,
+    result_out: *mut u64,
+    committed_length_out: *mut usize,
+    terminal_kind_out: *mut u64,
+    wait_out: *mut u64
+) -> u64 {
+    if request_out as usize == 0
+        || result_out as usize == 0
+        || committed_length_out as usize == 0
+        || terminal_kind_out as usize == 0
+        || wait_out as usize == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    volatile_store(request_out, 0);
+    volatile_store(result_out, 0);
+    volatile_store(committed_length_out, 0);
+    volatile_store(terminal_kind_out, 0);
+    volatile_store(wait_out, 0);
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if current_process_handle() != caller_process
+        || current_thread_handle() != caller_thread
+        || current_address_space_handle() != caller_address_space
+        || address_space_for(caller_process) != caller_address_space {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+
+    let existing: usize = record_for_thread(caller_thread);
+    if existing < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[existing] != BOUNDED_TERMINAL
+            || CALLER_PROCESSES[existing] != caller_process
+            || CALLER_ADDRESS_SPACES[existing] != caller_address_space
+            || REQUEST_FRAMES[existing] != request_frame
+            || FOREIGN_ADDRESSES[existing] != foreign_address
+            || LENGTHS[existing] != length
+            || DIRECTIONS[existing] as u64 != direction {
+            return deny(ERR_PERSONALITY_BUSY);
+        }
+        let request: u64 = REQUESTS[existing];
+        let view: u64 = VIEWS[existing];
+        if rpc_state(request) != RPC_STATE_TERMINAL
+            || view_state(view) != MEMORY_VIEW_STATE_TERMINAL
+            || !terminal_pair_valid(
+                view_terminal_kind(view),
+                rpc_terminal_kind(request)
+            ) {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        let mut view_kind: u64 = 0;
+        let mut committed: usize = 0;
+        if consume_view(
+            view,
+            caller_process,
+            caller_address_space,
+            foreign_address,
+            (&mut view_kind),
+            (&mut committed)
+        ) != 1 {
+            return deny(ERR_PERSONALITY_FAILED);
+        }
+        if !destroy_slot_resource(existing) {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        let mut consumed_request: u64 = 0;
+        let mut result: u64 = 0;
+        let disposition: u64 = dispatch_rpc(
+            caller_process,
+            caller_thread,
+            request_frame,
+            deadline,
+            (&mut consumed_request),
+            (&mut result)
+        );
+        if disposition != RPC_CONSUMED
+            || consumed_request != request
+            || CONSUMED == MAX_COUNTER {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        volatile_store(request_out, request);
+        volatile_store(result_out, result);
+        volatile_store(committed_length_out, committed);
+        volatile_store(terminal_kind_out, view_kind);
+        CONSUMED += 1;
+        release_slot(existing);
+        return finish(RPC_CONSUMED);
+    }
+
+    if !service_is_available() {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    let service_process: u64 = configured_service_process();
+    let service_generation: u64 = configured_service_generation();
+    let service_cspace: u64 = cspace_for(service_process);
+    if service_process == 0
+        || service_generation == 0
+        || service_cspace == 0
+        || !process_is_live(service_process) {
+        return deny(ERR_PERSONALITY_UNAVAILABLE);
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS
+        && STATES[slot] != BOUNDED_EMPTY {
+        slot += 1;
+    }
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || DISPATCHES == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+
+    let base_endpoint: u64 = service_request_endpoint();
+    let dispatches_before: u64 = base_dispatch_count();
+    let service_wakes_before: u64 = service_request_wake_count();
+    let messages_before: usize = endpoint_message_count(base_endpoint);
+    let views_before: usize = view_active_count();
+    let charged_before: usize = view_charged_bytes();
+    let service_caps_before: usize = live_slots_for_owner(service_cspace);
+    let wait_failures_before: u64 = rpc_wait_failure_count();
+
+    let mut request: u64 = 0;
+    let prepared: u64 = prepare_rpc_dispatch(
+        caller_process,
+        caller_thread,
+        request_frame,
+        deadline,
+        (&mut request)
+    );
+    if prepared != 1 {
+        return prepared;
+    }
+    // Mode24's live gate arms this one-shot before CPL3 scheduling.  The
+    // failure occurs after exact request reservation but before snapshot,
+    // capability publication, endpoint enqueue, or service wake, exercising
+    // the real reserve rollback edge rather than a synthetic counter oracle.
+    if FAIL_NEXT_ALLOCATION != 0 {
+        if abort_rpc_dispatch(request) != 1
+            || ALLOCATION_FAILURES == MAX_COUNTER
+            || ALLOCATION_ROLLBACK_PROOFS == MAX_COUNTER
+            || base_dispatch_count() != dispatches_before
+            || service_request_wake_count() != service_wakes_before
+            || endpoint_message_count(base_endpoint) != messages_before
+            || view_active_count() != views_before
+            || view_charged_bytes() != charged_before
+            || live_slots_for_owner(service_cspace)
+                != service_caps_before {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        FAIL_NEXT_ALLOCATION = 0;
+        ALLOCATION_FAILURES += 1;
+        ALLOCATION_ROLLBACK_PROOFS += 1;
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    let mut capability: u64 = 0;
+    let view: u64 = create_view(
+        request,
+        caller_process,
+        caller_address_space,
+        foreign_address,
+        length,
+        direction,
+        service_cspace,
+        (&mut capability)
+    );
+    if view == 0 || capability == 0 {
+        if abort_rpc_dispatch(request) != 1 {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        return deny(ERR_PERSONALITY_FAILED);
+    }
+    STATES[slot] = BOUNDED_LIVE;
+    REQUESTS[slot] = request;
+    VIEWS[slot] = view;
+    VIEW_CAPABILITIES[slot] = capability;
+    CALLER_PROCESSES[slot] = caller_process;
+    CALLER_THREADS[slot] = caller_thread;
+    CALLER_ADDRESS_SPACES[slot] = caller_address_space;
+    FOREIGN_ADDRESSES[slot] = foreign_address;
+    LENGTHS[slot] = length;
+    DIRECTIONS[slot] = direction as u8;
+    REQUEST_FRAMES[slot] = request_frame;
+    SERVICE_PROCESSES[slot] = service_process;
+    SERVICE_GENERATIONS[slot] = service_generation;
+    SERVICE_CSPACES[slot] = service_cspace;
+    let wait: u64 = prepare_rpc_wait(request);
+    if (wait & 0xff00_0000) != 0xb300_0000 {
+        if abort_created_view(view) != 1
+            || abort_rpc_dispatch(request) != 1
+            || base_dispatch_count() != dispatches_before
+            || service_request_wake_count() != service_wakes_before
+            || endpoint_message_count(base_endpoint) != messages_before
+            || view_active_count() != views_before
+            || view_charged_bytes() != charged_before
+            || live_slots_for_owner(service_cspace)
+                != service_caps_before {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        STATES[slot] = BOUNDED_EMPTY;
+        clear_slot(slot);
+        if rpc_wait_failure_count() == wait_failures_before + 1 {
+            if WAIT_ROLLBACK_PROOFS == MAX_COUNTER {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            WAIT_ROLLBACK_PROOFS += 1;
+        } else if rpc_wait_failure_count() != wait_failures_before {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        return deny(wait);
+    }
+    let published: u64 = publish_rpc_dispatch(request);
+    if published != RPC_DISPATCHED {
+        if abort_created_view(view) != 1
+            || abort_prepared_rpc_wait(request, wait) != 1 {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        STATES[slot] = BOUNDED_EMPTY;
+        clear_slot(slot);
+        return deny(published);
+    }
+    DISPATCHES += 1;
+    volatile_store(request_out, request);
+    volatile_store(wait_out, wait);
+    return finish(published);
+}
+
+// The daemon learns no ambient CSpace handle and cannot enumerate authority.
+// It supplies the unforgeable request correlation received through the normal
+// M6A endpoint; lookup returns only the cap already installed for that exact
+// request, service process, service generation, and service CSpace.
+pub unsafe fn lookup_view(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    let caller: u64 = current_process_handle();
+    let cspace: u64 = current_cspace_handle();
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || caller == 0
+        || caller != SERVICE_PROCESSES[slot]
+        || cspace != SERVICE_CSPACES[slot]
+        || configured_service_process() != caller
+        || configured_service_generation() != SERVICE_GENERATIONS[slot]
+        || request_service_process(request) != caller
+        || request_service_generation(request) != SERVICE_GENERATIONS[slot]
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0
+        || !view_is_live(VIEWS[slot])
+        || view_request(VIEWS[slot]) != request
+        || view_service_cspace(VIEWS[slot]) != cspace
+        || capability_for(VIEWS[slot]) != VIEW_CAPABILITIES[slot] {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if LOOKED_UP[slot] != 0 {
+        return deny(ERR_PERSONALITY_DUPLICATE);
+    }
+    if LOOKUPS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    LOOKED_UP[slot] = 1;
+    LOOKUPS += 1;
+    return finish(VIEW_CAPABILITIES[slot]);
+}
+
+unsafe fn service_record(capability: u64) -> usize {
+    let caller: u64 = current_process_handle();
+    let cspace: u64 = current_cspace_handle();
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && LOOKED_UP[slot] == 1
+            && SERVICE_PROCESSES[slot] == caller
+            && SERVICE_CSPACES[slot] == cspace
+            && SERVICE_GENERATIONS[slot] == configured_service_generation()
+            && VIEW_CAPABILITIES[slot] == capability
+            && view_is_live(VIEWS[slot]) {
+            return slot;
+        }
+        slot += 1;
+    }
+    return MAX_BOUNDED_PERSONALITY_REQUESTS;
+}
+
+unsafe fn correlated_service_record(
+    request: u64,
+    capability: u64
+) -> usize {
+    let slot: usize = record_for_request(request);
+    let caller: u64 = current_process_handle();
+    let cspace: u64 = current_cspace_handle();
+    if slot < MAX_BOUNDED_PERSONALITY_REQUESTS
+        && (STATES[slot] == BOUNDED_LIVE
+            || STATES[slot] == BOUNDED_TERMINAL)
+        && LOOKED_UP[slot] == 1
+        && SERVICE_PROCESSES[slot] == caller
+        && SERVICE_CSPACES[slot] == cspace
+        && SERVICE_GENERATIONS[slot] == configured_service_generation()
+        && VIEW_CAPABILITIES[slot] == capability
+        && request_service_process(request) == caller
+        && request_service_generation(request)
+            == SERVICE_GENERATIONS[slot] {
+        return slot;
+    }
+    return MAX_BOUNDED_PERSONALITY_REQUESTS;
+}
+
+// Return immutable request metadata only to the exact daemon that already
+// looked up this request's exact view capability. Personality adapters use
+// this instead of trusting operation arguments supplied independently by the
+// daemon after dispatch.
+pub unsafe fn request_metadata(
+    request: u64,
+    capability: u64,
+    request_frame_out: *mut u64,
+    length_out: *mut usize,
+    direction_out: *mut u64
+) -> u64 {
+    if request_frame_out as usize == 0
+        || length_out as usize == 0
+        || direction_out as usize == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    volatile_store(request_frame_out, 0);
+    volatile_store(length_out, 0);
+    volatile_store(direction_out, 0);
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = correlated_service_record(request, capability);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0
+        || !view_is_live(VIEWS[slot])
+        || view_request(VIEWS[slot]) != request
+        || capability_for(VIEWS[slot]) != capability {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    volatile_store(request_frame_out, REQUEST_FRAMES[slot]);
+    volatile_store(length_out, LENGTHS[slot]);
+    volatile_store(direction_out, DIRECTIONS[slot] as u64);
+    return finish(1);
+}
+
+pub unsafe fn read_byte(
+    capability: u64,
+    offset: usize,
+    result: *mut u8
+) -> u64 {
+    if result as usize == 0 || !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = service_record(capability);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if read_view_byte(
+        SERVICE_CSPACES[slot],
+        capability,
+        offset,
+        result
+    ) != 1 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    return finish(1);
+}
+
+pub unsafe fn write_byte(
+    capability: u64,
+    offset: usize,
+    value: u8
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = service_record(capability);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if write_view_byte(
+        SERVICE_CSPACES[slot],
+        capability,
+        offset,
+        value
+    ) != 1 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    return finish(1);
+}
+
+// Revoke the daemon's view authority before the M6A router records its reply
+// and performs the one real ipc_wait completion/wake.
+pub unsafe fn reply(
+    request: u64,
+    capability: u64,
+    committed_length: usize,
+    result: u64
+) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    if result == ERR_IPC_RETRY
+        || result == SYSCALL_CONTROL_EXIT
+        || result == SYSCALL_CONTROL_SCHEDULE {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    let caller: u64 = current_process_handle();
+    let request_slot: usize = record_for_request(request);
+    if request_slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        // Once the caller has consumed the bridge record, the M6A tombstone is
+        // still authoritative for exact duplicate/late/stale classification.
+        // Never let this fallback terminalize a live request that lacks its
+        // corresponding bounded view record.
+        if rpc_state(request) == RPC_STATE_WAITING {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        return deny(reply_rpc(request, caller, result));
+    }
+    let slot: usize = correlated_service_record(request, capability);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if STATES[slot] == BOUNDED_TERMINAL {
+        return deny(reply_rpc(request, caller, result));
+    }
+    if rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let outer_ready: u64 = can_reply_rpc(request, caller, result);
+    if outer_ready != 1 {
+        return deny(outer_ready);
+    }
+    if reply_view(
+        SERVICE_CSPACES[slot],
+        capability,
+        committed_length
+    ) != 1 {
+        return deny(ERR_PERSONALITY_UNSUPPORTED);
+    }
+    if !terminalize_record(slot, MEMORY_VIEW_TERMINAL_REPLY) {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    if reply_rpc(request, caller, result) != 1
+        || rpc_state(request) != RPC_STATE_TERMINAL
+        || !terminal_pair_valid(
+            MEMORY_VIEW_TERMINAL_REPLY,
+            rpc_terminal_kind(request)
+        )
+        || REPLIES == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    REPLIES += 1;
+    return finish(1);
+}
+
+pub unsafe fn cancel(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        // The caller may consume and retire the bridge record between two
+        // supervisor syscalls.  Preserve the base router's tombstone-backed
+        // duplicate/stale classification, while refusing to bypass a live
+        // outer request that has inexplicably lost its bounded record.
+        if rpc_state(request) == RPC_STATE_WAITING {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        return deny(cancel_rpc(request));
+    }
+    if STATES[slot] == BOUNDED_TERMINAL {
+        // Preserve M6A's exact duplicate-terminal classification without
+        // touching the already-closed view or publishing another wake.
+        return deny(cancel_rpc(request));
+    }
+    if STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_WAITING {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let outer_ready: u64 = can_transition_rpc(
+        request,
+        RPC_TERMINAL_SUPERVISOR_CANCEL
+    );
+    if outer_ready != 1 {
+        return deny(outer_ready);
+    }
+    if RESOURCES[slot] != 0 {
+        return deny(ERR_PERSONALITY_BUSY);
+    }
+    if cancel_view(VIEWS[slot]) != 1
+        || !terminalize_record(slot, MEMORY_VIEW_TERMINAL_CANCELLED)
+        || cancel_rpc(request) != 1
+        || rpc_state(request) != RPC_STATE_TERMINAL
+        || !terminal_pair_valid(
+            MEMORY_VIEW_TERMINAL_CANCELLED,
+            rpc_terminal_kind(request)
+        )
+        || CANCELLATIONS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    CANCELLATIONS += 1;
+    return finish(1);
+}
+
+pub unsafe fn expire(now: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let mut due: u64 = 0;
+    let mut slot: usize = 0;
+    // Preflight the entire batch before revoking any view authority.  With
+    // interrupts masked, this makes view-close -> terminal -> outer wake one
+    // composed transaction rather than a best-effort pair of mutations.
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && rpc_state(REQUESTS[slot]) == RPC_STATE_WAITING
+            && rpc_deadline(REQUESTS[slot]) != 0
+            && rpc_deadline(REQUESTS[slot]) <= now {
+            if RESOURCES[slot] != 0
+                || can_transition_rpc(
+                    REQUESTS[slot],
+                    RPC_TERMINAL_DEADLINE
+                ) != 1 {
+                return deny(ERR_PERSONALITY_BUSY);
+            }
+            due += 1;
+        }
+        slot += 1;
+    }
+    if due == 0 {
+        return finish(0);
+    }
+    slot = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && rpc_state(REQUESTS[slot]) == RPC_STATE_WAITING
+            && rpc_deadline(REQUESTS[slot]) != 0
+            && rpc_deadline(REQUESTS[slot]) <= now {
+            if timeout_view(VIEWS[slot]) != 1
+                || !terminalize_record(
+                    slot,
+                    MEMORY_VIEW_TERMINAL_TIMEOUT
+                ) {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+        }
+        slot += 1;
+    }
+    if expire_rpc(now) != due || TIMEOUTS > MAX_COUNTER - due {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    slot = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_TERMINAL
+            && TERMINAL_KINDS[slot] as u64
+                == MEMORY_VIEW_TERMINAL_TIMEOUT
+            && !terminal_pair_valid(
+                MEMORY_VIEW_TERMINAL_TIMEOUT,
+                rpc_terminal_kind(REQUESTS[slot])
+            ) {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        slot += 1;
+    }
+    TIMEOUTS += due;
+    return finish(due);
+}
+
+pub unsafe fn service_died(service_process: u64) -> u64 {
+    if !preflight() || service_process == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let service_cspace: u64 = cspace_for(service_process);
+    let mut expected: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && SERVICE_PROCESSES[slot] == service_process
+            && SERVICE_CSPACES[slot] == service_cspace
+            && rpc_state(REQUESTS[slot]) == RPC_STATE_WAITING {
+            if RESOURCES[slot] != 0
+                || can_transition_rpc(
+                    REQUESTS[slot],
+                    RPC_TERMINAL_SERVICE_DEATH
+                ) != 1 {
+                return deny(ERR_PERSONALITY_BUSY);
+            }
+            expected += 1;
+        }
+        slot += 1;
+    }
+    if expected == 0 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if views_service_died(service_cspace) != expected {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    slot = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && SERVICE_PROCESSES[slot] == service_process {
+            if !terminalize_record(
+                slot,
+                MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+            ) {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+        }
+        slot += 1;
+    }
+    if rpc_service_died(service_process) != expected
+        || SERVICE_DEATHS > MAX_COUNTER - expected {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    slot = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_TERMINAL
+            && TERMINAL_KINDS[slot] as u64
+                == MEMORY_VIEW_TERMINAL_SERVICE_DEATH
+            && !terminal_pair_valid(
+                MEMORY_VIEW_TERMINAL_SERVICE_DEATH,
+                rpc_terminal_kind(REQUESTS[slot])
+            ) {
+            POISONED = 1;
+            return ERR_PERSONALITY_FAILED;
+        }
+        slot += 1;
+    }
+    SERVICE_DEATHS += expected;
+    return finish(expected);
+}
+
+// Management may attach one exact delegated lease to a live, already-looked-
+// up request. The capability is installed only in that service CSpace and is
+// retained here solely so the bridge can revoke/destroy it transactionally.
+pub unsafe fn delegate_resource(
+    request: u64,
+    kind: u64,
+    capability_out: *mut u64
+) -> u64 {
+    if capability_out as usize == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    volatile_store(capability_out, 0);
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || LOOKED_UP[slot] != 1
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0
+        || RESOURCE_CAPABILITIES[slot] != 0 {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut capability: u64 = 0;
+    let resource: u64 = create_bound_resource(
+        request,
+        kind,
+        SERVICE_CSPACES[slot],
+        VIEWS[slot],
+        (&mut capability)
+    );
+    if resource == 0
+        || capability == 0 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    RESOURCES[slot] = resource;
+    RESOURCE_CAPABILITIES[slot] = capability;
+    volatile_store(capability_out, capability);
+    return finish(1);
+}
+
+// Actual caller teardown path: close/terminalize the view, unlink and retire
+// the paired M6A wait without waking the dying thread, discard staging, then
+// release the bridge record. The caller PCB must still be structurally live.
+pub unsafe fn process_exited(caller_process: u64) -> u64 {
+    if !preflight() || caller_process == 0 {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let mut expected: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] != BOUNDED_EMPTY
+            && STATES[slot] != BOUNDED_RETIRED
+            && CALLER_PROCESSES[slot] == caller_process {
+            if STATES[slot] != BOUNDED_LIVE
+                || rpc_state(REQUESTS[slot]) != RPC_STATE_WAITING
+                || RESOURCES[slot] != 0 {
+                return deny(ERR_PERSONALITY_BUSY);
+            }
+            expected += 1;
+        }
+        slot += 1;
+    }
+    if expected == 0 || PROCESS_EXITS > MAX_COUNTER - expected {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if views_process_exited(caller_process) != expected
+        || rpc_caller_exited(caller_process) != expected {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    slot = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            && CALLER_PROCESSES[slot] == caller_process {
+            if !terminalize_record(
+                slot,
+                MEMORY_VIEW_TERMINAL_PROCESS_EXIT
+            ) || discard_view(VIEWS[slot]) != 1 {
+                POISONED = 1;
+                return ERR_PERSONALITY_FAILED;
+            }
+            PROCESS_EXITS += 1;
+            release_slot(slot);
+        }
+        slot += 1;
+    }
+    return finish(expected);
+}
+
+// Mapping teardown must call this before removing the mapping. The bounded
+// view closes first; the paired M6A request then publishes one cancellation
+// wake. Non-reply terminal consumption performs no copy-out.
+pub unsafe fn unmap_request(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0
+        || can_transition_rpc(
+            request,
+            RPC_TERMINAL_SUPERVISOR_CANCEL
+        ) != 1
+        || UNMAPS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if views_unmapped(
+        CALLER_ADDRESS_SPACES[slot],
+        FOREIGN_ADDRESSES[slot],
+        LENGTHS[slot]
+    ) != 1
+        || !terminalize_record(slot, MEMORY_VIEW_TERMINAL_UNMAP)
+        || cancel_rpc(request) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    UNMAPS += 1;
+    return finish(1);
+}
+
+pub unsafe fn revoke_request(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] != 0
+        || can_transition_rpc(
+            request,
+            RPC_TERMINAL_SUPERVISOR_CANCEL
+        ) != 1
+        || REQUEST_REVOCATIONS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut resources: u64 = 0;
+    let mut views: u64 = 0;
+    if revoke_delegated_request(
+        request,
+        (&mut resources),
+        (&mut views)
+    ) != 1
+        || views != 1
+        || !terminalize_record(
+            slot,
+            MEMORY_VIEW_TERMINAL_REQUEST_REVOKED
+        )
+        || cancel_rpc(request) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    REQUEST_REVOCATIONS += 1;
+    return finish(1);
+}
+
+pub unsafe fn revoke_resource(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_WAITING
+        || RESOURCES[slot] == 0
+        || RESOURCE_CAPABILITIES[slot] == 0
+        || can_transition_rpc(
+            request,
+            RPC_TERMINAL_SUPERVISOR_CANCEL
+        ) != 1
+        || RESOURCE_REVOCATIONS == MAX_COUNTER {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    let mut views: u64 = 0;
+    if revoke_resource_capability(
+        SERVICE_CSPACES[slot],
+        RESOURCE_CAPABILITIES[slot],
+        (&mut views)
+    ) != 1
+        || views != 1
+        || !terminalize_record(
+            slot,
+            MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+        )
+        || cancel_rpc(request) != 1 {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    RESOURCE_CAPABILITIES[slot] = 0;
+    RESOURCE_REVOCATIONS += 1;
+    return finish(1);
+}
+
+// If scheduler handoff fails after a view exists, revoke the view first, then
+// abort the M6A wait/queued request and release the now-undeliverable terminal.
+pub unsafe fn abort_wait(request: u64, wait: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || RESOURCES[slot] != 0
+        || (rpc_state(request) != RPC_STATE_WAIT_PREPARED
+            && rpc_state(request) != RPC_STATE_WAITING) {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if cancel_view(VIEWS[slot]) != 1
+        || abort_rpc_wait(request, wait) != 1
+        || discard_view(VIEWS[slot]) != 1
+        || ABORTS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    ABORTS += 1;
+    release_slot(slot);
+    return finish(1);
+}
+
+// Wait reservation failed after endpoint publication.  Revoke the view first,
+// then remove the exact still-queued M6A request, then release terminal
+// staging.  The base router deliberately preserves DISPATCHED state for this
+// composed rollback path.
+pub unsafe fn abort_unarmed_dispatch(request: u64) -> u64 {
+    if !preflight() {
+        return ERR_PERSONALITY_FAILED;
+    }
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_LIVE
+        || rpc_state(request) != RPC_STATE_DISPATCHED {
+        return deny(ERR_PERSONALITY_STALE);
+    }
+    if cancel_view(VIEWS[slot]) != 1
+        || abort_published_rpc(request) != 1
+        || discard_view(VIEWS[slot]) != 1
+        || ABORTS == MAX_COUNTER {
+        POISONED = 1;
+        return ERR_PERSONALITY_FAILED;
+    }
+    ABORTS += 1;
+    release_slot(slot);
+    return finish(1);
+}
+
+// Phase one runs after CR3/TSS/GS plus PCB/Cspace installation, while the TCB
+// remains DISPATCHING and can still be rolled back by abort_next.  It performs
+// every fallible identity/disposition check and returns the final result that
+// must replace the provisional ERR_IPC_RETRY before commit_next.
+pub unsafe fn prepare_resume(thread: u64, result_out: *mut u64) -> u64 {
+    if result_out as usize == 0 {
+        return 2;
+    }
+    volatile_store(result_out, 0);
+    // This hook is consulted for every candidate TCB, including the daemon,
+    // supervisor, and unrelated observer that cannot own a bounded result.
+    // Reject an uninitialized/poisoned bridge immediately, then use the exact
+    // thread index before paying for the full cross-module oracle.  A real
+    // terminal resume still runs the unchanged preflight below.
+    if INITIALIZED == 0 || POISONED != 0 {
+        return 2;
+    }
+    let slot: usize = record_for_thread(thread);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS {
+        return 0;
+    }
+    if STATES[slot] == BOUNDED_LIVE {
+        return 0;
+    }
+    if STATES[slot] != BOUNDED_TERMINAL {
+        POISONED = 1;
+        return 2;
+    }
+    if !preflight() {
+        return 2;
+    }
+    let request: u64 = REQUESTS[slot];
+    let view: u64 = VIEWS[slot];
+    let caller: u64 = CALLER_PROCESSES[slot];
+    let caller_address_space: u64 = CALLER_ADDRESS_SPACES[slot];
+    let request_kind: u64 = rpc_terminal_kind(request);
+    let mut expected_wake: u64 = WAKE_REASON_CANCELLED;
+    if request_kind == RPC_TERMINAL_REPLY {
+        expected_wake = WAKE_REASON_IPC;
+    }
+    if current_thread_handle() != 0
+        || current_process_handle() != caller
+        || current_address_space_handle() != caller_address_space
+        || current_cspace_handle() != cspace_for(caller)
+        || rpc_caller_thread(request) != thread
+        || rpc_state(request) != RPC_STATE_TERMINAL
+        || view_state(view) != MEMORY_VIEW_STATE_TERMINAL
+        || thread_saved_result(thread) != ERR_IPC_RETRY
+        || thread_wake_reason(thread) != expected_wake
+        || can_consume_view(
+            view,
+            caller,
+            caller_address_space,
+            FOREIGN_ADDRESSES[slot]
+        ) != 1
+        || !terminal_pair_valid(
+            view_terminal_kind(view),
+            request_kind
+        ) {
+        POISONED = 1;
+        return 2;
+    }
+    volatile_store(result_out, rpc_terminal_result(request));
+    return 1;
+}
+
+// Phase two runs immediately after commit_next has made the prevalidated TCB
+// RUNNING and saved RAX already contains the final result.  Interrupts remain
+// masked, so no process, mapping, view, or request generation can change
+// between the phases.  Failure is a kernel invariant failure and must never
+// return this frame to IRETQ.
+pub unsafe fn commit_resume(thread: u64) -> u64 {
+    let slot: usize = record_for_thread(thread);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS
+        || STATES[slot] != BOUNDED_TERMINAL {
+        return 0;
+    }
+    let request: u64 = REQUESTS[slot];
+    let view: u64 = VIEWS[slot];
+    let caller: u64 = CALLER_PROCESSES[slot];
+    let caller_address_space: u64 = CALLER_ADDRESS_SPACES[slot];
+    let deadline: u64 = rpc_deadline(request);
+    let expected_result: u64 = rpc_terminal_result(request);
+    let expected_committed: usize = view_committed_length(view);
+    if current_thread_handle() != thread
+        || current_process_handle() != caller
+        || current_address_space_handle() != caller_address_space
+        || thread_saved_result(thread) != expected_result {
+        POISONED = 1;
+        return 2;
+    }
+    let mut view_kind: u64 = 0;
+    let mut committed: usize = 0;
+    if consume_view(
+        view,
+        caller,
+        caller_address_space,
+        FOREIGN_ADDRESSES[slot],
+        (&mut view_kind),
+        (&mut committed)
+    ) != 1 {
+        POISONED = 1;
+        return 2;
+    }
+    if !destroy_slot_resource(slot) {
+        POISONED = 1;
+        return 2;
+    }
+    let mut consumed_request: u64 = 0;
+    let mut result: u64 = 0;
+    if dispatch_rpc(
+        caller,
+        thread,
+        REQUEST_FRAMES[slot],
+        deadline,
+        (&mut consumed_request),
+        (&mut result)
+    ) != RPC_CONSUMED
+        || consumed_request != request
+        || result != expected_result
+        || view_kind != TERMINAL_KINDS[slot] as u64
+        || committed != expected_committed
+        || committed > LENGTHS[slot]
+        || view_committed_length(view) != 0
+        || CONSUMED == MAX_COUNTER {
+        POISONED = 1;
+        return 2;
+    }
+    CONSUMED += 1;
+    release_slot(slot);
+    if finish(1) != 1 {
+        return 2;
+    }
+    return 1;
+}
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !rpc_invariants_hold()
+        || !view_invariants_hold()
+        || !resource_invariants_hold()
+        || DISPATCHES
+            != CONSUMED
+                + ABORTS
+                + PROCESS_EXITS
+                + active_count() as u64
+        || REPLIES
+                + CANCELLATIONS
+                + TIMEOUTS
+                + SERVICE_DEATHS
+                + UNMAPS
+                + REQUEST_REVOCATIONS
+                + RESOURCE_REVOCATIONS
+            != terminal_count() as u64 + CONSUMED
+        || ALLOCATION_FAILURE_ARMS
+            != ALLOCATION_FAILURES + FAIL_NEXT_ALLOCATION as u64
+        || ALLOCATION_FAILURES != ALLOCATION_ROLLBACK_PROOFS
+        || WAIT_ROLLBACK_PROOFS != rpc_wait_failure_count() {
+        return false;
+    }
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        let state: u8 = STATES[slot];
+        if GENERATIONS[slot] == 0 {
+            return false;
+        }
+        if state == BOUNDED_EMPTY || state == BOUNDED_RETIRED {
+            if (state == BOUNDED_RETIRED
+                    && GENERATIONS[slot] != 0xffff_ffff)
+                || REQUESTS[slot] != 0
+                || VIEWS[slot] != 0
+                || VIEW_CAPABILITIES[slot] != 0
+                || CALLER_PROCESSES[slot] != 0
+                || CALLER_THREADS[slot] != 0
+                || CALLER_ADDRESS_SPACES[slot] != 0
+                || FOREIGN_ADDRESSES[slot] != 0
+                || LENGTHS[slot] != 0
+                || DIRECTIONS[slot] != 0
+                || REQUEST_FRAMES[slot] != 0
+                || SERVICE_PROCESSES[slot] != 0
+                || SERVICE_GENERATIONS[slot] != 0
+                || SERVICE_CSPACES[slot] != 0
+                || LOOKED_UP[slot] != 0
+                || TERMINAL_KINDS[slot] != 0
+                || RESOURCES[slot] != 0
+                || RESOURCE_CAPABILITIES[slot] != 0 {
+                return false;
+            }
+        } else if state == BOUNDED_LIVE || state == BOUNDED_TERMINAL {
+            if REQUESTS[slot] == 0
+                || VIEWS[slot] == 0
+                || VIEW_CAPABILITIES[slot] == 0
+                || CALLER_PROCESSES[slot] == 0
+                || CALLER_THREADS[slot] == 0
+                || CALLER_ADDRESS_SPACES[slot] == 0
+                || FOREIGN_ADDRESSES[slot] == 0
+                || LENGTHS[slot] == 0
+                || DIRECTIONS[slot] == 0
+                || REQUEST_FRAMES[slot] == 0
+                || SERVICE_PROCESSES[slot] == 0
+                || SERVICE_GENERATIONS[slot] == 0
+                || SERVICE_CSPACES[slot] == 0
+                || rpc_caller_process(REQUESTS[slot])
+                    != CALLER_PROCESSES[slot]
+                || rpc_caller_thread(REQUESTS[slot])
+                    != CALLER_THREADS[slot]
+                || rpc_request_frame(REQUESTS[slot])
+                    != REQUEST_FRAMES[slot]
+                || request_service_process(REQUESTS[slot])
+                    != SERVICE_PROCESSES[slot]
+                || request_service_generation(REQUESTS[slot])
+                    != SERVICE_GENERATIONS[slot]
+                || view_request(VIEWS[slot]) != REQUESTS[slot]
+                || view_service_cspace(VIEWS[slot])
+                    != SERVICE_CSPACES[slot] {
+                return false;
+            }
+            if RESOURCES[slot] == 0 {
+                if RESOURCE_CAPABILITIES[slot] != 0 {
+                    return false;
+                }
+            } else if resource_request_for(RESOURCES[slot])
+                    != REQUESTS[slot]
+                || resource_cspace_for(RESOURCES[slot])
+                    != SERVICE_CSPACES[slot] {
+                return false;
+            }
+            if state == BOUNDED_LIVE {
+                let request_state: u64 = rpc_state(REQUESTS[slot]);
+                if (request_state != RPC_STATE_DISPATCHED
+                        && request_state != RPC_STATE_WAIT_PREPARED
+                        && request_state != RPC_STATE_WAITING)
+                    || view_state(VIEWS[slot]) != MEMORY_VIEW_STATE_LIVE
+                    || capability_for(VIEWS[slot])
+                        != VIEW_CAPABILITIES[slot]
+                    || TERMINAL_KINDS[slot] != 0
+                    || (RESOURCES[slot] != 0
+                        && (resource_state(RESOURCES[slot])
+                                != DELEGATED_RESOURCE_STATE_LIVE
+                            || RESOURCE_CAPABILITIES[slot] == 0
+                            || resource_capability_for(RESOURCES[slot])
+                                != RESOURCE_CAPABILITIES[slot])) {
+                    return false;
+                }
+            } else if rpc_state(REQUESTS[slot]) != RPC_STATE_TERMINAL
+                || view_state(VIEWS[slot]) != MEMORY_VIEW_STATE_TERMINAL
+                || TERMINAL_KINDS[slot] == 0
+                || !terminal_pair_valid(
+                    TERMINAL_KINDS[slot] as u64,
+                    rpc_terminal_kind(REQUESTS[slot])
+                )
+                || capability_for(VIEWS[slot]) != 0
+                || cap_close_sequence(VIEWS[slot]) == 0
+                || terminal_sequence(VIEWS[slot])
+                    <= cap_close_sequence(VIEWS[slot])
+                || wake_sequence(VIEWS[slot])
+                    <= terminal_sequence(VIEWS[slot])
+                || (RESOURCES[slot] != 0
+                    && (TERMINAL_KINDS[slot] as u64
+                            != MEMORY_VIEW_TERMINAL_RESOURCE_REVOKED
+                        || resource_state(RESOURCES[slot])
+                            != DELEGATED_RESOURCE_STATE_REVOKED
+                        || RESOURCE_CAPABILITIES[slot] != 0
+                        || resource_capability_for(RESOURCES[slot]) != 0)) {
+                return false;
+            }
+            let mut other: usize = slot + 1;
+            while other < MAX_BOUNDED_PERSONALITY_REQUESTS {
+                if STATES[other] != BOUNDED_EMPTY
+                    && STATES[other] != BOUNDED_RETIRED
+                    && (REQUESTS[other] == REQUESTS[slot]
+                        || CALLER_THREADS[other]
+                            == CALLER_THREADS[slot]
+                        || VIEW_CAPABILITIES[other]
+                            == VIEW_CAPABILITIES[slot]) {
+                    return false;
+                }
+                other += 1;
+            }
+        } else {
+            return false;
+        }
+        slot += 1;
+    }
+    return true;
+}
+
+pub unsafe fn active_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE
+            || STATES[slot] == BOUNDED_TERMINAL {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn terminal_count() -> usize {
+    let mut count: usize = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_TERMINAL {
+            count += 1;
+        }
+        slot += 1;
+    }
+    return count;
+}
+
+pub unsafe fn view_for_request(request: u64) -> u64 {
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS { return 0; }
+    return VIEWS[slot];
+}
+
+pub unsafe fn capability_for_request(request: u64) -> u64 {
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS { return 0; }
+    return VIEW_CAPABILITIES[slot];
+}
+
+// Supervisor monitoring uses this request-specific publication bit rather
+// than a cumulative lookup counter, so it cannot race ahead of the daemon's
+// exact view-cap acquisition for either g1 cancel or the g2 admin matrix.
+pub unsafe fn lookup_complete(request: u64) -> bool {
+    let slot: usize = record_for_request(request);
+    return slot < MAX_BOUNDED_PERSONALITY_REQUESTS
+        && (STATES[slot] == BOUNDED_LIVE
+            || STATES[slot] == BOUNDED_TERMINAL)
+        && LOOKED_UP[slot] == 1;
+}
+
+// The timer path needs only a deadline hint until a request can actually
+// expire.  Running the bridge's full cross-module invariant oracle on every
+// hardware tick makes unoptimized QEMU spend nearly all of its time auditing
+// requests whose deadlines are still thousands of ticks away.  Every mutating
+// entry point continues to run preflight/finish; this read-only four-slot scan
+// merely keeps the expensive expiry transaction off the not-due fast path.
+// MAX_COUNTER is reserved here as an invalid/poisoned sentinel.
+pub unsafe fn next_live_deadline() -> u64 {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return MAX_COUNTER;
+    }
+    let mut next: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < MAX_BOUNDED_PERSONALITY_REQUESTS {
+        if STATES[slot] == BOUNDED_LIVE {
+            let request: u64 = REQUESTS[slot];
+            if request == 0 || !rpc_is_current(request) {
+                return MAX_COUNTER;
+            }
+            let deadline: u64 = rpc_deadline(request);
+            if deadline != 0 && (next == 0 || deadline < next) {
+                next = deadline;
+            }
+        }
+        slot += 1;
+    }
+    return next;
+}
+
+// Trusted management-only deterministic fault injection.  It is deliberately
+// one-shot and can be armed only before any bounded request exists.
+pub unsafe fn inject_allocation_failure_once() -> u64 {
+    if !preflight()
+        || current_process_handle() != 0
+        || active_count() != 0
+        || FAIL_NEXT_ALLOCATION != 0
+        || ALLOCATION_FAILURE_ARMS == MAX_COUNTER {
+        return 0;
+    }
+    FAIL_NEXT_ALLOCATION = 1;
+    ALLOCATION_FAILURE_ARMS += 1;
+    return finish(1);
+}
+
+// Request-correlated metadata for bounded personality adapters.  Keeping
+// these lookups on the bridge prevents an adapter from bypassing the bridge's
+// exact request/service-generation ownership boundary through raw M6A state.
+pub unsafe fn caller_process_for_request(request: u64) -> u64 {
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS { return 0; }
+    return CALLER_PROCESSES[slot];
+}
+
+pub unsafe fn service_process_for_request(request: u64) -> u64 {
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS { return 0; }
+    return SERVICE_PROCESSES[slot];
+}
+
+pub unsafe fn service_generation_for_request(request: u64) -> u64 {
+    let slot: usize = record_for_request(request);
+    if slot >= MAX_BOUNDED_PERSONALITY_REQUESTS { return 0; }
+    return SERVICE_GENERATIONS[slot];
+}
+
+pub unsafe fn dispatch_count() -> u64 { return DISPATCHES; }
+pub unsafe fn lookup_count() -> u64 { return LOOKUPS; }
+pub unsafe fn reply_count() -> u64 { return REPLIES; }
+pub unsafe fn cancellation_count() -> u64 { return CANCELLATIONS; }
+pub unsafe fn timeout_count() -> u64 { return TIMEOUTS; }
+pub unsafe fn service_death_count() -> u64 { return SERVICE_DEATHS; }
+pub unsafe fn process_exit_count() -> u64 { return PROCESS_EXITS; }
+pub unsafe fn unmap_count() -> u64 { return UNMAPS; }
+pub unsafe fn request_revocation_count() -> u64 {
+    return REQUEST_REVOCATIONS;
+}
+pub unsafe fn resource_revocation_count() -> u64 {
+    return RESOURCE_REVOCATIONS;
+}
+pub unsafe fn consumed_count() -> u64 { return CONSUMED; }
+pub unsafe fn abort_count() -> u64 { return ABORTS; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn allocation_failure_arm_count() -> u64 {
+    return ALLOCATION_FAILURE_ARMS;
+}
+pub unsafe fn allocation_failure_count() -> u64 {
+    return ALLOCATION_FAILURES;
+}
+pub unsafe fn allocation_rollback_proof_count() -> u64 {
+    return ALLOCATION_ROLLBACK_PROOFS;
+}
+pub unsafe fn wait_rollback_proof_count() -> u64 {
+    return WAIT_ROLLBACK_PROOFS;
+}
+pub unsafe fn charged_bytes() -> usize { return view_charged_bytes(); }
+pub unsafe fn poisoned() -> bool { return POISONED != 0; }

@@ -3,7 +3,7 @@ name = "ostadix-mcp-server"
 version = "0.2.0"
 edition = "2021"
 description = "Rust-only Ostadix-lang / O-lang MCP — endow agents to build with O"
-license = "MIT"
+license = "LGPL-2.1-only"
 publish = false
 
 [[bin]]
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 rmcp = { version = "0.6.3", features = ["server", "transport-io"] }
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }

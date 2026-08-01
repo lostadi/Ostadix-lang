@@ -18,6 +18,7 @@ use runtime::process::MAX_PROCESSES;
 // there is no address-sized buffer field that could be mistaken for a kernel
 // pointer or dereferenced by this module.
 pub const MAX_ENDPOINTS: usize = 8;
+pub const ENDPOINT_QUEUE_CAPACITY: usize = 4;
 pub const MAX_BLOCKED_SENDERS: usize = 4;
 
 pub const ENDPOINT_CLOSE_NONE: u64 = 0;
@@ -48,22 +49,26 @@ static mut RECEIVER_CSPACE_OWNERS: [u64; 8] = [0; 8];
 static mut REFERENCES: [u32; 8] = [0; 8];
 static mut CLOSE_REASONS: [u8; 8] = [0; 8];
 static mut DISCARDED_MESSAGES: [u32; 8] = [0; 8];
-static mut CAPABILITY_CLEANUP: [u64; 8] = [0; 8];
-static mut CAPABILITY_CLEANUP_OBJECTS: [u64; 8] = [0; 8];
-static mut CAPABILITY_CLEANUP_TYPES: [u64; 8] = [0; 8];
-static mut CAPABILITY_CLEANUP_RIGHTS: [u64; 8] = [0; 8];
+static mut CAPABILITY_CLEANUP_HEADS: [usize; 8] = [0; 8];
+static mut CAPABILITY_CLEANUP_LENGTHS: [usize; 8] = [0; 8];
+static mut CAPABILITY_CLEANUP: [u64; 32] = [0; 32];
+static mut CAPABILITY_CLEANUP_OBJECTS: [u64; 32] = [0; 32];
+static mut CAPABILITY_CLEANUP_TYPES: [u64; 32] = [0; 32];
+static mut CAPABILITY_CLEANUP_RIGHTS: [u64; 32] = [0; 32];
 
 // Each endpoint owns a four-element message ring. The destination capability
 // is created by the capability-transfer transaction before enqueue and is
 // therefore a handle in the receiver's exact CSpace generation. Zero means
 // that the message transfers no capability.
-static mut MESSAGE_SENDERS: [u64; 8] = [0; 8];
-static mut MESSAGE_CORRELATIONS: [u64; 8] = [0; 8];
-static mut MESSAGE_PAYLOADS: [u64; 8] = [0; 8];
-static mut MESSAGE_DESTINATION_CAPS: [u64; 8] = [0; 8];
-static mut MESSAGE_DESTINATION_OBJECTS: [u64; 8] = [0; 8];
-static mut MESSAGE_DESTINATION_TYPES: [u64; 8] = [0; 8];
-static mut MESSAGE_DESTINATION_RIGHTS: [u64; 8] = [0; 8];
+static mut MESSAGE_HEADS: [usize; 8] = [0; 8];
+static mut MESSAGE_LENGTHS: [usize; 8] = [0; 8];
+static mut MESSAGE_SENDERS: [u64; 32] = [0; 32];
+static mut MESSAGE_CORRELATIONS: [u64; 32] = [0; 32];
+static mut MESSAGE_PAYLOADS: [u64; 32] = [0; 32];
+static mut MESSAGE_DESTINATION_CAPS: [u64; 32] = [0; 32];
+static mut MESSAGE_DESTINATION_OBJECTS: [u64; 32] = [0; 32];
+static mut MESSAGE_DESTINATION_TYPES: [u64; 32] = [0; 32];
+static mut MESSAGE_DESTINATION_RIGHTS: [u64; 32] = [0; 32];
 
 // Wait lists also store complete generation-tagged thread handles. Endpoint
 // code never changes thread state and never calls the scheduler. The caller
@@ -82,7 +87,7 @@ fn endpoint_generation(handle: u64) -> u32 {
 }
 
 fn queue_index(slot: usize, physical: usize) -> usize {
-    return slot * MAX_BLOCKED_SENDERS + physical;
+    return slot * ENDPOINT_QUEUE_CAPACITY + physical;
 }
 
 unsafe fn make_handle(slot: usize) -> u64 {
@@ -161,7 +166,17 @@ unsafe fn escrow_record_valid(
         );
 }
 
-
+unsafe fn message_physical_active(slot: usize, physical: usize) -> bool {
+    let mut position: usize = 0;
+    while position < MESSAGE_LENGTHS[slot] {
+        if (MESSAGE_HEADS[slot] + position) % ENDPOINT_QUEUE_CAPACITY
+            == physical {
+            return true;
+        }
+        position += 1;
+    }
+    return false;
+}
 
 unsafe fn sender_waiter_physical_active(slot: usize, physical: usize) -> bool {
     let mut position: usize = 0;
@@ -175,9 +190,27 @@ unsafe fn sender_waiter_physical_active(slot: usize, physical: usize) -> bool {
     return false;
 }
 
+unsafe fn capability_cleanup_physical_active(
+    slot: usize,
+    physical: usize
+) -> bool {
+    let mut position: usize = 0;
+    while position < CAPABILITY_CLEANUP_LENGTHS[slot] {
+        if (CAPABILITY_CLEANUP_HEADS[slot] + position)
+            % ENDPOINT_QUEUE_CAPACITY == physical {
+            return true;
+        }
+        position += 1;
+    }
+    return false;
+}
 
-
-
+unsafe fn message_at(slot: usize, position: usize) -> usize {
+    if position >= MESSAGE_LENGTHS[slot] {
+        return ENDPOINT_QUEUE_CAPACITY;
+    }
+    return (MESSAGE_HEADS[slot] + position) % ENDPOINT_QUEUE_CAPACITY;
+}
 
 unsafe fn sender_waiter_at(slot: usize, position: usize) -> u64 {
     if position >= SENDER_WAITER_LENGTHS[slot] {
@@ -188,36 +221,37 @@ unsafe fn sender_waiter_at(slot: usize, position: usize) -> u64 {
     return SENDER_WAITERS[queue_index(slot, physical)];
 }
 
-unsafe fn clear_message_cell(slot: usize) -> void {
-    MESSAGE_SENDERS[slot] = 0;
-    MESSAGE_CORRELATIONS[slot] = 0;
-    MESSAGE_PAYLOADS[slot] = 0;
-    MESSAGE_DESTINATION_CAPS[slot] = 0;
-    MESSAGE_DESTINATION_OBJECTS[slot] = 0;
-    MESSAGE_DESTINATION_TYPES[slot] = 0;
-    MESSAGE_DESTINATION_RIGHTS[slot] = 0;
+unsafe fn clear_message_cell(slot: usize, physical: usize) -> void {
+    let index: usize = queue_index(slot, physical);
+    MESSAGE_SENDERS[index] = 0;
+    MESSAGE_CORRELATIONS[index] = 0;
+    MESSAGE_PAYLOADS[index] = 0;
+    MESSAGE_DESTINATION_CAPS[index] = 0;
+    MESSAGE_DESTINATION_OBJECTS[index] = 0;
+    MESSAGE_DESTINATION_TYPES[index] = 0;
+    MESSAGE_DESTINATION_RIGHTS[index] = 0;
 }
 
 unsafe fn clear_slot(slot: usize) -> void {
-    STATES[slot] = ENDPOINT_EMPTY;
-    GENERATIONS[slot] = 0;
     RECEIVER_CSPACE_OWNERS[slot] = 0;
     REFERENCES[slot] = 0;
     CLOSE_REASONS[slot] = ENDPOINT_CLOSE_NONE as u8;
     DISCARDED_MESSAGES[slot] = 0;
+    CAPABILITY_CLEANUP_HEADS[slot] = 0;
+    CAPABILITY_CLEANUP_LENGTHS[slot] = 0;
+    MESSAGE_HEADS[slot] = 0;
+    MESSAGE_LENGTHS[slot] = 0;
     RECEIVER_WAITERS[slot] = 0;
     SENDER_WAITER_HEADS[slot] = 0;
     SENDER_WAITER_LENGTHS[slot] = 0;
-    
-    clear_message_cell(slot);
-    CAPABILITY_CLEANUP[slot] = 0;
-    CAPABILITY_CLEANUP_OBJECTS[slot] = 0;
-    CAPABILITY_CLEANUP_TYPES[slot] = 0;
-    CAPABILITY_CLEANUP_RIGHTS[slot] = 0;
-    
     let mut physical: usize = 0;
-    while physical < MAX_BLOCKED_SENDERS {
+    while physical < ENDPOINT_QUEUE_CAPACITY {
+        clear_message_cell(slot, physical);
         let index: usize = queue_index(slot, physical);
+        CAPABILITY_CLEANUP[index] = 0;
+        CAPABILITY_CLEANUP_OBJECTS[index] = 0;
+        CAPABILITY_CLEANUP_TYPES[index] = 0;
+        CAPABILITY_CLEANUP_RIGHTS[index] = 0;
         SENDER_WAITERS[index] = 0;
         physical += 1;
     }
@@ -230,33 +264,91 @@ unsafe fn capability_cleanup_enqueue(
     object_type: u64,
     rights: u64
 ) -> bool {
-    if CAPABILITY_CLEANUP[slot] != 0
-        || CAPABILITY_CLEANUP_OBJECTS[slot] != 0
-        || CAPABILITY_CLEANUP_TYPES[slot] != 0
-        || CAPABILITY_CLEANUP_RIGHTS[slot] != 0 {
+    if cap == 0 {
+        return object == 0 && object_type == 0 && rights == 0;
+    }
+    if slot >= MAX_ENDPOINTS
+        || !escrow_record_valid(
+            RECEIVER_CSPACE_OWNERS[slot],
+            cap,
+            object,
+            object_type,
+            rights
+        )
+        || CAPABILITY_CLEANUP_LENGTHS[slot] >= ENDPOINT_QUEUE_CAPACITY {
         return false;
     }
-    CAPABILITY_CLEANUP[slot] = cap;
-    CAPABILITY_CLEANUP_OBJECTS[slot] = object;
-    CAPABILITY_CLEANUP_TYPES[slot] = object_type;
-    CAPABILITY_CLEANUP_RIGHTS[slot] = rights;
+    let physical: usize =
+        (CAPABILITY_CLEANUP_HEADS[slot]
+            + CAPABILITY_CLEANUP_LENGTHS[slot])
+            % ENDPOINT_QUEUE_CAPACITY;
+    let index: usize = queue_index(slot, physical);
+    if CAPABILITY_CLEANUP[index] != 0
+        || CAPABILITY_CLEANUP_OBJECTS[index] != 0
+        || CAPABILITY_CLEANUP_TYPES[index] != 0
+        || CAPABILITY_CLEANUP_RIGHTS[index] != 0 {
+        return false;
+    }
+    CAPABILITY_CLEANUP[index] = cap;
+    CAPABILITY_CLEANUP_OBJECTS[index] = object;
+    CAPABILITY_CLEANUP_TYPES[index] = object_type;
+    CAPABILITY_CLEANUP_RIGHTS[index] = rights;
+    CAPABILITY_CLEANUP_LENGTHS[slot] += 1;
     return true;
 }
 
 unsafe fn capability_cleanup_pop(slot: usize) -> u64 {
-    if slot >= MAX_ENDPOINTS || CAPABILITY_CLEANUP[slot] == 0 {
+    if slot >= MAX_ENDPOINTS || CAPABILITY_CLEANUP_LENGTHS[slot] == 0 {
         return 0;
     }
-    let cap: u64 = CAPABILITY_CLEANUP[slot];
-    CAPABILITY_CLEANUP[slot] = 0;
-    CAPABILITY_CLEANUP_OBJECTS[slot] = 0;
-    CAPABILITY_CLEANUP_TYPES[slot] = 0;
-    CAPABILITY_CLEANUP_RIGHTS[slot] = 0;
+    let physical: usize = CAPABILITY_CLEANUP_HEADS[slot];
+    let index: usize = queue_index(slot, physical);
+    let cap: u64 = CAPABILITY_CLEANUP[index];
+    CAPABILITY_CLEANUP[index] = 0;
+    CAPABILITY_CLEANUP_OBJECTS[index] = 0;
+    CAPABILITY_CLEANUP_TYPES[index] = 0;
+    CAPABILITY_CLEANUP_RIGHTS[index] = 0;
+    CAPABILITY_CLEANUP_LENGTHS[slot] -= 1;
+    if CAPABILITY_CLEANUP_LENGTHS[slot] == 0 {
+        CAPABILITY_CLEANUP_HEADS[slot] = 0;
+    } else {
+        CAPABILITY_CLEANUP_HEADS[slot] =
+            (CAPABILITY_CLEANUP_HEADS[slot] + 1)
+                % ENDPOINT_QUEUE_CAPACITY;
+    }
     return cap;
 }
 
 unsafe fn message_remove_at(slot: usize, position: usize) -> bool {
-    clear_message_cell(slot);
+    if position >= MESSAGE_LENGTHS[slot] {
+        return false;
+    }
+    let mut cursor: usize = position;
+    while cursor + 1 < MESSAGE_LENGTHS[slot] {
+        let target_physical: usize = message_at(slot, cursor);
+        let source_physical: usize = message_at(slot, cursor + 1);
+        let target: usize = queue_index(slot, target_physical);
+        let source: usize = queue_index(slot, source_physical);
+        MESSAGE_SENDERS[target] = MESSAGE_SENDERS[source];
+        MESSAGE_CORRELATIONS[target] = MESSAGE_CORRELATIONS[source];
+        MESSAGE_PAYLOADS[target] = MESSAGE_PAYLOADS[source];
+        MESSAGE_DESTINATION_CAPS[target] = MESSAGE_DESTINATION_CAPS[source];
+        MESSAGE_DESTINATION_OBJECTS[target] =
+            MESSAGE_DESTINATION_OBJECTS[source];
+        MESSAGE_DESTINATION_TYPES[target] =
+            MESSAGE_DESTINATION_TYPES[source];
+        MESSAGE_DESTINATION_RIGHTS[target] =
+            MESSAGE_DESTINATION_RIGHTS[source];
+        cursor += 1;
+    }
+    let old_tail: usize =
+        (MESSAGE_HEADS[slot] + MESSAGE_LENGTHS[slot] - 1)
+            % ENDPOINT_QUEUE_CAPACITY;
+    clear_message_cell(slot, old_tail);
+    MESSAGE_LENGTHS[slot] -= 1;
+    if MESSAGE_LENGTHS[slot] == 0 {
+        MESSAGE_HEADS[slot] = 0;
+    }
     return true;
 }
 
@@ -329,21 +421,30 @@ unsafe fn waiter_occurrences(waiter: u64) -> usize {
 }
 
 unsafe fn discard_messages(slot: usize) -> u32 {
-    let mut discarded: u32 = 0;
-    if MESSAGE_SENDERS[slot] != 0 {
-        discarded = 1;
-        let cap: u64 = MESSAGE_DESTINATION_CAPS[slot];
+    let discarded: u32 = MESSAGE_LENGTHS[slot] as u32;
+    let mut position: usize = 0;
+    while position < MESSAGE_LENGTHS[slot] {
+        let physical: usize = message_at(slot, position);
+        let index: usize = queue_index(slot, physical);
+        let cap: u64 = MESSAGE_DESTINATION_CAPS[index];
         if cap != 0 && !capability_cleanup_enqueue(
             slot,
             cap,
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
+            MESSAGE_DESTINATION_OBJECTS[index],
+            MESSAGE_DESTINATION_TYPES[index],
+            MESSAGE_DESTINATION_RIGHTS[index]
         ) {
-            POISONED = 1;
+            return 0xffff_ffff;
         }
+        position += 1;
     }
-    clear_message_cell(slot);
+    let mut physical: usize = 0;
+    while physical < ENDPOINT_QUEUE_CAPACITY {
+        clear_message_cell(slot, physical);
+        physical += 1;
+    }
+    MESSAGE_HEADS[slot] = 0;
+    MESSAGE_LENGTHS[slot] = 0;
     return discarded;
 }
 
@@ -373,8 +474,8 @@ unsafe fn try_retire(slot: usize) -> bool {
     if REFERENCES[slot] != 0
         || RECEIVER_WAITERS[slot] != 0
         || SENDER_WAITER_LENGTHS[slot] != 0
-        || MESSAGE_SENDERS[slot] != 0
-        || CAPABILITY_CLEANUP[slot] != 0 {
+        || MESSAGE_LENGTHS[slot] != 0
+        || CAPABILITY_CLEANUP_LENGTHS[slot] != 0 {
         return true;
     }
     let owner: u64 = RECEIVER_CSPACE_OWNERS[slot];
@@ -396,53 +497,72 @@ unsafe fn try_retire(slot: usize) -> bool {
 // kind/generation shape, globally unique waiters, exact owner liveness, and
 // lifecycle-specific reference and drain rules.
 pub unsafe fn invariants_hold() -> bool {
-    if POISONED != 0 {
+    if INITIALIZED == 0 || POISONED != 0 || !capability_invariants_hold() {
         return false;
-    }
-    if INITIALIZED == 0 {
-        return true;
     }
     let mut slot: usize = 0;
     while slot < MAX_ENDPOINTS {
         let state: u8 = STATES[slot];
         if GENERATIONS[slot] == 0
-            || SENDER_WAITER_LENGTHS[slot] > MAX_BLOCKED_SENDERS {
+            || MESSAGE_LENGTHS[slot] > ENDPOINT_QUEUE_CAPACITY
+            || SENDER_WAITER_LENGTHS[slot] > MAX_BLOCKED_SENDERS
+            || CAPABILITY_CLEANUP_LENGTHS[slot]
+                > ENDPOINT_QUEUE_CAPACITY
+            || MESSAGE_LENGTHS[slot] + CAPABILITY_CLEANUP_LENGTHS[slot]
+                > ENDPOINT_QUEUE_CAPACITY {
             return false;
         }
-        if (SENDER_WAITER_LENGTHS[slot] == 0
+        if (MESSAGE_LENGTHS[slot] == 0 && MESSAGE_HEADS[slot] != 0)
+            || (MESSAGE_LENGTHS[slot] != 0
+                && MESSAGE_HEADS[slot] >= ENDPOINT_QUEUE_CAPACITY)
+            || (SENDER_WAITER_LENGTHS[slot] == 0
                 && SENDER_WAITER_HEADS[slot] != 0)
             || (SENDER_WAITER_LENGTHS[slot] != 0
                 && SENDER_WAITER_HEADS[slot] >= MAX_BLOCKED_SENDERS) {
             return false;
         }
+        if (CAPABILITY_CLEANUP_LENGTHS[slot] == 0
+                && CAPABILITY_CLEANUP_HEADS[slot] != 0)
+            || (CAPABILITY_CLEANUP_LENGTHS[slot] != 0
+                && CAPABILITY_CLEANUP_HEADS[slot]
+                    >= ENDPOINT_QUEUE_CAPACITY) {
+            return false;
+        }
+
         if state == ENDPOINT_EMPTY || state == ENDPOINT_RETIRED {
             if (state == ENDPOINT_RETIRED
-                    && (RECEIVER_CSPACE_OWNERS[slot] == 0
-                        || !cspace_is_valid_owner(
-                            RECEIVER_CSPACE_OWNERS[slot]
-                        )))
+                    && GENERATIONS[slot] != 0xffff_ffff)
+                || RECEIVER_CSPACE_OWNERS[slot] != 0
                 || REFERENCES[slot] != 0
                 || CLOSE_REASONS[slot] != ENDPOINT_CLOSE_NONE as u8
                 || DISCARDED_MESSAGES[slot] != 0
-                || CAPABILITY_CLEANUP[slot] != 0
-                || MESSAGE_SENDERS[slot] != 0
+                || CAPABILITY_CLEANUP_HEADS[slot] != 0
+                || CAPABILITY_CLEANUP_LENGTHS[slot] != 0
+                || MESSAGE_HEADS[slot] != 0
+                || MESSAGE_LENGTHS[slot] != 0
                 || RECEIVER_WAITERS[slot] != 0
+                || SENDER_WAITER_HEADS[slot] != 0
                 || SENDER_WAITER_LENGTHS[slot] != 0 {
                 return false;
             }
         } else if state == ENDPOINT_LIVE || state == ENDPOINT_DRAINING {
-            if RECEIVER_CSPACE_OWNERS[slot] == 0
-                || !cspace_is_valid_owner(RECEIVER_CSPACE_OWNERS[slot]) {
+            let owner: u64 = RECEIVER_CSPACE_OWNERS[slot];
+            if owner == 0
+                || !cspace_is_valid_owner(owner)
+                || cspace_child_refs(owner) == 0 {
                 return false;
             }
             if state == ENDPOINT_LIVE {
-                if CLOSE_REASONS[slot] != ENDPOINT_CLOSE_NONE as u8
+                if REFERENCES[slot] == 0
+                    || CLOSE_REASONS[slot] != ENDPOINT_CLOSE_NONE as u8
                     || DISCARDED_MESSAGES[slot] != 0 {
                     return false;
                 }
             } else if (CLOSE_REASONS[slot] != ENDPOINT_CLOSE_NORMAL as u8
                     && CLOSE_REASONS[slot] != ENDPOINT_CLOSE_CRASH as u8)
-                || MESSAGE_SENDERS[slot] != 0 {
+                || MESSAGE_LENGTHS[slot] != 0
+                || MESSAGE_HEADS[slot] != 0
+                || DISCARDED_MESSAGES[slot] > ENDPOINT_QUEUE_CAPACITY as u32 {
                 return false;
             }
             if RECEIVER_WAITERS[slot] != 0 {
@@ -455,36 +575,49 @@ pub unsafe fn invariants_hold() -> bool {
             return false;
         }
 
-        if MESSAGE_SENDERS[slot] != 0 {
-            if state != ENDPOINT_LIVE
-                || !process_handle_shape_valid(MESSAGE_SENDERS[slot])
-                || !escrow_record_valid(
-                    RECEIVER_CSPACE_OWNERS[slot],
-                    MESSAGE_DESTINATION_CAPS[slot],
-                    MESSAGE_DESTINATION_OBJECTS[slot],
-                    MESSAGE_DESTINATION_TYPES[slot],
-                    MESSAGE_DESTINATION_RIGHTS[slot]
-                ) {
-                return false;
-            }
-        }
-
-        if CAPABILITY_CLEANUP[slot] != 0 {
-            if (state != ENDPOINT_LIVE && state != ENDPOINT_DRAINING)
-                || !escrow_record_valid(
-                    RECEIVER_CSPACE_OWNERS[slot],
-                    CAPABILITY_CLEANUP[slot],
-                    CAPABILITY_CLEANUP_OBJECTS[slot],
-                    CAPABILITY_CLEANUP_TYPES[slot],
-                    CAPABILITY_CLEANUP_RIGHTS[slot]
-                ) {
-                return false;
-            }
-        }
-
         let mut physical: usize = 0;
-        while physical < MAX_BLOCKED_SENDERS {
+        while physical < ENDPOINT_QUEUE_CAPACITY {
             let index: usize = queue_index(slot, physical);
+            if message_physical_active(slot, physical) {
+                if state != ENDPOINT_LIVE
+                    || !process_handle_shape_valid(MESSAGE_SENDERS[index])
+                    || !escrow_record_valid(
+                        RECEIVER_CSPACE_OWNERS[slot],
+                        MESSAGE_DESTINATION_CAPS[index],
+                        MESSAGE_DESTINATION_OBJECTS[index],
+                        MESSAGE_DESTINATION_TYPES[index],
+                        MESSAGE_DESTINATION_RIGHTS[index]
+                    ) {
+                    return false;
+                }
+            } else if MESSAGE_SENDERS[index] != 0
+                || MESSAGE_CORRELATIONS[index] != 0
+                || MESSAGE_PAYLOADS[index] != 0
+                || MESSAGE_DESTINATION_CAPS[index] != 0
+                || MESSAGE_DESTINATION_OBJECTS[index] != 0
+                || MESSAGE_DESTINATION_TYPES[index] != 0
+                || MESSAGE_DESTINATION_RIGHTS[index] != 0 {
+                return false;
+            }
+
+            if capability_cleanup_physical_active(slot, physical) {
+                if (state != ENDPOINT_LIVE && state != ENDPOINT_DRAINING)
+                    || !escrow_record_valid(
+                        RECEIVER_CSPACE_OWNERS[slot],
+                        CAPABILITY_CLEANUP[index],
+                        CAPABILITY_CLEANUP_OBJECTS[index],
+                        CAPABILITY_CLEANUP_TYPES[index],
+                        CAPABILITY_CLEANUP_RIGHTS[index]
+                    ) {
+                    return false;
+                }
+            } else if CAPABILITY_CLEANUP[index] != 0
+                || CAPABILITY_CLEANUP_OBJECTS[index] != 0
+                || CAPABILITY_CLEANUP_TYPES[index] != 0
+                || CAPABILITY_CLEANUP_RIGHTS[index] != 0 {
+                return false;
+            }
+
             if sender_waiter_physical_active(slot, physical) {
                 let waiter: u64 = SENDER_WAITERS[index];
                 if (state != ENDPOINT_LIVE && state != ENDPOINT_DRAINING)
@@ -631,25 +764,7 @@ pub unsafe fn close(handle: u64) -> u64 {
     if slot >= MAX_ENDPOINTS || !invariants_hold() {
         return 0;
     }
-    STATES[slot] = ENDPOINT_DRAINING;
-    CLOSE_REASONS[slot] = ENDPOINT_CLOSE_NORMAL as u8;
-    DISCARDED_MESSAGES[slot] = 0;
-    if MESSAGE_SENDERS[slot] != 0 {
-        if !capability_cleanup_enqueue(
-            slot,
-            MESSAGE_DESTINATION_CAPS[slot],
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
-            POISONED = 1;
-            return 0;
-        }
-        DISCARDED_MESSAGES[slot] += 1;
-    }
-    clear_message_cell(slot);
-    if !invariants_hold() {
-        POISONED = 1;
+    if !begin_drain(slot, ENDPOINT_CLOSE_NORMAL) {
         return 0;
     }
     return 1;
@@ -660,25 +775,7 @@ pub unsafe fn crash(handle: u64) -> u64 {
     if slot >= MAX_ENDPOINTS || !invariants_hold() {
         return 0;
     }
-    STATES[slot] = ENDPOINT_DRAINING;
-    CLOSE_REASONS[slot] = ENDPOINT_CLOSE_CRASH as u8;
-    DISCARDED_MESSAGES[slot] = 0;
-    if MESSAGE_SENDERS[slot] != 0 {
-        if !capability_cleanup_enqueue(
-            slot,
-            MESSAGE_DESTINATION_CAPS[slot],
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
-            POISONED = 1;
-            return 0;
-        }
-        DISCARDED_MESSAGES[slot] += 1;
-    }
-    clear_message_cell(slot);
-    if !invariants_hold() {
-        POISONED = 1;
+    if !begin_drain(slot, ENDPOINT_CLOSE_CRASH) {
         return 0;
     }
     return 1;
@@ -701,10 +798,11 @@ pub unsafe fn discarded_message_count(handle: u64) -> usize {
 }
 
 pub unsafe fn message_count(handle: u64) -> usize {
-    let slot: usize = checked_live_endpoint(handle);
-    if slot >= MAX_ENDPOINTS { return 0; }
-    if MESSAGE_SENDERS[slot] != 0 { return 1; }
-    return 0;
+    let slot: usize = checked_endpoint(handle);
+    if slot >= MAX_ENDPOINTS {
+        return 0;
+    }
+    return MESSAGE_LENGTHS[slot];
 }
 
 // Cancelled or close-discarded messages can own an already-created receiver
@@ -712,38 +810,50 @@ pub unsafe fn message_count(handle: u64) -> usize {
 // capacity until the lifecycle caller takes each one and closes it through the
 // capability module.
 pub unsafe fn pending_capability_cleanup_count(handle: u64) -> usize {
-    let slot: usize = checked_live_endpoint(handle);
-    if slot >= MAX_ENDPOINTS { return 0; }
-    if CAPABILITY_CLEANUP[slot] != 0 { return 1; }
-    return 0;
+    let slot: usize = checked_endpoint(handle);
+    if slot >= MAX_ENDPOINTS {
+        return 0;
+    }
+    return CAPABILITY_CLEANUP_LENGTHS[slot];
 }
 
 pub unsafe fn has_queue_capacity(handle: u64) -> bool {
     let slot: usize = checked_live_endpoint(handle);
-    if slot >= MAX_ENDPOINTS { return false; }
-    return RECEIVER_WAITERS[slot] != 0 && MESSAGE_SENDERS[slot] == 0 && CAPABILITY_CLEANUP[slot] == 0;
+    if slot >= MAX_ENDPOINTS {
+        return false;
+    }
+    return MESSAGE_LENGTHS[slot] + CAPABILITY_CLEANUP_LENGTHS[slot]
+        < ENDPOINT_QUEUE_CAPACITY;
 }
 
 pub unsafe fn take_capability_cleanup(handle: u64) -> u64 {
     let slot: usize = checked_endpoint(handle);
-    if slot >= MAX_ENDPOINTS || CAPABILITY_CLEANUP[slot] == 0 || !invariants_hold() {
+    if slot >= MAX_ENDPOINTS
+        || CAPABILITY_CLEANUP_LENGTHS[slot] == 0
+        || !invariants_hold() {
         return 0;
     }
-    let cap: u64 = CAPABILITY_CLEANUP[slot];
+    let physical: usize = CAPABILITY_CLEANUP_HEADS[slot];
+    let index: usize = queue_index(slot, physical);
+    let cap: u64 = CAPABILITY_CLEANUP[index];
     if !escrow_record_valid(
         RECEIVER_CSPACE_OWNERS[slot],
         cap,
-        CAPABILITY_CLEANUP_OBJECTS[slot],
-        CAPABILITY_CLEANUP_TYPES[slot],
-        CAPABILITY_CLEANUP_RIGHTS[slot]
+        CAPABILITY_CLEANUP_OBJECTS[index],
+        CAPABILITY_CLEANUP_TYPES[index],
+        CAPABILITY_CLEANUP_RIGHTS[index]
     ) || abort_close_for_owner(RECEIVER_CSPACE_OWNERS[slot], cap) == 0 {
         POISONED = 1;
         return 0;
     }
-    CAPABILITY_CLEANUP[slot] = 0;
-    CAPABILITY_CLEANUP_OBJECTS[slot] = 0;
-    CAPABILITY_CLEANUP_TYPES[slot] = 0;
-    CAPABILITY_CLEANUP_RIGHTS[slot] = 0;
+    if capability_cleanup_pop(slot) != cap {
+        POISONED = 1;
+        return 0;
+    }
+    if STATES[slot] == ENDPOINT_DRAINING && !try_retire(slot) {
+        POISONED = 1;
+        return 0;
+    }
     if !invariants_hold() {
         POISONED = 1;
         return 0;
@@ -760,9 +870,8 @@ pub unsafe fn enqueue(
 ) -> u64 {
     let slot: usize = checked_live_endpoint(handle);
     if slot >= MAX_ENDPOINTS
-        || RECEIVER_WAITERS[slot] == 0
-        || MESSAGE_SENDERS[slot] != 0
-        || CAPABILITY_CLEANUP[slot] != 0
+        || MESSAGE_LENGTHS[slot] + CAPABILITY_CLEANUP_LENGTHS[slot]
+            >= ENDPOINT_QUEUE_CAPACITY
         || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
         || !can_issue_operations(sender_process)
         || !process_handle_shape_valid(sender_process)
@@ -783,15 +892,37 @@ pub unsafe fn enqueue(
         ) == 0 {
         return 0;
     }
-    MESSAGE_SENDERS[slot] = sender_process;
-    MESSAGE_CORRELATIONS[slot] = correlation;
-    MESSAGE_PAYLOADS[slot] = scalar_payload;
-    MESSAGE_DESTINATION_CAPS[slot] = destination_capability;
-    MESSAGE_DESTINATION_OBJECTS[slot] = destination_object;
-    MESSAGE_DESTINATION_TYPES[slot] = destination_type;
-    MESSAGE_DESTINATION_RIGHTS[slot] = destination_rights;
+    let physical: usize =
+        (MESSAGE_HEADS[slot] + MESSAGE_LENGTHS[slot])
+            % ENDPOINT_QUEUE_CAPACITY;
+    let index: usize = queue_index(slot, physical);
+    if MESSAGE_SENDERS[index] != 0
+        || MESSAGE_CORRELATIONS[index] != 0
+        || MESSAGE_PAYLOADS[index] != 0
+        || MESSAGE_DESTINATION_CAPS[index] != 0
+        || MESSAGE_DESTINATION_OBJECTS[index] != 0
+        || MESSAGE_DESTINATION_TYPES[index] != 0
+        || MESSAGE_DESTINATION_RIGHTS[index] != 0 {
+        if destination_capability != 0
+            && abort_close_for_owner(
+                RECEIVER_CSPACE_OWNERS[slot],
+                destination_capability
+            ) == 0 {
+            POISONED = 1;
+        }
+        return 0;
+    }
+    MESSAGE_SENDERS[index] = sender_process;
+    MESSAGE_CORRELATIONS[index] = correlation;
+    MESSAGE_PAYLOADS[index] = scalar_payload;
+    MESSAGE_DESTINATION_CAPS[index] = destination_capability;
+    MESSAGE_DESTINATION_OBJECTS[index] = destination_object;
+    MESSAGE_DESTINATION_TYPES[index] = destination_type;
+    MESSAGE_DESTINATION_RIGHTS[index] = destination_rights;
+    MESSAGE_LENGTHS[slot] += 1;
     if !invariants_hold() {
-        clear_message_cell(slot);
+        MESSAGE_LENGTHS[slot] -= 1;
+        clear_message_cell(slot, physical);
         if destination_capability != 0
             && abort_close_for_owner(
                 RECEIVER_CSPACE_OWNERS[slot],
@@ -827,22 +958,28 @@ pub unsafe fn peek_head(
     volatile_store(destination_capability, 0);
     let slot: usize = checked_live_endpoint(handle);
     if slot >= MAX_ENDPOINTS
-        || MESSAGE_SENDERS[slot] == 0
+        || MESSAGE_LENGTHS[slot] == 0
         || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
         || !invariants_hold() {
         return 0;
     }
-    let sender: u64 = MESSAGE_SENDERS[slot];
-    let request_correlation: u64 = MESSAGE_CORRELATIONS[slot];
-    let payload: u64 = MESSAGE_PAYLOADS[slot];
-    let cap: u64 = MESSAGE_DESTINATION_CAPS[slot];
+    let physical: usize = message_at(slot, 0);
+    if physical >= ENDPOINT_QUEUE_CAPACITY {
+        return 0;
+    }
+    let index: usize = queue_index(slot, physical);
+    let sender: u64 = MESSAGE_SENDERS[index];
+    let request_correlation: u64 = MESSAGE_CORRELATIONS[index];
+    let payload: u64 = MESSAGE_PAYLOADS[index];
+    let cap: u64 = MESSAGE_DESTINATION_CAPS[index];
     if cap != 0 && !escrow_record_valid(
         RECEIVER_CSPACE_OWNERS[slot],
         cap,
-        MESSAGE_DESTINATION_OBJECTS[slot],
-        MESSAGE_DESTINATION_TYPES[slot],
-        MESSAGE_DESTINATION_RIGHTS[slot]
+        MESSAGE_DESTINATION_OBJECTS[index],
+        MESSAGE_DESTINATION_TYPES[index],
+        MESSAGE_DESTINATION_RIGHTS[index]
     ) {
+        POISONED = 1;
         return 0;
     }
     volatile_store(sender_process, sender);
@@ -858,23 +995,35 @@ pub unsafe fn peek_head(
 pub unsafe fn commit_head(handle: u64) -> u64 {
     let slot: usize = checked_live_endpoint(handle);
     if slot >= MAX_ENDPOINTS
-        || MESSAGE_SENDERS[slot] == 0
+        || MESSAGE_LENGTHS[slot] == 0
         || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
         || !invariants_hold() {
         return 0;
     }
-    let cap: u64 = MESSAGE_DESTINATION_CAPS[slot];
-    if cap != 0
-        && !escrow_record_valid(
-            RECEIVER_CSPACE_OWNERS[slot],
-            cap,
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
+    let physical: usize = message_at(slot, 0);
+    if physical >= ENDPOINT_QUEUE_CAPACITY {
         return 0;
     }
-    clear_message_cell(slot);
+    let index: usize = queue_index(slot, physical);
+    let cap: u64 = MESSAGE_DESTINATION_CAPS[index];
+    if cap != 0
+        && (!escrow_record_valid(
+            RECEIVER_CSPACE_OWNERS[slot],
+            cap,
+            MESSAGE_DESTINATION_OBJECTS[index],
+            MESSAGE_DESTINATION_TYPES[index],
+            MESSAGE_DESTINATION_RIGHTS[index]
+        ) || abort_close_for_owner(
+            RECEIVER_CSPACE_OWNERS[slot],
+            cap
+        ) == 0) {
+        POISONED = 1;
+        return 0;
+    }
+    if !message_remove_at(slot, 0) {
+        POISONED = 1;
+        return 0;
+    }
     if !invariants_hold() {
         POISONED = 1;
         return 0;
@@ -931,20 +1080,27 @@ pub unsafe fn cancel_by_sender(handle: u64, sender_process: u64) -> usize {
         return 0;
     }
     let mut removed: usize = 0;
-    if MESSAGE_SENDERS[slot] == sender_process {
-        if !capability_cleanup_enqueue(
-            slot,
-            MESSAGE_DESTINATION_CAPS[slot],
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
-            return 0;
+    let mut position: usize = 0;
+    while position < MESSAGE_LENGTHS[slot] {
+        let physical: usize = message_at(slot, position);
+        let index: usize = queue_index(slot, physical);
+        if MESSAGE_SENDERS[index] == sender_process {
+            if !capability_cleanup_enqueue(
+                slot,
+                MESSAGE_DESTINATION_CAPS[index],
+                MESSAGE_DESTINATION_OBJECTS[index],
+                MESSAGE_DESTINATION_TYPES[index],
+                MESSAGE_DESTINATION_RIGHTS[index]
+            ) {
+                return 0;
+            }
+            if !message_remove_at(slot, position) {
+                return 0;
+            }
+            removed += 1;
+        } else {
+            position += 1;
         }
-        if !message_remove_at(slot, 0) {
-            return 0;
-        }
-        removed += 1;
     }
     return removed;
 }
@@ -955,21 +1111,27 @@ pub unsafe fn cancel_by_correlation(handle: u64, correlation: u64) -> usize {
         return 0;
     }
     let mut removed: usize = 0;
-    if MESSAGE_SENDERS[slot] != 0
-        && MESSAGE_CORRELATIONS[slot] == correlation {
-        if !capability_cleanup_enqueue(
-            slot,
-            MESSAGE_DESTINATION_CAPS[slot],
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
-            return 0;
+    let mut position: usize = 0;
+    while position < MESSAGE_LENGTHS[slot] {
+        let physical: usize = message_at(slot, position);
+        let index: usize = queue_index(slot, physical);
+        if MESSAGE_CORRELATIONS[index] == correlation {
+            if !capability_cleanup_enqueue(
+                slot,
+                MESSAGE_DESTINATION_CAPS[index],
+                MESSAGE_DESTINATION_OBJECTS[index],
+                MESSAGE_DESTINATION_TYPES[index],
+                MESSAGE_DESTINATION_RIGHTS[index]
+            ) {
+                return 0;
+            }
+            if !message_remove_at(slot, position) {
+                return 0;
+            }
+            removed += 1;
+        } else {
+            position += 1;
         }
-        if !message_remove_at(slot, 0) {
-            return 0;
-        }
-        removed += 1;
     }
     return removed;
 }
@@ -986,21 +1148,28 @@ pub unsafe fn cancel_by_sender_correlation(
         return 0;
     }
     let mut removed: usize = 0;
-    if MESSAGE_SENDERS[slot] == sender_process
-        && MESSAGE_CORRELATIONS[slot] == correlation {
-        if !capability_cleanup_enqueue(
-            slot,
-            MESSAGE_DESTINATION_CAPS[slot],
-            MESSAGE_DESTINATION_OBJECTS[slot],
-            MESSAGE_DESTINATION_TYPES[slot],
-            MESSAGE_DESTINATION_RIGHTS[slot]
-        ) {
-            return 0;
+    let mut position: usize = 0;
+    while position < MESSAGE_LENGTHS[slot] {
+        let physical: usize = message_at(slot, position);
+        let index: usize = queue_index(slot, physical);
+        if MESSAGE_SENDERS[index] == sender_process
+            && MESSAGE_CORRELATIONS[index] == correlation {
+            if !capability_cleanup_enqueue(
+                slot,
+                MESSAGE_DESTINATION_CAPS[index],
+                MESSAGE_DESTINATION_OBJECTS[index],
+                MESSAGE_DESTINATION_TYPES[index],
+                MESSAGE_DESTINATION_RIGHTS[index]
+            ) {
+                return 0;
+            }
+            if !message_remove_at(slot, position) {
+                return 0;
+            }
+            removed += 1;
+        } else {
+            position += 1;
         }
-        if !message_remove_at(slot, 0) {
-            return 0;
-        }
-        removed += 1;
     }
     return removed;
 }
@@ -1012,7 +1181,7 @@ pub unsafe fn register_receiver_waiter(handle: u64, thread_handle: u64) -> u64 {
     let slot: usize = checked_live_endpoint(handle);
     if slot >= MAX_ENDPOINTS
         || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
-        || MESSAGE_SENDERS[slot] != 0
+        || MESSAGE_LENGTHS[slot] != 0
         || RECEIVER_WAITERS[slot] != 0
         || !thread_handle_shape_valid(thread_handle)
         || waiter_occurrences(thread_handle) != 0
@@ -1043,8 +1212,8 @@ pub unsafe fn register_sender_waiter(handle: u64, thread_handle: u64) -> u64 {
     let slot: usize = checked_live_endpoint(handle);
     if slot >= MAX_ENDPOINTS
         || !cspace_is_live(RECEIVER_CSPACE_OWNERS[slot])
-        || MESSAGE_SENDERS[slot] != 0
-        || CAPABILITY_CLEANUP[slot] != 0
+        || MESSAGE_LENGTHS[slot] + CAPABILITY_CLEANUP_LENGTHS[slot]
+            != ENDPOINT_QUEUE_CAPACITY
         || SENDER_WAITER_LENGTHS[slot] >= MAX_BLOCKED_SENDERS
         || !thread_handle_shape_valid(thread_handle)
         || waiter_occurrences(thread_handle) != 0

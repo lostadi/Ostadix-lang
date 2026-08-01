@@ -91,21 +91,20 @@ cargo check --manifest-path fuzz/Cargo.toml
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
-# O-core executable milestone gates (requires clang, LLD, and QEMU x86_64)
-./ocore/kernel/smoke-qemu.sh
-./ocore/kernel/smoke-faults-qemu.sh
-./ocore/kernel/smoke-processes-qemu.sh
-./ocore/kernel/smoke-scheduler-qemu.sh
-./ocore/kernel/smoke-ipc-foundation-qemu.sh
+# O-core executable milestone evidence (requires Clang, LLD, Python, and QEMU x86_64)
+python3 scripts/release_evidence.py validate
+./boot-and-test.sh smoke
 
 # Python reference runtime
 python3 -m tests.test_parser
+python3 tests/example_manifest.py validate
 python3 -m tests.test_evaluator
 python3 -m compileall -q o_lang backends tests
 
 # C17 interpreter and AOT compiler
 make -C c_cpp test
 make -C c_cpp olangc-test
+make -C c_cpp warnings-as-errors
 cmake -S c_cpp -B build/c_cpp-cmake
 cmake --build build/c_cpp-cmake
 ctest --test-dir build/c_cpp-cmake
@@ -115,14 +114,23 @@ bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
 
+<!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
+The aggregate executes all 15 required portable QEMU gates in the
+order declared by `evidence/gates.toml`, streams their output, and requires
+every declared marker exactly once in each captured live transcript. The
+manifest also records each gate's milestone, tools, evidence class, positive
+claims, and explicit non-claims. `kernel-world-mode21-svm-kvm` is validated as
+supplemental hardware evidence rather than part of this portable release set.
+<!-- END GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
+
 The byte-reproducible O-core object test protects deterministic native object
-output across source directories. The five QEMU scripts prove the default and
-fault boundaries, M1 process isolation, M2 scheduling, and the explicitly
-partial M3 IPC foundation. `cargo test --test parser_proptest` runs parser
+output across source directories. `cargo test --test parser_proptest` runs parser
 proptest properties, and `cargo check --manifest-path fuzz/Cargo.toml` ensures
 the parser fuzz target still compiles.
 The source-release tests protect the committed-ref allowlist, deterministic ZIP
-bytes, dirty-worktree boundary, and tamper detection.
+bytes and canonical metadata, dirty-worktree boundary, symlink denial, relative
+documentation-link closure, inert example/evidence/MCP schema and reference
+validation, required release surfaces, and tamper detection.
 
 ## Conventions
 

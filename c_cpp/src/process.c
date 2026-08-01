@@ -160,9 +160,7 @@ OBackendProcess *olang_backend_process_new(const char *shim_path) {
 void olang_backend_process_free(OBackendProcess *bp) {
     if (!bp) return;
     BackendProcessImpl *p = (BackendProcessImpl *)bp;
-    if (p->alive) {
-        olang_backend_process_cleanup(bp);
-    }
+    olang_backend_process_cleanup(bp);
     free(p);
 }
 
@@ -260,11 +258,11 @@ OValue *olang_backend_process_exec(OBackendProcess *bp, const char *code, OValue
 
 void olang_backend_process_cleanup(OBackendProcess *bp) {
     BackendProcessImpl *p = (BackendProcessImpl *)bp;
-    if (!p || !p->alive) return;
+    if (!p) return;
 
     OWireCommand cmd = {0};
     cmd.tag = WIRE_CMD_CLEANUP;
-    if (p->stdin_file) {
+    if (p->alive && p->stdin_file) {
         olang_backend_process_send_command(bp, &cmd);
     }
 
@@ -322,18 +320,27 @@ static int registry_find(const OProcessRegistry *reg, const char *lang, uint32_t
     return 0;
 }
 
-static void registry_add(OProcessRegistry *reg, const char *lang, uint32_t env_id, OBackendProcess *proc) {
+static bool registry_add(OProcessRegistry *reg, const char *lang, uint32_t env_id, OBackendProcess *proc) {
+    if (!reg || !lang || !proc) return false;
     if (reg->len == reg->cap) {
+        if (reg->cap > SIZE_MAX / 2U ||
+            (reg->cap ? reg->cap * 2U : 8U) > SIZE_MAX / sizeof(*reg->entries)) {
+            errno = EOVERFLOW;
+            return false;
+        }
         size_t newcap = reg->cap ? reg->cap * 2 : 8;
         RegistryEntry *ne = (RegistryEntry *)realloc(reg->entries, newcap * sizeof(*ne));
-        if (!ne) return;
+        if (!ne) return false;
         reg->entries = ne;
         reg->cap = newcap;
     }
-    reg->entries[reg->len].lang = strdup(lang);
+    char *lang_copy = strdup(lang);
+    if (!lang_copy) return false;
+    reg->entries[reg->len].lang = lang_copy;
     reg->entries[reg->len].env_id = env_id;
     reg->entries[reg->len].proc = proc;
     reg->len++;
+    return true;
 }
 
 void olang_process_registry_send_exec(OProcessRegistry *reg,
@@ -348,8 +355,12 @@ void olang_process_registry_send_exec(OProcessRegistry *reg,
             fprintf(stderr, "process: failed to start shim for %s\n", lang);
             return;
         }
-        registry_add(reg, lang, env_id, proc);
-        registry_find(reg, lang, env_id, &idx);
+        if (!registry_add(reg, lang, env_id, proc)) {
+            fprintf(stderr, "process: failed to register shim for %s\n", lang);
+            olang_backend_process_free(proc);
+            return;
+        }
+        idx = reg->len - 1;
     }
     OBackendProcess *proc = reg->entries[idx].proc;
     OWireCommand cmd = {0};
@@ -389,8 +400,12 @@ OValue *olang_process_registry_exec(OProcessRegistry *reg,
     if (!registry_find(reg, lang, env_id, &idx)) {
         OBackendProcess *proc = olang_backend_process_new(shim_path);
         if (!proc) return NULL;
-        registry_add(reg, lang, env_id, proc);
-        registry_find(reg, lang, env_id, &idx);
+        if (!registry_add(reg, lang, env_id, proc)) {
+            fprintf(stderr, "process: failed to register shim for %s\n", lang);
+            olang_backend_process_free(proc);
+            return NULL;
+        }
+        idx = reg->len - 1;
     }
     return olang_backend_process_exec(reg->entries[idx].proc, code, bindings);
 }

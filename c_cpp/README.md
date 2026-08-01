@@ -18,12 +18,13 @@ make
 ./O ../examples/hello.O ../backends
 # → 2
 
-./O ../examples/meta_eval.O ../backends
-# (demonstrates quote^ + O.eval homoiconicity across languages)
+./O ../examples/html_basic.O ../backends
+# output contains: <p>The answer is 42.</p>
 
-# AOT compile to a self-contained native binary
-./olangc ../examples/hello.O -o /tmp/hello_c
-/tmp/hello_c
+# AOT compile to an application bundle (hello + hello.shims/)
+mkdir -p /tmp/hello-c17
+./olangc ../examples/hello.O -o /tmp/hello-c17/hello
+/tmp/hello-c17/hello
 # → 2
 
 # The produced binary is native C code; it still needs python3 (and nix if your
@@ -35,21 +36,23 @@ make
 
 - `make` — builds `O` and `olangc`
 - `make clean`
-- `make test` — smoke-tests core examples (hello, bindings, meta_eval, html_basic)
-- `make olangc-test` — also exercises the AOT path
-- `make run EX=meta_eval` — quick run of an example
+- `make test` — runs the manifest-selected C17 interpreter examples
+- `make olangc-test` — runs the manifest-selected C17 AOT examples
+- `make path-test` — proves AOT paths and `CC` are passed literally, without a shell
+- `make warnings-as-errors` — clean-builds and tests native plus generated C with `-Werror`
+- `make run EX=html_basic` — quick run of an example
 
 The active implementation is built from the C17 `.c` files in `src/` plus `.h` headers in `include/`. The Makefile is deliberately simple (no subdirs, no generated build system); CMake builds the same C17 implementation for users who prefer it.
 
 ## What works
 
 - Full typed-paren grammar (`LANG^( ... )_LANG`, `[n]` envs, `{lazy}/{defer}`, `let`, `$var`, calls)
-- `O^`, `quote^`, `html^`, `markdown^`/`latex^`/`text^` (inline)
-- `python^` via the real `python_shim.py` (persistent envs, `__oval_result__`, trailing expr, stdout capture, `O.eval` + `O.quote`)
+- `html^`, `markdown^`/`latex^`/`text^` structural rendering
+- `python^` via the real `python_shim.py` (persistent envs, `__oval_result__`, trailing expressions, stdout capture)
 - Basic builtins: `now()`, `lazy()`, `instantiate()`, `realise()`, `activate()`, `current_system()`, `autonomous()`
 - Nix rung (when `nix` is in PATH)
 - Shebang stripping
-- `olangc` AOT that produces a single native binary embedding the runtime + shims + your program
+- `olangc` AOT that produces a native executable plus a required per-executable `<name>.shims/` directory
 
 See `SPEC.md` (in repo root) for the language specification.
 
@@ -61,18 +64,27 @@ See `SPEC.md` (in repo root) for the language specification.
 
 ## olangc (AOT)
 
-`olangc` turns a `.O` file into a native executable that contains:
+`olangc` turns a `.O` file into an application bundle containing:
 
-- the O-lang C evaluator compiled in
-- your program source
-- the backend shim scripts (extracted at startup to a private temp dir)
+- a native executable with the O-lang C evaluator and your program source compiled in
+- a required sibling `<executable>.shims/` directory containing the backend scripts
 
 ```bash
-./olangc myprog.O -o myprog
-./myprog
+mkdir -p build/myprog
+./olangc myprog.O -o build/myprog/myprog
+build/myprog/myprog
 ```
 
-The binary has **no dependency on the olangc tool or the source tree** at runtime.
+`olangc` launches the compiler directly with a POSIX argv vector. `CC` may be
+an executable name or path (including spaces and shell metacharacters), but is
+not parsed as shell text and must not contain command-line flags. Use
+`OLANGC_WARNINGS_AS_ERRORS=1` to compile the generated runtime with `-Werror`.
+
+The bundle has **no dependency on the `olangc` tool or source tree** at runtime,
+but copying the executable without its matching `<executable>.shims/` directory
+is unsupported and backend execution exits nonzero. The shim directory name is
+derived from the executable's resolved path, so separately named binaries in one
+directory retain independent backend assets.
 
 ## Layout
 
@@ -112,7 +124,10 @@ See the Python reference implementation and `backends/` for examples.
 ## Status & limitations
 
 - Matches the core of the Rust edition for the documented examples.
-- `O.eval` round-trips work (python only).
+- Basic quote values and scalar `O.eval` callbacks may work, but explicit
+  `OScope` callback transport is not implemented. The full `meta_eval.O`
+  round-trip is therefore not a supported C17 example and is excluded from
+  the C17 manifest corpus.
 - Stub shims (bash, rust, racket, shell) return the code text as a string (same as other editions).
 - Some advanced scheduler / concurrent Nix behaviour is serial in this port.
 - See root `SPEC.md` and `README.md` for the full feature set and known limitations.

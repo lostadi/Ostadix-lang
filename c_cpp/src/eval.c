@@ -368,6 +368,8 @@ struct OEvaluator {
     size_t ab_len, ab_cap;
     /* simple top-level scope list for lets */
     ScopeEntry *scope_head;
+    bool had_error;
+    size_t evaluation_depth;
 };
 
 static void eval_release_scope(OEvaluator *ev) {
@@ -383,12 +385,24 @@ static void eval_release_scope(OEvaluator *ev) {
 
 OEvaluator *olang_evaluator_new(const char *shim_dir) {
     OEvaluator *ev = (OEvaluator *)calloc(1, sizeof(*ev));
+    if (!ev) return NULL;
     ev->registry = olang_process_registry_new();
     ev->shim_dir = strdup(shim_dir ? shim_dir : "backends");
     ev->policy = POLICY_EAGER;
     ev->scheduler = olang_autonomous_scheduler_new();
+    if (!ev->registry || !ev->shim_dir || !ev->scheduler) {
+        olang_process_registry_free(ev->registry);
+        free(ev->shim_dir);
+        olang_autonomous_scheduler_free(ev->scheduler);
+        free(ev);
+        return NULL;
+    }
     /* registered filled later */
     return ev;
+}
+
+bool olang_evaluator_had_error(const OEvaluator *ev) {
+    return ev && ev->had_error;
 }
 
 void olang_evaluator_free(OEvaluator *ev) {
@@ -403,25 +417,36 @@ void olang_evaluator_free(OEvaluator *ev) {
     free(ev);
 }
 
-void olang_evaluator_set_registered(OEvaluator *ev, const StringSet *backends) {
-    if (!ev) return;
-    if (ev->registered) string_set_free(ev->registered);
-    ev->registered = string_set_new();
+bool olang_evaluator_set_registered(OEvaluator *ev, const StringSet *backends) {
+    if (!ev) return false;
+    StringSet *registered = string_set_new();
+    if (!registered) return false;
     if (!backends) {
         const char *defs[] = {"O","python","html","markdown","latex","text","quote",
                               "nix","nix_expr","nix_store","nixos_test","bash","shell","rust","racket", NULL};
-        for (int i=0; defs[i]; ++i) string_set_add(ev->registered, defs[i]);
-        return;
+        for (int i=0; defs[i]; ++i) {
+            string_set_add(registered, defs[i]);
+            if (!string_set_contains(registered, defs[i])) {
+                string_set_free(registered);
+                return false;
+            }
+        }
+    } else {
+        for (size_t i=0; i<backends->len; ++i) {
+            string_set_add(registered, backends->items[i]);
+            if (!string_set_contains(registered, backends->items[i])) {
+                string_set_free(registered);
+                return false;
+            }
+        }
     }
-    for (size_t i=0; i<backends->len; ++i) string_set_add(ev->registered, backends->items[i]);
+    if (ev->registered) string_set_free(ev->registered);
+    ev->registered = registered;
+    return true;
 }
 
 char *olang_find_shim(OEvaluator *ev, const char *lang) {
     if (!ev || !lang) return NULL;
-    const char *cands[4] = {NULL, NULL, NULL, NULL};
-    char buf[256];
-    snprintf(buf, sizeof(buf), "%s_shim.py", lang); cands[0] = buf; /* but need allocs */
-    /* simple: try in order, return first existing or default guess */
     /* For MVP use direct guess under shim_dir */
     SB p; sb_init(&p);
     sb_append(&p, ev->shim_dir); sb_append_c(&p, '/'); sb_append(&p, lang); sb_append(&p, "_shim.py");
@@ -438,12 +463,19 @@ static OValue *scope_lookup(OEvaluator *ev, const char *name) {
     }
     return NULL;
 }
-static void scope_bind(OEvaluator *ev, const char *name, OValue *val) {
+static bool scope_bind(OEvaluator *ev, const char *name, OValue *val) {
+    if (!ev || !name) return false;
     ScopeEntry *e = (ScopeEntry *)calloc(1, sizeof(*e));
+    if (!e) return false;
     e->name = strdup(name);
+    if (!e->name) {
+        free(e);
+        return false;
+    }
     e->val = oval_retain(val);
     e->next = ev->scope_head;
     ev->scope_head = e;
+    return true;
 }
 
 /* ── core eval ─────────────────────────────────────────────────────────── */
@@ -664,11 +696,18 @@ static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id
         if (step.kind == EXEC_STEP_DONE) {
             result = step.value;
             step.value = NULL;
+            if (!result) *err = true;
             oexec_step_free(&step);
             break;
         }
         /* EVAL_REQUEST: re-enter */
         OValue *inner = olang_eval_source(ev, step.src ? step.src : "");
+        if (olang_evaluator_had_error(ev)) {
+            *err = true;
+            oval_release(inner);
+            oexec_step_free(&step);
+            break;
+        }
         olang_process_registry_send_eval_result(ev->registry, lang, env_id, inner);
         oval_release(inner);
         oexec_step_free(&step);
@@ -694,7 +733,8 @@ static OValue *eval_node(OEvaluator *ev, ONode *node, bool *err) {
             return scope_lookup(ev, node->data.var_name ? node->data.var_name : "");
         case ONODE_LET_BINDING: {
             OValue *v = eval_node(ev, node->data.let_binding.expr, err);
-            if (!*err && node->data.let_binding.name) scope_bind(ev, node->data.let_binding.name, v);
+            if (!*err && node->data.let_binding.name &&
+                !scope_bind(ev, node->data.let_binding.name, v)) *err = true;
             return v;
         }
         case ONODE_TYPED_EXPR:
@@ -710,7 +750,11 @@ static OValue *eval_node(OEvaluator *ev, ONode *node, bool *err) {
 }
 
 OValue *olang_evaluator_eval_document(OEvaluator *ev, ONodeList *nodes) {
-    if (!ev || !nodes) return oval_null();
+    if (!ev) return oval_null();
+    if (!nodes) { ev->had_error = true; return oval_null(); }
+    bool outermost = ev->evaluation_depth == 0;
+    if (outermost) ev->had_error = false;
+    ev->evaluation_depth++;
     bool err = false;
     OValue *last = oval_null();
 
@@ -720,12 +764,12 @@ OValue *olang_evaluator_eval_document(OEvaluator *ev, ONodeList *nodes) {
         if (n && n->tag == ONODE_LET_BINDING) {
             bool e2 = false;
             OValue *v = eval_node(ev, n, &e2);
-            if (!e2 && n->data.let_binding.name) scope_bind(ev, n->data.let_binding.name, v);
             oval_release(v);
+            if (e2) { err = true; break; }
         }
     }
     /* second: eval non-lets */
-    for (size_t i=0; i<nodes->len; ++i) {
+    for (size_t i=0; !err && i<nodes->len; ++i) {
         ONode *n = nodes->items[i];
         if (!n) continue;
         if (n->tag == ONODE_LET_BINDING) continue;
@@ -744,9 +788,11 @@ OValue *olang_evaluator_eval_document(OEvaluator *ev, ONodeList *nodes) {
         oval_release(v);
     }
     if (err) {
+        ev->had_error = true;
         oval_release(last);
-        return oval_null();
+        last = oval_null();
     }
+    ev->evaluation_depth--;
     return last;
 }
 
@@ -758,6 +804,7 @@ OValue *olang_eval_source(OEvaluator *ev, const char *src) {
     ONodeList *nodes = parser_parse(&p);
     if (!nodes) {
         fprintf(stderr, "eval_source parse error: %s\n", p.error_msg);
+        ev->had_error = true;
         return oval_null();
     }
     OValue *r = olang_evaluator_eval_document(ev, nodes);

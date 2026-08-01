@@ -365,9 +365,9 @@ KVM or physical-hardware isolation evidence.
 
 The remaining dependency order is:
 
-1. complete the M6B boundary beyond its current bounded-copy mechanism by
-   integrating the CPL3 personality RPC, pinned windows, signals, fuzzing, and
-   allocation-failure/race gates;
+1. extend Mode 24's exact four-byte CPL3 bounded-RPC integration with pinned
+   windows, streaming, signals, actual mapping/resource events, broader request
+   shapes, fuzzing, and allocation-failure/race gates;
 2. replace Mode 23's fixed synthetic program and scalar endpoint with a pinned
    foreign-kernel image, boot protocol, timed health contract, and bounded
    guest-agent transport;

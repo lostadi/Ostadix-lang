@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-m3}"
-TIMEOUT_SECONDS=15
+TIMEOUT_SECONDS="${OCORE_QEMU_TIMEOUT_SECONDS:-15}"
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   echo "error: qemu-system-x86_64 is not installed" >&2
@@ -155,7 +155,7 @@ if (
     if not survived_after_completion:
         print(
             "QEMU did not survive the one-second post-lifecycle window "
-            "within the 15-second deadline",
+            f"within the {timeout_seconds:g}-second deadline",
             file=sys.stderr,
         )
     print("stdout:", output, file=sys.stderr)

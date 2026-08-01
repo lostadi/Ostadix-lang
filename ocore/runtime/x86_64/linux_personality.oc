@@ -1,0 +1,425 @@
+module runtime::linux_personality;
+
+use runtime::linux_fd_table::authorize_write;
+use runtime::linux_fd_table::init as fd_table_init;
+use runtime::linux_fd_table::invariants_hold as fd_invariants_hold;
+use runtime::linux_fd_table::lookup_write_object;
+use runtime::linux_fd_table::open_standard_streams;
+use runtime::linux_fd_table::revoke_process;
+use runtime::linux_fd_table::revoke_service_generation;
+use runtime::linux_fd_table::LINUX_FD_SINK_STDERR;
+use runtime::linux_fd_table::LINUX_FD_SINK_STDOUT;
+use runtime::personality_bounded_rpc::read_byte as bounded_read_byte;
+use runtime::personality_bounded_rpc::reply as bounded_reply;
+use runtime::personality_bounded_rpc::request_metadata as bounded_request_metadata;
+use runtime::personality_bounded_rpc::caller_process_for_request as request_caller_process;
+use runtime::personality_bounded_rpc::service_generation_for_request as request_service_generation;
+use runtime::personality_bounded_rpc::service_process_for_request as request_service_process;
+use runtime::personality_memory_view::MEMORY_VIEW_DIRECTION_IN;
+
+// This is intentionally not a general Linux ABI. It recognizes exactly the
+// three behaviors exercised by one pinned static x86-64 ET_EXEC corpus.
+pub const LINUX_X86_64_NR_WRITE: u64 = 1;
+pub const LINUX_X86_64_NR_EXIT_GROUP: u64 = 231;
+
+pub const LINUX_ACTION_RETURN: u64 = 1;
+pub const LINUX_ACTION_BOUNDED_WRITE: u64 = 2;
+pub const LINUX_ACTION_DIRECT_EXIT_GROUP: u64 = 3;
+
+// Linux x86-64 syscall results are signed long values carried in RAX. O-core
+// represents the exact two's-complement bit pattern as u64.
+pub const LINUX_NEG_EBADF: u64 = 0xffff_ffff_ffff_fff7;
+pub const LINUX_NEG_EAGAIN: u64 = 0xffff_ffff_ffff_fff5;
+pub const LINUX_NEG_EFAULT: u64 = 0xffff_ffff_ffff_fff2;
+pub const LINUX_NEG_ENOSYS: u64 = 0xffff_ffff_ffff_ffda;
+
+pub const MAX_LINUX_WRITE_BYTES: usize = 128;
+pub const MAX_LINUX_TRANSCRIPT_BYTES: usize = 128;
+
+// Preparatory live-adapter frame for one Linux write. The generic bounded
+// request owns the exact pointer and length independently; this frame binds
+// the syscall number, Linux fd, and count so a daemon cannot substitute any
+// of them at completion time.
+const LINUX_WRITE_FRAME_LENGTH_MASK: u64 = 0xff;
+const LINUX_WRITE_FRAME_FD_MASK: u64 = 0x0000_ffff_ffff_ffff;
+
+static mut STDOUT_BYTES: [u8; 128] = [0; 128];
+static mut STDERR_BYTES: [u8; 128] = [0; 128];
+static mut SCRATCH: [u8; 128] = [0; 128];
+static mut STDOUT_LENGTH: usize = 0;
+static mut STDERR_LENGTH: usize = 0;
+
+static mut WRITE_CALLS: u64 = 0;
+static mut WRITE_BYTES: u64 = 0;
+static mut EXIT_GROUP_CALLS: u64 = 0;
+static mut ENOSYS_CALLS: u64 = 0;
+static mut DENIALS: u64 = 0;
+static mut INITIALIZED: u8 = 0;
+static mut POISONED: u8 = 0;
+const MAX_COUNTER: u64 = 0xffff_ffff_ffff_ffff;
+
+unsafe fn clear_scratch() -> void {
+    let mut index: usize = 0;
+    while index < MAX_LINUX_WRITE_BYTES {
+        SCRATCH[index] = 0;
+        index += 1;
+    }
+}
+
+unsafe fn clear_outputs() -> void {
+    let mut index: usize = 0;
+    while index < MAX_LINUX_TRANSCRIPT_BYTES {
+        STDOUT_BYTES[index] = 0;
+        STDERR_BYTES[index] = 0;
+        index += 1;
+    }
+    STDOUT_LENGTH = 0;
+    STDERR_LENGTH = 0;
+}
+
+unsafe fn preflight() -> bool {
+    if INITIALIZED == 0 || POISONED != 0 {
+        return false;
+    }
+    if !invariants_hold() {
+        POISONED = 1;
+        return false;
+    }
+    return true;
+}
+
+unsafe fn finish(result: u64) -> u64 {
+    if !invariants_hold() {
+        POISONED = 1;
+        return 0;
+    }
+    return result;
+}
+
+unsafe fn count_denial() -> void {
+    if DENIALS == MAX_COUNTER {
+        POISONED = 1;
+    } else {
+        DENIALS += 1;
+    }
+}
+
+unsafe fn append(sink: u64, length: usize) -> bool {
+    let mut index: usize = 0;
+    if sink == LINUX_FD_SINK_STDOUT {
+        if STDOUT_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES - length {
+            return false;
+        }
+        while index < length {
+            STDOUT_BYTES[STDOUT_LENGTH + index] = SCRATCH[index];
+            index += 1;
+        }
+        STDOUT_LENGTH += length;
+        return true;
+    }
+    if sink == LINUX_FD_SINK_STDERR {
+        if STDERR_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES - length {
+            return false;
+        }
+        while index < length {
+            STDERR_BYTES[STDERR_LENGTH + index] = SCRATCH[index];
+            index += 1;
+        }
+        STDERR_LENGTH += length;
+        return true;
+    }
+    return false;
+}
+
+unsafe fn has_capacity(sink: u64, length: usize) -> bool {
+    if length > MAX_LINUX_TRANSCRIPT_BYTES {
+        return false;
+    }
+    if sink == LINUX_FD_SINK_STDOUT {
+        return STDOUT_LENGTH <= MAX_LINUX_TRANSCRIPT_BYTES - length;
+    }
+    if sink == LINUX_FD_SINK_STDERR {
+        return STDERR_LENGTH <= MAX_LINUX_TRANSCRIPT_BYTES - length;
+    }
+    return false;
+}
+
+pub fn make_write_request_frame(linux_fd: u64, length: usize) -> u64 {
+    if linux_fd > LINUX_WRITE_FRAME_FD_MASK
+        || length > MAX_LINUX_WRITE_BYTES {
+        return 0;
+    }
+    return (LINUX_X86_64_NR_WRITE << 56)
+        | (linux_fd << 8)
+        | length as u64;
+}
+
+// The first length is the bridge-owned view geometry; linux_fd and length are
+// the daemon's completion arguments. All must equal the immutable request
+// frame, and the request must be an IN view for the exact write operation.
+pub fn write_request_metadata_matches(
+    request_frame: u64,
+    bounded_length: usize,
+    direction: u64,
+    linux_fd: u64,
+    length: usize
+) -> bool {
+    let expected: u64 = make_write_request_frame(linux_fd, length);
+    if expected == 0
+        || request_frame != expected
+        || (request_frame >> 56) != LINUX_X86_64_NR_WRITE
+        || ((request_frame >> 8) & LINUX_WRITE_FRAME_FD_MASK) != linux_fd
+        || (request_frame & LINUX_WRITE_FRAME_LENGTH_MASK) != length as u64
+        || bounded_length != length
+        || direction != MEMORY_VIEW_DIRECTION_IN {
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn init() -> u64 {
+    if INITIALIZED != 0 || fd_table_init() != 1 {
+        return 0;
+    }
+    clear_outputs();
+    clear_scratch();
+    WRITE_CALLS = 0;
+    WRITE_BYTES = 0;
+    EXIT_GROUP_CALLS = 0;
+    ENOSYS_CALLS = 0;
+    DENIALS = 0;
+    POISONED = 0;
+    INITIALIZED = 1;
+    if !invariants_hold() {
+        INITIALIZED = 0;
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn provision_process(
+    owner_process: u64,
+    service_process: u64,
+    service_generation: u64,
+    stdout_object_out: *mut u64,
+    stderr_object_out: *mut u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    return finish(open_standard_streams(
+        owner_process,
+        service_process,
+        service_generation,
+        stdout_object_out,
+        stderr_object_out
+    ));
+}
+
+// Classification is pure with respect to foreign pointers. write is routed to
+// the live bounded bridge, exit_group is marked for direct kernel process
+// teardown, and every other number returns exactly Linux -ENOSYS.
+pub unsafe fn classify_syscall(
+    syscall_number: u64,
+    arg0: u64,
+    action_out: *mut u64,
+    result_out: *mut u64
+) -> u64 {
+    if action_out as usize == 0 || result_out as usize == 0 {
+        return 0;
+    }
+    volatile_store(action_out, 0);
+    volatile_store(result_out, 0);
+    if !preflight() {
+        return 0;
+    }
+    if syscall_number == LINUX_X86_64_NR_WRITE {
+        volatile_store(action_out, LINUX_ACTION_BOUNDED_WRITE);
+        return finish(1);
+    }
+    if syscall_number == LINUX_X86_64_NR_EXIT_GROUP {
+        if EXIT_GROUP_CALLS == MAX_COUNTER {
+            POISONED = 1;
+            return 0;
+        }
+        EXIT_GROUP_CALLS += 1;
+        volatile_store(action_out, LINUX_ACTION_DIRECT_EXIT_GROUP);
+        volatile_store(result_out, arg0 & 0xffff_ffff);
+        return finish(1);
+    }
+    if ENOSYS_CALLS == MAX_COUNTER {
+        POISONED = 1;
+        return 0;
+    }
+    ENOSYS_CALLS += 1;
+    volatile_store(action_out, LINUX_ACTION_RETURN);
+    volatile_store(result_out, LINUX_NEG_ENOSYS);
+    return finish(1);
+}
+
+// The daemon must have obtained view_capability by exactly one
+// personality_bounded_rpc::lookup_view(request). This routine never calls the
+// underlying memory-view layer. It reads only through the request-correlated
+// live bridge and closes/replies through that bridge before committing the
+// bounded observable transcript.
+pub unsafe fn complete_write(
+    request: u64,
+    view_capability: u64,
+    linux_fd: u64,
+    length: usize
+) -> u64 {
+    if !preflight() || request == 0 || view_capability == 0 {
+        return 0;
+    }
+    let mut request_frame: u64 = 0;
+    let mut bounded_length: usize = 0;
+    let mut direction: u64 = 0;
+    if bounded_request_metadata(
+        request,
+        view_capability,
+        (&mut request_frame),
+        (&mut bounded_length),
+        (&mut direction)
+    ) != 1
+        || !write_request_metadata_matches(
+            request_frame,
+            bounded_length,
+            direction,
+            linux_fd,
+            length
+        ) {
+        count_denial();
+        return 0;
+    }
+    let owner_process: u64 = request_caller_process(request);
+    let service_process: u64 = request_service_process(request);
+    let service_generation: u64 = request_service_generation(request);
+    let mut result: u64 = LINUX_NEG_EBADF;
+    let mut sink: u64 = 0;
+    if owner_process == 0 || service_process == 0 || service_generation == 0 {
+        count_denial();
+        return 0;
+    }
+
+    let object: u64 = lookup_write_object(
+        owner_process,
+        service_process,
+        service_generation,
+        linux_fd
+    );
+    if object != 0 {
+        sink = authorize_write(
+            object,
+            owner_process,
+            service_process,
+            service_generation,
+            linux_fd
+        );
+    }
+    if sink != 0 {
+        if length == 0 {
+            result = 0;
+        } else if length > MAX_LINUX_WRITE_BYTES
+            || !has_capacity(sink, length) {
+            result = LINUX_NEG_EAGAIN;
+        } else {
+            clear_scratch();
+            let mut offset: usize = 0;
+            let mut readable: bool = true;
+            while offset < length && readable {
+                let mut byte: u8 = 0;
+                if bounded_read_byte(
+                    view_capability,
+                    offset,
+                    (&mut byte)
+                ) != 1 {
+                    readable = false;
+                } else {
+                    SCRATCH[offset] = byte;
+                    offset += 1;
+                }
+            }
+            if readable {
+                result = length as u64;
+            } else {
+                clear_scratch();
+                result = LINUX_NEG_EFAULT;
+            }
+        }
+    }
+
+    // Reply is the linearization point. No transcript byte becomes externally
+    // visible if the generation-bound request loses its authority first.
+    if bounded_reply(request, view_capability, 0, result) != 1 {
+        clear_scratch();
+        count_denial();
+        return 0;
+    }
+    if result == length as u64 && length != 0 {
+        if !append(sink, length)
+            || WRITE_CALLS == MAX_COUNTER
+            || WRITE_BYTES > MAX_COUNTER - length as u64 {
+            POISONED = 1;
+            return 0;
+        }
+        WRITE_CALLS += 1;
+        WRITE_BYTES += length as u64;
+    } else if result != 0 {
+        count_denial();
+    }
+    clear_scratch();
+    return finish(1);
+}
+
+pub unsafe fn service_generation_died(
+    service_process: u64,
+    service_generation: u64
+) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    return finish(revoke_service_generation(
+        service_process,
+        service_generation
+    ));
+}
+
+pub unsafe fn process_exited(owner_process: u64) -> u64 {
+    if !preflight() {
+        return 0;
+    }
+    return finish(revoke_process(owner_process));
+}
+
+pub unsafe fn stdout_length() -> usize { return STDOUT_LENGTH; }
+pub unsafe fn stderr_length() -> usize { return STDERR_LENGTH; }
+
+pub unsafe fn stdout_byte(offset: usize) -> u64 {
+    if offset >= STDOUT_LENGTH { return 0x100; }
+    return STDOUT_BYTES[offset] as u64;
+}
+
+pub unsafe fn stderr_byte(offset: usize) -> u64 {
+    if offset >= STDERR_LENGTH { return 0x100; }
+    return STDERR_BYTES[offset] as u64;
+}
+
+pub unsafe fn write_call_count() -> u64 { return WRITE_CALLS; }
+pub unsafe fn write_byte_count() -> u64 { return WRITE_BYTES; }
+pub unsafe fn exit_group_count() -> u64 { return EXIT_GROUP_CALLS; }
+pub unsafe fn enosys_count() -> u64 { return ENOSYS_CALLS; }
+pub unsafe fn denial_count() -> u64 { return DENIALS; }
+pub unsafe fn poisoned() -> bool { return POISONED != 0; }
+
+pub unsafe fn invariants_hold() -> bool {
+    if INITIALIZED == 0
+        || POISONED != 0
+        || !fd_invariants_hold()
+        || STDOUT_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES
+        || STDERR_LENGTH > MAX_LINUX_TRANSCRIPT_BYTES
+        || WRITE_BYTES
+            != STDOUT_LENGTH as u64 + STDERR_LENGTH as u64 {
+        return false;
+    }
+    return true;
+}

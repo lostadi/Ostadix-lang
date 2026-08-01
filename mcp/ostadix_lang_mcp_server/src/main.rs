@@ -16,6 +16,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Clone)]
@@ -34,37 +35,57 @@ impl OstadixMcp {
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/ustad"))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn canonical_directory(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        path.canonicalize().ok()
+    } else {
+        None
+    }
+}
+
+fn is_lang_root(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file()
+        && path.join("backends/python_shim.py").is_file()
+        && path.join("examples/hello.O").is_file()
 }
 
 fn resolve_lang_root() -> PathBuf {
-    if let Ok(p) = std::env::var("O_LANG_ROOT") {
-        let pb = PathBuf::from(p);
-        if pb.is_dir() {
-            return pb;
+    if let Some(path) = std::env::var_os("O_LANG_ROOT").map(PathBuf::from) {
+        if is_lang_root(&path) {
+            return canonical_directory(&path).unwrap_or(path);
         }
     }
-    let candidates = [
-        home_dir().join("Ostadix-lang"),
-        home_dir().join("O-lang"),
-        PathBuf::from("/Users/ustad/Ostadix-lang"),
-    ];
-    for c in candidates {
-        if c.is_dir() {
-            return c;
+
+    if let Ok(current) = std::env::current_dir() {
+        for candidate in current.ancestors() {
+            if is_lang_root(candidate) {
+                return canonical_directory(candidate).unwrap_or_else(|| candidate.to_path_buf());
+            }
         }
     }
-    home_dir().join("Ostadix-lang")
+
+    for candidate in [home_dir().join("Ostadix-lang"), home_dir().join("O-lang")] {
+        if is_lang_root(&candidate) {
+            return canonical_directory(&candidate).unwrap_or(candidate);
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| home_dir().join("Ostadix-lang"))
 }
 
 fn resolve_backends(root: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("O_BACKENDS_DIR") {
         let pb = PathBuf::from(p);
-        if pb.is_dir() {
-            return pb;
+        if let Some(canonical) = canonical_directory(&pb) {
+            return canonical;
         }
     }
-    root.join("backends")
+    let backends = root.join("backends");
+    canonical_directory(&backends).unwrap_or(backends)
 }
 
 fn resolve_o_bin(root: &Path) -> PathBuf {
@@ -109,27 +130,134 @@ async fn run_cmd(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // On timeout below, the wait_with_output() future (and the Child it
-        // owns) is dropped without ever calling .kill() explicitly. Without
-        // this, the process is orphaned rather than reaped.
+        // Keep abnormal future cancellation from orphaning the group leader;
+        // the explicit timeout path below kills and reaps the whole group.
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
     if let Some(c) = cwd {
         cmd.current_dir(c);
     }
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", program.display()))?;
-    let out = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-        .await
-        .map_err(|_| format!("timeout after {timeout_secs}s"))?
-        .map_err(|e| format!("wait: {e}"))?;
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout was not piped".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr was not piped".to_string())?;
+    #[cfg(unix)]
+    let process_group_id = child.id();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let completed = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            stdout_pipe.read_to_end(&mut stdout_bytes),
+            stderr_pipe.read_to_end(&mut stderr_bytes),
+        );
+        let status = status.map_err(|e| format!("wait: {e}"))?;
+        stdout.map_err(|e| format!("read stdout: {e}"))?;
+        stderr.map_err(|e| format!("read stderr: {e}"))?;
+        Ok::<_, String>(status)
+    })
+    .await;
+
+    let status = match completed {
+        Ok(result) => result?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = process_group_id {
+                if let Ok(group_id) = i32::try_from(pid) {
+                    // SAFETY: the child was placed in a new process group whose
+                    // id is the leader pid. Keep that id before waiting so the
+                    // group can still be killed after the leader has exited and
+                    // descendants are retaining its stdout/stderr pipes.
+                    unsafe {
+                        libc::kill(-group_id, libc::SIGKILL);
+                    }
+                }
+            }
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill().await;
+            }
+            let _ = child.wait().await;
+            return Err(format!("timeout after {timeout_secs}s"));
+        }
+    };
+    let code = status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     Ok((code, stdout, stderr))
+}
+
+fn resolve_directory(base: &Path, requested: Option<&str>, label: &str) -> Result<PathBuf, String> {
+    let candidate = requested
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        })
+        .unwrap_or_else(|| base.to_path_buf());
+    if !candidate.is_dir() {
+        return Err(format!(
+            "{label} is not a directory: {}",
+            candidate.display()
+        ));
+    }
+    candidate
+        .canonicalize()
+        .map_err(|error| format!("resolve {label} {}: {error}", candidate.display()))
+}
+
+fn resolve_file(base: &Path, requested: &str, label: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(requested);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    if !candidate.is_file() {
+        return Err(format!("{label} is not a file: {}", candidate.display()));
+    }
+    candidate
+        .canonicalize()
+        .map_err(|error| format!("resolve {label} {}: {error}", candidate.display()))
+}
+
+fn resolve_run_target(
+    root: &Path,
+    requested_path: &str,
+    requested_cwd: Option<&str>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let input_path = Path::new(requested_path);
+    let cwd = match requested_cwd {
+        Some(requested) => resolve_directory(root, Some(requested), "cwd")?,
+        None if input_path.is_absolute() => {
+            let parent = input_path.parent().ok_or_else(|| {
+                format!(
+                    "absolute program has no parent directory: {}",
+                    input_path.display()
+                )
+            })?;
+            resolve_directory(parent, None, "program cwd")?
+        }
+        None => resolve_directory(root, None, "cwd")?,
+    };
+    let program = resolve_file(&cwd, requested_path, "program")?;
+    Ok((program, cwd))
 }
 
 fn format_run(code: i32, stdout: &str, stderr: &str) -> String {
@@ -153,9 +281,11 @@ fn format_run(code: i32, stdout: &str, stderr: &str) -> String {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunOArgs {
-    #[schemars(description = "Path to a .O program (absolute or relative to cwd)")]
+    #[schemars(
+        description = "Path to a .O program (absolute paths default cwd to their parent; relative paths use cwd/O_LANG_ROOT)"
+    )]
     path: String,
-    #[schemars(description = "Optional working directory")]
+    #[schemars(description = "Optional working directory (relative paths use O_LANG_ROOT)")]
     cwd: Option<String>,
     #[schemars(description = "Timeout seconds (default 120)")]
     timeout_secs: Option<u64>,
@@ -163,13 +293,13 @@ struct RunOArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OlangcArgs {
-    #[schemars(description = "Path to a .O program")]
+    #[schemars(description = "Path to a .O program (relative paths use O_LANG_ROOT)")]
     path: String,
     #[schemars(
         description = "olangc target: ir | dot | script | wasm | or omit for default AOT analysis"
     )]
     target: Option<String>,
-    #[schemars(description = "Optional -o output path")]
+    #[schemars(description = "Optional -o output path (relative paths use O_LANG_ROOT)")]
     output: Option<String>,
     #[schemars(description = "Timeout seconds (default 180)")]
     timeout_secs: Option<u64>,
@@ -229,7 +359,10 @@ impl OstadixMcp {
         }
         match run_cmd(
             &o_bin,
-            &[hello.to_str().unwrap_or(""), backends.to_str().unwrap_or("")],
+            &[
+                hello.to_str().unwrap_or(""),
+                backends.to_str().unwrap_or(""),
+            ],
             Some(&root),
             &[
                 ("O_LANG_ROOT", root.display().to_string()),
@@ -261,29 +394,17 @@ impl OstadixMcp {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
-        let path = PathBuf::from(&args.path);
-        let cwd = args
-            .cwd
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                path.parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-        if !path.is_file() {
-            return text_err(format!("not a file: {}", path.display()));
-        }
+        let (path, cwd) = match resolve_run_target(&root, &args.path, args.cwd.as_deref()) {
+            Ok(target) => target,
+            Err(error) => return text_err(error),
+        };
         if !backends.is_dir() {
             return text_err(format!("backends missing: {}", backends.display()));
         }
         let timeout = args.timeout_secs.unwrap_or(120);
         match run_cmd(
             &o_bin,
-            &[
-                path.to_str().unwrap_or(""),
-                backends.to_str().unwrap_or(""),
-            ],
+            &[path.to_str().unwrap_or(""), backends.to_str().unwrap_or("")],
             Some(&cwd),
             &[
                 ("O_LANG_ROOT", root.display().to_string()),
@@ -314,10 +435,10 @@ impl OstadixMcp {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let olangc = resolve_olangc(&root);
-        let path = PathBuf::from(&args.path);
-        if !path.is_file() {
-            return text_err(format!("not a file: {}", path.display()));
-        }
+        let path = match resolve_file(&root, &args.path, "program") {
+            Ok(path) => path,
+            Err(error) => return text_err(error),
+        };
         let mut argv: Vec<String> = vec![path.display().to_string()];
         if let Some(t) = &args.target {
             argv.push("--target".into());
@@ -325,7 +446,16 @@ impl OstadixMcp {
         }
         if let Some(o) = &args.output {
             argv.push("-o".into());
-            argv.push(o.clone());
+            let output = PathBuf::from(o);
+            argv.push(
+                if output.is_absolute() {
+                    output
+                } else {
+                    root.join(output)
+                }
+                .display()
+                .to_string(),
+            );
         }
         argv.push("--shim-dir".into());
         argv.push(backends.display().to_string());
@@ -334,7 +464,7 @@ impl OstadixMcp {
         match run_cmd(
             &olangc,
             &refs,
-            path.parent(),
+            Some(&root),
             &[
                 ("O_LANG_ROOT", root.display().to_string()),
                 ("O_BACKENDS_DIR", backends.display().to_string()),
@@ -372,10 +502,7 @@ impl OstadixMcp {
             ),
             format!("O={} exists={}", o_bin.display(), o_bin.is_file()),
             format!("olangc={} exists={}", olangc.display(), olangc.is_file()),
-            format!(
-                "python_shim={}",
-                backends.join("python_shim.py").is_file()
-            ),
+            format!("python_shim={}", backends.join("python_shim.py").is_file()),
         ];
         // list a few shims
         if let Ok(rd) = std::fs::read_dir(&backends) {
@@ -406,37 +533,53 @@ impl OstadixMcp {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
-        let work = args
+        let requested_work = args
             .work
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("A18_WORK").map(PathBuf::from))
             .unwrap_or_else(|| home_dir().join("a18re"));
-        let mut name = args.name.trim().to_string();
-        if name.ends_with(".O") {
-            name = name.trim_end_matches(".O").to_string();
-        }
-        let path = if Path::new(&name).is_file() {
-            PathBuf::from(&name)
-        } else {
-            work.join("search").join(format!("{name}.O"))
+        let requested_work_text = requested_work.to_string_lossy();
+        let work = match resolve_directory(&root, Some(&requested_work_text), "work") {
+            Ok(path) => path,
+            Err(error) => return text_err(error),
         };
-        if !path.is_file() {
-            return text_err(format!(
-                "not found: {} (tried search/{}.O under {})",
-                args.name,
-                name,
-                work.display()
-            ));
-        }
+        let requested_name = args.name.trim();
+        let direct = PathBuf::from(requested_name);
+        let direct = if direct.is_absolute() {
+            direct
+        } else {
+            work.join(direct)
+        };
+        let tool_name = requested_name.trim_end_matches(".O");
+        let candidate = if direct.is_file() {
+            direct
+        } else {
+            work.join("search").join(format!("{tool_name}.O"))
+        };
+        let path = match resolve_file(
+            candidate.parent().unwrap_or(&work),
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+            "search program",
+        ) {
+            Ok(path) => path,
+            Err(_) => {
+                return text_err(format!(
+                    "not found: {} (tried search/{}.O under {})",
+                    args.name,
+                    tool_name,
+                    work.display()
+                ))
+            }
+        };
         // Refuse relative backends pitfalls: always pass absolute backends
         let timeout = args.timeout_secs.unwrap_or(300);
         match run_cmd(
             &o_bin,
-            &[
-                path.to_str().unwrap_or(""),
-                backends.to_str().unwrap_or(""),
-            ],
+            &[path.to_str().unwrap_or(""), backends.to_str().unwrap_or("")],
             Some(&work),
             &[
                 ("O_LANG_ROOT", root.display().to_string()),
@@ -497,4 +640,148 @@ async fn main() -> anyhow::Result<()> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_lang_root, resolve_directory, resolve_file, resolve_run_target, run_cmd};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is before Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "ostadix-mcp-path-test-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(path.join("backends")).expect("create backends fixture");
+            fs::create_dir_all(path.join("examples/space dir")).expect("create examples fixture");
+            fs::write(path.join("Cargo.toml"), "[workspace]\n").expect("write Cargo fixture");
+            fs::write(path.join("backends/python_shim.py"), "# fixture\n")
+                .expect("write shim fixture");
+            fs::write(path.join("examples/hello.O"), "text^(ok)_text\n")
+                .expect("write hello fixture");
+            fs::write(path.join("examples/space dir/demo.O"), "text^(ok)_text\n")
+                .expect("write path fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn recognizes_only_complete_language_roots() {
+        let fixture = Fixture::new();
+        assert!(is_lang_root(&fixture.0));
+        fs::remove_file(fixture.0.join("examples/hello.O")).expect("remove hello fixture");
+        assert!(!is_lang_root(&fixture.0));
+    }
+
+    #[test]
+    fn resolves_relative_cwd_then_program_once() {
+        let fixture = Fixture::new();
+        let cwd = resolve_directory(&fixture.0, Some("examples/space dir"), "cwd")
+            .expect("resolve relative cwd");
+        let program = resolve_file(&cwd, "demo.O", "program").expect("resolve relative program");
+        assert_eq!(
+            program,
+            fixture
+                .0
+                .join("examples/space dir/demo.O")
+                .canonicalize()
+                .expect("canonical fixture program")
+        );
+    }
+
+    #[test]
+    fn missing_program_reports_effective_absolute_candidate() {
+        let fixture = Fixture::new();
+        let error = resolve_file(&fixture.0, "examples/missing.O", "program")
+            .expect_err("missing program must fail");
+        assert!(error.contains(&fixture.0.display().to_string()));
+        assert!(error.contains("examples/missing.O"));
+    }
+
+    #[test]
+    fn absolute_run_path_without_cwd_uses_program_parent() {
+        let fixture = Fixture::new();
+        let requested = fixture.0.join("examples/space dir/demo.O");
+        let (program, cwd) = resolve_run_target(
+            &fixture.0,
+            requested.to_str().expect("fixture path is UTF-8"),
+            None,
+        )
+        .expect("resolve absolute run target");
+        assert_eq!(
+            program,
+            requested.canonicalize().expect("canonical program")
+        );
+        assert_eq!(
+            cwd,
+            requested
+                .parent()
+                .expect("program parent")
+                .canonicalize()
+                .expect("canonical program parent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_backend_descendants_before_they_can_commit() {
+        let fixture = Fixture::new();
+        let sentinel = fixture.0.join("late-backend-write");
+        let command = format!("(sleep 2; printf late > '{}') & wait", sentinel.display());
+        let error = run_cmd(
+            PathBuf::from("/bin/sh").as_path(),
+            &["-c", &command],
+            None,
+            &[],
+            1,
+        )
+        .await
+        .expect_err("backend process group must time out");
+        assert_eq!(error, "timeout after 1s");
+        tokio::time::sleep(std::time::Duration::from_millis(1_250)).await;
+        assert!(
+            !sentinel.exists(),
+            "a backend descendant survived the timeout and wrote {}",
+            sentinel.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_covers_pipe_drain_after_group_leader_exits() {
+        let fixture = Fixture::new();
+        let sentinel = fixture.0.join("late-write-after-leader-exit");
+        let command = format!("(sleep 2; printf late > '{}') & exit 0", sentinel.display());
+        let error = run_cmd(
+            PathBuf::from("/bin/sh").as_path(),
+            &["-c", &command],
+            None,
+            &[],
+            1,
+        )
+        .await
+        .expect_err("pipe drain and child wait must share one timeout");
+        assert_eq!(error, "timeout after 1s");
+        tokio::time::sleep(std::time::Duration::from_millis(1_250)).await;
+        assert!(
+            !sentinel.exists(),
+            "a descendant retained the pipes and survived the timeout: {}",
+            sentinel.display()
+        );
+    }
 }
