@@ -1,0 +1,6 @@
+module kernel::m3;
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    disable_interrupts();
+    loop { halt(); }
+}

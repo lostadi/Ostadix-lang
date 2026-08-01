@@ -2551,7 +2551,7 @@ standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE -->
-The 15 required portable QEMU release gates and 1
+The 16 required portable QEMU release gates and 1
 supplemental hardware-dependent gate are defined once in
 [`evidence/gates.toml`](evidence/gates.toml). The aggregate reads that manifest
 at runtime, selects only `required = true`, streams each gate's output, and
@@ -2572,6 +2572,7 @@ is a checked projection.
 | `m6a-scalar-personality` | yes | M6A | [ocore/kernel/smoke-personality-qemu.sh](ocore/kernel/smoke-personality-qemu.sh) (`portable_tcg`) | Four packaged CPL3 ELFs exercise health-gated scalar personality RPC, deterministic terminal arbitration, and one supervised restart<br>Generation-1 authority stays stale after generation-2 rebind while an unrelated observer survives and resources return to baseline | Pointer-bearing calls and request-scoped foreign memory views are disabled<br>The native test personality is not a Linux or other foreign operating-system ABI |
 | `m6b-bounded-copy` | yes | M6B mechanism | [ocore/kernel/smoke-m6b-qemu.sh](ocore/kernel/smoke-m6b-qemu.sh) (`portable_tcg`) | Generation-tagged bounded-copy request views enforce snapshot input, written-prefix output, typed rights, quotas, and revoke-before-terminal ordering<br>Five delegated lease classes support transactional create-bind rollback and request-wide revocation while unrelated scope survives | The mechanism is not integrated with the live M6A CPL3 RPC path<br>It does not establish pinned windows, streaming, signals, a Linux oracle, or concrete delegated services |
 | `m6b-live-bounded-personality` | yes | M6B Mode 24 live | [ocore/kernel/smoke-live-bounded-personality-qemu.sh](ocore/kernel/smoke-live-bounded-personality-qemu.sh) (`portable_tcg`) | Four digest-pinned CPL3 ELFs exercise one-shot four-byte INOUT bounded personality RPC across health-gated publication, one contained daemon fault, and a generation-2 rebind<br>The live terminal corpus covers cancellation, timeout, service death, and supervisor-triggered pre-terminal unmap, request-revoke, delegated-resource-revoke, and caller-exit dispositions with stale and duplicate denial plus bounded cleanup | Mode 24 is a native test personality, not a Linux or Plan 9 boot, general foreign ABI, or general guest-agent path<br>The generation-2 lifecycle operations are supervisor-triggered pre-terminal dispositions; the gate does not mutate a mapping, observe an external resource event, or cover the post-reply/pre-consume process-exit or unmap race<br>The delegated device resource is one internal typed lease; this is not KVM, PCI or physical-device assignment, DMA, IOMMU, interrupt-remapping, or physical-device evidence |
+| `m6-linux-minimal-live` | yes | M6 Linux Mode 25 live | [ocore/kernel/smoke-live-linux-personality-qemu.sh](ocore/kernel/smoke-live-linux-personality-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF and three native service principals load from immutable OVFS data into isolated CPL3 address spaces<br>Bounded fd 1/fd 2 writes, exact -ENOSYS, and exit_group(42) survive one contained daemon fault, health-gated generation-2 replacement, stale generation-1 denial, and complete authority/resource reclamation | The pinned four-call success path, with a fifth failure-only exit site, is not Linux or Plan 9 boot, a distribution, root filesystem, dynamic linker, general foreign ABI, or arbitrary Linux binary compatibility<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping/isolation, IOMMU isolation, interrupt remapping, or hardware reset |
 | `kernel-world-mode20-objects` | yes | KernelWorld Mode 20 | [ocore/kernel/smoke-kernel-world-qemu.sh](ocore/kernel/smoke-kernel-world-qemu.sh) (`portable_tcg`) | The exact hash-pinned V2 record is parsed under default-deny package, manifest, request, export, and typed-rights binding<br>Generation-bound nonexecuting VM, vCPU, and guest-page objects enforce quota, stale denial, exact-world reclaim, and unrelated-VM survival | Mode 20 does not enter a guest, execute firmware, or publish a provider export<br>It does not establish device assignment, DMA mapping, or IOMMU isolation |
 | `kernel-world-mode21-svm-kvm` | no | KernelWorld Mode 21 | [ocore/kernel/smoke-kernel-world-execution-qemu.sh](ocore/kernel/smoke-kernel-world-execution-qemu.sh) (`hardware_kvm`) | On an AMD host with nested SVM/NPT and writable /dev/kvm, KVM enters a bounded synthetic guest and observes controlled hypercall and interrupt exits<br>An unmapped guest-physical access fails closed before exact NPT teardown, vCPU restart, and unrelated-VM survival | Mode 21 is supplemental hardware-dependent evidence and is not part of the portable release aggregate<br>It does not boot Linux, Plan 9, firmware, or a supplied image<br>It has no provider lifecycle, guest agent, service export, virtual device, PCI assignment, DMA mapping, or IOMMU-isolation proof |
 | `kernel-world-mode22-live` | yes | KernelWorld Mode 22 | [ocore/kernel/smoke-kernel-world-live-qemu.sh](ocore/kernel/smoke-kernel-world-live-qemu.sh) (`portable_tcg`) | The TCG-compatible native administrative gate health-publishes exact typed exports and dispatches bounded reset intent<br>Failure withdraws clients before exact VM-graph revoke; policy restarts generation 2 while unrelated service survives and generation 1 stays stale | Mode 22 does not enter a guest or enforce the manifest health timeout<br>It has no Linux or Plan 9 boot, guest agent, shared queue, device assignment, DMA/IOMMU isolation, or hardware reset |
@@ -2678,6 +2679,16 @@ python3 scripts/release_evidence.py validate
   dispositions. It is not a general foreign ABI, a mapping-mutation or external
   resource-event gate, a post-reply lifecycle-race gate, or physical-device
   evidence.
+- A bounded Mode 25 Linux-personality gate for one exact 8,520-byte static
+  x86-64 ELF plus three packaged native service principals. The foreign ELF
+  executes at CPL3, completes exact fd 1/fd 2 writes through request-scoped
+  bounded `IN` views, receives Linux `-ENOSYS`, and exits with status 42. One
+  daemon fault is contained before health-gated generation-2 replacement,
+  stale generation-1 denial, full authority/resource reclamation, and a later
+  timer. This is an exact four-call success path with a fifth failure-only exit
+  site, not Linux or Plan 9 boot, a
+  distribution, general foreign ABI, KVM/hardware evidence, PCI assignment,
+  DMA, IOMMU, or physical-device isolation.
 - A separately gated hosted Live-World oracle with bounded strict manifests,
   immutable package CAS objects, default-deny activation policy, health-gated
   service generations, rollback, targeted restart, reconstruction, revocable
@@ -2798,10 +2809,12 @@ features that are already present:
   separately packaged native test daemon/router path. Pinned windows, signals,
   the post-reply process/unmap race, actual mapping mutation and external
   resource events, concrete delegated filesystem/network/timer/device
-  services, shared OValues, foreign executable formats, a general foreign ABI,
-  and full Milestone 6 remain future work.
-- O-core remains fixed-capacity and single-CPU. It provides no Linux ABI,
-  foreign root filesystem, native compiler/self-hosting, framebuffer, or
+  services, shared OValues, arbitrary foreign executable corpora, a general
+  foreign ABI, and full Milestone 6 remain future work. Mode 25 separately
+  admits one exact static Linux x86-64 ELF with only two writes, one unknown
+  syscall, and `exit_group(42)`.
+- O-core remains fixed-capacity and single-CPU. It provides no general Linux
+  ABI, foreign root filesystem, native compiler/self-hosting, framebuffer, or
   nested-kernel execution. The hosted capability bridge remains a tested
   transport boundary, not a live connection to this QEMU kernel.
 - The exact per-mode `KernelWorld` evidence boundaries are projected in the

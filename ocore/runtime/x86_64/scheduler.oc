@@ -66,6 +66,7 @@ static mut PENDING_ACTION: u8 = 0;
 static mut PENDING_SLEEP_DELTA: u64 = 0;
 static mut PENDING_REQUEST: u64 = 0;
 static mut PENDING_RESULT: u64 = 0;
+static mut PENDING_EXIT_STATUS: u64 = 0;
 static mut HOSTILE_SYSCALL_SWITCHES: u64 = 0;
 static mut HOSTILE_FRAME_CONTAINMENTS: u64 = 0;
 static mut M2_PENDING_NT_THREAD: u64 = 0;
@@ -128,6 +129,11 @@ extern "sysv64" fn kernel_m6_prepare_bounded_resume(
     result_out: *mut u64
 ) -> u64;
 extern "sysv64" fn kernel_m6_commit_bounded_resume(thread: u64) -> u64;
+extern "sysv64" fn kernel_m6_defer_thread(thread: u64) -> u64;
+extern "sysv64" fn kernel_m6_linux_process_exit(
+    process: u64,
+    status: u64
+) -> u64;
 
 pub unsafe fn init() -> void {
     atomic_store((&mut YIELD_REQUESTS), 0, seq_cst);
@@ -153,6 +159,7 @@ pub unsafe fn init() -> void {
     PENDING_SLEEP_DELTA = 0;
     PENDING_REQUEST = 0;
     PENDING_RESULT = 0;
+    PENDING_EXIT_STATUS = 0;
     HOSTILE_SYSCALL_SWITCHES = 0;
     HOSTILE_FRAME_CONTAINMENTS = 0;
     M2_PENDING_NT_THREAD = 0;
@@ -220,11 +227,31 @@ pub unsafe fn request_ipc_wait(
     return SYSCALL_CONTROL_SCHEDULE;
 }
 
+// A Linux-minimal exit_group must retire only its current process while the
+// personality daemon, supervisor, and observer keep running.  Defer every
+// mutation until the architectural frame has been saved by the masked
+// scheduler syscall transaction; the Mode 25 harness performs the exact
+// foreign-resource cleanup immediately before process retirement.
+pub unsafe fn request_process_exit(status: u64) -> u64 {
+    if ACTIVE == 0
+        || (SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY
+            && SCHEDULER_KIND != SCHEDULER_KIND_PERSONALITY_RESTART)
+        || current_thread_handle() == 0
+        || current_process_handle() == 0
+        || PENDING_ACTION != 0 {
+        return ERR_NOT_IMPLEMENTED;
+    }
+    PENDING_ACTION = 4;
+    PENDING_EXIT_STATUS = status;
+    return SYSCALL_CONTROL_SCHEDULE;
+}
+
 unsafe fn clear_pending_action() -> void {
     PENDING_ACTION = 0;
     PENDING_SLEEP_DELTA = 0;
     PENDING_REQUEST = 0;
     PENDING_RESULT = 0;
+    PENDING_EXIT_STATUS = 0;
 }
 
 // Both syscall scheduler branches use this one-shot transaction. The pending
@@ -296,6 +323,29 @@ pub unsafe fn kernel_scheduler_syscall(frame: *mut u64) -> usize {
     let running_process: u64 = current_process_handle();
     if save_current(frame as *const u64) == 0 {
         return contain_invalid_current_frame(source_thread, running_process);
+    }
+    if PENDING_ACTION == 4 {
+        let status: u64 = PENDING_EXIT_STATUS;
+        if running_process == 0
+            || kernel_m6_linux_process_exit(running_process, status) != 1
+            || exit_current(status) == 0
+            || terminate_process(running_process) != 1
+            || mark_reapable(running_process) == 0
+            || !queue_invariants_hold() {
+            clear_pending_action();
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        clear_pending_action();
+        let next_frame: usize = dispatch_next(true);
+        if next_frame == 0
+            || !consume_m2_pending_selection(source_thread, next_frame) {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+        return next_frame;
     }
     let mut transitioned: u64 = 0;
     if PENDING_ACTION == 1 {
@@ -960,13 +1010,24 @@ unsafe fn dispatch_next(from_syscall: bool) -> usize {
     // a sibling scheduling syscall. A timer may preempt and save that frame,
     // but must defer it; the next syscall dispatch rotates directly to that
     // exact TCB so later counter loops cannot strand it behind the FIFO head.
-    // Both exceptions are bounded test-mode choreography; ordinary FIFO order
-    // resumes after the one hostile-frame proof edge.
+    // Mode 25 additionally rotates an exact client while its g1->g2 service
+    // generation barrier is closed.  These exceptions are bounded test-mode
+    // choreography; ordinary FIFO order resumes after each proof edge.
     let mut deferred: usize = 0;
     let prefer_mode2_hostile: bool =
         SCHEDULER_KIND == SCHEDULER_KIND_M2
         && from_syscall
         && M2_PENDING_NT_THREAD != 0;
+    let mut personality_defer: u64 = 0;
+    if SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+        || SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART {
+        personality_defer = kernel_m6_defer_thread(next_thread);
+        if personality_defer > 1 {
+            FAILED = 1;
+            ACTIVE = 0;
+            return 0;
+        }
+    }
     while (SCHEDULER_KIND == SCHEDULER_KIND_IPC
             && next_thread == THREADS[3]
             && sender_block_count() == 0)
@@ -975,7 +1036,8 @@ unsafe fn dispatch_next(from_syscall: bool) -> usize {
             && M2_PENDING_NT_THREAD != 0
             && next_thread == M2_PENDING_NT_THREAD)
         || (prefer_mode2_hostile
-            && next_thread != M2_PENDING_NT_THREAD) {
+            && next_thread != M2_PENDING_NT_THREAD)
+        || personality_defer == 1 {
         if defer_next(next_thread) == 0 {
             FAILED = 1;
             ACTIVE = 0;
@@ -992,6 +1054,16 @@ unsafe fn dispatch_next(from_syscall: bool) -> usize {
             FAILED = 1;
             ACTIVE = 0;
             return 0;
+        }
+        personality_defer = 0;
+        if SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY
+            || SCHEDULER_KIND == SCHEDULER_KIND_PERSONALITY_RESTART {
+            personality_defer = kernel_m6_defer_thread(next_thread);
+            if personality_defer > 1 {
+                FAILED = 1;
+                ACTIVE = 0;
+                return 0;
+            }
         }
     }
     let frame: usize = install_thread_context(next_thread);
