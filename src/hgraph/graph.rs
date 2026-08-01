@@ -637,6 +637,19 @@ impl HGraph {
         Ok(())
     }
 
+    /// Validate the executable graph and prove that it was projected from this
+    /// exact logical execution plan.
+    ///
+    /// Consumers such as planner inspection must not pair a valid graph with a
+    /// different plan whose node identifiers happen to overlap.
+    pub fn validate_execution_plan(&self, plan: &ExecutionPlan) -> Result<(), String> {
+        self.validate_execution_graph()?;
+        if self.source_plan.as_ref() != Some(plan) {
+            return Err("execution plan does not match the HGraph source plan".to_string());
+        }
+        Ok(())
+    }
+
     /// Validate both graph completeness and the exact program/plan provenance
     /// that will be executed by the coordinator. A state-complete graph is not
     /// a transferable scheduling hint: pairing it with different OIR could run
@@ -646,12 +659,7 @@ impl HGraph {
         program: &crate::ir::OIrProgram,
         plan: &ExecutionPlan,
     ) -> Result<(), String> {
-        self.validate_execution_graph()?;
-        if self.source_plan.as_ref() != Some(plan) {
-            return Err(
-                "coordinator execution plan does not match the HGraph source plan".to_string(),
-            );
-        }
+        self.validate_execution_plan(plan)?;
 
         let flat = program.flatten_for_plan();
         if flat.len() != plan.nodes.len() {

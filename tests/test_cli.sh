@@ -206,6 +206,33 @@ check_olangc_capability_compile_and_run() {
     fi
 }
 
+check_olangc_grounding_report() {
+    local desc="$1"
+
+    run_command "$OLANGC_BIN" examples/hello.O \
+        --target ir \
+        --grounding \
+        --world-id desk \
+        --world-epoch 4
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(grounding report failed with exit $RUN_EXIT)"
+        return
+    fi
+    if ! grep -Fqx -- 'world desk@4' "$STDOUT_FILE"; then
+        fail "$desc" "(grounding report omitted the caller-bound World epoch)"
+        return
+    fi
+    if ! grep -Fqx -- 'governed-effects none' "$STDOUT_FILE"; then
+        fail "$desc" "(grounding report did not preserve the empty governed-effect set)"
+        return
+    fi
+    if ! grep -Eq -- '^ambient-effects P[0-9]+ reads=\[[^]]*HostWorld[^]]*\] writes=\[[^]]*HostWorld[^]]*\] hostworld=residual$' "$STDOUT_FILE"; then
+        fail "$desc" "(grounding report did not expose residual HostWorld reads and writes)"
+        return
+    fi
+    pass "$desc"
+}
+
 check_olink_hardened_round_trip() {
     local source="$ARTIFACT_DIR/link-source"
     local expected="$ARTIFACT_DIR/link-expected"
@@ -292,6 +319,27 @@ check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^(\[nu
 check_stdout_contains "plain Python has ambient process authority" 0 '^(\[number\] )?0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
+check_olangc_grounding_report "olangc grounding reports exact World and residual HostWorld"
+check_nonzero_stderr_contains "olangc grounding rejects a non-IR target" \
+    '--grounding is available only with --target ir' \
+    "$OLANGC_BIN" examples/hello.O --target dot --grounding
+check_nonzero_stderr_contains "olangc World flags require grounding" \
+    '--world-id and --world-epoch require --grounding --target ir' \
+    "$OLANGC_BIN" examples/hello.O --target ir --world-id desk --world-epoch 4
+check_nonzero_stderr_contains "olangc World identity requires an epoch" \
+    '--world-id requires --world-epoch' \
+    "$OLANGC_BIN" examples/hello.O --target ir --grounding --world-id desk
+check_nonzero_stderr_contains "olangc World epoch requires an identity" \
+    '--world-epoch requires --world-id' \
+    "$OLANGC_BIN" examples/hello.O --target ir --grounding --world-epoch 4
+check_nonzero_stderr_contains "olangc grounding rejects an invalid World identity" \
+    'world identity .*unsupported character or path component' \
+    "$OLANGC_BIN" examples/hello.O --target ir --grounding \
+    --world-id desk/escape --world-epoch 4
+check_nonzero_stderr_contains "olangc grounding rejects World epoch zero" \
+    'world epoch must be nonzero' \
+    "$OLANGC_BIN" examples/hello.O --target ir --grounding \
+    --world-id desk --world-epoch 0
 check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
 check_olangc_capability_compile_and_run "olangc compiles legacy backend cap attrs without a host grant"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help

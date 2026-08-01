@@ -351,6 +351,31 @@
   KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
   physical-device evidence.
 
+## Ostadix World v0 boundary
+
+- [`OSTADIX_WORLD.md`](OSTADIX_WORLD.md) fixes the product definition,
+  vocabulary, crossing categories, four-plane architecture, lease and partition
+  policy, state machines, and exact claim boundary for the first hosted
+  multi-node demo. It is a normative contract, not evidence that the demo exists.
+- The hosted Live-World package/service oracle, project-route runtime, HGraph
+  executor, capability broker, KernelWorld lifecycle, and native Mode 25/26
+  gates are reusable but separate components. They do not currently compose
+  into a distributed World.
+- No completed distributed Governor, node-membership protocol, networked
+  resource registry, generation-bound `/world` tree, remote route dispatcher,
+  failure/rescheduling loop, or live placement engine is claimed. The shared
+  governed identity and effect vocabulary is a foundation only: descriptive
+  names, inventory, snapshots, and serialized identities remain non-authority.
+- The partial PR1 grounding command labels a report with a caller-supplied
+  World identity. It does not read a current World snapshot, enforce freshness,
+  or bind execution. No production lowering emits governed `ResourceKey`
+  effects yet; ordinary hosted operations retain their conservative
+  `HostWorld` dependency.
+- World v0 does not claim coherent cross-node RAM, remote pointers or threads,
+  fused accelerators, arbitrary Linux compatibility, general 9P or Plan 9,
+  physical-device passthrough, transparent migration, consensus, or aggregate
+  performance.
+
 ## Implemented conservatively
 
 - Graph construction, multi-output validation, type/fidelity solving, explicit
@@ -377,11 +402,12 @@
   in `src/value.rs`.
 - Deterministic cancellation and result-selection semantics for concurrent
   groups and future graph execution.
-- O-Domain evolution beyond the current bounded Mode 24/25 gates: add pinned
+- O-Domain evolution beyond the current bounded Mode 24--26 gates: add pinned
   windows, streaming, signals, real mapping/resource events, post-reply
   lifecycle-race evidence, fuzzing, allocation-failure coverage, and concrete
   delegated services, then broaden the exact Mode 25 Linux corpus only behind
-  equally explicit ABI and lifecycle evidence. Durable reboot reconstruction
-  and a capability-bounded build service also remain future work. No general
-  Linux ABI or root filesystem is claimed.
+  equally explicit ABI and lifecycle evidence. Mode 26 adds only its exact
+  bounded 9P2000 client/server corpus, not a general 9P namespace. Durable
+  reboot reconstruction and a capability-bounded build service also remain
+  future work. No general Linux ABI or root filesystem is claimed.
   The staged engineering plan is in `docs/ODOMAIN_PLAN.md`.

@@ -75,6 +75,7 @@ use o_lang::ir::OIrProgram;
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
 use o_lang::value::OValue;
+use o_lang::world::{GroundingReport, WorldEpoch, WorldId, WorldIdentity};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Runtime source files — embedded at olangc's own compile time.
@@ -97,6 +98,11 @@ const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
+
+// world — shared governed identities and the non-authorizing grounding view.
+const RUNTIME_WORLD_MOD_RS: &str = include_str!("../world/mod.rs");
+const RUNTIME_WORLD_IDENTITY_RS: &str = include_str!("../world/identity.rs");
+const RUNTIME_WORLD_GROUNDING_RS: &str = include_str!("../world/grounding.rs");
 
 // hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
 const RUNTIME_HGRAPH_MOD_RS: &str = include_str!("../hgraph/mod.rs");
@@ -208,9 +214,22 @@ struct Cli {
 
     /// Compatibility hook: mint a live backend capability at startup and bind
     /// it in O scope. Normal hosted backends already have default host authority.
-    /// Format: NAME=LANG[:fs_read,fs_write,network,process].
+    /// Format: `NAME=LANG[:fs_read,fs_write,network,process]`.
     #[arg(long = "backend-grant")]
     backend_grants: Vec<String>,
+
+    /// Append the governed/ambient grounding report to `--target ir` output.
+    /// This is a planner inspection view and does not perform placement.
+    #[arg(long)]
+    grounding: bool,
+
+    /// Bind grounding output to one logical World. Requires --world-epoch.
+    #[arg(long)]
+    world_id: Option<String>,
+
+    /// Bind grounding output to one exact, nonzero World epoch.
+    #[arg(long)]
+    world_epoch: Option<u64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +242,7 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let grounding_world = parse_grounding_world(&cli)?;
 
     let input_is_dir = cli.input.is_dir();
     let source = if input_is_dir {
@@ -288,8 +308,27 @@ fn main() -> Result<()> {
         CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
         }
+        CompileTarget::Ir if cli.grounding => dump_ir_with_grounding(&source, grounding_world),
         CompileTarget::Ir => dump_ir(&source),
         CompileTarget::Dot => dump_dot(&source),
+    }
+}
+
+fn parse_grounding_world(cli: &Cli) -> Result<Option<WorldIdentity>> {
+    if cli.grounding && cli.target != CompileTarget::Ir {
+        bail!("--grounding is available only with --target ir");
+    }
+    if !cli.grounding && (cli.world_id.is_some() || cli.world_epoch.is_some()) {
+        bail!("--world-id and --world-epoch require --grounding --target ir");
+    }
+    match (&cli.world_id, cli.world_epoch) {
+        (None, None) => Ok(None),
+        (Some(world), Some(epoch)) => Ok(Some(WorldIdentity::new(
+            WorldId::new(world.clone())?,
+            WorldEpoch::new(epoch)?,
+        ))),
+        (Some(_), None) => bail!("--world-id requires --world-epoch"),
+        (None, Some(_)) => bail!("--world-epoch requires --world-id"),
     }
 }
 
@@ -297,7 +336,7 @@ fn main() -> Result<()> {
 // Project compilation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the [`ProjectBundle`] for a project input (a directory or a lifted
+/// Build the `ProjectBundle` for a project input (a directory or a lifted
 /// `.O` file with an embedded bundle).
 fn load_project_bundle(
     input: &Path,
@@ -692,6 +731,13 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
     fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
 
+    // ── world — governed identity/effect vocabulary ────────────────────────
+    let world_dir = src_dir.join("world");
+    fs::create_dir_all(&world_dir)?;
+    fs::write(world_dir.join("mod.rs"), RUNTIME_WORLD_MOD_RS)?;
+    fs::write(world_dir.join("identity.rs"), RUNTIME_WORLD_IDENTITY_RS)?;
+    fs::write(world_dir.join("grounding.rs"), RUNTIME_WORLD_GROUNDING_RS)?;
+
     // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
     let hgraph_dir = src_dir.join("hgraph");
     fs::create_dir_all(&hgraph_dir)?;
@@ -824,6 +870,31 @@ fn run_as_script(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dump_ir(source: &str) -> Result<()> {
+    let (program, _plan, graph) = inspect_ir(source)?;
+    print!("{}\n{}", program.to_text(), graph.to_execution_text());
+    Ok(())
+}
+
+fn dump_ir_with_grounding(source: &str, world: Option<WorldIdentity>) -> Result<()> {
+    let (program, plan, graph) = inspect_ir(source)?;
+    let grounding = GroundingReport::analyze(&plan, &graph, world)
+        .context("failed to validate grounding plan/HGraph")?;
+    print!(
+        "{}\n{}\n{}",
+        program.to_text(),
+        graph.to_execution_text(),
+        grounding.to_text()
+    );
+    Ok(())
+}
+
+fn inspect_ir(
+    source: &str,
+) -> Result<(
+    OIrProgram,
+    o_lang::ir::ExecutionPlan,
+    o_lang::hgraph::HGraph,
+)> {
     let src = strip_shebang(source);
     let registered_backends = registered_backends();
 
@@ -836,8 +907,7 @@ fn dump_ir(source: &str) -> Result<()> {
         .hgraph_for_plan(&plan)
         .map_err(anyhow::Error::msg)
         .context("failed to build HGraph for IR target")?;
-    print!("{}\n{}", program.to_text(), graph.to_execution_text());
-    Ok(())
+    Ok((program, plan, graph))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1228,6 +1298,7 @@ pub mod process;
 pub mod nix_ops;
 pub mod nixos_ops;
 pub mod scheduler;
+pub mod world;
 {project_mod}pub(crate) mod wire;
 "
     )
@@ -1537,6 +1608,40 @@ mod tests {
     }
 
     #[test]
+    fn grounding_cli_binds_an_exact_nonzero_world_epoch() {
+        let cli = Cli::try_parse_from([
+            "olangc",
+            "demo.O",
+            "--target",
+            "ir",
+            "--grounding",
+            "--world-id",
+            "desk",
+            "--world-epoch",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(
+            parse_grounding_world(&cli).unwrap().unwrap().to_string(),
+            "desk@4"
+        );
+
+        let zero = Cli::try_parse_from([
+            "olangc",
+            "demo.O",
+            "--target",
+            "ir",
+            "--grounding",
+            "--world-id",
+            "desk",
+            "--world-epoch",
+            "0",
+        ])
+        .unwrap();
+        assert!(parse_grounding_world(&zero).is_err());
+    }
+
+    #[test]
     fn generated_runtime_includes_hgraph_modules() {
         let build_dir = create_build_dir().unwrap();
         let src_dir = build_dir.join("src");
@@ -1548,9 +1653,13 @@ mod tests {
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
+        assert!(lib_rs.contains("pub mod world;"));
 
         for path in [
             "effects.rs",
+            "world/mod.rs",
+            "world/identity.rs",
+            "world/grounding.rs",
             "hgraph/mod.rs",
             "hgraph/graph.rs",
             "hgraph/kinds.rs",
@@ -1575,6 +1684,11 @@ mod tests {
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,
             "generated runtimes must receive the shared semantic effect model verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("world/identity.rs")).unwrap(),
+            RUNTIME_WORLD_IDENTITY_RS,
+            "generated runtimes must receive governed identity types verbatim"
         );
 
         fs::remove_dir_all(build_dir).unwrap();
