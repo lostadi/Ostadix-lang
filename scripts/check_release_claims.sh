@@ -379,6 +379,42 @@ require_fixed README.md \
 require_fixed README.md \
     'No production lowering currently emits these' \
     'the hosted PR6 vocabulary could be misread as production governed lowering'
+require_fixed README.md \
+    'Project HGraph hosted logical-planning gate' \
+    'the executable hosted PR7 project-planning gate is missing from the public status'
+require_fixed scripts/o-cli.sh \
+    'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
+    'the repository-owned o plan dispatcher no longer reaches project IR planning'
+require_fixed setup.sh \
+    '"$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"' \
+    'the cargo-bin lowercase o wrapper no longer delegates to the repository installer'
+require_fixed setup.sh \
+    '"$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$BIN_DIR/o"' \
+    'the local-bin lowercase o wrapper no longer delegates to the repository installer'
+require_fixed scripts/install-o-cli-wrapper.sh \
+    'exec "$ROOT/scripts/o-cli.sh" "\$@"' \
+    'the installed lowercase o wrapper no longer delegates to the repository dispatcher'
+require_fixed AGENTS.md \
+    'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$O_LANG_ROOT/target/release:$PATH"' \
+    'the canonical PATH order lets the case-insensitive raw O binary shadow lowercase o'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'PATH="$installed_local_bin:$installed_cargo_bin:$ROOT/target/release:/usr/bin:/bin"' \
+    'the installed o smoke no longer covers the documented target-release shadow path'
+require_fixed docs/CLAIMS.md \
+    'PR7 now provides a bounded hosted project logical planner.' \
+    'the implemented PR7 project-plan boundary is missing'
+require_fixed docs/CLAIMS.md \
+    'logical-planning gate. It does not execute project commands through the' \
+    'the hosted project graph could be misread as the command-execution path'
+require_fixed docs/CLAIMS.md \
+    'conservative fallible `HostWorld` effects' \
+    'untrusted project purity could be misread as verified mediated execution'
+require_fixed docs/CLAIMS.md \
+    'Logical alternative branches may therefore be serialized and' \
+    'logical branches could be misread as independently mediated or parallel execution'
+require_fixed docs/OSTADIX_WORLD.md \
+    'complete at the bounded hosted logical-planning' \
+    'the PR7 roadmap status is missing'
 require_fixed docs/CLAIMS.md \
     'Strict decoding rejects malformed' \
     'invalid-record rejection must remain a decoder claim'

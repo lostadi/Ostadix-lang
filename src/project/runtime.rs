@@ -538,20 +538,37 @@ pub fn run_selection(
     policy_override: Option<RoutePolicy>,
     opts: &RunOptions,
 ) -> Result<Vec<OExecutionResult>> {
-    let (alternatives, policy) = resolve_selection(bundle, target, policy_override)?;
-    execute_policy(bundle, &alternatives, &policy, opts)
+    let selection = resolve_selection(bundle, target, policy_override)?;
+    execute_policy(bundle, &selection.alternatives, &selection.policy, opts)
 }
 
-fn resolve_selection(
+/// A route selection after every decision that can be made without executing
+/// a command has been resolved.
+///
+/// The planner and hosted runtime share this exact value so `o plan` cannot
+/// describe different alternatives or fallback order from `--target script`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSelection {
+    /// The caller-visible route or route-set name after default resolution.
+    pub target: String,
+    /// Concrete route ids in execution/candidate order.
+    pub alternatives: Vec<String>,
+    /// The policy whose dynamic result/cancellation semantics remain to run.
+    pub policy: RoutePolicy,
+}
+
+/// Resolve a route/route-set request without materializing a workspace or
+/// executing any command.
+pub fn resolve_selection(
     bundle: &ProjectBundle,
     target: Option<&str>,
     policy_override: Option<RoutePolicy>,
-) -> Result<(Vec<String>, RoutePolicy)> {
-    match target {
+) -> Result<ResolvedSelection> {
+    let (target, alternatives, policy) = match target {
         Some(name) => {
             if let Some(set) = bundle.route_set(name) {
                 let policy = policy_override.unwrap_or_else(|| set.policy.clone());
-                Ok((set.alternatives.clone(), policy))
+                (name.to_string(), set.alternatives.clone(), policy)
             } else if bundle.route(name).is_some() {
                 let policy = match policy_override {
                     Some(RoutePolicy::Explicit(id)) if id.is_empty() => {
@@ -560,30 +577,91 @@ fn resolve_selection(
                     Some(RoutePolicy::Default) | None => RoutePolicy::Explicit(name.to_string()),
                     Some(other) => other,
                 };
-                Ok((vec![name.to_string()], policy))
+                (name.to_string(), vec![name.to_string()], policy)
             } else {
-                bail!(
+                return Err(anyhow::anyhow!(
                     "no route or route set named `{name}`\n{}",
                     bundle.route_table()
-                )
+                ));
             }
         }
         None => {
             if let Some(policy) = policy_override {
-                bail!(
+                return Err(anyhow::anyhow!(
                     "--routes-policy `{}` requires --route to name a route or route set",
                     policy.token()
-                );
+                ));
             }
             match bundle.resolved_default() {
-                Some(id) => Ok((vec![id.clone()], RoutePolicy::Explicit(id))),
-                None => bail!(
-                    "no unambiguous default route — select one with --route <ID>\n{}",
-                    bundle.route_table()
-                ),
+                Some(id) => (id.clone(), vec![id.clone()], RoutePolicy::Explicit(id)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "no unambiguous default route — select one with --route <ID>\n{}",
+                        bundle.route_table()
+                    ))
+                }
             }
         }
+    };
+
+    if alternatives.is_empty() {
+        bail!("route set `{target}` has no alternatives to run");
     }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in &alternatives {
+        if !seen.insert(id.clone()) {
+            bail!("route selection `{target}` repeats alternative `{id}`");
+        }
+        if bundle.route(id).is_none() {
+            bail!("route selection `{target}` references missing route `{id}`");
+        }
+    }
+
+    let (alternatives, policy) = match policy {
+        RoutePolicy::Explicit(id) => {
+            let id = if id.is_empty() {
+                if alternatives.len() != 1 {
+                    bail!("explicit policy needs a specific route id");
+                }
+                alternatives[0].clone()
+            } else {
+                if !alternatives.contains(&id) {
+                    bail!("explicit route `{id}` is not among the alternatives");
+                }
+                id
+            };
+            (vec![id.clone()], RoutePolicy::Explicit(id))
+        }
+        RoutePolicy::Default => {
+            let default = bundle
+                .resolved_default()
+                .filter(|id| alternatives.contains(id))
+                .or_else(|| {
+                    let defaults = alternatives
+                        .iter()
+                        .filter(|id| bundle.route(id).is_some_and(|route| route.is_default))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (defaults.len() == 1).then(|| defaults[0].clone())
+                })
+                .context("no unambiguous default route among alternatives")?;
+            (vec![default], RoutePolicy::Default)
+        }
+        RoutePolicy::Fallback => {
+            let mut ordered = alternatives;
+            ordered.sort_by_key(|id| {
+                std::cmp::Reverse(bundle.route(id).map(|route| route.priority).unwrap_or(0))
+            });
+            (ordered, RoutePolicy::Fallback)
+        }
+        other => (alternatives, other),
+    };
+
+    Ok(ResolvedSelection {
+        target,
+        alternatives,
+        policy,
+    })
 }
 
 fn execute_policy(
@@ -597,47 +675,22 @@ fn execute_policy(
     }
     match policy {
         RoutePolicy::Explicit(id) => {
-            let id = if id.is_empty() {
-                if alternatives.len() != 1 {
-                    bail!("explicit policy needs a specific route id");
-                }
-                &alternatives[0]
-            } else {
-                if !alternatives.contains(id) {
-                    bail!("explicit route `{id}` is not among the alternatives");
-                }
-                id
-            };
+            let id = alternatives
+                .first()
+                .filter(|candidate| *candidate == id)
+                .context("resolved explicit selection lost its route")?;
             Ok(vec![run_route(bundle, id, opts)?])
         }
         RoutePolicy::Default => {
-            let default = bundle
-                .resolved_default()
-                .filter(|d| alternatives.contains(d))
-                .or_else(|| {
-                    let defaults: Vec<&String> = alternatives
-                        .iter()
-                        .filter(|id| bundle.route(id).map(|r| r.is_default).unwrap_or(false))
-                        .collect();
-                    if defaults.len() == 1 {
-                        Some(defaults[0].clone())
-                    } else {
-                        None
-                    }
-                });
-            match default {
-                Some(id) => Ok(vec![run_route(bundle, &id, opts)?]),
-                None => bail!("no unambiguous default route among alternatives"),
-            }
+            let default = alternatives
+                .first()
+                .context("resolved default selection lost its route")?;
+            Ok(vec![run_route(bundle, default, opts)?])
         }
         RoutePolicy::Fallback => {
-            let mut ordered: Vec<String> = alternatives.to_vec();
-            ordered.sort_by_key(|id| {
-                std::cmp::Reverse(bundle.route(id).map(|r| r.priority).unwrap_or(0))
-            });
             let mut results = Vec::new();
-            for id in ordered {
-                let result = run_route(bundle, &id, opts)?;
+            for id in alternatives {
+                let result = run_route(bundle, id, opts)?;
                 let ok = result.succeeded();
                 results.push(result);
                 if ok {

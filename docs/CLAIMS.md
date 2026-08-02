@@ -481,6 +481,35 @@
   native/QEMU or hardware evidence, Governor authority, device assignment,
   DMA/IOMMU isolation, Acceptance gate A, or passage of G0, G1, or any G0--G13
   gate.
+- PR7 now provides a bounded hosted project logical planner. A directory or
+  lifted `ProjectBundle` is resolved through the shared typed route selector,
+  bound by an exact bundle digest and policy in `ProjectExecutionPlan`, and
+  projected into a validated HGraph containing real `MaterializeProject`,
+  `BuildRoute`, `RunRoute`, `SelectRoute`, and, for `verify_equivalent`,
+  `CompareRouteResults` operations. Alternative materialization branches and
+  prerequisites are explicit in both layers. The project plan also records
+  guards, environment overlay key names, ambient environment-guard
+  dependencies, inputs/outputs, declared effects, cancellation, and
+  equivalence policy; its HGraph projection carries the corresponding
+  operation, effect/resource-transition, dependency, and output topology.
+  Planning is deterministic and nonexecuting, and exact source/projection
+  validation rejects malformed references, substitution, and graph forgery.
+- `scripts/smoke-project-hgraph.sh` is the Project HGraph hosted
+  logical-planning gate. It does not execute project commands through the
+  HGraph coordinator; script and compiled project execution remain on the
+  existing hosted project runtime. The gate also proves repository-owned
+  `scripts/o-cli.sh plan` parity, deterministic IR/DOT, and generated-project
+  binary route-listing plus checked option/policy rejection. Route
+  materialization and commands retain
+  conservative fallible `HostWorld` effects even when a manifest declares
+  `pure=true`. Logical alternative branches may therefore be serialized and
+  cross-coupled by the shared ambient/resource state chains; PR7 does not prove
+  parallel branch execution or independent host mediation. This is not
+  PR8/PR9, placement, deployment, Governor or receipt
+  integration, remote execution, WorldFS, native/QEMU/hardware evidence, Linux
+  or Plan 9 boot, a general foreign ABI, KVM/SVM evidence, physical-device
+  assignment, PCI/DMA/IOMMU isolation, Acceptance A, G1, or passage of any
+  G0--G13 gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.

@@ -22,12 +22,17 @@ pub mod lower;
 pub mod manifest;
 pub mod materialize;
 pub mod model;
+pub mod plan;
 pub mod runtime;
 
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,
     ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
     RouteSpec,
+};
+pub use plan::{
+    build_project_hgraph, ProjectCancellationSemantics, ProjectExecutionPlan, ProjectHGraph,
+    ProjectPlanOperation, RoutePlanFacts,
 };
 
 /// Derive a project name from a directory path.
