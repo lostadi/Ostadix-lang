@@ -23,6 +23,7 @@ bash scripts/check_declared_bins.sh
 cargo test --all-targets --all-features --verbose
 bash scripts/smoke-hosted-live-reference.sh
 bash scripts/smoke-world-resource-keys.sh
+bash scripts/smoke-project-hgraph.sh
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
@@ -59,6 +60,20 @@ real CLI projection. Grounding itself checks only the bound World
 epoch/membership. This is not Mode 31, a ResourceKey wire ABI, production
 governed lowering, native/QEMU/hardware evidence, Governor authority, device
 assignment, DMA/IOMMU isolation, Acceptance A, or G0--G13 passage.
+
+The Project HGraph smoke is the bounded hosted PR7 logical-planning gate. It
+constructs an exact-provenance plan and real HGraph operations from a checked-in
+project, validates logical alternatives and prerequisites, route policy and
+equivalence metadata, malformed/substitution rejection, stable nonexecuting
+IR/DOT output, residual `HostWorld`, and ordinary `.O` IR compatibility. It
+does not execute project commands through the HGraph coordinator and is not
+PR8/PR9, placement, deployment, Governor/receipt integration, native/QEMU or
+hardware evidence, G1, or G0--G13 passage. Its logical alternative branches may
+remain serialized and cross-coupled by shared conservative ambient/resource
+state chains; the smoke claims neither parallel execution nor independent host
+mediation. It also checks byte parity between the direct `olangc` planner and
+the repository-owned lowercase `o plan` dispatcher, plus a real compiled
+project binary's route listing and checked option/policy rejection.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a

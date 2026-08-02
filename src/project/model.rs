@@ -290,30 +290,47 @@ pub enum RoutePolicy {
 }
 
 impl RoutePolicy {
+    /// Parse a policy token without silently turning a typo into `default`.
+    ///
+    /// Manifests retain the compatibility-oriented [`Self::parse`] surface,
+    /// while planner/CLI entrypoints use this checked form so the logical
+    /// project graph records the policy the caller actually requested.
+    pub fn parse_checked(token: &str) -> Result<RoutePolicy, String> {
+        let token = token.trim();
+        if let Some(rest) = token.strip_prefix("explicit:") {
+            let route = rest.trim();
+            if route.is_empty() {
+                return Err("`explicit:` requires a route id".to_string());
+            }
+            return Ok(RoutePolicy::Explicit(route.to_string()));
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "explicit" => Ok(RoutePolicy::Explicit(String::new())),
+            "default" => Ok(RoutePolicy::Default),
+            "fallback" => Ok(RoutePolicy::Fallback),
+            "any_success" | "anysuccess" | "any" => Ok(RoutePolicy::AnySuccess),
+            "race_success" | "racesuccess" | "race" => Ok(RoutePolicy::RaceSuccess),
+            "race_settle" | "racesettle" => Ok(RoutePolicy::RaceSettle),
+            "all" => Ok(RoutePolicy::All),
+            "verify_equivalent" | "verifyequivalent" | "verify" => {
+                Ok(RoutePolicy::VerifyEquivalent)
+            }
+            "benchmark_and_select" | "benchmarkandselect" | "benchmark" => {
+                Ok(RoutePolicy::BenchmarkAndSelect)
+            }
+            _ => Err(format!(
+                "unknown route policy `{token}`; expected explicit[:ROUTE], default, fallback, any_success, race_success, race_settle, all, verify_equivalent, or benchmark_and_select"
+            )),
+        }
+    }
+
     /// Parse a policy token as used in the manifest / CLI.
     ///
     /// `explicit` requires the route id to be supplied separately (via
     /// `explicit_id`); when absent it degrades to [`RoutePolicy::Default`]
     /// unless the token itself carries it as `explicit:<id>`.
     pub fn parse(token: &str) -> RoutePolicy {
-        let token = token.trim();
-        if let Some(rest) = token.strip_prefix("explicit:") {
-            return RoutePolicy::Explicit(rest.trim().to_string());
-        }
-        match token.to_ascii_lowercase().as_str() {
-            "explicit" => RoutePolicy::Explicit(String::new()),
-            "default" => RoutePolicy::Default,
-            "fallback" => RoutePolicy::Fallback,
-            "any_success" | "anysuccess" | "any" => RoutePolicy::AnySuccess,
-            "race_success" | "racesuccess" | "race" => RoutePolicy::RaceSuccess,
-            "race_settle" | "racesettle" => RoutePolicy::RaceSettle,
-            "all" => RoutePolicy::All,
-            "verify_equivalent" | "verifyequivalent" | "verify" => RoutePolicy::VerifyEquivalent,
-            "benchmark_and_select" | "benchmarkandselect" | "benchmark" => {
-                RoutePolicy::BenchmarkAndSelect
-            }
-            _ => RoutePolicy::Default,
-        }
+        Self::parse_checked(token).unwrap_or_default()
     }
 
     /// A short human-readable token for this policy.

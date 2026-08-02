@@ -29,7 +29,7 @@ Ostadix-lang/
 │   ├── live_system/  #   Hosted Live-World package/service oracle
 │   ├── kernel_world.rs #  KernelWorld foreign-kernel manifest contract & oracle
 │   ├── world/        #   Shared governed identities/effects foundation
-│   ├── project/      #   Route-preserving project bundle lifting
+│   ├── project/      #   Project bundles, route runtime, and logical HGraph plans
 │   └── bin/          #   Additional binary targets (olangc, ocorec, olink, …)
 ├── ocore/            # Native systems runtime and bootable x86_64 kernel proof
 ├── okernel-multikernel/ # Foreign-kernel personality proposal & boot-and-test entrypoint
@@ -200,6 +200,32 @@ wire format or native Mode 31 and does not implement a distributed Governor,
 membership transport, resource registry, `/world` namespace, remote execution,
 placement, device assignment, DMA/IOMMU isolation, or current-epoch
 enforcement. It passes no G0--G13 gate.
+
+Project inputs use a second, direct planning path because routes are not OIR:
+
+```text
+ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan -> HGraph
+```
+
+`src/project/plan.rs` binds the logical plan to the exact deterministic bundle
+digest and route policy, constructs logically separate materialization branches with
+prerequisites, and projects real `MaterializeProject`, `BuildRoute`,
+`RunRoute`, `SelectRoute`, and policy-dependent `CompareRouteResults`
+operations. Project-specific validation reconstructs the source plan and checks
+the exact operation, dependency, effect, and graph projection, so generic graph
+well-formedness cannot hide bundle or policy substitution. `olangc` exposes the
+result through nonexecuting `ir` and `dot` targets for directory and lifted
+bundle inputs.
+
+This hosted PR7 surface is logical planning, not project HGraph execution.
+Project script and compiled binaries still dispatch commands through
+`project::runtime`; materialization and command operations stay fallible and
+conservatively read/write `HostWorld`, regardless of untrusted manifest
+`pure=true` metadata. The logical alternative branches therefore share
+conservative ambient/resource state chains in the HGraph and may be serialized;
+they are not a claim of parallel execution or independently mediated host
+worlds. It does not add deployment graph layers, placement,
+Governor authority, receipts, remote execution, or qualifying native evidence.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
@@ -347,8 +373,8 @@ bash test_o_lang_examples.sh
 | `binary` | `--target binary` | Native ELF/Mach-O binary on disk    |
 | `wasm`   | `--target wasm`   | `wasm32-wasip1` module on disk     |
 | `script` | `--target script` | In-process execution (no disk file) |
-| `ir`     | `--target ir`     | OIR, plan, and textual HGraph dump  |
-| `dot`    | `--target dot`    | Graphviz DOT hypergraph on stdout   |
+| `ir`     | `--target ir`     | OIR/ExecutionPlan/HGraph, or ProjectExecutionPlan/project HGraph, without execution |
+| `dot`    | `--target dot`    | Ordinary or project Graphviz DOT hypergraph on stdout |
 
 **Target A — Binary** (default): creates a temporary Cargo project that
 bundles the .O source, runtime, and backend shims, then compiles it with
@@ -368,7 +394,8 @@ is produced.
 **Target D — IR**: parses the program with the same front end, lowers the
 `ONode` forest to OIR (`src/ir.rs`), and prints the lowered program to
 stdout.  A debugging/inspection target — nothing is executed and no output
-file is produced.
+file is produced. A directory or lifted project instead constructs its typed,
+exact-provenance `ProjectExecutionPlan` and HGraph without running any route.
 
 **Target E — Dot**: parses and lowers to OIR, then builds the full
 `HGraph` hypergraph (`src/hgraph/`) from that OIR, runs the type solver, and
@@ -376,7 +403,8 @@ serialises the result as a Graphviz DOT digraph on stdout. Ordinary values,
 resource versions, actor-state versions, and completion/control values have
 distinct styles. Executable and constraint hyperedges are explicit vertices,
 so input-to-operation and operation-to-output port direction remains visible.
-Nothing is executed and no output file is produced.
+For a directory or lifted project it renders the separately validated project
+HGraph. Nothing is executed and no output file is produced.
 
 ```bash
 # Compile to a binary (Target A)

@@ -543,7 +543,12 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         bail!("no unambiguous default route — select one with --route <ID>");
     }
 
-    let policy = cli.routes_policy.as_deref().map(RoutePolicy::parse);
+    let policy = cli
+        .routes_policy
+        .as_deref()
+        .map(RoutePolicy::parse_checked)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let opts = RunOptions::default();
     let results = run_selection(bundle, cli.route.as_deref(), policy, &opts)?;
 

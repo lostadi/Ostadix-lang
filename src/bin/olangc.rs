@@ -138,6 +138,7 @@ const RUNTIME_PROJECT_MATERIALIZE_RS: &str = include_str!("../project/materializ
 const RUNTIME_PROJECT_MANIFEST_RS: &str = include_str!("../project/manifest.rs");
 const RUNTIME_PROJECT_DISCOVER_RS: &str = include_str!("../project/discover.rs");
 const RUNTIME_PROJECT_LOWER_RS: &str = include_str!("../project/lower.rs");
+const RUNTIME_PROJECT_PLAN_RS: &str = include_str!("../project/plan.rs");
 const RUNTIME_PROJECT_RUNTIME_RS: &str = include_str!("../project/runtime.rs");
 const RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS: &str = include_str!("../project/ecosystems/mod.rs");
 const RUNTIME_PROJECT_ECO_PYTHON_RS: &str = include_str!("../project/ecosystems/python.rs");
@@ -172,8 +173,8 @@ enum CompileTarget {
     Wasm,
     /// Execute the lowered and planned OIR inside the olangc process.
     Script,
-    /// Lower to OIR, build the ExecutionPlan and directed HGraph, and print all
-    /// three to stdout without executing them.
+    /// Print a non-executing logical plan: OIR/ExecutionPlan/HGraph for `.O`,
+    /// or ProjectExecutionPlan/HGraph for a directory or lifted project.
     Ir,
     /// Lower the parsed program to OIR, build its HGraph, solve types, and
     /// emit a Graphviz DOT digraph to stdout. Pipe to `dot -Tpng` for a PNG.
@@ -186,16 +187,16 @@ enum CompileTarget {
     about = "Compile or run a .O program",
     long_about = "\
 Compiles a .O source file into a native binary (--target binary, the default), \
-a wasm32-wasip1 module (--target wasm), executes executable OIR in-process \
-(--target script), prints the lowered OIR, ExecutionPlan, and HGraph (--target ir), or \
-emits the program execution hypergraph as Graphviz DOT (--target dot). Binary \
+a wasm32-wasip1 module (--target wasm), executes in-process (--target script), \
+prints the lowered OIR/ExecutionPlan/HGraph or project plan/HGraph (--target ir), \
+or emits the execution hypergraph as Graphviz DOT (--target dot). Binary \
 outputs embed the program source, compatibility adapters, and the Ostadix-lang \
-runtime. In ir mode the same OIR, plan, and directed execution HGraph are printed \
-without execution. In dot mode the HGraph is built and type-solved, then \
-serialised as a digraph; pipe to `dot -Tpng` for a rendered image."
+runtime. Project IR/DOT planning constructs route operations without running \
+commands. In dot mode the HGraph is serialised as a digraph; pipe to \
+`dot -Tpng` for a rendered image."
 )]
 struct Cli {
-    /// The .O source file to compile or run
+    /// A .O source/lifted bundle or project directory to compile, run, or plan
     input: PathBuf,
 
     /// Compilation target
@@ -224,6 +225,14 @@ struct Cli {
     /// Format: `NAME=LANG[:fs_read,fs_write,network,process]`.
     #[arg(long = "backend-grant")]
     backend_grants: Vec<String>,
+
+    /// Select one project route or route set for project script/IR/DOT modes.
+    #[arg(long)]
+    route: Option<String>,
+
+    /// Override the selected project's route policy. Requires --route.
+    #[arg(long = "routes-policy")]
+    routes_policy: Option<String>,
 
     /// Append the governed/ambient grounding report to `--target ir` output.
     /// This is a planner inspection view and does not perform placement.
@@ -265,6 +274,9 @@ fn main() -> Result<()> {
     let is_project = input_is_dir || o_lang::project::lower::has_embedded_bundle(&source);
     if is_project {
         return compile_or_run_project(&cli, input_is_dir, &source);
+    }
+    if cli.route.is_some() || cli.routes_policy.is_some() {
+        bail!("--route and --routes-policy are available only for project inputs");
     }
 
     match cli.target {
@@ -360,9 +372,26 @@ fn load_project_bundle(
 
 /// Dispatch a project input to the right pipeline based on the compile target.
 fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result<()> {
+    use o_lang::project::RoutePolicy;
+
+    let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
+    let policy_override = cli
+        .routes_policy
+        .as_deref()
+        .map(RoutePolicy::parse_checked)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    if policy_override.is_some() && cli.route.is_none() {
+        bail!("--routes-policy requires --route to name a project route or route set");
+    }
+
     match cli.target {
         CompileTarget::Binary | CompileTarget::Wasm => {
-            let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
+            if cli.route.is_some() || policy_override.is_some() {
+                bail!(
+                    "--route and --routes-policy select project script/IR/DOT plans; compiled project binaries accept them at runtime"
+                );
+            }
 
             let mut output = match cli.output.clone() {
                 Some(p) => p,
@@ -407,24 +436,46 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
             }
             result
         }
-        CompileTarget::Script => {
-            let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
-            run_project_script(&bundle)
-        }
-        CompileTarget::Ir | CompileTarget::Dot => {
-            bail!(
-                "--target {:?} is not supported for project inputs; use --target binary or script",
-                cli.target
+        CompileTarget::Script => run_project_script(&bundle, cli.route.as_deref(), policy_override),
+        CompileTarget::Ir => {
+            if cli.grounding {
+                bail!(
+                    "--grounding for project inputs is deferred to the PR9 project-grounding view"
+                );
+            }
+            let project = o_lang::project::build_project_hgraph(
+                &bundle,
+                cli.route.as_deref(),
+                policy_override,
             )
+            .map_err(anyhow::Error::msg)
+            .context("failed to build logical project HGraph")?;
+            print!("{}", project.to_text());
+            Ok(())
+        }
+        CompileTarget::Dot => {
+            let project = o_lang::project::build_project_hgraph(
+                &bundle,
+                cli.route.as_deref(),
+                policy_override,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("failed to build logical project HGraph")?;
+            print!("{}", hgraph_to_dot(&project.graph));
+            Ok(())
         }
     }
 }
 
 /// Run a project's default route in-process (script mode).
-fn run_project_script(bundle: &o_lang::project::ProjectBundle) -> Result<()> {
+fn run_project_script(
+    bundle: &o_lang::project::ProjectBundle,
+    route: Option<&str>,
+    policy: Option<o_lang::project::RoutePolicy>,
+) -> Result<()> {
     use o_lang::project::runtime::{run_selection, RunOptions};
-    eprintln!("olangc: project script mode — running default route");
-    let results = run_selection(bundle, None, None, &RunOptions::default())?;
+    eprintln!("olangc: project script mode — running resolved route selection");
+    let results = run_selection(bundle, route, policy, &RunOptions::default())?;
     for result in &results {
         print!("{}", result.summary());
     }
@@ -526,6 +577,7 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
     fs::write(project_dir.join("manifest.rs"), RUNTIME_PROJECT_MANIFEST_RS)?;
     fs::write(project_dir.join("discover.rs"), RUNTIME_PROJECT_DISCOVER_RS)?;
     fs::write(project_dir.join("lower.rs"), RUNTIME_PROJECT_LOWER_RS)?;
+    fs::write(project_dir.join("plan.rs"), RUNTIME_PROJECT_PLAN_RS)?;
     fs::write(project_dir.join("runtime.rs"), RUNTIME_PROJECT_RUNTIME_RS)?;
 
     fs::write(eco_dir.join("mod.rs"), RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS)?;
@@ -562,8 +614,8 @@ fn generate_project_main_rs(bin_name: &str, shim_include_lines: &[String]) -> St
     format!(
         r###"// AUTO-GENERATED by olangc. DO NOT EDIT.
 
-use {lib_name}::project::{{self, RoutePolicy}};
-use {lib_name}::project::runtime::{{run_selection, RunOptions}};
+use ::{lib_name}::project::RoutePolicy;
+use ::{lib_name}::project::runtime::{{run_selection, RunOptions}};
 
 /// The serialized project bundle, embedded at compile time.
 const PROJECT_BUNDLE: &[u8] = include_bytes!("project_bundle.json");
@@ -574,14 +626,14 @@ const EMBEDDED_SHIMS: &[(&str, &[u8])] = &[
 ];
 
 fn main() -> anyhow::Result<()> {{
-    if {lib_name}::backend::run_backend_from_env_args()? {{
+    if ::{lib_name}::backend::run_backend_from_env_args()? {{
         return Ok(());
     }}
 
     #[cfg(not(target_family = "wasm"))]
     let _ = EMBEDDED_SHIMS;
 
-    let bundle = project::bundle::deserialize(PROJECT_BUNDLE)?;
+    let bundle = ::{lib_name}::project::bundle::deserialize(PROJECT_BUNDLE)?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut list_routes = false;
@@ -593,11 +645,21 @@ fn main() -> anyhow::Result<()> {{
             "--list-routes" => list_routes = true,
             "--route" => {{
                 i += 1;
-                route = args.get(i).cloned();
+                route = Some(
+                    args.get(i)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--route requires a value"))?,
+                );
             }}
             "--routes-policy" => {{
                 i += 1;
-                policy = args.get(i).cloned();
+                policy = Some(
+                    args.get(i)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--routes-policy requires a value"))?,
+                );
             }}
             other => return Err(anyhow::anyhow!("unknown argument: {{other}}")),
         }}
@@ -609,7 +671,11 @@ fn main() -> anyhow::Result<()> {{
         return Ok(());
     }}
 
-    let policy = policy.as_deref().map(RoutePolicy::parse);
+    let policy = policy
+        .as_deref()
+        .map(RoutePolicy::parse_checked)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let opts = RunOptions::default();
     let results = run_selection(&bundle, route.as_deref(), policy, &opts)?;
     for result in &results {{
@@ -1729,6 +1795,32 @@ mod tests {
         assert!(generate_cargo_toml("generated-runtime", false).contains("ed25519-dalek = \"2\""));
 
         fs::remove_dir_all(build_dir).unwrap();
+    }
+
+    #[test]
+    fn generated_project_runtime_includes_project_plan_module() {
+        let build_dir = create_build_dir().unwrap();
+        let src_dir = build_dir.join("src");
+        write_project_sources(&src_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(src_dir.join("project/plan.rs")).unwrap(),
+            RUNTIME_PROJECT_PLAN_RS,
+            "compiled project runtimes must receive the project HGraph planner verbatim"
+        );
+        assert!(fs::read_to_string(src_dir.join("project/mod.rs"))
+            .unwrap()
+            .contains("pub mod plan;"));
+        fs::remove_dir_all(build_dir).unwrap();
+    }
+
+    #[test]
+    fn generated_project_main_handles_project_crate_name() {
+        let main = generate_project_main_rs("project", &[]);
+        assert!(main.contains("use ::project::project::RoutePolicy;"));
+        assert!(main.contains("::project::project::bundle::deserialize"));
+        assert!(!main.contains("use project::project::{self"));
+        assert!(main.contains("--route requires a value"));
+        assert!(main.contains("RoutePolicy::parse_checked"));
     }
 
     #[test]

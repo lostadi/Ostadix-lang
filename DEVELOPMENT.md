@@ -104,6 +104,7 @@ cargo test --test world_identity_wire
 cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
 ./scripts/smoke-world-resource-keys.sh
+./scripts/smoke-project-hgraph.sh
 ./boot-and-test.sh smoke
 
 # Python reference runtime
@@ -124,6 +125,21 @@ ctest --test-dir build/c_cpp-cmake
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
+
+`smoke-project-hgraph.sh` is the bounded hosted PR7 logical-planning gate. It
+uses a real project fixture to prove exact bundle/policy provenance, all five
+project operation kinds, logical alternative/prerequisite topology, stable
+nonexecuting IR/DOT output, malformed/substitution rejection, conservative
+`HostWorld`, and ordinary `.O` IR compatibility. It does not execute project
+commands through HGraph; project script/binary execution remains in the hosted
+project runtime. It is not placement, deployment, Governor/receipt integration,
+native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
+The gate also proves `scripts/o-cli.sh plan` is byte-identical to the direct
+`olangc --target ir` result. `setup.sh` installs lowercase `o` as a wrapper over
+that dispatcher while preserving evaluator fallback for non-subcommand input.
+Keep the installed-wrapper directories before `target/release` in `PATH`; on a
+case-insensitive host the raw `O` release binary is otherwise also found as
+lowercase `o` and shadows the dispatcher.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
 The aggregate executes all 21 required portable QEMU gates in the

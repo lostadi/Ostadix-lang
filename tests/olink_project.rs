@@ -37,6 +37,28 @@ fn python_project() -> tempfile::TempDir {
 }
 
 #[test]
+fn olink_rejects_unknown_project_policy_before_execution() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/project_hgraph");
+    let output = olink()
+        .args([
+            "--run",
+            "--route",
+            "main",
+            "--routes-policy",
+            "definitely-not-a-policy",
+        ])
+        .arg(fixture)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown route policy"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn olink_list_routes_for_directory() {
     let dir = python_project();
     let out = olink()

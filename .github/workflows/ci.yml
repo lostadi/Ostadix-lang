@@ -49,6 +49,9 @@ jobs:
       - name: Run hosted World ResourceKey conformance smoke
         run: bash scripts/smoke-world-resource-keys.sh
 
+      - name: Run hosted project HGraph planning smoke
+        run: bash scripts/smoke-project-hgraph.sh
+
       - name: Run deterministic parser properties
         run: cargo test --test parser_proptest
 

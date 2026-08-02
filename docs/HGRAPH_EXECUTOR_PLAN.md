@@ -4,6 +4,30 @@ The Rust hosted runtime executes OIR through a directed HGraph. The graph
 coordinator is the default; `O_EXECUTOR=serial` selects the reference OIR
 executor used by the differential conformance suite.
 
+Project inputs have a distinct, direct logical-planning surface:
+
+```text
+ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan -> HGraph
+```
+
+Routes are not synthesized as fake OIR. The project planner binds its source to
+the exact deterministic bundle digest and normalized route policy, constructs
+one logical materialization branch per selected alternative, recursively
+places prerequisite routes inside that branch, and then projects real project
+operation kinds. Its project-specific validator reconstructs the canonical
+source plan and checks the exact operations, dependencies, effects, values, and
+graph projection. This closes a provenance gap that generic HGraph
+well-formedness and the intentionally OIR-only `source_plan` field cannot close.
+
+`olangc <project> --target ir|dot` is inspection only. The coordinator described
+below executes ordinary OIR graphs; it does not yet execute project HGraphs.
+Project script and compiled execution continue through `project::runtime`, and
+materialization/command operations remain fallible `HostWorld` work even if a
+manifest declares `pure=true`. Alternative dependencies are logically branched,
+but the project HGraph intentionally retains shared conservative
+ambient/resource state chains; those chains may serialize and cross-couple
+branches until a trusted, branch-scoped resource model exists.
+
 ## Implemented operation shape
 
 ```text

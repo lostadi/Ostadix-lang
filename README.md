@@ -777,6 +777,37 @@ QEMU evidence, device assignment, DMA/IOMMU isolation, Governor authority,
 Acceptance gate A, G0/G1 passage, project placement, or a World-execution
 surface. `CapabilityState` is descriptive identity only and carries no grant.
 
+### Project HGraph hosted logical-planning gate
+
+PR7 constructs real project operations from a directory or lifted
+`ProjectBundle` without running project commands:
+
+```bash
+./scripts/smoke-project-hgraph.sh
+olangc tests/fixtures/project_hgraph --target ir --route main
+./scripts/o-cli.sh plan tests/fixtures/project_hgraph --route main
+# After setup.sh installs the wrapper:
+o plan tests/fixtures/project_hgraph --route main
+```
+
+The typed project plan is bound to an exact bundle digest and the resolved route
+policy. It builds logically separate materialization branches with prerequisite routes and
+projects `MaterializeProject`, `BuildRoute`, `RunRoute`, `SelectRoute`, and,
+for `verify_equivalent`, `CompareRouteResults` into a validated HGraph. Guards,
+environment key names, inputs, outputs, declared effects, cancellation, and
+equivalence policy remain visible in stable inspection output; command strings
+and environment values do not.
+
+This gate is hosted logical-planning evidence only. It does not execute project
+commands through the HGraph coordinator: script and compiled project execution
+still use the existing project runtime. Materialization and route commands
+remain fallible `HostWorld` operations even when a manifest says `pure=true`.
+The graph therefore preserves logical alternative branches while its shared
+ambient/resource state chains may conservatively serialize and cross-couple
+them; this is not proof of parallel branch execution.
+It supplies no graph-layer separation, placement, Governor authority, receipt,
+remote execution, native/QEMU/hardware evidence, G1, or G0--G13 passage.
+
 ### Docker
 
 The Dockerfile builds the hosted `O`, `olangc`, and `o-link` binaries and
@@ -1869,8 +1900,8 @@ with `O`.
 | `binary` | `olangc app.O -o target/app` | Builds a native hosted executable containing the program and Rust O runtime. |
 | `wasm` | `olangc app.O --target wasm -o target/app.wasm` | Builds for `wasm32-wasip1`; suited to programs that do not require unavailable WASI subprocess runtimes. |
 | `script` | `olangc app.O --target script` | Parses and executes directly inside the `olangc` process. |
-| `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and the directed executable HGraph without executing the program. |
-| `dot` | `olangc app.O --target dot` | Builds HGraph from OIR, solves types, emits Graphviz DOT digraph on stdout. Pipe to `dot -Tpng` for a rendered graph. |
+| `ir` | `olangc app.O --target ir` | Prints lowered OIR, its ExecutionPlan, and its directed executable HGraph; for a directory or lifted project, prints the deterministic ProjectExecutionPlan and project HGraph. Nothing executes. |
+| `dot` | `olangc app.O --target dot` | Emits Graphviz DOT for an ordinary OIR HGraph or a directory/lifted-project HGraph. Pipe to `dot -Tpng` for a rendered graph. Nothing executes. |
 
 Native hosted binaries contain the `.O` source, runtime modules, lockfile
 dependency versions, and bundled core shims. Python, Nix, and other language
@@ -1913,6 +1944,31 @@ O project.O
 Execution is an explicit project-runtime operation through `--run`. The legacy
 `--project` spelling remains accepted, and an already-lifted project `.O` file
 is detected automatically.
+
+Project planning is a separate nonexecuting inspection path. Select a route or
+route set with `--route`; an optional checked `--routes-policy` override accepts
+`explicit`/`explicit:ROUTE`, `default`, `fallback`, `any_success`,
+`race_success`, `race_settle`, `all`, `verify_equivalent`, or
+`benchmark_and_select`:
+
+```bash
+olangc src/ --target ir --route main
+olangc project.O --target dot --route main > project.dot
+./scripts/o-cli.sh plan src/ --route main
+```
+
+Directory and losslessly lifted inputs produce the same logical plan for the
+same bundle and selection. Planning validates project references and exact
+bundle/policy provenance but deliberately does not run a guard, prerequisite,
+or command.
+
+`olangc --target ir` is the direct project planner interface.
+`scripts/o-cli.sh` is the repository-owned lowercase dispatcher: `setup.sh`
+installs an `o` wrapper that delegates to it, so `o plan` reaches `olangc` while
+all other arguments retain the historical lowercase evaluator behavior. Keep
+`~/.local/bin` (or `~/.cargo/bin`) before `target/release` in `PATH`: on a
+case-insensitive filesystem the raw release binary named `O` is also reachable
+as lowercase `o` and would otherwise shadow the dispatcher.
 
 Project bundles preserve binary assets, empty and extensionless files,
 executable bits, Unix modes, and in-root symlinks. They respect `.gitignore`
@@ -2146,6 +2202,14 @@ executor used by graph/serial conformance tests.
 state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
+
+Project inputs take a direct, typed
+`ProjectBundle -> ProjectExecutionPlan -> HGraph` inspection path rather than
+synthesizing OIR. The project-specific validator reconstructs the exact plan
+from the bundle and selected policy before checking its operation, dependency,
+effect, and HGraph projection. Unlike ordinary OIR execution, this project
+HGraph is not yet consumed by the coordinator; the hosted project runtime
+remains the command-execution path.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.

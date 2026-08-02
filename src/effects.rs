@@ -686,6 +686,15 @@ fn parse_resource(item: &str) -> Result<ResourceKey, String> {
     }
 }
 
+/// Parse one user-declared ambient resource for trusted compiler subsystems.
+///
+/// Project-plan lowering shares the same grammar and, critically, the same
+/// governed-resource rejection as `.O` block effects. This is crate-private:
+/// it does not expose an authority-minting API to callers.
+pub(crate) fn parse_declared_resource(item: &str) -> Result<ResourceKey, String> {
+    parse_resource(item)
+}
+
 fn is_governed_source_resource_kind(kind: &str) -> bool {
     matches!(
         kind,

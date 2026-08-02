@@ -73,6 +73,9 @@ hosted World foundation:
   process, generic resource, object, descriptive capability, namespace,
   task-attempt, artifact-publication, device, and accelerator state, kept
   separate from ambient `HostWorld`;
+- the hosted PR7 deterministic project logical planner, which binds a real
+  directory or lifted bundle and resolved route policy to a
+  `ProjectExecutionPlan` and validated HGraph without executing commands;
 - deterministic grounding views for OValues, capabilities, capsules, and
   governed resources; underlying identity helpers compare caller-supplied
   pairs, while grounding checks only a bound World epoch/membership rather than
@@ -105,6 +108,19 @@ keys are descriptive scheduling views that share a generic resource dependency;
 they do not discover, own, assign, drive, or isolate hardware. The smoke is not
 Mode 31, native or QEMU evidence, a ResourceKey wire ABI, Governor authority,
 device assignment, DMA/IOMMU isolation, Acceptance gate A, or G0--G13 passage.
+
+The PR7 project-HGraph smoke is likewise hosted logical-planning evidence only.
+It constructs real materialize/build/run/select/compare operation topology with
+exact bundle/policy provenance, logical materialization alternatives and
+prerequisites, and visible route constraints. It does not execute project commands through the
+HGraph coordinator. The existing hosted project runtime remains the execution
+path, and route materialization and commands retain fallible `HostWorld`
+effects. Logical alternative branches may therefore remain serialized and
+cross-coupled through shared conservative ambient/resource state chains; this
+is not parallel-execution or independent-mediation evidence. This adds no graph-layer
+separation, placement, remote execution,
+Governor or receipt integration, native/QEMU/hardware evidence, G1, or G0--G13
+passage.
 
 ## Non-claims
 
