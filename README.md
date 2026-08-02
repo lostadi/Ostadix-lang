@@ -626,25 +626,41 @@ or live-system claims above. See
 [`docs/HOSTED_LIVE_REFERENCE.md`](docs/HOSTED_LIVE_REFERENCE.md) for its exact
 boundary and lifecycle CLI.
 
-### Ostadix World v0 contract
+### Ostadix World native constitution
 
-Ostadix World is defined as an elastic, capability-governed computational
-fabric: nodes contribute typed resources under renewable, generation-bound
-leases, and placement remains separate from the logical HGraph. The normative
-v0 vocabulary, crossing categories, four-plane architecture, partition policy,
-state machines, and first-demo claim boundary are pinned in
-[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md).
+The normative target is a native, replicated, capability-governed World whose
+boundary is governed membership rather than a chassis. The full-stack program,
+crossing kinds, consistency model, physical Alpha requirements, G0--G13 gate
+ladder, and explicit non-claims are pinned in
+[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md). The machine-readable
+qualification registry is
+[`evidence/world_alpha_gates.toml`](evidence/world_alpha_gates.toml).
 
-The existing hosted Live-World reference above is a local package and service
-semantic oracle, not the distributed World. The current repository does not yet
-provide a distributed Governor, node-membership protocol, networked resource
-registry, generation-bound `/world` tree, remote route dispatch, failure-driven
-rescheduling, or live placement. Names, inventory, and namespace lookup do not
-grant authority, and aggregate node memory is not presented as coherent local
-RAM.
+Hosted World work is retained only as a simulator, differential oracle,
+protocol-fuzz target, and development console under
+[`docs/HOSTED_WORLD_REFERENCE_PROFILE.md`](docs/HOSTED_WORLD_REFERENCE_PROFILE.md).
+It earns no native Alpha gate credit. The current repository does not yet
+provide a replicated Governor, native node-membership transport, WorldFS,
+distributed HGraph execution, real Linux KernelWorld boot, physical-device
+assignment and DMA/IOMMU isolation, a native Debian personality, or physical
+multinode convergence. Names, inventory, and namespace lookup do not grant
+authority, and aggregate node memory is never presented as coherent local RAM.
 
-The partial PR1 identity/effect/grounding foundation can be inspected without
-execution:
+Validate the constitution and its evidence-class substitution rules with:
+
+```bash
+python3 scripts/world_alpha_evidence.py
+```
+
+The checked-in result defines 14 entries--the G0 constitutional baseline plus
+13 integration gates through G13--and marks every one unpassed. Schema v1 is
+definition-only: it rejects `passed` and nonempty evidence until a typed
+attestation format is versioned. The existing 17 portable QEMU gates and
+supplemental Mode 21 result retain their narrow claims; they do not become
+G0--G13 evidence by proximity or addition.
+
+The current partial shared-identity/effect/grounding foundation can be
+inspected without execution:
 
 ```bash
 olangc examples/hello.O --target ir --grounding \
@@ -656,7 +672,7 @@ and labels the inspection with the caller-supplied World epoch. It does not
 consult a live World snapshot or enforce freshness. No production lowering
 currently emits the precise governed resource keys, so ordinary hosted `.O`
 plans retain residual `HostWorld` and report `governed-effects none`. This is
-not the later project placement or World-execution surface.
+not G0 or G1, project placement, or a World-execution surface.
 
 ### Docker
 
@@ -2868,6 +2884,10 @@ features that are already present:
 See [SPEC.md](SPEC.md) for the hosted language contract,
 [ARCHITECTURE.md](ARCHITECTURE.md) for the repository architecture, and
 [docs/OCORE.md](docs/OCORE.md) for the native language and ABI contract. The
+native World constitution and G0--G13 convergence program are in
+[docs/OSTADIX_WORLD.md](docs/OSTADIX_WORLD.md); the superseded hosted-first
+design survives only as the explicitly non-qualifying
+[hosted reference profile](docs/HOSTED_WORLD_REFERENCE_PROFILE.md). The
 dependency-ordered path from `native[0]` to foreign personalities is tracked in
 [docs/ODOMAIN_PLAN.md](docs/ODOMAIN_PLAN.md), with the native package/REPL
 contract in [docs/LIVE_SYSTEM.md](docs/LIVE_SYSTEM.md) and the bounded foreign

@@ -36,9 +36,10 @@
   non-executable or executable Git blobs, so a symlink cannot become an escaping
   archive member. Relative Markdown links outside code/comments must resolve to
   files, directories, or the root inside that archive. Verification also checks
-  canonical ZIP metadata/layout and inertly validates the MCP configuration and
-  crate license plus example/evidence manifest schemas and archive-local
-  references; it never imports or executes archive payloads. The supported local
+  canonical ZIP metadata/layout and inertly validates the MCP configuration,
+  crate license, example/evidence manifest schemas, sealed World Alpha v1
+  constitution/profile/registry bytes, and archive-local references; it never
+  imports or executes archive payloads. The supported local
   MCP crate, its lockfile, LGPL-2.1 license, repository config, and stdio smoke
   regressions are required release members. The regression suite covers debris
   exclusion, link closure, reproducibility, committed-byte behavior, required
@@ -351,30 +352,42 @@
   KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
   physical-device evidence.
 
-## Ostadix World v0 boundary
+## Ostadix World native Alpha boundary
 
-- [`OSTADIX_WORLD.md`](OSTADIX_WORLD.md) fixes the product definition,
-  vocabulary, crossing categories, four-plane architecture, lease and partition
-  policy, state machines, and exact claim boundary for the first hosted
-  multi-node demo. It is a normative contract, not evidence that the demo exists.
-- The hosted Live-World package/service oracle, project-route runtime, HGraph
-  executor, capability broker, KernelWorld lifecycle, and native Mode 25/26
-  gates are reusable but separate components. They do not currently compose
-  into a distributed World.
-- No completed distributed Governor, node-membership protocol, networked
-  resource registry, generation-bound `/world` tree, remote route dispatcher,
-  failure/rescheduling loop, or live placement engine is claimed. The shared
-  governed identity and effect vocabulary is a foundation only: descriptive
-  names, inventory, snapshots, and serialized identities remain non-authority.
-- The partial PR1 grounding command labels a report with a caller-supplied
-  World identity. It does not read a current World snapshot, enforce freshness,
-  or bind execution. No production lowering emits governed `ResourceKey`
-  effects yet; ordinary hosted operations retain their conservative
-  `HostWorld` dependency.
-- World v0 does not claim coherent cross-node RAM, remote pointers or threads,
-  fused accelerators, arbitrary Linux compatibility, general 9P or Plan 9,
-  physical-device passthrough, transparent migration, consensus, or aggregate
-  performance.
+- [`OSTADIX_WORLD.md`](OSTADIX_WORLD.md) is the normative native constitution.
+  It fixes the replicated-Governor model, OValue/capability/capsule crossings,
+  explicit aggregate-memory model, fifteen workstreams, and G0--G13
+  convergence ladder. Defining that target is not evidence that a gate passed.
+- [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) defines 14
+  entries--the G0 constitutional baseline plus 13 integration gates through
+  G13--with their dependencies, qualifying evidence classes, and prohibited
+  substitutes. `scripts/world_alpha_evidence.py` validates that registry. Every
+  checked-in gate is `defined`; zero gates are `passed`, including G0 and G13.
+  Schema v1 is definition-only and rejects both `passed` and nonempty evidence
+  until a typed attestation format is versioned.
+- [`HOSTED_WORLD_REFERENCE_PROFILE.md`](HOSTED_WORLD_REFERENCE_PROFILE.md)
+  retains the prior hosted design only as a simulator, differential oracle,
+  fuzzer, and development console. A hosted deployment cannot satisfy a native
+  release gate. The narrower hosted Live-World package/service oracle remains
+  separately bounded.
+- The existing project runtime, HGraph executor, capability broker,
+  KernelWorld lifecycle, and Modes 20--26 are reusable organs, not an integrated
+  World. Mode 23's synthetic guest is not G7 or G8; Mode 25's static ELF is not
+  G9; Mode 26's exact 9P2000 corpus is not G6; supplemental Mode 21 is not real
+  Linux boot or physical-device isolation.
+- No replicated Governor, native membership transport, WorldFS, physical
+  multinode HGraph execution, real Linux KernelWorld boot, physical-device
+  assignment, DMA/IOMMU isolation, native Debian personality, or accelerator
+  fabric is claimed. The shared Rust identity/effect vocabulary is still a
+  foundation: descriptive names, inventory, snapshots, and serialized
+  identities remain non-authority.
+- The grounding command labels a report with a caller-supplied World identity.
+  It does not read a current World snapshot, enforce freshness, or bind
+  execution. No production lowering emits governed `ResourceKey` effects yet;
+  ordinary hosted operations retain their conservative `HostWorld` dependency.
+- Neither the present repository nor the Alpha target claims coherent
+  cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
+  universal hardware support, or transparent migration of every process.
 
 ## Implemented conservatively
 
