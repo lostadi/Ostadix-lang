@@ -34,6 +34,10 @@ Key facts for agents:
 - [README](README.md): setup, all editions (Rust, C17, Python reference), tooling
 - [Architecture](ARCHITECTURE.md): runtime and compiler internals
 - [O-core](docs/OCORE.md): the statically typed freestanding native language
+- [Ostadix World constitution](docs/OSTADIX_WORLD.md): native Alpha target,
+  G0-G13 dependency ladder, evidence boundaries, and implementation program
+- [Hosted World reference profile](docs/HOSTED_WORLD_REFERENCE_PROFILE.md):
+  non-qualifying simulator/oracle boundary retained for development
 
 ## Examples
 

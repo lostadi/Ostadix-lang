@@ -156,8 +156,12 @@ production lowering emits these governed keys yet, and the optional grounding
 identity is caller-supplied rather than checked against a live snapshot. This
 type/effect foundation does not implement a distributed Governor, membership
 transport, resource registry, `/world` namespace, remote execution, placement,
-or current-epoch enforcement; those boundaries are fixed in
-[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md).
+or current-epoch enforcement. The native product boundary and G0--G13
+dependency ladder are fixed in
+[`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
+[`evidence/world_alpha_gates.toml`](evidence/world_alpha_gates.toml). Hosted
+implementations remain useful only under the non-qualifying
+[`Hosted World Reference Profile`](docs/HOSTED_WORLD_REFERENCE_PROFILE.md).
 
 Ordinary source sequence is lowered as a predecessor completion-token input.
 That dependency is omitted only for direct members of an explicit concurrent
