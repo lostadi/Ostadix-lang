@@ -1,0 +1,8 @@
+module kernel::world_value_semantics;
+
+// Non-Mode-29 builds retain a total fail-closed link surface without carrying
+// the bounded OWVALUE native evidence harness.
+pub unsafe fn start(mode: u64) -> never {
+    if mode != 0 { loop { halt(); } }
+    loop { halt(); }
+}

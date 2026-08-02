@@ -117,7 +117,7 @@ python3 -m unittest -v tests.test_source_release
 ```
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 18 required portable QEMU gates in the
+The aggregate executes all 20 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive
@@ -139,8 +139,16 @@ validation, required release surfaces, and tamper detection.
 - Keep the Rust implementation authoritative for hosted `.O` semantics; keep Python readable and C17 active rather than treating either as abandoned.
 - Keep wire-protocol claims precise: hosted shims use 4-byte length-prefixed canonical CBOR.
 - Keep `OWIDENT` v1 claims precise: it is the bounded cross-language identity
-  oracle only; serialized capability IDs are descriptive non-authority, and
-  general World transport, negotiation, OValue, and receipt wire formats remain
-  PR 3 work.
+  oracle only, and serialized capability IDs are descriptive non-authority.
+- Keep `OWPROTO` v1 claims precise: PR 3 provides deterministic bounded records
+  and an offline negotiation function, not a transport, live handshake,
+  authenticated authority path, OValue/extension envelope, or receipt codec.
+  Mode 29's `OWVALUE` is a separate self-framed format, not a fifth protocol-v1
+  kind.
+- Keep `OWVALUE` v1 claims precise: PR 4 freezes only the bounded portable
+  allowlist and root-only inert extension envelope, with canonical full-record
+  SHA-256. It does not make the full hosted `OValue` portable, change hosted
+  canonical-CBOR shims, create authority or transport, satisfy Workstream A, or
+  implement the PR 5 receipt.
 - Keep HGraph wording precise: graph dispatch is implemented, but worker-pool execution is limited to verified pure inline renderers. Unknown shims are serialized through `HostWorld`, and exact arbitrary-source filesystem/network inference is not implemented.
 - Prefer registry metadata over duplicated backend-name, purity, renderer, or authority tables.

@@ -6,7 +6,7 @@ alpha_gate = "G13"
 gate_count = 14
 
 # This registry defines qualification requirements. It is separate from
-# gates.toml, whose 18 required QEMU-TCG gates and one supplemental KVM gate
+# gates.toml, whose 20 required QEMU-TCG gates and one supplemental KVM gate
 # are executable evidence for narrower, already implemented O-core slices.
 # Schema v1 is definition-only: validators reject `passed` and every nonempty
 # evidence list. The first passage requires a new typed attestation schema

@@ -1,0 +1,762 @@
+module kernel::world_value_semantics;
+
+use runtime::interrupts::ticks;
+use runtime::serial::write;
+use world::protocol::SchemaOffer;
+use world::protocol::SchemaSelection;
+use world::protocol::offer_init;
+use world::protocol::selection_init;
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init as sha_scratch_init;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::VALUE_TEXT_NONE;
+use world::value::VALUE_TEXT_UTF8;
+use world::value::VALUE_FLOAT_BINARY32;
+use world::value::VALUE_FLOAT_BINARY64;
+use world::value::VALUE_CODE_SHA256;
+use world::value::VALUE_TAG_EXTENSION;
+use world::value::arena_init;
+use world::value::arena_clear;
+use world::value::arena_root;
+use world::value::node_tag;
+use world::value::add_null;
+use world::value::add_bool;
+use world::value::add_integer;
+use world::value::add_binary_float;
+use world::value::add_text;
+use world::value::add_char;
+use world::value::add_bytes;
+use world::value::add_list;
+use world::value::add_record;
+use world::value::add_map;
+use world::value::add_tagged;
+use world::value::add_code_ref;
+use world::value::add_object_ref;
+use world::value::add_error;
+use world::value::add_extension;
+use world::value::seal;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::scratch_init as codec_scratch_init;
+use world::value_codec::encode_record;
+use world::value_codec::decode_record;
+use world::value_codec::decode_selected_value;
+use world::value_codec::decode_selected_extension;
+use world::value_codec::hash_record;
+
+const MODE_WORLD_VALUE: u64 = 29;
+const CORPUS_LENGTH: usize = 928;
+const CORPUS_CAPACITY: usize = 1024;
+const BUFFER_CAPACITY: usize = 4096;
+
+static HEX_PREFIX: [u8; 19] = b"WORLD_VALUE_V1_HEX=";
+static SHA_PREFIX: [u8; 22] = b"WORLD_VALUE_V1_SHA256=";
+static CONVERGENCE_MESSAGE: [u8; 50] =
+    b"World value Rust/.oc exact-byte convergence: PASS\n";
+static HASH_MESSAGE: [u8; 48] =
+    b"World value canonical SHA-256 convergence: PASS\n";
+static ROUNDTRIP_MESSAGE: [u8; 54] =
+    b"World value core/extension canonical round-trip: PASS\n";
+static AUTHORITY_MESSAGE: [u8; 46] =
+    b"World value authority/capsule rejection: PASS\n";
+static MALFORMED_MESSAGE: [u8; 46] =
+    b"World value bounded malformed rejection: PASS\n";
+static COMPLETE_MESSAGE: [u8; 34] =
+    b"World value v1 native smoke: PASS\n";
+static POST_TICK_MESSAGE: [u8; 36] =
+    b"World value post-test timer: online\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+static BIG_MAGNITUDE: [u8; 11] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
+static NEGATIVE_FORTY_TWO: [u8; 1] = [0x2a];
+static NEGATIVE_SEVEN: [u8; 1] = [0x07];
+static NEGATIVE_ONE: [u8; 1] = [0x01];
+static POSITIVE_ONE: [u8; 1] = [0x01];
+static POSITIVE_THREE: [u8; 1] = [0x03];
+static POSITIVE_FOUR: [u8; 1] = [0x04];
+static POSITIVE_NINE: [u8; 1] = [0x09];
+static POSITIVE_FORTY_TWO: [u8; 1] = [0x2a];
+static FLOAT32_BITS: [u8; 4] = [0x7f, 0xc0, 0x12, 0x34];
+static FLOAT64_BITS: [u8; 8] = [0x80, 0, 0, 0, 0, 0, 0, 0];
+static TEXT_VALUE: [u8; 13] = [
+    b'O', b's', b't', b'a', b'd', b'i', b'x', b' ', 0, b' ', 0xe2, 0x98, 0x83,
+];
+static MEDIA_TYPE: [u8; 24] = b"application/octet-stream";
+static RAW_BYTES: [u8; 4] = [0, 1, 0xff, 0];
+static KEY_ANSWER: [u8; 6] = b"answer";
+static KEY_ZETA: [u8; 4] = b"zeta";
+static TEXT_ONE: [u8; 3] = b"one";
+static TAG_SOME: [u8; 4] = b"some";
+static KEY_VALUE: [u8; 5] = b"value";
+static EVALUATOR_O: [u8; 1] = b"o";
+static ENTRY_MAIN: [u8; 4] = b"main";
+static ERROR_FAILED: [u8; 6] = b"failed";
+static ERROR_MESSAGE: [u8; 15] = b"bounded failure";
+static EXTENSION_NAMESPACE: [u8; 16] = b"org.ostadix.demo";
+static EXTENSION_NAME: [u8; 5] = b"point";
+static KEY_X: [u8; 1] = b"x";
+static KEY_Y: [u8; 1] = b"y";
+static WRONG_NAMESPACE: [u8; 17] = b"org.ostadix.other";
+static CODE_DIGEST: [u8; 32] = [
+    0x36, 0x50, 0xac, 0x4a, 0x24, 0x59, 0xac, 0xf4,
+    0x62, 0x3b, 0xdf, 0x9f, 0x40, 0xe8, 0x77, 0x2a,
+    0xc8, 0xb3, 0x87, 0xfb, 0x5d, 0x1c, 0xd3, 0x4c,
+    0x2e, 0xd5, 0xb0, 0x29, 0x48, 0x56, 0x92, 0x1e,
+];
+static EXTENSION_DIGEST: [u8; 32] = [
+    0x9c, 0xa4, 0xb6, 0xb7, 0x14, 0x51, 0x43, 0x7b,
+    0x90, 0x75, 0x04, 0x3b, 0x09, 0xe4, 0xa6, 0xe6,
+    0x58, 0x7e, 0x04, 0xdd, 0xe3, 0xa9, 0x10, 0x7f,
+    0x38, 0x3f, 0xec, 0xba, 0x7b, 0xf5, 0x3d, 0x94,
+];
+static OBJECT_IDENTITY: [u8; 43] = [
+    b'O', b'W', b'I', b'D', b'E', b'N', b'T', 0,
+    0, 1, 0, 7, 0, 0, 0, 43,
+    0, 7, b'w', b'o', b'r', b'l', b'd', b'-', b'a',
+    0, 8, b'o', b'b', b'j', b'e', b'c', b't', b'-', b'a',
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+static EXPECTED_CORPUS_HASH: [u8; 32] = [
+    0x26, 0x4e, 0x00, 0x55, 0x0b, 0xbb, 0xe7, 0x56,
+    0x14, 0x12, 0xd9, 0xa4, 0x3f, 0x89, 0x03, 0x66,
+    0x67, 0xff, 0xbc, 0xf2, 0x7a, 0xdd, 0x52, 0x21,
+    0x31, 0xf8, 0xe6, 0x50, 0xab, 0xef, 0x19, 0xbc,
+];
+
+static mut ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut ARENA_BYTES: [u8; 4096] = [0; 4096];
+static mut ARENA_NODES: [u64; 1536] = [0; 1536];
+static mut ARENA_EDGES: [u64; 128] = [0; 128];
+static mut DECODED_STORAGE: [u64; 16] = [0; 16];
+static mut DECODED_BYTES: [u8; 4096] = [0; 4096];
+static mut DECODED_NODES: [u64; 1536] = [0; 1536];
+static mut DECODED_EDGES: [u64; 128] = [0; 128];
+static mut TEMP_STORAGE: [u64; 16] = [0; 16];
+static mut TEMP_BYTES: [u8; 4096] = [0; 4096];
+static mut TEMP_NODES: [u64; 1536] = [0; 1536];
+static mut TEMP_EDGES: [u64; 512] = [0; 512];
+static mut SECOND_TEMP_STORAGE: [u64; 16] = [0; 16];
+static mut SECOND_TEMP_BYTES: [u8; 4096] = [0; 4096];
+static mut SECOND_TEMP_NODES: [u64; 1536] = [0; 1536];
+static mut SECOND_TEMP_EDGES: [u64; 128] = [0; 128];
+static mut SECOND_OUTPUT_STORAGE: [u64; 16] = [0; 16];
+static mut SECOND_OUTPUT_BYTES: [u8; 4096] = [0; 4096];
+static mut SECOND_OUTPUT_NODES: [u64; 1536] = [0; 1536];
+static mut SECOND_OUTPUT_EDGES: [u64; 128] = [0; 128];
+
+static mut SCRATCH_STORAGE: [u64; 16] = [0; 16];
+static mut STAGED: [u8; 4096] = [0; 4096];
+static mut LENGTHS: [u64; 128] = [0; 128];
+static mut FRAMES: [u64; 256] = [0; 256];
+static mut PENDING: [u64; 512] = [0; 512];
+static mut SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut DIGEST_STAGE: [u8; 32] = [0; 32];
+static mut SECOND_SCRATCH_STORAGE: [u64; 16] = [0; 16];
+static mut SECOND_STAGED: [u8; 4096] = [0; 4096];
+static mut SECOND_LENGTHS: [u64; 128] = [0; 128];
+static mut SECOND_FRAMES: [u64; 256] = [0; 256];
+static mut SECOND_PENDING: [u64; 512] = [0; 512];
+static mut SECOND_SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SECOND_SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut SECOND_DIGEST_STAGE: [u8; 32] = [0; 32];
+
+static mut ENCODED: [u8; 4096] = [0; 4096];
+static mut REENCODED: [u8; 4096] = [0; 4096];
+static mut CORPUS: [u8; 1024] = [0; 1024];
+static mut HASH_CANONICAL: [u8; 32] = [0; 32];
+static mut HASH_DIRECT: [u8; 32] = [0; 32];
+static mut CORPUS_HASH: [u8; 32] = [0; 32];
+static mut CHILDREN: [u64; 64] = [0; 64];
+static mut ENTRIES: [u64; 96] = [0; 96];
+static mut PAIRS: [u64; 64] = [0; 64];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+static mut LOCAL_OFFER_STORAGE: [u64; 3] = [0; 3];
+static mut PEER_OFFER_STORAGE: [u64; 3] = [0; 3];
+static mut SELECTION_STORAGE: [u64; 2] = [0; 2];
+static mut SMALL_SELECTION_STORAGE: [u64; 2] = [0; 2];
+
+unsafe fn arena() -> *mut ValueArena {
+    return ((&mut ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn decoded() -> *mut ValueArena {
+    return ((&mut DECODED_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn temp() -> *mut ValueArena {
+    return ((&mut TEMP_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn second_temp() -> *mut ValueArena {
+    return ((&mut SECOND_TEMP_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn second_output() -> *mut ValueArena {
+    return ((&mut SECOND_OUTPUT_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn scratch() -> *mut ValueCodecScratch {
+    return ((&mut SCRATCH_STORAGE[0]) as *mut u64) as *mut ValueCodecScratch;
+}
+unsafe fn second_scratch() -> *mut ValueCodecScratch {
+    return ((&mut SECOND_SCRATCH_STORAGE[0]) as *mut u64) as *mut ValueCodecScratch;
+}
+unsafe fn sha_scratch() -> *mut Sha256Scratch {
+    return ((&mut SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch;
+}
+unsafe fn second_sha_scratch() -> *mut Sha256Scratch {
+    return ((&mut SECOND_SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch;
+}
+unsafe fn local_offer() -> *mut SchemaOffer {
+    return ((&mut LOCAL_OFFER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+unsafe fn peer_offer() -> *mut SchemaOffer {
+    return ((&mut PEER_OFFER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+unsafe fn selection() -> *mut SchemaSelection {
+    return ((&mut SELECTION_STORAGE[0]) as *mut u64) as *mut SchemaSelection;
+}
+unsafe fn small_selection() -> *mut SchemaSelection {
+    return ((&mut SMALL_SELECTION_STORAGE[0]) as *mut u64) as *mut SchemaSelection;
+}
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn initialize_storage() -> bool {
+    if arena_init(arena(), (&mut ARENA_BYTES[0]), 4096,
+        (&mut ARENA_NODES[0]), 1536, (&mut ARENA_EDGES[0]), 128) != 1
+        || arena_init(decoded(), (&mut DECODED_BYTES[0]), 4096,
+            (&mut DECODED_NODES[0]), 1536, (&mut DECODED_EDGES[0]), 128) != 1
+        || arena_init(temp(), (&mut TEMP_BYTES[0]), 4096,
+            (&mut TEMP_NODES[0]), 1536, (&mut TEMP_EDGES[0]), 512) != 1
+        || arena_init(second_temp(), (&mut SECOND_TEMP_BYTES[0]), 4096,
+            (&mut SECOND_TEMP_NODES[0]), 1536,
+            (&mut SECOND_TEMP_EDGES[0]), 128) != 1
+        || arena_init(second_output(), (&mut SECOND_OUTPUT_BYTES[0]), 4096,
+            (&mut SECOND_OUTPUT_NODES[0]), 1536,
+            (&mut SECOND_OUTPUT_EDGES[0]), 128) != 1
+        || sha_scratch_init(sha_scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1
+        || sha_scratch_init(second_sha_scratch(),
+            (&mut SECOND_SHA_SCHEDULE[0]), 64) != 1 {
+        return false;
+    }
+    if codec_scratch_init(scratch(), (&mut STAGED[0]), 4096,
+        (&mut LENGTHS[0]), 128, (&mut FRAMES[0]), 256,
+        (&mut PENDING[0]), 512, temp(), sha_scratch(),
+        (&mut DIGEST_STAGE[0]), 32) != 1
+        || codec_scratch_init(second_scratch(), (&mut SECOND_STAGED[0]), 4096,
+            (&mut SECOND_LENGTHS[0]), 128, (&mut SECOND_FRAMES[0]), 256,
+            (&mut SECOND_PENDING[0]), 512, second_temp(), second_sha_scratch(),
+            (&mut SECOND_DIGEST_STAGE[0]), 32) != 1 {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn bytes_equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn set_entry(index: usize, key: *const u8, length: usize, child: u64) -> void {
+    ENTRIES[index * 3] = key as usize as u64;
+    ENTRIES[index * 3 + 1] = length as u64;
+    ENTRIES[index * 3 + 2] = child;
+}
+
+unsafe fn append_current(root: u64, corpus_length: *mut usize) -> bool {
+    let mut encoded_length: usize = 0;
+    let mut reencoded_length: usize = 0;
+    if seal(arena(), root) != 1 { return false; }
+    if encode_record(arena() as *const ValueArena, (&mut ENCODED[0]), 4096,
+        (&mut encoded_length), scratch()) != 1
+        || encoded_length < 24 || encoded_length > 4096 { return false; }
+    if hash_record(arena() as *const ValueArena,
+        (&mut HASH_CANONICAL[0]), scratch()) != 1 { return false; }
+    if sha256_compute((&ENCODED[0]), encoded_length,
+        (&mut HASH_DIRECT[0]), sha_scratch()) != 1 { return false; }
+    if !bytes_equal((&HASH_CANONICAL[0]), (&HASH_DIRECT[0]), 32) { return false; }
+    if decode_record((&ENCODED[0]), encoded_length, 4096,
+        decoded(), scratch()) != 1 { return false; }
+    if encode_record(decoded() as *const ValueArena, (&mut REENCODED[0]), 4096,
+        (&mut reencoded_length), scratch()) != 1
+        || reencoded_length != encoded_length
+        || !bytes_equal((&ENCODED[0]), (&REENCODED[0]), encoded_length)
+        || *corpus_length > CORPUS_CAPACITY
+        || encoded_length > CORPUS_CAPACITY - *corpus_length { return false; }
+    let mut index: usize = 0;
+    while index < encoded_length {
+        CORPUS[*corpus_length + index] = ENCODED[index];
+        index += 1;
+    }
+    *corpus_length += encoded_length;
+    return true;
+}
+
+unsafe fn reset_arena() -> bool { return arena_clear(arena()) == 1; }
+
+unsafe fn append_scalar_records(length: *mut usize) -> bool {
+    let mut root: u64 = 0;
+    if !reset_arena() || add_null(arena(), (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_bool(arena(), 0, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_bool(arena(), 1, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_integer(arena(), 0, 0 as *const u8, 0,
+        (&mut root)) != 1 || !append_current(root, length) { return false; }
+    if !reset_arena() || add_integer(arena(), 0, (&BIG_MAGNITUDE[0]), 11,
+        (&mut root)) != 1 || !append_current(root, length) { return false; }
+    if !reset_arena() || add_integer(arena(), 1, (&NEGATIVE_FORTY_TWO[0]), 1,
+        (&mut root)) != 1 || !append_current(root, length) { return false; }
+    if !reset_arena() || add_binary_float(arena(), VALUE_FLOAT_BINARY32,
+        (&FLOAT32_BITS[0]), (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_binary_float(arena(), VALUE_FLOAT_BINARY64,
+        (&FLOAT64_BITS[0]), (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_text(arena(), VALUE_TEXT_UTF8,
+        (&TEXT_VALUE[0]), 13, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_char(arena(), 0x03bb, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    if !reset_arena() || add_bytes(arena(), (&MEDIA_TYPE[0]), 24,
+        (&RAW_BYTES[0]), 4, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+    return true;
+}
+
+unsafe fn append_list_record(length: *mut usize) -> bool {
+    if !reset_arena() { return false; }
+    let mut null_value: u64 = 0;
+    let mut true_value: u64 = 0;
+    let mut negative: u64 = 0;
+    let mut root: u64 = 0;
+    if add_null(arena(), (&mut null_value)) != 1
+        || add_bool(arena(), 1, (&mut true_value)) != 1
+        || add_integer(arena(), 1, (&NEGATIVE_SEVEN[0]), 1,
+            (&mut negative)) != 1 {
+        return false;
+    }
+    CHILDREN[0] = null_value;
+    CHILDREN[1] = true_value;
+    CHILDREN[2] = negative;
+    return add_list(arena(), (&CHILDREN[0]), 3, (&mut root)) == 1
+        && append_current(root, length);
+}
+
+unsafe fn append_record_record(length: *mut usize) -> bool {
+    if !reset_arena() { return false; }
+    let mut answer: u64 = 0;
+    let mut zeta: u64 = 0;
+    let mut root: u64 = 0;
+    if add_integer(arena(), 0, (&POSITIVE_FORTY_TWO[0]), 1,
+        (&mut answer)) != 1 || add_bool(arena(), 0, (&mut zeta)) != 1 {
+        return false;
+    }
+    set_entry(0, (&KEY_ANSWER[0]), 6, answer);
+    set_entry(1, (&KEY_ZETA[0]), 4, zeta);
+    return add_record(arena(), (&ENTRIES[0]), 2, (&mut root)) == 1
+        && append_current(root, length);
+}
+
+unsafe fn append_map_record(length: *mut usize) -> bool {
+    if !reset_arena() { return false; }
+    let mut bool_key: u64 = 0;
+    let mut null_value: u64 = 0;
+    let mut integer_key: u64 = 0;
+    let mut true_value: u64 = 0;
+    let mut text_key: u64 = 0;
+    let mut one_value: u64 = 0;
+    let mut root: u64 = 0;
+    if add_bool(arena(), 0, (&mut bool_key)) != 1
+        || add_null(arena(), (&mut null_value)) != 1
+        || add_integer(arena(), 1, (&NEGATIVE_ONE[0]), 1,
+            (&mut integer_key)) != 1
+        || add_bool(arena(), 1, (&mut true_value)) != 1
+        || add_text(arena(), VALUE_TEXT_NONE, (&TEXT_ONE[0]), 3,
+            (&mut text_key)) != 1
+        || add_integer(arena(), 0, (&POSITIVE_ONE[0]), 1,
+            (&mut one_value)) != 1 {
+        return false;
+    }
+    PAIRS[0] = bool_key; PAIRS[1] = null_value;
+    PAIRS[2] = integer_key; PAIRS[3] = true_value;
+    PAIRS[4] = text_key; PAIRS[5] = one_value;
+    return add_map(arena(), (&PAIRS[0]), 3, (&mut root)) == 1
+        && append_current(root, length);
+}
+
+unsafe fn append_tagged_record(length: *mut usize) -> bool {
+    if !reset_arena() { return false; }
+    let mut value: u64 = 0;
+    let mut record: u64 = 0;
+    let mut root: u64 = 0;
+    if add_integer(arena(), 0, (&POSITIVE_NINE[0]), 1, (&mut value)) != 1 {
+        return false;
+    }
+    set_entry(0, (&KEY_VALUE[0]), 5, value);
+    return add_record(arena(), (&ENTRIES[0]), 1, (&mut record)) == 1
+        && add_tagged(arena(), (&TAG_SOME[0]), 4, record, (&mut root)) == 1
+        && append_current(root, length);
+}
+
+unsafe fn append_remaining_records(length: *mut usize) -> bool {
+    let mut root: u64 = 0;
+    if !reset_arena() || add_code_ref(arena(), VALUE_CODE_SHA256,
+        (&CODE_DIGEST[0]), (&EVALUATOR_O[0]), 1, (&ENTRY_MAIN[0]), 4,
+        (&mut root)) != 1 || !append_current(root, length) { return false; }
+    if !reset_arena() || add_object_ref(arena(), (&OBJECT_IDENTITY[0]), 43,
+        (&mut root)) != 1 || !append_current(root, length) { return false; }
+    if !reset_arena() || add_error(arena(), (&ERROR_FAILED[0]), 6,
+        (&ERROR_MESSAGE[0]), 15, (&mut root)) != 1
+        || !append_current(root, length) { return false; }
+
+    if !reset_arena() { return false; }
+    let mut x: u64 = 0;
+    let mut y: u64 = 0;
+    let mut record: u64 = 0;
+    if add_integer(arena(), 0, (&POSITIVE_THREE[0]), 1, (&mut x)) != 1
+        || add_integer(arena(), 0, (&POSITIVE_FOUR[0]), 1, (&mut y)) != 1 {
+        return false;
+    }
+    set_entry(0, (&KEY_X[0]), 1, x);
+    set_entry(1, (&KEY_Y[0]), 1, y);
+    return add_record(arena(), (&ENTRIES[0]), 2, (&mut record)) == 1
+        && add_extension(arena(), (&EXTENSION_NAMESPACE[0]), 16,
+            (&EXTENSION_NAME[0]), 5, 2, (&EXTENSION_DIGEST[0]), record,
+            (&mut root)) == 1
+        && append_current(root, length);
+}
+
+unsafe fn canonical_corpus() -> usize {
+    let mut length: usize = 0;
+    if !append_scalar_records((&mut length))
+        || !append_list_record((&mut length))
+        || !append_record_record((&mut length))
+        || !append_map_record((&mut length))
+        || !append_tagged_record((&mut length))
+        || !append_remaining_records((&mut length)) {
+        return 0;
+    }
+    return length;
+}
+
+unsafe fn read_u32(source: *const u8) -> usize {
+    return ((volatile_load(source) as usize) << 24)
+        | ((volatile_load(source + 1) as usize) << 16)
+        | ((volatile_load(source + 2) as usize) << 8)
+        | volatile_load(source + 3) as usize;
+}
+
+unsafe fn copy_corpus(offset: usize, length: usize) -> bool {
+    if offset > CORPUS_LENGTH || length > CORPUS_LENGTH - offset
+        || length > BUFFER_CAPACITY {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        REENCODED[index] = CORPUS[offset + index];
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn rejection_preserves_output(
+    source: *const u8,
+    length: usize,
+    caller_maximum: usize
+) -> bool {
+    let before: u64 = arena_root(decoded() as *const ValueArena);
+    if before == 0 || node_tag(decoded() as *const ValueArena, before)
+        != VALUE_TAG_EXTENSION {
+        return false;
+    }
+    return decode_record(source, length, caller_maximum, decoded(), scratch()) == 0
+        && arena_root(decoded() as *const ValueArena) == before
+        && node_tag(decoded() as *const ValueArena, before) == VALUE_TAG_EXTENSION;
+}
+
+unsafe fn constructor_order_and_bounds_hold() -> bool {
+    if arena_clear(arena()) != 1 { return false; }
+    let mut first: u64 = 0;
+    let mut second: u64 = 0;
+    let mut rejected: u64 = 0xdead;
+    if add_null(arena(), (&mut first)) != 1
+        || add_bool(arena(), 1, (&mut second)) != 1 {
+        return false;
+    }
+    set_entry(0, (&KEY_ZETA[0]), 4, first);
+    set_entry(1, (&KEY_ANSWER[0]), 6, second);
+    if add_record(arena(), (&ENTRIES[0]), 2, (&mut rejected)) != 0
+        || rejected != 0xdead {
+        return false;
+    }
+    set_entry(0, (&KEY_ANSWER[0]), 6, first);
+    set_entry(1, (&KEY_ANSWER[0]), 6, second);
+    if add_record(arena(), (&ENTRIES[0]), 2, (&mut rejected)) != 0
+        || rejected != 0xdead {
+        return false;
+    }
+    PAIRS[0] = second; PAIRS[1] = first;
+    PAIRS[2] = first; PAIRS[3] = second;
+    if add_map(arena(), (&PAIRS[0]), 2, (&mut rejected)) != 0
+        || rejected != 0xdead {
+        return false;
+    }
+    PAIRS[0] = first; PAIRS[1] = second;
+    PAIRS[2] = first; PAIRS[3] = first;
+    if add_map(arena(), (&PAIRS[0]), 2, (&mut rejected)) != 0
+        || rejected != 0xdead {
+        return false;
+    }
+    PAIRS[0] = 0; PAIRS[1] = first;
+    rejected = 0xd00d;
+    if add_map(arena(), (&PAIRS[0]), 1, (&mut rejected)) != 0
+        || rejected != 0xd00d {
+        return false;
+    }
+
+    if arena_clear(arena()) != 1 || add_null(arena(), (&mut first)) != 1 {
+        return false;
+    }
+    let mut depth: usize = 1;
+    while depth < 16 {
+        if add_tagged(arena(), (&TAG_SOME[0]), 4, first, (&mut second)) != 1 {
+            return false;
+        }
+        first = second;
+        depth += 1;
+    }
+    rejected = 0xbeef;
+    if add_tagged(arena(), (&TAG_SOME[0]), 4, first, (&mut rejected)) != 0
+        || rejected != 0xbeef {
+        return false;
+    }
+
+    // The wire node bound counts emitted occurrences, not just unique arena
+    // handles.  A shared 64-item list emitted twice would contain 131 nodes.
+    if arena_clear(arena()) != 1 || add_null(arena(), (&mut first)) != 1 {
+        return false;
+    }
+    let mut shared_index: usize = 0;
+    while shared_index < 64 {
+        CHILDREN[shared_index] = first;
+        shared_index += 1;
+    }
+    if add_list(arena(), (&CHILDREN[0]), 64, (&mut second)) != 1 { return false; }
+    CHILDREN[0] = second;
+    CHILDREN[1] = second;
+    let mut shared_root: u64 = 0;
+    if add_list(arena(), (&CHILDREN[0]), 2, (&mut shared_root)) != 1
+        || seal(arena(), shared_root) != 1 {
+        return false;
+    }
+    let mut shared_written: usize = 0xdead;
+    if encode_record(arena() as *const ValueArena, (&mut REENCODED[0]), 4096,
+        (&mut shared_written), scratch()) != 0 || shared_written != 0xdead {
+        return false;
+    }
+
+    if arena_clear(temp()) != 1 { return false; }
+    let mut count: usize = 0;
+    while count < 128 {
+        if add_null(temp(), (&mut first)) != 1 { return false; }
+        count += 1;
+    }
+    rejected = 0xcafe;
+    return add_null(temp(), (&mut rejected)) == 0 && rejected == 0xcafe;
+}
+
+unsafe fn malformed_rejected() -> bool {
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[0] = b'X';
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[9] = 2;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[10] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[15] = 25;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[18] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(24, 25) { return false; }
+    REENCODED[24] = 2;
+    if !rejection_preserves_output((&REENCODED[0]), 25, 4096) { return false; }
+    if !copy_corpus(74, 25) { return false; }
+    REENCODED[24] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 25, 4096) { return false; }
+    if !copy_corpus(99, 36) { return false; }
+    REENCODED[25] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), 36, 4096) { return false; }
+    if !copy_corpus(161, 32) { return false; }
+    REENCODED[26] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 32, 4096) { return false; }
+    if !copy_corpus(229, 41) { return false; }
+    REENCODED[28] = 0xff;
+    if !rejection_preserves_output((&REENCODED[0]), 41, 4096) { return false; }
+    if !copy_corpus(270, 28) { return false; }
+    REENCODED[26] = 0xd8;
+    REENCODED[27] = 0x00;
+    if !rejection_preserves_output((&REENCODED[0]), 28, 4096) { return false; }
+    if !copy_corpus(298, 56) { return false; }
+    REENCODED[29] = b' ';
+    if !rejection_preserves_output((&REENCODED[0]), 56, 4096) { return false; }
+    if !copy_corpus(409, 61) { return false; }
+    REENCODED[30] = b'z';
+    if !rejection_preserves_output((&REENCODED[0]), 61, 4096) { return false; }
+    if !copy_corpus(470, 89) { return false; }
+    REENCODED[24] = 0;
+    REENCODED[25] = 2;
+    if !rejection_preserves_output((&REENCODED[0]), 89, 4096) { return false; }
+    if !copy_corpus(805, 123) { return false; }
+    REENCODED[28] = 0;
+    REENCODED[29] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), 123, 4096) { return false; }
+    return rejection_preserves_output((&CORPUS[0]), 23, 4096)
+        && rejection_preserves_output((&CORPUS[0]), 24, 23)
+        && rejection_preserves_output((&CORPUS[0]), 4097, 4096)
+        && constructor_order_and_bounds_hold();
+}
+
+unsafe fn authority_tags_rejected() -> bool {
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[16] = 0;
+    REENCODED[17] = 0x44;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[16] = 1;
+    REENCODED[17] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), 24, 4096) { return false; }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[16] = 0x7f;
+    REENCODED[17] = 1;
+    return rejection_preserves_output((&REENCODED[0]), 24, 4096);
+}
+
+unsafe fn two_scratch_instances_hold() -> bool {
+    let mut length: usize = 0;
+    if encode_record(arena() as *const ValueArena, (&mut REENCODED[0]), 4096,
+        (&mut length), second_scratch()) != 1 || length != 123
+        || !bytes_equal((&REENCODED[0]), (&CORPUS[805]), 123)
+        || decode_record((&REENCODED[0]), length, 4096,
+            second_output(), second_scratch()) != 1 {
+        return false;
+    }
+    length = 0;
+    return encode_record(second_output() as *const ValueArena,
+        (&mut REENCODED[0]), 4096, (&mut length), second_scratch()) == 1
+        && length == 123 && bytes_equal((&REENCODED[0]), (&CORPUS[805]), 123);
+}
+
+unsafe fn contextual_admission_holds() -> bool {
+    if offer_init(local_offer(), 1, 1, 4096) != 1
+        || offer_init(peer_offer(), 1, 1, 4096) != 1
+        || selection_init(selection(), 1, 4096) != 1
+        || selection_init(small_selection(), 1, 24) != 1
+        || decode_selected_value((&CORPUS[229]), 41,
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            second_output(), scratch()) != 1
+        || decode_selected_value((&CORPUS[229]), 41,
+            small_selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            second_output(), scratch()) != 0 {
+        return false;
+    }
+    // Exercise the core-as-extension rejection before installing the
+    // extension baseline in `decoded`, so later output-preservation checks
+    // retain that baseline.
+    if decode_selected_extension((&CORPUS[229]), 41,
+        selection() as *const SchemaSelection,
+        local_offer() as *const SchemaOffer,
+        peer_offer() as *const SchemaOffer,
+        (&EXTENSION_NAMESPACE[0]), 16, (&EXTENSION_NAME[0]), 5, 2,
+        (&EXTENSION_DIGEST[0]), decoded(), second_output(), scratch()) != 0 {
+        return false;
+    }
+    if decode_selected_extension((&CORPUS[805]), 123,
+        selection() as *const SchemaSelection,
+        local_offer() as *const SchemaOffer,
+        peer_offer() as *const SchemaOffer,
+        (&EXTENSION_NAMESPACE[0]), 16, (&EXTENSION_NAME[0]), 5, 2,
+        (&EXTENSION_DIGEST[0]), decoded(), second_output(), scratch()) != 1 {
+        return false;
+    }
+    let before: u64 = arena_root(second_output() as *const ValueArena);
+    if before == 0 || node_tag(second_output() as *const ValueArena, before)
+        != VALUE_TAG_EXTENSION {
+        return false;
+    }
+    return decode_selected_extension((&CORPUS[805]), 123,
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            (&WRONG_NAMESPACE[0]), 17, (&EXTENSION_NAME[0]), 5, 2,
+            (&EXTENSION_DIGEST[0]), decoded(), second_output(), scratch()) == 0
+        && arena_root(second_output() as *const ValueArena) == before
+        && decode_selected_extension((&CORPUS[805]), 123,
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            (&EXTENSION_NAMESPACE[0]), 16, (&EXTENSION_NAME[0]), 5, 2,
+            (&EXTENSION_DIGEST[0]), decoded(), temp(), scratch()) == 0;
+}
+
+fn hex_digit(value: u64) -> u8 {
+    if value < 10 { return (b'0' as u64 + value) as u8; }
+    return (b'a' as u64 + value - 10) as u8;
+}
+
+unsafe fn emit_hex(prefix: *const u8, prefix_length: usize,
+    source: *const u8, length: usize) -> void {
+    write(prefix, prefix_length);
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = volatile_load(source + index) as u64;
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_WORLD_VALUE || !initialize_storage() { fail_closed(); }
+    disable_interrupts();
+    let corpus_length: usize = canonical_corpus();
+    if corpus_length != CORPUS_LENGTH { fail_closed(); }
+    if sha256_compute((&CORPUS[0]), corpus_length,
+        (&mut CORPUS_HASH[0]), sha_scratch()) != 1 { fail_closed(); }
+    if !bytes_equal((&CORPUS_HASH[0]), (&EXPECTED_CORPUS_HASH[0]), 32) { fail_closed(); }
+    if !two_scratch_instances_hold() { fail_closed(); }
+    if !contextual_admission_holds() { fail_closed(); }
+    if !authority_tags_rejected() { fail_closed(); }
+    if !malformed_rejected() { fail_closed(); }
+    emit_hex((&HEX_PREFIX[0]), 19, (&CORPUS[0]), corpus_length);
+    emit_hex((&SHA_PREFIX[0]), 22, (&CORPUS_HASH[0]), 32);
+    write((&CONVERGENCE_MESSAGE[0]), 50);
+    write((&HASH_MESSAGE[0]), 48);
+    write((&ROUNDTRIP_MESSAGE[0]), 54);
+    write((&AUTHORITY_MESSAGE[0]), 46);
+    write((&MALFORMED_MESSAGE[0]), 46);
+    write((&COMPLETE_MESSAGE[0]), 34);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK_MESSAGE[0]), 36);
+    loop { halt(); }
+}
