@@ -1,0 +1,488 @@
+module kernel::world_identity_semantics;
+
+use runtime::interrupts::ticks;
+use runtime::serial::write;
+use world::identity::IdentityRecord;
+use world::identity::WorldEpoch;
+use world::identity::GovernorTerm;
+use world::identity::GovernorLogIndex;
+use world::identity::NodeGeneration;
+use world::identity::DomainGeneration;
+use world::identity::ProcessGeneration;
+use world::identity::ResourceGeneration;
+use world::identity::ObjectVersion;
+use world::identity::AttemptGeneration;
+use world::identity::IDENTITY_KIND_WORLD;
+use world::identity::IDENTITY_KIND_GOVERNOR;
+use world::identity::IDENTITY_KIND_NODE;
+use world::identity::IDENTITY_KIND_DOMAIN;
+use world::identity::IDENTITY_KIND_PROCESS;
+use world::identity::IDENTITY_KIND_RESOURCE;
+use world::identity::IDENTITY_KIND_OBJECT;
+use world::identity::IDENTITY_KIND_CAPABILITY;
+use world::identity::IDENTITY_KIND_LEASE;
+use world::identity::IDENTITY_KIND_TASK;
+use world::identity::IDENTITY_KIND_ATTEMPT;
+use world::identity::IDENTITY_KIND_CHECKPOINT;
+use world::identity::IDENTITY_KIND_RECEIPT;
+use world::identity::RESOURCE_OWNER_WORLD;
+use world::identity::RESOURCE_OWNER_NODE;
+use world::identity::RESOURCE_OWNER_DOMAIN;
+use world::identity::RESOURCE_OWNER_PROCESS;
+use world::identity::IDENTITY_FIELD_WORLD;
+use world::identity::IDENTITY_FIELD_NODE;
+use world::identity::IDENTITY_FIELD_DOMAIN;
+use world::identity::IDENTITY_FIELD_PROCESS;
+use world::identity::IDENTITY_FIELD_RESOURCE;
+use world::identity::IDENTITY_FIELD_OBJECT;
+use world::identity::IDENTITY_FIELD_CAPABILITY;
+use world::identity::IDENTITY_FIELD_LEASE;
+use world::identity::IDENTITY_FIELD_TASK;
+use world::identity::IDENTITY_FIELD_CHECKPOINT;
+use world::identity::IDENTITY_FIELD_RECEIPT;
+use world::identity::IDENTITY_COUNTER_EPOCH;
+use world::identity::IDENTITY_COUNTER_TERM;
+use world::identity::IDENTITY_COUNTER_LOG_INDEX;
+use world::identity::IDENTITY_COUNTER_NODE_GENERATION;
+use world::identity::IDENTITY_COUNTER_DOMAIN_GENERATION;
+use world::identity::IDENTITY_COUNTER_PROCESS_GENERATION;
+use world::identity::IDENTITY_COUNTER_RESOURCE_GENERATION;
+use world::identity::IDENTITY_COUNTER_OBJECT_VERSION;
+use world::identity::IDENTITY_COUNTER_ATTEMPT_GENERATION;
+use world::identity::record_begin;
+use world::identity::record_set_text;
+use world::identity::record_set_counter;
+use world::identity::record_kind;
+use world::identity::record_is_current;
+use world::identity::encode_record;
+use world::identity::decode_record;
+use world::identity::generation_is_current;
+use world::identity::world_epoch_init;
+use world::identity::governor_term_init;
+use world::identity::governor_log_index_init;
+use world::identity::node_generation_init;
+use world::identity::domain_generation_init;
+use world::identity::process_generation_init;
+use world::identity::resource_generation_init;
+use world::identity::object_version_init;
+use world::identity::attempt_generation_init;
+
+const MODE_WORLD_IDENTITY: u64 = 27;
+const BUFFER_LENGTH: usize = 1024;
+const CORPUS_CAPACITY: usize = 2048;
+const WIDE_GENERATION: u64 = 0x0102_0304_0506_0708;
+
+static WORLD: [u8; 7] = b"world-a";
+static NODE: [u8; 6] = b"node-a";
+static NODE_OTHER: [u8; 6] = b"node-b";
+static DOMAIN: [u8; 8] = b"domain-a";
+static PROCESS: [u8; 9] = b"process-a";
+static OBJECT: [u8; 8] = b"object-a";
+static CAPABILITY: [u8; 5] = b"cap-a";
+static LEASE: [u8; 7] = b"lease-a";
+static TASK: [u8; 6] = b"task-a";
+static CHECKPOINT: [u8; 12] = b"checkpoint-a";
+static RECEIPT: [u8; 9] = b"receipt-a";
+static RESOURCE_WORLD: [u8; 11] = b"world/state";
+static RESOURCE_NODE: [u8; 10] = b"cpu/slot-0";
+static RESOURCE_DOMAIN: [u8; 15] = b"service/console";
+static RESOURCE_PROCESS: [u8; 9] = b"fd/stdout";
+static INVALID_SIMPLE: [u8; 2] = b"..";
+static INVALID_RESOURCE: [u8; 8] = b"bad//res";
+
+static HEX_PREFIX: [u8; 22] = b"WORLD_IDENTITY_V1_HEX=";
+static CONVERGENCE_MESSAGE: [u8; 53] =
+    b"World identity Rust/.oc exact-byte convergence: PASS\n";
+static REJECTION_MESSAGE: [u8; 55] =
+    b"World identity malformed/nonzero/stale rejection: PASS\n";
+static COMPLETE_MESSAGE: [u8; 37] =
+    b"World identity v1 native smoke: PASS\n";
+static POST_TICK_MESSAGE: [u8; 39] =
+    b"World identity post-test timer: online\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+// One aligned record carrier is reused only by this single-threaded boot
+// oracle. The portable codec itself keeps no mutable global state.
+static mut RECORD_STORAGE: [u64; 512] = [0; 512];
+static mut CURRENT_STORAGE: [u64; 512] = [0; 512];
+static mut ENCODED: [u8; 1024] = [0; 1024];
+static mut REENCODED: [u8; 1024] = [0; 1024];
+static mut CORPUS: [u8; 2048] = [0; 2048];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn record() -> *mut IdentityRecord {
+    return ((&mut RECORD_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+
+unsafe fn current_record() -> *mut IdentityRecord {
+    return ((&mut CURRENT_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+
+unsafe fn set_text(field: u64, source: *const u8, length: usize) -> bool {
+    return record_set_text(record(), field, source, length) == 1;
+}
+
+unsafe fn set_counter(field: u64, value: u64) -> bool {
+    return record_set_counter(record(), field, value) == 1;
+}
+
+unsafe fn begin(kind: u64, owner: u64) -> bool {
+    return record_begin(record(), kind, owner) == 1;
+}
+
+unsafe fn set_world() -> bool {
+    return set_text(IDENTITY_FIELD_WORLD, (&WORLD[0]), 7);
+}
+
+unsafe fn set_node(generation: u64) -> bool {
+    return set_world()
+        && set_text(IDENTITY_FIELD_NODE, (&NODE[0]), 6)
+        && set_counter(IDENTITY_COUNTER_NODE_GENERATION, generation);
+}
+
+unsafe fn set_domain(node_generation: u64, domain_generation: u64) -> bool {
+    return set_node(node_generation)
+        && set_text(IDENTITY_FIELD_DOMAIN, (&DOMAIN[0]), 8)
+        && set_counter(IDENTITY_COUNTER_DOMAIN_GENERATION, domain_generation);
+}
+
+unsafe fn set_process(
+    node_generation: u64,
+    domain_generation: u64,
+    process_generation: u64
+) -> bool {
+    return set_domain(node_generation, domain_generation)
+        && set_text(IDENTITY_FIELD_PROCESS, (&PROCESS[0]), 9)
+        && set_counter(IDENTITY_COUNTER_PROCESS_GENERATION, process_generation);
+}
+
+unsafe fn bytes_equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn append_roundtrip(corpus_length: *mut usize) -> bool {
+    let mut encoded_length: usize = 0;
+    let mut reencoded_length: usize = 0;
+    if encode_record(
+        record() as *const IdentityRecord,
+        (&mut ENCODED[0]),
+        BUFFER_LENGTH,
+        (&mut encoded_length)
+    ) != 1 || encoded_length == 0 || encoded_length > BUFFER_LENGTH {
+        return false;
+    }
+    if *corpus_length > CORPUS_CAPACITY
+        || encoded_length > CORPUS_CAPACITY - *corpus_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < encoded_length {
+        CORPUS[*corpus_length + index] = ENCODED[index];
+        index += 1;
+    }
+    if decode_record((&ENCODED[0]), encoded_length, record()) != 1
+        || encode_record(
+            record() as *const IdentityRecord,
+            (&mut REENCODED[0]),
+            BUFFER_LENGTH,
+            (&mut reencoded_length)
+        ) != 1
+        || reencoded_length != encoded_length
+        || !bytes_equal((&ENCODED[0]), (&REENCODED[0]), encoded_length) {
+        return false;
+    }
+    *corpus_length += encoded_length;
+    return true;
+}
+
+unsafe fn canonical_corpus() -> usize {
+    let mut length: usize = 0;
+    if !begin(IDENTITY_KIND_WORLD, 0) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, 1)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_GOVERNOR, 0) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, WIDE_GENERATION)
+        || !set_counter(IDENTITY_COUNTER_TERM, 2)
+        || !set_counter(IDENTITY_COUNTER_LOG_INDEX, 3)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_NODE, 0) || !set_node(WIDE_GENERATION)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_DOMAIN, 0) || !set_domain(1, 2)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_PROCESS, 0) || !set_process(1, 2, 3)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_WORLD) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, 1)
+        || !set_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_WORLD[0]), 11)
+        || !set_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 11)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_NODE) || !set_node(1)
+        || !set_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_NODE[0]), 10)
+        || !set_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 12)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_DOMAIN) || !set_domain(1, 2)
+        || !set_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_DOMAIN[0]), 15)
+        || !set_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 13)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_PROCESS) || !set_process(1, 2, 3)
+        || !set_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_PROCESS[0]), 9)
+        || !set_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 14)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_OBJECT, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_OBJECT, (&OBJECT[0]), 8)
+        || !set_counter(IDENTITY_COUNTER_OBJECT_VERSION, 0xffff_ffff_ffff_ffff)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_CAPABILITY, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_CAPABILITY, (&CAPABILITY[0]), 5)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_LEASE, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_LEASE, (&LEASE[0]), 7)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_TASK, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_TASK, (&TASK[0]), 6)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_ATTEMPT, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_TASK, (&TASK[0]), 6)
+        || !set_counter(IDENTITY_COUNTER_ATTEMPT_GENERATION, WIDE_GENERATION)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_CHECKPOINT, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_TASK, (&TASK[0]), 6)
+        || !set_counter(IDENTITY_COUNTER_ATTEMPT_GENERATION, 2)
+        || !set_text(IDENTITY_FIELD_CHECKPOINT, (&CHECKPOINT[0]), 12)
+        || !append_roundtrip((&mut length)) { return 0; }
+
+    if !begin(IDENTITY_KIND_RECEIPT, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_RECEIPT, (&RECEIPT[0]), 9)
+        || !append_roundtrip((&mut length)) { return 0; }
+    return length;
+}
+
+unsafe fn zero_and_stale_rejected() -> bool {
+    let mut epoch: WorldEpoch = WorldEpoch { value: 77 };
+    let mut term: GovernorTerm = GovernorTerm { value: 77 };
+    let mut log_index: GovernorLogIndex = GovernorLogIndex { value: 77 };
+    let mut node: NodeGeneration = NodeGeneration { value: 77 };
+    let mut domain: DomainGeneration = DomainGeneration { value: 77 };
+    let mut process: ProcessGeneration = ProcessGeneration { value: 77 };
+    let mut resource: ResourceGeneration = ResourceGeneration { value: 77 };
+    let mut object: ObjectVersion = ObjectVersion { value: 77 };
+    let mut attempt: AttemptGeneration = AttemptGeneration { value: 77 };
+    return world_epoch_init((&mut epoch), 0) == 0
+        && governor_term_init((&mut term), 0) == 0
+        && governor_log_index_init((&mut log_index), 0) == 0
+        && node_generation_init((&mut node), 0) == 0
+        && domain_generation_init((&mut domain), 0) == 0
+        && process_generation_init((&mut process), 0) == 0
+        && resource_generation_init((&mut resource), 0) == 0
+        && object_version_init((&mut object), 0) == 0
+        && attempt_generation_init((&mut attempt), 0) == 0
+        && epoch.value == 77 && term.value == 77 && log_index.value == 77
+        && node.value == 77 && domain.value == 77 && process.value == 77
+        && resource.value == 77 && object.value == 77 && attempt.value == 77
+        && !generation_is_current(2, 1)
+        && !generation_is_current(3, 2)
+        && !generation_is_current(4, 3)
+        && !generation_is_current(0xffff_ffff_ffff_ffff, 1)
+        && generation_is_current(WIDE_GENERATION, WIDE_GENERATION);
+}
+
+unsafe fn copy_encoded(length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        REENCODED[index] = ENCODED[index];
+        index += 1;
+    }
+}
+
+unsafe fn rejection_preserves_output(source: *const u8, length: usize) -> bool {
+    if !begin(IDENTITY_KIND_RECEIPT, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_RECEIPT, (&RECEIPT[0]), 9) { return false; }
+    return decode_record(source, length, record()) == 0
+        && record_kind(record() as *const IdentityRecord) == IDENTITY_KIND_RECEIPT;
+}
+
+unsafe fn malformed_rejected() -> bool {
+    let mut length: usize = 0;
+    if !begin(IDENTITY_KIND_WORLD, 0) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, 1)
+        || encode_record(record() as *const IdentityRecord, (&mut ENCODED[0]), BUFFER_LENGTH, (&mut length)) != 1 {
+        return false;
+    }
+    copy_encoded(length);
+    REENCODED[0] = b'X';
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    REENCODED[9] = 2;
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    REENCODED[11] = 14;
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    REENCODED[16] = 0;
+    REENCODED[17] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    let mut index: usize = length - 8;
+    while index < length { REENCODED[index] = 0; index += 1; }
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    REENCODED[length] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), length + 1) { return false; }
+
+    if !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_WORLD) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, 1)
+        || !set_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_WORLD[0]), 11)
+        || !set_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 11)
+        || encode_record(record() as *const IdentityRecord, (&mut ENCODED[0]), BUFFER_LENGTH, (&mut length)) != 1 {
+        return false;
+    }
+    copy_encoded(length);
+    REENCODED[17] = 5;
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+    copy_encoded(length);
+    REENCODED[35] = 0;
+    REENCODED[36] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), length) { return false; }
+
+    if !begin(IDENTITY_KIND_WORLD, 0)
+        || record_set_text(record(), IDENTITY_FIELD_WORLD, (&INVALID_SIMPLE[0]), 2) != 0
+        || !begin(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_WORLD)
+        || record_set_text(record(), IDENTITY_FIELD_RESOURCE, (&INVALID_RESOURCE[0]), 8) != 0 {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn stale_and_mismatch_rejected() -> bool {
+    let mut length: usize = 0;
+    if !begin(IDENTITY_KIND_NODE, 0) || !set_node(2)
+        || encode_record(
+            record() as *const IdentityRecord,
+            (&mut ENCODED[0]),
+            BUFFER_LENGTH,
+            (&mut length)
+        ) != 1
+        || decode_record((&ENCODED[0]), length, current_record()) != 1 {
+        return false;
+    }
+    // Same logical hierarchy, older generation: stale.
+    if !begin(IDENTITY_KIND_NODE, 0) || !set_node(1)
+        || record_is_current(
+            current_record() as *const IdentityRecord,
+            record() as *const IdentityRecord
+        ) {
+        return false;
+    }
+    // Same generation, different logical node: mismatch, not current.
+    if !begin(IDENTITY_KIND_NODE, 0) || !set_world()
+        || !set_text(IDENTITY_FIELD_NODE, (&NODE_OTHER[0]), 6)
+        || !set_counter(IDENTITY_COUNTER_NODE_GENERATION, 2)
+        || record_is_current(
+            current_record() as *const IdentityRecord,
+            record() as *const IdentityRecord
+        ) {
+        return false;
+    }
+    if !begin(IDENTITY_KIND_NODE, 0) || !set_node(2)
+        || !record_is_current(
+            current_record() as *const IdentityRecord,
+            record() as *const IdentityRecord
+        ) {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn reserved_owner_rejected() -> bool {
+    let mut length: usize = 0;
+    if !begin(IDENTITY_KIND_WORLD, 0) || !set_world()
+        || !set_counter(IDENTITY_COUNTER_EPOCH, 1)
+        || encode_record(
+            record() as *const IdentityRecord,
+            (&mut ENCODED[0]),
+            BUFFER_LENGTH,
+            (&mut length)
+        ) != 1
+        || decode_record((&ENCODED[0]), length, current_record()) != 1 {
+        return false;
+    }
+    // Simulate an in-memory carrier corrupted after construction. Owner tags
+    // are reserved exclusively for Resource records and must fail both wire
+    // publication and current-reference comparison on every other kind.
+    (*record()).owner_tag = RESOURCE_OWNER_WORLD;
+    return encode_record(
+        record() as *const IdentityRecord,
+        (&mut REENCODED[0]),
+        BUFFER_LENGTH,
+        (&mut length)
+    ) == 0
+        && !record_is_current(
+            current_record() as *const IdentityRecord,
+            record() as *const IdentityRecord
+        );
+}
+
+fn hex_digit(value: u64) -> u8 {
+    if value < 10 { return (b'0' as u64 + value) as u8; }
+    return (b'a' as u64 + value - 10) as u8;
+}
+
+unsafe fn emit_hex(length: usize) -> void {
+    write((&HEX_PREFIX[0]), 22);
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = CORPUS[index] as u64;
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_WORLD_IDENTITY { fail_closed(); }
+    disable_interrupts();
+    let corpus_length: usize = canonical_corpus();
+    if corpus_length != 838 || !zero_and_stale_rejected()
+        || !malformed_rejected() || !stale_and_mismatch_rejected()
+        || !reserved_owner_rejected() {
+        fail_closed();
+    }
+    emit_hex(corpus_length);
+    write((&CONVERGENCE_MESSAGE[0]), 53);
+    write((&REJECTION_MESSAGE[0]), 55);
+    write((&COMPLETE_MESSAGE[0]), 37);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK_MESSAGE[0]), 39);
+    loop { halt(); }
+}
