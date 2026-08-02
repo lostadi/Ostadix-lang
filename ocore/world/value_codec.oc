@@ -1,0 +1,1228 @@
+module world::value_codec;
+
+use world::protocol::SchemaOffer;
+use world::protocol::SchemaSelection;
+use world::protocol::selection_matches_offers;
+use world::protocol::selection_schema;
+use world::protocol::selection_max_record_bytes;
+use world::sha256::Sha256Scratch;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::WORLD_VALUE_SCHEMA;
+use world::value::WORLD_VALUE_HEADER_BYTES;
+use world::value::WORLD_VALUE_NODE_HEADER_BYTES;
+use world::value::WORLD_VALUE_MIN_BYTES;
+use world::value::WORLD_VALUE_MAX_BYTES;
+use world::value::WORLD_VALUE_MAX_DEPTH;
+use world::value::WORLD_VALUE_MAX_NODES;
+use world::value::WORLD_VALUE_MAX_LIST;
+use world::value::WORLD_VALUE_MAX_RECORD;
+use world::value::WORLD_VALUE_MAX_MAP;
+use world::value::WORLD_VALUE_MAX_INTEGER_BYTES;
+use world::value::WORLD_VALUE_MAX_TEXT_BYTES;
+use world::value::WORLD_VALUE_MAX_MEDIA_BYTES;
+use world::value::WORLD_VALUE_MAX_RAW_BYTES;
+use world::value::WORLD_VALUE_MAX_IDENTIFIER_BYTES;
+use world::value::VALUE_TAG_NULL;
+use world::value::VALUE_TAG_BOOL;
+use world::value::VALUE_TAG_INTEGER;
+use world::value::VALUE_TAG_BINARY_FLOAT;
+use world::value::VALUE_TAG_TEXT;
+use world::value::VALUE_TAG_CHAR;
+use world::value::VALUE_TAG_BYTES;
+use world::value::VALUE_TAG_LIST;
+use world::value::VALUE_TAG_RECORD;
+use world::value::VALUE_TAG_MAP;
+use world::value::VALUE_TAG_TAGGED;
+use world::value::VALUE_TAG_CODE_REF;
+use world::value::VALUE_TAG_OBJECT_REF;
+use world::value::VALUE_TAG_ERROR;
+use world::value::VALUE_TAG_EXTENSION;
+use world::value::VALUE_FLOAT_BINARY32;
+use world::value::VALUE_FLOAT_BINARY64;
+use world::value::VALUE_TEXT_UTF8;
+use world::value::VALUE_CODE_SHA256;
+use world::value::VALUE_ORDER_LESS;
+use world::value::arena_clear;
+use world::value::arena_copy;
+use world::value::arena_is_sealed;
+use world::value::arena_node_count;
+use world::value::arena_root;
+use world::value::node_tag;
+use world::value::node_scalar;
+use world::value::node_data;
+use world::value::node_data_length;
+use world::value::node_aux;
+use world::value::node_aux_length;
+use world::value::node_blob;
+use world::value::node_blob_length;
+use world::value::node_edge_count;
+use world::value::node_edge_word;
+use world::value::node_record_key;
+use world::value::scalar_map_key;
+use world::value::compare_scalar_keys;
+use world::value::add_null;
+use world::value::add_bool;
+use world::value::add_integer;
+use world::value::add_binary_float;
+use world::value::add_text;
+use world::value::add_char;
+use world::value::add_bytes;
+use world::value::add_list;
+use world::value::add_record;
+use world::value::add_map;
+use world::value::add_tagged;
+use world::value::add_code_ref;
+use world::value::add_object_ref;
+use world::value::add_error;
+use world::value::add_extension;
+use world::value::seal;
+
+pub const VALUE_CODEC_LENGTH_WORDS: usize = 128;
+pub const VALUE_CODEC_FRAME_WORDS: usize = 256;
+pub const VALUE_CODEC_PENDING_WORDS: usize = 512;
+const FRAME_WORDS: usize = 16;
+const FRAME_TAG: usize = 0;
+const FRAME_END: usize = 1;
+const FRAME_COUNT: usize = 2;
+const FRAME_INDEX: usize = 3;
+const FRAME_PENDING_START: usize = 4;
+const FRAME_DATA_OFFSET: usize = 5;
+const FRAME_DATA_LENGTH: usize = 6;
+const FRAME_AUX_OFFSET: usize = 7;
+const FRAME_AUX_LENGTH: usize = 8;
+const FRAME_BLOB_OFFSET: usize = 9;
+const FRAME_BLOB_LENGTH: usize = 10;
+const FRAME_SCALAR: usize = 11;
+const FRAME_RAW_START: usize = 12;
+const FRAME_RAW_LENGTH: usize = 13;
+const FRAME_LAST_START: usize = 14;
+const FRAME_LAST_LENGTH: usize = 15;
+
+pub struct ValueCodecScratch {
+    staged: *mut u8,
+    staged_capacity: usize,
+    lengths: *mut u64,
+    length_capacity: usize,
+    frames: *mut u64,
+    frame_word_capacity: usize,
+    pending: *mut u64,
+    pending_capacity: usize,
+    decoded: *mut ValueArena,
+    sha: *mut Sha256Scratch,
+    digest: *mut u8,
+    digest_capacity: usize,
+}
+
+pub unsafe fn scratch_init(
+    scratch: *mut ValueCodecScratch,
+    staged: *mut u8,
+    staged_capacity: usize,
+    lengths: *mut u64,
+    length_capacity: usize,
+    frames: *mut u64,
+    frame_word_capacity: usize,
+    pending: *mut u64,
+    pending_capacity: usize,
+    decoded: *mut ValueArena,
+    sha: *mut Sha256Scratch,
+    digest: *mut u8,
+    digest_capacity: usize
+) -> u64 {
+    if scratch as usize == 0 || staged as usize == 0
+        || lengths as usize == 0 || frames as usize == 0
+        || pending as usize == 0 || decoded as usize == 0
+        || sha as usize == 0 || digest as usize == 0
+        || staged_capacity < WORLD_VALUE_MAX_BYTES
+        || length_capacity < VALUE_CODEC_LENGTH_WORDS
+        || frame_word_capacity < VALUE_CODEC_FRAME_WORDS
+        || pending_capacity < VALUE_CODEC_PENDING_WORDS
+        || digest_capacity < 32 {
+        return 0;
+    }
+    (*scratch).staged = staged;
+    (*scratch).staged_capacity = staged_capacity;
+    (*scratch).lengths = lengths;
+    (*scratch).length_capacity = length_capacity;
+    (*scratch).frames = frames;
+    (*scratch).frame_word_capacity = frame_word_capacity;
+    (*scratch).pending = pending;
+    (*scratch).pending_capacity = pending_capacity;
+    (*scratch).decoded = decoded;
+    (*scratch).sha = sha;
+    (*scratch).digest = digest;
+    (*scratch).digest_capacity = digest_capacity;
+    return 1;
+}
+
+unsafe fn source_byte(source: *const u8, offset: usize) -> u64 {
+    return volatile_load(source + offset) as u64;
+}
+
+unsafe fn source_word(source: *const u64, offset: usize) -> u64 {
+    return volatile_load(source + offset);
+}
+
+unsafe fn put_byte(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    volatile_store(output + *cursor, value as u8);
+    *cursor += 1;
+}
+
+unsafe fn put_u16(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_u32(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 24);
+    put_byte(output, cursor, value >> 16);
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn copy_to_output(
+    output: *mut u8,
+    cursor: *mut usize,
+    source: *const u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        put_byte(output, cursor, source_byte(source, index));
+        index += 1;
+    }
+}
+
+unsafe fn known_tag(tag: u64) -> bool {
+    return tag == VALUE_TAG_NULL || tag == VALUE_TAG_BOOL
+        || tag == VALUE_TAG_INTEGER || tag == VALUE_TAG_BINARY_FLOAT
+        || tag == VALUE_TAG_TEXT || tag == VALUE_TAG_CHAR
+        || tag == VALUE_TAG_BYTES || tag == VALUE_TAG_LIST
+        || tag == VALUE_TAG_RECORD || tag == VALUE_TAG_MAP
+        || tag == VALUE_TAG_TAGGED || tag == VALUE_TAG_CODE_REF
+        || tag == VALUE_TAG_OBJECT_REF || tag == VALUE_TAG_ERROR
+        || tag == VALUE_TAG_EXTENSION;
+}
+
+unsafe fn node_length(
+    arena: *const ValueArena,
+    handle: u64,
+    scratch: *mut ValueCodecScratch
+) -> usize {
+    let tag: u64 = node_tag(arena, handle);
+    if !known_tag(tag) { return 0; }
+    let mut payload: usize = 0;
+    if tag == VALUE_TAG_BOOL { payload = 1; }
+    if tag == VALUE_TAG_INTEGER { payload = 1 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_BINARY_FLOAT { payload = 4 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_TEXT { payload = 4 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_CHAR { payload = 4; }
+    if tag == VALUE_TAG_BYTES {
+        payload = 4 + node_data_length(arena, handle) + node_aux_length(arena, handle);
+    }
+    if tag == VALUE_TAG_LIST {
+        payload = 4;
+        let count: usize = node_edge_count(arena, handle);
+        if count > WORLD_VALUE_MAX_LIST { return 0; }
+        let mut index: usize = 0;
+        while index < count {
+            let child: u64 = node_edge_word(arena, handle, index);
+            if child == 0 || child >= handle { return 0; }
+            let child_length: usize = source_word((*scratch).lengths as *const u64,
+                child as usize - 1) as usize;
+            if child_length == 0 || payload > WORLD_VALUE_MAX_BYTES - child_length {
+                return 0;
+            }
+            payload += child_length;
+            index += 1;
+        }
+    }
+    if tag == VALUE_TAG_RECORD {
+        payload = 4;
+        let count: usize = node_edge_count(arena, handle);
+        if count > WORLD_VALUE_MAX_RECORD { return 0; }
+        let mut index: usize = 0;
+        while index < count {
+            let key_length: usize = node_edge_word(arena, handle, index * 3 + 1) as usize;
+            let child: u64 = node_edge_word(arena, handle, index * 3 + 2);
+            if key_length == 0 || key_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+                || child == 0 || child >= handle {
+                return 0;
+            }
+            let child_length: usize = source_word((*scratch).lengths as *const u64,
+                child as usize - 1) as usize;
+            if payload > WORLD_VALUE_MAX_BYTES - 2
+                || key_length > WORLD_VALUE_MAX_BYTES - payload - 2 {
+                return 0;
+            }
+            payload += 2 + key_length;
+            if child_length == 0 || payload > WORLD_VALUE_MAX_BYTES - child_length {
+                return 0;
+            }
+            payload += child_length;
+            index += 1;
+        }
+    }
+    if tag == VALUE_TAG_MAP {
+        payload = 4;
+        let count: usize = node_edge_count(arena, handle);
+        if count > WORLD_VALUE_MAX_MAP { return 0; }
+        let mut index: usize = 0;
+        while index < count * 2 {
+            let child: u64 = node_edge_word(arena, handle, index);
+            if child == 0 || child >= handle { return 0; }
+            let child_length: usize = source_word((*scratch).lengths as *const u64,
+                child as usize - 1) as usize;
+            if child_length == 0 || payload > WORLD_VALUE_MAX_BYTES - child_length {
+                return 0;
+            }
+            payload += child_length;
+            index += 1;
+        }
+    }
+    if tag == VALUE_TAG_TAGGED {
+        let child: u64 = node_edge_word(arena, handle, 0);
+        if node_edge_count(arena, handle) != 1 || child == 0 || child >= handle {
+            return 0;
+        }
+        payload = 4 + node_data_length(arena, handle)
+            + source_word((*scratch).lengths as *const u64, child as usize - 1) as usize;
+    }
+    if tag == VALUE_TAG_CODE_REF {
+        payload = 40 + node_data_length(arena, handle) + node_aux_length(arena, handle);
+    }
+    if tag == VALUE_TAG_OBJECT_REF { payload = node_data_length(arena, handle); }
+    if tag == VALUE_TAG_ERROR {
+        payload = 4 + node_data_length(arena, handle) + node_aux_length(arena, handle);
+    }
+    if tag == VALUE_TAG_EXTENSION {
+        let child: u64 = node_edge_word(arena, handle, 0);
+        if node_edge_count(arena, handle) != 1 || child == 0 || child >= handle {
+            return 0;
+        }
+        payload = 40 + node_data_length(arena, handle) + node_aux_length(arena, handle)
+            + source_word((*scratch).lengths as *const u64, child as usize - 1) as usize;
+    }
+    if payload > WORLD_VALUE_MAX_BYTES - WORLD_VALUE_NODE_HEADER_BYTES { return 0; }
+    return WORLD_VALUE_NODE_HEADER_BYTES + payload;
+}
+
+unsafe fn compute_lengths(
+    arena: *const ValueArena,
+    scratch: *mut ValueCodecScratch
+) -> usize {
+    if !arena_is_sealed(arena) || scratch as usize == 0
+        || (*scratch).lengths as usize == 0 {
+        return 0;
+    }
+    let count: usize = arena_node_count(arena);
+    if count == 0 || count > WORLD_VALUE_MAX_NODES
+        || count > (*scratch).length_capacity {
+        return 0;
+    }
+    let mut handle: u64 = 1;
+    while handle <= count as u64 {
+        let length: usize = node_length(arena, handle, scratch);
+        if length < WORLD_VALUE_NODE_HEADER_BYTES || length > WORLD_VALUE_MAX_BYTES {
+            return 0;
+        }
+        volatile_store((*scratch).lengths + handle as usize - 1, length as u64);
+        handle += 1;
+    }
+    let root: u64 = arena_root(arena);
+    if root == 0 || root as usize != count { return 0; }
+    let root_length: usize = source_word((*scratch).lengths as *const u64,
+        root as usize - 1) as usize;
+    if root_length > WORLD_VALUE_MAX_BYTES - WORLD_VALUE_HEADER_BYTES { return 0; }
+    return WORLD_VALUE_HEADER_BYTES + root_length;
+}
+
+unsafe fn put_node_header(
+    arena: *const ValueArena,
+    handle: u64,
+    output: *mut u8,
+    cursor: *mut usize,
+    scratch: *mut ValueCodecScratch
+) -> void {
+    put_u16(output, cursor, node_tag(arena, handle));
+    put_u16(output, cursor, 0);
+    put_u32(output, cursor, source_word((*scratch).lengths as *const u64,
+        handle as usize - 1));
+}
+
+unsafe fn emit_node_prefix(
+    arena: *const ValueArena,
+    handle: u64,
+    output: *mut u8,
+    cursor: *mut usize,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    let tag: u64 = node_tag(arena, handle);
+    put_node_header(arena, handle, output, cursor, scratch);
+    if tag == VALUE_TAG_NULL { return 0; }
+    if tag == VALUE_TAG_BOOL {
+        put_byte(output, cursor, node_scalar(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_INTEGER {
+        put_byte(output, cursor, node_scalar(arena, handle));
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_BINARY_FLOAT || tag == VALUE_TAG_TEXT {
+        put_byte(output, cursor, node_scalar(arena, handle));
+        put_byte(output, cursor, 0);
+        put_byte(output, cursor, 0);
+        put_byte(output, cursor, 0);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_CHAR {
+        put_u32(output, cursor, node_scalar(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_BYTES {
+        put_u16(output, cursor, node_data_length(arena, handle) as u64);
+        put_u16(output, cursor, 0);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        copy_to_output(output, cursor, node_aux(arena, handle),
+            node_aux_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_LIST || tag == VALUE_TAG_RECORD || tag == VALUE_TAG_MAP {
+        put_u16(output, cursor, node_edge_count(arena, handle) as u64);
+        put_u16(output, cursor, 0);
+        return 1;
+    }
+    if tag == VALUE_TAG_TAGGED {
+        put_u16(output, cursor, node_data_length(arena, handle) as u64);
+        put_u16(output, cursor, 0);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        return 1;
+    }
+    if tag == VALUE_TAG_CODE_REF {
+        put_u16(output, cursor, node_scalar(arena, handle));
+        put_u16(output, cursor, 0);
+        put_u16(output, cursor, node_data_length(arena, handle) as u64);
+        put_u16(output, cursor, node_aux_length(arena, handle) as u64);
+        copy_to_output(output, cursor, node_blob(arena, handle), 32);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        copy_to_output(output, cursor, node_aux(arena, handle),
+            node_aux_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_OBJECT_REF {
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_ERROR {
+        put_u16(output, cursor, node_data_length(arena, handle) as u64);
+        put_u16(output, cursor, 0);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        copy_to_output(output, cursor, node_aux(arena, handle),
+            node_aux_length(arena, handle));
+        return 0;
+    }
+    if tag == VALUE_TAG_EXTENSION {
+        put_u16(output, cursor, node_data_length(arena, handle) as u64);
+        put_u16(output, cursor, node_aux_length(arena, handle) as u64);
+        put_u16(output, cursor, node_scalar(arena, handle));
+        put_u16(output, cursor, 0);
+        copy_to_output(output, cursor, node_blob(arena, handle), 32);
+        copy_to_output(output, cursor, node_data(arena, handle),
+            node_data_length(arena, handle));
+        copy_to_output(output, cursor, node_aux(arena, handle),
+            node_aux_length(arena, handle));
+        return 1;
+    }
+    return 2;
+}
+
+unsafe fn encoding_child(
+    arena: *const ValueArena,
+    handle: u64,
+    index: usize
+) -> u64 {
+    let tag: u64 = node_tag(arena, handle);
+    if tag == VALUE_TAG_LIST { return node_edge_word(arena, handle, index); }
+    if tag == VALUE_TAG_RECORD { return node_edge_word(arena, handle, index * 3 + 2); }
+    if tag == VALUE_TAG_MAP { return node_edge_word(arena, handle, index); }
+    return node_edge_word(arena, handle, 0);
+}
+
+unsafe fn encoding_child_count(arena: *const ValueArena, handle: u64) -> usize {
+    if node_tag(arena, handle) == VALUE_TAG_MAP {
+        return node_edge_count(arena, handle) * 2;
+    }
+    if node_tag(arena, handle) == VALUE_TAG_TAGGED
+        || node_tag(arena, handle) == VALUE_TAG_EXTENSION {
+        return 1;
+    }
+    return node_edge_count(arena, handle);
+}
+
+pub unsafe fn encode_record(
+    arena: *const ValueArena,
+    output: *mut u8,
+    output_capacity: usize,
+    written: *mut usize,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if arena as usize == 0 || output as usize == 0 || written as usize == 0
+        || scratch as usize == 0 || (*scratch).staged as usize == 0
+        || (*scratch).frames as usize == 0 {
+        return 0;
+    }
+    let total: usize = compute_lengths(arena, scratch);
+    if total < WORLD_VALUE_MIN_BYTES || total > WORLD_VALUE_MAX_BYTES
+        || total > output_capacity || total > (*scratch).staged_capacity {
+        return 0;
+    }
+    let staged: *mut u8 = (*scratch).staged;
+    let mut cursor: usize = 0;
+    put_byte(staged, (&mut cursor), b'O' as u64);
+    put_byte(staged, (&mut cursor), b'W' as u64);
+    put_byte(staged, (&mut cursor), b'V' as u64);
+    put_byte(staged, (&mut cursor), b'A' as u64);
+    put_byte(staged, (&mut cursor), b'L' as u64);
+    put_byte(staged, (&mut cursor), b'U' as u64);
+    put_byte(staged, (&mut cursor), b'E' as u64);
+    put_byte(staged, (&mut cursor), 0);
+    put_u16(staged, (&mut cursor), WORLD_VALUE_SCHEMA);
+    put_u16(staged, (&mut cursor), 0);
+    put_u32(staged, (&mut cursor), total as u64);
+
+    let root: u64 = arena_root(arena);
+    let root_kind: u64 = emit_node_prefix(arena, root, staged,
+        (&mut cursor), scratch);
+    if root_kind == 2 { return 0; }
+    let mut emitted: usize = 1;
+    let mut depth: usize = 0;
+    if root_kind == 1 {
+        volatile_store((*scratch).frames, root);
+        volatile_store((*scratch).frames + 1, 0);
+        depth = 1;
+    }
+    while depth != 0 {
+        let base: usize = (depth - 1) * 2;
+        let parent: u64 = source_word((*scratch).frames as *const u64, base);
+        let index: usize = source_word((*scratch).frames as *const u64, base + 1) as usize;
+        let count: usize = encoding_child_count(arena, parent);
+        if index >= count {
+            depth -= 1;
+            continue;
+        }
+        if node_tag(arena, parent) == VALUE_TAG_RECORD {
+            let key_length: usize = node_edge_word(arena, parent, index * 3 + 1) as usize;
+            put_u16(staged, (&mut cursor), key_length as u64);
+            copy_to_output(staged, (&mut cursor),
+                node_record_key(arena, parent, index), key_length);
+        }
+        volatile_store((*scratch).frames + base + 1, (index + 1) as u64);
+        let child: u64 = encoding_child(arena, parent, index);
+        if emitted >= WORLD_VALUE_MAX_NODES { return 0; }
+        emitted += 1;
+        let child_kind: u64 = emit_node_prefix(arena, child, staged,
+            (&mut cursor), scratch);
+        if child_kind == 2 { return 0; }
+        if child_kind == 1 {
+            if depth >= WORLD_VALUE_MAX_DEPTH
+                || depth * 2 + 1 >= (*scratch).frame_word_capacity {
+                return 0;
+            }
+            volatile_store((*scratch).frames + depth * 2, child);
+            volatile_store((*scratch).frames + depth * 2 + 1, 0);
+            depth += 1;
+        }
+    }
+    if cursor != total { return 0; }
+    let mut index: usize = 0;
+    while index < total {
+        volatile_store(output + index, source_byte(staged as *const u8, index) as u8);
+        index += 1;
+    }
+    *written = total;
+    return 1;
+}
+
+unsafe fn read_u16_at(source: *const u8, offset: usize) -> u64 {
+    return (source_byte(source, offset) << 8) | source_byte(source, offset + 1);
+}
+
+unsafe fn read_u32_at(source: *const u8, offset: usize) -> u64 {
+    return (source_byte(source, offset) << 24)
+        | (source_byte(source, offset + 1) << 16)
+        | (source_byte(source, offset + 2) << 8)
+        | source_byte(source, offset + 3);
+}
+
+unsafe fn zero_reserved(source: *const u8, offset: usize, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if source_byte(source, offset + index) != 0 { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn raw_less(
+    source: *const u8,
+    left_start: usize,
+    left_length: usize,
+    right_start: usize,
+    right_length: usize
+) -> bool {
+    let mut common: usize = left_length;
+    if right_length < common { common = right_length; }
+    let mut index: usize = 0;
+    while index < common {
+        let left: u64 = source_byte(source, left_start + index);
+        let right: u64 = source_byte(source, right_start + index);
+        if left < right { return true; }
+        if left > right { return false; }
+        index += 1;
+    }
+    return left_length < right_length;
+}
+
+unsafe fn frame_get(
+    scratch: *mut ValueCodecScratch,
+    base: usize,
+    field: usize
+) -> u64 {
+    return source_word((*scratch).frames as *const u64, base + field);
+}
+
+unsafe fn frame_set(
+    scratch: *mut ValueCodecScratch,
+    base: usize,
+    field: usize,
+    value: u64
+) -> void {
+    volatile_store((*scratch).frames + base + field, value);
+}
+
+unsafe fn initialize_frame(
+    scratch: *mut ValueCodecScratch,
+    base: usize,
+    tag: u64,
+    end: usize,
+    count: usize,
+    pending_start: usize,
+    raw_start: usize,
+    raw_length: usize
+) -> void {
+    frame_set(scratch, base, FRAME_TAG, tag);
+    frame_set(scratch, base, FRAME_END, end as u64);
+    frame_set(scratch, base, FRAME_COUNT, count as u64);
+    frame_set(scratch, base, FRAME_INDEX, 0);
+    frame_set(scratch, base, FRAME_PENDING_START, pending_start as u64);
+    frame_set(scratch, base, FRAME_DATA_OFFSET, 0);
+    frame_set(scratch, base, FRAME_DATA_LENGTH, 0);
+    frame_set(scratch, base, FRAME_AUX_OFFSET, 0);
+    frame_set(scratch, base, FRAME_AUX_LENGTH, 0);
+    frame_set(scratch, base, FRAME_BLOB_OFFSET, 0);
+    frame_set(scratch, base, FRAME_BLOB_LENGTH, 0);
+    frame_set(scratch, base, FRAME_SCALAR, 0);
+    frame_set(scratch, base, FRAME_RAW_START, raw_start as u64);
+    frame_set(scratch, base, FRAME_RAW_LENGTH, raw_length as u64);
+    frame_set(scratch, base, FRAME_LAST_START, 0);
+    frame_set(scratch, base, FRAME_LAST_LENGTH, 0);
+}
+
+unsafe fn begin_node(
+    source: *const u8,
+    cursor: *mut usize,
+    limit: usize,
+    depth: usize,
+    pending_start: usize,
+    frame_base: usize,
+    output_handle: *mut u64,
+    output_compound: *mut u64,
+    output_raw_start: *mut usize,
+    output_raw_length: *mut usize,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if cursor as usize == 0 || output_handle as usize == 0
+        || output_compound as usize == 0 || output_raw_start as usize == 0
+        || output_raw_length as usize == 0 || scratch as usize == 0
+        || depth == 0 || depth > WORLD_VALUE_MAX_DEPTH
+        || *cursor > limit || limit - *cursor < WORLD_VALUE_NODE_HEADER_BYTES {
+        return 0;
+    }
+    let start: usize = *cursor;
+    let tag: u64 = read_u16_at(source, start);
+    let reserved: u64 = read_u16_at(source, start + 2);
+    let total: usize = read_u32_at(source, start + 4) as usize;
+    if !known_tag(tag) || reserved != 0 || total < WORLD_VALUE_NODE_HEADER_BYTES
+        || total > limit - start {
+        return 0;
+    }
+    if tag == VALUE_TAG_EXTENSION && depth != 1 { return 0; }
+    let payload: usize = start + WORLD_VALUE_NODE_HEADER_BYTES;
+    let end: usize = start + total;
+    *output_handle = 0;
+    *output_compound = 0;
+    *output_raw_start = start;
+    *output_raw_length = total;
+    let arena: *mut ValueArena = (*scratch).decoded;
+
+    if tag == VALUE_TAG_NULL {
+        if total != 8 || add_null(arena, output_handle) != 1 { return 0; }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_BOOL {
+        if total != 9 || source_byte(source, payload) > 1
+            || add_bool(arena, source_byte(source, payload), output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_INTEGER {
+        if total < 9 || total > 9 + WORLD_VALUE_MAX_INTEGER_BYTES
+            || add_integer(arena, source_byte(source, payload), source + payload + 1,
+                total - 9, output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_BINARY_FLOAT {
+        if total < 12 || !zero_reserved(source, payload + 1, 3) { return 0; }
+        let format: u64 = source_byte(source, payload);
+        if (format == VALUE_FLOAT_BINARY32 && total != 16)
+            || (format == VALUE_FLOAT_BINARY64 && total != 20)
+            || (format != VALUE_FLOAT_BINARY32 && format != VALUE_FLOAT_BINARY64)
+            || add_binary_float(arena, format, source + payload + 4,
+                output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_TEXT {
+        if total < 12 || total - 12 > WORLD_VALUE_MAX_TEXT_BYTES
+            || source_byte(source, payload) > VALUE_TEXT_UTF8
+            || !zero_reserved(source, payload + 1, 3)
+            || add_text(arena, source_byte(source, payload), source + payload + 4,
+                total - 12, output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_CHAR {
+        if total != 12 || add_char(arena, read_u32_at(source, payload),
+            output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_BYTES {
+        if total < 12 || read_u16_at(source, payload + 2) != 0 { return 0; }
+        let media_length: usize = read_u16_at(source, payload) as usize;
+        if media_length > WORLD_VALUE_MAX_MEDIA_BYTES || media_length > total - 12 {
+            return 0;
+        }
+        let raw_length: usize = total - 12 - media_length;
+        if raw_length > WORLD_VALUE_MAX_RAW_BYTES
+            || add_bytes(arena, source + payload + 4, media_length,
+                source + payload + 4 + media_length, raw_length,
+                output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_CODE_REF {
+        if total < 48 || read_u16_at(source, payload) != VALUE_CODE_SHA256
+            || read_u16_at(source, payload + 2) != 0 {
+            return 0;
+        }
+        let evaluator_length: usize = read_u16_at(source, payload + 4) as usize;
+        let entry_length: usize = read_u16_at(source, payload + 6) as usize;
+        if evaluator_length == 0 || entry_length == 0
+            || evaluator_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || entry_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || evaluator_length + entry_length != total - 48
+            || add_code_ref(arena, VALUE_CODE_SHA256, source + payload + 8,
+                source + payload + 40, evaluator_length,
+                source + payload + 40 + evaluator_length, entry_length,
+                output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_OBJECT_REF {
+        if total <= 8 || add_object_ref(arena, source + payload, total - 8,
+            output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+    if tag == VALUE_TAG_ERROR {
+        if total < 12 || read_u16_at(source, payload + 2) != 0 { return 0; }
+        let code_length: usize = read_u16_at(source, payload) as usize;
+        if code_length == 0 || code_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || code_length > total - 12
+            || total - 12 - code_length > WORLD_VALUE_MAX_TEXT_BYTES
+            || add_error(arena, source + payload + 4, code_length,
+                source + payload + 4 + code_length,
+                total - 12 - code_length, output_handle) != 1 {
+            return 0;
+        }
+        *cursor = end;
+        return 1;
+    }
+
+    if frame_base > (*scratch).frame_word_capacity
+        || FRAME_WORDS > (*scratch).frame_word_capacity - frame_base {
+        return 0;
+    }
+    if tag == VALUE_TAG_LIST || tag == VALUE_TAG_RECORD || tag == VALUE_TAG_MAP {
+        if total < 12 || read_u16_at(source, payload + 2) != 0 { return 0; }
+        let count: usize = read_u16_at(source, payload) as usize;
+        if (tag == VALUE_TAG_LIST && count > WORLD_VALUE_MAX_LIST)
+            || (tag == VALUE_TAG_RECORD && count > WORLD_VALUE_MAX_RECORD)
+            || (tag == VALUE_TAG_MAP && count > WORLD_VALUE_MAX_MAP) {
+            return 0;
+        }
+        let mut minimum: usize = count * 8;
+        if tag == VALUE_TAG_RECORD { minimum = count * 11; }
+        if tag == VALUE_TAG_MAP { minimum = count * 16; }
+        if minimum > total - 12 { return 0; }
+        initialize_frame(scratch, frame_base, tag, end, count,
+            pending_start, start, total);
+        *cursor = payload + 4;
+        *output_compound = 1;
+        return 1;
+    }
+    if tag == VALUE_TAG_TAGGED {
+        if total < 21 || read_u16_at(source, payload + 2) != 0 { return 0; }
+        let tag_length: usize = read_u16_at(source, payload) as usize;
+        if tag_length == 0 || tag_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || tag_length > total - 20 {
+            return 0;
+        }
+        initialize_frame(scratch, frame_base, tag, end, 1,
+            pending_start, start, total);
+        frame_set(scratch, frame_base, FRAME_DATA_OFFSET, (payload + 4) as u64);
+        frame_set(scratch, frame_base, FRAME_DATA_LENGTH, tag_length as u64);
+        *cursor = payload + 4 + tag_length;
+        *output_compound = 1;
+        return 1;
+    }
+    if tag == VALUE_TAG_EXTENSION {
+        if total < 58 || read_u16_at(source, payload + 6) != 0 { return 0; }
+        let namespace_length: usize = read_u16_at(source, payload) as usize;
+        let name_length: usize = read_u16_at(source, payload + 2) as usize;
+        let version: u64 = read_u16_at(source, payload + 4);
+        if namespace_length == 0 || name_length == 0 || version == 0
+            || namespace_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || name_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || namespace_length + name_length > total - 56 {
+            return 0;
+        }
+        initialize_frame(scratch, frame_base, tag, end, 1,
+            pending_start, start, total);
+        frame_set(scratch, frame_base, FRAME_DATA_OFFSET, (payload + 40) as u64);
+        frame_set(scratch, frame_base, FRAME_DATA_LENGTH, namespace_length as u64);
+        frame_set(scratch, frame_base, FRAME_AUX_OFFSET,
+            (payload + 40 + namespace_length) as u64);
+        frame_set(scratch, frame_base, FRAME_AUX_LENGTH, name_length as u64);
+        frame_set(scratch, frame_base, FRAME_BLOB_OFFSET, (payload + 8) as u64);
+        frame_set(scratch, frame_base, FRAME_BLOB_LENGTH, 32);
+        frame_set(scratch, frame_base, FRAME_SCALAR, version);
+        *cursor = payload + 40 + namespace_length + name_length;
+        *output_compound = 1;
+        return 1;
+    }
+    return 0;
+}
+
+unsafe fn expected_children(
+    scratch: *mut ValueCodecScratch,
+    base: usize
+) -> usize {
+    let tag: u64 = frame_get(scratch, base, FRAME_TAG);
+    if tag == VALUE_TAG_MAP {
+        return frame_get(scratch, base, FRAME_COUNT) as usize * 2;
+    }
+    return frame_get(scratch, base, FRAME_COUNT) as usize;
+}
+
+unsafe fn frame_ready(scratch: *mut ValueCodecScratch, base: usize) -> bool {
+    return frame_get(scratch, base, FRAME_INDEX) as usize
+        == expected_children(scratch, base);
+}
+
+unsafe fn prepare_record_key(
+    source: *const u8,
+    cursor: *mut usize,
+    scratch: *mut ValueCodecScratch,
+    base: usize
+) -> u64 {
+    if frame_get(scratch, base, FRAME_TAG) != VALUE_TAG_RECORD { return 1; }
+    let end: usize = frame_get(scratch, base, FRAME_END) as usize;
+    if *cursor > end || end - *cursor < 2 { return 0; }
+    let key_length: usize = read_u16_at(source, *cursor) as usize;
+    *cursor += 2;
+    if key_length == 0 || key_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+        || *cursor > end || key_length > end - *cursor
+        || end - *cursor - key_length < WORLD_VALUE_NODE_HEADER_BYTES {
+        return 0;
+    }
+    let key_start: usize = *cursor;
+    let index: usize = frame_get(scratch, base, FRAME_INDEX) as usize;
+    if index != 0 {
+        let last_start: usize = frame_get(scratch, base, FRAME_LAST_START) as usize;
+        let last_length: usize = frame_get(scratch, base, FRAME_LAST_LENGTH) as usize;
+        if !raw_less(source, last_start, last_length, key_start, key_length) {
+            return 0;
+        }
+    }
+    frame_set(scratch, base, FRAME_DATA_OFFSET, key_start as u64);
+    frame_set(scratch, base, FRAME_DATA_LENGTH, key_length as u64);
+    *cursor += key_length;
+    return 1;
+}
+
+unsafe fn pending_push(
+    scratch: *mut ValueCodecScratch,
+    pending_length: *mut usize,
+    value: u64
+) -> u64 {
+    if *pending_length >= (*scratch).pending_capacity { return 0; }
+    volatile_store((*scratch).pending + *pending_length, value);
+    *pending_length += 1;
+    return 1;
+}
+
+unsafe fn accept_child(
+    source: *const u8,
+    scratch: *mut ValueCodecScratch,
+    base: usize,
+    child: u64,
+    child_raw_start: usize,
+    child_raw_length: usize,
+    pending_length: *mut usize
+) -> u64 {
+    let tag: u64 = frame_get(scratch, base, FRAME_TAG);
+    let index: usize = frame_get(scratch, base, FRAME_INDEX) as usize;
+    if index >= expected_children(scratch, base) { return 0; }
+    if tag == VALUE_TAG_LIST || tag == VALUE_TAG_TAGGED
+        || tag == VALUE_TAG_EXTENSION {
+        if pending_push(scratch, pending_length, child) != 1 { return 0; }
+    }
+    if tag == VALUE_TAG_RECORD {
+        let key_start: usize = frame_get(scratch, base, FRAME_DATA_OFFSET) as usize;
+        let key_length: usize = frame_get(scratch, base, FRAME_DATA_LENGTH) as usize;
+        if pending_push(scratch, pending_length, (source + key_start) as usize as u64) != 1
+            || pending_push(scratch, pending_length, key_length as u64) != 1
+            || pending_push(scratch, pending_length, child) != 1 {
+            return 0;
+        }
+        frame_set(scratch, base, FRAME_LAST_START, key_start as u64);
+        frame_set(scratch, base, FRAME_LAST_LENGTH, key_length as u64);
+    }
+    if tag == VALUE_TAG_MAP {
+        if index % 2 == 0 {
+            if !scalar_map_key((*scratch).decoded as *const ValueArena, child) {
+                return 0;
+            }
+            if index != 0 {
+                let last_start: usize = frame_get(scratch, base, FRAME_LAST_START) as usize;
+                let last_length: usize = frame_get(scratch, base, FRAME_LAST_LENGTH) as usize;
+                if !raw_less(source, last_start, last_length,
+                    child_raw_start, child_raw_length) {
+                    return 0;
+                }
+            }
+            frame_set(scratch, base, FRAME_LAST_START, child_raw_start as u64);
+            frame_set(scratch, base, FRAME_LAST_LENGTH, child_raw_length as u64);
+        }
+        if pending_push(scratch, pending_length, child) != 1 { return 0; }
+    }
+    frame_set(scratch, base, FRAME_INDEX, (index + 1) as u64);
+    return 1;
+}
+
+unsafe fn finish_frame(
+    source: *const u8,
+    cursor: usize,
+    scratch: *mut ValueCodecScratch,
+    base: usize,
+    pending_length: *mut usize,
+    output_handle: *mut u64,
+    output_raw_start: *mut usize,
+    output_raw_length: *mut usize
+) -> u64 {
+    if !frame_ready(scratch, base)
+        || cursor != frame_get(scratch, base, FRAME_END) as usize {
+        return 0;
+    }
+    let tag: u64 = frame_get(scratch, base, FRAME_TAG);
+    let count: usize = frame_get(scratch, base, FRAME_COUNT) as usize;
+    let start: usize = frame_get(scratch, base, FRAME_PENDING_START) as usize;
+    if start > *pending_length { return 0; }
+    let pending: *const u64 = ((*scratch).pending + start) as *const u64;
+    let arena: *mut ValueArena = (*scratch).decoded;
+    let mut accepted: u64 = 0;
+    if tag == VALUE_TAG_LIST { accepted = add_list(arena, pending, count, output_handle); }
+    if tag == VALUE_TAG_RECORD { accepted = add_record(arena, pending, count, output_handle); }
+    if tag == VALUE_TAG_MAP { accepted = add_map(arena, pending, count, output_handle); }
+    if tag == VALUE_TAG_TAGGED {
+        accepted = add_tagged(arena,
+            source + frame_get(scratch, base, FRAME_DATA_OFFSET) as usize,
+            frame_get(scratch, base, FRAME_DATA_LENGTH) as usize,
+            source_word(pending, 0), output_handle);
+    }
+    if tag == VALUE_TAG_EXTENSION {
+        accepted = add_extension(arena,
+            source + frame_get(scratch, base, FRAME_DATA_OFFSET) as usize,
+            frame_get(scratch, base, FRAME_DATA_LENGTH) as usize,
+            source + frame_get(scratch, base, FRAME_AUX_OFFSET) as usize,
+            frame_get(scratch, base, FRAME_AUX_LENGTH) as usize,
+            frame_get(scratch, base, FRAME_SCALAR),
+            source + frame_get(scratch, base, FRAME_BLOB_OFFSET) as usize,
+            source_word(pending, 0), output_handle);
+    }
+    if accepted != 1 { return 0; }
+    *pending_length = start;
+    *output_raw_start = frame_get(scratch, base, FRAME_RAW_START) as usize;
+    *output_raw_length = frame_get(scratch, base, FRAME_RAW_LENGTH) as usize;
+    return 1;
+}
+
+unsafe fn header_valid(source: *const u8, length: usize) -> bool {
+    return length >= WORLD_VALUE_MIN_BYTES && length <= WORLD_VALUE_MAX_BYTES
+        && source_byte(source, 0) == b'O' as u64
+        && source_byte(source, 1) == b'W' as u64
+        && source_byte(source, 2) == b'V' as u64
+        && source_byte(source, 3) == b'A' as u64
+        && source_byte(source, 4) == b'L' as u64
+        && source_byte(source, 5) == b'U' as u64
+        && source_byte(source, 6) == b'E' as u64
+        && source_byte(source, 7) == 0
+        && read_u16_at(source, 8) == WORLD_VALUE_SCHEMA
+        && read_u16_at(source, 10) == 0
+        && read_u32_at(source, 12) as usize == length;
+}
+
+pub unsafe fn decode_record(
+    source: *const u8,
+    length: usize,
+    caller_maximum: usize,
+    output: *mut ValueArena,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if source as usize == 0 || output as usize == 0 || scratch as usize == 0
+        || (*scratch).staged as usize == 0 || (*scratch).decoded as usize == 0
+        || (*scratch).frames as usize == 0 || (*scratch).pending as usize == 0
+        || output as usize == (*scratch).decoded as usize
+        || length < WORLD_VALUE_MIN_BYTES || length > WORLD_VALUE_MAX_BYTES
+        || length > caller_maximum || length > (*scratch).staged_capacity {
+        return 0;
+    }
+    let staged: *mut u8 = (*scratch).staged;
+    let mut copy_index: usize = 0;
+    while copy_index < length {
+        volatile_store(staged + copy_index, source_byte(source, copy_index) as u8);
+        copy_index += 1;
+    }
+    if !header_valid(staged as *const u8, length)
+        || arena_clear((*scratch).decoded) != 1 {
+        return 0;
+    }
+
+    let mut cursor: usize = WORLD_VALUE_HEADER_BYTES;
+    let mut depth: usize = 0;
+    let mut pending_length: usize = 0;
+    let mut begun: usize = 0;
+    let mut handle: u64 = 0;
+    let mut compound: u64 = 0;
+    let mut raw_start: usize = 0;
+    let mut raw_length: usize = 0;
+    let mut completed: u64 = 0;
+    let mut root: u64 = 0;
+
+    loop {
+        if completed == 0 {
+            if begun >= WORLD_VALUE_MAX_NODES { return 0; }
+            let mut limit: usize = length;
+            if depth != 0 {
+                let parent_base: usize = (depth - 1) * FRAME_WORDS;
+                limit = frame_get(scratch, parent_base, FRAME_END) as usize;
+                if prepare_record_key(staged as *const u8, (&mut cursor),
+                    scratch, parent_base) != 1 {
+                    return 0;
+                }
+            }
+            let frame_base: usize = depth * FRAME_WORDS;
+            if begin_node(staged as *const u8, (&mut cursor), limit, depth + 1,
+                pending_length, frame_base, (&mut handle), (&mut compound),
+                (&mut raw_start), (&mut raw_length), scratch) != 1 {
+                return 0;
+            }
+            begun += 1;
+            if compound == 1 {
+                depth += 1;
+                let base: usize = (depth - 1) * FRAME_WORDS;
+                if frame_ready(scratch, base) {
+                    if finish_frame(staged as *const u8, cursor, scratch, base,
+                        (&mut pending_length), (&mut handle), (&mut raw_start),
+                        (&mut raw_length)) != 1 {
+                        return 0;
+                    }
+                    depth -= 1;
+                    completed = 1;
+                }
+            } else {
+                completed = 1;
+            }
+        }
+
+        while completed == 1 {
+            if depth == 0 {
+                root = handle;
+                completed = 0;
+                if cursor != length { return 0; }
+                if seal((*scratch).decoded, root) != 1
+                    || arena_copy((*scratch).decoded as *const ValueArena, output) != 1 {
+                    return 0;
+                }
+                return 1;
+            }
+            let parent_base: usize = (depth - 1) * FRAME_WORDS;
+            if accept_child(staged as *const u8, scratch, parent_base, handle,
+                raw_start, raw_length, (&mut pending_length)) != 1 {
+                return 0;
+            }
+            completed = 0;
+            if frame_ready(scratch, parent_base) {
+                if finish_frame(staged as *const u8, cursor, scratch, parent_base,
+                    (&mut pending_length), (&mut handle), (&mut raw_start),
+                    (&mut raw_length)) != 1 {
+                    return 0;
+                }
+                depth -= 1;
+                completed = 1;
+            }
+        }
+    }
+}
+
+pub unsafe fn decode_selected_value(
+    source: *const u8,
+    length: usize,
+    selection: *const SchemaSelection,
+    local: *const SchemaOffer,
+    peer: *const SchemaOffer,
+    output: *mut ValueArena,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if !selection_matches_offers(selection, local, peer)
+        || selection_schema(selection) != WORLD_VALUE_SCHEMA
+        || length > selection_max_record_bytes(selection) as usize {
+        return 0;
+    }
+    return decode_record(source, length,
+        selection_max_record_bytes(selection) as usize, output, scratch);
+}
+
+unsafe fn exact_bytes(
+    left: *const u8,
+    right: *const u8,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if source_byte(left, index) != source_byte(right, index) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+// Extension admission is contextual and output-preserving.  `candidate` is
+// caller-owned work storage, distinct from both the destination and the
+// scratch decoder arena; a schema mismatch may change only that work arena.
+pub unsafe fn decode_selected_extension(
+    source: *const u8,
+    length: usize,
+    selection: *const SchemaSelection,
+    local: *const SchemaOffer,
+    peer: *const SchemaOffer,
+    namespace: *const u8,
+    namespace_length: usize,
+    name: *const u8,
+    name_length: usize,
+    version: u64,
+    schema_digest: *const u8,
+    candidate: *mut ValueArena,
+    output: *mut ValueArena,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if namespace as usize == 0 || name as usize == 0
+        || schema_digest as usize == 0 || candidate as usize == 0
+        || output as usize == 0 || candidate as usize == output as usize
+        || scratch as usize == 0
+        || candidate as usize == (*scratch).decoded as usize
+        || output as usize == (*scratch).decoded as usize
+        || decode_selected_value(source, length, selection, local, peer,
+            candidate, scratch) != 1 {
+        return 0;
+    }
+    let root: u64 = arena_root(candidate as *const ValueArena);
+    if root == 0 || node_tag(candidate as *const ValueArena, root)
+            != VALUE_TAG_EXTENSION
+        || node_data_length(candidate as *const ValueArena, root) != namespace_length
+        || node_aux_length(candidate as *const ValueArena, root) != name_length
+        || node_blob_length(candidate as *const ValueArena, root) != 32
+        || node_scalar(candidate as *const ValueArena, root) != version
+        || !exact_bytes(node_data(candidate as *const ValueArena, root),
+            namespace, namespace_length)
+        || !exact_bytes(node_aux(candidate as *const ValueArena, root),
+            name, name_length)
+        || !exact_bytes(node_blob(candidate as *const ValueArena, root),
+            schema_digest, 32) {
+        return 0;
+    }
+    return arena_copy(candidate as *const ValueArena, output);
+}
+
+pub unsafe fn hash_record(
+    arena: *const ValueArena,
+    output: *mut u8,
+    scratch: *mut ValueCodecScratch
+) -> u64 {
+    if arena as usize == 0 || output as usize == 0 || scratch as usize == 0
+        || (*scratch).digest as usize == 0 || (*scratch).digest_capacity < 32 {
+        return 0;
+    }
+    let mut written: usize = 0;
+    if encode_record(arena, (*scratch).staged, (*scratch).staged_capacity,
+        (&mut written), scratch) != 1
+        || sha256_compute((*scratch).staged as *const u8, written,
+            (*scratch).digest, (*scratch).sha) != 1 {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < 32 {
+        volatile_store(output + index,
+            source_byte((*scratch).digest as *const u8, index) as u8);
+        index += 1;
+    }
+    return 1;
+}

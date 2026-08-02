@@ -311,8 +311,44 @@ require_fixed docs/CLAIMS.md \
     'A serialized `CapabilityId` is descriptive data' \
     'serialized identity must not be promoted to capability authority'
 require_fixed docs/CLAIMS.md \
-    "This is not PR3's" \
-    'the bounded identity codec is not separated from the future general wire protocol'
+    'Mode 28 adds the bounded canonical World wire-codec PR3 gate' \
+    'the implemented PR3 codec boundary is missing'
+require_fixed docs/CLAIMS.md \
+    'fixed 20-record, 1254-byte corpus' \
+    'the exact cross-language World protocol corpus is missing'
+require_fixed docs/CLAIMS.md \
+    'not a stream or network transport' \
+    'the World protocol codec could be misread as a live transport'
+require_fixed docs/CLAIMS.md \
+    'decode and negotiation grant no bearer' \
+    'the World protocol codec could be misread as authority'
+require_fixed docs/CLAIMS.md \
+    'Mode 29 adds the bounded canonical World-value PR4 gate' \
+    'the implemented PR4 portable-value boundary is missing'
+require_fixed docs/CLAIMS.md \
+    'separate self-framed `OWVALUE`' \
+    'OWVALUE must remain separate from frozen OWPROTO v1'
+require_fixed docs/CLAIMS.md \
+    'root-only inert versioned' \
+    'the bounded extension-envelope rule is missing'
+require_fixed docs/CLAIMS.md \
+    'same SHA-256 over each complete record' \
+    'the canonical full-record hash claim is missing'
+require_fixed docs/CLAIMS.md \
+    'fixed 19-record,' \
+    'the exact World-value corpus record count is missing'
+require_fixed docs/CLAIMS.md \
+    '928-byte corpus is 1856 lowercase hex digits' \
+    'the exact World-value corpus byte count is missing'
+require_fixed docs/CLAIMS.md \
+    '264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc' \
+    'the exact World-value corpus digest is missing'
+require_fixed docs/CLAIMS.md \
+    'does not make the full hosted `OValue` enum portable' \
+    'the bounded portable allowlist could be promoted to the full hosted value enum'
+require_fixed docs/CLAIMS.md \
+    'passes no G0--G13 gate' \
+    'the Mode 29 value slice could be misread as Alpha qualification'
 require_fixed docs/CLAIMS.md \
     'Strict decoding rejects malformed' \
     'invalid-record rejection must remain a decoder claim'
@@ -350,7 +386,7 @@ do
         "$file does not preserve the hosted reference as non-qualifying"
 done
 
-check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26|27) is the next[^.]*slice' \
-    "Modes 24-27 and KernelWorld Mode 23 are bounded implemented gates, not wholly planned next slices"
+check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26|27|28|29) is the next[^.]*slice' \
+    "Modes 24-29 and KernelWorld Mode 23 are bounded implemented gates, not wholly planned next slices"
 
 exit $fail

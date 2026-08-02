@@ -594,10 +594,66 @@ Run the native World-identity evidence gate with:
 ```
 
 Serialized capability IDs remain descriptive non-authority: they are not
-bearers, CSpace handles, or delegation. `OWIDENT` v1 is not PR3's general World
-wire protocol, transport, negotiation, OValue envelope, or receipt codec. The
+bearers, CSpace handles, or delegation. `OWIDENT` v1 remains the identity-only
+nested format rather than a transport, OValue envelope, or receipt codec. The
 gate supplies no Governor, consensus, native membership, or Alpha
 qualification; it passes no G0--G13 gate, and QEMU TCG is not physical or
+hardware-isolation evidence.
+
+Mode 28 is the bounded canonical World wire-codec PR3 slice. `OWPROTO` v1 uses
+a fixed 16-byte big-endian header, four record kinds, a 16 KiB hard maximum,
+and caller/negotiated record limits. Strict decoding requires exact total and
+payload lengths, known kinds and schemas, zero reserved fields, valid bounded
+schema ranges, and canonical nested `OWIDENT` records. The fixed corpus is
+exactly 20 records and 1254 bytes: two offers, one canonical v1 selection, one
+disjoint rejection, and all 16 identity-v1 conformance records. Rust and native
+`.oc` must produce those bytes exactly under QEMU TCG.
+
+Run the native World-protocol evidence gate with:
+
+```bash
+./ocore/kernel/smoke-world-protocol-qemu.sh
+```
+
+Schema negotiation is an offline deterministic function over two bounded
+offers. It chooses the highest common version and smaller maximum-record limit,
+or one exact contextual no-overlap rejection; validation rejects downgrades,
+inflated limits, and false rejection. It does not open a stream or network
+transport, perform a live handshake, authenticate a peer, establish a session,
+provide encryption or replay protection, or carry membership. Decoded identity
+and capability descriptions remain non-authority and cannot create bearers,
+CSpace handles, or delegation. Mode 28 implements neither PR4 OValues nor PR5
+receipts, and supplies no Governor, consensus, WorldFS, Workstream A acceptance,
+or G0--G13 qualification. QEMU TCG is not physical or hardware-isolation
+evidence.
+
+Mode 29 is the bounded canonical World-value PR4 slice. Its separate
+self-framed `OWVALUE` v1 format is not a new `OWPROTO` v1 kind. It admits only
+the frozen portable core, uses a 4096-byte record maximum with depth limited to
+16 and total nodes limited to 128, orders record fields and scalar-key maps
+canonically, and permits a root-only inert versioned extension whose payload
+must itself be a portable value. SHA-256 covers the complete canonical record.
+The fixed corpus is exactly 19 records and 928 bytes (1856 lowercase hex
+digits), with concatenated SHA-256
+`264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`. It must
+encode identically and hash identically in Rust and native `.oc`; strict decoding and reencoding reject malformed, duplicate,
+out-of-order, over-limit, or otherwise noncanonical records.
+
+Run the native World-value evidence gate with:
+
+```bash
+./ocore/kernel/smoke-world-value-qemu.sh
+```
+
+Hosted conversion is an explicit allowlist. Capabilities, capsules, live
+references, requests, and other authority-bearing or effectful hosted values
+are rejected rather than serialized. Descriptive code and object references do
+not become authority, and extensions never auto-dispatch or rehydrate a
+capsule. Mode 29 remains an offline codec/hash oracle rather than transport, a
+live M9 crossing, authenticated authority, PR5 receipts, execution/grounding
+convergence, a Governor, consensus, WorldFS, Workstream A acceptance, or
+G0--G13 qualification. It does not make the full hosted `OValue` enum portable
+or replace the hosted canonical-CBOR shim format. QEMU TCG is not physical or
 hardware-isolation evidence.
 
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model

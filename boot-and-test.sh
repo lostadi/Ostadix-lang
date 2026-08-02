@@ -139,7 +139,10 @@ phase_kernel() {
 # 21 historical AMD/KVM execution gate (not in the portable aggregate) | 22
 # TCG-compatible KernelWorld live lifecycle/service mechanism | 23 TCG-emulated
 # SVM execution bound to one exact-authority virtual PIO endpoint | 24 live
-# four-byte bounded personality RPC and pre-terminal lifecycle dispositions
+# four-byte bounded personality RPC and pre-terminal lifecycle dispositions |
+# 25 exact static Linux ELF/CPL3 personality | 26 exact Linux-to-9P2000 service
+# composition | 27 OWIDENT v1 identity oracle | 28 OWPROTO v1 codec oracle |
+# 29 OWVALUE v1 portable-value/hash oracle
 phase_smoke() {
   say "Layer 4 — smoke gates"
   need cargo; need clang; need python3; need qemu-system-x86_64; need tee

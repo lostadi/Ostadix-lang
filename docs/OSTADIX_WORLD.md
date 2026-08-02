@@ -1825,17 +1825,51 @@ strict `OWIDENT` v1 identity-only corpus is byte-identical between the Rust
 oracle and native O-core under QEMU TCG. Strict decode rejects malformed and
 zero-valued records; hierarchical current/reference checks reject stale
 generations and same-generation logical mismatches. Serialized capability IDs remain
-descriptive non-authority. This does not land PR 3's general wire protocol,
-transport, negotiation, OValue envelope, or receipt codec; it supplies no
-Governor or consensus and passes no G0--G13 gate.
+descriptive non-authority. `OWIDENT` itself remains an identity-only record and
+does not become the separate PR 3 protocol codec, a transport, an OValue
+envelope, or a receipt codec; it supplies no Governor or consensus and passes
+no G0--G13 gate.
 
 ### PR 3 -- canonical World wire codec
 
 Implement deterministic encoding, bounded decoding, schema version negotiation, and cross-language byte oracles.
 
+**Repository status:** landed as the bounded Mode 28 `OWPROTO` v1 codec slice.
+The Rust oracle and native `.oc` implementation share deterministic big-endian
+records with a 16 KiB hard maximum, caller/negotiated record bounds, four fixed
+kinds, strict exact-length and reserved-field validation, and canonical nested
+`OWIDENT` descriptions. Their fixed 20-record, 1254-byte corpus--two offers, one
+canonical v1 selection, one disjoint rejection, and all 16 identity conformance
+records--is byte-identical under QEMU TCG. Offline negotiation selects the
+highest common schema version and the smaller record limit, or returns one
+exact contextual no-overlap rejection.
+This is a record codec and pure negotiation function, not a stream or network
+transport, live peer handshake, authenticated session, authority channel,
+OValue envelope, receipt codec, Governor, consensus implementation, or
+Workstream A acceptance. It passes no G0--G13 gate.
+
 ### PR 4 -- freeze OValue core and extension envelope
 
 Split portable core values from versioned extensions. Prove canonical hashing and reject authority-bearing values.
+
+**Repository status:** landed as the bounded Mode 29 `OWVALUE` v1 value and
+hash oracle. The format is separate and self-framed rather than a new
+`OWPROTO` v1 record kind. It has a 4096-byte record maximum, depth-16 and
+128-node limits, an explicit portable-value allowlist, strictly ordered record
+fields and scalar-key maps, and a root-only inert versioned extension envelope
+whose payload must itself be portable. Rust and native `.oc` must emit the same
+fixed 19-record, 928-byte corpus--1856 lowercase hex digits with concatenated
+SHA-256 `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`--and
+the same SHA-256 over each complete record; strict
+decode/reencode rejects malformed and noncanonical values, while the hosted
+projection rejects capabilities, capsules, and effectful values.
+
+Mode 29 is an offline codec and hash oracle. It does not replace the richer
+hosted `OValue` or its canonical-CBOR shim wire format, transport values between
+domains, resolve descriptive references into authority, dispatch extensions,
+implement PR 5 receipts, or satisfy Acceptance gate A. It supplies no Governor,
+consensus, WorldFS, or G0--G13 passage, and QEMU TCG is not physical or
+hardware-isolation evidence.
 
 ### PR 5 -- canonical execution receipt
 
@@ -2548,7 +2582,7 @@ registry.
 
 The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
-The current 18 portable QEMU gates and one supplemental hardware gate retain
+The current 20 portable QEMU gates and one supplemental hardware gate retain
 only the bounded claims in [`CLAIMS.md`](CLAIMS.md) and
 [`evidence/gates.toml`](../evidence/gates.toml). Their results do not satisfy a
 G0--G13 gate. Schema v1 admits no evidence records; only a future versioned,

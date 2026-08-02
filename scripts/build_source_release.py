@@ -165,24 +165,43 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/boot.S",
         "ocore/kernel/build.sh",
         "ocore/kernel/main.oc",
+        "ocore/kernel/smoke-world-value-qemu.sh",
+        "ocore/kernel/smoke-world-protocol-qemu.sh",
         "ocore/kernel/smoke-world-identity-qemu.sh",
+        "ocore/kernel/world_value_semantics.oc",
+        "ocore/kernel/world_value_semantics_stub.oc",
+        "ocore/kernel/world_protocol_semantics.oc",
+        "ocore/kernel/world_protocol_semantics_stub.oc",
         "ocore/kernel/world_identity_semantics.oc",
         "ocore/kernel/world_identity_semantics_stub.oc",
         "ocore/runtime/x86_64/trap.oc",
+        "ocore/world/codec.oc",
         "ocore/world/identity.oc",
+        "ocore/world/protocol.oc",
+        "ocore/world/sha256.oc",
+        "ocore/world/value.oc",
+        "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
         "src/world/identity.rs",
         "src/world/identity_wire.rs",
+        "src/world/codec.rs",
         "src/world/mod.rs",
+        "src/world/protocol.rs",
+        "src/world/value.rs",
+        "src/world/value_codec.rs",
         "tests/example_manifest.py",
         "tests/fixtures/world_identity_v1.hex",
+        "tests/fixtures/world_protocol_v1.hex",
+        "tests/fixtures/world_value_v1.hex",
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
         "tests/test_world_alpha_evidence.py",
         "tests/world_identity.rs",
         "tests/world_identity_wire.rs",
+        "tests/world_protocol.rs",
+        "tests/world_value.rs",
     }
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
@@ -194,7 +213,7 @@ EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
 EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
 EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
-EXPECTED_REQUIRED_EVIDENCE_GATES = 18
+EXPECTED_REQUIRED_EVIDENCE_GATES = 20
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 
 # These three files jointly define the version-1 native World constitution and
@@ -204,13 +223,13 @@ EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "7bc5b1a682581566d12daeaf2cc9f8c5baeb22dbfaf4afe6fe7e7d0fbdd4cd92"
+        "d3db5a7d553bad43cbcba0ea7960a95d3cad26d8e830d4aea60b77b750235fe1"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
-        "faa233f06c3993bcbb29d198b1d9e5b66edc4842136963571c4822faa2149925"
+        "a8ee89ddcb535b11ebafd9f88c9c2e9258b0a2314e718b1264635a94246daa49"
     ),
     "evidence/world_alpha_gates.toml": (
-        "b0b7314234689f8137f86c769e0c866f26741af01bc9b06b8b1e6ee28590362f"
+        "d12df7b76415616d8bbf7ade3c688e6ccc8aafcc2057eb7d737bdab53eb55231"
     ),
 }
 EXPECTED_WORLD_ALPHA_GATE_IDS = tuple(f"G{number}" for number in range(14))
