@@ -1,0 +1,545 @@
+module world::codec;
+
+use world::identity::IdentityRecord;
+use world::identity::clear_record as clear_identity_record;
+use world::identity::decode_record as decode_identity_record;
+use world::identity::encode_record as encode_identity_record;
+use world::protocol::SchemaOffer;
+use world::protocol::SchemaSelection;
+use world::protocol::SchemaRejection;
+use world::protocol::WORLD_WIRE_MIN_RECORD_BYTES;
+use world::protocol::WORLD_WIRE_MAX_RECORD_BYTES;
+use world::protocol::clear_offer;
+use world::protocol::clear_selection;
+use world::protocol::clear_rejection;
+use world::protocol::offer_init;
+use world::protocol::selection_init;
+use world::protocol::rejection_init;
+use world::protocol::offer_valid;
+use world::protocol::selection_valid;
+use world::protocol::rejection_valid;
+use world::protocol::offer_min_schema;
+use world::protocol::offer_max_schema;
+use world::protocol::offer_max_record_bytes;
+use world::protocol::selection_schema;
+use world::protocol::selection_max_record_bytes;
+use world::protocol::selection_matches_offers;
+use world::protocol::rejection_local_min;
+use world::protocol::rejection_local_max;
+use world::protocol::rejection_peer_min;
+use world::protocol::rejection_peer_max;
+
+// A fixed-width architecture-independent envelope. Version 1 has four typed
+// record families only; no arbitrary byte payload can be labeled canonical.
+pub const WORLD_WIRE_CODEC_VERSION: u64 = 1;
+pub const WORLD_WIRE_KIND_SCHEMA_OFFER: u64 = 1;
+pub const WORLD_WIRE_KIND_SCHEMA_SELECTION: u64 = 2;
+pub const WORLD_WIRE_KIND_SCHEMA_REJECTION: u64 = 3;
+pub const WORLD_WIRE_KIND_IDENTITY_DESCRIPTION: u64 = 0x10;
+pub const WORLD_WIRE_IDENTITY_SCHEMA: u64 = 1;
+
+const WORLD_WIRE_HEADER_LENGTH: usize = 16;
+const WORLD_WIRE_NEGOTIATION_RECORD_LENGTH: usize = 24;
+const WORLD_WIRE_IDENTITY_PREFIX_LENGTH: usize = 20;
+const IDENTITY_RECORD_MAX_LENGTH: usize = 1024;
+// Although peers may negotiate a 16 KiB ceiling for future typed families,
+// every currently known v1 record is at most a four-byte identity prefix plus
+// one bounded OWIDENT record. Keeping the snapshot at this exact known bound
+// avoids consuming half of the 32 KiB bootstrap kernel stack.
+const WORLD_WIRE_V1_KNOWN_MAX_LENGTH: usize = 1044;
+pub const WORLD_CODEC_SCRATCH_WORDS: usize = 1024;
+
+pub struct WorldProtocolRecord {
+    kind: u64,
+    offer: SchemaOffer,
+    selection: SchemaSelection,
+    rejection: SchemaRejection,
+    identity_schema: u64,
+    identity: IdentityRecord,
+}
+
+// Freestanding callers own scratch explicitly. This keeps decode reentrant,
+// avoids hidden mutable globals, and prevents the spill-only bootstrap backend
+// from placing the bounded snapshots on its 64 KiB management kernel stack.
+pub struct WorldCodecScratch {
+    staged: [u8; 1044],
+    identity: IdentityRecord,
+    decoded: WorldProtocolRecord,
+}
+
+struct Reader {
+    source: *const u8,
+    length: usize,
+    cursor: usize,
+    failed: u64,
+}
+
+pub unsafe fn clear_record(record: *mut WorldProtocolRecord) -> u64 {
+    if record as usize == 0 { return 0; }
+    (*record).kind = 0;
+    if clear_offer((&mut (*record).offer)) != 1
+        || clear_selection((&mut (*record).selection)) != 1
+        || clear_rejection((&mut (*record).rejection)) != 1
+        || clear_identity_record((&mut (*record).identity)) != 1 {
+        return 0;
+    }
+    (*record).identity_schema = 0;
+    return 1;
+}
+
+pub unsafe fn record_from_offer(
+    record: *mut WorldProtocolRecord,
+    offer: *const SchemaOffer
+) -> u64 {
+    if record as usize == 0 || !offer_valid(offer) { return 0; }
+    if clear_record(record) != 1 { return 0; }
+    if offer_init(
+        (&mut (*record).offer),
+        offer_min_schema(offer),
+        offer_max_schema(offer),
+        offer_max_record_bytes(offer)
+    ) != 1 {
+        return 0;
+    }
+    (*record).kind = WORLD_WIRE_KIND_SCHEMA_OFFER;
+    return 1;
+}
+
+pub unsafe fn record_from_selection(
+    record: *mut WorldProtocolRecord,
+    selection: *const SchemaSelection
+) -> u64 {
+    if record as usize == 0 || !selection_valid(selection) { return 0; }
+    if clear_record(record) != 1 { return 0; }
+    if selection_init(
+        (&mut (*record).selection),
+        selection_schema(selection),
+        selection_max_record_bytes(selection)
+    ) != 1 {
+        return 0;
+    }
+    (*record).kind = WORLD_WIRE_KIND_SCHEMA_SELECTION;
+    return 1;
+}
+
+pub unsafe fn record_from_rejection(
+    record: *mut WorldProtocolRecord,
+    rejection: *const SchemaRejection
+) -> u64 {
+    if record as usize == 0 || !rejection_valid(rejection) { return 0; }
+    if clear_record(record) != 1 { return 0; }
+    if rejection_init(
+        (&mut (*record).rejection),
+        rejection_local_min(rejection),
+        rejection_local_max(rejection),
+        rejection_peer_min(rejection),
+        rejection_peer_max(rejection)
+    ) != 1 {
+        return 0;
+    }
+    (*record).kind = WORLD_WIRE_KIND_SCHEMA_REJECTION;
+    return 1;
+}
+
+pub unsafe fn record_from_identity(
+    record: *mut WorldProtocolRecord,
+    identity: *const IdentityRecord
+) -> u64 {
+    if record as usize == 0 || identity as usize == 0 { return 0; }
+    let mut staged: [u8; 1024] = [0; 1024];
+    let mut written: usize = 0;
+    if encode_identity_record(
+        identity,
+        (&mut staged[0]),
+        IDENTITY_RECORD_MAX_LENGTH,
+        (&mut written)
+    ) != 1 {
+        return 0;
+    }
+    if clear_record(record) != 1
+        || decode_identity_record(
+            (&staged[0]),
+            written,
+            (&mut (*record).identity)
+        ) != 1 {
+        return 0;
+    }
+    (*record).kind = WORLD_WIRE_KIND_IDENTITY_DESCRIPTION;
+    (*record).identity_schema = WORLD_WIRE_IDENTITY_SCHEMA;
+    return 1;
+}
+
+pub unsafe fn record_kind(record: *const WorldProtocolRecord) -> u64 {
+    if record as usize == 0 { return 0; }
+    return (*record).kind;
+}
+
+pub unsafe fn copy_offer(
+    record: *const WorldProtocolRecord,
+    output: *mut SchemaOffer
+) -> u64 {
+    if record as usize == 0 || output as usize == 0
+        || (*record).kind != WORLD_WIRE_KIND_SCHEMA_OFFER {
+        return 0;
+    }
+    return offer_init(
+        output,
+        offer_min_schema((&(*record).offer)),
+        offer_max_schema((&(*record).offer)),
+        offer_max_record_bytes((&(*record).offer))
+    );
+}
+
+pub unsafe fn copy_selection(
+    record: *const WorldProtocolRecord,
+    output: *mut SchemaSelection
+) -> u64 {
+    if record as usize == 0 || output as usize == 0
+        || (*record).kind != WORLD_WIRE_KIND_SCHEMA_SELECTION {
+        return 0;
+    }
+    return selection_init(
+        output,
+        selection_schema((&(*record).selection)),
+        selection_max_record_bytes((&(*record).selection))
+    );
+}
+
+pub unsafe fn copy_rejection(
+    record: *const WorldProtocolRecord,
+    output: *mut SchemaRejection
+) -> u64 {
+    if record as usize == 0 || output as usize == 0
+        || (*record).kind != WORLD_WIRE_KIND_SCHEMA_REJECTION {
+        return 0;
+    }
+    return rejection_init(
+        output,
+        rejection_local_min((&(*record).rejection)),
+        rejection_local_max((&(*record).rejection)),
+        rejection_peer_min((&(*record).rejection)),
+        rejection_peer_max((&(*record).rejection))
+    );
+}
+
+pub unsafe fn record_identity(
+    record: *const WorldProtocolRecord
+) -> *const IdentityRecord {
+    if record as usize == 0
+        || (*record).kind != WORLD_WIRE_KIND_IDENTITY_DESCRIPTION
+        || (*record).identity_schema != WORLD_WIRE_IDENTITY_SCHEMA {
+        return 0 as *const IdentityRecord;
+    }
+    return (&(*record).identity);
+}
+
+unsafe fn source_byte(source: *const u8, index: usize) -> u64 {
+    return volatile_load(source + index) as u64;
+}
+
+unsafe fn put_byte(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    volatile_store(output + *cursor, value as u8);
+    *cursor += 1;
+}
+
+unsafe fn put_u16(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_u32(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 24);
+    put_byte(output, cursor, value >> 16);
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_header(
+    output: *mut u8,
+    cursor: *mut usize,
+    kind: u64,
+    total: usize
+) -> void {
+    put_byte(output, cursor, b'O' as u64);
+    put_byte(output, cursor, b'W' as u64);
+    put_byte(output, cursor, b'P' as u64);
+    put_byte(output, cursor, b'R' as u64);
+    put_byte(output, cursor, b'O' as u64);
+    put_byte(output, cursor, b'T' as u64);
+    put_byte(output, cursor, b'O' as u64);
+    put_byte(output, cursor, 0);
+    put_u16(output, cursor, WORLD_WIRE_CODEC_VERSION);
+    put_u16(output, cursor, kind);
+    put_u32(output, cursor, total as u64);
+}
+
+pub unsafe fn encode_record(
+    record: *const WorldProtocolRecord,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if record as usize == 0 || output as usize == 0 || written as usize == 0 {
+        return 0;
+    }
+    let kind: u64 = (*record).kind;
+    let mut total: usize = WORLD_WIRE_NEGOTIATION_RECORD_LENGTH;
+    let mut identity_length: usize = 0;
+    let mut nested: [u8; 1024] = [0; 1024];
+    if kind == WORLD_WIRE_KIND_SCHEMA_OFFER
+        && !offer_valid((&(*record).offer)) { return 0; }
+    if kind == WORLD_WIRE_KIND_SCHEMA_SELECTION
+        && !selection_valid((&(*record).selection)) { return 0; }
+    if kind == WORLD_WIRE_KIND_SCHEMA_REJECTION
+        && !rejection_valid((&(*record).rejection)) { return 0; }
+    if kind == WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        if (*record).identity_schema != WORLD_WIRE_IDENTITY_SCHEMA
+            || encode_identity_record(
+                (&(*record).identity),
+                (&mut nested[0]),
+                IDENTITY_RECORD_MAX_LENGTH,
+                (&mut identity_length)
+            ) != 1 {
+            return 0;
+        }
+        total = WORLD_WIRE_IDENTITY_PREFIX_LENGTH + identity_length;
+    }
+    if kind != WORLD_WIRE_KIND_SCHEMA_OFFER
+        && kind != WORLD_WIRE_KIND_SCHEMA_SELECTION
+        && kind != WORLD_WIRE_KIND_SCHEMA_REJECTION
+        && kind != WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        return 0;
+    }
+    if total as u64 > WORLD_WIRE_MAX_RECORD_BYTES || capacity < total {
+        return 0;
+    }
+    let mut cursor: usize = 0;
+    put_header(output, (&mut cursor), kind, total);
+    if kind == WORLD_WIRE_KIND_SCHEMA_OFFER {
+        put_u16(output, (&mut cursor), offer_min_schema((&(*record).offer)));
+        put_u16(output, (&mut cursor), offer_max_schema((&(*record).offer)));
+        put_u32(output, (&mut cursor), offer_max_record_bytes((&(*record).offer)));
+    }
+    if kind == WORLD_WIRE_KIND_SCHEMA_SELECTION {
+        put_u16(output, (&mut cursor), selection_schema((&(*record).selection)));
+        put_u16(output, (&mut cursor), 0);
+        put_u32(
+            output,
+            (&mut cursor),
+            selection_max_record_bytes((&(*record).selection))
+        );
+    }
+    if kind == WORLD_WIRE_KIND_SCHEMA_REJECTION {
+        put_u16(output, (&mut cursor), rejection_local_min((&(*record).rejection)));
+        put_u16(output, (&mut cursor), rejection_local_max((&(*record).rejection)));
+        put_u16(output, (&mut cursor), rejection_peer_min((&(*record).rejection)));
+        put_u16(output, (&mut cursor), rejection_peer_max((&(*record).rejection)));
+    }
+    if kind == WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        put_u16(output, (&mut cursor), WORLD_WIRE_IDENTITY_SCHEMA);
+        put_u16(output, (&mut cursor), 0);
+        let mut index: usize = 0;
+        while index < identity_length {
+            put_byte(output, (&mut cursor), nested[index] as u64);
+            index += 1;
+        }
+    }
+    if cursor != total { return 0; }
+    volatile_store(written, total);
+    return 1;
+}
+
+unsafe fn take_byte(reader: *mut Reader) -> u64 {
+    if (*reader).failed != 0 || (*reader).cursor >= (*reader).length {
+        (*reader).failed = 1;
+        return 0;
+    }
+    let value: u64 = source_byte((*reader).source, (*reader).cursor);
+    (*reader).cursor += 1;
+    return value;
+}
+
+unsafe fn take_u16(reader: *mut Reader) -> u64 {
+    return (take_byte(reader) << 8) | take_byte(reader);
+}
+
+unsafe fn take_u32(reader: *mut Reader) -> u64 {
+    return (take_u16(reader) << 16) | take_u16(reader);
+}
+
+unsafe fn header_valid(reader: *mut Reader, length: usize) -> u64 {
+    if take_byte(reader) != b'O' as u64
+        || take_byte(reader) != b'W' as u64
+        || take_byte(reader) != b'P' as u64
+        || take_byte(reader) != b'R' as u64
+        || take_byte(reader) != b'O' as u64
+        || take_byte(reader) != b'T' as u64
+        || take_byte(reader) != b'O' as u64
+        || take_byte(reader) != 0 {
+        return 0;
+    }
+    if take_u16(reader) != WORLD_WIRE_CODEC_VERSION { return 0; }
+    let kind: u64 = take_u16(reader);
+    let total: u64 = take_u32(reader);
+    if (*reader).failed != 0 || total as usize != length { return 0; }
+    return kind;
+}
+
+pub unsafe fn decode_record(
+    source: *const u8,
+    length: usize,
+    caller_limit: usize,
+    record: *mut WorldProtocolRecord,
+    scratch: *mut WorldCodecScratch
+) -> u64 {
+    if source as usize == 0 || record as usize == 0 || scratch as usize == 0
+        || caller_limit < WORLD_WIRE_MIN_RECORD_BYTES as usize
+        || caller_limit as u64 > WORLD_WIRE_MAX_RECORD_BYTES
+        || length < WORLD_WIRE_HEADER_LENGTH
+        || length > caller_limit
+        || length as u64 > WORLD_WIRE_MAX_RECORD_BYTES
+        || length > WORLD_WIRE_V1_KNOWN_MAX_LENGTH {
+        return 0;
+    }
+
+    // Snapshot before parsing so validation and commit see identical bytes.
+    let mut index: usize = 0;
+    while index < length {
+        (*scratch).staged[index] = source_byte(source, index) as u8;
+        index += 1;
+    }
+    let mut reader: Reader = Reader {
+        source: (&(*scratch).staged[0]),
+        length: length,
+        cursor: 0,
+        failed: 0,
+    };
+    let kind: u64 = header_valid((&mut reader), length);
+    if kind == 0 { return 0; }
+
+    let mut offer_storage: [u64; 3] = [0; 3];
+    let offer: *mut SchemaOffer =
+        ((&mut offer_storage[0]) as *mut u64) as *mut SchemaOffer;
+    let mut selection_storage: [u64; 2] = [0; 2];
+    let selection: *mut SchemaSelection =
+        ((&mut selection_storage[0]) as *mut u64) as *mut SchemaSelection;
+    let mut rejection_storage: [u64; 4] = [0; 4];
+    let rejection: *mut SchemaRejection =
+        ((&mut rejection_storage[0]) as *mut u64) as *mut SchemaRejection;
+    if kind == WORLD_WIRE_KIND_SCHEMA_OFFER {
+        if length != WORLD_WIRE_NEGOTIATION_RECORD_LENGTH
+            || offer_init(
+                offer,
+                take_u16((&mut reader)),
+                take_u16((&mut reader)),
+                take_u32((&mut reader))
+            ) != 1
+            || reader.failed != 0 || reader.cursor != length {
+            return 0;
+        }
+        return record_from_offer(record, offer as *const SchemaOffer);
+    }
+    if kind == WORLD_WIRE_KIND_SCHEMA_SELECTION {
+        if length != WORLD_WIRE_NEGOTIATION_RECORD_LENGTH { return 0; }
+        let selected_schema: u64 = take_u16((&mut reader));
+        let reserved: u64 = take_u16((&mut reader));
+        let agreed_max: u64 = take_u32((&mut reader));
+        if reserved != 0
+            || selection_init(selection, selected_schema, agreed_max) != 1
+            || reader.failed != 0 || reader.cursor != length {
+            return 0;
+        }
+        return record_from_selection(record, selection as *const SchemaSelection);
+    }
+    if kind == WORLD_WIRE_KIND_SCHEMA_REJECTION {
+        if length != WORLD_WIRE_NEGOTIATION_RECORD_LENGTH
+            || rejection_init(
+                rejection,
+                take_u16((&mut reader)),
+                take_u16((&mut reader)),
+                take_u16((&mut reader)),
+                take_u16((&mut reader))
+            ) != 1
+            || reader.failed != 0 || reader.cursor != length {
+            return 0;
+        }
+        return record_from_rejection(record, rejection as *const SchemaRejection);
+    }
+    if kind == WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        let schema: u64 = take_u16((&mut reader));
+        let reserved: u64 = take_u16((&mut reader));
+        if reader.failed != 0 || schema != WORLD_WIRE_IDENTITY_SCHEMA
+            || reserved != 0 || reader.cursor >= length {
+            return 0;
+        }
+        let nested_length: usize = length - reader.cursor;
+        if nested_length > IDENTITY_RECORD_MAX_LENGTH
+            || decode_identity_record(
+                reader.source + reader.cursor,
+                nested_length,
+                (&mut (*scratch).identity)
+            ) != 1 {
+            return 0;
+        }
+        // OWIDENT's strict decoder already enforces its one canonical layout.
+        // Commit only from the stable snapshot after that complete pass.
+        if clear_record(record) != 1
+            || decode_identity_record(
+                reader.source + reader.cursor,
+                nested_length,
+                (&mut (*record).identity)
+            ) != 1 {
+            return 0;
+        }
+        (*record).kind = WORLD_WIRE_KIND_IDENTITY_DESCRIPTION;
+        (*record).identity_schema = WORLD_WIRE_IDENTITY_SCHEMA;
+        reader.cursor += nested_length;
+        if reader.cursor != length { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+// IdentityDescription is the only data-bearing v1 family. It must be decoded
+// under the exact selected schema and negotiated byte ceiling, not merely
+// under the codec's hard maximum. The caller's output remains untouched when
+// either contextual check fails.
+pub unsafe fn decode_selected_identity(
+    source: *const u8,
+    length: usize,
+    selection: *const SchemaSelection,
+    local_offer: *const SchemaOffer,
+    peer_offer: *const SchemaOffer,
+    record: *mut WorldProtocolRecord,
+    scratch: *mut WorldCodecScratch
+) -> u64 {
+    if record as usize == 0 || scratch as usize == 0
+        || !selection_valid(selection)
+        || selection_schema(selection) != WORLD_WIRE_IDENTITY_SCHEMA
+        || !selection_matches_offers(selection, local_offer, peer_offer) {
+        return 0;
+    }
+    if decode_record(
+        source,
+        length,
+        selection_max_record_bytes(selection) as usize,
+        (&mut (*scratch).decoded),
+        scratch
+    ) != 1
+        || record_kind((&(*scratch).decoded) as *const WorldProtocolRecord)
+            != WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        return 0;
+    }
+    let nested_length: usize = length - WORLD_WIRE_IDENTITY_PREFIX_LENGTH;
+    if clear_record(record) != 1
+        || decode_identity_record(
+            (&(*scratch).staged[WORLD_WIRE_IDENTITY_PREFIX_LENGTH]),
+            nested_length,
+            (&mut (*record).identity)
+        ) != 1 {
+        return 0;
+    }
+    (*record).kind = WORLD_WIRE_KIND_IDENTITY_DESCRIPTION;
+    (*record).identity_schema = WORLD_WIRE_IDENTITY_SCHEMA;
+    return 1;
+}

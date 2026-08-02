@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 27" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 29" >&2
     exit 2
     ;;
 esac
@@ -144,17 +144,31 @@ KERNEL_WORLD_EXECUTION_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_execution
 KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics_stub.oc"
 WORLD_IDENTITY_SEMANTICS_SOURCE="$KERNEL_DIR/world_identity_semantics_stub.oc"
 WORLD_IDENTITY_SOURCES=()
+WORLD_PROTOCOL_SEMANTICS_SOURCE="$KERNEL_DIR/world_protocol_semantics_stub.oc"
+WORLD_PROTOCOL_SOURCES=()
+WORLD_VALUE_SEMANTICS_SOURCE="$KERNEL_DIR/world_value_semantics_stub.oc"
+WORLD_VALUE_SOURCES=()
 ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint.oc"
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot.oc"
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics.oc"
 fi
-if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
+if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 || PROBE_MODE == 28 || PROBE_MODE == 29 )); then
   # Mode 19's direct memory-view oracle and the KernelWorld probes use neither
   # IPC queues nor endpoint lifecycle. Link a fail-closed API substitute that
-  # preserves common one-shot initialization; Modes 0-18 and 24 retain the
-  # full four-message endpoint implementation.
+  # preserves common one-shot initialization. Mode 28 is likewise a direct
+  # freestanding codec oracle with no endpoint traffic. Other probes retain
+  # the full four-message endpoint implementation where required.
   ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint_probe_stub.oc"
+fi
+if (( PROBE_MODE == 29 )); then
+  WORLD_VALUE_SEMANTICS_SOURCE="$KERNEL_DIR/world_value_semantics.oc"
+  WORLD_VALUE_SOURCES=(
+    "$ROOT/ocore/world/protocol.oc"
+    "$ROOT/ocore/world/value.oc"
+    "$ROOT/ocore/world/sha256.oc"
+    "$ROOT/ocore/world/value_codec.oc"
+  )
 fi
 if (( PROBE_MODE == 23 )); then
   KERNEL_WORLD_DEVICE_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_device.oc"
@@ -164,9 +178,19 @@ if (( PROBE_MODE == 23 )); then
   # historical Modes 20-22 contract harness.
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_execution_device_semantics.oc"
 fi
-if (( PROBE_MODE == 27 )); then
+if (( PROBE_MODE == 27 || PROBE_MODE == 28 )); then
   WORLD_IDENTITY_SEMANTICS_SOURCE="$KERNEL_DIR/world_identity_semantics.oc"
+fi
+if (( PROBE_MODE == 27 )); then
   WORLD_IDENTITY_SOURCES=("$ROOT/ocore/world/identity.oc")
+fi
+if (( PROBE_MODE == 28 )); then
+  WORLD_PROTOCOL_SEMANTICS_SOURCE="$KERNEL_DIR/world_protocol_semantics.oc"
+  WORLD_PROTOCOL_SOURCES=(
+    "$ROOT/ocore/world/identity.oc"
+    "$ROOT/ocore/world/protocol.oc"
+    "$ROOT/ocore/world/codec.oc"
+  )
 fi
 
 LINUX_PERSONALITY_SOURCES=(
@@ -234,10 +258,11 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
-  # Modes 25 and 26 are compile-time selected and enter only kernel::m6. Keep
-  # the historical probes fail-closed without linking their unreachable
-  # harness bodies, preserving the hard bootstrap headroom assertion.
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 )); then
+  # Modes 25 and 26 enter only kernel::m6, while Mode 28 enters only the World
+  # protocol oracle. Keep historical probes fail-closed without linking their
+  # unreachable harness bodies, preserving the hard bootstrap headroom
+  # assertion.
   M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
   M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
   M3_SOURCE="$KERNEL_DIR/m3_mode25_stub.oc"
@@ -247,6 +272,8 @@ fi
 
 "$ROOT/target/debug/ocorec" \
   ${WORLD_IDENTITY_SOURCES[@]+"${WORLD_IDENTITY_SOURCES[@]}"} \
+  ${WORLD_PROTOCOL_SOURCES[@]+"${WORLD_PROTOCOL_SOURCES[@]}"} \
+  ${WORLD_VALUE_SOURCES[@]+"${WORLD_VALUE_SOURCES[@]}"} \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
@@ -303,6 +330,8 @@ fi
   "$M6B_SEMANTICS_SOURCE" \
   "$KERNEL_WORLD_SEMANTICS_SOURCE" \
   "$WORLD_IDENTITY_SEMANTICS_SOURCE" \
+  "$WORLD_PROTOCOL_SEMANTICS_SOURCE" \
+  "$WORLD_VALUE_SEMANTICS_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \

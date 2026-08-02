@@ -1,0 +1,10 @@
+module kernel::world_protocol_semantics;
+
+// Non-Mode-28 builds retain a total, fail-closed link surface without carrying
+// the native World protocol evidence harness.
+pub unsafe fn start(mode: u64) -> never {
+    if mode != 0 {
+        loop { halt(); }
+    }
+    loop { halt(); }
+}
