@@ -1902,6 +1902,27 @@ passage. QEMU TCG is not physical or hardware-isolation evidence.
 
 Add World, node, domain, process, object, capability, namespace, device, and accelerator resources while retaining `HostWorld` only for ambient hosted effects.
 
+**Repository status (2026-08-02): bounded hosted slice implemented.** The Rust
+effect model exposes typed World, Governor, node, domain, process, generic
+`GovernedResource` (the `ResourceState` role above), object, descriptive
+capability, namespace, task-attempt, artifact-publication, device, and
+accelerator keys. Device and accelerator views also touch the canonical generic
+resource dependency. All governed source spellings are rejected from
+user-authored `reads=`/`writes=` declarations, and ordinary opaque hosted work
+continues to use `HostWorld`. `scripts/smoke-world-resource-keys.sh` proves the
+bounded hosted vocabulary, underlying identity helpers' caller-pair comparison,
+HGraph state chaining, alias-aware grounding partition, source-forgery
+rejection, and residual `HostWorld` CLI behavior. Grounding checks only the
+bound World epoch/membership.
+
+This status is repository-conformance, not O-core Mode 31, a ResourceKey wire
+format, production OIR/project/KernelWorld lowering, live Governor or snapshot
+authority, namespace service, device discovery/assignment/driver execution,
+PCI/DMA/IOMMU isolation, accelerator control, native/QEMU/hardware evidence,
+Acceptance gate A, or passage of G0, G1, or any G0--G13 gate. PR 7 still owns
+real project operations in HGraph, and PR 9 still owns the full grounding and
+locality views.
+
 ### PR 7 -- project operations constructed in HGraph
 
 Make `MaterializeProject`, `BuildRoute`, `RunRoute`, `SelectRoute`, and `CompareRouteResults` appear in real project plans.

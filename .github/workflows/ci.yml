@@ -46,6 +46,9 @@ jobs:
       - name: Run hosted Live-World reference smoke
         run: bash scripts/smoke-hosted-live-reference.sh
 
+      - name: Run hosted World ResourceKey conformance smoke
+        run: bash scripts/smoke-world-resource-keys.sh
+
       - name: Run deterministic parser properties
         run: cargo test --test parser_proptest
 

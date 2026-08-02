@@ -10,8 +10,9 @@ use std::fmt;
 
 use crate::ir::{ExecutionMode, PlanNodeId, PlanNodeKind};
 use crate::world::identity::{
-    ArtifactPublicationIdentity, DomainIdentity, NodeIdentity, ResourceIdentity,
-    TaskAttemptIdentity, WorldIdentity,
+    ArtifactPublicationIdentity, CapabilityIdentity, DomainIdentity, GovernorIdentity,
+    NodeIdentity, ObjectIdentity, ProcessIdentity, ResourceIdentity, TaskAttemptIdentity,
+    WorldIdentity,
 };
 
 /// Stable identity for a persistent evaluator resource.
@@ -42,21 +43,40 @@ impl fmt::Display for ActorResourceId {
 
 /// A semantic resource whose state may be consumed or produced by an operation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum ResourceKey {
     /// Conservative umbrella for host-observable state not modeled precisely.
     HostWorld,
     /// One exact governed World epoch. This is not ambient host authority.
     WorldState(WorldIdentity),
+    /// One exact descriptive Governor position for one World epoch.
+    GovernorState(GovernorIdentity),
     /// One exact governed node generation.
     NodeState(NodeIdentity),
     /// One exact governed execution-domain generation.
     DomainState(DomainIdentity),
-    /// One typed resource beneath an exact governed owner generation.
+    /// One exact governed process generation.
+    ProcessState(ProcessIdentity),
+    /// The canonical generic state for one resource beneath an exact owner
+    /// generation. Device and accelerator views also alias this key for
+    /// scheduling, so they cannot bypass generic resource dependencies.
     GovernedResource(ResourceIdentity),
+    /// One exact immutable-object version in a World.
+    ObjectState(ObjectIdentity),
+    /// Descriptive lifecycle state for an inert capability identifier.
+    ///
+    /// This key does not carry a grant or authorize an operation.
+    CapabilityState(CapabilityIdentity),
+    /// One exact World-wide namespace epoch.
+    NamespaceState(WorldIdentity),
     /// One exact task-attempt generation.
     TaskState(TaskAttemptIdentity),
     /// Publication state for one content-addressed artifact in one World epoch.
     ArtifactState(ArtifactPublicationIdentity),
+    /// One device resource beneath an exact governed owner generation.
+    DeviceState(ResourceIdentity),
+    /// One accelerator resource beneath an exact governed owner generation.
+    AcceleratorState(ResourceIdentity),
     /// Mutable state owned by the O evaluator itself.
     EvaluatorState,
     /// One O-level scope binding.
@@ -69,6 +89,70 @@ pub enum ResourceKey {
     NetworkUnknown,
     Service(String),
     ActorState(ActorResourceId),
+}
+
+/// Stable semantic class for a governed [`ResourceKey`].
+///
+/// This is hosted planner vocabulary. It is not a wire tag, capability grant,
+/// authoritative inventory record, or proof that an effect was mediated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum GovernedResourceKind {
+    World,
+    Governor,
+    Node,
+    Domain,
+    Process,
+    Resource,
+    Object,
+    Capability,
+    Namespace,
+    Task,
+    Artifact,
+    Device,
+    Accelerator,
+}
+
+impl GovernedResourceKind {
+    pub const ALL: [Self; 13] = [
+        Self::World,
+        Self::Governor,
+        Self::Node,
+        Self::Domain,
+        Self::Process,
+        Self::Resource,
+        Self::Object,
+        Self::Capability,
+        Self::Namespace,
+        Self::Task,
+        Self::Artifact,
+        Self::Device,
+        Self::Accelerator,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::World => "world",
+            Self::Governor => "governor",
+            Self::Node => "node",
+            Self::Domain => "domain",
+            Self::Process => "process",
+            Self::Resource => "resource",
+            Self::Object => "object",
+            Self::Capability => "capability",
+            Self::Namespace => "namespace",
+            Self::Task => "task",
+            Self::Artifact => "artifact",
+            Self::Device => "device",
+            Self::Accelerator => "accelerator",
+        }
+    }
+}
+
+impl fmt::Display for GovernedResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl ResourceKey {
@@ -95,15 +179,38 @@ impl ResourceKey {
     /// trusted lowering must keep `HostWorld` until mediation is actually
     /// established.
     pub fn is_governed_resource(&self) -> bool {
-        matches!(
-            self,
-            Self::WorldState(_)
-                | Self::NodeState(_)
-                | Self::DomainState(_)
-                | Self::GovernedResource(_)
-                | Self::TaskState(_)
-                | Self::ArtifactState(_)
-        )
+        self.governed_kind().is_some()
+    }
+
+    /// Return the precise governed class without collapsing it into
+    /// [`Self::HostWorld`].
+    pub fn governed_kind(&self) -> Option<GovernedResourceKind> {
+        match self {
+            Self::WorldState(_) => Some(GovernedResourceKind::World),
+            Self::GovernorState(_) => Some(GovernedResourceKind::Governor),
+            Self::NodeState(_) => Some(GovernedResourceKind::Node),
+            Self::DomainState(_) => Some(GovernedResourceKind::Domain),
+            Self::ProcessState(_) => Some(GovernedResourceKind::Process),
+            Self::GovernedResource(_) => Some(GovernedResourceKind::Resource),
+            Self::ObjectState(_) => Some(GovernedResourceKind::Object),
+            Self::CapabilityState(_) => Some(GovernedResourceKind::Capability),
+            Self::NamespaceState(_) => Some(GovernedResourceKind::Namespace),
+            Self::TaskState(_) => Some(GovernedResourceKind::Task),
+            Self::ArtifactState(_) => Some(GovernedResourceKind::Artifact),
+            Self::DeviceState(_) => Some(GovernedResourceKind::Device),
+            Self::AcceleratorState(_) => Some(GovernedResourceKind::Accelerator),
+            Self::HostWorld
+            | Self::EvaluatorState
+            | Self::ScopeBinding(_)
+            | Self::ProjectPath(_)
+            | Self::HostPath(_)
+            | Self::EnvVar(_)
+            | Self::Stdio
+            | Self::Network(_)
+            | Self::NetworkUnknown
+            | Self::Service(_)
+            | Self::ActorState(_) => None,
+        }
     }
 }
 
@@ -112,11 +219,20 @@ impl fmt::Display for ResourceKey {
         match self {
             Self::HostWorld => f.write_str("HostWorld"),
             Self::WorldState(world) => write!(f, "world-state:{world}"),
+            Self::GovernorState(governor) => write!(f, "governor-state:{governor}"),
             Self::NodeState(node) => write!(f, "node-state:{node}"),
             Self::DomainState(domain) => write!(f, "domain-state:{domain}"),
+            Self::ProcessState(process) => write!(f, "process-state:{process}"),
             Self::GovernedResource(resource) => write!(f, "governed-resource:{resource}"),
+            Self::ObjectState(object) => write!(f, "object-state:{object}"),
+            Self::CapabilityState(capability) => write!(f, "capability-state:{capability}"),
+            Self::NamespaceState(world) => write!(f, "namespace-state:{world}"),
             Self::TaskState(task) => write!(f, "task-state:{task}"),
             Self::ArtifactState(artifact) => write!(f, "artifact-state:{artifact}"),
+            Self::DeviceState(device) => write!(f, "device-state:{device}"),
+            Self::AcceleratorState(accelerator) => {
+                write!(f, "accelerator-state:{accelerator}")
+            }
             Self::EvaluatorState => f.write_str("EvaluatorState"),
             Self::ScopeBinding(name) => write!(f, "scope:{name}"),
             Self::ProjectPath(path) => write!(f, "project:{path}"),
@@ -230,19 +346,22 @@ impl EffectSummary {
 
     /// Union of read and write resource identities.
     pub fn resource_union(&self) -> BTreeSet<ResourceKey> {
-        let mut resources: BTreeSet<_> = self.reads.union(&self.writes).cloned().collect();
+        let mut resources = self.expanded_reads();
+        resources.extend(self.expanded_writes());
+        resources
+    }
 
-        // Until endpoint-level network independence is verified, every exact
-        // endpoint also participates in the shared unknown-network state. This
-        // makes `network:*` a real alias in the executable graph instead of a
-        // display-only spelling that could bypass an exact `network:...` key.
-        if resources
-            .iter()
-            .any(|resource| matches!(resource, ResourceKey::Network(_)))
-        {
-            resources.insert(ResourceKey::NetworkUnknown);
-        }
+    /// Read footprint after applying scheduler-visible resource aliases.
+    pub fn expanded_reads(&self) -> BTreeSet<ResourceKey> {
+        let mut resources = self.reads.clone();
+        expand_resource_aliases(&mut resources);
+        resources
+    }
 
+    /// Write footprint after applying scheduler-visible resource aliases.
+    pub fn expanded_writes(&self) -> BTreeSet<ResourceKey> {
+        let mut resources = self.writes.clone();
+        expand_resource_aliases(&mut resources);
         resources
     }
 
@@ -300,10 +419,43 @@ impl EffectSummary {
             return true;
         }
 
-        resource_conflict(&self.writes, &other.writes)
-            || resource_conflict(&self.writes, &other.reads)
-            || resource_conflict(&other.writes, &self.reads)
+        let self_reads = self.expanded_reads();
+        let self_writes = self.expanded_writes();
+        let other_reads = other.expanded_reads();
+        let other_writes = other.expanded_writes();
+
+        resource_conflict(&self_writes, &other_writes)
+            || resource_conflict(&self_writes, &other_reads)
+            || resource_conflict(&other_writes, &self_reads)
     }
+}
+
+fn expand_resource_aliases(resources: &mut BTreeSet<ResourceKey>) {
+    // Until endpoint-level network independence is verified, every exact
+    // endpoint also participates in the shared unknown-network state. This
+    // makes `network:*` a real alias in the executable graph instead of a
+    // display-only spelling that could bypass an exact `network:...` key.
+    if resources
+        .iter()
+        .any(|resource| matches!(resource, ResourceKey::Network(_)))
+    {
+        resources.insert(ResourceKey::NetworkUnknown);
+    }
+
+    // A typed device or accelerator view is more precise than the canonical
+    // generic resource state, but it is never independent from that state.
+    // Adding the generic alias here makes both the conflict predicate and the
+    // executable HGraph share the same version chain.
+    let governed_aliases = resources
+        .iter()
+        .filter_map(|resource| match resource {
+            ResourceKey::DeviceState(resource) | ResourceKey::AcceleratorState(resource) => {
+                Some(ResourceKey::GovernedResource(resource.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    resources.extend(governed_aliases);
 }
 
 fn resource_conflict(left: &BTreeSet<ResourceKey>, right: &BTreeSet<ResourceKey>) -> bool {
@@ -501,6 +653,12 @@ fn parse_resource(item: &str) -> Result<ResourceKey, String> {
         return Err(format!("resource `{item}` has an empty identity"));
     }
 
+    if is_governed_source_resource_kind(kind) {
+        return Err(format!(
+            "governed resource kind `{kind}` in `{item}` requires trusted lowering; source effect declarations cannot mint governed state or authority"
+        ));
+    }
+
     match kind {
         "project" => {
             if value.starts_with('/') {
@@ -526,6 +684,39 @@ fn parse_resource(item: &str) -> Result<ResourceKey, String> {
             "unknown resource kind `{kind}` in `{item}`; expected project, host, env, scope, network, service, or actor"
         )),
     }
+}
+
+fn is_governed_source_resource_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "world"
+            | "world-state"
+            | "governor"
+            | "governor-state"
+            | "node"
+            | "node-state"
+            | "domain"
+            | "domain-state"
+            | "process"
+            | "process-state"
+            | "resource"
+            | "resource-state"
+            | "governed-resource"
+            | "object"
+            | "object-state"
+            | "capability"
+            | "capability-state"
+            | "namespace"
+            | "namespace-state"
+            | "task"
+            | "task-state"
+            | "artifact"
+            | "artifact-state"
+            | "device"
+            | "device-state"
+            | "accelerator"
+            | "accelerator-state"
+    )
 }
 
 fn validate_identifier(value: &str, label: &str) -> Result<(), String> {

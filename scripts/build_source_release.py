@@ -187,8 +187,13 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/value.oc",
         "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
+        "scripts/smoke-world-resource-keys.sh",
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
+        "src/effects.rs",
+        "src/executor/mod.rs",
+        "src/hgraph/from_oir.rs",
+        "src/world/grounding.rs",
         "src/world/identity.rs",
         "src/world/identity_wire.rs",
         "src/world/codec.rs",
@@ -206,6 +211,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
         "tests/test_world_alpha_evidence.py",
+        "tests/world_resource_keys.rs",
         "tests/world_identity.rs",
         "tests/world_identity_wire.rs",
         "tests/world_protocol.rs",
@@ -232,10 +238,10 @@ EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "a81327a43e4cc91faf4f4d4d69de2978e349a5a8fc4b7f558697f75787e20a7b"
+        "e9a093ce74f6f0500accca860055c29553b14fe8501054a3a5d463629cdebaa9"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
-        "eeb6fcac7a9e108221ce8e9d22a260b7d7433c6202114a0aafd251214f138f9c"
+        "0c9cb9b117dc6d75800fa4cf222d23a80c11dbbae05b2764f32d678fc8f6ea65"
     ),
     "evidence/world_alpha_gates.toml": (
         "a4a15bda0771d22076624092768aa4219ae3074be261d80faed1381b8c5b5d42"
