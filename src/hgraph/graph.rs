@@ -38,7 +38,7 @@ pub enum HNodeKind {
 
 /// A semantic graph node. Type/fidelity facts apply only to ordinary Value
 /// nodes. `state` tracks materialization for the graph executor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HNode {
     pub id: NodeId,
     pub kind: HNodeKind,
@@ -132,7 +132,7 @@ impl HNode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
     pub node: NodeId,
     pub role: PortRole,
@@ -148,7 +148,7 @@ pub enum PortRole {
 /// A hyperedge. Its ontology classification is `op`; the legacy `kind` field
 /// carries the typed/fidelity `OpKind` used by the type solver and the DOT
 /// exporter (which is why constraint/type edges keep their historical shape).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HEdge {
     pub id: EdgeId,
     pub kind: OpKind,
@@ -209,7 +209,7 @@ pub struct SequenceDependency {
     pub completion: NodeId,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq)]
 pub struct HGraph {
     pub nodes: HashMap<NodeId, HNode>,
     /// Constraint/type hyperedges. Traversed by the type solver and the DOT
@@ -1064,6 +1064,50 @@ impl HGraph {
                     self.validate_operation_resource_transition(info, &resource)?;
                 }
             }
+            ExecutableOp::MaterializeProject => {
+                require_hosted_project_operation(summary, info.plan_node, false)?;
+            }
+            ExecutableOp::RunRoute { .. } => {
+                require_hosted_project_operation(summary, info.plan_node, true)?;
+            }
+            ExecutableOp::BuildRoute { .. } => {
+                if !summary.is_verified_pure_infallible() {
+                    return Err(format!(
+                        "BuildRoute operation {} must be verified logical preparation",
+                        info.plan_node.0
+                    ));
+                }
+            }
+            ExecutableOp::SelectRoute { policy } => {
+                if policy.is_empty()
+                    || summary.unknown
+                    || summary.fallibility != Fallibility::MayFail
+                    || summary.actor_state.is_some()
+                    || !summary.reads.is_empty()
+                    || !summary.writes.is_empty()
+                    || summary.spawn
+                {
+                    return Err(format!(
+                        "SelectRoute operation {} has invalid logical policy effects",
+                        info.plan_node.0
+                    ));
+                }
+            }
+            ExecutableOp::CompareRouteResults
+                if summary.unknown
+                    || !summary.deterministic
+                    || summary.fallibility != Fallibility::MayFail
+                    || summary.actor_state.is_some()
+                    || !summary.reads.is_empty()
+                    || !summary.writes.is_empty()
+                    || summary.spawn =>
+            {
+                return Err(format!(
+                    "CompareRouteResults operation {} has invalid logical comparison effects",
+                    info.plan_node.0
+                ));
+            }
+            ExecutableOp::CompareRouteResults => {}
             _ => {}
         }
         Ok(())
@@ -1473,6 +1517,24 @@ fn format_node_ids(nodes: &[NodeId]) -> String {
         .map(|node| format!("n{}", node.0))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn require_hosted_project_operation(
+    summary: &EffectSummary,
+    plan_node: PlanNodeId,
+    must_spawn: bool,
+) -> Result<(), String> {
+    if !summary.unknown
+        || summary.deterministic
+        || summary.fallibility != Fallibility::MayFail
+        || summary.spawn != must_spawn
+    {
+        return Err(format!(
+            "hosted project operation {} must remain unknown, nondeterministic, fallible, and spawn={must_spawn}",
+            plan_node.0
+        ));
+    }
+    require_read_write(summary, &ResourceKey::HostWorld, plan_node)
 }
 
 fn require_read_write(

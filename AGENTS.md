@@ -7,7 +7,7 @@ This is the **canonical** O / Ostadix-lang runtime monorepo.
 ```bash
 export O_LANG_ROOT=/Users/ustad/Ostadix-lang
 export O_BACKENDS_DIR=$O_LANG_ROOT/backends
-export PATH="$O_LANG_ROOT/target/release:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$O_LANG_ROOT/target/release:$PATH"
 ```
 
 Do **not** use `~/O-lang` for builds/runs on this machine.

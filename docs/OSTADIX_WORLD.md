@@ -249,7 +249,7 @@ The present archive already contains a surprisingly large portion of the semanti
 |---|---|---|---|
 | Polyglot execution | `OIR`, `ExecutionPlan`, `src/hgraph/` | explicit values, completions, resource states, actor state, constraints | distributed placement, native World identities, cross-node effects |
 | Effects | `src/effects.rs` | host paths, environment, network, services, actors, scope | precise World, node, domain, object, capability, device, and locality resources |
-| Project execution | `src/project/` | bundle lifting, routes, isolation, cancellation, artifacts, equivalence | project-to-HGraph construction and remote deployment |
+| Project execution | `src/project/` | bundle lifting, routes, isolation, cancellation, artifacts, equivalence, and deterministic logical project HGraphs | execution through HGraph, graph-layer separation, and remote deployment |
 | Hosted lifecycle | `src/live_system/` | package generations, health gating, rollback, stale-bearer denial | native replicated lifecycle and cross-node supervision |
 | Hosted authority bridge | `src/ocore/capability_bridge.rs` | metadata is not authority; live bearer binds to generation-tagged handle | authenticated network delegation and native capability transport |
 | KernelWorld model | `src/kernel_world.rs` | identity, generation, lifecycle, request and terminal-result discipline | shared identity with HGraph and replicated World state |
@@ -262,9 +262,9 @@ The present archive already contains a surprisingly large portion of the semanti
 Two structural seams deserve immediate treatment:
 
 1. `HostWorld@N` in the hosted execution graph and `KernelWorldIdentity { generation: N }` in the kernel are not yet one governed identity system.
-2. The project HGraph operation kinds exist, but the current lowering does not construct the project-level graph that the distributed Governor needs.
+2. Hosted project planning now constructs a bounded logical project HGraph, but project execution still bypasses that graph and no deployment or Governor layer consumes it.
 
-The first makes native execution epistemically continuous with the planner. The second turns the planner into the machine's live model rather than a language-only artifact.
+Closing the first seam will make native execution epistemically continuous with the planner. Closing the second will turn the planner into the machine's live model rather than a language-only artifact.
 
 ---
 
@@ -1919,13 +1919,51 @@ This status is repository-conformance, not O-core Mode 31, a ResourceKey wire
 format, production OIR/project/KernelWorld lowering, live Governor or snapshot
 authority, namespace service, device discovery/assignment/driver execution,
 PCI/DMA/IOMMU isolation, accelerator control, native/QEMU/hardware evidence,
-Acceptance gate A, or passage of G0, G1, or any G0--G13 gate. PR 7 still owns
-real project operations in HGraph, and PR 9 still owns the full grounding and
-locality views.
+Acceptance gate A, or passage of G0, G1, or any G0--G13 gate. PR 7's bounded
+hosted logical-planning status is recorded below; PR 9 still owns the full
+grounding and locality views.
 
 ### PR 7 -- project operations constructed in HGraph
 
 Make `MaterializeProject`, `BuildRoute`, `RunRoute`, `SelectRoute`, and `CompareRouteResults` appear in real project plans.
+
+**Repository status (2026-08-02): complete at the bounded hosted logical-planning
+boundary.** A real directory or lifted `ProjectBundle` now flows through the
+same typed route-selection resolver used by the hosted runtime, into an exact
+bundle-digest-bound `ProjectExecutionPlan`, and then into a validated HGraph.
+Each selected alternative receives its own materialization branch;
+prerequisites are constructed within that branch. The project plan records
+route guards, environment overlay key names, ambient environment-guard
+dependencies, inputs, outputs, declared effects, cancellation semantics,
+route-set policy, and equivalence policy; its HGraph projection records the
+operation, effect/resource-transition, dependency, and output topology. The
+repository-owned `olangc <project> --target ir|dot` inspection paths and
+`scripts/o-cli.sh plan` dispatcher are deterministic and nonexecuting.
+`setup.sh` installs the latter as `o plan`. Project-specific source and
+projection validation reject malformed route references, dependency cycles,
+bundle or policy substitution, and forged operation/effect/dependency
+projections.
+
+`MaterializeProject` and `RunRoute` remain conservative, fallible hosted
+operations over `HostWorld`; a manifest's `pure=true` field remains untrusted
+metadata and cannot upgrade hosted command execution. `BuildRoute` denotes
+verified logical route preparation, not execution of a build command.
+`CompareRouteResults` is constructed only for `verify_equivalent`. Project
+script and compiled execution continue to use the existing hosted project
+runtime; this slice does **not** execute project commands through the HGraph
+coordinator.
+
+The alternative dependencies are logical branches, not independently mediated
+host worlds. Shared conservative ambient/resource state chains remain in the
+HGraph and may serialize or cross-couple branches; PR7 does not prove parallel
+branch execution. Lowercase `o` retains its evaluator behavior for arguments
+other than the repo-owned `plan` subcommand.
+
+This is not PR 8 graph-layer separation, PR 9 grounding/authority/locality,
+placement, deployment, recovery, Governor integration, live receipt emission,
+WorldFS, remote execution, native or QEMU evidence, Linux or Plan 9 boot, a
+general foreign ABI, KVM/SVM evidence, PCI or physical-device assignment,
+DMA/IOMMU isolation, Acceptance gate A, G1, or passage of any G0--G13 gate.
 
 ### PR 8 -- graph-layer separation
 
@@ -2467,6 +2505,12 @@ Add precise governed `ResourceKey` variants. Bind native execution to real Kerne
 ## Move 4 -- make project HGraphs real
 
 Construct the currently declared project operations from `ProjectBundle` and route policy. Add logical HGraph output for `o plan <project>`.
+
+**Repository status:** complete at the bounded hosted logical-planning
+boundary. Directory and lifted bundles construct exact-provenance project
+plans and real HGraphs for inspection without running their commands. Project
+execution through HGraph, graph-layer separation, placement, deployment,
+Governor authority, and qualifying native evidence remain future work.
 
 ## Move 5 -- define `DeploymentPlan` and `RecoveryPlan`
 
