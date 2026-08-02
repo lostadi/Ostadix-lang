@@ -69,9 +69,14 @@ hosted World foundation:
   receipt and signing-preimage bytes, with hosted Ed25519 verification under a
   pinned public conformance key and native structural signature-envelope
   validation;
-- governed planner vocabulary that remains separate from ambient `HostWorld`;
+- the hosted PR6 typed planner vocabulary for World, Governor, node, domain,
+  process, generic resource, object, descriptive capability, namespace,
+  task-attempt, artifact-publication, device, and accelerator state, kept
+  separate from ambient `HostWorld`;
 - deterministic grounding views for OValues, capabilities, capsules, and
-  selected governed resources;
+  governed resources; underlying identity helpers compare caller-supplied
+  pairs, while grounding checks only a bound World epoch/membership rather than
+  authoritative nested freshness;
 - a descriptive KernelWorld-to-domain binding; and
 - local hosted lifecycle, project, HGraph, and capability-broker components.
 
@@ -94,6 +99,12 @@ Governor, an authoritative World snapshot service, governed distributed lowering
 WorldFS, physical multinode convergence, or an Alpha evidence bundle. No
 production lowering currently eliminates ambient `HostWorld` for arbitrary
 hosted effects.
+
+The PR6 smoke is hosted repository-conformance only. Its device and accelerator
+keys are descriptive scheduling views that share a generic resource dependency;
+they do not discover, own, assign, drive, or isolate hardware. The smoke is not
+Mode 31, native or QEMU evidence, a ResourceKey wire ABI, Governor authority,
+device assignment, DMA/IOMMU isolation, Acceptance gate A, or G0--G13 passage.
 
 ## Non-claims
 

@@ -368,6 +368,18 @@ require_fixed docs/CLAIMS.md \
     'typed World Alpha attestation' \
     'the PR5 receipt could be misread as qualifying World Alpha evidence'
 require_fixed docs/CLAIMS.md \
+    'Hosted ResourceKey PR6 now supplies typed World, Governor, node,' \
+    'the complete hosted PR6 ResourceKey vocabulary is missing'
+require_fixed docs/CLAIMS.md \
+    'This is not O-core Mode 31,' \
+    'the hosted PR6 corpus could be misread as native evidence'
+require_fixed README.md \
+    'World ResourceKey hosted repository-conformance gate' \
+    'the executable hosted PR6 gate is missing from the public status'
+require_fixed README.md \
+    'No production lowering currently emits these' \
+    'the hosted PR6 vocabulary could be misread as production governed lowering'
+require_fixed docs/CLAIMS.md \
     'Strict decoding rejects malformed' \
     'invalid-record rejection must remain a decoder claim'
 require_fixed docs/CLAIMS.md \

@@ -20,5 +20,6 @@ pub use cancellation::CancellationToken;
 pub use coordinator::Coordinator;
 pub use effects::{
     effect_summary_for_plan_node, ActorResourceId, DeclaredPurity, EffectConfidence,
-    EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, ResourceKey,
+    EffectDeclaration, EffectSummary, EffectTrustPolicy, Fallibility, GovernedResourceKind,
+    ResourceKey,
 };

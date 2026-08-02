@@ -154,11 +154,7 @@ fn add_execute_edges(
             inputs.push(predecessor_completion);
         }
 
-        for resource in summary.accessed_resources() {
-            let (prior, successor) = state.transition(graph, resource, id);
-            inputs.push(prior);
-            outputs.push(successor);
-        }
+        add_resource_state_transitions(graph, &mut state, summary, id, &mut inputs, &mut outputs);
 
         deduplicate_nodes(&mut inputs);
         deduplicate_nodes(&mut outputs);
@@ -171,6 +167,21 @@ fn add_execute_edges(
         }
     }
     Ok(())
+}
+
+fn add_resource_state_transitions(
+    graph: &mut HGraph,
+    state: &mut StateLowering,
+    summary: &EffectSummary,
+    producer: PlanNodeId,
+    inputs: &mut Vec<NodeId>,
+    outputs: &mut Vec<NodeId>,
+) {
+    for resource in summary.accessed_resources() {
+        let (prior, successor) = state.transition(graph, resource, producer);
+        inputs.push(prior);
+        outputs.push(successor);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -571,5 +582,98 @@ fn backend_output_constraints(backend: &BackendInterface) -> Option<(DomainFlags
     match backend.canonical.as_str() {
         "html" | "markdown" | "latex" | "text" => Some((DomainFlags::STRING, RepFlags::STR)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod world_resource_key_tests {
+    use super::*;
+    use crate::hgraph::HNodeKind;
+    use crate::world::{
+        NodeGeneration, NodeId, NodeIdentity, ResourceGeneration, ResourceId, ResourceIdentity,
+        ResourceOwner, WorldId,
+    };
+
+    #[test]
+    fn world_resource_keys_share_the_generic_hgraph_state_chain() {
+        let node = NodeIdentity::new(
+            WorldId::new("desk").unwrap(),
+            NodeId::new("node-a").unwrap(),
+            NodeGeneration::new(2).unwrap(),
+        );
+        let resource = ResourceIdentity::new(
+            ResourceOwner::Node { node },
+            ResourceId::new("device/gpu-0").unwrap(),
+            ResourceGeneration::new(5).unwrap(),
+        );
+        let generic = ResourceKey::GovernedResource(resource.clone());
+
+        let mut generic_writer = EffectSummary::pure();
+        generic_writer.writes.insert(generic.clone());
+        let mut device_writer = EffectSummary::pure();
+        device_writer
+            .writes
+            .insert(ResourceKey::DeviceState(resource));
+
+        let mut accelerator_writer = EffectSummary::pure();
+        accelerator_writer
+            .writes
+            .insert(ResourceKey::AcceleratorState(match &generic {
+                ResourceKey::GovernedResource(resource) => resource.clone(),
+                _ => unreachable!(),
+            }));
+
+        let mut graph = HGraph::default();
+        let mut lowering = StateLowering::default();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut generic_heads = Vec::new();
+        for (plan_node, summary) in [generic_writer, device_writer, accelerator_writer]
+            .into_iter()
+            .enumerate()
+        {
+            add_resource_state_transitions(
+                &mut graph,
+                &mut lowering,
+                &summary,
+                PlanNodeId(plan_node),
+                &mut inputs,
+                &mut outputs,
+            );
+            generic_heads.push(lowering.heads[&generic]);
+        }
+
+        assert_eq!(generic_heads[0].version, 1);
+        assert_eq!(generic_heads[1].version, 2);
+        assert_eq!(generic_heads[2].version, 3);
+        let versions = generic_heads
+            .iter()
+            .map(|head| match &graph.node(head.node).unwrap().kind {
+                HNodeKind::ResourceState { resource, version } if resource == &generic => *version,
+                other => panic!("unexpected generic resource node {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(versions, [1, 2, 3]);
+        assert!(inputs.contains(&generic_heads[0].node));
+        assert!(inputs.contains(&generic_heads[1].node));
+        assert!(outputs.contains(&generic_heads[2].node));
+        assert!(graph.node_ids().into_iter().any(|node| {
+            matches!(
+                &graph.node(node).unwrap().kind,
+                HNodeKind::ResourceState {
+                    resource: ResourceKey::DeviceState(_),
+                    ..
+                }
+            )
+        }));
+        assert!(graph.node_ids().into_iter().any(|node| {
+            matches!(
+                &graph.node(node).unwrap().kind,
+                HNodeKind::ResourceState {
+                    resource: ResourceKey::AcceleratorState(_),
+                    ..
+                }
+            )
+        }));
     }
 }
