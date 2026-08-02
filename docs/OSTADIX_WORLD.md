@@ -1819,6 +1819,16 @@ this PR does not itself pass G0.
 
 Add the complete identity and generation vocabulary to Rust and `.oc`, with round-trip tests and invalid-generation cases.
 
+**Repository status:** landed as the bounded Mode 27 identity slice. All 20
+identity atoms above have shared typed Rust and `.oc` definitions, and the
+strict `OWIDENT` v1 identity-only corpus is byte-identical between the Rust
+oracle and native O-core under QEMU TCG. Strict decode rejects malformed and
+zero-valued records; hierarchical current/reference checks reject stale
+generations and same-generation logical mismatches. Serialized capability IDs remain
+descriptive non-authority. This does not land PR 3's general wire protocol,
+transport, negotiation, OValue envelope, or receipt codec; it supplies no
+Governor or consensus and passes no G0--G13 gate.
+
 ### PR 3 -- canonical World wire codec
 
 Implement deterministic encoding, bounded decoding, schema version negotiation, and cross-language byte oracles.
@@ -2366,6 +2376,12 @@ qualifying gate credit, and no G0--G13 status was promoted.
 
 Implement Rust and `.oc` definitions for World, Governor, node, domain, resource, object, task, attempt, capability, and receipt identities. Add byte-level cross-language tests.
 
+**Repository status:** complete at the PR 2 boundary through the shared
+20-atom Rust/`.oc` vocabulary and bounded `OWIDENT` v1 QEMU byte oracle.
+Capability IDs in the serialized corpus remain descriptive, never authority.
+The general PR 3 wire/transport/negotiation/receipt surface, Governor,
+consensus, and all G0--G13 qualification remain outside this move.
+
 ## Move 3 -- unify `HostWorld@N` and KernelWorld semantics without renaming away opacity
 
 Add precise governed `ResourceKey` variants. Bind native execution to real KernelWorld and World generations. Keep unknown hosted effects under `HostWorld` so the planner can measure the remaining gap.
@@ -2532,7 +2548,7 @@ registry.
 
 The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
-The current 17 portable QEMU gates and one supplemental hardware gate retain
+The current 18 portable QEMU gates and one supplemental hardware gate retain
 only the bounded claims in [`CLAIMS.md`](CLAIMS.md) and
 [`evidence/gates.toml`](../evidence/gates.toml). Their results do not satisfy a
 G0--G13 gate. Schema v1 admits no evidence records; only a future versioned,

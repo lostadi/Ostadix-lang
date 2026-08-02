@@ -1,0 +1,10 @@
+module kernel::world_identity_semantics;
+
+// Non-Mode-27 builds retain a total, fail-closed link surface without carrying
+// the native identity evidence harness.
+pub unsafe fn start(mode: u64) -> never {
+    if mode != 0 {
+        loop { halt(); }
+    }
+    loop { halt(); }
+}

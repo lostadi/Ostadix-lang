@@ -655,12 +655,28 @@ python3 scripts/world_alpha_evidence.py
 The checked-in result defines 14 entries--the G0 constitutional baseline plus
 13 integration gates through G13--and marks every one unpassed. Schema v1 is
 definition-only: it rejects `passed` and nonempty evidence until a typed
-attestation format is versioned. The existing 17 portable QEMU gates and
+attestation format is versioned. The existing 18 portable QEMU gates and
 supplemental Mode 21 result retain their narrow claims; they do not become
 G0--G13 evidence by proximity or addition.
 
-The current partial shared-identity/effect/grounding foundation can be
-inspected without execution:
+Run the bounded shared World-identity gate with:
+
+```bash
+./ocore/kernel/smoke-world-identity-qemu.sh
+```
+
+Mode 27 gives all 20 constitutional identity atoms typed Rust and `.oc`
+definitions. Its strict `OWIDENT` v1 identity-only corpus converges
+byte-for-byte between Rust and native O-core under QEMU TCG. Strict decoding
+rejects malformed and zero-valued records; separate hierarchical
+current/reference checks reject stale generations and same-generation logical
+mismatches. Serialized capability IDs are descriptive non-authority. This is
+not PR3's general wire
+protocol, transport, negotiation, OValue envelope, or receipt codec; it
+implements no Governor or consensus and passes no G0--G13 gate.
+
+The shared identity/effect/grounding foundation can also be inspected without
+execution:
 
 ```bash
 olangc examples/hello.O --target ir --grounding \
@@ -2599,7 +2615,7 @@ standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE -->
-The 17 required portable QEMU release gates and 1
+The 18 required portable QEMU release gates and 1
 supplemental hardware-dependent gate are defined once in
 [`evidence/gates.toml`](evidence/gates.toml). The aggregate reads that manifest
 at runtime, selects only `required = true`, streams each gate's output, and
@@ -2609,6 +2625,7 @@ is a checked projection.
 | Gate | Required | Milestone | Evidence | Establishes | Explicit non-claims |
 |------|----------|-----------|----------|-------------|---------------------|
 | `ocore-bootstrap` | yes | M0.1-M0.3 | [ocore/kernel/smoke-qemu.sh](ocore/kernel/smoke-qemu.sh) (`portable_tcg`) | CPL3 entry, SYSCALL return, IRQ0 return, and a later heartbeat execute in QEMU<br>W^X pages, frame reclamation, typed memory objects, and capability denials pass the bounded bootstrap corpus | This one-process bootstrap is not multi-process isolation, IPC, or a foreign ABI<br>It is not evidence of Linux, Plan 9, or a foreign-kernel boot |
+| `world-identity-v1` | yes | World identity PR2 / Mode 27 | [ocore/kernel/smoke-world-identity-qemu.sh](ocore/kernel/smoke-world-identity-qemu.sh) (`portable_tcg`) | All 20 constitutional World identity atoms have shared typed Rust and O-core definitions with strict nonzero generation, version, term, and index rules<br>A bounded OWIDENT v1 identity-only corpus converges byte-for-byte between the Rust oracle and native O-core under QEMU; strict decode rejects malformed or zero-valued records, and hierarchical current/reference comparison rejects stale generations and same-generation logical mismatches | Serialized capability IDs are descriptive non-authority; this gate creates no bearer, CSpace handle, delegation, or authenticated authority<br>OWIDENT v1 is not the PR3 general World protocol, transport, schema negotiation, OValue envelope, or receipt codec, and it does not implement a Governor or consensus<br>This repository-conformance slice does not pass G0 or any G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence |
 | `m02-fault-recovery` | yes | M0.2 | [ocore/kernel/smoke-faults-qemu.sh](ocore/kernel/smoke-faults-qemu.sh) (`portable_tcg`) | Eight fresh boots contain the bounded fatal CPL3 fault corpus<br>A ninth boot recovers a bounded user-copy fault and reaches a later heartbeat | The one-process fault corpus is not the current kernel ceiling<br>It does not establish arbitrary fault recovery or multi-process scheduling |
 | `m1-process-isolation` | yes | M1 | [ocore/kernel/smoke-processes-qemu.sh](ocore/kernel/smoke-processes-qemu.sh) (`portable_tcg`) | Two bounded native processes use separate CR3s and same-VA physical isolation<br>Exit and fault teardown reject stale identities, reclaim frames, and preserve the sibling | The gate is single-CPU and does not establish SMP isolation<br>It is not a general scheduler, IPC, or foreign-process proof |
 | `m2-scheduler` | yes | M2 | [ocore/kernel/smoke-scheduler-qemu.sh](ocore/kernel/smoke-scheduler-qemu.sh) (`portable_tcg`) | Four TCBs across two processes exercise bounded single-CPU yield, sleep, wake-once, and timer preemption<br>One million forced identity transactions and lifecycle reclamation pass | The gate does not establish SMP safety or an unbounded production scheduler<br>The million-transaction phase does not itself enter CPL3 |
@@ -2747,6 +2764,13 @@ python3 scripts/release_evidence.py validate
   and a later timer. This is not Linux or Plan 9 boot, a Plan 9 binary, general
   Linux ABI, general 9P or namespace environment, hardware virtualization, or
   physical-device isolation.
+- A bounded Mode 27 shared-World-identity gate with all 20 constitutional
+  identity atoms typed in Rust and `.oc`, plus an exact cross-language
+  `OWIDENT` v1 identity-only byte oracle under QEMU TCG. Strict decode rejects
+  malformed and zero-valued records; hierarchical current/reference checks
+  reject stale generations and same-generation logical mismatches. Serialized
+  capability IDs remain descriptive non-authority; this is not a general World wire
+  protocol, Governor, consensus implementation, or G0--G13 passage.
 - A separately gated hosted Live-World oracle with bounded strict manifests,
   immutable package CAS objects, default-deny activation policy, health-gated
   service generations, rollback, targeted restart, reconstruction, revocable

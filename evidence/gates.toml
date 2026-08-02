@@ -1,5 +1,5 @@
 schema_version = 1
-required_gate_count = 17
+required_gate_count = 18
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -24,6 +24,28 @@ expected_markers = [
   "timer CPL3 return: online",
   "CPL3 heartbeat: online",
   "QEMU smoke: PASS",
+]
+
+[[gate]]
+id = "world-identity-v1"
+required = true
+milestone = "World identity PR2 / Mode 27"
+script = "ocore/kernel/smoke-world-identity-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "cmp", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "All 20 constitutional World identity atoms have shared typed Rust and O-core definitions with strict nonzero generation, version, term, and index rules",
+  "A bounded OWIDENT v1 identity-only corpus converges byte-for-byte between the Rust oracle and native O-core under QEMU; strict decode rejects malformed or zero-valued records, and hierarchical current/reference comparison rejects stale generations and same-generation logical mismatches",
+]
+nonclaims = [
+  "Serialized capability IDs are descriptive non-authority; this gate creates no bearer, CSpace handle, delegation, or authenticated authority",
+  "OWIDENT v1 is not the PR3 general World protocol, transport, schema negotiation, OValue envelope, or receipt codec, and it does not implement a Governor or consensus",
+  "This repository-conformance slice does not pass G0 or any G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence",
+]
+expected_markers = [
+  "World identity Rust/.oc exact-byte convergence: PASS",
+  "World identity malformed/nonzero/stale rejection: PASS",
+  "World identity v1 native smoke: PASS",
 ]
 
 [[gate]]

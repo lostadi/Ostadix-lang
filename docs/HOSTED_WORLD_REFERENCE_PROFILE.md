@@ -52,16 +52,22 @@ gate under the evidence class required by
 
 ## Current repository boundary
 
-The repository currently has a partial hosted World foundation:
+The repository currently has a shared identity foundation plus a partial
+hosted World foundation:
 
-- generation-bound Rust identities and exact stale-reference checks;
+- all 20 constitutional identity atoms typed in Rust and `.oc`, with bounded
+  `OWIDENT` v1 byte-exact native convergence, strict invalid-record rejection,
+  and separate hierarchical stale/mismatch rejection;
 - governed planner vocabulary that remains separate from ambient `HostWorld`;
 - deterministic grounding views for OValues, capabilities, capsules, and
   selected governed resources;
 - a descriptive KernelWorld-to-domain binding; and
 - local hosted lifecycle, project, HGraph, and capability-broker components.
 
-It does not yet have a live replicated Governor, an authoritative World
+The `OWIDENT` record is identity-only, and serialized capability IDs are
+descriptive non-authority. It is not the general World wire protocol,
+transport, negotiation, OValue envelope, or receipt codec and supplies no
+Governor or consensus. The repository does not yet have a live replicated Governor, an authoritative World
 snapshot service, governed distributed lowering, native World transport,
 WorldFS, physical multinode convergence, or an Alpha evidence bundle. No
 production lowering currently eliminates ambient `HostWorld` for arbitrary
@@ -85,6 +91,6 @@ establishes:
   migration; or
 - G12, G13, or the name **Ostadix World Alpha**.
 
-Modes 20 through 26 remain separately scoped native or QEMU evidence. Their
+Modes 20 through 27 remain separately scoped native or QEMU evidence. Their
 bounded claims and exclusions are recorded in [`CLAIMS.md`](CLAIMS.md) and
 [`gates.toml`](../evidence/gates.toml); they are not promoted by this profile.

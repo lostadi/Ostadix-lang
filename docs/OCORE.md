@@ -571,6 +571,35 @@ transport, persistent filesystem, or guest-agent framework. QEMU TCG is not
 KVM/SVM or physical-hardware evidence. PCI or physical-device assignment, DMA,
 IOMMU, interrupt remapping, and hardware reset remain outside this gate.
 
+Mode 27 is the bounded shared-World-identity PR2 slice. The 20 constitutional
+identity atoms--`WorldId`, `WorldEpoch`, `GovernorTerm`, `GovernorLogIndex`,
+`NodeId`, `NodeGeneration`, `DomainId`, `DomainGeneration`, `ProcessId`,
+`ProcessGeneration`, `ResourceId`, `ResourceGeneration`, `ObjectId`,
+`ObjectVersion`, `CapabilityId`, `LeaseId`, `TaskId`, `AttemptGeneration`,
+`CheckpointId`, and `ReceiptId`--have matching typed Rust and `.oc`
+definitions. The gate admits only strict `OWIDENT` v1 identity records and
+requires byte-exact Rust/native O-core convergence under QEMU TCG. Strict
+decoding rejects malformed records and zero generation/version/term/index
+fields; separate hierarchical current/reference checks reject stale
+generations and same-generation logical mismatches.
+Current `.oc` aggregate fields are constructible, so native validity is
+enforced by the nominal initializers and strict record boundaries rather than
+claimed as an unrepresentable raw bit pattern. A raw zero or mistagged
+aggregate is not an accepted identity record.
+
+Run the native World-identity evidence gate with:
+
+```bash
+./ocore/kernel/smoke-world-identity-qemu.sh
+```
+
+Serialized capability IDs remain descriptive non-authority: they are not
+bearers, CSpace handles, or delegation. `OWIDENT` v1 is not PR3's general World
+wire protocol, transport, negotiation, OValue envelope, or receipt codec. The
+gate supplies no Governor, consensus, native membership, or Alpha
+qualification; it passes no G0--G13 gate, and QEMU TCG is not physical or
+hardware-isolation evidence.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests

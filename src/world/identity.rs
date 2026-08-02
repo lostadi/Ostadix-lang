@@ -203,13 +203,24 @@ macro_rules! generation_identity {
 }
 
 string_identity!(WorldId, "world identity");
+string_identity!(ProcessId, "process identity");
 string_identity!(NodeId, "node identity");
 string_identity!(DomainId, "domain identity");
+string_identity!(ObjectId, "object identity");
+string_identity!(CapabilityId, "capability identity");
+string_identity!(LeaseId, "lease identity");
 string_identity!(TaskId, "task identity");
+string_identity!(CheckpointId, "checkpoint identity");
+string_identity!(ReceiptId, "receipt identity");
 
 generation_identity!(WorldEpoch, "world epoch");
+generation_identity!(GovernorTerm, "governor term");
+generation_identity!(GovernorLogIndex, "governor log index");
 generation_identity!(NodeGeneration, "node generation");
 generation_identity!(DomainGeneration, "domain generation");
+generation_identity!(ProcessGeneration, "process generation");
+generation_identity!(ResourceGeneration, "resource generation");
+generation_identity!(ObjectVersion, "object version");
 generation_identity!(AttemptGeneration, "attempt generation");
 
 /// A typed, relative resource name, for example `cpu/slot-0`.
@@ -336,6 +347,60 @@ impl fmt::Display for WorldIdentity {
     }
 }
 
+/// Exact replicated-state position for a Governor serving a World.
+///
+/// This value is descriptive identity only. It is not a leadership proof and
+/// carries no authority to act for the World.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorIdentity {
+    world: WorldIdentity,
+    term: GovernorTerm,
+    log_index: GovernorLogIndex,
+}
+
+impl GovernorIdentity {
+    pub fn new(world: WorldIdentity, term: GovernorTerm, log_index: GovernorLogIndex) -> Self {
+        Self {
+            world,
+            term,
+            log_index,
+        }
+    }
+
+    pub fn world(&self) -> &WorldIdentity {
+        &self.world
+    }
+
+    pub fn term(&self) -> GovernorTerm {
+        self.term
+    }
+
+    pub fn log_index(&self) -> GovernorLogIndex {
+        self.log_index
+    }
+
+    pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
+        self.world.require_current(&reference.world)?;
+        require_generation("governor term", self.term.get(), reference.term.get())?;
+        require_generation(
+            "governor log index",
+            self.log_index.get(),
+            reference.log_index.get(),
+        )
+    }
+}
+
+impl fmt::Display for GovernorIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}/governor:term-{}@{}",
+            self.world, self.term, self.log_index
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
@@ -437,30 +502,83 @@ impl fmt::Display for DomainIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    domain: DomainIdentity,
+    process: ProcessId,
+    generation: ProcessGeneration,
+}
+
+impl ProcessIdentity {
+    pub fn new(domain: DomainIdentity, process: ProcessId, generation: ProcessGeneration) -> Self {
+        Self {
+            domain,
+            process,
+            generation,
+        }
+    }
+
+    pub fn domain(&self) -> &DomainIdentity {
+        &self.domain
+    }
+
+    pub fn process(&self) -> &ProcessId {
+        &self.process
+    }
+
+    pub fn generation(&self) -> ProcessGeneration {
+        self.generation
+    }
+
+    pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
+        self.domain.require_current(&reference.domain)?;
+        require_same_logical("process", &self.process, &reference.process)?;
+        require_generation(
+            "process generation",
+            self.generation.get(),
+            reference.generation.get(),
+        )
+    }
+}
+
+impl fmt::Display for ProcessIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}/process:{}@{}",
+            self.domain, self.process, self.generation
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "scope", deny_unknown_fields)]
 pub enum ResourceOwner {
-    World { world: WorldId },
+    World { world: WorldIdentity },
     Node { node: NodeIdentity },
     Domain { domain: DomainIdentity },
+    Process { process: ProcessIdentity },
 }
 
 impl ResourceOwner {
     pub fn world(&self) -> &WorldId {
         match self {
-            Self::World { world } => world,
+            Self::World { world } => world.world(),
             Self::Node { node } => node.world(),
             Self::Domain { domain } => domain.node().world(),
+            Self::Process { process } => process.domain().node().world(),
         }
     }
 
     pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
         match (self, reference) {
-            (Self::World { world }, Self::World { world: other }) => {
-                require_same_logical("world", world, other)
-            }
+            (Self::World { world }, Self::World { world: other }) => world.require_current(other),
             (Self::Node { node }, Self::Node { node: other }) => node.require_current(other),
             (Self::Domain { domain }, Self::Domain { domain: other }) => {
                 domain.require_current(other)
+            }
+            (Self::Process { process }, Self::Process { process: other }) => {
+                process.require_current(other)
             }
             _ => Err(WorldIdentityError::IdentityMismatch {
                 kind: "resource owner",
@@ -477,6 +595,7 @@ impl fmt::Display for ResourceOwner {
             Self::World { world } => world.fmt(formatter),
             Self::Node { node } => node.fmt(formatter),
             Self::Domain { domain } => domain.fmt(formatter),
+            Self::Process { process } => process.fmt(formatter),
         }
     }
 }
@@ -486,11 +605,16 @@ impl fmt::Display for ResourceOwner {
 pub struct ResourceIdentity {
     owner: ResourceOwner,
     resource: ResourceId,
+    generation: ResourceGeneration,
 }
 
 impl ResourceIdentity {
-    pub fn new(owner: ResourceOwner, resource: ResourceId) -> Self {
-        Self { owner, resource }
+    pub fn new(owner: ResourceOwner, resource: ResourceId, generation: ResourceGeneration) -> Self {
+        Self {
+            owner,
+            resource,
+            generation,
+        }
     }
 
     pub fn owner(&self) -> &ResourceOwner {
@@ -501,27 +625,173 @@ impl ResourceIdentity {
         &self.resource
     }
 
+    pub fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+
     pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
         self.owner.require_current(&reference.owner)?;
-        require_same_logical("resource", &self.resource, &reference.resource)
+        require_same_logical("resource", &self.resource, &reference.resource)?;
+        require_generation(
+            "resource generation",
+            self.generation.get(),
+            reference.generation.get(),
+        )
     }
 }
 
 impl fmt::Display for ResourceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/resource:{}", self.owner, self.resource)
+        write!(
+            formatter,
+            "{}/resource:{}@{}",
+            self.owner, self.resource, self.generation
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskAttemptIdentity {
+pub struct ObjectIdentity {
+    world: WorldId,
+    object: ObjectId,
+    version: ObjectVersion,
+}
+
+impl ObjectIdentity {
+    pub fn new(world: WorldId, object: ObjectId, version: ObjectVersion) -> Self {
+        Self {
+            world,
+            object,
+            version,
+        }
+    }
+
+    pub fn world(&self) -> &WorldId {
+        &self.world
+    }
+
+    pub fn object(&self) -> &ObjectId {
+        &self.object
+    }
+
+    pub fn version(&self) -> ObjectVersion {
+        self.version
+    }
+
+    pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
+        require_same_logical("world", &self.world, &reference.world)?;
+        require_same_logical("object", &self.object, &reference.object)?;
+        require_generation(
+            "object version",
+            self.version.get(),
+            reference.version.get(),
+        )
+    }
+}
+
+impl fmt::Display for ObjectIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}/object:{}@{}",
+            self.world, self.object, self.version
+        )
+    }
+}
+
+/// Inert capability identity. Possessing this identifier does not grant the
+/// capability or authorize any operation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityIdentity {
+    world: WorldId,
+    capability: CapabilityId,
+}
+
+impl CapabilityIdentity {
+    pub fn new(world: WorldId, capability: CapabilityId) -> Self {
+        Self { world, capability }
+    }
+
+    pub fn world(&self) -> &WorldId {
+        &self.world
+    }
+
+    pub fn capability(&self) -> &CapabilityId {
+        &self.capability
+    }
+}
+
+impl fmt::Display for CapabilityIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/capability:{}", self.world, self.capability)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseIdentity {
+    world: WorldId,
+    lease: LeaseId,
+}
+
+impl LeaseIdentity {
+    pub fn new(world: WorldId, lease: LeaseId) -> Self {
+        Self { world, lease }
+    }
+
+    pub fn world(&self) -> &WorldId {
+        &self.world
+    }
+
+    pub fn lease(&self) -> &LeaseId {
+        &self.lease
+    }
+}
+
+impl fmt::Display for LeaseIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/lease:{}", self.world, self.lease)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIdentity {
+    world: WorldId,
+    task: TaskId,
+}
+
+impl TaskIdentity {
+    pub fn new(world: WorldId, task: TaskId) -> Self {
+        Self { world, task }
+    }
+
+    pub fn world(&self) -> &WorldId {
+        &self.world
+    }
+
+    pub fn task(&self) -> &TaskId {
+        &self.task
+    }
+}
+
+impl fmt::Display for TaskIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/task:{}", self.world, self.task)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptIdentity {
     world: WorldId,
     task: TaskId,
     attempt: AttemptGeneration,
 }
 
-impl TaskAttemptIdentity {
+impl AttemptIdentity {
     pub fn new(world: WorldId, task: TaskId, attempt: AttemptGeneration) -> Self {
         Self {
             world,
@@ -549,13 +819,79 @@ impl TaskAttemptIdentity {
     }
 }
 
-impl fmt::Display for TaskAttemptIdentity {
+impl fmt::Display for AttemptIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "{}/task:{}@{}",
             self.world, self.task, self.attempt
         )
+    }
+}
+
+/// Compatibility name retained for callers from the first World identity
+/// slice. Both names denote the same generation-bound value.
+pub type TaskAttemptIdentity = AttemptIdentity;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointIdentity {
+    attempt: AttemptIdentity,
+    checkpoint: CheckpointId,
+}
+
+impl CheckpointIdentity {
+    pub fn new(attempt: AttemptIdentity, checkpoint: CheckpointId) -> Self {
+        Self {
+            attempt,
+            checkpoint,
+        }
+    }
+
+    pub fn attempt(&self) -> &AttemptIdentity {
+        &self.attempt
+    }
+
+    pub fn checkpoint(&self) -> &CheckpointId {
+        &self.checkpoint
+    }
+
+    pub fn require_current(&self, reference: &Self) -> Result<(), WorldIdentityError> {
+        self.attempt.require_current(&reference.attempt)?;
+        require_same_logical("checkpoint", &self.checkpoint, &reference.checkpoint)
+    }
+}
+
+impl fmt::Display for CheckpointIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/checkpoint:{}", self.attempt, self.checkpoint)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptIdentity {
+    world: WorldId,
+    receipt: ReceiptId,
+}
+
+impl ReceiptIdentity {
+    pub fn new(world: WorldId, receipt: ReceiptId) -> Self {
+        Self { world, receipt }
+    }
+
+    pub fn world(&self) -> &WorldId {
+        &self.world
+    }
+
+    pub fn receipt(&self) -> &ReceiptId {
+        &self.receipt
+    }
+}
+
+impl fmt::Display for ReceiptIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/receipt:{}", self.world, self.receipt)
     }
 }
 

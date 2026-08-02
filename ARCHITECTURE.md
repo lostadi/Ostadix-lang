@@ -147,16 +147,21 @@ and `serial=host` declarations can add constraints, but cannot erase an unknown
 fallback. Likewise, `effects=pure` cannot upgrade an arbitrary shim into trusted
 worker-pool work.
 
-The governed-world identity foundation in `src/world/` separates a World
-snapshot epoch from independently generated node, domain, and task-attempt
-identity. Corresponding precise `ResourceKey` states can describe governed
-state without pretending that arbitrary hosted work has become mediated.
+The governed-world identity foundation in `src/world/` now shares all 20
+constitutional identity atoms with `ocore/world/identity.oc`. It separates a
+World snapshot epoch from independently generated node, domain, process,
+resource, object, and task-attempt identity. The bounded `OWIDENT` v1 corpus is
+an identity-only byte oracle, not the general World wire protocol; serialized
+capability IDs remain descriptive non-authority. Corresponding precise
+`ResourceKey` states can describe governed state without pretending that
+arbitrary hosted work has become mediated.
 `HostWorld` remains the residual umbrella for ambient host effects. No
 production lowering emits these governed keys yet, and the optional grounding
 identity is caller-supplied rather than checked against a live snapshot. This
 type/effect foundation does not implement a distributed Governor, membership
 transport, resource registry, `/world` namespace, remote execution, placement,
-or current-epoch enforcement. The native product boundary and G0--G13
+or current-epoch enforcement. The Mode 27 QEMU gate passes no G0--G13 gate.
+The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
 [`evidence/world_alpha_gates.toml`](evidence/world_alpha_gates.toml). Hosted

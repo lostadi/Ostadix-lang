@@ -43,13 +43,13 @@ EVIDENCE_SPEC.loader.exec_module(evidence_tool)
 def fixture_evidence_manifest() -> str:
     lines = [
         "schema_version = 1",
-        "required_gate_count = 17",
+        "required_gate_count = 18",
         "supplemental_gate_count = 1",
         'portable_command = "./boot-and-test.sh smoke"',
         "",
     ]
-    for index in range(18):
-        required = index < 17
+    for index in range(19):
+        required = index < 18
         evidence_class = "portable_tcg" if required else "hardware_kvm"
         lines.extend(
             [
@@ -190,17 +190,35 @@ class SourceReleaseTests(unittest.TestCase):
             "mcp/ostadix_lang_mcp_server/src/main.rs": "fn main() {}\n",
             "okernel-multikernel/boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md": "proposal\n",
+            "ocore/kernel/boot.S": ".section .text\n",
+            "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/smoke-world-identity-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/world_identity_semantics.oc": (
+                "module kernel::world_identity_semantics;\n"
+            ),
+            "ocore/kernel/world_identity_semantics_stub.oc": (
+                "module kernel::world_identity_semantics;\n"
+            ),
+            "ocore/runtime/x86_64/trap.oc": "module runtime::trap;\n",
+            "ocore/world/identity.oc": "module world::identity;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
+            "src/world/identity.rs": "// fixture World identities\n",
+            "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
+            "src/world/mod.rs": "pub mod identity;\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
+            "tests/fixtures/world_identity_v1.hex": "4f574944454e5431\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
+            "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
+            "tests/world_identity_wire.rs": "#[test] fn wire_fixture() {}\n",
         }
         if files:
             contents.update(files)
-        for index in range(18):
+        for index in range(19):
             contents[f"ocore/kernel/fixture-evidence-{index:02}.sh"] = (
                 "#!/bin/sh\n"
                 f"printf 'FIXTURE {index:02} START\\nFIXTURE {index:02} PASS\\n'\n"
@@ -213,6 +231,8 @@ class SourceReleaseTests(unittest.TestCase):
                 in {
                     "boot-and-test.sh",
                     "okernel-multikernel/boot-and-test.sh",
+                    "ocore/kernel/build.sh",
+                    "ocore/kernel/smoke-world-identity-qemu.sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
             )
@@ -325,13 +345,27 @@ class SourceReleaseTests(unittest.TestCase):
                 "mcp/ostadix_lang_mcp_server/src/main.rs",
                 "okernel-multikernel/boot-and-test.sh",
                 "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
+                "ocore/kernel/boot.S",
+                "ocore/kernel/build.sh",
+                "ocore/kernel/main.oc",
+                "ocore/kernel/smoke-world-identity-qemu.sh",
+                "ocore/kernel/world_identity_semantics.oc",
+                "ocore/kernel/world_identity_semantics_stub.oc",
+                "ocore/runtime/x86_64/trap.oc",
+                "ocore/world/identity.oc",
                 "scripts/smoke_ostadix_mcp.py",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
+                "src/world/identity.rs",
+                "src/world/identity_wire.rs",
+                "src/world/mod.rs",
                 "tests/example_manifest.py",
+                "tests/fixtures/world_identity_v1.hex",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
                 "tests/test_world_alpha_evidence.py",
+                "tests/world_identity.rs",
+                "tests/world_identity_wire.rs",
                 ".github/workflows/ci.yml",
                 "assets/logo.bin",
                 "backends/shim.py",
@@ -346,7 +380,7 @@ class SourceReleaseTests(unittest.TestCase):
             }
             included.update(
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
-                for index in range(18)
+                for index in range(19)
             )
             excluded = {
                 ".DS_Store",
@@ -648,6 +682,27 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-world-constitution.zip")
 
+    def test_world_identity_cross_language_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "ocore/kernel/smoke-world-identity-qemu.sh",
+            "ocore/world/identity.oc",
+            "src/world/identity.rs",
+            "src/world/identity_wire.rs",
+            "tests/fixtures/world_identity_v1.hex",
+            "tests/world_identity_wire.rs",
+        )
+        self._git("commit", "-q", "-m", "remove World identity surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*smoke-world-identity-qemu\.sh.*"
+            r"ocore/world/identity\.oc.*src/world/identity\.rs.*identity_wire\.rs.*"
+            r"world_identity_v1\.hex.*world_identity_wire\.rs",
+        ):
+            self._build("missing-world-identity.zip")
+
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():
             with self.subTest(path=path):
@@ -738,7 +793,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_zero_gate_evidence_manifest_is_rejected_before_packaging(self) -> None:
         self._commit({"evidence/gates.toml": ZERO_GATE_EVIDENCE_MANIFEST})
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 17"
+            release.ReleaseError, r"required_gate_count must be 18"
         ):
             self._build("zero-gate-evidence.zip")
 
@@ -766,7 +821,7 @@ class SourceReleaseTests(unittest.TestCase):
             result.output, "self-consistent-zero-gate-evidence.zip", remove_gates
         )
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 17"
+            release.ReleaseError, r"required_gate_count must be 18"
         ):
             release.verify_archive(tampered)
 
