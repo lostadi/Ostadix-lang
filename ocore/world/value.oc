@@ -1,0 +1,1005 @@
+module world::value;
+
+// OWVALUE is deliberately separate from the four-kind OWPROTO envelope.  It
+// carries inert, canonical data only: no capability, lease, task, receipt, or
+// other bearer-authority form is a v1 value tag.
+pub const WORLD_VALUE_SCHEMA: u64 = 1;
+pub const WORLD_VALUE_HEADER_BYTES: usize = 16;
+pub const WORLD_VALUE_NODE_HEADER_BYTES: usize = 8;
+pub const WORLD_VALUE_MIN_BYTES: usize = 24;
+pub const WORLD_VALUE_MAX_BYTES: usize = 4096;
+pub const WORLD_VALUE_MAX_DEPTH: usize = 16;
+pub const WORLD_VALUE_MAX_NODES: usize = 128;
+pub const WORLD_VALUE_MAX_LIST: usize = 64;
+pub const WORLD_VALUE_MAX_RECORD: usize = 32;
+pub const WORLD_VALUE_MAX_MAP: usize = 32;
+pub const WORLD_VALUE_MAX_INTEGER_BYTES: usize = 256;
+pub const WORLD_VALUE_MAX_TEXT_BYTES: usize = 1024;
+pub const WORLD_VALUE_MAX_MEDIA_BYTES: usize = 96;
+pub const WORLD_VALUE_MAX_RAW_BYTES: usize = 2048;
+pub const WORLD_VALUE_MAX_IDENTIFIER_BYTES: usize = 96;
+
+pub const VALUE_TAG_NULL: u64 = 0x0000;
+pub const VALUE_TAG_BOOL: u64 = 0x0001;
+pub const VALUE_TAG_INTEGER: u64 = 0x0010;
+pub const VALUE_TAG_BINARY_FLOAT: u64 = 0x0011;
+pub const VALUE_TAG_TEXT: u64 = 0x0020;
+pub const VALUE_TAG_CHAR: u64 = 0x0021;
+pub const VALUE_TAG_BYTES: u64 = 0x0022;
+pub const VALUE_TAG_LIST: u64 = 0x0030;
+pub const VALUE_TAG_RECORD: u64 = 0x0031;
+pub const VALUE_TAG_MAP: u64 = 0x0032;
+pub const VALUE_TAG_TAGGED: u64 = 0x0040;
+pub const VALUE_TAG_CODE_REF: u64 = 0x0041;
+pub const VALUE_TAG_OBJECT_REF: u64 = 0x0042;
+pub const VALUE_TAG_ERROR: u64 = 0x0043;
+pub const VALUE_TAG_EXTENSION: u64 = 0x7f00;
+
+pub const VALUE_FLOAT_BINARY32: u64 = 1;
+pub const VALUE_FLOAT_BINARY64: u64 = 2;
+pub const VALUE_TEXT_NONE: u64 = 0;
+pub const VALUE_TEXT_UTF8: u64 = 1;
+pub const VALUE_CODE_SHA256: u64 = 1;
+pub const VALUE_ORDER_LESS: u64 = 0;
+pub const VALUE_ORDER_EQUAL: u64 = 1;
+pub const VALUE_ORDER_GREATER: u64 = 2;
+
+pub const VALUE_NODE_WORDS: usize = 12;
+const NODE_TAG: usize = 0;
+const NODE_SCALAR: usize = 1;
+const NODE_DATA_OFFSET: usize = 2;
+const NODE_DATA_LENGTH: usize = 3;
+const NODE_AUX_OFFSET: usize = 4;
+const NODE_AUX_LENGTH: usize = 5;
+const NODE_BLOB_OFFSET: usize = 6;
+const NODE_BLOB_LENGTH: usize = 7;
+const NODE_EDGE_OFFSET: usize = 8;
+const NODE_EDGE_COUNT: usize = 9;
+const NODE_DEPTH: usize = 10;
+const NODE_RESERVED: usize = 11;
+
+// Handles are one-based node ordinals.  All backing stores belong to the
+// caller.  Child handles must already exist, making the arena acyclic by
+// construction and allowing iterative bottom-up codecs.
+pub struct ValueArena {
+    bytes: *mut u8,
+    byte_capacity: usize,
+    byte_length: usize,
+    nodes: *mut u64,
+    node_word_capacity: usize,
+    node_count: usize,
+    edges: *mut u64,
+    edge_word_capacity: usize,
+    edge_word_length: usize,
+    root: u64,
+    sealed: u64,
+}
+
+unsafe fn byte_at(source: *const u8, offset: usize) -> u64 {
+    return volatile_load(source + offset) as u64;
+}
+
+unsafe fn word_at(source: *const u64, offset: usize) -> u64 {
+    return volatile_load(source + offset);
+}
+
+unsafe fn node_word(arena: *const ValueArena, handle: u64, field: usize) -> u64 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return 0;
+    }
+    return word_at((*arena).nodes as *const u64,
+        (handle as usize - 1) * VALUE_NODE_WORDS + field);
+}
+
+unsafe fn store_node_word(
+    arena: *mut ValueArena,
+    handle: u64,
+    field: usize,
+    value: u64
+) -> void {
+    volatile_store((*arena).nodes
+        + (handle as usize - 1) * VALUE_NODE_WORDS + field, value);
+}
+
+pub unsafe fn arena_init(
+    arena: *mut ValueArena,
+    bytes: *mut u8,
+    byte_capacity: usize,
+    nodes: *mut u64,
+    node_word_capacity: usize,
+    edges: *mut u64,
+    edge_word_capacity: usize
+) -> u64 {
+    if arena as usize == 0 || bytes as usize == 0 || nodes as usize == 0
+        || edges as usize == 0 || byte_capacity == 0
+        || node_word_capacity < VALUE_NODE_WORDS
+        || edge_word_capacity == 0 {
+        return 0;
+    }
+    (*arena).bytes = bytes;
+    (*arena).byte_capacity = byte_capacity;
+    (*arena).byte_length = 0;
+    (*arena).nodes = nodes;
+    (*arena).node_word_capacity = node_word_capacity;
+    (*arena).node_count = 0;
+    (*arena).edges = edges;
+    (*arena).edge_word_capacity = edge_word_capacity;
+    (*arena).edge_word_length = 0;
+    (*arena).root = 0;
+    (*arena).sealed = 0;
+    return 1;
+}
+
+pub unsafe fn arena_clear(arena: *mut ValueArena) -> u64 {
+    if arena as usize == 0 || (*arena).bytes as usize == 0
+        || (*arena).nodes as usize == 0 || (*arena).edges as usize == 0 {
+        return 0;
+    }
+    (*arena).byte_length = 0;
+    (*arena).node_count = 0;
+    (*arena).edge_word_length = 0;
+    (*arena).root = 0;
+    (*arena).sealed = 0;
+    return 1;
+}
+
+pub unsafe fn arena_node_count(arena: *const ValueArena) -> usize {
+    if arena as usize == 0 { return 0; }
+    return (*arena).node_count;
+}
+
+pub unsafe fn arena_root(arena: *const ValueArena) -> u64 {
+    if arena as usize == 0 || (*arena).sealed != 1 { return 0; }
+    return (*arena).root;
+}
+
+pub unsafe fn arena_is_sealed(arena: *const ValueArena) -> bool {
+    return arena as usize != 0 && (*arena).sealed == 1;
+}
+
+pub unsafe fn node_tag(arena: *const ValueArena, handle: u64) -> u64 {
+    return node_word(arena, handle, NODE_TAG);
+}
+
+pub unsafe fn node_scalar(arena: *const ValueArena, handle: u64) -> u64 {
+    return node_word(arena, handle, NODE_SCALAR);
+}
+
+pub unsafe fn node_data_length(arena: *const ValueArena, handle: u64) -> usize {
+    return node_word(arena, handle, NODE_DATA_LENGTH) as usize;
+}
+
+pub unsafe fn node_aux_length(arena: *const ValueArena, handle: u64) -> usize {
+    return node_word(arena, handle, NODE_AUX_LENGTH) as usize;
+}
+
+pub unsafe fn node_blob_length(arena: *const ValueArena, handle: u64) -> usize {
+    return node_word(arena, handle, NODE_BLOB_LENGTH) as usize;
+}
+
+pub unsafe fn node_edge_count(arena: *const ValueArena, handle: u64) -> usize {
+    return node_word(arena, handle, NODE_EDGE_COUNT) as usize;
+}
+
+pub unsafe fn node_depth(arena: *const ValueArena, handle: u64) -> usize {
+    return node_word(arena, handle, NODE_DEPTH) as usize;
+}
+
+pub unsafe fn node_data(arena: *const ValueArena, handle: u64) -> *const u8 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return 0 as *const u8;
+    }
+    return ((*arena).bytes + node_word(arena, handle, NODE_DATA_OFFSET) as usize)
+        as *const u8;
+}
+
+pub unsafe fn node_aux(arena: *const ValueArena, handle: u64) -> *const u8 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return 0 as *const u8;
+    }
+    return ((*arena).bytes + node_word(arena, handle, NODE_AUX_OFFSET) as usize)
+        as *const u8;
+}
+
+pub unsafe fn node_blob(arena: *const ValueArena, handle: u64) -> *const u8 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return 0 as *const u8;
+    }
+    return ((*arena).bytes + node_word(arena, handle, NODE_BLOB_OFFSET) as usize)
+        as *const u8;
+}
+
+pub unsafe fn node_edge_word(
+    arena: *const ValueArena,
+    handle: u64,
+    index: usize
+) -> u64 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return 0;
+    }
+    let tag: u64 = node_tag(arena, handle);
+    let count: usize = node_edge_count(arena, handle);
+    let mut words: usize = 0;
+    if tag == VALUE_TAG_LIST { words = count; }
+    if tag == VALUE_TAG_RECORD { words = count * 3; }
+    if tag == VALUE_TAG_MAP { words = count * 2; }
+    if tag == VALUE_TAG_TAGGED || tag == VALUE_TAG_EXTENSION { words = 1; }
+    let offset: usize = node_word(arena, handle, NODE_EDGE_OFFSET) as usize;
+    if offset > (*arena).edge_word_length || words > (*arena).edge_word_length - offset
+        || index >= words {
+        return 0;
+    }
+    return word_at((*arena).edges as *const u64, offset + index);
+}
+
+pub unsafe fn node_record_key(
+    arena: *const ValueArena,
+    handle: u64,
+    index: usize
+) -> *const u8 {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count
+        || node_tag(arena, handle) != VALUE_TAG_RECORD
+        || index >= node_edge_count(arena, handle) {
+        return 0 as *const u8;
+    }
+    return ((*arena).bytes + node_edge_word(arena, handle, index * 3) as usize)
+        as *const u8;
+}
+
+unsafe fn bytes_compare(
+    left: *const u8,
+    left_length: usize,
+    right: *const u8,
+    right_length: usize
+) -> u64 {
+    let mut index: usize = 0;
+    let mut common: usize = left_length;
+    if right_length < common { common = right_length; }
+    while index < common {
+        let l: u64 = byte_at(left, index);
+        let r: u64 = byte_at(right, index);
+        if l < r { return VALUE_ORDER_LESS; }
+        if l > r { return VALUE_ORDER_GREATER; }
+        index += 1;
+    }
+    if left_length < right_length { return VALUE_ORDER_LESS; }
+    if left_length > right_length { return VALUE_ORDER_GREATER; }
+    return VALUE_ORDER_EQUAL;
+}
+
+pub unsafe fn utf8_valid(source: *const u8, length: usize) -> bool {
+    if length != 0 && source as usize == 0 { return false; }
+    let mut index: usize = 0;
+    while index < length {
+        let first: u64 = byte_at(source, index);
+        if first <= 0x7f { index += 1; continue; }
+        if first >= 0xc2 && first <= 0xdf {
+            if index + 1 >= length { return false; }
+            let second: u64 = byte_at(source, index + 1);
+            if second < 0x80 || second > 0xbf { return false; }
+            index += 2;
+            continue;
+        }
+        if first >= 0xe0 && first <= 0xef {
+            if index + 2 >= length { return false; }
+            let second: u64 = byte_at(source, index + 1);
+            let third: u64 = byte_at(source, index + 2);
+            if third < 0x80 || third > 0xbf || second < 0x80 || second > 0xbf
+                || (first == 0xe0 && second < 0xa0)
+                || (first == 0xed && second > 0x9f) {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if first >= 0xf0 && first <= 0xf4 {
+            if index + 3 >= length { return false; }
+            let second: u64 = byte_at(source, index + 1);
+            let third: u64 = byte_at(source, index + 2);
+            let fourth: u64 = byte_at(source, index + 3);
+            if second < 0x80 || second > 0xbf
+                || third < 0x80 || third > 0xbf
+                || fourth < 0x80 || fourth > 0xbf
+                || (first == 0xf0 && second < 0x90)
+                || (first == 0xf4 && second > 0x8f) {
+                return false;
+            }
+            index += 4;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+pub unsafe fn identifier_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0
+        || length > WORLD_VALUE_MAX_IDENTIFIER_BYTES {
+        return false;
+    }
+    let first: u64 = byte_at(source, 0);
+    if first < b'a' as u64 || first > b'z' as u64 { return false; }
+    let mut index: usize = 1;
+    while index < length {
+        let value: u64 = byte_at(source, index);
+        if !((value >= b'a' as u64 && value <= b'z' as u64)
+            || (value >= b'0' as u64 && value <= b'9' as u64)
+            || value == b'.' as u64 || value == b'_' as u64
+            || value == b'-' as u64) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+pub unsafe fn media_type_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0 || length > WORLD_VALUE_MAX_MEDIA_BYTES {
+        return false;
+    }
+    let mut slash: u64 = 0;
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = byte_at(source, index);
+        if value < 0x21 || value > 0x7e { return false; }
+        if value == b'/' as u64 { slash += 1; }
+        index += 1;
+    }
+    return slash == 1 && byte_at(source, 0) != b'/' as u64
+        && byte_at(source, length - 1) != b'/' as u64;
+}
+
+unsafe fn identity_text_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0 || length > 128 { return false; }
+    if (length == 1 && byte_at(source, 0) == b'.' as u64)
+        || (length == 2 && byte_at(source, 0) == b'.' as u64
+            && byte_at(source, 1) == b'.' as u64) {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = byte_at(source, index);
+        if !((value >= b'A' as u64 && value <= b'Z' as u64)
+            || (value >= b'a' as u64 && value <= b'z' as u64)
+            || (value >= b'0' as u64 && value <= b'9' as u64)
+            || value == b'.' as u64 || value == b'_' as u64
+            || value == b'-' as u64 || value == b'+' as u64) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn read_u16(source: *const u8) -> u64 {
+    return (byte_at(source, 0) << 8) | byte_at(source, 1);
+}
+
+unsafe fn read_u32(source: *const u8) -> u64 {
+    return (byte_at(source, 0) << 24) | (byte_at(source, 1) << 16)
+        | (byte_at(source, 2) << 8) | byte_at(source, 3);
+}
+
+unsafe fn read_u64(source: *const u8) -> u64 {
+    return (read_u32(source) << 32) | read_u32(source + 4);
+}
+
+pub unsafe fn object_identity_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length < 30 || length > 1024
+        || byte_at(source, 0) != b'O' as u64
+        || byte_at(source, 1) != b'W' as u64
+        || byte_at(source, 2) != b'I' as u64
+        || byte_at(source, 3) != b'D' as u64
+        || byte_at(source, 4) != b'E' as u64
+        || byte_at(source, 5) != b'N' as u64
+        || byte_at(source, 6) != b'T' as u64
+        || byte_at(source, 7) != 0 || read_u16(source + 8) != 1
+        || read_u16(source + 10) != 7 || read_u32(source + 12) as usize != length {
+        return false;
+    }
+    let mut cursor: usize = 16;
+    if cursor + 2 > length { return false; }
+    let world_length: usize = read_u16(source + cursor) as usize;
+    cursor += 2;
+    if world_length == 0 || cursor > length || world_length > length - cursor
+        || !identity_text_valid(source + cursor, world_length) {
+        return false;
+    }
+    cursor += world_length;
+    if cursor + 2 > length { return false; }
+    let object_length: usize = read_u16(source + cursor) as usize;
+    cursor += 2;
+    if object_length == 0 || cursor > length || object_length > length - cursor
+        || !identity_text_valid(source + cursor, object_length) {
+        return false;
+    }
+    cursor += object_length;
+    if cursor + 8 != length || read_u64(source + cursor) == 0 { return false; }
+    return true;
+}
+
+unsafe fn reserve_bytes(arena: *mut ValueArena, length: usize) -> bool {
+    return arena as usize != 0 && length <= (*arena).byte_capacity
+        && (*arena).byte_length <= (*arena).byte_capacity - length;
+}
+
+unsafe fn reserve_edges(arena: *mut ValueArena, words: usize) -> bool {
+    return arena as usize != 0 && words <= (*arena).edge_word_capacity
+        && (*arena).edge_word_length <= (*arena).edge_word_capacity - words;
+}
+
+unsafe fn reserve_node(arena: *mut ValueArena) -> bool {
+    return arena as usize != 0 && (*arena).sealed == 0
+        && (*arena).node_count < WORLD_VALUE_MAX_NODES
+        && (*arena).node_count <= ((*arena).node_word_capacity / VALUE_NODE_WORDS) - 1;
+}
+
+unsafe fn copy_bytes(arena: *mut ValueArena, source: *const u8, length: usize) -> usize {
+    let offset: usize = (*arena).byte_length;
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store((*arena).bytes + offset + index, byte_at(source, index) as u8);
+        index += 1;
+    }
+    (*arena).byte_length += length;
+    return offset;
+}
+
+unsafe fn create_node(
+    arena: *mut ValueArena,
+    tag: u64,
+    scalar: u64,
+    data_offset: usize,
+    data_length: usize,
+    aux_offset: usize,
+    aux_length: usize,
+    blob_offset: usize,
+    blob_length: usize,
+    edge_offset: usize,
+    edge_count: usize,
+    depth: usize,
+    output: *mut u64
+) -> u64 {
+    if output as usize == 0 || !reserve_node(arena) || depth == 0
+        || depth > WORLD_VALUE_MAX_DEPTH {
+        return 0;
+    }
+    let handle: u64 = ((*arena).node_count + 1) as u64;
+    (*arena).node_count += 1;
+    store_node_word(arena, handle, NODE_TAG, tag);
+    store_node_word(arena, handle, NODE_SCALAR, scalar);
+    store_node_word(arena, handle, NODE_DATA_OFFSET, data_offset as u64);
+    store_node_word(arena, handle, NODE_DATA_LENGTH, data_length as u64);
+    store_node_word(arena, handle, NODE_AUX_OFFSET, aux_offset as u64);
+    store_node_word(arena, handle, NODE_AUX_LENGTH, aux_length as u64);
+    store_node_word(arena, handle, NODE_BLOB_OFFSET, blob_offset as u64);
+    store_node_word(arena, handle, NODE_BLOB_LENGTH, blob_length as u64);
+    store_node_word(arena, handle, NODE_EDGE_OFFSET, edge_offset as u64);
+    store_node_word(arena, handle, NODE_EDGE_COUNT, edge_count as u64);
+    store_node_word(arena, handle, NODE_DEPTH, depth as u64);
+    store_node_word(arena, handle, NODE_RESERVED, 0);
+    *output = handle;
+    return 1;
+}
+
+unsafe fn scalar_node(
+    arena: *mut ValueArena,
+    tag: u64,
+    scalar: u64,
+    data: *const u8,
+    data_length: usize,
+    aux: *const u8,
+    aux_length: usize,
+    blob: *const u8,
+    blob_length: usize,
+    output: *mut u64
+) -> u64 {
+    let total: usize = data_length + aux_length + blob_length;
+    if output as usize == 0 || !reserve_node(arena) || !reserve_bytes(arena, total) {
+        return 0;
+    }
+    let data_offset: usize = (*arena).byte_length;
+    if data_length != 0 { copy_bytes(arena, data, data_length); }
+    let aux_offset: usize = (*arena).byte_length;
+    if aux_length != 0 { copy_bytes(arena, aux, aux_length); }
+    let blob_offset: usize = (*arena).byte_length;
+    if blob_length != 0 { copy_bytes(arena, blob, blob_length); }
+    return create_node(arena, tag, scalar, data_offset, data_length,
+        aux_offset, aux_length, blob_offset, blob_length,
+        (*arena).edge_word_length, 0, 1, output);
+}
+
+pub unsafe fn add_null(arena: *mut ValueArena, output: *mut u64) -> u64 {
+    return scalar_node(arena, VALUE_TAG_NULL, 0, 0 as *const u8, 0,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_bool(arena: *mut ValueArena, value: u64, output: *mut u64) -> u64 {
+    if value > 1 { return 0; }
+    return scalar_node(arena, VALUE_TAG_BOOL, value, 0 as *const u8, 0,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_integer(
+    arena: *mut ValueArena,
+    sign: u64,
+    magnitude: *const u8,
+    magnitude_length: usize,
+    output: *mut u64
+) -> u64 {
+    if sign > 1 || magnitude_length > WORLD_VALUE_MAX_INTEGER_BYTES
+        || (magnitude_length == 0 && sign != 0)
+        || (magnitude_length != 0 && (magnitude as usize == 0
+            || byte_at(magnitude, 0) == 0)) {
+        return 0;
+    }
+    return scalar_node(arena, VALUE_TAG_INTEGER, sign, magnitude, magnitude_length,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_binary_float(
+    arena: *mut ValueArena,
+    format: u64,
+    bits: *const u8,
+    output: *mut u64
+) -> u64 {
+    let mut length: usize = 0;
+    if format == VALUE_FLOAT_BINARY32 { length = 4; }
+    if format == VALUE_FLOAT_BINARY64 { length = 8; }
+    if length == 0 || bits as usize == 0 { return 0; }
+    return scalar_node(arena, VALUE_TAG_BINARY_FLOAT, format, bits, length,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_text(
+    arena: *mut ValueArena,
+    encoding: u64,
+    text: *const u8,
+    length: usize,
+    output: *mut u64
+) -> u64 {
+    if encoding > VALUE_TEXT_UTF8 || length > WORLD_VALUE_MAX_TEXT_BYTES
+        || !utf8_valid(text, length) {
+        return 0;
+    }
+    return scalar_node(arena, VALUE_TAG_TEXT, encoding, text, length,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_char(arena: *mut ValueArena, value: u64, output: *mut u64) -> u64 {
+    if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) { return 0; }
+    return scalar_node(arena, VALUE_TAG_CHAR, value, 0 as *const u8, 0,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_bytes(
+    arena: *mut ValueArena,
+    media: *const u8,
+    media_length: usize,
+    raw: *const u8,
+    raw_length: usize,
+    output: *mut u64
+) -> u64 {
+    if media_length > WORLD_VALUE_MAX_MEDIA_BYTES
+        || raw_length > WORLD_VALUE_MAX_RAW_BYTES
+        || (media_length != 0 && !media_type_valid(media, media_length))
+        || (raw_length != 0 && raw as usize == 0) {
+        return 0;
+    }
+    return scalar_node(arena, VALUE_TAG_BYTES, 0, media, media_length,
+        raw, raw_length, 0 as *const u8, 0, output);
+}
+
+unsafe fn child_valid(arena: *const ValueArena, child: u64) -> bool {
+    return arena as usize != 0 && child != 0
+        && child as usize <= (*arena).node_count
+        && node_tag(arena, child) != VALUE_TAG_EXTENSION;
+}
+
+unsafe fn append_edge(arena: *mut ValueArena, value: u64) -> void {
+    volatile_store((*arena).edges + (*arena).edge_word_length, value);
+    (*arena).edge_word_length += 1;
+}
+
+pub unsafe fn add_list(
+    arena: *mut ValueArena,
+    children: *const u64,
+    count: usize,
+    output: *mut u64
+) -> u64 {
+    if output as usize == 0 || count > WORLD_VALUE_MAX_LIST
+        || (count != 0 && children as usize == 0)
+        || !reserve_node(arena) || !reserve_edges(arena, count) {
+        return 0;
+    }
+    let mut depth: usize = 1;
+    let mut index: usize = 0;
+    while index < count {
+        let child: u64 = word_at(children, index);
+        if !child_valid(arena as *const ValueArena, child) { return 0; }
+        let candidate: usize = node_depth(arena as *const ValueArena, child) + 1;
+        if candidate > depth { depth = candidate; }
+        index += 1;
+    }
+    if depth > WORLD_VALUE_MAX_DEPTH { return 0; }
+    let edge_offset: usize = (*arena).edge_word_length;
+    index = 0;
+    while index < count { append_edge(arena, word_at(children, index)); index += 1; }
+    return create_node(arena, VALUE_TAG_LIST, 0, (*arena).byte_length, 0,
+        (*arena).byte_length, 0, (*arena).byte_length, 0,
+        edge_offset, count, depth, output);
+}
+
+pub unsafe fn add_record(
+    arena: *mut ValueArena,
+    entries: *const u64,
+    count: usize,
+    output: *mut u64
+) -> u64 {
+    if output as usize == 0 || count > WORLD_VALUE_MAX_RECORD
+        || (count != 0 && entries as usize == 0)
+        || !reserve_node(arena) || !reserve_edges(arena, count * 3) {
+        return 0;
+    }
+    let mut bytes_needed: usize = 0;
+    let mut depth: usize = 1;
+    let mut index: usize = 0;
+    while index < count {
+        let key_address: usize = word_at(entries, index * 3) as usize;
+        let key_length: usize = word_at(entries, index * 3 + 1) as usize;
+        let child: u64 = word_at(entries, index * 3 + 2);
+        let key: *const u8 = key_address as *const u8;
+        if key_length == 0 || key_length > WORLD_VALUE_MAX_IDENTIFIER_BYTES
+            || key_address == 0 || !utf8_valid(key, key_length)
+            || !child_valid(arena as *const ValueArena, child)
+            || key_length > (*arena).byte_capacity - bytes_needed {
+            return 0;
+        }
+        if index != 0 {
+            let prior: *const u8 = word_at(entries, (index - 1) * 3) as usize as *const u8;
+            let prior_length: usize = word_at(entries, (index - 1) * 3 + 1) as usize;
+            if bytes_compare(prior, prior_length, key, key_length)
+                != VALUE_ORDER_LESS { return 0; }
+        }
+        bytes_needed += key_length;
+        let candidate: usize = node_depth(arena as *const ValueArena, child) + 1;
+        if candidate > depth { depth = candidate; }
+        index += 1;
+    }
+    if !reserve_bytes(arena, bytes_needed) || depth > WORLD_VALUE_MAX_DEPTH { return 0; }
+    let edge_offset: usize = (*arena).edge_word_length;
+    index = 0;
+    while index < count {
+        let key: *const u8 = word_at(entries, index * 3) as usize as *const u8;
+        let key_length: usize = word_at(entries, index * 3 + 1) as usize;
+        let child: u64 = word_at(entries, index * 3 + 2);
+        let key_offset: usize = copy_bytes(arena, key, key_length);
+        append_edge(arena, key_offset as u64);
+        append_edge(arena, key_length as u64);
+        append_edge(arena, child);
+        index += 1;
+    }
+    return create_node(arena, VALUE_TAG_RECORD, 0, (*arena).byte_length, 0,
+        (*arena).byte_length, 0, (*arena).byte_length, 0,
+        edge_offset, count, depth, output);
+}
+
+pub unsafe fn scalar_map_key(arena: *const ValueArena, handle: u64) -> bool {
+    if arena as usize == 0 || handle == 0 || handle as usize > (*arena).node_count {
+        return false;
+    }
+    let tag: u64 = node_tag(arena, handle);
+    return tag == VALUE_TAG_NULL || tag == VALUE_TAG_BOOL
+        || tag == VALUE_TAG_INTEGER || tag == VALUE_TAG_BINARY_FLOAT
+        || tag == VALUE_TAG_TEXT || tag == VALUE_TAG_CHAR
+        || tag == VALUE_TAG_BYTES || tag == VALUE_TAG_CODE_REF
+        || tag == VALUE_TAG_OBJECT_REF;
+}
+
+unsafe fn scalar_payload_length(arena: *const ValueArena, handle: u64) -> usize {
+    let tag: u64 = node_tag(arena, handle);
+    if tag == VALUE_TAG_NULL { return 0; }
+    if tag == VALUE_TAG_BOOL { return 1; }
+    if tag == VALUE_TAG_INTEGER { return 1 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_BINARY_FLOAT { return 4 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_TEXT { return 4 + node_data_length(arena, handle); }
+    if tag == VALUE_TAG_CHAR { return 4; }
+    if tag == VALUE_TAG_BYTES {
+        return 4 + node_data_length(arena, handle) + node_aux_length(arena, handle);
+    }
+    if tag == VALUE_TAG_CODE_REF {
+        return 40 + node_data_length(arena, handle) + node_aux_length(arena, handle);
+    }
+    if tag == VALUE_TAG_OBJECT_REF { return node_data_length(arena, handle); }
+    return 0;
+}
+
+unsafe fn compare_scalar_payload(
+    arena: *const ValueArena,
+    left: u64,
+    right: u64
+) -> u64 {
+    let tag: u64 = node_tag(arena, left);
+    let left_scalar: u64 = node_scalar(arena, left);
+    let right_scalar: u64 = node_scalar(arena, right);
+    if tag == VALUE_TAG_BOOL || tag == VALUE_TAG_INTEGER
+        || tag == VALUE_TAG_BINARY_FLOAT || tag == VALUE_TAG_TEXT
+        || tag == VALUE_TAG_CHAR || tag == VALUE_TAG_CODE_REF {
+        if left_scalar < right_scalar { return VALUE_ORDER_LESS; }
+        if left_scalar > right_scalar { return VALUE_ORDER_GREATER; }
+    }
+    if tag == VALUE_TAG_BYTES {
+        let left_media: usize = node_data_length(arena, left);
+        let right_media: usize = node_data_length(arena, right);
+        if left_media < right_media { return VALUE_ORDER_LESS; }
+        if left_media > right_media { return VALUE_ORDER_GREATER; }
+    }
+    if tag == VALUE_TAG_CODE_REF {
+        let left_data_length: usize = node_data_length(arena, left);
+        let right_data_length: usize = node_data_length(arena, right);
+        if left_data_length < right_data_length { return VALUE_ORDER_LESS; }
+        if left_data_length > right_data_length { return VALUE_ORDER_GREATER; }
+        let left_aux_length: usize = node_aux_length(arena, left);
+        let right_aux_length: usize = node_aux_length(arena, right);
+        if left_aux_length < right_aux_length { return VALUE_ORDER_LESS; }
+        if left_aux_length > right_aux_length { return VALUE_ORDER_GREATER; }
+        let digest_order: u64 = bytes_compare(node_blob(arena, left),
+            node_blob_length(arena, left), node_blob(arena, right),
+            node_blob_length(arena, right));
+        if digest_order != VALUE_ORDER_EQUAL { return digest_order; }
+    }
+    let mut order: u64 = bytes_compare(node_data(arena, left),
+        node_data_length(arena, left), node_data(arena, right),
+        node_data_length(arena, right));
+    if order != VALUE_ORDER_EQUAL { return order; }
+    order = bytes_compare(node_aux(arena, left), node_aux_length(arena, left),
+        node_aux(arena, right), node_aux_length(arena, right));
+    if order != VALUE_ORDER_EQUAL { return order; }
+    if tag == VALUE_TAG_CODE_REF { return VALUE_ORDER_EQUAL; }
+    return bytes_compare(node_blob(arena, left), node_blob_length(arena, left),
+        node_blob(arena, right), node_blob_length(arena, right));
+}
+
+pub unsafe fn compare_scalar_keys(
+    arena: *const ValueArena,
+    left: u64,
+    right: u64
+) -> u64 {
+    if !scalar_map_key(arena, left) || !scalar_map_key(arena, right) {
+        return VALUE_ORDER_EQUAL;
+    }
+    let left_tag: u64 = node_tag(arena, left);
+    let right_tag: u64 = node_tag(arena, right);
+    if left_tag < right_tag { return VALUE_ORDER_LESS; }
+    if left_tag > right_tag { return VALUE_ORDER_GREATER; }
+    let left_total: usize = WORLD_VALUE_NODE_HEADER_BYTES
+        + scalar_payload_length(arena, left);
+    let right_total: usize = WORLD_VALUE_NODE_HEADER_BYTES
+        + scalar_payload_length(arena, right);
+    if left_total < right_total { return VALUE_ORDER_LESS; }
+    if left_total > right_total { return VALUE_ORDER_GREATER; }
+    return compare_scalar_payload(arena, left, right);
+}
+
+pub unsafe fn add_map(
+    arena: *mut ValueArena,
+    pairs: *const u64,
+    count: usize,
+    output: *mut u64
+) -> u64 {
+    if output as usize == 0 || count > WORLD_VALUE_MAX_MAP
+        || (count != 0 && pairs as usize == 0)
+        || !reserve_node(arena) || !reserve_edges(arena, count * 2) {
+        return 0;
+    }
+    let mut depth: usize = 1;
+    let mut index: usize = 0;
+    while index < count {
+        let key: u64 = word_at(pairs, index * 2);
+        let value: u64 = word_at(pairs, index * 2 + 1);
+        if !scalar_map_key(arena as *const ValueArena, key)
+            || !child_valid(arena as *const ValueArena, value)
+            || (index != 0 && compare_scalar_keys(arena as *const ValueArena,
+                word_at(pairs, (index - 1) * 2), key) != VALUE_ORDER_LESS) {
+            return 0;
+        }
+        let key_depth: usize = node_depth(arena as *const ValueArena, key) + 1;
+        let value_depth: usize = node_depth(arena as *const ValueArena, value) + 1;
+        if key_depth > depth { depth = key_depth; }
+        if value_depth > depth { depth = value_depth; }
+        index += 1;
+    }
+    if depth > WORLD_VALUE_MAX_DEPTH { return 0; }
+    let edge_offset: usize = (*arena).edge_word_length;
+    index = 0;
+    while index < count {
+        append_edge(arena, word_at(pairs, index * 2));
+        append_edge(arena, word_at(pairs, index * 2 + 1));
+        index += 1;
+    }
+    return create_node(arena, VALUE_TAG_MAP, 0, (*arena).byte_length, 0,
+        (*arena).byte_length, 0, (*arena).byte_length, 0,
+        edge_offset, count, depth, output);
+}
+
+unsafe fn one_child_node(
+    arena: *mut ValueArena,
+    tag: u64,
+    scalar: u64,
+    data: *const u8,
+    data_length: usize,
+    aux: *const u8,
+    aux_length: usize,
+    blob: *const u8,
+    blob_length: usize,
+    child: u64,
+    output: *mut u64
+) -> u64 {
+    let total: usize = data_length + aux_length + blob_length;
+    if output as usize == 0 || !child_valid(arena as *const ValueArena, child)
+        || !reserve_node(arena)
+        || !reserve_edges(arena, 1) || !reserve_bytes(arena, total) {
+        return 0;
+    }
+    let depth: usize = node_depth(arena as *const ValueArena, child) + 1;
+    if depth > WORLD_VALUE_MAX_DEPTH { return 0; }
+    let data_offset: usize = (*arena).byte_length;
+    if data_length != 0 { copy_bytes(arena, data, data_length); }
+    let aux_offset: usize = (*arena).byte_length;
+    if aux_length != 0 { copy_bytes(arena, aux, aux_length); }
+    let blob_offset: usize = (*arena).byte_length;
+    if blob_length != 0 { copy_bytes(arena, blob, blob_length); }
+    let edge_offset: usize = (*arena).edge_word_length;
+    append_edge(arena, child);
+    return create_node(arena, tag, scalar, data_offset, data_length,
+        aux_offset, aux_length, blob_offset, blob_length,
+        edge_offset, 1, depth, output);
+}
+
+pub unsafe fn add_tagged(
+    arena: *mut ValueArena,
+    tag: *const u8,
+    tag_length: usize,
+    child: u64,
+    output: *mut u64
+) -> u64 {
+    if !identifier_valid(tag, tag_length) { return 0; }
+    return one_child_node(arena, VALUE_TAG_TAGGED, 0, tag, tag_length,
+        0 as *const u8, 0, 0 as *const u8, 0, child, output);
+}
+
+pub unsafe fn add_code_ref(
+    arena: *mut ValueArena,
+    algorithm: u64,
+    digest: *const u8,
+    evaluator: *const u8,
+    evaluator_length: usize,
+    entry: *const u8,
+    entry_length: usize,
+    output: *mut u64
+) -> u64 {
+    if algorithm != VALUE_CODE_SHA256 || digest as usize == 0
+        || !identifier_valid(evaluator, evaluator_length)
+        || !identifier_valid(entry, entry_length) {
+        return 0;
+    }
+    return scalar_node(arena, VALUE_TAG_CODE_REF, algorithm,
+        evaluator, evaluator_length, entry, entry_length, digest, 32, output);
+}
+
+pub unsafe fn add_object_ref(
+    arena: *mut ValueArena,
+    identity: *const u8,
+    identity_length: usize,
+    output: *mut u64
+) -> u64 {
+    if !object_identity_valid(identity, identity_length) { return 0; }
+    return scalar_node(arena, VALUE_TAG_OBJECT_REF, 0, identity, identity_length,
+        0 as *const u8, 0, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_error(
+    arena: *mut ValueArena,
+    code: *const u8,
+    code_length: usize,
+    message: *const u8,
+    message_length: usize,
+    output: *mut u64
+) -> u64 {
+    if !identifier_valid(code, code_length)
+        || message_length > WORLD_VALUE_MAX_TEXT_BYTES
+        || !utf8_valid(message, message_length) {
+        return 0;
+    }
+    return scalar_node(arena, VALUE_TAG_ERROR, 0, code, code_length,
+        message, message_length, 0 as *const u8, 0, output);
+}
+
+pub unsafe fn add_extension(
+    arena: *mut ValueArena,
+    namespace: *const u8,
+    namespace_length: usize,
+    name: *const u8,
+    name_length: usize,
+    version: u64,
+    schema_digest: *const u8,
+    child: u64,
+    output: *mut u64
+) -> u64 {
+    if version == 0 || version > 0xffff
+        || !identifier_valid(namespace, namespace_length)
+        || !identifier_valid(name, name_length) || schema_digest as usize == 0 {
+        return 0;
+    }
+    let mut dot: u64 = 0;
+    let mut nonzero: u64 = 0;
+    let mut index: usize = 0;
+    while index < namespace_length {
+        if byte_at(namespace, index) == b'.' as u64 { dot = 1; }
+        index += 1;
+    }
+    index = 0;
+    while index < 32 { nonzero = nonzero | byte_at(schema_digest, index); index += 1; }
+    if dot == 0 || nonzero == 0 { return 0; }
+    return one_child_node(arena, VALUE_TAG_EXTENSION, version,
+        namespace, namespace_length, name, name_length,
+        schema_digest, 32, child, output);
+}
+
+pub unsafe fn seal(arena: *mut ValueArena, root: u64) -> u64 {
+    if arena as usize == 0 || (*arena).sealed != 0 || root == 0
+        || root as usize != (*arena).node_count
+        || (*arena).node_count > WORLD_VALUE_MAX_NODES
+        || node_depth(arena as *const ValueArena, root) > WORLD_VALUE_MAX_DEPTH {
+        return 0;
+    }
+    let mut handle: u64 = 1;
+    while handle <= (*arena).node_count as u64 {
+        if node_tag(arena as *const ValueArena, handle) == VALUE_TAG_EXTENSION
+            && handle != root {
+            return 0;
+        }
+        handle += 1;
+    }
+    (*arena).root = root;
+    (*arena).sealed = 1;
+    return 1;
+}
+
+pub unsafe fn arena_copy(
+    source: *const ValueArena,
+    destination: *mut ValueArena
+) -> u64 {
+    if source as usize == 0 || destination as usize == 0
+        || (*source).sealed != 1 || (*destination).bytes as usize == 0
+        || (*destination).nodes as usize == 0 || (*destination).edges as usize == 0
+        || (*source).byte_length > (*destination).byte_capacity
+        || (*source).node_count * VALUE_NODE_WORDS > (*destination).node_word_capacity
+        || (*source).edge_word_length > (*destination).edge_word_capacity {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < (*source).byte_length {
+        volatile_store((*destination).bytes + index,
+            byte_at((*source).bytes as *const u8, index) as u8);
+        index += 1;
+    }
+    index = 0;
+    while index < (*source).node_count * VALUE_NODE_WORDS {
+        volatile_store((*destination).nodes + index,
+            word_at((*source).nodes as *const u64, index));
+        index += 1;
+    }
+    index = 0;
+    while index < (*source).edge_word_length {
+        volatile_store((*destination).edges + index,
+            word_at((*source).edges as *const u64, index));
+        index += 1;
+    }
+    (*destination).byte_length = (*source).byte_length;
+    (*destination).node_count = (*source).node_count;
+    (*destination).edge_word_length = (*source).edge_word_length;
+    (*destination).root = (*source).root;
+    (*destination).sealed = 1;
+    return 1;
+}

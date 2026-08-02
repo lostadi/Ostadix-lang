@@ -359,13 +359,55 @@
   records and zero generation/version/term/index fields; separate hierarchical
   current/reference checks reject stale generations and same-generation
   logical mismatches. A serialized `CapabilityId` is descriptive data,
-  not bearer authority, a CSpace handle, or delegation. This is not PR3's
-  general World protocol, transport, schema negotiation, OValue envelope, or
+  not bearer authority, a CSpace handle, or delegation. `OWIDENT` remains the
+  identity-only nested format rather than a transport, OValue envelope, or
   receipt codec; it implements no Governor or consensus and passes no G0--G13
   gate.
   Native `.oc` nominal wrappers are validated by their initializers and by
   record encode/decode boundaries; directly constructed raw aggregates do not
   bypass those checks and are not accepted records.
+- Mode 28 adds the bounded canonical World wire-codec PR3 gate in
+  `ocore/kernel/smoke-world-protocol-qemu.sh`. `OWPROTO` v1 has deterministic
+  big-endian framing, four fixed record kinds, a 16 KiB hard maximum,
+  caller/negotiated record limits, and strict rejection of truncated,
+  overlong, mistagged, unknown-kind, unsupported-schema, nonzero-reserved, and
+  noncanonical nested-identity records. The fixed 20-record, 1254-byte corpus
+  contains two offers, one canonical v1 selection, one disjoint rejection, and
+  all 16 `OWIDENT` conformance records and is byte-identical between Rust and
+  native `.oc` under QEMU TCG. Its pure bounded negotiation function selects the
+  highest common version and smaller record limit or one exact contextual
+  no-overlap rejection; it rejects downgrade, inflated-limit, and
+  false-rejection results.
+  `OWPROTO` is not a stream or network transport, live handshake, authenticated
+  session, encryption, replay protection, membership protocol, or authority
+  channel. Identity and capability descriptions remain inert metadata: decode and negotiation grant no bearer,
+  CSpace handle, delegation, or ambient identity. This slice does not implement
+  PR4 OValues, PR5 receipts, a Governor,
+  consensus, WorldFS, Workstream A acceptance, or any G0--G13 passage. QEMU TCG
+  is not physical or hardware-isolation evidence.
+- Mode 29 adds the bounded canonical World-value PR4 gate in
+  `ocore/kernel/smoke-world-value-qemu.sh`. Its separate self-framed `OWVALUE`
+  v1 format has a 4096-byte record maximum, depth-16 and 128-node limits, and an
+  explicit portable allowlist. Records use strictly ordered fields, maps admit
+  only scalar keys in canonical encoded order, and a root-only inert versioned
+  extension carries one recursively portable payload. The fixed 19-record,
+  928-byte corpus is 1856 lowercase hex digits with concatenated SHA-256
+  `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc` and is
+  byte-identical between Rust and native `.oc` under QEMU TCG. Canonical
+  decode/reencode is stable, and both sides compute the same SHA-256 over each complete record.
+  Strict decoding rejects malformed, over-limit, duplicate,
+  out-of-order, or otherwise noncanonical values. The hosted conversion is an
+  explicit allowlist and rejects capabilities, capsules, live references,
+  requests, and other authority-bearing or effectful values.
+  `OWVALUE` is an offline codec and hash oracle, not a new `OWPROTO` v1 kind,
+  stream or network transport, live M9 crossing, authenticated authority path,
+  extension-dispatch mechanism, or execution result. Code and object references
+  remain descriptive, and versioned extensions neither run code nor resolve
+  authority. Mode 29 does not make the full hosted `OValue` enum portable or
+  replace its canonical-CBOR shim wire format. It implements neither PR5
+  receipts nor Workstream A acceptance, supplies no Governor, consensus, or
+  WorldFS, and passes no G0--G13 gate. QEMU TCG is not physical or
+  hardware-isolation evidence.
 
 ## Ostadix World native Alpha boundary
 
@@ -386,7 +428,7 @@
   release gate. The narrower hosted Live-World package/service oracle remains
   separately bounded.
 - The existing project runtime, HGraph executor, capability broker,
-  KernelWorld lifecycle, and Modes 20--27 are reusable organs, not an integrated
+  KernelWorld lifecycle, and Modes 20--29 are reusable organs, not an integrated
   World. Mode 23's synthetic guest is not G7 or G8; Mode 25's static ELF is not
   G9; Mode 26's exact 9P2000 corpus is not G6; supplemental Mode 21 is not real
   Linux boot or physical-device isolation.

@@ -68,6 +68,9 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-live-bounded-personality-qemu.sh # M6B mode-24 live four-byte bounded personality RPC
 ./ocore/kernel/smoke-live-linux-personality-qemu.sh # mode-25 exact static Linux ELF/CPL3 bounded personality
 ./ocore/kernel/smoke-live-linux-plan9-qemu.sh # mode-26 Linux ELF data through a Plan-9-style 9P2000 CPL3 client/server path
+./ocore/kernel/smoke-world-identity-qemu.sh # mode-27 exact Rust/.oc OWIDENT v1 identity corpus
+./ocore/kernel/smoke-world-protocol-qemu.sh # mode-28 exact Rust/.oc OWPROTO v1 codec corpus
+./ocore/kernel/smoke-world-value-qemu.sh # mode-29 exact Rust/.oc OWVALUE v1 byte/hash corpus
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
@@ -323,8 +326,17 @@ The current verified kernel boundary includes M6A's scalar CPL3 supervision in
 mode 18, M6B's bounded-copy/revocation mechanism in mode 19, Mode 24's exact
 four-byte live bounded personality composition, Mode 25's exact static Linux
 ELF/minimal-ABI composition, Mode 26's bounded Linux-to-9P2000 CPL3 service
-path, and the nonexecuting KernelWorld admission/object slice in mode 20. It
-remains
+path, Mode 27's shared `OWIDENT` identity corpus, Mode 28's bounded `OWPROTO`
+record-codec corpus, Mode 29's separate bounded `OWVALUE` portable-value and
+full-record SHA-256 corpus--19 records and 928 bytes, with concatenated SHA-256
+`264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`--and the nonexecuting KernelWorld admission/object
+slice in mode 20. Modes 27 through 29 are byte-level schema oracles, not a
+transport, authenticated authority path, Governor, consensus system, or World Alpha
+qualification. Mode 29 uses a 4096-byte maximum, depth-16 and 128-node limits,
+canonical records and scalar-key maps, and root-only inert extensions. It
+rejects hosted authority, capsules, live references, requests, and other
+effectful forms; it does not make the full hosted `OValue` portable, change the
+hosted canonical-CBOR shim, or provide a live crossing. It remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
 dynamic linker, writable general filesystem, general foreign ABI personality,

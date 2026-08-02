@@ -58,17 +58,30 @@ hosted World foundation:
 - all 20 constitutional identity atoms typed in Rust and `.oc`, with bounded
   `OWIDENT` v1 byte-exact native convergence, strict invalid-record rejection,
   and separate hierarchical stale/mismatch rejection;
+- a bounded `OWPROTO` v1 Rust/`.oc` record codec with deterministic framing,
+  strict size and canonical-form rejection, and offline schema-range selection;
+- a separate bounded `OWVALUE` v1 Rust/`.oc` oracle with an explicit portable
+  allowlist, canonical record and scalar-key-map ordering, a root-only inert
+  versioned extension envelope, and a byte-exact 19-record, 928-byte corpus
+  whose concatenated SHA-256 is
+  `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`;
 - governed planner vocabulary that remains separate from ambient `HostWorld`;
 - deterministic grounding views for OValues, capabilities, capsules, and
   selected governed resources;
 - a descriptive KernelWorld-to-domain binding; and
 - local hosted lifecycle, project, HGraph, and capability-broker components.
 
-The `OWIDENT` record is identity-only, and serialized capability IDs are
-descriptive non-authority. It is not the general World wire protocol,
-transport, negotiation, OValue envelope, or receipt codec and supplies no
-Governor or consensus. The repository does not yet have a live replicated Governor, an authoritative World
-snapshot service, governed distributed lowering, native World transport,
+The `OWIDENT` record remains identity-only, and serialized capability IDs are
+descriptive non-authority. The separate `OWPROTO` v1 slice is a record codec
+with a pure bounded negotiation function; it is not a stream or network
+transport, live peer handshake, authenticated session, OValue envelope, or
+receipt codec and supplies no authority, Governor, or consensus. The repository
+now also has the separate Mode 29 `OWVALUE` codec/hash oracle. It does not make
+the full hosted `OValue` enum portable: hosted capabilities, capsules, live
+references, requests, and other effectful values fail its explicit projection.
+Decoded extensions stay inert, and descriptive code or object references do not
+resolve into authority. The repository does not yet have a live replicated
+Governor, an authoritative World snapshot service, governed distributed lowering, native World transport,
 WorldFS, physical multinode convergence, or an Alpha evidence bundle. No
 production lowering currently eliminates ambient `HostWorld` for arbitrary
 hosted effects.
@@ -91,6 +104,6 @@ establishes:
   migration; or
 - G12, G13, or the name **Ostadix World Alpha**.
 
-Modes 20 through 27 remain separately scoped native or QEMU evidence. Their
+Modes 20 through 29 remain separately scoped native or QEMU evidence. Their
 bounded claims and exclusions are recorded in [`CLAIMS.md`](CLAIMS.md) and
 [`gates.toml`](../evidence/gates.toml); they are not promoted by this profile.

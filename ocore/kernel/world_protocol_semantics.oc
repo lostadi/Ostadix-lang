@@ -1,0 +1,518 @@
+module kernel::world_protocol_semantics;
+
+use kernel::world_identity_semantics::copy_conformance_corpus as copy_identity_corpus;
+use runtime::interrupts::ticks;
+use runtime::serial::write;
+use world::identity::IdentityRecord;
+use world::identity::decode_record as decode_identity_record;
+use world::protocol::SchemaOffer;
+use world::protocol::SchemaSelection;
+use world::protocol::SchemaRejection;
+use world::protocol::SCHEMA_DECISION_SELECTION;
+use world::protocol::SCHEMA_DECISION_REJECTION;
+use world::protocol::offer_init;
+use world::protocol::selection_init;
+use world::protocol::rejection_init;
+use world::protocol::negotiate_schema;
+use world::protocol::selection_matches_offers;
+use world::protocol::rejection_matches_offers;
+use world::protocol::selection_schema;
+use world::protocol::selection_max_record_bytes;
+use world::codec::WorldProtocolRecord;
+use world::codec::WorldCodecScratch;
+use world::codec::WORLD_WIRE_KIND_SCHEMA_OFFER;
+use world::codec::WORLD_WIRE_KIND_IDENTITY_DESCRIPTION;
+use world::codec::record_from_offer;
+use world::codec::record_from_selection;
+use world::codec::record_from_rejection;
+use world::codec::record_from_identity;
+use world::codec::record_kind;
+use world::codec::encode_record;
+use world::codec::decode_record;
+use world::codec::decode_selected_identity;
+
+const MODE_WORLD_PROTOCOL: u64 = 28;
+const IDENTITY_CORPUS_LENGTH: usize = 838;
+const PROTOCOL_CORPUS_LENGTH: usize = 1254;
+const BUFFER_LENGTH: usize = 1100;
+const CORPUS_CAPACITY: usize = 2048;
+const HARD_RECORD_LIMIT: usize = 16384;
+const FIRST_IDENTITY_OFFSET: usize = 96;
+
+static HEX_PREFIX: [u8; 22] = b"WORLD_PROTOCOL_V1_HEX=";
+static CONVERGENCE_MESSAGE: [u8; 53] =
+    b"World protocol Rust/.oc exact-byte convergence: PASS\n";
+static NEGOTIATION_MESSAGE: [u8; 53] =
+    b"World protocol negotiation/canonical rejection: PASS\n";
+static REJECTION_MESSAGE: [u8; 49] =
+    b"World protocol bounded malformed rejection: PASS\n";
+static COMPLETE_MESSAGE: [u8; 37] =
+    b"World protocol v1 native smoke: PASS\n";
+static POST_TICK_MESSAGE: [u8; 39] =
+    b"World protocol post-test timer: online\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+static mut RECORD_STORAGE: [u64; 544] = [0; 544];
+static mut DECODED_STORAGE: [u64; 544] = [0; 544];
+static mut DECODE_SCRATCH_STORAGE: [u64; 1024] = [0; 1024];
+static mut IDENTITY_STORAGE: [u64; 512] = [0; 512];
+static mut LOCAL_OFFER_STORAGE: [u64; 3] = [0; 3];
+static mut PEER_OFFER_STORAGE: [u64; 3] = [0; 3];
+static mut OTHER_OFFER_STORAGE: [u64; 3] = [0; 3];
+static mut TINY_LOCAL_STORAGE: [u64; 3] = [0; 3];
+static mut TINY_PEER_STORAGE: [u64; 3] = [0; 3];
+static mut SELECTION_STORAGE: [u64; 2] = [0; 2];
+static mut OTHER_SELECTION_STORAGE: [u64; 2] = [0; 2];
+static mut TINY_SELECTION_STORAGE: [u64; 2] = [0; 2];
+static mut REJECTION_STORAGE: [u64; 4] = [0; 4];
+static mut OTHER_REJECTION_STORAGE: [u64; 4] = [0; 4];
+static mut IDENTITY_CORPUS: [u8; 2048] = [0; 2048];
+static mut CORPUS: [u8; 2048] = [0; 2048];
+static mut ENCODED: [u8; 1100] = [0; 1100];
+static mut REENCODED: [u8; 1100] = [0; 1100];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn record() -> *mut WorldProtocolRecord {
+    return ((&mut RECORD_STORAGE[0]) as *mut u64) as *mut WorldProtocolRecord;
+}
+
+unsafe fn decoded() -> *mut WorldProtocolRecord {
+    return ((&mut DECODED_STORAGE[0]) as *mut u64) as *mut WorldProtocolRecord;
+}
+
+unsafe fn decode_scratch() -> *mut WorldCodecScratch {
+    return ((&mut DECODE_SCRATCH_STORAGE[0]) as *mut u64) as *mut WorldCodecScratch;
+}
+
+unsafe fn identity() -> *mut IdentityRecord {
+    return ((&mut IDENTITY_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+
+unsafe fn local_offer() -> *mut SchemaOffer {
+    return ((&mut LOCAL_OFFER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+
+unsafe fn peer_offer() -> *mut SchemaOffer {
+    return ((&mut PEER_OFFER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+
+unsafe fn other_offer() -> *mut SchemaOffer {
+    return ((&mut OTHER_OFFER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+
+unsafe fn tiny_local() -> *mut SchemaOffer {
+    return ((&mut TINY_LOCAL_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+
+unsafe fn tiny_peer() -> *mut SchemaOffer {
+    return ((&mut TINY_PEER_STORAGE[0]) as *mut u64) as *mut SchemaOffer;
+}
+
+unsafe fn selection() -> *mut SchemaSelection {
+    return ((&mut SELECTION_STORAGE[0]) as *mut u64) as *mut SchemaSelection;
+}
+
+unsafe fn other_selection() -> *mut SchemaSelection {
+    return ((&mut OTHER_SELECTION_STORAGE[0]) as *mut u64) as *mut SchemaSelection;
+}
+
+unsafe fn tiny_selection() -> *mut SchemaSelection {
+    return ((&mut TINY_SELECTION_STORAGE[0]) as *mut u64) as *mut SchemaSelection;
+}
+
+unsafe fn rejection() -> *mut SchemaRejection {
+    return ((&mut REJECTION_STORAGE[0]) as *mut u64) as *mut SchemaRejection;
+}
+
+unsafe fn other_rejection() -> *mut SchemaRejection {
+    return ((&mut OTHER_REJECTION_STORAGE[0]) as *mut u64) as *mut SchemaRejection;
+}
+
+unsafe fn bytes_equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn read_u32(source: *const u8) -> usize {
+    return ((volatile_load(source) as usize) << 24)
+        | ((volatile_load(source + 1) as usize) << 16)
+        | ((volatile_load(source + 2) as usize) << 8)
+        | (volatile_load(source + 3) as usize);
+}
+
+unsafe fn append_roundtrip(corpus_length: *mut usize) -> bool {
+    let mut encoded_length: usize = 0;
+    let mut reencoded_length: usize = 0;
+    if encode_record(
+        record() as *const WorldProtocolRecord,
+        (&mut ENCODED[0]),
+        BUFFER_LENGTH,
+        (&mut encoded_length)
+    ) != 1 || encoded_length == 0 || encoded_length > BUFFER_LENGTH {
+        return false;
+    }
+    if decode_record(
+        (&ENCODED[0]),
+        encoded_length,
+        HARD_RECORD_LIMIT,
+        decoded(),
+        decode_scratch()
+    ) != 1 {
+        return false;
+    }
+    if encode_record(
+            decoded() as *const WorldProtocolRecord,
+            (&mut REENCODED[0]),
+            BUFFER_LENGTH,
+            (&mut reencoded_length)
+        ) != 1
+        || reencoded_length != encoded_length
+        || !bytes_equal((&ENCODED[0]), (&REENCODED[0]), encoded_length) {
+        return false;
+    }
+    if *corpus_length > CORPUS_CAPACITY
+        || encoded_length > CORPUS_CAPACITY - *corpus_length {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < encoded_length {
+        CORPUS[*corpus_length + index] = ENCODED[index];
+        index += 1;
+    }
+    *corpus_length += encoded_length;
+    return true;
+}
+
+unsafe fn canonical_corpus() -> usize {
+    let mut length: usize = 0;
+    let mut identity_length: usize = 0;
+    if offer_init(local_offer(), 1, 1, 16384) != 1
+        || offer_init(peer_offer(), 1, 3, 1024) != 1
+        || negotiate_schema(
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            selection(),
+            rejection()
+        ) != SCHEMA_DECISION_SELECTION
+        || !selection_matches_offers(
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer
+        )
+        || selection_schema(selection() as *const SchemaSelection) != 1
+        || selection_max_record_bytes(selection() as *const SchemaSelection) != 1024 {
+        return 0;
+    }
+    if record_from_offer(record(), local_offer() as *const SchemaOffer) != 1
+        || !append_roundtrip((&mut length))
+        || record_from_offer(record(), peer_offer() as *const SchemaOffer) != 1
+        || !append_roundtrip((&mut length))
+        || record_from_selection(record(), selection() as *const SchemaSelection) != 1
+        || !append_roundtrip((&mut length)) {
+        return 0;
+    }
+
+    if offer_init(other_offer(), 2, 3, 1024) != 1
+        || negotiate_schema(
+            local_offer() as *const SchemaOffer,
+            other_offer() as *const SchemaOffer,
+            other_selection(),
+            rejection()
+        ) != SCHEMA_DECISION_REJECTION
+        || !rejection_matches_offers(
+            rejection() as *const SchemaRejection,
+            local_offer() as *const SchemaOffer,
+            other_offer() as *const SchemaOffer
+        )
+        || record_from_rejection(record(), rejection() as *const SchemaRejection) != 1
+        || !append_roundtrip((&mut length)) {
+        return 0;
+    }
+
+    if copy_identity_corpus(
+        (&mut IDENTITY_CORPUS[0]),
+        CORPUS_CAPACITY,
+        (&mut identity_length)
+    ) != 1 || identity_length != IDENTITY_CORPUS_LENGTH {
+        return 0;
+    }
+    let mut offset: usize = 0;
+    let mut count: usize = 0;
+    while offset < identity_length {
+        if identity_length - offset < 16 { return 0; }
+        let nested_length: usize = read_u32((&IDENTITY_CORPUS[offset + 12]));
+        if nested_length < 16 || nested_length > identity_length - offset {
+            return 0;
+        }
+        if decode_identity_record(
+                (&IDENTITY_CORPUS[offset]),
+                nested_length,
+                identity()
+            ) != 1 {
+            return 0;
+        }
+        if record_from_identity(record(), identity() as *const IdentityRecord) != 1 {
+            return 0;
+        }
+        if !append_roundtrip((&mut length)) { return 0; }
+        offset += nested_length;
+        count += 1;
+    }
+    if offset != identity_length || count != 16 { return 0; }
+    return length;
+}
+
+unsafe fn copy_corpus(offset: usize, length: usize) -> bool {
+    if offset > PROTOCOL_CORPUS_LENGTH
+        || length > PROTOCOL_CORPUS_LENGTH - offset
+        || length > BUFFER_LENGTH {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        REENCODED[index] = CORPUS[offset + index];
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn rejection_preserves_output(
+    source: *const u8,
+    length: usize,
+    caller_limit: usize
+) -> bool {
+    if decode_record(
+        (&CORPUS[0]),
+        24,
+        HARD_RECORD_LIMIT,
+        decoded(),
+        decode_scratch()
+    ) != 1
+        || record_kind(decoded() as *const WorldProtocolRecord)
+            != WORLD_WIRE_KIND_SCHEMA_OFFER {
+        return false;
+    }
+    return decode_record(
+            source,
+            length,
+            caller_limit,
+            decoded(),
+            decode_scratch()
+        ) == 0
+        && record_kind(decoded() as *const WorldProtocolRecord)
+            == WORLD_WIRE_KIND_SCHEMA_OFFER;
+}
+
+unsafe fn negotiation_rejections_hold() -> bool {
+    let first_identity_length: usize = read_u32((&CORPUS[FIRST_IDENTITY_OFFSET + 12]));
+    if first_identity_length == 0
+        || !selection_matches_offers(
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer
+        )
+        || decode_selected_identity(
+            (&CORPUS[FIRST_IDENTITY_OFFSET]),
+            first_identity_length,
+            selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            decoded(),
+            decode_scratch()
+        ) != 1
+        || record_kind(decoded() as *const WorldProtocolRecord)
+            != WORLD_WIRE_KIND_IDENTITY_DESCRIPTION {
+        return false;
+    }
+
+    if selection_init(other_selection(), 1, 2048) != 1
+        || selection_matches_offers(
+            other_selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer
+        )
+        || decode_record(
+            (&CORPUS[0]),
+            24,
+            HARD_RECORD_LIMIT,
+            decoded(),
+            decode_scratch()
+        ) != 1
+        || decode_selected_identity(
+            (&CORPUS[FIRST_IDENTITY_OFFSET]),
+            first_identity_length,
+            other_selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            decoded(),
+            decode_scratch()
+        ) != 0
+        || record_kind(decoded() as *const WorldProtocolRecord)
+            != WORLD_WIRE_KIND_SCHEMA_OFFER {
+        return false;
+    }
+    if selection_init(other_selection(), 2, 1024) != 1
+        || selection_matches_offers(
+            other_selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer
+        )
+        || decode_selected_identity(
+            (&CORPUS[FIRST_IDENTITY_OFFSET]),
+            first_identity_length,
+            other_selection() as *const SchemaSelection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer,
+            decoded(),
+            decode_scratch()
+        ) != 0 {
+        return false;
+    }
+
+    if offer_init(tiny_local(), 1, 1, 24) != 1
+        || offer_init(tiny_peer(), 1, 1, 24) != 1
+        || negotiate_schema(
+            tiny_local() as *const SchemaOffer,
+            tiny_peer() as *const SchemaOffer,
+            tiny_selection(),
+            other_rejection()
+        ) != SCHEMA_DECISION_SELECTION
+        || decode_selected_identity(
+            (&CORPUS[FIRST_IDENTITY_OFFSET]),
+            first_identity_length,
+            tiny_selection() as *const SchemaSelection,
+            tiny_local() as *const SchemaOffer,
+            tiny_peer() as *const SchemaOffer,
+            decoded(),
+            decode_scratch()
+        ) != 0 {
+        return false;
+    }
+
+    return rejection_init(other_rejection(), 1, 2, 2, 3) == 0
+        && rejection_init(other_rejection(), 1, 1, 3, 3) == 1
+        && !rejection_matches_offers(
+            other_rejection() as *const SchemaRejection,
+            local_offer() as *const SchemaOffer,
+            peer_offer() as *const SchemaOffer
+        );
+}
+
+unsafe fn malformed_rejected() -> bool {
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[0] = b'X';
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[9] = 2;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[10] = 0xff;
+    REENCODED[11] = 0xff;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[15] = 25;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(0, 24) { return false; }
+    REENCODED[16] = 0;
+    REENCODED[17] = 0;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(48, 24) { return false; }
+    REENCODED[18] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+    if !copy_corpus(72, 24) { return false; }
+    REENCODED[20] = 0;
+    REENCODED[21] = 1;
+    REENCODED[22] = 0;
+    REENCODED[23] = 1;
+    if !rejection_preserves_output((&REENCODED[0]), 24, HARD_RECORD_LIMIT) {
+        return false;
+    }
+
+    let identity_length: usize = read_u32((&CORPUS[FIRST_IDENTITY_OFFSET + 12]));
+    if !copy_corpus(FIRST_IDENTITY_OFFSET, identity_length) { return false; }
+    REENCODED[16] = 0;
+    REENCODED[17] = 2;
+    if !rejection_preserves_output(
+        (&REENCODED[0]),
+        identity_length,
+        HARD_RECORD_LIMIT
+    ) { return false; }
+    if !copy_corpus(FIRST_IDENTITY_OFFSET, identity_length) { return false; }
+    REENCODED[28] = 0;
+    REENCODED[29] = 2;
+    if !rejection_preserves_output(
+        (&REENCODED[0]),
+        identity_length,
+        HARD_RECORD_LIMIT
+    ) { return false; }
+    return rejection_preserves_output(
+            (&CORPUS[FIRST_IDENTITY_OFFSET]),
+            identity_length,
+            identity_length - 1
+        )
+        && rejection_preserves_output((&CORPUS[0]), 15, HARD_RECORD_LIMIT)
+        && rejection_preserves_output((&CORPUS[0]), 16385, HARD_RECORD_LIMIT);
+}
+
+fn hex_digit(value: u64) -> u8 {
+    if value < 10 { return (b'0' as u64 + value) as u8; }
+    return (b'a' as u64 + value - 10) as u8;
+}
+
+unsafe fn emit_hex(length: usize) -> void {
+    write((&HEX_PREFIX[0]), 22);
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = CORPUS[index] as u64;
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_WORLD_PROTOCOL { fail_closed(); }
+    disable_interrupts();
+    let corpus_length: usize = canonical_corpus();
+    if corpus_length != PROTOCOL_CORPUS_LENGTH
+        || !negotiation_rejections_hold()
+        || !malformed_rejected() {
+        fail_closed();
+    }
+    emit_hex(corpus_length);
+    write((&CONVERGENCE_MESSAGE[0]), 53);
+    write((&NEGOTIATION_MESSAGE[0]), 53);
+    write((&REJECTION_MESSAGE[0]), 49);
+    write((&COMPLETE_MESSAGE[0]), 37);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK_MESSAGE[0]), 39);
+    loop { halt(); }
+}

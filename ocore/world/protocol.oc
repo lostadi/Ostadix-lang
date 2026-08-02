@@ -1,0 +1,299 @@
+module world::protocol;
+
+// Canonical World schema negotiation. These records select only a codec
+// schema and a shared record-size ceiling. They do not create a transport
+// session, authenticate a peer, or carry authority.
+
+pub const WORLD_SCHEMA_MIN: u64 = 1;
+pub const WORLD_SCHEMA_MAX: u64 = 0xffff;
+pub const WORLD_WIRE_MIN_RECORD_BYTES: u64 = 24;
+pub const WORLD_WIRE_MAX_RECORD_BYTES: u64 = 16384;
+
+pub const SCHEMA_DECISION_SELECTION: u64 = 1;
+pub const SCHEMA_DECISION_REJECTION: u64 = 2;
+
+pub struct SchemaOffer {
+    min_schema: u64,
+    max_schema: u64,
+    max_record_bytes: u64,
+}
+
+pub struct SchemaSelection {
+    selected_schema: u64,
+    agreed_max_record_bytes: u64,
+}
+
+pub struct SchemaRejection {
+    local_min_schema: u64,
+    local_max_schema: u64,
+    peer_min_schema: u64,
+    peer_max_schema: u64,
+}
+
+fn schema_range_valid(min_schema: u64, max_schema: u64) -> bool {
+    return min_schema >= WORLD_SCHEMA_MIN
+        && max_schema <= WORLD_SCHEMA_MAX
+        && min_schema <= max_schema;
+}
+
+fn record_limit_valid(max_record_bytes: u64) -> bool {
+    return max_record_bytes >= WORLD_WIRE_MIN_RECORD_BYTES
+        && max_record_bytes <= WORLD_WIRE_MAX_RECORD_BYTES;
+}
+
+pub unsafe fn clear_offer(offer: *mut SchemaOffer) -> u64 {
+    if offer as usize == 0 { return 0; }
+    (*offer).min_schema = 0;
+    (*offer).max_schema = 0;
+    (*offer).max_record_bytes = 0;
+    return 1;
+}
+
+pub unsafe fn clear_selection(selection: *mut SchemaSelection) -> u64 {
+    if selection as usize == 0 { return 0; }
+    (*selection).selected_schema = 0;
+    (*selection).agreed_max_record_bytes = 0;
+    return 1;
+}
+
+pub unsafe fn clear_rejection(rejection: *mut SchemaRejection) -> u64 {
+    if rejection as usize == 0 { return 0; }
+    (*rejection).local_min_schema = 0;
+    (*rejection).local_max_schema = 0;
+    (*rejection).peer_min_schema = 0;
+    (*rejection).peer_max_schema = 0;
+    return 1;
+}
+
+pub unsafe fn offer_init(
+    result: *mut SchemaOffer,
+    min_schema: u64,
+    max_schema: u64,
+    max_record_bytes: u64
+) -> u64 {
+    if result as usize == 0
+        || !schema_range_valid(min_schema, max_schema)
+        || !record_limit_valid(max_record_bytes) {
+        return 0;
+    }
+    (*result).min_schema = min_schema;
+    (*result).max_schema = max_schema;
+    (*result).max_record_bytes = max_record_bytes;
+    return 1;
+}
+
+pub unsafe fn selection_init(
+    result: *mut SchemaSelection,
+    selected_schema: u64,
+    agreed_max_record_bytes: u64
+) -> u64 {
+    if result as usize == 0
+        || selected_schema < WORLD_SCHEMA_MIN
+        || selected_schema > WORLD_SCHEMA_MAX
+        || !record_limit_valid(agreed_max_record_bytes) {
+        return 0;
+    }
+    (*result).selected_schema = selected_schema;
+    (*result).agreed_max_record_bytes = agreed_max_record_bytes;
+    return 1;
+}
+
+fn ranges_overlap(
+    local_min: u64,
+    local_max: u64,
+    peer_min: u64,
+    peer_max: u64
+) -> bool {
+    let mut lower: u64 = local_min;
+    if peer_min > lower { lower = peer_min; }
+    let mut upper: u64 = local_max;
+    if peer_max < upper { upper = peer_max; }
+    return lower <= upper;
+}
+
+pub unsafe fn rejection_init(
+    result: *mut SchemaRejection,
+    local_min_schema: u64,
+    local_max_schema: u64,
+    peer_min_schema: u64,
+    peer_max_schema: u64
+) -> u64 {
+    if result as usize == 0
+        || !schema_range_valid(local_min_schema, local_max_schema)
+        || !schema_range_valid(peer_min_schema, peer_max_schema)
+        || ranges_overlap(
+            local_min_schema,
+            local_max_schema,
+            peer_min_schema,
+            peer_max_schema
+        ) {
+        return 0;
+    }
+    (*result).local_min_schema = local_min_schema;
+    (*result).local_max_schema = local_max_schema;
+    (*result).peer_min_schema = peer_min_schema;
+    (*result).peer_max_schema = peer_max_schema;
+    return 1;
+}
+
+pub unsafe fn offer_valid(offer: *const SchemaOffer) -> bool {
+    if offer as usize == 0 { return false; }
+    return schema_range_valid((*offer).min_schema, (*offer).max_schema)
+        && record_limit_valid((*offer).max_record_bytes);
+}
+
+pub unsafe fn selection_valid(selection: *const SchemaSelection) -> bool {
+    if selection as usize == 0 { return false; }
+    return (*selection).selected_schema >= WORLD_SCHEMA_MIN
+        && (*selection).selected_schema <= WORLD_SCHEMA_MAX
+        && record_limit_valid((*selection).agreed_max_record_bytes);
+}
+
+pub unsafe fn rejection_valid(rejection: *const SchemaRejection) -> bool {
+    if rejection as usize == 0 { return false; }
+    return schema_range_valid(
+            (*rejection).local_min_schema,
+            (*rejection).local_max_schema
+        )
+        && schema_range_valid(
+            (*rejection).peer_min_schema,
+            (*rejection).peer_max_schema
+        )
+        && !ranges_overlap(
+            (*rejection).local_min_schema,
+            (*rejection).local_max_schema,
+            (*rejection).peer_min_schema,
+            (*rejection).peer_max_schema
+        );
+}
+
+pub unsafe fn offer_min_schema(offer: *const SchemaOffer) -> u64 {
+    if !offer_valid(offer) { return 0; }
+    return (*offer).min_schema;
+}
+
+pub unsafe fn offer_max_schema(offer: *const SchemaOffer) -> u64 {
+    if !offer_valid(offer) { return 0; }
+    return (*offer).max_schema;
+}
+
+pub unsafe fn offer_max_record_bytes(offer: *const SchemaOffer) -> u64 {
+    if !offer_valid(offer) { return 0; }
+    return (*offer).max_record_bytes;
+}
+
+pub unsafe fn selection_schema(selection: *const SchemaSelection) -> u64 {
+    if !selection_valid(selection) { return 0; }
+    return (*selection).selected_schema;
+}
+
+pub unsafe fn selection_max_record_bytes(
+    selection: *const SchemaSelection
+) -> u64 {
+    if !selection_valid(selection) { return 0; }
+    return (*selection).agreed_max_record_bytes;
+}
+
+pub unsafe fn rejection_local_min(rejection: *const SchemaRejection) -> u64 {
+    if !rejection_valid(rejection) { return 0; }
+    return (*rejection).local_min_schema;
+}
+
+pub unsafe fn rejection_local_max(rejection: *const SchemaRejection) -> u64 {
+    if !rejection_valid(rejection) { return 0; }
+    return (*rejection).local_max_schema;
+}
+
+pub unsafe fn rejection_peer_min(rejection: *const SchemaRejection) -> u64 {
+    if !rejection_valid(rejection) { return 0; }
+    return (*rejection).peer_min_schema;
+}
+
+pub unsafe fn rejection_peer_max(rejection: *const SchemaRejection) -> u64 {
+    if !rejection_valid(rejection) { return 0; }
+    return (*rejection).peer_max_schema;
+}
+
+pub unsafe fn negotiate_schema(
+    local: *const SchemaOffer,
+    peer: *const SchemaOffer,
+    selection: *mut SchemaSelection,
+    rejection: *mut SchemaRejection
+) -> u64 {
+    if !offer_valid(local) || !offer_valid(peer)
+        || selection as usize == 0 || rejection as usize == 0 {
+        return 0;
+    }
+    let local_min: u64 = (*local).min_schema;
+    let local_max: u64 = (*local).max_schema;
+    let peer_min: u64 = (*peer).min_schema;
+    let peer_max: u64 = (*peer).max_schema;
+    if !ranges_overlap(local_min, local_max, peer_min, peer_max) {
+        if rejection_init(
+            rejection,
+            local_min,
+            local_max,
+            peer_min,
+            peer_max
+        ) != 1 {
+            return 0;
+        }
+        return SCHEMA_DECISION_REJECTION;
+    }
+    let mut selected: u64 = local_max;
+    if peer_max < selected { selected = peer_max; }
+    let mut agreed_max: u64 = (*local).max_record_bytes;
+    if (*peer).max_record_bytes < agreed_max {
+        agreed_max = (*peer).max_record_bytes;
+    }
+    if selection_init(selection, selected, agreed_max) != 1 { return 0; }
+    return SCHEMA_DECISION_SELECTION;
+}
+
+pub unsafe fn selection_matches_offers(
+    selection: *const SchemaSelection,
+    local: *const SchemaOffer,
+    peer: *const SchemaOffer
+) -> bool {
+    if !selection_valid(selection) || !offer_valid(local) || !offer_valid(peer) {
+        return false;
+    }
+    if !ranges_overlap(
+        (*local).min_schema,
+        (*local).max_schema,
+        (*peer).min_schema,
+        (*peer).max_schema
+    ) {
+        return false;
+    }
+    let mut expected_schema: u64 = (*local).max_schema;
+    if (*peer).max_schema < expected_schema {
+        expected_schema = (*peer).max_schema;
+    }
+    let mut expected_max: u64 = (*local).max_record_bytes;
+    if (*peer).max_record_bytes < expected_max {
+        expected_max = (*peer).max_record_bytes;
+    }
+    return (*selection).selected_schema == expected_schema
+        && (*selection).agreed_max_record_bytes == expected_max;
+}
+
+pub unsafe fn rejection_matches_offers(
+    rejection: *const SchemaRejection,
+    local: *const SchemaOffer,
+    peer: *const SchemaOffer
+) -> bool {
+    if !rejection_valid(rejection) || !offer_valid(local) || !offer_valid(peer) {
+        return false;
+    }
+    return !ranges_overlap(
+            (*local).min_schema,
+            (*local).max_schema,
+            (*peer).min_schema,
+            (*peer).max_schema
+        )
+        && (*rejection).local_min_schema == (*local).min_schema
+        && (*rejection).local_max_schema == (*local).max_schema
+        && (*rejection).peer_min_schema == (*peer).min_schema
+        && (*rejection).peer_max_schema == (*peer).max_schema;
+}

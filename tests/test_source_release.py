@@ -43,13 +43,13 @@ EVIDENCE_SPEC.loader.exec_module(evidence_tool)
 def fixture_evidence_manifest() -> str:
     lines = [
         "schema_version = 1",
-        "required_gate_count = 18",
+        "required_gate_count = 20",
         "supplemental_gate_count = 1",
         'portable_command = "./boot-and-test.sh smoke"',
         "",
     ]
-    for index in range(19):
-        required = index < 18
+    for index in range(21):
+        required = index < 20
         evidence_class = "portable_tcg" if required else "hardware_kvm"
         lines.extend(
             [
@@ -193,7 +193,21 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/boot.S": ".section .text\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/smoke-world-value-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-world-protocol-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-identity-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/world_value_semantics.oc": (
+                "module kernel::world_value_semantics;\n"
+            ),
+            "ocore/kernel/world_value_semantics_stub.oc": (
+                "module kernel::world_value_semantics;\n"
+            ),
+            "ocore/kernel/world_protocol_semantics.oc": (
+                "module kernel::world_protocol_semantics;\n"
+            ),
+            "ocore/kernel/world_protocol_semantics_stub.oc": (
+                "module kernel::world_protocol_semantics;\n"
+            ),
             "ocore/kernel/world_identity_semantics.oc": (
                 "module kernel::world_identity_semantics;\n"
             ),
@@ -201,24 +215,37 @@ class SourceReleaseTests(unittest.TestCase):
                 "module kernel::world_identity_semantics;\n"
             ),
             "ocore/runtime/x86_64/trap.oc": "module runtime::trap;\n",
+            "ocore/world/codec.oc": "module world::codec;\n",
             "ocore/world/identity.oc": "module world::identity;\n",
+            "ocore/world/protocol.oc": "module world::protocol;\n",
+            "ocore/world/sha256.oc": "module world::sha256;\n",
+            "ocore/world/value.oc": "module world::value;\n",
+            "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
+            "src/world/codec.rs": "// fixture World protocol codec oracle\n",
             "src/world/mod.rs": "pub mod identity;\n",
+            "src/world/protocol.rs": "// fixture World protocol vocabulary\n",
+            "src/world/value.rs": "// fixture portable World value vocabulary\n",
+            "src/world/value_codec.rs": "// fixture portable World value codec\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
             "tests/fixtures/world_identity_v1.hex": "4f574944454e5431\n",
+            "tests/fixtures/world_protocol_v1.hex": "4f5750524f544f31\n",
+            "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
             "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
             "tests/world_identity_wire.rs": "#[test] fn wire_fixture() {}\n",
+            "tests/world_protocol.rs": "#[test] fn protocol_fixture() {}\n",
+            "tests/world_value.rs": "#[test] fn value_fixture() {}\n",
         }
         if files:
             contents.update(files)
-        for index in range(19):
+        for index in range(21):
             contents[f"ocore/kernel/fixture-evidence-{index:02}.sh"] = (
                 "#!/bin/sh\n"
                 f"printf 'FIXTURE {index:02} START\\nFIXTURE {index:02} PASS\\n'\n"
@@ -232,6 +259,8 @@ class SourceReleaseTests(unittest.TestCase):
                     "boot-and-test.sh",
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
+                    "ocore/kernel/smoke-world-value-qemu.sh",
+                    "ocore/kernel/smoke-world-protocol-qemu.sh",
                     "ocore/kernel/smoke-world-identity-qemu.sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
@@ -348,24 +377,43 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/boot.S",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
+                "ocore/kernel/smoke-world-value-qemu.sh",
+                "ocore/kernel/smoke-world-protocol-qemu.sh",
                 "ocore/kernel/smoke-world-identity-qemu.sh",
+                "ocore/kernel/world_protocol_semantics.oc",
+                "ocore/kernel/world_protocol_semantics_stub.oc",
+                "ocore/kernel/world_value_semantics.oc",
+                "ocore/kernel/world_value_semantics_stub.oc",
                 "ocore/kernel/world_identity_semantics.oc",
                 "ocore/kernel/world_identity_semantics_stub.oc",
                 "ocore/runtime/x86_64/trap.oc",
+                "ocore/world/codec.oc",
                 "ocore/world/identity.oc",
+                "ocore/world/protocol.oc",
+                "ocore/world/sha256.oc",
+                "ocore/world/value.oc",
+                "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
                 "src/world/identity.rs",
                 "src/world/identity_wire.rs",
+                "src/world/codec.rs",
                 "src/world/mod.rs",
+                "src/world/protocol.rs",
+                "src/world/value.rs",
+                "src/world/value_codec.rs",
                 "tests/example_manifest.py",
                 "tests/fixtures/world_identity_v1.hex",
+                "tests/fixtures/world_protocol_v1.hex",
+                "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
                 "tests/test_world_alpha_evidence.py",
                 "tests/world_identity.rs",
                 "tests/world_identity_wire.rs",
+                "tests/world_protocol.rs",
+                "tests/world_value.rs",
                 ".github/workflows/ci.yml",
                 "assets/logo.bin",
                 "backends/shim.py",
@@ -380,7 +428,7 @@ class SourceReleaseTests(unittest.TestCase):
             }
             included.update(
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
-                for index in range(19)
+                for index in range(21)
             )
             excluded = {
                 ".DS_Store",
@@ -703,6 +751,59 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-world-identity.zip")
 
+    def test_world_protocol_cross_language_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "ocore/kernel/smoke-world-protocol-qemu.sh",
+            "ocore/kernel/world_protocol_semantics.oc",
+            "ocore/kernel/world_protocol_semantics_stub.oc",
+            "ocore/world/codec.oc",
+            "ocore/world/protocol.oc",
+            "src/world/codec.rs",
+            "src/world/protocol.rs",
+            "tests/fixtures/world_protocol_v1.hex",
+            "tests/world_protocol.rs",
+        )
+        self._git("commit", "-q", "-m", "remove World protocol surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*smoke-world-protocol-qemu\.sh.*"
+            r"world_protocol_semantics\.oc.*world_protocol_semantics_stub\.oc.*"
+            r"ocore/world/codec\.oc.*ocore/world/protocol\.oc.*"
+            r"src/world/codec\.rs.*src/world/protocol\.rs.*"
+            r"world_protocol_v1\.hex.*world_protocol\.rs",
+        ):
+            self._build("missing-world-protocol.zip")
+
+    def test_world_value_cross_language_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "ocore/kernel/smoke-world-value-qemu.sh",
+            "ocore/kernel/world_value_semantics.oc",
+            "ocore/kernel/world_value_semantics_stub.oc",
+            "ocore/world/sha256.oc",
+            "ocore/world/value.oc",
+            "ocore/world/value_codec.oc",
+            "src/world/value.rs",
+            "src/world/value_codec.rs",
+            "tests/fixtures/world_value_v1.hex",
+            "tests/world_value.rs",
+        )
+        self._git("commit", "-q", "-m", "remove World value surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*smoke-world-value-qemu\.sh.*"
+            r"world_value_semantics\.oc.*world_value_semantics_stub\.oc.*"
+            r"ocore/world/sha256\.oc.*ocore/world/value\.oc.*"
+            r"ocore/world/value_codec\.oc.*src/world/value\.rs.*"
+            r"src/world/value_codec\.rs.*world_value_v1\.hex.*world_value\.rs",
+        ):
+            self._build("missing-world-value.zip")
+
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():
             with self.subTest(path=path):
@@ -793,7 +894,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_zero_gate_evidence_manifest_is_rejected_before_packaging(self) -> None:
         self._commit({"evidence/gates.toml": ZERO_GATE_EVIDENCE_MANIFEST})
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 18"
+            release.ReleaseError, r"required_gate_count must be 20"
         ):
             self._build("zero-gate-evidence.zip")
 
@@ -821,7 +922,7 @@ class SourceReleaseTests(unittest.TestCase):
             result.output, "self-consistent-zero-gate-evidence.zip", remove_gates
         )
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 18"
+            release.ReleaseError, r"required_gate_count must be 20"
         ):
             release.verify_archive(tampered)
 

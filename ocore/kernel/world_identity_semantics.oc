@@ -283,6 +283,25 @@ unsafe fn canonical_corpus() -> usize {
     return length;
 }
 
+// Shared only with the separate Mode-28 OWPROTO byte oracle. The copy remains
+// inert descriptive identity data and grants no authority or stream semantics.
+pub unsafe fn copy_conformance_corpus(
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if output as usize == 0 || written as usize == 0 { return 0; }
+    let length: usize = canonical_corpus();
+    if length != 838 || capacity < length { return 0; }
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(output + index, CORPUS[index]);
+        index += 1;
+    }
+    volatile_store(written, length);
+    return 1;
+}
+
 unsafe fn zero_and_stale_rejected() -> bool {
     let mut epoch: WorldEpoch = WorldEpoch { value: 77 };
     let mut term: GovernorTerm = GovernorTerm { value: 77 };

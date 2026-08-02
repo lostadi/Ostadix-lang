@@ -151,16 +151,31 @@ The governed-world identity foundation in `src/world/` now shares all 20
 constitutional identity atoms with `ocore/world/identity.oc`. It separates a
 World snapshot epoch from independently generated node, domain, process,
 resource, object, and task-attempt identity. The bounded `OWIDENT` v1 corpus is
-an identity-only byte oracle, not the general World wire protocol; serialized
-capability IDs remain descriptive non-authority. Corresponding precise
-`ResourceKey` states can describe governed state without pretending that
-arbitrary hosted work has become mediated.
+an identity-only byte oracle; serialized capability IDs remain descriptive
+non-authority. The separate `OWPROTO` v1 foundation adds deterministic
+architecture-independent records, strict 16 KiB and caller-selected bounds,
+four fixed kinds, canonical nested identities, and offline schema negotiation.
+Its 20-record, 1254-byte Rust/`.oc` corpus is a codec oracle, not a stream or
+network transport, live handshake, authenticated session, authority channel,
+OValue envelope, receipt, Governor, or consensus implementation. Mode 29 adds a
+separate self-framed `OWVALUE` v1 layer rather than changing those four
+`OWPROTO` v1 kinds. The bounded portable layer has a 4096-byte record maximum,
+depth-16 and 128-node limits, an explicit allowlist, canonical ordered records
+and scalar-key maps, a root-only inert versioned extension with a recursively
+portable payload, and SHA-256 over the complete canonical record. Rust and
+native `.oc` share a fixed 19-record, 928-byte oracle whose concatenated
+SHA-256 is `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`,
+and hosted projection rejects
+authority-bearing, capsule, live-reference, request, and other effectful forms.
+Precise `ResourceKey` states can describe governed state without pretending
+that arbitrary hosted work has become mediated.
 `HostWorld` remains the residual umbrella for ambient host effects. No
 production lowering emits these governed keys yet, and the optional grounding
 identity is caller-supplied rather than checked against a live snapshot. This
 type/effect foundation does not implement a distributed Governor, membership
 transport, resource registry, `/world` namespace, remote execution, placement,
-or current-epoch enforcement. The Mode 27 QEMU gate passes no G0--G13 gate.
+or current-epoch enforcement. The Mode 27 through Mode 29 QEMU gates pass no
+G0--G13 gate.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
@@ -221,6 +236,12 @@ Every value crossing language boundaries is represented as one of these types:
 | `OSystem`      | Live OS/profile reference                           |
 | `OCapability`  | Authority-bearing resource handle                   |
 | `OSnapshot`    | Persistable captured world state                    |
+
+This table describes the rich hosted `src/value.rs::OValue` carrier. It is not
+the Mode 29 portable allowlist. Conversion into `src/world/value.rs` is
+fallible and rejects authority, capsules, live references, executable or
+deferred work, and other effectful hosted variants. The hosted canonical-CBOR
+shim protocol is unchanged by `OWVALUE` v1.
 
 The runtime boundary is intentionally split:
 
