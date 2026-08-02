@@ -22,6 +22,7 @@ cargo build --all-targets --all-features --verbose
 bash scripts/check_declared_bins.sh
 cargo test --all-targets --all-features --verbose
 bash scripts/smoke-hosted-live-reference.sh
+bash scripts/smoke-world-resource-keys.sh
 cargo test --test parser_proptest
 cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
 cargo check --manifest-path fuzz/Cargo.toml
@@ -49,6 +50,15 @@ cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --b
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
+
+The hosted World ResourceKey smoke is the bounded PR6 repository-conformance
+gate. It verifies typed governed vocabulary, underlying identity helpers'
+caller-pair comparison, generic/device/accelerator HGraph chaining, alias-aware
+grounding partitioning, source-forgery rejection, and residual `HostWorld` on a
+real CLI projection. Grounding itself checks only the bound World
+epoch/membership. This is not Mode 31, a ResourceKey wire ABI, production
+governed lowering, native/QEMU/hardware evidence, Governor authority, device
+assignment, DMA/IOMMU isolation, Acceptance A, or G0--G13 passage.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a

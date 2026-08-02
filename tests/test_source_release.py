@@ -231,8 +231,13 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/smoke-world-resource-keys.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
+            "src/effects.rs": "// fixture governed effect vocabulary\n",
+            "src/executor/mod.rs": "// fixture public executor effects surface\n",
+            "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
+            "src/world/grounding.rs": "// fixture World grounding projection\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
             "src/world/codec.rs": "// fixture World protocol codec oracle\n",
@@ -250,6 +255,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
+            "tests/world_resource_keys.rs": "#[test] fn resource_key_fixture() {}\n",
             "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
             "tests/world_identity_wire.rs": "#[test] fn wire_fixture() {}\n",
             "tests/world_protocol.rs": "#[test] fn protocol_fixture() {}\n",
@@ -276,6 +282,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/smoke-world-value-qemu.sh",
                     "ocore/kernel/smoke-world-protocol-qemu.sh",
                     "ocore/kernel/smoke-world-identity-qemu.sh",
+                    "scripts/smoke-world-resource-keys.sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
             )
@@ -413,8 +420,13 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/smoke-world-resource-keys.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
+                "src/effects.rs",
+                "src/executor/mod.rs",
+                "src/hgraph/from_oir.rs",
+                "src/world/grounding.rs",
                 "src/world/identity.rs",
                 "src/world/identity_wire.rs",
                 "src/world/codec.rs",
@@ -432,6 +444,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
                 "tests/test_world_alpha_evidence.py",
+                "tests/world_resource_keys.rs",
                 "tests/world_identity.rs",
                 "tests/world_identity_wire.rs",
                 "tests/world_protocol.rs",
@@ -852,6 +865,27 @@ class SourceReleaseTests(unittest.TestCase):
             r"world_receipt_v1\.hex.*world_receipt\.rs",
         ):
             self._build("missing-world-receipt.zip")
+
+    def test_world_resource_key_hosted_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "scripts/smoke-world-resource-keys.sh",
+            "src/effects.rs",
+            "src/executor/mod.rs",
+            "src/hgraph/from_oir.rs",
+            "src/world/grounding.rs",
+            "tests/world_resource_keys.rs",
+        )
+        self._git("commit", "-q", "-m", "remove World ResourceKey surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*smoke-world-resource-keys\.sh.*"
+            r"src/effects\.rs.*src/executor/mod\.rs.*src/hgraph/from_oir\.rs.*"
+            r"src/world/grounding\.rs.*tests/world_resource_keys\.rs",
+        ):
+            self._build("missing-world-resource-keys.zip")
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():
