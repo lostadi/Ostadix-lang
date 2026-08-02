@@ -77,6 +77,12 @@ derived backend classification is already verified pure. `reads=`, `writes=`,
 and `serial=host` add typed resource dependencies. Declarations do not prove a
 complete arbitrary host footprint, so host declarations keep the `HostWorld`
 umbrella unless a future verified analyzer supplies a precise model.
+Governed World/namespace epochs, Governor positions, node/domain/process and
+resource generations, object versions, descriptive capability identities,
+task attempts, artifact publications, devices, and accelerators are
+trusted-lowering vocabulary only. Source declarations cannot mint them. Device
+and accelerator keys expand to the same canonical generic governed-resource
+dependency.
 
 ## Test and validation commands
 
@@ -97,6 +103,7 @@ cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
 cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
+./scripts/smoke-world-resource-keys.sh
 ./boot-and-test.sh smoke
 
 # Python reference runtime
@@ -158,5 +165,12 @@ validation, required release surfaces, and tamper detection.
   signature-envelope structure. Neither path supplies production key custody,
   trusted signer policy, live receipt emission, authoritative fencing, a World
   Alpha attestation, Acceptance A, or G0--G13 passage.
+- Keep hosted ResourceKey PR6 claims precise: its smoke proves typed planner
+  vocabulary, underlying identity helpers' caller-pair comparison, HGraph state
+  chaining, alias-aware grounding partitioning, source-forgery rejection, and
+  residual `HostWorld`. Grounding only checks the bound World epoch/membership.
+  This is not Mode 31, a wire ABI, production governed lowering, native/QEMU
+  evidence, Governor authority, device assignment, DMA/IOMMU isolation,
+  Acceptance A, or G0--G13 passage.
 - Keep HGraph wording precise: graph dispatch is implemented, but worker-pool execution is limited to verified pure inline renderers. Unknown shims are serialized through `HostWorld`, and exact arbitrary-source filesystem/network inference is not implemented.
 - Prefer registry metadata over duplicated backend-name, purity, renderer, or authority tables.

@@ -751,12 +751,31 @@ olangc examples/hello.O --target ir --grounding \
   --world-id desk --world-epoch 4
 ```
 
-It reports requested capability rights without treating metadata as authority
-and labels the inspection with the caller-supplied World epoch. It does not
-consult a live World snapshot or enforce freshness. No production lowering
-currently emits the precise governed resource keys, so ordinary hosted `.O`
-plans retain residual `HostWorld` and report `governed-effects none`. This is
-not G0 or G1, project placement, or a World-execution surface.
+PR6 adds one hosted typed `ResourceKey` class for World, Governor, node, domain,
+process, generic resource, object, descriptive capability, namespace,
+task-attempt, artifact publication, device, and accelerator state. Device and
+accelerator views also touch the same canonical generic resource chain, so a
+trusted lowering cannot make one identity independent by changing its view.
+Source `reads=`/`writes=` declarations cannot mint any governed key.
+
+```bash
+./scripts/smoke-world-resource-keys.sh
+```
+
+The World ResourceKey hosted repository-conformance gate checks the exact
+vocabulary and display, underlying identity helpers' caller-pair stale/logical
+comparison, HGraph state chaining, alias-aware governed/ambient partitioning,
+source-forgery rejection, and the real CLI's residual `HostWorld` output. The
+grounding report checks only the caller-supplied bound World epoch and World
+membership; it does not consult a live snapshot or prove authoritative nested
+generation freshness. No production lowering currently emits these
+governed keys, so ordinary hosted `.O` plans retain residual `HostWorld` and
+report `governed-effects none`.
+
+This hosted gate is not O-core Mode 31, a ResourceKey wire format, native or
+QEMU evidence, device assignment, DMA/IOMMU isolation, Governor authority,
+Acceptance gate A, G0/G1 passage, project placement, or a World-execution
+surface. `CapabilityState` is descriptive identity only and carries no grant.
 
 ### Docker
 

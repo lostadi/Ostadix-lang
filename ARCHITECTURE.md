@@ -181,15 +181,25 @@ signing-preimage bytes and rejects malformed signature envelopes, but does not
 claim a general freestanding Ed25519 verifier or trusted signer policy. The
 offline corpus is not yet emitted by the HGraph, project, live-system,
 KernelWorld, O-Git, or World evidence paths.
-Precise `ResourceKey` states can describe governed state without pretending
-that arbitrary hosted work has become mediated.
-`HostWorld` remains the residual umbrella for ambient host effects. No
-production lowering emits these governed keys yet, and the optional grounding
-identity is caller-supplied rather than checked against a live snapshot. This
-type/effect foundation does not implement a distributed Governor, membership
-transport, resource registry, `/world` namespace, remote execution, placement,
-or current-epoch enforcement. The Mode 27 through Mode 30 QEMU gates pass no
-G0--G13 gate.
+The hosted PR6 `ResourceKey` vocabulary now distinguishes World, Governor,
+node, domain, process, generic resource, object, descriptive capability,
+namespace, task-attempt, artifact-publication, device, and accelerator state.
+Each class carries the existing validated World identity type rather than an
+unvalidated string. Device and accelerator access expands to the canonical
+generic resource key as well, giving all three views one shared HGraph state
+dependency. It never aliases ambient `HostWorld`.
+
+This vocabulary describes governed state without pretending that arbitrary
+hosted work has become mediated. User-authored effect declarations cannot mint
+the governed classes, no production lowering emits them yet, and `HostWorld`
+remains the residual umbrella for ambient host effects. The optional grounding
+identity is caller-supplied. Underlying identity helpers compare caller pairs;
+grounding checks the bound World epoch and membership only, not a live
+authoritative nested-generation snapshot. This type/effect foundation is not a
+wire format or native Mode 31 and does not implement a distributed Governor,
+membership transport, resource registry, `/world` namespace, remote execution,
+placement, device assignment, DMA/IOMMU isolation, or current-epoch
+enforcement. It passes no G0--G13 gate.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use thiserror::Error;
 
-use crate::effects::{ActorResourceId, ResourceKey};
+use crate::effects::{ActorResourceId, EffectSummary, ResourceKey};
 use crate::eval::BlockOptions;
 use crate::hgraph::HGraph;
 use crate::ir::{ExecutionMode, ExecutionPlan, PlanEdgeKind, PlanNodeId, PlanNodeKind};
@@ -178,34 +178,7 @@ impl GroundingReport {
                     .ok_or(GroundingError::MissingEffectSummary {
                         plan_node: node.id.0,
                     })?;
-            operations.push(OperationGrounding {
-                plan_node: node.id,
-                governed_reads: summary
-                    .reads
-                    .iter()
-                    .filter(|resource| resource.is_governed_resource())
-                    .cloned()
-                    .collect(),
-                governed_writes: summary
-                    .writes
-                    .iter()
-                    .filter(|resource| resource.is_governed_resource())
-                    .cloned()
-                    .collect(),
-                ambient_reads: summary
-                    .reads
-                    .iter()
-                    .filter(|resource| resource.is_host_resource())
-                    .cloned()
-                    .collect(),
-                ambient_writes: summary
-                    .writes
-                    .iter()
-                    .filter(|resource| resource.is_host_resource())
-                    .cloned()
-                    .collect(),
-                actor_affinity: summary.actor_state.clone(),
-            });
+            operations.push(operation_grounding(node.id, summary, bound_world.as_ref())?);
         }
         operations.sort_by_key(|operation| operation.plan_node.0);
 
@@ -379,6 +352,47 @@ impl GroundingReport {
     }
 }
 
+fn operation_grounding(
+    plan_node: PlanNodeId,
+    summary: &EffectSummary,
+    bound_world: Option<&WorldIdentity>,
+) -> Result<OperationGrounding, GroundingError> {
+    let expanded_reads = summary.expanded_reads();
+    let expanded_writes = summary.expanded_writes();
+    let governed_reads = expanded_reads
+        .iter()
+        .filter(|resource| resource.is_governed_resource())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let governed_writes = expanded_writes
+        .iter()
+        .filter(|resource| resource.is_governed_resource())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(world) = bound_world {
+        for resource in governed_reads.iter().chain(&governed_writes) {
+            require_governed_resource_world(world, resource)?;
+        }
+    }
+
+    Ok(OperationGrounding {
+        plan_node,
+        governed_reads,
+        governed_writes,
+        ambient_reads: expanded_reads
+            .iter()
+            .filter(|resource| resource.is_host_resource())
+            .cloned()
+            .collect(),
+        ambient_writes: expanded_writes
+            .iter()
+            .filter(|resource| resource.is_host_resource())
+            .cloned()
+            .collect(),
+        actor_affinity: summary.actor_state.clone(),
+    })
+}
+
 fn capability_grounding(
     plan_node: PlanNodeId,
     kind: &PlanNodeKind,
@@ -457,14 +471,49 @@ fn require_governed_resource_world(
 ) -> Result<(), WorldIdentityError> {
     match resource {
         ResourceKey::WorldState(world) => current.require_current(world),
+        ResourceKey::GovernorState(governor) => current.require_current(governor.world()),
+        ResourceKey::NamespaceState(world) => current.require_current(world),
         ResourceKey::ArtifactState(artifact) => current.require_current(artifact.world()),
         ResourceKey::NodeState(node) => require_same_world(current, node.world()),
         ResourceKey::DomainState(domain) => require_same_world(current, domain.node().world()),
-        ResourceKey::GovernedResource(resource) => {
-            require_same_world(current, resource.owner().world())
+        ResourceKey::ProcessState(process) => {
+            require_same_world(current, process.domain().node().world())
         }
+        ResourceKey::GovernedResource(resource) => require_resource_owner_world(current, resource),
+        ResourceKey::ObjectState(object) => require_same_world(current, object.world()),
+        ResourceKey::CapabilityState(capability) => require_same_world(current, capability.world()),
         ResourceKey::TaskState(task) => require_same_world(current, task.world()),
-        _ => Ok(()),
+        ResourceKey::DeviceState(device) => require_resource_owner_world(current, device),
+        ResourceKey::AcceleratorState(accelerator) => {
+            require_resource_owner_world(current, accelerator)
+        }
+        ResourceKey::HostWorld
+        | ResourceKey::EvaluatorState
+        | ResourceKey::ScopeBinding(_)
+        | ResourceKey::ProjectPath(_)
+        | ResourceKey::HostPath(_)
+        | ResourceKey::EnvVar(_)
+        | ResourceKey::Stdio
+        | ResourceKey::Network(_)
+        | ResourceKey::NetworkUnknown
+        | ResourceKey::Service(_)
+        | ResourceKey::ActorState(_) => Ok(()),
+    }
+}
+
+fn require_resource_owner_world(
+    current: &WorldIdentity,
+    resource: &super::identity::ResourceIdentity,
+) -> Result<(), WorldIdentityError> {
+    match resource.owner() {
+        super::identity::ResourceOwner::World { world } => current.require_current(world),
+        super::identity::ResourceOwner::Node { node } => require_same_world(current, node.world()),
+        super::identity::ResourceOwner::Domain { domain } => {
+            require_same_world(current, domain.node().world())
+        }
+        super::identity::ResourceOwner::Process { process } => {
+            require_same_world(current, process.domain().node().world())
+        }
     }
 }
 
@@ -486,14 +535,74 @@ fn require_same_world(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::GovernedResourceKind;
     use crate::world::{
-        ArtifactId, ArtifactPublicationIdentity, AttemptGeneration, DomainGeneration, DomainId,
-        DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceGeneration, ResourceId,
-        ResourceIdentity, ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch,
+        ArtifactId, ArtifactPublicationIdentity, AttemptGeneration, CapabilityId,
+        CapabilityIdentity, DomainGeneration, DomainId, DomainIdentity, GovernorIdentity,
+        GovernorLogIndex, GovernorTerm, NodeGeneration, NodeId, NodeIdentity, ObjectId,
+        ObjectIdentity, ObjectVersion, ProcessGeneration, ProcessId, ProcessIdentity,
+        ResourceGeneration, ResourceId, ResourceIdentity, ResourceOwner, TaskAttemptIdentity,
+        TaskId, WorldEpoch,
     };
 
     fn world(name: &str, epoch: u64) -> WorldIdentity {
         WorldIdentity::new(WorldId::new(name).unwrap(), WorldEpoch::new(epoch).unwrap())
+    }
+
+    fn governed_corpus(current: &WorldIdentity) -> Vec<ResourceKey> {
+        let node = NodeIdentity::new(
+            current.world().clone(),
+            NodeId::new("node-a").unwrap(),
+            NodeGeneration::new(2).unwrap(),
+        );
+        let domain = DomainIdentity::new(
+            node.clone(),
+            DomainId::new("provider").unwrap(),
+            DomainGeneration::new(3).unwrap(),
+        );
+        let process = ProcessIdentity::new(
+            domain.clone(),
+            ProcessId::new("runner").unwrap(),
+            ProcessGeneration::new(4).unwrap(),
+        );
+        let resource = ResourceIdentity::new(
+            ResourceOwner::Node { node: node.clone() },
+            ResourceId::new("device/gpu-0").unwrap(),
+            ResourceGeneration::new(5).unwrap(),
+        );
+        vec![
+            ResourceKey::WorldState(current.clone()),
+            ResourceKey::GovernorState(GovernorIdentity::new(
+                current.clone(),
+                GovernorTerm::new(2).unwrap(),
+                GovernorLogIndex::new(9).unwrap(),
+            )),
+            ResourceKey::NodeState(node),
+            ResourceKey::DomainState(domain),
+            ResourceKey::ProcessState(process),
+            ResourceKey::GovernedResource(resource.clone()),
+            ResourceKey::ObjectState(ObjectIdentity::new(
+                current.world().clone(),
+                ObjectId::new("result").unwrap(),
+                ObjectVersion::new(6).unwrap(),
+            )),
+            ResourceKey::CapabilityState(CapabilityIdentity::new(
+                current.world().clone(),
+                CapabilityId::new("gpu-use").unwrap(),
+            )),
+            ResourceKey::NamespaceState(current.clone()),
+            ResourceKey::TaskState(TaskAttemptIdentity::new(
+                current.world().clone(),
+                TaskId::new("build").unwrap(),
+                AttemptGeneration::new(7).unwrap(),
+            )),
+            ResourceKey::ArtifactState(ArtifactPublicationIdentity::new(
+                current.clone(),
+                ArtifactId::from_sha256("a".repeat(64)).unwrap(),
+            )),
+            ResourceKey::DeviceState(resource.clone()),
+            ResourceKey::AcceleratorState(resource),
+        ]
     }
 
     #[test]
@@ -516,6 +625,25 @@ mod tests {
             ResourceId::new("cpu/slot-0").unwrap(),
             ResourceGeneration::new(1).unwrap(),
         );
+        let process = ProcessIdentity::new(
+            domain.clone(),
+            ProcessId::new("runner").unwrap(),
+            ProcessGeneration::new(5).unwrap(),
+        );
+        let object = ObjectIdentity::new(
+            WorldId::new("desk").unwrap(),
+            ObjectId::new("result").unwrap(),
+            ObjectVersion::new(6).unwrap(),
+        );
+        let capability = CapabilityIdentity::new(
+            WorldId::new("desk").unwrap(),
+            CapabilityId::new("build-read").unwrap(),
+        );
+        let governor = GovernorIdentity::new(
+            current.clone(),
+            GovernorTerm::new(2).unwrap(),
+            GovernorLogIndex::new(12).unwrap(),
+        );
         let task = TaskAttemptIdentity::new(
             WorldId::new("desk").unwrap(),
             TaskId::new("build").unwrap(),
@@ -523,10 +651,17 @@ mod tests {
         );
 
         for owned in [
+            ResourceKey::GovernorState(governor),
             ResourceKey::NodeState(node),
             ResourceKey::DomainState(domain),
-            ResourceKey::GovernedResource(resource),
+            ResourceKey::ProcessState(process),
+            ResourceKey::GovernedResource(resource.clone()),
+            ResourceKey::ObjectState(object),
+            ResourceKey::CapabilityState(capability),
+            ResourceKey::NamespaceState(current.clone()),
             ResourceKey::TaskState(task),
+            ResourceKey::DeviceState(resource.clone()),
+            ResourceKey::AcceleratorState(resource),
         ] {
             require_governed_resource_world(&current, &owned).unwrap();
         }
@@ -543,6 +678,38 @@ mod tests {
                 got: 8
             })
         ));
+        assert!(matches!(
+            require_governed_resource_world(
+                &current,
+                &ResourceKey::NamespaceState(world("desk", 8))
+            ),
+            Err(WorldIdentityError::StaleGeneration {
+                kind: "world epoch",
+                expected: 9,
+                got: 8
+            })
+        ));
+        let stale_world_owned = ResourceIdentity::new(
+            ResourceOwner::World {
+                world: world("desk", 8),
+            },
+            ResourceId::new("device/gpu-0").unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+        );
+        for resource in [
+            ResourceKey::GovernedResource(stale_world_owned.clone()),
+            ResourceKey::DeviceState(stale_world_owned.clone()),
+            ResourceKey::AcceleratorState(stale_world_owned),
+        ] {
+            assert!(matches!(
+                require_governed_resource_world(&current, &resource),
+                Err(WorldIdentityError::StaleGeneration {
+                    kind: "world epoch",
+                    expected: 9,
+                    got: 8
+                })
+            ));
+        }
         let stale_publication = ArtifactPublicationIdentity::new(
             stale_world,
             ArtifactId::from_sha256("a".repeat(64)).unwrap(),
@@ -568,5 +735,79 @@ mod tests {
             require_governed_resource_world(&current, &ResourceKey::NodeState(other_node)),
             Err(WorldIdentityError::IdentityMismatch { kind: "world", .. })
         ));
+    }
+
+    #[test]
+    fn governed_resource_keys_partition_from_ambient_host_state() {
+        let current = world("desk", 4);
+        let node = NodeIdentity::new(
+            current.world().clone(),
+            NodeId::new("node-a").unwrap(),
+            NodeGeneration::new(2).unwrap(),
+        );
+        let device = ResourceKey::DeviceState(ResourceIdentity::new(
+            ResourceOwner::Node { node },
+            ResourceId::new("device/gpu-0").unwrap(),
+            ResourceGeneration::new(5).unwrap(),
+        ));
+        let generic = match &device {
+            ResourceKey::DeviceState(resource) => ResourceKey::GovernedResource(resource.clone()),
+            _ => unreachable!(),
+        };
+        let mut summary = EffectSummary::pure();
+        summary.reads.extend(governed_corpus(&current));
+        summary.writes.insert(device.clone());
+        summary.reads.insert(ResourceKey::HostWorld);
+        summary.writes.insert(ResourceKey::HostWorld);
+        let operation = operation_grounding(PlanNodeId(7), &summary, Some(&current)).unwrap();
+        assert_eq!(
+            operation
+                .governed_reads
+                .iter()
+                .filter_map(ResourceKey::governed_kind)
+                .collect::<BTreeSet<_>>(),
+            GovernedResourceKind::ALL.into_iter().collect()
+        );
+        assert!(operation.governed_reads.contains(&generic));
+        assert!(operation.governed_reads.contains(&device));
+        assert_eq!(
+            operation.governed_writes,
+            [generic, device].into_iter().collect()
+        );
+        assert_eq!(
+            operation.ambient_reads,
+            [ResourceKey::HostWorld].into_iter().collect()
+        );
+        assert_eq!(
+            operation.ambient_writes,
+            [ResourceKey::HostWorld].into_iter().collect()
+        );
+        let report = GroundingReport {
+            bound_world: Some(current.clone()),
+            ovalue_flows: Vec::new(),
+            capabilities: Vec::new(),
+            capsules: Vec::new(),
+            operations: vec![operation],
+        };
+
+        report.require_current_world(&current).unwrap();
+        let text = report.to_text();
+        assert!(
+            text.contains("governed-effects P7 reads=[world-state:desk@4"),
+            "{text}"
+        );
+        assert!(
+            text.contains(",governed-resource:")
+                && text.contains(",device-state:")
+                && text.contains(",accelerator-state:")
+                && text.contains("writes=[governed-resource:"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ambient-effects P7 reads=[HostWorld] writes=[HostWorld] hostworld=residual"
+            ),
+            "{text}"
+        );
     }
 }

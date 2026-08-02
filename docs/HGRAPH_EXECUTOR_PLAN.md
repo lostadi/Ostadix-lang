@@ -33,8 +33,11 @@ currently modeled resource keys are:
 - exact or unknown network endpoints
 - named services
 - persistent actor state keyed by canonical language and environment number
-- exact governed World epochs, node generations, and domain generations
-- owner-scoped governed resources, task attempts, and artifact publication state
+- exact governed World/namespace epochs and descriptive Governor positions
+- exact node, domain, and process generations
+- owner-scoped generic resource, device, and accelerator generations
+- object versions, descriptive capability identities, task attempts, and
+  artifact publication state
 
 Unknown hosted operations read and write `HostWorld` and evaluator-local state.
 `HostWorld` aliases precise host resource declarations conservatively. A
@@ -43,8 +46,11 @@ process registry does not expose a trustworthy generation, so actor resource
 identity does not invent a constant generation field.
 
 Governed resource keys do not alias `HostWorld`: they are vocabulary intended
-for a future trusted World/O-core lowering. A key by itself is not proof of
-mediation or authority. Source `reads=` and `writes=` declarations cannot
+for a future trusted World/O-core lowering. Device and accelerator views do
+also expand to the canonical generic governed-resource key so the same resource
+cannot bypass a dependency through a different typed view. A key by itself is
+not proof of mediation or authority, and `CapabilityState` is descriptive
+identity rather than a grant. Source `reads=` and `writes=` declarations cannot
 construct these keys, no production lowering emits them yet, and today's
 arbitrary hosted backends keep their conservative `HostWorld` dependency.
 `olangc file.O --target ir --grounding` renders the distinction,

@@ -465,8 +465,22 @@
   inventory, snapshots, and serialized identities remain non-authority.
 - The grounding command labels a report with a caller-supplied World identity.
   It does not read a current World snapshot, enforce freshness, or bind
-  execution. No production lowering emits governed `ResourceKey` effects yet;
-  ordinary hosted operations retain their conservative `HostWorld` dependency.
+  execution. Hosted ResourceKey PR6 now supplies typed World, Governor, node,
+  domain, process, generic resource, object, descriptive capability, namespace,
+  task-attempt, artifact-publication, device, and accelerator state classes.
+  Device and accelerator views share the generic resource dependency, and
+  source effect declarations cannot mint governed state or authority. No
+  production lowering emits governed `ResourceKey` effects yet; ordinary hosted
+  operations retain their conservative `HostWorld` dependency.
+- `scripts/smoke-world-resource-keys.sh` is bounded hosted
+  repository-conformance evidence for vocabulary, underlying identity helpers'
+  caller-pair comparison, HGraph state chaining, alias-aware grounding
+  partitioning, source-forgery rejection, and residual `HostWorld`. Grounding
+  checks only the bound World epoch/membership, not authoritative nested
+  freshness. This is not O-core Mode 31, a cross-language wire format,
+  native/QEMU or hardware evidence, Governor authority, device assignment,
+  DMA/IOMMU isolation, Acceptance gate A, or passage of G0, G1, or any G0--G13
+  gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.
