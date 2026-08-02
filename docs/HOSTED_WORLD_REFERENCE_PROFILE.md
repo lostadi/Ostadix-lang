@@ -65,6 +65,10 @@ hosted World foundation:
   versioned extension envelope, and a byte-exact 19-record, 928-byte corpus
   whose concatenated SHA-256 is
   `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`;
+- a separate bounded `OWRECEIPT` v1 Rust/`.oc` oracle for canonical execution
+  receipt and signing-preimage bytes, with hosted Ed25519 verification under a
+  pinned public conformance key and native structural signature-envelope
+  validation;
 - governed planner vocabulary that remains separate from ambient `HostWorld`;
 - deterministic grounding views for OValues, capabilities, capsules, and
   selected governed resources;
@@ -80,7 +84,12 @@ now also has the separate Mode 29 `OWVALUE` codec/hash oracle. It does not make
 the full hosted `OValue` enum portable: hosted capabilities, capsules, live
 references, requests, and other effectful values fail its explicit projection.
 Decoded extensions stay inert, and descriptive code or object references do not
-resolve into authority. The repository does not yet have a live replicated
+resolve into authority. Mode 30's receipt corpus is also offline: current
+HGraph, project, live-system, KernelWorld, O-Git, and evidence paths do not emit
+or consume it, and native O-core does not yet provide a general Ed25519 verifier.
+A conformance signature authenticates bytes under its pinned test key; it does
+not grant authority, establish trusted signer policy, or prove current World
+state. The repository does not yet have a live replicated
 Governor, an authoritative World snapshot service, governed distributed lowering, native World transport,
 WorldFS, physical multinode convergence, or an Alpha evidence bundle. No
 production lowering currently eliminates ambient `HostWorld` for arbitrary
@@ -104,6 +113,6 @@ establishes:
   migration; or
 - G12, G13, or the name **Ostadix World Alpha**.
 
-Modes 20 through 29 remain separately scoped native or QEMU evidence. Their
+Modes 20 through 30 remain separately scoped native or QEMU evidence. Their
 bounded claims and exclusions are recorded in [`CLAIMS.md`](CLAIMS.md) and
 [`gates.toml`](../evidence/gates.toml); they are not promoted by this profile.

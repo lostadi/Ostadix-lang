@@ -1,0 +1,933 @@
+module kernel::world_receipt_semantics;
+
+use runtime::interrupts::ticks;
+use runtime::serial::write;
+use world::identity::IdentityRecord;
+use world::identity::IDENTITY_KIND_WORLD;
+use world::identity::IDENTITY_KIND_GOVERNOR;
+use world::identity::IDENTITY_KIND_NODE;
+use world::identity::IDENTITY_KIND_DOMAIN;
+use world::identity::IDENTITY_KIND_PROCESS;
+use world::identity::IDENTITY_KIND_RESOURCE;
+use world::identity::IDENTITY_KIND_OBJECT;
+use world::identity::IDENTITY_KIND_CAPABILITY;
+use world::identity::IDENTITY_KIND_ATTEMPT;
+use world::identity::IDENTITY_KIND_CHECKPOINT;
+use world::identity::IDENTITY_KIND_RECEIPT;
+use world::identity::RESOURCE_OWNER_DOMAIN;
+use world::identity::IDENTITY_FIELD_WORLD;
+use world::identity::IDENTITY_FIELD_NODE;
+use world::identity::IDENTITY_FIELD_DOMAIN;
+use world::identity::IDENTITY_FIELD_PROCESS;
+use world::identity::IDENTITY_FIELD_RESOURCE;
+use world::identity::IDENTITY_FIELD_OBJECT;
+use world::identity::IDENTITY_FIELD_CAPABILITY;
+use world::identity::IDENTITY_FIELD_TASK;
+use world::identity::IDENTITY_FIELD_CHECKPOINT;
+use world::identity::IDENTITY_FIELD_RECEIPT;
+use world::identity::IDENTITY_COUNTER_EPOCH;
+use world::identity::IDENTITY_COUNTER_TERM;
+use world::identity::IDENTITY_COUNTER_LOG_INDEX;
+use world::identity::IDENTITY_COUNTER_NODE_GENERATION;
+use world::identity::IDENTITY_COUNTER_DOMAIN_GENERATION;
+use world::identity::IDENTITY_COUNTER_PROCESS_GENERATION;
+use world::identity::IDENTITY_COUNTER_RESOURCE_GENERATION;
+use world::identity::IDENTITY_COUNTER_OBJECT_VERSION;
+use world::identity::IDENTITY_COUNTER_ATTEMPT_GENERATION;
+use world::identity::record_begin;
+use world::identity::record_set_text;
+use world::identity::record_set_counter;
+use world::identity::record_is_current;
+use world::identity::encode_record as encode_identity;
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init as sha_scratch_init;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::VALUE_TEXT_UTF8;
+use world::value::arena_init;
+use world::value::arena_clear;
+use world::value::add_bool;
+use world::value::add_text;
+use world::value::add_record;
+use world::value::seal;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::scratch_init as value_scratch_init;
+use world::value_codec::encode_record as encode_value;
+use world::receipt::SignedReceipt;
+use world::receipt::ReceiptValidationScratch;
+use world::receipt::validation_scratch_init;
+use world::receipt::install as install_receipt_view;
+use world::receipt::source as receipt_source;
+use world::receipt::total_length as receipt_total_length;
+use world::receipt::unsigned_length;
+use world::receipt_codec::ReceiptCodecScratch;
+use world::receipt_codec::scratch_init as receipt_scratch_init;
+use world::receipt_codec::decode_envelope;
+use world::receipt_codec::decode_record as decode_receipt;
+use world::receipt_codec::encode_envelope;
+use world::receipt_codec::reencode_envelope;
+use world::receipt_codec::build_validated_signing_preimage;
+
+const MODE_WORLD_RECEIPT: u64 = 30;
+const BODY_CURRENT_LENGTH: usize = 1514;
+const BODY_STALE_LENGTH: usize = 1485;
+const RECORD_CURRENT_LENGTH: usize = 1634;
+const RECORD_STALE_LENGTH: usize = 1605;
+const CORPUS_LENGTH: usize = 3239;
+const PREIMAGE_CURRENT_LENGTH: usize = 1575;
+const PREIMAGE_STALE_LENGTH: usize = 1546;
+const PREIMAGE_CORPUS_LENGTH: usize = 3121;
+const BUFFER_CAPACITY: usize = 4096;
+
+static HEX_PREFIX: [u8; 21] = b"WORLD_RECEIPT_V1_HEX=";
+static SHA_PREFIX: [u8; 24] = b"WORLD_RECEIPT_V1_SHA256=";
+static PREIMAGE_PREFIX: [u8; 30] = b"WORLD_RECEIPT_V1_PREIMAGE_HEX=";
+static CONVERGENCE_MESSAGE: [u8; 52] =
+    b"World receipt Rust/.oc exact-byte convergence: PASS\n";
+static PREIMAGE_MESSAGE: [u8; 59] =
+    b"World receipt canonical signing-preimage convergence: PASS\n";
+static ENVELOPE_MESSAGE: [u8; 60] =
+    b"World receipt signature-envelope structural rejection: PASS\n";
+static BINDING_MESSAGE: [u8; 61] =
+    b"World receipt identity/generation/commit-field binding: PASS\n";
+static CAPABILITY_MESSAGE: [u8; 52] =
+    b"World receipt descriptive capability boundary: PASS\n";
+static MALFORMED_MESSAGE: [u8; 48] =
+    b"World receipt bounded malformed rejection: PASS\n";
+static COMPLETE_MESSAGE: [u8; 36] =
+    b"World receipt v1 native smoke: PASS\n";
+static POST_TICK_MESSAGE: [u8; 38] =
+    b"World receipt post-test timer: online\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+static WORLD: [u8; 7] = b"world-a";
+static NODE_A: [u8; 6] = b"node-a";
+static NODE_B: [u8; 6] = b"node-b";
+static DOMAIN: [u8; 8] = b"domain-a";
+static PROCESS: [u8; 9] = b"process-a";
+static TASK: [u8; 6] = b"task-a";
+static RECEIPT_CURRENT: [u8; 15] = b"receipt-current";
+static RECEIPT_STALE: [u8; 13] = b"receipt-stale";
+static OBJECT_INPUT: [u8; 12] = b"object-input";
+static OBJECT_OUTPUT: [u8; 13] = b"object-output";
+static CAPABILITY_A: [u8; 12] = b"capability-a";
+static RESOURCE_INPUT: [u8; 8] = b"fs/input";
+static CHECKPOINT_A: [u8; 12] = b"checkpoint-a";
+static PROJECT_DEMO: [u8; 12] = b"project/demo";
+static LIVE_ECHO: [u8; 9] = b"live/echo";
+static KERNEL_LINUX: [u8; 12] = b"kernel/linux";
+static RIGHT_INVOKE: [u8; 6] = b"invoke";
+static RIGHT_READ: [u8; 4] = b"read";
+static EVALUATOR_PYTHON: [u8; 6] = b"python";
+static REJECTION_BUSY: [u8; 13] = b"resource-busy";
+static FAILURE_STALE: [u8; 11] = b"stale-retry";
+static EVIDENCE_GATE: [u8; 16] = b"world-receipt-v1";
+static VALUE_KEY_OK: [u8; 2] = b"ok";
+static VALUE_KEY_RESULT: [u8; 6] = b"result";
+static VALUE_OSTADIX: [u8; 7] = b"ostadix";
+
+static LABEL_SOURCE: [u8; 6] = b"source";
+static LABEL_BUNDLE: [u8; 6] = b"bundle";
+static LABEL_PACKAGE: [u8; 7] = b"package";
+static LABEL_HGRAPH: [u8; 14] = b"logical-hgraph";
+static LABEL_EFFECTS: [u8; 7] = b"effects";
+static LABEL_LIVE_PACKAGE: [u8; 12] = b"live-package";
+static LABEL_KERNEL_PACKAGE: [u8; 14] = b"kernel-package";
+static LABEL_INPUT: [u8; 5] = b"input";
+static LABEL_OUTPUT: [u8; 6] = b"output";
+static LABEL_CAPSULE: [u8; 7] = b"capsule";
+static LABEL_EFFECT_BEFORE: [u8; 13] = b"effect-before";
+static LABEL_EFFECT_AFTER: [u8; 12] = b"effect-after";
+static LABEL_CHECKPOINT: [u8; 10] = b"checkpoint";
+static LABEL_FAILURE_DETAIL: [u8; 14] = b"failure-detail";
+static LABEL_TRANSCRIPT: [u8; 10] = b"transcript";
+
+static KEY_ID: [u8; 32] = [
+    0x30, 0x97, 0xe2, 0xde, 0xe2, 0xcb, 0x4a, 0x34,
+    0xb5, 0x38, 0x40, 0xcd, 0xb7, 0x05, 0xae, 0xd7,
+    0x10, 0x67, 0xc3, 0x6f, 0x68, 0xdb, 0x0e, 0x0f,
+    0x55, 0x9c, 0x3f, 0x3f, 0xa0, 0x43, 0x31, 0x5f,
+];
+static SIG_CURRENT: [u8; 64] = [
+    0x8b, 0x4a, 0x39, 0x28, 0x88, 0x71, 0xf3, 0xb0,
+    0xd5, 0xec, 0x45, 0xb6, 0xf5, 0xdb, 0x71, 0xeb,
+    0x90, 0x91, 0x6e, 0x65, 0x76, 0x30, 0x4f, 0x18,
+    0x4f, 0xca, 0xb4, 0x38, 0x61, 0x4b, 0x86, 0xd7,
+    0x2d, 0x40, 0xd2, 0xad, 0xf9, 0xaf, 0x75, 0x11,
+    0x49, 0xda, 0x3b, 0x72, 0x0a, 0xd1, 0x34, 0x3c,
+    0x09, 0xa7, 0x63, 0xfa, 0x3a, 0x37, 0x8b, 0x34,
+    0x2f, 0x1f, 0xb4, 0x70, 0x85, 0x93, 0xf9, 0x00,
+];
+static SIG_STALE: [u8; 64] = [
+    0xc9, 0x89, 0xd8, 0x53, 0xbb, 0xe0, 0x7d, 0xfa,
+    0x6b, 0xf4, 0x6b, 0x74, 0x06, 0x77, 0xe4, 0x61,
+    0xb6, 0xb0, 0x27, 0x12, 0xfd, 0x77, 0xa6, 0x9b,
+    0xbf, 0x13, 0x4b, 0xf3, 0x07, 0xe4, 0x4c, 0xc9,
+    0xf1, 0xa3, 0xda, 0x19, 0x53, 0x43, 0x52, 0xdf,
+    0x1a, 0x04, 0x5c, 0xcc, 0x17, 0xe9, 0x62, 0xb2,
+    0x25, 0x22, 0x47, 0x5b, 0x57, 0xab, 0x08, 0xe0,
+    0x2b, 0x7d, 0xeb, 0xef, 0x15, 0xf5, 0xf3, 0x04,
+];
+static EXPECTED_CORPUS_HASH: [u8; 32] = [
+    0x1e, 0xdd, 0x90, 0xbf, 0x88, 0x1c, 0xd4, 0x2d,
+    0x08, 0xe2, 0x03, 0x14, 0x82, 0xba, 0xae, 0x4e,
+    0x7c, 0x9a, 0x95, 0xbd, 0x78, 0xcf, 0xa6, 0x5f,
+    0x0c, 0xbe, 0x14, 0x14, 0x7c, 0x0a, 0x26, 0x04,
+];
+static EXPECTED_PREIMAGE_CURRENT_HASH: [u8; 32] = [
+    0xf3, 0x0a, 0x33, 0x79, 0x8f, 0x17, 0xaf, 0x3f,
+    0x9b, 0x33, 0xe1, 0xed, 0xbf, 0xa4, 0x25, 0x13,
+    0x7b, 0x64, 0xd2, 0x40, 0x48, 0x8b, 0x40, 0xd7,
+    0x79, 0xa3, 0x9d, 0xce, 0xe6, 0xe5, 0xf1, 0x3c,
+];
+static EXPECTED_PREIMAGE_STALE_HASH: [u8; 32] = [
+    0x0f, 0xe1, 0x52, 0xb9, 0x31, 0x49, 0xec, 0xf1,
+    0x10, 0x71, 0xca, 0xf8, 0xbd, 0x3f, 0xab, 0xbc,
+    0x5e, 0x4f, 0x29, 0x48, 0xce, 0x86, 0x79, 0xfe,
+    0x0a, 0x8e, 0xb9, 0xa9, 0x66, 0x3e, 0xa9, 0x45,
+];
+
+static mut BUILD_RECORD_STORAGE: [u64; 512] = [0; 512];
+static mut RECEIPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut WORLD_ID_STORAGE: [u64; 512] = [0; 512];
+static mut GOVERNOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut ATTEMPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut NODE_ID_STORAGE: [u64; 512] = [0; 512];
+static mut DOMAIN_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PROCESS_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PRIOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut CURRENT_ID_STORAGE: [u64; 512] = [0; 512];
+
+static mut VALUE_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_BYTES: [u8; 4096] = [0; 4096];
+static mut VALUE_NODES: [u64; 1536] = [0; 1536];
+static mut VALUE_EDGES: [u64; 128] = [0; 128];
+static mut TEMP_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut TEMP_BYTES: [u8; 4096] = [0; 4096];
+static mut TEMP_NODES: [u64; 1536] = [0; 1536];
+static mut TEMP_EDGES: [u64; 512] = [0; 512];
+static mut VALUE_SCRATCH_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_STAGED: [u8; 4096] = [0; 4096];
+static mut VALUE_LENGTHS: [u64; 128] = [0; 128];
+static mut VALUE_FRAMES: [u64; 256] = [0; 256];
+static mut VALUE_PENDING: [u64; 512] = [0; 512];
+static mut VALUE_DIGEST: [u8; 32] = [0; 32];
+
+static mut SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut HASH: [u8; 32] = [0; 32];
+static mut DIGEST: [u8; 32] = [0; 32];
+
+static mut SIGNED_STORAGE: [u64; 8] = [0; 8];
+static mut RECEIPT_SCRATCH_STORAGE: [u64; 8] = [0; 8];
+static mut VALIDATION_STORAGE: [u64; 16] = [0; 16];
+static mut RECEIPT_STAGED: [u8; 4096] = [0; 4096];
+static mut RECEIPT_COMMITTED: [u8; 4096] = [0; 4096];
+static mut RECEIPT_PREIMAGE: [u8; 4096] = [0; 4096];
+static mut IDENTITY_STAGED: [u8; 1024] = [0; 1024];
+static mut VALUE_REENCODED: [u8; 4096] = [0; 4096];
+
+static mut BODY: [u8; 2048] = [0; 2048];
+static mut IDENTITY_ENCODED: [u8; 1024] = [0; 1024];
+static mut VALUE_ENCODED: [u8; 4096] = [0; 4096];
+static mut CORPUS: [u8; 4096] = [0; 4096];
+static mut REENCODED: [u8; 4096] = [0; 4096];
+static mut MALFORMED: [u8; 4096] = [0; 4096];
+static mut PREIMAGE_CORPUS: [u8; 4096] = [0; 4096];
+static mut VALUE_ENTRIES: [u64; 6] = [0; 6];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+
+static mut BODY_CURSOR: usize = 0;
+static mut SUBJECT_MASK_OFFSET: usize = 0;
+static mut CAPABILITY_KIND_OFFSET: usize = 0;
+static mut COMMIT_TAG_OFFSET: usize = 0;
+static mut COMMIT_IDENTITY_OFFSET: usize = 0;
+static mut COMMIT_IDENTITY_LENGTH: usize = 0;
+
+unsafe fn build_record_storage() -> *mut IdentityRecord {
+    return ((&mut BUILD_RECORD_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn receipt_identity() -> *mut IdentityRecord { return ((&mut RECEIPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn world_identity() -> *mut IdentityRecord { return ((&mut WORLD_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn governor_identity() -> *mut IdentityRecord { return ((&mut GOVERNOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn attempt_identity() -> *mut IdentityRecord { return ((&mut ATTEMPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn node_identity() -> *mut IdentityRecord { return ((&mut NODE_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn domain_identity() -> *mut IdentityRecord { return ((&mut DOMAIN_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn process_identity() -> *mut IdentityRecord { return ((&mut PROCESS_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn prior_identity() -> *mut IdentityRecord { return ((&mut PRIOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn current_identity() -> *mut IdentityRecord { return ((&mut CURRENT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord; }
+unsafe fn value_arena() -> *mut ValueArena { return ((&mut VALUE_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena; }
+unsafe fn temp_arena() -> *mut ValueArena { return ((&mut TEMP_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena; }
+unsafe fn value_scratch() -> *mut ValueCodecScratch { return ((&mut VALUE_SCRATCH_STORAGE[0]) as *mut u64) as *mut ValueCodecScratch; }
+unsafe fn sha_scratch() -> *mut Sha256Scratch { return ((&mut SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch; }
+unsafe fn signed_receipt() -> *mut SignedReceipt { return ((&mut SIGNED_STORAGE[0]) as *mut u64) as *mut SignedReceipt; }
+unsafe fn receipt_scratch() -> *mut ReceiptCodecScratch { return ((&mut RECEIPT_SCRATCH_STORAGE[0]) as *mut u64) as *mut ReceiptCodecScratch; }
+unsafe fn validation_scratch() -> *mut ReceiptValidationScratch { return ((&mut VALIDATION_STORAGE[0]) as *mut u64) as *mut ReceiptValidationScratch; }
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn initialize_storage() -> bool {
+    if arena_init(value_arena(), (&mut VALUE_BYTES[0]), 4096,
+        (&mut VALUE_NODES[0]), 1536, (&mut VALUE_EDGES[0]), 128) != 1
+        || arena_init(temp_arena(), (&mut TEMP_BYTES[0]), 4096,
+            (&mut TEMP_NODES[0]), 1536, (&mut TEMP_EDGES[0]), 512) != 1
+        || sha_scratch_init(sha_scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1 {
+        return false;
+    }
+    if value_scratch_init(value_scratch(), (&mut VALUE_STAGED[0]), 4096,
+        (&mut VALUE_LENGTHS[0]), 128, (&mut VALUE_FRAMES[0]), 256,
+        (&mut VALUE_PENDING[0]), 512, temp_arena(), sha_scratch(),
+        (&mut VALUE_DIGEST[0]), 32) != 1
+        || receipt_scratch_init(receipt_scratch(), (&mut RECEIPT_STAGED[0]), 4096,
+            (&mut RECEIPT_COMMITTED[0]), 4096,
+            (&mut RECEIPT_PREIMAGE[0]), 4096) != 1 {
+        return false;
+    }
+    return validation_scratch_init(validation_scratch(), receipt_identity(),
+        world_identity(), governor_identity(), attempt_identity(), node_identity(),
+        domain_identity(), process_identity(), prior_identity(), current_identity(),
+        (&mut IDENTITY_STAGED[0]), 1024, value_arena(), value_scratch(),
+        (&mut VALUE_REENCODED[0]), 4096) == 1;
+}
+
+unsafe fn bytes_equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn put_byte(value: u64) -> bool {
+    if BODY_CURSOR >= 2048 { return false; }
+    BODY[BODY_CURSOR] = value as u8;
+    BODY_CURSOR += 1;
+    return true;
+}
+
+unsafe fn put_u16(value: u64) -> bool {
+    return put_byte(value >> 8) && put_byte(value);
+}
+
+unsafe fn put_u32(value: u64) -> bool {
+    return put_byte(value >> 24) && put_byte(value >> 16)
+        && put_byte(value >> 8) && put_byte(value);
+}
+
+unsafe fn put_u64(value: u64) -> bool {
+    let mut shift: usize = 56;
+    loop {
+        if !put_byte(value >> shift) { return false; }
+        if shift == 0 { break; }
+        shift -= 8;
+    }
+    return true;
+}
+
+unsafe fn put_bytes(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || BODY_CURSOR > 2048 || length > 2048 - BODY_CURSOR {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        BODY[BODY_CURSOR] = volatile_load(source + index);
+        BODY_CURSOR += 1;
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn put_token(source: *const u8, length: usize) -> bool {
+    return put_u16(length as u64) && put_bytes(source, length);
+}
+
+unsafe fn put_tag(value: u64) -> bool {
+    return put_byte(value) && put_byte(0) && put_byte(0) && put_byte(0);
+}
+
+unsafe fn put_digest(label: *const u8, length: usize) -> bool {
+    return sha256_compute(label, length, (&mut DIGEST[0]), sha_scratch()) == 1
+        && put_bytes((&DIGEST[0]), 32);
+}
+
+unsafe fn begin_identity(kind: u64, owner: u64) -> bool {
+    return record_begin(build_record_storage(), kind, owner) == 1;
+}
+
+unsafe fn identity_text(field: u64, source: *const u8, length: usize) -> bool {
+    return record_set_text(build_record_storage(), field, source, length) == 1;
+}
+
+unsafe fn identity_counter(field: u64, value: u64) -> bool {
+    return record_set_counter(build_record_storage(), field, value) == 1;
+}
+
+unsafe fn set_world() -> bool {
+    return identity_text(IDENTITY_FIELD_WORLD, (&WORLD[0]), 7);
+}
+
+unsafe fn set_node(name: *const u8, name_length: usize, generation: u64) -> bool {
+    return set_world() && identity_text(IDENTITY_FIELD_NODE, name, name_length)
+        && identity_counter(IDENTITY_COUNTER_NODE_GENERATION, generation);
+}
+
+unsafe fn set_domain(node_generation: u64, domain_generation: u64) -> bool {
+    return set_node((&NODE_A[0]), 6, node_generation)
+        && identity_text(IDENTITY_FIELD_DOMAIN, (&DOMAIN[0]), 8)
+        && identity_counter(IDENTITY_COUNTER_DOMAIN_GENERATION, domain_generation);
+}
+
+unsafe fn append_identity() -> bool {
+    let mut length: usize = 0;
+    return encode_identity(build_record_storage() as *const IdentityRecord,
+        (&mut IDENTITY_ENCODED[0]), 1024, (&mut length)) == 1
+        && length != 0 && length <= 1024
+        && put_u16(length as u64) && put_bytes((&IDENTITY_ENCODED[0]), length);
+}
+
+unsafe fn append_receipt_identity(name: *const u8, length: usize) -> bool {
+    return begin_identity(IDENTITY_KIND_RECEIPT, 0) && set_world()
+        && identity_text(IDENTITY_FIELD_RECEIPT, name, length) && append_identity();
+}
+
+unsafe fn append_world_identity() -> bool {
+    return begin_identity(IDENTITY_KIND_WORLD, 0) && set_world()
+        && identity_counter(IDENTITY_COUNTER_EPOCH, 7) && append_identity();
+}
+
+unsafe fn append_governor_identity() -> bool {
+    return begin_identity(IDENTITY_KIND_GOVERNOR, 0) && set_world()
+        && identity_counter(IDENTITY_COUNTER_EPOCH, 7)
+        && identity_counter(IDENTITY_COUNTER_TERM, 3)
+        && identity_counter(IDENTITY_COUNTER_LOG_INDEX, 9)
+        && append_identity();
+}
+
+unsafe fn append_attempt_identity(attempt_generation: u64) -> bool {
+    return begin_identity(IDENTITY_KIND_ATTEMPT, 0) && set_world()
+        && identity_text(IDENTITY_FIELD_TASK, (&TASK[0]), 6)
+        && identity_counter(IDENTITY_COUNTER_ATTEMPT_GENERATION, attempt_generation)
+        && append_identity();
+}
+
+unsafe fn append_node_identity(
+    name: *const u8,
+    name_length: usize,
+    node_generation: u64
+) -> bool {
+    return begin_identity(IDENTITY_KIND_NODE, 0)
+        && set_node(name, name_length, node_generation) && append_identity();
+}
+
+unsafe fn append_domain_identity(node_generation: u64, domain_generation: u64) -> bool {
+    return begin_identity(IDENTITY_KIND_DOMAIN, 0)
+        && set_domain(node_generation, domain_generation) && append_identity();
+}
+
+unsafe fn append_process_identity(
+    node_generation: u64,
+    domain_generation: u64,
+    process_generation: u64
+) -> bool {
+    return begin_identity(IDENTITY_KIND_PROCESS, 0)
+        && set_domain(node_generation, domain_generation)
+        && identity_text(IDENTITY_FIELD_PROCESS, (&PROCESS[0]), 9)
+        && identity_counter(IDENTITY_COUNTER_PROCESS_GENERATION, process_generation)
+        && append_identity();
+}
+
+unsafe fn append_capability_identity() -> bool {
+    return begin_identity(IDENTITY_KIND_CAPABILITY, 0) && set_world()
+        && identity_text(IDENTITY_FIELD_CAPABILITY, (&CAPABILITY_A[0]), 12)
+        && append_identity();
+}
+
+unsafe fn append_object_identity(
+    name: *const u8,
+    length: usize,
+    version: u64
+) -> bool {
+    return begin_identity(IDENTITY_KIND_OBJECT, 0) && set_world()
+        && identity_text(IDENTITY_FIELD_OBJECT, name, length)
+        && identity_counter(IDENTITY_COUNTER_OBJECT_VERSION, version)
+        && append_identity();
+}
+
+unsafe fn append_resource_identity(node_generation: u64, domain_generation: u64) -> bool {
+    return begin_identity(IDENTITY_KIND_RESOURCE, RESOURCE_OWNER_DOMAIN)
+        && set_domain(node_generation, domain_generation)
+        && identity_text(IDENTITY_FIELD_RESOURCE, (&RESOURCE_INPUT[0]), 8)
+        && identity_counter(IDENTITY_COUNTER_RESOURCE_GENERATION, 2)
+        && append_identity();
+}
+
+unsafe fn append_checkpoint_identity(attempt_generation: u64) -> bool {
+    return begin_identity(IDENTITY_KIND_CHECKPOINT, 0) && set_world()
+        && identity_text(IDENTITY_FIELD_TASK, (&TASK[0]), 6)
+        && identity_counter(IDENTITY_COUNTER_ATTEMPT_GENERATION, attempt_generation)
+        && identity_text(IDENTITY_FIELD_CHECKPOINT, (&CHECKPOINT_A[0]), 12)
+        && append_identity();
+}
+
+unsafe fn append_component(
+    kind: u64,
+    generation: u64,
+    name: *const u8,
+    name_length: usize,
+    digest_label: *const u8,
+    digest_label_length: usize
+) -> bool {
+    return put_tag(kind) && put_u64(generation) && put_token(name, name_length)
+        && put_digest(digest_label, digest_label_length);
+}
+
+unsafe fn append_success_value() -> bool {
+    if arena_clear(value_arena()) != 1 { return false; }
+    let mut ok: u64 = 0;
+    let mut result: u64 = 0;
+    let mut root: u64 = 0;
+    if add_bool(value_arena(), 1, (&mut ok)) != 1
+        || add_text(value_arena(), VALUE_TEXT_UTF8,
+            (&VALUE_OSTADIX[0]), 7, (&mut result)) != 1 {
+        return false;
+    }
+    VALUE_ENTRIES[0] = (&VALUE_KEY_OK[0]) as *const u8 as usize as u64;
+    VALUE_ENTRIES[1] = 2;
+    VALUE_ENTRIES[2] = ok;
+    VALUE_ENTRIES[3] = (&VALUE_KEY_RESULT[0]) as *const u8 as usize as u64;
+    VALUE_ENTRIES[4] = 6;
+    VALUE_ENTRIES[5] = result;
+    let mut written: usize = 0;
+    return add_record(value_arena(), (&VALUE_ENTRIES[0]), 2, (&mut root)) == 1
+        && seal(value_arena(), root) == 1
+        && encode_value(value_arena() as *const ValueArena,
+            (&mut VALUE_ENCODED[0]), 4096, (&mut written), value_scratch()) == 1
+        && put_tag(1) && put_u32(written as u64)
+        && put_bytes((&VALUE_ENCODED[0]), written);
+}
+
+unsafe fn build_body(
+    node_generation: u64,
+    domain_generation: u64,
+    process_generation: u64,
+    attempt_generation: u64,
+    object_version: u64,
+    receipt_name: *const u8,
+    receipt_name_length: usize,
+    success: bool,
+    capture_offsets: bool
+) -> usize {
+    BODY_CURSOR = 0;
+    if !append_receipt_identity(receipt_name, receipt_name_length)
+        || !append_world_identity() || !append_governor_identity()
+        || !append_attempt_identity(attempt_generation)
+        || !append_node_identity((&NODE_A[0]), 6, node_generation)
+        || !append_domain_identity(node_generation, domain_generation)
+        || !append_process_identity(node_generation, domain_generation,
+            process_generation) {
+        return 0;
+    }
+
+    if capture_offsets { SUBJECT_MASK_OFFSET = BODY_CURSOR; }
+    if !put_tag(31)
+        || !put_digest((&LABEL_SOURCE[0]), 6)
+        || !put_digest((&LABEL_BUNDLE[0]), 6)
+        || !put_digest((&LABEL_PACKAGE[0]), 7)
+        || !put_digest((&LABEL_HGRAPH[0]), 14)
+        || !put_digest((&LABEL_EFFECTS[0]), 7)
+        || !put_u16(3)
+        || !append_component(1, 0, (&PROJECT_DEMO[0]), 12,
+            (&LABEL_BUNDLE[0]), 6)
+        || !append_component(2, 4, (&LIVE_ECHO[0]), 9,
+            (&LABEL_LIVE_PACKAGE[0]), 12)
+        || !append_component(3, 2, (&KERNEL_LINUX[0]), 12,
+            (&LABEL_KERNEL_PACKAGE[0]), 14)
+        || !put_u16(1) {
+        return 0;
+    }
+
+    if capture_offsets { CAPABILITY_KIND_OFFSET = BODY_CURSOR + 2 + 11; }
+    if !append_capability_identity() || !put_u16(2)
+        || !put_token((&RIGHT_INVOKE[0]), 6)
+        || !put_token((&RIGHT_READ[0]), 4)
+        || !put_u16(2)
+        || !append_object_identity((&OBJECT_INPUT[0]), 12, object_version)
+        || !put_tag(1) || !put_digest((&LABEL_INPUT[0]), 5) || !put_u64(17)
+        || !append_object_identity((&OBJECT_OUTPUT[0]), 13, 1)
+        || !put_tag(2) || !put_digest((&LABEL_OUTPUT[0]), 6) || !put_u64(23)
+        || !put_u16(1)
+        || !put_digest((&LABEL_CAPSULE[0]), 7)
+        || !put_token((&EVALUATOR_PYTHON[0]), 6)
+        || !append_node_identity((&NODE_A[0]), 6, node_generation)
+        || !put_u16(1)
+        || !append_resource_identity(node_generation, domain_generation)
+        || !put_digest((&LABEL_EFFECT_BEFORE[0]), 13)
+        || !put_digest((&LABEL_EFFECT_AFTER[0]), 12)
+        || !put_u16(1)
+        || !append_node_identity((&NODE_B[0]), 6, 1)
+        || !put_token((&REJECTION_BUSY[0]), 13)
+        || !put_u16(1)
+        || !append_checkpoint_identity(attempt_generation)
+        || !put_digest((&LABEL_CHECKPOINT[0]), 10) {
+        return 0;
+    }
+
+    let mut recovered: u64 = 1;
+    if success { recovered = 0; }
+    if !put_tag(recovered) { return 0; }
+
+    if success {
+        if !append_success_value() { return 0; }
+    } else if !put_tag(2) || !put_token((&FAILURE_STALE[0]), 11)
+        || !put_digest((&LABEL_FAILURE_DETAIL[0]), 14) {
+        return 0;
+    }
+
+    if capture_offsets { COMMIT_TAG_OFFSET = BODY_CURSOR; }
+    if !put_tag(1) { return 0; }
+    let identity_prefix: usize = BODY_CURSOR;
+    if !append_governor_identity() { return 0; }
+    if capture_offsets {
+        COMMIT_IDENTITY_OFFSET = identity_prefix + 2;
+        COMMIT_IDENTITY_LENGTH = BODY_CURSOR - identity_prefix - 2;
+    }
+    if !put_tag(1) || !put_token((&EVIDENCE_GATE[0]), 16)
+        || !put_digest((&LABEL_TRANSCRIPT[0]), 10) {
+        return 0;
+    }
+    return BODY_CURSOR;
+}
+
+unsafe fn build_corpus() -> bool {
+    let body_current: usize = build_body(4, 2, 5, 6, 2,
+        (&RECEIPT_CURRENT[0]), 15, true, true);
+    if body_current != BODY_CURRENT_LENGTH { return false; }
+    let mut written: usize = 0;
+    if encode_envelope((&BODY[0]), body_current, (&KEY_ID[0]),
+        (&SIG_CURRENT[0]), (&mut CORPUS[0]), 4096, (&mut written)) != 1
+        || written != RECORD_CURRENT_LENGTH {
+        return false;
+    }
+
+    let body_stale: usize = build_body(3, 1, 4, 5, 1,
+        (&RECEIPT_STALE[0]), 13, false, false);
+    if body_stale != BODY_STALE_LENGTH { return false; }
+    written = 0;
+    return encode_envelope((&BODY[0]), body_stale, (&KEY_ID[0]),
+        (&SIG_STALE[0]), (&mut CORPUS[RECORD_CURRENT_LENGTH]),
+        4096 - RECORD_CURRENT_LENGTH, (&mut written)) == 1
+        && written == RECORD_STALE_LENGTH;
+}
+
+unsafe fn copy_bytes(
+    source: *const u8,
+    output: *mut u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(output + index, volatile_load(source + index));
+        index += 1;
+    }
+}
+
+unsafe fn canonical_record_holds(
+    record_offset: usize,
+    record_length: usize,
+    expected_body_length: usize,
+    preimage_offset: usize,
+    expected_preimage_length: usize,
+    expected_preimage_hash: *const u8
+) -> bool {
+    if decode_receipt((&CORPUS[record_offset]), record_length,
+        signed_receipt(), receipt_scratch(), validation_scratch()) != 1
+        || receipt_total_length(signed_receipt() as *const SignedReceipt)
+            != record_length
+        || unsigned_length(signed_receipt() as *const SignedReceipt)
+            != expected_body_length {
+        return false;
+    }
+    let mut written: usize = 0;
+    if reencode_envelope(signed_receipt() as *const SignedReceipt,
+        (&mut REENCODED[0]), 4096, (&mut written)) != 1
+        || written != record_length
+        || !bytes_equal((&REENCODED[0]), (&CORPUS[record_offset]), record_length) {
+        return false;
+    }
+    written = 0;
+    if build_validated_signing_preimage(signed_receipt() as *const SignedReceipt,
+        validation_scratch(), (&mut RECEIPT_PREIMAGE[0]), 4096,
+        (&mut written)) != 1 || written != expected_preimage_length
+        || preimage_offset > 4096 || written > 4096 - preimage_offset {
+        return false;
+    }
+    copy_bytes((&RECEIPT_PREIMAGE[0]),
+        (&mut PREIMAGE_CORPUS[preimage_offset]), written);
+    return sha256_compute((&RECEIPT_PREIMAGE[0]), written,
+        (&mut HASH[0]), sha_scratch()) == 1
+        && bytes_equal((&HASH[0]), expected_preimage_hash, 32);
+}
+
+unsafe fn canonical_convergence_holds() -> bool {
+    return canonical_record_holds(0, RECORD_CURRENT_LENGTH,
+            BODY_CURRENT_LENGTH, 0, PREIMAGE_CURRENT_LENGTH,
+            (&EXPECTED_PREIMAGE_CURRENT_HASH[0]))
+        && canonical_record_holds(RECORD_CURRENT_LENGTH, RECORD_STALE_LENGTH,
+            BODY_STALE_LENGTH, PREIMAGE_CURRENT_LENGTH,
+            PREIMAGE_STALE_LENGTH, (&EXPECTED_PREIMAGE_STALE_HASH[0]));
+}
+
+unsafe fn install_current_baseline() -> bool {
+    return decode_receipt((&CORPUS[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch(), validation_scratch()) == 1
+        && receipt_total_length(signed_receipt() as *const SignedReceipt)
+            == RECORD_CURRENT_LENGTH;
+}
+
+unsafe fn copy_current_to_malformed() -> void {
+    copy_bytes((&CORPUS[0]), (&mut MALFORMED[0]), RECORD_CURRENT_LENGTH);
+}
+
+unsafe fn structural_rejected() -> bool {
+    if !install_current_baseline() { return false; }
+    let baseline: *const u8 = receipt_source(signed_receipt() as *const SignedReceipt);
+    if baseline as usize == 0 || volatile_load(baseline) != b'O' { return false; }
+
+    copy_current_to_malformed(); MALFORMED[0] = b'X';
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+    copy_current_to_malformed(); MALFORMED[9] = 2;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+    copy_current_to_malformed(); MALFORMED[11] = 2;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+    copy_current_to_malformed(); MALFORMED[15] = MALFORMED[15] ^ 1;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+    copy_current_to_malformed(); MALFORMED[19] = MALFORMED[19] ^ 1;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+    copy_current_to_malformed(); MALFORMED[23] = 1;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 { return false; }
+
+    copy_current_to_malformed();
+    let mut index: usize = 24 + BODY_CURRENT_LENGTH;
+    while index < 24 + BODY_CURRENT_LENGTH + 32 {
+        MALFORMED[index] = 0;
+        index += 1;
+    }
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 0 {
+        return false;
+    }
+    return receipt_source(signed_receipt() as *const SignedReceipt) == baseline
+        && receipt_total_length(signed_receipt() as *const SignedReceipt)
+            == RECORD_CURRENT_LENGTH
+        && volatile_load(baseline) == b'O';
+}
+
+unsafe fn full_rejected_preserving_output(length: usize) -> bool {
+    let baseline: *const u8 = receipt_source(signed_receipt() as *const SignedReceipt);
+    let baseline_length: usize = receipt_total_length(
+        signed_receipt() as *const SignedReceipt);
+    if baseline as usize == 0 || baseline_length != RECORD_CURRENT_LENGTH {
+        return false;
+    }
+    return decode_receipt((&MALFORMED[0]), length, signed_receipt(),
+            receipt_scratch(), validation_scratch()) == 0
+        && receipt_source(signed_receipt() as *const SignedReceipt) == baseline
+        && receipt_total_length(signed_receipt() as *const SignedReceipt)
+            == baseline_length
+        && volatile_load(baseline) == b'O';
+}
+
+unsafe fn canonical_preimage_rejects_structural_only() -> bool {
+    copy_current_to_malformed();
+    MALFORMED[24 + SUBJECT_MASK_OFFSET] = 0;
+    if decode_envelope((&MALFORMED[0]), RECORD_CURRENT_LENGTH,
+        signed_receipt(), receipt_scratch()) != 1 {
+        return false;
+    }
+    let mut written: usize = 0xdead;
+    if build_validated_signing_preimage(
+        signed_receipt() as *const SignedReceipt, validation_scratch(),
+        (&mut RECEIPT_PREIMAGE[0]), 4096, (&mut written)) == 0
+        && written == 0xdead {
+        // Continue with forged-view negatives below.
+    } else {
+        return false;
+    }
+
+    copy_current_to_malformed();
+    let key_offset: usize = 24 + BODY_CURRENT_LENGTH;
+    let mut index: usize = key_offset;
+    while index < key_offset + 32 {
+        MALFORMED[index] = 0;
+        index += 1;
+    }
+    if install_receipt_view(signed_receipt(), (&MALFORMED[0]),
+        RECORD_CURRENT_LENGTH, (&MALFORMED[24]), BODY_CURRENT_LENGTH,
+        (&MALFORMED[key_offset]), (&MALFORMED[key_offset + 32])) != 1 {
+        return false;
+    }
+    written = 0xdead;
+    if build_validated_signing_preimage(
+        signed_receipt() as *const SignedReceipt, validation_scratch(),
+        (&mut RECEIPT_PREIMAGE[0]), 4096, (&mut written)) != 0
+        || written != 0xdead {
+        return false;
+    }
+
+    // Even a valid source envelope cannot be paired with pointers that do not
+    // name its exact body/key/signature offsets.
+    if install_receipt_view(signed_receipt(), (&CORPUS[0]),
+        RECORD_CURRENT_LENGTH, (&CORPUS[24]), BODY_CURRENT_LENGTH,
+        (&KEY_ID[0]), (&SIG_CURRENT[0])) != 1 {
+        return false;
+    }
+    written = 0xdead;
+    return build_validated_signing_preimage(
+            signed_receipt() as *const SignedReceipt, validation_scratch(),
+            (&mut RECEIPT_PREIMAGE[0]), 4096, (&mut written)) == 0
+        && written == 0xdead;
+}
+
+unsafe fn make_node(name: *const u8, length: usize, generation: u64) -> bool {
+    return begin_identity(IDENTITY_KIND_NODE, 0)
+        && set_node(name, length, generation);
+}
+
+unsafe fn identity_and_generation_binding_holds() -> bool {
+    if !install_current_baseline()
+        || !make_node((&NODE_A[0]), 6, 4)
+        || !record_is_current(node_identity() as *const IdentityRecord,
+            build_record_storage() as *const IdentityRecord)
+        || !make_node((&NODE_A[0]), 6, 3)
+        || record_is_current(node_identity() as *const IdentityRecord,
+            build_record_storage() as *const IdentityRecord)
+        || !make_node((&NODE_B[0]), 6, 4)
+        || record_is_current(node_identity() as *const IdentityRecord,
+            build_record_storage() as *const IdentityRecord) {
+        return false;
+    }
+
+    if decode_receipt((&CORPUS[RECORD_CURRENT_LENGTH]), RECORD_STALE_LENGTH,
+        signed_receipt(), receipt_scratch(), validation_scratch()) != 1
+        || !make_node((&NODE_A[0]), 6, 3)
+        || !record_is_current(node_identity() as *const IdentityRecord,
+            build_record_storage() as *const IdentityRecord)
+        || !make_node((&NODE_A[0]), 6, 4)
+        || record_is_current(node_identity() as *const IdentityRecord,
+            build_record_storage() as *const IdentityRecord) {
+        return false;
+    }
+
+    if !install_current_baseline() { return false; }
+    copy_current_to_malformed();
+    let fence_last: usize = 24 + COMMIT_IDENTITY_OFFSET
+        + COMMIT_IDENTITY_LENGTH - 1;
+    MALFORMED[fence_last] = 8;
+    return full_rejected_preserving_output(RECORD_CURRENT_LENGTH);
+}
+
+unsafe fn descriptive_capability_boundary_holds() -> bool {
+    if !install_current_baseline() { return false; }
+    copy_current_to_malformed();
+    // Capability and Lease have the same payload shape. Changing only the
+    // nested OWIDENT kind therefore proves the receipt grammar requires a
+    // descriptive Capability identity and does not accept another bearer kind.
+    MALFORMED[24 + CAPABILITY_KIND_OFFSET] = 9;
+    return full_rejected_preserving_output(RECORD_CURRENT_LENGTH);
+}
+
+unsafe fn malformed_body_rejected() -> bool {
+    if !install_current_baseline() { return false; }
+    copy_current_to_malformed();
+    MALFORMED[24 + SUBJECT_MASK_OFFSET] = 0;
+    if !full_rejected_preserving_output(RECORD_CURRENT_LENGTH) { return false; }
+
+    copy_current_to_malformed();
+    MALFORMED[24 + SUBJECT_MASK_OFFSET + 1] = 1;
+    if !full_rejected_preserving_output(RECORD_CURRENT_LENGTH) { return false; }
+
+    copy_current_to_malformed();
+    let mut index: usize = 24 + SUBJECT_MASK_OFFSET + 4;
+    while index < 24 + SUBJECT_MASK_OFFSET + 36 {
+        MALFORMED[index] = 0;
+        index += 1;
+    }
+    if !full_rejected_preserving_output(RECORD_CURRENT_LENGTH) { return false; }
+
+    copy_current_to_malformed();
+    MALFORMED[24 + COMMIT_TAG_OFFSET] = 2;
+    if !full_rejected_preserving_output(RECORD_CURRENT_LENGTH) { return false; }
+
+    copy_current_to_malformed();
+    return full_rejected_preserving_output(RECORD_CURRENT_LENGTH - 1);
+}
+
+fn hex_digit(value: u64) -> u8 {
+    if value < 10 { return (b'0' as u64 + value) as u8; }
+    return (b'a' as u64 + value - 10) as u8;
+}
+
+unsafe fn emit_hex(
+    prefix: *const u8,
+    prefix_length: usize,
+    source: *const u8,
+    length: usize
+) -> void {
+    write(prefix, prefix_length);
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = volatile_load(source + index) as u64;
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_WORLD_RECEIPT || !initialize_storage() { fail_closed(); }
+    disable_interrupts();
+    if !build_corpus()
+        || sha256_compute((&CORPUS[0]), CORPUS_LENGTH,
+            (&mut HASH[0]), sha_scratch()) != 1
+        || !bytes_equal((&HASH[0]), (&EXPECTED_CORPUS_HASH[0]), 32)
+        || !canonical_convergence_holds()
+        || !structural_rejected()
+        || !canonical_preimage_rejects_structural_only()
+        || !identity_and_generation_binding_holds()
+        || !descriptive_capability_boundary_holds()
+        || !malformed_body_rejected() {
+        fail_closed();
+    }
+
+    if sha256_compute((&CORPUS[0]), CORPUS_LENGTH,
+        (&mut HASH[0]), sha_scratch()) != 1 { fail_closed(); }
+    emit_hex((&HEX_PREFIX[0]), 21, (&CORPUS[0]), CORPUS_LENGTH);
+    emit_hex((&SHA_PREFIX[0]), 24, (&HASH[0]), 32);
+    emit_hex((&PREIMAGE_PREFIX[0]), 30,
+        (&PREIMAGE_CORPUS[0]), PREIMAGE_CORPUS_LENGTH);
+    write((&CONVERGENCE_MESSAGE[0]), 52);
+    write((&PREIMAGE_MESSAGE[0]), 59);
+    write((&ENVELOPE_MESSAGE[0]), 60);
+    write((&BINDING_MESSAGE[0]), 61);
+    write((&CAPABILITY_MESSAGE[0]), 52);
+    write((&MALFORMED_MESSAGE[0]), 48);
+    write((&COMPLETE_MESSAGE[0]), 36);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK_MESSAGE[0]), 38);
+    loop { halt(); }
+}

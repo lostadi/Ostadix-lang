@@ -350,6 +350,24 @@ require_fixed docs/CLAIMS.md \
     'passes no G0--G13 gate' \
     'the Mode 29 value slice could be misread as Alpha qualification'
 require_fixed docs/CLAIMS.md \
+    'Mode 30 adds the bounded canonical World-receipt PR5 gate' \
+    'the implemented PR5 canonical-receipt boundary is missing'
+require_fixed docs/CLAIMS.md \
+    '`OWRECEIPT` v1 record binds' \
+    'OWRECEIPT must remain separate from OWPROTO and OWVALUE'
+require_fixed docs/CLAIMS.md \
+    'pinned, explicitly non-secret conformance key' \
+    'the receipt conformance key could be misread as production key material'
+require_fixed docs/CLAIMS.md \
+    'does not implement or prove a general' \
+    'the native signature envelope could be misread as an Ed25519 verifier'
+require_fixed docs/CLAIMS.md \
+    'do not yet emit or consume it in live execution' \
+    'the offline receipt corpus could be misread as live receipt integration'
+require_fixed docs/CLAIMS.md \
+    'typed World Alpha attestation' \
+    'the PR5 receipt could be misread as qualifying World Alpha evidence'
+require_fixed docs/CLAIMS.md \
     'Strict decoding rejects malformed' \
     'invalid-record rejection must remain a decoder claim'
 require_fixed docs/CLAIMS.md \

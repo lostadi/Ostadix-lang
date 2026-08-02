@@ -1,0 +1,706 @@
+module world::receipt;
+
+use world::identity::IdentityRecord;
+use world::identity::IDENTITY_KIND_WORLD;
+use world::identity::IDENTITY_KIND_GOVERNOR;
+use world::identity::IDENTITY_KIND_NODE;
+use world::identity::IDENTITY_KIND_DOMAIN;
+use world::identity::IDENTITY_KIND_PROCESS;
+use world::identity::IDENTITY_KIND_RESOURCE;
+use world::identity::IDENTITY_KIND_OBJECT;
+use world::identity::IDENTITY_KIND_CAPABILITY;
+use world::identity::IDENTITY_KIND_ATTEMPT;
+use world::identity::IDENTITY_KIND_CHECKPOINT;
+use world::identity::IDENTITY_KIND_RECEIPT;
+use world::identity::IDENTITY_ORDER_LESS;
+use world::identity::decode_record_with_scratch as decode_identity;
+use world::identity::record_kind;
+use world::identity::record_is_current;
+use world::identity::records_share_world;
+use world::identity::receipt_context_is_bound;
+use world::identity::checkpoint_belongs_to_attempt;
+use world::identity::governor_fence_matches;
+use world::identity::node_record_order;
+use world::value::ValueArena;
+use world::value::WORLD_VALUE_MIN_BYTES;
+use world::value::WORLD_VALUE_MAX_BYTES;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::decode_record as decode_value;
+use world::value_codec::encode_record as encode_value;
+
+// OWRECEIPT is a separate, architecture-independent record.  It contains
+// descriptive execution evidence and a detached signature envelope; neither
+// decoding nor retaining one of these records creates kernel authority.
+pub const WORLD_RECEIPT_SCHEMA: u64 = 1;
+pub const WORLD_RECEIPT_SIGNATURE_ED25519: u64 = 1;
+pub const WORLD_RECEIPT_HEADER_BYTES: usize = 24;
+pub const WORLD_RECEIPT_KEY_ID_BYTES: usize = 32;
+pub const WORLD_RECEIPT_SIGNATURE_BYTES: usize = 64;
+pub const WORLD_RECEIPT_TRAILER_BYTES: usize = 96;
+pub const WORLD_RECEIPT_MIN_BYTES: usize = 120;
+pub const WORLD_RECEIPT_MAX_BYTES: usize = 16384;
+pub const WORLD_RECEIPT_MAX_UNSIGNED_BYTES: usize = 16264;
+pub const WORLD_RECEIPT_SIGNING_DOMAIN_BYTES: usize = 21;
+pub const WORLD_RECEIPT_SIGNING_PREFIX_BYTES: usize = 61;
+pub const WORLD_RECEIPT_MAX_SIGNING_PREIMAGE_BYTES: usize = 16325;
+
+pub const RECEIPT_DIGEST_SOURCE: u64 = 1;
+pub const RECEIPT_DIGEST_BUNDLE: u64 = 2;
+pub const RECEIPT_DIGEST_PACKAGE: u64 = 4;
+pub const RECEIPT_DIGEST_HGRAPH: u64 = 8;
+pub const RECEIPT_DIGEST_EFFECTS: u64 = 16;
+pub const RECEIPT_DIGEST_MASK: u64 = 31;
+
+pub const RECEIPT_TERMINAL_SUCCESS: u64 = 1;
+pub const RECEIPT_TERMINAL_FAILURE: u64 = 2;
+pub const RECEIPT_TERMINAL_CANCELLED: u64 = 3;
+pub const RECEIPT_TERMINAL_DEADLINE: u64 = 4;
+pub const RECEIPT_TERMINAL_WORLD_FAILED: u64 = 5;
+pub const RECEIPT_TERMINAL_STOPPED: u64 = 6;
+pub const RECEIPT_COMMIT_UNCOMMITTED: u64 = 0;
+pub const RECEIPT_COMMIT_COMMITTED: u64 = 1;
+pub const WORLD_RECEIPT_MAX_CAPABILITIES: usize = 16;
+pub const WORLD_RECEIPT_MAX_RIGHTS: usize = 16;
+pub const WORLD_RECEIPT_MAX_OBJECTS: usize = 16;
+pub const WORLD_RECEIPT_MAX_COMPONENTS: usize = 8;
+pub const WORLD_RECEIPT_MAX_CAPSULES: usize = 8;
+pub const WORLD_RECEIPT_MAX_EFFECTS: usize = 16;
+pub const WORLD_RECEIPT_MAX_REJECTIONS: usize = 16;
+pub const WORLD_RECEIPT_MAX_CHECKPOINTS: usize = 16;
+pub const WORLD_RECEIPT_MAX_IDENTIFIER_BYTES: usize = 96;
+
+struct BodyReader {
+    source: *const u8,
+    length: usize,
+    cursor: usize,
+    failed: u64,
+}
+
+// All large carriers belong to the caller. The spill-only compiler must never
+// materialize IdentityRecord, ValueArena, or a 4 KiB reencode buffer in a
+// receipt parser frame.
+pub struct ReceiptValidationScratch {
+    receipt: *mut IdentityRecord,
+    world: *mut IdentityRecord,
+    governor: *mut IdentityRecord,
+    attempt: *mut IdentityRecord,
+    node: *mut IdentityRecord,
+    domain: *mut IdentityRecord,
+    process: *mut IdentityRecord,
+    prior: *mut IdentityRecord,
+    current: *mut IdentityRecord,
+    identity_staged: *mut u8,
+    identity_staged_capacity: usize,
+    value: *mut ValueArena,
+    value_codec: *mut ValueCodecScratch,
+    value_reencoded: *mut u8,
+    value_reencoded_capacity: usize,
+}
+
+pub unsafe fn validation_scratch_init(
+    scratch: *mut ReceiptValidationScratch,
+    receipt: *mut IdentityRecord,
+    world: *mut IdentityRecord,
+    governor: *mut IdentityRecord,
+    attempt: *mut IdentityRecord,
+    node: *mut IdentityRecord,
+    domain: *mut IdentityRecord,
+    process: *mut IdentityRecord,
+    prior: *mut IdentityRecord,
+    current: *mut IdentityRecord,
+    identity_staged: *mut u8,
+    identity_staged_capacity: usize,
+    value: *mut ValueArena,
+    value_codec: *mut ValueCodecScratch,
+    value_reencoded: *mut u8,
+    value_reencoded_capacity: usize
+) -> u64 {
+    if scratch as usize == 0 || receipt as usize == 0 || world as usize == 0
+        || governor as usize == 0 || attempt as usize == 0 || node as usize == 0
+        || domain as usize == 0 || process as usize == 0 || prior as usize == 0
+        || current as usize == 0 || identity_staged as usize == 0
+        || identity_staged_capacity < 1024 || value as usize == 0
+        || value_codec as usize == 0 || value_reencoded as usize == 0
+        || value_reencoded_capacity < WORLD_VALUE_MAX_BYTES {
+        return 0;
+    }
+    (*scratch).receipt = receipt;
+    (*scratch).world = world;
+    (*scratch).governor = governor;
+    (*scratch).attempt = attempt;
+    (*scratch).node = node;
+    (*scratch).domain = domain;
+    (*scratch).process = process;
+    (*scratch).prior = prior;
+    (*scratch).current = current;
+    (*scratch).identity_staged = identity_staged;
+    (*scratch).identity_staged_capacity = identity_staged_capacity;
+    (*scratch).value = value;
+    (*scratch).value_codec = value_codec;
+    (*scratch).value_reencoded = value_reencoded;
+    (*scratch).value_reencoded_capacity = value_reencoded_capacity;
+    return 1;
+}
+
+unsafe fn byte_at(source: *const u8, offset: usize) -> u64 {
+    return volatile_load(source + offset) as u64;
+}
+
+unsafe fn bytes_order(
+    left: *const u8,
+    left_length: usize,
+    right: *const u8,
+    right_length: usize
+) -> u64 {
+    let mut common: usize = left_length;
+    if right_length < common { common = right_length; }
+    let mut index: usize = 0;
+    while index < common {
+        let l: u64 = byte_at(left, index);
+        let r: u64 = byte_at(right, index);
+        if l < r { return 0; }
+        if l > r { return 2; }
+        index += 1;
+    }
+    if left_length < right_length { return 0; }
+    if left_length > right_length { return 2; }
+    return 1;
+}
+
+unsafe fn bytes_equal(
+    left: *const u8,
+    right: *const u8,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if byte_at(left, index) != byte_at(right, index) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn take(reader: *mut BodyReader, length: usize) -> *const u8 {
+    if (*reader).failed != 0 || length > (*reader).length
+        || (*reader).cursor > (*reader).length - length {
+        (*reader).failed = 1;
+        return 0 as *const u8;
+    }
+    let result: *const u8 = (*reader).source + (*reader).cursor;
+    (*reader).cursor += length;
+    return result;
+}
+
+unsafe fn take_u8(reader: *mut BodyReader) -> u64 {
+    let source: *const u8 = take(reader, 1);
+    if source as usize == 0 { return 0; }
+    return byte_at(source, 0);
+}
+
+unsafe fn take_u16(reader: *mut BodyReader) -> u64 {
+    let source: *const u8 = take(reader, 2);
+    if source as usize == 0 { return 0; }
+    return (byte_at(source, 0) << 8) | byte_at(source, 1);
+}
+
+unsafe fn take_u32(reader: *mut BodyReader) -> u64 {
+    let source: *const u8 = take(reader, 4);
+    if source as usize == 0 { return 0; }
+    return (byte_at(source, 0) << 24) | (byte_at(source, 1) << 16)
+        | (byte_at(source, 2) << 8) | byte_at(source, 3);
+}
+
+unsafe fn take_u64(reader: *mut BodyReader) -> u64 {
+    let high: u64 = take_u32(reader);
+    let low: u64 = take_u32(reader);
+    return (high << 32) | low;
+}
+
+unsafe fn take_zeros(reader: *mut BodyReader, length: usize) -> bool {
+    let source: *const u8 = take(reader, length);
+    if source as usize == 0 { return false; }
+    let mut index: usize = 0;
+    while index < length {
+        if byte_at(source, index) != 0 { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn token_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0
+        || length > WORLD_RECEIPT_MAX_IDENTIFIER_BYTES {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        let value: u64 = byte_at(source, index);
+        if !((value >= b'a' as u64 && value <= b'z' as u64)
+            || (value >= b'0' as u64 && value <= b'9' as u64)
+            || (index != 0 && (value == b'.' as u64 || value == b'_' as u64
+                || value == b'-' as u64 || value == b'/' as u64
+                || value == b'+' as u64))) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn take_token(
+    reader: *mut BodyReader,
+    token: *mut *const u8,
+    length: *mut usize
+) -> bool {
+    let count: usize = take_u16(reader) as usize;
+    let source: *const u8 = take(reader, count);
+    if (*reader).failed != 0 || !token_valid(source, count) { return false; }
+    *token = source;
+    *length = count;
+    return true;
+}
+
+unsafe fn take_digest(reader: *mut BodyReader) -> *const u8 {
+    let source: *const u8 = take(reader, 32);
+    if source as usize == 0 { return source; }
+    let mut nonzero: u64 = 0;
+    let mut index: usize = 0;
+    while index < 32 {
+        nonzero = nonzero | byte_at(source, index);
+        index += 1;
+    }
+    if nonzero == 0 { (*reader).failed = 1; }
+    return source;
+}
+
+unsafe fn take_identity(
+    reader: *mut BodyReader,
+    expected_kind: u64,
+    output: *mut IdentityRecord,
+    scratch: *mut ReceiptValidationScratch,
+    raw: *mut *const u8,
+    raw_length: *mut usize
+) -> bool {
+    let length: usize = take_u16(reader) as usize;
+    let source: *const u8 = take(reader, length);
+    if (*reader).failed != 0 || length == 0 || length > 1024
+        || decode_identity(source, length, output, (*scratch).identity_staged,
+            (*scratch).identity_staged_capacity) != 1
+        || record_kind(output as *const IdentityRecord) != expected_kind {
+        return false;
+    }
+    *raw = source;
+    *raw_length = length;
+    return true;
+}
+
+unsafe fn take_count(reader: *mut BodyReader, maximum: usize) -> usize {
+    let count: usize = take_u16(reader) as usize;
+    if count > maximum { (*reader).failed = 1; }
+    return count;
+}
+
+pub unsafe fn validate_unsigned_body(
+    source: *const u8,
+    length: usize,
+    scratch: *mut ReceiptValidationScratch
+) -> u64 {
+    if source as usize == 0 || scratch as usize == 0 || length == 0
+        || length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES {
+        return 0;
+    }
+    let mut reader: BodyReader = BodyReader {
+        source: source,
+        length: length,
+        cursor: 0,
+        failed: 0,
+    };
+    let mut raw: *const u8 = 0 as *const u8;
+    let mut raw_length: usize = 0;
+    if !take_identity((&mut reader), IDENTITY_KIND_RECEIPT, (*scratch).receipt,
+        scratch, (&mut raw), (&mut raw_length))
+        || !take_identity((&mut reader), IDENTITY_KIND_WORLD, (*scratch).world,
+            scratch, (&mut raw), (&mut raw_length))
+        || !take_identity((&mut reader), IDENTITY_KIND_GOVERNOR, (*scratch).governor,
+            scratch, (&mut raw), (&mut raw_length))
+        || !take_identity((&mut reader), IDENTITY_KIND_ATTEMPT, (*scratch).attempt,
+            scratch, (&mut raw), (&mut raw_length))
+        || !take_identity((&mut reader), IDENTITY_KIND_NODE, (*scratch).node,
+            scratch, (&mut raw), (&mut raw_length))
+        || !take_identity((&mut reader), IDENTITY_KIND_DOMAIN, (*scratch).domain,
+            scratch, (&mut raw), (&mut raw_length)) {
+        return 0;
+    }
+    let mut process_present: bool = true;
+    if reader.cursor + 2 > reader.length { return 0; }
+    if byte_at(reader.source, reader.cursor) == 0
+        && byte_at(reader.source, reader.cursor + 1) == 0 {
+        take_u16((&mut reader));
+        process_present = false;
+    } else {
+        if !take_identity((&mut reader), IDENTITY_KIND_PROCESS, (*scratch).process,
+            scratch, (&mut raw), (&mut raw_length)) {
+            return 0;
+        }
+    }
+    let mut process_record: *const IdentityRecord = 0 as *const IdentityRecord;
+    if process_present { process_record = (*scratch).process as *const IdentityRecord; }
+    if !receipt_context_is_bound(
+        (*scratch).receipt as *const IdentityRecord,
+        (*scratch).world as *const IdentityRecord,
+        (*scratch).governor as *const IdentityRecord,
+        (*scratch).node as *const IdentityRecord,
+        (*scratch).domain as *const IdentityRecord,
+        process_record,
+        (*scratch).attempt as *const IdentityRecord
+    ) {
+        return 0;
+    }
+
+    let mask: u64 = take_u8((&mut reader));
+    if mask == 0 || mask > RECEIPT_DIGEST_MASK
+        || !take_zeros((&mut reader), 3) {
+        return 0;
+    }
+    let mut bit: u64 = 1;
+    while bit <= RECEIPT_DIGEST_EFFECTS {
+        if (mask & bit) != 0 && take_digest((&mut reader)) as usize == 0 { return 0; }
+        bit = bit << 1;
+    }
+
+    let component_count: usize = take_count((&mut reader), WORLD_RECEIPT_MAX_COMPONENTS);
+    let mut prior_kind: u64 = 0;
+    let mut prior_token: *const u8 = 0 as *const u8;
+    let mut prior_token_length: usize = 0;
+    let mut prior_generation: u64 = 0;
+    let mut index: usize = 0;
+    while index < component_count {
+        let kind: u64 = take_u8((&mut reader));
+        if kind < 1 || kind > 3 || !take_zeros((&mut reader), 3) { return 0; }
+        let generation: u64 = take_u64((&mut reader));
+        if kind != 1 && generation == 0 { return 0; }
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token((&mut reader), (&mut token), (&mut token_length))
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+        if index != 0 {
+            if kind < prior_kind { return 0; }
+            if kind == prior_kind {
+                let order: u64 = bytes_order(prior_token, prior_token_length,
+                    token, token_length);
+                if order == 2 || (order == 1 && generation <= prior_generation) {
+                    return 0;
+                }
+            }
+        }
+        prior_kind = kind;
+        prior_token = token;
+        prior_token_length = token_length;
+        prior_generation = generation;
+        index += 1;
+    }
+
+    let capability_count: usize = take_count((&mut reader),
+        WORLD_RECEIPT_MAX_CAPABILITIES);
+    let mut prior_raw: *const u8 = 0 as *const u8;
+    let mut prior_raw_length: usize = 0;
+    index = 0;
+    while index < capability_count {
+        if !take_identity((&mut reader), IDENTITY_KIND_CAPABILITY,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord)
+            || (index != 0 && bytes_order(prior_raw, prior_raw_length,
+                raw, raw_length) != 0) {
+            return 0;
+        }
+        prior_raw = raw;
+        prior_raw_length = raw_length;
+        let rights_count: usize = take_count((&mut reader), WORLD_RECEIPT_MAX_RIGHTS);
+        if rights_count == 0 { return 0; }
+        let mut prior_right: *const u8 = 0 as *const u8;
+        let mut prior_right_length: usize = 0;
+        let mut right: usize = 0;
+        while right < rights_count {
+            let mut token: *const u8 = 0 as *const u8;
+            let mut token_length: usize = 0;
+            if !take_token((&mut reader), (&mut token), (&mut token_length))
+                || (right != 0 && bytes_order(prior_right,
+                    prior_right_length, token, token_length) != 0) {
+                return 0;
+            }
+            prior_right = token;
+            prior_right_length = token_length;
+            right += 1;
+        }
+        index += 1;
+    }
+
+    let object_count: usize = take_count((&mut reader), WORLD_RECEIPT_MAX_OBJECTS);
+    prior_raw = 0 as *const u8;
+    prior_raw_length = 0;
+    index = 0;
+    while index < object_count {
+        if !take_identity((&mut reader), IDENTITY_KIND_OBJECT,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord)
+            || (index != 0 && bytes_order(prior_raw, prior_raw_length,
+                raw, raw_length) != 0) {
+            return 0;
+        }
+        prior_raw = raw;
+        prior_raw_length = raw_length;
+        let role: u64 = take_u8((&mut reader));
+        if role < 1 || role > 4 || !take_zeros((&mut reader), 3)
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+        take_u64((&mut reader));
+        index += 1;
+    }
+
+    let capsule_count: usize = take_count((&mut reader), WORLD_RECEIPT_MAX_CAPSULES);
+    let mut prior_digest: *const u8 = 0 as *const u8;
+    prior_token = 0 as *const u8;
+    prior_token_length = 0;
+    index = 0;
+    while index < capsule_count {
+        let digest: *const u8 = take_digest((&mut reader));
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if digest as usize == 0
+            || !take_token((&mut reader), (&mut token), (&mut token_length))
+            || !take_identity((&mut reader), IDENTITY_KIND_NODE,
+                (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord) {
+            return 0;
+        }
+        if index != 0 {
+            let digest_order: u64 = bytes_order(prior_digest, 32, digest, 32);
+            if digest_order == 2 || (digest_order == 1
+                && bytes_order(prior_token, prior_token_length,
+                    token, token_length) != 0) {
+                return 0;
+            }
+        }
+        prior_digest = digest;
+        prior_token = token;
+        prior_token_length = token_length;
+        index += 1;
+    }
+
+    let effect_count: usize = take_count((&mut reader), WORLD_RECEIPT_MAX_EFFECTS);
+    prior_raw = 0 as *const u8;
+    prior_raw_length = 0;
+    index = 0;
+    while index < effect_count {
+        if !take_identity((&mut reader), IDENTITY_KIND_RESOURCE,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord)
+            || (index != 0 && bytes_order(prior_raw, prior_raw_length,
+                raw, raw_length) != 0)
+            || take_digest((&mut reader)) as usize == 0
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+        prior_raw = raw;
+        prior_raw_length = raw_length;
+        index += 1;
+    }
+
+    let rejection_count: usize = take_count((&mut reader),
+        WORLD_RECEIPT_MAX_REJECTIONS);
+    index = 0;
+    while index < rejection_count {
+        if !take_identity((&mut reader), IDENTITY_KIND_NODE,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord)
+            || record_is_current((*scratch).node as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord) {
+            return 0;
+        }
+        if index != 0 && node_record_order(
+            (*scratch).prior as *const IdentityRecord,
+            (*scratch).current as *const IdentityRecord
+        ) != IDENTITY_ORDER_LESS {
+            return 0;
+        }
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token((&mut reader), (&mut token), (&mut token_length)) { return 0; }
+        let swap: *mut IdentityRecord = (*scratch).prior;
+        (*scratch).prior = (*scratch).current;
+        (*scratch).current = swap;
+        index += 1;
+    }
+
+    let checkpoint_count: usize = take_count((&mut reader),
+        WORLD_RECEIPT_MAX_CHECKPOINTS);
+    prior_raw = 0 as *const u8;
+    prior_raw_length = 0;
+    index = 0;
+    while index < checkpoint_count {
+        if !take_identity((&mut reader), IDENTITY_KIND_CHECKPOINT,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !records_share_world((*scratch).world as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord)
+            || !checkpoint_belongs_to_attempt(
+                (*scratch).current as *const IdentityRecord,
+                (*scratch).attempt as *const IdentityRecord)
+            || (index != 0 && bytes_order(prior_raw, prior_raw_length,
+                raw, raw_length) != 0)
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+        prior_raw = raw;
+        prior_raw_length = raw_length;
+        let recovered: u64 = take_u8((&mut reader));
+        if recovered > 1 || !take_zeros((&mut reader), 3) { return 0; }
+        index += 1;
+    }
+
+    let terminal: u64 = take_u8((&mut reader));
+    if terminal < RECEIPT_TERMINAL_SUCCESS || terminal > RECEIPT_TERMINAL_STOPPED
+        || !take_zeros((&mut reader), 3) {
+        return 0;
+    }
+    if terminal == RECEIPT_TERMINAL_SUCCESS {
+        let value_length: usize = take_u32((&mut reader)) as usize;
+        let value_source: *const u8 = take((&mut reader), value_length);
+        if value_source as usize == 0 || value_length < WORLD_VALUE_MIN_BYTES
+            || value_length > WORLD_VALUE_MAX_BYTES
+            || decode_value(value_source, value_length, WORLD_VALUE_MAX_BYTES,
+                (*scratch).value, (*scratch).value_codec) != 1 {
+            return 0;
+        }
+        let mut reencoded_length: usize = 0;
+        if encode_value((*scratch).value as *const ValueArena,
+            (*scratch).value_reencoded, (*scratch).value_reencoded_capacity,
+            (&mut reencoded_length), (*scratch).value_codec) != 1
+            || reencoded_length != value_length
+            || !bytes_equal(value_source,
+                (*scratch).value_reencoded as *const u8,
+                value_length) {
+            return 0;
+        }
+    }
+    if terminal == RECEIPT_TERMINAL_FAILURE {
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token((&mut reader), (&mut token), (&mut token_length))
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+    }
+
+    let commit: u64 = take_u8((&mut reader));
+    if commit > RECEIPT_COMMIT_COMMITTED || !take_zeros((&mut reader), 3) {
+        return 0;
+    }
+    if commit == RECEIPT_COMMIT_COMMITTED {
+        if !take_identity((&mut reader), IDENTITY_KIND_GOVERNOR,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !governor_fence_matches(
+                (*scratch).governor as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord) {
+            return 0;
+        }
+    }
+
+    let evidence: u64 = take_u8((&mut reader));
+    if evidence > 1 || !take_zeros((&mut reader), 3) { return 0; }
+    if evidence == 1 {
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token((&mut reader), (&mut token), (&mut token_length))
+            || take_digest((&mut reader)) as usize == 0 {
+            return 0;
+        }
+    }
+    if reader.failed != 0 || reader.cursor != reader.length { return 0; }
+    return 1;
+}
+
+// A decoded view borrows one immutable staged record owned by ReceiptScratch.
+// The public key is deliberately absent; callers must obtain it from an
+// independently trusted allowlist before applying signature verification.
+pub struct SignedReceipt {
+    source: *const u8,
+    total_length: usize,
+    unsigned: *const u8,
+    unsigned_length: usize,
+    signer_key_id: *const u8,
+    signature: *const u8,
+}
+
+pub unsafe fn clear(receipt: *mut SignedReceipt) -> u64 {
+    if receipt as usize == 0 { return 0; }
+    (*receipt).source = 0 as *const u8;
+    (*receipt).total_length = 0;
+    (*receipt).unsigned = 0 as *const u8;
+    (*receipt).unsigned_length = 0;
+    (*receipt).signer_key_id = 0 as *const u8;
+    (*receipt).signature = 0 as *const u8;
+    return 1;
+}
+
+pub unsafe fn install(
+    receipt: *mut SignedReceipt,
+    source: *const u8,
+    total_length: usize,
+    unsigned: *const u8,
+    unsigned_length: usize,
+    signer_key_id: *const u8,
+    signature: *const u8
+) -> u64 {
+    if receipt as usize == 0 || source as usize == 0
+        || unsigned as usize == 0 || signer_key_id as usize == 0
+        || signature as usize == 0 || total_length < WORLD_RECEIPT_MIN_BYTES
+        || total_length > WORLD_RECEIPT_MAX_BYTES
+        || unsigned_length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES {
+        return 0;
+    }
+    (*receipt).source = source;
+    (*receipt).total_length = total_length;
+    (*receipt).unsigned = unsigned;
+    (*receipt).unsigned_length = unsigned_length;
+    (*receipt).signer_key_id = signer_key_id;
+    (*receipt).signature = signature;
+    return 1;
+}
+
+pub unsafe fn source(receipt: *const SignedReceipt) -> *const u8 {
+    if receipt as usize == 0 { return 0 as *const u8; }
+    return (*receipt).source;
+}
+
+pub unsafe fn total_length(receipt: *const SignedReceipt) -> usize {
+    if receipt as usize == 0 { return 0; }
+    return (*receipt).total_length;
+}
+
+pub unsafe fn unsigned_bytes(receipt: *const SignedReceipt) -> *const u8 {
+    if receipt as usize == 0 { return 0 as *const u8; }
+    return (*receipt).unsigned;
+}
+
+pub unsafe fn unsigned_length(receipt: *const SignedReceipt) -> usize {
+    if receipt as usize == 0 { return 0; }
+    return (*receipt).unsigned_length;
+}
+
+pub unsafe fn signer_key_id(receipt: *const SignedReceipt) -> *const u8 {
+    if receipt as usize == 0 { return 0 as *const u8; }
+    return (*receipt).signer_key_id;
+}
+
+pub unsafe fn signature(receipt: *const SignedReceipt) -> *const u8 {
+    if receipt as usize == 0 { return 0 as *const u8; }
+    return (*receipt).signature;
+}

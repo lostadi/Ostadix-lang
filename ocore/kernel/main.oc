@@ -13,6 +13,7 @@ use kernel::kernel_world_semantics::start as start_kernel_world_semantics;
 use kernel::world_identity_semantics::start as start_world_identity_semantics;
 use kernel::world_protocol_semantics::start as start_world_protocol_semantics;
 use kernel::world_value_semantics::start as start_world_value_semantics;
+use kernel::world_receipt_semantics::start as start_world_receipt_semantics;
 use runtime::capability::init as capabilities_init;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
@@ -139,6 +140,13 @@ unsafe fn start_portable_world_probe(probe_mode: u64) -> void {
         }
         interrupts_init();
         start_world_value_semantics(probe_mode);
+    }
+    if probe_mode == 30 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_world_receipt_semantics(probe_mode);
     }
 }
 
