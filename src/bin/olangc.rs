@@ -101,8 +101,15 @@ const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
 
 // world — shared governed identities and the non-authorizing grounding view.
 const RUNTIME_WORLD_MOD_RS: &str = include_str!("../world/mod.rs");
+const RUNTIME_WORLD_CODEC_RS: &str = include_str!("../world/codec.rs");
 const RUNTIME_WORLD_IDENTITY_RS: &str = include_str!("../world/identity.rs");
+const RUNTIME_WORLD_IDENTITY_WIRE_RS: &str = include_str!("../world/identity_wire.rs");
 const RUNTIME_WORLD_GROUNDING_RS: &str = include_str!("../world/grounding.rs");
+const RUNTIME_WORLD_PROTOCOL_RS: &str = include_str!("../world/protocol.rs");
+const RUNTIME_WORLD_RECEIPT_RS: &str = include_str!("../world/receipt.rs");
+const RUNTIME_WORLD_RECEIPT_CODEC_RS: &str = include_str!("../world/receipt_codec.rs");
+const RUNTIME_WORLD_VALUE_RS: &str = include_str!("../world/value.rs");
+const RUNTIME_WORLD_VALUE_CODEC_RS: &str = include_str!("../world/value_codec.rs");
 
 // hgraph — hypergraph substrate used by ir.rs and eval.rs at runtime.
 const RUNTIME_HGRAPH_MOD_RS: &str = include_str!("../hgraph/mod.rs");
@@ -735,8 +742,24 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     let world_dir = src_dir.join("world");
     fs::create_dir_all(&world_dir)?;
     fs::write(world_dir.join("mod.rs"), RUNTIME_WORLD_MOD_RS)?;
+    fs::write(world_dir.join("codec.rs"), RUNTIME_WORLD_CODEC_RS)?;
     fs::write(world_dir.join("identity.rs"), RUNTIME_WORLD_IDENTITY_RS)?;
+    fs::write(
+        world_dir.join("identity_wire.rs"),
+        RUNTIME_WORLD_IDENTITY_WIRE_RS,
+    )?;
     fs::write(world_dir.join("grounding.rs"), RUNTIME_WORLD_GROUNDING_RS)?;
+    fs::write(world_dir.join("protocol.rs"), RUNTIME_WORLD_PROTOCOL_RS)?;
+    fs::write(world_dir.join("receipt.rs"), RUNTIME_WORLD_RECEIPT_RS)?;
+    fs::write(
+        world_dir.join("receipt_codec.rs"),
+        RUNTIME_WORLD_RECEIPT_CODEC_RS,
+    )?;
+    fs::write(world_dir.join("value.rs"), RUNTIME_WORLD_VALUE_RS)?;
+    fs::write(
+        world_dir.join("value_codec.rs"),
+        RUNTIME_WORLD_VALUE_CODEC_RS,
+    )?;
 
     // ── hgraph — hypergraph substrate (used by ir.rs and eval.rs) ───────────
     let hgraph_dir = src_dir.join("hgraph");
@@ -1463,6 +1486,7 @@ which      = "6"
 semver     = {{ version = "1", features = ["serde"] }}
 sha2       = "0.10"
 hex        = "0.4"
+ed25519-dalek = "2"
 num-bigint = {{ version = "0.4", features = ["serde"] }}
 num-traits = "0.2"
 bitflags   = "2"
@@ -1658,8 +1682,15 @@ mod tests {
         for path in [
             "effects.rs",
             "world/mod.rs",
+            "world/codec.rs",
             "world/identity.rs",
+            "world/identity_wire.rs",
             "world/grounding.rs",
+            "world/protocol.rs",
+            "world/receipt.rs",
+            "world/receipt_codec.rs",
+            "world/value.rs",
+            "world/value_codec.rs",
             "hgraph/mod.rs",
             "hgraph/graph.rs",
             "hgraph/kinds.rs",
@@ -1690,6 +1721,12 @@ mod tests {
             RUNTIME_WORLD_IDENTITY_RS,
             "generated runtimes must receive governed identity types verbatim"
         );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("world/receipt_codec.rs")).unwrap(),
+            RUNTIME_WORLD_RECEIPT_CODEC_RS,
+            "generated runtimes must receive the signed receipt codec verbatim"
+        );
+        assert!(generate_cargo_toml("generated-runtime", false).contains("ed25519-dalek = \"2\""));
 
         fs::remove_dir_all(build_dir).unwrap();
     }

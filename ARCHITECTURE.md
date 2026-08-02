@@ -167,6 +167,20 @@ native `.oc` share a fixed 19-record, 928-byte oracle whose concatenated
 SHA-256 is `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`,
 and hosted projection rejects
 authority-bearing, capsule, live-reference, request, and other effectful forms.
+Mode 30 adds the separate self-framed `OWRECEIPT` v1 bounded execution-receipt
+layer. It binds descriptive World identities and generations, content digests,
+capability-right descriptions, terminal/commit fields, evidence-gate identity,
+and an algorithm-tagged signature envelope into canonical records and
+domain-separated signing preimages. Rust and native `.oc` converge on the fixed
+two-record, 3,239-byte corpus (SHA-256
+`1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`) and its
+1,575-byte current and 1,546-byte stale signing preimages. A pinned public
+conformance key drives real
+hosted Ed25519 sign/verify and tamper tests. Native `.oc` converges on receipt and
+signing-preimage bytes and rejects malformed signature envelopes, but does not
+claim a general freestanding Ed25519 verifier or trusted signer policy. The
+offline corpus is not yet emitted by the HGraph, project, live-system,
+KernelWorld, O-Git, or World evidence paths.
 Precise `ResourceKey` states can describe governed state without pretending
 that arbitrary hosted work has become mediated.
 `HostWorld` remains the residual umbrella for ambient host effects. No
@@ -174,7 +188,7 @@ production lowering emits these governed keys yet, and the optional grounding
 identity is caller-supplied rather than checked against a live snapshot. This
 type/effect foundation does not implement a distributed Governor, membership
 transport, resource registry, `/world` namespace, remote execution, placement,
-or current-epoch enforcement. The Mode 27 through Mode 29 QEMU gates pass no
+or current-epoch enforcement. The Mode 27 through Mode 30 QEMU gates pass no
 G0--G13 gate.
 The native product boundary and G0--G13
 dependency ladder are fixed in
