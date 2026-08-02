@@ -25,6 +25,7 @@ cd "$ROOT" || exit 2
 # wiring before scanning prose; the aggregate separately enforces every marker
 # against each gate's captured live transcript.
 python3 scripts/release_evidence.py validate
+python3 scripts/world_alpha_evidence.py --quiet
 
 # Bash 3.2, shipped by macOS, has arrays but not mapfile/readarray.  Keep the
 # NUL-delimited Git path list in a temporary file so spaces and glob characters
@@ -213,10 +214,9 @@ check_current_ocore_docs \
 check 'direct [`]*HostedSupervisor[`]* API[^.]*(do(es)? not|has no)[^.]*(revision|stale.writer)|direct supervisor API has no persisted-revision' \
     "the hosted supervisor API now rejects stale active-set writers by persisted revision"
 
-# Ostadix World v0 has one normative product contract. Keep the public entry
-# points linked to it and pin the contract sections and non-claims that prevent
-# a future distributed demo from being confused with the existing local
-# Live-World oracle, partial PR1 foundation, or bounded native modes.
+# Ostadix World has one native constitution plus one explicitly non-qualifying
+# hosted reference profile. Pin both truths so a hosted demo or bounded native
+# mode cannot silently acquire G0-G13 or Alpha credit.
 require_fixed() {
     local file="$1" text="$2" why="$3"
     if [ ! -f "$file" ]; then
@@ -234,77 +234,99 @@ require_fixed() {
 }
 
 require_fixed docs/OSTADIX_WORLD.md \
-    'Ostadix World is an elastic, capability-governed computational fabric.' \
-    'the normative product definition is missing'
+    'normative native Alpha constitution and implementation program' \
+    'the native constitutional status is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    'A computer is not a box. A computer is a governed membership of' \
+    'A computer is not a box. A computer is a governed structure of computational resources.' \
     'the governing statement is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '### Explicit v0 non-goals' \
-    'the explicit World v0 non-goals are missing'
+    'They do not satisfy the native release gates in this roadmap.' \
+    'the hosted-reference release exclusion is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '- coherent shared RAM across nodes;' \
-    'the coherent-memory v0 non-goal is missing'
+    '## 2.1 Ostadix World Alpha qualifying gate' \
+    'the native Alpha qualification section is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '- physical-device passthrough or physical-device reuse across nodes;' \
-    'the physical-device v0 non-goal is missing'
+    '**At least three physical machines boot O-core as the sovereign kernel.**' \
+    'the physical native-node minimum is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## Vocabulary and identity' \
-    'the generation-bound World vocabulary is missing'
+    '**The Governor is logically singular and physically replicated.**' \
+    'the replicated-Governor requirement is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    'Names and inventory are descriptive. They do not grant authority.' \
-    'the identity-is-not-authority rule is missing'
+    '**A real foreign Linux kernel runs as a contained KernelWorld.**' \
+    'the real-Linux KernelWorld requirement is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '- **lease**: time-bounded authority issued by the Governor.' \
-    'the renewable-lease vocabulary is missing'
+    '**A real physical device is controlled through the foreign-kernel machinery.**' \
+    'the physical-device requirement is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## The three crossing categories' \
+    '## 3.2 The three crossing kinds remain constitutional' \
     'the OValue/capability/capsule partition is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## Four-plane architecture' \
-    'the namespace/authority/execution/bulk-data separation is missing'
+    '## 3.4 The Governor consistency model is fixed now' \
+    'the replicated consistency model is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## Membership and partition policy' \
-    'the authoritative-Governor lease and partition policy is missing'
+    'A minority partition enters **island mode**.' \
+    'the minority-partition fencing rule is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '- stale generation-bound references and capabilities are rejected;' \
-    'the lease-expiry stale-authority rule is missing'
+    '## 3.6 The memory model is aggregate and explicit, not transparent DSM' \
+    'the honest aggregate-memory model is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    'World v0 does not implement consensus.' \
-    'the single-Governor consensus non-claim is missing'
+    '# 21. Integration gate ladder' \
+    'the G0-G13 convergence ladder is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## State machines' \
-    'the node and task state-machine contract is missing'
+    '**G0 -- constitutional baseline**' \
+    'the G0 definition is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '-> Admitted(generation N+1, new lease)' \
-    'the fresh node-generation transition is missing'
+    '**G13 -- eight-node World Alpha**' \
+    'the G13 definition is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    'ResultPendingCommit -> FencedLateResult' \
-    'the late task-result fencing transition is missing'
+    '# 28. Alpha non-claims' \
+    'the Alpha non-claim section is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## First hosted demo claim boundary' \
-    'the first-demo claims and non-claims are missing'
+    '- uniform coherent RAM across nodes;' \
+    'the coherent-RAM non-claim is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    'general 9P, Linux or Plan 9 boot, a distributed Linux ABI,' \
-    'the general-9P, OS-boot, and distributed-ABI non-claims are missing'
-require_fixed docs/OSTADIX_WORLD.md \
-    'coherent memory, transparent migration, KVM/SVM hardware isolation, PCI or' \
-    'the memory, migration, hardware-virtualization, and PCI non-claims are missing'
-require_fixed docs/OSTADIX_WORLD.md \
-    'repository has no completed distributed Governor' \
-    'the current no-Governor implementation boundary is missing'
-require_fixed docs/OSTADIX_WORLD.md \
-    'No production lowering currently emits' \
-    'the partial PR1 production-lowering boundary is missing'
-require_fixed docs/OSTADIX_WORLD.md \
-    'Current-snapshot enforcement is absent.' \
-    'the partial PR1 current-snapshot boundary is missing'
+    'gate is not implemented merely because it is defined here or in the registry.' \
+    'the definition-is-not-evidence rule is missing'
 
-for file in README.md docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
+require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
+    'non-qualifying for native Ostadix' \
+    'the hosted profile is not explicitly non-qualifying'
+require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
+    'cannot satisfy G0 through G13' \
+    'the hosted profile could be misread as gate evidence'
+require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
+    'G12, G13, or the name **Ostadix World Alpha**' \
+    'the hosted profile Alpha non-claim is missing'
+
+require_fixed docs/CLAIMS.md \
+    'gate is `defined`; zero gates are `passed`, including G0 and G13.' \
+    'the current zero-passed-gate boundary is missing'
+require_fixed docs/CLAIMS.md \
+    "Mode 23's synthetic guest is not G7 or G8" \
+    'the bounded KernelWorld substitution guard is missing'
+require_fixed docs/OSTADIX_WORLD.md \
+    'Schema v1 admits no evidence records; only a future versioned,' \
+    'the definition-only evidence boundary is missing'
+
+for file in README.md llms.txt docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
     okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md
 do
     require_fixed "$file" 'OSTADIX_WORLD.md' \
-        "$file does not link the normative World v0 contract"
+        "$file does not link the native World constitution"
+done
+
+for file in README.md ARCHITECTURE.md docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
+    docs/RELEASE_CHECKLIST.md
+do
+    require_fixed "$file" 'world_alpha_gates.toml' \
+        "$file does not link the G0-G13 qualification registry"
+done
+
+for file in README.md llms.txt ARCHITECTURE.md docs/CLAIMS.md \
+    okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md
+do
+    require_fixed "$file" 'HOSTED_WORLD_REFERENCE_PROFILE.md' \
+        "$file does not preserve the hosted reference as non-qualifying"
 done
 
 check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26) is the next[^.]*slice' \

@@ -14,10 +14,12 @@ implementation plan for this repository. It is a claim boundary as well as a
 roadmap. Items described as planned are not implemented merely because their
 types, syscall numbers, setup scripts, or names already exist in source.
 
-The separate distributed-fabric product contract is
-[`OSTADIX_WORLD.md`](OSTADIX_WORLD.md). An O-Domain may later run on a World
-node, but the bounded native gates in this roadmap do not establish a
-distributed Governor, node membership, resource registry, or placement layer.
+The separate native distributed-fabric constitution is
+[`OSTADIX_WORLD.md`](OSTADIX_WORLD.md), with qualification rules in
+[`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml). An O-Domain may
+later run on a World node, but the bounded native gates in this roadmap do not
+establish a replicated Governor, native node membership, WorldFS, physical
+resource registry, or distributed placement layer.
 
 ## 1. Scope and terminology
 

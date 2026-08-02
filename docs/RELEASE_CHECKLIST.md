@@ -31,6 +31,8 @@ cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- 
 cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 python3 scripts/smoke_ostadix_mcp.py
 python3 scripts/release_evidence.py validate
+python3 scripts/world_alpha_evidence.py
+python3 -m unittest -v tests.test_world_alpha_evidence
 ./boot-and-test.sh smoke
 python3 -m tests.test_parser
 python3 tests/example_manifest.py validate
@@ -42,6 +44,18 @@ cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --b
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
+
+The World Alpha registry in
+[`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a
+qualification schema, not an additional set of portable release commands. Its
+checked-in baseline must report 14 defined entries--G0 plus 13 integration
+gates through G13--zero passed gates, and `G13 DEFINED`. Schema v1 rejects every
+`passed` status and every nonempty evidence list. The first passage requires a
+new typed attestation schema binding the exact gate, source commit, commands,
+transcripts, artifact digests,
+hardware/topology inventory, and required signatures. Hosted reference and
+virtual multinode classes can never be substituted for physical/native
+qualification.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
 The portable native release surface contains exactly **17** required
@@ -120,7 +134,10 @@ present in the release. Git symlinks are refused rather than encoded as archive
 members, and verification requires the writer's canonical ZIP metadata and
 layout. It also parses, without importing or executing released code,
 `.mcp.json`, the MCP crate metadata/license, `examples/manifest.json`, and
-`evidence/gates.toml`, then proves their required archive-local references.
+`evidence/gates.toml`, then proves their required archive-local references. For
+World Alpha version 1 it also verifies sealed bytes for the native
+constitution, hosted reference profile, and definition-only
+`evidence/world_alpha_gates.toml`, and inertly validates the registry structure.
 The allowlisted surface includes the separate `mcp/ostadix_lang_mcp_server`
 crate, the root LGPL-2.1 license, `.mcp.json`, its direct stdio smoke client, and
 the focused MCP/example regression tests. CI tests and lints that crate with its

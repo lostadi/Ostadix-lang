@@ -155,15 +155,20 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "mcp/ostadix_lang_mcp_server/src/main.rs",
         "README.md",
         "boot-and-test.sh",
+        "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+        "docs/OSTADIX_WORLD.md",
         "evidence/gates.toml",
+        "evidence/world_alpha_gates.toml",
         "examples/manifest.json",
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
         "scripts/smoke_ostadix_mcp.py",
         "scripts/release_evidence.py",
+        "scripts/world_alpha_evidence.py",
         "tests/example_manifest.py",
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
+        "tests/test_world_alpha_evidence.py",
     }
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
@@ -177,6 +182,40 @@ EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
 EXPECTED_REQUIRED_EVIDENCE_GATES = 17
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
+
+# These three files jointly define the version-1 native World constitution and
+# its definition-only G0-G13 registry.  Source releases are built from arbitrary
+# committed refs and archive verification must not execute the Python shipped in
+# an untrusted ZIP, so keep trusted byte seals here and recheck the inert data
+# below.  Any intentional constitutional edit requires an explicit seal update.
+SEALED_WORLD_ALPHA_SHA256 = {
+    "docs/OSTADIX_WORLD.md": (
+        "bf8ad9d9020e5e4e5eb2e35dbd9b2f88d20c9d19ccd1869434ead1b7b1ffa683"
+    ),
+    "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
+        "c00b3281f44060ea87089960cbb525307741a096a254b8a32dad917ff4cca186"
+    ),
+    "evidence/world_alpha_gates.toml": (
+        "43e8de06af84e0adc410c37f738bc6ae7803dbc68e2a6a5e7326655f70034c7b"
+    ),
+}
+EXPECTED_WORLD_ALPHA_GATE_IDS = tuple(f"G{number}" for number in range(14))
+EXPECTED_WORLD_ALPHA_CLASS_IDS = (
+    "repository_conformance",
+    "hosted_reference",
+    "qemu_tcg_x86_64",
+    "qemu_tcg_aarch64",
+    "qemu_virtualization",
+    "hardware_x86_64",
+    "hardware_x86_64_iommu",
+    "hardware_aarch64",
+    "hardware_aarch64_smmu",
+    "multinode_virtual",
+    "multinode_physical",
+    "fault_injection",
+    "security_adversarial",
+    "performance_characterization",
+)
 
 
 class ReleaseError(RuntimeError):
@@ -1096,6 +1135,161 @@ def _validate_evidence_manifest(
         raise ReleaseError(f"{path} supplemental_gate_count does not match gate tables")
 
 
+def _sealed_world_alpha_text(
+    files: dict[str, bytes], modes: dict[str, str], path: str
+) -> str:
+    if modes.get(path) != "100644":
+        raise ReleaseError(f"{path} must use release mode 100644")
+    expected = SEALED_WORLD_ALPHA_SHA256[path]
+    actual = hashlib.sha256(files[path]).hexdigest()
+    if actual != expected:
+        raise ReleaseError(
+            f"{path} SHA-256 differs from sealed World Alpha v1 bytes; "
+            f"expected {expected}, got {actual}"
+        )
+    try:
+        return files[path].decode("utf-8", "strict")
+    except UnicodeDecodeError as error:  # The seal makes this corruption-only.
+        raise ReleaseError(f"{path} is not valid UTF-8") from error
+
+
+def _validate_world_alpha_release_surface(
+    files: dict[str, bytes], modes: dict[str, str]
+) -> None:
+    texts = {
+        path: _sealed_world_alpha_text(files, modes, path)
+        for path in SEALED_WORLD_ALPHA_SHA256
+    }
+    required_document_markers = {
+        "docs/OSTADIX_WORLD.md": (
+            "# Ostadix World: Full-Stack Machine-Constructor Roadmap",
+            "**Status:** normative native Alpha constitution and implementation program,",
+            "| **G0 -- constitutional baseline** |",
+            "| **G13 -- eight-node World Alpha** |",
+            "Its first schema is definition-only and cannot certify a passage;",
+            "# 28. Alpha non-claims",
+        ),
+        "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
+            "# Hosted World Reference Profile",
+            "**Status:** design/reference profile with partial hosted foundations;",
+            "non-qualifying for native Ostadix World release gates.",
+            "cannot satisfy G0 through G13",
+            "## Non-claims",
+            "G12, G13, or the name **Ostadix World Alpha**.",
+        ),
+    }
+    for path, markers in required_document_markers.items():
+        for marker in markers:
+            if marker not in texts[path]:
+                raise ReleaseError(f"{path} is missing required World Alpha marker {marker!r}")
+
+    path = "evidence/world_alpha_gates.toml"
+    manifest = _strict_toml(files[path], path)
+    expected_root_keys = {
+        "schema_version",
+        "constitution_version",
+        "constitution",
+        "hosted_reference_profile",
+        "alpha_gate",
+        "gate_count",
+        "evidence_class",
+        "gate",
+    }
+    if set(manifest) != expected_root_keys:
+        raise ReleaseError(f"{path} root keys differ from schema")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    if (
+        type(manifest["constitution_version"]) is not int
+        or manifest["constitution_version"] != 1
+    ):
+        raise ReleaseError(f"{path} constitution_version must be 1")
+    if manifest["constitution"] != "docs/OSTADIX_WORLD.md":
+        raise ReleaseError(f"{path} constitution must reference docs/OSTADIX_WORLD.md")
+    if manifest["hosted_reference_profile"] != (
+        "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+    ):
+        raise ReleaseError(
+            f"{path} hosted_reference_profile must reference "
+            "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+        )
+    if manifest["alpha_gate"] != "G13":
+        raise ReleaseError(f"{path} alpha_gate must be G13")
+    if type(manifest["gate_count"]) is not int or manifest["gate_count"] != 14:
+        raise ReleaseError(f"{path} gate_count must be 14")
+
+    evidence_classes = manifest["evidence_class"]
+    if not isinstance(evidence_classes, list):
+        raise ReleaseError(f"{path} evidence_class must be a list of tables")
+    class_ids: list[str] = []
+    for index, evidence_class in enumerate(evidence_classes):
+        owner = f"{path} evidence_class[{index}]"
+        if not isinstance(evidence_class, dict) or set(evidence_class) != {
+            "id",
+            "scope",
+            "description",
+        }:
+            raise ReleaseError(f"{owner} keys differ from schema")
+        class_ids.append(_required_string(evidence_class["id"], f"{owner}.id"))
+        _required_string(evidence_class["scope"], f"{owner}.scope")
+        _required_string(evidence_class["description"], f"{owner}.description")
+    if tuple(class_ids) != EXPECTED_WORLD_ALPHA_CLASS_IDS:
+        raise ReleaseError(f"{path} evidence-class IDs or order differ from schema")
+    known_classes = set(class_ids)
+
+    gates = manifest["gate"]
+    if not isinstance(gates, list) or len(gates) != 14:
+        raise ReleaseError(f"{path} must contain exactly 14 gate tables")
+    gate_ids: list[str] = []
+    expected_gate_keys = {
+        "id",
+        "title",
+        "status",
+        "depends_on",
+        "required_classes",
+        "one_of_classes",
+        "acceptance",
+        "prohibited_substitutes",
+        "evidence",
+    }
+    for index, gate in enumerate(gates):
+        owner = f"{path} gate[{index}]"
+        if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
+            raise ReleaseError(f"{owner} keys differ from schema")
+        gate_ids.append(_required_string(gate["id"], f"{owner}.id"))
+        _required_string(gate["title"], f"{owner}.title")
+        if gate["status"] != "defined":
+            raise ReleaseError(f"{owner}.status must remain 'defined' in schema v1")
+        dependencies = _required_string_list(gate["depends_on"], f"{owner}.depends_on")
+        unknown_dependencies = set(dependencies) - set(EXPECTED_WORLD_ALPHA_GATE_IDS)
+        if unknown_dependencies:
+            raise ReleaseError(f"{owner}.depends_on references an unknown gate")
+        required_classes = _required_string_list(
+            gate["required_classes"], f"{owner}.required_classes", minimum=1
+        )
+        if set(required_classes) - known_classes:
+            raise ReleaseError(f"{owner}.required_classes references an unknown class")
+        alternatives = gate["one_of_classes"]
+        if not isinstance(alternatives, list):
+            raise ReleaseError(f"{owner}.one_of_classes must be a list")
+        for group_index, group in enumerate(alternatives):
+            choices = _required_string_list(
+                group, f"{owner}.one_of_classes[{group_index}]", minimum=1
+            )
+            if set(choices) - known_classes:
+                raise ReleaseError(f"{owner}.one_of_classes references an unknown class")
+        _required_string(gate["acceptance"], f"{owner}.acceptance")
+        _required_string_list(
+            gate["prohibited_substitutes"],
+            f"{owner}.prohibited_substitutes",
+            minimum=1,
+        )
+        if gate["evidence"] != []:
+            raise ReleaseError(f"{owner}.evidence must remain empty in schema v1")
+    if tuple(gate_ids) != EXPECTED_WORLD_ALPHA_GATE_IDS:
+        raise ReleaseError(f"{path} gate IDs or order differ from G0 through G13")
+
+
 def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:
     """Validate inert release metadata and every archive-local reference."""
 
@@ -1106,6 +1300,7 @@ def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:
     _validate_mcp_release_surface(files, modes)
     _validate_example_manifest(files)
     _validate_evidence_manifest(files, modes)
+    _validate_world_alpha_release_surface(files, modes)
 
 
 def _canonical_json(value: object) -> bytes:
