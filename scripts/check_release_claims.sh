@@ -304,6 +304,27 @@ require_fixed docs/CLAIMS.md \
 require_fixed docs/CLAIMS.md \
     "Mode 23's synthetic guest is not G7 or G8" \
     'the bounded KernelWorld substitution guard is missing'
+require_fixed docs/CLAIMS.md \
+    'All 20 identity atoms named by' \
+    'the complete shared World identity vocabulary is missing'
+require_fixed docs/CLAIMS.md \
+    'A serialized `CapabilityId` is descriptive data' \
+    'serialized identity must not be promoted to capability authority'
+require_fixed docs/CLAIMS.md \
+    "This is not PR3's" \
+    'the bounded identity codec is not separated from the future general wire protocol'
+require_fixed docs/CLAIMS.md \
+    'Strict decoding rejects malformed' \
+    'invalid-record rejection must remain a decoder claim'
+require_fixed docs/CLAIMS.md \
+    'current/reference checks reject stale generations' \
+    'staleness must remain a current/reference comparison claim'
+require_fixed docs/OSTADIX_WORLD.md \
+    '20-atom Rust/`.oc` vocabulary' \
+    'the shared-identity Move 2 status is missing'
+require_fixed README.md \
+    'passes no G0--G13 gate.' \
+    'the Mode 27 identity slice could be misread as Alpha qualification'
 require_fixed docs/OSTADIX_WORLD.md \
     'Schema v1 admits no evidence records; only a future versioned,' \
     'the definition-only evidence boundary is missing'
@@ -329,7 +350,7 @@ do
         "$file does not preserve the hosted reference as non-qualifying"
 done
 
-check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26) is the next[^.]*slice' \
-    "Modes 24-26 and KernelWorld Mode 23 are bounded implemented gates, not wholly planned next slices"
+check 'M7.?M11[^.]*(are|remain)[^.]*(all )?planned|next PR[^.]*M7[^.]*slice.?1|Mode (23|24|25|26|27) is the next[^.]*slice' \
+    "Modes 24-27 and KernelWorld Mode 23 are bounded implemented gates, not wholly planned next slices"
 
 exit $fail

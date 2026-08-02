@@ -31,6 +31,8 @@ cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- 
 cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
 python3 scripts/smoke_ostadix_mcp.py
 python3 scripts/release_evidence.py validate
+cargo test --test world_identity_wire
+./ocore/kernel/smoke-world-identity-qemu.sh
 python3 scripts/world_alpha_evidence.py
 python3 -m unittest -v tests.test_world_alpha_evidence
 ./boot-and-test.sh smoke
@@ -58,7 +60,7 @@ virtual multinode classes can never be substituted for physical/native
 qualification.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
-The portable native release surface contains exactly **17** required
+The portable native release surface contains exactly **18** required
 QEMU gates. `evidence/gates.toml` is authoritative; the aggregate, CI, this
 checklist, and the README status table are validated projections. After each
 successful gate, the aggregate requires every manifest marker exactly once in
@@ -72,22 +74,23 @@ python3 scripts/release_evidence.py validate
 | Order | Gate | Milestone | Class | Script |
 |------:|------|-----------|-------|--------|
 | 1 | `ocore-bootstrap` | M0.1-M0.3 | `portable_tcg` | `ocore/kernel/smoke-qemu.sh` |
-| 2 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
-| 3 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
-| 4 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
-| 5 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
-| 6 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
-| 7 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
-| 8 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
-| 9 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
-| 10 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
-| 11 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
-| 12 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
-| 13 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
-| 14 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
-| 15 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
-| 16 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
-| 17 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
+| 2 | `world-identity-v1` | World identity PR2 / Mode 27 | `portable_tcg` | `ocore/kernel/smoke-world-identity-qemu.sh` |
+| 3 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
+| 4 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
+| 5 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
+| 6 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
+| 7 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
+| 8 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
+| 9 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
+| 10 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
+| 11 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
+| 12 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
+| 13 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
+| 14 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
+| 15 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
+| 16 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
+| 17 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
+| 18 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
 
 Supplemental hardware evidence is validated by the same manifest but is not
 executed by the portable aggregate:

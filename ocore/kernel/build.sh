@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 26" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 27" >&2
     exit 2
     ;;
 esac
@@ -142,6 +142,8 @@ KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot_stub.oc"
 KERNEL_WORLD_DEVICE_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_device_stub.oc"
 KERNEL_WORLD_EXECUTION_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_execution_stub.oc"
 KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics_stub.oc"
+WORLD_IDENTITY_SEMANTICS_SOURCE="$KERNEL_DIR/world_identity_semantics_stub.oc"
+WORLD_IDENTITY_SOURCES=()
 ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint.oc"
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot.oc"
@@ -161,6 +163,10 @@ if (( PROBE_MODE == 23 )); then
   # 512 KiB reserve without weakening the linker assertion or inflating the
   # historical Modes 20-22 contract harness.
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_execution_device_semantics.oc"
+fi
+if (( PROBE_MODE == 27 )); then
+  WORLD_IDENTITY_SEMANTICS_SOURCE="$KERNEL_DIR/world_identity_semantics.oc"
+  WORLD_IDENTITY_SOURCES=("$ROOT/ocore/world/identity.oc")
 fi
 
 LINUX_PERSONALITY_SOURCES=(
@@ -240,6 +246,7 @@ if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
 fi
 
 "$ROOT/target/debug/ocorec" \
+  ${WORLD_IDENTITY_SOURCES[@]+"${WORLD_IDENTITY_SOURCES[@]}"} \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
@@ -295,6 +302,7 @@ fi
   "$M6_SOURCE" \
   "$M6B_SEMANTICS_SOURCE" \
   "$KERNEL_WORLD_SEMANTICS_SOURCE" \
+  "$WORLD_IDENTITY_SEMANTICS_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \

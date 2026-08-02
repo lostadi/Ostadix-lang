@@ -10,6 +10,7 @@ use kernel::m5_semantics::start as start_m5_semantics;
 use kernel::m6::start as start_m6;
 use kernel::m6b_semantics::start as start_m6b_semantics;
 use kernel::kernel_world_semantics::start as start_kernel_world_semantics;
+use kernel::world_identity_semantics::start as start_world_identity_semantics;
 use runtime::capability::init as capabilities_init;
 use runtime::capability::close_in_cspace;
 use runtime::capability::install_in_cspace;
@@ -359,6 +360,13 @@ pub unsafe fn kernel_main(multiboot_info: usize) -> never {
         }
         interrupts_init();
         start_kernel_world_semantics(probe_mode);
+    }
+    if probe_mode == 27 {
+        if configure_probe(probe_mode) == 0 {
+            fail_closed();
+        }
+        interrupts_init();
+        start_world_identity_semantics(probe_mode);
     }
 
     let kernel_stack_top: usize = ocore_kernel_stack_top();
