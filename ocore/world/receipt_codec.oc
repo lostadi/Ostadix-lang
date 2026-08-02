@@ -1,0 +1,355 @@
+module world::receipt_codec;
+
+use world::receipt::SignedReceipt;
+use world::receipt::ReceiptValidationScratch;
+use world::receipt::WORLD_RECEIPT_SCHEMA;
+use world::receipt::WORLD_RECEIPT_SIGNATURE_ED25519;
+use world::receipt::WORLD_RECEIPT_HEADER_BYTES;
+use world::receipt::WORLD_RECEIPT_KEY_ID_BYTES;
+use world::receipt::WORLD_RECEIPT_SIGNATURE_BYTES;
+use world::receipt::WORLD_RECEIPT_TRAILER_BYTES;
+use world::receipt::WORLD_RECEIPT_MIN_BYTES;
+use world::receipt::WORLD_RECEIPT_MAX_BYTES;
+use world::receipt::WORLD_RECEIPT_MAX_UNSIGNED_BYTES;
+use world::receipt::WORLD_RECEIPT_SIGNING_DOMAIN_BYTES;
+use world::receipt::WORLD_RECEIPT_SIGNING_PREFIX_BYTES;
+use world::receipt::WORLD_RECEIPT_MAX_SIGNING_PREIMAGE_BYTES;
+use world::receipt::install;
+use world::receipt::source as receipt_source;
+use world::receipt::total_length as receipt_total_length;
+use world::receipt::unsigned_bytes;
+use world::receipt::unsigned_length;
+use world::receipt::signer_key_id;
+use world::receipt::signature;
+use world::receipt::validate_unsigned_body;
+
+static SIGNING_DOMAIN: [u8; 21] = b"OSTADIX/OWRECEIPT/V1\0";
+
+pub struct ReceiptCodecScratch {
+    staged: *mut u8,
+    staged_capacity: usize,
+    committed: *mut u8,
+    committed_capacity: usize,
+    preimage: *mut u8,
+    preimage_capacity: usize,
+}
+
+pub unsafe fn scratch_init(
+    scratch: *mut ReceiptCodecScratch,
+    staged: *mut u8,
+    staged_capacity: usize,
+    committed: *mut u8,
+    committed_capacity: usize,
+    preimage: *mut u8,
+    preimage_capacity: usize
+) -> u64 {
+    if scratch as usize == 0 || staged as usize == 0
+        || committed as usize == 0 || preimage as usize == 0
+        || staged == committed || staged == preimage || committed == preimage
+        || staged_capacity < WORLD_RECEIPT_MIN_BYTES
+        || committed_capacity < WORLD_RECEIPT_MIN_BYTES
+        || preimage_capacity < WORLD_RECEIPT_SIGNING_PREFIX_BYTES {
+        return 0;
+    }
+    (*scratch).staged = staged;
+    (*scratch).staged_capacity = staged_capacity;
+    (*scratch).committed = committed;
+    (*scratch).committed_capacity = committed_capacity;
+    (*scratch).preimage = preimage;
+    (*scratch).preimage_capacity = preimage_capacity;
+    return 1;
+}
+
+unsafe fn byte_at(source: *const u8, offset: usize) -> u64 {
+    return volatile_load(source + offset) as u64;
+}
+
+unsafe fn read_u16(source: *const u8, offset: usize) -> u64 {
+    return (byte_at(source, offset) << 8) | byte_at(source, offset + 1);
+}
+
+unsafe fn read_u32(source: *const u8, offset: usize) -> u64 {
+    return (byte_at(source, offset) << 24)
+        | (byte_at(source, offset + 1) << 16)
+        | (byte_at(source, offset + 2) << 8)
+        | byte_at(source, offset + 3);
+}
+
+unsafe fn put_byte(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    volatile_store(output + *cursor, value as u8);
+    *cursor += 1;
+}
+
+unsafe fn put_u16(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_u32(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 24);
+    put_byte(output, cursor, value >> 16);
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_bytes(
+    output: *mut u8,
+    cursor: *mut usize,
+    source: *const u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        put_byte(output, cursor, byte_at(source, index));
+        index += 1;
+    }
+}
+
+unsafe fn bytes_nonzero(source: *const u8, length: usize) -> bool {
+    let mut nonzero: u64 = 0;
+    let mut index: usize = 0;
+    while index < length {
+        nonzero = nonzero | byte_at(source, index);
+        index += 1;
+    }
+    return nonzero != 0;
+}
+
+unsafe fn header_valid(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length < WORLD_RECEIPT_MIN_BYTES
+        || length > WORLD_RECEIPT_MAX_BYTES
+        || byte_at(source, 0) != b'O' as u64
+        || byte_at(source, 1) != b'W' as u64
+        || byte_at(source, 2) != b'R' as u64
+        || byte_at(source, 3) != b'C' as u64
+        || byte_at(source, 4) != b'P' as u64
+        || byte_at(source, 5) != b'T' as u64
+        || byte_at(source, 6) != 0 || byte_at(source, 7) != 0
+        || read_u16(source, 8) != WORLD_RECEIPT_SCHEMA
+        || read_u16(source, 10) != WORLD_RECEIPT_SIGNATURE_ED25519
+        || read_u32(source, 12) as usize != length
+        || read_u32(source, 20) != 0 {
+        return false;
+    }
+    let body_length: usize = read_u32(source, 16) as usize;
+    if body_length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES
+        || body_length > length - WORLD_RECEIPT_HEADER_BYTES
+        || length - WORLD_RECEIPT_HEADER_BYTES - body_length
+            != WORLD_RECEIPT_TRAILER_BYTES {
+        return false;
+    }
+    return bytes_nonzero(source + WORLD_RECEIPT_HEADER_BYTES + body_length,
+        WORLD_RECEIPT_KEY_ID_BYTES);
+}
+
+pub unsafe fn decode_envelope(
+    source: *const u8,
+    length: usize,
+    output: *mut SignedReceipt,
+    scratch: *mut ReceiptCodecScratch
+) -> u64 {
+    if source as usize == 0 || output as usize == 0 || scratch as usize == 0
+        || (*scratch).staged as usize == 0 || (*scratch).committed as usize == 0
+        || length > (*scratch).staged_capacity
+        || length > (*scratch).committed_capacity
+        || length < WORLD_RECEIPT_MIN_BYTES || length > WORLD_RECEIPT_MAX_BYTES {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store((*scratch).staged + index, byte_at(source, index) as u8);
+        index += 1;
+    }
+    let staged: *const u8 = (*scratch).staged as *const u8;
+    if !header_valid(staged, length) { return 0; }
+    index = 0;
+    while index < length {
+        volatile_store((*scratch).committed + index, byte_at(staged, index) as u8);
+        index += 1;
+    }
+    let committed: *const u8 = (*scratch).committed as *const u8;
+    let body_length: usize = read_u32(committed, 16) as usize;
+    let key_offset: usize = WORLD_RECEIPT_HEADER_BYTES + body_length;
+    let signature_offset: usize = key_offset + WORLD_RECEIPT_KEY_ID_BYTES;
+    return install(output, committed, length,
+        committed + WORLD_RECEIPT_HEADER_BYTES, body_length,
+        committed + key_offset, committed + signature_offset);
+}
+
+// Full receipt admission layers the fixed unsigned-body grammar over the
+// structural envelope. It deliberately performs no Ed25519 operation.
+pub unsafe fn decode_record(
+    source: *const u8,
+    length: usize,
+    output: *mut SignedReceipt,
+    scratch: *mut ReceiptCodecScratch,
+    validation: *mut ReceiptValidationScratch
+) -> u64 {
+    if source as usize == 0 || output as usize == 0 || scratch as usize == 0
+        || validation as usize == 0 || (*scratch).staged as usize == 0
+        || (*scratch).committed as usize == 0
+        || length > (*scratch).staged_capacity
+        || length > (*scratch).committed_capacity
+        || length < WORLD_RECEIPT_MIN_BYTES || length > WORLD_RECEIPT_MAX_BYTES {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store((*scratch).staged + index, byte_at(source, index) as u8);
+        index += 1;
+    }
+    let staged: *const u8 = (*scratch).staged as *const u8;
+    if !header_valid(staged, length) { return 0; }
+    let body_length: usize = read_u32(staged, 16) as usize;
+    if validate_unsigned_body(staged + WORLD_RECEIPT_HEADER_BYTES,
+        body_length, validation) != 1 {
+        return 0;
+    }
+    index = 0;
+    while index < length {
+        volatile_store((*scratch).committed + index, byte_at(staged, index) as u8);
+        index += 1;
+    }
+    let committed: *const u8 = (*scratch).committed as *const u8;
+    let key_offset: usize = WORLD_RECEIPT_HEADER_BYTES + body_length;
+    let signature_offset: usize = key_offset + WORLD_RECEIPT_KEY_ID_BYTES;
+    return install(output, committed, length,
+        committed + WORLD_RECEIPT_HEADER_BYTES, body_length,
+        committed + key_offset, committed + signature_offset);
+}
+
+pub unsafe fn encode_envelope(
+    body: *const u8,
+    body_length: usize,
+    key_id: *const u8,
+    signature_bytes: *const u8,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if body as usize == 0 || key_id as usize == 0
+        || signature_bytes as usize == 0 || output as usize == 0
+        || written as usize == 0 || body_length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES
+        || !bytes_nonzero(key_id, WORLD_RECEIPT_KEY_ID_BYTES) {
+        return 0;
+    }
+    let total: usize = WORLD_RECEIPT_HEADER_BYTES + body_length
+        + WORLD_RECEIPT_TRAILER_BYTES;
+    if total < WORLD_RECEIPT_MIN_BYTES || total > WORLD_RECEIPT_MAX_BYTES
+        || capacity < total {
+        return 0;
+    }
+    let mut cursor: usize = 0;
+    put_byte(output, (&mut cursor), b'O' as u64);
+    put_byte(output, (&mut cursor), b'W' as u64);
+    put_byte(output, (&mut cursor), b'R' as u64);
+    put_byte(output, (&mut cursor), b'C' as u64);
+    put_byte(output, (&mut cursor), b'P' as u64);
+    put_byte(output, (&mut cursor), b'T' as u64);
+    put_byte(output, (&mut cursor), 0);
+    put_byte(output, (&mut cursor), 0);
+    put_u16(output, (&mut cursor), WORLD_RECEIPT_SCHEMA);
+    put_u16(output, (&mut cursor), WORLD_RECEIPT_SIGNATURE_ED25519);
+    put_u32(output, (&mut cursor), total as u64);
+    put_u32(output, (&mut cursor), body_length as u64);
+    put_u32(output, (&mut cursor), 0);
+    put_bytes(output, (&mut cursor), body, body_length);
+    put_bytes(output, (&mut cursor), key_id, WORLD_RECEIPT_KEY_ID_BYTES);
+    put_bytes(output, (&mut cursor), signature_bytes, WORLD_RECEIPT_SIGNATURE_BYTES);
+    if cursor != total { return 0; }
+    volatile_store(written, total);
+    return 1;
+}
+
+pub unsafe fn reencode_envelope(
+    receipt: *const SignedReceipt,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if receipt as usize == 0 || receipt_source(receipt) as usize == 0
+        || receipt_total_length(receipt) < WORLD_RECEIPT_MIN_BYTES {
+        return 0;
+    }
+    return encode_envelope(unsigned_bytes(receipt), unsigned_length(receipt),
+        signer_key_id(receipt), signature(receipt), output, capacity, written);
+}
+
+unsafe fn build_signing_preimage(
+    receipt: *const SignedReceipt,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if receipt as usize == 0 || output as usize == 0 || written as usize == 0
+        || unsigned_bytes(receipt) as usize == 0
+        || signer_key_id(receipt) as usize == 0 {
+        return 0;
+    }
+    let body_length: usize = unsigned_length(receipt);
+    if body_length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES { return 0; }
+    let total: usize = WORLD_RECEIPT_SIGNING_PREFIX_BYTES + body_length;
+    if total > WORLD_RECEIPT_MAX_SIGNING_PREIMAGE_BYTES || capacity < total {
+        return 0;
+    }
+    let mut cursor: usize = 0;
+    put_bytes(output, (&mut cursor), (&SIGNING_DOMAIN[0]),
+        WORLD_RECEIPT_SIGNING_DOMAIN_BYTES);
+    put_u16(output, (&mut cursor), WORLD_RECEIPT_SCHEMA);
+    put_u16(output, (&mut cursor), WORLD_RECEIPT_SIGNATURE_ED25519);
+    put_u32(output, (&mut cursor), body_length as u64);
+    put_bytes(output, (&mut cursor), signer_key_id(receipt),
+        WORLD_RECEIPT_KEY_ID_BYTES);
+    put_bytes(output, (&mut cursor), unsigned_bytes(receipt), body_length);
+    if cursor != total { return 0; }
+    volatile_store(written, total);
+    return 1;
+}
+
+// A public signing preimage is available only for a fully canonical unsigned
+// body. Structural-only decode_envelope views are deliberately insufficient.
+pub unsafe fn build_validated_signing_preimage(
+    receipt: *const SignedReceipt,
+    validation: *mut ReceiptValidationScratch,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if receipt as usize == 0 || validation as usize == 0
+        || receipt_source(receipt) as usize == 0
+        || !header_valid(receipt_source(receipt), receipt_total_length(receipt)) {
+        return 0;
+    }
+    let source: *const u8 = receipt_source(receipt);
+    let body_length: usize = read_u32(source, 16) as usize;
+    let body: *const u8 = source + WORLD_RECEIPT_HEADER_BYTES;
+    let key: *const u8 = body + body_length;
+    let signature_bytes: *const u8 = key + WORLD_RECEIPT_KEY_ID_BYTES;
+    if unsigned_bytes(receipt) != body
+        || unsigned_length(receipt) != body_length
+        || signer_key_id(receipt) != key
+        || signature(receipt) != signature_bytes
+        || validate_unsigned_body(unsigned_bytes(receipt),
+            unsigned_length(receipt), validation) != 1 {
+        return 0;
+    }
+    return build_signing_preimage(receipt, output, capacity, written);
+}
+
+pub unsafe fn build_validated_signing_preimage_in_scratch(
+    receipt: *const SignedReceipt,
+    scratch: *mut ReceiptCodecScratch,
+    validation: *mut ReceiptValidationScratch,
+    written: *mut usize
+) -> u64 {
+    if scratch as usize == 0 || (*scratch).preimage as usize == 0 { return 0; }
+    return build_validated_signing_preimage(receipt, validation,
+        (*scratch).preimage, (*scratch).preimage_capacity, written);
+}
+
+pub unsafe fn signing_preimage(
+    scratch: *const ReceiptCodecScratch
+) -> *const u8 {
+    if scratch as usize == 0 { return 0 as *const u8; }
+    return (*scratch).preimage as *const u8;
+}

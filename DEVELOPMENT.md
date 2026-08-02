@@ -95,6 +95,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 python3 scripts/release_evidence.py validate
 cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
+cargo test --test world_receipt
+./ocore/kernel/smoke-world-receipt-qemu.sh
 ./boot-and-test.sh smoke
 
 # Python reference runtime
@@ -117,7 +119,7 @@ python3 -m unittest -v tests.test_source_release
 ```
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 20 required portable QEMU gates in the
+The aggregate executes all 21 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive
@@ -150,5 +152,11 @@ validation, required release surfaces, and tamper detection.
   SHA-256. It does not make the full hosted `OValue` portable, change hosted
   canonical-CBOR shims, create authority or transport, satisfy Workstream A, or
   implement the PR 5 receipt.
+- Keep `OWRECEIPT` v1 claims precise: PR 5 is a bounded offline canonical
+  receipt/signing-preimage oracle. Hosted Rust performs Ed25519 sign/verify with
+  a pinned public conformance key; native Mode 30 validates only receipt and
+  signature-envelope structure. Neither path supplies production key custody,
+  trusted signer policy, live receipt emission, authoritative fencing, a World
+  Alpha attestation, Acceptance A, or G0--G13 passage.
 - Keep HGraph wording precise: graph dispatch is implemented, but worker-pool execution is limited to verified pure inline renderers. Unknown shims are serialized through `HostWorld`, and exact arbitrary-source filesystem/network inference is not implemented.
 - Prefer registry metadata over duplicated backend-name, purity, renderer, or authority tables.

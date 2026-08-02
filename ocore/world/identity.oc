@@ -45,10 +45,15 @@ pub const IDENTITY_COUNTER_RESOURCE_GENERATION: u64 = 7;
 pub const IDENTITY_COUNTER_OBJECT_VERSION: u64 = 8;
 pub const IDENTITY_COUNTER_ATTEMPT_GENERATION: u64 = 9;
 
+pub const IDENTITY_ORDER_LESS: u64 = 0;
+pub const IDENTITY_ORDER_EQUAL: u64 = 1;
+pub const IDENTITY_ORDER_GREATER: u64 = 2;
+
 const SIMPLE_ID_MAX: usize = 128;
 const RESOURCE_ID_MAX: usize = 256;
 const RECORD_HEADER_LENGTH: usize = 16;
 const RECORD_MAX_LENGTH: usize = 1024;
+pub const IDENTITY_RECORD_MAX_BYTES: usize = RECORD_MAX_LENGTH;
 
 pub struct IdentityText {
     length: usize,
@@ -478,6 +483,24 @@ unsafe fn text_same(left: *const IdentityText, right: *const IdentityText) -> bo
     return true;
 }
 
+unsafe fn text_order(left: *const IdentityText, right: *const IdentityText) -> u64 {
+    let mut common: usize = (*left).length;
+    if (*right).length < common { common = (*right).length; }
+    let mut index: usize = 0;
+    while index < common {
+        if (*left).bytes[index] < (*right).bytes[index] {
+            return IDENTITY_ORDER_LESS;
+        }
+        if (*left).bytes[index] > (*right).bytes[index] {
+            return IDENTITY_ORDER_GREATER;
+        }
+        index += 1;
+    }
+    if (*left).length < (*right).length { return IDENTITY_ORDER_LESS; }
+    if (*left).length > (*right).length { return IDENTITY_ORDER_GREATER; }
+    return IDENTITY_ORDER_EQUAL;
+}
+
 unsafe fn node_same(left: *const IdentityRecord, right: *const IdentityRecord) -> bool {
     return text_same((&(*left).world), (&(*right).world))
         && text_same((&(*left).node), (&(*right).node))
@@ -573,6 +596,105 @@ pub unsafe fn record_is_current(
     }
     return text_same((&(*current).world), (&(*presented).world))
         && text_same((&(*current).receipt), (&(*presented).receipt));
+}
+
+// Receipt validation needs cross-kind hierarchy checks without exposing the
+// flat codec carrier's private storage. These relations remain descriptive;
+// they never resolve a serialized capability identity into kernel authority.
+pub unsafe fn records_share_world(
+    left: *const IdentityRecord,
+    right: *const IdentityRecord
+) -> bool {
+    return record_valid(left) && record_valid(right)
+        && text_same((&(*left).world), (&(*right).world));
+}
+
+pub unsafe fn receipt_context_is_bound(
+    receipt: *const IdentityRecord,
+    world: *const IdentityRecord,
+    governor: *const IdentityRecord,
+    node: *const IdentityRecord,
+    domain: *const IdentityRecord,
+    process: *const IdentityRecord,
+    attempt: *const IdentityRecord
+) -> bool {
+    if !record_valid(receipt) || !record_valid(world)
+        || !record_valid(governor) || !record_valid(node)
+        || !record_valid(domain) || !record_valid(attempt)
+        || (*receipt).kind != IDENTITY_KIND_RECEIPT
+        || (*world).kind != IDENTITY_KIND_WORLD
+        || (*governor).kind != IDENTITY_KIND_GOVERNOR
+        || (*node).kind != IDENTITY_KIND_NODE
+        || (*domain).kind != IDENTITY_KIND_DOMAIN
+        || (*attempt).kind != IDENTITY_KIND_ATTEMPT {
+        return false;
+    }
+    if process as usize != 0
+        && (!record_valid(process) || (*process).kind != IDENTITY_KIND_PROCESS) {
+        return false;
+    }
+    if !records_share_world(world, receipt)
+        || !records_share_world(world, governor)
+        || !records_share_world(world, node)
+        || !records_share_world(world, domain)
+        || !records_share_world(world, attempt)
+        || !generation_is_current((*world).epoch, (*governor).epoch)
+        || !node_same(node, domain) {
+        return false;
+    }
+    if process as usize != 0 {
+        return records_share_world(world, process) && domain_same(domain, process);
+    }
+    return true;
+}
+
+pub unsafe fn checkpoint_belongs_to_attempt(
+    checkpoint: *const IdentityRecord,
+    attempt: *const IdentityRecord
+) -> bool {
+    return record_valid(checkpoint) && record_valid(attempt)
+        && (*checkpoint).kind == IDENTITY_KIND_CHECKPOINT
+        && (*attempt).kind == IDENTITY_KIND_ATTEMPT
+        && text_same((&(*checkpoint).world), (&(*attempt).world))
+        && text_same((&(*checkpoint).task), (&(*attempt).task))
+        && generation_is_current(
+            (*checkpoint).attempt_generation,
+            (*attempt).attempt_generation
+        );
+}
+
+pub unsafe fn governor_fence_matches(
+    governor: *const IdentityRecord,
+    fence: *const IdentityRecord
+) -> bool {
+    return record_valid(governor) && record_valid(fence)
+        && (*governor).kind == IDENTITY_KIND_GOVERNOR
+        && (*fence).kind == IDENTITY_KIND_GOVERNOR
+        && record_is_current(governor, fence);
+}
+
+// Placement rejection ordering follows the typed Rust tuple
+// `(world, node, generation)`, not the length-prefixed OWIDENT byte order.
+pub unsafe fn node_record_order(
+    left: *const IdentityRecord,
+    right: *const IdentityRecord
+) -> u64 {
+    if !record_valid(left) || !record_valid(right)
+        || (*left).kind != IDENTITY_KIND_NODE
+        || (*right).kind != IDENTITY_KIND_NODE {
+        return IDENTITY_ORDER_EQUAL;
+    }
+    let mut order: u64 = text_order((&(*left).world), (&(*right).world));
+    if order != IDENTITY_ORDER_EQUAL { return order; }
+    order = text_order((&(*left).node), (&(*right).node));
+    if order != IDENTITY_ORDER_EQUAL { return order; }
+    if (*left).node_generation < (*right).node_generation {
+        return IDENTITY_ORDER_LESS;
+    }
+    if (*left).node_generation > (*right).node_generation {
+        return IDENTITY_ORDER_GREATER;
+    }
+    return IDENTITY_ORDER_EQUAL;
 }
 
 unsafe fn text_wire_length(text: *const IdentityText) -> usize {
@@ -986,14 +1108,45 @@ pub unsafe fn decode_record(
     // Copy first so a mutating caller cannot pass validation and then change
     // bytes during the committing pass. The destination remains untouched on
     // every rejection path.
-    let mut staged: [u8; 1024] = [0; 1024];
+    // Use an aligned word carrier rather than 1,024 separately lowered byte
+    // slots. This keeps the defensive snapshot while remaining below the
+    // native generated-frame ceiling.
+    let mut staged: [u64; 128] = [0; 128];
+    let staged_bytes: *mut u8 = ((&mut staged[0]) as *mut u64) as *mut u8;
     let mut index: usize = 0;
     while index < length {
-        staged[index] = source_byte(source, index) as u8;
+        volatile_store(staged_bytes + index, source_byte(source, index) as u8);
         index += 1;
     }
-    if !parse_record((&staged[0]), length, record, false) { return 0; }
+    if !parse_record(staged_bytes as *const u8, length, record, false) { return 0; }
     clear_record(record);
-    if !parse_record((&staged[0]), length, record, true) { return 0; }
+    if !parse_record(staged_bytes as *const u8, length, record, true) { return 0; }
+    return 1;
+}
+
+// Receipt and other bounded kernel parsers use caller-owned storage so the
+// spill-only backend does not turn this defensive copy into a >8 KiB frame.
+// The ordinary entry point above remains source compatible for hosted/native
+// callers that do not supply scratch.
+pub unsafe fn decode_record_with_scratch(
+    source: *const u8,
+    length: usize,
+    record: *mut IdentityRecord,
+    staged: *mut u8,
+    staged_capacity: usize
+) -> u64 {
+    if source as usize == 0 || record as usize == 0 || staged as usize == 0
+        || length < RECORD_HEADER_LENGTH || length > RECORD_MAX_LENGTH
+        || length > staged_capacity {
+        return 0;
+    }
+    let mut index: usize = 0;
+    while index < length {
+        volatile_store(staged + index, source_byte(source, index) as u8);
+        index += 1;
+    }
+    if !parse_record(staged as *const u8, length, record, false) { return 0; }
+    clear_record(record);
+    if !parse_record(staged as *const u8, length, record, true) { return 0; }
     return 1;
 }
