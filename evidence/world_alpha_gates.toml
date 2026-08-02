@@ -1,0 +1,238 @@
+schema_version = 1
+constitution_version = 1
+constitution = "docs/OSTADIX_WORLD.md"
+hosted_reference_profile = "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+alpha_gate = "G13"
+gate_count = 14
+
+# This registry defines qualification requirements. It is separate from
+# gates.toml, whose 17 required QEMU-TCG gates and one supplemental KVM gate
+# are executable evidence for narrower, already implemented O-core slices.
+# Schema v1 is definition-only: validators reject `passed` and every nonempty
+# evidence list. The first passage requires a new typed attestation schema
+# bound to gate, source commit, commands, transcripts, artifact digests,
+# hardware/topology inventory, and signatures where the constitution requires.
+
+[[evidence_class]]
+id = "repository_conformance"
+scope = "supporting"
+description = "Executable schema, compiler, protocol, and claim-drift checks run from the canonical repository."
+
+[[evidence_class]]
+id = "hosted_reference"
+scope = "reference_only"
+description = "Linux-hosted simulator, differential oracle, protocol fuzzer, or development console; never qualifying World Alpha evidence."
+
+[[evidence_class]]
+id = "qemu_tcg_x86_64"
+scope = "virtual_native"
+description = "Native x86_64 O-core execution under QEMU TCG; not hardware virtualization, physical-device, or multinode evidence."
+
+[[evidence_class]]
+id = "qemu_tcg_aarch64"
+scope = "virtual_native"
+description = "Native AArch64 O-core execution under QEMU TCG; not physical AArch64, SMMU, or multinode evidence."
+
+[[evidence_class]]
+id = "qemu_virtualization"
+scope = "virtual_native"
+description = "A real foreign kernel executed through a virtualized O-core path under a declared emulator or hypervisor."
+
+[[evidence_class]]
+id = "hardware_x86_64"
+scope = "physical_native"
+description = "Native O-core evidence collected on identified physical x86_64 hardware."
+
+[[evidence_class]]
+id = "hardware_x86_64_iommu"
+scope = "physical_native"
+description = "Physical x86_64 device, interrupt, DMA, reset, and IOMMU evidence with recorded hardware inventory."
+
+[[evidence_class]]
+id = "hardware_aarch64"
+scope = "physical_native"
+description = "Native O-core evidence collected on an identified physical AArch64 target."
+
+[[evidence_class]]
+id = "hardware_aarch64_smmu"
+scope = "physical_native"
+description = "Physical AArch64 device, interrupt, DMA, reset, and SMMU evidence with recorded hardware inventory."
+
+[[evidence_class]]
+id = "multinode_virtual"
+scope = "supporting"
+description = "Deterministic multinode simulation used for protocol and failure development; not physical convergence evidence."
+
+[[evidence_class]]
+id = "multinode_physical"
+scope = "physical_native"
+description = "One integrated scenario spanning identified physical O-core nodes over native transport."
+
+[[evidence_class]]
+id = "fault_injection"
+scope = "supporting"
+description = "Deterministic failure, partition, restart, stale-generation, and recovery evidence attached to a qualifying substrate."
+
+[[evidence_class]]
+id = "security_adversarial"
+scope = "supporting"
+description = "Adversarial authority, replay, isolation, enrollment, and denial-of-service evidence attached to a qualifying substrate."
+
+[[evidence_class]]
+id = "performance_characterization"
+scope = "descriptive_only"
+description = "Topology-labelled performance observations; never a substitute for a correctness or isolation gate."
+
+[[gate]]
+id = "G0"
+title = "constitutional baseline"
+status = "defined"
+depends_on = []
+required_classes = ["repository_conformance"]
+one_of_classes = []
+acceptance = "The versioned World contract, crossings, complete identity vocabulary, failure classes, consistency model, and claim taxonomy agree with executable schemas."
+prohibited_substitutes = ["Prose without executable schemas", "The superseded hosted-first World v0 contract"]
+evidence = []
+
+[[gate]]
+id = "G1"
+title = "semantic continuity"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["repository_conformance", "qemu_tcg_x86_64"]
+one_of_classes = []
+acceptance = "Project routes lower into logical HGraphs and hosted plus O-core receipts share exact World identities while residual HostWorld effects remain explicit."
+prohibited_substitutes = ["A local route runner beside the HGraph", "Planner labels with no governed lowering"]
+evidence = []
+
+[[gate]]
+id = "G2"
+title = "AArch64 native compiler"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["qemu_tcg_aarch64"]
+one_of_classes = []
+acceptance = "O-core compiles and boots under AArch64 QEMU with native process, IPC, capability, and lifecycle checks."
+prohibited_substitutes = ["Cross-compiling a trivial assembly stub", "An x86_64-only O-core result"]
+evidence = []
+
+[[gate]]
+id = "G3"
+title = "multicore O-core"
+status = "defined"
+depends_on = ["G2"]
+required_classes = ["hardware_x86_64", "hardware_aarch64", "fault_injection"]
+one_of_classes = []
+acceptance = "Physical x86_64 and AArch64 targets execute SMP stress gates with capability, IPC, mapping, teardown, and lifecycle linearization intact."
+prohibited_substitutes = ["Multiple single-core virtual machines", "A QEMU-only SMP boot message"]
+evidence = []
+
+[[gate]]
+id = "G4"
+title = "native World transport"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["multinode_physical", "security_adversarial"]
+one_of_classes = []
+acceptance = "Three physical O-core nodes communicate through authenticated native transport without a sovereign Linux host."
+prohibited_substitutes = ["Linux-hosted node daemons", "A multinode virtual protocol simulation"]
+evidence = []
+
+[[gate]]
+id = "G5"
+title = "replicated authority"
+status = "defined"
+depends_on = ["G4"]
+required_classes = ["multinode_physical", "fault_injection", "security_adversarial"]
+one_of_classes = []
+acceptance = "Three native Governor replicas preserve one authoritative log across leader loss and partition, with minority island-mode fencing."
+prohibited_substitutes = ["One Governor plus a backup process", "A hosted Raft demonstration"]
+evidence = []
+
+[[gate]]
+id = "G6"
+title = "WorldFS"
+status = "defined"
+depends_on = ["G5"]
+required_classes = ["multinode_physical", "fault_injection"]
+one_of_classes = []
+acceptance = "Per-process namespaces mount live resources from multiple physical nodes and preserve generation, cache, and stale-fid rules through churn."
+prohibited_substitutes = ["A static directory tree", "FUSE or 9P served above a sovereign Linux host", "The bounded Mode 26 9P corpus"]
+evidence = []
+
+[[gate]]
+id = "G7"
+title = "real KernelWorld"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["qemu_virtualization"]
+one_of_classes = []
+acceptance = "A pinned real Linux kernel boots under O-core, negotiates health through the guest-agent contract, and exports one governed service."
+prohibited_substitutes = ["The Mode 21 or Mode 23 synthetic guest", "A Linux ABI ELF running at CPL3", "Administrative boot state with no guest entry"]
+evidence = []
+
+[[gate]]
+id = "G8"
+title = "real driver service"
+status = "defined"
+depends_on = ["G7"]
+required_classes = ["fault_injection", "security_adversarial"]
+one_of_classes = [["hardware_x86_64_iommu", "hardware_aarch64_smmu"]]
+acceptance = "Linux controls a resettable physical device and O-core consumes its service through revocable capability, bounded DMA, generation-bound interrupts, teardown, and replacement."
+prohibited_substitutes = ["Virtio-only or kernel-internal fake devices", "Virtual PIO reset intent", "KVM availability without device isolation evidence"]
+evidence = []
+
+[[gate]]
+id = "G9"
+title = "native Debian personality"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["qemu_tcg_x86_64"]
+one_of_classes = []
+acceptance = "Dynamically linked Debian userland, process and memory semantics, dpkg, networking, and apt execute as an O-core-served Linux personality."
+prohibited_substitutes = ["A container or chroot on Linux", "A static pinned Linux ELF corpus", "A Debian-looking shell above a hidden Linux host"]
+evidence = []
+
+[[gate]]
+id = "G10"
+title = "distributed execution"
+status = "defined"
+depends_on = ["G0"]
+required_classes = ["multinode_physical", "fault_injection"]
+one_of_classes = []
+acceptance = "Logical HGraph placement, transfers, delegated capabilities, objects, checkpoints, recovery, and exactly-one global commit execute across physical nodes."
+prohibited_substitutes = ["SSH fan-out", "An external batch system", "Independent local HGraph runs"]
+evidence = []
+
+[[gate]]
+id = "G11"
+title = "accelerator fabric"
+status = "defined"
+depends_on = ["G10"]
+required_classes = ["multinode_physical", "fault_injection"]
+one_of_classes = [["hardware_x86_64_iommu", "hardware_aarch64_smmu"]]
+acceptance = "At least two accelerators execute one governed workload with explicit buffer locality, transfer, revocation, and recovery."
+prohibited_substitutes = ["Independent scripts on each GPU", "A throughput total that hides placement and transfer"]
+evidence = []
+
+[[gate]]
+id = "G12"
+title = "three-node native World"
+status = "defined"
+depends_on = ["G1", "G3", "G6", "G8", "G9", "G11"]
+required_classes = ["multinode_physical", "hardware_aarch64", "fault_injection", "security_adversarial"]
+one_of_classes = []
+acceptance = "G1 through G11 coexist in one reproducible scenario on at least three physical O-core nodes, including AArch64."
+prohibited_substitutes = ["Separate demonstrations on separate branches", "Linux-hosted convergence", "Adding unrelated gate transcripts together"]
+evidence = []
+
+[[gate]]
+id = "G13"
+title = "eight-node World Alpha"
+status = "defined"
+depends_on = ["G12"]
+required_classes = ["multinode_physical", "hardware_aarch64", "fault_injection", "security_adversarial", "performance_characterization"]
+one_of_classes = []
+acceptance = "Eight SBC-class physical nodes form one elastic native World with Debian, driver domains, WorldFS, objects, distributed execution, accelerators, visible failure recovery, and a signed evidence bundle."
+prohibited_substitutes = ["Any hosted or simulated aggregate", "Fewer than eight physical qualifying nodes", "A demo without reproducible evidence and non-claims"]
+evidence = []

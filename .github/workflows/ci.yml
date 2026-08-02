@@ -160,6 +160,9 @@ jobs:
       - name: Check active docs for stale claims
         run: bash scripts/check_release_claims.sh
 
+      - name: Test World Alpha gate substitution rules
+        run: python3 -m unittest -v tests.test_world_alpha_evidence
+
       - name: Test deterministic source-release builder
         run: python3 -m unittest -v tests.test_source_release
 

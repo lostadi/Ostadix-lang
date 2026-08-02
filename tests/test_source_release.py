@@ -11,10 +11,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_source_release.py"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = PROJECT_ROOT / "scripts" / "build_source_release.py"
 SPEC = importlib.util.spec_from_file_location("ostadix_source_release", SCRIPT)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import failure is fatal
     raise RuntimeError(f"cannot import {SCRIPT}")
@@ -22,7 +24,12 @@ release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
-EVIDENCE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "release_evidence.py"
+WORLD_NORMATIVE_BYTES = {
+    path: (PROJECT_ROOT / path).read_bytes()
+    for path in release.SEALED_WORLD_ALPHA_SHA256
+}
+
+EVIDENCE_SCRIPT = PROJECT_ROOT / "scripts" / "release_evidence.py"
 EVIDENCE_SPEC = importlib.util.spec_from_file_location(
     "ostadix_release_evidence", EVIDENCE_SCRIPT
 )
@@ -155,7 +162,18 @@ class SourceReleaseTests(unittest.TestCase):
             "LICENSE": "GNU Lesser General Public License version 2.1\n",
             "README.md": "committed [index](llms.txt)\n",
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "docs/CLAIMS.md": "fixture claims\n",
+            "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
+            "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
+                "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+            ],
+            "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
+                "docs/OSTADIX_WORLD.md"
+            ],
             "evidence/gates.toml": fixture_evidence_manifest(),
+            "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
+                "evidence/world_alpha_gates.toml"
+            ],
             "examples/manifest.json": '{"schema_version": 1, "examples": []}\n',
             "llms.txt": "release index\n",
             "mcp/ostadix_lang_mcp_server/Cargo.lock": "# fixture lock\n",
@@ -174,9 +192,11 @@ class SourceReleaseTests(unittest.TestCase):
             "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md": "proposal\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
+            "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
+            "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
         }
         if files:
             contents.update(files)
@@ -291,7 +311,12 @@ class SourceReleaseTests(unittest.TestCase):
                 "LICENSE",
                 "README.md",
                 "boot-and-test.sh",
+                "docs/CLAIMS.md",
+                "docs/HOSTED_LIVE_REFERENCE.md",
+                "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+                "docs/OSTADIX_WORLD.md",
                 "evidence/gates.toml",
+                "evidence/world_alpha_gates.toml",
                 "examples/manifest.json",
                 "llms.txt",
                 "mcp/ostadix_lang_mcp_server/Cargo.lock",
@@ -302,9 +327,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
                 "scripts/smoke_ostadix_mcp.py",
                 "scripts/release_evidence.py",
+                "scripts/world_alpha_evidence.py",
                 "tests/example_manifest.py",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
+                "tests/test_world_alpha_evidence.py",
                 ".github/workflows/ci.yml",
                 "assets/logo.bin",
                 "backends/shim.py",
@@ -600,6 +627,75 @@ class SourceReleaseTests(unittest.TestCase):
             r"release_evidence\.py.*test_example_manifest\.py",
         ):
             self._build("missing-evidence.zip")
+
+    def test_world_constitution_registry_and_validator_are_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+            "docs/OSTADIX_WORLD.md",
+            "evidence/world_alpha_gates.toml",
+            "scripts/world_alpha_evidence.py",
+            "tests/test_world_alpha_evidence.py",
+        )
+        self._git("commit", "-q", "-m", "remove World constitution surfaces")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*HOSTED_WORLD_REFERENCE_PROFILE\.md.*"
+            r"OSTADIX_WORLD\.md.*world_alpha_gates\.toml.*"
+            r"world_alpha_evidence\.py.*test_world_alpha_evidence\.py",
+        ):
+            self._build("missing-world-constitution.zip")
+
+    def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
+        for path, data in WORLD_NORMATIVE_BYTES.items():
+            with self.subTest(path=path):
+                self._commit({path: data + b"\n"})
+                with self.assertRaises(release.ReleaseError) as raised:
+                    self._build(f"tampered-world-{Path(path).name}.zip")
+                message = str(raised.exception)
+                self.assertIn(path, message)
+                self.assertIn("SHA-256 differs from sealed World Alpha v1 bytes", message)
+
+    def test_archive_verifier_rejects_self_consistent_world_byte_tamper(self) -> None:
+        result = self._build("valid-before-world-tamper.zip", ref=self._commit())
+        for index, path in enumerate(WORLD_NORMATIVE_BYTES):
+            with self.subTest(path=path):
+
+                def append_newline(entry, target=path):
+                    if entry.path == target:
+                        return release.SourceEntry(
+                            entry.path, entry.mode, entry.data + b"\n"
+                        )
+                    return entry
+
+                tampered = self._rewrite_self_consistent(
+                    result.output,
+                    f"self-consistent-world-tamper-{index}.zip",
+                    append_newline,
+                )
+                with self.assertRaises(release.ReleaseError) as raised:
+                    release.verify_archive(tampered)
+                message = str(raised.exception)
+                self.assertIn(path, message)
+                self.assertIn("SHA-256 differs from sealed World Alpha v1 bytes", message)
+
+    def test_world_registry_structure_is_checked_beneath_byte_seal(self) -> None:
+        path = "evidence/world_alpha_gates.toml"
+        malformed = b"schema_version = 1\n"
+        files = dict(WORLD_NORMATIVE_BYTES)
+        files[path] = malformed
+        modes = {candidate: "100644" for candidate in files}
+        with mock.patch.dict(
+            release.SEALED_WORLD_ALPHA_SHA256,
+            {path: hashlib.sha256(malformed).hexdigest()},
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                r"world_alpha_gates\.toml root keys differ from schema",
+            ):
+                release._validate_world_alpha_release_surface(files, modes)
 
     def test_example_manifest_references_must_resolve(self) -> None:
         missing_example = {

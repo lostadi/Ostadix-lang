@@ -477,9 +477,11 @@ renaming those two gates as full M7:
    failure evidence.
 
 The immediate product integration cycle is separately defined by
-[`docs/OSTADIX_WORLD.md`](../docs/OSTADIX_WORLD.md). Its hosted Governor,
-membership, registry, route-dispatch, and placement goals are not implemented by
-Modes 25 or 26.
+[`docs/OSTADIX_WORLD.md`](../docs/OSTADIX_WORLD.md). Its native replicated
+Governor, membership, WorldFS, real KernelWorld, device-isolation,
+route-dispatch, and placement gates are not implemented by Modes 25 or 26. The
+prior hosted-first topology is retained only as the non-qualifying
+[`Hosted World Reference Profile`](../docs/HOSTED_WORLD_REFERENCE_PROFILE.md).
 
 ---
 
