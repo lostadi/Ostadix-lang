@@ -194,7 +194,7 @@ refresh_cargo_bin_binaries() {
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
-    echo "[DRY] replace $CARGO_BIN_DIR/o from $PROJECT_ROOT/target/release/O if filesystem is case-sensitive"
+    echo "[DRY] install $CARGO_BIN_DIR/o through scripts/install-o-cli-wrapper.sh"
     return
   fi
 
@@ -212,11 +212,9 @@ refresh_cargo_bin_binaries() {
     cp "$src" "$dst"
     chmod +x "$dst"
   done
+  "$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"
   if directory_is_case_insensitive "$CARGO_BIN_DIR"; then
-    echo "  $CARGO_BIN_DIR is case-insensitive; O also satisfies lowercase o."
-  else
-    cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/o"
-    chmod +x "$CARGO_BIN_DIR/o"
+    echo "  $CARGO_BIN_DIR shares O/o; the wrapper dispatches by invocation spelling."
   fi
 }
 
@@ -513,15 +511,18 @@ create_wrappers() {
     remove_managed_file "$BIN_DIR/$wrapper"
   done
 
-  # Rust runner (prefers release)
-  for runner in O o; do
-    cat > "$BIN_DIR/$runner" <<WRAP
+  # Rust evaluator (prefers release).
+  cat > "$BIN_DIR/O" <<WRAP
 #!/usr/bin/env bash
 export O_BACKENDS_DIR="\${O_BACKENDS_DIR:-$PROJECT_ROOT/backends}"
 exec "$PROJECT_ROOT/target/release/O" "\$@"
 WRAP
-    chmod +x "$BIN_DIR/$runner"
-  done
+  chmod +x "$BIN_DIR/O"
+
+  # Lowercase `o` preserves evaluator compatibility and owns repo subcommands.
+  # The installer also preserves uppercase evaluator behavior when O/o share
+  # one filesystem entry on a case-insensitive host.
+  "$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$BIN_DIR/o"
 
   cat > "$BIN_DIR/olangc" <<WRAP
 #!/usr/bin/env bash

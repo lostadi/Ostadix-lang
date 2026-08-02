@@ -231,12 +231,22 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
+            "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
+            "scripts/smoke-project-hgraph.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-world-resource-keys.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
+            "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
             "src/executor/mod.rs": "// fixture public executor effects surface\n",
+            "src/hgraph/graph.rs": "// fixture HGraph validation\n",
+            "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
+            "src/project/mod.rs": "pub mod plan;\n",
+            "src/project/model.rs": "// fixture project model\n",
+            "src/project/plan.rs": "// fixture project HGraph planner\n",
+            "src/project/runtime.rs": "// fixture shared project selection\n",
             "src/world/grounding.rs": "// fixture World grounding projection\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
@@ -249,12 +259,15 @@ class SourceReleaseTests(unittest.TestCase):
             "src/world/value_codec.rs": "// fixture portable World value codec\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
             "tests/fixtures/world_identity_v1.hex": "4f574944454e5431\n",
+            "tests/fixtures/project_hgraph/input.txt": "fixture input\n",
+            "tests/fixtures/project_hgraph/olang.project.toml": "[project]\nname = \"fixture\"\n",
             "tests/fixtures/world_protocol_v1.hex": "4f5750524f544f31\n",
             "tests/fixtures/world_receipt_v1.hex": "4f57524543454950\n",
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
+            "tests/project_hgraph.rs": "#[test] fn project_hgraph_fixture() {}\n",
             "tests/world_resource_keys.rs": "#[test] fn resource_key_fixture() {}\n",
             "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
             "tests/world_identity_wire.rs": "#[test] fn wire_fixture() {}\n",
@@ -282,6 +295,9 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/smoke-world-value-qemu.sh",
                     "ocore/kernel/smoke-world-protocol-qemu.sh",
                     "ocore/kernel/smoke-world-identity-qemu.sh",
+                    "scripts/o-cli.sh",
+                    "scripts/install-o-cli-wrapper.sh",
+                    "scripts/smoke-project-hgraph.sh",
                     "scripts/smoke-world-resource-keys.sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
@@ -420,12 +436,22 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/install-o-cli-wrapper.sh",
+                "scripts/o-cli.sh",
+                "scripts/smoke-project-hgraph.sh",
                 "scripts/smoke-world-resource-keys.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
                 "src/effects.rs",
+                "src/bin/olangc.rs",
                 "src/executor/mod.rs",
+                "src/hgraph/graph.rs",
+                "src/hgraph/kinds.rs",
                 "src/hgraph/from_oir.rs",
+                "src/project/mod.rs",
+                "src/project/model.rs",
+                "src/project/plan.rs",
+                "src/project/runtime.rs",
                 "src/world/grounding.rs",
                 "src/world/identity.rs",
                 "src/world/identity_wire.rs",
@@ -438,12 +464,15 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/world/value_codec.rs",
                 "tests/example_manifest.py",
                 "tests/fixtures/world_identity_v1.hex",
+                "tests/fixtures/project_hgraph/input.txt",
+                "tests/fixtures/project_hgraph/olang.project.toml",
                 "tests/fixtures/world_protocol_v1.hex",
                 "tests/fixtures/world_receipt_v1.hex",
                 "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
                 "tests/test_world_alpha_evidence.py",
+                "tests/project_hgraph.rs",
                 "tests/world_resource_keys.rs",
                 "tests/world_identity.rs",
                 "tests/world_identity_wire.rs",
@@ -886,6 +915,36 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/world/grounding\.rs.*tests/world_resource_keys\.rs",
         ):
             self._build("missing-world-resource-keys.zip")
+
+    def test_project_hgraph_hosted_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "scripts/o-cli.sh",
+            "scripts/install-o-cli-wrapper.sh",
+            "scripts/smoke-project-hgraph.sh",
+            "src/bin/olangc.rs",
+            "src/hgraph/graph.rs",
+            "src/hgraph/kinds.rs",
+            "src/project/mod.rs",
+            "src/project/model.rs",
+            "src/project/plan.rs",
+            "src/project/runtime.rs",
+            "tests/fixtures/project_hgraph/input.txt",
+            "tests/fixtures/project_hgraph/olang.project.toml",
+            "tests/project_hgraph.rs",
+        )
+        self._git("commit", "-q", "-m", "remove hosted project HGraph surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*install-o-cli-wrapper\.sh.*o-cli\.sh.*smoke-project-hgraph\.sh.*"
+            r"src/bin/olangc\.rs.*src/hgraph/graph\.rs.*src/hgraph/kinds\.rs.*"
+            r"src/project/mod\.rs.*src/project/model\.rs.*src/project/plan\.rs.*"
+            r"src/project/runtime\.rs.*project_hgraph/input\.txt.*"
+            r"project_hgraph/olang\.project\.toml.*tests/project_hgraph\.rs",
+        ):
+            self._build("missing-project-hgraph.zip")
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():

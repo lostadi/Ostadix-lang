@@ -1,0 +1,40 @@
+[project]
+name = "pr7-project-hgraph"
+default_route = "impl-a"
+
+[[routes]]
+id = "prepare"
+label = "prepare fixture"
+kind = "build"
+command = ["sh", "-c", 'if [ -n "${PR7_NONEXEC_MARKER:-}" ]; then printf PR7_PREP_EXECUTED >> "$PR7_NONEXEC_MARKER"; fi; printf PR7_PREP_EXECUTED > SHOULD_NOT_EXIST']
+outputs = ["build/**"]
+
+[[routes]]
+id = "impl-a"
+label = "implementation A"
+kind = "shell"
+command = ["sh", "-c", 'if [ -n "${PR7_NONEXEC_MARKER:-}" ]; then printf PR7_IMPL_A_EXECUTED >> "$PR7_NONEXEC_MARKER"; fi; printf PR7_IMPL_A_EXECUTED > SHOULD_NOT_EXIST_A']
+depends_on = ["prepare"]
+inputs = ["input.txt"]
+outputs = ["out/a.json"]
+env = { PLAN_VARIANT = "a" }
+guards = { requires_env = "PR7_REQUIRED_ENV" }
+result_codec = "json"
+default = true
+
+[[routes]]
+id = "impl-b"
+label = "implementation B"
+kind = "shell"
+command = ["sh", "-c", 'if [ -n "${PR7_NONEXEC_MARKER:-}" ]; then printf PR7_IMPL_B_EXECUTED >> "$PR7_NONEXEC_MARKER"; fi; printf PR7_IMPL_B_EXECUTED > SHOULD_NOT_EXIST_B']
+depends_on = ["prepare"]
+inputs = ["input.txt"]
+outputs = ["out/b.json"]
+env = { PLAN_VARIANT = "b" }
+result_codec = "json"
+pure = true
+
+[[route_sets]]
+provides = "main"
+alternatives = ["impl-a", "impl-b"]
+policy = "verify_equivalent"

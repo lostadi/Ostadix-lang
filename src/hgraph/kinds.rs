@@ -160,7 +160,8 @@ pub enum ExecutableOp {
     Schedule {
         kind: String,
     },
-    // ── Declared for project-lowering; not yet constructed by from_oir. ──
+    // Project operations are constructed directly from ProjectBundle by the
+    // hosted project planner; they are intentionally not fake OIR nodes.
     MaterializeProject,
     BuildRoute {
         route_id: String,
