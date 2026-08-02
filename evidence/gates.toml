@@ -1,5 +1,5 @@
 schema_version = 1
-required_gate_count = 20
+required_gate_count = 21
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -95,6 +95,37 @@ expected_markers = [
   "World value authority/capsule rejection: PASS",
   "World value bounded malformed rejection: PASS",
   "World value v1 native smoke: PASS",
+]
+
+[[gate]]
+id = "world-receipt-v1"
+required = true
+milestone = "World receipt PR5 / Mode 30"
+script = "ocore/kernel/smoke-world-receipt-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "cmp", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "The separate self-framed OWRECEIPT v1 format deterministically binds one bounded canonical execution receipt to exact World identities and generations, SHA-256 content references, descriptive capability rights, terminal and commit fields, evidence-gate identity, and an algorithm-tagged signature envelope",
+  "The fixed two-record, 3239-byte conformance corpus (6478 lowercase hex digits; concatenated-corpus SHA-256 1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604) converges byte-for-byte between the Rust oracle and native O-core under QEMU, including its 1575-byte current and 1546-byte stale canonical signing preimages; hosted Ed25519 signs and verifies the exact domain-separated preimage and rejects tampering or a wrong key, while native O-core strictly validates the bounded receipt and signature-envelope structure",
+]
+nonclaims = [
+  "OWRECEIPT v1 carries signed descriptive evidence; receipt capability identities and rights are not bearers, CSpace handles, delegation certificates, session tokens, or grants of authority, and signature validity does not establish authorization or current World state",
+  "The pinned conformance key is public test material; this slice provides no production key generation, secure storage, hardware binding, enrollment, certificate chain, rotation, revocation, recovery, peer authentication, or trusted-signer policy",
+  "Mode 30 proves canonical receipt bytes and signing-preimage convergence under QEMU plus hosted Ed25519 sign/verify; native O-core structurally validates the signature envelope but does not implement or prove a general freestanding Ed25519 verifier",
+  "The corpus is constructed offline; HGraph, project, live-system, KernelWorld, object, capability, and evidence components do not yet emit or consume this receipt in live execution, and the existing O-Git semantic receipt remains a separate unsigned JSON demo",
+  "Local generation and commit-field checks are not an authoritative Governor snapshot, replay or commit-fencing service, transport, consensus, WorldFS, or Workstream A acceptance",
+  "This gate is not the typed World Alpha attestation schema, does not admit evidence into evidence/world_alpha_gates.toml, passes no G0-G13 gate, and QEMU TCG is not physical, hardware-virtualization, or hardware-isolation evidence",
+  "OWRECEIPT remains separate from frozen four-kind OWPROTO v1 and OWVALUE v1 and does not change the hosted canonical-CBOR shim wire format",
+]
+expected_markers = [
+  "World receipt hosted Ed25519 sign/verify: PASS",
+  "World receipt Rust/.oc exact-byte convergence: PASS",
+  "World receipt canonical signing-preimage convergence: PASS",
+  "World receipt signature-envelope structural rejection: PASS",
+  "World receipt identity/generation/commit-field binding: PASS",
+  "World receipt descriptive capability boundary: PASS",
+  "World receipt bounded malformed rejection: PASS",
+  "World receipt v1 native smoke: PASS",
 ]
 
 [[gate]]

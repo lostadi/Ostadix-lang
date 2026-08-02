@@ -408,6 +408,31 @@
   receipts nor Workstream A acceptance, supplies no Governor, consensus, or
   WorldFS, and passes no G0--G13 gate. QEMU TCG is not physical or
   hardware-isolation evidence.
+- Mode 30 adds the bounded canonical World-receipt PR5 gate in
+  `ocore/kernel/smoke-world-receipt-qemu.sh`. Its separate self-framed
+  `OWRECEIPT` v1 record binds bounded descriptive World identities and
+  generations, SHA-256 content references, capability-right descriptions,
+  terminal and commit fields, evidence-gate identity, and an algorithm-tagged
+  signature envelope. Rust and native `.oc` produce the same fixed two-record,
+  3,239-byte corpus (6,478 lowercase hex digits; SHA-256
+  `1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`) and
+  the same 1,575-byte current and 1,546-byte stale signing preimages. Both
+  strictly reject malformed,
+  over-limit, reserved, out-of-order, or otherwise noncanonical records.
+  Hosted Rust uses a pinned, explicitly non-secret conformance key for real
+  Ed25519 sign/verify, tamper, and wrong-key tests. Native Mode 30 structurally
+  validates the signature envelope but does not implement or prove a general
+  freestanding Ed25519 verifier.
+  Receipt capability identities and rights remain descriptive data, not
+  bearers, CSpace handles, delegation certificates, session tokens, or grants
+  of authority. Signature validity does not establish authorization, trusted
+  signer policy, or current World state. The corpus is constructed offline: the
+  HGraph, project, live-system, KernelWorld, object, capability, O-Git, and
+  evidence paths do not yet emit or consume it in live execution. This slice
+  supplies no production key generation or custody, enrollment, rotation,
+  revocation, transport, authoritative replay/commit fencing, Governor,
+  consensus, WorldFS, typed World Alpha attestation, Workstream A acceptance,
+  or G0--G13 passage. QEMU TCG is not physical or hardware-isolation evidence.
 
 ## Ostadix World native Alpha boundary
 
@@ -428,7 +453,7 @@
   release gate. The narrower hosted Live-World package/service oracle remains
   separately bounded.
 - The existing project runtime, HGraph executor, capability broker,
-  KernelWorld lifecycle, and Modes 20--29 are reusable organs, not an integrated
+  KernelWorld lifecycle, and Modes 20--30 are reusable organs, not an integrated
   World. Mode 23's synthetic guest is not G7 or G8; Mode 25's static ELF is not
   G9; Mode 26's exact 9P2000 corpus is not G6; supplemental Mode 21 is not real
   Linux boot or physical-device isolation.

@@ -71,6 +71,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-world-identity-qemu.sh # mode-27 exact Rust/.oc OWIDENT v1 identity corpus
 ./ocore/kernel/smoke-world-protocol-qemu.sh # mode-28 exact Rust/.oc OWPROTO v1 codec corpus
 ./ocore/kernel/smoke-world-value-qemu.sh # mode-29 exact Rust/.oc OWVALUE v1 byte/hash corpus
+./ocore/kernel/smoke-world-receipt-qemu.sh # mode-30 exact Rust/.oc OWRECEIPT v1 receipt/preimage corpus
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ```
@@ -330,13 +331,23 @@ path, Mode 27's shared `OWIDENT` identity corpus, Mode 28's bounded `OWPROTO`
 record-codec corpus, Mode 29's separate bounded `OWVALUE` portable-value and
 full-record SHA-256 corpus--19 records and 928 bytes, with concatenated SHA-256
 `264e00550bbbe7561412d9a43f89036667ffbcf27add522131f8e650abef19bc`--and the nonexecuting KernelWorld admission/object
-slice in mode 20. Modes 27 through 29 are byte-level schema oracles, not a
+slice in mode 20. Mode 30 adds a separate bounded `OWRECEIPT` canonical
+receipt/signing-preimage oracle with an algorithm-tagged signature envelope. Its
+fixed two-record corpus is 3,239 bytes (6,478 lowercase hex digits) with SHA-256
+`1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`; the
+current and stale signing preimages are 1,575 and 1,546 bytes respectively.
+Hosted Rust verifies Ed25519 using a pinned public conformance key; native O-core
+validates the receipt and envelope structure but is not a general freestanding
+Ed25519 verifier. Modes 27 through 30 are byte-level schema oracles, not a
 transport, authenticated authority path, Governor, consensus system, or World Alpha
 qualification. Mode 29 uses a 4096-byte maximum, depth-16 and 128-node limits,
 canonical records and scalar-key maps, and root-only inert extensions. It
 rejects hosted authority, capsules, live references, requests, and other
 effectful forms; it does not make the full hosted `OValue` portable, change the
-hosted canonical-CBOR shim, or provide a live crossing. It remains
+hosted canonical-CBOR shim, or provide a live crossing. Mode 30 is also an
+offline corpus: current HGraph, project, live-system, KernelWorld, O-Git, and
+evidence paths do not emit or consume Mode 30 receipts, and its signature does
+not grant authority or establish current World state. The kernel remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
 dynamic linker, writable general filesystem, general foreign ABI personality,

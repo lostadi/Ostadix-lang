@@ -1875,6 +1875,29 @@ hardware-isolation evidence.
 
 Unify HGraph, project, live-system, KernelWorld, object, capability, and evidence data into one signed receipt schema.
 
+**Repository status:** landed as the bounded Mode 30 `OWRECEIPT` v1 canonical
+receipt and signing-preimage oracle. The separate self-framed format binds a
+bounded descriptive subset of World identities and generations, SHA-256 content
+references, capability-right descriptions, terminal and commit fields,
+evidence-gate identity, and an algorithm-tagged signature envelope. Rust and
+native `.oc` converge on a fixed two-record, 3,239-byte corpus (6,478 lowercase
+hex digits; SHA-256
+`1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`) and
+its 1,575-byte current and 1,546-byte stale signing preimages. Hosted Rust
+performs Ed25519 sign/verify and tamper/wrong-key rejection
+with a pinned, explicitly non-secret conformance key. Native Mode 30 validates
+receipt and signature-envelope structure but does not claim a general
+freestanding Ed25519 verifier.
+
+This is an offline conformance corpus rather than an integrated execution
+receipt. HGraph, project, live-system, KernelWorld, object, capability, O-Git,
+and evidence paths do not yet emit or consume it in live operation. Descriptive
+capability identities and rights grant no authority, and a valid signature does
+not establish signer trust, authorization, current World state, or replay/commit
+fencing. Mode 30 supplies no production key lifecycle, transport, Governor,
+consensus, WorldFS, typed Alpha attestation, Acceptance gate A, or G0--G13
+passage. QEMU TCG is not physical or hardware-isolation evidence.
+
 ### PR 6 -- governed `ResourceKey` expansion
 
 Add World, node, domain, process, object, capability, namespace, device, and accelerator resources while retaining `HostWorld` only for ambient hosted effects.
@@ -2582,7 +2605,7 @@ registry.
 
 The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
-The current 20 portable QEMU gates and one supplemental hardware gate retain
+The current 21 portable QEMU gates and one supplemental hardware gate retain
 only the bounded claims in [`CLAIMS.md`](CLAIMS.md) and
 [`evidence/gates.toml`](../evidence/gates.toml). Their results do not satisfy a
 G0--G13 gate. Schema v1 admits no evidence records; only a future versioned,

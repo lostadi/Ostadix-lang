@@ -656,6 +656,34 @@ G0--G13 qualification. It does not make the full hosted `OValue` enum portable
 or replace the hosted canonical-CBOR shim format. QEMU TCG is not physical or
 hardware-isolation evidence.
 
+Mode 30 is the bounded canonical World-receipt PR5 slice. Its separate
+self-framed `OWRECEIPT` v1 format binds bounded descriptive World identities
+and generations, SHA-256 content references, capability-right descriptions,
+terminal and commit fields, evidence-gate identity, and an algorithm-tagged
+signature envelope. Rust and native `.oc` produce the same fixed two-record,
+3,239-byte corpus (6,478 lowercase hex digits; SHA-256
+`1edd90bf881cd42d08e2031482baae4e7c9a95bd78cfa65f0cbe14147c0a2604`) and
+the same 1,575-byte current and 1,546-byte stale signing preimages. Both strictly
+reject malformed or noncanonical record structure.
+
+Run the native World-receipt evidence gate with:
+
+```bash
+./ocore/kernel/smoke-world-receipt-qemu.sh
+```
+
+Hosted Rust performs real Ed25519 sign/verify, tamper rejection, and wrong-key
+rejection using a pinned, explicitly non-secret conformance key. Native Mode 30
+validates the receipt and signature-envelope structure but is not a general
+freestanding Ed25519 verifier. Capability identities and rights in a receipt
+remain descriptive rather than bearer authority. The offline corpus is not a
+live execution receipt emitted by HGraph, project, live-system, KernelWorld,
+O-Git, or evidence components. It supplies no production key lifecycle,
+trusted-signer policy, authoritative replay/commit fencing, transport,
+Governor, consensus, WorldFS, typed World Alpha attestation, Workstream A
+acceptance, or G0--G13 qualification. QEMU TCG is not physical or
+hardware-isolation evidence.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests
