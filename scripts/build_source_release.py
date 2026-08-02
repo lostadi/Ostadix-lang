@@ -162,13 +162,27 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "examples/manifest.json",
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
+        "ocore/kernel/boot.S",
+        "ocore/kernel/build.sh",
+        "ocore/kernel/main.oc",
+        "ocore/kernel/smoke-world-identity-qemu.sh",
+        "ocore/kernel/world_identity_semantics.oc",
+        "ocore/kernel/world_identity_semantics_stub.oc",
+        "ocore/runtime/x86_64/trap.oc",
+        "ocore/world/identity.oc",
         "scripts/smoke_ostadix_mcp.py",
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
+        "src/world/identity.rs",
+        "src/world/identity_wire.rs",
+        "src/world/mod.rs",
         "tests/example_manifest.py",
+        "tests/fixtures/world_identity_v1.hex",
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
         "tests/test_world_alpha_evidence.py",
+        "tests/world_identity.rs",
+        "tests/world_identity_wire.rs",
     }
 )
 VALID_GIT_MODES = frozenset({"100644", "100755"})
@@ -180,7 +194,7 @@ EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
 EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
 EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
-EXPECTED_REQUIRED_EVIDENCE_GATES = 17
+EXPECTED_REQUIRED_EVIDENCE_GATES = 18
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 
 # These three files jointly define the version-1 native World constitution and
@@ -190,13 +204,13 @@ EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "bf8ad9d9020e5e4e5eb2e35dbd9b2f88d20c9d19ccd1869434ead1b7b1ffa683"
+        "7bc5b1a682581566d12daeaf2cc9f8c5baeb22dbfaf4afe6fe7e7d0fbdd4cd92"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
-        "c00b3281f44060ea87089960cbb525307741a096a254b8a32dad917ff4cca186"
+        "faa233f06c3993bcbb29d198b1d9e5b66edc4842136963571c4822faa2149925"
     ),
     "evidence/world_alpha_gates.toml": (
-        "43e8de06af84e0adc410c37f738bc6ae7803dbc68e2a6a5e7326655f70034c7b"
+        "b0b7314234689f8137f86c769e0c866f26741af01bc9b06b8b1e6ee28590362f"
     ),
 }
 EXPECTED_WORLD_ALPHA_GATE_IDS = tuple(f"G{number}" for number in range(14))

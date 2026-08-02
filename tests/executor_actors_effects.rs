@@ -11,8 +11,9 @@ use o_lang::executor::{
 use o_lang::ir::{BackendRegistry, OIr, OIrProgram, PlanNodeId, PlanNodeKind};
 use o_lang::world::{
     ArtifactId, ArtifactPublicationIdentity, AttemptGeneration, DomainGeneration, DomainId,
-    DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceId, ResourceIdentity,
-    ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch, WorldId, WorldIdentity,
+    DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceGeneration, ResourceId,
+    ResourceIdentity, ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch, WorldId,
+    WorldIdentity,
 };
 
 fn shim(lang: &str) -> o_lang::ir::BackendInterface {
@@ -360,6 +361,7 @@ fn governed_vocabulary_is_precise_and_does_not_alias_ambient_hostworld() {
     let resource = ResourceIdentity::new(
         ResourceOwner::Node { node: node.clone() },
         ResourceId::new("cpu/slot-0").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
     );
     let task = TaskAttemptIdentity::new(
         world.world().clone(),

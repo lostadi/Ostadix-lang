@@ -1,0 +1,999 @@
+module world::identity;
+
+// Architecture-independent descriptive identity vocabulary. These values are
+// names and generations, never bearer authority. Native capability checks stay
+// at the operation boundary that consumes an identity.
+
+pub const IDENTITY_KIND_WORLD: u64 = 1;
+pub const IDENTITY_KIND_GOVERNOR: u64 = 2;
+pub const IDENTITY_KIND_NODE: u64 = 3;
+pub const IDENTITY_KIND_DOMAIN: u64 = 4;
+pub const IDENTITY_KIND_PROCESS: u64 = 5;
+pub const IDENTITY_KIND_RESOURCE: u64 = 6;
+pub const IDENTITY_KIND_OBJECT: u64 = 7;
+pub const IDENTITY_KIND_CAPABILITY: u64 = 8;
+pub const IDENTITY_KIND_LEASE: u64 = 9;
+pub const IDENTITY_KIND_TASK: u64 = 10;
+pub const IDENTITY_KIND_ATTEMPT: u64 = 11;
+pub const IDENTITY_KIND_CHECKPOINT: u64 = 12;
+pub const IDENTITY_KIND_RECEIPT: u64 = 13;
+
+pub const RESOURCE_OWNER_WORLD: u64 = 1;
+pub const RESOURCE_OWNER_NODE: u64 = 2;
+pub const RESOURCE_OWNER_DOMAIN: u64 = 3;
+pub const RESOURCE_OWNER_PROCESS: u64 = 4;
+
+pub const IDENTITY_FIELD_WORLD: u64 = 1;
+pub const IDENTITY_FIELD_NODE: u64 = 2;
+pub const IDENTITY_FIELD_DOMAIN: u64 = 3;
+pub const IDENTITY_FIELD_PROCESS: u64 = 4;
+pub const IDENTITY_FIELD_RESOURCE: u64 = 5;
+pub const IDENTITY_FIELD_OBJECT: u64 = 6;
+pub const IDENTITY_FIELD_CAPABILITY: u64 = 7;
+pub const IDENTITY_FIELD_LEASE: u64 = 8;
+pub const IDENTITY_FIELD_TASK: u64 = 9;
+pub const IDENTITY_FIELD_CHECKPOINT: u64 = 10;
+pub const IDENTITY_FIELD_RECEIPT: u64 = 11;
+
+pub const IDENTITY_COUNTER_EPOCH: u64 = 1;
+pub const IDENTITY_COUNTER_TERM: u64 = 2;
+pub const IDENTITY_COUNTER_LOG_INDEX: u64 = 3;
+pub const IDENTITY_COUNTER_NODE_GENERATION: u64 = 4;
+pub const IDENTITY_COUNTER_DOMAIN_GENERATION: u64 = 5;
+pub const IDENTITY_COUNTER_PROCESS_GENERATION: u64 = 6;
+pub const IDENTITY_COUNTER_RESOURCE_GENERATION: u64 = 7;
+pub const IDENTITY_COUNTER_OBJECT_VERSION: u64 = 8;
+pub const IDENTITY_COUNTER_ATTEMPT_GENERATION: u64 = 9;
+
+const SIMPLE_ID_MAX: usize = 128;
+const RESOURCE_ID_MAX: usize = 256;
+const RECORD_HEADER_LENGTH: usize = 16;
+const RECORD_MAX_LENGTH: usize = 1024;
+
+pub struct IdentityText {
+    length: usize,
+    bytes: [u8; 256],
+}
+
+pub struct WorldId { value: IdentityText }
+pub struct WorldEpoch { value: u64 }
+pub struct GovernorTerm { value: u64 }
+pub struct GovernorLogIndex { value: u64 }
+pub struct NodeId { value: IdentityText }
+pub struct NodeGeneration { value: u64 }
+pub struct DomainId { value: IdentityText }
+pub struct DomainGeneration { value: u64 }
+pub struct ProcessId { value: IdentityText }
+pub struct ProcessGeneration { value: u64 }
+pub struct ResourceId { value: IdentityText }
+pub struct ResourceGeneration { value: u64 }
+pub struct ObjectId { value: IdentityText }
+pub struct ObjectVersion { value: u64 }
+pub struct CapabilityId { value: IdentityText }
+pub struct LeaseId { value: IdentityText }
+pub struct TaskId { value: IdentityText }
+pub struct AttemptGeneration { value: u64 }
+pub struct CheckpointId { value: IdentityText }
+pub struct ReceiptId { value: IdentityText }
+
+pub struct WorldIdentity {
+    world: WorldId,
+    epoch: WorldEpoch,
+}
+
+pub struct GovernorIdentity {
+    world: WorldId,
+    epoch: WorldEpoch,
+    term: GovernorTerm,
+    log_index: GovernorLogIndex,
+}
+
+pub struct NodeIdentity {
+    world: WorldId,
+    node: NodeId,
+    generation: NodeGeneration,
+}
+
+pub struct DomainIdentity {
+    node: NodeIdentity,
+    domain: DomainId,
+    generation: DomainGeneration,
+}
+
+pub struct ProcessIdentity {
+    domain: DomainIdentity,
+    process: ProcessId,
+    generation: ProcessGeneration,
+}
+
+// A tagged, flattened owner avoids target-layout unions. Only the prefix
+// selected by tag is meaningful and serialized.
+pub struct ResourceOwner {
+    tag: u64,
+    world: WorldId,
+    world_epoch: WorldEpoch,
+    node: NodeId,
+    node_generation: NodeGeneration,
+    domain: DomainId,
+    domain_generation: DomainGeneration,
+    process: ProcessId,
+    process_generation: ProcessGeneration,
+}
+
+pub struct ResourceIdentity {
+    owner: ResourceOwner,
+    resource: ResourceId,
+    generation: ResourceGeneration,
+}
+
+pub struct ObjectIdentity {
+    world: WorldId,
+    object: ObjectId,
+    version: ObjectVersion,
+}
+
+pub struct CapabilityIdentity { world: WorldId, capability: CapabilityId }
+pub struct LeaseIdentity { world: WorldId, lease: LeaseId }
+pub struct TaskIdentity { world: WorldId, task: TaskId }
+pub struct TaskAttemptIdentity {
+    task: TaskIdentity,
+    generation: AttemptGeneration,
+}
+pub struct CheckpointIdentity {
+    task: TaskIdentity,
+    attempt_generation: AttemptGeneration,
+    checkpoint: CheckpointId,
+}
+pub struct ReceiptIdentity { world: WorldId, receipt: ReceiptId }
+
+// A decoded v1 record. The nominal composite types above are the public
+// vocabulary; this flat carrier keeps the freestanding codec total without a
+// target-specific union or aggregate ABI.
+pub struct IdentityRecord {
+    kind: u64,
+    owner_tag: u64,
+    world: IdentityText,
+    node: IdentityText,
+    domain: IdentityText,
+    process: IdentityText,
+    resource: IdentityText,
+    object: IdentityText,
+    capability: IdentityText,
+    lease: IdentityText,
+    task: IdentityText,
+    checkpoint: IdentityText,
+    receipt: IdentityText,
+    epoch: u64,
+    term: u64,
+    log_index: u64,
+    node_generation: u64,
+    domain_generation: u64,
+    process_generation: u64,
+    resource_generation: u64,
+    object_version: u64,
+    attempt_generation: u64,
+}
+
+struct Reader {
+    source: *const u8,
+    length: usize,
+    cursor: usize,
+    failed: u64,
+}
+
+unsafe fn clear_text(text: *mut IdentityText) -> void {
+    (*text).length = 0;
+    let mut index: usize = 0;
+    while index < RESOURCE_ID_MAX {
+        (*text).bytes[index] = 0;
+        index += 1;
+    }
+}
+
+pub unsafe fn clear_record(record: *mut IdentityRecord) -> u64 {
+    if record as usize == 0 { return 0; }
+    (*record).kind = 0;
+    (*record).owner_tag = 0;
+    clear_text((&mut (*record).world));
+    clear_text((&mut (*record).node));
+    clear_text((&mut (*record).domain));
+    clear_text((&mut (*record).process));
+    clear_text((&mut (*record).resource));
+    clear_text((&mut (*record).object));
+    clear_text((&mut (*record).capability));
+    clear_text((&mut (*record).lease));
+    clear_text((&mut (*record).task));
+    clear_text((&mut (*record).checkpoint));
+    clear_text((&mut (*record).receipt));
+    (*record).epoch = 0;
+    (*record).term = 0;
+    (*record).log_index = 0;
+    (*record).node_generation = 0;
+    (*record).domain_generation = 0;
+    (*record).process_generation = 0;
+    (*record).resource_generation = 0;
+    (*record).object_version = 0;
+    (*record).attempt_generation = 0;
+    return 1;
+}
+
+fn simple_byte(value: u64) -> bool {
+    return (value >= b'a' as u64 && value <= b'z' as u64)
+        || (value >= b'A' as u64 && value <= b'Z' as u64)
+        || (value >= b'0' as u64 && value <= b'9' as u64)
+        || value == b'.' as u64
+        || value == b'_' as u64
+        || value == b'+' as u64
+        || value == b'-' as u64;
+}
+
+unsafe fn source_byte(source: *const u8, index: usize) -> u64 {
+    return volatile_load(source + index) as u64;
+}
+
+unsafe fn valid_simple(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0 || length > SIMPLE_ID_MAX {
+        return false;
+    }
+    if length == 1 && source_byte(source, 0) == b'.' as u64 { return false; }
+    if length == 2
+        && source_byte(source, 0) == b'.' as u64
+        && source_byte(source, 1) == b'.' as u64 { return false; }
+    let mut index: usize = 0;
+    while index < length {
+        if !simple_byte(source_byte(source, index)) { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn valid_resource(source: *const u8, length: usize) -> bool {
+    if source as usize == 0 || length == 0 || length > RESOURCE_ID_MAX {
+        return false;
+    }
+    if source_byte(source, 0) == b'/' as u64
+        || source_byte(source, length - 1) == b'/' as u64 { return false; }
+    let mut component_start: usize = 0;
+    let mut index: usize = 0;
+    while index <= length {
+        if index == length || source_byte(source, index) == b'/' as u64 {
+            let component_length: usize = index - component_start;
+            if component_length == 0
+                || !valid_simple(source + component_start, component_length) {
+                return false;
+            }
+            component_start = index + 1;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn install_text(
+    destination: *mut IdentityText,
+    source: *const u8,
+    length: usize,
+    resource_path: bool
+) -> u64 {
+    if destination as usize == 0 { return 0; }
+    if (resource_path && !valid_resource(source, length))
+        || (!resource_path && !valid_simple(source, length)) { return 0; }
+    clear_text(destination);
+    (*destination).length = length;
+    let mut index: usize = 0;
+    while index < length {
+        (*destination).bytes[index] = source_byte(source, index) as u8;
+        index += 1;
+    }
+    return 1;
+}
+
+unsafe fn install_counter(destination: *mut u64, value: u64) -> u64 {
+    if destination as usize == 0 || value == 0 { return 0; }
+    *destination = value;
+    return 1;
+}
+
+pub unsafe fn world_id_init(result: *mut WorldId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn node_id_init(result: *mut NodeId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn domain_id_init(result: *mut DomainId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn process_id_init(result: *mut ProcessId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn resource_id_init(result: *mut ResourceId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, true); }
+pub unsafe fn object_id_init(result: *mut ObjectId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn capability_id_init(result: *mut CapabilityId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn lease_id_init(result: *mut LeaseId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn task_id_init(result: *mut TaskId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn checkpoint_id_init(result: *mut CheckpointId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+pub unsafe fn receipt_id_init(result: *mut ReceiptId, source: *const u8, length: usize) -> u64 { if result as usize == 0 { return 0; } return install_text((&mut (*result).value), source, length, false); }
+
+pub unsafe fn world_epoch_init(result: *mut WorldEpoch, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn governor_term_init(result: *mut GovernorTerm, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn governor_log_index_init(result: *mut GovernorLogIndex, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn node_generation_init(result: *mut NodeGeneration, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn domain_generation_init(result: *mut DomainGeneration, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn process_generation_init(result: *mut ProcessGeneration, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn resource_generation_init(result: *mut ResourceGeneration, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn object_version_init(result: *mut ObjectVersion, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+pub unsafe fn attempt_generation_init(result: *mut AttemptGeneration, value: u64) -> u64 { if result as usize == 0 { return 0; } return install_counter((&mut (*result).value), value); }
+
+pub fn generation_is_current(current: u64, presented: u64) -> bool {
+    return current != 0 && presented != 0 && current == presented;
+}
+
+pub unsafe fn record_begin(record: *mut IdentityRecord, kind: u64, owner_tag: u64) -> u64 {
+    if record as usize == 0 || kind == 0 || kind > IDENTITY_KIND_RECEIPT {
+        return 0;
+    }
+    if kind == IDENTITY_KIND_RESOURCE {
+        if owner_tag < RESOURCE_OWNER_WORLD || owner_tag > RESOURCE_OWNER_PROCESS {
+            return 0;
+        }
+    }
+    if kind != IDENTITY_KIND_RESOURCE && owner_tag != 0 {
+        return 0;
+    }
+    clear_record(record);
+    (*record).kind = kind;
+    (*record).owner_tag = owner_tag;
+    return 1;
+}
+
+pub unsafe fn record_set_text(
+    record: *mut IdentityRecord,
+    field: u64,
+    source: *const u8,
+    length: usize
+) -> u64 {
+    if record as usize == 0 { return 0; }
+    if field == IDENTITY_FIELD_WORLD { return install_text((&mut (*record).world), source, length, false); }
+    if field == IDENTITY_FIELD_NODE { return install_text((&mut (*record).node), source, length, false); }
+    if field == IDENTITY_FIELD_DOMAIN { return install_text((&mut (*record).domain), source, length, false); }
+    if field == IDENTITY_FIELD_PROCESS { return install_text((&mut (*record).process), source, length, false); }
+    if field == IDENTITY_FIELD_RESOURCE { return install_text((&mut (*record).resource), source, length, true); }
+    if field == IDENTITY_FIELD_OBJECT { return install_text((&mut (*record).object), source, length, false); }
+    if field == IDENTITY_FIELD_CAPABILITY { return install_text((&mut (*record).capability), source, length, false); }
+    if field == IDENTITY_FIELD_LEASE { return install_text((&mut (*record).lease), source, length, false); }
+    if field == IDENTITY_FIELD_TASK { return install_text((&mut (*record).task), source, length, false); }
+    if field == IDENTITY_FIELD_CHECKPOINT { return install_text((&mut (*record).checkpoint), source, length, false); }
+    if field == IDENTITY_FIELD_RECEIPT { return install_text((&mut (*record).receipt), source, length, false); }
+    return 0;
+}
+
+pub unsafe fn record_set_counter(record: *mut IdentityRecord, field: u64, value: u64) -> u64 {
+    if record as usize == 0 || value == 0 { return 0; }
+    if field == IDENTITY_COUNTER_EPOCH { (*record).epoch = value; return 1; }
+    if field == IDENTITY_COUNTER_TERM { (*record).term = value; return 1; }
+    if field == IDENTITY_COUNTER_LOG_INDEX { (*record).log_index = value; return 1; }
+    if field == IDENTITY_COUNTER_NODE_GENERATION { (*record).node_generation = value; return 1; }
+    if field == IDENTITY_COUNTER_DOMAIN_GENERATION { (*record).domain_generation = value; return 1; }
+    if field == IDENTITY_COUNTER_PROCESS_GENERATION { (*record).process_generation = value; return 1; }
+    if field == IDENTITY_COUNTER_RESOURCE_GENERATION { (*record).resource_generation = value; return 1; }
+    if field == IDENTITY_COUNTER_OBJECT_VERSION { (*record).object_version = value; return 1; }
+    if field == IDENTITY_COUNTER_ATTEMPT_GENERATION { (*record).attempt_generation = value; return 1; }
+    return 0;
+}
+
+pub unsafe fn record_kind(record: *const IdentityRecord) -> u64 {
+    if record as usize == 0 { return 0; }
+    return (*record).kind;
+}
+
+unsafe fn text_valid(text: *const IdentityText, resource_path: bool) -> bool {
+    if text as usize == 0 { return false; }
+    if resource_path {
+        return valid_resource((&(*text).bytes[0]), (*text).length);
+    }
+    return valid_simple((&(*text).bytes[0]), (*text).length);
+}
+
+unsafe fn world_valid(record: *const IdentityRecord) -> bool {
+    return text_valid((&(*record).world), false);
+}
+
+unsafe fn node_valid(record: *const IdentityRecord) -> bool {
+    return world_valid(record)
+        && text_valid((&(*record).node), false)
+        && (*record).node_generation != 0;
+}
+
+unsafe fn domain_valid(record: *const IdentityRecord) -> bool {
+    return node_valid(record)
+        && text_valid((&(*record).domain), false)
+        && (*record).domain_generation != 0;
+}
+
+unsafe fn process_valid(record: *const IdentityRecord) -> bool {
+    return domain_valid(record)
+        && text_valid((&(*record).process), false)
+        && (*record).process_generation != 0;
+}
+
+unsafe fn record_valid(record: *const IdentityRecord) -> bool {
+    if record as usize == 0 { return false; }
+    let kind: u64 = (*record).kind;
+    if kind != IDENTITY_KIND_RESOURCE && (*record).owner_tag != 0 {
+        return false;
+    }
+    if kind == IDENTITY_KIND_RESOURCE
+        && ((*record).owner_tag < RESOURCE_OWNER_WORLD
+            || (*record).owner_tag > RESOURCE_OWNER_PROCESS) {
+        return false;
+    }
+    if kind == IDENTITY_KIND_WORLD {
+        return world_valid(record) && (*record).epoch != 0;
+    }
+    if kind == IDENTITY_KIND_GOVERNOR {
+        return world_valid(record) && (*record).epoch != 0
+            && (*record).term != 0 && (*record).log_index != 0;
+    }
+    if kind == IDENTITY_KIND_NODE { return node_valid(record); }
+    if kind == IDENTITY_KIND_DOMAIN { return domain_valid(record); }
+    if kind == IDENTITY_KIND_PROCESS { return process_valid(record); }
+    if kind == IDENTITY_KIND_RESOURCE {
+        let owner: u64 = (*record).owner_tag;
+        let owner_valid: bool = (owner == RESOURCE_OWNER_WORLD
+                && world_valid(record) && (*record).epoch != 0)
+            || (owner == RESOURCE_OWNER_NODE && node_valid(record))
+            || (owner == RESOURCE_OWNER_DOMAIN && domain_valid(record))
+            || (owner == RESOURCE_OWNER_PROCESS && process_valid(record));
+        return owner_valid
+            && text_valid((&(*record).resource), true)
+            && (*record).resource_generation != 0;
+    }
+    if kind == IDENTITY_KIND_OBJECT {
+        return world_valid(record) && text_valid((&(*record).object), false)
+            && (*record).object_version != 0;
+    }
+    if kind == IDENTITY_KIND_CAPABILITY {
+        return world_valid(record) && text_valid((&(*record).capability), false);
+    }
+    if kind == IDENTITY_KIND_LEASE {
+        return world_valid(record) && text_valid((&(*record).lease), false);
+    }
+    if kind == IDENTITY_KIND_TASK {
+        return world_valid(record) && text_valid((&(*record).task), false);
+    }
+    if kind == IDENTITY_KIND_ATTEMPT {
+        return world_valid(record) && text_valid((&(*record).task), false)
+            && (*record).attempt_generation != 0;
+    }
+    if kind == IDENTITY_KIND_CHECKPOINT {
+        return world_valid(record) && text_valid((&(*record).task), false)
+            && (*record).attempt_generation != 0
+            && text_valid((&(*record).checkpoint), false);
+    }
+    if kind == IDENTITY_KIND_RECEIPT {
+        return world_valid(record) && text_valid((&(*record).receipt), false);
+    }
+    return false;
+}
+
+unsafe fn text_same(left: *const IdentityText, right: *const IdentityText) -> bool {
+    if (*left).length != (*right).length { return false; }
+    let mut index: usize = 0;
+    while index < (*left).length {
+        if (*left).bytes[index] != (*right).bytes[index] { return false; }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn node_same(left: *const IdentityRecord, right: *const IdentityRecord) -> bool {
+    return text_same((&(*left).world), (&(*right).world))
+        && text_same((&(*left).node), (&(*right).node))
+        && generation_is_current((*left).node_generation, (*right).node_generation);
+}
+
+unsafe fn domain_same(left: *const IdentityRecord, right: *const IdentityRecord) -> bool {
+    return node_same(left, right)
+        && text_same((&(*left).domain), (&(*right).domain))
+        && generation_is_current((*left).domain_generation, (*right).domain_generation);
+}
+
+unsafe fn process_same(left: *const IdentityRecord, right: *const IdentityRecord) -> bool {
+    return domain_same(left, right)
+        && text_same((&(*left).process), (&(*right).process))
+        && generation_is_current((*left).process_generation, (*right).process_generation);
+}
+
+// Currentness is an identity-and-generation relation, not scalar equality.
+// It deliberately compares the complete logical hierarchy selected by kind.
+pub unsafe fn record_is_current(
+    current: *const IdentityRecord,
+    presented: *const IdentityRecord
+) -> bool {
+    if !record_valid(current) || !record_valid(presented)
+        || (*current).kind != (*presented).kind
+        || (*current).owner_tag != (*presented).owner_tag {
+        return false;
+    }
+    let kind: u64 = (*current).kind;
+    if kind == IDENTITY_KIND_WORLD {
+        return text_same((&(*current).world), (&(*presented).world))
+            && generation_is_current((*current).epoch, (*presented).epoch);
+    }
+    if kind == IDENTITY_KIND_GOVERNOR {
+        return text_same((&(*current).world), (&(*presented).world))
+            && generation_is_current((*current).epoch, (*presented).epoch)
+            && generation_is_current((*current).term, (*presented).term)
+            && generation_is_current((*current).log_index, (*presented).log_index);
+    }
+    if kind == IDENTITY_KIND_NODE { return node_same(current, presented); }
+    if kind == IDENTITY_KIND_DOMAIN { return domain_same(current, presented); }
+    if kind == IDENTITY_KIND_PROCESS { return process_same(current, presented); }
+    if kind == IDENTITY_KIND_RESOURCE {
+        let mut owner_same: bool = false;
+        if (*current).owner_tag == RESOURCE_OWNER_WORLD {
+            owner_same = text_same((&(*current).world), (&(*presented).world))
+                && generation_is_current((*current).epoch, (*presented).epoch);
+        }
+        if (*current).owner_tag == RESOURCE_OWNER_NODE { owner_same = node_same(current, presented); }
+        if (*current).owner_tag == RESOURCE_OWNER_DOMAIN { owner_same = domain_same(current, presented); }
+        if (*current).owner_tag == RESOURCE_OWNER_PROCESS { owner_same = process_same(current, presented); }
+        return owner_same
+            && text_same((&(*current).resource), (&(*presented).resource))
+            && generation_is_current(
+                (*current).resource_generation,
+                (*presented).resource_generation
+            );
+    }
+    if kind == IDENTITY_KIND_OBJECT {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).object), (&(*presented).object))
+            && generation_is_current((*current).object_version, (*presented).object_version);
+    }
+    if kind == IDENTITY_KIND_CAPABILITY {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).capability), (&(*presented).capability));
+    }
+    if kind == IDENTITY_KIND_LEASE {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).lease), (&(*presented).lease));
+    }
+    if kind == IDENTITY_KIND_TASK {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).task), (&(*presented).task));
+    }
+    if kind == IDENTITY_KIND_ATTEMPT {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).task), (&(*presented).task))
+            && generation_is_current(
+                (*current).attempt_generation,
+                (*presented).attempt_generation
+            );
+    }
+    if kind == IDENTITY_KIND_CHECKPOINT {
+        return text_same((&(*current).world), (&(*presented).world))
+            && text_same((&(*current).task), (&(*presented).task))
+            && generation_is_current(
+                (*current).attempt_generation,
+                (*presented).attempt_generation
+            )
+            && text_same((&(*current).checkpoint), (&(*presented).checkpoint));
+    }
+    return text_same((&(*current).world), (&(*presented).world))
+        && text_same((&(*current).receipt), (&(*presented).receipt));
+}
+
+unsafe fn text_wire_length(text: *const IdentityText) -> usize {
+    return 2 + (*text).length;
+}
+
+unsafe fn node_wire_length(record: *const IdentityRecord) -> usize {
+    return text_wire_length((&(*record).world))
+        + text_wire_length((&(*record).node)) + 8;
+}
+
+unsafe fn domain_wire_length(record: *const IdentityRecord) -> usize {
+    return node_wire_length(record)
+        + text_wire_length((&(*record).domain)) + 8;
+}
+
+unsafe fn process_wire_length(record: *const IdentityRecord) -> usize {
+    return domain_wire_length(record)
+        + text_wire_length((&(*record).process)) + 8;
+}
+
+unsafe fn payload_length(record: *const IdentityRecord) -> usize {
+    let kind: u64 = (*record).kind;
+    if kind == IDENTITY_KIND_WORLD { return text_wire_length((&(*record).world)) + 8; }
+    if kind == IDENTITY_KIND_GOVERNOR { return text_wire_length((&(*record).world)) + 24; }
+    if kind == IDENTITY_KIND_NODE { return node_wire_length(record); }
+    if kind == IDENTITY_KIND_DOMAIN { return domain_wire_length(record); }
+    if kind == IDENTITY_KIND_PROCESS { return process_wire_length(record); }
+    if kind == IDENTITY_KIND_RESOURCE {
+        let mut owner_length: usize = text_wire_length((&(*record).world)) + 8;
+        if (*record).owner_tag == RESOURCE_OWNER_NODE { owner_length = node_wire_length(record); }
+        if (*record).owner_tag == RESOURCE_OWNER_DOMAIN { owner_length = domain_wire_length(record); }
+        if (*record).owner_tag == RESOURCE_OWNER_PROCESS { owner_length = process_wire_length(record); }
+        return 2 + owner_length + text_wire_length((&(*record).resource)) + 8;
+    }
+    if kind == IDENTITY_KIND_OBJECT { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).object)) + 8; }
+    if kind == IDENTITY_KIND_CAPABILITY { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).capability)); }
+    if kind == IDENTITY_KIND_LEASE { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).lease)); }
+    if kind == IDENTITY_KIND_TASK { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).task)); }
+    if kind == IDENTITY_KIND_ATTEMPT { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).task)) + 8; }
+    if kind == IDENTITY_KIND_CHECKPOINT { return text_wire_length((&(*record).world)) + text_wire_length((&(*record).task)) + 8 + text_wire_length((&(*record).checkpoint)); }
+    return text_wire_length((&(*record).world)) + text_wire_length((&(*record).receipt));
+}
+
+unsafe fn put_byte(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    volatile_store(output + *cursor, value as u8);
+    *cursor += 1;
+}
+
+unsafe fn put_u16(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_u32(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    put_byte(output, cursor, value >> 24);
+    put_byte(output, cursor, value >> 16);
+    put_byte(output, cursor, value >> 8);
+    put_byte(output, cursor, value);
+}
+
+unsafe fn put_u64(output: *mut u8, cursor: *mut usize, value: u64) -> void {
+    let mut shift: usize = 56;
+    loop {
+        put_byte(output, cursor, value >> shift);
+        if shift == 0 { return; }
+        shift -= 8;
+    }
+}
+
+unsafe fn put_text(output: *mut u8, cursor: *mut usize, text: *const IdentityText) -> void {
+    put_u16(output, cursor, (*text).length as u64);
+    let mut index: usize = 0;
+    while index < (*text).length {
+        put_byte(output, cursor, (*text).bytes[index] as u64);
+        index += 1;
+    }
+}
+
+unsafe fn put_node(output: *mut u8, cursor: *mut usize, record: *const IdentityRecord) -> void {
+    put_text(output, cursor, (&(*record).world));
+    put_text(output, cursor, (&(*record).node));
+    put_u64(output, cursor, (*record).node_generation);
+}
+
+unsafe fn put_domain(output: *mut u8, cursor: *mut usize, record: *const IdentityRecord) -> void {
+    put_node(output, cursor, record);
+    put_text(output, cursor, (&(*record).domain));
+    put_u64(output, cursor, (*record).domain_generation);
+}
+
+unsafe fn put_process(output: *mut u8, cursor: *mut usize, record: *const IdentityRecord) -> void {
+    put_domain(output, cursor, record);
+    put_text(output, cursor, (&(*record).process));
+    put_u64(output, cursor, (*record).process_generation);
+}
+
+pub unsafe fn encode_record(
+    record: *const IdentityRecord,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize
+) -> u64 {
+    if output as usize == 0 || written as usize == 0 || !record_valid(record) {
+        return 0;
+    }
+    let total: usize = RECORD_HEADER_LENGTH + payload_length(record);
+    if total > RECORD_MAX_LENGTH || capacity < total { return 0; }
+    let mut cursor: usize = 0;
+    put_byte(output, (&mut cursor), b'O' as u64);
+    put_byte(output, (&mut cursor), b'W' as u64);
+    put_byte(output, (&mut cursor), b'I' as u64);
+    put_byte(output, (&mut cursor), b'D' as u64);
+    put_byte(output, (&mut cursor), b'E' as u64);
+    put_byte(output, (&mut cursor), b'N' as u64);
+    put_byte(output, (&mut cursor), b'T' as u64);
+    put_byte(output, (&mut cursor), 0);
+    put_u16(output, (&mut cursor), 1);
+    put_u16(output, (&mut cursor), (*record).kind);
+    put_u32(output, (&mut cursor), total as u64);
+    let kind: u64 = (*record).kind;
+    if kind == IDENTITY_KIND_WORLD {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_u64(output, (&mut cursor), (*record).epoch);
+    }
+    if kind == IDENTITY_KIND_GOVERNOR {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_u64(output, (&mut cursor), (*record).epoch);
+        put_u64(output, (&mut cursor), (*record).term);
+        put_u64(output, (&mut cursor), (*record).log_index);
+    }
+    if kind == IDENTITY_KIND_NODE {
+        put_node(output, (&mut cursor), record);
+    }
+    if kind == IDENTITY_KIND_DOMAIN {
+        put_domain(output, (&mut cursor), record);
+    }
+    if kind == IDENTITY_KIND_PROCESS {
+        put_process(output, (&mut cursor), record);
+    }
+    if kind == IDENTITY_KIND_RESOURCE {
+        put_u16(output, (&mut cursor), (*record).owner_tag);
+        if (*record).owner_tag == RESOURCE_OWNER_WORLD {
+            put_text(output, (&mut cursor), (&(*record).world));
+            put_u64(output, (&mut cursor), (*record).epoch);
+        }
+        if (*record).owner_tag == RESOURCE_OWNER_NODE {
+            put_node(output, (&mut cursor), record);
+        }
+        if (*record).owner_tag == RESOURCE_OWNER_DOMAIN {
+            put_domain(output, (&mut cursor), record);
+        }
+        if (*record).owner_tag == RESOURCE_OWNER_PROCESS {
+            put_process(output, (&mut cursor), record);
+        }
+        put_text(output, (&mut cursor), (&(*record).resource));
+        put_u64(output, (&mut cursor), (*record).resource_generation);
+    }
+    if kind == IDENTITY_KIND_OBJECT {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).object));
+        put_u64(output, (&mut cursor), (*record).object_version);
+    }
+    if kind == IDENTITY_KIND_CAPABILITY {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).capability));
+    }
+    if kind == IDENTITY_KIND_LEASE {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).lease));
+    }
+    if kind == IDENTITY_KIND_TASK {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).task));
+    }
+    if kind == IDENTITY_KIND_ATTEMPT {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).task));
+        put_u64(output, (&mut cursor), (*record).attempt_generation);
+    }
+    if kind == IDENTITY_KIND_CHECKPOINT {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).task));
+        put_u64(output, (&mut cursor), (*record).attempt_generation);
+        put_text(output, (&mut cursor), (&(*record).checkpoint));
+    }
+    if kind == IDENTITY_KIND_RECEIPT {
+        put_text(output, (&mut cursor), (&(*record).world));
+        put_text(output, (&mut cursor), (&(*record).receipt));
+    }
+    if cursor != total { return 0; }
+    volatile_store(written, total);
+    return 1;
+}
+
+unsafe fn take_byte(reader: *mut Reader) -> u64 {
+    if (*reader).failed != 0 || (*reader).cursor >= (*reader).length {
+        (*reader).failed = 1;
+        return 0;
+    }
+    let value: u64 = source_byte((*reader).source, (*reader).cursor);
+    (*reader).cursor += 1;
+    return value;
+}
+
+unsafe fn take_u16(reader: *mut Reader) -> u64 {
+    return (take_byte(reader) << 8) | take_byte(reader);
+}
+
+unsafe fn take_u32(reader: *mut Reader) -> u64 {
+    return (take_u16(reader) << 16) | take_u16(reader);
+}
+
+unsafe fn take_u64(reader: *mut Reader) -> u64 {
+    let high: u64 = take_u32(reader);
+    let low: u64 = take_u32(reader);
+    return (high << 32) | low;
+}
+
+unsafe fn take_text(
+    reader: *mut Reader,
+    destination: *mut IdentityText,
+    resource_path: bool,
+    write_output: bool
+) -> bool {
+    let count: usize = take_u16(reader) as usize;
+    let mut maximum: usize = SIMPLE_ID_MAX;
+    if resource_path { maximum = RESOURCE_ID_MAX; }
+    if (*reader).failed != 0 || count == 0
+        || count > maximum
+        || (*reader).cursor > (*reader).length
+        || count > (*reader).length - (*reader).cursor {
+        (*reader).failed = 1;
+        return false;
+    }
+    let source: *const u8 = (*reader).source + (*reader).cursor;
+    if (resource_path && !valid_resource(source, count))
+        || (!resource_path && !valid_simple(source, count)) {
+        (*reader).failed = 1;
+        return false;
+    }
+    if write_output && install_text(destination, source, count, resource_path) == 0 {
+        (*reader).failed = 1;
+        return false;
+    }
+    (*reader).cursor += count;
+    return true;
+}
+
+unsafe fn take_counter(
+    reader: *mut Reader,
+    destination: *mut u64,
+    write_output: bool
+) -> bool {
+    let value: u64 = take_u64(reader);
+    if (*reader).failed != 0 || value == 0 {
+        (*reader).failed = 1;
+        return false;
+    }
+    if write_output { *destination = value; }
+    return true;
+}
+
+unsafe fn take_node(
+    reader: *mut Reader,
+    record: *mut IdentityRecord,
+    write_output: bool
+) -> bool {
+    return take_text(reader, (&mut (*record).world), false, write_output)
+        && take_text(reader, (&mut (*record).node), false, write_output)
+        && take_counter(reader, (&mut (*record).node_generation), write_output);
+}
+
+unsafe fn take_domain(
+    reader: *mut Reader,
+    record: *mut IdentityRecord,
+    write_output: bool
+) -> bool {
+    return take_node(reader, record, write_output)
+        && take_text(reader, (&mut (*record).domain), false, write_output)
+        && take_counter(reader, (&mut (*record).domain_generation), write_output);
+}
+
+unsafe fn take_process(
+    reader: *mut Reader,
+    record: *mut IdentityRecord,
+    write_output: bool
+) -> bool {
+    return take_domain(reader, record, write_output)
+        && take_text(reader, (&mut (*record).process), false, write_output)
+        && take_counter(reader, (&mut (*record).process_generation), write_output);
+}
+
+unsafe fn parse_record(
+    source: *const u8,
+    length: usize,
+    record: *mut IdentityRecord,
+    write_output: bool
+) -> bool {
+    let mut reader: Reader = Reader {
+        source: source,
+        length: length,
+        cursor: 0,
+        failed: 0,
+    };
+    if take_byte((&mut reader)) != b'O' as u64
+        || take_byte((&mut reader)) != b'W' as u64
+        || take_byte((&mut reader)) != b'I' as u64
+        || take_byte((&mut reader)) != b'D' as u64
+        || take_byte((&mut reader)) != b'E' as u64
+        || take_byte((&mut reader)) != b'N' as u64
+        || take_byte((&mut reader)) != b'T' as u64
+        || take_byte((&mut reader)) != 0 {
+        return false;
+    }
+    let version: u64 = take_u16((&mut reader));
+    let kind: u64 = take_u16((&mut reader));
+    let total: u64 = take_u32((&mut reader));
+    if reader.failed != 0 || version != 1 || kind == 0
+        || kind > IDENTITY_KIND_RECEIPT || total as usize != length {
+        return false;
+    }
+    if write_output { (*record).kind = kind; }
+    let mut accepted: bool = false;
+    if kind == IDENTITY_KIND_WORLD {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_counter((&mut reader), (&mut (*record).epoch), write_output);
+    }
+    if kind == IDENTITY_KIND_GOVERNOR {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_counter((&mut reader), (&mut (*record).epoch), write_output)
+            && take_counter((&mut reader), (&mut (*record).term), write_output)
+            && take_counter((&mut reader), (&mut (*record).log_index), write_output);
+    }
+    if kind == IDENTITY_KIND_NODE {
+        accepted = take_node((&mut reader), record, write_output);
+    }
+    if kind == IDENTITY_KIND_DOMAIN {
+        accepted = take_domain((&mut reader), record, write_output);
+    }
+    if kind == IDENTITY_KIND_PROCESS {
+        accepted = take_process((&mut reader), record, write_output);
+    }
+    if kind == IDENTITY_KIND_RESOURCE {
+        let owner: u64 = take_u16((&mut reader));
+        if owner >= RESOURCE_OWNER_WORLD && owner <= RESOURCE_OWNER_PROCESS {
+            if write_output { (*record).owner_tag = owner; }
+            if owner == RESOURCE_OWNER_WORLD {
+                accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+                    && take_counter((&mut reader), (&mut (*record).epoch), write_output);
+            }
+            if owner == RESOURCE_OWNER_NODE {
+                accepted = take_node((&mut reader), record, write_output);
+            }
+            if owner == RESOURCE_OWNER_DOMAIN {
+                accepted = take_domain((&mut reader), record, write_output);
+            }
+            if owner == RESOURCE_OWNER_PROCESS {
+                accepted = take_process((&mut reader), record, write_output);
+            }
+            accepted = accepted
+                && take_text((&mut reader), (&mut (*record).resource), true, write_output)
+                && take_counter((&mut reader), (&mut (*record).resource_generation), write_output);
+        }
+    }
+    if kind == IDENTITY_KIND_OBJECT {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).object), false, write_output)
+            && take_counter((&mut reader), (&mut (*record).object_version), write_output);
+    }
+    if kind == IDENTITY_KIND_CAPABILITY {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).capability), false, write_output);
+    }
+    if kind == IDENTITY_KIND_LEASE {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).lease), false, write_output);
+    }
+    if kind == IDENTITY_KIND_TASK {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).task), false, write_output);
+    }
+    if kind == IDENTITY_KIND_ATTEMPT {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).task), false, write_output)
+            && take_counter((&mut reader), (&mut (*record).attempt_generation), write_output);
+    }
+    if kind == IDENTITY_KIND_CHECKPOINT {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).task), false, write_output)
+            && take_counter((&mut reader), (&mut (*record).attempt_generation), write_output)
+            && take_text((&mut reader), (&mut (*record).checkpoint), false, write_output);
+    }
+    if kind == IDENTITY_KIND_RECEIPT {
+        accepted = take_text((&mut reader), (&mut (*record).world), false, write_output)
+            && take_text((&mut reader), (&mut (*record).receipt), false, write_output);
+    }
+    if !accepted || reader.failed != 0 || reader.cursor != length { return false; }
+    return !write_output || record_valid(record as *const IdentityRecord);
+}
+
+pub unsafe fn decode_record(
+    source: *const u8,
+    length: usize,
+    record: *mut IdentityRecord
+) -> u64 {
+    if source as usize == 0 || record as usize == 0
+        || length < RECORD_HEADER_LENGTH || length > RECORD_MAX_LENGTH {
+        return 0;
+    }
+    // Copy first so a mutating caller cannot pass validation and then change
+    // bytes during the committing pass. The destination remains untouched on
+    // every rejection path.
+    let mut staged: [u8; 1024] = [0; 1024];
+    let mut index: usize = 0;
+    while index < length {
+        staged[index] = source_byte(source, index) as u8;
+        index += 1;
+    }
+    if !parse_record((&staged[0]), length, record, false) { return 0; }
+    clear_record(record);
+    if !parse_record((&staged[0]), length, record, true) { return 0; }
+    return 1;
+}

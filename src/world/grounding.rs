@@ -488,8 +488,8 @@ mod tests {
     use super::*;
     use crate::world::{
         ArtifactId, ArtifactPublicationIdentity, AttemptGeneration, DomainGeneration, DomainId,
-        DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceId, ResourceIdentity,
-        ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch,
+        DomainIdentity, NodeGeneration, NodeId, NodeIdentity, ResourceGeneration, ResourceId,
+        ResourceIdentity, ResourceOwner, TaskAttemptIdentity, TaskId, WorldEpoch,
     };
 
     fn world(name: &str, epoch: u64) -> WorldIdentity {
@@ -514,6 +514,7 @@ mod tests {
                 domain: domain.clone(),
             },
             ResourceId::new("cpu/slot-0").unwrap(),
+            ResourceGeneration::new(1).unwrap(),
         );
         let task = TaskAttemptIdentity::new(
             WorldId::new("desk").unwrap(),

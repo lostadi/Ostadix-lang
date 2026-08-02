@@ -351,6 +351,21 @@
   binary, general Linux ABI, general 9P or namespace environment, guest agent,
   KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
   physical-device evidence.
+- Mode 27 adds the shared World identity PR2 gate in
+  `ocore/kernel/smoke-world-identity-qemu.sh`. All 20 identity atoms named by
+  the constitution have typed Rust and `.oc` definitions. A strict bounded
+  `OWIDENT` v1 identity-only record converges byte-for-byte between the Rust
+  oracle and native O-core under QEMU TCG. Strict decoding rejects malformed
+  records and zero generation/version/term/index fields; separate hierarchical
+  current/reference checks reject stale generations and same-generation
+  logical mismatches. A serialized `CapabilityId` is descriptive data,
+  not bearer authority, a CSpace handle, or delegation. This is not PR3's
+  general World protocol, transport, schema negotiation, OValue envelope, or
+  receipt codec; it implements no Governor or consensus and passes no G0--G13
+  gate.
+  Native `.oc` nominal wrappers are validated by their initializers and by
+  record encode/decode boundaries; directly constructed raw aggregates do not
+  bypass those checks and are not accepted records.
 
 ## Ostadix World native Alpha boundary
 
@@ -371,16 +386,16 @@
   release gate. The narrower hosted Live-World package/service oracle remains
   separately bounded.
 - The existing project runtime, HGraph executor, capability broker,
-  KernelWorld lifecycle, and Modes 20--26 are reusable organs, not an integrated
+  KernelWorld lifecycle, and Modes 20--27 are reusable organs, not an integrated
   World. Mode 23's synthetic guest is not G7 or G8; Mode 25's static ELF is not
   G9; Mode 26's exact 9P2000 corpus is not G6; supplemental Mode 21 is not real
   Linux boot or physical-device isolation.
 - No replicated Governor, native membership transport, WorldFS, physical
   multinode HGraph execution, real Linux KernelWorld boot, physical-device
   assignment, DMA/IOMMU isolation, native Debian personality, or accelerator
-  fabric is claimed. The shared Rust identity/effect vocabulary is still a
-  foundation: descriptive names, inventory, snapshots, and serialized
-  identities remain non-authority.
+  fabric is claimed. The shared Rust/`.oc` identity vocabulary and hosted
+  identity/effect vocabulary are still foundations: descriptive names,
+  inventory, snapshots, and serialized identities remain non-authority.
 - The grounding command labels a report with a caller-supplied World identity.
   It does not read a current World snapshot, enforce freshness, or bind
   execution. No production lowering emits governed `ResourceKey` effects yet;
