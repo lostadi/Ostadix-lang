@@ -859,6 +859,43 @@ For AArch64:
 - load `Image`, initramfs, and device tree; and
 - use the same guest-agent and service-export protocol.
 
+### EL2 authority boundary
+
+O-core at host EL1 remains the sole policy graph: it owns resource kinds,
+semantic rights, dependency edges, lifecycle, admission, and cascading
+revocation. O-Machine at EL2 owns only two irreducible authoritative facts:
+
+```text
+generation[slot]
+page_owner[physical_frame]
+```
+
+`generation[slot]` rejects authority from an obsolete machine incarnation.
+`page_owner[pfn]` decides which World, if any, may make a physical frame
+accessible. Saved vCPU registers, stage-2 roots, VMIDs, pending virtual
+interrupts, exit syndromes, and timer state are operational continuation state,
+not a second capability graph.
+
+Machine handles are domain separated:
+
+```text
+MAC_K(domain || world || slot || generation || rights)
+
+domain.page
+domain.stage2
+domain.vcpu
+domain.interrupt
+domain.entry
+```
+
+EL2 treats domains as non-interchangeable but does not interpret Linux, Plan 9,
+console, namespace, or other higher-level meanings. O-core walks revocation
+dependencies. EL2 acknowledges an invalidation only after the affected vCPU is
+stopped or exited, stage-2 mappings are disabled, required TLB invalidation and
+architectural draining complete, and the generation changes. Therefore an
+acknowledged revocation implies that no machine effect authorized by the old
+generation remains reachable.
+
 ## Ostadix guest agent
 
 Build a tiny, auditable `ostadix-agent` placed in the initramfs. It must:
@@ -1672,6 +1709,25 @@ performance_characterization
 
 A QEMU-TCG result cannot satisfy a hardware virtualization claim. One physical board cannot satisfy a multinode claim. One architecture cannot satisfy a multi-architecture claim.
 
+## Observation, claim, and history separation
+
+Kernel code and tests emit typed observations. The versioned validator
+normalizes those observations and derives the maximal supported claim set from
+central rules. Gate definitions contain evidence-class and claim floors; gate
+authors do not author claims in attestations. An attestation may record
+`derived_claims`, but validation recomputes the set and rejects any discrepancy.
+Absence from that set means `not_established`, not that the event was proven not
+to occur. Explicit nonclaims remain deliberate, centrally constrained scope
+boundaries.
+
+The evidence directory is an append-only ledger of immutable attestations and
+separate supersession or retraction events. Events link record IDs, never
+rewrite the subject. The validator rejects cycles, missing subjects,
+cross-gate replacement, and competing successors, resolves the active evidence
+heads, and computes current gate status from claims, evidence classes, and
+dependency status. Historical passage remains inspectable even when current
+qualification changes.
+
 ## Formal specifications
 
 Write executable or model-checked specifications for the highest-risk invariants.
@@ -1767,7 +1823,7 @@ The workstreams proceed in parallel, but the following gates define convergence.
 |---|---|---|---|
 | **G0 -- constitutional baseline** | World contract, crossing kinds, identities, failure classes, consistency model, and claim taxonomy are versioned | the project has one target rather than several homonymous “world” concepts | prose without executable schemas |
 | **G1 -- semantic continuity** | project routes lower into a logical HGraph; receipts use shared World identities; `HostWorld` is separated from governed World state | language, project runtime, and kernel vocabulary can converge | a local route runner beside the HGraph |
-| **G2 -- AArch64 native compiler** | O-core compiles and boots under AArch64 QEMU with process, IPC, capability, and lifecycle tests | the SBC target is real in the toolchain | cross-compiling a trivial assembly stub |
+| **G2 -- AArch64 native compiler** | O-core keeps EL2 resident, enters host EL1, completes one validated HVC return, and executes AArch64 EL0 process, IPC, capability, lifecycle, reclamation, and bounded counter-progress checks under QEMU TCG | the SBC target and EL2/EL1 architectural split are real in the toolchain | cross-compiling a trivial assembly stub or dropping EL2 permanently |
 | **G3 -- multicore O-core** | x86_64 and AArch64 physical targets execute SMP stress gates | the single-CPU proof model has survived concurrency | multiple single-core VMs |
 | **G4 -- native World transport** | three physical O-core nodes communicate through authenticated native transport | O-core can join a network without a Linux host | Linux-hosted node daemons |
 | **G5 -- replicated authority** | three native Governor replicas preserve one log across leader loss and partition | the World is logically singular without one physical point of failure | one Governor plus a backup process |
@@ -1813,11 +1869,12 @@ This is a merge-order skeleton, not a prohibition on parallel branches. Each PR 
 Add this full-stack program to `docs/`, update `docs/CLAIMS.md`, the multikernel proposal, and the release evidence schema. Define G0 through G13 and mark hosted World as reference-only.
 
 **Repository status:** the version-2 constitution is paired with
-`evidence/world_contract_v1.toml` and schema-v2
-`evidence/world_alpha_gates.toml`. Typed, content-addressed attestations now
-pass G0 and its dependent AArch64 QEMU/TCG gate G2. The other 12 gates remain
-defined. These two passages do not promote virtual evidence to physical,
-hardware-isolation, SMP, foreign-kernel, or multinode evidence.
+`evidence/world_contract_v1.toml` and the schema-v3 definition-only
+`evidence/world_alpha_gates.toml`. The validator derives claims and current
+status from active append-only ledger heads. G0 and the dependent AArch64
+QEMU/TCG gate G2 currently pass; the other 12 gates remain defined. These two
+passages do not promote virtual evidence to physical, hardware-isolation, SMP,
+foreign-kernel, or multinode evidence.
 
 ### PR 2 -- shared World identity types
 
@@ -2535,11 +2592,14 @@ ABI described by the full Workstream B design.
 Emit one freestanding AArch64 object, link it, print through PL011 under QEMU, and add the first AArch64 evidence gate.
 
 **Repository status:** complete beyond the minimum at virtual-native G2. One
-deterministic AArch64 image links compiled `.oc` kernel semantics and two EL0
-principals to bounded EL1 boot/vector glue. A forced one-vCPU QEMU/TCG `virt`
-run covers real SVC/ERET, endpoint request/reply, capability attenuation,
-contained EL0 fault and exit, generation reuse with stale denial, reclamation,
-and post-lifecycle counter liveness. This is not physical AArch64, SMP/G3,
+deterministic AArch64 image installs `VBAR_EL2`, retains a private EL2 stack,
+enters O-core at host EL1, and completes one domain-separated HVC/ERET round
+trip with sentinel-register and stack integrity before running two compiled EL0
+principals. A forced one-vCPU QEMU/TCG `virt,virtualization=on` run also covers
+real SVC/ERET, endpoint request/reply, capability attenuation, contained EL0
+fault and exit, generation reuse with stale denial, reclamation, and bounded
+post-lifecycle architectural-counter progress. It does not yet install stage-2
+translation or boot a foreign kernel. This is not physical AArch64, SMP/G3,
 KVM/SVM, Linux or Plan 9 boot, a general foreign ABI, or PCI/DMA/IOMMU/device
 assignment evidence.
 
@@ -2690,6 +2750,6 @@ registry.
 The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
 The bounded executable gates in `evidence/gates.toml` retain only the claims in
-[`CLAIMS.md`](CLAIMS.md). Only the evidence records named by the schema-v2
-World registry satisfy G0 or G2; unrelated bounded gate results remain
-non-qualifying for G0--G13.
+[`CLAIMS.md`](CLAIMS.md). Only active evidence-ledger heads whose
+validator-derived claims satisfy the schema-v3 class and claim floors can pass
+G0 or G2; unrelated bounded gate results remain non-qualifying for G0--G13.

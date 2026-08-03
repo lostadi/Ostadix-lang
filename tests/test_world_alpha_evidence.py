@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,25 +56,24 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
         ):
             world_alpha_evidence.validated_gates(manifest, ROOT)
 
-    def test_gate_cannot_pass_without_evidence(self):
+    def test_status_is_derived_from_active_evidence(self):
         manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][1]["status"] = "passed"
-        with self.assertRaisesRegex(
-            world_alpha_evidence.WorldEvidenceError,
-            "must contain at least 1 string",
+        with mock.patch.object(
+            world_alpha_evidence, "_active_evidence_ledger", return_value=([], [])
         ):
-            world_alpha_evidence.validated_gates(manifest, ROOT)
+            gates = world_alpha_evidence.validated_gates(manifest, ROOT)
+        self.assertTrue(all(gate["status"] == "defined" for gate in gates))
 
-    def test_defined_gate_rejects_attached_evidence(self):
-        manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][1]["evidence"] = [
-            "evidence/world/g0-repository-conformance.toml"
-        ]
-        with self.assertRaisesRegex(
-            world_alpha_evidence.WorldEvidenceError,
-            "must be empty while status is defined",
-        ):
-            world_alpha_evidence.validated_gates(manifest, ROOT)
+    def test_registry_rejects_manually_supplied_status_or_evidence(self):
+        for field, value in (("status", "passed"), ("evidence", [])):
+            with self.subTest(field=field):
+                manifest = copy.deepcopy(self.manifest())
+                manifest["gate"][0][field] = value
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "keys differ from schema",
+                ):
+                    world_alpha_evidence.validated_gates(manifest, ROOT)
 
     def test_dependency_graph_is_pinned(self):
         manifest = copy.deepcopy(self.manifest())
@@ -83,28 +84,111 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
         ):
             world_alpha_evidence.validated_gates(manifest, ROOT)
 
-    def test_passed_gate_requires_passed_dependencies(self):
-        manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][0]["status"] = "defined"
-        manifest["gate"][0]["evidence"] = []
-        with self.assertRaisesRegex(
-            world_alpha_evidence.WorldEvidenceError,
-            "G2 cannot pass before dependencies",
-        ):
-            world_alpha_evidence.validated_gates(
-                manifest, ROOT, definitions_only=True
+    def test_claim_derivation_uses_typed_observations(self):
+        transcript = "\n".join(
+            (
+                "@evidence event=lifecycle_terminal result=pass",
+                "@evidence event=counter_progress phase=post_lifecycle poll_bound=1000000 result=pass",
             )
+        )
+        claims = world_alpha_evidence._derive_claims(transcript, "fixture")
+        self.assertIn("counter.progress_after_lifecycle", claims)
+        self.assertIn("execution.post_lifecycle_reached", claims)
+        self.assertNotIn("timer.interrupt_delivery", claims)
 
-    def test_attestation_cannot_be_reused_for_a_different_gate(self):
-        manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][2]["evidence"] = [
-            "evidence/world/g0-repository-conformance.toml"
-        ]
-        with self.assertRaisesRegex(
-            world_alpha_evidence.WorldEvidenceError,
-            "gate must be G2",
-        ):
-            world_alpha_evidence.validated_gates(manifest, ROOT)
+    def test_supersession_event_is_a_separate_strict_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            path = ledger / "correction.toml"
+            path.write_text(
+                "\n".join(
+                    (
+                        "schema_version = 1",
+                        'id = "correction-1"',
+                        'event = "supersede"',
+                        'subject = "old-attestation"',
+                        'replacement = "new-attestation"',
+                        'reason_code = "semantic-overclaim"',
+                        'reason = "Counter progress was mislabeled as a timer."',
+                        f'source_commit = "{"0" * 40}"',
+                        "signatures = []",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            event = world_alpha_evidence._validate_evidence_event(root, path)
+            self.assertEqual(event["subject"], "old-attestation")
+            self.assertEqual(event["replacement"], "new-attestation")
+
+    def test_supersession_cycle_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            for name in ("a", "b"):
+                (ledger / f"{name}.toml").write_text('gate = "G2"\n')
+            for name in ("a-to-b", "b-to-a"):
+                (ledger / f"{name}.toml").write_text('event = "supersede"\n')
+
+            attestations = {
+                "evidence/world/a.toml": {
+                    "id": "a",
+                    "path": "evidence/world/a.toml",
+                    "gate": "G2",
+                    "class": "qemu_tcg_aarch64",
+                    "derived_claims": set(),
+                    "schema_version": 1,
+                },
+                "evidence/world/b.toml": {
+                    "id": "b",
+                    "path": "evidence/world/b.toml",
+                    "gate": "G2",
+                    "class": "qemu_tcg_aarch64",
+                    "derived_claims": set(),
+                    "schema_version": 1,
+                },
+            }
+            events = {
+                "a-to-b.toml": {
+                    "id": "event-a-to-b",
+                    "path": "evidence/world/a-to-b.toml",
+                    "event": "supersede",
+                    "subject": "a",
+                    "replacement": "b",
+                },
+                "b-to-a.toml": {
+                    "id": "event-b-to-a",
+                    "path": "evidence/world/b-to-a.toml",
+                    "event": "supersede",
+                    "subject": "b",
+                    "replacement": "a",
+                },
+            }
+
+            def fake_attestation(_root, path, *_args):
+                return attestations[path]
+
+            def fake_event(_root, path):
+                return events[path.name]
+
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                side_effect=fake_attestation,
+            ), mock.patch.object(
+                world_alpha_evidence,
+                "_validate_evidence_event",
+                side_effect=fake_event,
+            ):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError, "contains a cycle"
+                ):
+                    world_alpha_evidence._active_evidence_ledger(
+                        root, {"qemu_tcg_aarch64"}, "0" * 64
+                    )
 
     def test_acceptance_and_prohibition_semantics_are_pinned(self):
         for field in ("acceptance", "prohibited_substitutes"):

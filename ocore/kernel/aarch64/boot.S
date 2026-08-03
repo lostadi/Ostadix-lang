@@ -9,12 +9,18 @@ _start:
     mrs x1, CurrentEL
     cmp x1, #0x8
     b.eq g2_drop_el2
-    cmp x1, #0x4
-    b.eq g2_el1_entry
     b g2_early_halt
 
 g2_drop_el2:
-    // Give EL1 access to the physical counter/timer and enter 64-bit EL1h.
+    // EL2 remains resident.  Install its vector before changing privilege,
+    // retain a private EL2 stack, give EL1 physical-counter access, and enter
+    // 64-bit EL1h.  The G2 corpus refuses an EL1-only direct-kernel entry.
+    adrp x0, g2_el2_vectors
+    add x0, x0, :lo12:g2_el2_vectors
+    msr vbar_el2, x0
+    adrp x0, g2_el2_stack_top
+    add x0, x0, :lo12:g2_el2_stack_top
+    mov sp, x0
     mov x0, #3
     msr cnthctl_el2, x0
     msr cntvoff_el2, xzr
@@ -30,6 +36,76 @@ g2_drop_el2:
     msr spsr_el2, x0
     isb
     eret
+
+// Narrow G2 EL1->EL2 ABI probe.  EL2 accepts exactly one operation domain and
+// request value.  The wrapper proves the EL1 stack and preserved sentinel
+// registers survive the HVC/ERET round trip before compiled O-core reports it.
+.global g2_el2_probe
+.type g2_el2_probe, %function
+g2_el2_probe:
+    stp x19, x20, [sp, #-32]!
+    stp x29, x30, [sp, #16]
+    mov x19, sp
+    movz x0, #0x0001
+    movk x0, #0x4f4d, lsl #16
+    movz x1, #0x1111
+    movk x1, #0x1111, lsl #16
+    movz x2, #0x2222
+    movk x2, #0x2222, lsl #16
+    movz x3, #0x3333
+    movk x3, #0x3333, lsl #16
+    movz x4, #0x4444
+    movk x4, #0x4444, lsl #16
+    movz x5, #0x5555
+    movk x5, #0x5555, lsl #16
+    movz x6, #0x6666
+    movk x6, #0x6666, lsl #16
+    movz x7, #0x7777
+    movk x7, #0x7777, lsl #16
+    hvc #0x4f4d
+    movz x8, #0x0002
+    movk x8, #0x4f4d, lsl #16
+    cmp x0, x8
+    b.ne 1f
+    movz x8, #0x1111
+    movk x8, #0x1111, lsl #16
+    cmp x1, x8
+    b.ne 1f
+    movz x8, #0x2222
+    movk x8, #0x2222, lsl #16
+    cmp x2, x8
+    b.ne 1f
+    movz x8, #0x3333
+    movk x8, #0x3333, lsl #16
+    cmp x3, x8
+    b.ne 1f
+    movz x8, #0x4444
+    movk x8, #0x4444, lsl #16
+    cmp x4, x8
+    b.ne 1f
+    movz x8, #0x5555
+    movk x8, #0x5555, lsl #16
+    cmp x5, x8
+    b.ne 1f
+    movz x8, #0x6666
+    movk x8, #0x6666, lsl #16
+    cmp x6, x8
+    b.ne 1f
+    movz x8, #0x7777
+    movk x8, #0x7777, lsl #16
+    cmp x7, x8
+    b.ne 1f
+    cmp sp, x19
+    b.ne 1f
+    mov x0, #1
+    b 2f
+1:
+    mov x0, xzr
+2:
+    ldp x29, x30, [sp, #16]
+    ldp x19, x20, [sp], #32
+    ret
+.size g2_el2_probe, . - g2_el2_probe
 
 g2_el1_entry:
     msr spsel, #1

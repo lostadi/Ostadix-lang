@@ -329,7 +329,10 @@ Float operations, casts, and
 `sysv64` float crossings are rejected during type checking, so the layout-only
 float types cannot reach integer machine operations.
 
-The current verified kernel boundary includes M6A's scalar CPL3 supervision in
+The current verified kernel boundary includes G2's resident AArch64 EL2 vector,
+one domain-separated EL1 HVC/ERET integrity round trip, and its bounded MMU-off
+EL0 corpus under QEMU TCG. It does not install stage-2 translation or boot a
+foreign kernel. The boundary also includes M6A's scalar CPL3 supervision in
 mode 18, M6B's bounded-copy/revocation mechanism in mode 19, Mode 24's exact
 four-byte live bounded personality composition, Mode 25's exact static Linux
 ELF/minimal-ABI composition, Mode 26's bounded Linux-to-9P2000 CPL3 service

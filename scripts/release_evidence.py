@@ -51,9 +51,11 @@ G2_AARCH64_REQUIRED_TOOLS = COMMON_REQUIRED_TOOLS | {
     "shasum",
 }
 G2_AARCH64_POSITIVE_CLAIMS = (
-    "One O-core kernel compiled for AArch64 boots under forced QEMU TCG and, "
-    "in one live run, executes native EL0 process, IPC, capability, lifecycle, "
-    "stale-generation, reclamation, and post-lifecycle survival checks",
+    "One O-core kernel compiled for AArch64 retains EL2, enters host EL1, "
+    "completes one domain-separated HVC return with register and stack integrity, "
+    "and in one live QEMU TCG run executes native EL0 process, IPC, capability, "
+    "lifecycle, stale-generation, reclamation, and bounded post-lifecycle "
+    "counter-progress checks",
 )
 G2_AARCH64_NONCLAIMS = (
     "This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or "
@@ -64,9 +66,10 @@ G2_AARCH64_NONCLAIMS = (
 )
 G2_AARCH64_EXPECTED_MARKERS = (
     "G2 AArch64 ocorec object: PASS",
+    "G2 AArch64 resident EL2 HVC round-trip: PASS",
     "G2 AArch64 EL0 process lifecycle: PASS",
     "G2 AArch64 IPC capability lifecycle: PASS",
-    "G2 AArch64 post-lifecycle timer: online",
+    "G2 AArch64 post-lifecycle counter progress: PASS",
     "G2 AArch64 native compiler QEMU smoke: PASS",
 )
 

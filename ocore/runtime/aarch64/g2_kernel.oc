@@ -75,6 +75,7 @@ const MARK_RECLAIM: u64 = 32768;
 const MARK_TIMER: u64 = 65536;
 const MARK_PROCESS_LIFECYCLE: u64 = 131072;
 const MARK_IPC_CAP_LIFECYCLE: u64 = 262144;
+const MARK_EL2_HVC: u64 = 524288;
 
 static KERNEL_ONLINE: [u8; 30] = b"G2 AArch64 EL1 kernel: online\n";
 static SVC_ERET_PASS: [u8; 36] = b"G2 AArch64 real SVC/ERET path: PASS\n";
@@ -92,9 +93,10 @@ static CAP_REUSE: [u8; 52] = b"G2 AArch64 capability slot reuse stale denial: PA
 static PROCESS_REUSE: [u8; 49] = b"G2 AArch64 process slot reuse stale denial: PASS\n";
 static EXIT_CONTAINED: [u8; 36] = b"G2 AArch64 EL0 exit contained: PASS\n";
 static RECLAIMED: [u8; 42] = b"G2 AArch64 teardown and reclamation: PASS\n";
-static TIMER_ONLINE: [u8; 40] = b"G2 AArch64 post-lifecycle timer: online\n";
+static COUNTER_PROGRESS: [u8; 49] = b"G2 AArch64 post-lifecycle counter progress: PASS\n";
 static PROCESS_LIFECYCLE: [u8; 39] = b"G2 AArch64 EL0 process lifecycle: PASS\n";
 static IPC_CAP_LIFECYCLE: [u8; 42] = b"G2 AArch64 IPC capability lifecycle: PASS\n";
+static EL2_HVC_PASS: [u8; 45] = b"G2 AArch64 resident EL2 HVC round-trip: PASS\n";
 static INVARIANT_FAILURE: [u8; 36] = b"G2 AArch64 native invariant failure\n";
 
 static mut MARKERS: u64 = 0;
@@ -119,6 +121,7 @@ static mut RECLAIM_COUNT: u64 = 0;
 
 extern "ocore" fn g2_serial_putc(byte: u64) -> void;
 extern "ocore" fn g2_counter_read() -> u64;
+extern "ocore" fn g2_el2_probe() -> u64;
 extern "ocore" fn g2_arch_halt() -> never;
 
 unsafe fn emit(source: *const u8, length: usize) -> void {
@@ -211,6 +214,10 @@ pub unsafe fn g2_kernel_init() -> u64 {
     PENDING_ACTION = ACTION_RESUME;
     SVC_COUNT = 0;
     RECLAIM_COUNT = 0;
+    if g2_el2_probe() != 1 {
+        fail();
+    }
+    emit_once(MARK_EL2_HVC, (&EL2_HVC_PASS[0]), 45);
     emit_once(MARK_KERNEL, (&KERNEL_ONLINE[0]), 30);
     return PROCESS_A_HANDLE;
 }
@@ -526,6 +533,6 @@ pub unsafe fn g2_kernel_finish() -> never {
     if after <= before {
         fail();
     }
-    emit_once(MARK_TIMER, (&TIMER_ONLINE[0]), 40);
+    emit_once(MARK_TIMER, (&COUNTER_PROGRESS[0]), 49);
     g2_arch_halt();
 }
