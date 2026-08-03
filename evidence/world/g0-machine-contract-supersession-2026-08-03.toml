@@ -1,0 +1,9 @@
+schema_version = 1
+id = "g0-machine-contract-supersession-2026-08-03"
+event = "supersede"
+subject = "g0-repository-conformance-2026-08-03"
+replacement = "g0-repository-conformance-2026-08-03-v2"
+reason_code = "constitution-v3-machine-contract"
+reason = "Constitution v3 adds the executable O-Machine contract; the historical G0 transcript cannot derive the new machine-contract claim."
+source_commit = "c25d38c00283f2873eed1aa84dd89b437777e356"
+signatures = []

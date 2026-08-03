@@ -653,10 +653,13 @@ python3 scripts/world_alpha_evidence.py
 ```
 
 The checked-in result defines 14 entries--the G0 constitutional baseline plus
-13 integration gates through G13. Schema v2 admits typed, content-addressed
-attestations and currently passes only G0 and its dependent AArch64 QEMU/TCG
-gate G2; the other 12 remain defined. The executable G0 vocabulary is frozen in
-[`evidence/world_contract_v1.toml`](evidence/world_contract_v1.toml). Unrelated
+13 integration gates through G13. Registry schema v4 admits typed,
+content-addressed attestations and currently passes only G0 and its dependent
+AArch64 QEMU/TCG gate G2; the other 12 remain defined. The executable G0
+composition is [`evidence/world_contract_v2.toml`](evidence/world_contract_v2.toml):
+it imports the byte-frozen
+[`evidence/world_contract_v1.toml`](evidence/world_contract_v1.toml) vocabulary
+and the separately versioned O-Machine contract. Unrelated
 bounded gates do not become G0--G13 evidence by proximity or addition, and G2
 is not physical AArch64, KVM/SVM, SMP, Linux/Plan 9 boot, foreign-ABI,
 PCI/DMA/IOMMU, or device-assignment evidence.
@@ -3097,6 +3100,10 @@ memory protocol in
 The shared source-integrated/binary-contained world contract and its native
 dependency order are in
 [docs/KERNEL_WORLD_CONTRACT.md](docs/KERNEL_WORLD_CONTRACT.md).
+The normative future host-EL1-to-EL2 machine-resource ABI, including
+resource-class-specific asynchronous revocation and the G7 no-guest-HVC
+boundary, is in [docs/O_MACHINE_CONTRACT.md](docs/O_MACHINE_CONTRACT.md); it is
+a design contract and not a claim that G7 or G8 is implemented.
 The design proposal for containing and utilizing foreign kernels — Linux,
 Android, XNU/Darwin, and Windows NT — as O-Domain personalities is in
 [okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md](okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md).

@@ -19,6 +19,17 @@ request, failure, replacement, and provenance rules. A client binds to a typed
 export such as `o.net-port/v1`; it does not receive provider-internal handles or
 infer authority from manifest metadata.
 
+The G7 qualifying profile selects `binary_contained`: a pinned, fully
+virtualized Linux guest with standard virtio devices and trapped MMIO/PCI
+doorbells. It exposes no Ostadix-specific guest HVC or paravirtual
+authority/control ABI. The `source_integrated` track remains a separate planned
+integration mechanism and does not redefine that G7 guest boundary. The
+host-EL1-to-EL2 handle and resource revocation rules are normative in
+[`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md).
+That contract keeps virtio/9P commit points and error construction in the
+O-core broker; EL2 acknowledges only the composed mapping, DMA, interrupt,
+vCPU, generation, and ownership transitions.
+
 ## Strict manifest
 
 The accepted schema is `ocore.kernel-world/v1`. Unknown fields are rejected.
@@ -361,6 +372,11 @@ virtual PIO, not PCI or physical-device assignment, DMA, IOMMU isolation,
 interrupt remapping, or hardware reset. QEMU-TCG evidence must not be cited as
 KVM or physical-hardware isolation evidence.
 
+Mode 21/23's controlled `VMMCALL` is a bounded synthetic-test exit. It is not
+the G7 guest ABI and does not authorize carrying `MachineHandle` values from a
+guest. G7 health, service, and error transport instead use standard virtio
+queues whose doorbells trap as MMIO/PCI device activity.
+
 ## Next native slices
 
 The remaining dependency order is:
@@ -368,13 +384,28 @@ The remaining dependency order is:
 1. extend Mode 24's exact four-byte CPL3 bounded-RPC integration with pinned
    windows, streaming, signals, actual mapping/resource events, broader request
    shapes, fuzzing, and allocation-failure/race gates;
-2. replace Mode 23's fixed synthetic program and scalar endpoint with a pinned
-   foreign-kernel image, boot protocol, timed health contract, and bounded
-   guest-agent transport;
+2. replace Mode 23's fixed synthetic program and scalar endpoint with a pinned,
+   fully virtualized foreign-kernel image, boot protocol, timed health contract,
+   and bounded virtio guest-agent transport, without an Ostadix-specific guest
+   HVC or paravirtual authority/control ABI;
 3. carry request and export contracts over generation-tagged shared queues
-   with cancellation, quotas, and hostile descriptor tests; and
-4. add physical-device assignment only after separate IOMMU isolation, interrupt
-   revocation, DMA-window teardown, device-reset, and hostile-failure gates.
+   with cancellation, quotas, and hostile descriptor tests; distinguish the
+   composite two-phase host withdrawal acknowledgment from the guest's later
+   consumption of a protocol-native error;
+4. withdraw a virtual `MachineBlock` or `Machine9P` endpoint under in-flight I/O,
+   require both the composite host acknowledgment and the pinned guest
+   consuming the terminal completion and returning its `EIO`/9P error, in
+   either order, before tearing down `MachineMemory` with
+   stop/unmap/TLBI/drain/generation/ack ordering, followed by EL2-controlled
+   or independently verified quarantine scrubbing before reassignment; and
+5. add physical-device assignment only after separate IOMMU isolation,
+   interrupt revocation, DMA-window teardown, device-reset, and hostile-failure
+   gates. The first concrete device family must use a class-named withdrawal
+   operation and freeze quiesce, new-DMA fencing, DMA unmap/drain, interrupt
+   withdrawal/drain, class-defined reset, generation retirement, and host
+   acknowledgment in order; there is no generic device revoke verb. G8 must
+   also explicitly decide whether a direct guest machine ABI exists; only that
+   decision can activate a handle MAC and its key lifecycle.
 
 The first driver-compatibility proof should use a bounded resettable device
 class and must show that O-core has no native driver for it, a foreign kernel
@@ -400,6 +431,13 @@ The current native slices do not:
   device interrupts, or reset hardware;
 - establish asynchronous or SMP-safe execution/device coordination, or prove
   KVM-backed or physical-hardware isolation;
+- implement `MachineMemory`, `MachineBlock`, or `Machine9P` class-specific
+  two-phase withdrawal, produce a machine acknowledgment, or observe a
+  protocol-native error in a real guest;
+- quarantine and scrub a retired frame under EL2 control or independent
+  hardware/cryptographic verification before cross-World reassignment;
+- expose an Ostadix-specific guest hypercall/paravirtual authority ABI, mint a
+  guest-presentable machine handle, or implement a handle MAC/key lifecycle;
 - install a public `vm.machine` run capability or convert manifest identifiers
   into ambient authority; or
 - establish source-integrated or binary-contained isolation.

@@ -1,0 +1,26 @@
+schema = "ostadix.world-contract/v2"
+schema_version = 2
+constitution_version = 3
+constitution = "docs/OSTADIX_WORLD.md"
+constitution_sha256 = "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
+world_gate_registry = "evidence/world_alpha_gates.toml"
+
+# Constitution v3 composes the byte-frozen v1 World vocabulary with the
+# separately versioned O-Machine contract.  The imported vocabulary remains
+# immutable so schema-v1/v2 attestations keep their original meaning.
+imported_vocabulary = "evidence/world_contract_v1.toml"
+imported_vocabulary_schema_version = 1
+imported_vocabulary_constitution_version = 2
+imported_vocabulary_constitution_sha256 = "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+imported_vocabulary_sha256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+machine_contract = "evidence/o_machine_contract_v1.toml"
+machine_contract_schema_version = 1
+machine_contract_sha256 = "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
+
+[composition]
+crossings = "imported_vocabulary"
+identity_atoms = "imported_vocabulary"
+failure_classes = "imported_vocabulary"
+consistency_rules = "imported_vocabulary"
+evidence_classes = "imported_vocabulary"
+machine_authority_and_revocation = "machine_contract"

@@ -1,0 +1,135 @@
+schema = "ostadix.o-machine/v1"
+schema_version = 1
+constitution_version = 3
+specification = "docs/O_MACHINE_CONTRACT.md"
+specification_sha256 = "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
+g7_caller_model = "host_el1_only"
+g7_guest_machine_abi = "none"
+g7_device_transport = "virtio_mmio_or_pci_doorbell"
+g7_platform_call_exemption = "psci_without_machine_handles_or_resource_authority"
+g8_guest_machine_abi_decision = "required"
+async_abi_frozen_before_gate = "G3"
+
+# This schema makes the normative design mechanically inspectable. It is not
+# evidence that any G7/G8 resource object or transition is implemented.
+
+[tcb]
+authority = "ocore_el1"
+memory_safety = "omachine_el2"
+el2_authoritative_facts = ["machine_incarnation", "world_generation", "resource_generation", "page_owner"]
+el2_protocol_semantics = "none"
+machine_incarnation = "nonzero_128bit_durable_monotonic_or_cryptographically_unique"
+machine_incarnation_failure = "fail_closed_no_resource_assignment"
+host_el1_physical_access = "el2_stage2_mediated_owner_generation_checked"
+unrestricted_host_direct_map_world_frames = "forbidden"
+g7_dma_assumption = "no_unfenced_physical_dma_to_world_frames"
+protected_state = ["machine_incarnation", "world_generation", "resource_generation", "page_owner", "completion_tombstones", "stage2_roots", "el2_code", "el2_data"]
+protected_state_host_mapping = "forbidden"
+protected_state_device_dma = "iommu_smmu_deny_or_no_dma_capable_device"
+protected_state_failure = "fail_closed_no_guest_or_device_execution"
+
+[handles]
+format = ["abi_version", "machine_incarnation", "domain_tag", "world_slot", "world_generation", "resource_slot", "generation", "rights"]
+g7_authenticator = "none"
+domain_tag = "required_reserved_for_future_auth"
+domains = ["memory", "stage2", "vcpu", "interrupt", "dma", "entry", "completion"]
+cross_domain_use = "reject"
+generation_width_bits = 64
+generation_zero = "reject"
+world_generation_advance = "checked_monotonic_no_wrap_no_reuse"
+resource_generation_advance = "checked_monotonic_no_wrap_no_reuse"
+generation_exhaustion = "fail_closed_retire_slot"
+g8_mac_policy = "required_only_if_untrusted_guest_presents_handles"
+g8_mac_framing = "canonical_length_prefixed_all_handle_fields_including_abi_version"
+g8_key_lifecycle = ["generation", "enrollment", "rotation", "suspend_resume", "migration", "el1_restart", "crash_recovery", "destruction"]
+
+[page_owner]
+states = ["unowned_clean", "owned_machine_plus_world_slot_plus_generation", "quarantined_prior_or_unknown_owner"]
+initial_state = "quarantined_unless_independent_cleanliness_proof"
+missing_state = "never_implies_unowned_clean"
+transitions = ["unowned_clean_to_owned", "owned_to_quarantined_after_exact_memory_ack", "quarantined_to_unowned_clean_after_trusted_scrub"]
+assign = "unowned_clean_only"
+relabel_live_or_quarantined = "reject"
+blockers = ["mapping", "dma_window", "machine_pin"]
+checks_source = "live_el2_tables"
+scrub_trust = "el2_performed_or_hardware_or_cryptographic_verified_not_el1_assertion"
+
+[completion]
+begin_result = ["rejected", "pending"]
+query_operation = "query_completion"
+query_result = ["pending", "complete", "failed"]
+idempotency_key = "operation_id_bound_to_machine_opcode_resource_world_old_generation_reason"
+handle_binding = ["machine_incarnation", "resource_class", "world_slot", "world_generation", "resource_slot", "old_generation", "operation_id"]
+tombstone = "generation_independent_until_durable_consume_and_explicit_retire"
+rejected = "no_state_change"
+retry_while_pending = "same_operation_id_continues_idempotently"
+post_begin_failed = "durable_idempotent_tombstone_resource_fenced_no_ack_no_resume_no_reuse"
+failed_recovery = "class_specific_new_operation_linked_to_failed_tombstone_teardown_or_reset_only"
+failed_tombstone_retention = "until_recovery_ack_and_durable_consume"
+query_after_generation_advance = "exact_old_tuple_observation_only_no_live_authority"
+el2_recovery = "machine_ack_tombstone_survives_host_el1_restart"
+ocore_recovery = "composite_host_ack_uses_crash_consistent_write_ahead_journal"
+lost_state_policy = "whole_machine_reset_selects_fresh_machine_incarnation_quarantines_resource_and_never_synthesizes_ack"
+full_table = "reject_without_state_change"
+
+[ack]
+machine_revoke_ack_fields = ["abi_version", "machine_incarnation", "domain_tag", "world_slot", "world_generation", "resource_slot", "old_generation", "new_generation", "operation_id", "result"]
+cross_domain_world_resource_or_operation_use = "reject"
+
+[world_retirement]
+ocore_world_retire_requires = ["all_old_world_class_host_resource_acks", "broker_operations_terminal_and_journaled"]
+world_generation_advance_requires = ["all_old_world_vcpu_mapping_host_pin_dma_interrupt_effects_machine_acknowledged", "no_page_owned_by_old_world_generation"]
+quarantined_old_pages = "safe_for_world_generation_advance_but_not_reassignment_until_scrubbed"
+logical_bump_over_live_hardware = "forbidden"
+
+[[resource_class]]
+name = "MachineMemory"
+begin = "begin_teardown_memory"
+layer = "ocore_composite_with_el2_machine_ack"
+prerequisites = ["dependent_dma_windows_acknowledged"]
+el2_order = ["stop_or_exit_all_vcpus_and_quiesce_host_broker_access", "unmap_guest_and_host_broker_stage2_and_release_pins", "tlbi_all_affected_cpus", "architectural_drain", "checked_increment_generation", "machine_ack"]
+host_completion = "machine_ack"
+guest_outcome = "teardown_not_recoverable_error"
+
+[[resource_class]]
+name = "MachineBlock"
+begin = "begin_withdraw_block"
+layer = "ocore_protocol_broker_composite"
+el1_order = ["stop_new_old_generation_descriptors", "classify_accepted_requests_at_backend_commit_point", "preserve_result_of_already_committed_operation", "complete_accepted_uncommitted_with_VIRTIO_BLK_S_IOERR", "drain_old_generation_backing", "publish_used_ring_while_queue_mapped", "enqueue_terminal_notification", "fence_old_interrupt_route", "retire_endpoint_generation"]
+el2_obligation = "fence_dependent_mapping_dma_interrupt_effects"
+host_completion = "composite_broker_plus_machine_acks"
+guest_outcome = "pinned_linux_consumes_completion_and_returns_EIO"
+guest_health = "remains_healthy_after_error"
+terminal_result_lifetime = "immutable_nonreused_until_guest_consumed_or_explicit_memory_teardown"
+
+[[resource_class]]
+name = "Machine9P"
+begin = "begin_withdraw_9p"
+layer = "ocore_protocol_broker_composite"
+el1_order = ["stop_new_old_generation_tags_and_fids", "classify_accepted_requests_at_backend_commit_point", "preserve_result_of_already_committed_operation", "complete_accepted_uncommitted_with_negotiated_Rerror_or_Rlerror", "drain_old_generation_backend", "publish_terminal_response_or_used_ring_while_queue_mapped", "enqueue_terminal_notification_while_queue_mapped", "fence_old_interrupt_route", "retire_endpoint_generation"]
+el2_obligation = "fence_dependent_machine_effects"
+host_completion = "composite_broker_plus_machine_acks"
+guest_outcome = "pinned_linux_consumes_protocol_error"
+guest_health = "remains_healthy_after_error"
+terminal_result_lifetime = "immutable_nonreused_until_guest_consumed_or_explicit_memory_teardown"
+stale_fid = "reject_without_rebind"
+
+[g8_physical_device]
+contract_status = "concrete_device_class_extension_required_before_g8_qualification"
+generic_revoke_verb = "forbidden"
+minimum_obligations = ["quiesce_class_specific_broker", "fence_and_unmap_dma", "drain_and_invalidate_iommu_or_smmu", "withdraw_and_drain_generation_bound_interrupt_routes", "reset_device", "retire_resource_generation", "complete_composite_host_ack"]
+replacement = "after_composite_host_ack_only"
+unrelated_worlds = "must_survive"
+reset_verification = "class_specific_required"
+reset_failure = "quarantine_no_ack_no_replacement"
+shared_isolation_or_reset_group = "dedicated_or_all_affected_worlds_quiesced_and_survival_proven"
+
+[invariants]
+machine_ack = "no_machine_effect_authorized_by_old_generation_remains_reachable"
+terminal_bytes = "inert_completed_observation_not_machine_effect_or_authority"
+g7_memory_teardown_requires = ["host_resource_ack", "guest_error_consumed"]
+g7_join_order = "no_order_required_between_host_ack_and_guest_consumption"
+generation_increment = "not_completion_without_ack"
+generation_alias = "zero_wrap_and_reuse_forbidden"
+cold_reset_alias = "old_machine_incarnation_rejected"
+old_generation_host_access_after_ack = "none"

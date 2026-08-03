@@ -3,10 +3,15 @@
 ## The ambitious native path from the current Ostadix kernel to an elastic eight-node computer
 
 **Status:** normative native Alpha constitution and implementation program,
-version 2. The machine-readable qualification registry is
+version 3. The machine-readable qualification registry is
 [`evidence/world_alpha_gates.toml`](../evidence/world_alpha_gates.toml).
-Its executable constitutional vocabulary is
-[`evidence/world_contract_v1.toml`](../evidence/world_contract_v1.toml).
+Its executable constitutional composition is
+[`evidence/world_contract_v2.toml`](../evidence/world_contract_v2.toml), which
+imports the byte-frozen version-1 World vocabulary without changing its
+historical meaning.
+The normative host-EL1-to-EL2 machine-resource and revocation ABI is
+[`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md), with executable vocabulary in
+[`evidence/o_machine_contract_v1.toml`](../evidence/o_machine_contract_v1.toml).
 
 **Primary target:** a physically distributed computer whose identity is constituted by a governed World rather than by a chassis.
 
@@ -848,7 +853,10 @@ For x86_64:
 - provide boot parameters and initramfs;
 - establish nested page tables;
 - inject interrupts through governed virtual interrupt state; and
-- expose only explicitly declared paravirtual devices.
+- expose only explicitly declared standard virtio devices through trapped MMIO
+  or PCI doorbells; and
+- expose no Ostadix-specific guest hypercall or paravirtual authority/control
+  ABI at G7.
 
 For AArch64:
 
@@ -857,44 +865,118 @@ For AArch64:
 - provide PSCI and a minimal virtual platform description;
 - virtualize or mediate GIC state;
 - load `Image`, initramfs, and device tree; and
-- use the same guest-agent and service-export protocol.
+- use the same guest-agent and service-export protocol over a bounded virtio
+  transport, not an authority-bearing HVC.
 
 ### EL2 authority boundary
 
 O-core at host EL1 remains the sole policy graph: it owns resource kinds,
 semantic rights, dependency edges, lifecycle, admission, and cascading
-revocation. O-Machine at EL2 owns only two irreducible authoritative facts:
+revocation. O-Machine at EL2 owns only the irreducible authoritative facts
+below:
 
 ```text
-generation[slot]
+machine_incarnation
+world_generation[world_slot]
+resource_generation[resource_slot]
 page_owner[physical_frame]
 ```
 
-`generation[slot]` rejects authority from an obsolete machine incarnation.
-`page_owner[pfn]` decides which World, if any, may make a physical frame
-accessible. Saved vCPU registers, stage-2 roots, VMIDs, pending virtual
-interrupts, exit syndromes, and timer state are operational continuation state,
-not a second capability graph.
+The generation arrays reject authority from obsolete World and resource
+incarnations. Values are checked, nonzero 64-bit counters: they never wrap or
+repeat for a slot, and exhaustion retires that slot fail-closed rather than
+aliasing an old handle or completion.
 
-Machine handles are domain separated:
+Cold initialization also selects a durable-monotonic or cryptographically
+unique nonzero machine incarnation carried by every handle and completion, so
+volatile counter loss cannot make a pre-reset record current again.
+
+`page_owner[pfn]` decides which World, if any, may make a physical frame
+accessible. It is an EL2-owned, generation-bound state machine:
+`UnownedClean -> Owned(machine_incarnation, world_slot, world_generation) ->
+Quarantined -> UnownedClean`. A live owned, mapped, DMA-visible, pinned, or quarantined frame
+cannot be relabeled. Quarantine requires the exact old `MachineMemory` teardown
+acknowledgment; reassignment additionally requires EL2-controlled or
+independently hardware/cryptographically verified scrubbing, not an EL1
+assertion. On every EL2 boot/reset, missing ownership state means
+`Quarantined`, never `UnownedClean`, unless an independent cleanliness proof
+exists. Saved vCPU registers, stage-2 roots, VMIDs, pending virtual
+interrupts, exit syndromes, and timer state are operational continuation
+state, not a second capability graph.
+
+Host EL1 has no unrestricted physical/direct map of World-owned frames. Guest
+mappings and temporary virtio/9P broker views are both EL2-mediated,
+owner/generation-checked, bounded, and included in the teardown shootdown. A
+platform that cannot interpose on host-broker memory access cannot claim G7's
+cross-World memory-safety boundary against EL1 bugs.
+
+G7 likewise permits no unfenced physical DMA into World-owned frames. Real
+bus-mastering devices enter only through G8's class-specific IOMMU/SMMU,
+interrupt, reset, and acknowledgment contract.
+
+The normative machine ABI is specified in
+[`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md). Its G7 handles reserve and
+strictly check a domain tag:
 
 ```text
-MAC_K(domain || world || slot || generation || rights)
-
 domain.page
 domain.stage2
 domain.vcpu
 domain.interrupt
 domain.entry
+domain.dma
+domain.completion
 ```
 
+Every handle and completion identity binds both the World slot and its exact
+World generation; a resource generation alone cannot survive World-slot reuse.
+
 EL2 treats domains as non-interchangeable but does not interpret Linux, Plan 9,
-console, namespace, or other higher-level meanings. O-core walks revocation
-dependencies. EL2 acknowledges an invalidation only after the affected vCPU is
-stopped or exited, stage-2 mappings are disabled, required TLB invalidation and
-architectural draining complete, and the generation changes. Therefore an
-acknowledged revocation implies that no machine effect authorized by the old
+console, namespace, or other higher-level meanings. G7 has no handle MAC and no
+machine key lifecycle: only trusted host EL1 presents machine handles, while
+EL2 independently enforces slot generation and `page_owner`. G8 is the explicit
+decision point for a direct guest paravirtual interface. Only if an untrusted
+guest will present handles must G8 add an EL2-held key, a domain-separated MAC,
+and complete restart, suspend, migration, rotation, and destruction rules.
+
+O-core walks revocation dependencies and its guest-device broker interprets
+virtio and 9P. EL2 handles only the machine mappings, DMA, interrupt routes,
+vCPUs, generations, and ownership transitions underneath those protocols.
+Revocation is two-phase at the O-core machine-resource API:
+`begin_teardown_memory`, `begin_withdraw_block`, and `begin_withdraw_9p`
+return a pending completion handle bound to an idempotency operation ID;
+`query_completion` or a completion event later returns the host
+acknowledgment. A single-CPU implementation may complete the work
+synchronously internally, but it still uses this ABI so G3 can add vCPU
+rendezvous and cross-CPU shootdown without an interface change.
+
+For `MachineMemory`, EL2 acknowledges only after this exact sequence completes
+for every affected CPU:
+
+```text
+stop/exit vCPU -> unmap stage 2 -> TLBI -> architectural drain
+               -> checked generation increment -> acknowledge
+```
+
+The acknowledgment is the linearization point. A generation bump alone is not
+revocation, and `page_owner[pfn]` cannot change before the acknowledgment.
+Therefore `ack(revoke(s))` implies that no machine effect authorized by the old
 generation remains reachable.
+
+Revocation semantics are resource-class-specific. `MachineMemory` revocation
+is teardown and has no graceful Linux error. For `MachineBlock`, the O-core
+broker must use the virtio-blk error path so an accepted, uncommitted request
+completes with `VIRTIO_BLK_S_IOERR` and the pinned Linux guest observes `EIO`.
+For virtio-9p it must return the negotiated 9P error and leave old fids stale.
+EL2 neither chooses those commit points nor constructs those errors; it
+acknowledges the lower machine fences that the broker composes into the host
+resource completion. In both device cases that host completion proves machine
+quiescence, while a separate guest observation proves that Linux consumed the
+error; neither event substitutes for the other. Queue memory remains mapped
+until the terminal result and notification are published, and the gate waits
+for guest consumption before ordering memory teardown. Retained terminal bytes
+and the already-enqueued notification are inert observations, not continuing
+old-generation machine authority.
 
 ## Ostadix guest agent
 
@@ -913,6 +995,9 @@ Build a tiny, auditable `ostadix-agent` placed in the initramfs. It must:
 
 ## Shared queue contract
 
+At G7 these queues are reached through a standard virtio MMIO/PCI transport.
+They do not expose O-Machine handles or an Ostadix-specific guest HVC.
+
 Every descriptor should contain at least:
 
 ```text
@@ -921,8 +1006,8 @@ domain_id
 domain_generation
 request_id
 operation_code
-rights_required
-memory_view_capability
+rights_required (requested operation metadata, not authority)
+memory_view_token (guest-local opaque buffer ID, not a MachineHandle)
 input_length
 output_limit
 deadline
@@ -930,7 +1015,14 @@ cancellation_generation
 checksum or authentication tag
 ```
 
-No raw host or guest pointer crosses the boundary. Memory is shared only through pinned, bounded view capabilities. Descriptor consumption and completion have explicit linearization points.
+These are O-core-brokered fields, not a serialized EL2 authority object. The
+guest-local token names a buffer only within the already-created virtio service
+session; O-core resolves it through its own generation-bound table and checks
+the requested operation against authority the guest cannot mint. Neither the
+token, `rights_required`, nor an integrity checksum can recreate a
+`MachineHandle` or grant a right. No raw host or guest pointer crosses the
+boundary. Memory is shared only through host-authorized, pinned, bounded views.
+Descriptor consumption and completion have explicit linearization points.
 
 ## Lifecycle
 
@@ -948,7 +1040,17 @@ Exports become visible only after health. Failure withdraws them before memory o
 
 ## Acceptance gate G
 
-A real Linux kernel boots under O-core on x86_64 and AArch64 virtual hardware, the guest agent becomes healthy, a service is exported through a capability, the guest is killed while requests are in flight, stale completions are rejected, all memory views are revoked, and a replacement generation resumes service without damaging unrelated KernelWorlds.
+A real Linux kernel boots under O-core on x86_64 and AArch64 virtual hardware
+without an Ostadix-specific guest hypercall or paravirtual control ABI. The
+guest agent becomes healthy over a bounded virtio transport and a service is
+exported through a capability. A `MachineBlock` or `Machine9P` endpoint is
+withdrawn while a request is in flight; evidence records both the composite
+host resource acknowledgment and the pinned guest consuming the completion and
+returning the protocol-native `EIO`/9P error. Either observation may occur
+first, but both must exist before guest memory is torn down. Stale completions
+and old handles are rejected, and a replacement generation resumes service
+without damaging unrelated KernelWorlds. Revoking a page and crashing the
+guest cannot substitute for the device-error observation.
 
 ---
 
@@ -1045,6 +1147,19 @@ The board is chosen to serve the architecture, not merely because its enclosure 
 ## Acceptance gate H
 
 O-core boots bare metal, launches a Linux driver domain, assigns a real physical device, consumes a service through a capability, kills the domain under active I/O, proves DMA and interrupts are revoked, resets the device, launches a replacement generation, and preserves unrelated processes and devices. The final eight-node board must pass this gate through either the binary-contained or source-integrated path, with its path stated explicitly.
+
+Before freezing the G8 guest-facing ABI, record the decision whether a guest
+ever calls O-Machine directly. If yes, G8 must implement and qualify the
+EL2-held handle authenticator and full key lifecycle specified by the O-Machine
+contract. If no, retain G7's host-EL1-only caller model and do not add unused
+cryptographic key management.
+
+G8 must select at least one concrete physical device family and expose a
+class-named withdrawal operation, not a uniform device revoke verb. Its
+qualification freezes and observes quiesce, new-DMA fencing, DMA unmap/drain,
+interrupt withdrawal/drain, class-defined reset, generation retirement, and
+host acknowledgment in that order. Another device family must define its own
+contract rather than inherit unexamined reset or failure semantics.
 
 ---
 
@@ -1720,13 +1835,39 @@ Absence from that set means `not_established`, not that the event was proven not
 to occur. Explicit nonclaims remain deliberate, centrally constrained scope
 boundaries.
 
+For normalized observations `O`, validated topology `T`, one coherent
+content-addressed source snapshot `S`, and retained or transcript-bound
+artifacts `A`, the rule is:
+
+```text
+C = D_version(O, T, S, A)
+```
+
+The derivation identity binds observation parsing, same-attestation matching,
+context normalization, and compound-claim predicates. The qualification-policy
+identity separately binds the gate's claim, class, one-of-class, and nonclaim
+floors. This prevents a transcript from assembling a G7/G8 lifecycle out of
+unrelated runs or acquiring a physical/isolation claim without the required
+topology and pinned artifacts.
+
 The evidence directory is an append-only ledger of immutable attestations and
-separate supersession or retraction events. Events link record IDs, never
-rewrite the subject. The validator rejects cycles, missing subjects,
-cross-gate replacement, and competing successors, resolves the active evidence
-heads, and computes current gate status from claims, evidence classes, and
-dependency status. Historical passage remains inspectable even when current
+separate supersession, retraction, re-derivation, or witness events. Events link
+record IDs, never rewrite the subject. A schema-v3 attestation stores its exact
+`derivation_hash`. When `D` changes, a `rederive` edge names the prior and
+current hashes and the exact claims lost and gained; old recorded claims remain
+historical facts rather than being migrated in place. The validator rejects
+cycles, missing subjects, cross-gate replacement, competing successors,
+unreachable derivation edges, and inexact claim deltas, resolves the active
+evidence heads, and computes current gate status from claims, evidence classes,
+and dependency status. Historical passage remains inspectable even when current
 qualification changes.
+
+An external reviewer adds a separate witness record bound to the exact subject
+record and canonical payload; countersigning never edits the correction event.
+Until a trusted-key policy and real signature verifier are installed, the
+repository labels such envelopes `external_unverified` and keeps them
+status-inert. A Git hash or self-consistent payload digest is tamper binding,
+not an independent trust anchor.
 
 ## Formal specifications
 
@@ -1821,15 +1962,15 @@ The workstreams proceed in parallel, but the following gates define convergence.
 
 | Gate | Integrated result | What it proves | What cannot substitute for it |
 |---|---|---|---|
-| **G0 -- constitutional baseline** | World contract, crossing kinds, identities, failure classes, consistency model, and claim taxonomy are versioned | the project has one target rather than several homonymous “world” concepts | prose without executable schemas |
+| **G0 -- constitutional baseline** | World and O-Machine contracts, crossing kinds, identities, failure classes, consistency model, and claim taxonomy are versioned | the project has one target rather than several homonymous “world” concepts | prose without executable schemas |
 | **G1 -- semantic continuity** | project routes lower into a logical HGraph; receipts use shared World identities; `HostWorld` is separated from governed World state | language, project runtime, and kernel vocabulary can converge | a local route runner beside the HGraph |
 | **G2 -- AArch64 native compiler** | O-core keeps EL2 resident, enters host EL1, completes one validated HVC return, and executes AArch64 EL0 process, IPC, capability, lifecycle, reclamation, and bounded counter-progress checks under QEMU TCG | the SBC target and EL2/EL1 architectural split are real in the toolchain | cross-compiling a trivial assembly stub or dropping EL2 permanently |
-| **G3 -- multicore O-core** | x86_64 and AArch64 physical targets execute SMP stress gates | the single-CPU proof model has survived concurrency | multiple single-core VMs |
+| **G3 -- multicore O-core** | x86_64 and AArch64 physical targets execute SMP stress gates, with mapping teardown pending until every affected CPU completes invalidation and drain | the single-CPU proof model and asynchronous completion ABI have survived concurrency | multiple single-core VMs or a local-only generation bump |
 | **G4 -- native World transport** | three physical O-core nodes communicate through authenticated native transport | O-core can join a network without a Linux host | Linux-hosted node daemons |
 | **G5 -- replicated authority** | three native Governor replicas preserve one log across leader loss and partition | the World is logically singular without one physical point of failure | one Governor plus a backup process |
 | **G6 -- WorldFS** | per-process namespaces mount live resources from multiple physical nodes and survive churn | Plan 9-style composition has become the World interface | a static directory tree or FUSE mount above Linux |
-| **G7 -- real KernelWorld** | a pinned Linux kernel boots under O-core and exports a healthy service | foreign-kernel containment is operational | a synthetic guest or syscall emulator |
-| **G8 -- real driver service** | Linux controls a physical device and O-core consumes it through a revocable capability | the driver-reuse thesis has crossed into hardware | virtio-only or kernel-internal fake devices |
+| **G7 -- real KernelWorld** | a pinned, fully virtualized Linux kernel boots without an Ostadix-specific guest HVC/paravirtual control ABI, exports a healthy virtio-backed service, and consumes a protocol-native error from a class-specific asynchronous withdrawal; both guest consumption and host acknowledgment precede memory teardown, including guest and broker mappings/pins | foreign-kernel containment and graceful virtual-device withdrawal are operational | a synthetic guest, syscall emulator, published-but-unconsumed completion, unrestricted host direct map, or page removal presented as deterministic device failure |
+| **G8 -- real driver service** | Linux controls a physical device and O-core consumes it through a revocable capability; one concrete class freezes and qualifies quiesce -> DMA fence/unmap/drain -> interrupt withdrawal/drain -> reset -> generation retirement -> host acknowledgment, plus replacement and an explicit guest-interface decision with MAC/key evidence only when guest-presented handles exist | the driver-reuse thesis has crossed into hardware | virtio-only or kernel-internal fake devices, a generic revoke verb, an unresolved guest-interface decision, or missing key-lifecycle evidence when guest-presented handles are enabled |
 | **G9 -- native Debian personality** | dynamically linked Debian userland, `dpkg`, networking, and `apt` run under O-core | the familiar operating environment is a true personality | a container or chroot on Linux |
 | **G10 -- distributed execution** | logical HGraph placement, objects, checkpoints, and exactly-one commit work across physical nodes | the Governor governs computation, not just names | SSH fan-out or an external batch system |
 | **G11 -- accelerator fabric** | at least two accelerators execute one governed workload with explicit buffer locality and recovery | GPUs are resources in the World rather than separately administered devices | independent scripts on each GPU |
@@ -1868,8 +2009,9 @@ This is a merge-order skeleton, not a prohibition on parallel branches. Each PR 
 
 Add this full-stack program to `docs/`, update `docs/CLAIMS.md`, the multikernel proposal, and the release evidence schema. Define G0 through G13 and mark hosted World as reference-only.
 
-**Repository status:** the version-2 constitution is paired with
-`evidence/world_contract_v1.toml` and the schema-v3 definition-only
+**Repository status:** the version-3 constitution is paired with
+`evidence/world_contract_v2.toml`, its frozen version-1 vocabulary import, and
+the schema-v4 definition-only
 `evidence/world_alpha_gates.toml`. The validator derives claims and current
 status from active append-only ledger heads. G0 and the dependent AArch64
 QEMU/TCG gate G2 currently pass; the other 12 gates remain defined. These two
@@ -2178,31 +2320,52 @@ Pass G6 with resources and services from at least three physical O-core nodes.
 
 ### PR 43 -- foreign-kernel package format
 
-Define kernel, initramfs, boot, quota, service, device, health, and provenance fields with strict admission.
+Implement strict foreign-kernel package admission against the already-frozen
+image, initramfs, boot, quota, service, device, health, provenance, and
+resource-class-specific O-Machine withdrawal contracts.
 
 ### PR 44 -- real x86_64 Linux boot
 
-Replace the synthetic Mode 23 guest with a pinned Linux kernel and initramfs under AMD SVM; add VMX after the interface stabilizes.
+Replace the synthetic Mode 23 guest with a pinned, fully virtualized Linux
+kernel and initramfs under AMD SVM. Use trapped virtio MMIO/PCI doorbells and
+no Ostadix-specific guest hypercall or paravirtual control ABI; add VMX after
+the interface stabilizes.
 
 ### PR 45 -- AArch64 Linux guest boot
 
-Boot the same guest-agent contract at EL1 under O-core at EL2 with stage-2 translation.
+Boot the same guest-agent contract at guest EL1 under O-core at host EL1 and
+O-Machine at EL2 with stage-2 translation. Architecture platform calls carry
+no resource handles and do not create a guest authority ABI.
 
 ### PR 46 -- Ostadix guest agent and shared rings
 
-Implement health negotiation, service discovery, bounded descriptors, cancellation, deadlines, and terminal-state reporting.
+Implement health negotiation, service discovery, bounded descriptors,
+cancellation, deadlines, and terminal-state reporting over standard virtio
+transport.
 
 ### PR 47 -- hostile foreign-kernel lifecycle gates
 
-Crash, hang, replace, and race the guest while proving memory views, queues, and stale completions are revoked.
+Crash, hang, replace, and race the guest. Qualify the asynchronous two-phase
+host acknowledgment separately from the guest-visible result: withdraw a
+`MachineBlock` or `Machine9P` endpoint, observe the pinned guest's native
+terminal completion being consumed and returned as a device/protocol error,
+then tear down `MachineMemory` with the exact
+stop/unmap/TLBI/drain/generation/ack ordering. Reject stale completions.
 
 ### PR 48 -- physical-device object and reset state machine
 
-Model discovery, isolation group, DMA windows, interrupts, assignment, quiesce, reset, and generation replacement.
+Model discovery, isolation group, DMA windows, interrupts, assignment,
+quiesce, reset, and generation replacement. Freeze the G8 decision on direct
+guest machine calls; add a MAC and complete key lifecycle only if the guest is
+made an untrusted handle presenter. Define the first physical device family's
+class-named withdrawal operation and exact quiesce/DMA/interrupt/reset order;
+do not introduce a generic device revoke verb.
 
 ### PR 49 -- first physical Linux-driven device
 
-Pass the complete device lifecycle on a resettable NIC, NVMe, USB controller, or equally bounded device.
+Pass the complete class-specific device lifecycle on a resettable NIC, NVMe,
+USB controller, or equally bounded device, including the frozen withdrawal
+order and host acknowledgment.
 
 ### PR 50 -- source-integrated Linux Driver Environment
 
@@ -2613,7 +2776,9 @@ Preserve the existing wire oracle, move the codec into a reusable library, and f
 
 ## Move 10 -- define the real Linux KernelWorld package and guest-agent protocol
 
-Freeze the image, initramfs, health, shared-queue, service-export, and teardown contracts before choosing the first Linux image.
+Freeze the image, initramfs, health, virtio queue, service-export, class-specific
+device withdrawal, and memory-teardown contracts before choosing the first
+Linux image. Keep the G7 guest outside the O-Machine caller set.
 
 ## Move 11 -- create the hardware qualification worksheet
 
@@ -2751,5 +2916,5 @@ The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
 The bounded executable gates in `evidence/gates.toml` retain only the claims in
 [`CLAIMS.md`](CLAIMS.md). Only active evidence-ledger heads whose
-validator-derived claims satisfy the schema-v3 class and claim floors can pass
+validator-derived claims satisfy the schema-v4 class and claim floors can pass
 G0 or G2; unrelated bounded gate results remain non-qualifying for G0--G13.
