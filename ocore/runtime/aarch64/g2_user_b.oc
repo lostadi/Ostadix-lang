@@ -1,0 +1,68 @@
+module runtime::aarch64::g2_user_b;
+
+// Compiled O-core EL0 service principal.  It consumes A's queued request,
+// observes only attenuated authority, replies, and then raises a real BRK that
+// EL1 must contain without losing A's saved context.
+
+const SYS_REPORT: u64 = 1;
+const SYS_CAP_USE: u64 = 2;
+const SYS_ENDPOINT_RECEIVE: u64 = 4;
+const SYS_ENDPOINT_REPLY: u64 = 5;
+const SYS_FAIL: u64 = 255;
+
+const ERR_DENIED: u64 = 0xffff_ffff_ffff_ff01;
+const RIGHT_READ: u64 = 1;
+const RIGHT_WRITE: u64 = 2;
+
+const PROCESS_B_HANDLE: u64 = 0x0000_0001_0000_0002;
+const TRANSFER_B_HANDLE: u64 = 0x0000_0001_0000_0002;
+const ENDPOINT_B_HANDLE: u64 = 0x0000_0001_0000_0004;
+const REQUEST_CORRELATION: u64 = 0x4702_0001;
+const REQUEST_PAYLOAD: u64 = 0x2a;
+const REPLY_CORRELATION: u64 = 0x4702_0002;
+const REPLY_PAYLOAD: u64 = 0x2b;
+
+extern "ocore" fn g2_user_fault() -> never;
+
+unsafe fn fail(code: u64) -> never {
+    syscall1(SYS_FAIL, code);
+    loop {}
+}
+
+@export
+@no_mangle
+@link_section(".text.g2_user")
+pub unsafe fn g2_user_b_entry(process_handle: u64) -> never {
+    if process_handle != PROCESS_B_HANDLE
+        || syscall2(SYS_REPORT, 2, process_handle) != 1 {
+        fail(0xb001);
+    }
+
+    if syscall2(SYS_ENDPOINT_RECEIVE, ENDPOINT_B_HANDLE, 0)
+            != REQUEST_CORRELATION
+        || syscall2(SYS_ENDPOINT_RECEIVE, ENDPOINT_B_HANDLE, 1)
+            != REQUEST_PAYLOAD
+        || syscall2(SYS_ENDPOINT_RECEIVE, ENDPOINT_B_HANDLE, 2)
+            != TRANSFER_B_HANDLE {
+        fail(0xb002);
+    }
+
+    if syscall2(SYS_CAP_USE, TRANSFER_B_HANDLE, RIGHT_READ) != 1 {
+        fail(0xb003);
+    }
+    if syscall2(SYS_CAP_USE, TRANSFER_B_HANDLE, RIGHT_WRITE) != ERR_DENIED {
+        fail(0xb004);
+    }
+    if syscall3(
+        SYS_ENDPOINT_REPLY,
+        ENDPOINT_B_HANDLE,
+        REPLY_CORRELATION,
+        REPLY_PAYLOAD
+    ) != 1 {
+        fail(0xb005);
+    }
+
+    // BRK is handled as a lower-EL synchronous exception, not as a cooperative
+    // exit syscall.  Returning here would make fault containment a false claim.
+    g2_user_fault();
+}

@@ -4,7 +4,7 @@ O-core is O-lang's statically typed, freestanding systems language. It has a
 separate compiler pipeline from orchestration OIR:
 
 ```text
-.oc -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
+.oc -> AST -> typed HIR -> SSA MIR -> target ELF object
 ```
 
 The normative language, layout, ABI, unsafe, atomic, assembly, linkage, and
@@ -35,6 +35,10 @@ target/debug/ocorec ocore/examples/minimal.oc --emit mir -o -
 
 # Emit freestanding x86_64 ELF object and retain assembly
 target/debug/ocorec ocore/examples/minimal.oc --emit obj --keep-asm -o target/minimal.o
+
+# Emit the bounded freestanding AArch64 scalar subset
+target/debug/ocorec ocore/examples/minimal.oc \
+  --target aarch64-unknown-none --emit obj --keep-asm -o target/minimal-aarch64.o
 ```
 
 Multiple input files form one compilation unit. Each starts with a unique
@@ -74,6 +78,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-world-receipt-qemu.sh # mode-30 exact Rust/.oc OWRECEIPT v1 receipt/preimage corpus
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
+./ocore/kernel/smoke-aarch64-g2-qemu.sh # World G2 native AArch64 EL0/IPC/capability/lifecycle gate under forced TCG
 ```
 
 The asserted default `smoke-qemu.sh` output is:
@@ -314,8 +319,9 @@ or IOMMU behavior.
 
 ## Current boundary
 
-This is the first vertical slice, not yet a self-hosting general-purpose
-compiler. It is x86_64-only, uses a stack-spill backend, and currently requires
+This is not yet a self-hosting general-purpose compiler. The broad kernel and
+runtime remain x86_64; G2 adds a separate conservative scalar AArch64
+stack-spill backend and one bounded native image. Both targets currently require
 aggregate arguments/returns to travel through pointers. Indirect function
 calls, enum pattern matching, floating-point computation, and executable
 loading beyond the current bounded static-ELF gates remain follow-on work.
@@ -362,3 +368,7 @@ claims have separate bounded gates.
 The x86_64 backend rechecks MIR operand, result, call, branch, index, atomic,
 volatile, and assembly contracts so unsupported type shapes fail instead of
 falling through to integer-shaped instructions.
+The AArch64 backend supports AAPCS64-like compiler-versioned `extern "ocore"`
+scalar calls and `syscall0` through `syscall6`, and fails closed on AMD64
+`sysv64`, atomics, inline assembly, interrupt/naked functions, floating point,
+and calls with more than eight integer arguments.

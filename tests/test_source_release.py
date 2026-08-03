@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 import zipfile
@@ -28,6 +29,25 @@ WORLD_NORMATIVE_BYTES = {
     path: (PROJECT_ROOT / path).read_bytes()
     for path in release.SEALED_WORLD_ALPHA_SHA256
 }
+WORLD_ATTESTATION_PATHS = (
+    "evidence/world/g0-repository-conformance.toml",
+    "evidence/world/g2-aarch64-qemu.toml",
+)
+WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS)
+for _attestation_path in WORLD_ATTESTATION_PATHS:
+    _attestation = tomllib.loads(
+        (PROJECT_ROOT / _attestation_path).read_text(encoding="utf-8")
+    )
+    WORLD_EVIDENCE_RELEASE_PATHS.add(_attestation["transcript"])
+    WORLD_EVIDENCE_RELEASE_PATHS.add(_attestation["command"][0][2:])
+    WORLD_EVIDENCE_RELEASE_PATHS.update(
+        source["path"] for source in _attestation["source"]
+    )
+    WORLD_EVIDENCE_RELEASE_PATHS.update(
+        artifact["path"]
+        for artifact in _attestation["artifact"]
+        if artifact["retained"]
+    )
 
 EVIDENCE_SCRIPT = PROJECT_ROOT / "scripts" / "release_evidence.py"
 EVIDENCE_SPEC = importlib.util.spec_from_file_location(
@@ -42,27 +62,49 @@ EVIDENCE_SPEC.loader.exec_module(evidence_tool)
 
 def fixture_evidence_manifest() -> str:
     lines = [
-        "schema_version = 1",
-        "required_gate_count = 21",
+        "schema_version = 2",
+        "required_gate_count = 22",
         "supplemental_gate_count = 1",
         'portable_command = "./boot-and-test.sh smoke"',
         "",
     ]
-    for index in range(22):
-        required = index < 21
-        evidence_class = "portable_tcg" if required else "hardware_kvm"
+    for index in range(23):
+        required = index < 22
+        is_g2 = index == 1
+        if is_g2:
+            gate_id = release.G2_AARCH64_GATE_ID
+            script = release.G2_AARCH64_SCRIPT
+            evidence_class = "qemu_tcg_aarch64"
+            required_tools = sorted(release.G2_AARCH64_REQUIRED_TOOLS)
+            positive_claims = list(release.G2_AARCH64_POSITIVE_CLAIMS)
+            nonclaims = list(release.G2_AARCH64_NONCLAIMS)
+            expected_markers = list(release.G2_AARCH64_EXPECTED_MARKERS)
+        else:
+            gate_id = f"fixture-gate-{index:02}"
+            script = f"ocore/kernel/fixture-evidence-{index:02}.sh"
+            evidence_class = "portable_tcg" if required else "hardware_kvm"
+            required_tools = sorted(
+                release.EVIDENCE_COMMON_REQUIRED_TOOLS
+                | release.EVIDENCE_CLASS_REQUIRED_TOOLS[evidence_class]
+            )
+            positive_claims = [f"fixture claim {index:02}"]
+            nonclaims = [f"fixture nonclaim {index:02}"]
+            expected_markers = [
+                f"FIXTURE {index:02} START",
+                f"FIXTURE {index:02} PASS",
+            ]
         lines.extend(
             [
                 "[[gate]]",
-                f'id = "fixture-gate-{index:02}"',
+                f'id = {json.dumps(gate_id)}',
                 f"required = {'true' if required else 'false'}",
                 'milestone = "fixture"',
-                f'script = "ocore/kernel/fixture-evidence-{index:02}.sh"',
+                f'script = {json.dumps(script)}',
                 f'evidence_class = "{evidence_class}"',
-                'required_tools = ["bash"]',
-                f'positive_claims = ["fixture claim {index:02}"]',
-                f'nonclaims = ["fixture nonclaim {index:02}"]',
-                f'expected_markers = ["FIXTURE {index:02} START", "FIXTURE {index:02} PASS"]',
+                f"required_tools = {json.dumps(required_tools)}",
+                f"positive_claims = {json.dumps(positive_claims)}",
+                f"nonclaims = {json.dumps(nonclaims)}",
+                f"expected_markers = {json.dumps(expected_markers)}",
                 "",
             ]
         )
@@ -70,7 +112,7 @@ def fixture_evidence_manifest() -> str:
 
 
 ZERO_GATE_EVIDENCE_MANIFEST = """\
-schema_version = 1
+schema_version = 2
 required_gate_count = 0
 supplemental_gate_count = 0
 portable_command = "./boot-and-test.sh smoke"
@@ -174,6 +216,9 @@ class SourceReleaseTests(unittest.TestCase):
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
             ],
+            "evidence/world_contract_v1.toml": WORLD_NORMATIVE_BYTES[
+                "evidence/world_contract_v1.toml"
+            ],
             "examples/manifest.json": '{"schema_version": 1, "examples": []}\n',
             "llms.txt": "release index\n",
             "mcp/ostadix_lang_mcp_server/Cargo.lock": "# fixture lock\n",
@@ -191,12 +236,17 @@ class SourceReleaseTests(unittest.TestCase):
             "okernel-multikernel/boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md": "proposal\n",
             "ocore/kernel/boot.S": ".section .text\n",
+            "ocore/kernel/aarch64/boot.S": ".section .text\n",
+            "ocore/kernel/aarch64/linker.ld": "ENTRY(_start)\n",
+            "ocore/kernel/aarch64/vectors.S": ".section .text\n",
+            "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
             "ocore/kernel/smoke-world-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-value-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-protocol-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-identity-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-aarch64-g2-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/world_value_semantics.oc": (
                 "module kernel::world_value_semantics;\n"
             ),
@@ -222,6 +272,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "module kernel::world_receipt_semantics;\n"
             ),
             "ocore/runtime/x86_64/trap.oc": "module runtime::trap;\n",
+            "ocore/runtime/aarch64/g2_kernel.oc": "module runtime::g2_kernel;\n",
+            "ocore/runtime/aarch64/g2_user_a.oc": "module runtime::g2_user_a;\n",
+            "ocore/runtime/aarch64/g2_user_b.oc": "module runtime::g2_user_b;\n",
             "ocore/world/codec.oc": "module world::codec;\n",
             "ocore/world/identity.oc": "module world::identity;\n",
             "ocore/world/protocol.oc": "module world::protocol;\n",
@@ -235,10 +288,16 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/smoke-project-hgraph.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-world-resource-keys.sh": "#!/usr/bin/env bash\n",
+            "scripts/smoke-world-g0-conformance.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
             "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
+            "src/bin/ocorec.rs": "// fixture O-core compiler CLI\n",
+            "src/ocore/codegen.rs": "// fixture x86_64 O-core code generator\n",
+            "src/ocore/codegen_aarch64.rs": "// fixture AArch64 O-core code generator\n",
+            "src/ocore/driver.rs": "// fixture O-core target driver\n",
+            "src/ocore/mod.rs": "// fixture O-core module exports\n",
             "src/executor/mod.rs": "// fixture public executor effects surface\n",
             "src/hgraph/graph.rs": "// fixture HGraph validation\n",
             "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
@@ -266,6 +325,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
+            "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
             "tests/project_hgraph.rs": "#[test] fn project_hgraph_fixture() {}\n",
             "tests/world_resource_keys.rs": "#[test] fn resource_key_fixture() {}\n",
@@ -275,9 +335,11 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/world_receipt.rs": "#[test] fn receipt_fixture() {}\n",
             "tests/world_value.rs": "#[test] fn value_fixture() {}\n",
         }
+        for path in WORLD_EVIDENCE_RELEASE_PATHS:
+            contents[path] = (PROJECT_ROOT / path).read_bytes()
         if files:
             contents.update(files)
-        for index in range(22):
+        for index in range(23):
             contents[f"ocore/kernel/fixture-evidence-{index:02}.sh"] = (
                 "#!/bin/sh\n"
                 f"printf 'FIXTURE {index:02} START\\nFIXTURE {index:02} PASS\\n'\n"
@@ -291,14 +353,17 @@ class SourceReleaseTests(unittest.TestCase):
                     "boot-and-test.sh",
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
+                    "ocore/kernel/build-aarch64-g2.sh",
                     "ocore/kernel/smoke-world-receipt-qemu.sh",
                     "ocore/kernel/smoke-world-value-qemu.sh",
                     "ocore/kernel/smoke-world-protocol-qemu.sh",
                     "ocore/kernel/smoke-world-identity-qemu.sh",
+                    "ocore/kernel/smoke-aarch64-g2-qemu.sh",
                     "scripts/o-cli.sh",
                     "scripts/install-o-cli-wrapper.sh",
                     "scripts/smoke-project-hgraph.sh",
                     "scripts/smoke-world-resource-keys.sh",
+                    "scripts/smoke-world-g0-conformance.sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
             )
@@ -403,6 +468,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/OSTADIX_WORLD.md",
                 "evidence/gates.toml",
                 "evidence/world_alpha_gates.toml",
+                "evidence/world_contract_v1.toml",
+                "evidence/world/g0-repository-conformance.toml",
+                "evidence/world/g2-aarch64-qemu.toml",
+                "evidence/world/transcripts/g0-repository-conformance.log",
+                "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "examples/manifest.json",
                 "llms.txt",
                 "mcp/ostadix_lang_mcp_server/Cargo.lock",
@@ -412,12 +482,17 @@ class SourceReleaseTests(unittest.TestCase):
                 "okernel-multikernel/boot-and-test.sh",
                 "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
                 "ocore/kernel/boot.S",
+                "ocore/kernel/aarch64/boot.S",
+                "ocore/kernel/aarch64/linker.ld",
+                "ocore/kernel/aarch64/vectors.S",
+                "ocore/kernel/build-aarch64-g2.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
                 "ocore/kernel/smoke-world-receipt-qemu.sh",
                 "ocore/kernel/smoke-world-value-qemu.sh",
                 "ocore/kernel/smoke-world-protocol-qemu.sh",
                 "ocore/kernel/smoke-world-identity-qemu.sh",
+                "ocore/kernel/smoke-aarch64-g2-qemu.sh",
                 "ocore/kernel/world_protocol_semantics.oc",
                 "ocore/kernel/world_protocol_semantics_stub.oc",
                 "ocore/kernel/world_value_semantics.oc",
@@ -427,6 +502,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/world_receipt_semantics.oc",
                 "ocore/kernel/world_receipt_semantics_stub.oc",
                 "ocore/runtime/x86_64/trap.oc",
+                "ocore/runtime/aarch64/g2_kernel.oc",
+                "ocore/runtime/aarch64/g2_user_a.oc",
+                "ocore/runtime/aarch64/g2_user_b.oc",
                 "ocore/world/codec.oc",
                 "ocore/world/identity.oc",
                 "ocore/world/protocol.oc",
@@ -440,10 +518,16 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/o-cli.sh",
                 "scripts/smoke-project-hgraph.sh",
                 "scripts/smoke-world-resource-keys.sh",
+                "scripts/smoke-world-g0-conformance.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
                 "src/effects.rs",
                 "src/bin/olangc.rs",
+                "src/bin/ocorec.rs",
+                "src/ocore/codegen.rs",
+                "src/ocore/codegen_aarch64.rs",
+                "src/ocore/driver.rs",
+                "src/ocore/mod.rs",
                 "src/executor/mod.rs",
                 "src/hgraph/graph.rs",
                 "src/hgraph/kinds.rs",
@@ -471,6 +555,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
+                "tests/test_release_evidence.py",
                 "tests/test_world_alpha_evidence.py",
                 "tests/project_hgraph.rs",
                 "tests/world_resource_keys.rs",
@@ -493,7 +578,7 @@ class SourceReleaseTests(unittest.TestCase):
             }
             included.update(
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
-                for index in range(22)
+                for index in range(23)
             )
             excluded = {
                 ".DS_Store",
@@ -775,6 +860,42 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-evidence.zip")
 
+    def test_g2_aarch64_compiler_boot_and_gate_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "ocore/kernel/aarch64/boot.S",
+            "ocore/kernel/aarch64/linker.ld",
+            "ocore/kernel/aarch64/vectors.S",
+            "ocore/kernel/build-aarch64-g2.sh",
+            "ocore/kernel/smoke-aarch64-g2-qemu.sh",
+            "ocore/runtime/aarch64/g2_kernel.oc",
+            "ocore/runtime/aarch64/g2_user_a.oc",
+            "ocore/runtime/aarch64/g2_user_b.oc",
+            "src/bin/ocorec.rs",
+            "src/ocore/codegen_aarch64.rs",
+            "src/ocore/driver.rs",
+            "tests/test_release_evidence.py",
+            "evidence/world/g2-aarch64-qemu.toml",
+            "evidence/world/transcripts/g2-aarch64-qemu.log",
+        )
+        self._git("commit", "-q", "-m", "remove G2 AArch64 release surface")
+
+        with self.assertRaises(release.ReleaseError) as raised:
+            self._build("missing-g2-aarch64.zip")
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for path in (
+            "evidence/world/g2-aarch64-qemu.toml",
+            "ocore/kernel/aarch64/boot.S",
+            "ocore/kernel/build-aarch64-g2.sh",
+            "ocore/kernel/smoke-aarch64-g2-qemu.sh",
+            "ocore/runtime/aarch64/g2_kernel.oc",
+            "src/ocore/codegen_aarch64.rs",
+            "tests/test_release_evidence.py",
+        ):
+            self.assertIn(path, message)
+
     def test_world_constitution_registry_and_validator_are_required(self) -> None:
         self._commit()
         self._git(
@@ -782,18 +903,29 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
             "docs/OSTADIX_WORLD.md",
             "evidence/world_alpha_gates.toml",
+            "evidence/world_contract_v1.toml",
+            "evidence/world/g0-repository-conformance.toml",
+            "evidence/world/transcripts/g0-repository-conformance.log",
+            "scripts/smoke-world-g0-conformance.sh",
             "scripts/world_alpha_evidence.py",
             "tests/test_world_alpha_evidence.py",
         )
         self._git("commit", "-q", "-m", "remove World constitution surfaces")
 
-        with self.assertRaisesRegex(
-            release.ReleaseError,
-            r"missing required path\(s\): .*HOSTED_WORLD_REFERENCE_PROFILE\.md.*"
-            r"OSTADIX_WORLD\.md.*world_alpha_gates\.toml.*"
-            r"world_alpha_evidence\.py.*test_world_alpha_evidence\.py",
-        ):
+        with self.assertRaises(release.ReleaseError) as raised:
             self._build("missing-world-constitution.zip")
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for path in (
+            "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+            "docs/OSTADIX_WORLD.md",
+            "evidence/world_alpha_gates.toml",
+            "evidence/world_contract_v1.toml",
+            "evidence/world/g0-repository-conformance.toml",
+            "scripts/world_alpha_evidence.py",
+            "tests/test_world_alpha_evidence.py",
+        ):
+            self.assertIn(path, message)
 
     def test_world_identity_cross_language_surface_is_required(self) -> None:
         self._commit()
@@ -954,7 +1086,7 @@ class SourceReleaseTests(unittest.TestCase):
                     self._build(f"tampered-world-{Path(path).name}.zip")
                 message = str(raised.exception)
                 self.assertIn(path, message)
-                self.assertIn("SHA-256 differs from sealed World Alpha v1 bytes", message)
+                self.assertIn("SHA-256 differs from sealed World Alpha v2 bytes", message)
 
     def test_archive_verifier_rejects_self_consistent_world_byte_tamper(self) -> None:
         result = self._build("valid-before-world-tamper.zip", ref=self._commit())
@@ -977,14 +1109,48 @@ class SourceReleaseTests(unittest.TestCase):
                     release.verify_archive(tampered)
                 message = str(raised.exception)
                 self.assertIn(path, message)
-                self.assertIn("SHA-256 differs from sealed World Alpha v1 bytes", message)
+                self.assertIn("SHA-256 differs from sealed World Alpha v2 bytes", message)
+
+    def test_world_attestation_rejects_transcript_tamper(self) -> None:
+        path = "evidence/world/transcripts/g2-aarch64-qemu.log"
+        self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"tamper\n"})
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"g2-aarch64-qemu\.toml\.transcript digest does not match",
+        ):
+            self._build("tampered-g2-transcript.zip")
+
+    def test_world_attestation_rejects_source_byte_tamper(self) -> None:
+        path = "src/ocore/codegen_aarch64.rs"
+        self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"\n"})
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"g2-aarch64-qemu\.toml\.source\[[0-9]+\].*"
+            r"does not match released src/ocore/codegen_aarch64\.rs",
+        ):
+            self._build("tampered-g2-source.zip")
 
     def test_world_registry_structure_is_checked_beneath_byte_seal(self) -> None:
         path = "evidence/world_alpha_gates.toml"
-        malformed = b"schema_version = 1\n"
-        files = dict(WORLD_NORMATIVE_BYTES)
+        malformed = b"schema_version = 2\n"
+        files = {
+            candidate: (PROJECT_ROOT / candidate).read_bytes()
+            for candidate in WORLD_EVIDENCE_RELEASE_PATHS
+            | set(WORLD_NORMATIVE_BYTES)
+        }
         files[path] = malformed
-        modes = {candidate: "100644" for candidate in files}
+        modes = {
+            candidate: (
+                "100755"
+                if candidate
+                in {
+                    "scripts/smoke-world-g0-conformance.sh",
+                    "ocore/kernel/smoke-aarch64-g2-qemu.sh",
+                }
+                else "100644"
+            )
+            for candidate in files
+        }
         with mock.patch.dict(
             release.SEALED_WORLD_ALPHA_SHA256,
             {path: hashlib.sha256(malformed).hexdigest()},
@@ -1033,10 +1199,36 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("invalid-evidence-reference.zip")
 
+    def test_g2_aarch64_false_physical_claim_is_rejected_before_packaging(self) -> None:
+        evidence = fixture_evidence_manifest().replace(
+            json.dumps(list(release.G2_AARCH64_POSITIVE_CLAIMS)),
+            json.dumps(["Physical AArch64 and SMMU isolation are proven"]),
+            1,
+        )
+        self._commit({"evidence/gates.toml": evidence})
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"G2 AArch64 positive claims exceed the sealed boundary",
+        ):
+            self._build("false-g2-physical-claim.zip")
+
+    def test_g2_aarch64_linux_boot_claim_is_rejected_before_packaging(self) -> None:
+        evidence = fixture_evidence_manifest().replace(
+            json.dumps(list(release.G2_AARCH64_NONCLAIMS)),
+            json.dumps(["This AArch64 gate boots Linux and Plan 9"]),
+            1,
+        )
+        self._commit({"evidence/gates.toml": evidence})
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"G2 AArch64 nonclaims differ from the sealed boundary",
+        ):
+            self._build("false-g2-linux-claim.zip")
+
     def test_zero_gate_evidence_manifest_is_rejected_before_packaging(self) -> None:
         self._commit({"evidence/gates.toml": ZERO_GATE_EVIDENCE_MANIFEST})
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 21"
+            release.ReleaseError, r"required_gate_count must be 22"
         ):
             self._build("zero-gate-evidence.zip")
 
@@ -1064,7 +1256,7 @@ class SourceReleaseTests(unittest.TestCase):
             result.output, "self-consistent-zero-gate-evidence.zip", remove_gates
         )
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 21"
+            release.ReleaseError, r"required_gate_count must be 22"
         ):
             release.verify_archive(tampered)
 

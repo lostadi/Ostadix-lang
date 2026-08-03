@@ -1,17 +1,19 @@
-schema_version = 1
-constitution_version = 1
+schema_version = 2
+constitution_version = 2
 constitution = "docs/OSTADIX_WORLD.md"
 hosted_reference_profile = "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+contract_schema = "evidence/world_contract_v1.toml"
 alpha_gate = "G13"
 gate_count = 14
 
 # This registry defines qualification requirements. It is separate from
 # gates.toml, whose 21 required QEMU-TCG gates and one supplemental KVM gate
 # are executable evidence for narrower, already implemented O-core slices.
-# Schema v1 is definition-only: validators reject `passed` and every nonempty
-# evidence list. The first passage requires a new typed attestation schema
-# bound to gate, source commit, commands, transcripts, artifact digests,
-# hardware/topology inventory, and signatures where the constitution requires.
+# Schema v2 admits strict typed attestations bound to a gate, source commit and
+# exact source bytes, one repository-owned command, an immutable transcript,
+# artifact digests, topology inventory, claims, non-claims, and signatures
+# where a physical gate requires them. Dependency and evidence-class floors
+# are checked before a gate may be marked passed.
 
 [[evidence_class]]
 id = "repository_conformance"
@@ -86,13 +88,13 @@ description = "Topology-labelled performance observations; never a substitute fo
 [[gate]]
 id = "G0"
 title = "constitutional baseline"
-status = "defined"
+status = "passed"
 depends_on = []
 required_classes = ["repository_conformance"]
 one_of_classes = []
 acceptance = "The versioned World contract, crossings, complete identity vocabulary, failure classes, consistency model, and claim taxonomy agree with executable schemas."
 prohibited_substitutes = ["Prose without executable schemas", "The superseded hosted-first World v0 contract"]
-evidence = []
+evidence = ["evidence/world/g0-repository-conformance.toml"]
 
 [[gate]]
 id = "G1"
@@ -108,13 +110,13 @@ evidence = []
 [[gate]]
 id = "G2"
 title = "AArch64 native compiler"
-status = "defined"
+status = "passed"
 depends_on = ["G0"]
 required_classes = ["qemu_tcg_aarch64"]
 one_of_classes = []
 acceptance = "O-core compiles and boots under AArch64 QEMU with native process, IPC, capability, and lifecycle checks."
 prohibited_substitutes = ["Cross-compiling a trivial assembly stub", "An x86_64-only O-core result"]
-evidence = []
+evidence = ["evidence/world/g2-aarch64-qemu.toml"]
 
 [[gate]]
 id = "G3"

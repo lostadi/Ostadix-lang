@@ -26,8 +26,12 @@ OIR and O-core MIR are different representations with different invariants.
 OIR models dependency and backend execution. MIR models typed machine-level
 computation. Neither is implicitly converted to the other.
 
-The initial target is `x86_64-unknown-none`. Its object format is ELF64, its
-data model is LP64, and its default calling convention is System V AMD64.
+The primary target is `x86_64-unknown-none`. G2 also provides a bounded
+`aarch64-unknown-none` scalar backend. Both emit little-endian ELF64 and use an
+LP64 data model. The x86_64 default calling convention is System V AMD64; the
+AArch64 compiler-versioned `extern "ocore"` convention uses scalar AAPCS64
+register placement. `extern "sysv64"` remains AMD64-only and is rejected by the
+AArch64 backend.
 
 ## 2. Source units and modules
 
@@ -308,8 +312,9 @@ or subprocess execution part of the kernel trusted computing base.
 
 ## 11. Implemented bounded O-core milestone boundary
 
-The initial compiler targets only `x86_64-unknown-none` and uses a simple
-stack-spill backend without optimization or register allocation. Direct calls
+The broad compiler/kernel target remains `x86_64-unknown-none`; G2 adds a
+separate conservative scalar `aarch64-unknown-none` stack-spill backend. Neither
+backend has optimization or a general register allocator. Direct calls
 are supported; function-pointer types are representable, but indirect calls
 are not yet lowered. Aggregates support layout, construction, fields,
 indexing, locals, statics, and copies, while aggregate parameters and returns
@@ -320,6 +325,24 @@ MIR lowering. Code generation also validates the MIR type contracts for
 operations, calls, control flow, indexed places, atomics, volatile access, and
 assembly. This is a second boundary against malformed or future lowering paths
 silently selecting integer instructions.
+
+The bounded AArch64 backend emits statics, scalar locals and pointers,
+loads/stores/casts, integer operations, direct calls with at most eight scalar
+arguments, branches and current MIR phi shapes, volatile MIR memory, DAIF
+masks, `wfi`, and `syscall0` through `syscall6` using x8 and x0--x5. It traps
+explicitly on division by zero and signed 64-bit MIN/-1 instead of accepting
+AArch64's silent architectural result. It rejects AMD64 `sysv64`, port I/O,
+atomics, page invalidation, inline assembly, interrupt/naked functions,
+floating point, and wider call shapes.
+
+`ocore/kernel/smoke-aarch64-g2-qemu.sh` builds one deterministic `EM_AARCH64`
+image twice, proves semantic markers originate in compiled `.oc`, and boots it
+with one vCPU on QEMU/TCG `virt,gic-version=3`. The integrated run executes two
+EL0 principals through real SVC/ERET, endpoint request/reply, attenuated
+capability use, contained fault and exit, generation reuse/stale denial,
+reclamation, and later counter liveness. It is MMU-off virtual evidence, not
+physical AArch64, SMP/G3, KVM/SVM, Linux or Plan 9 boot, a general foreign ABI,
+or PCI/DMA/IOMMU/device-assignment evidence.
 
 Milestones 0.1 through 0.3 are complete for the bounded single-CPU bootstrap
 gate. The kernel enters a linked `native[0]` payload at CPL3, crosses an

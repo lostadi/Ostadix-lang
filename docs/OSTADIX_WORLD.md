@@ -3,8 +3,10 @@
 ## The ambitious native path from the current Ostadix kernel to an elastic eight-node computer
 
 **Status:** normative native Alpha constitution and implementation program,
-version 1. The machine-readable qualification registry is
+version 2. The machine-readable qualification registry is
 [`evidence/world_alpha_gates.toml`](../evidence/world_alpha_gates.toml).
+Its executable constitutional vocabulary is
+[`evidence/world_contract_v1.toml`](../evidence/world_contract_v1.toml).
 
 **Primary target:** a physically distributed computer whose identity is constituted by a governed World rather than by a chassis.
 
@@ -1810,10 +1812,12 @@ This is a merge-order skeleton, not a prohibition on parallel branches. Each PR 
 
 Add this full-stack program to `docs/`, update `docs/CLAIMS.md`, the multikernel proposal, and the release evidence schema. Define G0 through G13 and mark hosted World as reference-only.
 
-**Repository status:** landed as the version-1 constitution plus
-`evidence/world_alpha_gates.toml`. The registry defines all 14 gates and marks
-zero passed. Its first schema is definition-only and cannot certify a passage;
-this PR does not itself pass G0.
+**Repository status:** the version-2 constitution is paired with
+`evidence/world_contract_v1.toml` and schema-v2
+`evidence/world_alpha_gates.toml`. Typed, content-addressed attestations now
+pass G0 and its dependent AArch64 QEMU/TCG gate G2. The other 12 gates remain
+defined. These two passages do not promote virtual evidence to physical,
+hardware-isolation, SMP, foreign-kernel, or multinode evidence.
 
 ### PR 2 -- shared World identity types
 
@@ -2520,9 +2524,24 @@ Before implementing network execution, freeze how logical operations become plac
 
 Create the target interface and Machine IR while proving unchanged x86_64 output. This opens the AArch64 path without immediately rewriting the kernel.
 
+**Repository status:** the bounded G2 implementation adds a separate,
+fail-closed scalar AArch64 backend while preserving the existing x86_64
+backend. It does not yet provide the target-neutral Machine IR, general
+register allocator, atomics, floating point, vector types, or stable foreign
+ABI described by the full Workstream B design.
+
 ## Move 7 -- implement the AArch64 object and boot minimum
 
 Emit one freestanding AArch64 object, link it, print through PL011 under QEMU, and add the first AArch64 evidence gate.
+
+**Repository status:** complete beyond the minimum at virtual-native G2. One
+deterministic AArch64 image links compiled `.oc` kernel semantics and two EL0
+principals to bounded EL1 boot/vector glue. A forced one-vCPU QEMU/TCG `virt`
+run covers real SVC/ERET, endpoint request/reply, capability attenuation,
+contained EL0 fault and exit, generation reuse with stale denial, reclamation,
+and post-lifecycle counter liveness. This is not physical AArch64, SMP/G3,
+KVM/SVM, Linux or Plan 9 boot, a general foreign ABI, or PCI/DMA/IOMMU/device
+assignment evidence.
 
 ## Move 8 -- write the Governor state-machine model now
 
@@ -2670,8 +2689,7 @@ registry.
 
 The validator and repository suites run separately from this prose. A future
 gate is not implemented merely because it is defined here or in the registry.
-The current 21 portable QEMU gates and one supplemental hardware gate retain
-only the bounded claims in [`CLAIMS.md`](CLAIMS.md) and
-[`evidence/gates.toml`](../evidence/gates.toml). Their results do not satisfy a
-G0--G13 gate. Schema v1 admits no evidence records; only a future versioned,
-typed-attestation schema may bind a current or new result to an exact gate.
+The bounded executable gates in `evidence/gates.toml` retain only the claims in
+[`CLAIMS.md`](CLAIMS.md). Only the evidence records named by the schema-v2
+World registry satisfy G0 or G2; unrelated bounded gate results remain
+non-qualifying for G0--G13.

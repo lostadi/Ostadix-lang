@@ -169,6 +169,9 @@ jobs:
       - name: Test World Alpha gate substitution rules
         run: python3 -m unittest -v tests.test_world_alpha_evidence
 
+      - name: Test native release-evidence registry
+        run: python3 -m unittest -v tests.test_release_evidence
+
       - name: Test deterministic source-release builder
         run: python3 -m unittest -v tests.test_source_release
 
@@ -193,9 +196,10 @@ jobs:
       - name: Install freestanding build, ELF inspection, and QEMU tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86
+          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm
           command -v llvm-objdump
           command -v nm
+          command -v qemu-system-aarch64
 
       - name: Verify isolated minimal Linux personality corpus
         run: ocore/kernel/check-linux-minimal-slice.sh
