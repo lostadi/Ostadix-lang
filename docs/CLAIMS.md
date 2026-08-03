@@ -42,9 +42,12 @@
   files, directories, or the root inside that archive. Verification also checks
   canonical ZIP metadata/layout and inertly validates the MCP configuration,
   crate license, example/evidence manifest schemas, sealed World Alpha
-  constitution-v2/profile/contract/registry bytes, both typed G0/G2
-  attestations, their transcript and released-source digests, and archive-local
-  references; it never imports or executes archive payloads. The supported local
+  constitution-v3/profile/composed-contract/registry-v4 bytes, exact historical
+  attestation and ledger-event bytes, current released-source digests, and
+  archive-local references; it never imports or executes archive payloads.
+  Schema-v2 historical source sets are one coherent snapshot at commit
+  `c25d38c00283f2873eed1aa84dd89b437777e356`; reconstructing those bytes
+  requires full Git history and is explicitly not archive-only proof. The supported local
   MCP crate, its lockfile, LGPL-2.1 license, repository config, and stdio smoke
   regressions are required release members. The regression suite covers debris
   exclusion, link closure, reproducibility, committed-byte behavior, required
@@ -448,19 +451,33 @@
 - [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) defines 14
   entries--the G0 constitutional baseline plus 13 integration gates through
   G13--with their dependencies, qualifying evidence classes, and prohibited
-  substitutes. [`world_contract_v1.toml`](../evidence/world_contract_v1.toml)
-  freezes the three crossing kinds, all 20 identity atoms, seven failure
-  classes, eight consistency rules, and evidence-class taxonomy as executable
-  data. `scripts/world_alpha_evidence.py` validates both schemas and their exact
-  Rust/native/document references. Schema v3 keeps the registry definition-only,
-  resolves active append-only evidence heads, derives claims from typed
-  observations, and computes status. Only G0 and G2 currently derive `passed`;
+  substitutes. [`world_contract_v2.toml`](../evidence/world_contract_v2.toml)
+  composes the byte-frozen
+  [`world_contract_v1.toml`](../evidence/world_contract_v1.toml) vocabulary and
+  the separately versioned O-Machine schema. The frozen import retains the
+  three crossing kinds, all 20 identity atoms, seven failure classes, eight
+  consistency rules, and evidence-class taxonomy without rewriting historical
+  attestations. `scripts/world_alpha_evidence.py` validates the composition and
+  its exact Rust/native/document references. Schema v4 keeps the registry
+  definition-only, resolves active append-only evidence heads, derives claims
+  from typed observations, and computes status. Derivation identity is recorded
+  separately from the claim cache: a policy change requires an immutable
+  `rederive` event with the exact claims lost and gained, rather than rewriting
+  or invalidating the old attestation. Only G0 and G2 currently derive `passed`;
   G13 and the other 11 gates remain `defined`.
+- [`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md) settles the future G7/G8
+  machine boundary as resource-class-specific and asynchronous. G7 gives no
+  machine handle or Ostadix HVC to the guest and carries no handle MAC/key
+  lifecycle. `MachineMemory` revocation is terminal teardown; a graceful guest
+  error must instead come from a device-native path such as virtio-blk `EIO` or
+  a negotiated 9P error. This contract is not evidence that stage-2 teardown,
+  TLB shootdown, those device errors, G7, or G8 are implemented.
 - G2 is one forced-QEMU-TCG, one-vCPU AArch64
   `virt,virtualization=on` run. It compiles native semantic `.oc` code to
   `EM_AARCH64`, installs a resident EL2 vector and stack, enters O-core at host
   EL1, and completes one domain-separated HVC/ERET round trip with checked
-  register and stack integrity. It then enters two EL0 principals through a
+  register and stack integrity. The HVC is a host-EL1 probe, not a guest
+  hypercall interface. It then enters two EL0 principals through a
   real exception-return path, handles their SVC calls at EL1, exercises endpoint
   request/reply and attenuated capability transfer, contains one EL0 fault,
   tears down and reclaims generation-tagged state, rejects stale use after slot

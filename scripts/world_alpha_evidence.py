@@ -13,7 +13,6 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
-import shlex
 import subprocess
 import sys
 import tomllib
@@ -23,12 +22,20 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "evidence/world_alpha_gates.toml"
 
-EXPECTED_SCHEMA_VERSION = 3
-EXPECTED_CONSTITUTION_VERSION = 2
-EXPECTED_CONSTITUTION_SHA256 = "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+EXPECTED_SCHEMA_VERSION = 4
+EXPECTED_CONSTITUTION_VERSION = 3
+IMPORTED_WORLD_CONTRACT_CONSTITUTION_VERSION = 2
+EXPECTED_CONSTITUTION_SHA256 = "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
 EXPECTED_HOSTED_PROFILE_SHA256 = "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
+EXPECTED_WORLD_CONTRACT_V1_SHA256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+EXPECTED_WORLD_CONTRACT_V2_SHA256 = "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+EXPECTED_MACHINE_CONTRACT_SHA256 = "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
+EXPECTED_MACHINE_SPEC_SHA256 = "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
+EXPECTED_IMPORTED_CONSTITUTION_V2_SHA256 = (
+    "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+)
 EXPECTED_REGISTRY_SEMANTICS_SHA256 = (
-    "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
+    "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea"
 )
 EXPECTED_GATE_IDS = tuple(f"G{number}" for number in range(14))
 EXPECTED_CLASS_SCOPES = {
@@ -103,6 +110,7 @@ ONE_OF_CLASS_FLOORS = {
 REQUIRED_CLAIM_FLOORS = {
     "G0": {
         "world.contract_schema_consistent",
+        "world.machine_contract_consistent",
         "world.crossing_taxonomy_consistent",
         "world.identity_vocabulary_consistent",
         "world.failure_consistency_schema_consistent",
@@ -122,7 +130,11 @@ REQUIRED_CLAIM_FLOORS = {
         "lifecycle.reclamation",
         "counter.progress_after_lifecycle",
     },
-    "G3": {"aarch64.smp_execution", "lifecycle.multicore_linearization"},
+    "G3": {
+        "aarch64.smp_execution",
+        "lifecycle.multicore_linearization",
+        "machine_memory.cross_cpu_tlbi_drain_acknowledged",
+    },
     "G4": {"transport.native_authenticated", "transport.three_physical_nodes"},
     "G5": {"governor.authoritative_log", "governor.partition_fencing"},
     "G6": {"worldfs.live_multinode_namespace", "worldfs.stale_fid_rejected"},
@@ -130,10 +142,25 @@ REQUIRED_CLAIM_FLOORS = {
         "foreign_kernel.booted",
         "foreign_kernel.userspace_reached",
         "foreign_kernel.fresh_challenge_answered",
-        "kernel_world.revocation_complete",
+        "kernel_world.guest_machine_authority_hvc_absent",
+        "kernel_world.async_completion_tombstone",
+        "kernel_world.class_specific_host_ack",
+        "kernel_world.device_withdraw_error_observed",
+        "kernel_world.guest_error_before_memory_teardown",
+        "kernel_world.memory_teardown_complete",
+        "kernel_world.page_owner_quarantine_scrubbed",
         "kernel_world.pages_reclaimed",
+        "kernel_world.g7_class_withdrawal_lifecycle",
     },
-    "G8": {"driver.physical_device_service", "driver.revocation_complete"},
+    "G8": {
+        "driver.physical_device_service",
+        "driver.dma_revocation_complete",
+        "driver.interrupt_revocation_complete",
+        "driver.device_reset_complete",
+        "driver.class_specific_withdraw_complete",
+        "driver.guest_interface_policy_decided",
+        "driver.g8_physical_withdrawal_lifecycle",
+    },
     "G9": {"personality.debian_dynamic_userland"},
     "G10": {"execution.distributed_exactly_one_commit"},
     "G11": {"accelerator.multinode_governed_execution"},
@@ -148,6 +175,10 @@ CLAIM_RULES: tuple[tuple[str, tuple[tuple[str, tuple[tuple[str, str], ...]], ...
     (
         "world.contract_schema_consistent",
         (("g0_contract_schema", (("result", "pass"),)),),
+    ),
+    (
+        "world.machine_contract_consistent",
+        (("g0_machine_contract", (("result", "pass"),)),),
     ),
     (
         "world.crossing_taxonomy_consistent",
@@ -238,11 +269,179 @@ CLAIM_RULES: tuple[tuple[str, tuple[tuple[str, tuple[tuple[str, str], ...]], ...
             ),
         ),
     ),
+    (
+        "kernel_world.g7_class_withdrawal_lifecycle",
+        (
+            (
+                "g7_class_withdrawal_lifecycle",
+                (
+                    ("resource_class", "MachineBlock"),
+                    ("async", "pending_query_complete"),
+                    ("host_ack", "complete"),
+                    ("guest_error", "consumed_guest_healthy"),
+                    ("join_before_memory", "host_ack_and_guest_error"),
+                    (
+                        "memory_order",
+                        "stop_quiesce_unmap_guest_host_tlbi_drain_generation_ack",
+                    ),
+                    ("reclaim", "after_memory_ack"),
+                    ("guest_authority_hvc", "absent"),
+                    ("result", "pass"),
+                ),
+            ),
+        ),
+    ),
+    (
+        "kernel_world.g7_class_withdrawal_lifecycle",
+        (
+            (
+                "g7_class_withdrawal_lifecycle",
+                (
+                    ("resource_class", "Machine9P"),
+                    ("async", "pending_query_complete"),
+                    ("host_ack", "complete"),
+                    ("guest_error", "consumed_guest_healthy"),
+                    ("join_before_memory", "host_ack_and_guest_error"),
+                    (
+                        "memory_order",
+                        "stop_quiesce_unmap_guest_host_tlbi_drain_generation_ack",
+                    ),
+                    ("reclaim", "after_memory_ack"),
+                    ("guest_authority_hvc", "absent"),
+                    ("result", "pass"),
+                ),
+            ),
+        ),
+    ),
 )
 
-CLAIM_RULE_POLICY_SHA256 = hashlib.sha256(
-    json.dumps(CLAIM_RULES, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-).hexdigest()
+_REPOSITORY_CONTEXT = {
+    "evidence_classes": ("repository_conformance",),
+    "topology": (("kind", "repository"), ("acceleration", "none")),
+}
+_WORLD_CONTRACT_V1_ARTIFACT = (
+    "world-contract-v1",
+    "executable-constitutional-schema",
+    "evidence/world_contract_v1.toml",
+)
+_WORLD_CONTRACT_V2_ARTIFACT = (
+    "world-contract-v2",
+    "executable-constitutional-schema",
+    "evidence/world_contract_v2.toml",
+)
+_MACHINE_CONTRACT_V1_ARTIFACT = (
+    "o-machine-contract-v1",
+    "executable-machine-contract-schema",
+    "evidence/o_machine_contract_v1.toml",
+)
+_G2_AARCH64_CONTEXT = {
+    "evidence_classes": ("qemu_tcg_aarch64",),
+    "topology": (
+        ("kind", "virtual"),
+        ("architecture", "aarch64"),
+        ("acceleration", "tcg"),
+        ("cpu_count", 1),
+    ),
+    "artifact_names": ("g2-kernel-elf", "g2-kernel-object"),
+}
+CLAIM_CONTEXT_RULES: dict[str, dict[str, Any]] = {
+    "world.contract_schema_consistent": {
+        **_REPOSITORY_CONTEXT,
+        "artifact_bindings": (
+            _WORLD_CONTRACT_V1_ARTIFACT,
+            _WORLD_CONTRACT_V2_ARTIFACT,
+        ),
+        "source_paths": (
+            "evidence/world_contract_v1.toml",
+            "evidence/world_contract_v2.toml",
+            "evidence/world_alpha_gates.toml",
+        ),
+    },
+    "world.machine_contract_consistent": {
+        **_REPOSITORY_CONTEXT,
+        "artifact_bindings": (_MACHINE_CONTRACT_V1_ARTIFACT,),
+        "source_paths": (
+            "docs/O_MACHINE_CONTRACT.md",
+            "evidence/o_machine_contract_v1.toml",
+            "evidence/world_contract_v2.toml",
+        ),
+    },
+    "world.crossing_taxonomy_consistent": {
+        **_REPOSITORY_CONTEXT,
+        "artifact_bindings": (_WORLD_CONTRACT_V1_ARTIFACT,),
+    },
+    "world.identity_vocabulary_consistent": {
+        **_REPOSITORY_CONTEXT,
+        "artifact_bindings": (_WORLD_CONTRACT_V1_ARTIFACT,),
+    },
+    "world.failure_consistency_schema_consistent": {
+        **_REPOSITORY_CONTEXT,
+        "artifact_bindings": (_WORLD_CONTRACT_V1_ARTIFACT,),
+    },
+    "evidence.claim_class_guarded": {
+        **_REPOSITORY_CONTEXT,
+        "source_paths": (
+            "evidence/world_alpha_gates.toml",
+            "scripts/world_alpha_evidence.py",
+        ),
+    },
+    **{
+        claim: _G2_AARCH64_CONTEXT
+        for claim in (
+            "aarch64.native_object",
+            "aarch64.el2_resident",
+            "aarch64.el1_execution",
+            "aarch64.hvc_roundtrip",
+            "aarch64.el0_execution",
+            "aarch64.svc_eret_roundtrip",
+            "ipc.request_reply",
+            "capability.attenuation",
+            "capability.stale_generation_rejected",
+            "lifecycle.terminal",
+            "lifecycle.reclamation",
+            "execution.post_lifecycle_reached",
+            "counter.progress_after_lifecycle",
+        )
+    },
+    "kernel_world.g7_class_withdrawal_lifecycle": {
+        "evidence_classes": ("qemu_virtualization",),
+        "topology": (("kind", "virtual"),),
+        "source_paths": (
+            "docs/O_MACHINE_CONTRACT.md",
+            "evidence/o_machine_contract_v1.toml",
+        ),
+        "artifact_kinds": (
+            "foreign-kernel-image",
+            "guest-native-error-trace",
+            "machine-withdrawal-trace",
+        ),
+    },
+    "driver.g8_physical_withdrawal_lifecycle": {
+        "evidence_classes": (
+            "hardware_x86_64_iommu",
+            "hardware_aarch64_smmu",
+        ),
+        "topology": (("kind", "physical"),),
+        "source_paths": (
+            "docs/O_MACHINE_CONTRACT.md",
+            "evidence/o_machine_contract_v1.toml",
+        ),
+        "artifact_kinds": (
+            "physical-device-inventory",
+            "dma-iommu-withdrawal-trace",
+            "interrupt-reset-trace",
+            "unrelated-world-survival-trace",
+        ),
+    },
+}
+
+DERIVATION_HASH_PREFIX = "sha256:"
+DERIVATION_SPEC_VERSION = "ostadix-world-claim-derivation-v1"
+REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
+WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
+LEGACY_ACTIVE_SCHEMA2_IDS = frozenset(
+    {"g2-aarch64-qemu-tcg-2026-08-03"}
+)
 
 NONCLAIM_FLOORS = {
     "qemu_tcg_aarch64": (
@@ -310,6 +509,284 @@ EXPECTED_CONSISTENCY_RULES = (
     ("rejoin", "fresh_node_generation_stale_work_fenced"),
     ("memory", "aggregate_locality_visible_not_transparent_dsm"),
 )
+EXPECTED_MACHINE_CONTRACT = {
+    "schema": "ostadix.o-machine/v1",
+    "schema_version": 1,
+    "constitution_version": 3,
+    "specification": "docs/O_MACHINE_CONTRACT.md",
+    "specification_sha256": EXPECTED_MACHINE_SPEC_SHA256,
+    "g7_caller_model": "host_el1_only",
+    "g7_guest_machine_abi": "none",
+    "g7_device_transport": "virtio_mmio_or_pci_doorbell",
+    "g7_platform_call_exemption": (
+        "psci_without_machine_handles_or_resource_authority"
+    ),
+    "g8_guest_machine_abi_decision": "required",
+    "async_abi_frozen_before_gate": "G3",
+    "tcb": {
+        "authority": "ocore_el1",
+        "memory_safety": "omachine_el2",
+        "el2_authoritative_facts": [
+            "machine_incarnation",
+            "world_generation",
+            "resource_generation",
+            "page_owner",
+        ],
+        "el2_protocol_semantics": "none",
+        "machine_incarnation": (
+            "nonzero_128bit_durable_monotonic_or_cryptographically_unique"
+        ),
+        "machine_incarnation_failure": "fail_closed_no_resource_assignment",
+        "host_el1_physical_access": (
+            "el2_stage2_mediated_owner_generation_checked"
+        ),
+        "unrestricted_host_direct_map_world_frames": "forbidden",
+        "g7_dma_assumption": "no_unfenced_physical_dma_to_world_frames",
+        "protected_state": [
+            "machine_incarnation",
+            "world_generation",
+            "resource_generation",
+            "page_owner",
+            "completion_tombstones",
+            "stage2_roots",
+            "el2_code",
+            "el2_data",
+        ],
+        "protected_state_host_mapping": "forbidden",
+        "protected_state_device_dma": "iommu_smmu_deny_or_no_dma_capable_device",
+        "protected_state_failure": "fail_closed_no_guest_or_device_execution",
+    },
+    "handles": {
+        "format": [
+            "abi_version",
+            "machine_incarnation",
+            "domain_tag",
+            "world_slot",
+            "world_generation",
+            "resource_slot",
+            "generation",
+            "rights",
+        ],
+        "g7_authenticator": "none",
+        "domain_tag": "required_reserved_for_future_auth",
+        "domains": [
+            "memory",
+            "stage2",
+            "vcpu",
+            "interrupt",
+            "dma",
+            "entry",
+            "completion",
+        ],
+        "cross_domain_use": "reject",
+        "generation_width_bits": 64,
+        "generation_zero": "reject",
+        "world_generation_advance": "checked_monotonic_no_wrap_no_reuse",
+        "resource_generation_advance": "checked_monotonic_no_wrap_no_reuse",
+        "generation_exhaustion": "fail_closed_retire_slot",
+        "g8_mac_policy": "required_only_if_untrusted_guest_presents_handles",
+        "g8_mac_framing": (
+            "canonical_length_prefixed_all_handle_fields_including_abi_version"
+        ),
+        "g8_key_lifecycle": [
+            "generation",
+            "enrollment",
+            "rotation",
+            "suspend_resume",
+            "migration",
+            "el1_restart",
+            "crash_recovery",
+            "destruction",
+        ],
+    },
+    "page_owner": {
+        "states": [
+            "unowned_clean",
+            "owned_machine_plus_world_slot_plus_generation",
+            "quarantined_prior_or_unknown_owner",
+        ],
+        "initial_state": "quarantined_unless_independent_cleanliness_proof",
+        "missing_state": "never_implies_unowned_clean",
+        "transitions": [
+            "unowned_clean_to_owned",
+            "owned_to_quarantined_after_exact_memory_ack",
+            "quarantined_to_unowned_clean_after_trusted_scrub",
+        ],
+        "assign": "unowned_clean_only",
+        "relabel_live_or_quarantined": "reject",
+        "blockers": ["mapping", "dma_window", "machine_pin"],
+        "checks_source": "live_el2_tables",
+        "scrub_trust": (
+            "el2_performed_or_hardware_or_cryptographic_verified_not_el1_assertion"
+        ),
+    },
+    "completion": {
+        "begin_result": ["rejected", "pending"],
+        "query_operation": "query_completion",
+        "query_result": ["pending", "complete", "failed"],
+        "idempotency_key": (
+            "operation_id_bound_to_machine_opcode_resource_world_old_generation_reason"
+        ),
+        "handle_binding": [
+            "machine_incarnation",
+            "resource_class",
+            "world_slot",
+            "world_generation",
+            "resource_slot",
+            "old_generation",
+            "operation_id",
+        ],
+        "tombstone": (
+            "generation_independent_until_durable_consume_and_explicit_retire"
+        ),
+        "rejected": "no_state_change",
+        "retry_while_pending": "same_operation_id_continues_idempotently",
+        "post_begin_failed": (
+            "durable_idempotent_tombstone_resource_fenced_no_ack_no_resume_no_reuse"
+        ),
+        "failed_recovery": (
+            "class_specific_new_operation_linked_to_failed_tombstone_teardown_or_reset_only"
+        ),
+        "failed_tombstone_retention": "until_recovery_ack_and_durable_consume",
+        "query_after_generation_advance": (
+            "exact_old_tuple_observation_only_no_live_authority"
+        ),
+        "el2_recovery": "machine_ack_tombstone_survives_host_el1_restart",
+        "ocore_recovery": (
+            "composite_host_ack_uses_crash_consistent_write_ahead_journal"
+        ),
+        "lost_state_policy": (
+            "whole_machine_reset_selects_fresh_machine_incarnation_quarantines_resource_and_never_synthesizes_ack"
+        ),
+        "full_table": "reject_without_state_change",
+    },
+    "ack": {
+        "machine_revoke_ack_fields": [
+            "abi_version",
+            "machine_incarnation",
+            "domain_tag",
+            "world_slot",
+            "world_generation",
+            "resource_slot",
+            "old_generation",
+            "new_generation",
+            "operation_id",
+            "result",
+        ],
+        "cross_domain_world_resource_or_operation_use": "reject",
+    },
+    "world_retirement": {
+        "ocore_world_retire_requires": [
+            "all_old_world_class_host_resource_acks",
+            "broker_operations_terminal_and_journaled",
+        ],
+        "world_generation_advance_requires": [
+            "all_old_world_vcpu_mapping_host_pin_dma_interrupt_effects_machine_acknowledged",
+            "no_page_owned_by_old_world_generation",
+        ],
+        "quarantined_old_pages": (
+            "safe_for_world_generation_advance_but_not_reassignment_until_scrubbed"
+        ),
+        "logical_bump_over_live_hardware": "forbidden",
+    },
+    "resource_class": [
+        {
+            "name": "MachineMemory",
+            "begin": "begin_teardown_memory",
+            "layer": "ocore_composite_with_el2_machine_ack",
+            "prerequisites": ["dependent_dma_windows_acknowledged"],
+            "el2_order": [
+                "stop_or_exit_all_vcpus_and_quiesce_host_broker_access",
+                "unmap_guest_and_host_broker_stage2_and_release_pins",
+                "tlbi_all_affected_cpus",
+                "architectural_drain",
+                "checked_increment_generation",
+                "machine_ack",
+            ],
+            "host_completion": "machine_ack",
+            "guest_outcome": "teardown_not_recoverable_error",
+        },
+        {
+            "name": "MachineBlock",
+            "begin": "begin_withdraw_block",
+            "layer": "ocore_protocol_broker_composite",
+            "el1_order": [
+                "stop_new_old_generation_descriptors",
+                "classify_accepted_requests_at_backend_commit_point",
+                "preserve_result_of_already_committed_operation",
+                "complete_accepted_uncommitted_with_VIRTIO_BLK_S_IOERR",
+                "drain_old_generation_backing",
+                "publish_used_ring_while_queue_mapped",
+                "enqueue_terminal_notification",
+                "fence_old_interrupt_route",
+                "retire_endpoint_generation",
+            ],
+            "el2_obligation": "fence_dependent_mapping_dma_interrupt_effects",
+            "host_completion": "composite_broker_plus_machine_acks",
+            "guest_outcome": "pinned_linux_consumes_completion_and_returns_EIO",
+            "guest_health": "remains_healthy_after_error",
+            "terminal_result_lifetime": (
+                "immutable_nonreused_until_guest_consumed_or_explicit_memory_teardown"
+            ),
+        },
+        {
+            "name": "Machine9P",
+            "begin": "begin_withdraw_9p",
+            "layer": "ocore_protocol_broker_composite",
+            "el1_order": [
+                "stop_new_old_generation_tags_and_fids",
+                "classify_accepted_requests_at_backend_commit_point",
+                "preserve_result_of_already_committed_operation",
+                "complete_accepted_uncommitted_with_negotiated_Rerror_or_Rlerror",
+                "drain_old_generation_backend",
+                "publish_terminal_response_or_used_ring_while_queue_mapped",
+                "enqueue_terminal_notification_while_queue_mapped",
+                "fence_old_interrupt_route",
+                "retire_endpoint_generation",
+            ],
+            "el2_obligation": "fence_dependent_machine_effects",
+            "host_completion": "composite_broker_plus_machine_acks",
+            "guest_outcome": "pinned_linux_consumes_protocol_error",
+            "guest_health": "remains_healthy_after_error",
+            "terminal_result_lifetime": (
+                "immutable_nonreused_until_guest_consumed_or_explicit_memory_teardown"
+            ),
+            "stale_fid": "reject_without_rebind",
+        },
+    ],
+    "g8_physical_device": {
+        "contract_status": (
+            "concrete_device_class_extension_required_before_g8_qualification"
+        ),
+        "generic_revoke_verb": "forbidden",
+        "minimum_obligations": [
+            "quiesce_class_specific_broker",
+            "fence_and_unmap_dma",
+            "drain_and_invalidate_iommu_or_smmu",
+            "withdraw_and_drain_generation_bound_interrupt_routes",
+            "reset_device",
+            "retire_resource_generation",
+            "complete_composite_host_ack",
+        ],
+        "replacement": "after_composite_host_ack_only",
+        "unrelated_worlds": "must_survive",
+        "reset_verification": "class_specific_required",
+        "reset_failure": "quarantine_no_ack_no_replacement",
+        "shared_isolation_or_reset_group": (
+            "dedicated_or_all_affected_worlds_quiesced_and_survival_proven"
+        ),
+    },
+    "invariants": {
+        "machine_ack": "no_machine_effect_authorized_by_old_generation_remains_reachable",
+        "terminal_bytes": "inert_completed_observation_not_machine_effect_or_authority",
+        "g7_memory_teardown_requires": ["host_resource_ack", "guest_error_consumed"],
+        "g7_join_order": "no_order_required_between_host_ack_and_guest_consumption",
+        "generation_increment": "not_completion_without_ack",
+        "generation_alias": "zero_wrap_and_reuse_forbidden",
+        "cold_reset_alias": "old_machine_incarnation_rejected",
+        "old_generation_host_access_after_ack": "none",
+    },
+}
 
 
 class WorldEvidenceError(RuntimeError):
@@ -399,6 +876,17 @@ def _require_sha256(value: Any, location: str) -> str:
     return digest
 
 
+def _require_derivation_hash(value: Any, location: str) -> str:
+    digest = _require_string(value, location)
+    if not digest.startswith(DERIVATION_HASH_PREFIX) or HEX_SHA256.fullmatch(
+        digest[len(DERIVATION_HASH_PREFIX) :]
+    ) is None:
+        raise WorldEvidenceError(
+            f"{location} must be sha256 followed by a lowercase SHA-256 digest"
+        )
+    return digest
+
+
 def _require_exact_table_rows(
     raw_rows: Any,
     location: str,
@@ -425,10 +913,54 @@ def _require_exact_table_rows(
 def _validate_world_contract(
     data: dict[str, Any], root: Path, class_scopes: dict[str, str]
 ) -> None:
-    _, contract_path = _repo_file(
+    wrapper_text, wrapper_path = _repo_file(
         root, data["contract_schema"], "manifest.contract_schema"
     )
-    contract = _strict_toml_file(contract_path, data["contract_schema"])
+    if hashlib.sha256(wrapper_path.read_bytes()).hexdigest() != EXPECTED_WORLD_CONTRACT_V2_SHA256:
+        raise WorldEvidenceError(
+            "live World contract bytes drifted without a schema/version update"
+        )
+    wrapper = _strict_toml_file(wrapper_path, wrapper_text)
+    expected_wrapper = {
+        "schema": "ostadix.world-contract/v2",
+        "schema_version": 2,
+        "constitution_version": 3,
+        "constitution": "docs/OSTADIX_WORLD.md",
+        "constitution_sha256": EXPECTED_CONSTITUTION_SHA256,
+        "world_gate_registry": "evidence/world_alpha_gates.toml",
+        "imported_vocabulary": "evidence/world_contract_v1.toml",
+        "imported_vocabulary_schema_version": 1,
+        "imported_vocabulary_constitution_version": 2,
+        "imported_vocabulary_constitution_sha256": (
+            EXPECTED_IMPORTED_CONSTITUTION_V2_SHA256
+        ),
+        "imported_vocabulary_sha256": EXPECTED_WORLD_CONTRACT_V1_SHA256,
+        "machine_contract": "evidence/o_machine_contract_v1.toml",
+        "machine_contract_schema_version": 1,
+        "machine_contract_sha256": EXPECTED_MACHINE_CONTRACT_SHA256,
+        "composition": {
+            "crossings": "imported_vocabulary",
+            "identity_atoms": "imported_vocabulary",
+            "failure_classes": "imported_vocabulary",
+            "consistency_rules": "imported_vocabulary",
+            "evidence_classes": "imported_vocabulary",
+            "machine_authority_and_revocation": "machine_contract",
+        },
+    }
+    if wrapper != expected_wrapper:
+        raise WorldEvidenceError("live World contract composition differs from schema")
+    if wrapper["constitution"] != data["constitution"]:
+        raise WorldEvidenceError("live World contract constitution differs from registry")
+    if wrapper["machine_contract"] != data["machine_contract_schema"]:
+        raise WorldEvidenceError("live World contract machine schema differs from registry")
+    imported_text, imported_path = _repo_file(
+        root,
+        wrapper["imported_vocabulary"],
+        "World contract imported_vocabulary",
+    )
+    if hashlib.sha256(imported_path.read_bytes()).hexdigest() != EXPECTED_WORLD_CONTRACT_V1_SHA256:
+        raise WorldEvidenceError("imported World vocabulary bytes differ from frozen v1")
+    contract = _strict_toml_file(imported_path, imported_text)
     expected_keys = {
         "schema_version",
         "constitution_version",
@@ -448,13 +980,12 @@ def _validate_world_contract(
         raise WorldEvidenceError("World contract schema_version must be 1")
     if (
         type(contract["constitution_version"]) is not int
-        or contract["constitution_version"] != EXPECTED_CONSTITUTION_VERSION
+        or contract["constitution_version"]
+        != IMPORTED_WORLD_CONTRACT_CONSTITUTION_VERSION
     ):
         raise WorldEvidenceError(
-            f"World contract constitution_version must be {EXPECTED_CONSTITUTION_VERSION}"
+            "World contract must remain the imported frozen constitution-v2 vocabulary"
         )
-    if contract["constitution"] != data["constitution"]:
-        raise WorldEvidenceError("World contract constitution reference differs from registry")
     if contract["world_gate_registry"] != "evidence/world_alpha_gates.toml":
         raise WorldEvidenceError("World contract must name the World gate registry")
 
@@ -491,7 +1022,7 @@ def _validate_world_contract(
     )
 
     _, constitution_path = _repo_file(
-        root, contract["constitution"], "World contract constitution"
+        root, data["constitution"], "World contract constitution"
     )
     _, hosted_identity_path = _repo_file(
         root,
@@ -538,6 +1069,54 @@ def _validate_world_contract(
             )
 
 
+def _validate_machine_contract(data: dict[str, Any], root: Path) -> None:
+    path_text, path = _repo_file(
+        root,
+        data["machine_contract_schema"],
+        "manifest.machine_contract_schema",
+    )
+    if hashlib.sha256(path.read_bytes()).hexdigest() != EXPECTED_MACHINE_CONTRACT_SHA256:
+        raise WorldEvidenceError(
+            "O-Machine contract bytes drifted without a schema/version update"
+        )
+    contract = _strict_toml_file(path, path_text)
+    if contract != EXPECTED_MACHINE_CONTRACT:
+        raise WorldEvidenceError(
+            "O-Machine contract vocabulary or resource-class semantics differ from schema"
+        )
+    specification_text, specification_path = _repo_file(
+        root,
+        contract["specification"],
+        "O-Machine contract specification",
+    )
+    if (
+        hashlib.sha256(specification_path.read_bytes()).hexdigest()
+        != EXPECTED_MACHINE_SPEC_SHA256
+    ):
+        raise WorldEvidenceError(
+            "O-Machine specification bytes drifted without a schema/version update"
+        )
+    try:
+        specification = specification_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise WorldEvidenceError(
+            f"{specification_text} must be valid UTF-8"
+        ) from error
+    for marker in (
+        "# O-Machine EL2 and O-core Resource Contract",
+        "MachineMemory",
+        "MachineBlock",
+        "Machine9P",
+        "no machine effect authorized by s.old_generation remains reachable",
+        "no `MachineHandle`, no revocation-completion handle",
+        "a doorbell is not an authority-bearing hypercall",
+    ):
+        if marker not in specification:
+            raise WorldEvidenceError(
+                f"O-Machine specification is missing contract marker {marker!r}"
+            )
+
+
 LEGACY_CLAIM_MARKERS = {
     "world.contract_schema_consistent": ("G0 executable contract schema: PASS",),
     "world.crossing_taxonomy_consistent": ("G0 crossing taxonomy: PASS",),
@@ -568,17 +1147,99 @@ LEGACY_CLAIM_MARKERS = {
 }
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+# This digest names only the claim derivation semantics, not the whole
+# validator.  Changes elsewhere in this file therefore do not invalidate an
+# attestation, while a rule/parser change must update this explicit spec and
+# causes a re-derivation ledger edge.
+DERIVATION_SPEC = {
+    "version": DERIVATION_SPEC_VERSION,
+    "observation_prefix": "@evidence ",
+    "observation_syntax": "ascii-space-separated-unique-key-value-fields",
+    "typed_match": "all-requirements-existential-subset",
+    "claim_rules": CLAIM_RULES,
+    "claim_context_rules": CLAIM_CONTEXT_RULES,
+}
+
+
+def _derivation_implementation_bytes(source: bytes) -> bytes:
+    source = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    begin = b"# WORLD_CLAIM_DERIVATION_IMPLEMENTATION_BEGIN\n"
+    end = b"# WORLD_CLAIM_DERIVATION_IMPLEMENTATION_END\n"
+    if source.count(begin) != 1 or source.count(end) != 1:
+        raise RuntimeError("claim derivation implementation markers are missing or duplicated")
+    return source.split(begin, 1)[1].split(end, 1)[0]
+
+
+def _derivation_implementation_sha256() -> str:
+    try:
+        source = Path(__file__).read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot bind claim derivation implementation: {error}") from error
+    return hashlib.sha256(_derivation_implementation_bytes(source)).hexdigest()
+
+
+DERIVATION_SPEC["implementation_source_sha256"] = _derivation_implementation_sha256()
+CURRENT_DERIVATION_HASH = DERIVATION_HASH_PREFIX + hashlib.sha256(
+    _canonical_json_bytes(DERIVATION_SPEC)
+).hexdigest()
+# The legacy field remains for attestation readability, but now binds the
+# complete D specification (rules, context requirements, parser, and exact
+# normalization/derivation implementation) instead of only declarative rows.
+CLAIM_RULE_POLICY_SHA256 = CURRENT_DERIVATION_HASH[len(DERIVATION_HASH_PREFIX) :]
+
+
+# WORLD_CLAIM_DERIVATION_IMPLEMENTATION_BEGIN
+def _make_derivation_context(
+    evidence_class: str,
+    topology: dict[str, Any],
+    sources: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_paths = {source["path"] for source in sources}
+    artifact_names = {artifact["name"] for artifact in artifacts}
+    artifact_kinds = {artifact["kind"] for artifact in artifacts}
+    artifact_name_kinds = {
+        artifact["name"]: artifact["kind"] for artifact in artifacts
+    }
+    artifact_bindings = {
+        (
+            artifact["name"],
+            artifact["kind"],
+            artifact["path"] if artifact["retained"] else "",
+        )
+        for artifact in artifacts
+    }
+    return {
+        "evidence_class": evidence_class,
+        "topology": dict(topology),
+        "source_paths": set(source_paths),
+        "artifact_names": set(artifact_names),
+        "artifact_kinds": set(artifact_kinds),
+        "artifact_name_kinds": dict(artifact_name_kinds),
+        "artifact_bindings": set(artifact_bindings),
+    }
+
+
 def _parse_observations(transcript: str, location: str) -> list[dict[str, str]]:
     observations: list[dict[str, str]] = []
     for line_number, line in enumerate(transcript.splitlines(), 1):
         if not line.startswith("@evidence "):
             continue
-        try:
-            tokens = shlex.split(line[len("@evidence ") :])
-        except ValueError as error:
+        payload = line[len("@evidence ") :]
+        tokens = payload.split(" ")
+        if not payload or any(not token for token in tokens):
             raise WorldEvidenceError(
-                f"{location}:{line_number} contains malformed evidence fields"
-            ) from error
+                f"{location}:{line_number} contains noncanonical evidence spacing"
+            )
         fields: dict[str, str] = {}
         for token in tokens:
             if "=" not in token:
@@ -586,7 +1247,12 @@ def _parse_observations(transcript: str, location: str) -> list[dict[str, str]]:
                     f"{location}:{line_number} evidence token lacks '='"
                 )
             key, value = token.split("=", 1)
-            if not key or not value or key in fields:
+            if (
+                re.fullmatch(r"[a-z][a-z0-9_]*", key) is None
+                or not value
+                or any(not 0x21 <= ord(character) <= 0x7E for character in value)
+                or key in fields
+            ):
                 raise WorldEvidenceError(
                     f"{location}:{line_number} has an invalid/duplicate evidence field"
                 )
@@ -599,11 +1265,82 @@ def _parse_observations(transcript: str, location: str) -> list[dict[str, str]]:
     return observations
 
 
-def _derive_claims(transcript: str, location: str) -> set[str]:
+def _claim_context_satisfied(claim: str, context: dict[str, Any]) -> bool:
+    rule = CLAIM_CONTEXT_RULES.get(claim)
+    if rule is None:
+        return True
+    if context["evidence_class"] not in rule.get("evidence_classes", ()):
+        return False
+    topology = context["topology"]
+    if any(topology.get(key) != value for key, value in rule.get("topology", ())):
+        return False
+    if not set(rule.get("source_paths", ())) <= context["source_paths"]:
+        return False
+    if not set(rule.get("artifact_names", ())) <= context["artifact_names"]:
+        return False
+    if not set(rule.get("artifact_kinds", ())) <= context["artifact_kinds"]:
+        return False
+    if not set(rule.get("artifact_bindings", ())) <= context["artifact_bindings"]:
+        return False
+    return True
+
+
+def _g8_physical_observation_satisfied(
+    observation: dict[str, str], context: dict[str, Any]
+) -> bool:
+    required = {
+        "event": "g8_physical_withdrawal_lifecycle",
+        "order": "quiesce_dma_iommu_irq_reset_generation_ack_replacement",
+        "reset_verification": "class_specific_pass",
+        "reset_failure": "quarantine_no_ack_no_replacement",
+        "shared_group": "dedicated_or_all_affected_quiesced_survival_proven",
+        "unrelated_world": "healthy",
+        "result": "pass",
+    }
+    if any(observation.get(key) != value for key, value in required.items()):
+        return False
+    device_class = observation.get("device_class", "")
+    if re.fullmatch(r"[a-z][a-z0-9_-]*", device_class) is None:
+        return False
+    if device_class in {"device", "generic", "physical_device"}:
+        return False
+    if observation.get("withdraw_operation") != f"begin_withdraw_{device_class}":
+        return False
+    artifact_name_kinds = context["artifact_name_kinds"]
+    if artifact_name_kinds.get(
+        f"device-class-{device_class}"
+    ) != "physical-device-inventory":
+        return False
+    if artifact_name_kinds.get(
+        f"{device_class}-withdrawal-trace"
+    ) != "dma-iommu-withdrawal-trace":
+        return False
+    guest_machine_abi = observation.get("guest_machine_abi")
+    if guest_machine_abi == "none":
+        return (
+            observation.get("handle_mac") == "not_required"
+            and observation.get("key_lifecycle") == "not_applicable"
+        )
+    if guest_machine_abi == "direct":
+        return (
+            observation.get("handle_mac") == "verified"
+            and observation.get("key_lifecycle") == "verified"
+            and "handle-mac-key-lifecycle-trace" in context["artifact_kinds"]
+        )
+    return False
+
+
+def _derive_claims(
+    transcript: str,
+    location: str,
+    context: dict[str, Any],
+    *,
+    allow_legacy_markers: bool = False,
+) -> set[str]:
     observations = _parse_observations(transcript, location)
     claims: set[str] = set()
     for claim, requirements in CLAIM_RULES:
-        if all(
+        if _claim_context_satisfied(claim, context) and all(
             any(
                 observation.get("event") == event
                 and all(observation.get(key) == value for key, value in fields)
@@ -612,34 +1349,131 @@ def _derive_claims(transcript: str, location: str) -> set[str]:
             for event, fields in requirements
         ):
             claims.add(claim)
-    transcript_lines = set(transcript.splitlines())
-    for claim, markers in LEGACY_CLAIM_MARKERS.items():
-        if all(marker in transcript_lines for marker in markers):
-            claims.add(claim)
+    g8_claim = "driver.g8_physical_withdrawal_lifecycle"
+    if _claim_context_satisfied(g8_claim, context) and any(
+        _g8_physical_observation_satisfied(observation, context)
+        for observation in observations
+    ):
+        claims.add(g8_claim)
+    if allow_legacy_markers:
+        transcript_lines = set(transcript.splitlines())
+        for claim, markers in LEGACY_CLAIM_MARKERS.items():
+            if _claim_context_satisfied(claim, context) and all(
+                marker in transcript_lines for marker in markers
+            ):
+                claims.add(claim)
     return claims
+# WORLD_CLAIM_DERIVATION_IMPLEMENTATION_END
 
 
-def _validator_sha256(root: Path) -> str:
-    return hashlib.sha256(
-        (root / "scripts/world_alpha_evidence.py").read_bytes()
-    ).hexdigest()
+def _resolve_source_snapshot(
+    root: Path, source_commit: str, source_digests: dict[str, str]
+) -> str | None:
+    working_tree_matches = all(
+        hashlib.sha256((root / path).read_bytes()).hexdigest() == digest
+        for path, digest in source_digests.items()
+    )
+
+    def commit_matches(commit: str) -> bool:
+        for path, digest in source_digests.items():
+            candidate = subprocess.run(
+                ["git", "-C", str(root), "show", f"{commit}:{path}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            if (
+                candidate.returncode != 0
+                or hashlib.sha256(candidate.stdout).hexdigest() != digest
+            ):
+                return False
+        return True
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if head.returncode != 0:
+            return None
+        head_commit = head.stdout.strip()
+        source_on_head_lineage = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge-base",
+                "--is-ancestor",
+                source_commit,
+                head_commit,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if source_on_head_lineage.returncode != 0:
+            return None
+        if working_tree_matches:
+            if commit_matches(head_commit):
+                return head_commit
+            return "content-addressed-working-tree"
+        if commit_matches(source_commit):
+            return source_commit
+        history = subprocess.run(
+            ["git", "-C", str(root), "rev-list", "HEAD", "--topo-order"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if history.returncode != 0:
+            return None
+        for commit in history.stdout.splitlines():
+            ancestry = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "merge-base",
+                    "--is-ancestor",
+                    source_commit,
+                    commit,
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if ancestry.returncode == 0 and commit_matches(commit):
+                return commit
+    except OSError:
+        return None
+    return None
 
 
 def _source_digest_matches(
     root: Path, source_path: Path, source_text: str, source_commit: str, digest: str
 ) -> bool:
-    if hashlib.sha256(source_path.read_bytes()).hexdigest() == digest:
-        return True
+    # Compatibility wrapper for focused callers; full attestations use one
+    # coherent snapshot for their complete source set.
+    del source_path
+    return _resolve_source_snapshot(root, source_commit, {source_text: digest}) is not None
+
+
+def _require_git_commit(root: Path, commit: str, location: str) -> None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "show", f"{source_commit}:{source_text}"],
+            ["git", "-C", str(root), "cat-file", "-e", f"{commit}^{{commit}}"],
             check=False,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except OSError:
-        return False
-    return result.returncode == 0 and hashlib.sha256(result.stdout).hexdigest() == digest
+    except OSError as error:
+        raise WorldEvidenceError(f"{location} cannot be verified as a Git commit") from error
+    if result.returncode != 0:
+        raise WorldEvidenceError(f"{location} does not resolve to a Git commit")
 
 
 def _validate_attestation(
@@ -671,20 +1505,21 @@ def _validate_attestation(
         "signatures",
     }
     schema_version = attestation.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         raise WorldEvidenceError(
-            f"attestation {path_text} schema_version must be 1 or 2"
+            f"attestation {path_text} schema_version must be 1, 2, or 3"
         )
-    version_keys = (
-        {"claims"}
-        if schema_version == 1
-        else {
+    if schema_version == 1:
+        version_keys = {"claims"}
+    else:
+        version_keys = {
             "derived_claims",
             "validator_sha256",
             "claim_rule_policy_sha256",
             "registry_semantics_sha256",
         }
-    )
+        if schema_version == 3:
+            version_keys.add("derivation_hash")
     if set(attestation) != common_keys | version_keys:
         raise WorldEvidenceError(f"attestation {path_text} keys differ from schema")
     attestation_id = _require_string(attestation["id"], f"{path_text}.id")
@@ -702,6 +1537,7 @@ def _validate_attestation(
     )
     if HEX_COMMIT.fullmatch(source_commit) is None:
         raise WorldEvidenceError(f"{path_text}.source_commit must be a Git object ID")
+    _require_git_commit(root, source_commit, f"{path_text}.source_commit")
     if attestation["source_state"] != "content-addressed-working-tree":
         raise WorldEvidenceError(
             f"{path_text}.source_state must be content-addressed-working-tree"
@@ -743,8 +1579,9 @@ def _validate_attestation(
             raise WorldEvidenceError(
                 f"{transcript_text} must contain exactly one {line!r} line"
             )
-    derived_claims = _derive_claims(transcript, transcript_text)
-    if schema_version == 2:
+    recorded_claims: set[str] = set()
+    derivation_hash: str | None = None
+    if schema_version >= 2:
         recorded_claims = _require_string_list(
             attestation["derived_claims"],
             f"{path_text}.derived_claims",
@@ -754,29 +1591,26 @@ def _validate_attestation(
             raise WorldEvidenceError(
                 f"{path_text}.derived_claims must be sorted and unique"
             )
-        if set(recorded_claims) != derived_claims:
-            raise WorldEvidenceError(
-                f"{path_text}.derived_claims differs from validator output"
-            )
-        if _require_sha256(
+        recorded_claims = set(recorded_claims)
+        validator_sha256 = _require_sha256(
             attestation["validator_sha256"], f"{path_text}.validator_sha256"
-        ) != _validator_sha256(root):
-            raise WorldEvidenceError(
-                f"{path_text}.validator_sha256 does not pin this validator"
-            )
-        if _require_sha256(
+        )
+        claim_rule_policy_sha256 = _require_sha256(
             attestation["claim_rule_policy_sha256"],
             f"{path_text}.claim_rule_policy_sha256",
-        ) != CLAIM_RULE_POLICY_SHA256:
-            raise WorldEvidenceError(
-                f"{path_text}.claim_rule_policy_sha256 differs from claim rules"
-            )
-        if _require_sha256(
+        )
+        registry_semantics_sha256_value = _require_sha256(
             attestation["registry_semantics_sha256"],
             f"{path_text}.registry_semantics_sha256",
-        ) != registry_semantics_sha256:
-            raise WorldEvidenceError(
-                f"{path_text}.registry_semantics_sha256 differs from gate definitions"
+        )
+        if schema_version == 2:
+            # Schema v2 predates a derivation-only identifier.  Its exact
+            # validator digest is the only immutable identifier that captures
+            # the derivation implementation used for its recorded claims.
+            derivation_hash = DERIVATION_HASH_PREFIX + validator_sha256
+        else:
+            derivation_hash = _require_derivation_hash(
+                attestation["derivation_hash"], f"{path_text}.derivation_hash"
             )
     markers = _require_string_list(
         attestation["expected_markers"],
@@ -845,6 +1679,7 @@ def _validate_attestation(
     if not isinstance(sources, list) or not sources:
         raise WorldEvidenceError(f"{path_text}.source must contain file digests")
     seen_sources: set[str] = set()
+    source_digests: dict[str, str] = {}
     for index, source in enumerate(sources):
         owner = f"{path_text}.source[{index}]"
         if not isinstance(source, dict) or set(source) != {"path", "sha256"}:
@@ -854,15 +1689,31 @@ def _validate_attestation(
             raise WorldEvidenceError(f"{path_text}.source contains a duplicate path")
         seen_sources.add(source_text)
         digest = _require_sha256(source["sha256"], f"{owner}.sha256")
-        # Schema-v1 records predate the append-only ledger and used hashes of a
-        # content-addressed working tree that may never have been committed.
-        # Preserve those immutable records even when their historical bytes are
-        # no longer locally reconstructible.  Schema v2 requires live or Git
-        # object verification for every source digest.
-        if schema_version == 2 and not _source_digest_matches(
-            root, source_path, source_text, source_commit, digest
-        ):
-            raise WorldEvidenceError(f"{owner} digest does not match {source_text}")
+        source_digests[source_text] = digest
+        del source_path
+    snapshot_digests = dict(source_digests)
+    if schema_version >= 2:
+        validator_source_digest = source_digests.get(
+            "scripts/world_alpha_evidence.py"
+        )
+        if validator_source_digest is not None:
+            if validator_source_digest != validator_sha256:
+                raise WorldEvidenceError(
+                    f"{path_text}.validator_sha256 must match its validator source digest"
+                )
+        else:
+            # The immutable G2 schema-v2 record omitted the validator row. Add
+            # its pinned digest to the coherent snapshot lookup rather than
+            # mutating the historical attestation.
+            snapshot_digests["scripts/world_alpha_evidence.py"] = validator_sha256
+    resolved_source_snapshot = _resolve_source_snapshot(
+        root, source_commit, snapshot_digests
+    )
+    if resolved_source_snapshot is None:
+        raise WorldEvidenceError(
+            f"{path_text}.source digests do not resolve to one working tree, base commit, "
+            "or descendant commit"
+        )
 
     artifacts = attestation["artifact"]
     if not isinstance(artifacts, list) or not artifacts:
@@ -882,7 +1733,7 @@ def _validate_attestation(
         if name in artifact_names:
             raise WorldEvidenceError(f"{path_text}.artifact contains a duplicate name")
         artifact_names.add(name)
-        _require_string(artifact["kind"], f"{owner}.kind")
+        kind = _require_string(artifact["kind"], f"{owner}.kind")
         digest = _require_sha256(artifact["sha256"], f"{owner}.sha256")
         if type(artifact["retained"]) is not bool:
             raise WorldEvidenceError(f"{owner}.retained must be boolean")
@@ -906,20 +1757,169 @@ def _validate_attestation(
         raise WorldEvidenceError(
             f"{path_text}.signatures must be empty for repository/virtual evidence"
         )
+    current_derived_claims = _derive_claims(
+        transcript,
+        transcript_text,
+        _make_derivation_context(
+            evidence_class,
+            topology,
+            sources,
+            artifacts,
+        ),
+        allow_legacy_markers=schema_version == 1,
+    )
+    if schema_version == 3 and derivation_hash == CURRENT_DERIVATION_HASH:
+        if recorded_claims != current_derived_claims:
+            raise WorldEvidenceError(
+                f"{path_text}.derived_claims differs from its pinned derivation"
+            )
+        if claim_rule_policy_sha256 != CLAIM_RULE_POLICY_SHA256:
+            raise WorldEvidenceError(
+                f"{path_text}.claim_rule_policy_sha256 differs from claim rules"
+            )
+        if registry_semantics_sha256_value != registry_semantics_sha256:
+            raise WorldEvidenceError(
+                f"{path_text}.registry_semantics_sha256 differs from current qualification policy"
+            )
     return {
         "id": attestation_id,
         "path": path_text,
         "gate": gate_id,
         "class": evidence_class,
-        "derived_claims": derived_claims,
+        "recorded_claims": recorded_claims,
+        "current_derived_claims": current_derived_claims,
+        "derived_claims": set(),
+        "derivation_hash": derivation_hash,
         "schema_version": schema_version,
+        "resolved_source_snapshot": resolved_source_snapshot,
+        "record_sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+    }
+
+
+def _rederive_payload_sha256(event: dict[str, Any]) -> str:
+    payload_keys = (
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "prior_derivation",
+        "current_derivation",
+        "claims_lost",
+        "claims_gained",
+        "reason_code",
+        "reason",
+        "source_commit",
+    )
+    payload = {key: event[key] for key in payload_keys}
+    preimage = (
+        REDERIVE_PAYLOAD_DOMAIN.encode("ascii")
+        + b"\0"
+        + _canonical_json_bytes(payload)
+    )
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _witness_payload_sha256(event: dict[str, Any]) -> str:
+    payload_keys = (
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "subject_record_sha256",
+        "algorithm",
+        "key_id",
+        "public_key",
+        "run_identity",
+        "source_commit",
+        "verification",
+    )
+    payload = {key: event[key] for key in payload_keys}
+    preimage = (
+        WITNESS_PAYLOAD_DOMAIN.encode("ascii")
+        + b"\0"
+        + _canonical_json_bytes(payload)
+    )
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _validate_witness_event(
+    root: Path, path_text: str, event: dict[str, Any]
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "subject_record_sha256",
+        "witness_payload_sha256",
+        "algorithm",
+        "key_id",
+        "public_key",
+        "signature",
+        "run_identity",
+        "source_commit",
+        "verification",
+    }
+    if set(event) != expected_keys:
+        raise WorldEvidenceError(f"witness event {path_text} keys differ from schema")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise WorldEvidenceError(f"witness event {path_text} schema_version must be 1")
+    event_id = _require_string(event["id"], f"{path_text}.id")
+    subject = _require_string(event["subject"], f"{path_text}.subject")
+    key_id = _require_string(event["key_id"], f"{path_text}.key_id")
+    for field, value in (("id", event_id), ("subject", subject), ("key_id", key_id)):
+        if ATTESTATION_ID.fullmatch(value) is None:
+            raise WorldEvidenceError(f"{path_text}.{field} is not normalized")
+    record_sha256 = _require_sha256(
+        event["subject_record_sha256"], f"{path_text}.subject_record_sha256"
+    )
+    if event["algorithm"] != "ed25519":
+        raise WorldEvidenceError(f"{path_text}.algorithm must be ed25519")
+    if re.fullmatch(r"[0-9a-f]{64}", str(event["public_key"])) is None:
+        raise WorldEvidenceError(f"{path_text}.public_key must be 32-byte lowercase hex")
+    if event["public_key"] == "0" * 64:
+        raise WorldEvidenceError(f"{path_text}.public_key must not be all zero")
+    if re.fullmatch(r"[0-9a-f]{128}", str(event["signature"])) is None:
+        raise WorldEvidenceError(f"{path_text}.signature must be 64-byte lowercase hex")
+    if event["signature"] == "0" * 128:
+        raise WorldEvidenceError(f"{path_text}.signature must not be all zero")
+    _require_string(event["run_identity"], f"{path_text}.run_identity")
+    if event["verification"] != "external_unverified":
+        raise WorldEvidenceError(
+            f"{path_text}.verification must state external_unverified"
+        )
+    source_commit = _require_string(
+        event["source_commit"], f"{path_text}.source_commit"
+    )
+    if HEX_COMMIT.fullmatch(source_commit) is None:
+        raise WorldEvidenceError(f"{path_text}.source_commit must be a Git object ID")
+    _require_git_commit(root, source_commit, f"{path_text}.source_commit")
+    witness_payload_sha256 = _require_sha256(
+        event["witness_payload_sha256"], f"{path_text}.witness_payload_sha256"
+    )
+    if witness_payload_sha256 != _witness_payload_sha256(event):
+        raise WorldEvidenceError(
+            f"{path_text}.witness_payload_sha256 does not bind the detached signature preimage"
+        )
+    return {
+        "id": event_id,
+        "path": path_text,
+        "event": "witness",
+        "subject": subject,
+        "subject_record_sha256": record_sha256,
+        "witness_payload_sha256": witness_payload_sha256,
+        "verification": "external_unverified",
+        "record_sha256": hashlib.sha256((root / path_text).read_bytes()).hexdigest(),
     }
 
 
 def _validate_evidence_event(root: Path, path: Path) -> dict[str, Any]:
     path_text = path.relative_to(root).as_posix()
     event = _strict_toml_file(path, path_text)
-    expected_keys = {
+    kind = _require_string(event.get("event"), f"{path_text}.event")
+    if kind == "witness":
+        return _validate_witness_event(root, path_text, event)
+    lifecycle_keys = {
         "schema_version",
         "id",
         "event",
@@ -930,6 +1930,22 @@ def _validate_evidence_event(root: Path, path: Path) -> dict[str, Any]:
         "source_commit",
         "signatures",
     }
+    rederive_keys = {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "prior_derivation",
+        "current_derivation",
+        "claims_lost",
+        "claims_gained",
+        "reason_code",
+        "reason",
+        "source_commit",
+        "payload_sha256",
+        "signatures",
+    }
+    expected_keys = rederive_keys if kind == "rederive" else lifecycle_keys
     if set(event) != expected_keys:
         raise WorldEvidenceError(f"evidence event {path_text} keys differ from schema")
     if type(event["schema_version"]) is not int or event["schema_version"] != 1:
@@ -939,25 +1955,73 @@ def _validate_evidence_event(root: Path, path: Path) -> dict[str, Any]:
     for field, value in (("id", event_id), ("subject", subject)):
         if ATTESTATION_ID.fullmatch(value) is None:
             raise WorldEvidenceError(f"{path_text}.{field} is not normalized")
-    kind = _require_string(event["event"], f"{path_text}.event")
-    if kind not in {"supersede", "retract"}:
-        raise WorldEvidenceError(f"{path_text}.event must be supersede or retract")
-    replacement = event["replacement"]
-    if not isinstance(replacement, str):
-        raise WorldEvidenceError(f"{path_text}.replacement must be a string")
-    if kind == "supersede":
-        replacement = _require_string(replacement, f"{path_text}.replacement")
-        if ATTESTATION_ID.fullmatch(replacement) is None:
-            raise WorldEvidenceError(f"{path_text}.replacement is not normalized")
-        if replacement == subject:
-            raise WorldEvidenceError(f"{path_text} cannot supersede an attestation with itself")
-    elif replacement != "":
-        raise WorldEvidenceError(f"{path_text}.replacement must be empty for retraction")
+    if kind not in {"supersede", "retract", "rederive"}:
+        raise WorldEvidenceError(
+            f"{path_text}.event must be supersede, retract, rederive, or witness"
+        )
+    replacement = ""
+    prior_derivation = ""
+    current_derivation = ""
+    claims_lost: set[str] = set()
+    claims_gained: set[str] = set()
+    if kind in {"supersede", "retract"}:
+        replacement = event["replacement"]
+        if not isinstance(replacement, str):
+            raise WorldEvidenceError(f"{path_text}.replacement must be a string")
+        if kind == "supersede":
+            replacement = _require_string(replacement, f"{path_text}.replacement")
+            if ATTESTATION_ID.fullmatch(replacement) is None:
+                raise WorldEvidenceError(f"{path_text}.replacement is not normalized")
+            if replacement == subject:
+                raise WorldEvidenceError(
+                    f"{path_text} cannot supersede an attestation with itself"
+                )
+        elif replacement != "":
+            raise WorldEvidenceError(
+                f"{path_text}.replacement must be empty for retraction"
+            )
+    else:
+        prior_derivation = _require_derivation_hash(
+            event["prior_derivation"], f"{path_text}.prior_derivation"
+        )
+        current_derivation = _require_derivation_hash(
+            event["current_derivation"], f"{path_text}.current_derivation"
+        )
+        if current_derivation == prior_derivation:
+            raise WorldEvidenceError(
+                f"{path_text} must change the derivation identifier"
+            )
+        lost_list = _require_string_list(
+            event["claims_lost"], f"{path_text}.claims_lost"
+        )
+        gained_list = _require_string_list(
+            event["claims_gained"], f"{path_text}.claims_gained"
+        )
+        if lost_list != sorted(lost_list) or gained_list != sorted(gained_list):
+            raise WorldEvidenceError(
+                f"{path_text} claim deltas must be sorted and unique"
+            )
+        claims_lost = set(lost_list)
+        claims_gained = set(gained_list)
+        overlap = claims_lost & claims_gained
+        if overlap:
+            raise WorldEvidenceError(
+                f"{path_text} cannot both lose and gain claims {sorted(overlap)}"
+            )
     _require_string(event["reason_code"], f"{path_text}.reason_code")
     _require_string(event["reason"], f"{path_text}.reason")
     source_commit = _require_string(event["source_commit"], f"{path_text}.source_commit")
     if HEX_COMMIT.fullmatch(source_commit) is None:
         raise WorldEvidenceError(f"{path_text}.source_commit must be a Git object ID")
+    _require_git_commit(root, source_commit, f"{path_text}.source_commit")
+    if kind == "rederive":
+        payload_sha256 = _require_sha256(
+            event["payload_sha256"], f"{path_text}.payload_sha256"
+        )
+        if payload_sha256 != _rederive_payload_sha256(event):
+            raise WorldEvidenceError(
+                f"{path_text}.payload_sha256 does not bind the rederive event"
+            )
     if event["signatures"] != []:
         raise WorldEvidenceError(
             f"{path_text}.signatures must be empty for repository-authored events"
@@ -968,6 +2032,12 @@ def _validate_evidence_event(root: Path, path: Path) -> dict[str, Any]:
         "event": kind,
         "subject": subject,
         "replacement": replacement,
+        "prior_derivation": prior_derivation,
+        "current_derivation": current_derivation,
+        "claims_lost": claims_lost,
+        "claims_gained": claims_gained,
+        "payload_sha256": payload_sha256 if kind == "rederive" else "",
+        "record_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
 
@@ -1002,16 +2072,45 @@ def _active_evidence_ledger(
             raise WorldEvidenceError(f"evidence ledger ID {item['id']} is reused")
         by_id[item["id"]] = item
     attestations_by_id = {item["id"]: item for item in attestations}
-    event_by_subject: dict[str, dict[str, Any]] = {}
+    events_by_id = {item["id"]: item for item in events}
+    for witness in (item for item in events if item["event"] == "witness"):
+        subject = witness["subject"]
+        target = events_by_id.get(subject)
+        if target is None or target["event"] == "witness":
+            raise WorldEvidenceError(
+                f"{witness['path']} must witness one exact non-witness event record"
+            )
+        if witness["subject_record_sha256"] != target["record_sha256"]:
+            raise WorldEvidenceError(
+                f"{witness['path']} does not bind its exact subject record"
+            )
+    lifecycle_by_subject: dict[str, dict[str, Any]] = {}
+    rederive_by_subject: dict[str, dict[str, dict[str, Any]]] = {}
     for event in events:
+        if event["event"] == "witness":
+            continue
         subject = event["subject"]
         if subject not in attestations_by_id:
             raise WorldEvidenceError(
                 f"{event['path']} references missing subject {subject}"
             )
-        if subject in event_by_subject:
+        if event["event"] == "rederive":
+            attestation = attestations_by_id[subject]
+            if attestation["derivation_hash"] is None:
+                raise WorldEvidenceError(
+                    f"{event['path']} cannot rederive schema-v1 prose claims"
+                )
+            transitions = rederive_by_subject.setdefault(subject, {})
+            prior = event["prior_derivation"]
+            if prior in transitions:
+                raise WorldEvidenceError(
+                    f"attestation {subject} has competing rederive events from {prior}"
+                )
+            transitions[prior] = event
+            continue
+        if subject in lifecycle_by_subject:
             raise WorldEvidenceError(
-                f"attestation {subject} has multiple competing ledger events"
+                f"attestation {subject} has multiple competing lifecycle events"
             )
         replacement = event["replacement"]
         if replacement:
@@ -1023,12 +2122,12 @@ def _active_evidence_ledger(
                 raise WorldEvidenceError(
                     f"{event['path']} supersedes evidence across unrelated gates"
                 )
-        event_by_subject[subject] = event
+        lifecycle_by_subject[subject] = event
 
     # Every successor chain must terminate, and no attestation may be the
     # replacement of two unrelated active histories.
     replacement_predecessors: dict[str, str] = {}
-    for subject, event in event_by_subject.items():
+    for subject, event in lifecycle_by_subject.items():
         replacement = event["replacement"]
         if replacement:
             previous = replacement_predecessors.setdefault(replacement, subject)
@@ -1038,16 +2137,81 @@ def _active_evidence_ledger(
                 )
         seen: set[str] = set()
         current = subject
-        while current in event_by_subject:
+        while current in lifecycle_by_subject:
             if current in seen:
                 raise WorldEvidenceError("evidence supersession graph contains a cycle")
             seen.add(current)
-            current = event_by_subject[current]["replacement"]
+            current = lifecycle_by_subject[current]["replacement"]
             if not current:
                 break
 
-    inactive_ids = set(event_by_subject)
+    inactive_ids = set(lifecycle_by_subject)
+
+    # Re-derivation is independent of lifecycle history: it neither retires nor
+    # replaces an attestation.  Follow an exact, non-forking chain from the
+    # immutable record's derivation and replay each declared claim delta.
+    for attestation in attestations:
+        if attestation["schema_version"] == 1:
+            if attestation["id"] not in inactive_ids:
+                raise WorldEvidenceError(
+                    f"schema-v1 attestation {attestation['id']} cannot be an active ledger head"
+                )
+            continue
+        subject = attestation["id"]
+        transitions = rederive_by_subject.get(subject, {})
+        derivation = attestation["derivation_hash"]
+        claims = set(attestation["recorded_claims"])
+        seen_derivations = {derivation}
+        used_priors: set[str] = set()
+        while derivation in transitions:
+            transition = transitions[derivation]
+            used_priors.add(derivation)
+            missing = transition["claims_lost"] - claims
+            if missing:
+                raise WorldEvidenceError(
+                    f"{transition['path']} loses absent claims {sorted(missing)}"
+                )
+            already_present = transition["claims_gained"] & claims
+            if already_present:
+                raise WorldEvidenceError(
+                    f"{transition['path']} gains existing claims {sorted(already_present)}"
+                )
+            claims = (claims - transition["claims_lost"]) | transition["claims_gained"]
+            derivation = transition["current_derivation"]
+            if derivation in seen_derivations:
+                raise WorldEvidenceError(
+                    f"attestation {subject} rederive graph contains a cycle"
+                )
+            seen_derivations.add(derivation)
+        unreachable = set(transitions) - used_priors
+        if unreachable:
+            raise WorldEvidenceError(
+                f"attestation {subject} has unreachable rederive prior(s) {sorted(unreachable)}"
+            )
+        if derivation != CURRENT_DERIVATION_HASH:
+            raise WorldEvidenceError(
+                f"active derivation for attestation {subject} is {derivation}, "
+                f"expected {CURRENT_DERIVATION_HASH}; append a rederive event"
+            )
+        if claims != attestation["current_derived_claims"]:
+            lost = sorted(claims - attestation["current_derived_claims"])
+            gained = sorted(attestation["current_derived_claims"] - claims)
+            raise WorldEvidenceError(
+                f"attestation {subject} rederive delta differs from current derivation; "
+                f"undeclared_lost={lost}, undeclared_gained={gained}"
+            )
+        attestation["derived_claims"] = claims
+
     active = [item for item in attestations if item["id"] not in inactive_ids]
+    for attestation in active:
+        if (
+            attestation["schema_version"] != 3
+            and attestation["id"] not in LEGACY_ACTIVE_SCHEMA2_IDS
+        ):
+            raise WorldEvidenceError(
+                f"active attestation {attestation['id']} must use schema v3; "
+                "only the explicitly pinned G2 legacy exception is allowed"
+            )
     return active, events
 
 
@@ -1110,6 +2274,7 @@ def _registry_semantics_sha256(data: dict[str, Any]) -> str:
         "constitution": data["constitution"],
         "hosted_reference_profile": data["hosted_reference_profile"],
         "contract_schema": data["contract_schema"],
+        "machine_contract_schema": data["machine_contract_schema"],
         "alpha_gate": data["alpha_gate"],
         "gate_count": data["gate_count"],
         "evidence_class": data["evidence_class"],
@@ -1121,6 +2286,26 @@ def _registry_semantics_sha256(data: dict[str, Any]) -> str:
             }
             for gate in data["gate"]
         ],
+        "qualification_policy": {
+            "required_claim_floors": {
+                gate: sorted(claims)
+                for gate, claims in sorted(REQUIRED_CLAIM_FLOORS.items())
+            },
+            "required_class_floors": {
+                gate: sorted(classes)
+                for gate, classes in sorted(REQUIRED_CLASS_FLOORS.items())
+            },
+            "one_of_class_floors": {
+                gate: sorted(sorted(group) for group in groups)
+                for gate, groups in sorted(ONE_OF_CLASS_FLOORS.items())
+            },
+            "nonclaim_floors": {
+                evidence_class: list(fragments)
+                for evidence_class, fragments in sorted(NONCLAIM_FLOORS.items())
+            },
+            "nonqualifying_classes": sorted(NONQUALIFYING_CLASSES),
+            "legacy_active_schema2_ids": sorted(LEGACY_ACTIVE_SCHEMA2_IDS),
+        },
     }
     encoded = json.dumps(
         projection,
@@ -1198,6 +2383,7 @@ def validated_gates(
         "constitution",
         "hosted_reference_profile",
         "contract_schema",
+        "machine_contract_schema",
         "alpha_gate",
         "gate_count",
         "evidence_class",
@@ -1234,6 +2420,7 @@ def validated_gates(
     class_scopes = _validate_classes(data["evidence_class"])
     class_ids = set(class_scopes)
     _validate_world_contract(data, root, class_scopes)
+    _validate_machine_contract(data, root)
 
     raw_gates = data["gate"]
     if not isinstance(raw_gates, list):
@@ -1422,7 +2609,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "World Alpha gate registry: "
             f"{len(gates)}/{len(gates)} gates defined, {passed} passed; "
-            f"G13 {alpha['status'].upper()} (schema v3 derived ledger view)"
+            f"G13 {alpha['status'].upper()} (registry schema v4 derived ledger view)"
         )
     return 0
 
