@@ -31,9 +31,15 @@ WORLD_NORMATIVE_BYTES = {
 }
 WORLD_ATTESTATION_PATHS = (
     "evidence/world/g0-repository-conformance.toml",
+    "evidence/world/g0-repository-conformance-2026-08-03.toml",
     "evidence/world/g2-aarch64-qemu.toml",
+    "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
 )
-WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS)
+WORLD_EVIDENCE_EVENT_PATHS = {
+    "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
+    "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
+}
+WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS) | WORLD_EVIDENCE_EVENT_PATHS
 for _attestation_path in WORLD_ATTESTATION_PATHS:
     _attestation = tomllib.loads(
         (PROJECT_ROOT / _attestation_path).read_text(encoding="utf-8")
@@ -470,9 +476,15 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world_alpha_gates.toml",
                 "evidence/world_contract_v1.toml",
                 "evidence/world/g0-repository-conformance.toml",
+                "evidence/world/g0-repository-conformance-2026-08-03.toml",
+                "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
                 "evidence/world/g2-aarch64-qemu.toml",
+                "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
+                "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
                 "evidence/world/transcripts/g0-repository-conformance.log",
+                "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
+                "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
                 "llms.txt",
                 "mcp/ostadix_lang_mcp_server/Cargo.lock",
@@ -1125,14 +1137,14 @@ class SourceReleaseTests(unittest.TestCase):
         self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"\n"})
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"g2-aarch64-qemu\.toml\.source\[[0-9]+\].*"
+            r"g2-aarch64-qemu-2026-08-03\.toml\.source\[[0-9]+\].*"
             r"does not match released src/ocore/codegen_aarch64\.rs",
         ):
             self._build("tampered-g2-source.zip")
 
     def test_world_registry_structure_is_checked_beneath_byte_seal(self) -> None:
         path = "evidence/world_alpha_gates.toml"
-        malformed = b"schema_version = 2\n"
+        malformed = b"schema_version = 3\n"
         files = {
             candidate: (PROJECT_ROOT / candidate).read_bytes()
             for candidate in WORLD_EVIDENCE_RELEASE_PATHS

@@ -1,0 +1,118 @@
+schema_version = 2
+id = "g2-aarch64-qemu-tcg-2026-08-03"
+gate = "G2"
+evidence_class = "qemu_tcg_aarch64"
+source_commit = "563a0d458d8ba2a8e9b3385bfbd37b85b6666991"
+source_state = "content-addressed-working-tree"
+command = ["./ocore/kernel/smoke-aarch64-g2-qemu.sh"]
+transcript = "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log"
+transcript_sha256 = "bc14e54518021cbb1ee4be8456bf1df1fb80269480bc1e7eb77f326fcc3db7cb"
+validator_sha256 = "4ad65ced8628208827503c7008db2850d6ed9693e7628354bb9ef8654080d6ef"
+claim_rule_policy_sha256 = "5396b8bf538735aac81467d828b9600d683d04b84a52ce22188755b1fdbbe3dd"
+registry_semantics_sha256 = "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
+derived_claims = [
+  "aarch64.el0_execution",
+  "aarch64.el1_execution",
+  "aarch64.el2_resident",
+  "aarch64.hvc_roundtrip",
+  "aarch64.native_object",
+  "aarch64.svc_eret_roundtrip",
+  "capability.attenuation",
+  "capability.stale_generation_rejected",
+  "counter.progress_after_lifecycle",
+  "execution.post_lifecycle_reached",
+  "ipc.request_reply",
+  "lifecycle.reclamation",
+  "lifecycle.terminal",
+]
+nonclaims = [
+  "This one-vCPU QEMU TCG result is not physical AArch64, KVM/SVM, SMP, G3, SMMU, or physical hardware evidence",
+  "It does not boot Linux or Plan 9, install stage-2 translation, or establish a general foreign ABI",
+  "It provides no PCI/DMA/IOMMU isolation, physical-device assignment, hardware reset, or driver-domain evidence",
+  "Bounded architectural-counter progress does not establish interrupt-driven timer delivery",
+]
+expected_markers = [
+  "G2 AArch64 ocorec object: PASS",
+  "G2 AArch64 resident EL2 HVC round-trip: PASS",
+  "G2 AArch64 EL0 process lifecycle: PASS",
+  "G2 AArch64 IPC capability lifecycle: PASS",
+  "G2 AArch64 post-lifecycle counter progress: PASS",
+  "G2 AArch64 native compiler QEMU smoke: PASS",
+]
+signatures = []
+
+[topology]
+kind = "virtual"
+architecture = "aarch64"
+machine = "QEMU virt,virtualization=on,gic-version=3 with cortex-a57"
+acceleration = "tcg"
+cpu_count = 1
+inventory = [
+  "QEMU emulator version 11.0.2",
+  "128 MiB guest RAM",
+  "Resident EL2 vector and stack; host EL1 plus two compiled EL0 principals",
+  "PL011 serial, stage-1 and stage-2 MMUs off, asynchronous exceptions masked",
+  "macOS arm64 evidence host; no hardware virtualization used",
+]
+
+[[source]]
+path = "src/ocore/codegen_aarch64.rs"
+sha256 = "36044a6a0e57bca4f48f029196e4fda976af71c09815b84e830a5495035618eb"
+
+[[source]]
+path = "src/ocore/driver.rs"
+sha256 = "092cd897c95fe1f2eb31b2276d6e93ee6140ba411cdff37672a0c9c38d976821"
+
+[[source]]
+path = "src/ocore/mod.rs"
+sha256 = "576c0626c9bb589ce9f0ea85fc7b9e10eaa183702ee0ac77a3cb1791e1f3b701"
+
+[[source]]
+path = "src/bin/ocorec.rs"
+sha256 = "d2ea0cf3623d0b654b45df3a290d0860e14f2ea2655456451aeee6dfc2703abe"
+
+[[source]]
+path = "ocore/kernel/build-aarch64-g2.sh"
+sha256 = "fb820b20a71bc033a50d770d6c10aad4818b15899cc9d136f114cf8694b490e8"
+
+[[source]]
+path = "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+sha256 = "4a3228e86d3334d87288bb4847ae6034613ec225a03d8d8752221f9aafd29a4b"
+
+[[source]]
+path = "ocore/kernel/aarch64/boot.S"
+sha256 = "9e46e51b6bcfaf6585b3fc0f9bcad943315b2d79b747969698f2c140eed42193"
+
+[[source]]
+path = "ocore/kernel/aarch64/vectors.S"
+sha256 = "d626bbeaf5e354ba645e2963df86fc7c5633d337d03fb43601a56fcfe966d702"
+
+[[source]]
+path = "ocore/kernel/aarch64/linker.ld"
+sha256 = "ccda27fafb461ec6826fcafe8bc52006efd922fa528668c0a8e2d334a664be55"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_kernel.oc"
+sha256 = "f732e25317b70e452b9adf075c54fa9d3c5d562c4d77e8a69951e9b4de339731"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_user_a.oc"
+sha256 = "a5a6ab5cdf40cd720aef0710516e9786e894e9a97b7cb152111038d9abcac9e6"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_user_b.oc"
+sha256 = "271c64edb5f653756edc93f4591022a414070dbdcfa41dd875a9e6a7632f37dc"
+
+[[artifact]]
+name = "g2-kernel-object"
+kind = "aarch64-relocatable-elf"
+sha256 = "74e6c429f4420f9eace004a17492db8fe3511049aba3e0a34cc9cef3475d83e7"
+retained = false
+path = ""
+
+[[artifact]]
+name = "g2-kernel-elf"
+kind = "aarch64-executable-elf"
+sha256 = "d65b88e17cf8332db895350458aaf1a9a63b26480624749a217699d81b81f7e2"
+retained = false
+path = ""

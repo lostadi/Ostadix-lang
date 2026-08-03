@@ -161,9 +161,15 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world_alpha_gates.toml",
         "evidence/world_contract_v1.toml",
         "evidence/world/g0-repository-conformance.toml",
+        "evidence/world/g0-repository-conformance-2026-08-03.toml",
+        "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
         "evidence/world/g2-aarch64-qemu.toml",
+        "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
+        "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
         "evidence/world/transcripts/g0-repository-conformance.log",
+        "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
+        "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
@@ -279,9 +285,11 @@ G2_AARCH64_REQUIRED_TOOLS = EVIDENCE_COMMON_REQUIRED_TOOLS | frozenset(
     {"cmp", "git", "qemu-system-aarch64", "shasum"}
 )
 G2_AARCH64_POSITIVE_CLAIMS = (
-    "One O-core kernel compiled for AArch64 boots under forced QEMU TCG and, "
-    "in one live run, executes native EL0 process, IPC, capability, lifecycle, "
-    "stale-generation, reclamation, and post-lifecycle survival checks",
+    "One O-core kernel compiled for AArch64 retains EL2, enters host EL1, "
+    "completes one domain-separated HVC return with register and stack integrity, "
+    "and in one live QEMU TCG run executes native EL0 process, IPC, capability, "
+    "lifecycle, stale-generation, reclamation, and bounded post-lifecycle "
+    "counter-progress checks",
 )
 G2_AARCH64_NONCLAIMS = (
     "This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or "
@@ -292,30 +300,61 @@ G2_AARCH64_NONCLAIMS = (
 )
 G2_AARCH64_EXPECTED_MARKERS = (
     "G2 AArch64 ocorec object: PASS",
+    "G2 AArch64 resident EL2 HVC round-trip: PASS",
     "G2 AArch64 EL0 process lifecycle: PASS",
     "G2 AArch64 IPC capability lifecycle: PASS",
-    "G2 AArch64 post-lifecycle timer: online",
+    "G2 AArch64 post-lifecycle counter progress: PASS",
     "G2 AArch64 native compiler QEMU smoke: PASS",
 )
 
 # These four files jointly define the version-2 native World constitution,
-# executable G0 contract, and typed G0-G13 registry. Source releases are built from arbitrary
+# executable G0 contract, and definition-only G0-G13 registry. Source releases are built from arbitrary
 # committed refs and archive verification must not execute the Python shipped in
 # an untrusted ZIP, so keep trusted byte seals here and recheck the inert data
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "c2dbd100ba8acb60a88cfb06ebdfcac5bd2d70a112537f62c428d6ebac33fa61"
+        "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
         "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
     ),
     "evidence/world_alpha_gates.toml": (
-        "f06bd933dc4d11ca7ca9d31c4e20edf06c62425c806f6978c42871f169664f4f"
+        "4afa892b58d98c8212d44250a2f78270f96570fc88063733f89c9747336a0a92"
     ),
     "evidence/world_contract_v1.toml": (
         "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
     ),
+}
+WORLD_CLAIM_POLICY_SHA256 = (
+    "5396b8bf538735aac81467d828b9600d683d04b84a52ce22188755b1fdbbe3dd"
+)
+WORLD_REGISTRY_SEMANTICS_SHA256 = (
+    "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
+)
+WORLD_DERIVED_CLAIMS = {
+    "G0": {
+        "evidence.claim_class_guarded",
+        "world.contract_schema_consistent",
+        "world.crossing_taxonomy_consistent",
+        "world.failure_consistency_schema_consistent",
+        "world.identity_vocabulary_consistent",
+    },
+    "G2": {
+        "aarch64.el0_execution",
+        "aarch64.el1_execution",
+        "aarch64.el2_resident",
+        "aarch64.hvc_roundtrip",
+        "aarch64.native_object",
+        "aarch64.svc_eret_roundtrip",
+        "capability.attenuation",
+        "capability.stale_generation_rejected",
+        "counter.progress_after_lifecycle",
+        "execution.post_lifecycle_reached",
+        "ipc.request_reply",
+        "lifecycle.reclamation",
+        "lifecycle.terminal",
+    },
 }
 EXPECTED_WORLD_ALPHA_GATE_IDS = tuple(f"G{number}" for number in range(14))
 EXPECTED_WORLD_ALPHA_CLASS_IDS = (
@@ -1329,7 +1368,7 @@ def _validate_world_attestation_release_surface(
     if path not in files or modes.get(path) != "100644":
         raise ReleaseError(f"{path} must be a regular non-executable release file")
     attestation = _strict_toml(files[path], path)
-    expected_keys = {
+    common_keys = {
         "schema_version",
         "id",
         "gate",
@@ -1340,17 +1379,27 @@ def _validate_world_attestation_release_surface(
         "transcript",
         "transcript_sha256",
         "topology",
-        "claims",
         "nonclaims",
         "expected_markers",
         "source",
         "artifact",
         "signatures",
     }
-    if set(attestation) != expected_keys:
+    schema_version = attestation.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ReleaseError(f"{path} schema_version must be 1 or 2")
+    version_keys = (
+        {"claims"}
+        if schema_version == 1
+        else {
+            "derived_claims",
+            "validator_sha256",
+            "claim_rule_policy_sha256",
+            "registry_semantics_sha256",
+        }
+    )
+    if set(attestation) != common_keys | version_keys:
         raise ReleaseError(f"{path} keys differ from the World attestation schema")
-    if type(attestation["schema_version"]) is not int or attestation["schema_version"] != 1:
-        raise ReleaseError(f"{path} schema_version must be 1")
     _required_string(attestation["id"], f"{path}.id")
     if attestation["gate"] != gate_id:
         raise ReleaseError(f"{path}.gate must be {gate_id}")
@@ -1423,7 +1472,12 @@ def _validate_world_attestation_release_surface(
         digest = _required_string(source["sha256"], f"{owner}.sha256")
         if HEX_DIGEST.fullmatch(digest) is None:
             raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
-        if source_path not in files or hashlib.sha256(files[source_path]).hexdigest() != digest:
+        if source_path not in files:
+            raise ReleaseError(f"{owner} references absent released {source_path}")
+        if (
+            schema_version == 2
+            and hashlib.sha256(files[source_path]).hexdigest() != digest
+        ):
             raise ReleaseError(f"{owner} does not match released {source_path}")
 
     artifacts = attestation["artifact"]
@@ -1466,7 +1520,27 @@ def _validate_world_attestation_release_surface(
     if type(topology["cpu_count"]) is not int or topology["cpu_count"] < 0:
         raise ReleaseError(f"{path}.topology.cpu_count must be nonnegative")
     _required_string_list(topology["inventory"], f"{path}.topology.inventory", minimum=1)
-    _required_string_list(attestation["claims"], f"{path}.claims", minimum=1)
+    if schema_version == 1:
+        _required_string_list(attestation["claims"], f"{path}.claims", minimum=1)
+    else:
+        derived_claims = _required_string_list(
+            attestation["derived_claims"], f"{path}.derived_claims", minimum=1
+        )
+        if derived_claims != sorted(set(derived_claims)):
+            raise ReleaseError(f"{path}.derived_claims must be sorted and unique")
+        if set(derived_claims) != WORLD_DERIVED_CLAIMS[gate_id]:
+            raise ReleaseError(f"{path}.derived_claims differs from trusted rules")
+        validator_digest = _required_string(
+            attestation["validator_sha256"], f"{path}.validator_sha256"
+        )
+        if validator_digest != hashlib.sha256(
+            files["scripts/world_alpha_evidence.py"]
+        ).hexdigest():
+            raise ReleaseError(f"{path}.validator_sha256 does not pin released validator")
+        if attestation["claim_rule_policy_sha256"] != WORLD_CLAIM_POLICY_SHA256:
+            raise ReleaseError(f"{path}.claim_rule_policy_sha256 differs from trusted rules")
+        if attestation["registry_semantics_sha256"] != WORLD_REGISTRY_SEMANTICS_SHA256:
+            raise ReleaseError(f"{path}.registry_semantics_sha256 differs from trusted registry")
     nonclaims = _required_string_list(
         attestation["nonclaims"], f"{path}.nonclaims", minimum=1
     )
@@ -1487,6 +1561,41 @@ def _validate_world_attestation_release_surface(
         raise ReleaseError(f"{path}.signatures must be empty for this evidence class")
 
 
+def _validate_world_evidence_event_release_surface(
+    files: dict[str, bytes], modes: dict[str, str], path: str,
+    subject: str, replacement: str,
+) -> None:
+    if path not in files or modes.get(path) != "100644":
+        raise ReleaseError(f"{path} must be a regular non-executable release file")
+    event = _strict_toml(files[path], path)
+    if set(event) != {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "replacement",
+        "reason_code",
+        "reason",
+        "source_commit",
+        "signatures",
+    }:
+        raise ReleaseError(f"{path} keys differ from evidence-event schema")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    _required_string(event["id"], f"{path}.id")
+    if event["event"] != "supersede":
+        raise ReleaseError(f"{path}.event must be supersede")
+    if event["subject"] != subject or event["replacement"] != replacement:
+        raise ReleaseError(f"{path} does not preserve the expected evidence edge")
+    _required_string(event["reason_code"], f"{path}.reason_code")
+    _required_string(event["reason"], f"{path}.reason")
+    commit = _required_string(event["source_commit"], f"{path}.source_commit")
+    if HEX_COMMIT.fullmatch(commit) is None:
+        raise ReleaseError(f"{path}.source_commit must be a Git object ID")
+    if event["signatures"] != []:
+        raise ReleaseError(f"{path}.signatures must be empty")
+
+
 def _validate_world_alpha_release_surface(
     files: dict[str, bytes], modes: dict[str, str]
 ) -> None:
@@ -1500,7 +1609,7 @@ def _validate_world_alpha_release_surface(
             "**Status:** normative native Alpha constitution and implementation program,",
             "| **G0 -- constitutional baseline** |",
             "| **G13 -- eight-node World Alpha** |",
-            "Typed, content-addressed attestations now",
+            "validator derives claims and current",
             "# 28. Alpha non-claims",
         ),
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
@@ -1573,8 +1682,8 @@ def _validate_world_alpha_release_surface(
     }
     if set(manifest) != expected_root_keys:
         raise ReleaseError(f"{path} root keys differ from schema")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 2:
-        raise ReleaseError(f"{path} schema_version must be 2")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 3:
+        raise ReleaseError(f"{path} schema_version must be 3")
     if (
         type(manifest["constitution_version"]) is not int
         or manifest["constitution_version"] != 2
@@ -1624,13 +1733,11 @@ def _validate_world_alpha_release_surface(
     expected_gate_keys = {
         "id",
         "title",
-        "status",
         "depends_on",
         "required_classes",
         "one_of_classes",
         "acceptance",
         "prohibited_substitutes",
-        "evidence",
     }
     for index, gate in enumerate(gates):
         owner = f"{path} gate[{index}]"
@@ -1638,11 +1745,6 @@ def _validate_world_alpha_release_surface(
             raise ReleaseError(f"{owner} keys differ from schema")
         gate_ids.append(_required_string(gate["id"], f"{owner}.id"))
         _required_string(gate["title"], f"{owner}.title")
-        expected_status = "passed" if gate["id"] in {"G0", "G2"} else "defined"
-        if gate["status"] != expected_status:
-            raise ReleaseError(
-                f"{owner}.status must be {expected_status!r} in schema v2"
-            )
         dependencies = _required_string_list(gate["depends_on"], f"{owner}.depends_on")
         unknown_dependencies = set(dependencies) - set(EXPECTED_WORLD_ALPHA_GATE_IDS)
         if unknown_dependencies:
@@ -1667,15 +1769,6 @@ def _validate_world_alpha_release_surface(
             f"{owner}.prohibited_substitutes",
             minimum=1,
         )
-        evidence = _required_string_list(gate["evidence"], f"{owner}.evidence")
-        expected_evidence = {
-            "G0": ["evidence/world/g0-repository-conformance.toml"],
-            "G2": ["evidence/world/g2-aarch64-qemu.toml"],
-        }.get(gate["id"], [])
-        if evidence != expected_evidence:
-            raise ReleaseError(
-                f"{owner}.evidence must be the sealed schema-v2 evidence list"
-            )
     if tuple(gate_ids) != EXPECTED_WORLD_ALPHA_GATE_IDS:
         raise ReleaseError(f"{path} gate IDs or order differ from G0 through G13")
     _validate_world_attestation_release_surface(
@@ -1688,9 +1781,37 @@ def _validate_world_alpha_release_surface(
     _validate_world_attestation_release_surface(
         files,
         modes,
+        "evidence/world/g0-repository-conformance-2026-08-03.toml",
+        "G0",
+        "repository_conformance",
+    )
+    _validate_world_attestation_release_surface(
+        files,
+        modes,
         "evidence/world/g2-aarch64-qemu.toml",
         "G2",
         "qemu_tcg_aarch64",
+    )
+    _validate_world_attestation_release_surface(
+        files,
+        modes,
+        "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
+        "G2",
+        "qemu_tcg_aarch64",
+    )
+    _validate_world_evidence_event_release_surface(
+        files,
+        modes,
+        "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
+        "g0-repository-conformance-2026-08-02",
+        "g0-repository-conformance-2026-08-03",
+    )
+    _validate_world_evidence_event_release_surface(
+        files,
+        modes,
+        "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
+        "g2-aarch64-qemu-tcg-2026-08-02",
+        "g2-aarch64-qemu-tcg-2026-08-03",
     )
 
 

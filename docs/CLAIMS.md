@@ -452,20 +452,24 @@
   freezes the three crossing kinds, all 20 identity atoms, seven failure
   classes, eight consistency rules, and evidence-class taxonomy as executable
   data. `scripts/world_alpha_evidence.py` validates both schemas and their exact
-  Rust/native/document references. Schema v2 marks only G0 and G2 `passed`; G2
-  is accepted only after its G0 dependency and its separate content-addressed
-  `qemu_tcg_aarch64` attestation validate. G13 and the other 11 gates remain
-  `defined`.
-- G2 is one forced-QEMU-TCG, one-vCPU AArch64 `virt` run. It compiles native
-  semantic `.oc` code to `EM_AARCH64`, enters two EL0 principals through a real
-  exception-return path, handles their SVC calls at EL1, exercises endpoint
+  Rust/native/document references. Schema v3 keeps the registry definition-only,
+  resolves active append-only evidence heads, derives claims from typed
+  observations, and computes status. Only G0 and G2 currently derive `passed`;
+  G13 and the other 11 gates remain `defined`.
+- G2 is one forced-QEMU-TCG, one-vCPU AArch64
+  `virt,virtualization=on` run. It compiles native semantic `.oc` code to
+  `EM_AARCH64`, installs a resident EL2 vector and stack, enters O-core at host
+  EL1, and completes one domain-separated HVC/ERET round trip with checked
+  register and stack integrity. It then enters two EL0 principals through a
+  real exception-return path, handles their SVC calls at EL1, exercises endpoint
   request/reply and attenuated capability transfer, contains one EL0 fault,
   tears down and reclaims generation-tagged state, rejects stale use after slot
-  reuse, and reaches a later architectural-counter liveness check. Assembly is
-  limited to boot/vector/context glue and is checked not to contain the
-  semantic PASS strings.
+  reuse, and establishes bounded post-lifecycle architectural-counter progress.
+  Assembly is limited to boot/vector/context/EL2 enforcement glue and is checked
+  not to contain the semantic PASS strings.
 - G2 is not physical AArch64 or KVM/SVM evidence; it is single-core and does
-  not pass G3. It does not boot Linux or Plan 9, provide a general foreign ABI,
+  not pass G3. It does not install stage-2 translation, prove timer-interrupt
+  delivery, boot Linux or Plan 9, provide a general foreign ABI,
   assign a PCI or physical device, isolate DMA through an IOMMU/SMMU, or pass
   any later native World gate.
 - [`HOSTED_WORLD_REFERENCE_PROFILE.md`](HOSTED_WORLD_REFERENCE_PROFILE.md)

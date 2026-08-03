@@ -37,3 +37,9 @@ printf '%s\n' 'G0 failure and consistency schemas: PASS'
 
 printf '%s\n' 'G0 claim-class substitution guard: PASS'
 printf '%s\n' 'G0 repository conformance: PASS'
+printf '%s\n' \
+    '@evidence event=g0_contract_schema result=pass' \
+    '@evidence event=g0_crossing_taxonomy result=pass' \
+    '@evidence event=g0_identity_vocabulary result=pass' \
+    '@evidence event=g0_failure_consistency result=pass' \
+    '@evidence event=g0_claim_class_guard result=pass'

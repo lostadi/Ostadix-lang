@@ -13,6 +13,8 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import shlex
+import subprocess
 import sys
 import tomllib
 from typing import Any
@@ -21,12 +23,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "evidence/world_alpha_gates.toml"
 
-EXPECTED_SCHEMA_VERSION = 2
+EXPECTED_SCHEMA_VERSION = 3
 EXPECTED_CONSTITUTION_VERSION = 2
-EXPECTED_CONSTITUTION_SHA256 = "c2dbd100ba8acb60a88cfb06ebdfcac5bd2d70a112537f62c428d6ebac33fa61"
+EXPECTED_CONSTITUTION_SHA256 = "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
 EXPECTED_HOSTED_PROFILE_SHA256 = "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
 EXPECTED_REGISTRY_SEMANTICS_SHA256 = (
-    "e67c582af4250f16f32d11941feced4e36b6df9d6dff75e9bd185cfe672ad768"
+    "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
 )
 EXPECTED_GATE_IDS = tuple(f"G{number}" for number in range(14))
 EXPECTED_CLASS_SCOPES = {
@@ -94,6 +96,161 @@ REQUIRED_CLASS_FLOORS = {
 ONE_OF_CLASS_FLOORS = {
     "G8": {frozenset({"hardware_x86_64_iommu", "hardware_aarch64_smmu"})},
     "G11": {frozenset({"hardware_x86_64_iommu", "hardware_aarch64_smmu"})},
+}
+
+# Claims are validator-owned identifiers.  Attestations may record the derived
+# set, but they never define claim meaning or gate qualification.
+REQUIRED_CLAIM_FLOORS = {
+    "G0": {
+        "world.contract_schema_consistent",
+        "world.crossing_taxonomy_consistent",
+        "world.identity_vocabulary_consistent",
+        "world.failure_consistency_schema_consistent",
+        "evidence.claim_class_guarded",
+    },
+    "G1": {"hgraph.world_identity_continuity"},
+    "G2": {
+        "aarch64.native_object",
+        "aarch64.el2_resident",
+        "aarch64.el1_execution",
+        "aarch64.hvc_roundtrip",
+        "aarch64.el0_execution",
+        "aarch64.svc_eret_roundtrip",
+        "ipc.request_reply",
+        "capability.attenuation",
+        "capability.stale_generation_rejected",
+        "lifecycle.reclamation",
+        "counter.progress_after_lifecycle",
+    },
+    "G3": {"aarch64.smp_execution", "lifecycle.multicore_linearization"},
+    "G4": {"transport.native_authenticated", "transport.three_physical_nodes"},
+    "G5": {"governor.authoritative_log", "governor.partition_fencing"},
+    "G6": {"worldfs.live_multinode_namespace", "worldfs.stale_fid_rejected"},
+    "G7": {
+        "foreign_kernel.booted",
+        "foreign_kernel.userspace_reached",
+        "foreign_kernel.fresh_challenge_answered",
+        "kernel_world.revocation_complete",
+        "kernel_world.pages_reclaimed",
+    },
+    "G8": {"driver.physical_device_service", "driver.revocation_complete"},
+    "G9": {"personality.debian_dynamic_userland"},
+    "G10": {"execution.distributed_exactly_one_commit"},
+    "G11": {"accelerator.multinode_governed_execution"},
+    "G12": {"world.three_node_integrated"},
+    "G13": {"world.eight_node_alpha"},
+}
+
+# A rule is a claim plus the normalized observations that must all be present.
+# Required fields are matched as subsets, so producers may append descriptive
+# fields without changing claim meaning.
+CLAIM_RULES: tuple[tuple[str, tuple[tuple[str, tuple[tuple[str, str], ...]], ...]], ...] = (
+    (
+        "world.contract_schema_consistent",
+        (("g0_contract_schema", (("result", "pass"),)),),
+    ),
+    (
+        "world.crossing_taxonomy_consistent",
+        (("g0_crossing_taxonomy", (("result", "pass"),)),),
+    ),
+    (
+        "world.identity_vocabulary_consistent",
+        (("g0_identity_vocabulary", (("result", "pass"),)),),
+    ),
+    (
+        "world.failure_consistency_schema_consistent",
+        (("g0_failure_consistency", (("result", "pass"),)),),
+    ),
+    (
+        "evidence.claim_class_guarded",
+        (("g0_claim_class_guard", (("result", "pass"),)),),
+    ),
+    (
+        "aarch64.native_object",
+        (
+            (
+                "aarch64_native_object",
+                (("format", "elf64"), ("machine", "183"), ("result", "pass")),
+            ),
+        ),
+    ),
+    ("aarch64.el2_resident", (("el2_resident", (("result", "pass"),)),)),
+    ("aarch64.el1_execution", (("el1_execution", (("result", "pass"),)),)),
+    (
+        "aarch64.hvc_roundtrip",
+        (
+            (
+                "el2_hvc_roundtrip",
+                (
+                    ("domain", "0x4f4d"),
+                    ("registers", "preserved"),
+                    ("stack", "preserved"),
+                    ("result", "pass"),
+                ),
+            ),
+        ),
+    ),
+    (
+        "aarch64.el0_execution",
+        (("el0_execution", (("principals", "2"), ("result", "pass"))),),
+    ),
+    (
+        "aarch64.svc_eret_roundtrip",
+        (("svc_eret_roundtrip", (("result", "pass"),)),),
+    ),
+    ("ipc.request_reply", (("ipc_request_reply", (("result", "pass"),)),)),
+    (
+        "capability.attenuation",
+        (("capability_attenuation", (("result", "pass"),)),),
+    ),
+    (
+        "capability.stale_generation_rejected",
+        (
+            (
+                "stale_generation_rejected",
+                (("kinds", "process,capability"), ("result", "pass")),
+            ),
+        ),
+    ),
+    ("lifecycle.terminal", (("lifecycle_terminal", (("result", "pass"),)),)),
+    ("lifecycle.reclamation", (("reclamation", (("result", "pass"),)),)),
+    (
+        "execution.post_lifecycle_reached",
+        (
+            ("lifecycle_terminal", (("result", "pass"),)),
+            (
+                "counter_progress",
+                (("phase", "post_lifecycle"), ("result", "pass")),
+            ),
+        ),
+    ),
+    (
+        "counter.progress_after_lifecycle",
+        (
+            ("lifecycle_terminal", (("result", "pass"),)),
+            (
+                "counter_progress",
+                (
+                    ("phase", "post_lifecycle"),
+                    ("poll_bound", "1000000"),
+                    ("result", "pass"),
+                ),
+            ),
+        ),
+    ),
+)
+
+CLAIM_RULE_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(CLAIM_RULES, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+).hexdigest()
+
+NONCLAIM_FLOORS = {
+    "qemu_tcg_aarch64": (
+        "physical AArch64",
+        "KVM/SVM",
+        "Linux or Plan 9",
+        "PCI/DMA/IOMMU",
+    ),
 }
 NONQUALIFYING_CLASSES = {"hosted_reference", "multinode_virtual"}
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -381,17 +538,122 @@ def _validate_world_contract(
             )
 
 
+LEGACY_CLAIM_MARKERS = {
+    "world.contract_schema_consistent": ("G0 executable contract schema: PASS",),
+    "world.crossing_taxonomy_consistent": ("G0 crossing taxonomy: PASS",),
+    "world.identity_vocabulary_consistent": (
+        "G0 identity vocabulary Rust/native: PASS",
+    ),
+    "world.failure_consistency_schema_consistent": (
+        "G0 failure and consistency schemas: PASS",
+    ),
+    "evidence.claim_class_guarded": ("G0 claim-class substitution guard: PASS",),
+    "aarch64.native_object": ("G2 AArch64 ocorec object: PASS",),
+    "aarch64.el1_execution": ("G2 AArch64 EL1 kernel: online",),
+    "aarch64.el0_execution": ("G2 AArch64 EL0 process lifecycle: PASS",),
+    "aarch64.svc_eret_roundtrip": (
+        "G2 AArch64 real SVC/ERET path: PASS",
+    ),
+    "ipc.request_reply": ("G2 AArch64 endpoint request/reply: PASS",),
+    "capability.attenuation": (
+        "G2 AArch64 attenuated capability read: PASS",
+        "G2 AArch64 attenuated capability write: denied",
+    ),
+    "capability.stale_generation_rejected": (
+        "G2 AArch64 process slot reuse stale denial: PASS",
+        "G2 AArch64 capability slot reuse stale denial: PASS",
+    ),
+    "lifecycle.terminal": ("G2 AArch64 IPC capability lifecycle: PASS",),
+    "lifecycle.reclamation": ("G2 AArch64 teardown and reclamation: PASS",),
+}
+
+
+def _parse_observations(transcript: str, location: str) -> list[dict[str, str]]:
+    observations: list[dict[str, str]] = []
+    for line_number, line in enumerate(transcript.splitlines(), 1):
+        if not line.startswith("@evidence "):
+            continue
+        try:
+            tokens = shlex.split(line[len("@evidence ") :])
+        except ValueError as error:
+            raise WorldEvidenceError(
+                f"{location}:{line_number} contains malformed evidence fields"
+            ) from error
+        fields: dict[str, str] = {}
+        for token in tokens:
+            if "=" not in token:
+                raise WorldEvidenceError(
+                    f"{location}:{line_number} evidence token lacks '='"
+                )
+            key, value = token.split("=", 1)
+            if not key or not value or key in fields:
+                raise WorldEvidenceError(
+                    f"{location}:{line_number} has an invalid/duplicate evidence field"
+                )
+            fields[key] = value
+        if "event" not in fields:
+            raise WorldEvidenceError(
+                f"{location}:{line_number} evidence observation lacks event"
+            )
+        observations.append(fields)
+    return observations
+
+
+def _derive_claims(transcript: str, location: str) -> set[str]:
+    observations = _parse_observations(transcript, location)
+    claims: set[str] = set()
+    for claim, requirements in CLAIM_RULES:
+        if all(
+            any(
+                observation.get("event") == event
+                and all(observation.get(key) == value for key, value in fields)
+                for observation in observations
+            )
+            for event, fields in requirements
+        ):
+            claims.add(claim)
+    transcript_lines = set(transcript.splitlines())
+    for claim, markers in LEGACY_CLAIM_MARKERS.items():
+        if all(marker in transcript_lines for marker in markers):
+            claims.add(claim)
+    return claims
+
+
+def _validator_sha256(root: Path) -> str:
+    return hashlib.sha256(
+        (root / "scripts/world_alpha_evidence.py").read_bytes()
+    ).hexdigest()
+
+
+def _source_digest_matches(
+    root: Path, source_path: Path, source_text: str, source_commit: str, digest: str
+) -> bool:
+    if hashlib.sha256(source_path.read_bytes()).hexdigest() == digest:
+        return True
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f"{source_commit}:{source_text}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and hashlib.sha256(result.stdout).hexdigest() == digest
+
+
 def _validate_attestation(
     root: Path,
     path_value: Any,
     gate_id: str,
     class_ids: set[str],
+    registry_semantics_sha256: str,
 ) -> dict[str, Any]:
     path_text, attestation_path = _repo_file(
         root, path_value, f"{gate_id}.evidence path"
     )
     attestation = _strict_toml_file(attestation_path, path_text)
-    expected_keys = {
+    common_keys = {
         "schema_version",
         "id",
         "gate",
@@ -402,17 +664,29 @@ def _validate_attestation(
         "transcript",
         "transcript_sha256",
         "topology",
-        "claims",
         "nonclaims",
         "expected_markers",
         "source",
         "artifact",
         "signatures",
     }
-    if set(attestation) != expected_keys:
+    schema_version = attestation.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise WorldEvidenceError(
+            f"attestation {path_text} schema_version must be 1 or 2"
+        )
+    version_keys = (
+        {"claims"}
+        if schema_version == 1
+        else {
+            "derived_claims",
+            "validator_sha256",
+            "claim_rule_policy_sha256",
+            "registry_semantics_sha256",
+        }
+    )
+    if set(attestation) != common_keys | version_keys:
         raise WorldEvidenceError(f"attestation {path_text} keys differ from schema")
-    if type(attestation["schema_version"]) is not int or attestation["schema_version"] != 1:
-        raise WorldEvidenceError(f"attestation {path_text} schema_version must be 1")
     attestation_id = _require_string(attestation["id"], f"{path_text}.id")
     if ATTESTATION_ID.fullmatch(attestation_id) is None:
         raise WorldEvidenceError(f"{path_text}.id is not a normalized identifier")
@@ -469,6 +743,41 @@ def _validate_attestation(
             raise WorldEvidenceError(
                 f"{transcript_text} must contain exactly one {line!r} line"
             )
+    derived_claims = _derive_claims(transcript, transcript_text)
+    if schema_version == 2:
+        recorded_claims = _require_string_list(
+            attestation["derived_claims"],
+            f"{path_text}.derived_claims",
+            minimum=1,
+        )
+        if recorded_claims != sorted(set(recorded_claims)):
+            raise WorldEvidenceError(
+                f"{path_text}.derived_claims must be sorted and unique"
+            )
+        if set(recorded_claims) != derived_claims:
+            raise WorldEvidenceError(
+                f"{path_text}.derived_claims differs from validator output"
+            )
+        if _require_sha256(
+            attestation["validator_sha256"], f"{path_text}.validator_sha256"
+        ) != _validator_sha256(root):
+            raise WorldEvidenceError(
+                f"{path_text}.validator_sha256 does not pin this validator"
+            )
+        if _require_sha256(
+            attestation["claim_rule_policy_sha256"],
+            f"{path_text}.claim_rule_policy_sha256",
+        ) != CLAIM_RULE_POLICY_SHA256:
+            raise WorldEvidenceError(
+                f"{path_text}.claim_rule_policy_sha256 differs from claim rules"
+            )
+        if _require_sha256(
+            attestation["registry_semantics_sha256"],
+            f"{path_text}.registry_semantics_sha256",
+        ) != registry_semantics_sha256:
+            raise WorldEvidenceError(
+                f"{path_text}.registry_semantics_sha256 differs from gate definitions"
+            )
     markers = _require_string_list(
         attestation["expected_markers"],
         f"{path_text}.expected_markers",
@@ -519,26 +828,14 @@ def _validate_attestation(
                 f"{path_text} does not describe the required one-vCPU AArch64 TCG virt topology"
             )
 
-    claims = _require_string_list(
-        attestation["claims"], f"{path_text}.claims", minimum=1
-    )
+    if schema_version == 1:
+        _require_string_list(attestation["claims"], f"{path_text}.claims", minimum=1)
     nonclaims = _require_string_list(
         attestation["nonclaims"], f"{path_text}.nonclaims", minimum=1
     )
-    if evidence_class == "qemu_tcg_aarch64":
-        claim_text = " ".join(claims)
-        for fragment in ("AArch64", "EL0", "IPC", "capability", "lifecycle"):
-            if fragment not in claim_text:
-                raise WorldEvidenceError(
-                    f"{path_text}.claims is missing bounded G2 term {fragment!r}"
-                )
+    if evidence_class in NONCLAIM_FLOORS:
         nonclaim_text = " ".join(nonclaims)
-        for fragment in (
-            "physical AArch64",
-            "KVM/SVM",
-            "Linux or Plan 9",
-            "PCI/DMA/IOMMU",
-        ):
+        for fragment in NONCLAIM_FLOORS[evidence_class]:
             if fragment not in nonclaim_text:
                 raise WorldEvidenceError(
                     f"{path_text}.nonclaims is missing boundary {fragment!r}"
@@ -557,7 +854,14 @@ def _validate_attestation(
             raise WorldEvidenceError(f"{path_text}.source contains a duplicate path")
         seen_sources.add(source_text)
         digest = _require_sha256(source["sha256"], f"{owner}.sha256")
-        if hashlib.sha256(source_path.read_bytes()).hexdigest() != digest:
+        # Schema-v1 records predate the append-only ledger and used hashes of a
+        # content-addressed working tree that may never have been committed.
+        # Preserve those immutable records even when their historical bytes are
+        # no longer locally reconstructible.  Schema v2 requires live or Git
+        # object verification for every source digest.
+        if schema_version == 2 and not _source_digest_matches(
+            root, source_path, source_text, source_commit, digest
+        ):
             raise WorldEvidenceError(f"{owner} digest does not match {source_text}")
 
     artifacts = attestation["artifact"]
@@ -605,8 +909,146 @@ def _validate_attestation(
     return {
         "id": attestation_id,
         "path": path_text,
+        "gate": gate_id,
         "class": evidence_class,
+        "derived_claims": derived_claims,
+        "schema_version": schema_version,
     }
+
+
+def _validate_evidence_event(root: Path, path: Path) -> dict[str, Any]:
+    path_text = path.relative_to(root).as_posix()
+    event = _strict_toml_file(path, path_text)
+    expected_keys = {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "replacement",
+        "reason_code",
+        "reason",
+        "source_commit",
+        "signatures",
+    }
+    if set(event) != expected_keys:
+        raise WorldEvidenceError(f"evidence event {path_text} keys differ from schema")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise WorldEvidenceError(f"evidence event {path_text} schema_version must be 1")
+    event_id = _require_string(event["id"], f"{path_text}.id")
+    subject = _require_string(event["subject"], f"{path_text}.subject")
+    for field, value in (("id", event_id), ("subject", subject)):
+        if ATTESTATION_ID.fullmatch(value) is None:
+            raise WorldEvidenceError(f"{path_text}.{field} is not normalized")
+    kind = _require_string(event["event"], f"{path_text}.event")
+    if kind not in {"supersede", "retract"}:
+        raise WorldEvidenceError(f"{path_text}.event must be supersede or retract")
+    replacement = event["replacement"]
+    if not isinstance(replacement, str):
+        raise WorldEvidenceError(f"{path_text}.replacement must be a string")
+    if kind == "supersede":
+        replacement = _require_string(replacement, f"{path_text}.replacement")
+        if ATTESTATION_ID.fullmatch(replacement) is None:
+            raise WorldEvidenceError(f"{path_text}.replacement is not normalized")
+        if replacement == subject:
+            raise WorldEvidenceError(f"{path_text} cannot supersede an attestation with itself")
+    elif replacement != "":
+        raise WorldEvidenceError(f"{path_text}.replacement must be empty for retraction")
+    _require_string(event["reason_code"], f"{path_text}.reason_code")
+    _require_string(event["reason"], f"{path_text}.reason")
+    source_commit = _require_string(event["source_commit"], f"{path_text}.source_commit")
+    if HEX_COMMIT.fullmatch(source_commit) is None:
+        raise WorldEvidenceError(f"{path_text}.source_commit must be a Git object ID")
+    if event["signatures"] != []:
+        raise WorldEvidenceError(
+            f"{path_text}.signatures must be empty for repository-authored events"
+        )
+    return {
+        "id": event_id,
+        "path": path_text,
+        "event": kind,
+        "subject": subject,
+        "replacement": replacement,
+    }
+
+
+def _active_evidence_ledger(
+    root: Path, class_ids: set[str], registry_semantics_sha256: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ledger_dir = root / "evidence/world"
+    paths = sorted(ledger_dir.glob("*.toml"))
+    attestations: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for path in paths:
+        raw = _strict_toml_file(path, path.relative_to(root).as_posix())
+        if "event" in raw:
+            events.append(_validate_evidence_event(root, path))
+            continue
+        gate_id = _require_string(raw.get("gate"), f"{path}.gate")
+        if gate_id not in EXPECTED_GATE_IDS:
+            raise WorldEvidenceError(f"{path} references unknown gate {gate_id}")
+        attestations.append(
+            _validate_attestation(
+                root,
+                path.relative_to(root).as_posix(),
+                gate_id,
+                class_ids,
+                registry_semantics_sha256,
+            )
+        )
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in [*attestations, *events]:
+        if item["id"] in by_id:
+            raise WorldEvidenceError(f"evidence ledger ID {item['id']} is reused")
+        by_id[item["id"]] = item
+    attestations_by_id = {item["id"]: item for item in attestations}
+    event_by_subject: dict[str, dict[str, Any]] = {}
+    for event in events:
+        subject = event["subject"]
+        if subject not in attestations_by_id:
+            raise WorldEvidenceError(
+                f"{event['path']} references missing subject {subject}"
+            )
+        if subject in event_by_subject:
+            raise WorldEvidenceError(
+                f"attestation {subject} has multiple competing ledger events"
+            )
+        replacement = event["replacement"]
+        if replacement:
+            if replacement not in attestations_by_id:
+                raise WorldEvidenceError(
+                    f"{event['path']} references missing replacement {replacement}"
+                )
+            if attestations_by_id[replacement]["gate"] != attestations_by_id[subject]["gate"]:
+                raise WorldEvidenceError(
+                    f"{event['path']} supersedes evidence across unrelated gates"
+                )
+        event_by_subject[subject] = event
+
+    # Every successor chain must terminate, and no attestation may be the
+    # replacement of two unrelated active histories.
+    replacement_predecessors: dict[str, str] = {}
+    for subject, event in event_by_subject.items():
+        replacement = event["replacement"]
+        if replacement:
+            previous = replacement_predecessors.setdefault(replacement, subject)
+            if previous != subject:
+                raise WorldEvidenceError(
+                    f"replacement {replacement} has competing predecessors"
+                )
+        seen: set[str] = set()
+        current = subject
+        while current in event_by_subject:
+            if current in seen:
+                raise WorldEvidenceError("evidence supersession graph contains a cycle")
+            seen.add(current)
+            current = event_by_subject[current]["replacement"]
+            if not current:
+                break
+
+    inactive_ids = set(event_by_subject)
+    active = [item for item in attestations if item["id"] not in inactive_ids]
+    return active, events
 
 
 def _validate_constitution(data: dict[str, Any], root: Path) -> None:
@@ -804,16 +1246,13 @@ def validated_gates(
     expected_gate_keys = {
         "id",
         "title",
-        "status",
         "depends_on",
         "required_classes",
         "one_of_classes",
         "acceptance",
         "prohibited_substitutes",
-        "evidence",
     }
     gates: list[dict[str, Any]] = []
-    seen_attestation_ids: set[str] = set()
     for index, (expected_id, raw) in enumerate(zip(EXPECTED_GATE_IDS, raw_gates)):
         location = f"gate[{index}]"
         if not isinstance(raw, dict) or set(raw) != expected_gate_keys:
@@ -822,11 +1261,6 @@ def validated_gates(
         if gate_id != expected_id:
             raise WorldEvidenceError(
                 f"{location}.id must be {expected_id}, got {gate_id}"
-            )
-        status = _require_string(raw["status"], f"{location}.status")
-        if status not in {"defined", "passed"}:
-            raise WorldEvidenceError(
-                f"{location}.status must be defined or passed"
             )
         dependencies = _require_string_list(
             raw["depends_on"], f"{location}.depends_on"
@@ -870,45 +1304,10 @@ def validated_gates(
                 f"{location} treats nonqualifying classes as qualifying: "
                 f"{sorted(forbidden)}"
             )
-        evidence_paths = _require_string_list(
-            raw["evidence"],
-            f"{location}.evidence",
-            minimum=1 if status == "passed" else 0,
-        )
-        if status == "defined" and evidence_paths:
-            raise WorldEvidenceError(
-                f"{location}.evidence must be empty while status is defined"
-            )
-        attestations: list[dict[str, Any]] = []
-        if status == "passed" and not definitions_only:
-            attestations = [
-                _validate_attestation(root, path, gate_id, class_ids)
-                for path in evidence_paths
-            ]
-            for attestation in attestations:
-                if attestation["id"] in seen_attestation_ids:
-                    raise WorldEvidenceError(
-                        f"attestation ID {attestation['id']} is reused"
-                    )
-                seen_attestation_ids.add(attestation["id"])
-            observed_classes = {item["class"] for item in attestations}
-            missing_classes = required_classes - observed_classes
-            if missing_classes:
-                raise WorldEvidenceError(
-                    f"{location}.evidence is missing required classes "
-                    f"{sorted(missing_classes)}"
-                )
-            for alternatives in one_of_classes:
-                if not (alternatives & observed_classes):
-                    raise WorldEvidenceError(
-                        f"{location}.evidence satisfies no class from "
-                        f"{sorted(alternatives)}"
-                    )
         gates.append(
             {
                 "id": gate_id,
                 "title": _require_string(raw["title"], f"{location}.title"),
-                "status": status,
                 "depends_on": dependencies,
                 "required_classes": required_classes,
                 "one_of_classes": one_of_classes,
@@ -920,27 +1319,69 @@ def validated_gates(
                     f"{location}.prohibited_substitutes",
                     minimum=1,
                 ),
-                "evidence": attestations if not definitions_only else evidence_paths,
+                "required_claims": REQUIRED_CLAIM_FLOORS[gate_id],
             }
         )
-    statuses = {gate["id"]: gate["status"] for gate in gates}
-    for gate in gates:
-        if gate["status"] == "passed":
-            missing_dependencies = [
-                dependency
-                for dependency in gate["depends_on"]
-                if statuses[dependency] != "passed"
-            ]
-            if missing_dependencies:
-                raise WorldEvidenceError(
-                    f"{gate['id']} cannot pass before dependencies "
-                    f"{missing_dependencies}"
-                )
     actual_semantics = _registry_semantics_sha256(data)
     if actual_semantics != EXPECTED_REGISTRY_SEMANTICS_SHA256:
         raise WorldEvidenceError(
             "registry semantics drifted without a constitution/schema version update; "
             f"got {actual_semantics}"
+        )
+    if definitions_only:
+        for gate in gates:
+            gate.update(
+                {
+                    "status": "defined",
+                    "evidence": [],
+                    "derived_claims": set(),
+                    "not_established": sorted(gate["required_claims"]),
+                }
+            )
+        return gates
+
+    active_evidence, _events = _active_evidence_ledger(
+        root, class_ids, actual_semantics
+    )
+    by_gate: dict[str, list[dict[str, Any]]] = {
+        gate_id: [] for gate_id in EXPECTED_GATE_IDS
+    }
+    for attestation in active_evidence:
+        by_gate[attestation["gate"]].append(attestation)
+
+    statuses: dict[str, str] = {}
+    for gate in gates:
+        attestations = by_gate[gate["id"]]
+        observed_classes = {item["class"] for item in attestations}
+        derived_claims = set().union(
+            *(item["derived_claims"] for item in attestations)
+        ) if attestations else set()
+        classes_satisfied = gate["required_classes"] <= observed_classes
+        alternatives_satisfied = all(
+            alternatives & observed_classes
+            for alternatives in gate["one_of_classes"]
+        )
+        claims_satisfied = gate["required_claims"] <= derived_claims
+        dependencies_satisfied = all(
+            statuses.get(dependency) == "passed"
+            for dependency in gate["depends_on"]
+        )
+        status = (
+            "passed"
+            if classes_satisfied
+            and alternatives_satisfied
+            and claims_satisfied
+            and dependencies_satisfied
+            else "defined"
+        )
+        statuses[gate["id"]] = status
+        gate.update(
+            {
+                "status": status,
+                "evidence": attestations,
+                "derived_claims": derived_claims,
+                "not_established": sorted(gate["required_claims"] - derived_claims),
+            }
         )
     return gates
 
@@ -981,7 +1422,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "World Alpha gate registry: "
             f"{len(gates)}/{len(gates)} gates defined, {passed} passed; "
-            f"G13 {alpha['status'].upper()} (schema v2 typed attestations)"
+            f"G13 {alpha['status'].upper()} (schema v3 derived ledger view)"
         )
     return 0
 

@@ -42,6 +42,11 @@ SECTIONS
         *(COMMON)
 
         . = ALIGN(16);
+        g2_el2_stack_bottom = .;
+        . += 0x4000;
+        g2_el2_stack_top = .;
+
+        . = ALIGN(16);
         g2_kernel_stack_bottom = .;
         . += 0x10000;
         g2_kernel_stack_top = .;
@@ -68,6 +73,7 @@ SECTIONS
 }
 
 ASSERT((g2_vectors & 0x7ff) == 0, "AArch64 VBAR must be 2 KiB aligned")
+ASSERT((g2_el2_vectors & 0x7ff) == 0, "AArch64 VBAR_EL2 must be 2 KiB aligned")
 ASSERT(__g2_user_text_end > __g2_user_text_start,
        "G2 must contain compiled EL0 O-core text")
 ASSERT(__image_end < 0x41000000, "G2 image exceeds bounded QEMU virt window")

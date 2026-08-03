@@ -1,11 +1,68 @@
 .arch armv8-a
 
 .equ G2_FRAME_SIZE, 288
+.equ G2_EL2_HVC_IMM, 0x4f4d
 
 .macro G2_VECTOR target
     b \target
     .space 124
 .endm
+
+// Resident EL2 vector.  Only a lower-AArch64 synchronous HVC in the G2
+// operation domain is accepted; every other exception stops at EL2.
+.section .vectors, "ax", %progbits
+.balign 2048
+.global g2_el2_vectors
+g2_el2_vectors:
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SP0, synchronous
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SP0, IRQ
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SP0, FIQ
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SP0, SError
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SPx, synchronous
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SPx, IRQ
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SPx, FIQ
+    G2_VECTOR g2_el2_unexpected_vector // Current EL with SPx, SError
+    G2_VECTOR g2_el2_lower_a64_sync    // Lower EL using AArch64, synchronous
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch64, IRQ
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch64, FIQ
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch64, SError
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch32, synchronous
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch32, IRQ
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch32, FIQ
+    G2_VECTOR g2_el2_unexpected_vector // Lower EL using AArch32, SError
+
+.section .text.g2_el2_vectors, "ax", %progbits
+.balign 16
+g2_el2_lower_a64_sync:
+    mrs x9, esr_el2
+    lsr x10, x9, #26
+    cmp x10, #0x16
+    b.ne g2_el2_unexpected_vector
+    and x10, x9, #0xffff
+    movz x11, #G2_EL2_HVC_IMM
+    cmp x10, x11
+    b.ne g2_el2_unexpected_vector
+    movz x11, #0x0001
+    movk x11, #0x4f4d, lsl #16
+    cmp x0, x11
+    b.ne g2_el2_unexpected_vector
+    movz x11, #0x1111
+    movk x11, #0x1111, lsl #16
+    cmp x1, x11
+    b.ne g2_el2_unexpected_vector
+    adrp x11, g2_el2_hvc_count
+    add x11, x11, :lo12:g2_el2_hvc_count
+    ldr x12, [x11]
+    cbnz x12, g2_el2_unexpected_vector
+    mov x12, #1
+    str x12, [x11]
+    movz x0, #0x0002
+    movk x0, #0x4f4d, lsl #16
+    eret
+
+g2_el2_unexpected_vector:
+    wfe
+    b g2_el2_unexpected_vector
 
 .section .vectors, "ax", %progbits
 .balign 2048
@@ -191,6 +248,12 @@ g2_unexpected_vector:
     mrs x0, esr_el1
     bl g2_kernel_vector_failure
     b g2_arch_halt
+
+.section .bss.g2_el2, "aw", %nobits
+.balign 8
+.global g2_el2_hvc_count
+g2_el2_hvc_count:
+    .skip 8
 
 .section .bss.g2_context, "aw", %nobits
 .balign 16

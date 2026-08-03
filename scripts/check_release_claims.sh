@@ -299,13 +299,13 @@ require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
     'the hosted profile Alpha non-claim is missing'
 
 require_fixed docs/CLAIMS.md \
-    'Schema v2 marks only G0 and G2 `passed`' \
+    'Only G0 and G2 currently derive `passed`' \
     'the dependency-checked G0/G2 passage boundary is missing'
 require_fixed docs/CLAIMS.md \
     'G2 is not physical AArch64 or KVM/SVM evidence' \
     'the AArch64 TCG gate could be promoted to physical or hardware virtualization evidence'
 require_fixed docs/CLAIMS.md \
-    'It does not boot Linux or Plan 9, provide a general foreign ABI' \
+    'delivery, boot Linux or Plan 9, provide a general foreign ABI' \
     'the AArch64 G2 gate could be promoted to foreign-OS or general ABI evidence'
 require_fixed docs/CLAIMS.md \
     "Mode 23's synthetic guest is not G7 or G8" \
@@ -434,7 +434,7 @@ require_fixed README.md \
     'passes no G0--G13 gate.' \
     'the Mode 27 identity slice could be misread as Alpha qualification'
 require_fixed docs/OSTADIX_WORLD.md \
-    'Only the evidence records named by the schema-v2' \
+    'Only active evidence-ledger heads whose' \
     'the typed World evidence admission boundary is missing'
 
 for file in README.md llms.txt docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
