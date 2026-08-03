@@ -1,0 +1,117 @@
+schema_version = 3
+id = "g0-repository-conformance-2026-08-03-v2"
+gate = "G0"
+evidence_class = "repository_conformance"
+source_commit = "c25d38c00283f2873eed1aa84dd89b437777e356"
+source_state = "content-addressed-working-tree"
+command = ["./scripts/smoke-world-g0-conformance.sh"]
+transcript = "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log"
+transcript_sha256 = "6d26ba8774299d5b72155841e6adfe97930ef92e4256a0673403d8ba164b670c"
+validator_sha256 = "996429367acc37db22bde50f2b3283279bb242b4299d6fa1ab3a8f8a3cb868db"
+claim_rule_policy_sha256 = "3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
+registry_semantics_sha256 = "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea"
+derivation_hash = "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
+derived_claims = [
+  "evidence.claim_class_guarded",
+  "world.contract_schema_consistent",
+  "world.crossing_taxonomy_consistent",
+  "world.failure_consistency_schema_consistent",
+  "world.identity_vocabulary_consistent",
+  "world.machine_contract_consistent",
+]
+nonclaims = [
+  "Repository conformance is supporting design evidence, not native execution, physical hardware, a Governor, WorldFS, distributed execution, a foreign-kernel boot, device assignment, DMA/IOMMU isolation, or World Alpha",
+  "Passing G0 does not pass any dependent gate without that gate's separate qualifying evidence and derived claim floor",
+]
+expected_markers = [
+  "G0 executable contract schema: PASS",
+  "G0 executable O-Machine contract schema: PASS",
+  "G0 crossing taxonomy: PASS",
+  "G0 identity vocabulary Rust/native: PASS",
+  "G0 failure and consistency schemas: PASS",
+  "G0 claim-class substitution guard: PASS",
+  "G0 repository conformance: PASS",
+]
+signatures = []
+
+[topology]
+kind = "repository"
+architecture = "multi-target-schema"
+machine = "canonical repository checkout"
+acceleration = "none"
+cpu_count = 0
+inventory = [
+  "Git base commit c25d38c00283f2873eed1aa84dd89b437777e356",
+  "Constitution v3 with composed World contract v2 and O-Machine contract v1",
+  "Schema-v4 definition-only gate registry and append-only evidence ledger",
+  "Versioned derivation and qualification identities with explicit nonclaim floors",
+]
+
+[[source]]
+path = "docs/OSTADIX_WORLD.md"
+sha256 = "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
+
+[[source]]
+path = "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+sha256 = "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
+
+[[source]]
+path = "docs/O_MACHINE_CONTRACT.md"
+sha256 = "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
+
+[[source]]
+path = "evidence/world_contract_v1.toml"
+sha256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+
+[[source]]
+path = "evidence/world_contract_v2.toml"
+sha256 = "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+
+[[source]]
+path = "evidence/o_machine_contract_v1.toml"
+sha256 = "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
+
+[[source]]
+path = "evidence/world_alpha_gates.toml"
+sha256 = "1407755260bc59317ea6a28e7178e7774c58e4b7ad13d54f2ab579c4dedbb81c"
+
+[[source]]
+path = "scripts/world_alpha_evidence.py"
+sha256 = "996429367acc37db22bde50f2b3283279bb242b4299d6fa1ab3a8f8a3cb868db"
+
+[[source]]
+path = "scripts/smoke-world-g0-conformance.sh"
+sha256 = "c4a66a2d80985f64b78d8d3898172e68e9fca0dd462d7c4849072ba7d2622e22"
+
+[[source]]
+path = "src/world/identity.rs"
+sha256 = "e771eaf259f78e1f7fc640afcdd19234a79ccabcefc5274d568c69719b25e592"
+
+[[source]]
+path = "ocore/world/identity.oc"
+sha256 = "610b78053032014935f019a68f2ce732a3c3bcf97fd3a76e15344cfe3be91020"
+
+[[source]]
+path = "tests/test_world_alpha_evidence.py"
+sha256 = "d7f130e3ea1b2a940145bfd7d519f91ab20d6c73fbeb87c74185db2de8b4fd3b"
+
+[[artifact]]
+name = "world-contract-v1"
+kind = "executable-constitutional-schema"
+sha256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+retained = true
+path = "evidence/world_contract_v1.toml"
+
+[[artifact]]
+name = "world-contract-v2"
+kind = "executable-constitutional-schema"
+sha256 = "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+retained = true
+path = "evidence/world_contract_v2.toml"
+
+[[artifact]]
+name = "o-machine-contract-v1"
+kind = "executable-machine-contract-schema"
+sha256 = "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
+retained = true
+path = "evidence/o_machine_contract_v1.toml"

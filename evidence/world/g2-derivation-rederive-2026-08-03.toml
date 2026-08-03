@@ -1,0 +1,13 @@
+schema_version = 1
+id = "g2-claim-rederive-2026-08-03-v1"
+event = "rederive"
+subject = "g2-aarch64-qemu-tcg-2026-08-03"
+prior_derivation = "sha256:4ad65ced8628208827503c7008db2850d6ed9693e7628354bb9ef8654080d6ef"
+current_derivation = "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
+claims_lost = []
+claims_gained = []
+reason_code = "derivation-identity-upgrade"
+reason = "The claim set is unchanged; this event separates claim-derivation identity from the whole-validator digest."
+source_commit = "c25d38c00283f2873eed1aa84dd89b437777e356"
+payload_sha256 = "6163643480a5f6bccbfa7baa9ea7bbbf9acdaf90c010a95b8758fbdfea911360"
+signatures = []

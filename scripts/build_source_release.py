@@ -156,18 +156,26 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "README.md",
         "boot-and-test.sh",
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+        "docs/O_MACHINE_CONTRACT.md",
         "docs/OSTADIX_WORLD.md",
         "evidence/gates.toml",
         "evidence/world_alpha_gates.toml",
         "evidence/world_contract_v1.toml",
+        "evidence/world_contract_v2.toml",
+        "evidence/o_machine_contract_v1.toml",
         "evidence/world/g0-repository-conformance.toml",
         "evidence/world/g0-repository-conformance-2026-08-03.toml",
+        "evidence/world/g0-derivation-rederive-2026-08-03.toml",
         "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
+        "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
+        "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
         "evidence/world/g2-aarch64-qemu.toml",
         "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
+        "evidence/world/g2-derivation-rederive-2026-08-03.toml",
         "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
         "evidence/world/transcripts/g0-repository-conformance.log",
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
+        "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
         "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
@@ -262,6 +270,7 @@ VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40,64}\Z")
+WORLD_LEDGER_ID = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
 EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
@@ -307,30 +316,98 @@ G2_AARCH64_EXPECTED_MARKERS = (
     "G2 AArch64 native compiler QEMU smoke: PASS",
 )
 
-# These four files jointly define the version-2 native World constitution,
-# executable G0 contract, and definition-only G0-G13 registry. Source releases are built from arbitrary
+# These files jointly define the version-3 native World constitution,
+# composed executable G0 contracts, and definition-only G0-G13 registry. Source releases are built from arbitrary
 # committed refs and archive verification must not execute the Python shipped in
 # an untrusted ZIP, so keep trusted byte seals here and recheck the inert data
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+        "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
         "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
     ),
     "evidence/world_alpha_gates.toml": (
-        "4afa892b58d98c8212d44250a2f78270f96570fc88063733f89c9747336a0a92"
+        "1407755260bc59317ea6a28e7178e7774c58e4b7ad13d54f2ab579c4dedbb81c"
     ),
     "evidence/world_contract_v1.toml": (
         "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
     ),
+    "evidence/world_contract_v2.toml": (
+        "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+    ),
+    "docs/O_MACHINE_CONTRACT.md": (
+        "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
+    ),
+    "evidence/o_machine_contract_v1.toml": (
+        "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
+    ),
 }
-WORLD_CLAIM_POLICY_SHA256 = (
-    "5396b8bf538735aac81467d828b9600d683d04b84a52ce22188755b1fdbbe3dd"
+WORLD_CONTRACT_V2_SEMANTICS_SHA256 = (
+    "d2faa552ddb549c600566651a8978f524019c76231703226c33b57b6a8cc1727"
 )
+WORLD_MACHINE_CONTRACT_SEMANTICS_SHA256 = (
+    "d67c050831b1b52bbb3ec6569d775ce8b0782c6610acc7a8e2e92658af599bf2"
+)
+WORLD_IMPORTED_CONSTITUTION_V2_SHA256 = (
+    "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+)
+WORLD_CLAIM_POLICY_SHA256 = (
+    "3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
+)
+WORLD_DERIVATION_HASH = (
+    "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
+)
+WORLD_VALIDATOR_SHA256 = (
+    "996429367acc37db22bde50f2b3283279bb242b4299d6fa1ab3a8f8a3cb868db"
+)
+WORLD_REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
+WORLD_WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
+WORLD_HISTORICAL_ATTESTATION_SHA256 = {
+    "evidence/world/g0-repository-conformance.toml": (
+        "f1d1579e8cd7b65e4aa2ce641fe174ff185196c260b65efd4d7cdd1f52d43caa"
+    ),
+    "evidence/world/g0-repository-conformance-2026-08-03.toml": (
+        "a057ec3ab8fb9eac618be635133d106342aff13e85335c74d3e6522e8e46d425"
+    ),
+    "evidence/world/g2-aarch64-qemu.toml": (
+        "99414f1cf356b3666c163e0e28172eaf2b46e3f14c8f13f2ce12fa24cc9d30d7"
+    ),
+    "evidence/world/g2-aarch64-qemu-2026-08-03.toml": (
+        "5b2af3bdaad2cdc4f5efb097c784e28ee5915dfa32b3404bc7ba69caa5ff9eb2"
+    ),
+}
+WORLD_CURRENT_ATTESTATION_SHA256 = {
+    "evidence/world/g0-repository-conformance-2026-08-03-v2.toml": (
+        "0016e953bbd353f28b771e8e2d0cfe34867bc7f6561e06c7e1c86fb908a9a8c4"
+    ),
+}
+# Repository-authored lifecycle and derivation events are immutable ledger
+# records.  The release verifier seals their complete bytes independently of
+# the payload hash carried by a rederive event.
+WORLD_EVIDENCE_EVENT_SHA256 = {
+    "evidence/world/g0-derivation-rederive-2026-08-03.toml": (
+        "80a0f4805fb4ebf63f6e22d70aa7d01dc5d84856df1bbc2fe4626fca8ac08f7c"
+    ),
+    "evidence/world/g0-schema-v3-supersession-2026-08-03.toml": (
+        "367171fbfe3cf92f0f4f0ec21d4cbccf16f9b4c0582be3ca007633e67090c810"
+    ),
+    "evidence/world/g0-machine-contract-supersession-2026-08-03.toml": (
+        "e4b924570811db48a03a5cae48de7c3061e932feabf89a92f20ce571c82aa047"
+    ),
+    "evidence/world/g2-counter-wording-supersession-2026-08-03.toml": (
+        "c2098f66697e0b0b3435e83e75e6e6fa64d22e24beb93a086d9b1a25a947a01b"
+    ),
+    "evidence/world/g2-derivation-rederive-2026-08-03.toml": (
+        "f8c89bd76f0c428486729f175615ad7a1d4df87b5640cfa2b6fb508a2ab3da3f"
+    ),
+}
 WORLD_REGISTRY_SEMANTICS_SHA256 = (
-    "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
+    "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea"
+)
+WORLD_LEGACY_ACTIVE_SCHEMA2_IDS = frozenset(
+    {"g2-aarch64-qemu-tcg-2026-08-03"}
 )
 WORLD_DERIVED_CLAIMS = {
     "G0": {
@@ -339,6 +416,7 @@ WORLD_DERIVED_CLAIMS = {
         "world.crossing_taxonomy_consistent",
         "world.failure_consistency_schema_consistent",
         "world.identity_vocabulary_consistent",
+        "world.machine_contract_consistent",
     },
     "G2": {
         "aarch64.el0_execution",
@@ -958,6 +1036,13 @@ def _strict_toml(data: bytes, path: str) -> dict[str, object]:
     return value
 
 
+def _toml_semantics_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _required_string(value: object, owner: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ReleaseError(f"{owner} must be a non-empty trimmed string")
@@ -1352,7 +1437,7 @@ def _sealed_world_alpha_text(
     actual = hashlib.sha256(files[path]).hexdigest()
     if actual != expected:
         raise ReleaseError(
-            f"{path} SHA-256 differs from sealed World Alpha v2 bytes; "
+            f"{path} SHA-256 differs from sealed World Alpha constitutional bytes; "
             f"expected {expected}, got {actual}"
         )
     try:
@@ -1361,10 +1446,182 @@ def _sealed_world_alpha_text(
         raise ReleaseError(f"{path} is not valid UTF-8") from error
 
 
+def _release_world_observations(transcript: str, location: str) -> list[dict[str, str]]:
+    observations: list[dict[str, str]] = []
+    for line_number, line in enumerate(transcript.splitlines(), 1):
+        if not line.startswith("@evidence "):
+            continue
+        payload = line[len("@evidence ") :]
+        tokens = payload.split(" ")
+        if not payload or any(not token for token in tokens):
+            raise ReleaseError(
+                f"{location}:{line_number} contains noncanonical evidence spacing"
+            )
+        fields: dict[str, str] = {}
+        for token in tokens:
+            if "=" not in token:
+                raise ReleaseError(f"{location}:{line_number} evidence token lacks '='")
+            key, value = token.split("=", 1)
+            if (
+                re.fullmatch(r"[a-z][a-z0-9_]*", key) is None
+                or not value
+                or any(not 0x21 <= ord(character) <= 0x7E for character in value)
+                or key in fields
+            ):
+                raise ReleaseError(
+                    f"{location}:{line_number} has an invalid/duplicate evidence field"
+                )
+            fields[key] = value
+        if "event" not in fields:
+            raise ReleaseError(f"{location}:{line_number} evidence observation lacks event")
+        observations.append(fields)
+    return observations
+
+
+def _derive_release_world_claims(
+    transcript: str,
+    location: str,
+    evidence_class: str,
+    topology: dict[str, object],
+    source_paths: set[str],
+    artifact_names: set[str],
+    artifact_bindings: set[tuple[str, str, str]],
+) -> set[str]:
+    observations = _release_world_observations(transcript, location)
+
+    def observed(event: str, **fields: str) -> bool:
+        return any(
+            observation.get("event") == event
+            and all(observation.get(key) == value for key, value in fields.items())
+            for observation in observations
+        )
+
+    claims: set[str] = set()
+    repository = (
+        evidence_class == "repository_conformance"
+        and topology.get("kind") == "repository"
+        and topology.get("acceleration") == "none"
+    )
+    v1_artifact = (
+        "world-contract-v1",
+        "executable-constitutional-schema",
+        "evidence/world_contract_v1.toml",
+    )
+    v2_artifact = (
+        "world-contract-v2",
+        "executable-constitutional-schema",
+        "evidence/world_contract_v2.toml",
+    )
+    machine_artifact = (
+        "o-machine-contract-v1",
+        "executable-machine-contract-schema",
+        "evidence/o_machine_contract_v1.toml",
+    )
+    g0_rules = {
+        "world.contract_schema_consistent": (
+            "g0_contract_schema",
+            {v1_artifact, v2_artifact},
+            {
+                "evidence/world_contract_v1.toml",
+                "evidence/world_contract_v2.toml",
+                "evidence/world_alpha_gates.toml",
+            },
+        ),
+        "world.machine_contract_consistent": (
+            "g0_machine_contract",
+            {machine_artifact},
+            {
+                "docs/O_MACHINE_CONTRACT.md",
+                "evidence/o_machine_contract_v1.toml",
+                "evidence/world_contract_v2.toml",
+            },
+        ),
+        "world.crossing_taxonomy_consistent": (
+            "g0_crossing_taxonomy",
+            {v1_artifact},
+            set(),
+        ),
+        "world.identity_vocabulary_consistent": (
+            "g0_identity_vocabulary",
+            {v1_artifact},
+            set(),
+        ),
+        "world.failure_consistency_schema_consistent": (
+            "g0_failure_consistency",
+            {v1_artifact},
+            set(),
+        ),
+        "evidence.claim_class_guarded": (
+            "g0_claim_class_guard",
+            set(),
+            {"evidence/world_alpha_gates.toml", "scripts/world_alpha_evidence.py"},
+        ),
+    }
+    if repository:
+        for claim, (event, required_artifacts, required_sources) in g0_rules.items():
+            if (
+                observed(event, result="pass")
+                and required_artifacts <= artifact_bindings
+                and required_sources <= source_paths
+            ):
+                claims.add(claim)
+
+    g2_context = (
+        evidence_class == "qemu_tcg_aarch64"
+        and topology.get("kind") == "virtual"
+        and topology.get("architecture") == "aarch64"
+        and topology.get("acceleration") == "tcg"
+        and topology.get("cpu_count") == 1
+        and {"g2-kernel-object", "g2-kernel-elf"} <= artifact_names
+    )
+    if g2_context:
+        simple = {
+            "aarch64.el2_resident": "el2_resident",
+            "aarch64.el1_execution": "el1_execution",
+            "aarch64.svc_eret_roundtrip": "svc_eret_roundtrip",
+            "ipc.request_reply": "ipc_request_reply",
+            "capability.attenuation": "capability_attenuation",
+            "lifecycle.terminal": "lifecycle_terminal",
+            "lifecycle.reclamation": "reclamation",
+        }
+        for claim, event in simple.items():
+            if observed(event, result="pass"):
+                claims.add(claim)
+        if observed("aarch64_native_object", format="elf64", machine="183", result="pass"):
+            claims.add("aarch64.native_object")
+        if observed(
+            "el2_hvc_roundtrip",
+            domain="0x4f4d",
+            registers="preserved",
+            stack="preserved",
+            result="pass",
+        ):
+            claims.add("aarch64.hvc_roundtrip")
+        if observed("el0_execution", principals="2", result="pass"):
+            claims.add("aarch64.el0_execution")
+        if observed(
+            "stale_generation_rejected", kinds="process,capability", result="pass"
+        ):
+            claims.add("capability.stale_generation_rejected")
+        lifecycle = observed("lifecycle_terminal", result="pass")
+        progress = observed("counter_progress", phase="post_lifecycle", result="pass")
+        bounded = observed(
+            "counter_progress",
+            phase="post_lifecycle",
+            poll_bound="1000000",
+            result="pass",
+        )
+        if lifecycle and progress:
+            claims.add("execution.post_lifecycle_reached")
+        if lifecycle and bounded:
+            claims.add("counter.progress_after_lifecycle")
+    return claims
+
+
 def _validate_world_attestation_release_surface(
     files: dict[str, bytes], modes: dict[str, str], path: str, gate_id: str,
     evidence_class: str,
-) -> None:
+) -> dict[str, object]:
     if path not in files or modes.get(path) != "100644":
         raise ReleaseError(f"{path} must be a regular non-executable release file")
     attestation = _strict_toml(files[path], path)
@@ -1386,18 +1643,27 @@ def _validate_world_attestation_release_surface(
         "signatures",
     }
     schema_version = attestation.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2}:
-        raise ReleaseError(f"{path} schema_version must be 1 or 2")
-    version_keys = (
-        {"claims"}
-        if schema_version == 1
-        else {
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+        raise ReleaseError(f"{path} schema_version must be 1, 2, or 3")
+    if schema_version <= 2:
+        expected_historical_digest = WORLD_HISTORICAL_ATTESTATION_SHA256.get(path)
+        if expected_historical_digest is None:
+            raise ReleaseError(
+                f"{path} historical attestation lacks a trusted exact-byte seal"
+            )
+        if hashlib.sha256(files[path]).hexdigest() != expected_historical_digest:
+            raise ReleaseError(f"{path} historical attestation bytes differ from seal")
+    if schema_version == 1:
+        version_keys = {"claims"}
+    else:
+        version_keys = {
             "derived_claims",
             "validator_sha256",
             "claim_rule_policy_sha256",
             "registry_semantics_sha256",
         }
-    )
+        if schema_version == 3:
+            version_keys.add("derivation_hash")
     if set(attestation) != common_keys | version_keys:
         raise ReleaseError(f"{path} keys differ from the World attestation schema")
     _required_string(attestation["id"], f"{path}.id")
@@ -1474,16 +1740,19 @@ def _validate_world_attestation_release_surface(
             raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
         if source_path not in files:
             raise ReleaseError(f"{owner} references absent released {source_path}")
-        if (
-            schema_version == 2
-            and hashlib.sha256(files[source_path]).hexdigest() != digest
-        ):
-            raise ReleaseError(f"{owner} does not match released {source_path}")
+        # Schema-v1/v2 records describe immutable historical working trees;
+        # their source bytes are not falsely claimed to be the current ZIP
+        # members.  A schema-v3 record on the current derivation is a current
+        # release attestation and must bind the released bytes exactly.
+        if schema_version == 3 and attestation["derivation_hash"] == WORLD_DERIVATION_HASH:
+            if hashlib.sha256(files[source_path]).hexdigest() != digest:
+                raise ReleaseError(f"{owner} does not match released {source_path}")
 
     artifacts = attestation["artifact"]
     if not isinstance(artifacts, list) or not artifacts:
         raise ReleaseError(f"{path}.artifact must contain artifact digests")
     seen_artifacts: set[str] = set()
+    artifact_bindings: set[tuple[str, str, str]] = set()
     for index, artifact in enumerate(artifacts):
         owner = f"{path}.artifact[{index}]"
         if not isinstance(artifact, dict) or set(artifact) != {
@@ -1494,7 +1763,7 @@ def _validate_world_attestation_release_surface(
         if name in seen_artifacts:
             raise ReleaseError(f"{path}.artifact contains duplicate {name}")
         seen_artifacts.add(name)
-        _required_string(artifact["kind"], f"{owner}.kind")
+        kind = _required_string(artifact["kind"], f"{owner}.kind")
         digest = _required_string(artifact["sha256"], f"{owner}.sha256")
         if HEX_DIGEST.fullmatch(digest) is None:
             raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
@@ -1502,11 +1771,13 @@ def _validate_world_attestation_release_surface(
             raise ReleaseError(f"{owner}.retained must be boolean")
         if artifact["retained"]:
             artifact_path = _normalized_reference(artifact["path"], f"{owner}.path")
+            artifact_bindings.add((name, kind, artifact_path))
             if artifact_path not in files or hashlib.sha256(files[artifact_path]).hexdigest() != digest:
                 raise ReleaseError(f"{owner} does not match retained {artifact_path}")
         else:
             if artifact["path"] != "":
                 raise ReleaseError(f"{owner}.path must be empty when not retained")
+            artifact_bindings.add((name, kind, ""))
             if transcript_lines.count(f"artifact:{name}:sha256={digest}") != 1:
                 raise ReleaseError(f"{transcript_path} does not bind artifact {name}")
 
@@ -1520,6 +1791,17 @@ def _validate_world_attestation_release_surface(
     if type(topology["cpu_count"]) is not int or topology["cpu_count"] < 0:
         raise ReleaseError(f"{path}.topology.cpu_count must be nonnegative")
     _required_string_list(topology["inventory"], f"{path}.topology.inventory", minimum=1)
+    current_derived_claims = _derive_release_world_claims(
+        transcript,
+        transcript_path,
+        evidence_class,
+        topology,
+        seen_sources,
+        seen_artifacts,
+        artifact_bindings,
+    )
+    recorded_claims: set[str] = set()
+    derivation_hash: str | None = None
     if schema_version == 1:
         _required_string_list(attestation["claims"], f"{path}.claims", minimum=1)
     else:
@@ -1528,19 +1810,55 @@ def _validate_world_attestation_release_surface(
         )
         if derived_claims != sorted(set(derived_claims)):
             raise ReleaseError(f"{path}.derived_claims must be sorted and unique")
-        if set(derived_claims) != WORLD_DERIVED_CLAIMS[gate_id]:
-            raise ReleaseError(f"{path}.derived_claims differs from trusted rules")
+        recorded_claims = set(derived_claims)
         validator_digest = _required_string(
             attestation["validator_sha256"], f"{path}.validator_sha256"
         )
-        if validator_digest != hashlib.sha256(
-            files["scripts/world_alpha_evidence.py"]
-        ).hexdigest():
-            raise ReleaseError(f"{path}.validator_sha256 does not pin released validator")
-        if attestation["claim_rule_policy_sha256"] != WORLD_CLAIM_POLICY_SHA256:
-            raise ReleaseError(f"{path}.claim_rule_policy_sha256 differs from trusted rules")
-        if attestation["registry_semantics_sha256"] != WORLD_REGISTRY_SEMANTICS_SHA256:
-            raise ReleaseError(f"{path}.registry_semantics_sha256 differs from trusted registry")
+        if HEX_DIGEST.fullmatch(validator_digest) is None:
+            raise ReleaseError(f"{path}.validator_sha256 must be a SHA-256 digest")
+        validator_sources = [
+            source["sha256"]
+            for source in sources
+            if source["path"] == "scripts/world_alpha_evidence.py"
+        ]
+        if validator_sources and validator_sources != [validator_digest]:
+            raise ReleaseError(
+                f"{path}.validator_sha256 must bind its historical validator source"
+            )
+        if not validator_sources and schema_version == 3:
+            raise ReleaseError(
+                f"{path} current schema-v3 evidence must retain its validator source"
+            )
+        for field in ("claim_rule_policy_sha256", "registry_semantics_sha256"):
+            if HEX_DIGEST.fullmatch(str(attestation[field])) is None:
+                raise ReleaseError(f"{path}.{field} must be a SHA-256 digest")
+        if schema_version == 3:
+            derivation_hash = _required_string(
+                attestation["derivation_hash"], f"{path}.derivation_hash"
+            )
+            if not derivation_hash.startswith("sha256:") or HEX_DIGEST.fullmatch(
+                derivation_hash[len("sha256:") :]
+            ) is None:
+                raise ReleaseError(f"{path}.derivation_hash must be a SHA-256 identifier")
+            if derivation_hash == WORLD_DERIVATION_HASH:
+                if validator_digest != WORLD_VALIDATOR_SHA256:
+                    raise ReleaseError(
+                        f"{path}.validator_sha256 differs from the trusted validator bytes"
+                    )
+                if recorded_claims != current_derived_claims:
+                    raise ReleaseError(
+                        f"{path}.derived_claims differs from trusted current rules"
+                    )
+                if attestation["claim_rule_policy_sha256"] != WORLD_CLAIM_POLICY_SHA256:
+                    raise ReleaseError(
+                        f"{path}.claim_rule_policy_sha256 differs from trusted rules"
+                    )
+                if attestation["registry_semantics_sha256"] != WORLD_REGISTRY_SEMANTICS_SHA256:
+                    raise ReleaseError(
+                        f"{path}.registry_semantics_sha256 differs from trusted registry"
+                    )
+        else:
+            derivation_hash = "sha256:" + validator_digest
     nonclaims = _required_string_list(
         attestation["nonclaims"], f"{path}.nonclaims", minimum=1
     )
@@ -1559,12 +1877,21 @@ def _validate_world_attestation_release_surface(
                 raise ReleaseError(f"{path}.nonclaims is missing {fragment!r}")
     if attestation["signatures"] != []:
         raise ReleaseError(f"{path}.signatures must be empty for this evidence class")
+    return {
+        "id": attestation["id"],
+        "path": path,
+        "gate": gate_id,
+        "schema_version": schema_version,
+        "recorded_claims": recorded_claims,
+        "current_derived_claims": current_derived_claims,
+        "derivation_hash": derivation_hash,
+        "record_sha256": hashlib.sha256(files[path]).hexdigest(),
+    }
 
 
 def _validate_world_evidence_event_release_surface(
     files: dict[str, bytes], modes: dict[str, str], path: str,
-    subject: str, replacement: str,
-) -> None:
+) -> dict[str, object]:
     if path not in files or modes.get(path) != "100644":
         raise ReleaseError(f"{path} must be a regular non-executable release file")
     event = _strict_toml(files[path], path)
@@ -1582,11 +1909,25 @@ def _validate_world_evidence_event_release_surface(
         raise ReleaseError(f"{path} keys differ from evidence-event schema")
     if type(event["schema_version"]) is not int or event["schema_version"] != 1:
         raise ReleaseError(f"{path} schema_version must be 1")
-    _required_string(event["id"], f"{path}.id")
-    if event["event"] != "supersede":
-        raise ReleaseError(f"{path}.event must be supersede")
-    if event["subject"] != subject or event["replacement"] != replacement:
-        raise ReleaseError(f"{path} does not preserve the expected evidence edge")
+    event_id = _required_string(event["id"], f"{path}.id")
+    subject = _required_string(event["subject"], f"{path}.subject")
+    for field, value in (("id", event_id), ("subject", subject)):
+        if WORLD_LEDGER_ID.fullmatch(value) is None:
+            raise ReleaseError(f"{path}.{field} is not normalized")
+    kind = event["event"]
+    if kind not in {"supersede", "retract"}:
+        raise ReleaseError(f"{path}.event must be supersede or retract")
+    replacement = event["replacement"]
+    if not isinstance(replacement, str):
+        raise ReleaseError(f"{path}.replacement must be a string")
+    if kind == "supersede":
+        replacement = _required_string(replacement, f"{path}.replacement")
+        if WORLD_LEDGER_ID.fullmatch(replacement) is None:
+            raise ReleaseError(f"{path}.replacement is not normalized")
+        if replacement == subject:
+            raise ReleaseError(f"{path} cannot supersede an attestation with itself")
+    elif replacement != "":
+        raise ReleaseError(f"{path}.replacement must be empty for retraction")
     _required_string(event["reason_code"], f"{path}.reason_code")
     _required_string(event["reason"], f"{path}.reason")
     commit = _required_string(event["source_commit"], f"{path}.source_commit")
@@ -1594,6 +1935,441 @@ def _validate_world_evidence_event_release_surface(
         raise ReleaseError(f"{path}.source_commit must be a Git object ID")
     if event["signatures"] != []:
         raise ReleaseError(f"{path}.signatures must be empty")
+    return {
+        "id": event_id,
+        "path": path,
+        "event": kind,
+        "subject": subject,
+        "replacement": replacement,
+        "record_sha256": hashlib.sha256(files[path]).hexdigest(),
+    }
+
+
+def _world_rederive_payload_sha256(event: dict[str, object]) -> str:
+    payload_keys = (
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "prior_derivation",
+        "current_derivation",
+        "claims_lost",
+        "claims_gained",
+        "reason_code",
+        "reason",
+        "source_commit",
+    )
+    payload = {key: event[key] for key in payload_keys}
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return hashlib.sha256(
+        WORLD_REDERIVE_PAYLOAD_DOMAIN.encode("ascii") + b"\0" + encoded
+    ).hexdigest()
+
+
+def _validate_world_rederive_event_release_surface(
+    files: dict[str, bytes],
+    modes: dict[str, str],
+    path: str,
+) -> dict[str, object]:
+    if path not in files or modes.get(path) != "100644":
+        raise ReleaseError(f"{path} must be a regular non-executable release file")
+    event = _strict_toml(files[path], path)
+    if set(event) != {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "prior_derivation",
+        "current_derivation",
+        "claims_lost",
+        "claims_gained",
+        "reason_code",
+        "reason",
+        "source_commit",
+        "payload_sha256",
+        "signatures",
+    }:
+        raise ReleaseError(f"{path} keys differ from rederive-event schema")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    event_id = _required_string(event["id"], f"{path}.id")
+    subject = _required_string(event["subject"], f"{path}.subject")
+    for field, value in (("id", event_id), ("subject", subject)):
+        if WORLD_LEDGER_ID.fullmatch(value) is None:
+            raise ReleaseError(f"{path}.{field} is not normalized")
+    if event["event"] != "rederive":
+        raise ReleaseError(f"{path}.event must be rederive")
+    prior_derivation = _required_string(
+        event["prior_derivation"], f"{path}.prior_derivation"
+    )
+    current_derivation = _required_string(
+        event["current_derivation"], f"{path}.current_derivation"
+    )
+    for field, value in (
+        ("prior_derivation", prior_derivation),
+        ("current_derivation", current_derivation),
+    ):
+        if not value.startswith("sha256:") or HEX_DIGEST.fullmatch(
+            value[len("sha256:") :]
+        ) is None:
+            raise ReleaseError(f"{path}.{field} must be a SHA-256 identifier")
+    if prior_derivation == current_derivation:
+        raise ReleaseError(f"{path} must change the derivation identifier")
+    lost = _required_string_list(event["claims_lost"], f"{path}.claims_lost")
+    gained = _required_string_list(event["claims_gained"], f"{path}.claims_gained")
+    if lost != sorted(set(lost)) or gained != sorted(set(gained)):
+        raise ReleaseError(f"{path} claim deltas must be sorted and unique")
+    if set(lost) & set(gained):
+        raise ReleaseError(f"{path} cannot both lose and gain one claim")
+    _required_string(event["reason_code"], f"{path}.reason_code")
+    _required_string(event["reason"], f"{path}.reason")
+    commit = _required_string(event["source_commit"], f"{path}.source_commit")
+    if HEX_COMMIT.fullmatch(commit) is None:
+        raise ReleaseError(f"{path}.source_commit must be a Git object ID")
+    digest = _required_string(event["payload_sha256"], f"{path}.payload_sha256")
+    if digest != _world_rederive_payload_sha256(event):
+        raise ReleaseError(f"{path}.payload_sha256 does not bind the rederive event")
+    if event["signatures"] != []:
+        raise ReleaseError(
+            f"{path}.signatures must remain empty; append a separate witness event"
+        )
+    return {
+        "id": event_id,
+        "path": path,
+        "event": "rederive",
+        "subject": subject,
+        "prior_derivation": prior_derivation,
+        "current_derivation": current_derivation,
+        "claims_lost": set(lost),
+        "claims_gained": set(gained),
+        "payload_sha256": digest,
+        "record_sha256": hashlib.sha256(files[path]).hexdigest(),
+    }
+
+
+def _world_witness_payload_sha256(event: dict[str, object]) -> str:
+    payload_keys = (
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "subject_record_sha256",
+        "algorithm",
+        "key_id",
+        "public_key",
+        "run_identity",
+        "source_commit",
+        "verification",
+    )
+    payload = {key: event[key] for key in payload_keys}
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return hashlib.sha256(
+        WORLD_WITNESS_PAYLOAD_DOMAIN.encode("ascii") + b"\0" + encoded
+    ).hexdigest()
+
+
+def _validate_world_witness_event_release_surface(
+    files: dict[str, bytes], modes: dict[str, str], path: str,
+) -> dict[str, object]:
+    if path not in files or modes.get(path) != "100644":
+        raise ReleaseError(f"{path} must be a regular non-executable release file")
+    event = _strict_toml(files[path], path)
+    expected_keys = {
+        "schema_version",
+        "id",
+        "event",
+        "subject",
+        "subject_record_sha256",
+        "witness_payload_sha256",
+        "algorithm",
+        "key_id",
+        "public_key",
+        "signature",
+        "run_identity",
+        "source_commit",
+        "verification",
+    }
+    if set(event) != expected_keys:
+        raise ReleaseError(f"{path} keys differ from witness-event schema")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise ReleaseError(f"{path}.schema_version must be 1")
+    event_id = _required_string(event["id"], f"{path}.id")
+    subject = _required_string(event["subject"], f"{path}.subject")
+    key_id = _required_string(event["key_id"], f"{path}.key_id")
+    for field, value in (("id", event_id), ("subject", subject), ("key_id", key_id)):
+        if WORLD_LEDGER_ID.fullmatch(value) is None:
+            raise ReleaseError(f"{path}.{field} is not normalized")
+    if event["event"] != "witness":
+        raise ReleaseError(f"{path}.event must be witness")
+    record_sha256 = _required_string(
+        event["subject_record_sha256"], f"{path}.subject_record_sha256"
+    )
+    if HEX_DIGEST.fullmatch(record_sha256) is None:
+        raise ReleaseError(f"{path}.subject_record_sha256 must be a SHA-256 digest")
+    if event["algorithm"] != "ed25519":
+        raise ReleaseError(f"{path}.algorithm must be ed25519")
+    if re.fullmatch(r"[0-9a-f]{64}", str(event["public_key"])) is None:
+        raise ReleaseError(f"{path}.public_key must be 32-byte lowercase hex")
+    if event["public_key"] == "0" * 64:
+        raise ReleaseError(f"{path}.public_key must not be all zero")
+    if re.fullmatch(r"[0-9a-f]{128}", str(event["signature"])) is None:
+        raise ReleaseError(f"{path}.signature must be 64-byte lowercase hex")
+    if event["signature"] == "0" * 128:
+        raise ReleaseError(f"{path}.signature must not be all zero")
+    _required_string(event["run_identity"], f"{path}.run_identity")
+    commit = _required_string(event["source_commit"], f"{path}.source_commit")
+    if HEX_COMMIT.fullmatch(commit) is None:
+        raise ReleaseError(f"{path}.source_commit must be a Git object ID")
+    if event["verification"] != "external_unverified":
+        raise ReleaseError(f"{path}.verification must state external_unverified")
+    witness_payload_sha256 = _required_string(
+        event["witness_payload_sha256"], f"{path}.witness_payload_sha256"
+    )
+    if (
+        HEX_DIGEST.fullmatch(witness_payload_sha256) is None
+        or witness_payload_sha256 != _world_witness_payload_sha256(event)
+    ):
+        raise ReleaseError(
+            f"{path}.witness_payload_sha256 does not bind the detached signature preimage"
+        )
+    return {
+        "id": event_id,
+        "path": path,
+        "event": "witness",
+        "subject": subject,
+        "subject_record_sha256": record_sha256,
+        "witness_payload_sha256": witness_payload_sha256,
+        "verification": "external_unverified",
+        "record_sha256": hashlib.sha256(files[path]).hexdigest(),
+    }
+
+
+def _validate_release_rederive_ledger(
+    attestations: list[dict[str, object]], events: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    identifiers: set[str] = set()
+    for item in [*attestations, *events]:
+        identifier = str(item["id"])
+        if identifier in identifiers:
+            raise ReleaseError(f"World evidence ledger ID {identifier} is reused")
+        identifiers.add(identifier)
+    attestations_by_id = {str(item["id"]): item for item in attestations}
+    events_by_id = {str(item["id"]): item for item in events}
+    for witness in (item for item in events if item["event"] == "witness"):
+        target = events_by_id.get(str(witness["subject"]))
+        if target is None or target["event"] == "witness":
+            raise ReleaseError(
+                f"{witness['path']} must witness one exact non-witness event record"
+            )
+        if witness["subject_record_sha256"] != target["record_sha256"]:
+            raise ReleaseError(
+                f"{witness['path']} does not bind its exact subject record"
+            )
+
+    lifecycle_by_subject: dict[str, dict[str, object]] = {}
+    transitions_by_subject: dict[str, dict[str, dict[str, object]]] = {}
+    for event in events:
+        if event["event"] == "witness":
+            continue
+        subject = str(event["subject"])
+        if subject not in attestations_by_id:
+            raise ReleaseError(f"{event['path']} references missing subject {subject}")
+        if event["event"] == "rederive":
+            if attestations_by_id[subject]["derivation_hash"] is None:
+                raise ReleaseError(f"{event['path']} cannot rederive schema-v1 prose claims")
+            transitions = transitions_by_subject.setdefault(subject, {})
+            prior = str(event["prior_derivation"])
+            if prior in transitions:
+                raise ReleaseError(
+                    f"attestation {subject} has competing rederive events from {prior}"
+                )
+            transitions[prior] = event
+            continue
+        if subject in lifecycle_by_subject:
+            raise ReleaseError(
+                f"attestation {subject} has multiple competing lifecycle events"
+            )
+        replacement = str(event["replacement"])
+        if replacement:
+            if replacement not in attestations_by_id:
+                raise ReleaseError(
+                    f"{event['path']} references missing replacement {replacement}"
+                )
+            if attestations_by_id[replacement]["gate"] != attestations_by_id[subject]["gate"]:
+                raise ReleaseError(
+                    f"{event['path']} supersedes evidence across unrelated gates"
+                )
+        lifecycle_by_subject[subject] = event
+
+    replacement_predecessors: dict[str, str] = {}
+    for subject, event in lifecycle_by_subject.items():
+        replacement = str(event["replacement"])
+        if replacement:
+            previous = replacement_predecessors.setdefault(replacement, subject)
+            if previous != subject:
+                raise ReleaseError(f"replacement {replacement} has competing predecessors")
+        seen_subjects: set[str] = set()
+        current = subject
+        while current in lifecycle_by_subject:
+            if current in seen_subjects:
+                raise ReleaseError("World evidence supersession graph contains a cycle")
+            seen_subjects.add(current)
+            current = str(lifecycle_by_subject[current]["replacement"])
+            if not current:
+                break
+
+    inactive_ids = set(lifecycle_by_subject)
+
+    for attestation in attestations:
+        if attestation["schema_version"] == 1:
+            if attestation["id"] not in inactive_ids:
+                raise ReleaseError(
+                    f"schema-v1 attestation {attestation['id']} cannot be an active ledger head"
+                )
+            continue
+        subject = str(attestation["id"])
+        derivation = str(attestation["derivation_hash"])
+        claims = set(attestation["recorded_claims"])
+        transitions = transitions_by_subject.get(subject, {})
+        used: set[str] = set()
+        seen = {derivation}
+        while derivation in transitions:
+            event = transitions[derivation]
+            used.add(derivation)
+            lost = set(event["claims_lost"])
+            gained = set(event["claims_gained"])
+            if not lost <= claims:
+                raise ReleaseError(f"{event['path']} loses absent claims")
+            if gained & claims:
+                raise ReleaseError(f"{event['path']} gains existing claims")
+            claims = (claims - lost) | gained
+            derivation = str(event["current_derivation"])
+            if derivation in seen:
+                raise ReleaseError(f"attestation {subject} rederive graph contains a cycle")
+            seen.add(derivation)
+        unreachable = set(transitions) - used
+        if unreachable:
+            raise ReleaseError(
+                f"attestation {subject} has unreachable rederive prior(s) {sorted(unreachable)}"
+            )
+        if derivation != WORLD_DERIVATION_HASH:
+            raise ReleaseError(
+                f"attestation {subject} does not reach the released derivation"
+            )
+        if claims != set(attestation["current_derived_claims"]):
+            raise ReleaseError(
+                f"attestation {subject} rederive delta differs from trusted released derivation"
+            )
+
+    active = [item for item in attestations if item["id"] not in inactive_ids]
+    for attestation in active:
+        if (
+            attestation["schema_version"] != 3
+            and attestation["id"] not in WORLD_LEGACY_ACTIVE_SCHEMA2_IDS
+        ):
+            raise ReleaseError(
+                f"active attestation {attestation['id']} must use schema v3; "
+                "only the explicitly pinned G2 legacy exception is allowed"
+            )
+    return active
+
+
+def _validate_world_evidence_ledger_release_surface(
+    files: dict[str, bytes],
+    modes: dict[str, str],
+    known_gates: set[str],
+    known_classes: set[str],
+) -> list[dict[str, object]]:
+    actual_paths = {
+        path
+        for path in files
+        if PurePosixPath(path).parent == PurePosixPath("evidence/world")
+        and path.endswith(".toml")
+    }
+    expected_paths = (
+        set(WORLD_HISTORICAL_ATTESTATION_SHA256)
+        | set(WORLD_CURRENT_ATTESTATION_SHA256)
+        | set(WORLD_EVIDENCE_EVENT_SHA256)
+    )
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        extra = sorted(actual_paths - expected_paths)
+        raise ReleaseError(
+            "World evidence ledger TOML set differs from the exhaustive release set; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    attestations: list[dict[str, object]] = []
+    events: list[dict[str, object]] = []
+    for path in sorted(actual_paths):
+        if path in WORLD_CURRENT_ATTESTATION_SHA256:
+            actual_digest = hashlib.sha256(files[path]).hexdigest()
+            if actual_digest != WORLD_CURRENT_ATTESTATION_SHA256[path]:
+                raise ReleaseError(
+                    f"{path} bytes differ from the immutable current-attestation seal"
+                )
+        if path in WORLD_EVIDENCE_EVENT_SHA256:
+            actual_digest = hashlib.sha256(files[path]).hexdigest()
+            expected_digest = WORLD_EVIDENCE_EVENT_SHA256[path]
+            if actual_digest != expected_digest:
+                raise ReleaseError(
+                    f"{path} bytes differ from the immutable evidence-event seal"
+                )
+        record = _strict_toml(files[path], path)
+        if "event" not in record:
+            gate_id = _required_string(record.get("gate"), f"{path}.gate")
+            evidence_class = _required_string(
+                record.get("evidence_class"), f"{path}.evidence_class"
+            )
+            if gate_id not in known_gates:
+                raise ReleaseError(f"{path}.gate references unknown {gate_id}")
+            if evidence_class not in known_classes:
+                raise ReleaseError(
+                    f"{path}.evidence_class references unknown {evidence_class}"
+                )
+            attestations.append(
+                _validate_world_attestation_release_surface(
+                    files, modes, path, gate_id, evidence_class
+                )
+            )
+            continue
+        kind = _required_string(record.get("event"), f"{path}.event")
+        if kind == "rederive":
+            events.append(
+                _validate_world_rederive_event_release_surface(files, modes, path)
+            )
+        elif kind == "witness":
+            events.append(
+                _validate_world_witness_event_release_surface(files, modes, path)
+            )
+        else:
+            events.append(
+                _validate_world_evidence_event_release_surface(files, modes, path)
+            )
+
+    active = _validate_release_rederive_ledger(attestations, events)
+    active_gates = {str(item["gate"]) for item in active}
+    if active_gates != {"G0", "G2"}:
+        raise ReleaseError(
+            f"released active evidence heads must cover exactly G0 and G2, got {sorted(active_gates)}"
+        )
+    for gate_id, expected_claims in WORLD_DERIVED_CLAIMS.items():
+        derived = set().union(
+            *(
+                set(item["current_derived_claims"])
+                for item in active
+                if item["gate"] == gate_id
+            )
+        )
+        if derived != expected_claims:
+            raise ReleaseError(
+                f"released active {gate_id} claims differ from the trusted derivation"
+            )
+    return active
 
 
 def _validate_world_alpha_release_surface(
@@ -1603,6 +2379,15 @@ def _validate_world_alpha_release_surface(
         path: _sealed_world_alpha_text(files, modes, path)
         for path in SEALED_WORLD_ALPHA_SHA256
     }
+    validator_path = "scripts/world_alpha_evidence.py"
+    if (
+        validator_path not in files
+        or hashlib.sha256(files[validator_path]).hexdigest()
+        != WORLD_VALIDATOR_SHA256
+    ):
+        raise ReleaseError(
+            f"{validator_path} differs from the trusted World evidence validator bytes"
+        )
     required_document_markers = {
         "docs/OSTADIX_WORLD.md": (
             "# Ostadix World: Full-Stack Machine-Constructor Roadmap",
@@ -1620,11 +2405,83 @@ def _validate_world_alpha_release_surface(
             "## Non-claims",
             "G12, G13, or the name **Ostadix World Alpha**.",
         ),
+        "docs/O_MACHINE_CONTRACT.md": (
+            "# O-Machine EL2 and O-core Resource Contract",
+            "MachineMemory",
+            "MachineBlock",
+            "Machine9P",
+            "no machine effect authorized by s.old_generation remains reachable",
+            "no `MachineHandle`, no revocation-completion handle",
+            "a doorbell is not an authority-bearing hypercall",
+        ),
     }
     for path, markers in required_document_markers.items():
         for marker in markers:
             if marker not in texts[path]:
                 raise ReleaseError(f"{path} is missing required World Alpha marker {marker!r}")
+
+    wrapper_path = "evidence/world_contract_v2.toml"
+    wrapper = _strict_toml(files[wrapper_path], wrapper_path)
+    if _toml_semantics_sha256(wrapper) != WORLD_CONTRACT_V2_SEMANTICS_SHA256:
+        raise ReleaseError(f"{wrapper_path} composition semantics differ from schema")
+    expected_wrapper = {
+        "schema": "ostadix.world-contract/v2",
+        "schema_version": 2,
+        "constitution_version": 3,
+        "constitution": "docs/OSTADIX_WORLD.md",
+        "constitution_sha256": SEALED_WORLD_ALPHA_SHA256["docs/OSTADIX_WORLD.md"],
+        "world_gate_registry": "evidence/world_alpha_gates.toml",
+        "imported_vocabulary": "evidence/world_contract_v1.toml",
+        "imported_vocabulary_schema_version": 1,
+        "imported_vocabulary_constitution_version": 2,
+        "imported_vocabulary_constitution_sha256": (
+            WORLD_IMPORTED_CONSTITUTION_V2_SHA256
+        ),
+        "imported_vocabulary_sha256": SEALED_WORLD_ALPHA_SHA256[
+            "evidence/world_contract_v1.toml"
+        ],
+        "machine_contract": "evidence/o_machine_contract_v1.toml",
+        "machine_contract_schema_version": 1,
+        "machine_contract_sha256": SEALED_WORLD_ALPHA_SHA256[
+            "evidence/o_machine_contract_v1.toml"
+        ],
+        "composition": {
+            "crossings": "imported_vocabulary",
+            "identity_atoms": "imported_vocabulary",
+            "failure_classes": "imported_vocabulary",
+            "consistency_rules": "imported_vocabulary",
+            "evidence_classes": "imported_vocabulary",
+            "machine_authority_and_revocation": "machine_contract",
+        },
+    }
+    if wrapper != expected_wrapper:
+        raise ReleaseError(f"{wrapper_path} composition differs from exact schema")
+    for field, digest_field in (
+        ("constitution", "constitution_sha256"),
+        ("imported_vocabulary", "imported_vocabulary_sha256"),
+        ("machine_contract", "machine_contract_sha256"),
+    ):
+        referenced = str(wrapper[field])
+        if referenced not in files:
+            raise ReleaseError(f"{wrapper_path}.{field} references absent {referenced}")
+        if hashlib.sha256(files[referenced]).hexdigest() != wrapper[digest_field]:
+            raise ReleaseError(f"{wrapper_path}.{digest_field} does not bind {referenced}")
+
+    machine_path = "evidence/o_machine_contract_v1.toml"
+    machine = _strict_toml(files[machine_path], machine_path)
+    if _toml_semantics_sha256(machine) != WORLD_MACHINE_CONTRACT_SEMANTICS_SHA256:
+        raise ReleaseError(f"{machine_path} semantics differ from exact schema")
+    if (
+        machine.get("schema") != "ostadix.o-machine/v1"
+        or type(machine.get("schema_version")) is not int
+        or machine["schema_version"] != 1
+        or type(machine.get("constitution_version")) is not int
+        or machine["constitution_version"] != 3
+        or machine.get("specification") != "docs/O_MACHINE_CONTRACT.md"
+        or machine.get("specification_sha256")
+        != SEALED_WORLD_ALPHA_SHA256["docs/O_MACHINE_CONTRACT.md"]
+    ):
+        raise ReleaseError(f"{machine_path} self-description differs from schema")
 
     contract_path = "evidence/world_contract_v1.toml"
     contract = _strict_toml(files[contract_path], contract_path)
@@ -1675,6 +2532,7 @@ def _validate_world_alpha_release_surface(
         "constitution",
         "hosted_reference_profile",
         "contract_schema",
+        "machine_contract_schema",
         "alpha_gate",
         "gate_count",
         "evidence_class",
@@ -1682,13 +2540,13 @@ def _validate_world_alpha_release_surface(
     }
     if set(manifest) != expected_root_keys:
         raise ReleaseError(f"{path} root keys differ from schema")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 3:
-        raise ReleaseError(f"{path} schema_version must be 3")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 4:
+        raise ReleaseError(f"{path} schema_version must be 4")
     if (
         type(manifest["constitution_version"]) is not int
-        or manifest["constitution_version"] != 2
+        or manifest["constitution_version"] != 3
     ):
-        raise ReleaseError(f"{path} constitution_version must be 2")
+        raise ReleaseError(f"{path} constitution_version must be 3")
     if manifest["constitution"] != "docs/OSTADIX_WORLD.md":
         raise ReleaseError(f"{path} constitution must reference docs/OSTADIX_WORLD.md")
     if manifest["hosted_reference_profile"] != (
@@ -1698,9 +2556,13 @@ def _validate_world_alpha_release_surface(
             f"{path} hosted_reference_profile must reference "
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
         )
-    if manifest["contract_schema"] != "evidence/world_contract_v1.toml":
+    if manifest["contract_schema"] != "evidence/world_contract_v2.toml":
         raise ReleaseError(
-            f"{path} contract_schema must reference evidence/world_contract_v1.toml"
+            f"{path} contract_schema must reference evidence/world_contract_v2.toml"
+        )
+    if manifest["machine_contract_schema"] != "evidence/o_machine_contract_v1.toml":
+        raise ReleaseError(
+            f"{path} machine_contract_schema must reference evidence/o_machine_contract_v1.toml"
         )
     if manifest["alpha_gate"] != "G13":
         raise ReleaseError(f"{path} alpha_gate must be G13")
@@ -1771,47 +2633,11 @@ def _validate_world_alpha_release_surface(
         )
     if tuple(gate_ids) != EXPECTED_WORLD_ALPHA_GATE_IDS:
         raise ReleaseError(f"{path} gate IDs or order differ from G0 through G13")
-    _validate_world_attestation_release_surface(
+    _validate_world_evidence_ledger_release_surface(
         files,
         modes,
-        "evidence/world/g0-repository-conformance.toml",
-        "G0",
-        "repository_conformance",
-    )
-    _validate_world_attestation_release_surface(
-        files,
-        modes,
-        "evidence/world/g0-repository-conformance-2026-08-03.toml",
-        "G0",
-        "repository_conformance",
-    )
-    _validate_world_attestation_release_surface(
-        files,
-        modes,
-        "evidence/world/g2-aarch64-qemu.toml",
-        "G2",
-        "qemu_tcg_aarch64",
-    )
-    _validate_world_attestation_release_surface(
-        files,
-        modes,
-        "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
-        "G2",
-        "qemu_tcg_aarch64",
-    )
-    _validate_world_evidence_event_release_surface(
-        files,
-        modes,
-        "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
-        "g0-repository-conformance-2026-08-02",
-        "g0-repository-conformance-2026-08-03",
-    )
-    _validate_world_evidence_event_release_surface(
-        files,
-        modes,
-        "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
-        "g2-aarch64-qemu-tcg-2026-08-02",
-        "g2-aarch64-qemu-tcg-2026-08-03",
+        set(gate_ids),
+        known_classes,
     )
 
 

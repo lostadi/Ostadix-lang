@@ -161,7 +161,13 @@ jobs:
     name: Release-claim guard
     runs-on: ubuntu-latest
     steps:
+      # Immutable evidence can bind content-addressed working-tree bytes that
+      # were committed by a later correction. The ledger validator searches
+      # reachable history for those exact bytes; a depth-1 checkout is
+      # intentionally insufficient.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Check active docs for stale claims
         run: bash scripts/check_release_claims.sh

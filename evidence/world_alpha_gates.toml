@@ -1,15 +1,16 @@
-schema_version = 3
-constitution_version = 2
+schema_version = 4
+constitution_version = 3
 constitution = "docs/OSTADIX_WORLD.md"
 hosted_reference_profile = "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
-contract_schema = "evidence/world_contract_v1.toml"
+contract_schema = "evidence/world_contract_v2.toml"
+machine_contract_schema = "evidence/o_machine_contract_v1.toml"
 alpha_gate = "G13"
 gate_count = 14
 
 # This registry defines qualification requirements. It is separate from
 # gates.toml, whose 21 required QEMU-TCG gates and one supplemental KVM gate
 # are executable evidence for narrower, already implemented O-core slices.
-# Schema v3 contains definitions only. The validator discovers the append-only
+# Schema v4 contains definitions only. The validator discovers the append-only
 # evidence ledger under evidence/world, derives claims from typed transcript
 # observations, resolves supersession/retraction events, and computes status.
 # Attestations record derived claims only as a checked validator-output cache;
@@ -91,7 +92,7 @@ title = "constitutional baseline"
 depends_on = []
 required_classes = ["repository_conformance"]
 one_of_classes = []
-acceptance = "The versioned World contract, crossings, complete identity vocabulary, failure classes, consistency model, and claim taxonomy agree with executable schemas."
+acceptance = "The versioned World and O-Machine contracts, crossings, complete identity vocabulary, failure classes, consistency model, and claim taxonomy agree with executable schemas."
 prohibited_substitutes = ["Prose without executable schemas", "The superseded hosted-first World v0 contract"]
 
 [[gate]]
@@ -118,7 +119,7 @@ title = "multicore O-core"
 depends_on = ["G2"]
 required_classes = ["hardware_x86_64", "hardware_aarch64", "fault_injection"]
 one_of_classes = []
-acceptance = "Physical x86_64 and AArch64 targets execute SMP stress gates with capability, IPC, mapping, teardown, and lifecycle linearization intact."
+acceptance = "Physical x86_64 and AArch64 targets execute SMP stress gates with capability, IPC, mapping, teardown, and lifecycle linearization intact; a cross-CPU mapping teardown remains pending until every affected CPU completes invalidation and architectural drain."
 prohibited_substitutes = ["Multiple single-core virtual machines", "A QEMU-only SMP boot message"]
 
 [[gate]]
@@ -154,8 +155,8 @@ title = "real KernelWorld"
 depends_on = ["G0"]
 required_classes = ["qemu_virtualization"]
 one_of_classes = []
-acceptance = "A pinned real Linux kernel boots under O-core, negotiates health through the guest-agent contract, and exports one governed service."
-prohibited_substitutes = ["The Mode 21 or Mode 23 synthetic guest", "A Linux ABI ELF running at CPL3", "Administrative boot state with no guest entry"]
+acceptance = "A pinned real Linux kernel boots under O-core without a guest-issued Ostadix/O-Machine authority hypercall or resource-handle ABI, negotiates health through a bounded virtio/shared-queue MMIO contract, exports one governed service, and consumes a deterministic native device error from a class-specific asynchronous withdrawal. Both that guest observation and the composite host acknowledgment precede separate terminal memory teardown, which removes guest and host-broker mappings and pins before page reclamation."
+prohibited_substitutes = ["The Mode 21 or Mode 23 synthetic guest", "A Linux ABI ELF running at CPL3", "Administrative boot state with no guest entry", "Removing a guest page and treating the resulting abort or panic as graceful device revocation", "An unrestricted host-EL1 direct map of World-owned frames"]
 
 [[gate]]
 id = "G8"
@@ -163,8 +164,8 @@ title = "real driver service"
 depends_on = ["G7"]
 required_classes = ["fault_injection", "security_adversarial"]
 one_of_classes = [["hardware_x86_64_iommu", "hardware_aarch64_smmu"]]
-acceptance = "Linux controls a resettable physical device and O-core consumes its service through revocable capability, bounded DMA, generation-bound interrupts, teardown, and replacement."
-prohibited_substitutes = ["Virtio-only or kernel-internal fake devices", "Virtual PIO reset intent", "KVM availability without device isolation evidence"]
+acceptance = "Linux controls a resettable physical device and O-core consumes its service through a revocable capability and a concrete class-named asynchronous withdrawal contract covering bounded DMA, IOMMU/SMMU drain, generation-bound interrupts, class-verified reset, acknowledgment, and replacement. Injected reset failure proves quarantine with no acknowledgment or replacement; shared isolation/reset groups are dedicated or every affected World is quiesced and survives. The guest-hypercall policy is decided explicitly; authenticated handles and their full key lifecycle are required only if untrusted guests present handles."
+prohibited_substitutes = ["Virtio-only or kernel-internal fake devices", "Virtual PIO reset intent", "KVM availability without device isolation evidence", "A generic revoke acknowledgment based only on a generation increment", "A success-only reset trace with no failed-reset quarantine evidence", "An unresolved shared isolation/reset group", "An unresolved guest-interface decision or missing key-lifecycle evidence when guest-presented handles are enabled"]
 
 [[gate]]
 id = "G9"

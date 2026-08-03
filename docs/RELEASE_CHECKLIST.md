@@ -78,14 +78,33 @@ project binary's route listing and checked option/policy rejection.
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a
 qualification schema, not an additional set of portable release commands. Its
-checked-in baseline must report 14 defined entries--G0 plus 13 integration
-gates through G13--zero passed gates, and `G13 DEFINED`. Schema v1 rejects every
-`passed` status and every nonempty evidence list. The first passage requires a
-new typed attestation schema binding the exact gate, source commit, commands,
-transcripts, artifact digests,
-hardware/topology inventory, and required signatures. Hosted reference and
-virtual multinode classes can never be substituted for physical/native
-qualification.
+checked-in ledger view must report 14 defined entries--G0 plus 13 integration
+gates through G13--with only G0 and G2 passed and `G13 DEFINED`. Schema v4 keeps
+the registry definition-only; the validator derives status from immutable
+attestations, typed transcript observations, evidence-class and claim floors,
+dependency status, and separate history events. Hosted reference and virtual
+multinode classes can never be substituted for physical/native qualification.
+
+When derivation policy or validator code changes, use this order:
+
+1. finish the validator and rule changes;
+2. compute the final derivation and validator hashes;
+3. append every required `rederive` event, recording the exact claims lost and
+   gained without editing the original attestation;
+4. validate the complete ledger and deterministic source release; and
+5. only then ask an external CI/reviewer to witness or countersign the final
+   implementation hash.
+
+Repository CI checks the checked-in ledger, but it is not by itself an
+independent trust anchor. Never pin an intermediate validator and never repair
+history by rewriting an attestation. A later reviewer must append a separate
+witness record rather than edit the correction event; until trusted-key policy
+and cryptographic verification exist, the repository reports that envelope as
+`external_unverified` and does not use it for gate status. Run ledger
+validation from a full Git checkout: historical content-addressed working-tree
+attestations may resolve
+their immutable source bytes from a later reachable commit, and shallow clones
+cannot establish that provenance.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
 The portable native release surface contains exactly **22** required
@@ -170,11 +189,15 @@ members, and verification requires the writer's canonical ZIP metadata and
 layout. It also parses, without importing or executing released code,
 `.mcp.json`, the MCP crate metadata/license, `examples/manifest.json`, and
 `evidence/gates.toml`, then proves their required archive-local references. For
-World Alpha constitution version 2 it also verifies sealed bytes for the
-native constitution, hosted reference profile, executable G0 contract, and
-typed `evidence/world_alpha_gates.toml`; it inertly validates both G0/G2
-attestations, their released source/transcript digests, topology, exact markers,
-and bounded non-claims.
+World Alpha constitution version 3 it also verifies sealed bytes for the
+native constitution, hosted reference profile, composed executable G0
+contracts, and typed `evidence/world_alpha_gates.toml`; it inertly validates
+exact-byte-sealed historical attestations and ledger events plus their retained
+transcripts/artifacts, topology, markers, and bounded non-claims. Only a current
+schema-v3 active attestation binds its source digests to current ZIP members.
+Schema-v2 source reconstruction requires the coherent
+`c25d38c00283f2873eed1aa84dd89b437777e356` Git tree and is not archive-only
+proof.
 The allowlisted surface includes the separate `mcp/ostadix_lang_mcp_server`
 crate, the root LGPL-2.1 license, `.mcp.json`, its direct stdio smoke client, and
 the focused MCP/example regression tests. CI tests and lints that crate with its
