@@ -1,0 +1,531 @@
+module runtime::aarch64::g2_kernel;
+
+// Bounded native G2 semantic core.  Architecture entry, vector save/restore,
+// and PL011/counter access live in ocore/kernel/aarch64/*.S; every process,
+// endpoint, capability, lifecycle transition, and positive evidence marker is
+// owned here so assembly cannot substitute a scripted transcript for O-core
+// execution.
+
+const SYS_REPORT: u64 = 1;
+const SYS_CAP_USE: u64 = 2;
+const SYS_ENDPOINT_SEND: u64 = 3;
+const SYS_ENDPOINT_RECEIVE: u64 = 4;
+const SYS_ENDPOINT_REPLY: u64 = 5;
+const SYS_FRESH_CAP: u64 = 6;
+const SYS_CAP_CLOSE: u64 = 7;
+const SYS_EXIT: u64 = 8;
+const SYS_FAIL: u64 = 255;
+
+const ERR_DENIED: u64 = 0xffff_ffff_ffff_ff01;
+const ERR_STATE: u64 = 0xffff_ffff_ffff_ff02;
+
+const RIGHT_READ: u64 = 1;
+const RIGHT_WRITE: u64 = 2;
+const RIGHT_EXECUTE: u64 = 4;
+const RIGHT_SEND: u64 = 8;
+const RIGHT_RECEIVE: u64 = 16;
+const RIGHT_TRANSFER: u64 = 32;
+
+const PROCESS_A_HANDLE: u64 = 0x0000_0001_0000_0001;
+const PROCESS_B_HANDLE: u64 = 0x0000_0001_0000_0002;
+const PROCESS_B_REUSED_HANDLE: u64 = 0x0000_0002_0000_0002;
+
+const RESOURCE_A_HANDLE: u64 = 0x0000_0001_0000_0001;
+const TRANSFER_B_HANDLE: u64 = 0x0000_0001_0000_0002;
+const TRANSFER_REUSED_HANDLE: u64 = 0x0000_0002_0000_0002;
+const ENDPOINT_A_HANDLE: u64 = 0x0000_0001_0000_0003;
+const ENDPOINT_B_HANDLE: u64 = 0x0000_0001_0000_0004;
+
+const PROCESS_DEAD: u64 = 0;
+const PROCESS_RUNNABLE: u64 = 1;
+const PROCESS_BLOCKED: u64 = 2;
+const PROCESS_FAULTED: u64 = 3;
+const PROCESS_EXITED: u64 = 4;
+const PROCESS_REUSED: u64 = 5;
+
+const ACTION_RESUME: u64 = 0;
+const ACTION_START_B: u64 = 1;
+const ACTION_RESUME_A: u64 = 2;
+const ACTION_COMPLETE: u64 = 3;
+
+const REPORT_A_ONLINE: u64 = 1;
+const REPORT_B_ONLINE: u64 = 2;
+
+const REQUEST_CORRELATION: u64 = 0x4702_0001;
+const REQUEST_PAYLOAD: u64 = 0x2a;
+const REPLY_CORRELATION: u64 = 0x4702_0002;
+const REPLY_PAYLOAD: u64 = 0x2b;
+
+const MARK_KERNEL: u64 = 1;
+const MARK_SVC_ERET: u64 = 2;
+const MARK_A_ONLINE: u64 = 4;
+const MARK_FORGED_DENIED: u64 = 8;
+const MARK_RIGHTS_DENIED: u64 = 16;
+const MARK_REQUEST: u64 = 32;
+const MARK_B_ONLINE: u64 = 64;
+const MARK_READ_PASS: u64 = 128;
+const MARK_WRITE_DENIED: u64 = 256;
+const MARK_REPLY: u64 = 512;
+const MARK_FAULT: u64 = 1024;
+const MARK_ROUND_TRIP: u64 = 2048;
+const MARK_CAP_REUSE: u64 = 4096;
+const MARK_PROCESS_REUSE: u64 = 8192;
+const MARK_EXIT: u64 = 16384;
+const MARK_RECLAIM: u64 = 32768;
+const MARK_TIMER: u64 = 65536;
+const MARK_PROCESS_LIFECYCLE: u64 = 131072;
+const MARK_IPC_CAP_LIFECYCLE: u64 = 262144;
+
+static KERNEL_ONLINE: [u8; 30] = b"G2 AArch64 EL1 kernel: online\n";
+static SVC_ERET_PASS: [u8; 36] = b"G2 AArch64 real SVC/ERET path: PASS\n";
+static A_ONLINE: [u8; 35] = b"G2 AArch64 EL0 principal A: online\n";
+static FORGED_DENIED: [u8; 37] = b"G2 AArch64 forged capability: denied\n";
+static RIGHTS_DENIED: [u8; 39] = b"G2 AArch64 over-rights request: denied\n";
+static REQUEST_QUEUED: [u8; 41] = b"G2 AArch64 endpoint request queued: PASS\n";
+static B_ONLINE: [u8; 35] = b"G2 AArch64 EL0 principal B: online\n";
+static READ_PASS: [u8; 44] = b"G2 AArch64 attenuated capability read: PASS\n";
+static WRITE_DENIED: [u8; 47] = b"G2 AArch64 attenuated capability write: denied\n";
+static REPLY_QUEUED: [u8; 39] = b"G2 AArch64 endpoint reply queued: PASS\n";
+static FAULT_CONTAINED: [u8; 37] = b"G2 AArch64 EL0 fault contained: PASS\n";
+static ROUND_TRIP: [u8; 40] = b"G2 AArch64 endpoint request/reply: PASS\n";
+static CAP_REUSE: [u8; 52] = b"G2 AArch64 capability slot reuse stale denial: PASS\n";
+static PROCESS_REUSE: [u8; 49] = b"G2 AArch64 process slot reuse stale denial: PASS\n";
+static EXIT_CONTAINED: [u8; 36] = b"G2 AArch64 EL0 exit contained: PASS\n";
+static RECLAIMED: [u8; 42] = b"G2 AArch64 teardown and reclamation: PASS\n";
+static TIMER_ONLINE: [u8; 40] = b"G2 AArch64 post-lifecycle timer: online\n";
+static PROCESS_LIFECYCLE: [u8; 39] = b"G2 AArch64 EL0 process lifecycle: PASS\n";
+static IPC_CAP_LIFECYCLE: [u8; 42] = b"G2 AArch64 IPC capability lifecycle: PASS\n";
+static INVARIANT_FAILURE: [u8; 36] = b"G2 AArch64 native invariant failure\n";
+
+static mut MARKERS: u64 = 0;
+static mut CURRENT_PROCESS: u64 = 0;
+static mut PROCESS_A_STATE: u64 = PROCESS_DEAD;
+static mut PROCESS_B_STATE: u64 = PROCESS_DEAD;
+static mut PROCESS_B_GENERATION: u64 = 0;
+static mut RESOURCE_A_LIVE: u64 = 0;
+static mut TRANSFER_LIVE: u64 = 0;
+static mut TRANSFER_GENERATION: u64 = 0;
+static mut TRANSFER_RIGHTS: u64 = 0;
+static mut ENDPOINT_LIVE: u64 = 0;
+static mut REQUEST_READY: u64 = 0;
+static mut REQUEST_CORRELATION_VALUE: u64 = 0;
+static mut REQUEST_PAYLOAD_VALUE: u64 = 0;
+static mut REPLY_READY: u64 = 0;
+static mut REPLY_CORRELATION_VALUE: u64 = 0;
+static mut REPLY_PAYLOAD_VALUE: u64 = 0;
+static mut PENDING_ACTION: u64 = ACTION_RESUME;
+static mut SVC_COUNT: u64 = 0;
+static mut RECLAIM_COUNT: u64 = 0;
+
+extern "ocore" fn g2_serial_putc(byte: u64) -> void;
+extern "ocore" fn g2_counter_read() -> u64;
+extern "ocore" fn g2_arch_halt() -> never;
+
+unsafe fn emit(source: *const u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        let byte: u8 = *(source + index);
+        g2_serial_putc(byte as u64);
+        index += 1;
+    }
+}
+
+unsafe fn fail() -> never {
+    emit((&INVARIANT_FAILURE[0]), 36);
+    g2_arch_halt();
+}
+
+unsafe fn emit_once(bit: u64, source: *const u8, length: usize) -> void {
+    if bit == 0 || (MARKERS & bit) != 0 {
+        fail();
+    }
+    MARKERS = MARKERS | bit;
+    emit(source, length);
+}
+
+unsafe fn process_is_current(handle: u64) -> bool {
+    if handle == PROCESS_A_HANDLE {
+        return PROCESS_A_STATE == PROCESS_RUNNABLE
+            || PROCESS_A_STATE == PROCESS_BLOCKED;
+    }
+    if handle == PROCESS_B_HANDLE {
+        return PROCESS_B_GENERATION == 1
+            && PROCESS_B_STATE == PROCESS_RUNNABLE;
+    }
+    if handle == PROCESS_B_REUSED_HANDLE {
+        return PROCESS_B_GENERATION == 2
+            && PROCESS_B_STATE == PROCESS_REUSED;
+    }
+    return false;
+}
+
+unsafe fn current_process_valid() -> bool {
+    return process_is_current(CURRENT_PROCESS);
+}
+
+unsafe fn cap_use(handle: u64, rights: u64) -> u64 {
+    if CURRENT_PROCESS == PROCESS_A_HANDLE
+        && handle == RESOURCE_A_HANDLE
+        && RESOURCE_A_LIVE == 1 {
+        if (rights & (RIGHT_READ | RIGHT_WRITE)) == rights {
+            return 1;
+        }
+        return ERR_DENIED;
+    }
+    if CURRENT_PROCESS == PROCESS_B_HANDLE
+        && handle == TRANSFER_B_HANDLE
+        && TRANSFER_LIVE == 1
+        && TRANSFER_GENERATION == 1 {
+        if (rights & TRANSFER_RIGHTS) == rights {
+            return 1;
+        }
+        return ERR_DENIED;
+    }
+    if CURRENT_PROCESS == PROCESS_A_HANDLE
+        && handle == TRANSFER_REUSED_HANDLE
+        && TRANSFER_LIVE == 1
+        && TRANSFER_GENERATION == 2 {
+        if (rights & TRANSFER_RIGHTS) == rights {
+            return 1;
+        }
+        return ERR_DENIED;
+    }
+    return ERR_DENIED;
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_init() -> u64 {
+    MARKERS = 0;
+    CURRENT_PROCESS = PROCESS_A_HANDLE;
+    PROCESS_A_STATE = PROCESS_RUNNABLE;
+    PROCESS_B_STATE = PROCESS_DEAD;
+    PROCESS_B_GENERATION = 1;
+    RESOURCE_A_LIVE = 1;
+    TRANSFER_LIVE = 0;
+    TRANSFER_GENERATION = 1;
+    TRANSFER_RIGHTS = 0;
+    ENDPOINT_LIVE = 1;
+    REQUEST_READY = 0;
+    REPLY_READY = 0;
+    PENDING_ACTION = ACTION_RESUME;
+    SVC_COUNT = 0;
+    RECLAIM_COUNT = 0;
+    emit_once(MARK_KERNEL, (&KERNEL_ONLINE[0]), 30);
+    return PROCESS_A_HANDLE;
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_svc(
+    number: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64
+) -> u64 {
+    // All six syscall argument slots are part of the native ABI even though
+    // this bounded corpus deliberately needs no ambient seventh argument.
+    if a5 == 0xffff_ffff_ffff_ffff {
+        fail();
+    }
+    if !current_process_valid() {
+        fail();
+    }
+    SVC_COUNT += 1;
+
+    if number == SYS_REPORT {
+        if a0 == REPORT_A_ONLINE
+            && a1 == PROCESS_A_HANDLE
+            && CURRENT_PROCESS == PROCESS_A_HANDLE {
+            emit_once(MARK_A_ONLINE, (&A_ONLINE[0]), 35);
+            return 1;
+        }
+        if a0 == REPORT_B_ONLINE
+            && a1 == PROCESS_B_HANDLE
+            && CURRENT_PROCESS == PROCESS_B_HANDLE {
+            emit_once(MARK_B_ONLINE, (&B_ONLINE[0]), 35);
+            return 1;
+        }
+        return ERR_DENIED;
+    }
+
+    if number == SYS_CAP_USE {
+        let result: u64 = cap_use(a0, a1);
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && a0 == 0x0000_0009_0000_0001
+            && a1 == RIGHT_READ
+            && result == ERR_DENIED {
+            // Reaching a second SVC proves that the first SVC returned through
+            // ERET to the compiled EL0 principal rather than stopping in EL1.
+            emit_once(MARK_SVC_ERET, (&SVC_ERET_PASS[0]), 36);
+            emit_once(MARK_FORGED_DENIED, (&FORGED_DENIED[0]), 37);
+        }
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && a0 == RESOURCE_A_HANDLE
+            && a1 == RIGHT_EXECUTE
+            && result == ERR_DENIED {
+            emit_once(MARK_RIGHTS_DENIED, (&RIGHTS_DENIED[0]), 39);
+        }
+        if CURRENT_PROCESS == PROCESS_B_HANDLE
+            && a0 == TRANSFER_B_HANDLE
+            && a1 == RIGHT_READ
+            && result == 1 {
+            emit_once(MARK_READ_PASS, (&READ_PASS[0]), 44);
+        }
+        if CURRENT_PROCESS == PROCESS_B_HANDLE
+            && a0 == TRANSFER_B_HANDLE
+            && a1 == RIGHT_WRITE
+            && result == ERR_DENIED {
+            emit_once(MARK_WRITE_DENIED, (&WRITE_DENIED[0]), 47);
+        }
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && a0 == TRANSFER_B_HANDLE
+            && a1 == RIGHT_READ
+            && TRANSFER_GENERATION == 2
+            && result == ERR_DENIED {
+            emit_once(MARK_CAP_REUSE, (&CAP_REUSE[0]), 52);
+        }
+        return result;
+    }
+
+    if number == SYS_ENDPOINT_SEND {
+        if CURRENT_PROCESS != PROCESS_A_HANDLE
+            || PROCESS_A_STATE != PROCESS_RUNNABLE
+            || ENDPOINT_LIVE != 1
+            || a0 != ENDPOINT_A_HANDLE
+            || a1 != REQUEST_CORRELATION
+            || a2 != REQUEST_PAYLOAD
+            || a3 != RESOURCE_A_HANDLE
+            || a4 != RIGHT_READ
+            || cap_use(a3, RIGHT_READ | RIGHT_WRITE) != 1
+            || (a4 & (RIGHT_READ | RIGHT_WRITE)) != a4 {
+            return ERR_DENIED;
+        }
+        REQUEST_READY = 1;
+        REQUEST_CORRELATION_VALUE = a1;
+        REQUEST_PAYLOAD_VALUE = a2;
+        TRANSFER_LIVE = 1;
+        TRANSFER_GENERATION = 1;
+        TRANSFER_RIGHTS = a4;
+        PROCESS_A_STATE = PROCESS_BLOCKED;
+        PROCESS_B_STATE = PROCESS_RUNNABLE;
+        CURRENT_PROCESS = PROCESS_B_HANDLE;
+        PENDING_ACTION = ACTION_START_B;
+        emit_once(MARK_REQUEST, (&REQUEST_QUEUED[0]), 41);
+        return 1;
+    }
+
+    if number == SYS_ENDPOINT_RECEIVE {
+        if CURRENT_PROCESS == PROCESS_B_HANDLE
+            && PROCESS_B_STATE == PROCESS_RUNNABLE
+            && a0 == ENDPOINT_B_HANDLE
+            && REQUEST_READY == 1 {
+            if a1 == 0 {
+                return REQUEST_CORRELATION_VALUE;
+            }
+            if a1 == 1 {
+                return REQUEST_PAYLOAD_VALUE;
+            }
+            if a1 == 2 {
+                return TRANSFER_B_HANDLE;
+            }
+            return ERR_DENIED;
+        }
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && PROCESS_A_STATE == PROCESS_RUNNABLE
+            && a0 == ENDPOINT_A_HANDLE
+            && REPLY_READY == 1 {
+            if a1 == 0 {
+                return REPLY_CORRELATION_VALUE;
+            }
+            if a1 == 1 {
+                emit_once(MARK_ROUND_TRIP, (&ROUND_TRIP[0]), 40);
+                return REPLY_PAYLOAD_VALUE;
+            }
+            return ERR_DENIED;
+        }
+        return ERR_STATE;
+    }
+
+    if number == SYS_ENDPOINT_REPLY {
+        if CURRENT_PROCESS != PROCESS_B_HANDLE
+            || PROCESS_B_STATE != PROCESS_RUNNABLE
+            || ENDPOINT_LIVE != 1
+            || a0 != ENDPOINT_B_HANDLE
+            || a1 != REPLY_CORRELATION
+            || a2 != REPLY_PAYLOAD
+            || REQUEST_READY != 1
+            || PROCESS_A_STATE != PROCESS_BLOCKED {
+            return ERR_DENIED;
+        }
+        REPLY_READY = 1;
+        REPLY_CORRELATION_VALUE = a1;
+        REPLY_PAYLOAD_VALUE = a2;
+        emit_once(MARK_REPLY, (&REPLY_QUEUED[0]), 39);
+        return 1;
+    }
+
+    if number == SYS_FRESH_CAP {
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && PROCESS_A_STATE == PROCESS_RUNNABLE
+            && TRANSFER_LIVE == 1
+            && TRANSFER_GENERATION == 2 {
+            return TRANSFER_REUSED_HANDLE;
+        }
+        return ERR_DENIED;
+    }
+
+    if number == SYS_CAP_CLOSE {
+        if CURRENT_PROCESS == PROCESS_A_HANDLE
+            && a0 == TRANSFER_REUSED_HANDLE
+            && TRANSFER_LIVE == 1
+            && TRANSFER_GENERATION == 2 {
+            TRANSFER_LIVE = 0;
+            TRANSFER_GENERATION = 3;
+            TRANSFER_RIGHTS = 0;
+            RECLAIM_COUNT += 1;
+            return 1;
+        }
+        return ERR_DENIED;
+    }
+
+    if number == SYS_EXIT {
+        if CURRENT_PROCESS != PROCESS_A_HANDLE
+            || a0 != PROCESS_A_HANDLE
+            || PROCESS_A_STATE != PROCESS_RUNNABLE
+            || TRANSFER_LIVE != 0 {
+            return ERR_DENIED;
+        }
+        PROCESS_A_STATE = PROCESS_EXITED;
+        RESOURCE_A_LIVE = 0;
+        ENDPOINT_LIVE = 0;
+        REQUEST_READY = 0;
+        REPLY_READY = 0;
+        RECLAIM_COUNT += 3;
+        PENDING_ACTION = ACTION_COMPLETE;
+        emit_once(MARK_EXIT, (&EXIT_CONTAINED[0]), 36);
+        return 1;
+    }
+
+    if number == SYS_FAIL {
+        fail();
+    }
+    return ERR_DENIED;
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_fault(esr: u64, far: u64) -> u64 {
+    let exception_class: u64 = esr >> 26;
+    // BRK from the compiled B principal is the one expected contained fault.
+    // FAR is architecturally irrelevant for BRK and must not influence policy.
+    if far == 0xffff_ffff_ffff_ffff {
+        fail();
+    }
+    if exception_class != 0x3c
+        || CURRENT_PROCESS != PROCESS_B_HANDLE
+        || PROCESS_B_STATE != PROCESS_RUNNABLE
+        || REPLY_READY != 1
+        || PROCESS_A_STATE != PROCESS_BLOCKED {
+        return 0;
+    }
+
+    PROCESS_B_STATE = PROCESS_FAULTED;
+    emit_once(MARK_FAULT, (&FAULT_CONTAINED[0]), 37);
+
+    // Revoke the transferred generation, immediately reuse the bounded slot at
+    // a new generation, and later require A to prove that B's old handle stays
+    // stale while the fresh handle works and can be reclaimed.
+    TRANSFER_GENERATION = 2;
+    TRANSFER_LIVE = 1;
+    TRANSFER_RIGHTS = RIGHT_READ;
+
+    // The process registry follows the same generation rule.  Validate both
+    // identities while the replacement occupies the slot, then tear it down;
+    // the faulted generation never regains authority.
+    PROCESS_B_GENERATION = 2;
+    PROCESS_B_STATE = PROCESS_REUSED;
+    if process_is_current(PROCESS_B_HANDLE)
+        || !process_is_current(PROCESS_B_REUSED_HANDLE) {
+        fail();
+    }
+    PROCESS_B_STATE = PROCESS_DEAD;
+    RECLAIM_COUNT += 2;
+    emit_once(MARK_PROCESS_REUSE, (&PROCESS_REUSE[0]), 49);
+
+    CURRENT_PROCESS = PROCESS_A_HANDLE;
+    PROCESS_A_STATE = PROCESS_RUNNABLE;
+    PENDING_ACTION = ACTION_RESUME_A;
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_take_action() -> u64 {
+    let action: u64 = PENDING_ACTION;
+    PENDING_ACTION = ACTION_RESUME;
+    return action;
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_vector_failure(esr: u64) -> never {
+    if esr == 0 {
+        fail();
+    }
+    fail();
+}
+
+@export
+@no_mangle
+pub unsafe fn g2_kernel_finish() -> never {
+    if CURRENT_PROCESS != PROCESS_A_HANDLE
+        || PROCESS_A_STATE != PROCESS_EXITED
+        || PROCESS_B_STATE != PROCESS_DEAD
+        || PROCESS_B_GENERATION != 2
+        || RESOURCE_A_LIVE != 0
+        || TRANSFER_LIVE != 0
+        || TRANSFER_GENERATION != 3
+        || ENDPOINT_LIVE != 0
+        || REQUEST_READY != 0
+        || REPLY_READY != 0
+        || RECLAIM_COUNT != 6
+        || SVC_COUNT < 19
+        || (MARKERS & MARK_FAULT) == 0
+        || (MARKERS & MARK_CAP_REUSE) == 0
+        || (MARKERS & MARK_PROCESS_REUSE) == 0
+        || (MARKERS & MARK_EXIT) == 0 {
+        fail();
+    }
+
+    emit_once(MARK_RECLAIM, (&RECLAIMED[0]), 42);
+
+    emit_once(
+        MARK_PROCESS_LIFECYCLE,
+        (&PROCESS_LIFECYCLE[0]),
+        39
+    );
+    emit_once(
+        MARK_IPC_CAP_LIFECYCLE,
+        (&IPC_CAP_LIFECYCLE[0]),
+        42
+    );
+
+    // Read the architectural physical counter only after every process, IPC,
+    // capability, and reclamation invariant has reached its terminal state.
+    let before: u64 = g2_counter_read();
+    let mut after: u64 = before;
+    let mut spins: u64 = 0;
+    while after == before && spins < 1_000_000 {
+        after = g2_counter_read();
+        spins += 1;
+    }
+    if after <= before {
+        fail();
+    }
+    emit_once(MARK_TIMER, (&TIMER_ONLINE[0]), 40);
+    g2_arch_halt();
+}

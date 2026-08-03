@@ -1,0 +1,12 @@
+WORLD_ALPHA_ATTESTATION_TRANSCRIPT_V1
+gate=G0
+evidence_class=repository_conformance
+source_commit=ebedf6b3391f6865c89939a624e2ddec468edaf9
+command=./scripts/smoke-world-g0-conformance.sh
+artifact:world-contract-v1:sha256=4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8
+G0 executable contract schema: PASS
+G0 crossing taxonomy: PASS
+G0 identity vocabulary Rust/native: PASS
+G0 failure and consistency schemas: PASS
+G0 claim-class substitution guard: PASS
+G0 repository conformance: PASS

@@ -18,14 +18,20 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
     def manifest(self):
         return world_alpha_evidence.load_manifest()
 
-    def test_checked_in_registry_defines_every_gate_without_claiming_passage(self):
+    def test_checked_in_registry_passes_only_dependency_complete_g0_and_g2(self):
         gates = world_alpha_evidence.validated_gates(self.manifest(), ROOT)
         self.assertEqual(
             [gate["id"] for gate in gates],
             [f"G{number}" for number in range(14)],
         )
-        self.assertEqual({gate["status"] for gate in gates}, {"defined"})
-        self.assertTrue(all(not gate["evidence"] for gate in gates))
+        statuses = {gate["id"]: gate["status"] for gate in gates}
+        self.assertEqual(
+            {gate_id for gate_id, status in statuses.items() if status == "passed"},
+            {"G0", "G2"},
+        )
+        self.assertEqual(statuses["G13"], "defined")
+        self.assertEqual(gates[0]["evidence"][0]["class"], "repository_conformance")
+        self.assertEqual(gates[2]["evidence"][0]["class"], "qemu_tcg_aarch64")
 
     def test_hosted_reference_cannot_become_a_qualifying_class(self):
         manifest = copy.deepcopy(self.manifest())
@@ -50,21 +56,21 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
 
     def test_gate_cannot_pass_without_evidence(self):
         manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][0]["status"] = "passed"
+        manifest["gate"][1]["status"] = "passed"
         with self.assertRaisesRegex(
             world_alpha_evidence.WorldEvidenceError,
-            "definition-only and cannot certify passed gates",
+            "must contain at least 1 string",
         ):
             world_alpha_evidence.validated_gates(manifest, ROOT)
 
-    def test_definition_only_schema_rejects_self_declared_evidence(self):
+    def test_defined_gate_rejects_attached_evidence(self):
         manifest = copy.deepcopy(self.manifest())
-        manifest["gate"][0]["evidence"] = [
-            {"path": "evidence/world/empty.txt", "class": "repository_conformance"}
+        manifest["gate"][1]["evidence"] = [
+            "evidence/world/g0-repository-conformance.toml"
         ]
         with self.assertRaisesRegex(
             world_alpha_evidence.WorldEvidenceError,
-            "schema v1 has no attestation format",
+            "must be empty while status is defined",
         ):
             world_alpha_evidence.validated_gates(manifest, ROOT)
 
@@ -74,6 +80,29 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(
             world_alpha_evidence.WorldEvidenceError,
             "depends_on must be",
+        ):
+            world_alpha_evidence.validated_gates(manifest, ROOT)
+
+    def test_passed_gate_requires_passed_dependencies(self):
+        manifest = copy.deepcopy(self.manifest())
+        manifest["gate"][0]["status"] = "defined"
+        manifest["gate"][0]["evidence"] = []
+        with self.assertRaisesRegex(
+            world_alpha_evidence.WorldEvidenceError,
+            "G2 cannot pass before dependencies",
+        ):
+            world_alpha_evidence.validated_gates(
+                manifest, ROOT, definitions_only=True
+            )
+
+    def test_attestation_cannot_be_reused_for_a_different_gate(self):
+        manifest = copy.deepcopy(self.manifest())
+        manifest["gate"][2]["evidence"] = [
+            "evidence/world/g0-repository-conformance.toml"
+        ]
+        with self.assertRaisesRegex(
+            world_alpha_evidence.WorldEvidenceError,
+            "gate must be G2",
         ):
             world_alpha_evidence.validated_gates(manifest, ROOT)
 

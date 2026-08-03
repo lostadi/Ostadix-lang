@@ -19,10 +19,56 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "evidence/gates.toml"
-EXPECTED_SCHEMA = 1
-EXPECTED_REQUIRED_GATE_COUNT = 21
+EXPECTED_SCHEMA = 2
+EXPECTED_REQUIRED_GATE_COUNT = 22
 EXPECTED_SUPPLEMENTAL_GATE_COUNT = 1
-ALLOWED_EVIDENCE_CLASSES = {"portable_tcg", "hardware_kvm"}
+ALLOWED_EVIDENCE_CLASSES = {
+    "portable_tcg",
+    "qemu_tcg_aarch64",
+    "hardware_kvm",
+}
+
+COMMON_REQUIRED_TOOLS = {
+    "bash",
+    "cargo",
+    "rustc",
+    "clang",
+    "lld",
+    "python3",
+}
+CLASS_REQUIRED_TOOLS = {
+    "portable_tcg": {"qemu-system-x86_64"},
+    "qemu_tcg_aarch64": {"qemu-system-aarch64"},
+    "hardware_kvm": {"qemu-system-x86_64"},
+}
+
+G2_AARCH64_GATE_ID = "world-g2-aarch64-native"
+G2_AARCH64_SCRIPT = "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+G2_AARCH64_REQUIRED_TOOLS = COMMON_REQUIRED_TOOLS | {
+    "cmp",
+    "git",
+    "qemu-system-aarch64",
+    "shasum",
+}
+G2_AARCH64_POSITIVE_CLAIMS = (
+    "One O-core kernel compiled for AArch64 boots under forced QEMU TCG and, "
+    "in one live run, executes native EL0 process, IPC, capability, lifecycle, "
+    "stale-generation, reclamation, and post-lifecycle survival checks",
+)
+G2_AARCH64_NONCLAIMS = (
+    "This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or "
+    "G3 evidence",
+    "It does not boot Linux or Plan 9 and does not establish a general foreign ABI",
+    "It provides no PCI or physical-device assignment, DMA isolation, or "
+    "IOMMU/SMMU evidence",
+)
+G2_AARCH64_EXPECTED_MARKERS = (
+    "G2 AArch64 ocorec object: PASS",
+    "G2 AArch64 EL0 process lifecycle: PASS",
+    "G2 AArch64 IPC capability lifecycle: PASS",
+    "G2 AArch64 post-lifecycle timer: online",
+    "G2 AArch64 native compiler QEMU smoke: PASS",
+)
 
 README_BEGIN = "<!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE -->"
 README_END = "<!-- END GENERATED: REQUIRED_QEMU_EVIDENCE -->"
@@ -176,22 +222,18 @@ def validated_gates(data: dict[str, Any]) -> list[dict[str, Any]]:
                 raw_gate["expected_markers"], f"{location}.expected_markers", minimum=2
             ),
         }
-        if required and evidence_class != "portable_tcg":
+        if required and evidence_class == "hardware_kvm":
             raise EvidenceError(
                 f"required gate {gate_id} is {evidence_class}; hardware-dependent gates "
                 "must not enter the portable release aggregate"
             )
-        for tool in (
-            "bash",
-            "cargo",
-            "rustc",
-            "clang",
-            "lld",
-            "python3",
-            "qemu-system-x86_64",
-        ):
+        required_tools = COMMON_REQUIRED_TOOLS | CLASS_REQUIRED_TOOLS[evidence_class]
+        for tool in sorted(required_tools):
             if tool not in gate["required_tools"]:
-                raise EvidenceError(f"{location}.required_tools must include {tool!r}")
+                raise EvidenceError(
+                    f"{location}.required_tools must include {tool!r} "
+                    f"for evidence class {evidence_class!r}"
+                )
         gates.append(gate)
     required = [gate for gate in gates if gate["required"]]
     supplemental = [gate for gate in gates if not gate["required"]]
@@ -207,6 +249,42 @@ def validated_gates(data: dict[str, Any]) -> list[dict[str, Any]]:
         )
     if supplemental[0]["evidence_class"] != "hardware_kvm":
         raise EvidenceError("the supplemental evidence gate must be hardware_kvm")
+    aarch64 = [
+        gate for gate in required if gate["evidence_class"] == "qemu_tcg_aarch64"
+    ]
+    if len(aarch64) != 1:
+        raise EvidenceError(
+            "the portable release aggregate must contain exactly one "
+            "qemu_tcg_aarch64 gate"
+        )
+    if aarch64[0]["id"] != G2_AARCH64_GATE_ID or aarch64[0]["script"] != (
+        G2_AARCH64_SCRIPT
+    ):
+        raise EvidenceError(
+            "the qemu_tcg_aarch64 gate must be world-g2-aarch64-native at "
+            "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+        )
+    if tuple(aarch64[0]["positive_claims"]) != G2_AARCH64_POSITIVE_CLAIMS:
+        raise EvidenceError(
+            "world-g2-aarch64-native positive claims differ from the bounded "
+            "AArch64 QEMU/TCG contract"
+        )
+    if tuple(aarch64[0]["nonclaims"]) != G2_AARCH64_NONCLAIMS:
+        raise EvidenceError(
+            "world-g2-aarch64-native nonclaims must preserve the physical, "
+            "virtualization, SMP, foreign-OS, ABI, and device-isolation boundaries"
+        )
+    if tuple(aarch64[0]["expected_markers"]) != G2_AARCH64_EXPECTED_MARKERS:
+        raise EvidenceError(
+            "world-g2-aarch64-native expected markers differ from the integrated "
+            "AArch64 execution contract"
+        )
+    missing_g2_tools = G2_AARCH64_REQUIRED_TOOLS - set(aarch64[0]["required_tools"])
+    if missing_g2_tools:
+        raise EvidenceError(
+            "world-g2-aarch64-native required_tools is missing "
+            f"{sorted(missing_g2_tools)}"
+        )
     return gates
 
 

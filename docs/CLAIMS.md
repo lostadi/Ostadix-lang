@@ -20,6 +20,10 @@
   `c_cpp/CMakeLists.txt`, both using C17), and the Python reference edition
   (`o_lang/`). It also contains O-core freestanding x86_64 ELF object emission
   through `ocorec` (`README.md`, `src/bin/ocorec.rs`, `src/ocore/driver.rs`).
+  `ocorec` now also emits a conservative freestanding AArch64 scalar subset
+  through `src/ocore/codegen_aarch64.rs`; unsupported atomics, inline assembly,
+  interrupt/naked functions, floating point, and calls exceeding eight integer
+  arguments fail closed.
 - `examples/manifest.json` completely classifies the checked-in `.O` example
   tree by supported edition, unit/integration/manual status, runtime and
   authority requirements, timeout, and edition-specific oracle. The Rust,
@@ -37,9 +41,10 @@
   archive member. Relative Markdown links outside code/comments must resolve to
   files, directories, or the root inside that archive. Verification also checks
   canonical ZIP metadata/layout and inertly validates the MCP configuration,
-  crate license, example/evidence manifest schemas, sealed World Alpha v1
-  constitution/profile/registry bytes, and archive-local references; it never
-  imports or executes archive payloads. The supported local
+  crate license, example/evidence manifest schemas, sealed World Alpha
+  constitution-v2/profile/contract/registry bytes, both typed G0/G2
+  attestations, their transcript and released-source digests, and archive-local
+  references; it never imports or executes archive payloads. The supported local
   MCP crate, its lockfile, LGPL-2.1 license, repository config, and stdio smoke
   regressions are required release members. The regression suite covers debris
   exclusion, link closure, reproducibility, committed-byte behavior, required
@@ -443,10 +448,26 @@
 - [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) defines 14
   entries--the G0 constitutional baseline plus 13 integration gates through
   G13--with their dependencies, qualifying evidence classes, and prohibited
-  substitutes. `scripts/world_alpha_evidence.py` validates that registry. Every
-  checked-in gate is `defined`; zero gates are `passed`, including G0 and G13.
-  Schema v1 is definition-only and rejects both `passed` and nonempty evidence
-  until a typed attestation format is versioned.
+  substitutes. [`world_contract_v1.toml`](../evidence/world_contract_v1.toml)
+  freezes the three crossing kinds, all 20 identity atoms, seven failure
+  classes, eight consistency rules, and evidence-class taxonomy as executable
+  data. `scripts/world_alpha_evidence.py` validates both schemas and their exact
+  Rust/native/document references. Schema v2 marks only G0 and G2 `passed`; G2
+  is accepted only after its G0 dependency and its separate content-addressed
+  `qemu_tcg_aarch64` attestation validate. G13 and the other 11 gates remain
+  `defined`.
+- G2 is one forced-QEMU-TCG, one-vCPU AArch64 `virt` run. It compiles native
+  semantic `.oc` code to `EM_AARCH64`, enters two EL0 principals through a real
+  exception-return path, handles their SVC calls at EL1, exercises endpoint
+  request/reply and attenuated capability transfer, contains one EL0 fault,
+  tears down and reclaims generation-tagged state, rejects stale use after slot
+  reuse, and reaches a later architectural-counter liveness check. Assembly is
+  limited to boot/vector/context glue and is checked not to contain the
+  semantic PASS strings.
+- G2 is not physical AArch64 or KVM/SVM evidence; it is single-core and does
+  not pass G3. It does not boot Linux or Plan 9, provide a general foreign ABI,
+  assign a PCI or physical device, isolate DMA through an IOMMU/SMMU, or pass
+  any later native World gate.
 - [`HOSTED_WORLD_REFERENCE_PROFILE.md`](HOSTED_WORLD_REFERENCE_PROFILE.md)
   retains the prior hosted design only as a simulator, differential oracle,
   fuzzer, and development console. A hosted deployment cannot satisfy a native

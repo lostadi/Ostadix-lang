@@ -1,0 +1,101 @@
+schema_version = 1
+id = "g2-aarch64-qemu-tcg-2026-08-02"
+gate = "G2"
+evidence_class = "qemu_tcg_aarch64"
+source_commit = "ebedf6b3391f6865c89939a624e2ddec468edaf9"
+source_state = "content-addressed-working-tree"
+command = ["./ocore/kernel/smoke-aarch64-g2-qemu.sh"]
+transcript = "evidence/world/transcripts/g2-aarch64-qemu.log"
+transcript_sha256 = "3d95bf9c6e423a28f8c2e3d32c07e566a95916420181f3b58131c0ec7adf9c08"
+claims = [
+  "One deterministic EM_AARCH64 O-core image boots on AArch64 QEMU TCG and executes two compiled EL0 principals through real SVC/ERET, IPC request/reply, capability attenuation, and lifecycle teardown",
+  "The integrated run contains one EL0 fault, resumes the sibling's saved frame, rejects stale generation-tagged process and capability handles after slot reuse, reclaims state, and reaches post-lifecycle counter liveness",
+]
+nonclaims = [
+  "This one-vCPU QEMU TCG result is not physical AArch64, KVM/SVM, SMP, G3, SMMU, or physical hardware evidence",
+  "It does not boot Linux or Plan 9 and does not establish a general foreign ABI",
+  "It provides no PCI/DMA/IOMMU isolation, physical-device assignment, hardware reset, or driver-domain evidence",
+]
+expected_markers = [
+  "G2 AArch64 ocorec object: PASS",
+  "G2 AArch64 EL0 process lifecycle: PASS",
+  "G2 AArch64 IPC capability lifecycle: PASS",
+  "G2 AArch64 post-lifecycle timer: online",
+  "G2 AArch64 native compiler QEMU smoke: PASS",
+]
+signatures = []
+
+[topology]
+kind = "virtual"
+architecture = "aarch64"
+machine = "QEMU virt,gic-version=3 with cortex-a57"
+acceleration = "tcg"
+cpu_count = 1
+inventory = [
+  "QEMU emulator version 11.0.2",
+  "128 MiB guest RAM",
+  "PL011 serial, MMU off, asynchronous exceptions masked",
+  "macOS arm64 evidence host; no hardware virtualization used",
+]
+
+[[source]]
+path = "src/ocore/codegen_aarch64.rs"
+sha256 = "36044a6a0e57bca4f48f029196e4fda976af71c09815b84e830a5495035618eb"
+
+[[source]]
+path = "src/ocore/driver.rs"
+sha256 = "092cd897c95fe1f2eb31b2276d6e93ee6140ba411cdff37672a0c9c38d976821"
+
+[[source]]
+path = "src/ocore/mod.rs"
+sha256 = "576c0626c9bb589ce9f0ea85fc7b9e10eaa183702ee0ac77a3cb1791e1f3b701"
+
+[[source]]
+path = "src/bin/ocorec.rs"
+sha256 = "d2ea0cf3623d0b654b45df3a290d0860e14f2ea2655456451aeee6dfc2703abe"
+
+[[source]]
+path = "ocore/kernel/build-aarch64-g2.sh"
+sha256 = "fb820b20a71bc033a50d770d6c10aad4818b15899cc9d136f114cf8694b490e8"
+
+[[source]]
+path = "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+sha256 = "8c3ca783855f117d8d4d5a9bdff87734a28b7e1b19d30f6ba622ff9421e7c50c"
+
+[[source]]
+path = "ocore/kernel/aarch64/boot.S"
+sha256 = "c28b3bc5b7d6be3255a97250074f100145e2d17ba575a520c57c26813f19f89c"
+
+[[source]]
+path = "ocore/kernel/aarch64/vectors.S"
+sha256 = "7e644528bf46fa053a7768c9363550d02035dd24d0ed04a5b1fee29b33b28ee5"
+
+[[source]]
+path = "ocore/kernel/aarch64/linker.ld"
+sha256 = "5fe5d2c84b3325e29f837e124bc9136c96273f529c2c2c7e9c7331029d16c180"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_kernel.oc"
+sha256 = "beb15eccc72555bde2ee0fee28750f4571697439ed4b91f729231b894597cd1e"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_user_a.oc"
+sha256 = "a5a6ab5cdf40cd720aef0710516e9786e894e9a97b7cb152111038d9abcac9e6"
+
+[[source]]
+path = "ocore/runtime/aarch64/g2_user_b.oc"
+sha256 = "271c64edb5f653756edc93f4591022a414070dbdcfa41dd875a9e6a7632f37dc"
+
+[[artifact]]
+name = "g2-kernel-object"
+kind = "aarch64-relocatable-elf"
+sha256 = "189a1416cde69b15a6ff892de5e700eb3fd9d05fdbd9b2a8b68173af888e2515"
+retained = false
+path = ""
+
+[[artifact]]
+name = "g2-kernel-elf"
+kind = "aarch64-executable-elf"
+sha256 = "eb00a1aeae8adcb31c3194c5055cdfdf475eed53c803f1547c550c4696e8f587"
+retained = false
+path = ""

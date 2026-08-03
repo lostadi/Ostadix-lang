@@ -1,5 +1,5 @@
-schema_version = 1
-required_gate_count = 21
+schema_version = 2
+required_gate_count = 22
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -24,6 +24,29 @@ expected_markers = [
   "timer CPL3 return: online",
   "CPL3 heartbeat: online",
   "QEMU smoke: PASS",
+]
+
+[[gate]]
+id = "world-g2-aarch64-native"
+required = true
+milestone = "World G2 / AArch64 native compiler"
+script = "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+evidence_class = "qemu_tcg_aarch64"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "cmp", "git", "shasum", "python3", "qemu-system-aarch64"]
+positive_claims = [
+  "One O-core kernel compiled for AArch64 boots under forced QEMU TCG and, in one live run, executes native EL0 process, IPC, capability, lifecycle, stale-generation, reclamation, and post-lifecycle survival checks",
+]
+nonclaims = [
+  "This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or G3 evidence",
+  "It does not boot Linux or Plan 9 and does not establish a general foreign ABI",
+  "It provides no PCI or physical-device assignment, DMA isolation, or IOMMU/SMMU evidence",
+]
+expected_markers = [
+  "G2 AArch64 ocorec object: PASS",
+  "G2 AArch64 EL0 process lifecycle: PASS",
+  "G2 AArch64 IPC capability lifecycle: PASS",
+  "G2 AArch64 post-lifecycle timer: online",
+  "G2 AArch64 native compiler QEMU smoke: PASS",
 ]
 
 [[gate]]

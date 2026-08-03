@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="/Users/ustad/Ostadix-lang/tools/lsp"
+source "$DIR/venv/bin/activate"
+exec python3 "$DIR/server.py" "$@"
