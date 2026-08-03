@@ -340,12 +340,19 @@ image twice, proves semantic markers originate in compiled `.oc`, and boots it
 with one vCPU on QEMU/TCG `virt,virtualization=on,gic-version=3`. The image
 installs a resident EL2 vector and stack, enters O-core at host EL1, and proves
 one domain-separated HVC/ERET round trip with sentinel-register and stack
-integrity. It then executes two EL0 principals through real SVC/ERET, endpoint
+integrity. That HVC is a host-EL1 bring-up probe, not a guest hypercall or
+paravirtual authority interface. It then executes two EL0 principals through real SVC/ERET, endpoint
 request/reply, attenuated capability use, contained fault and exit, generation
 reuse/stale denial, reclamation, and bounded post-lifecycle architectural
 counter progress. It has no stage-2 mappings and remains MMU-off virtual
 evidence, not physical AArch64, SMP/G3, KVM/SVM, Linux or Plan 9 boot, a general
 foreign ABI, or PCI/DMA/IOMMU/device-assignment evidence.
+
+The future host-EL1-to-EL2 resource boundary, including per-resource
+asynchronous completion, memory teardown ordering, G7's no-guest-HVC decision,
+and the deferred G8 handle-authentication decision, is specified in
+[`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md). It is a design contract, not
+an implemented G2 claim.
 
 Milestones 0.1 through 0.3 are complete for the bounded single-CPU bootstrap
 gate. The kernel enters a linked `native[0]` payload at CPL3, crosses an

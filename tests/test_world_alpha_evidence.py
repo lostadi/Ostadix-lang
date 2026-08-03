@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -91,10 +94,276 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
                 "@evidence event=counter_progress phase=post_lifecycle poll_bound=1000000 result=pass",
             )
         )
-        claims = world_alpha_evidence._derive_claims(transcript, "fixture")
+        claims = world_alpha_evidence._derive_claims(
+            transcript,
+            "fixture",
+            {
+                "evidence_class": "qemu_tcg_aarch64",
+                "topology": {
+                    "kind": "virtual",
+                    "architecture": "aarch64",
+                    "acceleration": "tcg",
+                    "cpu_count": 1,
+                },
+                "source_paths": set(),
+                "artifact_names": {"g2-kernel-elf", "g2-kernel-object"},
+                "artifact_kinds": set(),
+                "artifact_name_kinds": {},
+                "artifact_bindings": set(),
+            },
+        )
         self.assertIn("counter.progress_after_lifecycle", claims)
         self.assertIn("execution.post_lifecycle_reached", claims)
         self.assertNotIn("timer.interrupt_delivery", claims)
+
+    def test_derivation_hash_binds_artifact_context_normalization(self):
+        source = MODULE_PATH.read_bytes()
+        needle = b'artifact["path"] if artifact["retained"] else ""'
+        self.assertEqual(source.count(needle), 1)
+        mutated = source.replace(needle, b'""', 1)
+        current_implementation = hashlib.sha256(
+            world_alpha_evidence._derivation_implementation_bytes(source)
+        ).hexdigest()
+        mutated_implementation = hashlib.sha256(
+            world_alpha_evidence._derivation_implementation_bytes(mutated)
+        ).hexdigest()
+        self.assertNotEqual(mutated_implementation, current_implementation)
+        mutated_spec = copy.deepcopy(world_alpha_evidence.DERIVATION_SPEC)
+        mutated_spec["implementation_source_sha256"] = mutated_implementation
+        mutated_derivation = "sha256:" + hashlib.sha256(
+            world_alpha_evidence._canonical_json_bytes(mutated_spec)
+        ).hexdigest()
+        self.assertNotEqual(
+            mutated_derivation, world_alpha_evidence.CURRENT_DERIVATION_HASH
+        )
+
+    def test_observation_values_are_canonical_printable_ascii(self):
+        with self.assertRaisesRegex(
+            world_alpha_evidence.WorldEvidenceError,
+            "invalid/duplicate evidence field",
+        ):
+            world_alpha_evidence._parse_observations(
+                "@evidence event=résultat result=pass", "fixture"
+            )
+
+    def test_g7_compound_claim_requires_one_context_bound_lifecycle(self):
+        transcript = (
+            "@evidence event=g7_class_withdrawal_lifecycle "
+            "resource_class=MachineBlock async=pending_query_complete "
+            "host_ack=complete guest_error=consumed_guest_healthy "
+            "join_before_memory=host_ack_and_guest_error "
+            "memory_order=stop_quiesce_unmap_guest_host_tlbi_drain_generation_ack "
+            "reclaim=after_memory_ack guest_authority_hvc=absent result=pass"
+        )
+        context = {
+            "evidence_class": "qemu_virtualization",
+            "topology": {"kind": "virtual"},
+            "source_paths": {
+                "docs/O_MACHINE_CONTRACT.md",
+                "evidence/o_machine_contract_v1.toml",
+            },
+            "artifact_names": set(),
+            "artifact_kinds": {
+                "foreign-kernel-image",
+                "guest-native-error-trace",
+                "machine-withdrawal-trace",
+            },
+            "artifact_name_kinds": {},
+            "artifact_bindings": set(),
+        }
+        claim = "kernel_world.g7_class_withdrawal_lifecycle"
+        self.assertIn(
+            claim,
+            world_alpha_evidence._derive_claims(transcript, "fixture", context),
+        )
+        for field, replacement in (
+            ("evidence_class", "fault_injection"),
+            ("topology", {"kind": "physical"}),
+            (
+                "artifact_kinds",
+                {"foreign-kernel-image", "guest-native-error-trace"},
+            ),
+        ):
+            with self.subTest(field=field):
+                weakened = copy.deepcopy(context)
+                weakened[field] = replacement
+                self.assertNotIn(
+                    claim,
+                    world_alpha_evidence._derive_claims(
+                        transcript, "fixture", weakened
+                    ),
+                )
+        self.assertNotIn(
+            claim,
+            world_alpha_evidence._derive_claims(
+                transcript.replace(" host_ack=complete", ""),
+                "fixture",
+                context,
+            ),
+        )
+        self.assertNotIn(
+            claim,
+            world_alpha_evidence._derive_claims(
+                transcript.replace(
+                    "stop_quiesce_unmap_guest_host_tlbi_drain_generation_ack",
+                    "stop_unmap_tlbi_drain_generation_ack",
+                ),
+                "fixture",
+                context,
+            ),
+        )
+
+    def test_g8_compound_claim_requires_physical_artifact_context(self):
+        transcript = (
+            "@evidence event=g8_physical_withdrawal_lifecycle "
+            "device_class=nvme withdraw_operation=begin_withdraw_nvme "
+            "order=quiesce_dma_iommu_irq_reset_generation_ack_replacement "
+            "reset_verification=class_specific_pass "
+            "reset_failure=quarantine_no_ack_no_replacement "
+            "shared_group=dedicated_or_all_affected_quiesced_survival_proven "
+            "unrelated_world=healthy guest_machine_abi=none "
+            "handle_mac=not_required key_lifecycle=not_applicable result=pass"
+        )
+        context = {
+            "evidence_class": "hardware_aarch64_smmu",
+            "topology": {"kind": "physical"},
+            "source_paths": {
+                "docs/O_MACHINE_CONTRACT.md",
+                "evidence/o_machine_contract_v1.toml",
+            },
+            "artifact_names": {"device-class-nvme", "nvme-withdrawal-trace"},
+            "artifact_kinds": {
+                "physical-device-inventory",
+                "dma-iommu-withdrawal-trace",
+                "interrupt-reset-trace",
+                "unrelated-world-survival-trace",
+            },
+            "artifact_name_kinds": {
+                "device-class-nvme": "physical-device-inventory",
+                "nvme-withdrawal-trace": "dma-iommu-withdrawal-trace",
+            },
+            "artifact_bindings": set(),
+        }
+        claim = "driver.g8_physical_withdrawal_lifecycle"
+        self.assertIn(
+            claim,
+            world_alpha_evidence._derive_claims(transcript, "fixture", context),
+        )
+        context["artifact_kinds"].remove("physical-device-inventory")
+        self.assertNotIn(
+            claim,
+            world_alpha_evidence._derive_claims(transcript, "fixture", context),
+        )
+        symbolic = (
+            "@evidence event=g8_physical_withdrawal_lifecycle "
+            "class_contract=concrete_named "
+            "order=quiesce_dma_iommu_irq_reset_generation_ack_replacement "
+            "unrelated_world=healthy guest_interface_policy=decided result=pass"
+        )
+        self.assertNotIn(
+            claim,
+            world_alpha_evidence._derive_claims(symbolic, "fixture", context),
+        )
+        context["artifact_kinds"].add("physical-device-inventory")
+        for field in ("reset_verification", "reset_failure", "shared_group"):
+            with self.subTest(field=field):
+                weakened = " ".join(
+                    token
+                    for token in transcript.split(" ")
+                    if not token.startswith(f"{field}=")
+                )
+                self.assertNotIn(
+                    claim,
+                    world_alpha_evidence._derive_claims(
+                        weakened, "fixture", context
+                    ),
+                )
+        direct_context = copy.deepcopy(context)
+        direct_context["artifact_kinds"].add("handle-mac-key-lifecycle-trace")
+        direct = transcript.replace(
+            "guest_machine_abi=none handle_mac=not_required key_lifecycle=not_applicable",
+            "guest_machine_abi=direct handle_mac=verified key_lifecycle=verified",
+        )
+        self.assertIn(
+            claim,
+            world_alpha_evidence._derive_claims(
+                direct, "direct-abi-fixture", direct_context
+            ),
+        )
+        self.assertNotIn(
+            claim,
+            world_alpha_evidence._derive_claims(
+                direct.replace("handle_mac=verified", "handle_mac=absent"),
+                "direct-abi-fixture",
+                direct_context,
+            ),
+        )
+
+    def test_g0_claims_bind_artifact_name_kind_and_retained_path(self):
+        transcript = "\n".join(
+            (
+                "@evidence event=g0_contract_schema result=pass",
+                "@evidence event=g0_machine_contract result=pass",
+            )
+        )
+        v1 = (
+            "world-contract-v1",
+            "executable-constitutional-schema",
+            "evidence/world_contract_v1.toml",
+        )
+        v2 = (
+            "world-contract-v2",
+            "executable-constitutional-schema",
+            "evidence/world_contract_v2.toml",
+        )
+        machine = (
+            "o-machine-contract-v1",
+            "executable-machine-contract-schema",
+            "evidence/o_machine_contract_v1.toml",
+        )
+        context = {
+            "evidence_class": "repository_conformance",
+            "topology": {"kind": "repository", "acceleration": "none"},
+            "source_paths": {
+                "docs/O_MACHINE_CONTRACT.md",
+                "evidence/o_machine_contract_v1.toml",
+                "evidence/world_contract_v1.toml",
+                "evidence/world_contract_v2.toml",
+                "evidence/world_alpha_gates.toml",
+            },
+            "artifact_names": {item[0] for item in (v1, v2, machine)},
+            "artifact_kinds": {item[1] for item in (v1, v2, machine)},
+            "artifact_name_kinds": {
+                item[0]: item[1] for item in (v1, v2, machine)
+            },
+            "artifact_bindings": {v1, v2, machine},
+        }
+        claims = world_alpha_evidence._derive_claims(transcript, "fixture", context)
+        self.assertIn("world.contract_schema_consistent", claims)
+        self.assertIn("world.machine_contract_consistent", claims)
+
+        substituted = copy.deepcopy(context)
+        substituted["artifact_bindings"] = {
+            (v1[0], v1[1], v2[2]),
+            (v2[0], v2[1], v1[2]),
+            machine,
+        }
+        claims = world_alpha_evidence._derive_claims(
+            transcript, "fixture", substituted
+        )
+        self.assertNotIn("world.contract_schema_consistent", claims)
+        self.assertIn("world.machine_contract_consistent", claims)
+
+        substituted = copy.deepcopy(context)
+        substituted["artifact_bindings"].remove(machine)
+        substituted["artifact_bindings"].add(
+            (machine[0], "executable-constitutional-schema", machine[2])
+        )
+        claims = world_alpha_evidence._derive_claims(
+            transcript, "fixture", substituted
+        )
+        self.assertIn("world.contract_schema_consistent", claims)
+        self.assertNotIn("world.machine_contract_consistent", claims)
 
     def test_supersession_event_is_a_separate_strict_record(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,9 +388,569 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            event = world_alpha_evidence._validate_evidence_event(root, path)
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                event = world_alpha_evidence._validate_evidence_event(root, path)
             self.assertEqual(event["subject"], "old-attestation")
             self.assertEqual(event["replacement"], "new-attestation")
+
+    def test_checked_in_rederive_event_has_a_bound_payload(self):
+        path = ROOT / "evidence/world/g2-derivation-rederive-2026-08-03.toml"
+        event = world_alpha_evidence._validate_evidence_event(ROOT, path)
+        self.assertEqual(event["event"], "rederive")
+        self.assertEqual(event["current_derivation"], world_alpha_evidence.CURRENT_DERIVATION_HASH)
+        self.assertEqual(event["claims_lost"], set())
+        self.assertEqual(event["claims_gained"], set())
+
+    def test_rederive_payload_tamper_is_rejected(self):
+        source = ROOT / "evidence/world/g0-derivation-rederive-2026-08-03.toml"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "evidence/world/rederive.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    "this historical record retained only v1",
+                    "this historical record retained v1 and v2",
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "payload_sha256 does not bind",
+                ):
+                    world_alpha_evidence._validate_evidence_event(root, path)
+
+    def test_schema_v2_validator_bytes_are_reconstructible_from_history(self):
+        attestation = tomllib.loads(
+            (ROOT / "evidence/world/g2-aarch64-qemu-2026-08-03.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        source_path = "scripts/world_alpha_evidence.py"
+        digest = attestation["validator_sha256"]
+        current_digest = hashlib.sha256(
+            (ROOT / source_path).read_bytes()
+        ).hexdigest()
+        self.assertNotEqual(current_digest, digest)
+        base = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "show",
+                f"{attestation['source_commit']}:{source_path}",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        self.assertNotEqual(hashlib.sha256(base.stdout).hexdigest(), digest)
+        source_digests = {
+            item["path"]: item["sha256"] for item in attestation["source"]
+        }
+        source_digests[source_path] = digest
+        self.assertEqual(
+            world_alpha_evidence._resolve_source_snapshot(
+                ROOT, attestation["source_commit"], source_digests
+            ),
+            "c25d38c00283f2873eed1aa84dd89b437777e356",
+        )
+
+    def test_source_snapshot_requires_one_coherent_descendant_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Evidence Test"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "evidence@example.invalid",
+                ],
+                check=True,
+            )
+
+            def commit(message):
+                subprocess.run(["git", "-C", str(root), "add", "a", "b"], check=True)
+                subprocess.run(
+                    ["git", "-C", str(root), "commit", "-q", "-m", message],
+                    check=True,
+                )
+                return subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+
+            (root / "a").write_text("a0\n", encoding="utf-8")
+            (root / "b").write_text("b0\n", encoding="utf-8")
+            base = commit("base")
+            subprocess.run(
+                ["git", "-C", str(root), "switch", "-q", "-c", "branch-a"],
+                check=True,
+            )
+            (root / "a").write_text("a1\n", encoding="utf-8")
+            branch_a = commit("a1")
+            subprocess.run(
+                ["git", "-C", str(root), "switch", "-q", "-c", "branch-b", base],
+                check=True,
+            )
+            (root / "b").write_text("b1\n", encoding="utf-8")
+            branch_b = commit("b1")
+            digests = {
+                "a": hashlib.sha256(b"a1\n").hexdigest(),
+                "b": hashlib.sha256(b"b1\n").hexdigest(),
+            }
+            self.assertIsNone(
+                world_alpha_evidence._resolve_source_snapshot(root, base, digests)
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "switch", "-q", "branch-a"],
+                check=True,
+            )
+            (root / "b").write_text("b1\n", encoding="utf-8")
+            coherent = commit("coherent")
+            self.assertEqual(
+                world_alpha_evidence._resolve_source_snapshot(root, base, digests),
+                coherent,
+            )
+            self.assertNotEqual(coherent, branch_a)
+            unrelated_digests = {
+                "a": hashlib.sha256(b"a0\n").hexdigest(),
+                "b": hashlib.sha256(b"b1\n").hexdigest(),
+            }
+            self.assertIsNone(
+                world_alpha_evidence._resolve_source_snapshot(
+                    root, branch_b, unrelated_digests
+                )
+            )
+
+    def test_source_commit_must_resolve_to_a_real_commit(self):
+        with self.assertRaisesRegex(
+            world_alpha_evidence.WorldEvidenceError,
+            "does not resolve to a Git commit",
+        ):
+            world_alpha_evidence._require_git_commit(
+                ROOT, "0" * 40, "fixture.source_commit"
+            )
+
+    def test_rederive_chain_updates_claims_without_retiring_attestation(self):
+        prior = "sha256:" + "1" * 64
+        attestation_id = "g2-aarch64-qemu-tcg-2026-08-03"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            (ledger / "a.toml").write_text('gate = "G2"\n', encoding="utf-8")
+            (ledger / "rederive.toml").write_text(
+                'event = "rederive"\n', encoding="utf-8"
+            )
+            attestation = {
+                "id": attestation_id,
+                "path": "evidence/world/a.toml",
+                "gate": "G2",
+                "class": "qemu_tcg_aarch64",
+                "recorded_claims": {"claim.old"},
+                "current_derived_claims": {"claim.new"},
+                "derived_claims": set(),
+                "derivation_hash": prior,
+                "schema_version": 2,
+            }
+            event = {
+                "id": "rederive-a",
+                "path": "evidence/world/rederive.toml",
+                "event": "rederive",
+                "subject": attestation_id,
+                "replacement": "",
+                "prior_derivation": prior,
+                "current_derivation": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                "claims_lost": {"claim.old"},
+                "claims_gained": {"claim.new"},
+            }
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                return_value=attestation,
+            ), mock.patch.object(
+                world_alpha_evidence,
+                "_validate_evidence_event",
+                return_value=event,
+            ):
+                active, events = world_alpha_evidence._active_evidence_ledger(
+                    root, {"qemu_tcg_aarch64"}, "0" * 64
+                )
+            self.assertEqual([item["id"] for item in active], [attestation_id])
+            self.assertEqual(active[0]["derived_claims"], {"claim.new"})
+            self.assertEqual([item["event"] for item in events], ["rederive"])
+
+    def test_external_unverified_witness_is_status_inert(self):
+        prior = "sha256:" + "1" * 64
+        attestation_id = "g2-aarch64-qemu-tcg-2026-08-03"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            for name, marker in (
+                ("a.toml", 'gate = "G2"\n'),
+                ("rederive.toml", 'event = "rederive"\n'),
+                ("witness.toml", 'event = "witness"\n'),
+            ):
+                (ledger / name).write_text(marker, encoding="utf-8")
+            attestation = {
+                "id": attestation_id,
+                "path": "evidence/world/a.toml",
+                "gate": "G2",
+                "class": "qemu_tcg_aarch64",
+                "recorded_claims": {"claim"},
+                "current_derived_claims": {"claim"},
+                "derived_claims": set(),
+                "derivation_hash": prior,
+                "schema_version": 2,
+            }
+            events = {
+                "rederive.toml": {
+                    "id": "rederive-a",
+                    "path": "evidence/world/rederive.toml",
+                    "event": "rederive",
+                    "subject": attestation_id,
+                    "replacement": "",
+                    "prior_derivation": prior,
+                    "current_derivation": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                    "claims_lost": set(),
+                    "claims_gained": set(),
+                    "payload_sha256": "2" * 64,
+                    "record_sha256": "2" * 64,
+                },
+                "witness.toml": {
+                    "id": "witness-a",
+                    "path": "evidence/world/witness.toml",
+                    "event": "witness",
+                    "subject": "rederive-a",
+                    "subject_record_sha256": "2" * 64,
+                    "verification": "external_unverified",
+                },
+            }
+
+            def fake_event(_root, path):
+                return copy.deepcopy(events[path.name])
+
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                return_value=attestation,
+            ), mock.patch.object(
+                world_alpha_evidence,
+                "_validate_evidence_event",
+                side_effect=fake_event,
+            ):
+                active, validated_events = world_alpha_evidence._active_evidence_ledger(
+                    root, {"qemu_tcg_aarch64"}, "0" * 64
+                )
+            self.assertEqual([item["id"] for item in active], [attestation_id])
+            self.assertEqual(active[0]["derived_claims"], {"claim"})
+            self.assertEqual(
+                {item["event"] for item in validated_events},
+                {"rederive", "witness"},
+            )
+
+    def test_external_witness_schema_remains_explicitly_unverified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "evidence/world/witness.toml"
+            path.parent.mkdir(parents=True)
+            witness_record = {
+                "schema_version": 1,
+                "id": "witness-a",
+                "event": "witness",
+                "subject": "rederive-a",
+                "subject_record_sha256": "1" * 64,
+                "algorithm": "ed25519",
+                "key_id": "external-key-1",
+                "public_key": "2" * 64,
+                "run_identity": "external-run-1",
+                "source_commit": "4" * 40,
+                "verification": "external_unverified",
+            }
+            witness_payload_sha256 = world_alpha_evidence._witness_payload_sha256(
+                witness_record
+            )
+            path.write_text(
+                "\n".join(
+                    (
+                        "schema_version = 1",
+                        'id = "witness-a"',
+                        'event = "witness"',
+                        'subject = "rederive-a"',
+                        f'subject_record_sha256 = "{"1" * 64}"',
+                        f'witness_payload_sha256 = "{witness_payload_sha256}"',
+                        'algorithm = "ed25519"',
+                        'key_id = "external-key-1"',
+                        f'public_key = "{"2" * 64}"',
+                        f'signature = "{"3" * 128}"',
+                        'run_identity = "external-run-1"',
+                        f'source_commit = "{"4" * 40}"',
+                        'verification = "external_unverified"',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                event = world_alpha_evidence._validate_evidence_event(root, path)
+            self.assertEqual(event["event"], "witness")
+            self.assertEqual(event["verification"], "external_unverified")
+            original = path.read_text(encoding="utf-8")
+            path.write_text(
+                original.replace(
+                    'run_identity = "external-run-1"',
+                    'run_identity = "external-run-2"',
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "does not bind the detached signature preimage",
+                ):
+                    world_alpha_evidence._validate_evidence_event(root, path)
+            path.write_text(original, encoding="utf-8")
+            path.write_text(
+                original.replace(f'public_key = "{"2" * 64}"', f'public_key = "{"0" * 64}"'),
+                encoding="utf-8",
+            )
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "public_key must not be all zero",
+                ):
+                    world_alpha_evidence._validate_evidence_event(root, path)
+            path.write_text(original, encoding="utf-8")
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    'verification = "external_unverified"',
+                    'verification = "verified"',
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(world_alpha_evidence, "_require_git_commit"):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "must state external_unverified",
+                ):
+                    world_alpha_evidence._validate_evidence_event(root, path)
+
+    def test_rederive_chain_rejects_an_inexact_claim_delta(self):
+        prior = "sha256:" + "1" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            (ledger / "a.toml").write_text('gate = "G2"\n', encoding="utf-8")
+            (ledger / "rederive.toml").write_text(
+                'event = "rederive"\n', encoding="utf-8"
+            )
+            attestation = {
+                "id": "a",
+                "path": "evidence/world/a.toml",
+                "gate": "G2",
+                "class": "qemu_tcg_aarch64",
+                "recorded_claims": {"claim.old"},
+                "current_derived_claims": set(),
+                "derived_claims": set(),
+                "derivation_hash": prior,
+                "schema_version": 2,
+            }
+            event = {
+                "id": "rederive-a",
+                "path": "evidence/world/rederive.toml",
+                "event": "rederive",
+                "subject": "a",
+                "replacement": "",
+                "prior_derivation": prior,
+                "current_derivation": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                "claims_lost": set(),
+                "claims_gained": set(),
+            }
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                return_value=attestation,
+            ), mock.patch.object(
+                world_alpha_evidence,
+                "_validate_evidence_event",
+                return_value=event,
+            ):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "rederive delta differs from current derivation",
+                ):
+                    world_alpha_evidence._active_evidence_ledger(
+                        root, {"qemu_tcg_aarch64"}, "0" * 64
+                    )
+
+    def test_rederive_and_supersession_are_independent_edges(self):
+        prior = "sha256:" + "1" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            for name, marker in (
+                ("a.toml", 'gate = "G2"\n'),
+                ("b.toml", 'gate = "G2"\n'),
+                ("rederive.toml", 'event = "rederive"\n'),
+                ("supersede.toml", 'event = "supersede"\n'),
+                ("witness.toml", 'event = "witness"\n'),
+            ):
+                (ledger / name).write_text(marker, encoding="utf-8")
+            attestations = {
+                "a.toml": {
+                    "id": "a",
+                    "path": "evidence/world/a.toml",
+                    "gate": "G2",
+                    "class": "qemu_tcg_aarch64",
+                    "recorded_claims": {"claim"},
+                    "current_derived_claims": {"claim"},
+                    "derived_claims": set(),
+                    "derivation_hash": prior,
+                    "schema_version": 2,
+                },
+                "b.toml": {
+                    "id": "b",
+                    "path": "evidence/world/b.toml",
+                    "gate": "G2",
+                    "class": "qemu_tcg_aarch64",
+                    "recorded_claims": {"claim"},
+                    "current_derived_claims": {"claim"},
+                    "derived_claims": set(),
+                    "derivation_hash": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                    "schema_version": 3,
+                },
+            }
+            events = {
+                "rederive.toml": {
+                    "id": "rederive-a",
+                    "path": "evidence/world/rederive.toml",
+                    "event": "rederive",
+                    "subject": "a",
+                    "replacement": "",
+                    "prior_derivation": prior,
+                    "current_derivation": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                    "claims_lost": set(),
+                    "claims_gained": set(),
+                    "payload_sha256": "2" * 64,
+                    "record_sha256": "2" * 64,
+                },
+                "supersede.toml": {
+                    "id": "supersede-a",
+                    "path": "evidence/world/supersede.toml",
+                    "event": "supersede",
+                    "subject": "a",
+                    "replacement": "b",
+                    "prior_derivation": "",
+                    "current_derivation": "",
+                    "claims_lost": set(),
+                    "claims_gained": set(),
+                    "payload_sha256": "3" * 64,
+                    "record_sha256": "3" * 64,
+                },
+                "witness.toml": {
+                    "id": "witness-supersede-a",
+                    "path": "evidence/world/witness.toml",
+                    "event": "witness",
+                    "subject": "supersede-a",
+                    "subject_record_sha256": "3" * 64,
+                    "verification": "external_unverified",
+                },
+            }
+
+            def fake_attestation(_root, path, *_args):
+                return copy.deepcopy(attestations[Path(path).name])
+
+            def fake_event(_root, path):
+                return copy.deepcopy(events[path.name])
+
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                side_effect=fake_attestation,
+            ), mock.patch.object(
+                world_alpha_evidence,
+                "_validate_evidence_event",
+                side_effect=fake_event,
+            ):
+                active, validated_events = world_alpha_evidence._active_evidence_ledger(
+                    root, {"qemu_tcg_aarch64"}, "0" * 64
+                )
+            self.assertEqual([item["id"] for item in active], ["b"])
+            self.assertEqual(active[0]["derived_claims"], {"claim"})
+            self.assertIn("witness", {item["event"] for item in validated_events})
+
+    def test_schema_v1_attestation_cannot_be_an_active_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            (ledger / "legacy.toml").write_text('gate = "G0"\n', encoding="utf-8")
+            legacy = {
+                "id": "legacy",
+                "path": "evidence/world/legacy.toml",
+                "gate": "G0",
+                "class": "repository_conformance",
+                "recorded_claims": {"world.contract_schema_consistent"},
+                "current_derived_claims": {"world.contract_schema_consistent"},
+                "derived_claims": set(),
+                "derivation_hash": None,
+                "schema_version": 1,
+            }
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                return_value=legacy,
+            ):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "schema-v1 attestation legacy cannot be an active ledger head",
+                ):
+                    world_alpha_evidence._active_evidence_ledger(
+                        root, {"repository_conformance"}, "0" * 64
+                    )
+
+    def test_unpinned_schema_v2_attestation_cannot_be_an_active_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / "evidence/world"
+            ledger.mkdir(parents=True)
+            (ledger / "legacy.toml").write_text('gate = "G0"\n', encoding="utf-8")
+            legacy = {
+                "id": "unlisted-schema-v2",
+                "path": "evidence/world/legacy.toml",
+                "gate": "G0",
+                "class": "repository_conformance",
+                "recorded_claims": {"claim"},
+                "current_derived_claims": {"claim"},
+                "derived_claims": set(),
+                "derivation_hash": world_alpha_evidence.CURRENT_DERIVATION_HASH,
+                "schema_version": 2,
+            }
+            with mock.patch.object(
+                world_alpha_evidence,
+                "_validate_attestation",
+                return_value=legacy,
+            ):
+                with self.assertRaisesRegex(
+                    world_alpha_evidence.WorldEvidenceError,
+                    "active attestation unlisted-schema-v2 must use schema v3",
+                ):
+                    world_alpha_evidence._active_evidence_ledger(
+                        root, {"repository_conformance"}, "0" * 64
+                    )
 
     def test_supersession_cycle_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +1032,20 @@ class WorldAlphaEvidenceTests(unittest.TestCase):
                     "registry semantics drifted",
                 ):
                     world_alpha_evidence.validated_gates(manifest, ROOT)
+
+    def test_registry_semantics_hash_binds_validator_owned_qualification_floors(self):
+        manifest = self.manifest()
+        baseline = world_alpha_evidence._registry_semantics_sha256(manifest)
+        weakened = {
+            gate: set(claims)
+            for gate, claims in world_alpha_evidence.REQUIRED_CLAIM_FLOORS.items()
+        }
+        weakened["G0"].remove("world.machine_contract_consistent")
+        with mock.patch.object(
+            world_alpha_evidence, "REQUIRED_CLAIM_FLOORS", weakened
+        ):
+            changed = world_alpha_evidence._registry_semantics_sha256(manifest)
+        self.assertNotEqual(changed, baseline)
 
     def test_windows_style_constitution_path_is_rejected(self):
         manifest = copy.deepcopy(self.manifest())

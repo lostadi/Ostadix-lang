@@ -32,11 +32,15 @@ WORLD_NORMATIVE_BYTES = {
 WORLD_ATTESTATION_PATHS = (
     "evidence/world/g0-repository-conformance.toml",
     "evidence/world/g0-repository-conformance-2026-08-03.toml",
+    "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
     "evidence/world/g2-aarch64-qemu.toml",
     "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
 )
 WORLD_EVIDENCE_EVENT_PATHS = {
+    "evidence/world/g0-derivation-rederive-2026-08-03.toml",
+    "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
     "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
+    "evidence/world/g2-derivation-rederive-2026-08-03.toml",
     "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
 }
 WORLD_EVIDENCE_RELEASE_PATHS = set(WORLD_ATTESTATION_PATHS) | WORLD_EVIDENCE_EVENT_PATHS
@@ -212,8 +216,12 @@ class SourceReleaseTests(unittest.TestCase):
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
+            "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+            ],
+            "docs/O_MACHINE_CONTRACT.md": WORLD_NORMATIVE_BYTES[
+                "docs/O_MACHINE_CONTRACT.md"
             ],
             "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
                 "docs/OSTADIX_WORLD.md"
@@ -224,6 +232,12 @@ class SourceReleaseTests(unittest.TestCase):
             ],
             "evidence/world_contract_v1.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_contract_v1.toml"
+            ],
+            "evidence/world_contract_v2.toml": WORLD_NORMATIVE_BYTES[
+                "evidence/world_contract_v2.toml"
+            ],
+            "evidence/o_machine_contract_v1.toml": WORLD_NORMATIVE_BYTES[
+                "evidence/o_machine_contract_v1.toml"
             ],
             "examples/manifest.json": '{"schema_version": 1, "examples": []}\n',
             "llms.txt": "release index\n",
@@ -471,18 +485,27 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/CLAIMS.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
+                "docs/KERNEL_WORLD_CONTRACT.md",
+                "docs/O_MACHINE_CONTRACT.md",
                 "docs/OSTADIX_WORLD.md",
                 "evidence/gates.toml",
+                "evidence/o_machine_contract_v1.toml",
                 "evidence/world_alpha_gates.toml",
                 "evidence/world_contract_v1.toml",
+                "evidence/world_contract_v2.toml",
+                "evidence/world/g0-derivation-rederive-2026-08-03.toml",
+                "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
                 "evidence/world/g0-repository-conformance.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03.toml",
+                "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
                 "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
                 "evidence/world/g2-aarch64-qemu.toml",
                 "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
                 "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
+                "evidence/world/g2-derivation-rederive-2026-08-03.toml",
                 "evidence/world/transcripts/g0-repository-conformance.log",
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
+                "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
@@ -1098,7 +1121,10 @@ class SourceReleaseTests(unittest.TestCase):
                     self._build(f"tampered-world-{Path(path).name}.zip")
                 message = str(raised.exception)
                 self.assertIn(path, message)
-                self.assertIn("SHA-256 differs from sealed World Alpha v2 bytes", message)
+                self.assertIn(
+                    "SHA-256 differs from sealed World Alpha constitutional bytes",
+                    message,
+                )
 
     def test_archive_verifier_rejects_self_consistent_world_byte_tamper(self) -> None:
         result = self._build("valid-before-world-tamper.zip", ref=self._commit())
@@ -1121,7 +1147,10 @@ class SourceReleaseTests(unittest.TestCase):
                     release.verify_archive(tampered)
                 message = str(raised.exception)
                 self.assertIn(path, message)
-                self.assertIn("SHA-256 differs from sealed World Alpha v2 bytes", message)
+                self.assertIn(
+                    "SHA-256 differs from sealed World Alpha constitutional bytes",
+                    message,
+                )
 
     def test_world_attestation_rejects_transcript_tamper(self) -> None:
         path = "evidence/world/transcripts/g2-aarch64-qemu.log"
@@ -1132,15 +1161,299 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("tampered-g2-transcript.zip")
 
-    def test_world_attestation_rejects_source_byte_tamper(self) -> None:
+    def test_historical_world_attestation_does_not_claim_current_archive_sources(self) -> None:
         path = "src/ocore/codegen_aarch64.rs"
-        self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"\n"})
+        commit = self._commit({path: (PROJECT_ROOT / path).read_bytes() + b"\n"})
+        result = self._build("historical-g2-source.zip", ref=commit)
+        self.assertTrue(result.output.is_file())
+
+    def test_world_rederive_event_rejects_payload_tamper(self) -> None:
+        path = "evidence/world/g2-derivation-rederive-2026-08-03.toml"
+        tampered = (PROJECT_ROOT / path).read_text(encoding="utf-8").replace(
+            "The claim set is unchanged", "The claim set changed"
+        )
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"g2-aarch64-qemu-2026-08-03\.toml\.source\[[0-9]+\].*"
-            r"does not match released src/ocore/codegen_aarch64\.rs",
+            r"payload_sha256 does not bind the rederive event",
         ):
-            self._build("tampered-g2-source.zip")
+            release._validate_world_rederive_event_release_surface(
+                {path: tampered.encode("utf-8")}, {path: "100644"}, path
+            )
+        self._commit({path: tampered})
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"bytes differ from the immutable evidence-event seal",
+        ):
+            self._build("tampered-g2-rederive.zip")
+
+    def test_release_ledger_rejects_an_unenumerated_world_toml(self) -> None:
+        files = {"evidence/world/ignored.toml": b'schema_version = 1\n'}
+        modes = {"evidence/world/ignored.toml": "100644"}
+        with mock.patch.object(
+            release, "WORLD_HISTORICAL_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_CURRENT_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_EVIDENCE_EVENT_SHA256", {}
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                r"exhaustive release set.*ignored\.toml",
+            ):
+                release._validate_world_evidence_ledger_release_surface(
+                    files, modes, {"G0"}, {"repository_conformance"}
+                )
+
+    def test_release_ledger_exact_byte_seals_every_event(self) -> None:
+        path = "evidence/world/event.toml"
+        files = {path: b'event = "retract"\n'}
+        modes = {path: "100644"}
+        with mock.patch.object(
+            release, "WORLD_HISTORICAL_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_CURRENT_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_EVIDENCE_EVENT_SHA256", {path: "0" * 64}
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                r"immutable evidence-event seal",
+            ):
+                release._validate_world_evidence_ledger_release_surface(
+                    files, modes, {"G0"}, {"repository_conformance"}
+                )
+
+    def test_release_ledger_exact_byte_seals_current_attestations(self) -> None:
+        path = "evidence/world/current.toml"
+        files = {path: b'schema_version = 3\n'}
+        modes = {path: "100644"}
+        with mock.patch.object(
+            release, "WORLD_HISTORICAL_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_CURRENT_ATTESTATION_SHA256", {path: "0" * 64}
+        ), mock.patch.object(
+            release, "WORLD_EVIDENCE_EVENT_SHA256", {}
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                r"immutable current-attestation seal",
+            ):
+                release._validate_world_evidence_ledger_release_surface(
+                    files, modes, {"G0"}, {"repository_conformance"}
+                )
+
+    def test_release_external_unverified_witness_is_status_inert(self) -> None:
+        witness_path = "evidence/world/witness.toml"
+        payload = "2" * 64
+        witness_record = {
+            "schema_version": 1,
+            "id": "witness-a",
+            "event": "witness",
+            "subject": "rederive-a",
+            "subject_record_sha256": payload,
+            "algorithm": "ed25519",
+            "key_id": "external-key-1",
+            "public_key": "3" * 64,
+            "run_identity": "external-run-1",
+            "source_commit": "5" * 40,
+            "verification": "external_unverified",
+        }
+        witness_payload_sha256 = release._world_witness_payload_sha256(
+            witness_record
+        )
+        witness_text = "\n".join(
+            (
+                "schema_version = 1",
+                'id = "witness-a"',
+                'event = "witness"',
+                'subject = "rederive-a"',
+                f'subject_record_sha256 = "{payload}"',
+                f'witness_payload_sha256 = "{witness_payload_sha256}"',
+                'algorithm = "ed25519"',
+                'key_id = "external-key-1"',
+                f'public_key = "{"3" * 64}"',
+                f'signature = "{"4" * 128}"',
+                'run_identity = "external-run-1"',
+                f'source_commit = "{"5" * 40}"',
+                'verification = "external_unverified"',
+                "",
+            )
+        ).encode("utf-8")
+        witness = release._validate_world_witness_event_release_surface(
+            {witness_path: witness_text}, {witness_path: "100644"}, witness_path
+        )
+        zero_key_text = witness_text.replace(
+            f'public_key = "{"3" * 64}"'.encode("ascii"),
+            f'public_key = "{"0" * 64}"'.encode("ascii"),
+        )
+        with self.assertRaisesRegex(
+            release.ReleaseError, "public_key must not be all zero"
+        ):
+            release._validate_world_witness_event_release_surface(
+                {witness_path: zero_key_text},
+                {witness_path: "100644"},
+                witness_path,
+            )
+        prior = "sha256:" + "1" * 64
+        attestation = {
+            "id": "g2-aarch64-qemu-tcg-2026-08-03",
+            "path": "evidence/world/g2.toml",
+            "gate": "G2",
+            "schema_version": 2,
+            "recorded_claims": {"claim"},
+            "current_derived_claims": {"claim"},
+            "derivation_hash": prior,
+        }
+        rederive = {
+            "id": "rederive-a",
+            "path": "evidence/world/rederive.toml",
+            "event": "rederive",
+            "subject": attestation["id"],
+            "prior_derivation": prior,
+            "current_derivation": release.WORLD_DERIVATION_HASH,
+            "claims_lost": set(),
+            "claims_gained": set(),
+            "payload_sha256": payload,
+            "record_sha256": payload,
+        }
+        active = release._validate_release_rederive_ledger(
+            [attestation], [rederive, witness]
+        )
+        self.assertEqual([item["id"] for item in active], [attestation["id"]])
+
+    def test_release_witness_can_bind_a_supersession_without_changing_status(self) -> None:
+        old = {
+            "id": "old",
+            "path": "evidence/world/old.toml",
+            "gate": "G0",
+            "schema_version": 3,
+            "recorded_claims": {"claim"},
+            "current_derived_claims": {"claim"},
+            "derivation_hash": release.WORLD_DERIVATION_HASH,
+        }
+        replacement = {
+            **old,
+            "id": "replacement",
+            "path": "evidence/world/replacement.toml",
+        }
+        lifecycle = {
+            "id": "supersede-old",
+            "path": "evidence/world/supersede.toml",
+            "event": "supersede",
+            "subject": "old",
+            "replacement": "replacement",
+            "record_sha256": "6" * 64,
+        }
+        witness = {
+            "id": "witness-supersede-old",
+            "path": "evidence/world/witness.toml",
+            "event": "witness",
+            "subject": "supersede-old",
+            "subject_record_sha256": "6" * 64,
+            "verification": "external_unverified",
+        }
+        active = release._validate_release_rederive_ledger(
+            [old, replacement], [lifecycle, witness]
+        )
+        self.assertEqual([item["id"] for item in active], ["replacement"])
+
+    def test_release_schema_v1_attestation_cannot_be_active(self) -> None:
+        attestation = {
+            "id": "legacy",
+            "path": "evidence/world/legacy.toml",
+            "gate": "G0",
+            "schema_version": 1,
+            "recorded_claims": set(),
+            "current_derived_claims": set(),
+            "derivation_hash": None,
+        }
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "schema-v1 attestation legacy cannot be an active ledger head",
+        ):
+            release._validate_release_rederive_ledger([attestation], [])
+
+    def test_release_unpinned_schema_v2_attestation_cannot_be_active(self) -> None:
+        attestation = {
+            "id": "unlisted-schema-v2",
+            "path": "evidence/world/legacy.toml",
+            "gate": "G0",
+            "schema_version": 2,
+            "recorded_claims": {"claim"},
+            "current_derived_claims": {"claim"},
+            "derivation_hash": release.WORLD_DERIVATION_HASH,
+        }
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "active attestation unlisted-schema-v2 must use schema v3",
+        ):
+            release._validate_release_rederive_ledger([attestation], [])
+
+    def test_fresh_attestation_cannot_couple_replace_the_trusted_validator(self) -> None:
+        path = "evidence/world/g0-repository-conformance-2026-08-03-v2.toml"
+        source_path = PROJECT_ROOT / path
+        if not source_path.is_file():
+            self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
+        attestation = tomllib.loads(source_path.read_text(encoding="utf-8"))
+        referenced = {
+            path,
+            attestation["transcript"],
+            attestation["command"][0][2:],
+            *(item["path"] for item in attestation["source"]),
+            *(
+                item["path"]
+                for item in attestation["artifact"]
+                if item["retained"]
+            ),
+        }
+        files = {item: (PROJECT_ROOT / item).read_bytes() for item in referenced}
+        modes = {item: "100644" for item in referenced}
+        modes[attestation["command"][0][2:]] = "100755"
+        validator_path = "scripts/world_alpha_evidence.py"
+        old_digest = attestation["validator_sha256"]
+        files[validator_path] += b"\n"
+        replacement_digest = hashlib.sha256(files[validator_path]).hexdigest()
+        record = files[path].decode("utf-8")
+        self.assertGreaterEqual(record.count(old_digest), 2)
+        files[path] = record.replace(old_digest, replacement_digest).encode("utf-8")
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "validator_sha256 differs from the trusted validator bytes",
+        ):
+            release._validate_world_attestation_release_surface(
+                files, modes, path, "G0", "repository_conformance"
+            )
+
+    def test_fresh_attestation_seal_rejects_coupled_transcript_rewrite(self) -> None:
+        path = "evidence/world/g0-repository-conformance-2026-08-03-v2.toml"
+        source_path = PROJECT_ROOT / path
+        if not source_path.is_file():
+            self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
+        attestation = tomllib.loads(source_path.read_text(encoding="utf-8"))
+        transcript_path = attestation["transcript"]
+        transcript = (PROJECT_ROOT / transcript_path).read_bytes() + b"tamper\n"
+        old_digest = attestation["transcript_sha256"]
+        replacement_digest = hashlib.sha256(transcript).hexdigest()
+        record = source_path.read_text(encoding="utf-8").replace(
+            old_digest, replacement_digest
+        ).encode("utf-8")
+        files = {path: record, transcript_path: transcript}
+        modes = {path: "100644", transcript_path: "100644"}
+        original_seal = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        with mock.patch.object(
+            release, "WORLD_HISTORICAL_ATTESTATION_SHA256", {}
+        ), mock.patch.object(
+            release, "WORLD_CURRENT_ATTESTATION_SHA256", {path: original_seal}
+        ), mock.patch.object(
+            release, "WORLD_EVIDENCE_EVENT_SHA256", {}
+        ):
+            with self.assertRaisesRegex(
+                release.ReleaseError,
+                "immutable current-attestation seal",
+            ):
+                release._validate_world_evidence_ledger_release_surface(
+                    files, modes, {"G0"}, {"repository_conformance"}
+                )
 
     def test_world_registry_structure_is_checked_beneath_byte_seal(self) -> None:
         path = "evidence/world_alpha_gates.toml"
