@@ -337,12 +337,15 @@ floating point, and wider call shapes.
 
 `ocore/kernel/smoke-aarch64-g2-qemu.sh` builds one deterministic `EM_AARCH64`
 image twice, proves semantic markers originate in compiled `.oc`, and boots it
-with one vCPU on QEMU/TCG `virt,gic-version=3`. The integrated run executes two
-EL0 principals through real SVC/ERET, endpoint request/reply, attenuated
-capability use, contained fault and exit, generation reuse/stale denial,
-reclamation, and later counter liveness. It is MMU-off virtual evidence, not
-physical AArch64, SMP/G3, KVM/SVM, Linux or Plan 9 boot, a general foreign ABI,
-or PCI/DMA/IOMMU/device-assignment evidence.
+with one vCPU on QEMU/TCG `virt,virtualization=on,gic-version=3`. The image
+installs a resident EL2 vector and stack, enters O-core at host EL1, and proves
+one domain-separated HVC/ERET round trip with sentinel-register and stack
+integrity. It then executes two EL0 principals through real SVC/ERET, endpoint
+request/reply, attenuated capability use, contained fault and exit, generation
+reuse/stale denial, reclamation, and bounded post-lifecycle architectural
+counter progress. It has no stage-2 mappings and remains MMU-off virtual
+evidence, not physical AArch64, SMP/G3, KVM/SVM, Linux or Plan 9 boot, a general
+foreign ABI, or PCI/DMA/IOMMU/device-assignment evidence.
 
 Milestones 0.1 through 0.3 are complete for the bounded single-CPU bootstrap
 gate. The kernel enters a linked `native[0]` payload at CPL3, crosses an

@@ -1,0 +1,9 @@
+schema_version = 1
+id = "g2-counter-wording-supersession-2026-08-03"
+event = "supersede"
+subject = "g2-aarch64-qemu-tcg-2026-08-02"
+replacement = "g2-aarch64-qemu-tcg-2026-08-03"
+reason_code = "semantic-overclaim"
+reason = "The prior marker named timer availability, but the execution established only bounded architectural-counter progress after lifecycle teardown."
+source_commit = "563a0d458d8ba2a8e9b3385bfbd37b85b6666991"
+signatures = []
