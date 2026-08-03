@@ -159,16 +159,26 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "docs/OSTADIX_WORLD.md",
         "evidence/gates.toml",
         "evidence/world_alpha_gates.toml",
+        "evidence/world_contract_v1.toml",
+        "evidence/world/g0-repository-conformance.toml",
+        "evidence/world/g2-aarch64-qemu.toml",
+        "evidence/world/transcripts/g0-repository-conformance.log",
+        "evidence/world/transcripts/g2-aarch64-qemu.log",
         "examples/manifest.json",
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
         "ocore/kernel/boot.S",
+        "ocore/kernel/aarch64/boot.S",
+        "ocore/kernel/aarch64/linker.ld",
+        "ocore/kernel/aarch64/vectors.S",
+        "ocore/kernel/build-aarch64-g2.sh",
         "ocore/kernel/build.sh",
         "ocore/kernel/main.oc",
         "ocore/kernel/smoke-world-receipt-qemu.sh",
         "ocore/kernel/smoke-world-value-qemu.sh",
         "ocore/kernel/smoke-world-protocol-qemu.sh",
         "ocore/kernel/smoke-world-identity-qemu.sh",
+        "ocore/kernel/smoke-aarch64-g2-qemu.sh",
         "ocore/kernel/world_value_semantics.oc",
         "ocore/kernel/world_value_semantics_stub.oc",
         "ocore/kernel/world_protocol_semantics.oc",
@@ -178,6 +188,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/runtime/x86_64/trap.oc",
+        "ocore/runtime/aarch64/g2_kernel.oc",
+        "ocore/runtime/aarch64/g2_user_a.oc",
+        "ocore/runtime/aarch64/g2_user_b.oc",
         "ocore/world/codec.oc",
         "ocore/world/identity.oc",
         "ocore/world/protocol.oc",
@@ -191,10 +204,16 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/o-cli.sh",
         "scripts/smoke-project-hgraph.sh",
         "scripts/smoke-world-resource-keys.sh",
+        "scripts/smoke-world-g0-conformance.sh",
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
         "src/effects.rs",
         "src/bin/olangc.rs",
+        "src/bin/ocorec.rs",
+        "src/ocore/codegen.rs",
+        "src/ocore/codegen_aarch64.rs",
+        "src/ocore/driver.rs",
+        "src/ocore/mod.rs",
         "src/executor/mod.rs",
         "src/hgraph/graph.rs",
         "src/hgraph/kinds.rs",
@@ -222,6 +241,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/fixtures/world_value_v1.hex",
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
+        "tests/test_release_evidence.py",
         "tests/test_world_alpha_evidence.py",
         "tests/project_hgraph.rs",
         "tests/world_resource_keys.rs",
@@ -240,24 +260,61 @@ URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 EXAMPLE_EDITIONS = frozenset({"rust", "c17", "python"})
 EXAMPLE_CLASSIFICATIONS = frozenset({"unit", "integration", "manual"})
 EXAMPLE_MODES = frozenset({"interpreter", "aot"})
-EVIDENCE_CLASSES = frozenset({"portable_tcg", "hardware_kvm"})
-EXPECTED_REQUIRED_EVIDENCE_GATES = 21
+EVIDENCE_CLASSES = frozenset(
+    {"portable_tcg", "qemu_tcg_aarch64", "hardware_kvm"}
+)
+EXPECTED_REQUIRED_EVIDENCE_GATES = 22
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
+EVIDENCE_COMMON_REQUIRED_TOOLS = frozenset(
+    {"bash", "cargo", "rustc", "clang", "lld", "python3"}
+)
+EVIDENCE_CLASS_REQUIRED_TOOLS = {
+    "portable_tcg": frozenset({"qemu-system-x86_64"}),
+    "qemu_tcg_aarch64": frozenset({"qemu-system-aarch64"}),
+    "hardware_kvm": frozenset({"qemu-system-x86_64"}),
+}
+G2_AARCH64_GATE_ID = "world-g2-aarch64-native"
+G2_AARCH64_SCRIPT = "ocore/kernel/smoke-aarch64-g2-qemu.sh"
+G2_AARCH64_REQUIRED_TOOLS = EVIDENCE_COMMON_REQUIRED_TOOLS | frozenset(
+    {"cmp", "git", "qemu-system-aarch64", "shasum"}
+)
+G2_AARCH64_POSITIVE_CLAIMS = (
+    "One O-core kernel compiled for AArch64 boots under forced QEMU TCG and, "
+    "in one live run, executes native EL0 process, IPC, capability, lifecycle, "
+    "stale-generation, reclamation, and post-lifecycle survival checks",
+)
+G2_AARCH64_NONCLAIMS = (
+    "This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or "
+    "G3 evidence",
+    "It does not boot Linux or Plan 9 and does not establish a general foreign ABI",
+    "It provides no PCI or physical-device assignment, DMA isolation, or "
+    "IOMMU/SMMU evidence",
+)
+G2_AARCH64_EXPECTED_MARKERS = (
+    "G2 AArch64 ocorec object: PASS",
+    "G2 AArch64 EL0 process lifecycle: PASS",
+    "G2 AArch64 IPC capability lifecycle: PASS",
+    "G2 AArch64 post-lifecycle timer: online",
+    "G2 AArch64 native compiler QEMU smoke: PASS",
+)
 
-# These three files jointly define the version-1 native World constitution and
-# its definition-only G0-G13 registry.  Source releases are built from arbitrary
+# These four files jointly define the version-2 native World constitution,
+# executable G0 contract, and typed G0-G13 registry. Source releases are built from arbitrary
 # committed refs and archive verification must not execute the Python shipped in
 # an untrusted ZIP, so keep trusted byte seals here and recheck the inert data
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "e7f3e4965d02c13f94fc6b8e16b3fbaca73020d73668eecc3a10b66443f4b91d"
+        "c2dbd100ba8acb60a88cfb06ebdfcac5bd2d70a112537f62c428d6ebac33fa61"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
         "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
     ),
     "evidence/world_alpha_gates.toml": (
-        "a4a15bda0771d22076624092768aa4219ae3074be261d80faed1381b8c5b5d42"
+        "f06bd933dc4d11ca7ca9d31c4e20edf06c62425c806f6978c42871f169664f4f"
+    ),
+    "evidence/world_contract_v1.toml": (
+        "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
     ),
 }
 EXPECTED_WORLD_ALPHA_GATE_IDS = tuple(f"G{number}" for number in range(14))
@@ -1093,8 +1150,8 @@ def _validate_evidence_manifest(
     }
     if set(manifest) != expected_root_keys:
         raise ReleaseError(f"{path} root keys differ from schema")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
-        raise ReleaseError(f"{path} schema_version must be 1")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 2:
+        raise ReleaseError(f"{path} schema_version must be 2")
     if type(manifest["required_gate_count"]) is not int or (
         manifest["required_gate_count"] != EXPECTED_REQUIRED_EVIDENCE_GATES
     ):
@@ -1135,6 +1192,7 @@ def _validate_evidence_manifest(
     identifiers: set[str] = set()
     scripts: set[str] = set()
     required_count = 0
+    aarch64_gates: list[dict[str, Any]] = []
     for index, gate in enumerate(gates):
         owner = f"{path} gate[{index}]"
         if not isinstance(gate, dict) or set(gate) != expected_gate_keys:
@@ -1153,8 +1211,10 @@ def _validate_evidence_manifest(
         )
         if evidence_class not in EVIDENCE_CLASSES:
             raise ReleaseError(f"{owner}.evidence_class is invalid")
-        if required and evidence_class != "portable_tcg":
-            raise ReleaseError(f"{owner}: required gates must be portable_tcg")
+        if required and evidence_class == "hardware_kvm":
+            raise ReleaseError(
+                f"{owner}: required gates must be portable QEMU evidence"
+            )
         if not required and evidence_class != "hardware_kvm":
             raise ReleaseError(f"{owner}: the supplemental gate must be hardware_kvm")
         script = _normalized_reference(gate["script"], f"{owner}.script")
@@ -1168,16 +1228,37 @@ def _validate_evidence_manifest(
             raise ReleaseError(f"{owner}.script references absent {script}")
         if modes.get(script) != "100755":
             raise ReleaseError(f"{owner}.script references non-executable {script}")
-        _required_string_list(
+        required_tools = _required_string_list(
             gate["required_tools"], f"{owner}.required_tools", minimum=1
         )
-        _required_string_list(
+        missing_tools = (
+            EVIDENCE_COMMON_REQUIRED_TOOLS
+            | EVIDENCE_CLASS_REQUIRED_TOOLS[evidence_class]
+        ) - set(required_tools)
+        if missing_tools:
+            raise ReleaseError(
+                f"{owner}.required_tools is missing class requirements "
+                f"{sorted(missing_tools)}"
+            )
+        positive_claims = _required_string_list(
             gate["positive_claims"], f"{owner}.positive_claims", minimum=1
         )
-        _required_string_list(gate["nonclaims"], f"{owner}.nonclaims", minimum=1)
-        _required_string_list(
+        nonclaims = _required_string_list(
+            gate["nonclaims"], f"{owner}.nonclaims", minimum=1
+        )
+        expected_markers = _required_string_list(
             gate["expected_markers"], f"{owner}.expected_markers", minimum=2
         )
+        if evidence_class == "qemu_tcg_aarch64":
+            aarch64_gates.append(
+                {
+                    "id": identifier,
+                    "script": script,
+                    "positive_claims": positive_claims,
+                    "nonclaims": nonclaims,
+                    "expected_markers": expected_markers,
+                }
+            )
 
     supplemental_count = len(gates) - required_count
     if required_count != EXPECTED_REQUIRED_EVIDENCE_GATES:
@@ -1194,6 +1275,33 @@ def _validate_evidence_manifest(
         raise ReleaseError(f"{path} required_gate_count does not match gate tables")
     if supplemental_count != manifest["supplemental_gate_count"]:
         raise ReleaseError(f"{path} supplemental_gate_count does not match gate tables")
+    if len(aarch64_gates) != 1:
+        raise ReleaseError(
+            f"{path} must contain exactly one qemu_tcg_aarch64 gate"
+        )
+    g2 = aarch64_gates[0]
+    if g2["id"] != G2_AARCH64_GATE_ID or g2["script"] != G2_AARCH64_SCRIPT:
+        raise ReleaseError(
+            f"{path} qemu_tcg_aarch64 evidence must be {G2_AARCH64_GATE_ID} "
+            f"at {G2_AARCH64_SCRIPT}"
+        )
+    if tuple(g2["positive_claims"]) != G2_AARCH64_POSITIVE_CLAIMS:
+        raise ReleaseError(f"{path} G2 AArch64 positive claims exceed the sealed boundary")
+    if tuple(g2["nonclaims"]) != G2_AARCH64_NONCLAIMS:
+        raise ReleaseError(f"{path} G2 AArch64 nonclaims differ from the sealed boundary")
+    if tuple(g2["expected_markers"]) != G2_AARCH64_EXPECTED_MARKERS:
+        raise ReleaseError(f"{path} G2 AArch64 runtime markers differ from the sealed contract")
+    missing_g2_tools = G2_AARCH64_REQUIRED_TOOLS - set(
+        next(
+            gate["required_tools"]
+            for gate in gates
+            if gate["id"] == G2_AARCH64_GATE_ID
+        )
+    )
+    if missing_g2_tools:
+        raise ReleaseError(
+            f"{path} G2 AArch64 required_tools is missing {sorted(missing_g2_tools)}"
+        )
 
 
 def _sealed_world_alpha_text(
@@ -1205,13 +1313,178 @@ def _sealed_world_alpha_text(
     actual = hashlib.sha256(files[path]).hexdigest()
     if actual != expected:
         raise ReleaseError(
-            f"{path} SHA-256 differs from sealed World Alpha v1 bytes; "
+            f"{path} SHA-256 differs from sealed World Alpha v2 bytes; "
             f"expected {expected}, got {actual}"
         )
     try:
         return files[path].decode("utf-8", "strict")
     except UnicodeDecodeError as error:  # The seal makes this corruption-only.
         raise ReleaseError(f"{path} is not valid UTF-8") from error
+
+
+def _validate_world_attestation_release_surface(
+    files: dict[str, bytes], modes: dict[str, str], path: str, gate_id: str,
+    evidence_class: str,
+) -> None:
+    if path not in files or modes.get(path) != "100644":
+        raise ReleaseError(f"{path} must be a regular non-executable release file")
+    attestation = _strict_toml(files[path], path)
+    expected_keys = {
+        "schema_version",
+        "id",
+        "gate",
+        "evidence_class",
+        "source_commit",
+        "source_state",
+        "command",
+        "transcript",
+        "transcript_sha256",
+        "topology",
+        "claims",
+        "nonclaims",
+        "expected_markers",
+        "source",
+        "artifact",
+        "signatures",
+    }
+    if set(attestation) != expected_keys:
+        raise ReleaseError(f"{path} keys differ from the World attestation schema")
+    if type(attestation["schema_version"]) is not int or attestation["schema_version"] != 1:
+        raise ReleaseError(f"{path} schema_version must be 1")
+    _required_string(attestation["id"], f"{path}.id")
+    if attestation["gate"] != gate_id:
+        raise ReleaseError(f"{path}.gate must be {gate_id}")
+    if attestation["evidence_class"] != evidence_class:
+        raise ReleaseError(f"{path}.evidence_class must be {evidence_class}")
+    commit = _required_string(attestation["source_commit"], f"{path}.source_commit")
+    if HEX_COMMIT.fullmatch(commit) is None:
+        raise ReleaseError(f"{path}.source_commit must be a Git object ID")
+    if attestation["source_state"] != "content-addressed-working-tree":
+        raise ReleaseError(f"{path}.source_state is invalid")
+
+    command = _required_string_list(attestation["command"], f"{path}.command", minimum=1)
+    if len(command) != 1 or not command[0].startswith("./"):
+        raise ReleaseError(f"{path}.command must name one repository executable")
+    command_path = _normalized_reference(command[0][2:], f"{path}.command[0]")
+    if command_path not in files or modes.get(command_path) != "100755":
+        raise ReleaseError(f"{path}.command references absent/non-executable {command_path}")
+
+    transcript_path = _normalized_reference(
+        attestation["transcript"], f"{path}.transcript"
+    )
+    if transcript_path not in files or modes.get(transcript_path) != "100644":
+        raise ReleaseError(f"{path}.transcript references absent {transcript_path}")
+    transcript_digest = _required_string(
+        attestation["transcript_sha256"], f"{path}.transcript_sha256"
+    )
+    if HEX_DIGEST.fullmatch(transcript_digest) is None:
+        raise ReleaseError(f"{path}.transcript_sha256 must be a SHA-256 digest")
+    if hashlib.sha256(files[transcript_path]).hexdigest() != transcript_digest:
+        raise ReleaseError(f"{path}.transcript digest does not match")
+    try:
+        transcript = files[transcript_path].decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{transcript_path} must be UTF-8") from error
+    transcript_lines = transcript.splitlines()
+    for line in (
+        "WORLD_ALPHA_ATTESTATION_TRANSCRIPT_V1",
+        f"gate={gate_id}",
+        f"evidence_class={evidence_class}",
+        f"source_commit={commit}",
+        f"command={command[0]}",
+    ):
+        if transcript_lines.count(line) != 1:
+            raise ReleaseError(f"{transcript_path} must contain exactly one {line!r}")
+    markers = _required_string_list(
+        attestation["expected_markers"], f"{path}.expected_markers", minimum=1
+    )
+    positions: list[int] = []
+    for marker in markers:
+        if transcript_lines.count(marker) != 1:
+            raise ReleaseError(
+                f"{transcript_path} must contain exactly one marker {marker!r}"
+            )
+        positions.append(transcript_lines.index(marker))
+    if positions != sorted(positions):
+        raise ReleaseError(f"{transcript_path} markers are not in causal order")
+
+    sources = attestation["source"]
+    if not isinstance(sources, list) or not sources:
+        raise ReleaseError(f"{path}.source must contain content digests")
+    seen_sources: set[str] = set()
+    for index, source in enumerate(sources):
+        owner = f"{path}.source[{index}]"
+        if not isinstance(source, dict) or set(source) != {"path", "sha256"}:
+            raise ReleaseError(f"{owner} keys differ from schema")
+        source_path = _normalized_reference(source["path"], f"{owner}.path")
+        if source_path in seen_sources:
+            raise ReleaseError(f"{path}.source contains duplicate {source_path}")
+        seen_sources.add(source_path)
+        digest = _required_string(source["sha256"], f"{owner}.sha256")
+        if HEX_DIGEST.fullmatch(digest) is None:
+            raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
+        if source_path not in files or hashlib.sha256(files[source_path]).hexdigest() != digest:
+            raise ReleaseError(f"{owner} does not match released {source_path}")
+
+    artifacts = attestation["artifact"]
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ReleaseError(f"{path}.artifact must contain artifact digests")
+    seen_artifacts: set[str] = set()
+    for index, artifact in enumerate(artifacts):
+        owner = f"{path}.artifact[{index}]"
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "name", "kind", "sha256", "retained", "path"
+        }:
+            raise ReleaseError(f"{owner} keys differ from schema")
+        name = _required_string(artifact["name"], f"{owner}.name")
+        if name in seen_artifacts:
+            raise ReleaseError(f"{path}.artifact contains duplicate {name}")
+        seen_artifacts.add(name)
+        _required_string(artifact["kind"], f"{owner}.kind")
+        digest = _required_string(artifact["sha256"], f"{owner}.sha256")
+        if HEX_DIGEST.fullmatch(digest) is None:
+            raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
+        if type(artifact["retained"]) is not bool:
+            raise ReleaseError(f"{owner}.retained must be boolean")
+        if artifact["retained"]:
+            artifact_path = _normalized_reference(artifact["path"], f"{owner}.path")
+            if artifact_path not in files or hashlib.sha256(files[artifact_path]).hexdigest() != digest:
+                raise ReleaseError(f"{owner} does not match retained {artifact_path}")
+        else:
+            if artifact["path"] != "":
+                raise ReleaseError(f"{owner}.path must be empty when not retained")
+            if transcript_lines.count(f"artifact:{name}:sha256={digest}") != 1:
+                raise ReleaseError(f"{transcript_path} does not bind artifact {name}")
+
+    topology = attestation["topology"]
+    if not isinstance(topology, dict) or set(topology) != {
+        "kind", "architecture", "machine", "acceleration", "cpu_count", "inventory"
+    }:
+        raise ReleaseError(f"{path}.topology keys differ from schema")
+    for field in ("kind", "architecture", "machine", "acceleration"):
+        _required_string(topology[field], f"{path}.topology.{field}")
+    if type(topology["cpu_count"]) is not int or topology["cpu_count"] < 0:
+        raise ReleaseError(f"{path}.topology.cpu_count must be nonnegative")
+    _required_string_list(topology["inventory"], f"{path}.topology.inventory", minimum=1)
+    _required_string_list(attestation["claims"], f"{path}.claims", minimum=1)
+    nonclaims = _required_string_list(
+        attestation["nonclaims"], f"{path}.nonclaims", minimum=1
+    )
+    if evidence_class == "qemu_tcg_aarch64":
+        if (
+            topology["kind"] != "virtual"
+            or topology["architecture"] != "aarch64"
+            or topology["acceleration"] != "tcg"
+            or topology["cpu_count"] != 1
+            or "virt" not in topology["machine"]
+        ):
+            raise ReleaseError(f"{path} does not bind the one-vCPU AArch64 TCG virt topology")
+        boundary = " ".join(nonclaims)
+        for fragment in ("physical AArch64", "KVM/SVM", "Linux or Plan 9", "PCI/DMA/IOMMU"):
+            if fragment not in boundary:
+                raise ReleaseError(f"{path}.nonclaims is missing {fragment!r}")
+    if attestation["signatures"] != []:
+        raise ReleaseError(f"{path}.signatures must be empty for this evidence class")
 
 
 def _validate_world_alpha_release_surface(
@@ -1227,7 +1500,7 @@ def _validate_world_alpha_release_surface(
             "**Status:** normative native Alpha constitution and implementation program,",
             "| **G0 -- constitutional baseline** |",
             "| **G13 -- eight-node World Alpha** |",
-            "Its first schema is definition-only and cannot certify a passage;",
+            "Typed, content-addressed attestations now",
             "# 28. Alpha non-claims",
         ),
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
@@ -1244,6 +1517,47 @@ def _validate_world_alpha_release_surface(
             if marker not in texts[path]:
                 raise ReleaseError(f"{path} is missing required World Alpha marker {marker!r}")
 
+    contract_path = "evidence/world_contract_v1.toml"
+    contract = _strict_toml(files[contract_path], contract_path)
+    if set(contract) != {
+        "schema_version",
+        "constitution_version",
+        "constitution",
+        "hosted_identity_schema",
+        "native_identity_schema",
+        "world_gate_registry",
+        "crossing",
+        "identity_atom",
+        "failure_class",
+        "consistency_rule",
+        "claim_class",
+    }:
+        raise ReleaseError(f"{contract_path} root keys differ from schema")
+    if type(contract["schema_version"]) is not int or contract["schema_version"] != 1:
+        raise ReleaseError(f"{contract_path} schema_version must be 1")
+    if (
+        type(contract["constitution_version"]) is not int
+        or contract["constitution_version"] != 2
+    ):
+        raise ReleaseError(f"{contract_path} constitution_version must be 2")
+    for field, expected in {
+        "constitution": "docs/OSTADIX_WORLD.md",
+        "hosted_identity_schema": "src/world/identity.rs",
+        "native_identity_schema": "ocore/world/identity.oc",
+        "world_gate_registry": "evidence/world_alpha_gates.toml",
+    }.items():
+        if contract[field] != expected or expected not in files:
+            raise ReleaseError(f"{contract_path}.{field} must reference released {expected}")
+    for field, count in {
+        "crossing": 3,
+        "identity_atom": 20,
+        "failure_class": 7,
+        "consistency_rule": 8,
+        "claim_class": 14,
+    }.items():
+        if not isinstance(contract[field], list) or len(contract[field]) != count:
+            raise ReleaseError(f"{contract_path}.{field} must contain {count} tables")
+
     path = "evidence/world_alpha_gates.toml"
     manifest = _strict_toml(files[path], path)
     expected_root_keys = {
@@ -1251,6 +1565,7 @@ def _validate_world_alpha_release_surface(
         "constitution_version",
         "constitution",
         "hosted_reference_profile",
+        "contract_schema",
         "alpha_gate",
         "gate_count",
         "evidence_class",
@@ -1258,13 +1573,13 @@ def _validate_world_alpha_release_surface(
     }
     if set(manifest) != expected_root_keys:
         raise ReleaseError(f"{path} root keys differ from schema")
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
-        raise ReleaseError(f"{path} schema_version must be 1")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 2:
+        raise ReleaseError(f"{path} schema_version must be 2")
     if (
         type(manifest["constitution_version"]) is not int
-        or manifest["constitution_version"] != 1
+        or manifest["constitution_version"] != 2
     ):
-        raise ReleaseError(f"{path} constitution_version must be 1")
+        raise ReleaseError(f"{path} constitution_version must be 2")
     if manifest["constitution"] != "docs/OSTADIX_WORLD.md":
         raise ReleaseError(f"{path} constitution must reference docs/OSTADIX_WORLD.md")
     if manifest["hosted_reference_profile"] != (
@@ -1273,6 +1588,10 @@ def _validate_world_alpha_release_surface(
         raise ReleaseError(
             f"{path} hosted_reference_profile must reference "
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
+        )
+    if manifest["contract_schema"] != "evidence/world_contract_v1.toml":
+        raise ReleaseError(
+            f"{path} contract_schema must reference evidence/world_contract_v1.toml"
         )
     if manifest["alpha_gate"] != "G13":
         raise ReleaseError(f"{path} alpha_gate must be G13")
@@ -1319,8 +1638,11 @@ def _validate_world_alpha_release_surface(
             raise ReleaseError(f"{owner} keys differ from schema")
         gate_ids.append(_required_string(gate["id"], f"{owner}.id"))
         _required_string(gate["title"], f"{owner}.title")
-        if gate["status"] != "defined":
-            raise ReleaseError(f"{owner}.status must remain 'defined' in schema v1")
+        expected_status = "passed" if gate["id"] in {"G0", "G2"} else "defined"
+        if gate["status"] != expected_status:
+            raise ReleaseError(
+                f"{owner}.status must be {expected_status!r} in schema v2"
+            )
         dependencies = _required_string_list(gate["depends_on"], f"{owner}.depends_on")
         unknown_dependencies = set(dependencies) - set(EXPECTED_WORLD_ALPHA_GATE_IDS)
         if unknown_dependencies:
@@ -1345,10 +1667,31 @@ def _validate_world_alpha_release_surface(
             f"{owner}.prohibited_substitutes",
             minimum=1,
         )
-        if gate["evidence"] != []:
-            raise ReleaseError(f"{owner}.evidence must remain empty in schema v1")
+        evidence = _required_string_list(gate["evidence"], f"{owner}.evidence")
+        expected_evidence = {
+            "G0": ["evidence/world/g0-repository-conformance.toml"],
+            "G2": ["evidence/world/g2-aarch64-qemu.toml"],
+        }.get(gate["id"], [])
+        if evidence != expected_evidence:
+            raise ReleaseError(
+                f"{owner}.evidence must be the sealed schema-v2 evidence list"
+            )
     if tuple(gate_ids) != EXPECTED_WORLD_ALPHA_GATE_IDS:
         raise ReleaseError(f"{path} gate IDs or order differ from G0 through G13")
+    _validate_world_attestation_release_surface(
+        files,
+        modes,
+        "evidence/world/g0-repository-conformance.toml",
+        "G0",
+        "repository_conformance",
+    )
+    _validate_world_attestation_release_surface(
+        files,
+        modes,
+        "evidence/world/g2-aarch64-qemu.toml",
+        "G2",
+        "qemu_tcg_aarch64",
+    )
 
 
 def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:

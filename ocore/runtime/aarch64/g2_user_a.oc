@@ -1,0 +1,95 @@
+module runtime::aarch64::g2_user_a;
+
+// Compiled O-core EL0 client.  The kernel passes a generation-tagged process
+// handle in x0; every transition crosses the real AArch64 SVC/ERET path.
+
+const SYS_REPORT: u64 = 1;
+const SYS_CAP_USE: u64 = 2;
+const SYS_ENDPOINT_SEND: u64 = 3;
+const SYS_ENDPOINT_RECEIVE: u64 = 4;
+const SYS_FRESH_CAP: u64 = 6;
+const SYS_CAP_CLOSE: u64 = 7;
+const SYS_EXIT: u64 = 8;
+const SYS_FAIL: u64 = 255;
+
+const ERR_DENIED: u64 = 0xffff_ffff_ffff_ff01;
+const RIGHT_READ: u64 = 1;
+const RIGHT_WRITE: u64 = 2;
+const RIGHT_EXECUTE: u64 = 4;
+
+const PROCESS_A_HANDLE: u64 = 0x0000_0001_0000_0001;
+const RESOURCE_A_HANDLE: u64 = 0x0000_0001_0000_0001;
+const TRANSFER_B_HANDLE: u64 = 0x0000_0001_0000_0002;
+const TRANSFER_REUSED_HANDLE: u64 = 0x0000_0002_0000_0002;
+const ENDPOINT_A_HANDLE: u64 = 0x0000_0001_0000_0003;
+const FORGED_RESOURCE_HANDLE: u64 = 0x0000_0009_0000_0001;
+
+const REQUEST_CORRELATION: u64 = 0x4702_0001;
+const REQUEST_PAYLOAD: u64 = 0x2a;
+const REPLY_CORRELATION: u64 = 0x4702_0002;
+const REPLY_PAYLOAD: u64 = 0x2b;
+
+unsafe fn fail(code: u64) -> never {
+    syscall1(SYS_FAIL, code);
+    loop {}
+}
+
+@export
+@no_mangle
+@link_section(".text.g2_user")
+pub unsafe fn g2_user_a_entry(process_handle: u64) -> never {
+    if process_handle != PROCESS_A_HANDLE
+        || syscall2(SYS_REPORT, 1, process_handle) != 1 {
+        fail(0xa001);
+    }
+
+    if syscall2(SYS_CAP_USE, FORGED_RESOURCE_HANDLE, RIGHT_READ) != ERR_DENIED {
+        fail(0xa002);
+    }
+    if syscall2(SYS_CAP_USE, RESOURCE_A_HANDLE, RIGHT_EXECUTE) != ERR_DENIED {
+        fail(0xa003);
+    }
+
+    // This send installs only READ in B, blocks A, and causes the EL1 vector
+    // path to preserve this exact EL0 frame while B runs.
+    if syscall5(
+        SYS_ENDPOINT_SEND,
+        ENDPOINT_A_HANDLE,
+        REQUEST_CORRELATION,
+        REQUEST_PAYLOAD,
+        RESOURCE_A_HANDLE,
+        RIGHT_READ
+    ) != 1 {
+        fail(0xa004);
+    }
+
+    // B has now replied and faulted.  The vector path restored this principal
+    // rather than restarting its entrypoint.
+    if syscall2(SYS_ENDPOINT_RECEIVE, ENDPOINT_A_HANDLE, 0)
+        != REPLY_CORRELATION {
+        fail(0xa005);
+    }
+    if syscall2(SYS_ENDPOINT_RECEIVE, ENDPOINT_A_HANDLE, 1) != REPLY_PAYLOAD {
+        fail(0xa006);
+    }
+
+    // B's generation-1 transferred handle must remain stale after its fault.
+    // The same bounded slot is live at generation 2, then explicitly closed.
+    if syscall2(SYS_CAP_USE, TRANSFER_B_HANDLE, RIGHT_READ) != ERR_DENIED {
+        fail(0xa007);
+    }
+    let fresh: u64 = syscall0(SYS_FRESH_CAP);
+    if fresh != TRANSFER_REUSED_HANDLE
+        || syscall2(SYS_CAP_USE, fresh, RIGHT_READ) != 1
+        || syscall2(SYS_CAP_USE, fresh, RIGHT_WRITE) != ERR_DENIED
+        || syscall1(SYS_CAP_CLOSE, fresh) != 1
+        || syscall1(SYS_CAP_CLOSE, fresh) != ERR_DENIED {
+        fail(0xa008);
+    }
+
+    if syscall1(SYS_EXIT, process_handle) != 1 {
+        fail(0xa009);
+    }
+    // A successful exit is non-returning: EL1 validates global teardown.
+    fail(0xa00a);
+}
