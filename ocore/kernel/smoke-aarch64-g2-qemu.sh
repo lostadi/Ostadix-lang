@@ -115,6 +115,7 @@ PY
 # All positive native markers must originate in g2_kernel.oc and therefore may
 # appear in compiler-generated kernel.s, but never in boot/vector source.
 native_markers=(
+  'G2 AArch64 resident EL2 HVC round-trip: PASS'
   'G2 AArch64 EL1 kernel: online'
   'G2 AArch64 real SVC/ERET path: PASS'
   'G2 AArch64 EL0 principal A: online'
@@ -133,7 +134,7 @@ native_markers=(
   'G2 AArch64 teardown and reclamation: PASS'
   'G2 AArch64 EL0 process lifecycle: PASS'
   'G2 AArch64 IPC capability lifecycle: PASS'
-  'G2 AArch64 post-lifecycle timer: online'
+  'G2 AArch64 post-lifecycle counter progress: PASS'
 )
 for marker in "${native_markers[@]}"; do
   if grep -Fq "$marker" \
@@ -176,7 +177,7 @@ timeout = float(sys.argv[3])
 command = [
     "qemu-system-aarch64",
     "-accel", "tcg",
-    "-machine", "virt,gic-version=3",
+    "-machine", "virt,virtualization=on,gic-version=3",
     "-cpu", "cortex-a57",
     "-smp", "1",
     "-m", "128M",
@@ -195,7 +196,7 @@ selector.register(process.stderr, selectors.EVENT_READ, "stderr")
 raw = bytearray()
 qemu_stderr = bytearray()
 deadline = time.monotonic() + timeout
-terminal = b"G2 AArch64 post-lifecycle timer: online\n"
+terminal = b"G2 AArch64 post-lifecycle counter progress: PASS\n"
 terminal_seen = None
 survived = False
 
@@ -239,6 +240,7 @@ stderr_path.write_bytes(qemu_stderr)
 text = raw.decode("utf-8", "replace").replace("\r\n", "\n")
 stderr_text = qemu_stderr.decode("utf-8", "replace").replace("\r\n", "\n")
 markers = [
+    "G2 AArch64 resident EL2 HVC round-trip: PASS\n",
     "G2 AArch64 EL1 kernel: online\n",
     "G2 AArch64 EL0 principal A: online\n",
     "G2 AArch64 real SVC/ERET path: PASS\n",
@@ -257,7 +259,7 @@ markers = [
     "G2 AArch64 teardown and reclamation: PASS\n",
     "G2 AArch64 EL0 process lifecycle: PASS\n",
     "G2 AArch64 IPC capability lifecycle: PASS\n",
-    "G2 AArch64 post-lifecycle timer: online\n",
+    "G2 AArch64 post-lifecycle counter progress: PASS\n",
 ]
 missing = [marker for marker in markers if marker not in text]
 wrong_count = [marker for marker in markers if text.count(marker) != 1]
@@ -310,6 +312,23 @@ printf '%s\n' \
   'G2 AArch64 artifact digests: artifacts.sha256 (ephemeral evidence directory)' \
   'G2 AArch64 serial transcript: qemu-transcript.log (ephemeral evidence directory)' \
   'G2 AArch64 serial transcript digest: transcript.sha256 (ephemeral evidence directory)'
+
+# These normalized observations are validator inputs, not author-supplied
+# claims.  Each line is emitted only after the live transcript, artifact, and
+# causal-order checks above have succeeded.
+printf '%s\n' \
+  '@evidence event=aarch64_native_object format=elf64 machine=183 result=pass' \
+  '@evidence event=el2_resident result=pass' \
+  '@evidence event=el2_hvc_roundtrip domain=0x4f4d registers=preserved stack=preserved result=pass' \
+  '@evidence event=el1_execution result=pass' \
+  '@evidence event=el0_execution principals=2 result=pass' \
+  '@evidence event=svc_eret_roundtrip result=pass' \
+  '@evidence event=ipc_request_reply result=pass' \
+  '@evidence event=capability_attenuation result=pass' \
+  '@evidence event=stale_generation_rejected kinds=process,capability result=pass' \
+  '@evidence event=lifecycle_terminal result=pass' \
+  '@evidence event=reclamation result=pass' \
+  '@evidence event=counter_progress phase=post_lifecycle poll_bound=1000000 result=pass'
 
 # Exact boundary: this is single-vCPU QEMU TCG on the virt platform.  It is not
 # physical AArch64/SMMU evidence, SMP, an MMU-isolation proof, a Linux/Plan 9

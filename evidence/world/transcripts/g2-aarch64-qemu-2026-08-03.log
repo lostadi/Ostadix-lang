@@ -1,0 +1,53 @@
+WORLD_ALPHA_ATTESTATION_TRANSCRIPT_V1
+gate=G2
+evidence_class=qemu_tcg_aarch64
+source_commit=563a0d458d8ba2a8e9b3385bfbd37b85b6666991
+command=./ocore/kernel/smoke-aarch64-g2-qemu.sh
+ocorec: wrote /Users/ustad/Ostadix-lang/target/ocore-g2-aarch64/first/kernel.o
+ocorec: kept /Users/ustad/Ostadix-lang/target/ocore-g2-aarch64/first/kernel.s
+ocorec: wrote /Users/ustad/Ostadix-lang/target/ocore-g2-aarch64/second/kernel.o
+ocorec: kept /Users/ustad/Ostadix-lang/target/ocore-g2-aarch64/second/kernel.s
+artifact:g2-kernel-object:sha256=74e6c429f4420f9eace004a17492db8fe3511049aba3e0a34cc9cef3475d83e7
+artifact:g2-kernel-elf:sha256=d65b88e17cf8332db895350458aaf1a9a63b26480624749a217699d81b81f7e2
+G2 AArch64 ocorec object: PASS
+G2 AArch64 deterministic object/image rebuild: PASS
+G2 AArch64 ELF64 EM_AARCH64=183: PASS
+G2 AArch64 resident EL2 HVC round-trip: PASS
+G2 AArch64 EL1 kernel: online
+G2 AArch64 EL0 principal A: online
+G2 AArch64 real SVC/ERET path: PASS
+G2 AArch64 forged capability: denied
+G2 AArch64 over-rights request: denied
+G2 AArch64 endpoint request queued: PASS
+G2 AArch64 EL0 principal B: online
+G2 AArch64 attenuated capability read: PASS
+G2 AArch64 attenuated capability write: denied
+G2 AArch64 endpoint reply queued: PASS
+G2 AArch64 EL0 fault contained: PASS
+G2 AArch64 process slot reuse stale denial: PASS
+G2 AArch64 endpoint request/reply: PASS
+G2 AArch64 capability slot reuse stale denial: PASS
+G2 AArch64 EL0 exit contained: PASS
+G2 AArch64 teardown and reclamation: PASS
+G2 AArch64 EL0 process lifecycle: PASS
+G2 AArch64 IPC capability lifecycle: PASS
+G2 AArch64 post-lifecycle counter progress: PASS
+G2 AArch64 artifact digests: artifacts.sha256 (ephemeral evidence directory)
+G2 AArch64 serial transcript: qemu-transcript.log (ephemeral evidence directory)
+G2 AArch64 serial transcript digest: transcript.sha256 (ephemeral evidence directory)
+@evidence event=aarch64_native_object format=elf64 machine=183 result=pass
+@evidence event=el2_resident result=pass
+@evidence event=el2_hvc_roundtrip domain=0x4f4d registers=preserved stack=preserved result=pass
+@evidence event=el1_execution result=pass
+@evidence event=el0_execution principals=2 result=pass
+@evidence event=svc_eret_roundtrip result=pass
+@evidence event=ipc_request_reply result=pass
+@evidence event=capability_attenuation result=pass
+@evidence event=stale_generation_rejected kinds=process,capability result=pass
+@evidence event=lifecycle_terminal result=pass
+@evidence event=reclamation result=pass
+@evidence event=counter_progress phase=post_lifecycle poll_bound=1000000 result=pass
+G2 nonclaim: QEMU TCG virt is not physical AArch64, SMMU, SMP, or hardware-isolation evidence.
+G2 nonclaim: the bounded MMU-off EL0 corpus is not a general protected-memory or driver platform.
+G2 nonclaim: no Linux/Plan 9 kernel, KVM/SVM, PCI, DMA, IOMMU, or physical device is exercised.
+G2 AArch64 native compiler QEMU smoke: PASS

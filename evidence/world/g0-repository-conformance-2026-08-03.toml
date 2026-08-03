@@ -1,0 +1,83 @@
+schema_version = 2
+id = "g0-repository-conformance-2026-08-03"
+gate = "G0"
+evidence_class = "repository_conformance"
+source_commit = "563a0d458d8ba2a8e9b3385bfbd37b85b6666991"
+source_state = "content-addressed-working-tree"
+command = ["./scripts/smoke-world-g0-conformance.sh"]
+transcript = "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log"
+transcript_sha256 = "156ae6cde82a097ac377a4d0751c26c481910614cc6e48469f7966e3b7d692be"
+validator_sha256 = "4ad65ced8628208827503c7008db2850d6ed9693e7628354bb9ef8654080d6ef"
+claim_rule_policy_sha256 = "5396b8bf538735aac81467d828b9600d683d04b84a52ce22188755b1fdbbe3dd"
+registry_semantics_sha256 = "325c1ca4443481596491b8147361c6dcd5f2382fde65e0cc5c1aabd07f1cb6eb"
+derived_claims = [
+  "evidence.claim_class_guarded",
+  "world.contract_schema_consistent",
+  "world.crossing_taxonomy_consistent",
+  "world.failure_consistency_schema_consistent",
+  "world.identity_vocabulary_consistent",
+]
+nonclaims = [
+  "Repository conformance is supporting evidence, not native execution, physical hardware, a Governor, WorldFS, distributed execution, or World Alpha",
+  "Passing G0 does not pass any dependent gate without that gate's separate qualifying evidence and derived claim floor",
+]
+expected_markers = [
+  "G0 executable contract schema: PASS",
+  "G0 crossing taxonomy: PASS",
+  "G0 identity vocabulary Rust/native: PASS",
+  "G0 failure and consistency schemas: PASS",
+  "G0 claim-class substitution guard: PASS",
+  "G0 repository conformance: PASS",
+]
+signatures = []
+
+[topology]
+kind = "repository"
+architecture = "multi-target-schema"
+machine = "canonical repository checkout"
+acceleration = "none"
+cpu_count = 0
+inventory = [
+  "Git base commit 563a0d458d8ba2a8e9b3385bfbd37b85b6666991",
+  "Schema-v3 definition-only gate registry and append-only evidence ledger",
+  "Versioned validator-derived claims with explicit nonclaim floors",
+]
+
+[[source]]
+path = "docs/OSTADIX_WORLD.md"
+sha256 = "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
+
+[[source]]
+path = "evidence/world_contract_v1.toml"
+sha256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+
+[[source]]
+path = "evidence/world_alpha_gates.toml"
+sha256 = "4afa892b58d98c8212d44250a2f78270f96570fc88063733f89c9747336a0a92"
+
+[[source]]
+path = "scripts/world_alpha_evidence.py"
+sha256 = "4ad65ced8628208827503c7008db2850d6ed9693e7628354bb9ef8654080d6ef"
+
+[[source]]
+path = "scripts/smoke-world-g0-conformance.sh"
+sha256 = "af648948c2dbbed1a50ad90579e44761887bc791876d92cb1f39533b883916d0"
+
+[[source]]
+path = "src/world/identity.rs"
+sha256 = "e771eaf259f78e1f7fc640afcdd19234a79ccabcefc5274d568c69719b25e592"
+
+[[source]]
+path = "ocore/world/identity.oc"
+sha256 = "610b78053032014935f019a68f2ce732a3c3bcf97fd3a76e15344cfe3be91020"
+
+[[source]]
+path = "tests/test_world_alpha_evidence.py"
+sha256 = "ba48765c470cd1b35a6f38590bfb4459ad8ee019ca6a6ce936f2714a2fd1abe4"
+
+[[artifact]]
+name = "world-contract-v1"
+kind = "executable-constitutional-schema"
+sha256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
+retained = true
+path = "evidence/world_contract_v1.toml"
