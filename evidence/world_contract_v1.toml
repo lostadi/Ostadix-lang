@@ -1,0 +1,224 @@
+schema_version = 1
+constitution_version = 2
+constitution = "docs/OSTADIX_WORLD.md"
+hosted_identity_schema = "src/world/identity.rs"
+native_identity_schema = "ocore/world/identity.oc"
+world_gate_registry = "evidence/world_alpha_gates.toml"
+
+# This file is the executable vocabulary required by G0. It freezes the
+# constitutional categories without turning descriptions into bearer
+# authority or pretending that the hosted reference is native evidence.
+
+[[crossing]]
+id = "ovalue"
+kind = "portable_data"
+authority = "none"
+unknown_policy = "capsule"
+
+[[crossing]]
+id = "capability"
+kind = "transferable_authority"
+authority = "authenticated_attenuating_delegation"
+unknown_policy = "deny"
+
+[[crossing]]
+id = "capsule"
+kind = "explicit_affinity"
+authority = "origin_bound"
+unknown_policy = "capsule"
+
+[[identity_atom]]
+id = "WorldId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "WorldEpoch"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "GovernorTerm"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "GovernorLogIndex"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "NodeId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "NodeGeneration"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "DomainId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "DomainGeneration"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "ProcessId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "ProcessGeneration"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "ResourceId"
+representation = "bounded_resource_path"
+
+[[identity_atom]]
+id = "ResourceGeneration"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "ObjectId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "ObjectVersion"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "CapabilityId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "LeaseId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "TaskId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "AttemptGeneration"
+representation = "nonzero_u64"
+
+[[identity_atom]]
+id = "CheckpointId"
+representation = "bounded_string"
+
+[[identity_atom]]
+id = "ReceiptId"
+representation = "bounded_string"
+
+[[failure_class]]
+id = "ephemeral"
+terminal_rule = "loss_is_final"
+
+[[failure_class]]
+id = "restartable"
+terminal_rule = "replay_from_immutable_inputs"
+
+[[failure_class]]
+id = "checkpointable"
+terminal_rule = "resume_from_committed_checkpoint"
+
+[[failure_class]]
+id = "replicated"
+terminal_rule = "multiple_attempts_exactly_one_global_commit"
+
+[[failure_class]]
+id = "affinity-bound"
+terminal_rule = "report_capsule_owner_loss"
+
+[[failure_class]]
+id = "transactional"
+terminal_rule = "require_governor_commit_token"
+
+[[failure_class]]
+id = "compensatable"
+terminal_rule = "invoke_declared_compensation"
+
+[[consistency_rule]]
+id = "authority-replication"
+rule = "three_replica_raft_style_group"
+
+[[consistency_rule]]
+id = "authoritative-mutations"
+rule = "linearizable_replicated_log"
+
+[[consistency_rule]]
+id = "telemetry"
+rule = "recent_snapshot_labelled_with_log_index"
+
+[[consistency_rule]]
+id = "clocks"
+rule = "failure_detection_only_not_authority"
+
+[[consistency_rule]]
+id = "commit-fencing"
+rule = "governor_term_log_or_epoch_and_attempt_generation"
+
+[[consistency_rule]]
+id = "partition"
+rule = "majority_authoritative_minority_island_noncommitting"
+
+[[consistency_rule]]
+id = "rejoin"
+rule = "fresh_node_generation_stale_work_fenced"
+
+[[consistency_rule]]
+id = "memory"
+rule = "aggregate_locality_visible_not_transparent_dsm"
+
+[[claim_class]]
+id = "repository_conformance"
+scope = "supporting"
+
+[[claim_class]]
+id = "hosted_reference"
+scope = "reference_only"
+
+[[claim_class]]
+id = "qemu_tcg_x86_64"
+scope = "virtual_native"
+
+[[claim_class]]
+id = "qemu_tcg_aarch64"
+scope = "virtual_native"
+
+[[claim_class]]
+id = "qemu_virtualization"
+scope = "virtual_native"
+
+[[claim_class]]
+id = "hardware_x86_64"
+scope = "physical_native"
+
+[[claim_class]]
+id = "hardware_x86_64_iommu"
+scope = "physical_native"
+
+[[claim_class]]
+id = "hardware_aarch64"
+scope = "physical_native"
+
+[[claim_class]]
+id = "hardware_aarch64_smmu"
+scope = "physical_native"
+
+[[claim_class]]
+id = "multinode_virtual"
+scope = "supporting"
+
+[[claim_class]]
+id = "multinode_physical"
+scope = "physical_native"
+
+[[claim_class]]
+id = "fault_injection"
+scope = "supporting"
+
+[[claim_class]]
+id = "security_adversarial"
+scope = "supporting"
+
+[[claim_class]]
+id = "performance_characterization"
+scope = "descriptive_only"

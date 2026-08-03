@@ -7,6 +7,7 @@
 pub mod ast;
 pub mod capability_bridge;
 pub mod codegen;
+pub mod codegen_aarch64;
 pub mod driver;
 pub mod hir;
 pub mod lexer;

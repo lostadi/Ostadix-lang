@@ -27,7 +27,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Emit::Obj)]
     emit: Emit,
 
-    /// Compilation target. The initial implementation accepts only x86_64-unknown-none.
+    /// Compilation target.
     #[arg(long, default_value = "x86_64-unknown-none")]
     target: String,
 
@@ -42,13 +42,13 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    if cli.target != "x86_64-unknown-none" && cli.target != "x86_64-unknown-none-elf" {
+    let Some(target) = Target::parse(&cli.target) else {
         eprintln!(
-            "ocorec: unsupported target `{}`; expected x86_64-unknown-none",
+            "ocorec: unsupported target `{}`; expected x86_64-unknown-none or aarch64-unknown-none",
             cli.target
         );
         std::process::exit(2);
-    }
+    };
     let emit = match cli.emit {
         Emit::Ast => EmitKind::Ast,
         Emit::Hir => EmitKind::Hir,
@@ -60,7 +60,7 @@ fn main() {
         .output
         .unwrap_or_else(|| default_output(&cli.inputs[0], emit));
     let options = CompileOptions {
-        target: Target::X86_64UnknownNone,
+        target,
         emit,
         output,
         keep_assembly: cli.keep_asm,
