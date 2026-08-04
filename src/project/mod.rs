@@ -18,13 +18,19 @@ use std::path::{Path, PathBuf};
 pub mod bundle;
 pub mod discover;
 pub mod ecosystems;
+pub mod executor;
 pub mod lower;
 pub mod manifest;
 pub mod materialize;
 pub mod model;
 pub mod plan;
 pub mod runtime;
+pub mod trace;
 
+pub use executor::{
+    execute_project_hgraph, run_selection_with_configured_executor, ProjectCoordinator,
+    ProjectExecutionError, ProjectExecutionOutcome,
+};
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,
     ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
@@ -33,6 +39,10 @@ pub use model::{
 pub use plan::{
     build_project_hgraph, ProjectCancellationSemantics, ProjectExecutionPlan, ProjectHGraph,
     ProjectPlanOperation, RoutePlanFacts,
+};
+pub use trace::{
+    ProjectArtifactFingerprint, ProjectAttemptEvent, ProjectAttemptIdentity, ProjectAttemptState,
+    ProjectAttemptTrace, ProjectRouteOutcome, ProjectTraceError,
 };
 
 /// Derive a project name from a directory path.
