@@ -535,7 +535,8 @@ fn project_mode(cli: &Cli) -> Result<()> {
 
 /// Execute a route (or route set) through the project runtime.
 fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()> {
-    use o_lang::project::runtime::{run_selection, RunOptions};
+    use o_lang::project::executor::run_selection_with_configured_executor;
+    use o_lang::project::runtime::RunOptions;
     use o_lang::project::RoutePolicy;
 
     if cli.route.is_none() && cli.routes_policy.is_none() && bundle.resolved_default().is_none() {
@@ -550,7 +551,8 @@ fn run_project(cli: &Cli, bundle: &o_lang::project::ProjectBundle) -> Result<()>
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let opts = RunOptions::default();
-    let results = run_selection(bundle, cli.route.as_deref(), policy, &opts)?;
+    let results =
+        run_selection_with_configured_executor(bundle, cli.route.as_deref(), policy, &opts)?;
 
     for result in &results {
         print!("{}", result.summary());

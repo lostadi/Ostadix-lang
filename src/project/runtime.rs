@@ -202,27 +202,42 @@ fn execute_in_workspace(
         }
     }
 
-    // ── Guards ──────────────────────────────────────────────────────────────
-    if let Some(reason) = unmet_guard(&route) {
-        ctx.stack.pop();
-        match ctx.opts.guard_behavior {
-            GuardBehavior::Enforce => {
-                bail!("route `{route_id}` guard not satisfied: {reason}")
-            }
-            GuardBehavior::Skip => {
-                let result = skipped_result(&route, workspace, &reason);
-                ctx.skipped.insert(route_id.to_string());
-                ctx.done.insert(route_id.to_string(), result.clone());
-                return Ok(result);
-            }
-        }
-    }
-
-    // ── Execute ─────────────────────────────────────────────────────────────
-    let result = spawn_route(&route, workspace, ctx.opts, &ctx.cancel)?;
+    // ── Execute this route (including guards) ─────────────────────────────
+    let result = execute_route_in_workspace(&route, workspace, ctx.opts, &ctx.cancel)?;
     ctx.stack.pop();
+    if is_skipped_result(&result) {
+        ctx.skipped.insert(route_id.to_string());
+    }
     ctx.done.insert(route_id.to_string(), result.clone());
     Ok(result)
+}
+
+/// Execute exactly one route in an already-materialized workspace.
+///
+/// This primitive evaluates the route's guards, runs its command, decodes its
+/// value, and collects its declared artifacts. It deliberately does not
+/// allocate a workspace, visit prerequisites, select alternatives, or invoke
+/// [`run_route`] or [`run_selection`]. Those concerns remain with the caller.
+pub(crate) fn execute_route_in_workspace(
+    route: &RouteSpec,
+    workspace: &Workspace,
+    opts: &RunOptions,
+    cancel: &CancellationToken,
+) -> Result<OExecutionResult> {
+    if let Some(reason) = unmet_guard(route) {
+        return match opts.guard_behavior {
+            GuardBehavior::Enforce => {
+                bail!("route `{}` guard not satisfied: {reason}", route.id)
+            }
+            GuardBehavior::Skip => Ok(skipped_result(route, workspace, &reason)),
+        };
+    }
+
+    spawn_route(route, workspace, opts, cancel)
+}
+
+pub(crate) fn is_skipped_result(result: &OExecutionResult) -> bool {
+    result.exit_code.is_none() && result.stderr.starts_with(SKIP_MARKER.as_bytes())
 }
 
 fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OExecutionResult {

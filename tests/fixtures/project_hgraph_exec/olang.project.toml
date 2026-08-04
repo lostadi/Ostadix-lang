@@ -1,0 +1,71 @@
+[project]
+name = "pr8a-project-hgraph-exec"
+default_route = "main"
+
+[[routes]]
+id = "prepare"
+label = "prepare shared branch workspace"
+kind = "build"
+command = ["sh", "-c", '''
+set -eu
+case "$PWD" in
+  */olang-ws-*) ;;
+  *)
+    if [ -n "${PR8A_EXTERNAL_POISON_MARKER:-}" ]; then
+      printf '%s\n' 'executed outside isolated workspace' > "$PR8A_EXTERNAL_POISON_MARKER"
+    fi
+    exit 91
+    ;;
+esac
+if [ -n "${PR8A_EXECUTION_MARKER:-}" ]; then
+  printf '%s\n' 'prepare-executed' >> "$PR8A_EXECUTION_MARKER"
+fi
+if [ -n "${PR8A_WORKSPACE_AUDIT_LOG:-}" ]; then
+  printf 'prepare\t%s\n' "$PWD" >> "$PR8A_WORKSPACE_AUDIT_LOG"
+fi
+printf '%s\n' 'prepared-by-pr8a' > prepared.txt
+printf '%s\n' 'prepare-run' >> prepare-count.txt
+''']
+outputs = ["prepared.txt", "prepare-count.txt"]
+guards = { requires_command = "sh" }
+
+[[routes]]
+id = "main"
+label = "execute prepared project"
+kind = "shell"
+command = ["sh", "-c", '''
+set -eu
+case "$PWD" in
+  */olang-ws-*) ;;
+  *)
+    if [ -n "${PR8A_EXTERNAL_POISON_MARKER:-}" ]; then
+      printf '%s\n' 'executed outside isolated workspace' > "$PR8A_EXTERNAL_POISON_MARKER"
+    fi
+    exit 92
+    ;;
+esac
+if [ -n "${PR8A_EXECUTION_MARKER:-}" ]; then
+  printf '%s\n' 'main-executed' >> "$PR8A_EXECUTION_MARKER"
+fi
+if [ -n "${PR8A_WORKSPACE_AUDIT_LOG:-}" ]; then
+  printf 'main\t%s\n' "$PWD" >> "$PR8A_WORKSPACE_AUDIT_LOG"
+fi
+test "$(cat prepared.txt)" = 'prepared-by-pr8a'
+test "$(tr -d '[:space:]' < prepare-count.txt)" = 'prepare-run'
+test "$(cat input.txt)" = 'project-hgraph-exec-input'
+printf '%s\n' 'project-hgraph-result' > result.txt
+printf '%s\n' 'project-hgraph-stderr' >&2
+printf '%s\n' '{"prepared":true,"result":"project-hgraph"}'
+''']
+depends_on = ["prepare"]
+inputs = ["input.txt"]
+outputs = ["result.txt"]
+result_codec = "json"
+guards = { requires_command = "sh" }
+default = true
+pure = true
+
+[[route_sets]]
+provides = "application"
+alternatives = ["main"]
+policy = "default"
