@@ -257,6 +257,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/fixtures/project_hgraph/olang.project.toml",
         "tests/fixtures/project_hgraph_exec/input.txt",
         "tests/fixtures/project_hgraph_exec/olang.project.toml",
+        "tests/fixtures/project_hgraph_tools/sh",
         "tests/fixtures/world_protocol_v1.hex",
         "tests/fixtures/world_receipt_v1.hex",
         "tests/fixtures/world_value_v1.hex",

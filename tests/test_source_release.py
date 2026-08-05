@@ -347,6 +347,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/project_hgraph/olang.project.toml": "[project]\nname = \"fixture\"\n",
             "tests/fixtures/project_hgraph_exec/input.txt": "fixture exec input\n",
             "tests/fixtures/project_hgraph_exec/olang.project.toml": "[project]\nname = \"fixture-exec\"\n",
+            "tests/fixtures/project_hgraph_tools/sh": "#!/bin/sh\nexec /bin/sh \"$@\"\n",
             "tests/fixtures/world_protocol_v1.hex": "4f5750524f544f31\n",
             "tests/fixtures/world_receipt_v1.hex": "4f57524543454950\n",
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
@@ -393,6 +394,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "scripts/smoke-project-hgraph.sh",
                     "scripts/smoke-world-resource-keys.sh",
                     "scripts/smoke-world-g0-conformance.sh",
+                    "tests/fixtures/project_hgraph_tools/sh",
                 }
                 or path.startswith("ocore/kernel/fixture-evidence-"),
             )
@@ -600,6 +602,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/fixtures/project_hgraph/olang.project.toml",
                 "tests/fixtures/project_hgraph_exec/input.txt",
                 "tests/fixtures/project_hgraph_exec/olang.project.toml",
+                "tests/fixtures/project_hgraph_tools/sh",
                 "tests/fixtures/world_protocol_v1.hex",
                 "tests/fixtures/world_receipt_v1.hex",
                 "tests/fixtures/world_value_v1.hex",
@@ -656,6 +659,7 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(
                 modes["okernel-multikernel/boot-and-test.sh"], "100755"
             )
+            self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
             cargo_digest = hashlib.sha256(
                 archive.read(f"{prefix}/Cargo.toml")
@@ -1122,6 +1126,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/project_hgraph/olang.project.toml",
             "tests/fixtures/project_hgraph_exec/input.txt",
             "tests/fixtures/project_hgraph_exec/olang.project.toml",
+            "tests/fixtures/project_hgraph_tools/sh",
             "tests/project_hgraph.rs",
             "tests/project_hgraph_exec.rs",
         )
@@ -1137,6 +1142,7 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/project/plan\.rs.*src/project/runtime\.rs.*src/project/trace\.rs.*"
             r"project_hgraph/input\.txt.*project_hgraph/olang\.project\.toml.*"
             r"project_hgraph_exec/input\.txt.*project_hgraph_exec/olang\.project\.toml.*"
+            r"project_hgraph_tools/sh.*"
             r"tests/project_hgraph\.rs.*tests/project_hgraph_exec\.rs",
         ):
             self._build("missing-project-hgraph.zip")

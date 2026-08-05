@@ -218,21 +218,27 @@ result through nonexecuting `ir` and `dot` targets for directory and lifted
 bundle inputs.
 
 PR8A adds an opt-in `ProjectCoordinator` path for one resolved `Explicit` or
-`Default` alternative. With `O_PROJECT_EXECUTOR=hgraph`, the Project HGraph
-governs isolated materialization, typed prerequisite readiness, route execution,
-and sole-result selection. Ordinary route values and successful-completion
+`Default` alternative. PR8B extends that path to serial ordered `Fallback` and
+`AnySuccess`: `ReadySchedule` marks their `SelectRoute` input relation as
+`OrderedFirstSuccess`, the coordinator retains each attempted alternative
+result, and a first success prevents later branches from materializing. With
+`O_PROJECT_EXECUTOR=hgraph`, the Project HGraph governs isolated
+materialization, typed prerequisite readiness, route execution, and policy
+selection. Ordinary route values and successful-completion
 tokens are distinct: nonzero settlement publishes its result and conservative
 resource successor but cannot release a success-dependent prerequisite edge.
-Infrastructure abort publishes neither. The compatibility project runtime
-remains the default when the opt-in is absent.
+Guard skips and nonzero alternative results continue ordered first-success;
+infrastructure abort publishes neither a result nor a resource successor and
+stops the policy. The compatibility project runtime remains the default when
+the opt-in is absent.
 
 Materialization and command operations stay fallible and conservatively
 read/write `HostWorld`, regardless of untrusted manifest `pure=true` metadata.
 The logical alternative branches therefore share conservative ambient/resource
 state chains and may be serialized; the bounded executor is not a claim of
-multipath execution, retry, independently mediated host worlds, deployment
-graph layers, placement, Governor authority, receipts, remote execution,
-exactly-once effects, G1, or qualifying native evidence.
+parallel races or cancellation, retry, independently mediated host worlds,
+deployment graph layers, placement, Governor authority, receipts, remote
+execution, exactly-once effects, G1, or qualifying native evidence.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by

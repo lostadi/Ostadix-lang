@@ -4,18 +4,18 @@ use crate::ir::PlanNodeId;
 
 use super::{
     graph::{ActorId, EdgeId, HGraph, HNodeKind, NodeId, PortRole},
-    kinds::OpKind,
+    kinds::{OpKind, ReadyInputPolicy},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ready-operation scheduler
 //
-// An Execute hyperedge is ready when all of its input value nodes are
-// materialized. Blockers are derived only from the producers of input nodes, so
-// the same rule covers ordinary data, resource/evaluator state, actor state,
-// successful completion, and branch-control values. Source sequence is lowered
-// as completion input unless explicit concurrency or the narrow verified-pure
-// rule safely relaxes it.
+// Most Execute hyperedges are ready when all input nodes are materialized.
+// Ordered first-success SelectRoute operations instead carry an explicit
+// prefix-choice policy: their project coordinator may settle them after the
+// first successful alternative result, or after every alternative settles
+// unsuccessfully. Blockers are still derived only from graph input producers;
+// `input_policy` says whether all potential blockers are conjunctive.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One schedulable operation: its plan node, its Execute edge, the value nodes
@@ -28,9 +28,30 @@ pub struct ReadyOp {
     pub inputs: Vec<NodeId>,
     pub outputs: Vec<NodeId>,
     pub ordinal: u64,
-    /// Indices (into `ReadySchedule::ops`) of operations that must complete
-    /// before this one can run.
+    /// Indices (into `ReadySchedule::ops`) of operations that can block this
+    /// operation. Under `All` every listed producer must complete; under
+    /// `OrderedFirstSuccess` a successful prefix can settle the choice early.
     pub blocked_by: Vec<usize>,
+}
+
+impl ReadyOp {
+    /// Derive and validate how this operation interprets its graph inputs.
+    /// Keeping this out of the public struct preserves its construction shape.
+    pub fn input_policy(&self, graph: &HGraph) -> Result<ReadyInputPolicy, String> {
+        let info = graph.op_for(self.plan_node).ok_or_else(|| {
+            format!(
+                "ready operation {} is absent from the supplied HGraph",
+                self.plan_node.0
+            )
+        })?;
+        if info.edge != self.edge || info.inputs != self.inputs {
+            return Err(format!(
+                "ready operation {} does not match the supplied HGraph edge or inputs",
+                self.plan_node.0
+            ));
+        }
+        info.ready_input_policy(graph)
+    }
 }
 
 /// The derived ready-operation schedule for a graph.
@@ -59,9 +80,10 @@ impl ReadySchedule {
             }
         }
 
-        let mut ops: Vec<ReadyOp> = infos
-            .iter()
-            .map(|info| ReadyOp {
+        let mut ops: Vec<ReadyOp> = Vec::with_capacity(infos.len());
+        for info in &infos {
+            info.ready_input_policy(graph)?;
+            ops.push(ReadyOp {
                 plan_node: info.plan_node,
                 edge: info.edge,
                 value_output: info.value_output,
@@ -69,8 +91,8 @@ impl ReadySchedule {
                 outputs: info.outputs.clone(),
                 ordinal: info.ordinal,
                 blocked_by: Vec::new(),
-            })
-            .collect();
+            });
+        }
 
         // Data/structural blocking: an op waits on the producers of its inputs.
         for (index, op) in ops.iter_mut().enumerate() {
@@ -93,10 +115,12 @@ impl ReadySchedule {
         Ok(ReadySchedule { ops })
     }
 
-    /// Topological "waves": each wave is the set of operations that become
-    /// ready at the same step (in stable ordinal order). Independent siblings
-    /// share a wave; same-actor and data-dependent operations land in later
-    /// waves. Returns an error if the operation dependency graph has a cycle.
+    /// Conservative topological waves over every potential input producer.
+    /// Independent siblings share a wave; same-actor and data-dependent
+    /// operations land in later waves. An `OrderedFirstSuccess` operation may
+    /// become dynamically ready before its conservative wave once a prefix
+    /// result succeeds. Returns an error if the potential-dependency graph has
+    /// a cycle.
     pub fn waves(&self) -> Result<Vec<Vec<PlanNodeId>>, String> {
         let mut indegree = vec![0usize; self.ops.len()];
         let mut successors: Vec<Vec<usize>> = vec![Vec::new(); self.ops.len()];
@@ -139,9 +163,10 @@ impl ReadySchedule {
         Ok(waves)
     }
 
-    /// The plan nodes in a deterministic, dependency-respecting order (stable
-    /// ordinal breaks ties). This is the order the coordinator uses to launch
-    /// operations onto the ready frontier.
+    /// The plan nodes in a deterministic potential-dependency order (stable
+    /// ordinal breaks ties). Coordinators use this as their baseline launch
+    /// rank; an already-ready ordered choice may be prioritized so it can stop
+    /// later alternatives before they start.
     pub fn launch_order(&self) -> Result<Vec<PlanNodeId>, String> {
         Ok(self.waves()?.into_iter().flatten().collect())
     }

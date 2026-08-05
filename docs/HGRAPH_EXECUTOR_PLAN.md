@@ -24,17 +24,21 @@ well-formedness and the intentionally OIR-only `source_plan` field cannot close.
 
 `olangc <project> --target ir|dot` remains inspection only. With
 `O_PROJECT_EXECUTOR=hgraph`, project script execution and compiled project
-binaries use `ProjectCoordinator` for exactly one resolved `Explicit` or
-`Default` alternative. The graph controls isolated materialization,
-prerequisite readiness, route execution, and sole-result selection. Unsupported
-multipath policies fail closed and never fall back to `run_selection`.
+binaries use `ProjectCoordinator` for one resolved `Explicit`/`Default`
+alternative or serial ordered `Fallback`/`AnySuccess` alternatives. The graph
+controls isolated materialization, prerequisite readiness, route execution,
+and policy selection. `Fallback` uses resolved priority order; `AnySuccess`
+uses declaration order. Both preserve the attempted result prefix and stop
+before materializing a later alternative after the first successful result.
+Parallel/racing and aggregate policies fail closed and never fall back to
+`run_selection`.
 
 The compatibility project runtime remains the default when the environment
 variable is unset. In either mode, materialization and commands remain
 fallible `HostWorld` work even if a manifest declares `pure=true`. Logical
 alternative branches still share conservative ambient/resource chains; the
-single-branch executor is not evidence of parallel or independently mediated
-branch execution.
+ordered executor is not evidence of parallel or independently mediated branch
+execution.
 
 The normative World-v3 constitution and Hosted World profile are byte-sealed
 by the append-only G0 evidence ledger. Their older repository-status paragraphs
@@ -134,7 +138,14 @@ directed `HostWorld` chain.
 
 `ReadySchedule` builds a producer map over every ordinary and synthetic output.
 An operation's blockers are exactly the producers of its input nodes. There is
-no separately maintained actor or effect blocker in the final scheduler.
+no separately maintained actor or effect blocker in the final scheduler. The
+one explicit exception to conjunctive input readiness is recorded in
+`ReadyOp::input_policy`: `SelectRoute(fallback|any_success)` derives
+`OrderedFirstSuccess`. Its ordered inputs are alternative results, so the
+operation can settle after the first successful prefix member or after all
+members settle unsuccessfully. Every other operation derives `All`; the
+project coordinator rejects a policy/operation mismatch rather than silently
+bypassing readiness.
 
 The ordinary OIR coordinator owns the mutable evaluator and process registry.
 It launches only verified pure inline renderer tasks on worker threads. After
@@ -144,8 +155,13 @@ outputs and admits no later dependent operation. Root values and scope writes
 commit in deterministic source order, but commit order is not used to justify
 early side effects.
 
-The separate hosted `ProjectCoordinator` is serial and launches ready project
-operations in stable ordinal order. Its terminal route states are
+The separate hosted `ProjectCoordinator` is serial and uses the conservative
+launch rank plus stable ordinal as its baseline/tie-break order. For ordered
+first-success policies it prioritizes the now-ready `SelectRoute` choice over
+later potential branches; those later operations never receive `Ready` or
+`Started` attempt events. A valid nonzero result or guard skip continues to the
+next alternative, while an infrastructure abort stops because it publishes no
+alternative result or resource successor. Its terminal route states are
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted`; non-route
 operations use `Finished`. Recording the terminal event, storing the operation
 value, and publishing the settlement-appropriate outputs is the coordinator's
