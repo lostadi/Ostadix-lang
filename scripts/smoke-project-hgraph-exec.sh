@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bounded PR8A smoke: one hosted branch under Explicit/Default selection.
-# This does not establish multipath execution, retry, placement, Governor
-# authority, OWRECEIPT attestation, exactly-once effects, native execution, or
-# G1 passage.
+# Bounded PR8A/PR8B smoke: Explicit/Default plus serial ordered
+# Fallback/AnySuccess selection. This does not establish parallel
+# race/cancellation, retry, placement, Governor authority, OWRECEIPT
+# attestation, exactly-once effects, native execution, or G1 passage.
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -18,4 +18,4 @@ if ! env CARGO_TERM_COLOR=never cargo test --locked --quiet \
     exit 1
 fi
 
-printf '%s\n' 'Project HGraph single-branch hosted execution: PASS'
+printf '%s\n' 'Project HGraph ordered hosted execution: PASS'

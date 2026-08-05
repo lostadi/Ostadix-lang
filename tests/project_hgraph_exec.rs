@@ -1,21 +1,23 @@
-//! PR8A single-branch hosted Project HGraph execution.
+//! PR8A/PR8B hosted Project HGraph execution.
 //!
-//! This corpus is deliberately bounded to one resolved Explicit/Default
-//! alternative. It is not multipath, retry, placement, governed, attested,
-//! exactly-once, native, O-core, or World G1 evidence.
+//! This corpus covers one resolved Explicit/Default alternative plus serial,
+//! ordered Fallback/AnySuccess short-circuiting. It is not parallel race,
+//! retry, placement, governed, attested, exactly-once, native, O-core, or World
+//! G1 evidence.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use o_lang::effects::ResourceKey;
-use o_lang::hgraph::{ExecutableOp, HNode, HNodeKind, ReadySchedule};
-use o_lang::project::runtime::{run_route, RunOptions};
+use o_lang::effects::{EffectSummary, Fallibility, ResourceKey};
+use o_lang::hgraph::{ExecutableOp, HGraph, HNode, HNodeKind, ReadyInputPolicy, ReadySchedule};
+use o_lang::ir::PlanNodeId;
+use o_lang::project::runtime::{run_route, run_selection, RunOptions};
 use o_lang::project::{
-    self, build_project_hgraph, execute_project_hgraph, OExecutionResult, ProjectAttemptIdentity,
-    ProjectAttemptState, ProjectBundle, ProjectExecutionError, ProjectExecutionOutcome,
-    ProjectHGraph, RouteExecutionDisposition, RouteGuard, RoutePolicy, RouteProvenance, RouteSet,
-    RouteSpec,
+    self, build_project_hgraph, execute_project_hgraph, execute_project_hgraph_selection,
+    OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState, ProjectBundle,
+    ProjectExecutionError, ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition,
+    RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 use o_lang::value::OValue;
 use sha2::{Digest, Sha256};
@@ -220,10 +222,117 @@ fn default_policy_executes_its_sole_resolved_alternative() {
     let project = build_project_hgraph(&bundle, Some("application"), None).unwrap();
     assert_eq!(project.plan.policy, RoutePolicy::Default);
     assert_eq!(project.plan.alternatives, ["main"]);
+    let schedule = ReadySchedule::derive(&project.graph).unwrap();
+    let select = schedule
+        .ops
+        .iter()
+        .find(|ready| {
+            matches!(
+                project.plan.operations[ready.plan_node.0].op,
+                ExecutableOp::SelectRoute { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        select.input_policy(&project.graph).unwrap(),
+        ReadyInputPolicy::All
+    );
+    assert!(!project.to_text().contains("input-policy=all"));
 
     let outcome = execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap();
     assert_expected_result(&outcome.result);
     assert_isolated(&outcome.result, &poison);
+}
+
+#[test]
+fn ready_schedule_rejects_ordered_selection_without_run_route_inputs() {
+    let mut graph = HGraph::default();
+    let literal = graph.add_node(HNode::with_value(OValue::text("logical-input")));
+
+    let build_plan = PlanNodeId(0);
+    let build_value = graph.add_node(HNode::fresh());
+    let build_completion = graph.add_completion_node(build_plan).unwrap();
+    graph.set_effect_summary(build_plan, EffectSummary::pure());
+    graph
+        .add_exec_edge(
+            build_plan,
+            ExecutableOp::BuildRoute {
+                route_id: "prepared-only".into(),
+            },
+            vec![literal],
+            vec![build_value, build_completion],
+            build_value,
+            0,
+        )
+        .unwrap();
+
+    let select_plan = PlanNodeId(1);
+    let select_value = graph.add_node(HNode::fresh());
+    let select_completion = graph.add_completion_node(select_plan).unwrap();
+    let mut select_effects = EffectSummary::pure();
+    select_effects.fallibility = Fallibility::MayFail;
+    graph.set_effect_summary(select_plan, select_effects);
+    graph
+        .add_exec_edge(
+            select_plan,
+            ExecutableOp::SelectRoute {
+                policy: "any_success".into(),
+            },
+            vec![build_value],
+            vec![select_value, select_completion],
+            select_value,
+            1,
+        )
+        .unwrap();
+    graph.push_root(select_value);
+    graph
+        .validate_execution_graph()
+        .expect("the generic graph is valid before schedule policy derivation");
+
+    let error = ReadySchedule::derive(&graph).unwrap_err();
+    assert!(
+        error.contains("is not produced by RunRoute"),
+        "unexpected schedule error: {error}"
+    );
+    let rendered = graph.to_execution_text();
+    assert!(rendered.contains("input-policy=invalid"));
+    assert!(!rendered.contains("input-policy=ordered-first-success"));
+}
+
+#[test]
+fn ready_schedule_rejects_ordered_selection_without_any_inputs() {
+    let mut graph = HGraph::default();
+    let select_plan = PlanNodeId(0);
+    let select_value = graph.add_node(HNode::fresh());
+    let select_completion = graph.add_completion_node(select_plan).unwrap();
+    let mut select_effects = EffectSummary::pure();
+    select_effects.fallibility = Fallibility::MayFail;
+    graph.set_effect_summary(select_plan, select_effects);
+    graph
+        .add_exec_edge(
+            select_plan,
+            ExecutableOp::SelectRoute {
+                policy: "fallback".into(),
+            },
+            Vec::new(),
+            vec![select_value, select_completion],
+            select_value,
+            0,
+        )
+        .unwrap();
+    graph.push_root(select_value);
+    graph
+        .validate_execution_graph()
+        .expect("the generic graph is valid before schedule policy derivation");
+
+    let error = ReadySchedule::derive(&graph).unwrap_err();
+    assert!(
+        error.contains("has no alternative-result inputs"),
+        "unexpected schedule error: {error}"
+    );
+    let rendered = graph.to_execution_text();
+    assert!(rendered.contains("input-policy=invalid"));
+    assert!(!rendered.contains("input-policy=ordered-first-success"));
 }
 
 #[test]
@@ -957,12 +1066,481 @@ fn unsupported_policy_bundle(
     bundle
 }
 
+fn ordered_policy_bundle(
+    policy: RoutePolicy,
+    alternatives: &[(&str, i32, i32)],
+    audit_log: &Path,
+) -> ProjectBundle {
+    let mut bundle = ProjectBundle::empty("ordered-first-success");
+    for (id, exit_code, priority) in alternatives {
+        let mut route = RouteSpec::new(*id, RouteProvenance::CliOverride);
+        route.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"\nexit \"$PR8B_EXIT_CODE\"".into(),
+        ];
+        route.environment = BTreeMap::from([
+            ("PR8B_ROUTE_ID".into(), (*id).to_string()),
+            ("PR8B_EXIT_CODE".into(), exit_code.to_string()),
+            (
+                "PR8B_ATTEMPT_LOG".into(),
+                audit_log.to_string_lossy().into_owned(),
+            ),
+        ]);
+        route.priority = *priority;
+        bundle.routes.push(route);
+    }
+    bundle.default_route = alternatives.first().map(|(id, _, _)| (*id).to_string());
+    bundle.route_sets.push(RouteSet {
+        provides: "service".into(),
+        alternatives: alternatives
+            .iter()
+            .map(|(id, _, _)| (*id).to_string())
+            .collect(),
+        policy,
+    });
+    bundle
+}
+
+fn attempted_route_ids(results: &[OExecutionResult]) -> Vec<&str> {
+    results
+        .iter()
+        .map(|result| result.route_id.as_str())
+        .collect()
+}
+
+fn audited_route_ids(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn any_success_uses_declared_order_and_stops_before_later_graph_branches() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("any-success-attempts.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[
+            ("first-failure", 7, 0),
+            ("second-success", 0, 0),
+            ("never", 0, 0),
+        ],
+        &audit_log,
+    );
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    assert_eq!(project.plan.policy, RoutePolicy::AnySuccess);
+    assert_eq!(
+        project.plan.alternatives,
+        ["first-failure", "second-success", "never"]
+    );
+    let schedule = ReadySchedule::derive(&project.graph).unwrap();
+    let select = schedule
+        .ops
+        .iter()
+        .find(|ready| {
+            matches!(
+                project.plan.operations[ready.plan_node.0].op,
+                ExecutableOp::SelectRoute { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        select.input_policy(&project.graph).unwrap(),
+        ReadyInputPolicy::OrderedFirstSuccess
+    );
+    let never_materialize = project
+        .plan
+        .operations
+        .iter()
+        .find(|operation| {
+            operation.branch == Some(2) && matches!(operation.op, ExecutableOp::MaterializeProject)
+        })
+        .unwrap();
+    let conservative_order = schedule.launch_order().unwrap();
+    assert!(
+        conservative_order
+            .iter()
+            .position(|plan_node| *plan_node == never_materialize.id)
+            .unwrap()
+            < conservative_order
+                .iter()
+                .position(|plan_node| *plan_node == select.plan_node)
+                .unwrap(),
+        "the static potential-dependency order should retain the later branch"
+    );
+    assert!(project
+        .to_text()
+        .contains("input-policy=ordered-first-success"));
+
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.results.last().unwrap().route_id, "second-success");
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["first-failure", "second-success"]
+    );
+    assert_eq!(
+        outcome
+            .results
+            .iter()
+            .map(|result| result.exit_code)
+            .collect::<Vec<_>>(),
+        [Some(7), Some(0)]
+    );
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["first-failure", "second-success"]
+    );
+    let trace = outcome.trace.as_ref().unwrap();
+    assert!(!trace.events().iter().any(|event| event.branch == Some(2)));
+    assert!(trace.events().iter().any(|event| {
+        event.operation_label == "select-route:any_success"
+            && event.state == ProjectAttemptState::Started
+    }));
+
+    std::fs::remove_file(&audit_log).unwrap();
+    let legacy = run_selection(&bundle, Some("service"), None, &RunOptions::default()).unwrap();
+    assert_eq!(
+        attempted_route_ids(&legacy),
+        attempted_route_ids(&outcome.results)
+    );
+    assert_eq!(
+        legacy
+            .iter()
+            .map(|result| result.exit_code)
+            .collect::<Vec<_>>(),
+        [Some(7), Some(0)]
+    );
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["first-failure", "second-success"]
+    );
+
+    std::fs::remove_file(&audit_log).unwrap();
+    let ProjectExecutionOutcome { result, trace } =
+        execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(result.route_id, "second-success");
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!trace.events().iter().any(|event| event.branch == Some(2)));
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["first-failure", "second-success"]
+    );
+}
+
+#[test]
+fn ordered_first_success_continues_after_a_guard_skip() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("guard-skip-attempts.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("guard-skipped", 0, 0), ("fallback-success", 0, 0)],
+        &audit_log,
+    );
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "guard-skipped")
+        .unwrap()
+        .guards = vec![RouteGuard::CommandAvailable(
+        "pr8b-guard-command-that-must-not-exist".into(),
+    )];
+    let options = RunOptions {
+        guard_behavior: o_lang::project::runtime::GuardBehavior::Skip,
+        ..RunOptions::default()
+    };
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome = execute_project_hgraph_selection(&bundle, &project, &options).unwrap();
+
+    assert_eq!(outcome.results.last().unwrap().route_id, "fallback-success");
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["guard-skipped", "fallback-success"]
+    );
+    assert!(outcome.results[0].was_guard_skipped());
+    assert_eq!(outcome.results[0].exit_code, None);
+    assert_eq!(audited_route_ids(&audit_log), ["fallback-success"]);
+    assert!(outcome
+        .trace
+        .as_ref()
+        .unwrap()
+        .events()
+        .iter()
+        .any(|event| {
+            event.operation_label == "run-route:guard-skipped"
+                && event.state == ProjectAttemptState::Skipped
+        }));
+}
+
+#[test]
+fn fallback_uses_priority_order_and_short_circuits_at_first_success() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("fallback-attempts.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::Fallback,
+        &[
+            ("manifest-first-never", 0, 1),
+            ("priority-failure", 9, 30),
+            ("priority-success", 0, 20),
+        ],
+        &audit_log,
+    );
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    assert_eq!(
+        project.plan.alternatives,
+        [
+            "priority-failure",
+            "priority-success",
+            "manifest-first-never"
+        ]
+    );
+
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.results.last().unwrap().route_id, "priority-success");
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["priority-failure", "priority-success"]
+    );
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["priority-failure", "priority-success"]
+    );
+    assert!(!outcome
+        .trace
+        .as_ref()
+        .unwrap()
+        .events()
+        .iter()
+        .any(|event| event.branch == Some(2)));
+}
+
+#[test]
+fn ordered_first_success_returns_every_result_when_all_alternatives_fail() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("all-failed-attempts.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 3, 0), ("last-failure", 11, 0)],
+        &audit_log,
+    );
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+
+    assert_eq!(outcome.results.last().unwrap().route_id, "last-failure");
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["first-failure", "last-failure"]
+    );
+    assert!(outcome.results.iter().all(|result| !result.succeeded()));
+    assert!(outcome
+        .trace
+        .as_ref()
+        .unwrap()
+        .events()
+        .iter()
+        .any(|event| {
+            event.operation_label == "select-route:any_success"
+                && event.state == ProjectAttemptState::Finished
+        }));
+}
+
+#[test]
+fn olangc_any_success_failure_prints_all_attempts_and_persists_the_trace() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("olang.project.toml"),
+        r#"[project]
+name = "cli-any-success-failure"
+
+[[routes]]
+id = "first-failure"
+kind = "shell"
+command = ["sh", "-c", "exit 4"]
+
+[[routes]]
+id = "last-failure"
+kind = "shell"
+command = ["sh", "-c", "exit 12"]
+
+[[route_sets]]
+provides = "service"
+alternatives = ["first-failure", "last-failure"]
+policy = "any_success"
+"#,
+    )
+    .unwrap();
+    let trace_path = project_dir.path().join("any-success-failure.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_olangc"))
+        .arg(project_dir.path())
+        .args(["--target", "script", "--route", "service"])
+        .arg("--project-trace-out")
+        .arg(&trace_path)
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "all-nonzero policy unexpectedly succeeded"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("first-failure"),
+        "first result missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("last-failure"),
+        "last result missing: {stdout}"
+    );
+    assert!(
+        stdout.find("first-failure").unwrap() < stdout.find("last-failure").unwrap(),
+        "attempt results were not printed in declared order: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no route succeeded"),
+        "unexpected CLI error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let trace = read_cli_trace(&trace_path);
+    assert_unsigned_diagnostic_trace(&trace);
+    assert_eq!(trace["header"]["policy"], "any_success");
+    for route in ["first-failure", "last-failure"] {
+        assert!(trace["events"].as_array().unwrap().iter().any(|event| {
+            event["operation_label"] == format!("run-route:{route}")
+                && event["state"] == "settled_failure"
+        }));
+    }
+}
+
+#[test]
+fn olangc_any_success_prints_only_the_successful_attempt_prefix() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("olang.project.toml"),
+        r#"[project]
+name = "cli-any-success-prefix"
+
+[[routes]]
+id = "first-failure"
+kind = "shell"
+command = ["sh", "-c", "exit 4"]
+
+[[routes]]
+id = "second-success"
+kind = "shell"
+command = ["sh", "-c", "exit 0"]
+
+[[routes]]
+id = "never-started"
+kind = "shell"
+command = ["sh", "-c", "exit 0"]
+
+[[route_sets]]
+provides = "service"
+alternatives = ["first-failure", "second-success", "never-started"]
+policy = "any_success"
+"#,
+    )
+    .unwrap();
+    let dot = Command::new(env!("CARGO_BIN_EXE_olangc"))
+        .arg(project_dir.path())
+        .args(["--target", "dot", "--route", "service"])
+        .output()
+        .unwrap();
+    assert!(
+        dot.status.success(),
+        "ordered DOT rendering failed: {}",
+        String::from_utf8_lossy(&dot.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dot.stdout).contains("inputs:ordered-first-success"));
+
+    let trace_path = project_dir.path().join("any-success-prefix.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_olangc"))
+        .arg(project_dir.path())
+        .args(["--target", "script", "--route", "service"])
+        .arg("--project-trace-out")
+        .arg(&trace_path)
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "ordered CLI execution failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout
+        .find("first-failure")
+        .unwrap_or_else(|| panic!("first result missing: {stdout}"));
+    let second = stdout
+        .find("second-success")
+        .unwrap_or_else(|| panic!("second result missing: {stdout}"));
+    assert!(first < second, "attempt prefix was reordered: {stdout}");
+    assert!(
+        !stdout.contains("never-started"),
+        "unstarted result was printed: {stdout}"
+    );
+
+    let trace = read_cli_trace(&trace_path);
+    assert_unsigned_diagnostic_trace(&trace);
+    assert_eq!(trace["header"]["policy"], "any_success");
+    assert!(!trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["branch"] == 2));
+}
+
+#[test]
+fn ordered_first_success_aborts_without_starting_the_next_alternative() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("abort-next-attempts.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::Fallback,
+        &[("cannot-spawn", 0, 20), ("must-not-run", 0, 10)],
+        &audit_log,
+    );
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "cannot-spawn")
+        .unwrap()
+        .command = vec!["pr8b-command-that-must-not-exist".into()];
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let error =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap_err();
+    let attempt = error
+        .downcast_ref::<ProjectExecutionError>()
+        .expect("infrastructure failure must retain its coordinator trace");
+
+    assert!(attempt.trace.events().iter().any(|event| {
+        event.operation_label == "run-route:cannot-spawn"
+            && event.state == ProjectAttemptState::Aborted
+    }));
+    assert!(!attempt
+        .trace
+        .events()
+        .iter()
+        .any(|event| event.branch == Some(1)));
+    assert!(!audit_log.exists());
+
+    let legacy_error =
+        run_selection(&bundle, Some("service"), None, &RunOptions::default()).unwrap_err();
+    assert!(format!("{legacy_error:#}").contains("pr8b-command-that-must-not-exist"));
+    assert!(!audit_log.exists());
+}
+
 #[test]
 fn unsupported_policy_kinds_fail_closed_with_one_or_many_alternatives() {
     let external = tempfile::tempdir().unwrap();
     for policy in [
-        RoutePolicy::Fallback,
-        RoutePolicy::AnySuccess,
         RoutePolicy::RaceSuccess,
         RoutePolicy::RaceSettle,
         RoutePolicy::All,

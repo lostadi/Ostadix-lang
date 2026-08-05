@@ -1,11 +1,11 @@
-//! Hosted, single-branch execution of a validated project HGraph.
+//! Hosted execution of a validated project HGraph.
 //!
-//! This executor is intentionally narrower than the legacy route-policy
-//! runtime. It accepts one already-resolved `Explicit` or `Default`
-//! alternative and lets the graph govern workspace materialization, route
-//! preparation, prerequisite readiness, route execution, and final selection.
-//! Multipath policy, retries, placement, receipts, and native/O-core dispatch
-//! are rejected rather than delegated to the legacy selection path.
+//! The coordinator accepts one already-resolved `Explicit` or `Default`
+//! alternative, plus ordered `Fallback` and `AnySuccess` alternatives. The
+//! graph governs workspace materialization, route preparation, prerequisite
+//! readiness, route execution, short-circuit selection, and final publication.
+//! Parallel/racing policies, retries, placement, receipts, and native/O-core
+//! dispatch are rejected rather than delegated to the legacy selection path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -16,7 +16,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::executor::CancellationToken;
-use crate::hgraph::{ExecutableOp, HNodeKind, NodeId, ReadyOp, ReadySchedule, ValueState};
+use crate::hgraph::{
+    ExecutableOp, HNodeKind, NodeId, ReadyInputPolicy, ReadyOp, ReadySchedule, ValueState,
+};
 use crate::ir::PlanNodeId;
 
 use super::materialize::{materialize_isolated, Workspace};
@@ -35,6 +37,7 @@ pub const PROJECT_EXECUTOR_ENV: &str = "O_PROJECT_EXECUTOR";
 /// The selected route result together with its deterministic coordinator trace.
 #[derive(Debug)]
 pub struct ProjectExecutionOutcome {
+    /// Result selected by the route policy.
     pub result: OExecutionResult,
     pub trace: ProjectAttemptTrace,
 }
@@ -91,10 +94,15 @@ struct PreparedRoute {
 
 #[derive(Debug)]
 enum ProjectRuntimeValue {
-    Workspace { branch: usize },
+    Workspace {
+        branch: usize,
+    },
     PreparedRoute(PreparedRoute),
     RouteResult(OExecutionResult),
-    SelectedResult(OExecutionResult),
+    SelectedResult {
+        result: OExecutionResult,
+        attempted_results: Vec<OExecutionResult>,
+    },
 }
 
 /// A `RunRoute` operation that either produced a semantic result or aborted
@@ -139,7 +147,13 @@ pub struct ConfiguredProjectExecution {
     pub trace: Option<ProjectAttemptTrace>,
 }
 
-/// Deterministic coordinator for one validated project branch.
+struct ProjectCoordinatorOutcome {
+    result: OExecutionResult,
+    attempted_results: Vec<OExecutionResult>,
+    trace: ProjectAttemptTrace,
+}
+
+/// Deterministic coordinator for validated ordered project branches.
 ///
 /// Runtime values are indexed by the graph operation's ordinary value-output
 /// `NodeId`; readiness and publication are tracked for every graph output,
@@ -149,6 +163,7 @@ pub struct ProjectCoordinator<'a> {
     project: &'a ProjectHGraph,
     opts: &'a RunOptions,
     schedule: ReadySchedule,
+    input_policies: BTreeMap<PlanNodeId, ReadyInputPolicy>,
     launch_rank: BTreeMap<PlanNodeId, usize>,
     materialized: BTreeSet<NodeId>,
     failed_outputs: BTreeMap<NodeId, PlanNodeId>,
@@ -180,22 +195,36 @@ impl<'a> ProjectCoordinator<'a> {
             .context("project HGraph source/projection validation failed")?;
 
         match &project.plan.policy {
-            RoutePolicy::Explicit(_) | RoutePolicy::Default => {}
+            RoutePolicy::Explicit(_) | RoutePolicy::Default => {
+                if project.plan.alternatives.len() != 1 {
+                    bail!(
+                        "project HGraph executor requires exactly one resolved alternative for policy `{}`, found {}",
+                        project.plan.policy.token(),
+                        project.plan.alternatives.len()
+                    );
+                }
+            }
+            RoutePolicy::Fallback | RoutePolicy::AnySuccess => {}
             policy => bail!(
-                "project HGraph executor does not support policy `{}`; only explicit/default single-branch execution is supported",
+                "project HGraph executor does not support policy `{}`; supported policies are explicit, default, fallback, and any_success",
                 policy.token()
             ),
-        }
-        if project.plan.alternatives.len() != 1 {
-            bail!(
-                "project HGraph executor requires exactly one resolved alternative, found {}",
-                project.plan.alternatives.len()
-            );
         }
 
         let schedule = ReadySchedule::derive(&project.graph)
             .map_err(anyhow::Error::msg)
             .context("failed to derive project ReadySchedule")?;
+        let input_policies = schedule
+            .ops
+            .iter()
+            .map(|ready| {
+                ready
+                    .input_policy(&project.graph)
+                    .map(|policy| (ready.plan_node, policy))
+            })
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+            .map_err(anyhow::Error::msg)
+            .context("failed to bind project ReadySchedule input policies")?;
         let launch_rank = schedule
             .launch_order()
             .map_err(anyhow::Error::msg)
@@ -218,6 +247,7 @@ impl<'a> ProjectCoordinator<'a> {
             project,
             opts,
             schedule,
+            input_policies,
             launch_rank,
             materialized,
             failed_outputs: BTreeMap::new(),
@@ -229,23 +259,29 @@ impl<'a> ProjectCoordinator<'a> {
         })
     }
 
-    /// Run ready operations serially in stable `(ordinal, PlanNodeId)` order.
-    pub fn execute(mut self) -> Result<ProjectExecutionOutcome> {
+    /// Run ready operations serially using the conservative launch rank and
+    /// stable operation identity as tie-breakers. A ready ordered selector
+    /// with a successful prefix is prioritized over later alternatives.
+    pub fn execute(self) -> Result<ProjectExecutionOutcome> {
+        let outcome = self.execute_with_attempts()?;
+        Ok(ProjectExecutionOutcome {
+            result: outcome.result,
+            trace: outcome.trace,
+        })
+    }
+
+    fn execute_with_attempts(mut self) -> Result<ProjectCoordinatorOutcome> {
         let mut pending = (0..self.schedule.ops.len()).collect::<BTreeSet<_>>();
 
         while !pending.is_empty() {
             let next = pending
                 .iter()
                 .copied()
-                .filter(|index| {
-                    self.schedule.ops[*index]
-                        .inputs
-                        .iter()
-                        .all(|input| self.materialized.contains(input))
-                })
+                .filter(|index| self.operation_is_ready(&self.schedule.ops[*index]))
                 .min_by_key(|index| {
                     let ready = &self.schedule.ops[*index];
                     (
+                        self.operation_priority(ready),
                         self.launch_rank
                             .get(&ready.plan_node)
                             .copied()
@@ -277,6 +313,14 @@ impl<'a> ProjectCoordinator<'a> {
                     self.commit_abort(&ready, &identity, &error, None)?;
                 }
             }
+
+            // `Fallback` and `AnySuccess` may materialize the SelectRoute root
+            // after only a successful prefix of alternatives. Operations in
+            // later branches were never ready/started attempts and must not be
+            // launched after the policy has selected its result.
+            if self.root_is_materialized() {
+                break;
+            }
         }
 
         let root = self
@@ -286,15 +330,112 @@ impl<'a> ProjectCoordinator<'a> {
             .first()
             .copied()
             .context("project HGraph has no result root")?;
-        let result = match self.values.remove(&root) {
-            Some(ProjectRuntimeValue::SelectedResult(result)) => result,
+        let (result, attempted_results) = match self.values.remove(&root) {
+            Some(ProjectRuntimeValue::SelectedResult {
+                result,
+                attempted_results,
+            }) => (result, attempted_results),
             Some(_) => bail!("project HGraph root does not contain a selected route result"),
             None => return Err(self.stall_error(&BTreeSet::new())),
         };
-        Ok(ProjectExecutionOutcome {
+        Ok(ProjectCoordinatorOutcome {
             result,
+            attempted_results,
             trace: self.trace,
         })
+    }
+
+    fn operation_is_ready(&self, ready: &ReadyOp) -> bool {
+        let Some(operation) = self
+            .project
+            .plan
+            .operations
+            .get(ready.plan_node.0)
+            .filter(|operation| operation.id == ready.plan_node)
+        else {
+            return false;
+        };
+
+        let Some(input_policy) = self.input_policies.get(&ready.plan_node).copied() else {
+            return false;
+        };
+        match input_policy {
+            ReadyInputPolicy::All => {}
+            ReadyInputPolicy::OrderedFirstSuccess => {
+                return self.uses_ordered_first_success()
+                    && matches!(operation.op, ExecutableOp::SelectRoute { .. })
+                    && self.ordered_selection_is_ready(ready);
+            }
+        }
+
+        ready
+            .inputs
+            .iter()
+            .all(|input| self.materialized.contains(input))
+    }
+
+    fn operation_priority(&self, ready: &ReadyOp) -> u8 {
+        let selection_has_winner = self.input_policies.get(&ready.plan_node).copied()
+            == Some(ReadyInputPolicy::OrderedFirstSuccess)
+            && self.uses_ordered_first_success()
+            && self
+                .project
+                .plan
+                .operations
+                .get(ready.plan_node.0)
+                .filter(|operation| operation.id == ready.plan_node)
+                .is_some_and(|operation| {
+                    matches!(operation.op, ExecutableOp::SelectRoute { .. })
+                        && self.selection_has_success(ready)
+                });
+        if selection_has_winner {
+            0
+        } else {
+            1
+        }
+    }
+
+    fn uses_ordered_first_success(&self) -> bool {
+        matches!(
+            self.project.plan.policy,
+            RoutePolicy::Fallback | RoutePolicy::AnySuccess
+        )
+    }
+
+    fn ordered_selection_is_ready(&self, ready: &ReadyOp) -> bool {
+        let mut saw_result = false;
+        for input in &ready.inputs {
+            let Some(result) = self.route_result_for_node(*input) else {
+                return false;
+            };
+            saw_result = true;
+            if result.succeeded() {
+                return true;
+            }
+        }
+        saw_result
+    }
+
+    fn selection_has_success(&self, ready: &ReadyOp) -> bool {
+        ready.inputs.iter().any(|input| {
+            self.route_result_for_node(*input)
+                .is_some_and(OExecutionResult::succeeded)
+        })
+    }
+
+    fn route_result_for_node(&self, node: NodeId) -> Option<&OExecutionResult> {
+        match self.values.get(&node)? {
+            ProjectRuntimeValue::RouteResult(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    fn root_is_materialized(&self) -> bool {
+        self.project
+            .graph
+            .root_nodes
+            .first()
+            .is_some_and(|root| self.materialized.contains(root))
     }
 
     fn execute_operation(
@@ -353,15 +494,18 @@ impl<'a> ProjectCoordinator<'a> {
                     Err(error) => OperationResult::Route(RouteSettlement::Aborted(error)),
                 }
             }
-            ExecutableOp::SelectRoute { .. } => match self.select_sole_result(operation) {
-                Ok(result) => OperationResult::Finished {
-                    value: ProjectRuntimeValue::SelectedResult(result),
+            ExecutableOp::SelectRoute { .. } => match self.select_results(ready) {
+                Ok((result, attempted_results)) => OperationResult::Finished {
+                    value: ProjectRuntimeValue::SelectedResult {
+                        result,
+                        attempted_results,
+                    },
                     workspace: None,
                 },
                 Err(error) => OperationResult::Aborted(error),
             },
             ExecutableOp::CompareRouteResults => OperationResult::Aborted(anyhow!(
-                "CompareRouteResults is unsupported by the single-branch project HGraph executor"
+                "CompareRouteResults is unsupported by the ordered project HGraph executor"
             )),
             other => OperationResult::Aborted(anyhow!(
                 "non-project operation {other:?} reached the project HGraph executor"
@@ -456,29 +600,52 @@ impl<'a> ProjectCoordinator<'a> {
         execute_route_in_workspace(&prepared.route, workspace, self.opts, &self.cancel)
     }
 
-    fn select_sole_result(&self, operation: &ProjectPlanOperation) -> Result<OExecutionResult> {
-        if !matches!(
-            self.project.plan.policy,
-            RoutePolicy::Explicit(_) | RoutePolicy::Default
-        ) {
+    fn select_results(&self, ready: &ReadyOp) -> Result<(OExecutionResult, Vec<OExecutionResult>)> {
+        let ordered_first_success = self.uses_ordered_first_success();
+        if !ordered_first_success
+            && !matches!(
+                self.project.plan.policy,
+                RoutePolicy::Explicit(_) | RoutePolicy::Default
+            )
+        {
             bail!(
-                "SelectRoute policy `{}` is unsupported by the single-branch executor",
+                "SelectRoute policy `{}` is unsupported by the ordered executor",
                 self.project.plan.policy.token()
             );
         }
-        if operation.dependencies.len() != 1 {
+        if !ordered_first_success && ready.inputs.len() != 1 {
             bail!(
-                "SelectRoute requires exactly one materialized route result, found {}",
-                operation.dependencies.len()
+                "SelectRoute requires exactly one materialized route result for policy `{}`, found {}",
+                self.project.plan.policy.token(),
+                ready.inputs.len()
             );
         }
-        let ProjectDependency::Value(result_operation) = operation.dependencies[0] else {
-            bail!("SelectRoute dependency is not an ordinary route-result value");
-        };
-        match self.value_for_operation(result_operation)? {
-            ProjectRuntimeValue::RouteResult(result) => Ok(result.clone()),
-            _ => bail!("SelectRoute dependency is not a route result"),
+
+        let mut attempted_results = Vec::new();
+        for input in &ready.inputs {
+            let Some(result) = self.route_result_for_node(*input) else {
+                if ordered_first_success
+                    && attempted_results.iter().any(OExecutionResult::succeeded)
+                {
+                    break;
+                }
+                bail!(
+                    "SelectRoute reached an unresolved alternative before a successful short circuit"
+                );
+            };
+            attempted_results.push(result.clone());
+            if ordered_first_success && result.succeeded() {
+                break;
+            }
         }
+
+        let selected = attempted_results
+            .iter()
+            .find(|result| ordered_first_success && result.succeeded())
+            .or_else(|| attempted_results.last())
+            .cloned()
+            .context("SelectRoute has no materialized alternative result")?;
+        Ok((selected, attempted_results))
     }
 
     fn operation(&self, plan_node: PlanNodeId) -> Result<&ProjectPlanOperation> {
@@ -710,13 +877,28 @@ impl<'a> ProjectCoordinator<'a> {
     }
 }
 
-/// Execute one validated, single-branch hosted project HGraph.
+/// Execute one validated hosted project HGraph under a supported route policy.
 pub fn execute_project_hgraph(
     bundle: &ProjectBundle,
     project: &ProjectHGraph,
     opts: &RunOptions,
 ) -> Result<ProjectExecutionOutcome> {
     ProjectCoordinator::new(bundle, project, opts)?.execute()
+}
+
+/// Execute one validated hosted project HGraph while retaining the exact
+/// ordered alternative-result prefix expected by route-selection callers.
+/// Prerequisite route results remain in the trace and are not alternatives.
+pub fn execute_project_hgraph_selection(
+    bundle: &ProjectBundle,
+    project: &ProjectHGraph,
+    opts: &RunOptions,
+) -> Result<ConfiguredProjectExecution> {
+    let outcome = ProjectCoordinator::new(bundle, project, opts)?.execute_with_attempts()?;
+    Ok(ConfiguredProjectExecution {
+        results: outcome.attempted_results,
+        trace: Some(outcome.trace),
+    })
 }
 
 fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHeader> {
@@ -762,11 +944,7 @@ pub fn execute_selection_with_configured_executor(
             let project = build_project_hgraph(bundle, target, policy_override)
                 .map_err(anyhow::Error::msg)
                 .context("failed to build project HGraph for execution")?;
-            let outcome = execute_project_hgraph(bundle, &project, opts)?;
-            Ok(ConfiguredProjectExecution {
-                results: vec![outcome.result],
-                trace: Some(outcome.trace),
-            })
+            execute_project_hgraph_selection(bundle, &project, opts)
         }
         Some(value) => bail!(
             "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected `hgraph` or an unset variable",

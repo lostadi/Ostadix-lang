@@ -1220,7 +1220,7 @@ fn hgraph_to_dot(hgraph: &o_lang::hgraph::HGraph) -> String {
             info.edge.0,
             info.plan_node.0,
             info.ordinal,
-            executable_op_label(op)
+            executable_op_label(op, info.ready_input_policy(hgraph))
         );
         push_dot_vertex(&mut out, &exec_id, &label, DOT_EXECUTE_STYLE);
 
@@ -1410,27 +1410,40 @@ fn dot_escape(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn executable_op_label(op: &o_lang::hgraph::ExecutableOp) -> String {
-    use o_lang::hgraph::ExecutableOp;
+fn executable_op_label(
+    op: &o_lang::hgraph::ExecutableOp,
+    input_policy: Result<o_lang::hgraph::ReadyInputPolicy, String>,
+) -> String {
+    use o_lang::hgraph::{ExecutableOp, ReadyInputPolicy};
 
-    match op {
-        ExecutableOp::Store => "store".into(),
-        ExecutableOp::LoadBinding => "load binding".into(),
-        ExecutableOp::Invoke { fn_name, mode } => format!("invoke:{fn_name} ({mode:?})"),
-        ExecutableOp::EvalBackend { lang, env } if *env == u32::MAX => {
+    match (op, input_policy) {
+        (ExecutableOp::Store, _) => "store".into(),
+        (ExecutableOp::LoadBinding, _) => "load binding".into(),
+        (ExecutableOp::Invoke { fn_name, mode }, _) => {
+            format!("invoke:{fn_name} ({mode:?})")
+        }
+        (ExecutableOp::EvalBackend { lang, env }, _) if *env == u32::MAX => {
             format!("eval:{lang}")
         }
-        ExecutableOp::EvalBackend { lang, env } => format!("eval:{lang}[{env}]"),
-        ExecutableOp::InlineBackend { lang } => format!("inline:{lang}"),
-        ExecutableOp::ForceRequest { kind } => format!("force-request:{kind}"),
-        ExecutableOp::Request { kind } => format!("request:{kind}"),
-        ExecutableOp::Group { mode } => format!("group:{mode:?}"),
-        ExecutableOp::Schedule { kind } => format!("schedule:{kind}"),
-        ExecutableOp::MaterializeProject => "materialize-project".into(),
-        ExecutableOp::BuildRoute { route_id } => format!("build-route:{route_id}"),
-        ExecutableOp::RunRoute { route_id } => format!("run-route:{route_id}"),
-        ExecutableOp::SelectRoute { policy } => format!("select-route:{policy}"),
-        ExecutableOp::CompareRouteResults => "compare-route-results".into(),
+        (ExecutableOp::EvalBackend { lang, env }, _) => format!("eval:{lang}[{env}]"),
+        (ExecutableOp::InlineBackend { lang }, _) => format!("inline:{lang}"),
+        (ExecutableOp::ForceRequest { kind }, _) => format!("force-request:{kind}"),
+        (ExecutableOp::Request { kind }, _) => format!("request:{kind}"),
+        (ExecutableOp::Group { mode }, _) => format!("group:{mode:?}"),
+        (ExecutableOp::Schedule { kind }, _) => format!("schedule:{kind}"),
+        (ExecutableOp::MaterializeProject, _) => "materialize-project".into(),
+        (ExecutableOp::BuildRoute { route_id }, _) => format!("build-route:{route_id}"),
+        (ExecutableOp::RunRoute { route_id }, _) => format!("run-route:{route_id}"),
+        (ExecutableOp::SelectRoute { policy }, Ok(ReadyInputPolicy::OrderedFirstSuccess)) => {
+            format!("select-route:{policy}\ninputs:ordered-first-success")
+        }
+        (ExecutableOp::SelectRoute { policy }, Err(_))
+            if matches!(policy.as_str(), "fallback" | "any_success") =>
+        {
+            format!("select-route:{policy}\ninputs:invalid")
+        }
+        (ExecutableOp::SelectRoute { policy }, _) => format!("select-route:{policy}"),
+        (ExecutableOp::CompareRouteResults, _) => "compare-route-results".into(),
     }
 }
 

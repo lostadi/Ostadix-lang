@@ -782,17 +782,25 @@ QEMU evidence, device assignment, DMA/IOMMU isolation, Governor authority,
 Acceptance gate A, G0/G1 passage, project placement, or a World-execution
 surface. `CapabilityState` is descriptive identity only and carries no grant.
 
-### Project HGraph planning and single-branch hosted execution gates
+### Project HGraph planning and ordered hosted execution gates
 
 PR7 constructs real project operations from a directory or lifted
-`ProjectBundle` without running project commands:
+`ProjectBundle`. The direct IR planning commands below do not run project
+commands:
 
 ```bash
-./scripts/smoke-project-hgraph.sh
 olangc tests/fixtures/project_hgraph --target ir --route main
 ./scripts/o-cli.sh plan tests/fixtures/project_hgraph --route main
 # After setup.sh installs the wrapper:
 o plan tests/fixtures/project_hgraph --route main
+```
+
+The composite smoke checks those nonexecution properties, then compiles a
+project binary and runs bounded opt-in AnySuccess short-circuit and
+nonzero-to-success cases in disposable workspaces:
+
+```bash
+./scripts/smoke-project-hgraph.sh
 ```
 
 The typed project plan is bound to an exact bundle digest and the resolved route
@@ -803,8 +811,9 @@ environment key names, inputs, outputs, declared effects, cancellation, and
 equivalence policy remain visible in stable inspection output; command strings
 and environment values do not.
 
-PR8A adds a separate, opt-in hosted executor for exactly one resolved
-`Explicit` or `Default` alternative:
+PR8A adds a separate, opt-in hosted executor for one resolved `Explicit` or
+`Default` alternative. PR8B extends it to serial ordered `Fallback` and
+`AnySuccess` alternatives:
 
 ```bash
 ./scripts/smoke-project-hgraph-exec.sh
@@ -813,19 +822,26 @@ O_PROJECT_EXECUTOR=hgraph olangc tests/fixtures/project_hgraph_exec \
 ```
 
 In this mode, the validated Project HGraph governs isolated workspace
-materialization, typed prerequisite ordering, route execution, and sole-result
-selection. A settled nonzero route publishes its result and conservative
+materialization, typed prerequisite ordering, route execution, and policy
+selection. `ReadySchedule` gives only
+`SelectRoute(fallback|any_success)` an `OrderedFirstSuccess` input policy.
+`Fallback` follows resolved priority order; `AnySuccess` follows declaration
+order. Both retain the attempted result prefix and stop before later branch
+materialization after the first success. A settled nonzero route publishes its
+result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
-abort publishes no route result. The unsigned trace distinguishes
+abort publishes no route result and stops the policy. Guard skips continue to
+the next alternative. The unsigned trace distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
 to stable source/graph digests plus a fresh execution-attempt identifier. The
 compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is unset.
 
 Materialization and route commands remain fallible `HostWorld` operations even
-when a manifest says `pure=true`. Unsupported multipath policies fail closed.
-This bounded hosted gate does not establish multipath execution, retry,
-placement, Governor authority, OWRECEIPT attestation, exactly-once effects,
-remote or native execution, QEMU/hardware evidence, G1, or G0--G13 passage.
+when a manifest says `pure=true`. Race, aggregate, equivalence, and benchmark
+policies fail closed. This bounded hosted gate does not establish parallel
+race/cancellation, retry, placement, Governor authority, OWRECEIPT attestation,
+exactly-once effects, remote or native execution, QEMU/hardware evidence, G1,
+or G0--G13 passage.
 
 ### Docker
 
@@ -2228,10 +2244,13 @@ synthesizing OIR. The project-specific validator reconstructs the exact plan
 from the bundle and selected policy before checking its operation, dependency,
 effect, and HGraph projection. Unlike ordinary OIR execution, this project
 HGraph has its own opt-in coordinator: `O_PROJECT_EXECUTOR=hgraph` executes one
-resolved `Explicit` or `Default` branch through graph-governed materialization,
-typed prerequisite readiness, route settlement, and selection. The compatibility
-hosted project runtime remains the default, and multipath policies are not yet
-implemented by the Project HGraph coordinator.
+resolved `Explicit`/`Default` branch or serial ordered `Fallback`/`AnySuccess`
+alternatives through graph-governed materialization, typed prerequisite
+readiness, route settlement, and selection. Ordered first-success selectors
+retain attempted results and stop before later branches start. The compatibility
+hosted project runtime remains the default; parallel races and aggregate,
+equivalence, and benchmark policies are not yet implemented by the Project
+HGraph coordinator.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.

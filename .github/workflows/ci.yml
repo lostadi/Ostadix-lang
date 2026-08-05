@@ -49,10 +49,10 @@ jobs:
       - name: Run hosted World ResourceKey conformance smoke
         run: bash scripts/smoke-world-resource-keys.sh
 
-      - name: Run hosted project HGraph planning smoke
+      - name: Run hosted project HGraph planning and compiled-adapter smoke
         run: bash scripts/smoke-project-hgraph.sh
 
-      - name: Run hosted single-branch project HGraph execution smoke
+      - name: Run hosted ordered project HGraph execution smoke
         run: bash scripts/smoke-project-hgraph-exec.sh
 
       - name: Run deterministic parser properties

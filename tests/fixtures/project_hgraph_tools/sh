@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Test-only PATH shim for the generated-project smoke. Preserve the fixture
+# command's observable behavior, then force impl-a to settle nonzero so the
+# compiled AnySuccess coordinator must continue to impl-b.
+if [ "${1-}" = "-c" ]; then
+    case "${2-}" in
+        *PR7_IMPL_A_EXECUTED*)
+            /bin/sh "$@"
+            exit 7
+            ;;
+    esac
+fi
+
+exec /bin/sh "$@"
