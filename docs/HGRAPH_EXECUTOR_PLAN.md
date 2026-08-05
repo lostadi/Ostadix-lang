@@ -159,13 +159,26 @@ The separate hosted `ProjectCoordinator` is serial and uses the conservative
 launch rank plus stable ordinal as its baseline/tie-break order. For ordered
 first-success policies it prioritizes the now-ready `SelectRoute` choice over
 later potential branches; those later operations never receive `Ready` or
-`Started` attempt events. A valid nonzero result or guard skip continues to the
-next alternative, while an infrastructure abort stops because it publishes no
-alternative result or resource successor. Its terminal route states are
+`Started` attempt events. When the terminal alternative settles unsuccessfully,
+continuation is admitted only when every route child was guard-skipped or every
+executed route in that branch, including successful prerequisites, carries the bundle-bound
+`failure_continuation = "declared_idempotent"` contract. The field defaults to
+`unproven`, which stops before the next branch. An infrastructure abort also
+stops because it publishes no alternative result or resource successor. A
+nonzero prerequisite also hard-stops: this slice does not synthesize a
+branch-terminal result or continuation decision from a failed prerequisite,
+regardless of its declared contract. Its terminal route states are
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted`; non-route
 operations use `Finished`. Recording the terminal event, storing the operation
 value, and publishing the settlement-appropriate outputs is the coordinator's
-local linearization point. It does not establish exactly-once external effects.
+local linearization point. The idempotency contract is an author declaration,
+not a verified sandbox, effect log, fence, compensation protocol, or proof of
+exactly-once external effects. This admission rule exists only in the opt-in
+hosted HGraph coordinator; it does not change the compatibility runtime.
+Project-bundle format v2 carries the continuation contract. Legacy v1 bundles
+migrate only when all routes omit that field and then default to `unproven`;
+v1 documents carrying the v2 field and mislabeled serializer inputs are
+rejected.
 
 ## Validation and observability
 
@@ -175,10 +188,22 @@ preserved sequence, and executable acyclicity. `olangc --target dot` renders
 ordinary, resource, actor, completion/control, executable, and constraint nodes
 with distinct styles and directed ports.
 
-`ProjectAttemptTrace` version 2 binds events to the project name, bundle digest,
+`ProjectAttemptTrace` version 3 binds events to the project name, bundle digest,
 target, policy, logical graph digest, and a fresh execution-attempt identifier.
+For an unsuccessful ordered branch it also records the proposed next route,
+the assessed route prefix, the `no_execution`, `declared_idempotent`, or
+`unproven_effects` evidence class, and the allow/deny result.
 `--project-trace-out PATH` stores the unsigned JSON diagnostic when HGraph mode
-is selected. It is not an OWRECEIPT or attestation.
+is selected, including a denied decision before the command reports no
+successful route. Structural replay alone checks only event-local lifecycle
+invariants. Plan-aware replay against a trusted `ProjectHGraph` additionally
+checks all header bindings and exact operation identities, requires the
+decision on the correct terminal alternative, requires complete causally
+ordered lifecycle coverage for every transitive route prerequisite, recomputes
+its evidence from `RoutePlanFacts`, checks the exact next alternative, and
+rejects later-branch events after denial. Every complete coordinator-produced
+trace passes that semantic replay before it is returned. The trace remains
+unsigned and is not an OWRECEIPT or attestation.
 
 The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,

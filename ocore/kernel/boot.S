@@ -4,11 +4,11 @@
 #define OCORE_PROBE_MODE 0
 #endif
 
-// All historical probes retain the 512 KiB kernel-growth reserve. Mode 26's
-// larger, verified four-principal OVFS backing store has an explicit 448 KiB
+// All historical probes retain the 512 KiB kernel-growth reserve. Modes 26
+// and 31 use larger verified OVFS backing stores with an explicit 448 KiB
 // reserve while remaining below the same 4 MiB bootstrap mapping ceiling.
 .globl ocore_kernel_end_limit
-#if OCORE_PROBE_MODE == 26
+#if OCORE_PROBE_MODE == 26 || OCORE_PROBE_MODE == 31
 .set ocore_kernel_end_limit, 0x00390000
 #else
 .set ocore_kernel_end_limit, 0x00380000
@@ -124,6 +124,22 @@ ocore_m7_linux_plan9_image_bytes_start:
 #endif
 .globl ocore_m7_linux_plan9_image_bytes_end
 ocore_m7_linux_plan9_image_bytes_end:
+
+// Mode 31 embeds one deterministic provider ELF (instantiated twice), one
+// client/witness ELF (instantiated twice), and the exact 20-byte immutable
+// object. Provider B is admitted with A but its service loop is staged until
+// A's terminal denial and stale-capability cut have completed.
+.balign 16
+.globl ocore_m7b_logical_read_image_bytes_start
+ocore_m7b_logical_read_image_bytes_start:
+#if OCORE_PROBE_MODE == 31
+#ifndef OCORE_M7B_LOGICAL_READ_IMAGE_PATH
+#error "OCORE_M7B_LOGICAL_READ_IMAGE_PATH is required for M7B-1 LogicalRead mode"
+#endif
+  .incbin OCORE_M7B_LOGICAL_READ_IMAGE_PATH
+#endif
+.globl ocore_m7b_logical_read_image_bytes_end
+ocore_m7b_logical_read_image_bytes_end:
 
 // Modes 20 through 23 embed the deterministic host-verified KernelWorld normal
 // form. Native admission pins the complete record SHA before parsing it. Mode
@@ -619,6 +635,20 @@ ocore_m7_linux_plan9_image_end:
   lea rax, [rip + ocore_m7_linux_plan9_image_bytes_end]
   ret
 .size ocore_m7_linux_plan9_image_end, .-ocore_m7_linux_plan9_image_end
+
+.globl ocore_m7b_logical_read_image_start
+.type ocore_m7b_logical_read_image_start, @function
+ocore_m7b_logical_read_image_start:
+  lea rax, [rip + ocore_m7b_logical_read_image_bytes_start]
+  ret
+.size ocore_m7b_logical_read_image_start, .-ocore_m7b_logical_read_image_start
+
+.globl ocore_m7b_logical_read_image_end
+.type ocore_m7b_logical_read_image_end, @function
+ocore_m7b_logical_read_image_end:
+  lea rax, [rip + ocore_m7b_logical_read_image_bytes_end]
+  ret
+.size ocore_m7b_logical_read_image_end, .-ocore_m7b_logical_read_image_end
 
 .globl ocore_kernel_world_record_start
 .type ocore_kernel_world_record_start, @function

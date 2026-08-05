@@ -69,17 +69,23 @@ evidence_tool = importlib.util.module_from_spec(EVIDENCE_SPEC)
 sys.modules[EVIDENCE_SPEC.name] = evidence_tool
 EVIDENCE_SPEC.loader.exec_module(evidence_tool)
 
+FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT = release.EXPECTED_REQUIRED_EVIDENCE_GATES
+FIXTURE_EVIDENCE_GATE_COUNT = (
+    FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT
+    + release.EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES
+)
+
 
 def fixture_evidence_manifest() -> str:
     lines = [
         "schema_version = 2",
-        "required_gate_count = 22",
+        f"required_gate_count = {FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT}",
         "supplemental_gate_count = 1",
         'portable_command = "./boot-and-test.sh smoke"',
         "",
     ]
-    for index in range(23):
-        required = index < 22
+    for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
+        required = index < FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT
         is_g2 = index == 1
         if is_g2:
             gate_id = release.G2_AARCH64_GATE_ID
@@ -368,7 +374,7 @@ class SourceReleaseTests(unittest.TestCase):
             contents[path] = (PROJECT_ROOT / path).read_bytes()
         if files:
             contents.update(files)
-        for index in range(23):
+        for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
             contents[f"ocore/kernel/fixture-evidence-{index:02}.sh"] = (
                 "#!/bin/sh\n"
                 f"printf 'FIXTURE {index:02} START\\nFIXTURE {index:02} PASS\\n'\n"
@@ -632,7 +638,7 @@ class SourceReleaseTests(unittest.TestCase):
             }
             included.update(
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
-                for index in range(23)
+                for index in range(FIXTURE_EVIDENCE_GATE_COUNT)
             )
             excluded = {
                 ".DS_Store",
@@ -1587,7 +1593,8 @@ class SourceReleaseTests(unittest.TestCase):
     def test_zero_gate_evidence_manifest_is_rejected_before_packaging(self) -> None:
         self._commit({"evidence/gates.toml": ZERO_GATE_EVIDENCE_MANIFEST})
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 22"
+            release.ReleaseError,
+            rf"required_gate_count must be {FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT}",
         ):
             self._build("zero-gate-evidence.zip")
 
@@ -1615,7 +1622,8 @@ class SourceReleaseTests(unittest.TestCase):
             result.output, "self-consistent-zero-gate-evidence.zip", remove_gates
         )
         with self.assertRaisesRegex(
-            release.ReleaseError, r"required_gate_count must be 22"
+            release.ReleaseError,
+            rf"required_gate_count must be {FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT}",
         ):
             release.verify_archive(tampered)
 

@@ -103,6 +103,7 @@ cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
 cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
+./ocore/kernel/smoke-m7b-logical-read-qemu.sh
 ./scripts/smoke-world-resource-keys.sh
 ./scripts/smoke-project-hgraph.sh
 ./scripts/smoke-project-hgraph-exec.sh
@@ -136,7 +137,10 @@ IR compatibility. It also proves `scripts/o-cli.sh plan` is byte-identical to
 the direct `olangc --target ir` result. After those nonexecution checks, the
 smoke compiles a project binary and runs bounded opt-in AnySuccess cases for
 immediate short-circuit and nonzero-to-success continuation in disposable
-workspaces. `setup.sh` installs lowercase `o` as a wrapper over the dispatcher
+workspaces. The continuation fixture explicitly declares both its executed
+prerequisite and first route `failure_continuation = "declared_idempotent"`;
+omitting that contract now fails closed before the second branch. `setup.sh`
+installs lowercase `o` as a wrapper over the dispatcher
 while preserving evaluator fallback for non-subcommand input.
 
 `smoke-project-hgraph-exec.sh` is the separate PR8A/PR8B ordered hosted
@@ -144,17 +148,31 @@ execution gate. It proves that the opt-in HGraph coordinator owns isolated
 materialization, typed prerequisite ordering, route settlement, and unsigned
 lifecycle tracing for one `Explicit`/`Default` alternative plus serial
 `Fallback`/`AnySuccess`. The latter use a first-class ordered-prefix input
-policy, retain each attempted result, continue after nonzero or guard skip, and
-never start a later branch after the first success. Infrastructure abort stops
-without publishing a route result. This is not parallel race/cancellation,
-retry, placement, deployment, Governor/receipt integration, exactly-once
-effects, native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
+policy and retain each attempted result. When the terminal alternative settles
+unsuccessfully, the next branch starts only if no route child executed
+(guard-only skips) or every route that executed in that branch, including
+successful prerequisites, explicitly declares
+`failure_continuation = "declared_idempotent"`; the default `unproven` class
+fails closed. A failed prerequisite remains a hard stop regardless of that
+declaration because this slice has no synthesized branch-failure result. Bundle
+format v2 carries the contract; a v1 bundle migrates only when all routes omit
+the new field and therefore default to `unproven`. Trace v3 records the assessed
+prefix, evidence class, next route, and allow/deny result. Complete traces pass
+plan-aware semantic replay against the trusted HGraph, including complete
+causally ordered lifecycle coverage for transitive route prerequisites;
+structural replay alone does not prove bundle-bound evidence. Infrastructure
+abort stops without publishing a route result. This is an HGraph-only
+author-declaration gate, not
+verified idempotency, a sandbox/fence/effect log, parallel race/cancellation,
+retry,
+placement, deployment, Governor/receipt integration, exactly-once effects,
+native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
 case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 22 required portable QEMU gates in the
+The aggregate executes all 23 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive

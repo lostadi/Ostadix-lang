@@ -287,7 +287,7 @@ EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset(
     {"portable_tcg", "qemu_tcg_aarch64", "hardware_kvm"}
 )
-EXPECTED_REQUIRED_EVIDENCE_GATES = 22
+EXPECTED_REQUIRED_EVIDENCE_GATES = 23
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 EVIDENCE_COMMON_REQUIRED_TOOLS = frozenset(
     {"bash", "cargo", "rustc", "clang", "lld", "python3"}

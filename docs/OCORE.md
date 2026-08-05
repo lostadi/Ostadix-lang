@@ -604,6 +604,44 @@ transport, persistent filesystem, or guest-agent framework. QEMU TCG is not
 KVM/SVM or physical-hardware evidence. PCI or physical-device assignment, DMA,
 IOMMU, interrupt remapping, and hardware reset remain outside this gate.
 
+Mode 26 is not two-provider routing evidence. Generation 2 is a replacement
+instance of the same server implementation and serves a later, different
+20-byte snapshot after generation 1's read and clunk have completed. There is
+no route set for one immutable object, requester-local provider choice, recovery
+of one logical read on a second provider, fresh provider-B session/fid
+reconstruction, causal multi-attempt trace, or live `OWRECEIPT` emission.
+
+Mode 31 is the bounded M7B-1 mechanism gate. Run it with:
+
+```bash
+./ocore/kernel/smoke-m7b-logical-read-qemu.sh
+```
+
+The deterministic 78,304-byte OVFS contains one requester-local client/router
+ELF, one provider ELF instantiated as two distinct generation-bound CPL3
+provider principals, and one exact 20-byte immutable object. Before the request,
+O-core admits distinct A/B provider identities, service bindings, endpoints,
+and client call capabilities. Provider B's service loop remains staged while A
+receives fresh `version`, `attach`, `walk`, `open`, and `read` exchanges. A
+returns a valid 9P `Rerror`, faults deliberately, and has its local route and
+call authority withdrawn; the client then proves its old A capability stale.
+Only afterward does B run a fresh provider-local `version`, `attach`, `walk`,
+`open`, `read`, and `clunk` sequence with different fids. The client verifies
+the exact bytes and SHA-256, and the kernel checks a volatile causal state before
+separately proving A physical/process cleanup, B session/queue cleanup, complete
+bounded resource reclamation, unrelated-witness survival, and a later timer.
+
+This passes M7B-1, not the complete M7B milestone described in
+[`ODOMAIN_PLAN.md`](ODOMAIN_PLAN.md#m7b-two-provider-immutable-9p-read-fallback).
+The requester and route coordinator are one principal, both providers use the
+same deterministic implementation artifact, and the route set is fixed local
+configuration. The causal state is non-persisted, unsigned diagnostic evidence,
+not a live `OWRECEIPT`. Mode 31 does not establish implementation-diverse
+providers, general 9P or WorldFS, writes, fid migration, exactly-once effects,
+network transport, Governor consensus, G7/G8, a foreign kernel, Linux or Plan 9
+boot, hardware virtualization, physical-device assignment, DMA/IOMMU isolation,
+or physical-hardware evidence.
+
 Mode 27 is the bounded shared-World-identity PR2 slice. The 20 constitutional
 identity atoms--`WorldId`, `WorldEpoch`, `GovernorTerm`, `GovernorLogIndex`,
 `NodeId`, `NodeGeneration`, `DomainId`, `DomainGeneration`, `ProcessId`,

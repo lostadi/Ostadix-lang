@@ -358,7 +358,36 @@
   one exact native client/server corpus, not Linux or Plan 9 boot, a Plan 9
   binary, general Linux ABI, general 9P or namespace environment, guest agent,
   KVM/SVM hardware proof, PCI/device assignment, DMA/IOMMU isolation, or
-  physical-device evidence.
+  physical-device evidence. Generation 2 is a replacement instance of the same
+  server implementation and serves a later, different 20-byte snapshot after
+  generation 1's read and clunk complete. Mode 26 therefore does not establish
+  two independently admitted providers for one immutable object,
+  requester-local route selection, recovery of one logical read on a second
+  provider, fresh provider-B session/fid reconstruction, causal multi-attempt
+  tracing, or live `OWRECEIPT` emission.
+- Mode 31 adds the bounded M7B-1 local mechanism gate in
+  `ocore/kernel/smoke-m7b-logical-read-qemu.sh`. One deterministic provider ELF
+  is instantiated as two distinct generation-bound CPL3 provider principals;
+  a requester-local client/router and unrelated witness instantiate a second
+  ELF. Distinct A/B identities, service bindings, endpoints, and call
+  capabilities are admitted before the request for the same immutable,
+  content-addressed 20-byte object. A completes fresh 9P setup, returns a valid
+  `Rerror`, and faults; O-core withdraws A's local route and authority, the
+  client proves its retained A handle stale, and only then does B complete a
+  fresh provider-local setup/read/clunk with different fids and the pinned
+  digest. A volatile causal state, separate A physical/process cleanup, B
+  session/queue cleanup, full bounded reclamation, witness survival, and a
+  later timer all pass under QEMU TCG.
+  This is M7B-1, not complete M7B. The client and router are one principal, the
+  two providers share one implementation artifact, and the route set is fixed
+  local configuration. The causal state is non-persisted and unsigned, not a
+  live `OWRECEIPT`; the offline Mode 30 corpus is not live routing evidence.
+  The detailed milestone boundary and remaining work are in
+  [`ODOMAIN_PLAN.md`](ODOMAIN_PLAN.md#m7b-two-provider-immutable-9p-read-fallback).
+  Mode 31 does not establish implementation diversity, general 9P/WorldFS,
+  writes, fid migration, exactly-once effects, networking, Governor consensus,
+  G7/G8, foreign-kernel boot, KVM/SVM, physical devices, DMA/IOMMU isolation,
+  or physical-hardware evidence.
 - Mode 27 adds the shared World identity PR2 gate in
   `ocore/kernel/smoke-world-identity-qemu.sh`. All 20 identity atoms named by
   the constitution have typed Rust and `.oc` definitions. A strict bounded
@@ -472,6 +501,14 @@
   error must instead come from a device-native path such as virtio-blk `EIO` or
   a negotiated 9P error. This contract is not evidence that stage-2 teardown,
   TLB shootdown, those device errors, G7, or G8 are implemented.
+- [`LOCAL_AUTHORITY_ROUTING_AMENDMENT.md`](LOCAL_AUTHORITY_ROUTING_AMENDMENT.md)
+  records a proposed additive split between one local O-Machine authority per
+  physical node, node-local O-core policy, requester-local route selection, and
+  replicated Governor facts. It also separates local route exclusion, lease
+  expiry, owner revocation, and physical reclamation. It does not alter the
+  sealed contracts or establish the complete amendment as implemented or
+  passed; those claims require versioned successor schemas and executable
+  evidence. Mode 31 is only the bounded M7B-1 local mechanism described above.
 - G2 is one forced-QEMU-TCG, one-vCPU AArch64
   `virt,virtualization=on` run. It compiles native semantic `.oc` code to
   `EM_AARCH64`, installs a resident EL2 vector and stack, enters O-core at host
@@ -532,8 +569,13 @@
   prerequisites are explicit in both layers. The project plan also records
   guards, environment overlay key names, ambient environment-guard
   dependencies, inputs/outputs, declared effects, cancellation, and
-  equivalence policy; its HGraph projection carries the corresponding
+  equivalence policy, including each route's `failure-continuation` contract;
+  its HGraph projection carries the corresponding
   operation, effect/resource-transition, dependency, and output topology.
+  Project-bundle format v2 carries that safety contract. The v1 reader path
+  migrates only bundles in which every route omits the v2 field, defaults those
+  routes to `unproven`, and emits v2 thereafter; a v1 document carrying the new
+  field and an in-memory bundle mislabeled as v1 are both rejected.
   Planning is deterministic and nonexecuting, and exact source/projection
   validation rejects malformed references, substitution, and graph forgery.
 - `scripts/smoke-project-hgraph.sh` is the composite Project HGraph hosted
@@ -541,7 +583,10 @@
   `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. It
   then compiles a project binary, checks route listing and option/policy
   rejection, and runs opt-in AnySuccess for immediate short-circuit plus
-  nonzero-to-success continuation in disposable workspaces. Route
+  explicitly admitted nonzero-to-success continuation in disposable
+  workspaces. The continuation fixture declares its executed prerequisite and
+  failed first route `failure_continuation = "declared_idempotent"`; omission
+  defaults to `unproven` and stops before the second branch. Route
   materialization and commands retain
   conservative fallible `HostWorld` effects even when a manifest declares
   `pure=true`. Logical alternative branches may therefore be serialized and
@@ -556,16 +601,36 @@
   conjunctive input readiness. Fallback follows resolved priority order,
   AnySuccess follows declaration order, and a first success prevents later
   branches from materializing or starting. Every attempted alternative result
-  is retained; nonzero and guard-skipped results continue, while an
-  infrastructure abort publishes no route value and stops the policy. A
-  nonzero prerequisite publishes its value and conservative `HostWorld`
-  successor but withholds completion. The unsigned diagnostic trace binds
+  is retained. When the terminal alternative settles unsuccessfully, it admits
+  the next route only when every route child was guard-skipped or every route
+  that executed in that branch, including successful prerequisites, carries
+  the bundle-bound `failure_continuation = "declared_idempotent"` contract. The default
+  `unproven` class denies continuation; an infrastructure abort publishes no
+  route value and stops the policy. A nonzero prerequisite publishes its value
+  and conservative `HostWorld` successor but withholds completion; because no
+  first-class branch-failure value is synthesized in this slice, a failed
+  prerequisite hard-stops even when it declares idempotence. The unsigned
+  diagnostic trace v3 binds
   stable source/graph identity to a fresh execution-attempt identifier and
-  distinguishes settlement, guard skip, and abort; operations never attempted
-  after short-circuit emit no lifecycle event. Parallel/racing, aggregate,
+  distinguishes settlement, guard skip, and abort. Its continuation decision
+  records the assessed route prefix, proposed next route,
+  `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
+  allow/deny result; a denied decision is persisted before the CLI reports no
+  successful route. Standalone replay checks only structural lifecycle
+  consistency. Plan-aware replay against a trusted `ProjectHGraph` verifies the
+  header/projection, exact operation identities and next alternative, requires
+  complete causally ordered lifecycle coverage for every transitive route
+  prerequisite, recomputes evidence from `RoutePlanFacts`, and rejects missing
+  decisions or later-branch events after denial; every complete coordinator
+  trace passes that semantic replay before return. Operations never attempted
+  after short-circuit or denial emit no lifecycle event. Parallel/racing, aggregate,
   equivalence, and benchmark
   policies fail closed rather than falling back to the compatibility runtime.
-  This is not parallel race/cancellation, retry, placement, deployment,
+  `declared_idempotent` is an author declaration, not independently verified
+  idempotency, sandboxing, effect journaling, fencing, compensation, or an
+  exactly-once guarantee. This rule exists only in the opt-in hosted HGraph
+  coordinator and does not alter the default compatibility runtime. This is
+  not parallel race/cancellation, retry, placement, deployment,
   Governor or receipt integration, remote execution, WorldFS,
   native/QEMU/hardware evidence, Linux or Plan 9 boot, a general foreign ABI,
   KVM/SVM evidence, physical-device assignment, PCI/DMA/IOMMU isolation,

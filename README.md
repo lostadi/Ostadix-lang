@@ -797,7 +797,7 @@ o plan tests/fixtures/project_hgraph --route main
 
 The composite smoke checks those nonexecution properties, then compiles a
 project binary and runs bounded opt-in AnySuccess short-circuit and
-nonzero-to-success cases in disposable workspaces:
+explicitly admitted nonzero-to-success cases in disposable workspaces:
 
 ```bash
 ./scripts/smoke-project-hgraph.sh
@@ -808,8 +808,11 @@ policy. It builds logically separate materialization branches with prerequisite 
 projects `MaterializeProject`, `BuildRoute`, `RunRoute`, `SelectRoute`, and,
 for `verify_equivalent`, `CompareRouteResults` into a validated HGraph. Guards,
 environment key names, inputs, outputs, declared effects, cancellation, and
-equivalence policy remain visible in stable inspection output; command strings
-and environment values do not.
+equivalence policy remain visible in stable inspection output. The route facts
+also show the `failure-continuation` contract; command strings and environment
+values do not. Project-bundle format v2 carries that contract. Legacy v1 bundles
+migrate only when every route omits the field, in which case all routes become
+fail-closed `unproven`; a v1 document carrying the v2 field is rejected.
 
 PR8A adds a separate, opt-in hosted executor for one resolved `Explicit` or
 `Default` alternative. PR8B extends it to serial ordered `Fallback` and
@@ -827,21 +830,41 @@ selection. `ReadySchedule` gives only
 `SelectRoute(fallback|any_success)` an `OrderedFirstSuccess` input policy.
 `Fallback` follows resolved priority order; `AnySuccess` follows declaration
 order. Both retain the attempted result prefix and stop before later branch
-materialization after the first success. A settled nonzero route publishes its
+materialization after the first success. When the terminal alternative settles
+unsuccessfully, the next alternative starts only if every route child was
+guard-skipped or every route that executed in the branch, including successful
+prerequisites, declares
+`failure_continuation = "declared_idempotent"`. The field defaults to
+`unproven`, so execution fails closed before the next branch. A failed
+prerequisite remains a hard stop because this slice does not synthesize a
+branch-terminal result from it. A settled nonzero route still publishes its
 result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
 abort publishes no route result and stops the policy. Guard skips continue to
-the next alternative. The unsigned trace distinguishes
+the next alternative when no route child executed. The unsigned trace v3
+distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
-to stable source/graph digests plus a fresh execution-attempt identifier. The
-compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is unset.
+to stable source/graph digests plus a fresh execution-attempt identifier. It
+also records the assessed route prefix, proposed next route,
+`no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
+allow/deny decision. A denied decision is persisted before the command reports
+that no route succeeded. Structural replay checks lifecycle shape only;
+plan-aware replay against the trusted HGraph verifies all bindings, recomputes
+the evidence and exact next branch, requires complete causally ordered
+lifecycle coverage for every transitive route prerequisite, and rejects missing
+decisions or execution after denial. Every complete coordinator trace passes
+that semantic replay.
+The compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is
+unset.
 
 Materialization and route commands remain fallible `HostWorld` operations even
 when a manifest says `pure=true`. Race, aggregate, equivalence, and benchmark
 policies fail closed. This bounded hosted gate does not establish parallel
 race/cancellation, retry, placement, Governor authority, OWRECEIPT attestation,
 exactly-once effects, remote or native execution, QEMU/hardware evidence, G1,
-or G0--G13 passage.
+or G0--G13 passage. `declared_idempotent` is a bundle-bound author declaration,
+not verified idempotency, sandboxing, effect journaling, fencing, compensation,
+or an exactly-once guarantee.
 
 ### Docker
 
@@ -2807,7 +2830,7 @@ standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE -->
-The 22 required portable QEMU release gates and 1
+The 23 required portable QEMU release gates and 1
 supplemental hardware-dependent gate are defined once in
 [`evidence/gates.toml`](evidence/gates.toml). The aggregate reads that manifest
 at runtime, selects only `required = true`, streams each gate's output, and
@@ -2834,7 +2857,8 @@ is a checked projection.
 | `m6b-bounded-copy` | yes | M6B mechanism | [ocore/kernel/smoke-m6b-qemu.sh](ocore/kernel/smoke-m6b-qemu.sh) (`portable_tcg`) | Generation-tagged bounded-copy request views enforce snapshot input, written-prefix output, typed rights, quotas, and revoke-before-terminal ordering<br>Five delegated lease classes support transactional create-bind rollback and request-wide revocation while unrelated scope survives | The mechanism is not integrated with the live M6A CPL3 RPC path<br>It does not establish pinned windows, streaming, signals, a Linux oracle, or concrete delegated services |
 | `m6b-live-bounded-personality` | yes | M6B Mode 24 live | [ocore/kernel/smoke-live-bounded-personality-qemu.sh](ocore/kernel/smoke-live-bounded-personality-qemu.sh) (`portable_tcg`) | Four digest-pinned CPL3 ELFs exercise one-shot four-byte INOUT bounded personality RPC across health-gated publication, one contained daemon fault, and a generation-2 rebind<br>The live terminal corpus covers cancellation, timeout, service death, and supervisor-triggered pre-terminal unmap, request-revoke, delegated-resource-revoke, and caller-exit dispositions with stale and duplicate denial plus bounded cleanup | Mode 24 is a native test personality, not a Linux or Plan 9 boot, general foreign ABI, or general guest-agent path<br>The generation-2 lifecycle operations are supervisor-triggered pre-terminal dispositions; the gate does not mutate a mapping, observe an external resource event, or cover the post-reply/pre-consume process-exit or unmap race<br>The delegated device resource is one internal typed lease; this is not KVM, PCI or physical-device assignment, DMA, IOMMU, interrupt-remapping, or physical-device evidence |
 | `m6-linux-minimal-live` | yes | M6 Linux Mode 25 live | [ocore/kernel/smoke-live-linux-personality-qemu.sh](ocore/kernel/smoke-live-linux-personality-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF and three native service principals load from immutable OVFS data into isolated CPL3 address spaces<br>Bounded fd 1/fd 2 writes, exact -ENOSYS, and exit_group(42) survive one contained daemon fault, health-gated generation-2 replacement, stale generation-1 denial, and complete authority/resource reclamation | The pinned four-call success path, with a fifth failure-only exit site, is not Linux or Plan 9 boot, a distribution, root filesystem, dynamic linker, general foreign ABI, or arbitrary Linux binary compatibility<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping/isolation, IOMMU isolation, interrupt remapping, or hardware reset |
-| `m7-linux-plan9-9p2000-live` | yes | M7 Linux/Plan 9 Mode 26 live | [ocore/kernel/smoke-live-linux-plan9-qemu.sh](ocore/kernel/smoke-live-linux-plan9-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF, an unprivileged native Linux 9P2000 server, a native supervisor, and a Plan-9-style native 9P2000 client load from immutable OVFS data into four isolated CPL3 address spaces<br>The Linux ELF's bounded stdout/stderr results are read through exact 9P2000 version, attach, walk, open, read, and clunk exchanges at /srv/linux/status across namespace withdrawal, one contained server fault, generation-2 replacement, stale generation-1 denial, and complete resource reclamation | Mode 26 executes the same bounded Linux-ABI ELF and a native O-core Plan-9-style client; it does not boot Linux or Plan 9, run a Plan 9 binary, provide a distribution, root filesystem, or dynamic linker, or establish a general foreign ABI<br>The exact 128-byte 9P2000 corpus exposes only the generation-bound /srv/linux/status path; it is not a general 9P server, Plan 9 namespace or mount environment, network transport, persistent filesystem, or guest-agent framework<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping or isolation, IOMMU isolation, interrupt remapping, or hardware reset |
+| `m7-linux-plan9-9p2000-live` | yes | M7 Linux/Plan 9 Mode 26 live | [ocore/kernel/smoke-live-linux-plan9-qemu.sh](ocore/kernel/smoke-live-linux-plan9-qemu.sh) (`portable_tcg`) | One exact digest-pinned static Linux x86-64 ELF, an unprivileged native Linux 9P2000 server, a native supervisor, and a Plan-9-style native 9P2000 client load from immutable OVFS data into four isolated CPL3 address spaces<br>The Linux ELF's bounded stdout/stderr results are read through exact 9P2000 version, attach, walk, open, read, and clunk exchanges at /srv/linux/status across namespace withdrawal, one contained server fault, generation-2 replacement, stale generation-1 denial, and complete resource reclamation | Mode 26 executes the same bounded Linux-ABI ELF and a native O-core Plan-9-style client; it does not boot Linux or Plan 9, run a Plan 9 binary, provide a distribution, root filesystem, or dynamic linker, or establish a general foreign ABI<br>The exact 128-byte 9P2000 corpus exposes only the generation-bound /srv/linux/status path; it is not a general 9P server, Plan 9 namespace or mount environment, network transport, persistent filesystem, or guest-agent framework<br>Generation 2 is the same server implementation serving a later, different snapshot after generation 1 completed; this is not two-provider routing for one immutable object, requester-local fallback, fresh provider-B session/fid reconstruction, causal multi-attempt tracing, or live OWRECEIPT emission<br>QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence<br>The gate has no PCI or physical-device assignment, DMA mapping or isolation, IOMMU isolation, interrupt remapping, or hardware reset |
+| `m7b-logical-read-fallback-live` | yes | M7B-1 native LogicalRead Mode 31 | [ocore/kernel/smoke-m7b-logical-read-qemu.sh](ocore/kernel/smoke-m7b-logical-read-qemu.sh) (`portable_tcg`) | One deterministic provider ELF is instantiated as two generation-distinct isolated CPL3 provider principals; distinct A/B service bindings, endpoints, and client call capabilities are admitted before one requester-local LogicalRead for an exact immutable 20-byte object<br>Provider A returns a valid terminal 9P Rerror, faults, and has its local route and call authority withdrawn; the client proves A stale before staged provider-B activation, then completes a fresh B-local version/attach/walk/open/read/clunk sequence with different fids, verifies the pinned SHA-256, and reaches separate cleanup, full reclamation, witness-survival, and post-timer evidence | This is the bounded M7B-1 local mechanism, not complete M7B: requester and router are one principal, both providers instantiate one implementation artifact, and the route set is fixed local configuration rather than a general route registry<br>The kernel causal state and serial transcript are non-persisted unsigned diagnostics, not a live OWRECEIPT, attestation, Governor commitment, lease protocol, or distributed consensus evidence<br>The exact read-only 9P2000 corpus is not general 9P, WorldFS, a writable filesystem, fid migration, exactly-once effects, network transport, persistence, Linux or Plan 9 boot, or a foreign KernelWorld<br>Forced QEMU TCG CPL3 execution is not KVM/SVM, physical-hardware, G7/G8, PCI/device assignment, DMA/IOMMU isolation, interrupt-remapping, or hardware-reset evidence |
 | `kernel-world-mode20-objects` | yes | KernelWorld Mode 20 | [ocore/kernel/smoke-kernel-world-qemu.sh](ocore/kernel/smoke-kernel-world-qemu.sh) (`portable_tcg`) | The exact hash-pinned V2 record is parsed under default-deny package, manifest, request, export, and typed-rights binding<br>Generation-bound nonexecuting VM, vCPU, and guest-page objects enforce quota, stale denial, exact-world reclaim, and unrelated-VM survival | Mode 20 does not enter a guest, execute firmware, or publish a provider export<br>It does not establish device assignment, DMA mapping, or IOMMU isolation |
 | `kernel-world-mode21-svm-kvm` | no | KernelWorld Mode 21 | [ocore/kernel/smoke-kernel-world-execution-qemu.sh](ocore/kernel/smoke-kernel-world-execution-qemu.sh) (`hardware_kvm`) | On an AMD host with nested SVM/NPT and writable /dev/kvm, KVM enters a bounded synthetic guest and observes controlled hypercall and interrupt exits<br>An unmapped guest-physical access fails closed before exact NPT teardown, vCPU restart, and unrelated-VM survival | Mode 21 is supplemental hardware-dependent evidence and is not part of the portable release aggregate<br>It does not boot Linux, Plan 9, firmware, or a supplied image<br>It has no provider lifecycle, guest agent, service export, virtual device, PCI assignment, DMA mapping, or IOMMU-isolation proof |
 | `kernel-world-mode22-live` | yes | KernelWorld Mode 22 | [ocore/kernel/smoke-kernel-world-live-qemu.sh](ocore/kernel/smoke-kernel-world-live-qemu.sh) (`portable_tcg`) | The TCG-compatible native administrative gate health-publishes exact typed exports and dispatches bounded reset intent<br>Failure withdraws clients before exact VM-graph revoke; policy restarts generation 2 while unrelated service survives and generation 1 stays stale | Mode 22 does not enter a guest or enforce the manifest health timeout<br>It has no Linux or Plan 9 boot, guest agent, shared queue, device assignment, DMA/IOMMU isolation, or hardware reset |
@@ -2987,6 +3011,20 @@ python3 scripts/release_evidence.py validate
   verifier, and the offline fixture is not live receipt emission, authority,
   trusted-signer policy, World Alpha attestation, Acceptance A, or G0--G13
   passage.
+- A bounded Mode 31 M7B-1 local LogicalRead gate. One deterministic provider
+  ELF is instantiated as two distinct generation-bound CPL3 provider
+  principals, and both A/B routes are admitted before the request for one exact
+  immutable 20-byte object. A returns a valid 9P `Rerror`, faults, and has its
+  local route/authority withdrawn; the requester-local client/router proves the
+  A handle stale before staged B activation, then completes a fresh
+  provider-local setup/read/clunk with different fids and verifies the pinned
+  SHA-256. A bounded volatile causal state, separate A physical cleanup, B
+  session cleanup, full resource reclamation, an unrelated witness, and a later
+  timer pass under QEMU TCG. This is not complete M7B: both providers share one
+  implementation artifact, routing is fixed and local, and the non-persisted
+  causal state is not a live `OWRECEIPT`. It adds no general 9P/WorldFS, writes,
+  network, Governor, foreign kernel, G7/G8, hardware virtualization,
+  DMA/IOMMU isolation, or physical-hardware evidence.
 - A separately gated hosted Live-World oracle with bounded strict manifests,
   immutable package CAS objects, default-deny activation policy, health-gated
   service generations, rollback, targeted restart, reconstruction, revocable
