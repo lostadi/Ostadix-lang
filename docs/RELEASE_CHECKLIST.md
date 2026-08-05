@@ -5,7 +5,11 @@ This checklist is grounded in the current repository state: `Cargo.toml` version
 workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
 `scripts/check_release_claims.sh`. The source-release builder and its tests
 also reject disagreement among the root LGPL-2.1-only license text, Cargo
-package metadata, `CITATION.cff`, and the live README citation prose.
+package metadata, `CITATION.cff`, and the live README citation prose. The
+`olangc` unit suite parses both generated host and project Cargo manifests,
+requires component-scoped metadata to identify the embedded runtime as
+LGPL-2.1-only, records that embedded input licensing is retained by its source,
+and keeps the mixed generated crates `publish = false`.
 
 ## Pre-tag validation
 
@@ -58,7 +62,7 @@ python3 -m unittest -v tests.test_source_release
 The hosted World ResourceKey smoke is the bounded PR6 repository-conformance
 gate. It verifies typed governed vocabulary, underlying identity helpers'
 caller-pair comparison, generic/device/accelerator HGraph chaining, alias-aware
-grounding partitioning, source-forgery rejection, and residual `HostWorld` on a
+grounding projection, source-forgery rejection, and residual `HostWorld` on a
 real CLI projection. Grounding itself checks only the bound World
 epoch/membership. This is not Mode 31, a ResourceKey wire ABI, production
 governed lowering, native/QEMU/hardware evidence, Governor authority, device

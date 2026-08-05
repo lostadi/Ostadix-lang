@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn governed_resource_keys_partition_from_ambient_host_state() {
+    fn governed_resource_keys_project_into_governed_and_ambient_fields() {
         let current = world("desk", 4);
         let node = NodeIdentity::new(
             current.world().clone(),
