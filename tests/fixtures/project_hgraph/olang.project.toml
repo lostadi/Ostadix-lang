@@ -8,6 +8,7 @@ label = "prepare fixture"
 kind = "build"
 command = ["sh", "-c", 'if [ -n "${PR7_NONEXEC_MARKER:-}" ]; then printf PR7_PREP_EXECUTED >> "$PR7_NONEXEC_MARKER"; fi; printf PR7_PREP_EXECUTED > SHOULD_NOT_EXIST']
 outputs = ["build/**"]
+failure_continuation = "declared_idempotent"
 
 [[routes]]
 id = "impl-a"
@@ -21,6 +22,7 @@ env = { PLAN_VARIANT = "a" }
 guards = { requires_env = "PR7_REQUIRED_ENV" }
 result_codec = "json"
 default = true
+failure_continuation = "declared_idempotent"
 
 [[routes]]
 id = "impl-b"

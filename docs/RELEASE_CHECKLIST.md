@@ -81,9 +81,13 @@ for one resolved `Explicit`/`Default` alternative plus serial ordered
 value/success prerequisite edges, first-success prefix readiness, attempted
 result retention, guard-skip/nonzero continuation, conservative `HostWorld`
 progression, infrastructure aborts, and unsigned deterministic lifecycle
-events. It is not parallel race/cancellation, retry, placement, deployment,
-Governor/receipt integration, exactly-once effects, native/QEMU or hardware
-evidence, G1, or G0--G13 passage.
+events. A terminal alternative may continue only after no route child executed
+or after every executed route declares `failure_continuation =
+"declared_idempotent"`; a failed prerequisite remains a hard stop. Bundle v2
+carries that contract, and complete traces pass plan-aware semantic replay
+against the trusted HGraph. It is not parallel race/cancellation, retry,
+placement, deployment, Governor/receipt integration, exactly-once effects,
+native/QEMU or hardware evidence, G1, or G0--G13 passage.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a
@@ -117,7 +121,7 @@ their immutable source bytes from a later reachable commit, and shallow clones
 cannot establish that provenance.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
-The portable native release surface contains exactly **22** required
+The portable native release surface contains exactly **23** required
 QEMU gates. `evidence/gates.toml` is authoritative; the aggregate, CI, this
 checklist, and the README status table are validated projections. After each
 successful gate, the aggregate requires every manifest marker exactly once in
@@ -149,9 +153,10 @@ python3 scripts/release_evidence.py validate
 | 17 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
 | 18 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
 | 19 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
-| 20 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
-| 21 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
-| 22 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
+| 20 | `m7b-logical-read-fallback-live` | M7B-1 native LogicalRead Mode 31 | `portable_tcg` | `ocore/kernel/smoke-m7b-logical-read-qemu.sh` |
+| 21 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
+| 22 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
+| 23 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
 
 Supplemental hardware evidence is validated by the same manifest but is not
 executed by the portable aggregate:

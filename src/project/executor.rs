@@ -12,23 +12,25 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
-
 use crate::executor::CancellationToken;
 use crate::hgraph::{
     ExecutableOp, HNodeKind, NodeId, ReadyInputPolicy, ReadyOp, ReadySchedule, ValueState,
 };
 use crate::ir::PlanNodeId;
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::materialize::{materialize_isolated, Workspace};
-use super::model::{OExecutionResult, ProjectBundle, RoutePolicy, RouteSpec};
+use super::model::{
+    OExecutionResult, ProjectBundle, RouteFailureContinuation, RoutePolicy, RouteSpec,
+};
 use super::plan::{
     build_project_hgraph, ProjectDependency, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
 use super::runtime::{execute_route_in_workspace, is_skipped_result, run_selection, RunOptions};
 use super::trace::{
-    ProjectAttemptIdentity, ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectRouteOutcome,
+    project_logical_graph_digest, ProjectAttemptIdentity, ProjectAttemptTrace,
+    ProjectAttemptTraceHeader, ProjectContinuationDecision, ProjectContinuationEvidence,
+    ProjectRouteOutcome,
 };
 
 /// Opt-in selector for the hosted project HGraph executor.
@@ -130,6 +132,13 @@ enum SettledRouteStatus {
     Skipped,
 }
 
+#[derive(Clone)]
+struct BranchRouteAssessment {
+    route_id: String,
+    executed: bool,
+    failure_continuation: RouteFailureContinuation,
+}
+
 enum OperationResult {
     Finished {
         value: ProjectRuntimeValue,
@@ -170,6 +179,8 @@ pub struct ProjectCoordinator<'a> {
     values: BTreeMap<NodeId, ProjectRuntimeValue>,
     workspaces: BTreeMap<usize, Workspace>,
     failures: BTreeMap<PlanNodeId, String>,
+    branch_assessments: BTreeMap<usize, Vec<BranchRouteAssessment>>,
+    continuation_denied: bool,
     trace: ProjectAttemptTrace,
     cancel: CancellationToken,
 }
@@ -254,6 +265,8 @@ impl<'a> ProjectCoordinator<'a> {
             values: BTreeMap::new(),
             workspaces: BTreeMap::new(),
             failures: BTreeMap::new(),
+            branch_assessments: BTreeMap::new(),
+            continuation_denied: false,
             trace,
             cancel: CancellationToken::new(),
         })
@@ -338,10 +351,16 @@ impl<'a> ProjectCoordinator<'a> {
             Some(_) => bail!("project HGraph root does not contain a selected route result"),
             None => return Err(self.stall_error(&BTreeSet::new())),
         };
+        let trace = ProjectAttemptTrace::try_from_project_events(
+            self.project,
+            self.trace.header().clone(),
+            self.trace.events().to_vec(),
+        )
+        .context("coordinator-produced project trace failed semantic replay")?;
         Ok(ProjectCoordinatorOutcome {
             result,
             attempted_results,
-            trace: self.trace,
+            trace,
         })
     }
 
@@ -364,7 +383,7 @@ impl<'a> ProjectCoordinator<'a> {
             ReadyInputPolicy::OrderedFirstSuccess => {
                 return self.uses_ordered_first_success()
                     && matches!(operation.op, ExecutableOp::SelectRoute { .. })
-                    && self.ordered_selection_is_ready(ready);
+                    && (self.continuation_denied || self.ordered_selection_is_ready(ready));
             }
         }
 
@@ -375,7 +394,7 @@ impl<'a> ProjectCoordinator<'a> {
     }
 
     fn operation_priority(&self, ready: &ReadyOp) -> u8 {
-        let selection_has_winner = self.input_policies.get(&ready.plan_node).copied()
+        let selection_must_settle = self.input_policies.get(&ready.plan_node).copied()
             == Some(ReadyInputPolicy::OrderedFirstSuccess)
             && self.uses_ordered_first_success()
             && self
@@ -386,9 +405,9 @@ impl<'a> ProjectCoordinator<'a> {
                 .filter(|operation| operation.id == ready.plan_node)
                 .is_some_and(|operation| {
                     matches!(operation.op, ExecutableOp::SelectRoute { .. })
-                        && self.selection_has_success(ready)
+                        && (self.continuation_denied || self.selection_has_success(ready))
                 });
-        if selection_has_winner {
+        if selection_must_settle {
             0
         } else {
             1
@@ -625,7 +644,8 @@ impl<'a> ProjectCoordinator<'a> {
         for input in &ready.inputs {
             let Some(result) = self.route_result_for_node(*input) else {
                 if ordered_first_success
-                    && attempted_results.iter().any(OExecutionResult::succeeded)
+                    && (self.continuation_denied
+                        || attempted_results.iter().any(OExecutionResult::succeeded))
                 {
                     break;
                 }
@@ -717,9 +737,81 @@ impl<'a> ProjectCoordinator<'a> {
                 (SettledRouteStatus::Skipped, result, outcome)
             }
             RouteSettlement::Aborted(error) => {
-                return self.commit_abort(ready, identity, &error, None)
+                self.commit_abort(ready, identity, &error, None)?;
+                return Ok(());
             }
         };
+
+        let operation = self.operation(ready.plan_node)?;
+        let branch = identity.branch.with_context(|| {
+            format!(
+                "route `{}` has no alternative branch",
+                identity.route_id.as_deref().unwrap_or("<unknown>")
+            )
+        })?;
+        let route_id = identity
+            .route_id
+            .clone()
+            .context("route settlement has no route identity")?;
+        let failure_continuation = operation
+            .route_facts
+            .as_ref()
+            .with_context(|| format!("route `{route_id}` has no RoutePlanFacts"))?
+            .failure_continuation;
+        let mut assessments = self
+            .branch_assessments
+            .get(&branch)
+            .cloned()
+            .unwrap_or_default();
+        assessments.push(BranchRouteAssessment {
+            route_id: route_id.clone(),
+            executed: !matches!(status, SettledRouteStatus::Skipped),
+            failure_continuation,
+        });
+        let continuation = if !matches!(status, SettledRouteStatus::Succeeded)
+            && self.uses_ordered_first_success()
+            && self
+                .project
+                .plan
+                .alternatives
+                .get(branch)
+                .is_some_and(|alternative| alternative == &route_id)
+        {
+            self.project
+                .plan
+                .alternatives
+                .get(branch + 1)
+                .map(|next_route| {
+                    let evidence = if assessments.iter().all(|entry| !entry.executed) {
+                        ProjectContinuationEvidence::NoExecution
+                    } else if assessments
+                        .iter()
+                        .filter(|entry| entry.executed)
+                        .all(|entry| {
+                            entry.failure_continuation
+                                == RouteFailureContinuation::DeclaredIdempotent
+                        })
+                    {
+                        ProjectContinuationEvidence::DeclaredIdempotent
+                    } else {
+                        ProjectContinuationEvidence::UnprovenEffects
+                    };
+                    ProjectContinuationDecision::new(
+                        next_route.clone(),
+                        assessments
+                            .iter()
+                            .map(|entry| entry.route_id.clone())
+                            .collect(),
+                        evidence,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let continuation_denied = continuation
+            .as_ref()
+            .is_some_and(|decision| !decision.admitted);
 
         self.ensure_outputs_unpublished(ready)?;
         let mut publish = Vec::new();
@@ -765,12 +857,21 @@ impl<'a> ProjectCoordinator<'a> {
             SettledRouteStatus::Succeeded => {
                 self.trace.record_settled_success(identity, outcome)?
             }
-            SettledRouteStatus::NonZero => self.trace.record_settled_failure(identity, outcome)?,
-            SettledRouteStatus::Skipped => self.trace.record_skipped(identity, outcome)?,
+            SettledRouteStatus::NonZero => self.trace.record_settled_failure_with_continuation(
+                identity,
+                outcome,
+                continuation.clone(),
+            )?,
+            SettledRouteStatus::Skipped => self.trace.record_skipped_with_continuation(
+                identity,
+                outcome,
+                continuation.clone(),
+            )?,
         }
         let exit_code = result.exit_code;
         self.values
             .insert(ready.value_output, ProjectRuntimeValue::RouteResult(result));
+        self.branch_assessments.insert(branch, assessments);
         self.materialized.extend(publish);
         for output in withhold {
             self.failed_outputs.insert(output, ready.plan_node);
@@ -781,6 +882,19 @@ impl<'a> ProjectCoordinator<'a> {
                 format!(
                     "route `{}` settled unsuccessfully with exit code {exit_code:?}",
                     identity.route_id.as_deref().unwrap_or("<unknown>")
+                ),
+            );
+        }
+        if continuation_denied {
+            self.continuation_denied = true;
+            self.failures.insert(
+                ready.plan_node,
+                format!(
+                    "route `{route_id}` settled unsuccessfully, but continuation to `{}` was denied because branch {branch} contains executed routes without a declared_idempotent contract",
+                    continuation
+                        .as_ref()
+                        .expect("denied continuation exists")
+                        .next_route_id
                 ),
             );
         }
@@ -902,13 +1016,7 @@ pub fn execute_project_hgraph_selection(
 }
 
 fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHeader> {
-    const GRAPH_DIGEST_DOMAIN: &[u8] = b"ostadix.project-hgraph.logical/v1\0";
-
-    let logical = project.to_text();
-    let mut hasher = Sha256::new();
-    hasher.update(GRAPH_DIGEST_DOMAIN);
-    hasher.update(logical.as_bytes());
-    let logical_graph_digest = hex::encode(hasher.finalize());
+    let logical_graph_digest = project_logical_graph_digest(project);
 
     let mut attempt = [0_u8; 32];
     getrandom::fill(&mut attempt)
@@ -989,5 +1097,6 @@ fn route_plan_facts(route: &RouteSpec) -> RoutePlanFacts {
         declared_reads: route.effects.reads.clone(),
         declared_writes: route.effects.writes.clone(),
         declared_pure: route.effects.pure,
+        failure_continuation: route.failure_continuation,
     }
 }

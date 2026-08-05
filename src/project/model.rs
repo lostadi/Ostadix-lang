@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The on-disk/on-wire format version of a [`ProjectBundle`].
-pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+pub const BUNDLE_FORMAT_VERSION: u32 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // base64 helper for byte payloads inside JSON
@@ -179,6 +179,45 @@ impl RouteEffects {
     }
 }
 
+/// Evidence supplied by a route contract for continuing with another
+/// implementation after this route has executed and settled unsuccessfully.
+///
+/// This is deliberately narrow. `DeclaredIdempotent` is a bundle-bound author
+/// declaration, not proof that the hosted command was sandboxed or that its
+/// effects were independently verified. The HGraph coordinator records that
+/// exact provenance when it relies on the declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteFailureContinuation {
+    /// No safe post-execution continuation contract is available.
+    #[default]
+    Unproven,
+    /// Repeating the logical operation after this route settles unsuccessfully
+    /// is declared idempotent by the bundle author.
+    DeclaredIdempotent,
+}
+
+impl RouteFailureContinuation {
+    /// Parse the manifest/CLI token without weakening an unknown value to the
+    /// fail-closed default silently.
+    pub fn parse_checked(token: &str) -> Result<Self, String> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "unproven" | "deny" => Ok(Self::Unproven),
+            "declared_idempotent" => Ok(Self::DeclaredIdempotent),
+            other => Err(format!(
+                "unknown failure continuation `{other}`; expected unproven or declared_idempotent"
+            )),
+        }
+    }
+
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Unproven => "unproven",
+            Self::DeclaredIdempotent => "declared_idempotent",
+        }
+    }
+}
+
 /// A single, concrete, runnable route through the project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSpec {
@@ -209,6 +248,10 @@ pub struct RouteSpec {
     pub outputs: Vec<String>,
     /// Declared effects.
     pub effects: RouteEffects,
+    /// Bundle-author evidence governing whether ordered selection may continue
+    /// after this route actually executes and settles unsuccessfully.
+    #[serde(default)]
+    pub failure_continuation: RouteFailureContinuation,
     /// How to decode stdout.
     pub result_codec: ResultCodec,
     /// Capability tokens this route provides (used by route sets).
@@ -241,6 +284,7 @@ impl RouteSpec {
             inputs: Vec::new(),
             outputs: Vec::new(),
             effects: RouteEffects::unknown(),
+            failure_continuation: RouteFailureContinuation::Unproven,
             result_codec: ResultCodec::Text,
             provides: Vec::new(),
             guards: Vec::new(),

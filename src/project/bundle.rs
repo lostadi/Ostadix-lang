@@ -424,25 +424,67 @@ fn classify_role(rel: &str, bytes: &[u8], executable: bool) -> FileRole {
 /// field order, and all keyed collections in the model are `BTreeMap`, so the
 /// output is stable across runs.
 pub fn serialize(bundle: &ProjectBundle) -> Result<Vec<u8>> {
+    require_current_format(bundle)?;
     let bytes = serde_json::to_vec(bundle).context("failed to serialize project bundle")?;
     Ok(bytes)
 }
 
 /// Serialize a bundle to a pretty JSON string (for human inspection).
 pub fn serialize_pretty(bundle: &ProjectBundle) -> Result<String> {
+    require_current_format(bundle)?;
     serde_json::to_string_pretty(bundle).context("failed to serialize project bundle")
 }
 
-/// Deserialize a bundle from JSON bytes.
-pub fn deserialize(bytes: &[u8]) -> Result<ProjectBundle> {
-    let bundle: ProjectBundle =
-        serde_json::from_slice(bytes).context("failed to deserialize project bundle")?;
+fn require_current_format(bundle: &ProjectBundle) -> Result<()> {
     if bundle.format_version != BUNDLE_FORMAT_VERSION {
         bail!(
-            "unsupported project bundle format version {} (expected {})",
+            "refusing to serialize project bundle format version {} as current version {}",
             bundle.format_version,
             BUNDLE_FORMAT_VERSION
         );
     }
-    Ok(bundle)
+    Ok(())
+}
+
+/// Deserialize a bundle from JSON bytes.
+pub fn deserialize(bytes: &[u8]) -> Result<ProjectBundle> {
+    let wire: serde_json::Value =
+        serde_json::from_slice(bytes).context("failed to deserialize project bundle")?;
+    let format_version = wire
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .context("project bundle has a missing or invalid format_version")?;
+
+    match format_version {
+        1 => {
+            let carries_v2_continuation = wire
+                .get("routes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|routes| {
+                    routes.iter().any(|route| {
+                        route
+                            .as_object()
+                            .is_some_and(|route| route.contains_key("failure_continuation"))
+                    })
+                });
+            if carries_v2_continuation {
+                bail!(
+                    "project bundle format version 1 must not carry the version 2 `failure_continuation` route field"
+                );
+            }
+            let mut bundle: ProjectBundle = serde_json::from_value(wire)
+                .context("failed to deserialize project bundle format version 1")?;
+            // Version 1 had no post-failure continuation contract. The model's
+            // serde default migrates every route to the fail-closed `unproven`
+            // class; future serialization always emits the current version.
+            bundle.format_version = BUNDLE_FORMAT_VERSION;
+            Ok(bundle)
+        }
+        BUNDLE_FORMAT_VERSION => serde_json::from_value(wire)
+            .context("failed to deserialize project bundle format version 2"),
+        other => bail!(
+            "unsupported project bundle format version {other} (expected 1 or {BUNDLE_FORMAT_VERSION})"
+        ),
+    }
 }

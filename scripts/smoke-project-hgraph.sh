@@ -116,6 +116,7 @@ grep -Fq 'deps=[value:p3,success:p2]' "$first"
 grep -Fq 'deps=[value:p8,success:p7]' "$first"
 grep -Fq 'guards=[env:PR7_REQUIRED_ENV] env=[PLAN_VARIANT]' "$first"
 grep -Fq 'declared-pure=true' "$first"
+grep -Fq 'failure-continuation=declared_idempotent' "$first"
 grep -Fq 'reads=[HostWorld,project:input.txt]' "$first"
 if grep -Fq 'PR7_IMPL_A_EXECUTED' "$first"; then
     printf 'project plan exposed or executed the poison command\n' >&2
@@ -236,7 +237,7 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 2
+assert trace["format_version"] == 3
 assert trace["header"]["policy"] == "any_success"
 events = trace["events"]
 assert any(
@@ -273,12 +274,18 @@ assert first < second
 
 with open(sys.argv[2], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 2
+assert trace["format_version"] == 3
 assert trace["header"]["policy"] == "any_success"
 events = trace["events"]
 assert any(
     event["operation_label"] == "run-route:impl-a"
     and event["state"] == "settled_failure"
+    and event["continuation"] == {
+        "next_route_id": "impl-b",
+        "assessed_route_ids": ["prepare", "impl-a"],
+        "evidence": "declared_idempotent",
+        "admitted": True,
+    }
     for event in events
 )
 assert any(
