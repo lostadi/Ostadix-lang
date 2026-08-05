@@ -16,8 +16,8 @@ pub use graph::{
     SequenceDependency,
 };
 pub use kinds::{
-    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, MemOrder, OcoreOpKind, OpKind, RepFlags,
-    ValueState,
+    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, MemOrder, OcoreOpKind, OpKind,
+    ReadyInputPolicy, RepFlags, ValueState,
 };
 pub use schedule::{schedule, try_schedule, ExecutionCluster, ReadyOp, ReadySchedule, Schedule};
 

@@ -536,31 +536,40 @@
   operation, effect/resource-transition, dependency, and output topology.
   Planning is deterministic and nonexecuting, and exact source/projection
   validation rejects malformed references, substitution, and graph forgery.
-- `scripts/smoke-project-hgraph.sh` is the Project HGraph hosted
-  logical-planning gate. The gate proves repository-owned
-  `scripts/o-cli.sh plan` parity, deterministic IR/DOT, and generated-project
-  binary route-listing plus checked option/policy rejection. Route
+- `scripts/smoke-project-hgraph.sh` is the composite Project HGraph hosted
+  planning and generated-adapter gate. Its PR7 phase proves repository-owned
+  `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. It
+  then compiles a project binary, checks route listing and option/policy
+  rejection, and runs opt-in AnySuccess for immediate short-circuit plus
+  nonzero-to-success continuation in disposable workspaces. Route
   materialization and commands retain
   conservative fallible `HostWorld` effects even when a manifest declares
   `pure=true`. Logical alternative branches may therefore be serialized and
   cross-coupled by the shared ambient/resource state chains; PR7 does not prove
   parallel branch execution or independent host mediation.
-- `scripts/smoke-project-hgraph-exec.sh` is the opt-in, single-alternative
+- `scripts/smoke-project-hgraph-exec.sh` is the opt-in, ordered-alternative
   hosted execution gate. Under `O_PROJECT_EXECUTOR=hgraph`, a validated Project
   HGraph controls isolated materialization, `Value` versus `Success`
-  prerequisite readiness, one route chain, and sole-result selection for
-  `Explicit` or `Default`. A nonzero terminal route remains a selectable
-  `OExecutionResult`; a nonzero prerequisite publishes its value and
-  conservative `HostWorld` successor but withholds completion. An
-  infrastructure abort publishes no route value. The unsigned diagnostic trace
-  binds stable source/graph identity to a fresh execution-attempt identifier and
-  distinguishes settlement from abort. Unsupported multipath policies fail
-  closed rather than falling back to the compatibility runtime. This is not
-  multipath execution, retry, placement, deployment, Governor or receipt
-  integration, remote execution, WorldFS, native/QEMU/hardware evidence, Linux
-  or Plan 9 boot, a general foreign ABI, KVM/SVM evidence, physical-device
-  assignment, PCI/DMA/IOMMU isolation, exactly-once effects, Acceptance A, G1,
-  or passage of any G0--G13 gate.
+  prerequisite readiness, and policy selection for `Explicit`, `Default`, and
+  serial ordered `Fallback`/`AnySuccess`. Only the two first-success selectors
+  derive `ReadyInputPolicy::OrderedFirstSuccess`; every other operation retains
+  conjunctive input readiness. Fallback follows resolved priority order,
+  AnySuccess follows declaration order, and a first success prevents later
+  branches from materializing or starting. Every attempted alternative result
+  is retained; nonzero and guard-skipped results continue, while an
+  infrastructure abort publishes no route value and stops the policy. A
+  nonzero prerequisite publishes its value and conservative `HostWorld`
+  successor but withholds completion. The unsigned diagnostic trace binds
+  stable source/graph identity to a fresh execution-attempt identifier and
+  distinguishes settlement, guard skip, and abort; operations never attempted
+  after short-circuit emit no lifecycle event. Parallel/racing, aggregate,
+  equivalence, and benchmark
+  policies fail closed rather than falling back to the compatibility runtime.
+  This is not parallel race/cancellation, retry, placement, deployment,
+  Governor or receipt integration, remote execution, WorldFS,
+  native/QEMU/hardware evidence, Linux or Plan 9 boot, a general foreign ABI,
+  KVM/SVM evidence, physical-device assignment, PCI/DMA/IOMMU isolation,
+  exactly-once effects, Acceptance A, G1, or passage of any G0--G13 gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.

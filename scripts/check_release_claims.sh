@@ -386,7 +386,7 @@ require_fixed README.md \
     'No production lowering currently emits these' \
     'the hosted PR6 vocabulary could be misread as production governed lowering'
 require_fixed README.md \
-    'Project HGraph planning and single-branch hosted execution gates' \
+    'Project HGraph planning and ordered hosted execution gates' \
     'the hosted project planning/execution gates are missing from public status'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
@@ -406,11 +406,20 @@ require_fixed AGENTS.md \
 require_fixed scripts/smoke-project-hgraph.sh \
     'PATH="$installed_local_bin:$installed_cargo_bin:$ROOT/target/release:/usr/bin:/bin"' \
     'the installed o smoke no longer covers the documented target-release shadow path'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'Generated project binary ordered hosted execution: PASS' \
+    'the generated binary immediate short-circuit evidence marker is missing'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'Generated project binary nonzero-to-success continuation: PASS' \
+    'the generated binary continuation evidence marker is missing'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'tests/fixtures/project_hgraph_tools' \
+    'the generated binary continuation shim is no longer wired into its smoke'
 require_fixed docs/CLAIMS.md \
     'PR7 now provides a bounded hosted project logical planner.' \
     'the implemented PR7 project-plan boundary is missing'
 require_fixed docs/CLAIMS.md \
-    'opt-in, single-alternative' \
+    'opt-in, ordered-alternative' \
     'the bounded hosted project execution claim is missing'
 require_fixed docs/CLAIMS.md \
     'conservative fallible `HostWorld` effects' \
@@ -419,14 +428,23 @@ require_fixed docs/CLAIMS.md \
     'Logical alternative branches may therefore be serialized and' \
     'logical branches could be misread as independently mediated or parallel execution'
 require_fixed docs/CLAIMS.md \
-    'Unsupported multipath policies fail' \
+    'Parallel/racing, aggregate,' \
     'unsupported project policies must fail closed rather than use legacy fallback'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'Project HGraph single-branch hosted execution: PASS' \
-    'the exact PR8A hosted execution evidence marker is missing'
+    'Project HGraph ordered hosted execution: PASS' \
+    'the exact PR8A/PR8B hosted execution evidence marker is missing'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
-    'does not establish multipath execution, retry, placement, Governor' \
-    'the PR8A smoke non-claim boundary is missing'
+    'does not establish parallel' \
+    'the PR8A/PR8B smoke non-claim boundary is missing'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'retry, placement, Governor authority, OWRECEIPT' \
+    'the ordered hosted smoke could be promoted to retries, placement, governance, or receipts'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'exactly-once effects, native execution, or G1 passage' \
+    'the ordered hosted smoke could be promoted to exact-once, native, or World-gate evidence'
+require_fixed docs/RELEASE_CHECKLIST.md \
+    'plus serial ordered' \
+    'the release checklist omits the bounded PR8B ordered execution surface'
 require_fixed .github/workflows/ci.yml \
     'bash scripts/smoke-project-hgraph-exec.sh' \
     'CI does not invoke the dedicated PR8A hosted execution smoke'
