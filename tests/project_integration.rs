@@ -5,13 +5,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use o_lang::project::bundle::{bundle_dir, bundle_dir_excluding, deserialize, serialize};
+use o_lang::project::bundle::{
+    bundle_dir, bundle_dir_excluding, deserialize, serialize, serialize_pretty,
+};
 use o_lang::project::lower::{extract_bundle_from_o, has_embedded_bundle, lower_to_o_validated};
 use o_lang::project::manifest::{apply_cli_overrides, apply_manifest, parse_route_decl};
 use o_lang::project::materialize::{materialize, materialize_isolated};
 use o_lang::project::model::{
-    FileRole, ProjectBundle, ProjectFile, ResultCodec, RoutePolicy, RouteProvenance, RouteSet,
-    RouteSpec,
+    FileRole, ProjectBundle, ProjectFile, ResultCodec, RouteFailureContinuation, RoutePolicy,
+    RouteProvenance, RouteSet, RouteSpec, BUNDLE_FORMAT_VERSION,
 };
 use o_lang::project::runtime::{glob_match, run_route, run_selection, GuardBehavior, RunOptions};
 use o_lang::project::{assemble, discover, RouteGuard};
@@ -51,6 +53,7 @@ fn project_bundle_roundtrip_lossless() {
     std::os::unix::fs::symlink("a.txt", root.join("link.txt")).unwrap();
 
     let bundle = bundle_dir(root, "roundtrip").unwrap();
+    assert_eq!(bundle.format_version, BUNDLE_FORMAT_VERSION);
 
     // Serialize → deserialize preserves the bundle exactly.
     let bytes = serialize(&bundle).unwrap();
@@ -89,6 +92,51 @@ fn project_bundle_roundtrip_lossless() {
     let bin = bundle.files.iter().find(|f| f.path == "data.bin").unwrap();
     assert_eq!(bin.role, FileRole::Asset);
     assert!(bundle.files.iter().any(|f| f.path == "empty"));
+}
+
+#[test]
+fn project_bundle_v1_migrates_only_without_v2_continuation_fields() {
+    let mut bundle = ProjectBundle::empty("legacy-v1");
+    let mut route = RouteSpec::new("main", RouteProvenance::CliOverride);
+    route.command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+    bundle.routes.push(route);
+
+    let mut legacy = serde_json::to_value(&bundle).unwrap();
+    legacy["format_version"] = serde_json::json!(1);
+    for route in legacy["routes"].as_array_mut().unwrap() {
+        route
+            .as_object_mut()
+            .unwrap()
+            .remove("failure_continuation");
+    }
+    let migrated = deserialize(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(migrated.format_version, BUNDLE_FORMAT_VERSION);
+    assert_eq!(
+        migrated.route("main").unwrap().failure_continuation,
+        RouteFailureContinuation::Unproven
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&serialize(&migrated).unwrap()).unwrap()
+            ["format_version"],
+        BUNDLE_FORMAT_VERSION
+    );
+
+    let mut mislabeled_v1 = serde_json::to_value(&bundle).unwrap();
+    mislabeled_v1["format_version"] = serde_json::json!(1);
+    let error = deserialize(&serde_json::to_vec(&mislabeled_v1).unwrap()).unwrap_err();
+    assert!(format!("{error:#}").contains("must not carry"));
+
+    let mut future = serde_json::to_value(&bundle).unwrap();
+    future["format_version"] = serde_json::json!(BUNDLE_FORMAT_VERSION + 1);
+    let error = deserialize(&serde_json::to_vec(&future).unwrap()).unwrap_err();
+    assert!(format!("{error:#}").contains("unsupported project bundle format version"));
+
+    let mut mislabeled_in_memory = bundle;
+    mislabeled_in_memory.format_version = 1;
+    let error = serialize(&mislabeled_in_memory).unwrap_err();
+    assert!(format!("{error:#}").contains("refusing to serialize"));
+    let error = serialize_pretty(&mislabeled_in_memory).unwrap_err();
+    assert!(format!("{error:#}").contains("refusing to serialize"));
 }
 
 #[test]
@@ -228,6 +276,7 @@ depends_on = ["assets"]
 outputs = ["dist/**"]
 env = { KEY = "V" }
 guards = { os = "linux", requires_command = "python3" }
+failure_continuation = "declared_idempotent"
 
 [[routes]]
 id = "main-b"
@@ -259,6 +308,15 @@ policy = "explicit"
     assert!(main_a
         .guards
         .contains(&RouteGuard::CommandAvailable("python3".into())));
+    assert_eq!(
+        main_a.failure_continuation,
+        RouteFailureContinuation::DeclaredIdempotent
+    );
+    assert_eq!(
+        bundle.route("main-b").unwrap().failure_continuation,
+        RouteFailureContinuation::Unproven,
+        "an omitted continuation contract must remain fail-closed"
+    );
 
     let set = bundle.route_set("main").unwrap();
     assert_eq!(set.alternatives, vec!["main-a", "main-b"]);
@@ -268,7 +326,7 @@ policy = "explicit"
 #[test]
 fn project_cli_route_decl_micro_syntax() {
     let spec = parse_route_decl(
-        "id=main-a;cmd=python3 implementation_a.py;cwd=.;provides=main;codec=json;depends=assets",
+        "id=main-a;cmd=python3 implementation_a.py;cwd=.;provides=main;codec=json;depends=assets;failure_continuation=declared_idempotent",
     )
     .unwrap();
     assert_eq!(spec.id, "main-a");
@@ -277,7 +335,31 @@ fn project_cli_route_decl_micro_syntax() {
     assert_eq!(spec.provides, vec!["main"]);
     assert_eq!(spec.result_codec, ResultCodec::Json);
     assert_eq!(spec.prerequisites, vec!["assets"]);
+    assert_eq!(
+        spec.failure_continuation,
+        RouteFailureContinuation::DeclaredIdempotent
+    );
     assert!(matches!(spec.provenance, RouteProvenance::CliOverride));
+}
+
+#[test]
+fn invalid_failure_continuation_tokens_are_rejected() {
+    let mut bundle = ProjectBundle::empty("invalid-continuation");
+    let error = apply_manifest(
+        &mut bundle,
+        r#"[[routes]]
+id = "main"
+command = ["sh", "-c", "exit 0"]
+failure_continuation = "trust_me"
+"#,
+        "olang.project.toml",
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("invalid failure_continuation"));
+
+    let error =
+        parse_route_decl("id=main;cmd=sh run.sh;failure_continuation=trust_me").unwrap_err();
+    assert!(format!("{error:#}").contains("invalid failure_continuation"));
 }
 
 #[test]

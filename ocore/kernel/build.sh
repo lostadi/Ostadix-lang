@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 30" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 31" >&2
     exit 2
     ;;
 esac
@@ -22,6 +22,7 @@ M6_IMAGE_DEFINE='-DOCORE_M6_IMAGE_PATH=""'
 M6B_LIVE_IMAGE_DEFINE='-DOCORE_M6B_LIVE_IMAGE_PATH=""'
 M6_LINUX_IMAGE_DEFINE='-DOCORE_M6_LINUX_IMAGE_PATH=""'
 M7_LINUX_PLAN9_IMAGE_DEFINE='-DOCORE_M7_LINUX_PLAN9_IMAGE_PATH=""'
+M7B_LOGICAL_READ_IMAGE_DEFINE='-DOCORE_M7B_LOGICAL_READ_IMAGE_PATH=""'
 KERNEL_WORLD_RECORD_DEFINE='-DOCORE_KERNEL_WORLD_RECORD_PATH=""'
 if (( PROBE_MODE == 15 )); then
   M4_ARTIFACT_OUTPUT="$(
@@ -112,6 +113,23 @@ if (( PROBE_MODE == 26 )); then
     exit 1
   fi
   M7_LINUX_PLAN9_IMAGE_DEFINE="-DOCORE_M7_LINUX_PLAN9_IMAGE_PATH=\"$M7_LINUX_PLAN9_IMAGE_PATH\""
+fi
+
+if (( PROBE_MODE == 31 )); then
+  M7B_LOGICAL_READ_ARTIFACT_OUTPUT="$(
+    OCORE_M7B_BUILD_DIR="$ROOT/target/ocore-m7b-logical-read-artifacts" \
+      "$KERNEL_DIR/build-m7b-logical-read-artifacts.sh"
+  )"
+  M7B_LOGICAL_READ_IMAGE_PATH="$(
+    printf '%s\n' "$M7B_LOGICAL_READ_ARTIFACT_OUTPUT" \
+      | sed -n 's/^image: //p' | tail -n 1
+  )"
+  if [[ -z "$M7B_LOGICAL_READ_IMAGE_PATH" \
+      || ! -f "$M7B_LOGICAL_READ_IMAGE_PATH" ]]; then
+    echo "error: M7B-1 LogicalRead artifact build did not produce an OVFS image" >&2
+    exit 1
+  fi
+  M7B_LOGICAL_READ_IMAGE_DEFINE="-DOCORE_M7B_LOGICAL_READ_IMAGE_PATH=\"$M7B_LOGICAL_READ_IMAGE_PATH\""
 fi
 
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
@@ -231,7 +249,7 @@ if (( PROBE_MODE == 19 )); then
 fi
 
 IMAGE_VFS_STORAGE_SOURCE="$ROOT/ocore/runtime/x86_64/image_vfs_storage.oc"
-if (( PROBE_MODE == 26 )); then
+if (( PROBE_MODE == 26 || PROBE_MODE == 31 )); then
   IMAGE_VFS_STORAGE_SOURCE="$ROOT/ocore/runtime/x86_64/image_vfs_storage_m7.oc"
 fi
 
@@ -242,6 +260,9 @@ if (( PROBE_MODE == 18 || PROBE_MODE == 24 )); then
 fi
 if (( PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   M6_SOURCE="$KERNEL_DIR/m6_linux.oc"
+fi
+if (( PROBE_MODE == 31 )); then
+  M6_SOURCE="$KERNEL_DIR/m7b_logical_read.oc"
 fi
 if (( PROBE_MODE == 18 || PROBE_MODE == 19 || PROBE_MODE == 24 || PROBE_MODE == 25 || PROBE_MODE == 26 )); then
   # Mode 19 directly exercises views/resources and its pinned Linux oracle
@@ -272,10 +293,10 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 )); then
-  # Modes 25 and 26 enter only kernel::m6, while Mode 28 enters only the World
-  # protocol oracle. Keep historical probes fail-closed without linking their
-  # unreachable harness bodies, preserving the hard bootstrap headroom
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 )); then
+  # Modes 25, 26, and 31 enter only kernel::m6, while Mode 28 enters only the
+  # World protocol oracle. Keep historical probes fail-closed without linking
+  # their unreachable harness bodies, preserving the hard bootstrap headroom
   # assertion.
   M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
   M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
@@ -363,6 +384,7 @@ clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   "$M6B_LIVE_IMAGE_DEFINE" \
   "$M6_LINUX_IMAGE_DEFINE" \
   "$M7_LINUX_PLAN9_IMAGE_DEFINE" \
+  "$M7B_LOGICAL_READ_IMAGE_DEFINE" \
   "$KERNEL_WORLD_RECORD_DEFINE" \
   "$KERNEL_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 
@@ -459,6 +481,9 @@ if (( PROBE_MODE == 25 )); then
 fi
 if (( PROBE_MODE == 26 )); then
   printf '%s\n' "$M7_LINUX_PLAN9_IMAGE_PATH" > "$BUILD_DIR/m7-linux-plan9-image.path"
+fi
+if (( PROBE_MODE == 31 )); then
+  printf '%s\n' "$M7B_LOGICAL_READ_IMAGE_PATH" > "$BUILD_DIR/m7b-logical-read-image.path"
 fi
 
 file "$BUILD_DIR/kernel.o"

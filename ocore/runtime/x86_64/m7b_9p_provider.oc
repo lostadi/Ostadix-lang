@@ -1,0 +1,622 @@
+module runtime::m7b_9p_provider;
+
+// M7B-1 is a deliberately narrow native 9P2000 provider.  The same pinned
+// ELF is instantiated in two independent CPL3 processes.  Each instance has
+// private writable image storage, a private request endpoint, provider-local
+// fids, and a QID version derived from its configured process generation.  The
+// only object is one immutable, SHA-addressed 20-byte value; this is not a
+// general filesystem or a writable/network 9P service.
+use runtime::native_abi::ERR_IPC_RETRY;
+use runtime::native_abi::SYS_DEBUG_WRITE;
+use runtime::native_abi::SYS_ENDPOINT_RECEIVE;
+use runtime::native_abi::SYS_ENDPOINT_SEND;
+use runtime::native_abi::SYS_YIELD;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const INBOX_CAP_OFFSET: usize = 8;
+const REPLY_CAP_OFFSET: usize = 16;
+const GENERATION_OFFSET: usize = 24;
+const ORDINAL_OFFSET: usize = 32;
+const EXPECTED_CLIENT_OFFSET: usize = 40;
+const ACTIVATION_OFFSET: usize = 48;
+const MESSAGE_OFFSET: usize = 128;
+const MESSAGE_SIZE: u64 = 32;
+
+const PROVIDER_A: u64 = 1;
+const PROVIDER_B: u64 = 2;
+
+const MSIZE: u64 = 64;
+const WIRE_SIZE: usize = 64;
+const FRAGMENT_BYTES: usize = 16;
+const FRAGMENT_COUNT: usize = 4;
+
+const TVERSION: u64 = 100;
+const RVERSION: u64 = 101;
+const TATTACH: u64 = 104;
+const RATTACH: u64 = 105;
+const RERROR: u64 = 107;
+const TWALK: u64 = 110;
+const RWALK: u64 = 111;
+const TOPEN: u64 = 112;
+const ROPEN: u64 = 113;
+const TREAD: u64 = 116;
+const RREAD: u64 = 117;
+const TCLUNK: u64 = 120;
+const RCLUNK: u64 = 121;
+
+const NOTAG: u64 = 0xffff;
+const NOFID: u64 = 0xffff_ffff;
+const OREAD: u64 = 0;
+const QTDIR: u64 = 0x80;
+
+const STATE_UNVERSIONED: u64 = 0;
+const STATE_VERSIONED: u64 = 1;
+const STATE_ATTACHED: u64 = 2;
+const STATE_WALKED: u64 = 3;
+const STATE_OPENED: u64 = 4;
+const STATE_READ: u64 = 5;
+const STATE_CLUNKED: u64 = 6;
+
+@link_section(".rodata")
+static VERSION_9P2000: [u8; 6] = b"9P2000";
+@link_section(".rodata")
+static OBJECT_NAME: [u8; 6] = b"object";
+@link_section(".rodata")
+static UNAVAILABLE: [u8; 7] = b"unavail";
+@link_section(".rodata")
+static LOGICAL_OBJECT: [u8; 20] = b"m7b-logical-object!\n";
+
+// SHA-256("m7b-logical-object!\n") =
+// 59a08e13c63eb8acdae93f4caf05130733a0f5ab24e564fb1206f0f1d055809b.
+// Tattach carries these 32 digest bytes as aname, not an abbreviated or
+// textual identifier.
+@link_section(".rodata")
+static LOGICAL_DIGEST: [u8; 32] = [
+    0x59, 0xa0, 0x8e, 0x13, 0xc6, 0x3e, 0xb8, 0xac,
+    0xda, 0xe9, 0x3f, 0x4c, 0xaf, 0x05, 0x13, 0x07,
+    0x33, 0xa0, 0xf5, 0xab, 0x24, 0xe5, 0x64, 0xfb,
+    0x12, 0x06, 0xf0, 0xf1, 0xd0, 0x55, 0x80, 0x9b
+];
+
+@link_section(".rodata")
+static A_ONLINE: [u8; 25] = b"M7B-1 provider A: online\n";
+@link_section(".rodata")
+static A_UNAVAILABLE: [u8; 35] =
+    b"M7B-1 provider A read: unavailable\n";
+@link_section(".rodata")
+static A_FAULT: [u8; 35] =
+    b"M7B-1 provider A: deliberate fault\n";
+@link_section(".rodata")
+static B_ONLINE: [u8; 25] = b"M7B-1 provider B: online\n";
+@link_section(".rodata")
+static B_READ: [u8; 38] =
+    b"M7B-1 provider B immutable read: PASS\n";
+@link_section(".rodata")
+static B_CLUNK: [u8; 39] =
+    b"M7B-1 provider B fresh fid clunk: PASS\n";
+
+// These buffers are private to each provider process because the loader maps
+// distinct writable image storage into each address space.
+static mut REQUEST: [u8; 64] = [0; 64];
+static mut RESPONSE: [u8; 64] = [0; 64];
+
+unsafe fn stop() -> never {
+    loop {
+        asm!("pause", options(nomem, nostack));
+    }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(
+        SYS_DEBUG_WRITE,
+        capability,
+        pointer as u64,
+        length as u64
+    ) != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 {
+        stop();
+    }
+}
+
+unsafe fn wait_nonzero(offset: usize) -> u64 {
+    loop {
+        let value: u64 = config(offset);
+        if value != 0 {
+            return value;
+        }
+        yield_once();
+    }
+}
+
+unsafe fn wait_for_activation() -> void {
+    loop {
+        let activation: u64 = config(ACTIVATION_OFFSET);
+        if activation == 1 {
+            return;
+        }
+        if activation != 0 {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn message_word(offset: usize) -> u64 {
+    return volatile_load(
+        (CONFIG_VA + MESSAGE_OFFSET + offset) as *const u64
+    );
+}
+
+unsafe fn receive_fragment(capability: u64) -> void {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            capability,
+            (CONFIG_VA + MESSAGE_OFFSET) as u64,
+            MESSAGE_SIZE
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn store_request_word(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 8 {
+        REQUEST[offset + index] = (value >> (index * 8)) as u8;
+        index += 1;
+    }
+}
+
+unsafe fn receive_request(capability: u64, expected_client: u64) -> void {
+    let mut fragment: usize = 0;
+    while fragment < FRAGMENT_COUNT {
+        receive_fragment(capability);
+        // word 0 is the kernel-authenticated sender process, words 1 and 2
+        // are the 16 data bytes, and word 3 is the optional cap transfer.
+        if message_word(0) != expected_client || message_word(24) != 0 {
+            stop();
+        }
+        let offset: usize = fragment * FRAGMENT_BYTES;
+        store_request_word(offset, message_word(8));
+        store_request_word(offset + 8, message_word(16));
+        fragment += 1;
+    }
+}
+
+unsafe fn response_word(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = value | ((RESPONSE[offset + index] as u64) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn send_fragment(
+    capability: u64,
+    first: u64,
+    second: u64
+) -> void {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            capability,
+            first,
+            second,
+            0
+        );
+        if result == 1 {
+            return;
+        }
+        if result != ERR_IPC_RETRY {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn send_response(capability: u64) -> void {
+    let mut fragment: usize = 0;
+    while fragment < FRAGMENT_COUNT {
+        let offset: usize = fragment * FRAGMENT_BYTES;
+        send_fragment(
+            capability,
+            response_word(offset),
+            response_word(offset + 8)
+        );
+        fragment += 1;
+    }
+}
+
+unsafe fn clear_response() -> void {
+    let mut index: usize = 0;
+    while index < WIRE_SIZE {
+        RESPONSE[index] = 0;
+        index += 1;
+    }
+}
+
+unsafe fn request_byte(offset: usize) -> u64 {
+    return REQUEST[offset] as u64;
+}
+
+unsafe fn response_put_byte(offset: usize, value: u64) -> void {
+    RESPONSE[offset] = (value & 0xff) as u8;
+}
+
+unsafe fn request_u16(offset: usize) -> u64 {
+    return request_byte(offset) | (request_byte(offset + 1) << 8);
+}
+
+unsafe fn request_u32(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        value = value | (request_byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn request_u64(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = value | (request_byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn response_put_u16(offset: usize, value: u64) -> void {
+    response_put_byte(offset, value);
+    response_put_byte(offset + 1, value >> 8);
+}
+
+unsafe fn response_put_u32(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 4 {
+        response_put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn response_put_u64(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 8 {
+        response_put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn literal_byte(value: *const u8, index: usize) -> u64 {
+    return volatile_load(value + index) as u64;
+}
+
+unsafe fn request_matches(
+    offset: usize,
+    expected: *const u8,
+    length: usize
+) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if request_byte(offset + index) != literal_byte(expected, index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn response_put_bytes(
+    offset: usize,
+    value: *const u8,
+    length: usize
+) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        response_put_byte(offset + index, literal_byte(value, index));
+        index += 1;
+    }
+}
+
+unsafe fn request_is_canonical() -> bool {
+    let size: u64 = request_u32(0);
+    if size < 7 || size > MSIZE {
+        return false;
+    }
+    let mut index: usize = size as usize;
+    while index < WIRE_SIZE {
+        if request_byte(index) != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn response_begin(kind: u64, tag: u64) -> void {
+    clear_response();
+    response_put_byte(4, kind);
+    response_put_u16(5, tag);
+}
+
+unsafe fn response_finish(size: u64) -> void {
+    response_put_u32(0, size);
+}
+
+unsafe fn put_qid(
+    offset: usize,
+    qtype: u64,
+    generation: u64,
+    path: u64
+) -> void {
+    response_put_byte(offset, qtype);
+    response_put_u32(offset + 1, generation & 0xffff_ffff);
+    response_put_u64(offset + 5, path);
+}
+
+unsafe fn qid_path(ordinal: u64, leaf: u64) -> u64 {
+    return (ordinal << 32) | leaf;
+}
+
+unsafe fn root_fid(ordinal: u64) -> u64 {
+    return (ordinal << 8) | 1;
+}
+
+unsafe fn file_fid(ordinal: u64) -> u64 {
+    return (ordinal << 8) | 2;
+}
+
+unsafe fn reply_version(capability: u64, tag: u64) -> void {
+    response_begin(RVERSION, tag);
+    response_put_u32(7, MSIZE);
+    response_put_u16(11, 6);
+    response_put_bytes(13, (&VERSION_9P2000[0]), 6);
+    response_finish(19);
+    send_response(capability);
+}
+
+unsafe fn reply_attach(
+    capability: u64,
+    tag: u64,
+    generation: u64,
+    ordinal: u64
+) -> void {
+    response_begin(RATTACH, tag);
+    put_qid(7, QTDIR, generation, qid_path(ordinal, 1));
+    response_finish(20);
+    send_response(capability);
+}
+
+unsafe fn reply_walk(
+    capability: u64,
+    tag: u64,
+    generation: u64,
+    ordinal: u64
+) -> void {
+    response_begin(RWALK, tag);
+    response_put_u16(7, 1);
+    put_qid(9, 0, generation, qid_path(ordinal, 2));
+    response_finish(22);
+    send_response(capability);
+}
+
+unsafe fn reply_open(
+    capability: u64,
+    tag: u64,
+    generation: u64,
+    ordinal: u64
+) -> void {
+    response_begin(ROPEN, tag);
+    put_qid(7, 0, generation, qid_path(ordinal, 2));
+    response_put_u32(20, MSIZE);
+    response_finish(24);
+    send_response(capability);
+}
+
+unsafe fn reply_unavailable(capability: u64, tag: u64) -> void {
+    response_begin(RERROR, tag);
+    response_put_u16(7, 7);
+    response_put_bytes(9, (&UNAVAILABLE[0]), 7);
+    response_finish(16);
+    send_response(capability);
+}
+
+unsafe fn reply_read(capability: u64, tag: u64) -> void {
+    response_begin(RREAD, tag);
+    response_put_u32(7, 20);
+    response_put_bytes(11, (&LOGICAL_OBJECT[0]), 20);
+    response_finish(31);
+    send_response(capability);
+}
+
+unsafe fn reply_clunk(capability: u64, tag: u64) -> void {
+    response_begin(RCLUNK, tag);
+    response_finish(7);
+    send_response(capability);
+}
+
+unsafe fn exact_version() -> bool {
+    return request_u32(0) == 19
+        && request_byte(4) == TVERSION
+        && request_u16(5) == NOTAG
+        && request_u32(7) == MSIZE
+        && request_u16(11) == 6
+        && request_matches(13, (&VERSION_9P2000[0]), 6);
+}
+
+unsafe fn exact_attach(ordinal: u64) -> bool {
+    return request_u32(0) == 51
+        && request_byte(4) == TATTACH
+        && request_u32(7) == root_fid(ordinal)
+        && request_u32(11) == NOFID
+        && request_u16(15) == 0
+        && request_u16(17) == 32
+        && request_matches(19, (&LOGICAL_DIGEST[0]), 32);
+}
+
+unsafe fn exact_walk(ordinal: u64) -> bool {
+    return request_u32(0) == 25
+        && request_byte(4) == TWALK
+        && request_u32(7) == root_fid(ordinal)
+        && request_u32(11) == file_fid(ordinal)
+        && request_u16(15) == 1
+        && request_u16(17) == 6
+        && request_matches(19, (&OBJECT_NAME[0]), 6);
+}
+
+unsafe fn exact_open(ordinal: u64) -> bool {
+    return request_u32(0) == 12
+        && request_byte(4) == TOPEN
+        && request_u32(7) == file_fid(ordinal)
+        && request_byte(11) == OREAD;
+}
+
+unsafe fn exact_read(ordinal: u64) -> bool {
+    return request_u32(0) == 23
+        && request_byte(4) == TREAD
+        && request_u32(7) == file_fid(ordinal)
+        && request_u64(11) == 0
+        && request_u32(19) == 20;
+}
+
+unsafe fn exact_clunk(ordinal: u64) -> bool {
+    return request_u32(0) == 11
+        && request_byte(4) == TCLUNK
+        && request_u32(7) == file_fid(ordinal);
+}
+
+unsafe fn run_provider(
+    report: u64,
+    inbox: u64,
+    reply: u64,
+    expected_client: u64,
+    generation: u64,
+    ordinal: u64
+) -> never {
+    let mut state: u64 = STATE_UNVERSIONED;
+    loop {
+        receive_request(inbox, expected_client);
+        if !request_is_canonical() {
+            stop();
+        }
+        let tag: u64 = request_u16(5);
+
+        if state == STATE_UNVERSIONED && exact_version() {
+            reply_version(reply, tag);
+            state = STATE_VERSIONED;
+            progress(2);
+        } else {
+            if state == STATE_VERSIONED && exact_attach(ordinal) {
+                reply_attach(reply, tag, generation, ordinal);
+                state = STATE_ATTACHED;
+                progress(3);
+            } else {
+                if state == STATE_ATTACHED && exact_walk(ordinal) {
+                    reply_walk(reply, tag, generation, ordinal);
+                    state = STATE_WALKED;
+                    progress(4);
+                } else {
+                    if state == STATE_WALKED && exact_open(ordinal) {
+                        reply_open(reply, tag, generation, ordinal);
+                        state = STATE_OPENED;
+                        progress(5);
+                    } else {
+                        if state == STATE_OPENED && exact_read(ordinal) {
+                            if ordinal == PROVIDER_A {
+                                reply_unavailable(reply, tag);
+                                emit(report, (&A_UNAVAILABLE[0]), 35);
+                                progress(6);
+                                // Let the client consume all four terminal
+                                // response fragments before entering #UD.
+                                yield_once();
+                                emit(report, (&A_FAULT[0]), 35);
+                                progress(7);
+                                asm!("ud2", options(nomem, nostack));
+                                stop();
+                            }
+                            reply_read(reply, tag);
+                            emit(report, (&B_READ[0]), 38);
+                            state = STATE_READ;
+                            progress(6);
+                        } else {
+                            if state == STATE_READ
+                                && ordinal == PROVIDER_B
+                                && exact_clunk(ordinal) {
+                                reply_clunk(reply, tag);
+                                emit(report, (&B_CLUNK[0]), 39);
+                                state = STATE_CLUNKED;
+                                progress(7);
+                            } else {
+                                // Malformed, out-of-sequence, writable, and
+                                // otherwise unpinned requests fail closed.
+                                stop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if state == STATE_CLUNKED {
+            stop();
+        }
+    }
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, boot_ordinal: u64) -> never {
+    let inbox: u64 = wait_nonzero(INBOX_CAP_OFFSET);
+    let reply: u64 = wait_nonzero(REPLY_CAP_OFFSET);
+    let generation: u64 = config(GENERATION_OFFSET);
+    let ordinal: u64 = config(ORDINAL_OFFSET);
+    let expected_client: u64 = wait_nonzero(EXPECTED_CLIENT_OFFSET);
+    if report_capability == 0
+        || generation == 0
+        || (ordinal != PROVIDER_A && ordinal != PROVIDER_B)
+        || boot_ordinal != ordinal {
+        stop();
+    }
+
+    // Provider B neither announces itself nor enters its service loop until
+    // the kernel has fault-contained/withdrawn A and flips this gate.
+    wait_for_activation();
+    if ordinal == PROVIDER_A {
+        emit(report_capability, (&A_ONLINE[0]), 25);
+    } else {
+        emit(report_capability, (&B_ONLINE[0]), 25);
+    }
+    progress(1);
+    run_provider(
+        report_capability,
+        inbox,
+        reply,
+        expected_client,
+        generation,
+        ordinal
+    );
+}

@@ -1,0 +1,1080 @@
+module kernel::m6;
+
+// Mode 31 is the bounded M7B-1 mechanism gate.  It instantiates one pinned
+// provider ELF twice in distinct native processes/CSpaces/address spaces,
+// withdraws provider A at an exact #UD boundary, proves A's client capability
+// stale, and only then publishes/activates provider B.  This is one immutable
+// local LogicalRead, not general 9P, remote transport, consensus, or a foreign
+// kernel/personality claim.
+
+use runtime::address_space::create_loaded_for_owner;
+use runtime::address_space::destroy as destroy_address_space;
+use runtime::address_space::is_live as address_space_is_live;
+use runtime::address_space::is_loaded;
+use runtime::address_space::isolation_physical;
+use runtime::address_space::loaded_entry;
+use runtime::address_space::loaded_frame_count;
+use runtime::address_space::loaded_protections_hold;
+use runtime::address_space::loaded_stack_pointer;
+use runtime::address_space::root_cr3;
+use runtime::capability::close_for_owner as close_capability_for_owner;
+use runtime::capability::cspace_handle_for_slot;
+use runtime::capability::install_for_owner as install_capability_for_owner;
+use runtime::capability::invariants_hold as capability_invariants_hold;
+use runtime::capability::cspace_is_live;
+use runtime::capability::validate_for_owner;
+use runtime::capability::OBJECT_DEBUG;
+use runtime::capability::OBJECT_ENDPOINT;
+use runtime::capability::RIGHT_DEBUG_WRITE;
+use runtime::capability::RIGHT_ENDPOINT_RECEIVE;
+use runtime::capability::RIGHT_ENDPOINT_SEND;
+use runtime::domain_namespace::bind_process;
+use runtime::domain_namespace::begin_teardown as begin_namespace_teardown;
+use runtime::domain_namespace::contains_process;
+use runtime::domain_namespace::create as create_namespace;
+use runtime::domain_namespace::finish_teardown as finish_namespace_teardown;
+use runtime::domain_namespace::init as namespaces_init;
+use runtime::domain_namespace::invariants_hold as namespace_invariants_hold;
+use runtime::domain_namespace::process_refs as namespace_process_refs;
+use runtime::domain_namespace::release_quiescent_processes;
+use runtime::domain_namespace::unbind_process;
+use runtime::domain::child_refs as domain_child_refs;
+use runtime::elf_loader::commit_count;
+use runtime::elf_loader::init as elf_loader_init;
+use runtime::elf_loader::invariants_hold as elf_invariants_hold;
+use runtime::elf_loader::release_plan;
+use runtime::elf_loader::validate as validate_elf;
+use runtime::elf_loader::validation_count;
+use runtime::endpoint::create as create_endpoint;
+use runtime::endpoint::invariants_hold as endpoint_invariants_hold;
+use runtime::endpoint::is_draining as endpoint_is_draining;
+use runtime::endpoint::is_live as endpoint_is_live;
+use runtime::endpoint::message_count as endpoint_message_count;
+use runtime::endpoint::release as release_endpoint;
+use runtime::image_vfs::append_image_bytes;
+use runtime::image_vfs::begin_image;
+use runtime::image_vfs::destroy_image;
+use runtime::image_vfs::image_id_for;
+use runtime::image_vfs::import_ovfs_image;
+use runtime::image_vfs::init as image_vfs_init;
+use runtime::image_vfs::invariants_hold as image_invariants_hold;
+use runtime::image_vfs::lookup as vfs_lookup;
+use runtime::image_vfs::mount_root;
+use runtime::image_vfs::object_digest;
+use runtime::image_vfs::object_length;
+use runtime::image_vfs::publish_image;
+use runtime::image_vfs::read_retained_byte;
+use runtime::image_vfs::release_object;
+use runtime::image_vfs::retain_object;
+use runtime::image_vfs::sha256_selftest;
+use runtime::image_vfs::teardown_namespace as teardown_mount_namespace;
+use runtime::image_vfs::verify_image_sha256;
+use runtime::image_vfs::IMAGE_BYTE_CAPACITY;
+use runtime::image_vfs::OVFS_IMPORT_OK;
+use runtime::ipc_lifecycle::process_died as ipc_process_died;
+use runtime::mapping::invariants_hold as mapping_invariants_hold;
+use runtime::memory_object::drain_cspace;
+use runtime::memory_object::invariants_hold as memory_invariants_hold;
+use runtime::memory_object::set_quota_for_owner;
+use runtime::native_abi::ERR_NOT_IMPLEMENTED;
+use runtime::pages::free_frames;
+use runtime::pages::invariants_hold as page_invariants_hold;
+use runtime::process::begin_reap;
+use runtime::process::finalize_reap;
+use runtime::process::install_for_owner as install_process_for_owner;
+use runtime::process::is_live as process_is_live;
+use runtime::process::process_state;
+use runtime::process::stop_process;
+use runtime::process::PROCESS_STATE_REAPABLE;
+use runtime::scheduler::arm_personality;
+use runtime::scheduler::complete as scheduler_complete;
+use runtime::scheduler::completion_kind;
+use runtime::scheduler::failed as scheduler_failed;
+use runtime::scheduler::personality_fault_containments;
+use runtime::scheduler::SCHEDULER_COMPLETION_PERSONALITY_CRASH;
+use runtime::serial::write;
+use runtime::service_registry::binding_is_live;
+use runtime::service_registry::init as service_registry_init;
+use runtime::service_registry::invariants_hold as service_invariants_hold;
+use runtime::service_registry::lookup as service_lookup;
+use runtime::service_registry::publish as publish_service;
+use runtime::service_registry::teardown_namespace as teardown_service_namespace;
+use runtime::service_registry::unpublish as unpublish_service;
+use runtime::thread::init as threads_init;
+use runtime::thread::install_loaded as install_loaded_thread;
+use runtime::thread::is_live as thread_is_live;
+use runtime::thread::queue_invariants_hold as thread_invariants_hold;
+use runtime::thread::reap as reap_thread;
+use runtime::thread::runnable_count;
+use runtime::thread::blocked_count;
+use runtime::thread::terminate_process;
+use runtime::thread::THREAD_ROLE_BLOCKING;
+use runtime::thread::THREAD_ROLE_CPU;
+use runtime::interrupts::ticks;
+
+const MODE_M7B_LOGICAL_READ: u64 = 31;
+const PROCESS_COUNT: usize = 4;
+const CLIENT: usize = 0;
+const PROVIDER_A: usize = 1;
+const PROVIDER_B: usize = 2;
+const WITNESS: usize = 3;
+const QUOTA: usize = 16;
+
+const PATH_CLIENT: u64 = 0x3e3c_6043_6eb1_e944;
+const PATH_PROVIDER: u64 = 0x1015_04f6_a11b_cb48;
+const PATH_OBJECT: u64 = 0x9694_1904_85ab_7ecd;
+
+const IMAGE_LENGTH: usize = 78304;
+const IMAGE_ID: u64 = 0xeec3_5da3_93f0_0576;
+const IMAGE_DIGEST_0: u64 = 0x7605_f093_a35d_c3ee;
+const IMAGE_DIGEST_1: u64 = 0xdf07_05a0_376f_8d92;
+const IMAGE_DIGEST_2: u64 = 0xcf2a_98e9_2770_f446;
+const IMAGE_DIGEST_3: u64 = 0x8134_5e79_de07_b01e;
+const IMAGE_SHA_0: u64 = 0xeec3_5da3_93f0_0576;
+const IMAGE_SHA_1: u64 = 0x928d_6f37_a005_07df;
+const IMAGE_SHA_2: u64 = 0x46f4_7027_e998_2acf;
+const IMAGE_SHA_3: u64 = 0x1eb0_07de_795e_3481;
+
+const OBJECT_DIGEST_0: u64 = 0xacb8_3ec6_138e_a059;
+const OBJECT_DIGEST_1: u64 = 0x0713_05af_4c3f_e9da;
+const OBJECT_DIGEST_2: u64 = 0xfb64_e524_abf5_a033;
+const OBJECT_DIGEST_3: u64 = 0x9b80_55d0_f1f0_0612;
+
+const SERVICE_A_NAME: u64 = 0x4d37_422d_3150_5241;
+const SERVICE_B_NAME: u64 = 0x4d37_422d_3150_5242;
+const SERVICE_PROTOCOL: u64 = 0x3950_3230_3030_0001;
+
+const PROGRESS_OFFSET: usize = 0;
+const CONFIG_A_SEND_OFFSET: usize = 8;
+const CONFIG_B_SEND_OFFSET: usize = 16;
+const CONFIG_REPLY_RECEIVE_OFFSET: usize = 24;
+const CONFIG_A_GENERATION_OFFSET: usize = 32;
+const CONFIG_B_GENERATION_OFFSET: usize = 40;
+const CONFIG_A_PROCESS_OFFSET: usize = 48;
+const CONFIG_B_PROCESS_OFFSET: usize = 56;
+const CONFIG_ROLE_OFFSET: usize = 64;
+const CONFIG_A_WITHDRAWN_OFFSET: usize = 72;
+
+const PROVIDER_INBOX_OFFSET: usize = 8;
+const PROVIDER_REPLY_OFFSET: usize = 16;
+const PROVIDER_GENERATION_OFFSET: usize = 24;
+const PROVIDER_ORDINAL_OFFSET: usize = 32;
+const PROVIDER_CLIENT_OFFSET: usize = 40;
+const PROVIDER_ACTIVATION_OFFSET: usize = 48;
+
+@link_section(".rodata")
+static LOGICAL_OBJECT: [u8; 20] = b"m7b-logical-object!\n";
+static IMAGE_MESSAGE: [u8; 34] = b"M7B-1 OVFS immutable corpus: PASS\n";
+static LOAD_MESSAGE: [u8; 49] =
+    b"M7B-1 one provider ELF, two CPL3 instances: PASS\n";
+static ISOLATION_MESSAGE: [u8; 56] =
+    b"M7B-1 four isolated native CSpaces/address spaces: PASS\n";
+static ROUTES_MESSAGE: [u8; 56] =
+    b"M7B-1 A/B identities and distinct routes admitted: PASS\n";
+static ARMED_MESSAGE: [u8; 36] =
+    b"M7B-1 local 9P fragment path: armed\n";
+static A_FAULT_MESSAGE: [u8; 57] =
+    b"M7B-1 provider A route withdrawal/stale generation: PASS\n";
+static B_ACTIVATE_MESSAGE: [u8; 59] =
+    b"M7B-1 provider B staged activation after stale proof: PASS\n";
+static CAUSAL_MESSAGE: [u8; 57] =
+    b"M7B-1 non-persisted causal attempt (not OWRECEIPT): PASS\n";
+static A_PHYSICAL_MESSAGE: [u8; 48] =
+    b"M7B-1 provider A physical/process cleanup: PASS\n";
+static B_CLEANUP_MESSAGE: [u8; 46] =
+    b"M7B-1 provider B session/queues cleanup: PASS\n";
+static RECLAIM_MESSAGE: [u8; 50] =
+    b"M7B-1 bounded mechanism resources reclaimed: PASS\n";
+static POST_TIMER_MESSAGE: [u8; 35] =
+    b"M7B-1 post-lifecycle timer: online\n";
+
+static mut NATIVE_DOMAIN: u64 = 0;
+static mut NAMESPACE: u64 = 0;
+static mut ROOT_MOUNT: u64 = 0;
+static mut IMAGE: u64 = 0;
+static mut CSPACES: [u64; 4] = [0; 4];
+static mut PLANS: [u64; 4] = [0; 4];
+static mut ADDRESS_SPACES: [u64; 4] = [0; 4];
+static mut PHYSICALS: [usize; 4] = [0; 4];
+static mut PROCESSES: [u64; 4] = [0; 4];
+static mut THREADS: [u64; 4] = [0; 4];
+static mut DEBUG_CAPS: [u64; 4] = [0; 4];
+
+static mut A_ENDPOINT: u64 = 0;
+static mut B_ENDPOINT: u64 = 0;
+static mut REPLY_ENDPOINT: u64 = 0;
+static mut CLIENT_A_SEND: u64 = 0;
+static mut CLIENT_B_SEND: u64 = 0;
+static mut CLIENT_REPLY_RECEIVE: u64 = 0;
+static mut A_INBOX_RECEIVE: u64 = 0;
+static mut A_REPLY_SEND: u64 = 0;
+static mut B_INBOX_RECEIVE: u64 = 0;
+static mut B_REPLY_SEND: u64 = 0;
+static mut A_BINDING: u64 = 0;
+static mut B_BINDING: u64 = 0;
+static mut ARMED: u8 = 0;
+static mut A_FAULTED: u8 = 0;
+static mut B_ACTIVATED: u8 = 0;
+static mut CAUSAL_STATE: u8 = 0;
+static mut BASELINE_FREE: usize = 0;
+
+extern "sysv64" fn ocore_current_cr3() -> usize;
+extern "sysv64" fn ocore_management_cr3() -> usize;
+extern "sysv64" fn ocore_process_kernel_stack_top(slot: usize) -> usize;
+extern "sysv64" fn ocore_m7b_logical_read_image_start() -> usize;
+extern "sysv64" fn ocore_m7b_logical_read_image_end() -> usize;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn management_context() -> bool {
+    return ocore_current_cr3() == ocore_management_cr3();
+}
+
+unsafe fn distinct_four_u64(values: *const u64) -> bool {
+    return volatile_load(values) != 0
+        && volatile_load(values + 1) != 0
+        && volatile_load(values + 2) != 0
+        && volatile_load(values + 3) != 0
+        && volatile_load(values) != volatile_load(values + 1)
+        && volatile_load(values) != volatile_load(values + 2)
+        && volatile_load(values) != volatile_load(values + 3)
+        && volatile_load(values + 1) != volatile_load(values + 2)
+        && volatile_load(values + 1) != volatile_load(values + 3)
+        && volatile_load(values + 2) != volatile_load(values + 3);
+}
+
+unsafe fn distinct_four_usize(values: *const usize) -> bool {
+    return volatile_load(values) != 0
+        && volatile_load(values + 1) != 0
+        && volatile_load(values + 2) != 0
+        && volatile_load(values + 3) != 0
+        && volatile_load(values) != volatile_load(values + 1)
+        && volatile_load(values) != volatile_load(values + 2)
+        && volatile_load(values) != volatile_load(values + 3)
+        && volatile_load(values + 1) != volatile_load(values + 2)
+        && volatile_load(values + 1) != volatile_load(values + 3)
+        && volatile_load(values + 2) != volatile_load(values + 3);
+}
+
+unsafe fn path_for(index: usize) -> u64 {
+    if index == CLIENT || index == WITNESS { return PATH_CLIENT; }
+    return PATH_PROVIDER;
+}
+
+unsafe fn load_plan(path: u64) -> u64 {
+    let object: u64 = vfs_lookup(NAMESPACE, path);
+    if object == 0 || retain_object(NAMESPACE, object) == 0 { return 0; }
+    return validate_elf(object);
+}
+
+unsafe fn verify_object() -> bool {
+    let object: u64 = vfs_lookup(NAMESPACE, PATH_OBJECT);
+    let mut digest_0: u64 = 0;
+    let mut digest_1: u64 = 0;
+    let mut digest_2: u64 = 0;
+    let mut digest_3: u64 = 0;
+    if object == 0 || retain_object(NAMESPACE, object) == 0
+        || object_length(object) != 20
+        || object_digest(
+            object,
+            (&mut digest_0),
+            (&mut digest_1),
+            (&mut digest_2),
+            (&mut digest_3)
+        ) != 1
+        || digest_0 != OBJECT_DIGEST_0
+        || digest_1 != OBJECT_DIGEST_1
+        || digest_2 != OBJECT_DIGEST_2
+        || digest_3 != OBJECT_DIGEST_3 {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < 20 {
+        let mut actual: u8 = 0;
+        if read_retained_byte(object, index, (&mut actual)) != 1
+            || actual != volatile_load((&LOGICAL_OBJECT[0]) + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return release_object(object) == 1;
+}
+
+unsafe fn store_config(index: usize, offset: usize, value: u64) -> void {
+    volatile_store((PHYSICALS[index] + offset) as *mut u64, value);
+}
+
+unsafe fn reap_loaded_process(index: usize) -> bool {
+    if index >= PROCESS_COUNT
+        || process_state(PROCESSES[index]) != PROCESS_STATE_REAPABLE
+        || begin_reap(PROCESSES[index]) != 1
+        || destroy_address_space(ADDRESS_SPACES[index]) != 1
+        || drain_cspace(CSPACES[index]) != 1
+        || finalize_reap(PROCESSES[index]) != 1 {
+        return false;
+    }
+    return true;
+}
+
+unsafe fn load_progress(index: usize) -> u64 {
+    return volatile_load(
+        (PHYSICALS[index] + PROGRESS_OFFSET) as *const u64
+    );
+}
+
+unsafe fn seed_config() -> void {
+    store_config(CLIENT, PROGRESS_OFFSET, 0);
+    store_config(CLIENT, CONFIG_A_SEND_OFFSET, CLIENT_A_SEND);
+    store_config(CLIENT, CONFIG_B_SEND_OFFSET, CLIENT_B_SEND);
+    store_config(CLIENT, CONFIG_REPLY_RECEIVE_OFFSET, CLIENT_REPLY_RECEIVE);
+    store_config(CLIENT, CONFIG_A_GENERATION_OFFSET, PROCESSES[PROVIDER_A] >> 32);
+    store_config(CLIENT, CONFIG_B_GENERATION_OFFSET, PROCESSES[PROVIDER_B] >> 32);
+    store_config(CLIENT, CONFIG_A_PROCESS_OFFSET, PROCESSES[PROVIDER_A]);
+    store_config(CLIENT, CONFIG_B_PROCESS_OFFSET, PROCESSES[PROVIDER_B]);
+    store_config(CLIENT, CONFIG_ROLE_OFFSET, 1);
+    store_config(CLIENT, CONFIG_A_WITHDRAWN_OFFSET, 0);
+
+    store_config(WITNESS, PROGRESS_OFFSET, 0);
+    store_config(WITNESS, CONFIG_ROLE_OFFSET, 2);
+
+    store_config(PROVIDER_A, PROGRESS_OFFSET, 0);
+    store_config(PROVIDER_A, PROVIDER_INBOX_OFFSET, A_INBOX_RECEIVE);
+    store_config(PROVIDER_A, PROVIDER_REPLY_OFFSET, A_REPLY_SEND);
+    store_config(
+        PROVIDER_A,
+        PROVIDER_GENERATION_OFFSET,
+        PROCESSES[PROVIDER_A] >> 32
+    );
+    store_config(PROVIDER_A, PROVIDER_ORDINAL_OFFSET, 1);
+    store_config(PROVIDER_A, PROVIDER_CLIENT_OFFSET, PROCESSES[CLIENT]);
+    store_config(PROVIDER_A, PROVIDER_ACTIVATION_OFFSET, 1);
+
+    store_config(PROVIDER_B, PROGRESS_OFFSET, 0);
+    store_config(PROVIDER_B, PROVIDER_INBOX_OFFSET, B_INBOX_RECEIVE);
+    store_config(PROVIDER_B, PROVIDER_REPLY_OFFSET, B_REPLY_SEND);
+    store_config(
+        PROVIDER_B,
+        PROVIDER_GENERATION_OFFSET,
+        PROCESSES[PROVIDER_B] >> 32
+    );
+    store_config(PROVIDER_B, PROVIDER_ORDINAL_OFFSET, 2);
+    store_config(PROVIDER_B, PROVIDER_CLIENT_OFFSET, PROCESSES[CLIENT]);
+    store_config(PROVIDER_B, PROVIDER_ACTIVATION_OFFSET, 0);
+}
+
+unsafe fn install_endpoints_and_caps() -> bool {
+    A_ENDPOINT = create_endpoint(CSPACES[PROVIDER_A]);
+    B_ENDPOINT = create_endpoint(CSPACES[PROVIDER_B]);
+    REPLY_ENDPOINT = create_endpoint(CSPACES[CLIENT]);
+    if A_ENDPOINT == 0 || B_ENDPOINT == 0 || REPLY_ENDPOINT == 0
+        || A_ENDPOINT == B_ENDPOINT || A_ENDPOINT == REPLY_ENDPOINT
+        || B_ENDPOINT == REPLY_ENDPOINT {
+        return false;
+    }
+    CLIENT_A_SEND = install_capability_for_owner(
+        CSPACES[CLIENT], 1, A_ENDPOINT, OBJECT_ENDPOINT, RIGHT_ENDPOINT_SEND
+    );
+    CLIENT_B_SEND = install_capability_for_owner(
+        CSPACES[CLIENT], 2, B_ENDPOINT, OBJECT_ENDPOINT, RIGHT_ENDPOINT_SEND
+    );
+    CLIENT_REPLY_RECEIVE = install_capability_for_owner(
+        CSPACES[CLIENT], 3, REPLY_ENDPOINT, OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_RECEIVE
+    );
+    A_INBOX_RECEIVE = install_capability_for_owner(
+        CSPACES[PROVIDER_A], 1, A_ENDPOINT, OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_RECEIVE
+    );
+    A_REPLY_SEND = install_capability_for_owner(
+        CSPACES[PROVIDER_A], 2, REPLY_ENDPOINT, OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    B_INBOX_RECEIVE = install_capability_for_owner(
+        CSPACES[PROVIDER_B], 1, B_ENDPOINT, OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_RECEIVE
+    );
+    B_REPLY_SEND = install_capability_for_owner(
+        CSPACES[PROVIDER_B], 2, REPLY_ENDPOINT, OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    return CLIENT_A_SEND != 0 && CLIENT_B_SEND != 0
+        && CLIENT_REPLY_RECEIVE != 0 && A_INBOX_RECEIVE != 0
+        && A_REPLY_SEND != 0 && B_INBOX_RECEIVE != 0 && B_REPLY_SEND != 0
+        && validate_for_owner(
+            CSPACES[CLIENT], CLIENT_A_SEND, OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        ) == A_ENDPOINT
+        && validate_for_owner(
+            CSPACES[CLIENT], CLIENT_B_SEND, OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        ) == B_ENDPOINT;
+}
+
+unsafe fn publish_routes() -> bool {
+    A_BINDING = publish_service(
+        NAMESPACE,
+        SERVICE_A_NAME,
+        SERVICE_PROTOCOL,
+        PROCESSES[PROVIDER_A],
+        CSPACES[CLIENT],
+        CLIENT_A_SEND,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    B_BINDING = publish_service(
+        NAMESPACE,
+        SERVICE_B_NAME,
+        SERVICE_PROTOCOL,
+        PROCESSES[PROVIDER_B],
+        CSPACES[CLIENT],
+        CLIENT_B_SEND,
+        OBJECT_ENDPOINT,
+        RIGHT_ENDPOINT_SEND
+    );
+    let mut resolved_a: u64 = 0;
+    let mut resolved_b: u64 = 0;
+    return A_BINDING != 0 && B_BINDING != 0 && A_BINDING != B_BINDING
+        && binding_is_live(A_BINDING)
+        && binding_is_live(B_BINDING)
+        && service_lookup(
+            NAMESPACE,
+            SERVICE_A_NAME,
+            SERVICE_PROTOCOL,
+            CSPACES[CLIENT],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND,
+            (&mut resolved_a)
+        ) == 1
+        && service_lookup(
+            NAMESPACE,
+            SERVICE_B_NAME,
+            SERVICE_PROTOCOL,
+            CSPACES[CLIENT],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND,
+            (&mut resolved_b)
+        ) == 1
+        && resolved_a == CLIENT_A_SEND
+        && resolved_b == CLIENT_B_SEND
+        && resolved_a != resolved_b
+        && service_invariants_hold();
+}
+
+unsafe fn activate_b_after_stale_proof() -> bool {
+    if A_FAULTED == 0 || B_ACTIVATED != 0 || load_progress(CLIENT) != 3
+        || CAUSAL_STATE != 1
+        || A_BINDING != 0 || B_BINDING == 0 || !binding_is_live(B_BINDING)
+        || endpoint_is_live(A_ENDPOINT) || endpoint_is_draining(A_ENDPOINT) {
+        return false;
+    }
+    let mut resolved: u64 = 0;
+    if service_lookup(
+            NAMESPACE,
+            SERVICE_B_NAME,
+            SERVICE_PROTOCOL,
+            CSPACES[CLIENT],
+            OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND,
+            (&mut resolved)
+        ) != 1
+        || resolved != CLIENT_B_SEND
+        || !service_invariants_hold() {
+        return false;
+    }
+    // This store is the first event that lets provider B announce itself or
+    // receive the already-bounded request queue.  The client's progress value
+    // is written only after its stale A send returned capability-denied.
+    store_config(PROVIDER_B, PROVIDER_ACTIVATION_OFFSET, 1);
+    B_ACTIVATED = 1;
+    CAUSAL_STATE = 2;
+    write((&B_ACTIVATE_MESSAGE[0]), 59);
+    return true;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_service_fault(process: u64) -> u64 {
+    if ARMED == 0 || A_FAULTED != 0 || B_ACTIVATED != 0
+        || CAUSAL_STATE != 0 || process != PROCESSES[PROVIDER_A]
+        || !process_is_live(process)
+        || load_progress(PROVIDER_A) != 7
+        || load_progress(CLIENT) != 2
+        || endpoint_message_count(REPLY_ENDPOINT) != 0
+        || A_BINDING == 0 || !binding_is_live(A_BINDING)
+        || B_BINDING == 0 || !binding_is_live(B_BINDING) {
+        return 0;
+    }
+    // The terminal Rerror is already consumed.  Only now may process death
+    // cancel sender state on the shared reply endpoint without erasing causal
+    // response evidence.
+    if unpublish_service(A_BINDING) != 1 {
+        return 0;
+    }
+    A_BINDING = 0;
+    if ipc_process_died(process) != 1
+        || !endpoint_is_draining(A_ENDPOINT)
+        || close_capability_for_owner(CSPACES[CLIENT], CLIENT_A_SEND) != 1
+        || close_capability_for_owner(
+            CSPACES[PROVIDER_A], A_INBOX_RECEIVE
+        ) != 1
+        || close_capability_for_owner(
+            CSPACES[PROVIDER_A], A_REPLY_SEND
+        ) != 1
+        || release_endpoint(A_ENDPOINT) != 1
+        || endpoint_is_live(A_ENDPOINT)
+        || endpoint_is_draining(A_ENDPOINT)
+        || validate_for_owner(
+            CSPACES[CLIENT], CLIENT_A_SEND, OBJECT_ENDPOINT,
+            RIGHT_ENDPOINT_SEND
+        ) != 0
+        || !endpoint_invariants_hold()
+        || !capability_invariants_hold()
+        || !service_invariants_hold() {
+        return 0;
+    }
+    // Keep the stale numeric handle in both kernel state and the client's
+    // private page. Closing the slot changed its generation; the client must
+    // now present this old value and observe ERR_CAPABILITY_DENIED itself.
+    store_config(CLIENT, CONFIG_A_WITHDRAWN_OFFSET, 1);
+    A_FAULTED = 1;
+    CAUSAL_STATE = 1;
+    write((&A_FAULT_MESSAGE[0]), 57);
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_expire_requests(now: u64) -> u64 {
+    if ARMED == 0 || now == 0 || scheduler_failed() { return 0; }
+    if A_FAULTED != 0 && B_ACTIVATED == 0 && load_progress(CLIENT) == 3 {
+        if !activate_b_after_stale_proof() { return 0; }
+    }
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_phase_one_ready() -> u64 {
+    if ARMED == 0 || A_FAULTED == 0 || B_ACTIVATED == 0
+        || CAUSAL_STATE != 2 || load_progress(CLIENT) != 5
+        || load_progress(PROVIDER_A) != 7
+        || load_progress(PROVIDER_B) != 7
+        || load_progress(WITNESS) != 1
+        || endpoint_message_count(B_ENDPOINT) != 0
+        || endpoint_message_count(REPLY_ENDPOINT) != 0
+        || A_BINDING != 0 || B_BINDING == 0
+        || !binding_is_live(B_BINDING) {
+        return 0;
+    }
+    // State 0 -> 1 was the consumed A Rerror plus route withdrawal; 1 -> 2
+    // was the client's stale-cap denial followed by B activation. Reaching 3
+    // requires B read, native digest check, and fresh-fid clunk to have all
+    // completed. This is bounded volatile evidence, not a persisted receipt.
+    CAUSAL_STATE = 3;
+    return 1;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_final_ready() -> u64 { return 0; }
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_crash_continue() -> never {
+    if !management_context() || scheduler_failed() || !scheduler_complete()
+        || completion_kind() != SCHEDULER_COMPLETION_PERSONALITY_CRASH
+        || personality_fault_containments() != 1
+        || runnable_count() != 3 || blocked_count() != 0
+        || A_FAULTED == 0 || B_ACTIVATED == 0 || CAUSAL_STATE != 3
+        || load_progress(CLIENT) != 5 || load_progress(PROVIDER_A) != 7
+        || load_progress(PROVIDER_B) != 7 || load_progress(WITNESS) != 1
+        || process_state(PROCESSES[PROVIDER_A]) != PROCESS_STATE_REAPABLE
+        || endpoint_message_count(B_ENDPOINT) != 0
+        || endpoint_message_count(REPLY_ENDPOINT) != 0
+        || A_BINDING != 0 || B_BINDING == 0
+        || !binding_is_live(B_BINDING) {
+        fail_closed();
+    }
+    write((&CAUSAL_MESSAGE[0]), 57);
+
+    // Route/cap retirement happened in the fault hook. Only this management
+    // continuation may now retire A's TCB, PCB, CSpace, address space, and
+    // physical frames, proving that authority withdrawal and physical cleanup
+    // are distinct lifecycle facts.
+    if reap_thread(THREADS[PROVIDER_A]) != 1
+        || thread_is_live(THREADS[PROVIDER_A])
+        || unbind_process(NAMESPACE, PROCESSES[PROVIDER_A]) != 1
+        || !reap_loaded_process(PROVIDER_A)
+        || process_state(PROCESSES[PROVIDER_A]) != 0
+        || cspace_is_live(CSPACES[PROVIDER_A])
+        || address_space_is_live(ADDRESS_SPACES[PROVIDER_A]) {
+        fail_closed();
+    }
+    write((&A_PHYSICAL_MESSAGE[0]), 48);
+
+    // B's bounded successful session is already clunked and both queues are
+    // empty. Unpublish the route, retire endpoint capabilities, then invoke
+    // owner-death lifecycle so the B inbox and shared reply endpoint cross
+    // their explicit crash/drain boundaries before releasing base references.
+    if unpublish_service(B_BINDING) != 1 {
+        fail_closed();
+    }
+    B_BINDING = 0;
+    if close_capability_for_owner(CSPACES[CLIENT], CLIENT_B_SEND) != 1
+        || close_capability_for_owner(
+            CSPACES[CLIENT], CLIENT_REPLY_RECEIVE
+        ) != 1
+        || close_capability_for_owner(
+            CSPACES[PROVIDER_B], B_INBOX_RECEIVE
+        ) != 1
+        || close_capability_for_owner(
+            CSPACES[PROVIDER_B], B_REPLY_SEND
+        ) != 1
+        || ipc_process_died(PROCESSES[PROVIDER_B]) != 1
+        || !endpoint_is_draining(B_ENDPOINT)
+        || ipc_process_died(PROCESSES[CLIENT]) != 1
+        || !endpoint_is_draining(REPLY_ENDPOINT)
+        || ipc_process_died(PROCESSES[WITNESS]) != 1
+        || release_endpoint(B_ENDPOINT) != 1
+        || release_endpoint(REPLY_ENDPOINT) != 1
+        || endpoint_is_live(B_ENDPOINT) || endpoint_is_draining(B_ENDPOINT)
+        || endpoint_is_live(REPLY_ENDPOINT)
+        || endpoint_is_draining(REPLY_ENDPOINT)
+        || !endpoint_invariants_hold() || !capability_invariants_hold()
+        || !service_invariants_hold() {
+        fail_closed();
+    }
+    write((&B_CLEANUP_MESSAGE[0]), 46);
+
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        if index != PROVIDER_A
+            && (terminate_process(PROCESSES[index]) != 1
+                || stop_process(PROCESSES[index], 0x7b + index as u64) != 1
+                || process_state(PROCESSES[index])
+                    != PROCESS_STATE_REAPABLE) {
+            fail_closed();
+        }
+        index += 1;
+    }
+
+    if begin_namespace_teardown(NAMESPACE) != 1
+        || teardown_service_namespace(NAMESPACE) != 1
+        || teardown_mount_namespace(NAMESPACE) != 1
+        || release_quiescent_processes(NAMESPACE) != 1
+        || namespace_process_refs(NAMESPACE) != 0 {
+        fail_closed();
+    }
+    ROOT_MOUNT = 0;
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        if index != PROVIDER_A
+            && (reap_thread(THREADS[index]) != 1
+                || thread_is_live(THREADS[index])
+                || !reap_loaded_process(index)) {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if destroy_image(IMAGE) != 1 || image_id_for(IMAGE) != 0
+        || finish_namespace_teardown(NAMESPACE) != 1
+        || domain_child_refs(NATIVE_DOMAIN) != 0
+        || free_frames() != BASELINE_FREE
+        || !page_invariants_hold() || !mapping_invariants_hold()
+        || !memory_invariants_hold() || !capability_invariants_hold()
+        || !endpoint_invariants_hold() || !thread_invariants_hold()
+        || !namespace_invariants_hold() || !image_invariants_hold()
+        || !elf_invariants_hold() || !service_invariants_hold() {
+        fail_closed();
+    }
+    write((&RECLAIM_MESSAGE[0]), 50);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TIMER_MESSAGE[0]), 35);
+    loop { halt(); }
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_complete_continue() -> never { fail_closed(); }
+
+pub unsafe fn start(mode: u64, native_domain: u64) -> never {
+    if mode != MODE_M7B_LOGICAL_READ || native_domain == 0
+        || ARMED != 0 || !management_context()
+        || threads_init() == 0 || threads_init() != 0
+        || namespaces_init() == 0 || namespaces_init() != 0
+        || image_vfs_init() == 0 || image_vfs_init() != 0
+        || sha256_selftest() != 1
+        || elf_loader_init() == 0 || elf_loader_init() != 0
+        || service_registry_init() == 0 || service_registry_init() != 0 {
+        fail_closed();
+    }
+    NATIVE_DOMAIN = native_domain;
+    A_FAULTED = 0;
+    B_ACTIVATED = 0;
+    CAUSAL_STATE = 0;
+    A_BINDING = 0;
+    B_BINDING = 0;
+
+    let image_start: usize = ocore_m7b_logical_read_image_start();
+    let image_end: usize = ocore_m7b_logical_read_image_end();
+    if image_start == 0 || image_end <= image_start
+        || image_end - image_start != IMAGE_LENGTH
+        || IMAGE_LENGTH > IMAGE_BYTE_CAPACITY {
+        fail_closed();
+    }
+    IMAGE = begin_image(
+        0,
+        IMAGE_ID,
+        IMAGE_LENGTH,
+        IMAGE_DIGEST_0,
+        IMAGE_DIGEST_1,
+        IMAGE_DIGEST_2,
+        IMAGE_DIGEST_3
+    );
+    if IMAGE == 0
+        || append_image_bytes(IMAGE, image_start as *const u8, IMAGE_LENGTH)
+            != 1
+        || verify_image_sha256(
+            IMAGE,
+            IMAGE_SHA_0,
+            IMAGE_SHA_1,
+            IMAGE_SHA_2,
+            IMAGE_SHA_3
+        ) != 1
+        || import_ovfs_image(IMAGE) != OVFS_IMPORT_OK
+        || publish_image(IMAGE) != 1
+        || image_id_for(IMAGE) != IMAGE_ID {
+        fail_closed();
+    }
+    NAMESPACE = create_namespace(0, native_domain);
+    ROOT_MOUNT = mount_root(NAMESPACE, IMAGE);
+    if NAMESPACE == 0 || ROOT_MOUNT == 0 || !verify_object()
+        || !image_invariants_hold() || !namespace_invariants_hold() {
+        fail_closed();
+    }
+    write((&IMAGE_MESSAGE[0]), 34);
+
+    let mut index: usize = 0;
+    while index < PROCESS_COUNT {
+        PLANS[index] = load_plan(path_for(index));
+        if PLANS[index] == 0 { fail_closed(); }
+        index += 1;
+    }
+    if !distinct_four_u64((&PLANS[0])) || validation_count() != 4 {
+        fail_closed();
+    }
+
+    BASELINE_FREE = free_frames();
+    index = 0;
+    while index < PROCESS_COUNT {
+        CSPACES[index] = cspace_handle_for_slot(index);
+        if CSPACES[index] == 0
+            || set_quota_for_owner(CSPACES[index], QUOTA) != 1 {
+            fail_closed();
+        }
+        ADDRESS_SPACES[index] = create_loaded_for_owner(
+            CSPACES[index], PLANS[index]
+        );
+        PHYSICALS[index] = isolation_physical(ADDRESS_SPACES[index]);
+        if ADDRESS_SPACES[index] == 0 || PHYSICALS[index] == 0
+            || !is_loaded(ADDRESS_SPACES[index])
+            || loaded_entry(ADDRESS_SPACES[index]) == 0
+            || loaded_stack_pointer(ADDRESS_SPACES[index]) == 0
+            || loaded_frame_count(ADDRESS_SPACES[index]) == 0
+            || root_cr3(ADDRESS_SPACES[index]) == ocore_management_cr3()
+            || !loaded_protections_hold(ADDRESS_SPACES[index])
+            || release_plan(PLANS[index]) != 1 {
+            fail_closed();
+        }
+        index += 1;
+    }
+    if !distinct_four_u64((&ADDRESS_SPACES[0]))
+        || !distinct_four_usize((&PHYSICALS[0]))
+        || commit_count() != 4 || !elf_invariants_hold() {
+        fail_closed();
+    }
+    write((&LOAD_MESSAGE[0]), 49);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        PROCESSES[index] = install_process_for_owner(
+            index,
+            3101 + index as u64,
+            native_domain,
+            ADDRESS_SPACES[index],
+            CSPACES[index],
+            ocore_process_kernel_stack_top(index),
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index])
+        );
+        if PROCESSES[index] == 0
+            || bind_process(NAMESPACE, PROCESSES[index]) != 1
+            || !contains_process(NAMESPACE, PROCESSES[index]) {
+            fail_closed();
+        }
+        DEBUG_CAPS[index] = install_capability_for_owner(
+            CSPACES[index],
+            0,
+            0x7b0 + index as u64,
+            OBJECT_DEBUG,
+            RIGHT_DEBUG_WRITE
+        );
+        if DEBUG_CAPS[index] == 0 { fail_closed(); }
+        index += 1;
+    }
+    if !distinct_four_u64((&PROCESSES[0]))
+        || namespace_process_refs(NAMESPACE) != 4 {
+        fail_closed();
+    }
+
+    if !install_endpoints_and_caps() || !publish_routes() {
+        fail_closed();
+    }
+    seed_config();
+    write((&ISOLATION_MESSAGE[0]), 56);
+    write((&ROUTES_MESSAGE[0]), 56);
+
+    index = 0;
+    while index < PROCESS_COUNT {
+        let mut argument: u64 = 1;
+        let mut role: u64 = THREAD_ROLE_BLOCKING;
+        if index == PROVIDER_B || index == WITNESS { argument = 2; }
+        if index == WITNESS { role = THREAD_ROLE_CPU; }
+        THREADS[index] = install_loaded_thread(
+            index,
+            3201 + index as u64,
+            PROCESSES[index],
+            loaded_entry(ADDRESS_SPACES[index]),
+            loaded_stack_pointer(ADDRESS_SPACES[index]),
+            ocore_process_kernel_stack_top(index),
+            DEBUG_CAPS[index],
+            argument,
+            role,
+            1
+        );
+        if THREADS[index] == 0 { fail_closed(); }
+        index += 1;
+    }
+    if !distinct_four_u64((&THREADS[0]))
+        || !thread_invariants_hold() || !capability_invariants_hold()
+        || !endpoint_invariants_hold() || !mapping_invariants_hold()
+        || !memory_invariants_hold() || !namespace_invariants_hold()
+        || !service_invariants_hold() || !image_invariants_hold()
+        || !elf_invariants_hold() {
+        fail_closed();
+    }
+    ARMED = 1;
+    disable_interrupts();
+    if arm_personality(
+        THREADS[CLIENT], PROCESSES[CLIENT], PHYSICALS[CLIENT],
+        THREADS[PROVIDER_A], PROCESSES[PROVIDER_A], PHYSICALS[PROVIDER_A],
+        THREADS[PROVIDER_B], PROCESSES[PROVIDER_B], PHYSICALS[PROVIDER_B],
+        THREADS[WITNESS], PROCESSES[WITNESS], PHYSICALS[WITNESS]
+    ) != 1 {
+        fail_closed();
+    }
+    write((&ARMED_MESSAGE[0]), 36);
+    enable_interrupts();
+    loop { halt(); }
+}
+
+// Mode 31 uses the direct native endpoint ABI only.  The shared scheduler and
+// syscall dispatcher still require the complete kernel::m6 adapter surface;
+// every unrelated personality/bounded/foreign operation stays fail-closed.
+@export
+@no_mangle
+pub unsafe fn kernel_m6_prepare_bounded_resume(
+    thread: u64,
+    result_out: *mut u64
+) -> u64 {
+    let _unused_thread: u64 = thread;
+    if result_out as usize != 0 { volatile_store(result_out, 0); }
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_commit_bounded_resume(thread: u64) -> u64 {
+    let _unused_thread: u64 = thread;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    foreign_address: u64,
+    length: u64,
+    direction: u64,
+    timeout_ticks: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_capability: u64 = capability;
+    let _unused_operation: u64 = operation;
+    let _unused_address: u64 = foreign_address;
+    let _unused_length: u64 = length;
+    let _unused_direction: u64 = direction;
+    let _unused_timeout: u64 = timeout_ticks;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_lookup(
+    capability_object: u64,
+    request: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_read(capability: u64, offset: u64) -> u64 {
+    let _unused_capability: u64 = capability;
+    let _unused_offset: u64 = offset;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_write(
+    capability: u64,
+    offset: u64,
+    value: u64
+) -> u64 {
+    let _unused_capability: u64 = capability;
+    let _unused_offset: u64 = offset;
+    let _unused_value: u64 = value;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_bounded_reply(
+    capability_object: u64,
+    request: u64,
+    view_capability: u64,
+    committed_length: u64,
+    result: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_view: u64 = view_capability;
+    let _unused_length: u64 = committed_length;
+    let _unused_result: u64 = result;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_complete(
+    capability_object: u64,
+    request: u64,
+    view: u64,
+    fd: u64,
+    count: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_view: u64 = view;
+    let _unused_fd: u64 = fd;
+    let _unused_count: u64 = count;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_syscall(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64
+) -> u64 {
+    let _unused_number: u64 = number;
+    let _unused_arg0: u64 = arg0;
+    let _unused_arg1: u64 = arg1;
+    let _unused_arg2: u64 = arg2;
+    let _unused_arg3: u64 = arg3;
+    let _unused_arg4: u64 = arg4;
+    let _unused_arg5: u64 = arg5;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_defer_thread(thread: u64) -> u64 {
+    let _unused_thread: u64 = thread;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_linux_process_exit(
+    process: u64,
+    status: u64
+) -> u64 {
+    let _unused_process: u64 = process;
+    let _unused_status: u64 = status;
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_call(
+    capability_object: u64,
+    capability: u64,
+    operation: u64,
+    scalar: u64,
+    timeout_ticks: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_capability: u64 = capability;
+    let _unused_operation: u64 = operation;
+    let _unused_scalar: u64 = scalar;
+    let _unused_timeout: u64 = timeout_ticks;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_reply(
+    capability_object: u64,
+    request: u64,
+    status: u64,
+    scalar: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_request: u64 = request;
+    let _unused_status: u64 = status;
+    let _unused_scalar: u64 = scalar;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+@export
+@no_mangle
+pub unsafe fn kernel_m6_personality_supervise(
+    capability_object: u64,
+    action: u64,
+    generation: u64,
+    subject: u64
+) -> u64 {
+    let _unused_object: u64 = capability_object;
+    let _unused_action: u64 = action;
+    let _unused_generation: u64 = generation;
+    let _unused_subject: u64 = subject;
+    return ERR_NOT_IMPLEMENTED;
+}

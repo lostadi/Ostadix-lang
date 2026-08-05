@@ -1,0 +1,481 @@
+module runtime::m7b_logical_read_client;
+
+// M7B-1 is deliberately smaller than a general 9P client.  One independently
+// linked native CPL3 principal selects between two independently instantiated
+// providers for one immutable, SHA-addressed 20-byte object.  A 64-byte 9P
+// frame crosses the public local endpoint ABI as four ordered 16-byte payloads;
+// the 9P size word remains authoritative and all transport padding is checked.
+
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init as sha_scratch_init;
+use world::sha256::compute as sha256_compute;
+
+const SYS_DEBUG_WRITE: u64 = 0;
+const SYS_YIELD: u64 = 4;
+const SYS_ENDPOINT_SEND: u64 = 9;
+const SYS_ENDPOINT_RECEIVE: u64 = 10;
+const ERR_CAPABILITY_DENIED: u64 = 0xffff_ffff_ffff_fff1;
+const ERR_IPC_RETRY: u64 = 0xffff_ffff_ffff_ffe8;
+
+const CONFIG_VA: usize = 0x0120_1000;
+const PROGRESS_OFFSET: usize = 0;
+const PROVIDER_A_SEND_OFFSET: usize = 8;
+const PROVIDER_B_SEND_OFFSET: usize = 16;
+const REPLY_RECEIVE_OFFSET: usize = 24;
+const PROVIDER_A_GENERATION_OFFSET: usize = 32;
+const PROVIDER_B_GENERATION_OFFSET: usize = 40;
+const PROVIDER_A_PROCESS_OFFSET: usize = 48;
+const PROVIDER_B_PROCESS_OFFSET: usize = 56;
+const ROLE_OFFSET: usize = 64;
+const A_WITHDRAWN_OFFSET: usize = 72;
+const MESSAGE_OFFSET: usize = 128;
+const MESSAGE_BYTES: u64 = 32;
+
+const ROLE_CLIENT: u64 = 1;
+const ROLE_WITNESS: u64 = 2;
+const MSIZE: usize = 64;
+const NOTAG: u64 = 0xffff;
+const NOFID: u64 = 0xffff_ffff;
+const QTDIR: u64 = 0x80;
+const OREAD: u64 = 0;
+
+const TVERSION: u64 = 100;
+const RVERSION: u64 = 101;
+const TATTACH: u64 = 104;
+const RATTACH: u64 = 105;
+const RERROR: u64 = 107;
+const TWALK: u64 = 110;
+const RWALK: u64 = 111;
+const TOPEN: u64 = 112;
+const ROPEN: u64 = 113;
+const TREAD: u64 = 116;
+const RREAD: u64 = 117;
+const TCLUNK: u64 = 120;
+const RCLUNK: u64 = 121;
+
+@link_section(".rodata")
+static VERSION: [u8; 6] = b"9P2000";
+@link_section(".rodata")
+static OBJECT_NAME: [u8; 6] = b"object";
+@link_section(".rodata")
+static UNAVAILABLE: [u8; 7] = b"unavail";
+@link_section(".rodata")
+static EXPECTED_OBJECT: [u8; 20] = b"m7b-logical-object!\n";
+@link_section(".rodata")
+static EXPECTED_DIGEST: [u8; 32] = [
+    0x59, 0xa0, 0x8e, 0x13, 0xc6, 0x3e, 0xb8, 0xac,
+    0xda, 0xe9, 0x3f, 0x4c, 0xaf, 0x05, 0x13, 0x07,
+    0x33, 0xa0, 0xf5, 0xab, 0x24, 0xe5, 0x64, 0xfb,
+    0x12, 0x06, 0xf0, 0xf1, 0xd0, 0x55, 0x80, 0x9b,
+];
+
+@link_section(".rodata")
+static CLIENT_ONLINE: [u8; 33] = b"M7B-1 client LogicalRead: online\n";
+@link_section(".rodata")
+static A_ERROR_PASS: [u8; 39] =
+    b"M7B-1 provider A Rerror consumed: PASS\n";
+@link_section(".rodata")
+static STALE_PASS: [u8; 40] =
+    b"M7B-1 stale provider A capability: PASS\n";
+@link_section(".rodata")
+static FALLBACK_PASS: [u8; 45] =
+    b"M7B-1 fallback A to B after withdrawal: PASS\n";
+@link_section(".rodata")
+static B_READ_PASS: [u8; 46] =
+    b"M7B-1 provider B immutable 20-byte read: PASS\n";
+@link_section(".rodata")
+static B_CLUNK_PASS: [u8; 39] =
+    b"M7B-1 provider B fresh fid clunk: PASS\n";
+@link_section(".rodata")
+static SHA_PASS: [u8; 39] =
+    b"M7B-1 native LogicalRead SHA-256: PASS\n";
+@link_section(".rodata")
+static FINAL_PASS: [u8; 40] =
+    b"M7B-1 native LogicalRead fallback: PASS\n";
+@link_section(".rodata")
+static WITNESS_ONLINE: [u8; 49] =
+    b"M7B-1 witness unrelated native principal: online\n";
+
+static mut BUFFER: [u8; 64] = [0; 64];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut SHA_STORAGE: [u64; 2] = [0; 2];
+static mut ACTUAL_DIGEST: [u8; 32] = [0; 32];
+
+unsafe fn stop() -> never {
+    loop { asm!("pause", options(nomem, nostack)); }
+}
+
+unsafe fn config(offset: usize) -> u64 {
+    return volatile_load((CONFIG_VA + offset) as *const u64);
+}
+
+unsafe fn progress(value: u64) -> void {
+    volatile_store((CONFIG_VA + PROGRESS_OFFSET) as *mut u64, value);
+}
+
+unsafe fn emit(capability: u64, pointer: *const u8, length: usize) -> void {
+    if syscall3(SYS_DEBUG_WRITE, capability, pointer as u64, length as u64)
+        != length as u64 {
+        stop();
+    }
+}
+
+unsafe fn yield_once() -> void {
+    if syscall0(SYS_YIELD) != 0 { stop(); }
+}
+
+unsafe fn clear_buffer() -> void {
+    let mut index: usize = 0;
+    while index < MSIZE {
+        volatile_store((&mut BUFFER[0]) + index, 0);
+        index += 1;
+    }
+}
+
+unsafe fn byte(offset: usize) -> u64 {
+    return volatile_load(((&BUFFER[0]) + offset) as *const u8) as u64;
+}
+
+unsafe fn put_byte(offset: usize, value: u64) -> void {
+    volatile_store((&mut BUFFER[0]) + offset, (value & 0xff) as u8);
+}
+
+unsafe fn put_u16(offset: usize, value: u64) -> void {
+    put_byte(offset, value);
+    put_byte(offset + 1, value >> 8);
+}
+
+unsafe fn get_u16(offset: usize) -> u64 {
+    return byte(offset) | (byte(offset + 1) << 8);
+}
+
+unsafe fn put_u32(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 4 {
+        put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn get_u32(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        value = value | (byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn put_u64(offset: usize, value: u64) -> void {
+    let mut index: usize = 0;
+    while index < 8 {
+        put_byte(offset + index, value >> (index * 8));
+        index += 1;
+    }
+}
+
+unsafe fn get_u64(offset: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut index: usize = 0;
+    while index < 8 {
+        value = value | (byte(offset + index) << (index * 8));
+        index += 1;
+    }
+    return value;
+}
+
+unsafe fn put_bytes(offset: usize, source: *const u8, length: usize) -> void {
+    let mut index: usize = 0;
+    while index < length {
+        put_byte(offset + index, volatile_load(source + index) as u64);
+        index += 1;
+    }
+}
+
+unsafe fn bytes_equal(offset: usize, expected: *const u8, length: usize)
+    -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if byte(offset + index) != volatile_load(expected + index) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn begin(kind: u64, tag: u64) -> void {
+    clear_buffer();
+    put_byte(4, kind);
+    put_u16(5, tag);
+}
+
+unsafe fn finish(size: usize) -> void { put_u32(0, size as u64); }
+
+unsafe fn build_version() -> void {
+    begin(TVERSION, NOTAG);
+    put_u32(7, MSIZE as u64);
+    put_u16(11, 6);
+    put_bytes(13, (&VERSION[0]), 6);
+    finish(19);
+}
+
+unsafe fn build_attach(tag: u64, root_fid: u64) -> void {
+    begin(TATTACH, tag);
+    put_u32(7, root_fid);
+    put_u32(11, NOFID);
+    put_u16(15, 0);
+    put_u16(17, 32);
+    put_bytes(19, (&EXPECTED_DIGEST[0]), 32);
+    finish(51);
+}
+
+unsafe fn build_walk(tag: u64, root_fid: u64, file_fid: u64) -> void {
+    begin(TWALK, tag);
+    put_u32(7, root_fid);
+    put_u32(11, file_fid);
+    put_u16(15, 1);
+    put_u16(17, 6);
+    put_bytes(19, (&OBJECT_NAME[0]), 6);
+    finish(25);
+}
+
+unsafe fn build_open(tag: u64, file_fid: u64) -> void {
+    begin(TOPEN, tag);
+    put_u32(7, file_fid);
+    put_byte(11, OREAD);
+    finish(12);
+}
+
+unsafe fn build_read(tag: u64, file_fid: u64) -> void {
+    begin(TREAD, tag);
+    put_u32(7, file_fid);
+    put_u64(11, 0);
+    put_u32(19, 20);
+    finish(23);
+}
+
+unsafe fn build_clunk(tag: u64, file_fid: u64) -> void {
+    begin(TCLUNK, tag);
+    put_u32(7, file_fid);
+    finish(11);
+}
+
+unsafe fn send_fragment(capability: u64, offset: usize) -> u64 {
+    loop {
+        let result: u64 = syscall4(
+            SYS_ENDPOINT_SEND,
+            capability,
+            get_u64(offset),
+            get_u64(offset + 8),
+            0
+        );
+        if result == 1 { return 1; }
+        if result != ERR_IPC_RETRY { return result; }
+    }
+}
+
+unsafe fn message_word(offset: usize) -> u64 {
+    return volatile_load(
+        (CONFIG_VA + MESSAGE_OFFSET + offset) as *const u64
+    );
+}
+
+unsafe fn receive_fragment(capability: u64) -> void {
+    loop {
+        let result: u64 = syscall3(
+            SYS_ENDPOINT_RECEIVE,
+            capability,
+            (CONFIG_VA + MESSAGE_OFFSET) as u64,
+            MESSAGE_BYTES
+        );
+        if result == 1 { return; }
+        if result != ERR_IPC_RETRY { stop(); }
+    }
+}
+
+unsafe fn exchange(send_capability: u64, expected_sender: u64) -> void {
+    let mut fragment: usize = 0;
+    while fragment < 4 {
+        if send_fragment(send_capability, fragment * 16) != 1 { stop(); }
+        fragment += 1;
+    }
+    clear_buffer();
+    fragment = 0;
+    while fragment < 4 {
+        receive_fragment(config(REPLY_RECEIVE_OFFSET));
+        if message_word(0) != expected_sender || message_word(24) != 0 {
+            stop();
+        }
+        put_u64(fragment * 16, message_word(8));
+        put_u64(fragment * 16 + 8, message_word(16));
+        fragment += 1;
+    }
+    let size: u64 = get_u32(0);
+    if size < 7 || size > MSIZE as u64 { stop(); }
+    let mut padding: usize = size as usize;
+    while padding < MSIZE {
+        if byte(padding) != 0 { stop(); }
+        padding += 1;
+    }
+}
+
+unsafe fn header(size: u64, kind: u64, tag: u64) -> bool {
+    return get_u32(0) == size && byte(4) == kind && get_u16(5) == tag;
+}
+
+unsafe fn expect_qid(
+    offset: usize,
+    kind: u64,
+    generation: u64,
+    path: u64
+) -> bool {
+    return byte(offset) == kind
+        && get_u32(offset + 1) == generation
+        && get_u64(offset + 5) == path;
+}
+
+unsafe fn run_prefix(
+    send_capability: u64,
+    expected_sender: u64,
+    ordinal: u64,
+    generation: u64,
+    root_fid: u64,
+    file_fid: u64,
+    tag: u64
+) -> bool {
+    build_version();
+    exchange(send_capability, expected_sender);
+    if !header(19, RVERSION, NOTAG) || get_u32(7) != 64
+        || get_u16(11) != 6 || !bytes_equal(13, (&VERSION[0]), 6) {
+        return false;
+    }
+    build_attach(tag, root_fid);
+    exchange(send_capability, expected_sender);
+    if !header(20, RATTACH, tag)
+        || !expect_qid(7, QTDIR, generation, (ordinal << 32) | 1) {
+        return false;
+    }
+    build_walk(tag + 1, root_fid, file_fid);
+    exchange(send_capability, expected_sender);
+    if !header(22, RWALK, tag + 1) || get_u16(7) != 1
+        || !expect_qid(9, 0, generation, (ordinal << 32) | 2) {
+        return false;
+    }
+    build_open(tag + 2, file_fid);
+    exchange(send_capability, expected_sender);
+    return header(24, ROPEN, tag + 2)
+        && expect_qid(7, 0, generation, (ordinal << 32) | 2)
+        && get_u32(20) == 64;
+}
+
+unsafe fn sha_scratch() -> *mut Sha256Scratch {
+    return ((&mut SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch;
+}
+
+unsafe fn digest_matches() -> bool {
+    if sha_scratch_init(sha_scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1
+        || sha256_compute(
+            ((&BUFFER[0]) + 11) as *const u8,
+            20,
+            (&mut ACTUAL_DIGEST[0]),
+            sha_scratch()
+        ) != 1 {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < 32 {
+        if volatile_load((&ACTUAL_DIGEST[0]) + index)
+            != volatile_load((&EXPECTED_DIGEST[0]) + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn run_client(report: u64) -> never {
+    let a_send: u64 = config(PROVIDER_A_SEND_OFFSET);
+    let b_send: u64 = config(PROVIDER_B_SEND_OFFSET);
+    let reply_receive: u64 = config(REPLY_RECEIVE_OFFSET);
+    let a_process: u64 = config(PROVIDER_A_PROCESS_OFFSET);
+    let b_process: u64 = config(PROVIDER_B_PROCESS_OFFSET);
+    if a_send == 0 || b_send == 0 || reply_receive == 0
+        || a_process == 0 || b_process == 0 || a_send == b_send
+        || a_process == b_process || config(A_WITHDRAWN_OFFSET) != 0 {
+        stop();
+    }
+    emit(report, (&CLIENT_ONLINE[0]), 33);
+    progress(1);
+
+    if !run_prefix(
+        a_send,
+        a_process,
+        1,
+        config(PROVIDER_A_GENERATION_OFFSET),
+        0x101,
+        0x102,
+        1
+    ) { stop(); }
+    build_read(4, 0x102);
+    exchange(a_send, a_process);
+    if !header(16, RERROR, 4) || get_u16(7) != 7
+        || !bytes_equal(9, (&UNAVAILABLE[0]), 7) {
+        stop();
+    }
+    emit(report, (&A_ERROR_PASS[0]), 39);
+    progress(2);
+
+    while config(A_WITHDRAWN_OFFSET) != 1 { yield_once(); }
+    build_version();
+    if send_fragment(a_send, 0) != ERR_CAPABILITY_DENIED { stop(); }
+    emit(report, (&STALE_PASS[0]), 40);
+    progress(3);
+    emit(report, (&FALLBACK_PASS[0]), 45);
+
+    if !run_prefix(
+        b_send,
+        b_process,
+        2,
+        config(PROVIDER_B_GENERATION_OFFSET),
+        0x201,
+        0x202,
+        10
+    ) { stop(); }
+    build_read(13, 0x202);
+    exchange(b_send, b_process);
+    if !header(31, RREAD, 13) || get_u32(7) != 20
+        || !bytes_equal(11, (&EXPECTED_OBJECT[0]), 20) {
+        stop();
+    }
+    emit(report, (&B_READ_PASS[0]), 46);
+    if !digest_matches() { stop(); }
+    emit(report, (&SHA_PASS[0]), 39);
+    progress(4);
+
+    build_clunk(14, 0x202);
+    exchange(b_send, b_process);
+    if !header(7, RCLUNK, 14) { stop(); }
+    emit(report, (&B_CLUNK_PASS[0]), 39);
+    emit(report, (&FINAL_PASS[0]), 40);
+    progress(5);
+    stop();
+}
+
+@export
+@no_mangle
+@link_section(".text.entry")
+pub unsafe fn _start(report_capability: u64, bootstrap_role: u64) -> never {
+    let role: u64 = config(ROLE_OFFSET);
+    if report_capability == 0 || role != bootstrap_role {
+        stop();
+    }
+    if role == ROLE_WITNESS {
+        emit(report_capability, (&WITNESS_ONLINE[0]), 49);
+        progress(1);
+        stop();
+    }
+    if role != ROLE_CLIENT { stop(); }
+    run_client(report_capability);
+}

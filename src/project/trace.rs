@@ -26,7 +26,7 @@
 //! performed another effect before a crash, cancellation, or retry. Such
 //! effects require their own idempotency or recovery protocol.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -36,14 +36,24 @@ use sha2::{Digest, Sha256};
 use crate::hgraph::ExecutableOp;
 use crate::ir::PlanNodeId;
 
-use super::model::{Artifact, OExecutionResult};
-use super::plan::ProjectPlanOperation;
+use super::model::{Artifact, OExecutionResult, RouteFailureContinuation, RoutePolicy};
+use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 
 /// Version of the deterministic project-attempt event vocabulary.
 ///
-/// Version 2 adds an execution-context header and distinguishes route
-/// settlement from coordinator aborts.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 2;
+/// Version 2 added an execution-context header and distinguished route
+/// settlement from coordinator aborts. Version 3 adds the checked decision
+/// evidence used before an ordered selector may activate its next branch.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 3;
+
+const PROJECT_LOGICAL_GRAPH_DIGEST_DOMAIN: &[u8] = b"ostadix.project-hgraph.logical/v1\0";
+
+pub(crate) fn project_logical_graph_digest(project: &ProjectHGraph) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECT_LOGICAL_GRAPH_DIGEST_DOMAIN);
+    hasher.update(project.to_text().as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// Context binding shared by every event in one project execution attempt.
 ///
@@ -267,6 +277,77 @@ impl TryFrom<&OExecutionResult> for ProjectRouteOutcome {
     }
 }
 
+/// Evidence class used by the hosted coordinator to decide whether another
+/// ordered alternative may start after an unsuccessful branch.
+///
+/// `DeclaredIdempotent` remains an author declaration bound by the bundle
+/// digest. It is not an independently verified sandbox, fence, or effect log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectContinuationEvidence {
+    /// Every assessed route was guard-skipped, so no child process started.
+    NoExecution,
+    /// Every child process that started carried a bundle-bound
+    /// `declared_idempotent` continuation contract.
+    DeclaredIdempotent,
+    /// At least one child process started without a safe continuation contract.
+    UnprovenEffects,
+}
+
+/// One checked admission/denial for the next ordered route alternative.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectContinuationDecision {
+    /// Route that would become the next selected alternative.
+    pub next_route_id: String,
+    /// Routes whose completed executions were considered, in coordinator order.
+    pub assessed_route_ids: Vec<String>,
+    pub evidence: ProjectContinuationEvidence,
+    pub admitted: bool,
+}
+
+impl ProjectContinuationDecision {
+    pub fn new(
+        next_route_id: impl Into<String>,
+        assessed_route_ids: Vec<String>,
+        evidence: ProjectContinuationEvidence,
+    ) -> Result<Self, ProjectTraceError> {
+        let decision = Self {
+            next_route_id: next_route_id.into(),
+            assessed_route_ids,
+            admitted: !matches!(evidence, ProjectContinuationEvidence::UnprovenEffects),
+            evidence,
+        };
+        decision.validate()?;
+        Ok(decision)
+    }
+
+    fn validate(&self) -> Result<(), ProjectTraceError> {
+        validate_label(&self.next_route_id, "next route id")?;
+        if self.assessed_route_ids.is_empty() {
+            return Err(ProjectTraceError::InvalidEvent(
+                "continuation decision has no assessed routes".to_string(),
+            ));
+        }
+        let mut prior = BTreeMap::<&str, ()>::new();
+        for route_id in &self.assessed_route_ids {
+            validate_label(route_id, "assessed route id")?;
+            if prior.insert(route_id.as_str(), ()).is_some() {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "continuation decision repeats an assessed route".to_string(),
+                ));
+            }
+        }
+        let expected_admitted =
+            !matches!(self.evidence, ProjectContinuationEvidence::UnprovenEffects);
+        if self.admitted != expected_admitted {
+            return Err(ProjectTraceError::InvalidEvent(
+                "continuation admission disagrees with its evidence class".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Lifecycle state of one project-plan operation attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,6 +402,10 @@ pub struct ProjectAttemptEvent {
     /// text is not retained because host paths and tool diagnostics are often
     /// nondeterministic.
     pub failure_sha256: Option<String>,
+    /// Present only on the unsuccessful terminal route event that decides
+    /// whether the next ordered alternative may start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ProjectContinuationDecision>,
 }
 
 impl ProjectAttemptEvent {
@@ -330,6 +415,7 @@ impl ProjectAttemptEvent {
         state: ProjectAttemptState,
         outcome: Option<ProjectRouteOutcome>,
         failure_sha256: Option<String>,
+        continuation: Option<ProjectContinuationDecision>,
     ) -> Self {
         Self {
             coordinator_ordinal,
@@ -340,6 +426,7 @@ impl ProjectAttemptEvent {
             state,
             outcome,
             failure_sha256,
+            continuation,
         }
     }
 
@@ -358,9 +445,15 @@ impl ProjectAttemptEvent {
         if let Some(outcome) = &self.outcome {
             outcome.validate()?;
         }
+        if let Some(continuation) = &self.continuation {
+            continuation.validate()?;
+        }
         match self.state {
             ProjectAttemptState::Ready | ProjectAttemptState::Started => {
-                if self.outcome.is_some() || self.failure_sha256.is_some() {
+                if self.outcome.is_some()
+                    || self.failure_sha256.is_some()
+                    || self.continuation.is_some()
+                {
                     return Err(ProjectTraceError::InvalidEvent(
                         "nonterminal attempt event carries terminal data".to_string(),
                     ));
@@ -372,7 +465,10 @@ impl ProjectAttemptEvent {
                         "route attempt uses the non-route Finished state".to_string(),
                     ));
                 }
-                if self.outcome.is_some() || self.failure_sha256.is_some() {
+                if self.outcome.is_some()
+                    || self.failure_sha256.is_some()
+                    || self.continuation.is_some()
+                {
                     return Err(ProjectTraceError::InvalidEvent(
                         "finished non-route event carries route or failure data".to_string(),
                     ));
@@ -394,6 +490,17 @@ impl ProjectAttemptEvent {
                 if self.failure_sha256.is_some() {
                     return Err(ProjectTraceError::InvalidEvent(
                         "route settlement event carries an abort fingerprint".to_string(),
+                    ));
+                }
+                if self.state == ProjectAttemptState::SettledSuccess && self.continuation.is_some()
+                {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "successful route settlement carries a continuation decision".to_string(),
+                    ));
+                }
+                if self.continuation.is_some() && self.branch.is_none() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "continuation decision is not bound to an alternative branch".to_string(),
                     ));
                 }
                 let exit_code = self
@@ -432,6 +539,11 @@ impl ProjectAttemptEvent {
                         "non-route abort carries a route outcome".to_string(),
                     ));
                 }
+                if self.continuation.is_some() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "aborted attempt carries a continuation decision".to_string(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -464,7 +576,13 @@ impl ProjectAttemptTrace {
         })
     }
 
-    /// Rebuild a trace from events while replaying every lifecycle invariant.
+    /// Rebuild a trace while checking event-local metadata, ordinals, lifecycle
+    /// transitions, and self-contained continuation inventory.
+    ///
+    /// This structural replay has no trusted project plan, so it cannot prove
+    /// that a continuation names the planned next branch or that its evidence
+    /// matches bundle-bound route contracts. Use [`Self::try_from_project_events`]
+    /// when those semantic checks are required.
     pub fn try_from_events(
         header: ProjectAttemptTraceHeader,
         events: impl IntoIterator<Item = ProjectAttemptEvent>,
@@ -473,6 +591,30 @@ impl ProjectAttemptTrace {
         for event in events {
             trace.record(event)?;
         }
+        Ok(trace)
+    }
+
+    /// Rebuild a trace and validate it against one trusted Project HGraph.
+    ///
+    /// In addition to structural replay, this checks the trace header, exact
+    /// plan-operation identities, ordered-branch admission, the exact next
+    /// alternative, and continuation evidence recomputed from RoutePlanFacts.
+    pub fn try_from_project_events(
+        project: &ProjectHGraph,
+        header: ProjectAttemptTraceHeader,
+        events: impl IntoIterator<Item = ProjectAttemptEvent>,
+    ) -> Result<Self, ProjectTraceError> {
+        let canonical_graph = project.plan.to_hgraph().map_err(|error| {
+            ProjectTraceError::InvalidMetadata(format!("trusted project plan is invalid: {error}"))
+        })?;
+        if canonical_graph != project.graph {
+            return Err(ProjectTraceError::InvalidMetadata(
+                "trusted Project HGraph differs from its canonical plan projection".to_string(),
+            ));
+        }
+        validate_project_header(project, &header)?;
+        let trace = Self::try_from_events(header, events)?;
+        trace.validate_project_semantics(project)?;
         Ok(trace)
     }
 
@@ -508,14 +650,14 @@ impl ProjectAttemptTrace {
         &mut self,
         identity: &ProjectAttemptIdentity,
     ) -> Result<(), ProjectTraceError> {
-        self.record_state(identity, ProjectAttemptState::Ready, None, None)
+        self.record_state(identity, ProjectAttemptState::Ready, None, None, None)
     }
 
     pub fn record_started(
         &mut self,
         identity: &ProjectAttemptIdentity,
     ) -> Result<(), ProjectTraceError> {
-        self.record_state(identity, ProjectAttemptState::Started, None, None)
+        self.record_state(identity, ProjectAttemptState::Started, None, None, None)
     }
 
     /// Record successful completion of a non-route project operation.
@@ -523,7 +665,7 @@ impl ProjectAttemptTrace {
         &mut self,
         identity: &ProjectAttemptIdentity,
     ) -> Result<(), ProjectTraceError> {
-        self.record_state(identity, ProjectAttemptState::Finished, None, None)
+        self.record_state(identity, ProjectAttemptState::Finished, None, None, None)
     }
 
     /// Record a route result whose process status is successful.
@@ -537,6 +679,7 @@ impl ProjectAttemptTrace {
             ProjectAttemptState::SettledSuccess,
             Some(outcome),
             None,
+            None,
         )
     }
 
@@ -546,11 +689,23 @@ impl ProjectAttemptTrace {
         identity: &ProjectAttemptIdentity,
         outcome: ProjectRouteOutcome,
     ) -> Result<(), ProjectTraceError> {
+        self.record_settled_failure_with_continuation(identity, outcome, None)
+    }
+
+    /// Record an unsuccessful route settlement together with the checked
+    /// admission/denial governing the next ordered alternative.
+    pub fn record_settled_failure_with_continuation(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        outcome: ProjectRouteOutcome,
+        continuation: Option<ProjectContinuationDecision>,
+    ) -> Result<(), ProjectTraceError> {
         self.record_state(
             identity,
             ProjectAttemptState::SettledFailure,
             Some(outcome),
             None,
+            continuation,
         )
     }
 
@@ -560,7 +715,24 @@ impl ProjectAttemptTrace {
         identity: &ProjectAttemptIdentity,
         outcome: ProjectRouteOutcome,
     ) -> Result<(), ProjectTraceError> {
-        self.record_state(identity, ProjectAttemptState::Skipped, Some(outcome), None)
+        self.record_skipped_with_continuation(identity, outcome, None)
+    }
+
+    /// Record a guard-skipped route result and any ordered continuation that
+    /// this no-execution settlement admits.
+    pub fn record_skipped_with_continuation(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        outcome: ProjectRouteOutcome,
+        continuation: Option<ProjectContinuationDecision>,
+    ) -> Result<(), ProjectTraceError> {
+        self.record_state(
+            identity,
+            ProjectAttemptState::Skipped,
+            Some(outcome),
+            None,
+            continuation,
+        )
     }
 
     /// Record an infrastructure/coordinator abort.
@@ -579,6 +751,7 @@ impl ProjectAttemptTrace {
             ProjectAttemptState::Aborted,
             outcome,
             Some(sha256_hex(normalized_failure.as_ref())),
+            None,
         )
     }
 
@@ -596,6 +769,7 @@ impl ProjectAttemptTrace {
                 actual: event.coordinator_ordinal,
             });
         }
+        self.validate_continuation_history(&event)?;
         let identity = event.identity();
 
         match self.attempts.get(&event.plan_node) {
@@ -640,12 +814,192 @@ impl ProjectAttemptTrace {
         Ok(())
     }
 
+    fn validate_continuation_history(
+        &self,
+        event: &ProjectAttemptEvent,
+    ) -> Result<(), ProjectTraceError> {
+        let Some(decision) = &event.continuation else {
+            return Ok(());
+        };
+        let branch = event.branch.ok_or_else(|| {
+            ProjectTraceError::InvalidEvent(
+                "continuation decision is not bound to an alternative branch".to_string(),
+            )
+        })?;
+        let mut terminal_events = self
+            .events
+            .iter()
+            .filter(|prior| {
+                prior.branch == Some(branch)
+                    && prior.route_id.is_some()
+                    && matches!(
+                        prior.state,
+                        ProjectAttemptState::SettledSuccess
+                            | ProjectAttemptState::SettledFailure
+                            | ProjectAttemptState::Skipped
+                    )
+            })
+            .collect::<Vec<_>>();
+        terminal_events.push(event);
+        let observed = terminal_events
+            .iter()
+            .map(|terminal| {
+                terminal
+                    .route_id
+                    .clone()
+                    .expect("filtered continuation event identifies a route")
+            })
+            .collect::<Vec<_>>();
+        if observed != decision.assessed_route_ids {
+            return Err(ProjectTraceError::InvalidEvent(
+                "continuation decision route inventory disagrees with terminal branch events"
+                    .to_string(),
+            ));
+        }
+        let any_executed = terminal_events
+            .iter()
+            .any(|terminal| terminal.state != ProjectAttemptState::Skipped);
+        match decision.evidence {
+            ProjectContinuationEvidence::NoExecution if any_executed => {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "no-execution continuation includes an executed route".to_string(),
+                ));
+            }
+            ProjectContinuationEvidence::DeclaredIdempotent
+            | ProjectContinuationEvidence::UnprovenEffects
+                if !any_executed =>
+            {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "executed-route continuation evidence has no executed route".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_project_semantics(&self, project: &ProjectHGraph) -> Result<(), ProjectTraceError> {
+        for event in &self.events {
+            let operation = project
+                .plan
+                .operations
+                .get(event.plan_node.0)
+                .filter(|operation| operation.id == event.plan_node)
+                .ok_or_else(|| {
+                    ProjectTraceError::InvalidMetadata(format!(
+                        "trace references missing project plan node {}",
+                        event.plan_node.0
+                    ))
+                })?;
+            let expected = ProjectAttemptIdentity::from_operation(operation)?;
+            if event.identity() != expected {
+                return Err(ProjectTraceError::InvalidMetadata(format!(
+                    "trace identity for plan node {} differs from the trusted project plan",
+                    event.plan_node.0
+                )));
+            }
+        }
+
+        let ordered = matches!(
+            project.plan.policy,
+            RoutePolicy::Fallback | RoutePolicy::AnySuccess
+        );
+        if !ordered {
+            if self.events.iter().any(|event| event.continuation.is_some()) {
+                return Err(ProjectTraceError::InvalidEvent(
+                    "non-ordered project trace carries a continuation decision".to_string(),
+                ));
+            }
+            return validate_completed_selection(project, &self.events);
+        }
+
+        let mut admitted_branches = BTreeSet::from([0_usize]);
+        let mut highest_observed_branch = 0_usize;
+        for (event_index, event) in self.events.iter().enumerate() {
+            let Some(branch) = event.branch else {
+                continue;
+            };
+            if branch >= project.plan.alternatives.len() {
+                return Err(ProjectTraceError::InvalidEvent(format!(
+                    "trace references out-of-range alternative branch {branch}"
+                )));
+            }
+            if !admitted_branches.contains(&branch) {
+                return Err(ProjectTraceError::InvalidEvent(format!(
+                    "alternative branch {branch} emitted an event before its continuation was admitted"
+                )));
+            }
+            if branch < highest_observed_branch {
+                return Err(ProjectTraceError::InvalidEvent(format!(
+                    "alternative branch {branch} emitted an event after branch {highest_observed_branch} started"
+                )));
+            }
+            highest_observed_branch = highest_observed_branch.max(branch);
+
+            let is_terminal_alternative = event
+                .route_id
+                .as_ref()
+                .is_some_and(|route_id| project.plan.alternatives.get(branch) == Some(route_id));
+            let settled_unsuccessfully = matches!(
+                event.state,
+                ProjectAttemptState::SettledFailure | ProjectAttemptState::Skipped
+            );
+            let has_next_alternative = branch + 1 < project.plan.alternatives.len();
+            let decision_required =
+                is_terminal_alternative && settled_unsuccessfully && has_next_alternative;
+
+            match (&event.continuation, decision_required) {
+                (None, true) => {
+                    return Err(ProjectTraceError::InvalidEvent(format!(
+                        "unsuccessful terminal alternative on branch {branch} lacks a continuation decision"
+                    )));
+                }
+                (Some(_), false) => {
+                    return Err(ProjectTraceError::InvalidEvent(format!(
+                        "continuation decision is not attached to an unsuccessful non-final terminal alternative on branch {branch}"
+                    )));
+                }
+                (None, false) => continue,
+                (Some(decision), true) => {
+                    validate_transitive_prerequisite_coverage(
+                        project,
+                        &self.events,
+                        event.plan_node,
+                        &mut BTreeSet::new(),
+                    )?;
+                    let expected_next = &project.plan.alternatives[branch + 1];
+                    if &decision.next_route_id != expected_next {
+                        return Err(ProjectTraceError::InvalidEvent(format!(
+                            "continuation from branch {branch} names `{}` instead of planned alternative `{expected_next}`",
+                            decision.next_route_id
+                        )));
+                    }
+                    let expected_evidence = recompute_continuation_evidence(
+                        project,
+                        &self.events[..=event_index],
+                        branch,
+                    )?;
+                    if decision.evidence != expected_evidence {
+                        return Err(ProjectTraceError::InvalidEvent(format!(
+                            "continuation evidence on branch {branch} differs from trusted RoutePlanFacts"
+                        )));
+                    }
+                    if decision.admitted {
+                        admitted_branches.insert(branch + 1);
+                    }
+                }
+            }
+        }
+        validate_completed_selection(project, &self.events)
+    }
+
     fn record_state(
         &mut self,
         identity: &ProjectAttemptIdentity,
         state: ProjectAttemptState,
         outcome: Option<ProjectRouteOutcome>,
         failure_sha256: Option<String>,
+        continuation: Option<ProjectContinuationDecision>,
     ) -> Result<(), ProjectTraceError> {
         let coordinator_ordinal = self.next_ordinal()?;
         self.record(ProjectAttemptEvent::new(
@@ -654,12 +1008,281 @@ impl ProjectAttemptTrace {
             state,
             outcome,
             failure_sha256,
+            continuation,
         ))
     }
 
     fn next_ordinal(&self) -> Result<u64, ProjectTraceError> {
         u64::try_from(self.events.len()).map_err(|_| ProjectTraceError::OrdinalOverflow)
     }
+}
+
+fn validate_project_header(
+    project: &ProjectHGraph,
+    header: &ProjectAttemptTraceHeader,
+) -> Result<(), ProjectTraceError> {
+    header.validate()?;
+    let expected_policy = project.plan.policy.token();
+    let expected = [
+        (
+            "project name",
+            header.project_name.as_str(),
+            project.plan.project_name.as_str(),
+        ),
+        (
+            "bundle digest",
+            header.bundle_digest.as_str(),
+            project.plan.bundle_digest.as_str(),
+        ),
+        (
+            "selection target",
+            header.target.as_str(),
+            project.plan.target.as_str(),
+        ),
+        (
+            "route policy",
+            header.policy.as_str(),
+            expected_policy.as_str(),
+        ),
+    ];
+    for (field, actual, expected) in expected {
+        if actual != expected {
+            return Err(ProjectTraceError::InvalidMetadata(format!(
+                "trace {field} `{actual}` differs from trusted project `{expected}`"
+            )));
+        }
+    }
+    let expected_graph_digest = project_logical_graph_digest(project);
+    if header.logical_graph_digest != expected_graph_digest {
+        return Err(ProjectTraceError::InvalidMetadata(
+            "trace logical graph digest differs from the trusted Project HGraph".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transitive_prerequisite_coverage(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+    consumer: PlanNodeId,
+    visiting: &mut BTreeSet<PlanNodeId>,
+) -> Result<(), ProjectTraceError> {
+    if !visiting.insert(consumer) {
+        return Err(ProjectTraceError::InvalidMetadata(format!(
+            "trusted project prerequisite cycle reaches plan node {}",
+            consumer.0
+        )));
+    }
+    let operation = project
+        .plan
+        .operations
+        .get(consumer.0)
+        .filter(|operation| operation.id == consumer)
+        .ok_or_else(|| {
+            ProjectTraceError::InvalidMetadata(format!(
+                "trace references missing project plan node {}",
+                consumer.0
+            ))
+        })?;
+    let consumer_ready = events
+        .iter()
+        .position(|event| event.plan_node == consumer && event.state == ProjectAttemptState::Ready)
+        .ok_or_else(|| {
+            ProjectTraceError::InvalidEvent(format!(
+                "plan node {} has no Ready lifecycle event",
+                consumer.0
+            ))
+        })?;
+
+    for dependency in &operation.dependencies {
+        let ProjectDependency::Success(prerequisite) = dependency else {
+            continue;
+        };
+        let prerequisite_operation = project
+            .plan
+            .operations
+            .get(prerequisite.0)
+            .filter(|operation| operation.id == *prerequisite)
+            .ok_or_else(|| {
+                ProjectTraceError::InvalidMetadata(format!(
+                    "plan node {} has missing Success prerequisite {}",
+                    consumer.0, prerequisite.0
+                ))
+            })?;
+        if !matches!(prerequisite_operation.op, ExecutableOp::RunRoute { .. }) {
+            return Err(ProjectTraceError::InvalidMetadata(format!(
+                "plan node {} has non-route Success prerequisite {}",
+                consumer.0, prerequisite.0
+            )));
+        }
+        let (terminal_index, terminal) = events
+            .iter()
+            .enumerate()
+            .find(|(_, event)| event.plan_node == *prerequisite && event.state.is_terminal())
+            .ok_or_else(|| {
+                ProjectTraceError::InvalidEvent(format!(
+                    "plan node {} omits terminal lifecycle coverage for prerequisite {}",
+                    consumer.0, prerequisite.0
+                ))
+            })?;
+        if terminal_index >= consumer_ready {
+            return Err(ProjectTraceError::InvalidEvent(format!(
+                "prerequisite plan node {} settled after dependent plan node {} became Ready",
+                prerequisite.0, consumer.0
+            )));
+        }
+        if !matches!(
+            terminal.state,
+            ProjectAttemptState::SettledSuccess | ProjectAttemptState::Skipped
+        ) {
+            return Err(ProjectTraceError::InvalidEvent(format!(
+                "dependent plan node {} became Ready without successful prerequisite {}",
+                consumer.0, prerequisite.0
+            )));
+        }
+        validate_transitive_prerequisite_coverage(project, events, *prerequisite, visiting)?;
+    }
+    visiting.remove(&consumer);
+    Ok(())
+}
+
+fn validate_completed_selection(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+) -> Result<(), ProjectTraceError> {
+    let Some((_, selection_finished)) = events.iter().enumerate().find(|(_, event)| {
+        event.state == ProjectAttemptState::Finished
+            && project
+                .plan
+                .operations
+                .get(event.plan_node.0)
+                .is_some_and(|operation| matches!(operation.op, ExecutableOp::SelectRoute { .. }))
+    }) else {
+        // Stalled/aborted coordinators intentionally retain partial traces with
+        // no successfully committed SelectRoute root.
+        return Ok(());
+    };
+    let selection_ready = events
+        .iter()
+        .position(|event| {
+            event.plan_node == selection_finished.plan_node
+                && event.state == ProjectAttemptState::Ready
+        })
+        .ok_or_else(|| {
+            ProjectTraceError::InvalidEvent(
+                "completed SelectRoute has no Ready lifecycle event".to_string(),
+            )
+        })?;
+    let (terminal_index, terminal) = events
+        .iter()
+        .enumerate()
+        .rfind(|(_, event)| {
+            let Some(branch) = event.branch else {
+                return false;
+            };
+            event
+                .route_id
+                .as_ref()
+                .is_some_and(|route_id| project.plan.alternatives.get(branch) == Some(route_id))
+                && matches!(
+                    event.state,
+                    ProjectAttemptState::SettledSuccess
+                        | ProjectAttemptState::SettledFailure
+                        | ProjectAttemptState::Skipped
+                )
+        })
+        .ok_or_else(|| {
+            ProjectTraceError::InvalidEvent(
+                "completed SelectRoute omits its terminal alternative lifecycle".to_string(),
+            )
+        })?;
+    if terminal_index >= selection_ready {
+        return Err(ProjectTraceError::InvalidEvent(
+            "SelectRoute became Ready before its selected terminal alternative settled".to_string(),
+        ));
+    }
+    validate_transitive_prerequisite_coverage(
+        project,
+        events,
+        terminal.plan_node,
+        &mut BTreeSet::new(),
+    )?;
+
+    if matches!(
+        project.plan.policy,
+        RoutePolicy::Fallback | RoutePolicy::AnySuccess
+    ) && terminal.state != ProjectAttemptState::SettledSuccess
+    {
+        let branch = terminal
+            .branch
+            .expect("filtered terminal alternative has a branch");
+        let exhausted = branch + 1 == project.plan.alternatives.len();
+        let denied = terminal
+            .continuation
+            .as_ref()
+            .is_some_and(|decision| !decision.admitted);
+        if !exhausted && !denied {
+            return Err(ProjectTraceError::InvalidEvent(format!(
+                "completed ordered selection stops after admitted branch {branch} without a later terminal alternative"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn recompute_continuation_evidence(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+    branch: usize,
+) -> Result<ProjectContinuationEvidence, ProjectTraceError> {
+    let mut saw_executed = false;
+    let mut every_executed_route_is_idempotent = true;
+    for event in events.iter().filter(|event| {
+        event.branch == Some(branch)
+            && event.route_id.is_some()
+            && matches!(
+                event.state,
+                ProjectAttemptState::SettledSuccess
+                    | ProjectAttemptState::SettledFailure
+                    | ProjectAttemptState::Skipped
+            )
+    }) {
+        if event.state == ProjectAttemptState::Skipped {
+            continue;
+        }
+        saw_executed = true;
+        let operation = project
+            .plan
+            .operations
+            .get(event.plan_node.0)
+            .filter(|operation| operation.id == event.plan_node)
+            .ok_or_else(|| {
+                ProjectTraceError::InvalidMetadata(format!(
+                    "trace references missing project plan node {}",
+                    event.plan_node.0
+                ))
+            })?;
+        let continuation = operation
+            .route_facts
+            .as_ref()
+            .ok_or_else(|| {
+                ProjectTraceError::InvalidMetadata(format!(
+                    "run-route plan node {} lacks RoutePlanFacts",
+                    event.plan_node.0
+                ))
+            })?
+            .failure_continuation;
+        every_executed_route_is_idempotent &=
+            continuation == RouteFailureContinuation::DeclaredIdempotent;
+    }
+
+    Ok(if !saw_executed {
+        ProjectContinuationEvidence::NoExecution
+    } else if every_executed_route_is_idempotent {
+        ProjectContinuationEvidence::DeclaredIdempotent
+    } else {
+        ProjectContinuationEvidence::UnprovenEffects
+    })
 }
 
 /// Deterministic trace-construction failure.
@@ -864,7 +1487,7 @@ mod tests {
         assert_eq!(trace.format_version, PROJECT_ATTEMPT_TRACE_VERSION);
         assert_eq!(trace.header(), &expected);
         let serialized = serde_json::to_value(&trace).unwrap();
-        assert_eq!(serialized["format_version"], 2);
+        assert_eq!(serialized["format_version"], 3);
         assert_eq!(serialized["header"]["project_name"], "project");
         assert_eq!(serialized["header"]["execution_attempt_id"], "attempt-1");
 
@@ -1036,7 +1659,8 @@ mod tests {
     fn trace_rejects_noncontiguous_external_ordinal() {
         let identity = identity(1);
         let mut trace = ProjectAttemptTrace::new(header()).unwrap();
-        let event = ProjectAttemptEvent::new(1, &identity, ProjectAttemptState::Ready, None, None);
+        let event =
+            ProjectAttemptEvent::new(1, &identity, ProjectAttemptState::Ready, None, None, None);
         assert!(matches!(
             trace.record(event),
             Err(ProjectTraceError::NoncontiguousOrdinal {
@@ -1075,6 +1699,7 @@ mod tests {
             &identity,
             ProjectAttemptState::SettledSuccess,
             Some(outcome),
+            None,
             None,
         );
         let value = serde_json::to_value(event).unwrap();

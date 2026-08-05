@@ -1,5 +1,5 @@
 schema_version = 2
-required_gate_count = 22
+required_gate_count = 23
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -457,6 +457,7 @@ positive_claims = [
 nonclaims = [
   "Mode 26 executes the same bounded Linux-ABI ELF and a native O-core Plan-9-style client; it does not boot Linux or Plan 9, run a Plan 9 binary, provide a distribution, root filesystem, or dynamic linker, or establish a general foreign ABI",
   "The exact 128-byte 9P2000 corpus exposes only the generation-bound /srv/linux/status path; it is not a general 9P server, Plan 9 namespace or mount environment, network transport, persistent filesystem, or guest-agent framework",
+  "Generation 2 is the same server implementation serving a later, different snapshot after generation 1 completed; this is not two-provider routing for one immutable object, requester-local fallback, fresh provider-B session/fid reconstruction, causal multi-attempt tracing, or live OWRECEIPT emission",
   "QEMU TCG CPL3 execution is not KVM/SVM or physical-hardware evidence",
   "The gate has no PCI or physical-device assignment, DMA mapping or isolation, IOMMU isolation, interrupt remapping, or hardware reset",
 ]
@@ -488,6 +489,52 @@ expected_markers = [
   "M7 Linux/9P resources reclaimed: PASS",
   "M7 Linux/9P post-lifecycle timer: online",
   "live Linux/Plan 9 9P2000 lifecycle: PASS",
+]
+
+[[gate]]
+id = "m7b-logical-read-fallback-live"
+required = true
+milestone = "M7B-1 native LogicalRead Mode 31"
+script = "ocore/kernel/smoke-m7b-logical-read-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "file", "objdump", "nm", "shasum", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "One deterministic provider ELF is instantiated as two generation-distinct isolated CPL3 provider principals; distinct A/B service bindings, endpoints, and client call capabilities are admitted before one requester-local LogicalRead for an exact immutable 20-byte object",
+  "Provider A returns a valid terminal 9P Rerror, faults, and has its local route and call authority withdrawn; the client proves A stale before staged provider-B activation, then completes a fresh B-local version/attach/walk/open/read/clunk sequence with different fids, verifies the pinned SHA-256, and reaches separate cleanup, full reclamation, witness-survival, and post-timer evidence",
+]
+nonclaims = [
+  "This is the bounded M7B-1 local mechanism, not complete M7B: requester and router are one principal, both providers instantiate one implementation artifact, and the route set is fixed local configuration rather than a general route registry",
+  "The kernel causal state and serial transcript are non-persisted unsigned diagnostics, not a live OWRECEIPT, attestation, Governor commitment, lease protocol, or distributed consensus evidence",
+  "The exact read-only 9P2000 corpus is not general 9P, WorldFS, a writable filesystem, fid migration, exactly-once effects, network transport, persistence, Linux or Plan 9 boot, or a foreign KernelWorld",
+  "Forced QEMU TCG CPL3 execution is not KVM/SVM, physical-hardware, G7/G8, PCI/device assignment, DMA/IOMMU isolation, interrupt-remapping, or hardware-reset evidence",
+]
+expected_markers = [
+  "M7B-1 OVFS immutable corpus: PASS",
+  "M7B-1 one provider ELF, two CPL3 instances: PASS",
+  "M7B-1 four isolated native CSpaces/address spaces: PASS",
+  "M7B-1 A/B identities and distinct routes admitted: PASS",
+  "M7B-1 local 9P fragment path: armed",
+  "M7B-1 provider A: online",
+  "M7B-1 client LogicalRead: online",
+  "M7B-1 witness unrelated native principal: online",
+  "M7B-1 provider A read: unavailable",
+  "M7B-1 provider A Rerror consumed: PASS",
+  "M7B-1 provider A: deliberate fault",
+  "M7B-1 provider A route withdrawal/stale generation: PASS",
+  "M7B-1 stale provider A capability: PASS",
+  "M7B-1 fallback A to B after withdrawal: PASS",
+  "M7B-1 provider B staged activation after stale proof: PASS",
+  "M7B-1 provider B: online",
+  "M7B-1 provider B immutable read: PASS",
+  "M7B-1 provider B immutable 20-byte read: PASS",
+  "M7B-1 native LogicalRead SHA-256: PASS",
+  "M7B-1 native LogicalRead fallback: PASS",
+  "M7B-1 non-persisted causal attempt (not OWRECEIPT): PASS",
+  "M7B-1 provider A physical/process cleanup: PASS",
+  "M7B-1 provider B session/queues cleanup: PASS",
+  "M7B-1 bounded mechanism resources reclaimed: PASS",
+  "M7B-1 post-lifecycle timer: online",
+  "Mode 31 M7B-1 LogicalRead smoke: PASS",
 ]
 
 [[gate]]

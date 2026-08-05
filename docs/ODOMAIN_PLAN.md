@@ -21,6 +21,12 @@ later run on a World node, but the bounded native gates in this roadmap do not
 establish a replicated Governor, native node membership, WorldFS, physical
 resource registry, or distributed placement layer.
 
+The proposed additive split between node-local O-Machine/O-core authority,
+requester-local route selection, and replicated global facts is recorded in
+[`LOCAL_AUTHORITY_ROUTING_AMENDMENT.md`](LOCAL_AUTHORITY_ROUTING_AMENDMENT.md).
+That clarification does not alter the sealed contracts and is not an
+implementation or evidence claim.
+
 ## 1. Scope and terminology
 
 O-core remains the small privileged mechanism layer. It owns CPU entry,
@@ -700,6 +706,74 @@ environment, network transport, persistent filesystem, or guest-agent path. It
 does not boot Linux or Plan 9 and adds no general Linux ABI, hardware
 virtualization, PCI/device assignment, DMA/IOMMU isolation, or physical-device
 evidence.
+
+Mode 26 also does not prove provider routing or request fallback. Generation 2
+is a replacement instance of the same server implementation, and it serves a
+later, different 20-byte snapshot only after generation 1's read and clunk have
+completed. The gate has no two-provider route set for one immutable object,
+requester-local route choice, recovery of one logical read on another provider,
+fresh second-provider session/fid reconstruction, causal multi-attempt trace,
+or live `OWRECEIPT` emission.
+
+#### M7B: two-provider immutable 9P read fallback
+
+Status: **partially implemented**. Mode 31 passes the bounded M7B-1 local
+mechanism gate; the complete milestone, persistent attempt evidence, live
+receipt binding, provider-implementation diversity, and later KernelWorld
+escalations remain open.
+
+M7B is intentionally narrower than general WorldFS or general retry. Its first
+qualifying gate should require all of the following:
+
+- one native client and an unprivileged requester-local route coordinator;
+- two independently admitted native CPL3 9P provider principals, both bound
+  before the request to the same immutable, content-addressed 20-byte object
+  under one logical operation but with distinct provider identities;
+- a first attempt on provider A that is accepted and then ends in a valid
+  terminal failure or withdrawal before successful logical settlement;
+- local exclusion of A and stale denial of A's generation-bound call authority,
+  without describing that observation as owner revocation or physical
+  reclamation;
+- a second attempt on provider B using fresh `version`, `attach`, `walk`,
+  `open`, `read`, and `clunk` exchanges and a fresh provider-local fid;
+- exactly one successful logical result whose digest matches the admitted
+  object, plus a causal attempt trace recording A failure before B success;
+  and
+- complete bounded reclamation of A and B request/session resources while an
+  unrelated service remains live and a later timer fires.
+
+Mode 31 implements that first mechanism boundary in
+`ocore/kernel/smoke-m7b-logical-read-qemu.sh`. One deterministic provider ELF is
+instantiated in two isolated provider processes with distinct process/resource
+generations, CSpaces, address spaces, endpoints, service bindings, and call
+capabilities. A requester-local client/router principal has both routes before
+the request while B's service loop remains staged. A completes fresh 9P setup
+and returns a valid terminal `Rerror`; O-core then removes A's local route,
+retires its call authority, and the client proves the retained numeric handle
+stale. B starts only afterward and completes a fresh setup/read/clunk with
+provider-local fids, exact 20-byte bytes, and the pinned object digest.
+
+The kernel's bounded causal state requires A terminal failure and withdrawal
+before B activation, then B read, digest validation, and clunk before cleanup.
+It separately reports local route withdrawal, A owner-side physical/process
+cleanup, B session/queue cleanup, complete bounded resource reclamation,
+unrelated-witness survival, and a later timer. This state is volatile and
+non-persisted; its serial transcript is executable gate evidence, not a signed
+trace or live `OWRECEIPT`.
+
+M7B-1 intentionally combines requester and route coordinator, and both
+provider principals instantiate the same provider artifact. It therefore proves
+two coexisting, independently revocable provider principals rather than two
+independent implementations or packages. A later diversity claim requires
+distinct admitted provider artifacts and contracts. If M7B claims a live
+`OWRECEIPT`, it must first connect the currently offline Mode 30 format to the
+live request, object, provider generations, attempt outcomes, and settlement.
+An offline receipt fixture is not a substitute.
+
+M7B would still not establish mutable writes, fid migration, general 9P or
+WorldFS, network transport, exactly-once effects, Governor consensus, G7/G8,
+foreign-kernel boot, hardware virtualization, PCI/device assignment,
+DMA/IOMMU isolation, or physical-device evidence.
 
 These slices intentionally do not complete the broader milestone. Grow it in
 dependency slices: process identity and exit, console I/O, file descriptors and
