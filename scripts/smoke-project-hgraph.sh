@@ -112,8 +112,8 @@ require_count "$first" '^project-op p[0-9]+ kind=build-route:' 4
 require_count "$first" '^project-op p[0-9]+ kind=run-route:' 4
 require_count "$first" '^project-op p[0-9]+ kind=compare-route-results ' 1
 require_count "$first" '^project-op p[0-9]+ kind=select-route:verify_equivalent ' 1
-grep -Fq 'deps=[p3,p2]' "$first"
-grep -Fq 'deps=[p8,p7]' "$first"
+grep -Fq 'deps=[value:p3,success:p2]' "$first"
+grep -Fq 'deps=[value:p8,success:p7]' "$first"
 grep -Fq 'guards=[env:PR7_REQUIRED_ENV] env=[PLAN_VARIANT]' "$first"
 grep -Fq 'declared-pure=true' "$first"
 grep -Fq 'reads=[HostWorld,project:input.txt]' "$first"

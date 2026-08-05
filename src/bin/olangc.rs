@@ -236,6 +236,12 @@ struct Cli {
     #[arg(long = "routes-policy")]
     routes_policy: Option<String>,
 
+    /// Write the unsigned Project HGraph attempt trace as JSON. This is
+    /// available only for hosted project execution with --target script and
+    /// requires O_PROJECT_EXECUTOR=hgraph.
+    #[arg(long = "project-trace-out", value_name = "PATH")]
+    project_trace_out: Option<PathBuf>,
+
     /// Append the governed/ambient grounding report to `--target ir` output.
     /// This is a planner inspection view and does not perform placement.
     #[arg(long)]
@@ -277,8 +283,10 @@ fn main() -> Result<()> {
     if is_project {
         return compile_or_run_project(&cli, input_is_dir, &source);
     }
-    if cli.route.is_some() || cli.routes_policy.is_some() {
-        bail!("--route and --routes-policy are available only for project inputs");
+    if cli.route.is_some() || cli.routes_policy.is_some() || cli.project_trace_out.is_some() {
+        bail!(
+            "--route, --routes-policy, and --project-trace-out are available only for project inputs"
+        );
     }
 
     match cli.target {
@@ -363,10 +371,11 @@ fn load_project_bundle(
     input: &Path,
     input_is_dir: bool,
     source: &str,
+    exclusions: &[PathBuf],
 ) -> Result<o_lang::project::ProjectBundle> {
     if input_is_dir {
         let name = o_lang::project::name_from_path(input);
-        o_lang::project::assemble(input, &name, &[])
+        o_lang::project::assemble_excluding(input, &name, &[], exclusions)
     } else {
         o_lang::project::lower::extract_bundle_from_o(source)
     }
@@ -376,7 +385,17 @@ fn load_project_bundle(
 fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result<()> {
     use o_lang::project::RoutePolicy;
 
-    let bundle = load_project_bundle(&cli.input, input_is_dir, source)?;
+    if cli.project_trace_out.is_some() && cli.target != CompileTarget::Script {
+        bail!(
+            "--project-trace-out requires hosted project execution with --target script; compiled project binaries accept this option at runtime"
+        );
+    }
+    let exclusions = cli
+        .project_trace_out
+        .iter()
+        .cloned()
+        .collect::<Vec<PathBuf>>();
+    let bundle = load_project_bundle(&cli.input, input_is_dir, source, &exclusions)?;
     let policy_override = cli
         .routes_policy
         .as_deref()
@@ -386,7 +405,6 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
     if policy_override.is_some() && cli.route.is_none() {
         bail!("--routes-policy requires --route to name a project route or route set");
     }
-
     match cli.target {
         CompileTarget::Binary | CompileTarget::Wasm => {
             if cli.route.is_some() || policy_override.is_some() {
@@ -438,7 +456,12 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
             }
             result
         }
-        CompileTarget::Script => run_project_script(&bundle, cli.route.as_deref(), policy_override),
+        CompileTarget::Script => run_project_script(
+            &bundle,
+            cli.route.as_deref(),
+            policy_override,
+            cli.project_trace_out.as_deref(),
+        ),
         CompileTarget::Ir => {
             if cli.grounding {
                 bail!(
@@ -474,12 +497,12 @@ fn run_project_script(
     bundle: &o_lang::project::ProjectBundle,
     route: Option<&str>,
     policy: Option<o_lang::project::RoutePolicy>,
+    trace_out: Option<&Path>,
 ) -> Result<()> {
-    use o_lang::project::executor::run_selection_with_configured_executor;
     use o_lang::project::runtime::RunOptions;
     eprintln!("olangc: project script mode — running resolved route selection");
     let results =
-        run_selection_with_configured_executor(bundle, route, policy, &RunOptions::default())?;
+        execute_project_selection(bundle, route, policy, &RunOptions::default(), trace_out)?;
     for result in &results {
         print!("{}", result.summary());
     }
@@ -487,6 +510,55 @@ fn run_project_script(
         bail!("no route succeeded");
     }
     Ok(())
+}
+
+/// Execute through the configured project runtime and, when requested, retain
+/// the unsigned HGraph diagnostic trace on both successful and failed attempts.
+fn execute_project_selection(
+    bundle: &o_lang::project::ProjectBundle,
+    route: Option<&str>,
+    policy: Option<o_lang::project::RoutePolicy>,
+    opts: &o_lang::project::runtime::RunOptions,
+    trace_out: Option<&Path>,
+) -> Result<Vec<o_lang::project::OExecutionResult>> {
+    use o_lang::project::executor::{
+        execute_selection_with_configured_executor, write_project_attempt_trace,
+        ProjectExecutionError, PROJECT_EXECUTOR_ENV,
+    };
+
+    if trace_out.is_some()
+        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref() != Some(std::ffi::OsStr::new("hgraph"))
+    {
+        bail!(
+            "--project-trace-out requires {PROJECT_EXECUTOR_ENV}=hgraph; the legacy project runtime does not produce a Project HGraph attempt trace"
+        );
+    }
+
+    let execution = match execute_selection_with_configured_executor(bundle, route, policy, opts) {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let (Some(path), Some(project_error)) =
+                (trace_out, error.downcast_ref::<ProjectExecutionError>())
+            {
+                if let Err(trace_error) = write_project_attempt_trace(path, &project_error.trace) {
+                    return Err(error.context(format!(
+                        "additionally failed to retain the Project HGraph attempt trace: {trace_error:#}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(path) = trace_out {
+        let trace = execution
+            .trace
+            .as_ref()
+            .context("HGraph project execution returned no Project HGraph attempt trace")?;
+        write_project_attempt_trace(path, trace)?;
+    }
+
+    Ok(execution.results)
 }
 
 /// Generate a hosted Cargo project that embeds the serialized bundle and, at
@@ -608,7 +680,7 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
 
 /// Generate the `main.rs` for a compiled project binary. It embeds the bundle
 /// and supports `--list-routes`, `--route <ID>`, `--routes-policy <POLICY>`,
-/// and default-route execution.
+/// `--project-trace-out <PATH>`, and default-route execution.
 fn generate_project_main_rs(bin_name: &str, shim_include_lines: &[String]) -> String {
     let lib_name = bin_name.replace('-', "_");
     let shim_entries = if shim_include_lines.is_empty() {
@@ -621,7 +693,10 @@ fn generate_project_main_rs(bin_name: &str, shim_include_lines: &[String]) -> St
         r###"// AUTO-GENERATED by olangc. DO NOT EDIT.
 
 use ::{lib_name}::project::RoutePolicy;
-use ::{lib_name}::project::executor::run_selection_with_configured_executor;
+use ::{lib_name}::project::executor::{{
+    execute_selection_with_configured_executor, write_project_attempt_trace,
+    ProjectExecutionError, PROJECT_EXECUTOR_ENV,
+}};
 use ::{lib_name}::project::runtime::RunOptions;
 
 /// The serialized project bundle, embedded at compile time.
@@ -646,6 +721,7 @@ fn main() -> anyhow::Result<()> {{
     let mut list_routes = false;
     let mut route: Option<String> = None;
     let mut policy: Option<String> = None;
+    let mut trace_out: Option<std::path::PathBuf> = None;
     let mut i = 0;
     while i < args.len() {{
         match args[i].as_str() {{
@@ -668,14 +744,37 @@ fn main() -> anyhow::Result<()> {{
                         .ok_or_else(|| anyhow::anyhow!("--routes-policy requires a value"))?,
                 );
             }}
+            "--project-trace-out" => {{
+                i += 1;
+                trace_out = Some(std::path::PathBuf::from(
+                    args.get(i)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--project-trace-out requires a path"))?,
+                ));
+            }}
             other => return Err(anyhow::anyhow!("unknown argument: {{other}}")),
         }}
         i += 1;
     }}
 
     if list_routes {{
+        if trace_out.is_some() {{
+            return Err(anyhow::anyhow!(
+                "--project-trace-out requires project execution and cannot be combined with --list-routes"
+            ));
+        }}
         print!("{{}}", bundle.route_table());
         return Ok(());
+    }}
+
+    if trace_out.is_some()
+        && std::env::var_os(PROJECT_EXECUTOR_ENV).as_deref()
+            != Some(std::ffi::OsStr::new("hgraph"))
+    {{
+        return Err(anyhow::anyhow!(
+            "--project-trace-out requires {{PROJECT_EXECUTOR_ENV}}=hgraph; the legacy project runtime does not produce a Project HGraph attempt trace"
+        ));
     }}
 
     let policy = policy
@@ -684,12 +783,34 @@ fn main() -> anyhow::Result<()> {{
         .transpose()
         .map_err(anyhow::Error::msg)?;
     let opts = RunOptions::default();
-    let results = run_selection_with_configured_executor(
+    let execution = match execute_selection_with_configured_executor(
         &bundle,
         route.as_deref(),
         policy,
         &opts,
-    )?;
+    ) {{
+        Ok(execution) => execution,
+        Err(error) => {{
+            if let (Some(path), Some(project_error)) = (
+                trace_out.as_deref(),
+                error.downcast_ref::<ProjectExecutionError>(),
+            ) {{
+                if let Err(trace_error) = write_project_attempt_trace(path, &project_error.trace) {{
+                    return Err(error.context(format!(
+                        "additionally failed to retain the Project HGraph attempt trace: {{trace_error:#}}"
+                    )));
+                }}
+            }}
+            return Err(error);
+        }}
+    }};
+    if let Some(path) = trace_out.as_deref() {{
+        let trace = execution.trace.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "HGraph project execution returned no Project HGraph attempt trace"
+        ))?;
+        write_project_attempt_trace(path, trace)?;
+    }}
+    let results = execution.results;
     for result in &results {{
         print!("{{}}", result.summary());
     }}
@@ -1759,6 +1880,23 @@ mod tests {
     }
 
     #[test]
+    fn project_trace_cli_accepts_an_explicit_output_path() {
+        let cli = Cli::try_parse_from([
+            "olangc",
+            "project",
+            "--target",
+            "script",
+            "--project-trace-out",
+            "attempt.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.project_trace_out.as_deref(),
+            Some(Path::new("attempt.json"))
+        );
+    }
+
+    #[test]
     fn generated_runtime_includes_hgraph_modules() {
         let build_dir = create_build_dir().unwrap();
         let src_dir = build_dir.join("src");
@@ -1859,7 +1997,10 @@ mod tests {
         assert!(!main.contains("use project::project::{self"));
         assert!(main.contains("--route requires a value"));
         assert!(main.contains("RoutePolicy::parse_checked"));
-        assert!(main.contains("run_selection_with_configured_executor"));
+        assert!(main.contains("--project-trace-out requires a path"));
+        assert!(main.contains("execute_selection_with_configured_executor"));
+        assert!(main.contains("write_project_attempt_trace"));
+        assert!(main.contains("ProjectExecutionError"));
     }
 
     #[test]

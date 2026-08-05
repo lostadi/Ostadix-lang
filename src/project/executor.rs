@@ -10,18 +10,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::executor::CancellationToken;
-use crate::hgraph::{ExecutableOp, NodeId, ReadyOp, ReadySchedule, ValueState};
+use crate::hgraph::{ExecutableOp, HNodeKind, NodeId, ReadyOp, ReadySchedule, ValueState};
 use crate::ir::PlanNodeId;
 
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{OExecutionResult, ProjectBundle, RoutePolicy, RouteSpec};
-use super::plan::{build_project_hgraph, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts};
+use super::plan::{
+    build_project_hgraph, ProjectDependency, ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
+};
 use super::runtime::{execute_route_in_workspace, is_skipped_result, run_selection, RunOptions};
-use super::trace::{ProjectAttemptIdentity, ProjectAttemptTrace, ProjectRouteOutcome};
+use super::trace::{
+    ProjectAttemptIdentity, ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectRouteOutcome,
+};
 
 /// Opt-in selector for the hosted project HGraph executor.
 pub const PROJECT_EXECUTOR_ENV: &str = "O_PROJECT_EXECUTOR";
@@ -41,11 +47,31 @@ pub struct ProjectExecutionOutcome {
 pub struct ProjectExecutionError {
     message: String,
     pub trace: ProjectAttemptTrace,
+    settled_results: BTreeMap<NodeId, OExecutionResult>,
+    materialized_outputs: BTreeSet<NodeId>,
+    failed_outputs: BTreeSet<NodeId>,
 }
 
 impl ProjectExecutionError {
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// A valid route result published before the graph stalled, indexed by
+    /// the producing operation's ordinary value-output node.
+    pub fn settled_result(&self, output: NodeId) -> Option<&OExecutionResult> {
+        self.settled_results.get(&output)
+    }
+
+    /// Whether the coordinator materialized this graph output before stalling.
+    pub fn is_materialized(&self, output: NodeId) -> bool {
+        self.materialized_outputs.contains(&output)
+    }
+
+    /// Whether this graph output was deliberately withheld after an
+    /// unsuccessful settlement or infrastructure abort.
+    pub fn is_failed(&self, output: NodeId) -> bool {
+        self.failed_outputs.contains(&output)
     }
 }
 
@@ -71,16 +97,46 @@ enum ProjectRuntimeValue {
     SelectedResult(OExecutionResult),
 }
 
+/// A `RunRoute` operation that either produced a semantic result or aborted
+/// before one could be committed.
+enum RouteSettlement {
+    Succeeded {
+        result: OExecutionResult,
+        outcome: ProjectRouteOutcome,
+    },
+    NonZero {
+        result: OExecutionResult,
+        outcome: ProjectRouteOutcome,
+    },
+    Skipped {
+        result: OExecutionResult,
+        outcome: ProjectRouteOutcome,
+    },
+    Aborted(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum SettledRouteStatus {
+    Succeeded,
+    NonZero,
+    Skipped,
+}
+
 enum OperationResult {
-    Success {
+    Finished {
         value: ProjectRuntimeValue,
-        outcome: Option<ProjectRouteOutcome>,
         workspace: Option<(usize, Workspace)>,
     },
-    Failed {
-        error: anyhow::Error,
-        outcome: Option<ProjectRouteOutcome>,
-    },
+    Route(RouteSettlement),
+    Aborted(anyhow::Error),
+}
+
+/// Result plus optional trace returned by the compatibility/HGraph dispatcher.
+/// Legacy execution has no project-coordinator trace; HGraph execution does.
+#[derive(Debug)]
+pub struct ConfiguredProjectExecution {
+    pub results: Vec<OExecutionResult>,
+    pub trace: Option<ProjectAttemptTrace>,
 }
 
 /// Deterministic coordinator for one validated project branch.
@@ -154,6 +210,8 @@ impl<'a> ProjectCoordinator<'a> {
             .iter()
             .filter_map(|(id, node)| (node.state == ValueState::Materialized).then_some(*id))
             .collect();
+        let trace = ProjectAttemptTrace::new(project_trace_header(project)?)
+            .context("failed to initialize project attempt trace")?;
 
         Ok(Self {
             bundle,
@@ -166,7 +224,7 @@ impl<'a> ProjectCoordinator<'a> {
             values: BTreeMap::new(),
             workspaces: BTreeMap::new(),
             failures: BTreeMap::new(),
-            trace: ProjectAttemptTrace::new(),
+            trace,
             cancel: CancellationToken::new(),
         })
     }
@@ -209,15 +267,14 @@ impl<'a> ProjectCoordinator<'a> {
             self.trace.record_started(&identity)?;
 
             match self.execute_operation(&ready, &operation) {
-                OperationResult::Success {
-                    value,
-                    outcome,
-                    workspace,
-                } => {
-                    self.commit_success(&ready, &identity, value, outcome, workspace)?;
+                OperationResult::Finished { value, workspace } => {
+                    self.commit_finished(&ready, &identity, value, workspace)?;
                 }
-                OperationResult::Failed { error, outcome } => {
-                    self.commit_failure(&ready, &identity, &error, outcome)?;
+                OperationResult::Route(settlement) => {
+                    self.commit_route_settlement(&ready, &identity, settlement)?;
+                }
+                OperationResult::Aborted(error) => {
+                    self.commit_abort(&ready, &identity, &error, None)?;
                 }
             }
         }
@@ -248,71 +305,65 @@ impl<'a> ProjectCoordinator<'a> {
         match &operation.op {
             ExecutableOp::MaterializeProject => {
                 let Some(branch) = operation.branch else {
-                    return OperationResult::failed(anyhow!(
+                    return OperationResult::Aborted(anyhow!(
                         "materialize operation p{} has no branch",
                         operation.id.0
                     ));
                 };
                 if self.workspaces.contains_key(&branch) {
-                    return OperationResult::failed(anyhow!(
+                    return OperationResult::Aborted(anyhow!(
                         "project branch {branch} already owns a workspace"
                     ));
                 }
                 match materialize_isolated(self.bundle)
                     .context("failed to materialize project branch in an isolated workspace")
                 {
-                    Ok(workspace) => OperationResult::Success {
+                    Ok(workspace) => OperationResult::Finished {
                         value: ProjectRuntimeValue::Workspace { branch },
-                        outcome: None,
                         workspace: Some((branch, workspace)),
                     },
-                    Err(error) => OperationResult::failed(error),
+                    Err(error) => OperationResult::Aborted(error),
                 }
             }
             ExecutableOp::BuildRoute { route_id } => {
                 match self.prepare_route(operation, route_id) {
-                    Ok(prepared) => OperationResult::Success {
+                    Ok(prepared) => OperationResult::Finished {
                         value: ProjectRuntimeValue::PreparedRoute(prepared),
-                        outcome: None,
                         workspace: None,
                     },
-                    Err(error) => OperationResult::failed(error),
+                    Err(error) => OperationResult::Aborted(error),
                 }
             }
             ExecutableOp::RunRoute { route_id } => {
                 match self.execute_prepared_route(ready, operation, route_id) {
                     Ok(result) => match ProjectRouteOutcome::from_result(&result) {
-                        Ok(outcome) if result.succeeded() || is_skipped_result(&result) => {
-                            OperationResult::Success {
-                                value: ProjectRuntimeValue::RouteResult(result),
-                                outcome: Some(outcome),
-                                workspace: None,
-                            }
+                        Ok(outcome) if is_skipped_result(&result) => {
+                            OperationResult::Route(RouteSettlement::Skipped { result, outcome })
                         }
-                        Ok(outcome) => OperationResult::Failed {
-                            error: anyhow!(
-                                "route `{route_id}` failed with exit code {:?}",
-                                result.exit_code
-                            ),
-                            outcome: Some(outcome),
-                        },
-                        Err(error) => OperationResult::failed(error.into()),
+                        Ok(outcome) if result.succeeded() => {
+                            OperationResult::Route(RouteSettlement::Succeeded { result, outcome })
+                        }
+                        Ok(outcome) => {
+                            OperationResult::Route(RouteSettlement::NonZero { result, outcome })
+                        }
+                        Err(error) => {
+                            OperationResult::Route(RouteSettlement::Aborted(error.into()))
+                        }
                     },
-                    Err(error) => OperationResult::failed(error),
+                    Err(error) => OperationResult::Route(RouteSettlement::Aborted(error)),
                 }
             }
             ExecutableOp::SelectRoute { .. } => match self.select_sole_result(operation) {
-                Ok(result) => OperationResult::Success {
+                Ok(result) => OperationResult::Finished {
                     value: ProjectRuntimeValue::SelectedResult(result),
-                    outcome: None,
                     workspace: None,
                 },
-                Err(error) => OperationResult::failed(error),
+                Err(error) => OperationResult::Aborted(error),
             },
-            ExecutableOp::CompareRouteResults => OperationResult::failed(anyhow!(
+            ExecutableOp::CompareRouteResults => OperationResult::Aborted(anyhow!(
                 "CompareRouteResults is unsupported by the single-branch project HGraph executor"
             )),
-            other => OperationResult::failed(anyhow!(
+            other => OperationResult::Aborted(anyhow!(
                 "non-project operation {other:?} reached the project HGraph executor"
             )),
         }
@@ -326,9 +377,12 @@ impl<'a> ProjectCoordinator<'a> {
         let branch = operation
             .branch
             .with_context(|| format!("build route `{route_id}` has no branch"))?;
-        let materialize = operation.dependencies.first().copied().with_context(|| {
+        let dependency = operation.dependencies.first().copied().with_context(|| {
             format!("build route `{route_id}` has no MaterializeProject dependency")
         })?;
+        let ProjectDependency::Value(materialize) = dependency else {
+            bail!("build route `{route_id}` does not consume a workspace value");
+        };
         match self.value_for_operation(materialize)? {
             ProjectRuntimeValue::Workspace {
                 branch: workspace_branch,
@@ -374,11 +428,14 @@ impl<'a> ProjectCoordinator<'a> {
         operation: &ProjectPlanOperation,
         route_id: &str,
     ) -> Result<OExecutionResult> {
-        let build = operation
+        let dependency = operation
             .dependencies
             .first()
             .copied()
             .with_context(|| format!("run route `{route_id}` has no BuildRoute dependency"))?;
+        let ProjectDependency::Value(build) = dependency else {
+            bail!("run route `{route_id}` does not consume a PreparedRoute value");
+        };
         let prepared = match self.value_for_operation(build)? {
             ProjectRuntimeValue::PreparedRoute(prepared) => prepared,
             _ => bail!("run route `{route_id}` did not receive a PreparedRoute value"),
@@ -415,7 +472,10 @@ impl<'a> ProjectCoordinator<'a> {
                 operation.dependencies.len()
             );
         }
-        match self.value_for_operation(operation.dependencies[0])? {
+        let ProjectDependency::Value(result_operation) = operation.dependencies[0] else {
+            bail!("SelectRoute dependency is not an ordinary route-result value");
+        };
+        match self.value_for_operation(result_operation)? {
             ProjectRuntimeValue::RouteResult(result) => Ok(result.clone()),
             _ => bail!("SelectRoute dependency is not a route result"),
         }
@@ -447,14 +507,141 @@ impl<'a> ProjectCoordinator<'a> {
             .with_context(|| format!("plan node p{} has no stored runtime value", plan_node.0))
     }
 
-    fn commit_success(
+    fn commit_finished(
         &mut self,
         ready: &ReadyOp,
         identity: &ProjectAttemptIdentity,
         value: ProjectRuntimeValue,
-        outcome: Option<ProjectRouteOutcome>,
         workspace: Option<(usize, Workspace)>,
     ) -> Result<()> {
+        self.ensure_outputs_unpublished(ready)?;
+        if let Some((branch, _)) = &workspace {
+            if self.workspaces.contains_key(branch) {
+                bail!("project branch {branch} attempted to publish two workspaces");
+            }
+        }
+
+        // Local linearization point: once trace validation succeeds, the
+        // remaining map/set updates are infallible and form one coordinator
+        // transition. This does not make command-side external effects exact-once.
+        self.trace.record_finished(identity)?;
+        self.values.insert(ready.value_output, value);
+        if let Some((branch, workspace)) = workspace {
+            self.workspaces.insert(branch, workspace);
+        }
+        self.materialized.extend(ready.outputs.iter().copied());
+        Ok(())
+    }
+
+    fn commit_route_settlement(
+        &mut self,
+        ready: &ReadyOp,
+        identity: &ProjectAttemptIdentity,
+        settlement: RouteSettlement,
+    ) -> Result<()> {
+        let (status, result, outcome) = match settlement {
+            RouteSettlement::Succeeded { result, outcome } => {
+                (SettledRouteStatus::Succeeded, result, outcome)
+            }
+            RouteSettlement::NonZero { result, outcome } => {
+                (SettledRouteStatus::NonZero, result, outcome)
+            }
+            RouteSettlement::Skipped { result, outcome } => {
+                (SettledRouteStatus::Skipped, result, outcome)
+            }
+            RouteSettlement::Aborted(error) => {
+                return self.commit_abort(ready, identity, &error, None)
+            }
+        };
+
+        self.ensure_outputs_unpublished(ready)?;
+        let mut publish = Vec::new();
+        let mut withhold = Vec::new();
+        for output in &ready.outputs {
+            let node = self.project.graph.node(*output).with_context(|| {
+                format!(
+                    "project operation p{} references missing output N{}",
+                    ready.plan_node.0, output.0
+                )
+            })?;
+            let should_publish = match &node.kind {
+                HNodeKind::Value => true,
+                HNodeKind::Completion { .. } => {
+                    matches!(
+                        status,
+                        SettledRouteStatus::Succeeded | SettledRouteStatus::Skipped
+                    )
+                }
+                // A started command may have changed host state before
+                // reporting nonzero. Conservatively advance every declared
+                // resource successor for all valid route settlements.
+                HNodeKind::ResourceState { .. } => true,
+                HNodeKind::BranchControl { .. } => {
+                    matches!(
+                        status,
+                        SettledRouteStatus::Succeeded | SettledRouteStatus::Skipped
+                    )
+                }
+            };
+            if should_publish {
+                publish.push(*output);
+            } else {
+                withhold.push(*output);
+            }
+        }
+
+        // Route linearization point: the terminal event, ordinary result, and
+        // settlement-specific output publication are one infallible local
+        // transition after trace validation. This says nothing about
+        // exactly-once command-side effects.
+        match status {
+            SettledRouteStatus::Succeeded => {
+                self.trace.record_settled_success(identity, outcome)?
+            }
+            SettledRouteStatus::NonZero => self.trace.record_settled_failure(identity, outcome)?,
+            SettledRouteStatus::Skipped => self.trace.record_skipped(identity, outcome)?,
+        }
+        let exit_code = result.exit_code;
+        self.values
+            .insert(ready.value_output, ProjectRuntimeValue::RouteResult(result));
+        self.materialized.extend(publish);
+        for output in withhold {
+            self.failed_outputs.insert(output, ready.plan_node);
+        }
+        if matches!(status, SettledRouteStatus::NonZero) {
+            self.failures.insert(
+                ready.plan_node,
+                format!(
+                    "route `{}` settled unsuccessfully with exit code {exit_code:?}",
+                    identity.route_id.as_deref().unwrap_or("<unknown>")
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn commit_abort(
+        &mut self,
+        ready: &ReadyOp,
+        identity: &ProjectAttemptIdentity,
+        error: &anyhow::Error,
+        outcome: Option<ProjectRouteOutcome>,
+    ) -> Result<()> {
+        self.ensure_outputs_unpublished(ready)?;
+        let description = error.to_string();
+
+        // An abort has no operation value. Its terminal trace event and the
+        // withholding of every graph output form the local commit.
+        self.trace
+            .record_aborted(identity, outcome, description.as_bytes())?;
+        for output in &ready.outputs {
+            self.failed_outputs.insert(*output, ready.plan_node);
+        }
+        self.failures.insert(ready.plan_node, description);
+        Ok(())
+    }
+
+    fn ensure_outputs_unpublished(&self, ready: &ReadyOp) -> Result<()> {
         if self.values.contains_key(&ready.value_output) {
             bail!(
                 "project operation p{} attempted to publish its value twice",
@@ -469,38 +656,6 @@ impl<'a> ProjectCoordinator<'a> {
                 ready.plan_node.0
             );
         }
-        if let Some((branch, _)) = &workspace {
-            if self.workspaces.contains_key(branch) {
-                bail!("project branch {branch} attempted to publish two workspaces");
-            }
-        }
-
-        // Local linearization point: once trace validation succeeds, the
-        // remaining map/set updates are infallible and form one coordinator
-        // transition. This does not make command-side external effects exact-once.
-        self.trace.record_finished(identity, outcome)?;
-        self.values.insert(ready.value_output, value);
-        if let Some((branch, workspace)) = workspace {
-            self.workspaces.insert(branch, workspace);
-        }
-        self.materialized.extend(ready.outputs.iter().copied());
-        Ok(())
-    }
-
-    fn commit_failure(
-        &mut self,
-        ready: &ReadyOp,
-        identity: &ProjectAttemptIdentity,
-        error: &anyhow::Error,
-        outcome: Option<ProjectRouteOutcome>,
-    ) -> Result<()> {
-        let description = error.to_string();
-        self.trace
-            .record_failed(identity, outcome, description.as_bytes())?;
-        for output in &ready.outputs {
-            self.failed_outputs.insert(*output, ready.plan_node);
-        }
-        self.failures.insert(ready.plan_node, description);
         Ok(())
     }
 
@@ -537,19 +692,21 @@ impl<'a> ProjectCoordinator<'a> {
         } else {
             format!("project HGraph stalled: {}", details.join("; "))
         };
+        let settled_results = self
+            .values
+            .iter()
+            .filter_map(|(output, value)| match value {
+                ProjectRuntimeValue::RouteResult(result) => Some((*output, result.clone())),
+                _ => None,
+            })
+            .collect();
         anyhow::Error::new(ProjectExecutionError {
             message,
             trace: self.trace.clone(),
+            settled_results,
+            materialized_outputs: self.materialized.clone(),
+            failed_outputs: self.failed_outputs.keys().copied().collect(),
         })
-    }
-}
-
-impl OperationResult {
-    fn failed(error: anyhow::Error) -> Self {
-        Self::Failed {
-            error,
-            outcome: None,
-        }
     }
 }
 
@@ -562,31 +719,85 @@ pub fn execute_project_hgraph(
     ProjectCoordinator::new(bundle, project, opts)?.execute()
 }
 
+fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHeader> {
+    const GRAPH_DIGEST_DOMAIN: &[u8] = b"ostadix.project-hgraph.logical/v1\0";
+
+    let logical = project.to_text();
+    let mut hasher = Sha256::new();
+    hasher.update(GRAPH_DIGEST_DOMAIN);
+    hasher.update(logical.as_bytes());
+    let logical_graph_digest = hex::encode(hasher.finalize());
+
+    let mut attempt = [0_u8; 32];
+    getrandom::fill(&mut attempt)
+        .context("failed to obtain entropy for project execution attempt identity")?;
+
+    Ok(ProjectAttemptTraceHeader::new(
+        project.plan.project_name.clone(),
+        project.plan.bundle_digest.clone(),
+        project.plan.target.clone(),
+        project.plan.policy.token(),
+        logical_graph_digest,
+        hex::encode(attempt),
+    ))
+}
+
 /// Dispatch project selection through the explicitly configured runtime.
 ///
 /// With `O_PROJECT_EXECUTOR=hgraph`, planning or execution errors are returned
 /// directly and never fall back to `run_selection`. With the variable unset,
 /// the existing project runtime remains the compatibility default.
-pub fn run_selection_with_configured_executor(
+pub fn execute_selection_with_configured_executor(
     bundle: &ProjectBundle,
     target: Option<&str>,
     policy_override: Option<RoutePolicy>,
     opts: &RunOptions,
-) -> Result<Vec<OExecutionResult>> {
+) -> Result<ConfiguredProjectExecution> {
     match std::env::var_os(PROJECT_EXECUTOR_ENV) {
-        None => run_selection(bundle, target, policy_override, opts),
+        None => Ok(ConfiguredProjectExecution {
+            results: run_selection(bundle, target, policy_override, opts)?,
+            trace: None,
+        }),
         Some(value) if value == "hgraph" => {
             let project = build_project_hgraph(bundle, target, policy_override)
                 .map_err(anyhow::Error::msg)
                 .context("failed to build project HGraph for execution")?;
             let outcome = execute_project_hgraph(bundle, &project, opts)?;
-            Ok(vec![outcome.result])
+            Ok(ConfiguredProjectExecution {
+                results: vec![outcome.result],
+                trace: Some(outcome.trace),
+            })
         }
         Some(value) => bail!(
             "unsupported {PROJECT_EXECUTOR_ENV} value `{}`; expected `hgraph` or an unset variable",
             value.to_string_lossy()
         ),
     }
+}
+
+/// Compatibility wrapper retaining the pre-PR8A result-only API.
+pub fn run_selection_with_configured_executor(
+    bundle: &ProjectBundle,
+    target: Option<&str>,
+    policy_override: Option<RoutePolicy>,
+    opts: &RunOptions,
+) -> Result<Vec<OExecutionResult>> {
+    Ok(execute_selection_with_configured_executor(bundle, target, policy_override, opts)?.results)
+}
+
+/// Store one unsigned diagnostic project-attempt trace as formatted JSON.
+///
+/// This is an observability surface, not an OWRECEIPT or attestation.
+pub fn write_project_attempt_trace(path: &Path, trace: &ProjectAttemptTrace) -> Result<()> {
+    let mut encoded =
+        serde_json::to_vec_pretty(trace).context("failed to serialize project attempt trace")?;
+    encoded.push(b'\n');
+    std::fs::write(path, encoded).with_context(|| {
+        format!(
+            "failed to write project attempt trace to {}",
+            path.display()
+        )
+    })
 }
 
 fn route_plan_facts(route: &RouteSpec) -> RoutePlanFacts {

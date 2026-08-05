@@ -537,21 +537,30 @@
   Planning is deterministic and nonexecuting, and exact source/projection
   validation rejects malformed references, substitution, and graph forgery.
 - `scripts/smoke-project-hgraph.sh` is the Project HGraph hosted
-  logical-planning gate. It does not execute project commands through the
-  HGraph coordinator; script and compiled project execution remain on the
-  existing hosted project runtime. The gate also proves repository-owned
+  logical-planning gate. The gate proves repository-owned
   `scripts/o-cli.sh plan` parity, deterministic IR/DOT, and generated-project
   binary route-listing plus checked option/policy rejection. Route
   materialization and commands retain
   conservative fallible `HostWorld` effects even when a manifest declares
   `pure=true`. Logical alternative branches may therefore be serialized and
   cross-coupled by the shared ambient/resource state chains; PR7 does not prove
-  parallel branch execution or independent host mediation. This is not
-  PR8/PR9, placement, deployment, Governor or receipt
+  parallel branch execution or independent host mediation.
+- `scripts/smoke-project-hgraph-exec.sh` is the opt-in, single-alternative
+  hosted execution gate. Under `O_PROJECT_EXECUTOR=hgraph`, a validated Project
+  HGraph controls isolated materialization, `Value` versus `Success`
+  prerequisite readiness, one route chain, and sole-result selection for
+  `Explicit` or `Default`. A nonzero terminal route remains a selectable
+  `OExecutionResult`; a nonzero prerequisite publishes its value and
+  conservative `HostWorld` successor but withholds completion. An
+  infrastructure abort publishes no route value. The unsigned diagnostic trace
+  binds stable source/graph identity to a fresh execution-attempt identifier and
+  distinguishes settlement from abort. Unsupported multipath policies fail
+  closed rather than falling back to the compatibility runtime. This is not
+  multipath execution, retry, placement, deployment, Governor or receipt
   integration, remote execution, WorldFS, native/QEMU/hardware evidence, Linux
   or Plan 9 boot, a general foreign ABI, KVM/SVM evidence, physical-device
-  assignment, PCI/DMA/IOMMU isolation, Acceptance A, G1, or passage of any
-  G0--G13 gate.
+  assignment, PCI/DMA/IOMMU isolation, exactly-once effects, Acceptance A, G1,
+  or passage of any G0--G13 gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.
