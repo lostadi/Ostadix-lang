@@ -31,6 +31,9 @@ SCHEMA = "ostadix-source-release-v1"
 MANIFEST_NAME = "SOURCE-MANIFEST.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+ROOT_LICENSE_SPDX = "LGPL-2.1-only"
+ROOT_REPOSITORY = "https://github.com/lostadi/Ostadix-lang"
+EXISTING_PREPRINT_DOI = "10.5281/zenodo.21544345"
 
 # Keep this list intentionally narrow.  Adding a new top-level project surface
 # requires an explicit release-engineering decision here.
@@ -147,6 +150,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
     {
         ".github/workflows/ci.yml",
         ".mcp.json",
+        "CITATION.cff",
         "Cargo.toml",
         "LICENSE",
         "llms.txt",
@@ -1058,6 +1062,212 @@ def _required_string(value: object, owner: str) -> str:
     if "\x00" in value or "\r" in value or "\n" in value:
         raise ReleaseError(f"{owner} contains a forbidden control character")
     return value
+
+
+def _utf8_text(data: bytes, path: str) -> str:
+    try:
+        return data.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{path} is not valid UTF-8") from error
+
+
+def _cff_scalar(
+    text: str,
+    key: str,
+    *,
+    indent: str = "",
+    required: bool = True,
+) -> str | None:
+    """Read one deliberately simple CFF scalar without a YAML dependency."""
+
+    prefix = f"{indent}{key}:"
+    matches = [
+        line[len(prefix) :].strip()
+        for line in text.splitlines()
+        if line.startswith(prefix)
+    ]
+    if not matches:
+        if required:
+            raise ReleaseError(f"CITATION.cff is missing {prefix}")
+        return None
+    if len(matches) != 1:
+        raise ReleaseError(f"CITATION.cff must contain exactly one {prefix}")
+    raw = matches[0]
+    if not raw:
+        raise ReleaseError(f"CITATION.cff {prefix} must be a scalar")
+    if raw.startswith('"'):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ReleaseError(
+                f"CITATION.cff {prefix} is not a valid quoted scalar"
+            ) from error
+        if not isinstance(value, str):
+            raise ReleaseError(f"CITATION.cff {prefix} must be a string")
+        return _required_string(value, f"CITATION.cff {prefix}")
+    if raw.startswith("'"):
+        if len(raw) < 2 or not raw.endswith("'"):
+            raise ReleaseError(f"CITATION.cff {prefix} is not a valid quoted scalar")
+        return _required_string(
+            raw[1:-1].replace("''", "'"), f"CITATION.cff {prefix}"
+        )
+    if " #" in raw:
+        raw = raw.split(" #", 1)[0].rstrip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+./:_-]*", raw):
+        raise ReleaseError(f"CITATION.cff {prefix} must be a simple scalar")
+    return _required_string(raw, f"CITATION.cff {prefix}")
+
+
+def _cff_mapping_body(text: str, key: str) -> str:
+    """Return one top-level CFF mapping body without accepting relocated keys."""
+
+    header = f"{key}:"
+    lines = text.splitlines()
+    matches = [index for index, line in enumerate(lines) if line == header]
+    if not matches:
+        raise ReleaseError(f"CITATION.cff is missing top-level {header}")
+    if len(matches) != 1:
+        raise ReleaseError(
+            f"CITATION.cff must contain exactly one top-level {header}"
+        )
+
+    body = []
+    for line in lines[matches[0] + 1 :]:
+        if line and not line[0].isspace() and not line.startswith("#"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _readme_how_to_cite(text: str) -> str:
+    headings = list(re.finditer(r"(?m)^### How to cite[ \t]*$", text))
+    if len(headings) != 1:
+        raise ReleaseError(
+            "README.md must contain exactly one '### How to cite' section"
+        )
+    start = headings[0].end()
+    following = re.search(r"(?m)^#{1,3}[ \t]+", text[start:])
+    end = start + following.start() if following else len(text)
+    return " ".join(text[start:end].split())
+
+
+def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
+    """Keep root license, Cargo, CFF, and live citation prose coherent."""
+
+    required_paths = ("Cargo.toml", "CITATION.cff", "LICENSE", "README.md")
+    missing = [path for path in required_paths if path not in files]
+    if missing:
+        raise ReleaseError(
+            "root release metadata is incomplete; missing: " + ", ".join(missing)
+        )
+
+    cargo = _strict_toml(files["Cargo.toml"], "Cargo.toml")
+    package = cargo.get("package")
+    if not isinstance(package, dict):
+        raise ReleaseError("Cargo.toml must contain a package table")
+    cargo_version = _required_string(
+        package.get("version"), "Cargo.toml package.version"
+    )
+    cargo_license = _required_string(
+        package.get("license"), "Cargo.toml package.license"
+    )
+    cargo_repository = _required_string(
+        package.get("repository"), "Cargo.toml package.repository"
+    )
+    if cargo_license != ROOT_LICENSE_SPDX:
+        raise ReleaseError(
+            f"Cargo.toml package.license must be {ROOT_LICENSE_SPDX!r}"
+        )
+    if cargo_repository != ROOT_REPOSITORY:
+        raise ReleaseError(
+            f"Cargo.toml package.repository must be {ROOT_REPOSITORY!r}"
+        )
+
+    license_text = _utf8_text(files["LICENSE"], "LICENSE")
+    for marker in (
+        "GNU LESSER GENERAL PUBLIC LICENSE",
+        "Version 2.1, February 1999",
+    ):
+        if marker not in license_text:
+            raise ReleaseError(
+                f"LICENSE does not contain the expected LGPL-2.1 text: {marker}"
+            )
+
+    citation = _utf8_text(files["CITATION.cff"], "CITATION.cff")
+    citation_version = _cff_scalar(citation, "version")
+    citation_license = _cff_scalar(citation, "license")
+    citation_repository = _cff_scalar(citation, "repository-code")
+    preferred_citation = _cff_mapping_body(citation, "preferred-citation")
+    preferred_doi = _cff_scalar(preferred_citation, "doi", indent="  ")
+    preferred_url = _cff_scalar(preferred_citation, "url", indent="  ")
+    source_release_doi = _cff_scalar(citation, "doi", required=False)
+
+    if citation_version != cargo_version:
+        raise ReleaseError(
+            "CITATION.cff version must match Cargo.toml package.version "
+            f"({citation_version!r} != {cargo_version!r})"
+        )
+    if citation_license != cargo_license:
+        raise ReleaseError(
+            "CITATION.cff license must match Cargo.toml package.license "
+            f"({citation_license!r} != {cargo_license!r})"
+        )
+    if citation_repository != cargo_repository:
+        raise ReleaseError(
+            "CITATION.cff repository-code must match Cargo.toml package.repository"
+        )
+    if preferred_doi != EXISTING_PREPRINT_DOI:
+        raise ReleaseError(
+            "CITATION.cff preferred-citation DOI must remain the existing "
+            f"preprint/package DOI {EXISTING_PREPRINT_DOI}"
+        )
+    expected_preprint_url = f"https://doi.org/{EXISTING_PREPRINT_DOI}"
+    if preferred_url != expected_preprint_url:
+        raise ReleaseError(
+            "CITATION.cff preferred-citation URL must resolve its DOI through "
+            f"{expected_preprint_url}"
+        )
+    if source_release_doi == preferred_doi:
+        raise ReleaseError(
+            "CITATION.cff top-level source-release DOI must differ from the "
+            "preferred preprint/package DOI"
+        )
+
+    readme = _utf8_text(files["README.md"], "README.md")
+    readme_compact = " ".join(readme.split())
+    for phrase in (
+        "GNU Lesser General Public License v2.1 only",
+        f"`{ROOT_LICENSE_SPDX}`",
+    ):
+        if phrase not in readme_compact:
+            raise ReleaseError(f"README.md license prose must contain {phrase!r}")
+
+    how_to_cite = _readme_how_to_cite(readme)
+    required_citation_phrases = (
+        expected_preprint_url,
+        f"DOI `{EXISTING_PREPRINT_DOI}` identifies that existing "
+        "preprint/package record",
+        "it is not an archive of a tagged Ostadix-lang source release",
+        f"Version {cargo_version}.",
+        "Commit: `FULL_COMMIT_SHA_USED`.",
+        cargo_repository,
+        "the existing preprint/package DOI remains under `preferred-citation`",
+        "top-level `doi` field",
+    )
+    for phrase in required_citation_phrases:
+        if phrase not in how_to_cite:
+            raise ReleaseError(f"README.md How to cite must contain {phrase!r}")
+    if source_release_doi is None:
+        if "future tagged source release" not in how_to_cite:
+            raise ReleaseError(
+                "README.md How to cite must reserve a separate DOI for a future "
+                "tagged source release"
+            )
+    elif source_release_doi not in how_to_cite:
+        raise ReleaseError(
+            "README.md How to cite must include the top-level tagged "
+            f"source-release DOI {source_release_doi}"
+        )
 
 
 def _required_string_list(
@@ -2657,6 +2867,7 @@ def validate_release_metadata(entries: Sequence[SourceEntry]) -> None:
     modes = {entry.path: entry.mode for entry in entries}
     if len(files) != len(entries):
         raise ReleaseError("release contains duplicate metadata paths")
+    _validate_root_release_metadata(files)
     _validate_mcp_release_surface(files, modes)
     _validate_example_manifest(files)
     _validate_evidence_manifest(files, modes)

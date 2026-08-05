@@ -153,6 +153,15 @@ pub enum FloatSpecial {
 
 /// A class of information that can be dropped when a native backend value is
 /// projected into O or when an OValue is rendered into another backend.
+///
+/// `BackendSpecific` deliberately has an open string vocabulary, so the type's
+/// universe is not globally finite. The HGraph solver remains bounded by
+/// deriving a per-graph loss vocabulary from its initial nodes plus the fixed
+/// outputs of current transfer rules, and by failing closed at its convergence
+/// budget. Any future solver transfer rule that constructs `BackendSpecific`
+/// must draw labels from a statically finite set accounted for by that budget
+/// (or add an explicit widening rule) and add a convergence regression. Current
+/// production transfer rules construct only the fixed variants above it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnnotationKind {
