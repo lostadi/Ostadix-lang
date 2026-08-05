@@ -578,9 +578,23 @@
   field and an in-memory bundle mislabeled as v1 are both rejected.
   Planning is deterministic and nonexecuting, and exact source/projection
   validation rejects malformed references, substitution, and graph forgery.
+- World PR8-1 adds the bounded hosted project-profile `LogicalHGraphV1` schema.
+  It canonically records the exact bundle/selection binding, operations, typed
+  dependencies, route facts, declared input/output paths, raw effects, and
+  scheduler-expanded resources while retaining residual `HostWorld` and rejecting fabricated
+  governed resources or authority requirements. Its domain-separated digest is
+  an exact-source-bound projection identity, not a whitespace-insensitive
+  source-semantic hash: source bytes, file modes, and manifest formatting alter
+  the bundle and therefore the graph identity; canonical decode/re-encode
+  normalizes only the logical JSON record. This slice does not implement
+  deployment, runtime, recovery, World task identity, receipts, native parity,
+  or G1 evidence.
 - `scripts/smoke-project-hgraph.sh` is the composite Project HGraph hosted
   planning and generated-adapter gate. Its PR7 phase proves repository-owned
-  `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. It
+  `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. Its
+  PR8-1 phase exercises canonical/strict logical encoding and digesting,
+  scheduler-expanded resources, `HostWorld` retention, governed-resource and
+  authority forgery rejection, and trusted project-projection comparison. It
   then compiles a project binary, checks route listing and option/policy
   rejection, and runs opt-in AnySuccess for immediate short-circuit plus
   explicitly admitted nonzero-to-success continuation in disposable
@@ -610,8 +624,8 @@
   and conservative `HostWorld` successor but withholds completion; because no
   first-class branch-failure value is synthesized in this slice, a failed
   prerequisite hard-stops even when it declares idempotence. The unsigned
-  diagnostic trace v3 binds
-  stable source/graph identity to a fresh execution-attempt identifier and
+  diagnostic trace v4 binds a canonical `LogicalHGraphV1` schema/digest plus
+  stable source identity to a fresh execution-attempt identifier and
   distinguishes settlement, guard skip, and abort. Its continuation decision
   records the assessed route prefix, proposed next route,
   `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the

@@ -253,9 +253,21 @@ well-formedness cannot hide bundle or policy substitution. `olangc` exposes the
 result through nonexecuting `ir` and `dot` targets for directory and lifted
 bundle inputs.
 
-PR8A adds an opt-in `ProjectCoordinator` path for one resolved `Explicit` or
-`Default` alternative. PR8B extends that path to serial ordered `Fallback` and
-`AnySuccess`: `ReadySchedule` marks their `SelectRoute` input relation as
+World PR8-1 adds a strict project-profile `LogicalHGraphV1` normalization over
+that exact validated plan/projection. Canonical JSON and a domain-separated
+digest bind source, selection policy, operations, typed dependencies, route
+facts, declared input/output paths, and complete effect resources without
+serializing mutable HGraph execution state. It is an exact-source-bound
+projection identity, not a
+whitespace-insensitive source-semantic hash: only alternate JSON encodings of
+the logical record normalize through decode and canonical re-encoding.
+`HostWorld` remains explicit. Logical operation IDs are
+planner-local and carry no World identity or authority. Deployment, runtime,
+recovery, receipt, native-parity, and G1 layers remain separate future work.
+
+ProjectExec-A adds an opt-in `ProjectCoordinator` path for one resolved
+`Explicit` or `Default` alternative. ProjectExec-B extends that path to serial
+ordered `Fallback` and `AnySuccess`: `ReadySchedule` marks their `SelectRoute` input relation as
 `OrderedFirstSuccess`, the coordinator retains each attempted alternative
 result, and a first success prevents later branches from materializing. With
 `O_PROJECT_EXECUTOR=hgraph`, the Project HGraph governs isolated
@@ -270,8 +282,9 @@ including successful prerequisites, carries the bundle-bound
 verified effect safety, fencing, journaling, compensation, or exactly-once
 evidence. The default `unproven` route contract yields `unproven_effects`
 evidence and denies continuation; a failed prerequisite or infrastructure abort
-hard-stops. The unsigned trace v3 records this decision, and plan-aware replay
-verifies it, but the trace is not an `OWRECEIPT` or attestation. The
+hard-stops. The unsigned trace v4 records this decision and binds the canonical
+`LogicalHGraphV1` schema/digest. Plan-aware replay verifies it, but the trace is
+not an `OWRECEIPT` or attestation. The
 compatibility project runtime remains the default when the opt-in is absent.
 
 Materialization and command operations stay fallible and conservatively

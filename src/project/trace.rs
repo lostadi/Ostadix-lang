@@ -42,17 +42,25 @@ use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 /// Version of the deterministic project-attempt event vocabulary.
 ///
 /// Version 2 added an execution-context header and distinguished route
-/// settlement from coordinator aborts. Version 3 adds the checked decision
-/// evidence used before an ordered selector may activate its next branch.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 3;
+/// settlement from coordinator aborts. Version 3 added checked ordered-branch
+/// decision evidence. Version 4 binds the trace to canonical
+/// `LogicalHGraphV1` schema bytes instead of human inspection text.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 4;
 
-const PROJECT_LOGICAL_GRAPH_DIGEST_DOMAIN: &[u8] = b"ostadix.project-hgraph.logical/v1\0";
-
-pub(crate) fn project_logical_graph_digest(project: &ProjectHGraph) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(PROJECT_LOGICAL_GRAPH_DIGEST_DOMAIN);
-    hasher.update(project.to_text().as_bytes());
-    hex::encode(hasher.finalize())
+pub(crate) fn project_logical_graph_digest(
+    project: &ProjectHGraph,
+) -> Result<String, ProjectTraceError> {
+    let logical = project.logical_v1().map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to construct canonical LogicalHGraphV1: {error}"
+        ))
+    })?;
+    let digest = logical.digest().map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to digest canonical LogicalHGraphV1: {error}"
+        ))
+    })?;
+    Ok(digest.as_sha256().to_string())
 }
 
 /// Context binding shared by every event in one project execution attempt.
@@ -67,6 +75,7 @@ pub struct ProjectAttemptTraceHeader {
     pub bundle_digest: String,
     pub target: String,
     pub policy: String,
+    pub logical_graph_schema: u16,
     pub logical_graph_digest: String,
     pub execution_attempt_id: String,
 }
@@ -77,6 +86,7 @@ impl ProjectAttemptTraceHeader {
         bundle_digest: impl Into<String>,
         target: impl Into<String>,
         policy: impl Into<String>,
+        logical_graph_schema: u16,
         logical_graph_digest: impl Into<String>,
         execution_attempt_id: impl Into<String>,
     ) -> Self {
@@ -85,6 +95,7 @@ impl ProjectAttemptTraceHeader {
             bundle_digest: bundle_digest.into(),
             target: target.into(),
             policy: policy.into(),
+            logical_graph_schema,
             logical_graph_digest: logical_graph_digest.into(),
             execution_attempt_id: execution_attempt_id.into(),
         }
@@ -95,6 +106,13 @@ impl ProjectAttemptTraceHeader {
         validate_metadata_sha256(&self.bundle_digest, "bundle digest")?;
         validate_label(&self.target, "selection target")?;
         validate_label(&self.policy, "route policy")?;
+        if self.logical_graph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1 {
+            return Err(ProjectTraceError::InvalidMetadata(format!(
+                "logical graph schema must be {}, got {}",
+                super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
+                self.logical_graph_schema
+            )));
+        }
         validate_metadata_sha256(&self.logical_graph_digest, "logical graph digest")?;
         validate_label(&self.execution_attempt_id, "execution attempt id")?;
         Ok(())
@@ -557,7 +575,7 @@ impl ProjectAttemptEvent {
 /// Checked deterministic lifecycle history for project-plan attempts.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectAttemptTrace {
-    pub format_version: u32,
+    format_version: u32,
     header: ProjectAttemptTraceHeader,
     events: Vec<ProjectAttemptEvent>,
     #[serde(skip)]
@@ -621,6 +639,11 @@ impl ProjectAttemptTrace {
     /// Execution context to which every event in this trace is bound.
     pub fn header(&self) -> &ProjectAttemptTraceHeader {
         &self.header
+    }
+
+    /// Immutable persisted format version selected by the checked constructor.
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
     }
 
     /// Read-only event order emitted by the coordinator.
@@ -1052,7 +1075,12 @@ fn validate_project_header(
             )));
         }
     }
-    let expected_graph_digest = project_logical_graph_digest(project);
+    if header.logical_graph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1 {
+        return Err(ProjectTraceError::InvalidMetadata(
+            "trace logical graph schema differs from LogicalHGraphV1".to_string(),
+        ));
+    }
+    let expected_graph_digest = project_logical_graph_digest(project)?;
     if header.logical_graph_digest != expected_graph_digest {
         return Err(ProjectTraceError::InvalidMetadata(
             "trace logical graph digest differs from the trusted Project HGraph".to_string(),
@@ -1421,6 +1449,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "main",
             "default",
+            super::super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "attempt-1",
         )
@@ -1484,11 +1513,12 @@ mod tests {
     fn trace_requires_a_canonical_execution_header() {
         let expected = header();
         let trace = ProjectAttemptTrace::new(expected.clone()).unwrap();
-        assert_eq!(trace.format_version, PROJECT_ATTEMPT_TRACE_VERSION);
+        assert_eq!(trace.format_version(), PROJECT_ATTEMPT_TRACE_VERSION);
         assert_eq!(trace.header(), &expected);
         let serialized = serde_json::to_value(&trace).unwrap();
-        assert_eq!(serialized["format_version"], 3);
+        assert_eq!(serialized["format_version"], 4);
         assert_eq!(serialized["header"]["project_name"], "project");
+        assert_eq!(serialized["header"]["logical_graph_schema"], 1);
         assert_eq!(serialized["header"]["execution_attempt_id"], "attempt-1");
 
         let mut invalid = expected;

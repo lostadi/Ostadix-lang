@@ -300,6 +300,9 @@ fn every_route_policy_uses_shared_resolution_and_exact_policy_metadata() {
     for policy in policies {
         let resolved = resolve_selection(&bundle, Some("main"), Some(policy.clone())).unwrap();
         let project = build_project_hgraph(&bundle, Some("main"), Some(policy.clone())).unwrap();
+        let logical = project.logical_v1().unwrap();
+        logical.validate_trusted_project(&project).unwrap();
+        assert_eq!(logical.operations.len(), project.plan.operations.len());
         assert_eq!(project.plan.target, resolved.target);
         assert_eq!(project.plan.alternatives, resolved.alternatives);
         assert_eq!(project.plan.policy, resolved.policy);
@@ -314,6 +317,8 @@ fn every_route_policy_uses_shared_resolution_and_exact_policy_metadata() {
 
     let explicit = RoutePolicy::Explicit("impl-b".to_string());
     let project = build_project_hgraph(&bundle, Some("main"), Some(explicit)).unwrap();
+    let logical = project.logical_v1().unwrap();
+    logical.validate_trusted_project(&project).unwrap();
     assert_eq!(project.plan.alternatives, ["impl-b"]);
     assert_eq!(project.plan.policy.token(), "explicit:impl-b");
     assert_eq!(

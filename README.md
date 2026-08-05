@@ -39,8 +39,9 @@ jobs:
    operating-system values through typed parentheses and OValue.
 2. **O-core**, written in `.oc` files, is the statically typed native systems
    language. It compiles through typed HIR and SSA MIR into freestanding
-   x86_64 ELF object files and is capable of building a kernel without Python,
-   JSON, subprocesses, a filesystem, libc, or Rust `std` in the target image.
+   ELF64 object files for its primary x86_64 target and bounded AArch64 G2
+   subset. It is capable of building a kernel without Python, JSON,
+   subprocesses, a filesystem, libc, or Rust `std` in the target image.
 
 This separation is deliberate. OIR describes orchestration between language
 runtimes. O-core MIR describes machine computation, control flow, memory, and
@@ -50,9 +51,11 @@ available in user space without becoming kernel dependencies.
 **Portability.** Hosted Ostadix-lang is architecture-portable through its
 Rust/Cargo, C17, and Python implementations, subject to availability of the
 evaluator runtimes used by a program. It has been developed and run on macOS
-ARM64, Android ARM64 on a rooted Pixel 8 Pro, and Intel x86_64 Linux. The
-current x86_64 limitation applies only to O-core's emitted freestanding ELF
-target, not to hosted `.O` execution.
+ARM64, Android ARM64 on a rooted Pixel 8 Pro, and Intel x86_64 Linux. O-core's
+broad compiler/kernel target remains x86_64, while G2 adds a bounded,
+conservative `aarch64-unknown-none` scalar backend and single-vCPU QEMU/TCG
+execution. Those native target boundaries do not apply to hosted `.O`
+execution.
 
 ---
 
@@ -814,9 +817,23 @@ values do not. Project-bundle format v2 carries that contract. Legacy v1 bundles
 migrate only when every route omits the field, in which case all routes become
 fail-closed `unproven`; a v1 document carrying the v2 field is rejected.
 
-PR8A adds a separate, opt-in hosted executor for one resolved `Explicit` or
-`Default` alternative. PR8B extends it to serial ordered `Fallback` and
-`AnySuccess` alternatives:
+World PR8-1 adds a versioned project-profile `LogicalHGraphV1`. It normalizes
+the exact validated plan/HGraph projection into strict canonical JSON with a
+domain-separated SHA-256 identity. The schema records exact bundle/selection
+binding, typed value-versus-success dependencies, project operations, route
+facts, declared input/output paths, and the complete effect-resource vocabulary.
+This is an exact-source-bound projection identity, not a whitespace-insensitive
+source-semantic hash: source bytes, file modes, and manifest formatting feed the
+bundle digest and therefore change the logical digest. Permissive decode plus
+canonical re-encoding normalizes only the `LogicalHGraphV1` JSON record.
+Unknown hosted work remains an explicit `HostWorld` read/write, and the hosted
+profile emits no governed authority requirements. Planner-local logical IDs are
+not World task identities. This slice does not yet provide `DeploymentPlan`,
+`RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 passage.
+
+ProjectExec-A adds a separate, opt-in hosted executor for one resolved
+`Explicit` or `Default` alternative. ProjectExec-B extends it to serial ordered
+`Fallback` and `AnySuccess` alternatives:
 
 ```bash
 ./scripts/smoke-project-hgraph-exec.sh
@@ -841,8 +858,8 @@ branch-terminal result from it. A settled nonzero route still publishes its
 result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
 abort publishes no route result and stops the policy. Guard skips continue to
-the next alternative when no route child executed. The unsigned trace v3
-distinguishes
+the next alternative when no route child executed. The unsigned trace v4 binds
+the canonical `LogicalHGraphV1` schema/digest and distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
 to stable source/graph digests plus a fresh execution-attempt identifier. It
 also records the assessed route prefix, proposed next route,
@@ -890,7 +907,7 @@ needs QEMU and the local Rust linker toolchain.
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
-| `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to x86_64 ELF objects. |
+| `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Safely lifts codebases into route-preserving project bundles, or combines explicit scripts in literal mode. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
@@ -1159,7 +1176,7 @@ machine code.
 
 ```text
 .O  -> ONode -> OIR -> ExecutionPlan -> hosted evaluators
-.oc -> AST -> typed HIR -> SSA MIR -> x86_64 ELF object
+.oc -> AST -> typed HIR -> SSA MIR -> target ELF64 object
 ```
 
 This is the point where Ostadix-lang becomes both a polyglot meta-language and a
@@ -1259,10 +1276,10 @@ Ostadix-lang is now an implemented toolchain rather than only an organizing idea
 The repository contains the parser, evaluator, OValue protocol, persistent
 process registry, OIR and execution planner, scheduler and disk cache, real
 hosted backends, native and WASI packaging, linker and unlinker, notebook,
-static O-core front end, SSA lowering, x86_64 object generation, freestanding
-runtime, and an asserted QEMU boot. The current boundaries are documented at
-the end of this README as concrete engineering scope, not as placeholders for
-features that already exist.
+static O-core front end, SSA lowering, primary x86_64 and bounded AArch64 object
+generation, freestanding runtime, and bounded QEMU boot evidence. The current
+boundaries are documented at the end of this README as concrete engineering
+scope, not as placeholders for features that already exist.
 
 ---
 
@@ -3086,8 +3103,9 @@ features that are already present:
   feature-identical to the authoritative Rust runtime. The C17 native port
   keeps activation dry-only; ambient real activation is implemented in the Rust
   evaluator.
-- O-core currently targets x86_64 only and uses a stack-spill backend without
-  optimization or register allocation.
+- O-core's broad compiler/kernel target remains x86_64; G2 adds a bounded,
+  conservative AArch64 scalar stack-spill backend. Neither backend has
+  optimization or general register allocation.
 - O-core direct calls are implemented. Function-pointer types are represented,
   while indirect calls are not yet lowered.
 - O-core aggregates support deterministic layout, construction, indexing,

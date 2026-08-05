@@ -385,9 +385,23 @@ require_fixed README.md \
 require_fixed README.md \
     'No production lowering currently emits these' \
     'the hosted PR6 vocabulary could be misread as production governed lowering'
+check 'PR8[AB]' \
+    'hosted execution milestones are ProjectExec-A/ProjectExec-B; PR8 is reserved for World graph-layer separation'
 require_fixed README.md \
     'Project HGraph planning and ordered hosted execution gates' \
     'the hosted project planning/execution gates are missing from public status'
+require_fixed README.md \
+    'World PR8-1 adds a versioned project-profile `LogicalHGraphV1`' \
+    'the canonical project logical-graph slice is missing from public status'
+require_fixed README.md \
+    'This slice does not yet provide `DeploymentPlan`' \
+    'the partial World PR8-1 slice lacks its deployment/runtime/recovery non-claim'
+require_fixed README.md \
+    'not a whitespace-insensitive' \
+    'the logical graph digest could be misread as source-format-insensitive'
+require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
+    '`ProjectAttemptTrace` version 4 binds events' \
+    'the executor plan still describes an obsolete project trace version'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
@@ -432,10 +446,10 @@ require_fixed docs/CLAIMS.md \
     'unsupported project policies must fail closed rather than use legacy fallback'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
     'Project HGraph ordered hosted execution: PASS' \
-    'the exact PR8A/PR8B hosted execution evidence marker is missing'
+    'the exact ProjectExec-A/ProjectExec-B hosted execution evidence marker is missing'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
     'does not establish parallel' \
-    'the PR8A/PR8B smoke non-claim boundary is missing'
+    'the ProjectExec-A/ProjectExec-B smoke non-claim boundary is missing'
 require_fixed scripts/smoke-project-hgraph-exec.sh \
     'retry, placement, Governor authority, OWRECEIPT' \
     'the ordered hosted smoke could be promoted to retries, placement, governance, or receipts'
@@ -444,10 +458,16 @@ require_fixed scripts/smoke-project-hgraph-exec.sh \
     'the ordered hosted smoke could be promoted to exact-once, native, or World-gate evidence'
 require_fixed docs/RELEASE_CHECKLIST.md \
     'plus serial ordered' \
-    'the release checklist omits the bounded PR8B ordered execution surface'
+    'the release checklist omits the bounded ProjectExec-B ordered execution surface'
 require_fixed .github/workflows/ci.yml \
     'bash scripts/smoke-project-hgraph-exec.sh' \
-    'CI does not invoke the dedicated PR8A hosted execution smoke'
+    'CI does not invoke the dedicated ProjectExec-A hosted execution smoke'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'LogicalHGraphV1 canonical schema and digest: PASS' \
+    'the project smoke does not prove the canonical LogicalHGraphV1 contract'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'LogicalHGraphV1 HostWorld and no-authority boundary: PASS' \
+    'the project smoke omits the LogicalHGraphV1 authority boundary'
 require_fixed docs/OSTADIX_WORLD.md \
     'complete at the bounded hosted logical-planning' \
     'the PR7 roadmap status is missing'
