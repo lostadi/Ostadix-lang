@@ -62,13 +62,13 @@ require_test "$hgraph_test" "$hgraph_name"
 mark 'World ResourceKey HGraph state-transition corpus: PASS'
 
 grounding_test="$work_dir/world-resource-keys-grounding.log"
-grounding_name='world::grounding::tests::governed_resource_keys_partition_from_ambient_host_state'
+grounding_name='world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields'
 run_logged "$grounding_test" env CARGO_TERM_COLOR=never cargo test --locked --lib \
-    world::grounding::tests::governed_resource_keys_partition_from_ambient_host_state \
+    world::grounding::tests::governed_resource_keys_project_into_governed_and_ambient_fields \
     -- --exact
 require_test_count "$grounding_test" 1
 require_test "$grounding_test" "$grounding_name"
-mark 'World ResourceKey governed/ambient grounding partition: PASS'
+mark 'World ResourceKey governed/ambient grounding projection: PASS'
 
 run cargo build --locked --bin olangc
 cli_log="$work_dir/world-resource-keys-cli.log"
