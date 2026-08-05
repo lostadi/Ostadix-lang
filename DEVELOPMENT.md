@@ -105,6 +105,7 @@ cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
 ./scripts/smoke-world-resource-keys.sh
 ./scripts/smoke-project-hgraph.sh
+./scripts/smoke-project-hgraph-exec.sh
 ./boot-and-test.sh smoke
 
 # Python reference runtime
@@ -130,13 +131,20 @@ python3 -m unittest -v tests.test_source_release
 uses a real project fixture to prove exact bundle/policy provenance, all five
 project operation kinds, logical alternative/prerequisite topology, stable
 nonexecuting IR/DOT output, malformed/substitution rejection, conservative
-`HostWorld`, and ordinary `.O` IR compatibility. It does not execute project
-commands through HGraph; project script/binary execution remains in the hosted
-project runtime. It is not placement, deployment, Governor/receipt integration,
-native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
+`HostWorld`, and ordinary `.O` IR compatibility.
 The gate also proves `scripts/o-cli.sh plan` is byte-identical to the direct
 `olangc --target ir` result. `setup.sh` installs lowercase `o` as a wrapper over
 that dispatcher while preserving evaluator fallback for non-subcommand input.
+
+`smoke-project-hgraph-exec.sh` is the separate PR8A single-branch hosted
+execution gate. It proves that the opt-in HGraph coordinator owns isolated
+materialization, typed prerequisite ordering, route settlement, sole-result
+selection, and an unsigned lifecycle trace for one `Explicit`/`Default`
+alternative. Nonzero settlement retains the ordinary result and conservative
+resource successor while withholding successful completion. It is not
+multipath execution, retry, placement, deployment, Governor/receipt
+integration, exactly-once effects, native or QEMU evidence, hardware isolation,
+G1, or G0--G13 passage.
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
 case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.

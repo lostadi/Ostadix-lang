@@ -28,21 +28,22 @@ pub mod runtime;
 pub mod trace;
 
 pub use executor::{
-    execute_project_hgraph, run_selection_with_configured_executor, ProjectCoordinator,
-    ProjectExecutionError, ProjectExecutionOutcome,
+    execute_project_hgraph, execute_selection_with_configured_executor,
+    run_selection_with_configured_executor, write_project_attempt_trace,
+    ConfiguredProjectExecution, ProjectCoordinator, ProjectExecutionError, ProjectExecutionOutcome,
 };
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,
-    ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance, RouteSet,
-    RouteSpec,
+    ResultCodec, RouteEffects, RouteExecutionDisposition, RouteGuard, RouteKind, RoutePolicy,
+    RouteProvenance, RouteSet, RouteSpec,
 };
 pub use plan::{
-    build_project_hgraph, ProjectCancellationSemantics, ProjectExecutionPlan, ProjectHGraph,
-    ProjectPlanOperation, RoutePlanFacts,
+    build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
+    ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
 pub use trace::{
     ProjectArtifactFingerprint, ProjectAttemptEvent, ProjectAttemptIdentity, ProjectAttemptState,
-    ProjectAttemptTrace, ProjectRouteOutcome, ProjectTraceError,
+    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectRouteOutcome, ProjectTraceError,
 };
 
 /// Derive a project name from a directory path.

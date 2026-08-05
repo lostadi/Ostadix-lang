@@ -26,6 +26,13 @@ fn write(root: &Path, rel: &str, contents: &[u8]) {
     fs::write(path, contents).unwrap();
 }
 
+fn read_project_trace(path: &Path) -> serde_json::Value {
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read trace {}: {error}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("trace {} is not valid JSON: {error}", path.display()))
+}
+
 fn python_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     write(
@@ -223,6 +230,81 @@ fn olink_directory_run_uses_project_default_route() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(combined.contains("hello from app"), "output:\n{combined}");
+}
+
+#[test]
+fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
+    // The discovered project route invokes python3 directly.
+    if which_python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = python_project();
+    let external = tempfile::tempdir().unwrap();
+    let trace_path = external.path().join("olink-project-attempt.json");
+
+    let output = olink()
+        .arg("--project")
+        .arg(dir.path())
+        .arg("--run")
+        .arg("--project-trace-out")
+        .arg(&trace_path)
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "o-link HGraph project run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let trace = read_project_trace(&trace_path);
+    let root = trace.as_object().expect("trace root must be an object");
+    assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
+    assert_eq!(trace["format_version"], 2);
+    let target = trace["header"]["target"]
+        .as_str()
+        .expect("trace header must name the selected route");
+    assert!(
+        target.starts_with("py-main"),
+        "unexpected Python route: {target}"
+    );
+    assert_eq!(trace["header"]["policy"], format!("explicit:{target}"));
+    for field in [
+        "bundle_digest",
+        "logical_graph_digest",
+        "execution_attempt_id",
+    ] {
+        let digest = trace["header"][field]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing trace header field `{field}`"));
+        assert_eq!(digest.len(), 64, "{field} must be a SHA-256-sized id");
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    let events = trace["events"]
+        .as_array()
+        .expect("trace events must be an array");
+    assert!(!events.is_empty());
+    let run_label = format!("run-route:{target}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["operation_label"] == run_label)
+            .map(|event| event["state"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["ready", "started", "settled_success"]
+    );
+    for (ordinal, event) in events.iter().enumerate() {
+        assert_eq!(event["coordinator_ordinal"], ordinal as u64);
+    }
+    let encoded = serde_json::to_string(&trace).unwrap().to_ascii_lowercase();
+    for forbidden in ["signature", "signed_receipt", "owreceipt", "attestation"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "unsigned diagnostic trace contains `{forbidden}`"
+        );
+    }
 }
 
 #[test]

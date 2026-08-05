@@ -6,18 +6,20 @@
 //! It is not a wall-clock timestamp or an operation identity; [`PlanNodeId`]
 //! identifies the operation.
 //!
-//! A successful operation's commit (linearization) point is one indivisible
-//! local coordinator transition containing all three of:
+//! A non-route operation's successful commit (linearization) point is one
+//! indivisible local coordinator transition containing all three of:
 //!
 //! 1. the terminal `Finished` event;
 //! 2. the stored successful operation value; and
 //! 3. atomic materialization/publication of the operation's declared outputs.
 //!
-//! A failed operation instead linearizes when the coordinator records its
-//! terminal `Failed` event and marks the operation's output nodes failed. No
-//! successful operation value is stored and none of that operation's outputs
-//! are materialized or published. Appending a terminal event before its
-//! corresponding coordinator state transition is therefore not a commit.
+//! Route execution has more precise terminal states. `SettledSuccess`,
+//! `SettledFailure`, and `Skipped` all bind a valid [`ProjectRouteOutcome`]; an
+//! unsuccessful process settlement is therefore not confused with an
+//! infrastructure `Aborted` event that may have produced no route result.
+//! Which graph outputs become materialized for each settlement remains a
+//! coordinator responsibility. Appending a terminal event before its
+//! corresponding coordinator state transition is not a commit.
 //!
 //! This local commit discipline does **not** imply exactly-once external
 //! effects: a command may have changed a host file, contacted a service, or
@@ -38,7 +40,56 @@ use super::model::{Artifact, OExecutionResult};
 use super::plan::ProjectPlanOperation;
 
 /// Version of the deterministic project-attempt event vocabulary.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 1;
+///
+/// Version 2 adds an execution-context header and distinguishes route
+/// settlement from coordinator aborts.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 2;
+
+/// Context binding shared by every event in one project execution attempt.
+///
+/// The logical graph digest is stable for the same validated graph. The
+/// execution attempt identifier is deliberately separate and must identify
+/// this particular invocation, so repeated executions of one graph need not
+/// reuse an identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAttemptTraceHeader {
+    pub project_name: String,
+    pub bundle_digest: String,
+    pub target: String,
+    pub policy: String,
+    pub logical_graph_digest: String,
+    pub execution_attempt_id: String,
+}
+
+impl ProjectAttemptTraceHeader {
+    pub fn new(
+        project_name: impl Into<String>,
+        bundle_digest: impl Into<String>,
+        target: impl Into<String>,
+        policy: impl Into<String>,
+        logical_graph_digest: impl Into<String>,
+        execution_attempt_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_name: project_name.into(),
+            bundle_digest: bundle_digest.into(),
+            target: target.into(),
+            policy: policy.into(),
+            logical_graph_digest: logical_graph_digest.into(),
+            execution_attempt_id: execution_attempt_id.into(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProjectTraceError> {
+        validate_label(&self.project_name, "project name")?;
+        validate_metadata_sha256(&self.bundle_digest, "bundle digest")?;
+        validate_label(&self.target, "selection target")?;
+        validate_label(&self.policy, "route policy")?;
+        validate_metadata_sha256(&self.logical_graph_digest, "logical graph digest")?;
+        validate_label(&self.execution_attempt_id, "execution attempt id")?;
+        Ok(())
+    }
+}
 
 /// One operation's stable identity as seen by the project coordinator.
 ///
@@ -222,15 +273,31 @@ impl TryFrom<&OExecutionResult> for ProjectRouteOutcome {
 pub enum ProjectAttemptState {
     Ready,
     Started,
+    /// Successful terminal state for a non-route project operation.
     Finished,
-    Failed,
+    /// A route produced a successful execution result.
+    SettledSuccess,
+    /// A route produced a valid execution result with an unsuccessful status.
+    SettledFailure,
+    /// A route guard produced a valid skip result.
+    Skipped,
+    /// The coordinator could not complete the operation. A route outcome is
+    /// absent unless execution had genuinely produced one before the abort.
+    Aborted,
 }
 
 impl ProjectAttemptState {
     /// True only for the states that participate in the coordinator's local
     /// commit/linearization point.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finished | Self::Failed)
+        matches!(
+            self,
+            Self::Finished
+                | Self::SettledSuccess
+                | Self::SettledFailure
+                | Self::Skipped
+                | Self::Aborted
+        )
     }
 }
 
@@ -246,8 +313,9 @@ pub struct ProjectAttemptEvent {
     pub branch: Option<usize>,
     pub route_id: Option<String>,
     pub state: ProjectAttemptState,
-    /// Present for route terminal events; absent for non-route operations and
-    /// all nonterminal lifecycle events.
+    /// Present for settled/skipped `RunRoute` events and only for an `Aborted`
+    /// event when a valid route result was genuinely available. Absent for
+    /// other project operations and all nonterminal lifecycle events.
     pub outcome: Option<ProjectRouteOutcome>,
     /// SHA-256 of the coordinator's normalized failure description. Raw error
     /// text is not retained because host paths and tool diagnostics are often
@@ -299,22 +367,78 @@ impl ProjectAttemptEvent {
                 }
             }
             ProjectAttemptState::Finished => {
-                if self.failure_sha256.is_some() {
+                if self.is_run_route() {
                     return Err(ProjectTraceError::InvalidEvent(
-                        "finished attempt event carries a failure fingerprint".to_string(),
+                        "route attempt uses the non-route Finished state".to_string(),
+                    ));
+                }
+                if self.outcome.is_some() || self.failure_sha256.is_some() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "finished non-route event carries route or failure data".to_string(),
                     ));
                 }
             }
-            ProjectAttemptState::Failed => {
+            ProjectAttemptState::SettledSuccess
+            | ProjectAttemptState::SettledFailure
+            | ProjectAttemptState::Skipped => {
+                if !self.is_run_route() || self.route_id.is_none() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "route settlement event does not identify a RunRoute operation".to_string(),
+                    ));
+                }
+                if self.outcome.is_none() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "route settlement event lacks a route outcome".to_string(),
+                    ));
+                }
+                if self.failure_sha256.is_some() {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "route settlement event carries an abort fingerprint".to_string(),
+                    ));
+                }
+                let exit_code = self
+                    .outcome
+                    .as_ref()
+                    .expect("route settlement outcome presence was checked")
+                    .exit_code;
+                match self.state {
+                    ProjectAttemptState::SettledSuccess if exit_code != Some(0) => {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "successful route settlement does not have exit code 0".to_string(),
+                        ));
+                    }
+                    ProjectAttemptState::SettledFailure if exit_code == Some(0) => {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "unsuccessful route settlement has exit code 0".to_string(),
+                        ));
+                    }
+                    ProjectAttemptState::Skipped if exit_code.is_some() => {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "skipped route settlement carries a process exit code".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            ProjectAttemptState::Aborted => {
                 let digest = self.failure_sha256.as_deref().ok_or_else(|| {
                     ProjectTraceError::InvalidEvent(
-                        "failed attempt event lacks a failure fingerprint".to_string(),
+                        "aborted attempt event lacks a failure fingerprint".to_string(),
                     )
                 })?;
                 validate_sha256(digest, "failure fingerprint")?;
+                if self.outcome.is_some() && (!self.is_run_route() || self.route_id.is_none()) {
+                    return Err(ProjectTraceError::InvalidEvent(
+                        "non-route abort carries a route outcome".to_string(),
+                    ));
+                }
             }
         }
         Ok(())
+    }
+
+    fn is_run_route(&self) -> bool {
+        self.operation_label.starts_with("run-route:")
     }
 }
 
@@ -322,35 +446,39 @@ impl ProjectAttemptEvent {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectAttemptTrace {
     pub format_version: u32,
+    header: ProjectAttemptTraceHeader,
     events: Vec<ProjectAttemptEvent>,
     #[serde(skip)]
     attempts: BTreeMap<PlanNodeId, (ProjectAttemptIdentity, ProjectAttemptState)>,
 }
 
-impl Default for ProjectAttemptTrace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ProjectAttemptTrace {
-    pub fn new() -> Self {
-        Self {
+    /// Start an empty checked trace bound to one validated execution context.
+    pub fn new(header: ProjectAttemptTraceHeader) -> Result<Self, ProjectTraceError> {
+        header.validate()?;
+        Ok(Self {
             format_version: PROJECT_ATTEMPT_TRACE_VERSION,
+            header,
             events: Vec::new(),
             attempts: BTreeMap::new(),
-        }
+        })
     }
 
     /// Rebuild a trace from events while replaying every lifecycle invariant.
     pub fn try_from_events(
+        header: ProjectAttemptTraceHeader,
         events: impl IntoIterator<Item = ProjectAttemptEvent>,
     ) -> Result<Self, ProjectTraceError> {
-        let mut trace = Self::new();
+        let mut trace = Self::new(header)?;
         for event in events {
             trace.record(event)?;
         }
         Ok(trace)
+    }
+
+    /// Execution context to which every event in this trace is bound.
+    pub fn header(&self) -> &ProjectAttemptTraceHeader {
+        &self.header
     }
 
     /// Read-only event order emitted by the coordinator.
@@ -390,26 +518,57 @@ impl ProjectAttemptTrace {
         self.record_state(identity, ProjectAttemptState::Started, None, None)
     }
 
-    /// Record a successful terminal event.
-    ///
-    /// `outcome` is required by the coordinator for `RunRoute` and remains
-    /// `None` for other project operations. This method only validates/appends
-    /// trace state; the caller must include it in the atomic terminal-event +
-    /// stored-value + output-materialization commit described at module scope.
+    /// Record successful completion of a non-route project operation.
     pub fn record_finished(
         &mut self,
         identity: &ProjectAttemptIdentity,
-        outcome: Option<ProjectRouteOutcome>,
     ) -> Result<(), ProjectTraceError> {
-        self.record_state(identity, ProjectAttemptState::Finished, outcome, None)
+        self.record_state(identity, ProjectAttemptState::Finished, None, None)
     }
 
-    /// Record a failed terminal event without retaining nondeterministic raw
-    /// diagnostics. The exact normalized failure bytes are SHA-256-bound. The
-    /// caller must pair this event with failed-output bookkeeping only; it must
-    /// not store a success value or materialize/publish this operation's
-    /// outputs.
-    pub fn record_failed(
+    /// Record a route result whose process status is successful.
+    pub fn record_settled_success(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        outcome: ProjectRouteOutcome,
+    ) -> Result<(), ProjectTraceError> {
+        self.record_state(
+            identity,
+            ProjectAttemptState::SettledSuccess,
+            Some(outcome),
+            None,
+        )
+    }
+
+    /// Record a route result whose process status is unsuccessful.
+    pub fn record_settled_failure(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        outcome: ProjectRouteOutcome,
+    ) -> Result<(), ProjectTraceError> {
+        self.record_state(
+            identity,
+            ProjectAttemptState::SettledFailure,
+            Some(outcome),
+            None,
+        )
+    }
+
+    /// Record a valid route result produced by guard-skip semantics.
+    pub fn record_skipped(
+        &mut self,
+        identity: &ProjectAttemptIdentity,
+        outcome: ProjectRouteOutcome,
+    ) -> Result<(), ProjectTraceError> {
+        self.record_state(identity, ProjectAttemptState::Skipped, Some(outcome), None)
+    }
+
+    /// Record an infrastructure/coordinator abort.
+    ///
+    /// Raw diagnostics are not retained; their normalized bytes are
+    /// SHA-256-bound. `outcome` must be `None` unless route execution genuinely
+    /// produced a valid result before the abort.
+    pub fn record_aborted(
         &mut self,
         identity: &ProjectAttemptIdentity,
         outcome: Option<ProjectRouteOutcome>,
@@ -417,7 +576,7 @@ impl ProjectAttemptTrace {
     ) -> Result<(), ProjectTraceError> {
         self.record_state(
             identity,
-            ProjectAttemptState::Failed,
+            ProjectAttemptState::Aborted,
             outcome,
             Some(sha256_hex(normalized_failure.as_ref())),
         )
@@ -458,7 +617,11 @@ impl ProjectAttemptTrace {
                     (ProjectAttemptState::Ready, ProjectAttemptState::Started)
                         | (
                             ProjectAttemptState::Started,
-                            ProjectAttemptState::Finished | ProjectAttemptState::Failed
+                            ProjectAttemptState::Finished
+                                | ProjectAttemptState::SettledSuccess
+                                | ProjectAttemptState::SettledFailure
+                                | ProjectAttemptState::Skipped
+                                | ProjectAttemptState::Aborted
                         )
                 );
                 if !valid {
@@ -576,6 +739,13 @@ fn validate_sha256(value: &str, field: &str) -> Result<(), ProjectTraceError> {
     Ok(())
 }
 
+fn validate_metadata_sha256(value: &str, field: &str) -> Result<(), ProjectTraceError> {
+    validate_sha256(value, field).map_err(|error| match error {
+        ProjectTraceError::InvalidOutcome(message) => ProjectTraceError::InvalidMetadata(message),
+        other => other,
+    })
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -607,7 +777,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::project::model::ExecutionProvenance;
+    use crate::project::model::{ExecutionProvenance, RouteExecutionDisposition};
 
     fn identity(node: usize) -> ProjectAttemptIdentity {
         ProjectAttemptIdentity::new(
@@ -615,6 +785,21 @@ mod tests {
             "run-route:test",
             Some(0),
             Some("test".to_string()),
+        )
+    }
+
+    fn non_route_identity(node: usize) -> ProjectAttemptIdentity {
+        ProjectAttemptIdentity::new(PlanNodeId(node), "materialize-project", Some(0), None)
+    }
+
+    fn header() -> ProjectAttemptTraceHeader {
+        ProjectAttemptTraceHeader::new(
+            "project",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            "default",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "attempt-1",
         )
     }
 
@@ -626,6 +811,7 @@ mod tests {
             stderr: Vec::new(),
             value: None,
             artifacts,
+            disposition: RouteExecutionDisposition::Executed,
             duration_ns: 999,
             provenance: ExecutionProvenance {
                 workspace: PathBuf::from("/volatile/workspace"),
@@ -672,19 +858,39 @@ mod tests {
     }
 
     #[test]
+    fn trace_requires_a_canonical_execution_header() {
+        let expected = header();
+        let trace = ProjectAttemptTrace::new(expected.clone()).unwrap();
+        assert_eq!(trace.format_version, PROJECT_ATTEMPT_TRACE_VERSION);
+        assert_eq!(trace.header(), &expected);
+        let serialized = serde_json::to_value(&trace).unwrap();
+        assert_eq!(serialized["format_version"], 2);
+        assert_eq!(serialized["header"]["project_name"], "project");
+        assert_eq!(serialized["header"]["execution_attempt_id"], "attempt-1");
+
+        let mut invalid = expected;
+        invalid.logical_graph_digest = "not-a-digest".to_string();
+        assert!(matches!(
+            ProjectAttemptTrace::new(invalid),
+            Err(ProjectTraceError::InvalidMetadata(message))
+                if message == "logical graph digest must be a lowercase SHA-256 digest"
+        ));
+    }
+
+    #[test]
     fn checked_trace_records_one_complete_lifecycle() {
         let identity = identity(4);
         let outcome = ProjectRouteOutcome::from_result(&result(Vec::new())).unwrap();
-        let mut trace = ProjectAttemptTrace::new();
+        let mut trace = ProjectAttemptTrace::new(header()).unwrap();
         trace.record_ready(&identity).unwrap();
         trace.record_started(&identity).unwrap();
         trace
-            .record_finished(&identity, Some(outcome.clone()))
+            .record_settled_success(&identity, outcome.clone())
             .unwrap();
 
         assert_eq!(
             trace.state(PlanNodeId(4)),
-            Some(ProjectAttemptState::Finished)
+            Some(ProjectAttemptState::SettledSuccess)
         );
         assert_eq!(
             trace
@@ -695,7 +901,7 @@ mod tests {
             [
                 ProjectAttemptState::Ready,
                 ProjectAttemptState::Started,
-                ProjectAttemptState::Finished,
+                ProjectAttemptState::SettledSuccess,
             ]
         );
         assert_eq!(
@@ -711,8 +917,8 @@ mod tests {
 
     #[test]
     fn trace_rejects_metadata_drift_and_duplicate_terminal_events() {
-        let identity = identity(1);
-        let mut trace = ProjectAttemptTrace::new();
+        let identity = non_route_identity(1);
+        let mut trace = ProjectAttemptTrace::new(header()).unwrap();
         trace.record_ready(&identity).unwrap();
 
         let mut changed = identity.clone();
@@ -721,21 +927,115 @@ mod tests {
         assert_eq!(error, ProjectTraceError::MetadataChanged(PlanNodeId(1)));
 
         trace.record_started(&identity).unwrap();
-        trace.record_finished(&identity, None).unwrap();
+        trace.record_finished(&identity).unwrap();
         assert!(matches!(
-            trace.record_failed(&identity, None, "late failure"),
+            trace.record_aborted(&identity, None, "late failure"),
             Err(ProjectTraceError::InvalidTransition {
                 from: Some(ProjectAttemptState::Finished),
-                to: ProjectAttemptState::Failed,
+                to: ProjectAttemptState::Aborted,
                 ..
             })
         ));
     }
 
     #[test]
+    fn trace_accepts_each_exact_terminal_vocabulary() {
+        let outcome = ProjectRouteOutcome::from_result(&result(Vec::new())).unwrap();
+        let mut trace = ProjectAttemptTrace::new(header()).unwrap();
+
+        let finished = non_route_identity(0);
+        trace.record_ready(&finished).unwrap();
+        trace.record_started(&finished).unwrap();
+        trace.record_finished(&finished).unwrap();
+
+        for (node, state) in [
+            (1, ProjectAttemptState::SettledSuccess),
+            (2, ProjectAttemptState::SettledFailure),
+            (3, ProjectAttemptState::Skipped),
+        ] {
+            let route = identity(node);
+            trace.record_ready(&route).unwrap();
+            trace.record_started(&route).unwrap();
+            match state {
+                ProjectAttemptState::SettledSuccess => trace
+                    .record_settled_success(&route, outcome.clone())
+                    .unwrap(),
+                ProjectAttemptState::SettledFailure => {
+                    let mut failed = outcome.clone();
+                    failed.exit_code = Some(7);
+                    trace.record_settled_failure(&route, failed).unwrap()
+                }
+                ProjectAttemptState::Skipped => {
+                    let mut skipped = outcome.clone();
+                    skipped.exit_code = None;
+                    trace.record_skipped(&route, skipped).unwrap()
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let aborted = identity(4);
+        trace.record_ready(&aborted).unwrap();
+        trace.record_started(&aborted).unwrap();
+        trace
+            .record_aborted(&aborted, None, b"normalized infrastructure failure")
+            .unwrap();
+
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|node| trace.state(PlanNodeId(node)).unwrap()),
+            [
+                ProjectAttemptState::Finished,
+                ProjectAttemptState::SettledSuccess,
+                ProjectAttemptState::SettledFailure,
+                ProjectAttemptState::Skipped,
+                ProjectAttemptState::Aborted,
+            ]
+        );
+        assert_eq!(
+            trace
+                .events()
+                .iter()
+                .map(|event| event.coordinator_ordinal)
+                .collect::<Vec<_>>(),
+            (0_u64..15).collect::<Vec<_>>()
+        );
+        let aborted_event = trace.events().last().unwrap();
+        assert!(aborted_event.outcome.is_none());
+        assert_eq!(
+            aborted_event.failure_sha256.as_deref().map(str::len),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn trace_rejects_route_and_non_route_terminal_confusion() {
+        let outcome = ProjectRouteOutcome::from_result(&result(Vec::new())).unwrap();
+
+        let route = identity(0);
+        let mut route_trace = ProjectAttemptTrace::new(header()).unwrap();
+        route_trace.record_ready(&route).unwrap();
+        route_trace.record_started(&route).unwrap();
+        assert!(matches!(
+            route_trace.record_finished(&route),
+            Err(ProjectTraceError::InvalidEvent(message))
+                if message == "route attempt uses the non-route Finished state"
+        ));
+
+        let non_route = non_route_identity(1);
+        let mut non_route_trace = ProjectAttemptTrace::new(header()).unwrap();
+        non_route_trace.record_ready(&non_route).unwrap();
+        non_route_trace.record_started(&non_route).unwrap();
+        assert!(matches!(
+            non_route_trace.record_settled_failure(&non_route, outcome),
+            Err(ProjectTraceError::InvalidEvent(message))
+                if message == "route settlement event does not identify a RunRoute operation"
+        ));
+    }
+
+    #[test]
     fn trace_rejects_noncontiguous_external_ordinal() {
         let identity = identity(1);
-        let mut trace = ProjectAttemptTrace::new();
+        let mut trace = ProjectAttemptTrace::new(header()).unwrap();
         let event = ProjectAttemptEvent::new(1, &identity, ProjectAttemptState::Ready, None, None);
         assert!(matches!(
             trace.record(event),
@@ -754,10 +1054,15 @@ mod tests {
             Some(0),
             Some(" route\n".to_string()),
         );
-        let mut trace = ProjectAttemptTrace::new();
+        let mut trace = ProjectAttemptTrace::new(header()).unwrap();
         trace.record_ready(&identity).unwrap();
         trace.record_started(&identity).unwrap();
-        trace.record_finished(&identity, None).unwrap();
+        trace
+            .record_settled_success(
+                &identity,
+                ProjectRouteOutcome::from_result(&result(Vec::new())).unwrap(),
+            )
+            .unwrap();
         assert_eq!(trace.events()[2].route_id.as_deref(), Some(" route\n"));
     }
 
@@ -768,13 +1073,13 @@ mod tests {
         let event = ProjectAttemptEvent::new(
             0,
             &identity,
-            ProjectAttemptState::Finished,
+            ProjectAttemptState::SettledSuccess,
             Some(outcome),
             None,
         );
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["plan_node"], 3);
-        assert_eq!(value["state"], "finished");
+        assert_eq!(value["state"], "settled_success");
         assert!(value.get("stdout").is_none());
         assert!(value["outcome"].get("stdout_sha256").is_some());
     }
