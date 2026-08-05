@@ -294,15 +294,6 @@ impl PlacementSnapshotV1 {
         digest_canonical(PLACEMENT_SNAPSHOT_DIGEST_DOMAIN, &self.canonical_bytes()?)
     }
 
-    fn provider(
-        &self,
-        binding: &DeploymentProviderBindingV1,
-    ) -> Option<&DeploymentProviderSnapshotV1> {
-        self.providers
-            .binary_search_by(|candidate| candidate.binding.cmp(binding))
-            .ok()
-            .map(|index| &self.providers[index])
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
