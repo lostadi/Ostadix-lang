@@ -49,6 +49,14 @@ impl ProjectCancellationSemantics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePlanFacts {
     pub kind: RouteKind,
+    /// Executable program named by the route, without arguments. This is a
+    /// placement/runtime requirement, not proof that any provider has it.
+    pub executable: Option<String>,
+    /// Named O evaluator required by the route, when execution does not begin
+    /// with an ordinary command.
+    pub evaluator: Option<String>,
+    /// Bundle-relative entrypoint retained for runtime/package matching.
+    pub entrypoint: Option<String>,
     pub prerequisites: Vec<String>,
     pub guards: Vec<RouteGuard>,
     pub environment_keys: Vec<String>,
@@ -64,6 +72,9 @@ impl RoutePlanFacts {
     fn from_route(route: &RouteSpec) -> Self {
         Self {
             kind: route.kind,
+            executable: route.command.first().cloned(),
+            evaluator: route.evaluator.clone(),
+            entrypoint: route.entrypoint.clone(),
             prerequisites: route.prerequisites.clone(),
             guards: route.guards.clone(),
             environment_keys: route.environment.keys().cloned().collect(),
@@ -652,13 +663,19 @@ impl ProjectExecutionPlan {
             );
             deduplicate_nodes(&mut inputs);
             deduplicate_nodes(&mut outputs);
+            let stable_order = u64::try_from(operation.id.0).map_err(|_| {
+                format!(
+                    "project operation id {} does not fit the HGraph stable-order field",
+                    operation.id.0
+                )
+            })?;
             graph.add_exec_edge(
                 operation.id,
                 operation.op.clone(),
                 inputs,
                 outputs,
                 value,
-                operation.id.0 as u64,
+                stable_order,
             )?;
             values.insert(operation.id, value);
         }

@@ -188,8 +188,9 @@ preserved sequence, and executable acyclicity. `olangc --target dot` renders
 ordinary, resource, actor, completion/control, executable, and constraint nodes
 with distinct styles and directed ports.
 
-`ProjectAttemptTrace` version 3 binds events to the project name, bundle digest,
-target, policy, logical graph digest, and a fresh execution-attempt identifier.
+`ProjectAttemptTrace` version 4 binds events to the project name, bundle digest,
+target, policy, canonical `LogicalHGraphV1` schema/digest, and a fresh
+execution-attempt identifier.
 For an unsuccessful ordered branch it also records the proposed next route,
 the assessed route prefix, the `no_execution`, `declared_idempotent`, or
 `unproven_effects` evidence class, and the allow/deny result.

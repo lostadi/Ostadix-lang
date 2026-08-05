@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bounded PR8A/PR8B smoke: Explicit/Default plus serial ordered
+# Bounded ProjectExec-A/ProjectExec-B smoke: Explicit/Default plus serial ordered
 # Fallback/AnySuccess selection. This does not establish parallel
 # race/cancellation, retry, placement, Governor authority, OWRECEIPT
 # attestation, exactly-once effects, native execution, or G1 passage.

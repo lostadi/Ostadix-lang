@@ -138,6 +138,7 @@ const RUNTIME_PROJECT_MATERIALIZE_RS: &str = include_str!("../project/materializ
 const RUNTIME_PROJECT_MANIFEST_RS: &str = include_str!("../project/manifest.rs");
 const RUNTIME_PROJECT_DISCOVER_RS: &str = include_str!("../project/discover.rs");
 const RUNTIME_PROJECT_LOWER_RS: &str = include_str!("../project/lower.rs");
+const RUNTIME_PROJECT_LOGICAL_RS: &str = include_str!("../project/logical.rs");
 const RUNTIME_PROJECT_PLAN_RS: &str = include_str!("../project/plan.rs");
 const RUNTIME_PROJECT_EXECUTOR_RS: &str = include_str!("../project/executor.rs");
 const RUNTIME_PROJECT_RUNTIME_RS: &str = include_str!("../project/runtime.rs");
@@ -475,6 +476,18 @@ fn compile_or_run_project(cli: &Cli, input_is_dir: bool, source: &str) -> Result
             )
             .map_err(anyhow::Error::msg)
             .context("failed to build logical project HGraph")?;
+            let logical = project
+                .logical_v1()
+                .context("failed to normalize LogicalHGraphV1")?;
+            let logical_digest = logical
+                .digest()
+                .context("failed to digest LogicalHGraphV1")?;
+            println!("; LogicalHGraphV1");
+            println!(
+                "logical schema={} sha256={}",
+                logical.schema_version,
+                logical_digest.as_sha256()
+            );
             print!("{}", project.to_text());
             Ok(())
         }
@@ -653,6 +666,7 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
     fs::write(project_dir.join("manifest.rs"), RUNTIME_PROJECT_MANIFEST_RS)?;
     fs::write(project_dir.join("discover.rs"), RUNTIME_PROJECT_DISCOVER_RS)?;
     fs::write(project_dir.join("lower.rs"), RUNTIME_PROJECT_LOWER_RS)?;
+    fs::write(project_dir.join("logical.rs"), RUNTIME_PROJECT_LOGICAL_RS)?;
     fs::write(project_dir.join("plan.rs"), RUNTIME_PROJECT_PLAN_RS)?;
     fs::write(project_dir.join("executor.rs"), RUNTIME_PROJECT_EXECUTOR_RS)?;
     fs::write(project_dir.join("runtime.rs"), RUNTIME_PROJECT_RUNTIME_RS)?;
@@ -2031,6 +2045,11 @@ mod tests {
         let src_dir = build_dir.join("src");
         write_project_sources(&src_dir).unwrap();
         assert_eq!(
+            fs::read_to_string(src_dir.join("project/logical.rs")).unwrap(),
+            RUNTIME_PROJECT_LOGICAL_RS,
+            "compiled project runtimes must receive LogicalHGraphV1 verbatim"
+        );
+        assert_eq!(
             fs::read_to_string(src_dir.join("project/plan.rs")).unwrap(),
             RUNTIME_PROJECT_PLAN_RS,
             "compiled project runtimes must receive the project HGraph planner verbatim"
@@ -2046,7 +2065,12 @@ mod tests {
             "compiled project runtimes must receive the project attempt trace verbatim"
         );
         let module = fs::read_to_string(src_dir.join("project/mod.rs")).unwrap();
-        for declaration in ["pub mod plan;", "pub mod executor;", "pub mod trace;"] {
+        for declaration in [
+            "pub mod logical;",
+            "pub mod plan;",
+            "pub mod executor;",
+            "pub mod trace;",
+        ] {
             assert!(module.contains(declaration), "missing `{declaration}`");
         }
         fs::remove_dir_all(build_dir).unwrap();

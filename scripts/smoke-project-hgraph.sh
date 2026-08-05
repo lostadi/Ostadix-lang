@@ -72,6 +72,28 @@ done
 mark 'ProjectBundle selection and exact provenance: PASS'
 mark 'Project HGraph malformed/substitution rejection: PASS'
 
+logical_tests_log="$work_dir/project-logical-hgraph-tests.log"
+run_logged "$logical_tests_log" env CARGO_TERM_COLOR=never \
+    cargo test --locked --test project_logical_hgraph
+require_test_count "$logical_tests_log" 11
+for name in \
+    directory_and_lifted_project_have_identical_canonical_bytes_and_digest \
+    project_profile_v1_digest_is_pinned \
+    source_formatting_changes_the_exact_bundle_and_logical_identity \
+    canonical_decode_round_trips_and_strict_mode_rejects_noncanonical_json \
+    unknown_fields_versions_and_operation_variants_fail_closed \
+    hosted_effects_preserve_host_world_and_mint_no_authority_requirements \
+    logical_effect_resources_match_the_scheduler_expansion \
+    hosted_profile_rejects_forged_governed_resources_and_authority \
+    hosted_profile_rejects_host_world_removal_and_effect_flag_tampering \
+    trusted_project_comparison_rejects_a_digest_substitution \
+    structural_substitutions_fail_closed_while_valid_source_and_policy_changes_rehash
+do
+    require_test "$logical_tests_log" "$name"
+done
+mark 'LogicalHGraphV1 canonical schema and digest: PASS'
+mark 'LogicalHGraphV1 HostWorld and no-authority boundary: PASS'
+
 run cargo build --locked --bin olangc
 first="$work_dir/project-plan-first.log"
 second="$work_dir/project-plan-second.log"
@@ -105,6 +127,8 @@ PATH="$installed_cargo_bin:$installed_local_bin:$ROOT/target/release:/usr/bin:/b
     >"$fallback_log" 2>>"$transcript"
 grep -Fqx 'pr7-fallback-probe preserved-argument' "$fallback_log"
 
+grep -Fqx '; LogicalHGraphV1' "$first"
+grep -Eq '^logical schema=1 sha256=[0-9a-f]{64}$' "$first"
 grep -Fqx '; ProjectExecutionPlan' "$first"
 grep -Fqx 'selection target=main policy=verify_equivalent alternatives=[impl-a,impl-b] cancellation=none equivalence=required' "$first"
 require_count "$first" '^project-op p[0-9]+ kind=materialize-project ' 2
@@ -237,8 +261,13 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 3
-assert trace["header"]["policy"] == "any_success"
+assert trace["format_version"] == 4
+header = trace["header"]
+assert header["policy"] == "any_success"
+assert header["logical_graph_schema"] == 1
+logical_digest = header["logical_graph_digest"]
+assert len(logical_digest) == 64
+assert all(character in "0123456789abcdef" for character in logical_digest)
 events = trace["events"]
 assert any(
     event["operation_label"] == "run-route:impl-a"
@@ -274,8 +303,13 @@ assert first < second
 
 with open(sys.argv[2], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 3
-assert trace["header"]["policy"] == "any_success"
+assert trace["format_version"] == 4
+header = trace["header"]
+assert header["policy"] == "any_success"
+assert header["logical_graph_schema"] == 1
+logical_digest = header["logical_graph_digest"]
+assert len(logical_digest) == 64
+assert all(character in "0123456789abcdef" for character in logical_digest)
 events = trace["events"]
 assert any(
     event["operation_label"] == "run-route:impl-a"

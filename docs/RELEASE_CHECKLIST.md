@@ -68,12 +68,16 @@ epoch/membership. This is not Mode 31, a ResourceKey wire ABI, production
 governed lowering, native/QEMU/hardware evidence, Governor authority, device
 assignment, DMA/IOMMU isolation, Acceptance A, or G0--G13 passage.
 
-The composite Project HGraph smoke contains a bounded hosted PR7
-logical-planning phase. It constructs an exact-provenance plan and real HGraph
-operations from a checked-in project, validates logical alternatives and
+The composite Project HGraph smoke contains bounded hosted PR7 planning and
+World PR8-1 project-profile phases. It constructs an exact-provenance plan and
+real HGraph operations from a checked-in project, validates logical alternatives and
 prerequisites, route policy and equivalence metadata, malformed/substitution
 rejection, stable nonexecuting IR/DOT output, residual `HostWorld`, and ordinary
-`.O` IR compatibility. Its logical alternative branches may remain serialized
+`.O` IR compatibility. The PR8-1 phase checks canonical `LogicalHGraphV1`
+encoding/digest, raw and scheduler-expanded effect resources, strict decoding,
+forged-governed-resource rejection, and the hosted no-authority boundary. That
+digest is exact-source-bound; it does not normalize source or manifest
+formatting. Its logical alternative branches may remain serialized
 and cross-coupled by shared conservative ambient/resource state chains; the
 smoke claims neither parallel execution nor independent host mediation. It
 also checks byte parity between direct `olangc` and repository-owned `o plan`,
@@ -81,13 +85,15 @@ then compiles a real project binary, checks its CLI, and runs opt-in AnySuccess
 for immediate short-circuit plus nonzero-to-success continuation in disposable
 workspaces.
 
-The execution Project HGraph smoke is the bounded PR8A/PR8B opt-in hosted gate
-for one resolved `Explicit`/`Default` alternative plus serial ordered
+The execution Project HGraph smoke is the bounded
+ProjectExec-A/ProjectExec-B opt-in hosted gate for one resolved
+`Explicit`/`Default` alternative plus serial ordered
 `Fallback`/`AnySuccess`. It checks shared isolated workspace execution, typed
 value/success prerequisite edges, first-success prefix readiness, attempted
 result retention, guard-skip/nonzero continuation, conservative `HostWorld`
 progression, infrastructure aborts, and unsigned deterministic lifecycle
-events. A terminal alternative may continue only after no route child executed
+events. Trace v4 binds those events to the canonical logical graph schema and
+digest. A terminal alternative may continue only after no route child executed
 or after every executed route declares `failure_continuation =
 "declared_idempotent"`; a failed prerequisite remains a hard stop. Bundle v2
 carries that contract, and complete traces pass plan-aware semantic replay

@@ -9,7 +9,11 @@ There are three active, supported hosted `.O` implementations plus O-core:
 - **Rust hosted implementation** (`src/`) is authoritative. It provides the `O` interpreter, OIR planner/evaluator, backend registry, scheduler, linker tools, notebook server, `olangc`, and `ocorec`.
 - **C17 hosted implementation** (`c_cpp/`) is active and supported. `make` or CMake build the interpreter `O` and AOT compiler `olangc` from C sources.
 - **Python hosted implementation** (`o_lang/`) is active and supported as a readable semantic reference and cross-check target.
-- **O-core** (`src/ocore/`, `docs/OCORE.md`) is a freestanding native systems language. It compiles `.oc` source through AST, typed HIR, and SSA MIR to x86_64 ELF object files. That x86_64 ELF restriction applies only to O-core's emitted object format, not to hosted `.O` execution.
+- **O-core** (`src/ocore/`, `docs/OCORE.md`) is a freestanding native systems
+  language. It compiles `.oc` source through AST, typed HIR, and SSA MIR to
+  ELF64 object files for its primary x86_64 target and bounded, conservative
+  AArch64 G2 subset. Those native target boundaries do not apply to hosted `.O`
+  execution.
 
 `c_cpp/legacy_cpp/` is the historical C++ prototype only. It used an obsolete line-oriented JSON protocol and is not built by the active C17 Makefile or CMake paths.
 
@@ -143,8 +147,9 @@ omitting that contract now fails closed before the second branch. `setup.sh`
 installs lowercase `o` as a wrapper over the dispatcher
 while preserving evaluator fallback for non-subcommand input.
 
-`smoke-project-hgraph-exec.sh` is the separate PR8A/PR8B ordered hosted
-execution gate. It proves that the opt-in HGraph coordinator owns isolated
+`smoke-project-hgraph-exec.sh` is the separate
+ProjectExec-A/ProjectExec-B ordered hosted execution gate. It proves that the
+opt-in HGraph coordinator owns isolated
 materialization, typed prerequisite ordering, route settlement, and unsigned
 lifecycle tracing for one `Explicit`/`Default` alternative plus serial
 `Fallback`/`AnySuccess`. The latter use a first-class ordered-prefix input
@@ -156,8 +161,9 @@ successful prerequisites, explicitly declares
 fails closed. A failed prerequisite remains a hard stop regardless of that
 declaration because this slice has no synthesized branch-failure result. Bundle
 format v2 carries the contract; a v1 bundle migrates only when all routes omit
-the new field and therefore default to `unproven`. Trace v3 records the assessed
-prefix, evidence class, next route, and allow/deny result. Complete traces pass
+the new field and therefore default to `unproven`. Trace v4 records the assessed
+prefix, evidence class, next route, allow/deny result, and canonical
+`LogicalHGraphV1` schema/digest. Complete traces pass
 plan-aware semantic replay against the trusted HGraph, including complete
 causally ordered lifecycle coverage for transitive route prerequisites;
 structural replay alone does not prove bundle-bound evidence. Infrastructure
@@ -167,6 +173,16 @@ verified idempotency, a sandbox/fence/effect log, parallel race/cancellation,
 retry,
 placement, deployment, Governor/receipt integration, exactly-once effects,
 native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
+
+`src/project/logical.rs` is the World PR8-1 project profile. It derives
+`LogicalHGraphV1` after validating the exact plan-to-HGraph projection,
+preserves residual `HostWorld`, rejects unknown schema data, offers a separate
+strict canonical decoder, and supplies the digest used by trace v4. The digest
+binds exact bundle bytes and metadata; it
+normalizes logical-record JSON encoding, not source or manifest formatting. It
+does not define placement, runtime, recovery, World
+task identity, authority grants, receipts, or G1 evidence.
+
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
 case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.
