@@ -516,6 +516,19 @@ pub struct ExecutionProvenance {
     pub cwd: PathBuf,
 }
 
+/// How a valid route result was produced.
+///
+/// This is deliberately separate from the process exit code: an executed
+/// command may settle successfully or unsuccessfully, while a guard skip is a
+/// synthetic compatibility result for which no child process was launched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteExecutionDisposition {
+    #[default]
+    Executed,
+    GuardSkipped,
+}
+
 /// The result of running one route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OExecutionResult {
@@ -533,6 +546,10 @@ pub struct OExecutionResult {
     pub value: Option<serde_json::Value>,
     /// Collected output artifacts.
     pub artifacts: Vec<Artifact>,
+    /// Whether this result came from a child process or guard-skip synthesis.
+    /// The default preserves decoding compatibility with older result JSON.
+    #[serde(default)]
+    pub disposition: RouteExecutionDisposition,
     /// Wall-clock duration in nanoseconds.
     pub duration_ns: u128,
     /// Where/how it ran.
@@ -543,6 +560,11 @@ impl OExecutionResult {
     /// Whether the process exited successfully (exit code 0).
     pub fn succeeded(&self) -> bool {
         self.exit_code == Some(0)
+    }
+
+    /// Whether guard policy synthesized this result without launching a child.
+    pub fn was_guard_skipped(&self) -> bool {
+        self.disposition == RouteExecutionDisposition::GuardSkipped
     }
 
     /// stdout decoded as UTF-8 (lossy).
@@ -558,10 +580,11 @@ impl OExecutionResult {
     /// A compact, human-readable one-run summary.
     pub fn summary(&self) -> String {
         let mut out = String::new();
-        let status = match self.exit_code {
-            Some(0) => "ok".to_string(),
-            Some(code) => format!("exit {code}"),
-            None => "no exit code".to_string(),
+        let status = match (self.disposition, self.exit_code) {
+            (RouteExecutionDisposition::GuardSkipped, _) => "skipped".to_string(),
+            (_, Some(0)) => "ok".to_string(),
+            (_, Some(code)) => format!("exit {code}"),
+            (_, None) => "no exit code".to_string(),
         };
         out.push_str(&format!(
             "route {} → {} ({} ms)\n",
@@ -616,6 +639,7 @@ impl OExecutionResult {
             "stderr": self.stderr_text(),
             "value": self.value,
             "artifacts": self.artifacts,
+            "disposition": self.disposition,
             "duration_ns": self.duration_ns.to_string(),
             "provenance": {
                 "workspace": self.provenance.workspace.display().to_string(),

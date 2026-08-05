@@ -52,6 +52,9 @@ jobs:
       - name: Run hosted project HGraph planning smoke
         run: bash scripts/smoke-project-hgraph.sh
 
+      - name: Run hosted single-branch project HGraph execution smoke
+        run: bash scripts/smoke-project-hgraph-exec.sh
+
       - name: Run deterministic parser properties
         run: cargo test --test parser_proptest
 

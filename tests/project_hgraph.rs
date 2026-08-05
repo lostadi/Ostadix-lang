@@ -10,6 +10,7 @@ use std::process::Command;
 use o_lang::effects::{EffectSummary, ResourceKey};
 use o_lang::hgraph::{ExecutableOp, HNode, HNodeKind};
 use o_lang::ir::PlanNodeId;
+use o_lang::project::plan::ProjectDependency;
 use o_lang::project::runtime::resolve_selection;
 use o_lang::project::{
     self, build_project_hgraph, ProjectBundle, ProjectCancellationSemantics, RoutePolicy,
@@ -140,13 +141,37 @@ fn topology_preserves_logical_branches_prerequisites_compare_and_selection() {
         let prepare_run = route_operation(&project, branch, "prepare", true);
         let terminal_build = route_operation(&project, branch, terminal_id, false);
         let terminal_run = route_operation(&project, branch, terminal_id, true);
-        assert_eq!(prepare_build.dependencies, [materializations[branch]]);
-        assert_eq!(prepare_run.dependencies, [prepare_build.id]);
-        assert_eq!(terminal_build.dependencies, [materializations[branch]]);
+        assert_eq!(
+            prepare_build.dependencies,
+            [ProjectDependency::Value(materializations[branch])]
+        );
+        assert_eq!(
+            prepare_run.dependencies,
+            [ProjectDependency::Value(prepare_build.id)]
+        );
+        assert_eq!(
+            terminal_build.dependencies,
+            [ProjectDependency::Value(materializations[branch])]
+        );
         assert_eq!(
             terminal_run.dependencies,
-            [terminal_build.id, prepare_run.id]
+            [
+                ProjectDependency::Value(terminal_build.id),
+                ProjectDependency::Success(prepare_run.id),
+            ]
         );
+
+        let terminal_inputs = &project.graph.op_for(terminal_run.id).unwrap().inputs;
+        let build_value = project
+            .graph
+            .op_for(terminal_build.id)
+            .unwrap()
+            .value_output;
+        let prerequisite_value = project.graph.op_for(prepare_run.id).unwrap().value_output;
+        let prerequisite_completion = project.graph.completion_node(prepare_run.id).unwrap();
+        assert!(terminal_inputs.contains(&build_value));
+        assert!(terminal_inputs.contains(&prerequisite_completion));
+        assert!(!terminal_inputs.contains(&prerequisite_value));
         terminal_runs.push(terminal_run.id);
     }
 
@@ -156,14 +181,21 @@ fn topology_preserves_logical_branches_prerequisites_compare_and_selection() {
         .iter()
         .find(|operation| matches!(operation.op, ExecutableOp::CompareRouteResults))
         .unwrap();
-    assert_eq!(compare.dependencies, terminal_runs);
+    assert_eq!(
+        compare.dependencies,
+        terminal_runs
+            .iter()
+            .copied()
+            .map(ProjectDependency::Value)
+            .collect::<Vec<_>>()
+    );
     let select = project
         .plan
         .operations
         .iter()
         .find(|operation| matches!(operation.op, ExecutableOp::SelectRoute { .. }))
         .unwrap();
-    assert_eq!(select.dependencies, [compare.id]);
+    assert_eq!(select.dependencies, [ProjectDependency::Value(compare.id)]);
     assert_eq!(project.plan.roots, [select.id]);
 
     let schedule = o_lang::hgraph::ReadySchedule::derive(&project.graph).unwrap();
@@ -171,8 +203,9 @@ fn topology_preserves_logical_branches_prerequisites_compare_and_selection() {
     for operation in &project.plan.operations {
         let position = order.iter().position(|id| *id == operation.id).unwrap();
         for dependency in &operation.dependencies {
+            let dependency = dependency.plan_node();
             assert!(
-                order.iter().position(|id| id == dependency).unwrap() < position,
+                order.iter().position(|id| *id == dependency).unwrap() < position,
                 "dependency {} must precede {}",
                 dependency.0,
                 operation.id.0
@@ -223,6 +256,8 @@ fn project_plan_text_is_deterministic_and_omits_command_and_environment_values()
     assert!(first.contains("guards=[env:PR7_REQUIRED_ENV]"));
     assert!(first.contains("env=[PLAN_VARIANT]"));
     assert!(first.contains("outputs=[out/a.json]"));
+    assert!(first.contains("deps=[value:p"));
+    assert!(first.contains("success:p"));
     assert!(!first.contains("PR7_IMPL_A_EXECUTED"));
     assert!(!first.contains("PLAN_VARIANT = \"a\""));
 }
@@ -289,6 +324,17 @@ fn every_route_policy_uses_shared_resolution_and_exact_policy_metadata() {
         .len(),
         1
     );
+    let terminal = route_operation(&project, 0, "impl-b", true);
+    let select = project
+        .plan
+        .operations
+        .iter()
+        .find(|operation| matches!(operation.op, ExecutableOp::SelectRoute { .. }))
+        .unwrap();
+    assert_eq!(select.dependencies, [ProjectDependency::Value(terminal.id)]);
+    let select_inputs = &project.graph.op_for(select.id).unwrap().inputs;
+    assert!(select_inputs.contains(&project.graph.op_for(terminal.id).unwrap().value_output));
+    assert!(!select_inputs.contains(&project.graph.completion_node(terminal.id).unwrap()));
 }
 
 #[test]
@@ -356,6 +402,25 @@ fn project_source_validation_rejects_bundle_and_policy_substitution() {
 
 #[test]
 fn project_projection_rejects_dependency_and_effect_forgery() {
+    let mut dependency_kind_forgery = fixture_plan().plan;
+    let terminal = dependency_kind_forgery
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.branch == Some(0)
+                && matches!(
+                    &operation.op,
+                    ExecutableOp::RunRoute { route_id } if route_id == "impl-a"
+                )
+        })
+        .unwrap();
+    let prerequisite = terminal.dependencies[1].plan_node();
+    terminal.dependencies[1] = ProjectDependency::Value(prerequisite);
+    assert!(dependency_kind_forgery
+        .validate()
+        .unwrap_err()
+        .contains("run dependencies differ"));
+
     let mut dependency_forgery = fixture_plan();
     let compare = operation_ids(&dependency_forgery, |op| {
         matches!(op, ExecutableOp::CompareRouteResults)

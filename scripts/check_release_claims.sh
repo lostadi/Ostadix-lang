@@ -9,8 +9,8 @@
 #   - c_cpp/legacy_cpp/  : explicitly marked historical C++ prototype; it
 #     genuinely used the obsolete newline-JSON protocol, so those phrases
 #     are correct there and deliberately excluded.
-#   - docs/HGRAPH_EXECUTOR_PLAN.md : a future-work design document; it may
-#     legitimately describe not-yet-implemented graph execution.
+#   - docs/HGRAPH_EXECUTOR_PLAN.md : detailed executor design/status prose is
+#     guarded by focused assertions below rather than broad stale-phrase scans.
 #   - This script itself and CI config (they name the phrases they ban).
 set -euo pipefail
 
@@ -386,8 +386,8 @@ require_fixed README.md \
     'No production lowering currently emits these' \
     'the hosted PR6 vocabulary could be misread as production governed lowering'
 require_fixed README.md \
-    'Project HGraph hosted logical-planning gate' \
-    'the executable hosted PR7 project-planning gate is missing from the public status'
+    'Project HGraph planning and single-branch hosted execution gates' \
+    'the hosted project planning/execution gates are missing from public status'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
@@ -410,14 +410,26 @@ require_fixed docs/CLAIMS.md \
     'PR7 now provides a bounded hosted project logical planner.' \
     'the implemented PR7 project-plan boundary is missing'
 require_fixed docs/CLAIMS.md \
-    'logical-planning gate. It does not execute project commands through the' \
-    'the hosted project graph could be misread as the command-execution path'
+    'opt-in, single-alternative' \
+    'the bounded hosted project execution claim is missing'
 require_fixed docs/CLAIMS.md \
     'conservative fallible `HostWorld` effects' \
     'untrusted project purity could be misread as verified mediated execution'
 require_fixed docs/CLAIMS.md \
     'Logical alternative branches may therefore be serialized and' \
     'logical branches could be misread as independently mediated or parallel execution'
+require_fixed docs/CLAIMS.md \
+    'Unsupported multipath policies fail' \
+    'unsupported project policies must fail closed rather than use legacy fallback'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'Project HGraph single-branch hosted execution: PASS' \
+    'the exact PR8A hosted execution evidence marker is missing'
+require_fixed scripts/smoke-project-hgraph-exec.sh \
+    'does not establish multipath execution, retry, placement, Governor' \
+    'the PR8A smoke non-claim boundary is missing'
+require_fixed .github/workflows/ci.yml \
+    'bash scripts/smoke-project-hgraph-exec.sh' \
+    'CI does not invoke the dedicated PR8A hosted execution smoke'
 require_fixed docs/OSTADIX_WORLD.md \
     'complete at the bounded hosted logical-planning' \
     'the PR7 roadmap status is missing'

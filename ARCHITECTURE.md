@@ -217,15 +217,22 @@ well-formedness cannot hide bundle or policy substitution. `olangc` exposes the
 result through nonexecuting `ir` and `dot` targets for directory and lifted
 bundle inputs.
 
-This hosted PR7 surface is logical planning, not project HGraph execution.
-Project script and compiled binaries still dispatch commands through
-`project::runtime`; materialization and command operations stay fallible and
-conservatively read/write `HostWorld`, regardless of untrusted manifest
-`pure=true` metadata. The logical alternative branches therefore share
-conservative ambient/resource state chains in the HGraph and may be serialized;
-they are not a claim of parallel execution or independently mediated host
-worlds. It does not add deployment graph layers, placement,
-Governor authority, receipts, remote execution, or qualifying native evidence.
+PR8A adds an opt-in `ProjectCoordinator` path for one resolved `Explicit` or
+`Default` alternative. With `O_PROJECT_EXECUTOR=hgraph`, the Project HGraph
+governs isolated materialization, typed prerequisite readiness, route execution,
+and sole-result selection. Ordinary route values and successful-completion
+tokens are distinct: nonzero settlement publishes its result and conservative
+resource successor but cannot release a success-dependent prerequisite edge.
+Infrastructure abort publishes neither. The compatibility project runtime
+remains the default when the opt-in is absent.
+
+Materialization and command operations stay fallible and conservatively
+read/write `HostWorld`, regardless of untrusted manifest `pure=true` metadata.
+The logical alternative branches therefore share conservative ambient/resource
+state chains and may be serialized; the bounded executor is not a claim of
+multipath execution, retry, independently mediated host worlds, deployment
+graph layers, placement, Governor authority, receipts, remote execution,
+exactly-once effects, G1, or qualifying native evidence.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
