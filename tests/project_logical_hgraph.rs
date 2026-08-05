@@ -68,7 +68,7 @@ fn directory_and_lifted_project_have_identical_canonical_bytes_and_digest() {
 fn project_profile_v1_digest_is_pinned() {
     assert_eq!(
         fixture_logical().digest().unwrap().as_sha256(),
-        "fe1c49b7a7ec5c4a56deae23acdccd12d1e51f5aa2fbcbbc37dbb58738d1267a",
+        "5f8815019223109644bd20e765983872e133dd3a3b038d52c04155271fb96216",
         "a canonical schema change requires a new version and reviewed vector"
     );
 }
@@ -197,6 +197,40 @@ fn hosted_effects_preserve_host_world_and_mint_no_authority_requirements() {
     assert!(unknown_effects > 0);
     assert!(value_dependencies > 0);
     assert!(success_dependencies > 0);
+}
+
+#[test]
+fn logical_route_runtime_requirements_are_source_bound_and_digest_relevant() {
+    let project = fixture_project();
+    let logical = project.logical_v1().unwrap();
+    let run = logical
+        .operations
+        .iter()
+        .find(|operation| {
+            matches!(
+                &operation.kind,
+                LogicalOperationKindV1::RunRoute { route_id } if route_id == "impl-a"
+            )
+        })
+        .unwrap();
+    let facts = run.route_facts.as_ref().unwrap();
+    assert_eq!(facts.executable.as_deref(), Some("sh"));
+    assert_eq!(facts.evaluator, None);
+
+    let mut substituted = logical.clone();
+    for operation in substituted.operations.iter_mut().filter(|operation| {
+        matches!(
+            &operation.kind,
+            LogicalOperationKindV1::BuildRoute { route_id }
+                | LogicalOperationKindV1::RunRoute { route_id }
+                if route_id == "impl-a"
+        )
+    }) {
+        operation.route_facts.as_mut().unwrap().executable = Some("forged-runtime".to_string());
+    }
+    substituted.validate().unwrap();
+    assert_ne!(logical.digest().unwrap(), substituted.digest().unwrap());
+    assert!(substituted.validate_trusted_project(&project).is_err());
 }
 
 #[test]

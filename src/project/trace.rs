@@ -44,8 +44,11 @@ use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 /// Version 2 added an execution-context header and distinguished route
 /// settlement from coordinator aborts. Version 3 added checked ordered-branch
 /// decision evidence. Version 4 binds the trace to canonical
-/// `LogicalHGraphV1` schema bytes instead of human inspection text.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 4;
+/// `LogicalHGraphV1` schema bytes instead of human inspection text. Version 5
+/// also binds the canonical hosted-unbound `DeploymentPlanV1`; trusted replay
+/// rejects substitution of that artifact. It does not bind or execute a
+/// snapshot-derived provider proposal or attach World identity.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 5;
 
 pub(crate) fn project_logical_graph_digest(
     project: &ProjectHGraph,
@@ -58,6 +61,27 @@ pub(crate) fn project_logical_graph_digest(
     let digest = logical.digest().map_err(|error| {
         ProjectTraceError::InvalidMetadata(format!(
             "failed to digest canonical LogicalHGraphV1: {error}"
+        ))
+    })?;
+    Ok(digest.as_sha256().to_string())
+}
+
+pub(crate) fn project_hosted_deployment_digest(
+    project: &ProjectHGraph,
+) -> Result<String, ProjectTraceError> {
+    let logical = project.logical_v1().map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to construct canonical LogicalHGraphV1: {error}"
+        ))
+    })?;
+    let deployment = super::deployment::DeploymentPlanV1::hosted(&logical).map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to construct canonical hosted DeploymentPlanV1: {error}"
+        ))
+    })?;
+    let digest = deployment.digest().map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to digest canonical hosted DeploymentPlanV1: {error}"
         ))
     })?;
     Ok(digest.as_sha256().to_string())
@@ -77,6 +101,8 @@ pub struct ProjectAttemptTraceHeader {
     pub policy: String,
     pub logical_graph_schema: u16,
     pub logical_graph_digest: String,
+    pub deployment_plan_schema: u16,
+    pub deployment_plan_digest: String,
     pub execution_attempt_id: String,
 }
 
@@ -88,6 +114,8 @@ impl ProjectAttemptTraceHeader {
         policy: impl Into<String>,
         logical_graph_schema: u16,
         logical_graph_digest: impl Into<String>,
+        deployment_plan_schema: u16,
+        deployment_plan_digest: impl Into<String>,
         execution_attempt_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -97,6 +125,8 @@ impl ProjectAttemptTraceHeader {
             policy: policy.into(),
             logical_graph_schema,
             logical_graph_digest: logical_graph_digest.into(),
+            deployment_plan_schema,
+            deployment_plan_digest: deployment_plan_digest.into(),
             execution_attempt_id: execution_attempt_id.into(),
         }
     }
@@ -114,6 +144,14 @@ impl ProjectAttemptTraceHeader {
             )));
         }
         validate_metadata_sha256(&self.logical_graph_digest, "logical graph digest")?;
+        if self.deployment_plan_schema != super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1 {
+            return Err(ProjectTraceError::InvalidMetadata(format!(
+                "deployment plan schema must be {}, got {}",
+                super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
+                self.deployment_plan_schema
+            )));
+        }
+        validate_metadata_sha256(&self.deployment_plan_digest, "deployment plan digest")?;
         validate_label(&self.execution_attempt_id, "execution attempt id")?;
         Ok(())
     }
@@ -1086,6 +1124,17 @@ fn validate_project_header(
             "trace logical graph digest differs from the trusted Project HGraph".to_string(),
         ));
     }
+    if header.deployment_plan_schema != super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1 {
+        return Err(ProjectTraceError::InvalidMetadata(
+            "trace deployment plan schema differs from DeploymentPlanV1".to_string(),
+        ));
+    }
+    let expected_deployment_digest = project_hosted_deployment_digest(project)?;
+    if header.deployment_plan_digest != expected_deployment_digest {
+        return Err(ProjectTraceError::InvalidMetadata(
+            "trace deployment plan digest differs from the trusted hosted deployment".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1451,6 +1500,8 @@ mod tests {
             "default",
             super::super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            super::super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "attempt-1",
         )
     }
@@ -1516,9 +1567,10 @@ mod tests {
         assert_eq!(trace.format_version(), PROJECT_ATTEMPT_TRACE_VERSION);
         assert_eq!(trace.header(), &expected);
         let serialized = serde_json::to_value(&trace).unwrap();
-        assert_eq!(serialized["format_version"], 4);
+        assert_eq!(serialized["format_version"], 5);
         assert_eq!(serialized["header"]["project_name"], "project");
         assert_eq!(serialized["header"]["logical_graph_schema"], 1);
+        assert_eq!(serialized["header"]["deployment_plan_schema"], 1);
         assert_eq!(serialized["header"]["execution_attempt_id"], "attempt-1");
 
         let mut invalid = expected;

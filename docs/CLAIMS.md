@@ -586,15 +586,38 @@
   an exact-source-bound projection identity, not a whitespace-insensitive
   source-semantic hash: source bytes, file modes, and manifest formatting alter
   the bundle and therefore the graph identity; canonical decode/re-encode
-  normalizes only the logical JSON record. This slice does not implement
-  deployment, runtime, recovery, World task identity, receipts, native parity,
-  or G1 evidence.
+  normalizes only the logical JSON record. `LogicalHGraphV1` itself does not
+  supply deployment, runtime, recovery, World task identity, receipts, native
+  parity, or G1 evidence.
+- World PR8-2 adds bounded canonical `PlacementSnapshotV1` and
+  `DeploymentPlanV1` intention records. The exact hosted-unbound plan maps
+  operations for supported coordinator policies only to `AmbientHost` or
+  `HostedCoordinator`, carries no World/task/provider identity, and keeps
+  unsupported hosted policies `Unresolved`. Its active derived requirements
+  are the exact bundle plus bundle-scoped role/path declarations, runtime
+  classes, executable/evaluator facts, platform and ambient-environment guards,
+  authority absence, and residual `HostWorld` admission. Bundle environment
+  overlays are recorded separately. Architecture, package, and failure-domain
+  fields are schema vocabulary but are currently unconstrained or empty.
+- A snapshot-derived `ProposedProvider` requires a caller-supplied exact
+  World-epoch `PlacementSnapshotV1` and one caller-supplied exact
+  `TaskIdentity` per logical operation. Canonical provider selection is a
+  deterministic descriptive proposal, not authenticated or current inventory,
+  Governor admission, authority, dispatch, reservation, health, or execution.
+  `require_current_world` checks only World identity/epoch. The current executor
+  does not consume snapshot-derived plans. There is no `RuntimeGraph`,
+  `RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 evidence; G1 remains
+  defined and unpassed.
 - `scripts/smoke-project-hgraph.sh` is the composite Project HGraph hosted
   planning and generated-adapter gate. Its PR7 phase proves repository-owned
   `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. Its
   PR8-1 phase exercises canonical/strict logical encoding and digesting,
   scheduler-expanded resources, `HostWorld` retention, governed-resource and
-  authority forgery rejection, and trusted project-projection comparison. It
+  authority forgery rejection, and trusted project-projection comparison. Its
+  PR8-2 phase exercises canonical hosted-unbound and snapshot-derived
+  deployment records, exact logical/bundle binding, bundle-scoped role/path
+  compatibility, deterministic provider proposals, World/task hierarchy
+  rejection, and trusted substitution rejection. It
   then compiles a project binary, checks route listing and option/policy
   rejection, and runs opt-in AnySuccess for immediate short-circuit plus
   explicitly admitted nonzero-to-success continuation in disposable
@@ -624,31 +647,36 @@
   and conservative `HostWorld` successor but withholds completion; because no
   first-class branch-failure value is synthesized in this slice, a failed
   prerequisite hard-stops even when it declares idempotence. The unsigned
-  diagnostic trace v4 binds a canonical `LogicalHGraphV1` schema/digest plus
-  stable source identity to a fresh execution-attempt identifier and
+  diagnostic trace v5 binds a canonical `LogicalHGraphV1` schema/digest plus
+  stable source identity and the exact canonical hosted-unbound
+  `DeploymentPlanV1` schema/digest to a fresh execution-attempt identifier and
   distinguishes settlement, guard skip, and abort. Its continuation decision
   records the assessed route prefix, proposed next route,
   `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
   allow/deny result; a denied decision is persisted before the CLI reports no
   successful route. Standalone replay checks only structural lifecycle
   consistency. Plan-aware replay against a trusted `ProjectHGraph` verifies the
-  header/projection, exact operation identities and next alternative, requires
-  complete causally ordered lifecycle coverage for every transitive route
-  prerequisite, recomputes evidence from `RoutePlanFacts`, and rejects missing
-  decisions or later-branch events after denial; every complete coordinator
-  trace passes that semantic replay before return. Operations never attempted
-  after short-circuit or denial emit no lifecycle event. Parallel/racing, aggregate,
-  equivalence, and benchmark
-  policies fail closed rather than falling back to the compatibility runtime.
+  header/projection, reconstructs the hosted-unbound deployment artifact and
+  rejects its substitution, verifies exact operation identities and next
+  alternative, requires complete causally ordered lifecycle coverage for every
+  transitive route prerequisite, recomputes evidence from `RoutePlanFacts`, and
+  rejects missing decisions or later-branch events after denial; every complete
+  coordinator trace passes that semantic replay before return. Operations never
+  attempted after short-circuit or denial emit no lifecycle event.
+  Parallel/racing, aggregate, equivalence, and benchmark policies fail closed
+  rather than falling back to the compatibility runtime. The execution-attempt
+  identifier is diagnostic and is not a World `TaskIdentity` or
+  `TaskAttemptIdentity`.
   `declared_idempotent` is an author declaration, not independently verified
   idempotency, sandboxing, effect journaling, fencing, compensation, or an
   exactly-once guarantee. This rule exists only in the opt-in hosted HGraph
   coordinator and does not alter the default compatibility runtime. This is
-  not parallel race/cancellation, retry, placement, deployment,
-  Governor or receipt integration, remote execution, WorldFS,
-  native/QEMU/hardware evidence, Linux or Plan 9 boot, a general foreign ABI,
-  KVM/SVM evidence, physical-device assignment, PCI/DMA/IOMMU isolation,
-  exactly-once effects, Acceptance A, G1, or passage of any G0--G13 gate.
+  not parallel race/cancellation, retry, snapshot-plan execution, actual
+  placement, runtime/recovery graphs, Governor or receipt integration, remote
+  execution, WorldFS, native/QEMU/hardware evidence, Linux or Plan 9 boot, a
+  general foreign ABI, KVM/SVM evidence, physical-device assignment,
+  PCI/DMA/IOMMU isolation, exactly-once effects, Acceptance A, G1, or passage of
+  any G0--G13 gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.

@@ -28,9 +28,9 @@ use super::plan::{
 };
 use super::runtime::{execute_route_in_workspace, is_skipped_result, run_selection, RunOptions};
 use super::trace::{
-    project_logical_graph_digest, ProjectAttemptIdentity, ProjectAttemptTrace,
-    ProjectAttemptTraceHeader, ProjectContinuationDecision, ProjectContinuationEvidence,
-    ProjectRouteOutcome,
+    project_hosted_deployment_digest, project_logical_graph_digest, ProjectAttemptIdentity,
+    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectContinuationDecision,
+    ProjectContinuationEvidence, ProjectRouteOutcome,
 };
 
 /// Opt-in selector for the hosted project HGraph executor.
@@ -1017,6 +1017,7 @@ pub fn execute_project_hgraph_selection(
 
 fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHeader> {
     let logical_graph_digest = project_logical_graph_digest(project)?;
+    let deployment_plan_digest = project_hosted_deployment_digest(project)?;
 
     let mut attempt = [0_u8; 32];
     getrandom::fill(&mut attempt)
@@ -1029,6 +1030,8 @@ fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHe
         project.plan.policy.token(),
         super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
         logical_graph_digest,
+        super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
+        deployment_plan_digest,
         hex::encode(attempt),
     ))
 }
