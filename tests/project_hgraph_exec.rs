@@ -15,8 +15,9 @@ use o_lang::ir::PlanNodeId;
 use o_lang::project::runtime::{run_route, run_selection, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_project_hgraph, execute_project_hgraph_selection,
-    OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState, ProjectBundle,
-    ProjectExecutionError, ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition,
+    OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState, ProjectAttemptTrace,
+    ProjectBundle, ProjectContinuationDecision, ProjectContinuationEvidence, ProjectExecutionError,
+    ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition, RouteFailureContinuation,
     RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 use o_lang::value::OValue;
@@ -64,7 +65,7 @@ fn read_cli_trace(path: &Path) -> serde_json::Value {
 fn assert_unsigned_diagnostic_trace(trace: &serde_json::Value) {
     let root = trace.as_object().expect("trace root must be a JSON object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 2);
+    assert_eq!(trace["format_version"], 3);
     assert!(trace["header"].is_object());
     let events = trace["events"]
         .as_array()
@@ -1087,6 +1088,7 @@ fn ordered_policy_bundle(
                 audit_log.to_string_lossy().into_owned(),
             ),
         ]);
+        route.failure_continuation = RouteFailureContinuation::DeclaredIdempotent;
         route.priority = *priority;
         bundle.routes.push(route);
     }
@@ -1195,6 +1197,22 @@ fn any_success_uses_declared_order_and_stops_before_later_graph_branches() {
         ["first-failure", "second-success"]
     );
     let trace = outcome.trace.as_ref().unwrap();
+    let continuation = trace
+        .events()
+        .iter()
+        .find(|event| {
+            event.route_id.as_deref() == Some("first-failure")
+                && event.state == ProjectAttemptState::SettledFailure
+        })
+        .and_then(|event| event.continuation.as_ref())
+        .expect("failed first route must carry its continuation decision");
+    assert!(continuation.admitted);
+    assert_eq!(
+        continuation.evidence,
+        ProjectContinuationEvidence::DeclaredIdempotent
+    );
+    assert_eq!(continuation.next_route_id, "second-success");
+    assert_eq!(continuation.assessed_route_ids, ["first-failure"]);
     assert!(!trace.events().iter().any(|event| event.branch == Some(2)));
     assert!(trace.events().iter().any(|event| {
         event.operation_label == "select-route:any_success"
@@ -1232,6 +1250,106 @@ fn any_success_uses_declared_order_and_stops_before_later_graph_branches() {
 }
 
 #[test]
+fn ordered_continuation_defaults_to_deny_after_executed_unproven_effects() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("default-deny-attempts.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("unproven-failure", 7, 0), ("must-not-start", 0, 0)],
+        &audit_log,
+    );
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "unproven-failure")
+        .unwrap()
+        .failure_continuation = RouteFailureContinuation::Unproven;
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+
+    assert_eq!(attempted_route_ids(&outcome.results), ["unproven-failure"]);
+    assert_eq!(audited_route_ids(&audit_log), ["unproven-failure"]);
+    let trace = outcome.trace.as_ref().unwrap();
+    assert!(!trace.events().iter().any(|event| event.branch == Some(1)));
+    let continuation = trace
+        .events()
+        .iter()
+        .find(|event| {
+            event.route_id.as_deref() == Some("unproven-failure")
+                && event.state == ProjectAttemptState::SettledFailure
+        })
+        .and_then(|event| event.continuation.as_ref())
+        .expect("denied continuation must remain trace-visible");
+    assert!(!continuation.admitted);
+    assert_eq!(
+        continuation.evidence,
+        ProjectContinuationEvidence::UnprovenEffects
+    );
+    assert_eq!(continuation.next_route_id, "must-not-start");
+    assert_eq!(continuation.assessed_route_ids, ["unproven-failure"]);
+}
+
+#[test]
+fn olangc_persists_a_denied_continuation_before_reporting_no_success() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("must-not-start");
+    let manifest = format!(
+        r#"[project]
+name = "cli-denied-continuation"
+
+[[routes]]
+id = "unproven-failure"
+kind = "shell"
+command = ["sh", "-c", "exit 4"]
+
+[[routes]]
+id = "must-not-start"
+kind = "shell"
+command = ["sh", "-c", "printf started > \"$DENIAL_MARKER\""]
+env = {{ DENIAL_MARKER = {marker:?} }}
+
+[[route_sets]]
+provides = "service"
+alternatives = ["unproven-failure", "must-not-start"]
+policy = "any_success"
+"#,
+        marker = marker.to_string_lossy(),
+    );
+    std::fs::write(project_dir.path().join("olang.project.toml"), manifest).unwrap();
+    let trace_path = external.path().join("denied-continuation.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_olangc"))
+        .arg(project_dir.path())
+        .args(["--target", "script", "--route", "service"])
+        .arg("--project-trace-out")
+        .arg(&trace_path)
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no route succeeded"));
+    assert!(!marker.exists(), "denied alternative unexpectedly started");
+    let trace = read_cli_trace(&trace_path);
+    assert_unsigned_diagnostic_trace(&trace);
+    let decision = trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|event| event.get("continuation"))
+        .expect("persisted trace lacks the denial decision");
+    assert_eq!(decision["admitted"], false);
+    assert_eq!(decision["evidence"], "unproven_effects");
+    assert_eq!(decision["next_route_id"], "must-not-start");
+    assert!(!trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["branch"] == 1));
+}
+
+#[test]
 fn ordered_first_success_continues_after_a_guard_skip() {
     let external = tempfile::tempdir().unwrap();
     let audit_log = external.path().join("guard-skip-attempts.log");
@@ -1263,16 +1381,609 @@ fn ordered_first_success_continues_after_a_guard_skip() {
     assert!(outcome.results[0].was_guard_skipped());
     assert_eq!(outcome.results[0].exit_code, None);
     assert_eq!(audited_route_ids(&audit_log), ["fallback-success"]);
-    assert!(outcome
+    let skipped = outcome
         .trace
         .as_ref()
         .unwrap()
         .events()
         .iter()
-        .any(|event| {
+        .find(|event| {
             event.operation_label == "run-route:guard-skipped"
                 && event.state == ProjectAttemptState::Skipped
+        })
+        .unwrap();
+    let continuation = skipped
+        .continuation
+        .as_ref()
+        .expect("guard-only continuation must be trace-visible");
+    assert!(continuation.admitted);
+    assert_eq!(
+        continuation.evidence,
+        ProjectContinuationEvidence::NoExecution
+    );
+    assert_eq!(continuation.next_route_id, "fallback-success");
+}
+
+#[test]
+fn declared_idempotent_prerequisite_and_failure_admit_the_next_branch() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("idempotent-prerequisite-attempts.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 9, 0), ("second-success", 0, 0)],
+        &audit_log,
+    );
+    let mut prerequisite = RouteSpec::new(
+        "prepare",
+        RouteProvenance::Manifest {
+            path: "olang.project.toml".into(),
+        },
+    );
+    prerequisite.command = vec![
+        "sh".into(),
+        "-c".into(),
+        "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"".into(),
+    ];
+    prerequisite.environment = BTreeMap::from([
+        ("PR8B_ROUTE_ID".into(), "prepare".into()),
+        (
+            "PR8B_ATTEMPT_LOG".into(),
+            audit_log.to_string_lossy().into_owned(),
+        ),
+    ]);
+    prerequisite.failure_continuation = RouteFailureContinuation::DeclaredIdempotent;
+    bundle.routes.push(prerequisite);
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "first-failure")
+        .unwrap()
+        .prerequisites = vec!["prepare".into()];
+
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["first-failure", "second-success"]
+    );
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["prepare", "first-failure", "second-success"]
+    );
+    let continuation = outcome
+        .trace
+        .as_ref()
+        .unwrap()
+        .events()
+        .iter()
+        .find(|event| {
+            event.route_id.as_deref() == Some("first-failure")
+                && event.state == ProjectAttemptState::SettledFailure
+        })
+        .and_then(|event| event.continuation.as_ref())
+        .unwrap();
+    assert_eq!(
+        continuation.evidence,
+        ProjectContinuationEvidence::DeclaredIdempotent
+    );
+    assert_eq!(
+        continuation.assessed_route_ids,
+        ["prepare", "first-failure"]
+    );
+}
+
+#[test]
+fn a_later_alternative_may_have_run_as_a_prior_branch_prerequisite() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("cross-branch-route-reuse.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 9, 0), ("second-success", 0, 0)],
+        &audit_log,
+    );
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "first-failure")
+        .unwrap()
+        .prerequisites = vec!["second-success".into()];
+
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    assert_eq!(
+        attempted_route_ids(&outcome.results),
+        ["first-failure", "second-success"]
+    );
+    assert_eq!(
+        audited_route_ids(&audit_log),
+        ["second-success", "first-failure", "second-success"]
+    );
+    let continuation = outcome
+        .trace
+        .as_ref()
+        .unwrap()
+        .events()
+        .iter()
+        .find_map(|event| event.continuation.as_ref())
+        .unwrap();
+    assert_eq!(continuation.next_route_id, "second-success");
+    assert_eq!(
+        continuation.assessed_route_ids,
+        ["second-success", "first-failure"]
+    );
+}
+
+#[test]
+fn failing_prerequisites_hard_stop_without_synthesizing_a_branch_decision() {
+    for (label, contract) in [
+        ("unproven", RouteFailureContinuation::Unproven),
+        (
+            "declared-idempotent",
+            RouteFailureContinuation::DeclaredIdempotent,
+        ),
+    ] {
+        let external = tempfile::tempdir().unwrap();
+        let audit_log = external.path().join(format!("{label}-prerequisite.log"));
+        let mut bundle = ordered_policy_bundle(
+            RoutePolicy::AnySuccess,
+            &[("first", 0, 0), ("must-not-start", 0, 0)],
+            &audit_log,
+        );
+        let mut prerequisite = RouteSpec::new("prepare", RouteProvenance::CliOverride);
+        prerequisite.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"\nexit 17".into(),
+        ];
+        prerequisite.environment = BTreeMap::from([
+            ("PR8B_ROUTE_ID".into(), "prepare".into()),
+            (
+                "PR8B_ATTEMPT_LOG".into(),
+                audit_log.to_string_lossy().into_owned(),
+            ),
+        ]);
+        prerequisite.failure_continuation = contract;
+        bundle.routes.push(prerequisite);
+        bundle
+            .routes
+            .iter_mut()
+            .find(|route| route.id == "first")
+            .unwrap()
+            .prerequisites = vec!["prepare".into()];
+
+        let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+        let error = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+            .unwrap_err();
+        let failed = error
+            .downcast_ref::<ProjectExecutionError>()
+            .expect("failing prerequisite must retain a partial trace");
+        assert_eq!(audited_route_ids(&audit_log), ["prepare"]);
+        assert!(!failed
+            .trace
+            .events()
+            .iter()
+            .any(|event| event.branch == Some(1)));
+        assert!(!failed
+            .trace
+            .events()
+            .iter()
+            .any(|event| event.continuation.is_some()));
+        assert!(failed.trace.events().iter().any(|event| {
+            event.route_id.as_deref() == Some("prepare")
+                && event.state == ProjectAttemptState::SettledFailure
         }));
+        ProjectAttemptTrace::try_from_project_events(
+            &project,
+            failed.trace.header().clone(),
+            failed.trace.events().to_vec(),
+        )
+        .expect("a prerequisite hard-stop remains a valid partial semantic trace");
+    }
+}
+
+#[test]
+fn continuation_trace_replay_rejects_tampered_evidence_and_route_inventory() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("trace-replay-attempts.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 7, 0), ("second-success", 0, 0)],
+        &audit_log,
+    );
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let outcome =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap();
+    let trace = outcome.trace.unwrap();
+    ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        trace.events().to_vec(),
+    )
+    .expect("untampered continuation trace must replay semantically");
+
+    let mut tampered_evidence = trace.events().to_vec();
+    let decision = tampered_evidence
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap();
+    decision.evidence = ProjectContinuationEvidence::UnprovenEffects;
+    decision.admitted = false;
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), tampered_evidence.clone())
+        .expect("structural replay cannot inspect trusted route contracts");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        tampered_evidence,
+    )
+    .is_err());
+
+    let mut tampered_inventory = trace.events().to_vec();
+    tampered_inventory
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap()
+        .assessed_route_ids = vec!["invented-route".into()];
+    assert!(
+        ProjectAttemptTrace::try_from_events(trace.header().clone(), tampered_inventory,).is_err()
+    );
+
+    let mut missing_decision = trace.events().to_vec();
+    missing_decision
+        .iter_mut()
+        .find_map(|event| event.continuation.take())
+        .unwrap();
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), missing_decision.clone())
+        .expect("a structural replay has no plan that requires the decision");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        missing_decision,
+    )
+    .is_err());
+
+    let mut missing_selected_terminal = trace
+        .events()
+        .iter()
+        .filter(|event| event.operation_label != "run-route:second-success")
+        .cloned()
+        .collect::<Vec<_>>();
+    for (ordinal, event) in missing_selected_terminal.iter_mut().enumerate() {
+        event.coordinator_ordinal = ordinal as u64;
+    }
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), missing_selected_terminal.clone())
+        .expect("structural replay cannot require the selector's terminal alternative");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        missing_selected_terminal,
+    )
+    .is_err());
+
+    let mut wrong_next = trace.events().to_vec();
+    wrong_next
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap()
+        .next_route_id = "invented-next-route".into();
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), wrong_next.clone())
+        .expect("a structural replay has no alternative inventory");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        wrong_next,
+    )
+    .is_err());
+
+    let mut wrong_identity = trace.events().to_vec();
+    for event in wrong_identity
+        .iter_mut()
+        .filter(|event| event.operation_label == "run-route:first-failure")
+    {
+        event.operation_label = "run-route:forged-first".into();
+    }
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), wrong_identity.clone())
+        .expect("the forged identity is structurally self-consistent");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        trace.header().clone(),
+        wrong_identity,
+    )
+    .is_err());
+
+    let mut wrong_header = trace.header().clone();
+    wrong_header.logical_graph_digest = "b".repeat(64);
+    ProjectAttemptTrace::try_from_events(wrong_header.clone(), trace.events().to_vec())
+        .expect("the forged digest is structurally well-formed");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        wrong_header,
+        trace.events().to_vec(),
+    )
+    .is_err());
+}
+
+#[test]
+fn semantic_replay_rejects_an_omitted_unproven_successful_prerequisite() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("omitted-prerequisite-tamper.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 7, 0), ("must-not-start", 0, 0)],
+        &audit_log,
+    );
+    let mut prerequisite = RouteSpec::new("prepare", RouteProvenance::CliOverride);
+    prerequisite.command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+    prerequisite.failure_continuation = RouteFailureContinuation::Unproven;
+    bundle.routes.push(prerequisite);
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "first-failure")
+        .unwrap()
+        .prerequisites = vec!["prepare".into()];
+
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let trace = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+        .unwrap()
+        .trace
+        .unwrap();
+    let mut events = trace
+        .events()
+        .iter()
+        .filter(|event| event.operation_label != "run-route:prepare")
+        .cloned()
+        .collect::<Vec<_>>();
+    for (ordinal, event) in events.iter_mut().enumerate() {
+        event.coordinator_ordinal = ordinal as u64;
+    }
+    let decision = events
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap();
+    decision.assessed_route_ids = vec!["first-failure".into()];
+    decision.evidence = ProjectContinuationEvidence::DeclaredIdempotent;
+    decision.admitted = true;
+
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone())
+        .expect("the omitted prerequisite is invisible to structural replay");
+    let error =
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events)
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("omits terminal lifecycle coverage for prerequisite"),
+        "unexpected semantic replay error: {error}"
+    );
+}
+
+#[test]
+fn semantic_replay_rejects_an_omitted_prerequisite_on_a_successful_explicit_path() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external
+        .path()
+        .join("omitted-success-prerequisite-tamper.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("only-success", 0, 0)],
+        &audit_log,
+    );
+    let mut prerequisite = RouteSpec::new("prepare", RouteProvenance::CliOverride);
+    prerequisite.command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+    bundle.routes.push(prerequisite);
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "only-success")
+        .unwrap()
+        .prerequisites = vec!["prepare".into()];
+
+    let policy = RoutePolicy::Explicit("only-success".into());
+    let project = build_project_hgraph(&bundle, Some("only-success"), Some(policy)).unwrap();
+    let trace = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+        .unwrap()
+        .trace
+        .unwrap();
+    let mut events = trace
+        .events()
+        .iter()
+        .filter(|event| event.operation_label != "run-route:prepare")
+        .cloned()
+        .collect::<Vec<_>>();
+    for (ordinal, event) in events.iter_mut().enumerate() {
+        event.coordinator_ordinal = ordinal as u64;
+    }
+
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone())
+        .expect("structural replay cannot require a successful path prerequisite");
+    let error =
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events)
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("omits terminal lifecycle coverage for prerequisite"),
+        "unexpected semantic replay error: {error}"
+    );
+}
+
+#[test]
+fn semantic_replay_rejects_a_continuation_attached_to_a_failed_prerequisite() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("prerequisite-decision-tamper.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first", 0, 0), ("must-not-start", 0, 0)],
+        &audit_log,
+    );
+    let mut prerequisite = RouteSpec::new("prepare", RouteProvenance::CliOverride);
+    prerequisite.command = vec!["sh".into(), "-c".into(), "exit 17".into()];
+    prerequisite.failure_continuation = RouteFailureContinuation::DeclaredIdempotent;
+    bundle.routes.push(prerequisite);
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "first")
+        .unwrap()
+        .prerequisites = vec!["prepare".into()];
+
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let error =
+        execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap_err();
+    let trace = &error.downcast_ref::<ProjectExecutionError>().unwrap().trace;
+    let mut events = trace.events().to_vec();
+    let decision = ProjectContinuationDecision::new(
+        "must-not-start",
+        vec!["prepare".into()],
+        ProjectContinuationEvidence::DeclaredIdempotent,
+    )
+    .unwrap();
+    let prerequisite_failure = events
+        .iter_mut()
+        .find(|event| {
+            event.route_id.as_deref() == Some("prepare")
+                && event.state == ProjectAttemptState::SettledFailure
+        })
+        .unwrap();
+    prerequisite_failure.continuation = Some(decision);
+
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone())
+        .expect("the prerequisite decision is structurally self-consistent");
+    assert!(
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events,)
+            .is_err()
+    );
+}
+
+#[test]
+fn semantic_replay_rejects_forged_idempotence_for_an_unproven_route() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("forged-idempotence-tamper.log");
+    let mut bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("unproven-failure", 7, 0), ("must-not-start", 0, 0)],
+        &audit_log,
+    );
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "unproven-failure")
+        .unwrap()
+        .failure_continuation = RouteFailureContinuation::Unproven;
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let trace = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+        .unwrap()
+        .trace
+        .unwrap();
+    let mut events = trace.events().to_vec();
+    let decision = events
+        .iter_mut()
+        .find_map(|event| event.continuation.as_mut())
+        .unwrap();
+    decision.evidence = ProjectContinuationEvidence::DeclaredIdempotent;
+    decision.admitted = true;
+
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone())
+        .expect("the forged contract remains structurally self-consistent");
+    assert!(
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events,)
+            .is_err()
+    );
+}
+
+#[test]
+fn semantic_replay_rejects_a_continuation_on_an_explicit_policy_trace() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("explicit-decision-tamper.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("only-failure", 7, 0)],
+        &audit_log,
+    );
+    let policy = RoutePolicy::Explicit("only-failure".into());
+    let project = build_project_hgraph(&bundle, Some("only-failure"), Some(policy)).unwrap();
+    let trace = execute_project_hgraph_selection(&bundle, &project, &RunOptions::default())
+        .unwrap()
+        .trace
+        .unwrap();
+    let mut events = trace.events().to_vec();
+    let failure = events
+        .iter_mut()
+        .find(|event| {
+            event.route_id.as_deref() == Some("only-failure")
+                && event.state == ProjectAttemptState::SettledFailure
+        })
+        .unwrap();
+    failure.continuation = Some(
+        ProjectContinuationDecision::new(
+            "invented-next-route",
+            vec!["only-failure".into()],
+            ProjectContinuationEvidence::DeclaredIdempotent,
+        )
+        .unwrap(),
+    );
+
+    ProjectAttemptTrace::try_from_events(trace.header().clone(), events.clone())
+        .expect("the explicit-policy decision is structurally self-consistent");
+    assert!(
+        ProjectAttemptTrace::try_from_project_events(&project, trace.header().clone(), events,)
+            .is_err()
+    );
+}
+
+#[test]
+fn semantic_replay_rejects_later_branch_events_after_a_denial() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("post-denial-event-tamper.log");
+    let admitted_bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first-failure", 7, 0), ("second-success", 0, 0)],
+        &audit_log,
+    );
+    let admitted_project = build_project_hgraph(&admitted_bundle, Some("service"), None).unwrap();
+    let admitted_trace = execute_project_hgraph_selection(
+        &admitted_bundle,
+        &admitted_project,
+        &RunOptions::default(),
+    )
+    .unwrap()
+    .trace
+    .unwrap();
+
+    let mut denied_bundle = admitted_bundle;
+    denied_bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "first-failure")
+        .unwrap()
+        .failure_continuation = RouteFailureContinuation::Unproven;
+    let denied_project = build_project_hgraph(&denied_bundle, Some("service"), None).unwrap();
+    let denied_trace =
+        execute_project_hgraph_selection(&denied_bundle, &denied_project, &RunOptions::default())
+            .unwrap()
+            .trace
+            .unwrap();
+
+    let mut events = denied_trace.events().to_vec();
+    for mut event in admitted_trace
+        .events()
+        .iter()
+        .filter(|event| event.branch == Some(1))
+        .cloned()
+    {
+        event.coordinator_ordinal = events.len() as u64;
+        events.push(event);
+    }
+    ProjectAttemptTrace::try_from_events(denied_trace.header().clone(), events.clone())
+        .expect("structural replay does not enforce ordered branch admission");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &denied_project,
+        denied_trace.header().clone(),
+        events,
+    )
+    .is_err());
 }
 
 #[test]
@@ -1361,6 +2072,7 @@ name = "cli-any-success-failure"
 id = "first-failure"
 kind = "shell"
 command = ["sh", "-c", "exit 4"]
+failure_continuation = "declared_idempotent"
 
 [[routes]]
 id = "last-failure"
@@ -1430,6 +2142,7 @@ name = "cli-any-success-prefix"
 id = "first-failure"
 kind = "shell"
 command = ["sh", "-c", "exit 4"]
+failure_continuation = "declared_idempotent"
 
 [[routes]]
 id = "second-success"

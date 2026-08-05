@@ -19,7 +19,9 @@ use crate::ir::PlanNodeId;
 use crate::value::OValue;
 
 use super::bundle;
-use super::model::{ProjectBundle, RouteGuard, RouteKind, RoutePolicy, RouteSpec};
+use super::model::{
+    ProjectBundle, RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy, RouteSpec,
+};
 use super::runtime::resolve_selection;
 
 /// Policy-level cancellation/short-circuit behavior retained in the logical
@@ -55,6 +57,7 @@ pub struct RoutePlanFacts {
     pub declared_reads: Vec<String>,
     pub declared_writes: Vec<String>,
     pub declared_pure: bool,
+    pub failure_continuation: RouteFailureContinuation,
 }
 
 impl RoutePlanFacts {
@@ -69,6 +72,7 @@ impl RoutePlanFacts {
             declared_reads: route.effects.reads.clone(),
             declared_writes: route.effects.writes.clone(),
             declared_pure: route.effects.pure,
+            failure_continuation: route.failure_continuation,
         }
     }
 }
@@ -583,7 +587,7 @@ impl ProjectExecutionPlan {
             if let Some(facts) = &operation.route_facts {
                 writeln!(
                     output,
-                    "route-facts p{} kind={:?} prerequisites=[{}] guards=[{}] env=[{}] inputs=[{}] outputs=[{}] declared-reads=[{}] declared-writes=[{}] declared-pure={}",
+                    "route-facts p{} kind={:?} prerequisites=[{}] guards=[{}] env=[{}] inputs=[{}] outputs=[{}] declared-reads=[{}] declared-writes=[{}] declared-pure={} failure-continuation={}",
                     operation.id.0,
                     facts.kind,
                     facts.prerequisites.join(","),
@@ -594,6 +598,7 @@ impl ProjectExecutionPlan {
                     facts.declared_reads.join(","),
                     facts.declared_writes.join(","),
                     facts.declared_pure,
+                    facts.failure_continuation.token(),
                 )
                 .expect("writing to a String cannot fail");
             }

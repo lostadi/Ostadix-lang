@@ -11,8 +11,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::model::{
-    ProjectBundle, ResultCodec, RouteEffects, RouteGuard, RouteKind, RoutePolicy, RouteProvenance,
-    RouteSet, RouteSpec,
+    ProjectBundle, ResultCodec, RouteEffects, RouteFailureContinuation, RouteGuard, RouteKind,
+    RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 
 /// The canonical manifest filename at a project root.
@@ -64,6 +64,7 @@ struct ManifestRoute {
     default: Option<bool>,
     guards: Option<ManifestGuards>,
     pure: Option<bool>,
+    failure_continuation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,7 +122,7 @@ fn guards_from_manifest(guards: &ManifestGuards) -> Vec<RouteGuard> {
     out
 }
 
-fn route_from_manifest(route: ManifestRoute, manifest_path: &str) -> RouteSpec {
+fn route_from_manifest(route: ManifestRoute, manifest_path: &str) -> Result<RouteSpec> {
     let has_evaluator = route.evaluator.is_some();
     let mut spec = RouteSpec::new(
         route.id.clone(),
@@ -163,7 +164,12 @@ fn route_from_manifest(route: ManifestRoute, manifest_path: &str) -> RouteSpec {
             RouteEffects::unknown()
         };
     }
-    spec
+    if let Some(continuation) = route.failure_continuation {
+        spec.failure_continuation = RouteFailureContinuation::parse_checked(&continuation)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("route `{}` has an invalid failure_continuation", spec.id))?;
+    }
+    Ok(spec)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +192,7 @@ pub fn apply_manifest(bundle: &mut ProjectBundle, text: &str, manifest_path: &st
     }
 
     for manifest_route in root.routes {
-        let spec = route_from_manifest(manifest_route, manifest_path);
+        let spec = route_from_manifest(manifest_route, manifest_path)?;
         upsert_route(bundle, spec);
     }
 
@@ -267,6 +273,7 @@ fn upsert_route_set(bundle: &mut ProjectBundle, set: RouteSet) {
 /// | `kind`     | route kind token (interpreter, binary, shell, …)    |
 /// | `priority` | integer selection priority                          |
 /// | `default`  | `true` \| `false`                                   |
+/// | `failure_continuation` | `unproven` \| `declared_idempotent`      |
 ///
 /// Example: `id=main-a;cmd=python3 implementation_a.py;cwd=.;provides=main;codec=json`
 pub fn apply_cli_overrides(bundle: &mut ProjectBundle, route_decls: &[String]) -> Result<()> {
@@ -347,6 +354,13 @@ pub fn parse_route_decl(decl: &str) -> Result<RouteSpec> {
     }
     if let Some(default) = fields.get("default") {
         spec.is_default = matches!(default.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
+    }
+    if let Some(continuation) = fields.get("failure_continuation") {
+        spec.failure_continuation = RouteFailureContinuation::parse_checked(continuation)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!("route declaration `{id}` has an invalid failure_continuation")
+            })?;
     }
 
     if spec.command.is_empty() && spec.evaluator.is_none() {

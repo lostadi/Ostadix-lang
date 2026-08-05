@@ -35,8 +35,8 @@ pub use executor::{
 };
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,
-    ResultCodec, RouteEffects, RouteExecutionDisposition, RouteGuard, RouteKind, RoutePolicy,
-    RouteProvenance, RouteSet, RouteSpec,
+    ResultCodec, RouteEffects, RouteExecutionDisposition, RouteFailureContinuation, RouteGuard,
+    RouteKind, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 pub use plan::{
     build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
@@ -44,7 +44,8 @@ pub use plan::{
 };
 pub use trace::{
     ProjectArtifactFingerprint, ProjectAttemptEvent, ProjectAttemptIdentity, ProjectAttemptState,
-    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectRouteOutcome, ProjectTraceError,
+    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectContinuationDecision,
+    ProjectContinuationEvidence, ProjectRouteOutcome, ProjectTraceError,
 };
 
 /// Derive a project name from a directory path.
