@@ -19,6 +19,7 @@ pub mod bundle;
 pub mod discover;
 pub mod ecosystems;
 pub mod executor;
+pub mod logical;
 pub mod lower;
 pub mod manifest;
 pub mod materialize;
@@ -32,6 +33,14 @@ pub use executor::{
     execute_selection_with_configured_executor, run_selection_with_configured_executor,
     write_project_attempt_trace, ConfiguredProjectExecution, ProjectCoordinator,
     ProjectExecutionError, ProjectExecutionOutcome,
+};
+pub use logical::{
+    LogicalArtifactRefV1, LogicalArtifactRoleV1, LogicalAuthorityRequirementV1,
+    LogicalCancellationV1, LogicalDependencyKindV1, LogicalDependencyV1, LogicalEffectConfidenceV1,
+    LogicalEffectSummaryV1, LogicalFailureContinuationV1, LogicalFallibilityV1, LogicalHGraphError,
+    LogicalHGraphV1, LogicalOperationIdV1, LogicalOperationKindV1, LogicalOperationV1,
+    LogicalProjectSourceV1, LogicalResourceV1, LogicalRouteFactsV1, LogicalRouteGuardV1,
+    LogicalRouteKindV1, LogicalRoutePolicyV1, LOGICAL_HGRAPH_SCHEMA_V1, MAX_LOGICAL_HGRAPH_BYTES,
 };
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,

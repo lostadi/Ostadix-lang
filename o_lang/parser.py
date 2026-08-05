@@ -17,8 +17,8 @@ Key design decisions:
    This means '2 ^ (x+1)' in a Python body does NOT accidentally parse as
    a language expression, because '2' is not a registered language tag.
 
-2. Backslash escape is SELECTIVE: '\)_python' and '\python^(' are the
-   only forms that consume the backslash. A lone '\n' inside a Python body
+2. Backslash escape is SELECTIVE: '\\)_python' and '\\python^(' are the
+   only forms that consume the backslash. A lone '\\n' inside a Python body
    is left alone so Python string escapes keep working.
 
 3. The inner body is only inspected for (a) the matching CLOSER, and
