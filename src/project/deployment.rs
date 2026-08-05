@@ -2,7 +2,7 @@
 //!
 //! A deployment plan describes intention. It is neither a runtime observation
 //! nor an authority grant. The ordinary hosted profile keeps project work on
-//! explicit ambient/coordinator bindings. A governed proposal is admitted only
+//! explicit ambient/coordinator bindings. A provider proposal is derived only
 //! from a caller-supplied, exact [`PlacementSnapshotV1`] plus caller-supplied
 //! [`TaskIdentity`] values; neither identity nor provider generations are
 //! invented from route labels. Even then, the snapshot is descriptive input,
@@ -23,7 +23,8 @@ use crate::world::{
 use super::logical::{
     LogicalArtifactRefV1, LogicalArtifactRoleV1, LogicalAuthorityRequirementV1, LogicalHGraphError,
     LogicalHGraphV1, LogicalOperationIdV1, LogicalOperationKindV1, LogicalOperationV1,
-    LogicalResourceV1, LogicalRouteGuardV1, LogicalRouteKindV1, LOGICAL_HGRAPH_SCHEMA_V1,
+    LogicalResourceV1, LogicalRouteGuardV1, LogicalRouteKindV1, LogicalRoutePolicyV1,
+    LOGICAL_HGRAPH_SCHEMA_V1,
 };
 
 pub const PLACEMENT_SNAPSHOT_SCHEMA_V1: u16 = 1;
@@ -113,6 +114,65 @@ fn digest_canonical(domain: &[u8], bytes: &[u8]) -> Result<ArtifactId, Deploymen
     Ok(ArtifactId::from_sha256(hex::encode(hasher.finalize()))?)
 }
 
+/// Reject provider metadata that contains contradictory generations for one
+/// logical hierarchy slot. This proves internal record coherence only; it does
+/// not establish that any described generation is current.
+fn validate_provider_generation_coherence<'a>(
+    bindings: impl IntoIterator<Item = &'a DeploymentProviderBindingV1>,
+) -> Result<(), DeploymentPlanError> {
+    let mut nodes = BTreeMap::new();
+    let mut domains = BTreeMap::new();
+    let mut processes = BTreeMap::new();
+    let mut services = BTreeMap::new();
+    for binding in bindings {
+        let node_key = (binding.node.world().clone(), binding.node.node().clone());
+        if nodes
+            .insert(node_key, binding.node.clone())
+            .is_some_and(|existing| existing != binding.node)
+        {
+            return Err(invalid(
+                "placement contains conflicting generations for one logical node",
+            ));
+        }
+        let domain_key = (
+            binding.domain.node().clone(),
+            binding.domain.domain().clone(),
+        );
+        if domains
+            .insert(domain_key, binding.domain.clone())
+            .is_some_and(|existing| existing != binding.domain)
+        {
+            return Err(invalid(
+                "placement contains conflicting generations for one logical domain",
+            ));
+        }
+        if let Some(process) = &binding.process {
+            let process_key = (process.domain().clone(), process.process().clone());
+            if processes
+                .insert(process_key, process.clone())
+                .is_some_and(|existing| existing != *process)
+            {
+                return Err(invalid(
+                    "placement contains conflicting generations for one logical process",
+                ));
+            }
+        }
+        let service_key = (
+            binding.service.owner().clone(),
+            binding.service.resource().clone(),
+        );
+        if services
+            .insert(service_key, binding.service.clone())
+            .is_some_and(|existing| existing != binding.service)
+        {
+            return Err(invalid(
+                "placement contains conflicting generations for one logical service",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A generation-bound provider proposal composed from existing constitutional
 /// identity atoms. `service` is descriptive resource identity, not a bearer.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -173,6 +233,13 @@ pub struct DeploymentProviderSnapshotV1 {
     pub evaluators: Vec<String>,
     pub environment_keys: Vec<String>,
     pub packages: Vec<ArtifactId>,
+    /// Exact project bundles this provider declares it can materialize or has
+    /// received. This is descriptive input, not an object reservation.
+    pub project_bundles: Vec<ArtifactId>,
+    /// Role-specific path declarations: `Input` means available after
+    /// materialization; `Output` means an accepted destination. These are not
+    /// governed object locations and carry no `ObjectIdentity` or version.
+    pub project_paths: Vec<DeploymentProjectPathV1>,
     pub failure_domain: String,
     /// Whether this provider is willing to host operations whose effects still
     /// include ambient `HostWorld`. This is descriptive compatibility only.
@@ -198,8 +265,28 @@ impl DeploymentProviderSnapshotV1 {
             return Err(invalid("provider package count exceeds the limit"));
         }
         ensure_strict_order(&self.packages, "provider packages")?;
+        if self.project_bundles.len() > MAX_DEPLOYMENT_REQUIREMENTS {
+            return Err(invalid("provider project-bundle count exceeds the limit"));
+        }
+        ensure_strict_order(&self.project_bundles, "provider project bundles")?;
+        if self.project_paths.len() > MAX_DEPLOYMENT_REQUIREMENTS {
+            return Err(invalid("provider project-path count exceeds the limit"));
+        }
+        ensure_strict_order(&self.project_paths, "provider project paths")?;
         for package in &self.packages {
             validate_digest(package, "provider package digest")?;
+        }
+        for bundle in &self.project_bundles {
+            validate_digest(bundle, "provider project bundle digest")?;
+        }
+        for path in &self.project_paths {
+            validate_digest(&path.bundle, "provider project-path bundle digest")?;
+            validate_text(&path.artifact.path, "provider project path")?;
+            if self.project_bundles.binary_search(&path.bundle).is_err() {
+                return Err(invalid(
+                    "provider project path names an undeclared project bundle",
+                ));
+            }
         }
         Ok(())
     }
@@ -220,7 +307,7 @@ impl PlacementSnapshotV1 {
         world: WorldIdentity,
         mut providers: Vec<DeploymentProviderSnapshotV1>,
     ) -> Result<Self, DeploymentPlanError> {
-        providers.sort_by(|left, right| left.binding.cmp(&right.binding));
+        providers.sort_by(|left, right| left.binding.service.cmp(&right.binding.service));
         let snapshot = Self {
             schema_version: PLACEMENT_SNAPSHOT_SCHEMA_V1,
             world,
@@ -230,6 +317,8 @@ impl PlacementSnapshotV1 {
         Ok(snapshot)
     }
 
+    /// Validate structural and internal generation coherence only. This does
+    /// not authenticate the snapshot or prove that its observations are live.
     pub fn validate(&self) -> Result<(), DeploymentPlanError> {
         if self.schema_version != PLACEMENT_SNAPSHOT_SCHEMA_V1 {
             return Err(invalid(format!(
@@ -246,15 +335,18 @@ impl PlacementSnapshotV1 {
         if self
             .providers
             .windows(2)
-            .any(|pair| pair[0].binding >= pair[1].binding)
+            .any(|pair| pair[0].binding.service >= pair[1].binding.service)
         {
             return Err(invalid(
-                "placement providers must be strictly ordered by exact binding",
+                "placement providers must have unique, strictly ordered exact service identities",
             ));
         }
         for provider in &self.providers {
             provider.validate(&self.world)?;
         }
+        validate_provider_generation_coherence(
+            self.providers.iter().map(|provider| &provider.binding),
+        )?;
         Ok(())
     }
 
@@ -270,6 +362,8 @@ impl PlacementSnapshotV1 {
         Ok(bytes)
     }
 
+    /// Decode a structurally valid snapshot. Callers must establish snapshot
+    /// provenance and freshness outside this descriptive schema.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeploymentPlanError> {
         if bytes.len() > MAX_DEPLOYMENT_RECORD_BYTES {
             return Err(DeploymentPlanError::RecordTooLarge {
@@ -282,6 +376,7 @@ impl PlacementSnapshotV1 {
         Ok(snapshot)
     }
 
+    /// Decode exact canonical bytes without authenticating their source.
     pub fn decode_canonical(bytes: &[u8]) -> Result<Self, DeploymentPlanError> {
         let snapshot = Self::decode(bytes)?;
         if snapshot.canonical_bytes()? != bytes {
@@ -293,7 +388,6 @@ impl PlacementSnapshotV1 {
     pub fn digest(&self) -> Result<ArtifactId, DeploymentPlanError> {
         digest_canonical(PLACEMENT_SNAPSHOT_DIGEST_DOMAIN, &self.canonical_bytes()?)
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -310,31 +404,46 @@ pub enum DeploymentFailureDomainConstraintV1 {
     Avoid { failure_domain: String },
 }
 
+/// One role/path declaration scoped to the exact project bundle whose
+/// materialization gives that path meaning. This is still not an ObjectId.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentProjectPathV1 {
+    pub bundle: ArtifactId,
+    pub artifact: LogicalArtifactRefV1,
+}
+
 /// Requirements copied or deterministically derived from one logical
 /// operation. Empty authority/failure/package sets remain explicit; planning
 /// must not manufacture their satisfaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentOperationRequirementsV1 {
+    pub project_bundle: ArtifactId,
     pub architecture: DeploymentArchitectureRequirementV1,
     pub runtime_classes: Vec<String>,
     pub executables: Vec<String>,
     pub evaluators: Vec<String>,
     pub platform_os: Vec<String>,
+    /// Environment keys whose values are supplied by the bundle itself. They
+    /// are source-bound configuration, not provider inventory requirements.
+    pub environment_overlay_keys: Vec<String>,
+    /// Ambient environment names required by explicit `EnvVarSet` guards.
     pub environment_keys: Vec<String>,
     pub packages: Vec<ArtifactId>,
-    pub locality: Vec<LogicalArtifactRefV1>,
+    pub locality: Vec<DeploymentProjectPathV1>,
     pub authority: Vec<LogicalAuthorityRequirementV1>,
     pub failure_domains: Vec<DeploymentFailureDomainConstraintV1>,
     pub residual_host_world: bool,
     /// False means the logical layer lacks enough command/evaluator facts to
-    /// license a governed provider match. Hosted ambient execution can remain
-    /// explicit, but governed lowering must fail closed.
+    /// license a snapshot-derived provider match. Hosted ambient execution can
+    /// remain explicit, but provider proposal must fail closed.
     pub runtime_contract_complete: bool,
 }
 
 impl DeploymentOperationRequirementsV1 {
     fn validate(&self) -> Result<(), DeploymentPlanError> {
+        validate_digest(&self.project_bundle, "required project bundle digest")?;
         if let DeploymentArchitectureRequirementV1::Exact { architecture } = &self.architecture {
             validate_text(architecture, "required architecture")?;
         }
@@ -342,6 +451,10 @@ impl DeploymentOperationRequirementsV1 {
         ensure_text_order(&self.executables, "required executables")?;
         ensure_text_order(&self.evaluators, "required evaluators")?;
         ensure_text_order(&self.platform_os, "required platform OS values")?;
+        ensure_text_order(
+            &self.environment_overlay_keys,
+            "bundle environment overlay keys",
+        )?;
         ensure_text_order(&self.environment_keys, "required environment keys")?;
         if self.packages.len() > MAX_DEPLOYMENT_REQUIREMENTS
             || self.locality.len() > MAX_DEPLOYMENT_REQUIREMENTS
@@ -358,7 +471,13 @@ impl DeploymentOperationRequirementsV1 {
             validate_digest(package, "required package digest")?;
         }
         for locality in &self.locality {
-            validate_text(&locality.path, "locality path")?;
+            validate_digest(&locality.bundle, "locality bundle digest")?;
+            validate_text(&locality.artifact.path, "locality path")?;
+            if locality.bundle != self.project_bundle {
+                return Err(invalid(
+                    "locality path belongs to a different project bundle",
+                ));
+            }
         }
         for authority in &self.authority {
             validate_text(&authority.right, "authority right")?;
@@ -388,10 +507,13 @@ pub enum DeploymentCompatibilityIssueV1 {
     MissingEvaluator { evaluator: String },
     MissingEnvironmentKey { name: String },
     MissingPackage { package: ArtifactId },
+    MissingProjectBundle { bundle: ArtifactId },
+    MissingProjectPath { path: DeploymentProjectPathV1 },
     AuthorityBrokerRequired,
     FailureDomainMismatch { failure_domain: String },
     ResidualHostWorldDenied,
     NoCompatibleProvider,
+    UnsupportedHostedPolicy { policy: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -419,7 +541,9 @@ pub enum DeploymentOperationBindingV1 {
     Unresolved {
         issues: Vec<DeploymentCompatibilityIssueV1>,
     },
-    Governed {
+    /// Deterministic provider proposal derived from descriptive snapshot data.
+    /// It is not Governor admission, reservation, dispatch, or runtime proof.
+    ProposedProvider {
         provider: DeploymentProviderBindingV1,
     },
 }
@@ -459,8 +583,33 @@ fn route_runtime_class(kind: LogicalRouteKindV1) -> &'static str {
     }
 }
 
+fn policy_runtime_class(policy: &LogicalRoutePolicyV1) -> &'static str {
+    match policy {
+        LogicalRoutePolicyV1::Explicit { .. } => "policy.explicit",
+        LogicalRoutePolicyV1::Default => "policy.default",
+        LogicalRoutePolicyV1::Fallback => "policy.fallback",
+        LogicalRoutePolicyV1::AnySuccess => "policy.any-success",
+        LogicalRoutePolicyV1::RaceSuccess => "policy.race-success",
+        LogicalRoutePolicyV1::RaceSettle => "policy.race-settle",
+        LogicalRoutePolicyV1::All => "policy.all",
+        LogicalRoutePolicyV1::VerifyEquivalent => "policy.verify-equivalent",
+        LogicalRoutePolicyV1::BenchmarkAndSelect => "policy.benchmark-and-select",
+    }
+}
+
+fn hosted_coordinator_supports(policy: &LogicalRoutePolicyV1) -> bool {
+    matches!(
+        policy,
+        LogicalRoutePolicyV1::Explicit { .. }
+            | LogicalRoutePolicyV1::Default
+            | LogicalRoutePolicyV1::Fallback
+            | LogicalRoutePolicyV1::AnySuccess
+    )
+}
+
 fn requirements_from_operation(
     operation: &LogicalOperationV1,
+    project_bundle: &ArtifactId,
 ) -> DeploymentOperationRequirementsV1 {
     let mut runtime_classes = BTreeSet::new();
     match &operation.kind {
@@ -468,13 +617,17 @@ fn requirements_from_operation(
             runtime_classes.insert("project.materializer".to_owned());
         }
         LogicalOperationKindV1::BuildRoute { .. } => {
-            runtime_classes.insert("project.builder".to_owned());
+            runtime_classes.insert("project.route-preparer".to_owned());
         }
         LogicalOperationKindV1::RunRoute { .. } => {
             runtime_classes.insert("project.runner".to_owned());
         }
-        LogicalOperationKindV1::SelectRoute { .. }
-        | LogicalOperationKindV1::CompareRouteResults => {
+        LogicalOperationKindV1::SelectRoute { policy } => {
+            runtime_classes.insert("project.coordinator".to_owned());
+            runtime_classes.insert(policy_runtime_class(policy).to_owned());
+        }
+        LogicalOperationKindV1::CompareRouteResults => {
+            runtime_classes.insert("project.compare-route-results".to_owned());
             runtime_classes.insert("project.coordinator".to_owned());
         }
     }
@@ -482,15 +635,17 @@ fn requirements_from_operation(
     let mut executables = BTreeSet::new();
     let mut evaluators = BTreeSet::new();
     let mut platform_os = BTreeSet::new();
+    let mut environment_overlay_keys = BTreeSet::new();
     let mut environment_keys = BTreeSet::new();
-    let mut locality = operation.artifact_refs.clone();
-    let route_operation = matches!(
-        &operation.kind,
-        LogicalOperationKindV1::BuildRoute { .. } | LogicalOperationKindV1::RunRoute { .. }
-    );
-    let mut runtime_contract_complete = !route_operation;
+    let is_run_route = matches!(&operation.kind, LogicalOperationKindV1::RunRoute { .. });
+    let mut locality = if is_run_route {
+        operation.artifact_refs.clone()
+    } else {
+        Vec::new()
+    };
+    let mut runtime_contract_complete = !is_run_route;
 
-    if let Some(facts) = &operation.route_facts {
+    if let Some(facts) = operation.route_facts.as_ref().filter(|_| is_run_route) {
         runtime_classes.insert(route_runtime_class(facts.route_kind).to_owned());
         if let Some(executable) = &facts.executable {
             executables.insert(executable.clone());
@@ -499,6 +654,7 @@ fn requirements_from_operation(
             evaluators.insert(evaluator.clone());
         }
         runtime_contract_complete = facts.executable.is_some() || facts.evaluator.is_some();
+        environment_overlay_keys.extend(facts.environment_keys.iter().cloned());
         if let Some(entrypoint) = &facts.entrypoint {
             locality.push(LogicalArtifactRefV1 {
                 role: LogicalArtifactRoleV1::Input,
@@ -519,15 +675,24 @@ fn requirements_from_operation(
             }
         }
     }
+    let mut locality = locality
+        .into_iter()
+        .map(|artifact| DeploymentProjectPathV1 {
+            bundle: project_bundle.clone(),
+            artifact,
+        })
+        .collect::<Vec<_>>();
     locality.sort();
     locality.dedup();
 
     DeploymentOperationRequirementsV1 {
+        project_bundle: project_bundle.clone(),
         architecture: DeploymentArchitectureRequirementV1::Unspecified,
         runtime_classes: runtime_classes.into_iter().collect(),
         executables: executables.into_iter().collect(),
         evaluators: evaluators.into_iter().collect(),
         platform_os: platform_os.into_iter().collect(),
+        environment_overlay_keys: environment_overlay_keys.into_iter().collect(),
         environment_keys: environment_keys.into_iter().collect(),
         packages: Vec::new(),
         locality,
@@ -605,6 +770,21 @@ fn compatibility_issues(
             });
         }
     }
+    if provider
+        .project_bundles
+        .binary_search(&requirements.project_bundle)
+        .is_err()
+    {
+        issues.insert(DeploymentCompatibilityIssueV1::MissingProjectBundle {
+            bundle: requirements.project_bundle.clone(),
+        });
+    }
+    for path in &requirements.locality {
+        if provider.project_paths.binary_search(path).is_err() {
+            issues
+                .insert(DeploymentCompatibilityIssueV1::MissingProjectPath { path: path.clone() });
+        }
+    }
     if !requirements.authority.is_empty() {
         // Snapshot metadata can never stand in for a live authority broker.
         issues.insert(DeploymentCompatibilityIssueV1::AuthorityBrokerRequired);
@@ -662,6 +842,13 @@ fn validate_issue(issue: &DeploymentCompatibilityIssueV1) -> Result<(), Deployme
         DeploymentCompatibilityIssueV1::MissingPackage { package } => {
             validate_digest(package, "missing package digest")?;
         }
+        DeploymentCompatibilityIssueV1::MissingProjectBundle { bundle } => {
+            validate_digest(bundle, "missing project bundle digest")?;
+        }
+        DeploymentCompatibilityIssueV1::MissingProjectPath { path } => {
+            validate_digest(&path.bundle, "missing project-path bundle digest")?;
+            validate_text(&path.artifact.path, "missing project path")?;
+        }
         DeploymentCompatibilityIssueV1::FailureDomainMismatch { failure_domain } => {
             validate_text(failure_domain, "failure-domain mismatch")?;
         }
@@ -672,33 +859,47 @@ fn validate_issue(issue: &DeploymentCompatibilityIssueV1) -> Result<(), Deployme
         | DeploymentCompatibilityIssueV1::AuthorityBrokerRequired
         | DeploymentCompatibilityIssueV1::ResidualHostWorldDenied
         | DeploymentCompatibilityIssueV1::NoCompatibleProvider => {}
+        DeploymentCompatibilityIssueV1::UnsupportedHostedPolicy { policy } => {
+            validate_text(policy, "unsupported hosted policy")?;
+        }
     }
     Ok(())
 }
 
 impl DeploymentPlanV1 {
-    /// Construct the exact current hosted deployment profile. Workspaces and
-    /// route commands remain ambient; coordinator operations remain in-process.
-    /// No World or task identity is attached after the fact.
+    /// Construct the exact current hosted deployment profile. Supported graph
+    /// policies keep workspaces/routes ambient and coordinator operations
+    /// in-process. Other policies remain explicitly unresolved because the
+    /// opt-in ProjectCoordinator does not instantiate them. No World or task
+    /// identity is attached after the fact.
     pub fn hosted(logical: &LogicalHGraphV1) -> Result<Self, DeploymentPlanError> {
         logical.validate()?;
         let logical_hgraph = logical.digest()?;
+        let supported = hosted_coordinator_supports(&logical.source.policy);
         let operations = logical
             .operations
             .iter()
             .map(|operation| DeploymentOperationV1 {
                 logical_operation: operation.id,
                 task: None,
-                requirements: requirements_from_operation(operation),
-                binding: match &operation.kind {
-                    LogicalOperationKindV1::SelectRoute { .. }
-                    | LogicalOperationKindV1::CompareRouteResults => {
-                        DeploymentOperationBindingV1::HostedCoordinator
+                requirements: requirements_from_operation(operation, &logical.source.bundle),
+                binding: if !supported {
+                    DeploymentOperationBindingV1::Unresolved {
+                        issues: vec![DeploymentCompatibilityIssueV1::UnsupportedHostedPolicy {
+                            policy: policy_runtime_class(&logical.source.policy).to_owned(),
+                        }],
                     }
-                    LogicalOperationKindV1::MaterializeProject
-                    | LogicalOperationKindV1::BuildRoute { .. }
-                    | LogicalOperationKindV1::RunRoute { .. } => {
-                        DeploymentOperationBindingV1::AmbientHost
+                } else {
+                    match &operation.kind {
+                        LogicalOperationKindV1::BuildRoute { .. }
+                        | LogicalOperationKindV1::SelectRoute { .. }
+                        | LogicalOperationKindV1::CompareRouteResults => {
+                            DeploymentOperationBindingV1::HostedCoordinator
+                        }
+                        LogicalOperationKindV1::MaterializeProject
+                        | LogicalOperationKindV1::RunRoute { .. } => {
+                            DeploymentOperationBindingV1::AmbientHost
+                        }
                     }
                 },
             })
@@ -718,7 +919,7 @@ impl DeploymentPlanV1 {
         Ok(plan)
     }
 
-    /// Derive a deterministic, single-provider governed proposal from one
+    /// Derive a deterministic, single-provider proposal from one
     /// exact descriptive snapshot and caller-supplied task identities.
     ///
     /// Selection uses canonical provider order after filtering every logical
@@ -738,7 +939,7 @@ impl DeploymentPlanV1 {
                 .any(|operation| !tasks.contains_key(&operation.id))
         {
             return Err(invalid(
-                "governed deployment requires exactly one caller-supplied task identity per logical operation",
+                "snapshot-derived deployment requires exactly one caller-supplied task identity per logical operation",
             ));
         }
         let mut unique_tasks = BTreeSet::new();
@@ -756,7 +957,12 @@ impl DeploymentPlanV1 {
         let requirements = logical
             .operations
             .iter()
-            .map(|operation| (operation.id, requirements_from_operation(operation)))
+            .map(|operation| {
+                (
+                    operation.id,
+                    requirements_from_operation(operation, &logical.source.bundle),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut eligible = Vec::new();
         let mut rejected = Vec::new();
@@ -796,7 +1002,7 @@ impl DeploymentPlanV1 {
                     || DeploymentOperationBindingV1::Unresolved {
                         issues: vec![DeploymentCompatibilityIssueV1::NoCompatibleProvider],
                     },
-                    |provider| DeploymentOperationBindingV1::Governed {
+                    |provider| DeploymentOperationBindingV1::ProposedProvider {
                         provider: provider.clone(),
                     },
                 ),
@@ -817,6 +1023,9 @@ impl DeploymentPlanV1 {
         Ok(plan)
     }
 
+    /// Validate record structure and internal consistency. This does not prove
+    /// that source-derived fields match a trusted logical graph or snapshot;
+    /// use `validate_trusted_hosted` or `validate_trusted_snapshot` for that.
     pub fn validate(&self) -> Result<(), DeploymentPlanError> {
         if self.schema_version != DEPLOYMENT_PLAN_SCHEMA_V1 {
             return Err(invalid(format!(
@@ -849,7 +1058,7 @@ impl DeploymentPlanV1 {
         if self
             .eligible_alternatives
             .windows(2)
-            .any(|pair| pair[0] >= pair[1])
+            .any(|pair| pair[0].service >= pair[1].service)
         {
             return Err(invalid(
                 "eligible provider alternatives must be strictly ordered",
@@ -858,7 +1067,7 @@ impl DeploymentPlanV1 {
         if self
             .rejected_providers
             .windows(2)
-            .any(|pair| pair[0].provider >= pair[1].provider)
+            .any(|pair| pair[0].provider.service >= pair[1].provider.service)
         {
             return Err(invalid("rejected providers must be strictly ordered"));
         }
@@ -866,14 +1075,24 @@ impl DeploymentPlanV1 {
         let mut provider_set = BTreeSet::new();
         if let Some(selected) = &self.selected_provider {
             selected.validate()?;
-            if !provider_set.insert(selected) {
+            if !provider_set.insert(selected.service.clone()) {
                 return Err(invalid("selected provider is duplicated"));
             }
         }
         for provider in &self.eligible_alternatives {
             provider.validate()?;
-            if !provider_set.insert(provider) {
+            if !provider_set.insert(provider.service.clone()) {
                 return Err(invalid("eligible provider is duplicated"));
+            }
+        }
+        if let (Some(selected), Some(first_alternative)) = (
+            self.selected_provider.as_ref(),
+            self.eligible_alternatives.first(),
+        ) {
+            if selected.service >= first_alternative.service {
+                return Err(invalid(
+                    "selected provider is not the first canonical eligible provider",
+                ));
             }
         }
         for rejection in &self.rejected_providers {
@@ -885,7 +1104,7 @@ impl DeploymentPlanV1 {
                     "provider rejection issues must be nonempty and strictly ordered",
                 ));
             }
-            if !provider_set.insert(&rejection.provider) {
+            if !provider_set.insert(rejection.provider.service.clone()) {
                 return Err(invalid(
                     "provider appears in more than one placement decision set",
                 ));
@@ -902,8 +1121,28 @@ impl DeploymentPlanV1 {
                 validate_issue(&issue.issue)?;
             }
         }
+        validate_provider_generation_coherence(
+            self.selected_provider
+                .iter()
+                .chain(&self.eligible_alternatives)
+                .chain(self.rejected_providers.iter().map(|entry| &entry.provider)),
+        )?;
+        if let Some(world) = &self.world {
+            if self
+                .selected_provider
+                .iter()
+                .chain(&self.eligible_alternatives)
+                .chain(self.rejected_providers.iter().map(|entry| &entry.provider))
+                .any(|provider| !provider.world_matches(world))
+            {
+                return Err(invalid(
+                    "placement decision contains a provider from another World",
+                ));
+            }
+        }
 
         let mut tasks = BTreeSet::new();
+        let project_bundle = &self.operations[0].requirements.project_bundle;
         let operation_count = u64::try_from(self.operations.len())
             .map_err(|_| invalid("deployment operation count does not fit u64"))?;
         for (index, operation) in self.operations.iter().enumerate() {
@@ -916,9 +1155,23 @@ impl DeploymentPlanV1 {
                 )));
             }
             operation.requirements.validate()?;
+            if &operation.requirements.project_bundle != project_bundle {
+                return Err(invalid(
+                    "deployment operations disagree on the exact project bundle",
+                ));
+            }
             if let Some(task) = &operation.task {
                 if !tasks.insert(task) {
                     return Err(invalid("deployment repeats a task identity"));
+                }
+                if self
+                    .world
+                    .as_ref()
+                    .is_some_and(|world| task.world() != world.world())
+                {
+                    return Err(invalid(
+                        "deployment task belongs to a different logical World",
+                    ));
                 }
             }
             match &operation.binding {
@@ -940,18 +1193,18 @@ impl DeploymentPlanV1 {
                         validate_issue(issue)?;
                     }
                 }
-                DeploymentOperationBindingV1::Governed { provider } => {
+                DeploymentOperationBindingV1::ProposedProvider { provider } => {
                     provider.validate()?;
                     let world = self
                         .world
                         .as_ref()
-                        .ok_or_else(|| invalid("governed binding has no exact World reference"))?;
+                        .ok_or_else(|| invalid("provider proposal has no exact World reference"))?;
                     let task = operation.task.as_ref().ok_or_else(|| {
-                        invalid("governed binding has no caller-supplied task identity")
+                        invalid("provider proposal has no caller-supplied task identity")
                     })?;
                     if !provider.world_matches(world) || task.world() != world.world() {
                         return Err(invalid(
-                            "governed provider/task belongs to a different logical World",
+                            "proposed provider/task belongs to a different logical World",
                         ));
                     }
                     if self.selected_provider.as_ref() != Some(provider) {
@@ -970,18 +1223,20 @@ impl DeploymentPlanV1 {
             (None, None) => {
                 if !self.eligible_alternatives.is_empty() || !self.rejected_providers.is_empty() {
                     return Err(invalid(
-                        "hosted deployment cannot carry governed provider decisions",
+                        "hosted deployment cannot carry snapshot provider decisions",
                     ));
                 }
                 if self.operations.iter().any(|operation| {
-                    !matches!(
-                        operation.binding,
-                        DeploymentOperationBindingV1::HostedCoordinator
-                            | DeploymentOperationBindingV1::AmbientHost
-                    )
+                    operation.task.is_some()
+                        || !matches!(
+                            operation.binding,
+                            DeploymentOperationBindingV1::HostedCoordinator
+                                | DeploymentOperationBindingV1::AmbientHost
+                                | DeploymentOperationBindingV1::Unresolved { .. }
+                        )
                 }) {
                     return Err(invalid(
-                        "unbound hosted deployment must use only explicit hosted/ambient bindings",
+                        "unbound hosted deployment must use only explicit hosted, ambient, or unresolved bindings",
                     ));
                 }
             }
@@ -990,16 +1245,21 @@ impl DeploymentPlanV1 {
                     || self.operations.iter().any(|operation| {
                         !matches!(
                             operation.binding,
-                            DeploymentOperationBindingV1::Governed { .. }
+                            DeploymentOperationBindingV1::ProposedProvider { .. }
                         )
                     })
                 {
                     return Err(invalid(
-                        "selected governed provider must bind every operation in the exact World",
+                        "selected proposed provider must bind every operation in the exact World",
                     ));
                 }
             }
             (Some(world), None) => {
+                if !self.eligible_alternatives.is_empty() {
+                    return Err(invalid(
+                        "deployment cannot leave compatible providers unselected",
+                    ));
+                }
                 if self
                     .eligible_alternatives
                     .iter()
@@ -1042,6 +1302,8 @@ impl DeploymentPlanV1 {
         Ok(bytes)
     }
 
+    /// Decode a structurally valid record for inspection. Canonical source
+    /// authenticity still requires one of the trusted validation methods.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeploymentPlanError> {
         if bytes.len() > MAX_DEPLOYMENT_RECORD_BYTES {
             return Err(DeploymentPlanError::RecordTooLarge {
@@ -1054,6 +1316,7 @@ impl DeploymentPlanV1 {
         Ok(plan)
     }
 
+    /// Decode canonical record bytes; this is not a trusted source comparison.
     pub fn decode_canonical(bytes: &[u8]) -> Result<Self, DeploymentPlanError> {
         let plan = Self::decode(bytes)?;
         if plan.canonical_bytes()? != bytes {
@@ -1136,8 +1399,8 @@ impl DeploymentPlanV1 {
                 DeploymentOperationBindingV1::HostedCoordinator => "hosted-coordinator".to_owned(),
                 DeploymentOperationBindingV1::AmbientHost => "ambient-host".to_owned(),
                 DeploymentOperationBindingV1::Unresolved { .. } => "unresolved".to_owned(),
-                DeploymentOperationBindingV1::Governed { provider } => {
-                    format!("governed:{}", provider.service)
+                DeploymentOperationBindingV1::ProposedProvider { provider } => {
+                    format!("proposed-provider:{}", provider.service)
                 }
             };
             writeln!(

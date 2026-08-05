@@ -394,14 +394,26 @@ require_fixed README.md \
     'World PR8-1 adds a versioned project-profile `LogicalHGraphV1`' \
     'the canonical project logical-graph slice is missing from public status'
 require_fixed README.md \
-    'This slice does not yet provide `DeploymentPlan`' \
-    'the partial World PR8-1 slice lacks its deployment/runtime/recovery non-claim'
+    'World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`' \
+    'the canonical project deployment-intention slice is missing from public status'
+require_fixed README.md \
+    'unsupported hosted policies remain' \
+    'unsupported hosted policies could be misread as executable placements'
+require_fixed README.md \
+    'not consume snapshot-derived plans.' \
+    'the descriptive snapshot proposal could be misread as current executor input'
 require_fixed README.md \
     'not a whitespace-insensitive' \
     'the logical graph digest could be misread as source-format-insensitive'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
-    '`ProjectAttemptTrace` version 4 binds events' \
+    '`ProjectAttemptTrace` version 5 binds events' \
     'the executor plan still describes an obsolete project trace version'
+require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
+    'hosted-unbound `DeploymentPlanV1` schema/digest' \
+    'trace v5 is missing its exact hosted-unbound deployment-artifact binding'
+require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
+    'This does not bind or' \
+    'the trace could be misread as binding a snapshot-derived provider proposal'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
@@ -432,6 +444,24 @@ require_fixed scripts/smoke-project-hgraph.sh \
 require_fixed docs/CLAIMS.md \
     'PR7 now provides a bounded hosted project logical planner.' \
     'the implemented PR7 project-plan boundary is missing'
+require_fixed docs/CLAIMS.md \
+    'World PR8-2 adds bounded canonical `PlacementSnapshotV1` and' \
+    'the bounded World PR8-2 deployment-intention claim is missing'
+require_fixed docs/CLAIMS.md \
+    'unsupported hosted policies `Unresolved`' \
+    'unsupported hosted policies could be promoted to executable placement'
+require_fixed docs/CLAIMS.md \
+    'does not consume snapshot-derived plans.' \
+    'snapshot-derived provider proposals could be promoted to current execution'
+require_fixed docs/CLAIMS.md \
+    'Architecture, package, and failure-domain' \
+    'schema vocabulary could be promoted to active architecture/package/failure-domain constraints'
+require_fixed docs/CLAIMS.md \
+    'G1 remains' \
+    'the bounded deployment-intention slice could be promoted to G1 passage'
+require_fixed docs/CLAIMS.md \
+    'identifier is diagnostic and is not a World `TaskIdentity`' \
+    'the hosted trace attempt identifier could be misread as a World task identity'
 require_fixed docs/CLAIMS.md \
     'opt-in, ordered-alternative' \
     'the bounded hosted project execution claim is missing'
@@ -468,6 +498,12 @@ require_fixed scripts/smoke-project-hgraph.sh \
 require_fixed scripts/smoke-project-hgraph.sh \
     'LogicalHGraphV1 HostWorld and no-authority boundary: PASS' \
     'the project smoke omits the LogicalHGraphV1 authority boundary'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'DeploymentPlanV1 canonical hosted intent and bundle-scoped snapshot proposal: PASS' \
+    'the project smoke omits the canonical deployment-intention evidence marker'
+require_fixed scripts/smoke-project-hgraph.sh \
+    'DeploymentPlanV1 World-epoch, hierarchy/task, and substitution rejection: PASS' \
+    'the project smoke omits the bounded deployment rejection evidence marker'
 require_fixed docs/OSTADIX_WORLD.md \
     'complete at the bounded hosted logical-planning' \
     'the PR7 roadmap status is missing'

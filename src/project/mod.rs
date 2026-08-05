@@ -33,10 +33,11 @@ pub use deployment::{
     DeploymentArchitectureRequirementV1, DeploymentCompatibilityIssueV1,
     DeploymentFailureDomainConstraintV1, DeploymentOperationBindingV1,
     DeploymentOperationRequirementsV1, DeploymentOperationV1, DeploymentPlanError,
-    DeploymentPlanV1, DeploymentProviderBindingV1, DeploymentProviderIssueV1,
-    DeploymentProviderRejectionV1, DeploymentProviderSnapshotV1, PlacementSnapshotV1,
-    DEPLOYMENT_PLAN_SCHEMA_V1, MAX_DEPLOYMENT_OPERATIONS, MAX_DEPLOYMENT_PROVIDERS,
-    MAX_DEPLOYMENT_RECORD_BYTES, MAX_DEPLOYMENT_REQUIREMENTS, PLACEMENT_SNAPSHOT_SCHEMA_V1,
+    DeploymentPlanV1, DeploymentProjectPathV1, DeploymentProviderBindingV1,
+    DeploymentProviderIssueV1, DeploymentProviderRejectionV1, DeploymentProviderSnapshotV1,
+    PlacementSnapshotV1, DEPLOYMENT_PLAN_SCHEMA_V1, MAX_DEPLOYMENT_OPERATIONS,
+    MAX_DEPLOYMENT_PROVIDERS, MAX_DEPLOYMENT_RECORD_BYTES, MAX_DEPLOYMENT_REQUIREMENTS,
+    PLACEMENT_SNAPSHOT_SCHEMA_V1,
 };
 pub use executor::{
     execute_project_hgraph, execute_project_hgraph_selection,
