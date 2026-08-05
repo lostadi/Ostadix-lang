@@ -201,6 +201,42 @@ membership transport, resource registry, `/world` namespace, remote execution,
 placement, device assignment, DMA/IOMMU isolation, or current-epoch
 enforcement. It passes no G0--G13 gate.
 
+### Nonnormative residual-analysis interpretation
+
+For one concrete validated plan, the finite derived effect summaries contain a
+finite set of concrete `ResourceKey` values. Grounding projects their governed
+resource and host-resource subsets into separate fields; aliases can overlap
+and some key classes belong to neither subset, so this is not a mathematical
+partition. `has_residual_host_world()` provides a decidable presence test for
+the conservative `HostWorld` cell on each `OperationGrounding`; report-wide
+residual status is whether any operation reports it. A future trusted lowering
+or effect analysis could justify replacing that umbrella with validated, more
+specific keys and thereby refine the *reported* footprint. Merely naming a
+specific key does not justify removing `HostWorld` today.
+
+In the associated DRE research model, let `S ~ mu` be a source-program random
+variable, let `c` be a deterministic compilation channel, and let `B = c(S)`.
+The compiler quantity is `DRE(c, mu) = H_mu(S | B)`: source conditioned on the
+emitted artifact. Under that model's semantics-preservation assumptions, the
+behavior-only `H_mu(S | beh(S))` is a separate ceiling. Neither quantity is
+computed here. `GroundingReport` is not `B` or an entropy estimator; it is a
+deterministic projection of a finite validated plan into set-valued diagnostics
+and defines no source or workload distribution. A separate execution-context
+channel `X -> G = g(X)`, a quantity `H(X | G)`, or a theorem connecting it to
+`H_mu(S | B)` remains future research.
+
+This is an engineering analogy, not an information-theoretic result.
+`ResourceKey` is not a globally finite universe, a report without `HostWorld`
+does not establish complete mediation or replay determinism, and the current
+predicate does not measure behavioral entropy. Likewise, the `lost` set in
+`Fidelity::Structural` and grounding's ambient sets are both set-valued
+residual diagnostics, but they have different elements and transfer rules; the
+implementation does not prove that they are duals or the same lattice. Any
+quantitative connection still requires defined random variables and
+distributions, a soundness argument, and empirical validation. This section is
+nonnormative and does not amend the sealed World constitution, the O-Machine
+contract, or any G0--G13 gate.
+
 Project inputs use a second, direct planning path because routes are not OIR:
 
 ```text
@@ -227,10 +263,16 @@ materialization, typed prerequisite readiness, route execution, and policy
 selection. Ordinary route values and successful-completion
 tokens are distinct: nonzero settlement publishes its result and conservative
 resource successor but cannot release a success-dependent prerequisite edge.
-Guard skips and nonzero alternative results continue ordered first-success;
-infrastructure abort publishes neither a result nor a resource successor and
-stops the policy. The compatibility project runtime remains the default when
-the opt-in is absent.
+When an alternative settles unsuccessfully, the next alternative starts only
+if every route child was guard-skipped or every executed route in that branch,
+including successful prerequisites, carries the bundle-bound
+`declared_idempotent` contract. That contract is author-declared; it is not
+verified effect safety, fencing, journaling, compensation, or exactly-once
+evidence. The default `unproven` route contract yields `unproven_effects`
+evidence and denies continuation; a failed prerequisite or infrastructure abort
+hard-stops. The unsigned trace v3 records this decision, and plan-aware replay
+verifies it, but the trace is not an `OWRECEIPT` or attestation. The
+compatibility project runtime remains the default when the opt-in is absent.
 
 Materialization and command operations stay fallible and conservatively
 read/write `HostWorld`, regardless of untrusted manifest `pure=true` metadata.

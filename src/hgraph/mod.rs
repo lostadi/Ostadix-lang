@@ -26,6 +26,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use num_bigint::BigInt;
+    use proptest::prelude::*;
 
     use crate::{
         effects::ResourceKey,
@@ -34,6 +35,83 @@ mod tests {
     };
 
     use super::*;
+
+    type SolverProjection = (DomainFlags, RepFlags, Option<Fidelity>, Option<OValue>);
+
+    fn solve_dataflow_order(order: &[usize]) -> SolverProjection {
+        let mut graph = HGraph::default();
+        let dataflow_input = graph.add_node(HNode {
+            fidelity: Some(Fidelity::Lossless),
+            ..HNode::fresh()
+        });
+        let crossing_input = graph.add_node(HNode {
+            value: Some(OValue::Number {
+                v: ONumber::Rational {
+                    num: BigInt::from(1),
+                    den: BigInt::from(3),
+                },
+            }),
+            domain: DomainFlags::NUMERIC,
+            rep: RepFlags::BIG,
+            ..HNode::fresh()
+        });
+        let output = graph.add_node(HNode::fresh());
+
+        for relation in order {
+            let edge = match relation {
+                0 => HEdge::constraint(
+                    OpKind::AbiFixed {
+                        dom: DomainFlags::BOOL,
+                        rep: RepFlags::BOOL,
+                    },
+                    vec![Port {
+                        node: output,
+                        role: PortRole::Output,
+                    }],
+                ),
+                1 => HEdge::constraint(
+                    OpKind::BackendCrossing {
+                        from_lang: "O".into(),
+                        to_lang: "javascript".into(),
+                    },
+                    vec![
+                        Port {
+                            node: crossing_input,
+                            role: PortRole::Input,
+                        },
+                        Port {
+                            node: output,
+                            role: PortRole::Output,
+                        },
+                    ],
+                ),
+                2 => HEdge::constraint(
+                    OpKind::DataFlow,
+                    vec![
+                        Port {
+                            node: dataflow_input,
+                            role: PortRole::Input,
+                        },
+                        Port {
+                            node: output,
+                            role: PortRole::Output,
+                        },
+                    ],
+                ),
+                other => panic!("unknown solver test relation {other}"),
+            };
+            graph.add_edge(edge);
+        }
+
+        solve::solve_types(&mut graph).unwrap();
+        let output = graph.node(output).unwrap();
+        (
+            output.domain,
+            output.rep,
+            output.fidelity.clone(),
+            output.value.clone(),
+        )
+    }
 
     #[test]
     fn oir_hgraph_records_core_execution_relations() {
@@ -69,7 +147,7 @@ mod tests {
         };
 
         let mut graph = program.hgraph();
-        solve::solve_types(&mut graph);
+        solve::solve_types(&mut graph).unwrap();
 
         assert_eq!(graph.root_nodes.len(), 5);
         for root in &graph.root_nodes {
@@ -186,7 +264,7 @@ mod tests {
             }],
         ));
 
-        solve::solve_types(&mut graph);
+        solve::solve_types(&mut graph).unwrap();
         let node = graph.node(out).unwrap();
         assert!(node.domain.contains(DomainFlags::INTEGER));
         assert_eq!(node.rep, RepFlags::BIG);
@@ -196,6 +274,518 @@ mod tests {
                 v: ONumber::Int { v: bigint }
             })
         );
+    }
+
+    #[test]
+    fn dataflow_meets_abi_fixed_domain_and_representation() {
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode::fresh());
+        let output = graph.add_node(HNode::fresh());
+        graph.add_edge(HEdge::constraint(
+            OpKind::AbiFixed {
+                dom: DomainFlags::BOOL,
+                rep: RepFlags::BOOL,
+            },
+            vec![Port {
+                node: output,
+                role: PortRole::Output,
+            }],
+        ));
+        graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        solve::solve_types(&mut graph).unwrap();
+
+        let output = graph.node(output).unwrap();
+        assert_eq!(output.domain, DomainFlags::BOOL);
+        assert_eq!(output.rep, RepFlags::BOOL);
+    }
+
+    #[test]
+    fn dataflow_preserves_backend_crossing_fidelity_join() {
+        let mut graph = HGraph::default();
+        let crossing_input = graph.add_node(HNode {
+            value: Some(OValue::Number {
+                v: ONumber::Rational {
+                    num: BigInt::from(1),
+                    den: BigInt::from(3),
+                },
+            }),
+            domain: DomainFlags::NUMERIC,
+            rep: RepFlags::BIG,
+            ..HNode::fresh()
+        });
+        let dataflow_input = graph.add_node(HNode {
+            fidelity: Some(Fidelity::Lossless),
+            ..HNode::fresh()
+        });
+        let output = graph.add_node(HNode::fresh());
+        graph.add_edge(HEdge::constraint(
+            OpKind::BackendCrossing {
+                from_lang: "O".into(),
+                to_lang: "javascript".into(),
+            },
+            vec![
+                Port {
+                    node: crossing_input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+        graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![
+                Port {
+                    node: dataflow_input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        solve::solve_types(&mut graph).unwrap();
+
+        assert_eq!(
+            graph.node(output).and_then(|node| node.fidelity.clone()),
+            Some(Fidelity::Structural {
+                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
+            })
+        );
+    }
+
+    #[test]
+    fn dataflow_solution_is_independent_of_reversed_edge_insertion_order() {
+        let forward = solve_dataflow_order(&[0, 1, 2]);
+        let reversed = solve_dataflow_order(&[2, 1, 0]);
+
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            forward,
+            (
+                DomainFlags::BOOL,
+                RepFlags::BOOL,
+                Some(Fidelity::Structural {
+                    lost: BTreeSet::from([
+                        AnnotationKind::NumericExactness,
+                        AnnotationKind::TypeTag,
+                    ]),
+                }),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn dataflow_solution_is_independent_of_every_edge_permutation() {
+        let expected = solve_dataflow_order(&[0, 1, 2]);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            assert_eq!(
+                solve_dataflow_order(&order),
+                expected,
+                "solver result changed for edge order {order:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn dataflow_solution_is_independent_of_random_edge_permutations(
+            keys in proptest::array::uniform3(any::<u64>()),
+        ) {
+            let mut order = [0_usize, 1, 2];
+            order.sort_by_key(|relation| (keys[*relation], *relation));
+
+            prop_assert_eq!(
+                solve_dataflow_order(&order),
+                solve_dataflow_order(&[0, 1, 2]),
+            );
+        }
+    }
+
+    #[test]
+    fn dataflow_rejects_multiple_value_inputs() {
+        let mut graph = HGraph::default();
+        let first = graph.add_node(HNode::fresh());
+        let second = graph.add_node(HNode::fresh());
+        let output = graph.add_node(HNode::fresh());
+        let edge = graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![
+                Port {
+                    node: first,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: second,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        assert_eq!(
+            solve::solve_types(&mut graph).unwrap_err(),
+            solve::SolveError::InvalidDataFlowShape {
+                edge,
+                value_inputs: 2,
+                value_outputs: 1,
+                non_value_ports: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn dataflow_rejects_missing_value_output() {
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode::fresh());
+        let edge = graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![Port {
+                node: input,
+                role: PortRole::Input,
+            }],
+        ));
+
+        assert_eq!(
+            solve::solve_types(&mut graph).unwrap_err(),
+            solve::SolveError::InvalidDataFlowShape {
+                edge,
+                value_inputs: 1,
+                value_outputs: 0,
+                non_value_ports: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn dataflow_rejects_multiple_producers_for_one_destination() {
+        let mut graph = HGraph::default();
+        let first_input = graph.add_node(HNode::fresh());
+        let second_input = graph.add_node(HNode::fresh());
+        let output = graph.add_node(HNode::fresh());
+        let mut producers = Vec::new();
+        for input in [first_input, second_input] {
+            producers.push(graph.add_edge(HEdge::constraint(
+                OpKind::DataFlow,
+                vec![
+                    Port {
+                        node: input,
+                        role: PortRole::Input,
+                    },
+                    Port {
+                        node: output,
+                        role: PortRole::Output,
+                    },
+                ],
+            )));
+        }
+
+        assert_eq!(
+            solve::solve_types(&mut graph).unwrap_err(),
+            solve::SolveError::MultipleDataFlowProducers {
+                node: output,
+                first: producers[0],
+                second: producers[1],
+            }
+        );
+    }
+
+    #[test]
+    fn dataflow_rejects_duplicate_destination_ports() {
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode::fresh());
+        let output = graph.add_node(HNode::fresh());
+        let edge = graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        assert_eq!(
+            solve::solve_types(&mut graph).unwrap_err(),
+            solve::SolveError::DuplicateDataFlowDestination { edge, node: output }
+        );
+    }
+
+    #[test]
+    fn graph_seeded_backend_specific_fidelity_vocabulary_converges() {
+        let mut graph = HGraph::default();
+        let first_kind = AnnotationKind::BackendSpecific {
+            lang: "python".into(),
+            label: "dtype".into(),
+        };
+        let second_kind = AnnotationKind::BackendSpecific {
+            lang: "python".into(),
+            label: "shape".into(),
+        };
+        let input = graph.add_node(HNode {
+            fidelity: Some(Fidelity::structural([second_kind.clone()])),
+            ..HNode::fresh()
+        });
+        let output = graph.add_node(HNode {
+            fidelity: Some(Fidelity::structural([first_kind.clone()])),
+            ..HNode::fresh()
+        });
+        graph.add_edge(HEdge::constraint(
+            OpKind::DataFlow,
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+
+        solve::solve_types(&mut graph).unwrap();
+
+        assert_eq!(
+            graph.node(output).and_then(|node| node.fidelity.clone()),
+            Some(Fidelity::Structural {
+                lost: BTreeSet::from([first_kind, second_kind]),
+            })
+        );
+    }
+
+    #[test]
+    fn conflicting_bounded_literals_return_typed_error() {
+        let mut graph = HGraph::default();
+        let output = graph.add_node(HNode::fresh());
+        for value in [BigInt::from(3), BigInt::from(5)] {
+            graph.add_edge(HEdge::constraint(
+                OpKind::Bounded { value },
+                vec![Port {
+                    node: output,
+                    role: PortRole::Output,
+                }],
+            ));
+        }
+
+        let error = solve::solve_types(&mut graph).unwrap_err();
+
+        assert_eq!(
+            error,
+            solve::SolveError::ConflictingMaterializedValue {
+                edge: EdgeId(1),
+                node: output,
+                existing: Box::new(OValue::big_int(BigInt::from(3))),
+                incoming: Box::new(OValue::big_int(BigInt::from(5))),
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_and_dataflow_conflicts_fail_in_both_edge_orders() {
+        let three = OValue::big_int(BigInt::from(3));
+        let five = OValue::big_int(BigInt::from(5));
+
+        for dataflow_first in [false, true] {
+            let mut graph = HGraph::default();
+            let input = graph.add_node(HNode::with_value(five.clone()));
+            let output = graph.add_node(HNode::fresh());
+            let dataflow = HEdge::constraint(
+                OpKind::DataFlow,
+                vec![
+                    Port {
+                        node: input,
+                        role: PortRole::Input,
+                    },
+                    Port {
+                        node: output,
+                        role: PortRole::Output,
+                    },
+                ],
+            );
+            let bounded = HEdge::constraint(
+                OpKind::Bounded {
+                    value: BigInt::from(3),
+                },
+                vec![Port {
+                    node: output,
+                    role: PortRole::Output,
+                }],
+            );
+            if dataflow_first {
+                graph.add_edge(dataflow);
+                graph.add_edge(bounded);
+            } else {
+                graph.add_edge(bounded);
+                graph.add_edge(dataflow);
+            }
+
+            let solve::SolveError::ConflictingMaterializedValue {
+                edge,
+                node,
+                existing,
+                incoming,
+            } = solve::solve_types(&mut graph).unwrap_err()
+            else {
+                panic!("expected a materialized-value conflict");
+            };
+            assert_eq!(edge, EdgeId(1));
+            assert_eq!(node, output);
+            assert!(
+                (*existing == three && *incoming == five)
+                    || (*existing == five && *incoming == three)
+            );
+        }
+    }
+
+    #[test]
+    fn matching_bounded_and_dataflow_values_converge_in_both_edge_orders() {
+        for dataflow_first in [false, true] {
+            let mut graph = HGraph::default();
+            let value = OValue::big_int(BigInt::from(3));
+            let input = graph.add_node(HNode::with_value(value.clone()));
+            let output = graph.add_node(HNode::fresh());
+            let dataflow = HEdge::constraint(
+                OpKind::DataFlow,
+                vec![
+                    Port {
+                        node: input,
+                        role: PortRole::Input,
+                    },
+                    Port {
+                        node: output,
+                        role: PortRole::Output,
+                    },
+                ],
+            );
+            let bounded = HEdge::constraint(
+                OpKind::Bounded {
+                    value: BigInt::from(3),
+                },
+                vec![Port {
+                    node: output,
+                    role: PortRole::Output,
+                }],
+            );
+            if dataflow_first {
+                graph.add_edge(dataflow);
+                graph.add_edge(bounded);
+            } else {
+                graph.add_edge(bounded);
+                graph.add_edge(dataflow);
+            }
+
+            solve::solve_types(&mut graph).unwrap();
+            assert_eq!(
+                graph.node(output).and_then(|node| node.value.clone()),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn solver_budget_exhaustion_returns_typed_error() {
+        let mut graph = HGraph::default();
+        let output = graph.add_node(HNode::fresh());
+        let edge = graph.add_edge(HEdge::constraint(
+            OpKind::AbiFixed {
+                dom: DomainFlags::BOOL,
+                rep: RepFlags::BOOL,
+            },
+            vec![Port {
+                node: output,
+                role: PortRole::Output,
+            }],
+        ));
+
+        let solve::SolveError::BudgetExhausted(diagnostics) =
+            solve::solve_types_with_budget(&mut graph, 1).unwrap_err()
+        else {
+            panic!("expected solver budget exhaustion");
+        };
+        assert_eq!(diagnostics.completed_passes, 1);
+        assert_eq!(diagnostics.slot_updates, 2);
+        assert!(diagnostics.derived_pass_bound > diagnostics.applied_pass_limit);
+        assert_eq!(diagnostics.applied_pass_limit, 1);
+        assert!(diagnostics.limit_is_below_derived_bound);
+        assert_eq!(diagnostics.last_changed_edge, Some(edge));
+        assert_eq!(diagnostics.last_changed_node, Some(output));
+        assert_eq!(diagnostics.last_changed_slot, Some("representation"));
+        assert_eq!(
+            diagnostics.last_before.as_deref(),
+            Some("representation bits 0x07ff")
+        );
+        assert_eq!(
+            diagnostics.last_after.as_deref(),
+            Some("representation bits 0x0200")
+        );
+        assert_eq!(diagnostics.recent_changed_edges, vec![edge]);
+    }
+
+    #[test]
+    fn solver_budget_diagnostic_bounds_recent_changed_edge_trace() {
+        let mut graph = HGraph::default();
+        let mut edges = Vec::new();
+        for _ in 0..20 {
+            let output = graph.add_node(HNode::fresh());
+            edges.push(graph.add_edge(HEdge::constraint(
+                OpKind::AbiFixed {
+                    dom: DomainFlags::BOOL,
+                    rep: RepFlags::BOOL,
+                },
+                vec![Port {
+                    node: output,
+                    role: PortRole::Output,
+                }],
+            )));
+        }
+
+        let solve::SolveError::BudgetExhausted(diagnostics) =
+            solve::solve_types_with_budget(&mut graph, 1).unwrap_err()
+        else {
+            panic!("expected solver budget exhaustion");
+        };
+        assert_eq!(diagnostics.slot_updates, 40);
+        assert_eq!(diagnostics.recent_changed_edges, edges[4..]);
+        assert_eq!(diagnostics.last_changed_edge, edges.last().copied());
     }
 
     #[test]
@@ -225,7 +815,7 @@ mod tests {
             ],
         ));
 
-        solve::solve_types(&mut graph);
+        solve::solve_types(&mut graph).unwrap();
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
             Some(Fidelity::Structural {
@@ -274,7 +864,7 @@ mod tests {
             ],
         ));
 
-        solve::solve_types(&mut graph);
+        solve::solve_types(&mut graph).unwrap();
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
             Some(Fidelity::Structural {
