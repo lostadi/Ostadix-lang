@@ -1681,6 +1681,11 @@ fn generate_cargo_toml(bin_name: &str, include_project: bool) -> String {
 name    = "{bin_name}"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[package.metadata.ostadix]
+embedded-runtime-license = "{package_license}"
+embedded-input-license-policy = "retained-by-source"
 
 [lib]
 name = "{lib_name}"
@@ -1720,6 +1725,7 @@ strip         = "symbols"
 "#,
         bin_name = bin_name,
         lib_name = bin_name.replace('-', "_"),
+        package_license = env!("CARGO_PKG_LICENSE"),
         ignore_dep = ignore_dep,
     )
 }
@@ -1974,6 +1980,49 @@ mod tests {
         assert!(generate_cargo_toml("generated-runtime", false).contains("ed25519-dalek = \"2\""));
 
         fs::remove_dir_all(build_dir).unwrap();
+    }
+
+    #[test]
+    fn generated_runtime_manifests_inherit_root_license_policy() {
+        for include_project in [false, true] {
+            let generated = generate_cargo_toml("generated-runtime", include_project);
+            let manifest = toml::from_str::<toml::Value>(&generated)
+                .expect("generated Cargo.toml must remain structurally valid");
+            let package = manifest
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .expect("generated Cargo.toml must contain a package table");
+
+            assert_eq!(
+                package.get("publish").and_then(toml::Value::as_bool),
+                Some(false),
+                "generated runtimes are build artifacts, not publishable crates"
+            );
+            assert!(
+                package.get("license").is_none(),
+                "a mixed generated package must not relicense embedded input source"
+            );
+            let policy = package
+                .get("metadata")
+                .and_then(toml::Value::as_table)
+                .and_then(|metadata| metadata.get("ostadix"))
+                .and_then(toml::Value::as_table)
+                .expect("generated Cargo.toml must declare component license policy");
+            assert_eq!(
+                policy
+                    .get("embedded-runtime-license")
+                    .and_then(toml::Value::as_str),
+                Some(env!("CARGO_PKG_LICENSE")),
+                "generated runtimes must identify the embedded runtime license"
+            );
+            assert_eq!(
+                policy
+                    .get("embedded-input-license-policy")
+                    .and_then(toml::Value::as_str),
+                Some("retained-by-source"),
+                "generated runtimes must preserve the input source's license policy"
+            );
+        }
     }
 
     #[test]

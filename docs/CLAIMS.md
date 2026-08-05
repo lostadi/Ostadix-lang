@@ -554,7 +554,7 @@
 - `scripts/smoke-world-resource-keys.sh` is bounded hosted
   repository-conformance evidence for vocabulary, underlying identity helpers'
   caller-pair comparison, HGraph state chaining, alias-aware grounding
-  partitioning, source-forgery rejection, and residual `HostWorld`. Grounding
+  projection, source-forgery rejection, and residual `HostWorld`. Grounding
   checks only the bound World epoch/membership, not authoritative nested
   freshness. This is not O-core Mode 31, a cross-language wire format,
   native/QEMU or hardware evidence, Governor authority, device assignment,

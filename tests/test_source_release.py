@@ -113,6 +113,11 @@ committed [index](llms.txt)
 GNU Lesser General Public License v2.1 only (SPDX identifier
 `{release.ROOT_LICENSE_SPDX}`). See [LICENSE](LICENSE) for the full text.
 
+Generated AOT build crates are `publish = false`. Their component-scoped Cargo
+metadata identifies the embedded Ostadix runtime as LGPL-2.1-only while marking
+embedded user or project inputs as retaining the licensing attached to their
+source; it does not declare one license for the mixed generated package.
+
 ## Citation
 
 ### How to cite
@@ -312,6 +317,14 @@ class RootReleaseMetadataValidationTests(unittest.TestCase):
                     "it is the source release.",
                 ),
                 r"README\.md How to cite must contain.*not an archive",
+            ),
+            "generated-runtime license policy": (
+                "README.md",
+                fixture_readme().replace(
+                    "embedded Ostadix runtime as LGPL-2.1-only",
+                    "embedded runtime has no fixed license",
+                ),
+                r"README\.md generated-runtime license policy must contain.*embedded Ostadix",
             ),
         }
         for label, (path, replacement, message) in mutations.items():
