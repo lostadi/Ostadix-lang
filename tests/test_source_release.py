@@ -498,6 +498,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
             "src/project/executor.rs": "// fixture project HGraph executor\n",
+            "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
             "src/project/logical.rs": "// fixture canonical project logical HGraph\n",
             "src/project/mod.rs": "pub mod plan;\n",
             "src/project/model.rs": "// fixture project model\n",
@@ -530,6 +531,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
             "tests/project_hgraph.rs": "#[test] fn project_hgraph_fixture() {}\n",
             "tests/project_hgraph_exec.rs": "#[test] fn project_hgraph_exec_fixture() {}\n",
+            "tests/project_deployment_plan.rs": "#[test] fn project_deployment_plan_fixture() {}\n",
             "tests/project_logical_hgraph.rs": "#[test] fn project_logical_hgraph_fixture() {}\n",
             "tests/world_resource_keys.rs": "#[test] fn resource_key_fixture() {}\n",
             "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
@@ -756,6 +758,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/hgraph/kinds.rs",
                 "src/hgraph/from_oir.rs",
                 "src/project/executor.rs",
+                "src/project/deployment.rs",
                 "src/project/logical.rs",
                 "src/project/mod.rs",
                 "src/project/model.rs",
@@ -788,6 +791,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_world_alpha_evidence.py",
                 "tests/project_hgraph.rs",
                 "tests/project_hgraph_exec.rs",
+                "tests/project_deployment_plan.rs",
                 "tests/project_logical_hgraph.rs",
                 "tests/world_resource_keys.rs",
                 "tests/world_identity.rs",
@@ -1334,6 +1338,8 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hgraph/graph.rs",
             "src/hgraph/kinds.rs",
             "src/project/executor.rs",
+            "src/project/deployment.rs",
+            "src/project/logical.rs",
             "src/project/mod.rs",
             "src/project/model.rs",
             "src/project/plan.rs",
@@ -1346,6 +1352,8 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/project_hgraph_tools/sh",
             "tests/project_hgraph.rs",
             "tests/project_hgraph_exec.rs",
+            "tests/project_deployment_plan.rs",
+            "tests/project_logical_hgraph.rs",
         )
         self._git("commit", "-q", "-m", "remove hosted project HGraph surface")
 
@@ -1355,12 +1363,14 @@ class SourceReleaseTests(unittest.TestCase):
             r"install-o-cli-wrapper\.sh.*o-cli\.sh.*"
             r"smoke-project-hgraph-exec\.sh.*smoke-project-hgraph\.sh.*"
             r"src/bin/olangc\.rs.*src/bin/olink\.rs.*src/hgraph/graph\.rs.*src/hgraph/kinds\.rs.*"
-            r"src/project/executor\.rs.*src/project/mod\.rs.*src/project/model\.rs.*"
+            r"src/project/deployment\.rs.*src/project/executor\.rs.*src/project/logical\.rs.*"
+            r"src/project/mod\.rs.*src/project/model\.rs.*"
             r"src/project/plan\.rs.*src/project/runtime\.rs.*src/project/trace\.rs.*"
             r"project_hgraph/input\.txt.*project_hgraph/olang\.project\.toml.*"
             r"project_hgraph_exec/input\.txt.*project_hgraph_exec/olang\.project\.toml.*"
             r"project_hgraph_tools/sh.*"
-            r"tests/project_hgraph\.rs.*tests/project_hgraph_exec\.rs",
+            r"tests/project_deployment_plan\.rs.*tests/project_hgraph\.rs.*"
+            r"tests/project_hgraph_exec\.rs.*tests/project_logical_hgraph\.rs",
         ):
             self._build("missing-project-hgraph.zip")
 

@@ -75,7 +75,7 @@ mark 'Project HGraph malformed/substitution rejection: PASS'
 logical_tests_log="$work_dir/project-logical-hgraph-tests.log"
 run_logged "$logical_tests_log" env CARGO_TERM_COLOR=never \
     cargo test --locked --test project_logical_hgraph
-require_test_count "$logical_tests_log" 11
+require_test_count "$logical_tests_log" 12
 for name in \
     directory_and_lifted_project_have_identical_canonical_bytes_and_digest \
     project_profile_v1_digest_is_pinned \
@@ -83,6 +83,7 @@ for name in \
     canonical_decode_round_trips_and_strict_mode_rejects_noncanonical_json \
     unknown_fields_versions_and_operation_variants_fail_closed \
     hosted_effects_preserve_host_world_and_mint_no_authority_requirements \
+    logical_route_runtime_requirements_are_source_bound_and_digest_relevant \
     logical_effect_resources_match_the_scheduler_expansion \
     hosted_profile_rejects_forged_governed_resources_and_authority \
     hosted_profile_rejects_host_world_removal_and_effect_flag_tampering \
@@ -93,6 +94,26 @@ do
 done
 mark 'LogicalHGraphV1 canonical schema and digest: PASS'
 mark 'LogicalHGraphV1 HostWorld and no-authority boundary: PASS'
+
+deployment_tests_log="$work_dir/project-deployment-plan-tests.log"
+run_logged "$deployment_tests_log" env CARGO_TERM_COLOR=never \
+    cargo test --locked --test project_deployment_plan
+require_test_count "$deployment_tests_log" 9
+for name in \
+    hosted_plan_is_canonical_explicit_and_never_mints_world_identity \
+    placement_snapshot_is_canonical_strict_and_pinned \
+    hosted_deployment_digest_is_pinned \
+    snapshot_placement_uses_exact_caller_tasks_and_rejects_incompatible_provider \
+    no_compatible_provider_remains_unresolved_instead_of_fabricating_placement \
+    snapshot_provider_generation_changes_both_source_and_deployment_digest \
+    stale_world_task_substitution_and_provider_hierarchy_fail_closed \
+    project_paths_are_bundle_scoped_and_provider_choice_is_canonical \
+    unknown_fields_versions_and_semantic_substitutions_are_rejected
+do
+    require_test "$deployment_tests_log" "$name"
+done
+mark 'DeploymentPlanV1 canonical hosted intent and bundle-scoped snapshot proposal: PASS'
+mark 'DeploymentPlanV1 World-epoch, hierarchy/task, and substitution rejection: PASS'
 
 run cargo build --locked --bin olangc
 first="$work_dir/project-plan-first.log"
@@ -129,6 +150,11 @@ grep -Fqx 'pr7-fallback-probe preserved-argument' "$fallback_log"
 
 grep -Fqx '; LogicalHGraphV1' "$first"
 grep -Eq '^logical schema=1 sha256=[0-9a-f]{64}$' "$first"
+grep -Fqx '; DeploymentPlanV1' "$first"
+grep -Eq '^deployment schema=1 sha256=[0-9a-f]{64}$' "$first"
+grep -Fqx '; DeploymentPlan oworld.deployment/v1' "$first"
+grep -Fqx 'placement hosted-unbound' "$first"
+grep -Fq 'binding=unresolved' "$first"
 grep -Fqx '; ProjectExecutionPlan' "$first"
 grep -Fqx 'selection target=main policy=verify_equivalent alternatives=[impl-a,impl-b] cancellation=none equivalence=required' "$first"
 require_count "$first" '^project-op p[0-9]+ kind=materialize-project ' 2
@@ -164,6 +190,8 @@ mark 'Project hosted HostWorld and source-authority boundary: PASS'
 default_log="$work_dir/project-plan-default.log"
 run_logged "$default_log" "$ROOT/target/debug/olangc" "$fixture" --target ir
 grep -Fqx 'selection target=impl-a policy=explicit:impl-a alternatives=[impl-a] cancellation=none equivalence=none' "$default_log"
+grep -Fq 'binding=ambient-host hostworld=residual' "$default_log"
+grep -Fq 'binding=hosted-coordinator' "$default_log"
 require_count "$default_log" '^project-op p[0-9]+ kind=materialize-project ' 1
 require_count "$default_log" '^project-op p[0-9]+ kind=select-route:explicit:impl-a ' 1
 
@@ -261,13 +289,17 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 4
+assert trace["format_version"] == 5
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1
+assert header["deployment_plan_schema"] == 1
 logical_digest = header["logical_graph_digest"]
 assert len(logical_digest) == 64
 assert all(character in "0123456789abcdef" for character in logical_digest)
+deployment_digest = header["deployment_plan_digest"]
+assert len(deployment_digest) == 64
+assert all(character in "0123456789abcdef" for character in deployment_digest)
 events = trace["events"]
 assert any(
     event["operation_label"] == "run-route:impl-a"
@@ -303,13 +335,17 @@ assert first < second
 
 with open(sys.argv[2], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 4
+assert trace["format_version"] == 5
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1
+assert header["deployment_plan_schema"] == 1
 logical_digest = header["logical_graph_digest"]
 assert len(logical_digest) == 64
 assert all(character in "0123456789abcdef" for character in logical_digest)
+deployment_digest = header["deployment_plan_digest"]
+assert len(deployment_digest) == 64
+assert all(character in "0123456789abcdef" for character in deployment_digest)
 events = trace["events"]
 assert any(
     event["operation_label"] == "run-route:impl-a"

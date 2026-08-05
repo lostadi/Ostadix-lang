@@ -11,6 +11,9 @@ surface:
 ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan
               -> ProjectHGraph -> ReadySchedule -> ProjectCoordinator
               -> OExecutionResult + ProjectAttemptTrace
+
+ProjectHGraph -> LogicalHGraphV1 -> DeploymentPlanV1(hosted-unbound)
+                                  -> ProjectAttemptTrace v5 header binding
 ```
 
 Routes are not synthesized as fake OIR. The project planner binds its source to
@@ -45,6 +48,40 @@ by the append-only G0 evidence ledger. Their older repository-status paragraphs
 are not rewritten by this hosted executor patch; changing those bytes requires
 a separate constitution-source refresh, a new schema-v3 G0 attestation, and an
 explicit supersession event. Nothing here claims G1.
+
+## Deployment intention boundary
+
+World PR8-2 adds `DeploymentPlanV1` as a canonical intention record bound to
+the exact `LogicalHGraphV1` digest. The opt-in hosted executor derives only the
+hosted-unbound form. For coordinator-supported `Explicit`, `Default`,
+`Fallback`, and `AnySuccess` policies, `BuildRoute`, `SelectRoute`, and
+`CompareRouteResults` are `HostedCoordinator`; `MaterializeProject` and
+`RunRoute` are `AmbientHost`. The record carries no World, task, node, domain,
+process, provider, or placement identity. Unsupported hosted policies remain
+`Unresolved`; they do not acquire a placement by using the compatibility
+runtime.
+
+The active requirements derived from the logical graph are the exact project
+bundle, bundle-scoped role/path declarations, runtime classes,
+executable/evaluator facts, platform and ambient-environment guards, explicit
+authority absence, and residual `HostWorld` admission. Bundle-provided
+environment-overlay key names are recorded separately from ambient environment
+requirements. Architecture, package, and failure-domain fields are canonical
+schema vocabulary, but the current project logical profile leaves them
+unconstrained or empty.
+
+The separate `from_snapshot_single_provider` constructor requires a
+caller-supplied exact World-epoch `PlacementSnapshotV1` and one caller-supplied
+exact `TaskIdentity` for each logical operation. It deterministically emits a
+`ProposedProvider` or `Unresolved` result from those descriptive facts. This is
+not current or authenticated inventory, Governor admission, authority,
+dispatch, reservation, provider health, or execution. `require_current_world`
+checks only World identity/epoch. The current executor does not consume
+snapshot-derived plans; it only records the hosted-unbound plan digest in the
+unsigned trace header.
+
+This slice has no `RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native
+parity, or G1 evidence. G1 remains defined and unpassed.
 
 Project dependencies distinguish `Value(pN)` from `Success(pN)`. A settled
 nonzero route publishes its ordinary result and conservative resource
@@ -188,9 +225,11 @@ preserved sequence, and executable acyclicity. `olangc --target dot` renders
 ordinary, resource, actor, completion/control, executable, and constraint nodes
 with distinct styles and directed ports.
 
-`ProjectAttemptTrace` version 4 binds events to the project name, bundle digest,
-target, policy, canonical `LogicalHGraphV1` schema/digest, and a fresh
-execution-attempt identifier.
+`ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
+target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
+hosted-unbound `DeploymentPlanV1` schema/digest, and a fresh execution-attempt
+identifier. That identifier is diagnostic, not a World `TaskIdentity` or
+`TaskAttemptIdentity`.
 For an unsuccessful ordered branch it also records the proposed next route,
 the assessed route prefix, the `no_execution`, `declared_idempotent`, or
 `unproven_effects` evidence class, and the allow/deny result.
@@ -198,13 +237,15 @@ the assessed route prefix, the `no_execution`, `declared_idempotent`, or
 is selected, including a denied decision before the command reports no
 successful route. Structural replay alone checks only event-local lifecycle
 invariants. Plan-aware replay against a trusted `ProjectHGraph` additionally
-checks all header bindings and exact operation identities, requires the
-decision on the correct terminal alternative, requires complete causally
-ordered lifecycle coverage for every transitive route prerequisite, recomputes
-its evidence from `RoutePlanFacts`, checks the exact next alternative, and
-rejects later-branch events after denial. Every complete coordinator-produced
-trace passes that semantic replay before it is returned. The trace remains
-unsigned and is not an OWRECEIPT or attestation.
+checks all header bindings, reconstructs the hosted-unbound deployment artifact
+and rejects substitution of that artifact, checks exact operation identities,
+requires the decision on the correct terminal alternative, requires complete
+causally ordered lifecycle coverage for every transitive route prerequisite,
+recomputes its evidence from `RoutePlanFacts`, checks the exact next alternative,
+and rejects later-branch events after denial. Every complete
+coordinator-produced trace passes that semantic replay before it is returned.
+This does not bind or execute a snapshot-derived provider proposal. The trace
+remains unsigned and is not an OWRECEIPT or attestation.
 
 The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,

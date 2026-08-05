@@ -821,15 +821,43 @@ World PR8-1 adds a versioned project-profile `LogicalHGraphV1`. It normalizes
 the exact validated plan/HGraph projection into strict canonical JSON with a
 domain-separated SHA-256 identity. The schema records exact bundle/selection
 binding, typed value-versus-success dependencies, project operations, route
-facts, declared input/output paths, and the complete effect-resource vocabulary.
+facts including executable/evaluator/entrypoint requirements, declared
+input/output paths, and the complete effect-resource vocabulary.
 This is an exact-source-bound projection identity, not a whitespace-insensitive
 source-semantic hash: source bytes, file modes, and manifest formatting feed the
 bundle digest and therefore change the logical digest. Permissive decode plus
 canonical re-encoding normalizes only the `LogicalHGraphV1` JSON record.
 Unknown hosted work remains an explicit `HostWorld` read/write, and the hosted
 profile emits no governed authority requirements. Planner-local logical IDs are
-not World task identities. This slice does not yet provide `DeploymentPlan`,
-`RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 passage.
+not World task identities.
+
+World PR8-2 adds canonical `PlacementSnapshotV1` and `DeploymentPlanV1`
+records. For policies implemented by the current hosted coordinator, the
+ordinary hosted plan binds workspace/route work to `ambient_host` and
+in-process work to `hosted_coordinator`; unsupported hosted policies remain
+explicit `unresolved`. The hosted plan preserves residual `HostWorld` and
+contains no World, task, node, domain, process, or provider identity.
+Optionally, a caller may supply an exact World-epoch placement snapshot plus
+one exact `TaskIdentity` per logical operation. The deterministic
+single-provider reference policy checks the exact project bundle,
+bundle-scoped role/path declarations, policy/runtime classes,
+executable/evaluator requirements, platform/environment guards, authority
+absence, and residual-`HostWorld` admission. Architecture, package, and
+failure-domain constraints are schema vocabulary but are currently
+unconstrained or empty in the project logical profile. The planner records
+rejected providers and either emits a `proposed_provider` with an exact
+node/domain/service generation and optional exact process, or remains
+`unresolved`. Snapshot/provider metadata and the proposal are descriptive and
+non-authorizing. They do not prove authenticated membership, freshness,
+health, Governor admission, capability grant, reservation, dispatch, or actual
+runtime placement. `require_current_world` checks only the supplied World
+identity and epoch, not nested generation freshness. Structural/canonical
+decode is not a trusted source comparison; callers must use the trusted hosted
+or snapshot validator. `olangc --target ir` prints both canonical digests.
+The current executor binds only the canonical hosted-unbound plan into trace
+v5; it does not consume snapshot-derived plans. `RuntimeGraph`, `RecoveryPlan`,
+live `OWRECEIPT`, native receipt parity, and G1 evidence remain absent. G1 is
+defined and unpassed.
 
 ProjectExec-A adds a separate, opt-in hosted executor for one resolved
 `Explicit` or `Default` alternative. ProjectExec-B extends it to serial ordered
@@ -858,13 +886,18 @@ branch-terminal result from it. A settled nonzero route still publishes its
 result and conservative
 `HostWorld` successor, but not its success-completion token; infrastructure
 abort publishes no route result and stops the policy. Guard skips continue to
-the next alternative when no route child executed. The unsigned trace v4 binds
+the next alternative when no route child executed. The unsigned trace v5 binds
 the canonical `LogicalHGraphV1` schema/digest and distinguishes
 `SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
 to stable source/graph digests plus a fresh execution-attempt identifier. It
 also records the assessed route prefix, proposed next route,
 `no_execution`/`declared_idempotent`/`unproven_effects` evidence, and the
-allow/deny decision. A denied decision is persisted before the command reports
+allow/deny decision. Trace v5 additionally binds the canonical hosted-unbound
+`DeploymentPlanV1` schema/digest before execution; plan-aware replay recomputes
+it and rejects substitution of that exact artifact. This does not bind or
+execute a snapshot-derived plan, attach World identity, or turn the fresh
+diagnostic execution-attempt identifier into a World `TaskIdentity`. A denied
+decision is persisted before the command reports
 that no route succeeded. Structural replay checks lifecycle shape only;
 plan-aware replay against the trusted HGraph verifies all bindings, recomputes
 the evidence and exact next branch, requires complete causally ordered

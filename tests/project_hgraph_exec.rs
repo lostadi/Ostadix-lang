@@ -15,10 +15,10 @@ use o_lang::ir::PlanNodeId;
 use o_lang::project::runtime::{run_route, run_selection, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_project_hgraph, execute_project_hgraph_selection,
-    OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState, ProjectAttemptTrace,
-    ProjectBundle, ProjectContinuationDecision, ProjectContinuationEvidence, ProjectExecutionError,
-    ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition, RouteFailureContinuation,
-    RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
+    DeploymentPlanV1, OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState,
+    ProjectAttemptTrace, ProjectBundle, ProjectContinuationDecision, ProjectContinuationEvidence,
+    ProjectExecutionError, ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition,
+    RouteFailureContinuation, RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 use o_lang::value::OValue;
 use sha2::{Digest, Sha256};
@@ -66,7 +66,7 @@ fn read_cli_trace(path: &Path) -> serde_json::Value {
 fn assert_unsigned_diagnostic_trace(trace: &serde_json::Value) {
     let root = trace.as_object().expect("trace root must be a JSON object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 4);
+    assert_eq!(trace["format_version"], 5);
     assert!(trace["header"].is_object());
     let events = trace["events"]
         .as_array()
@@ -1017,6 +1017,15 @@ fn trace_header_binds_stable_graph_context_and_fresh_attempt_identity() {
         first_header.logical_graph_digest,
         expected_logical_digest.as_sha256()
     );
+    let expected_deployment_digest = DeploymentPlanV1::hosted(&project.logical_v1().unwrap())
+        .unwrap()
+        .digest()
+        .unwrap();
+    assert_eq!(first_header.deployment_plan_schema, 1);
+    assert_eq!(
+        first_header.deployment_plan_digest,
+        expected_deployment_digest.as_sha256()
+    );
     assert_eq!(first_header.project_name, second_header.project_name);
     assert_eq!(first_header.bundle_digest, second_header.bundle_digest);
     assert_eq!(first_header.target, second_header.target);
@@ -1028,6 +1037,14 @@ fn trace_header_binds_stable_graph_context_and_fresh_attempt_identity() {
     assert_eq!(
         first_header.logical_graph_digest,
         second_header.logical_graph_digest
+    );
+    assert_eq!(
+        first_header.deployment_plan_schema,
+        second_header.deployment_plan_schema
+    );
+    assert_eq!(
+        first_header.deployment_plan_digest,
+        second_header.deployment_plan_digest
     );
     assert_ne!(
         first_header.execution_attempt_id, second_header.execution_attempt_id,
@@ -1711,6 +1728,17 @@ fn continuation_trace_replay_rejects_tampered_evidence_and_route_inventory() {
     let mut wrong_schema = trace.header().clone();
     wrong_schema.logical_graph_schema = 2;
     assert!(ProjectAttemptTrace::try_from_events(wrong_schema, trace.events().to_vec()).is_err());
+
+    let mut wrong_deployment = trace.header().clone();
+    wrong_deployment.deployment_plan_digest = "c".repeat(64);
+    ProjectAttemptTrace::try_from_events(wrong_deployment.clone(), trace.events().to_vec())
+        .expect("the forged deployment digest is structurally well-formed");
+    assert!(ProjectAttemptTrace::try_from_project_events(
+        &project,
+        wrong_deployment,
+        trace.events().to_vec(),
+    )
+    .is_err());
 }
 
 #[test]
@@ -2398,8 +2426,10 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
     assert_eq!(header["target"], "application");
     assert_eq!(header["policy"], "default");
     assert_eq!(header["logical_graph_schema"], 1);
+    assert_eq!(header["deployment_plan_schema"], 1);
     assert_sha256_json(&header["bundle_digest"], "bundle digest");
     assert_sha256_json(&header["logical_graph_digest"], "logical graph digest");
+    assert_sha256_json(&header["deployment_plan_digest"], "deployment plan digest");
     assert_sha256_json(&header["execution_attempt_id"], "execution attempt id");
     assert_eq!(
         first_trace["header"]["bundle_digest"], header["bundle_digest"],
@@ -2408,6 +2438,10 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
     assert_eq!(
         first_trace["header"]["logical_graph_digest"], header["logical_graph_digest"],
         "logical graph changed when an existing trace was overwritten"
+    );
+    assert_eq!(
+        first_trace["header"]["deployment_plan_digest"], header["deployment_plan_digest"],
+        "deployment plan changed when an existing trace was overwritten"
     );
     assert_ne!(
         first_trace["header"]["execution_attempt_id"], header["execution_attempt_id"],
