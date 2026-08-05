@@ -602,11 +602,12 @@ fn validate_sha256(field: &'static str, value: &str) -> Result<(), PackageError>
 fn scan_payload_tree(payload_root: &Path) -> Result<Vec<PayloadFile>, PackageError> {
     let root = open_payload_directory_path(payload_root)?;
 
-    // Open every payload object during admission and keep each regular-file
-    // descriptor until capture. On Unix, all descendant lookup is relative to
-    // an already-open directory and O_NOFOLLOW is applied at every step. A
-    // rename or symlink swap therefore cannot redirect the bytes that become
-    // the verified package identity.
+    // Preflight the complete tree before reading file contents, but do not keep
+    // one descriptor open per regular file. Retaining every descriptor makes
+    // the declared 4096-file limit unreachable on hosts whose RLIMIT_NOFILE is
+    // lower than that limit. After preflight succeeds, each candidate is
+    // reopened through the still-open payload-root descriptor, checked against
+    // the object observed during preflight, and captured immediately.
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
     let mut total_bytes = 0_u64;
@@ -624,7 +625,7 @@ fn scan_payload_tree(payload_root: &Path) -> Result<Vec<PayloadFile>, PackageErr
 
     let mut payload_files = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        payload_files.push(capture_payload_file(candidate)?);
+        payload_files.push(capture_payload_file(payload_root, &root, candidate)?);
     }
     Ok(payload_files)
 }
@@ -632,9 +633,13 @@ fn scan_payload_tree(payload_root: &Path) -> Result<Vec<PayloadFile>, PackageErr
 #[derive(Debug)]
 struct PayloadCandidate {
     normalized: String,
+    relative: PathBuf,
     path: PathBuf,
     expected_size: u64,
-    file: File,
+    #[cfg(unix)]
+    expected_device: u64,
+    #[cfg(unix)]
+    expected_inode: u64,
 }
 
 #[cfg(unix)]
@@ -716,11 +721,17 @@ fn scan_directory(
             });
         }
         *total_bytes = next_total;
+        let (expected_device, expected_inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
         candidates.push(PayloadCandidate {
             normalized,
+            relative,
             path,
             expected_size: size,
-            file,
+            expected_device,
+            expected_inode,
         });
     }
     Ok(())
@@ -737,9 +748,9 @@ fn scan_directory(
     total_entries: &mut usize,
 ) -> Result<(), PackageError> {
     // Rust's portable filesystem API has no openat/O_NOFOLLOW equivalent. The
-    // fallback checks every component immediately before opening it and keeps
-    // regular-file handles for capture, but cannot promise Unix's race-free
-    // descriptor-relative traversal semantics.
+    // fallback checks every component during preflight and checks it again when
+    // capturing, but cannot promise Unix's descriptor-relative traversal
+    // semantics.
     let directory_path = payload_root.join(relative_directory);
     let entries = fs::read_dir(&directory_path).map_err(|source| PackageError::Io {
         operation: "read directory",
@@ -830,18 +841,23 @@ fn scan_directory(
             path: path.clone(),
             source,
         })?;
+        drop(file);
         candidates.push(PayloadCandidate {
             normalized,
+            relative,
             path,
             expected_size: size,
-            file,
         });
     }
     Ok(())
 }
 
-fn capture_payload_file(candidate: PayloadCandidate) -> Result<PayloadFile, PackageError> {
-    let file = candidate.file;
+fn capture_payload_file(
+    payload_root: &Path,
+    root: &File,
+    candidate: PayloadCandidate,
+) -> Result<PayloadFile, PackageError> {
+    let file = open_payload_regular_file_from_root(payload_root, root, &candidate.relative)?;
     let opened_metadata = file.metadata().map_err(|source| PackageError::Io {
         operation: "inspect opened file",
         path: candidate.path.clone(),
@@ -851,6 +867,17 @@ fn capture_payload_file(candidate: PayloadCandidate) -> Result<PayloadFile, Pack
         return Err(PackageError::UnsupportedFileType {
             path: candidate.path,
         });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened_metadata.dev() != candidate.expected_device
+            || opened_metadata.ino() != candidate.expected_inode
+        {
+            return Err(PackageError::PayloadChanged {
+                path: candidate.path,
+            });
+        }
     }
     if opened_metadata.len() > MAX_PAYLOAD_FILE_BYTES {
         return Err(PackageError::PayloadFileTooLarge {
@@ -912,76 +939,93 @@ pub(crate) fn open_payload_regular_file(
     payload_root: &Path,
     relative: &Path,
 ) -> Result<File, PackageError> {
+    let root = open_payload_directory_path(payload_root)?;
+    open_payload_regular_file_from_root(payload_root, &root, relative)
+}
+
+#[cfg(unix)]
+fn open_payload_regular_file_from_root(
+    payload_root: &Path,
+    root: &File,
+    relative: &Path,
+) -> Result<File, PackageError> {
+    let normalized = normalize_relative_payload_path(relative)?;
+    let normalized = Path::new(&normalized);
+    let mut directory = root.try_clone().map_err(|source| PackageError::Io {
+        operation: "duplicate payload root descriptor",
+        path: payload_root.to_path_buf(),
+        source,
+    })?;
+    let components: Vec<_> = normalized.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("normalized payload paths contain only normal components");
+        };
+        let display_path = payload_root.join(components[..=index].iter().fold(
+            PathBuf::new(),
+            |mut path, component| {
+                path.push(component.as_os_str());
+                path
+            },
+        ));
+        let opened = if index + 1 == components.len() {
+            open_child_no_follow(&directory, name, &display_path)?
+        } else {
+            open_directory_child_no_follow(&directory, name, &display_path)?
+        };
+        let metadata = opened.metadata().map_err(|source| PackageError::Io {
+            operation: "inspect opened entry",
+            path: display_path.clone(),
+            source,
+        })?;
+        if index + 1 == components.len() {
+            if !metadata.is_file() {
+                return Err(PackageError::UnsupportedFileType { path: display_path });
+            }
+            return Ok(opened);
+        }
+        if !metadata.is_dir() {
+            return Err(PackageError::UnsupportedFileType { path: display_path });
+        }
+        directory = opened;
+    }
+    unreachable!("normalized payload paths are non-empty");
+}
+
+#[cfg(not(unix))]
+fn open_payload_regular_file_from_root(
+    payload_root: &Path,
+    _root: &File,
+    relative: &Path,
+) -> Result<File, PackageError> {
     let normalized = normalize_relative_payload_path(relative)?;
     let normalized = Path::new(&normalized);
 
-    #[cfg(unix)]
-    {
-        let mut directory = open_payload_directory_path(payload_root)?;
-        let components: Vec<_> = normalized.components().collect();
-        for (index, component) in components.iter().enumerate() {
-            let std::path::Component::Normal(name) = component else {
-                unreachable!("normalized payload paths contain only normal components");
-            };
-            let display_path = payload_root.join(components[..=index].iter().fold(
-                PathBuf::new(),
-                |mut path, component| {
-                    path.push(component.as_os_str());
-                    path
-                },
-            ));
-            let opened = if index + 1 == components.len() {
-                open_child_no_follow(&directory, name, &display_path)?
-            } else {
-                open_directory_child_no_follow(&directory, name, &display_path)?
-            };
-            let metadata = opened.metadata().map_err(|source| PackageError::Io {
-                operation: "inspect opened entry",
-                path: display_path.clone(),
-                source,
-            })?;
-            if index + 1 == components.len() {
-                if !metadata.is_file() {
-                    return Err(PackageError::UnsupportedFileType { path: display_path });
-                }
-                return Ok(opened);
-            }
-            if !metadata.is_dir() {
-                return Err(PackageError::UnsupportedFileType { path: display_path });
-            }
-            directory = opened;
-        }
-        unreachable!("normalized payload paths are non-empty");
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Best available portable fallback: reject symlinks component by
-        // component and keep the opened final file. The standard library does
-        // not expose descriptor-relative traversal on non-Unix targets.
-        let _root = open_payload_directory_path(payload_root)?;
-        let mut current = payload_root.to_path_buf();
-        for (index, component) in normalized.components().enumerate() {
-            current.push(component.as_os_str());
-            let metadata = fs::symlink_metadata(&current).map_err(|source| PackageError::Io {
-                operation: "inspect",
-                path: current.clone(),
-                source,
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(PackageError::Symlink { path: current });
-            }
-            let is_last = index + 1 == normalized.components().count();
-            if (!is_last && !metadata.is_dir()) || (is_last && !metadata.is_file()) {
-                return Err(PackageError::UnsupportedFileType { path: current });
-            }
-        }
-        File::open(&current).map_err(|source| PackageError::Io {
-            operation: "open",
-            path: current,
+    // Best available portable fallback: reject symlinks component by
+    // component and keep the opened final file. The standard library does not
+    // expose descriptor-relative traversal on non-Unix targets.
+    let mut current = payload_root.to_path_buf();
+    let component_count = normalized.components().count();
+    for (index, component) in normalized.components().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|source| PackageError::Io {
+            operation: "inspect",
+            path: current.clone(),
             source,
-        })
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PackageError::Symlink { path: current });
+        }
+        let is_last = index + 1 == component_count;
+        if (!is_last && !metadata.is_dir()) || (is_last && !metadata.is_file()) {
+            return Err(PackageError::UnsupportedFileType { path: current });
+        }
     }
+    File::open(&current).map_err(|source| PackageError::Io {
+        operation: "open",
+        path: current,
+        source,
+    })
 }
 
 #[cfg(unix)]
