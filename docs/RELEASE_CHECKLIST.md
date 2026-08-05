@@ -69,21 +69,27 @@ governed lowering, native/QEMU/hardware evidence, Governor authority, device
 assignment, DMA/IOMMU isolation, Acceptance A, or G0--G13 passage.
 
 The composite Project HGraph smoke contains bounded hosted PR7 planning and
-World PR8-1 project-profile phases. It constructs an exact-provenance plan and
-real HGraph operations from a checked-in project, validates logical alternatives and
-prerequisites, route policy and equivalence metadata, malformed/substitution
-rejection, stable nonexecuting IR/DOT output, residual `HostWorld`, and ordinary
-`.O` IR compatibility. The PR8-1 phase checks canonical `LogicalHGraphV1`
+World PR8-1/PR8-2 project-profile phases. It constructs an exact-provenance plan
+and real HGraph operations from a checked-in project, validates logical
+alternatives and prerequisites, route policy and equivalence metadata,
+malformed/substitution rejection, stable nonexecuting IR/DOT output, residual
+`HostWorld`, and ordinary `.O` IR compatibility. The PR8-1 phase checks
+canonical `LogicalHGraphV1`
 encoding/digest, raw and scheduler-expanded effect resources, strict decoding,
 forged-governed-resource rejection, and the hosted no-authority boundary. That
 digest is exact-source-bound; it does not normalize source or manifest
-formatting. Its logical alternative branches may remain serialized
-and cross-coupled by shared conservative ambient/resource state chains; the
-smoke claims neither parallel execution nor independent host mediation. It
-also checks byte parity between direct `olangc` and repository-owned `o plan`,
-then compiles a real project binary, checks its CLI, and runs opt-in AnySuccess
-for immediate short-circuit plus nonzero-to-success continuation in disposable
-workspaces.
+formatting. The PR8-2 phase checks canonical hosted-unbound and
+snapshot-derived `DeploymentPlanV1` records, exact logical/bundle binding,
+bundle-scoped role/path compatibility, deterministic provider proposals,
+World/task hierarchy rejection, and trusted substitution rejection. Supported
+hosted policies use only `AmbientHost` and `HostedCoordinator`; unsupported
+hosted policies remain `Unresolved`. Its logical alternative branches may
+remain serialized and cross-coupled by shared conservative ambient/resource
+state chains; the smoke claims neither parallel execution nor independent host
+mediation. It also checks byte parity between direct `olangc` and
+repository-owned `o plan`, then compiles a real project binary, checks its CLI,
+and runs opt-in AnySuccess for immediate short-circuit plus nonzero-to-success
+continuation in disposable workspaces.
 
 The execution Project HGraph smoke is the bounded
 ProjectExec-A/ProjectExec-B opt-in hosted gate for one resolved
@@ -92,14 +98,29 @@ ProjectExec-A/ProjectExec-B opt-in hosted gate for one resolved
 value/success prerequisite edges, first-success prefix readiness, attempted
 result retention, guard-skip/nonzero continuation, conservative `HostWorld`
 progression, infrastructure aborts, and unsigned deterministic lifecycle
-events. Trace v4 binds those events to the canonical logical graph schema and
-digest. A terminal alternative may continue only after no route child executed
-or after every executed route declares `failure_continuation =
-"declared_idempotent"`; a failed prerequisite remains a hard stop. Bundle v2
-carries that contract, and complete traces pass plan-aware semantic replay
-against the trusted HGraph. It is not parallel race/cancellation, retry,
-placement, deployment, Governor/receipt integration, exactly-once effects,
+events. Trace v5 binds those events to the canonical logical graph schema and
+digest plus the exact canonical hosted-unbound `DeploymentPlanV1` schema and
+digest. Trusted plan-aware replay reconstructs that deployment artifact and
+rejects its substitution. A terminal alternative may continue only after no
+route child executed or after every executed route declares
+`failure_continuation = "declared_idempotent"`; a failed prerequisite remains a
+hard stop. Bundle v2 carries that contract, and complete traces pass plan-aware
+semantic replay against the trusted HGraph. It is not parallel
+race/cancellation, retry, snapshot-plan execution, actual placement,
+runtime/recovery graphs, Governor/receipt integration, exactly-once effects,
 native/QEMU or hardware evidence, G1, or G0--G13 passage.
+
+The snapshot-derived deployment record is a deterministic descriptive proposal
+from caller-supplied exact snapshot and task identities. It is not current or
+authenticated inventory, Governor admission, authority, dispatch, reservation,
+health, or execution, and the current executor does not consume it. Active
+compatibility checks cover the exact bundle plus bundle-scoped role/path
+declarations, runtime classes, executable/evaluator facts, platform and
+ambient-environment guards, authority absence, and residual `HostWorld`
+admission. Architecture, package, and failure-domain fields are currently
+unconstrained or empty schema vocabulary; `require_current_world` checks only
+World identity/epoch. No `RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`,
+native parity, or G1 evidence is claimed. G1 remains defined and unpassed.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a

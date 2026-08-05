@@ -137,11 +137,15 @@ project-adapter gate. Its planning phase uses a real fixture to prove exact
 bundle/policy provenance, all five project operation kinds, logical
 alternative/prerequisite topology, stable nonexecuting IR/DOT output,
 malformed/substitution rejection, conservative `HostWorld`, and ordinary `.O`
-IR compatibility. It also proves `scripts/o-cli.sh plan` is byte-identical to
-the direct `olangc --target ir` result. After those nonexecution checks, the
-smoke compiles a project binary and runs bounded opt-in AnySuccess cases for
-immediate short-circuit and nonzero-to-success continuation in disposable
-workspaces. The continuation fixture explicitly declares both its executed
+IR compatibility. Its World PR8-2 phase checks canonical hosted-unbound and
+snapshot-derived `DeploymentPlanV1` records, exact logical/bundle binding,
+bundle-scoped role/path compatibility, deterministic provider proposals, and
+fail-closed unresolved cases. It also proves `scripts/o-cli.sh plan` is
+byte-identical to the direct `olangc --target ir` result. After those
+nonexecution checks, the smoke compiles a project binary and runs bounded
+opt-in AnySuccess cases for immediate short-circuit and nonzero-to-success
+continuation in disposable workspaces. The continuation fixture explicitly
+declares both its executed
 prerequisite and first route `failure_continuation = "declared_idempotent"`;
 omitting that contract now fails closed before the second branch. `setup.sh`
 installs lowercase `o` as a wrapper over the dispatcher
@@ -161,9 +165,11 @@ successful prerequisites, explicitly declares
 fails closed. A failed prerequisite remains a hard stop regardless of that
 declaration because this slice has no synthesized branch-failure result. Bundle
 format v2 carries the contract; a v1 bundle migrates only when all routes omit
-the new field and therefore default to `unproven`. Trace v4 records the assessed
+the new field and therefore default to `unproven`. Trace v5 records the assessed
 prefix, evidence class, next route, allow/deny result, and canonical
-`LogicalHGraphV1` schema/digest. Complete traces pass
+`LogicalHGraphV1` schema/digest. It also binds the exact canonical
+hosted-unbound `DeploymentPlanV1` schema/digest; plan-aware replay reconstructs
+that artifact and rejects its substitution. Complete traces pass
 plan-aware semantic replay against the trusted HGraph, including complete
 causally ordered lifecycle coverage for transitive route prerequisites;
 structural replay alone does not prove bundle-bound evidence. Infrastructure
@@ -171,17 +177,39 @@ abort stops without publishing a route result. This is an HGraph-only
 author-declaration gate, not
 verified idempotency, a sandbox/fence/effect log, parallel race/cancellation,
 retry,
-placement, deployment, Governor/receipt integration, exactly-once effects,
-native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
+snapshot-plan execution, actual placement, runtime/recovery graphs,
+Governor/receipt integration, exactly-once effects, native or QEMU evidence,
+hardware isolation, G1, or G0--G13 passage.
 
 `src/project/logical.rs` is the World PR8-1 project profile. It derives
 `LogicalHGraphV1` after validating the exact plan-to-HGraph projection,
 preserves residual `HostWorld`, rejects unknown schema data, offers a separate
-strict canonical decoder, and supplies the digest used by trace v4. The digest
-binds exact bundle bytes and metadata; it
-normalizes logical-record JSON encoding, not source or manifest formatting. It
-does not define placement, runtime, recovery, World
-task identity, authority grants, receipts, or G1 evidence.
+strict canonical decoder, and supplies the logical digest used by trace v5.
+The digest binds exact bundle bytes and metadata; it normalizes logical-record
+JSON encoding, not source or manifest formatting. It does not itself define
+placement, runtime, recovery, World task identity, authority grants, receipts,
+or G1 evidence.
+
+`src/project/deployment.rs` is the bounded World PR8-2 intention layer. Its
+ordinary hosted constructor binds supported coordinator operations only to
+`HostedCoordinator` or `AmbientHost`, carries no World/task/provider identity,
+and leaves unsupported hosted policies `Unresolved`. Requirements actively
+derive the exact project bundle and bundle-scoped role/path declarations,
+runtime classes, executable/evaluator facts, platform and ambient-environment
+guards, authority absence, and residual `HostWorld` admission. Bundle
+environment overlays are recorded separately; architecture, package, and
+failure-domain fields are currently unconstrained or empty schema vocabulary.
+
+The snapshot constructor requires an exact caller-supplied
+`PlacementSnapshotV1` and exact caller-supplied `TaskIdentity` map, then derives
+a deterministic single-provider `ProposedProvider` or `Unresolved` record.
+Snapshot/provider facts are descriptive and do not prove current inventory,
+Governor admission, authority, dispatch, reservation, health, or execution.
+`require_current_world` checks only World identity/epoch. The current executor
+does not consume snapshot-derived plans; it binds only the canonical
+hosted-unbound plan into unsigned trace v5. There is no `RuntimeGraph`,
+`RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 evidence, and G1 remains
+defined and unpassed.
 
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
 case-insensitive host the raw `O` release binary is otherwise also found as

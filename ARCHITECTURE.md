@@ -262,8 +262,34 @@ projection identity, not a
 whitespace-insensitive source-semantic hash: only alternate JSON encodings of
 the logical record normalize through decode and canonical re-encoding.
 `HostWorld` remains explicit. Logical operation IDs are
-planner-local and carry no World identity or authority. Deployment, runtime,
-recovery, receipt, native-parity, and G1 layers remain separate future work.
+planner-local and carry no World identity or authority.
+
+World PR8-2 adds a strict canonical `DeploymentPlanV1` intention layer bound to
+that `LogicalHGraphV1` digest. The ordinary hosted constructor is deliberately
+unbound: for the policies implemented by `ProjectCoordinator`, it labels
+`BuildRoute`, `SelectRoute`, and `CompareRouteResults` as
+`HostedCoordinator`, labels `MaterializeProject` and `RunRoute` as
+`AmbientHost`, and carries no World, task, provider, or placement identity.
+Unsupported hosted policies remain explicitly `Unresolved`; the deployment
+record does not silently promote them to executable placements.
+
+Requirements are copied or derived from the exact project bundle: the bundle
+digest and bundle-scoped role/path declarations, runtime classes,
+executable/evaluator facts, platform and ambient-environment guards, explicit
+authority absence, and residual `HostWorld` admission are active compatibility
+checks. Bundle environment-overlay key names are recorded separately from
+ambient environment requirements. Architecture, package, and failure-domain
+fields are schema vocabulary, but the current logical projection leaves them
+unconstrained or empty.
+
+A separate constructor can derive a deterministic `ProposedProvider` from a
+caller-supplied exact `PlacementSnapshotV1` and one caller-supplied exact
+`TaskIdentity` per logical operation. That result is a descriptive proposal,
+not current inventory, Governor admission, authority, dispatch, reservation,
+or execution. `require_current_world` checks only the referenced World identity
+and epoch. The current executor does not consume snapshot-derived plans.
+`RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native parity, and G1 remain
+outside this slice; G1 remains defined and unpassed.
 
 ProjectExec-A adds an opt-in `ProjectCoordinator` path for one resolved
 `Explicit` or `Default` alternative. ProjectExec-B extends that path to serial
@@ -282,9 +308,12 @@ including successful prerequisites, carries the bundle-bound
 verified effect safety, fencing, journaling, compensation, or exactly-once
 evidence. The default `unproven` route contract yields `unproven_effects`
 evidence and denies continuation; a failed prerequisite or infrastructure abort
-hard-stops. The unsigned trace v4 records this decision and binds the canonical
-`LogicalHGraphV1` schema/digest. Plan-aware replay verifies it, but the trace is
-not an `OWRECEIPT` or attestation. The
+hard-stops. The unsigned trace v5 records this decision and binds both the
+canonical `LogicalHGraphV1` schema/digest and the exact canonical
+hosted-unbound `DeploymentPlanV1` schema/digest. Plan-aware replay reconstructs
+the hosted-unbound deployment artifact and rejects substitution of that
+artifact. It does not bind or execute a snapshot-derived provider proposal,
+and the trace is not an `OWRECEIPT` or attestation. The
 compatibility project runtime remains the default when the opt-in is absent.
 
 Materialization and command operations stay fallible and conservatively
@@ -292,8 +321,9 @@ read/write `HostWorld`, regardless of untrusted manifest `pure=true` metadata.
 The logical alternative branches therefore share conservative ambient/resource
 state chains and may be serialized; the bounded executor is not a claim of
 parallel races or cancellation, retry, independently mediated host worlds,
-deployment graph layers, placement, Governor authority, receipts, remote
-execution, exactly-once effects, G1, or qualifying native evidence.
+snapshot-plan execution, runtime or recovery graph layers, actual placement,
+Governor authority, receipts, remote execution, exactly-once effects, G1, or
+qualifying native evidence.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by
