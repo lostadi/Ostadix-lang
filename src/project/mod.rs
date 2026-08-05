@@ -16,6 +16,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub mod bundle;
+pub mod deployment;
 pub mod discover;
 pub mod ecosystems;
 pub mod executor;
@@ -28,6 +29,15 @@ pub mod plan;
 pub mod runtime;
 pub mod trace;
 
+pub use deployment::{
+    DeploymentArchitectureRequirementV1, DeploymentCompatibilityIssueV1,
+    DeploymentFailureDomainConstraintV1, DeploymentOperationBindingV1,
+    DeploymentOperationRequirementsV1, DeploymentOperationV1, DeploymentPlanError,
+    DeploymentPlanV1, DeploymentProviderBindingV1, DeploymentProviderIssueV1,
+    DeploymentProviderRejectionV1, DeploymentProviderSnapshotV1, PlacementSnapshotV1,
+    DEPLOYMENT_PLAN_SCHEMA_V1, MAX_DEPLOYMENT_OPERATIONS, MAX_DEPLOYMENT_PROVIDERS,
+    MAX_DEPLOYMENT_RECORD_BYTES, MAX_DEPLOYMENT_REQUIREMENTS, PLACEMENT_SNAPSHOT_SCHEMA_V1,
+};
 pub use executor::{
     execute_project_hgraph, execute_project_hgraph_selection,
     execute_selection_with_configured_executor, run_selection_with_configured_executor,
