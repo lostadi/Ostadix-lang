@@ -62,25 +62,28 @@ epoch/membership. This is not Mode 31, a ResourceKey wire ABI, production
 governed lowering, native/QEMU/hardware evidence, Governor authority, device
 assignment, DMA/IOMMU isolation, Acceptance A, or G0--G13 passage.
 
-The planning Project HGraph smoke is the bounded hosted PR7 logical-planning
-gate. It constructs an exact-provenance plan and real HGraph operations from a
-checked-in project, validates logical alternatives and prerequisites, route
-policy and equivalence metadata, malformed/substitution rejection, stable
-nonexecuting IR/DOT output, residual `HostWorld`, and ordinary `.O` IR
-compatibility. Its logical alternative branches may remain serialized and
-cross-coupled by shared conservative ambient/resource state chains; the smoke
-claims neither parallel execution nor independent host mediation. It also
-checks byte parity between the direct `olangc` planner and the repository-owned
-lowercase `o plan` dispatcher, plus a real compiled project binary's route
-listing and checked option/policy rejection.
+The composite Project HGraph smoke contains a bounded hosted PR7
+logical-planning phase. It constructs an exact-provenance plan and real HGraph
+operations from a checked-in project, validates logical alternatives and
+prerequisites, route policy and equivalence metadata, malformed/substitution
+rejection, stable nonexecuting IR/DOT output, residual `HostWorld`, and ordinary
+`.O` IR compatibility. Its logical alternative branches may remain serialized
+and cross-coupled by shared conservative ambient/resource state chains; the
+smoke claims neither parallel execution nor independent host mediation. It
+also checks byte parity between direct `olangc` and repository-owned `o plan`,
+then compiles a real project binary, checks its CLI, and runs opt-in AnySuccess
+for immediate short-circuit plus nonzero-to-success continuation in disposable
+workspaces.
 
-The execution Project HGraph smoke is the bounded PR8A opt-in hosted gate for
-one resolved `Explicit`/`Default` alternative. It checks shared isolated
-workspace execution, typed value/success prerequisite edges, nonzero-result
-selection, conservative `HostWorld` progression, infrastructure aborts, and
-unsigned deterministic lifecycle events. It is not multipath policy execution,
-retry, placement, deployment, Governor/receipt integration, exactly-once
-effects, native/QEMU or hardware evidence, G1, or G0--G13 passage.
+The execution Project HGraph smoke is the bounded PR8A/PR8B opt-in hosted gate
+for one resolved `Explicit`/`Default` alternative plus serial ordered
+`Fallback`/`AnySuccess`. It checks shared isolated workspace execution, typed
+value/success prerequisite edges, first-success prefix readiness, attempted
+result retention, guard-skip/nonzero continuation, conservative `HostWorld`
+progression, infrastructure aborts, and unsigned deterministic lifecycle
+events. It is not parallel race/cancellation, retry, placement, deployment,
+Governor/receipt integration, exactly-once effects, native/QEMU or hardware
+evidence, G1, or G0--G13 passage.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a

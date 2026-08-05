@@ -175,6 +175,18 @@ pub enum ExecutableOp {
     CompareRouteResults,
 }
 
+/// How a coordinator interprets an executable operation's ordered input ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyInputPolicy {
+    /// Every input must be materialized before the operation can start.
+    All,
+    /// Inputs are ordered alternative results. The operation can start after a
+    /// successful prefix member or after every member settles unsuccessfully.
+    /// Only a shape-validated `SelectRoute(fallback|any_success)` derives this
+    /// policy.
+    OrderedFirstSuccess,
+}
+
 /// The constraint relations a constraint hyperedge can carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstraintOp {

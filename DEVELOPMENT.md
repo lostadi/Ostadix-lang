@@ -127,24 +127,28 @@ bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
 
-`smoke-project-hgraph.sh` is the bounded hosted PR7 logical-planning gate. It
-uses a real project fixture to prove exact bundle/policy provenance, all five
-project operation kinds, logical alternative/prerequisite topology, stable
-nonexecuting IR/DOT output, malformed/substitution rejection, conservative
-`HostWorld`, and ordinary `.O` IR compatibility.
-The gate also proves `scripts/o-cli.sh plan` is byte-identical to the direct
-`olangc --target ir` result. `setup.sh` installs lowercase `o` as a wrapper over
-that dispatcher while preserving evaluator fallback for non-subcommand input.
+`smoke-project-hgraph.sh` is the composite hosted PR7 planning and generated
+project-adapter gate. Its planning phase uses a real fixture to prove exact
+bundle/policy provenance, all five project operation kinds, logical
+alternative/prerequisite topology, stable nonexecuting IR/DOT output,
+malformed/substitution rejection, conservative `HostWorld`, and ordinary `.O`
+IR compatibility. It also proves `scripts/o-cli.sh plan` is byte-identical to
+the direct `olangc --target ir` result. After those nonexecution checks, the
+smoke compiles a project binary and runs bounded opt-in AnySuccess cases for
+immediate short-circuit and nonzero-to-success continuation in disposable
+workspaces. `setup.sh` installs lowercase `o` as a wrapper over the dispatcher
+while preserving evaluator fallback for non-subcommand input.
 
-`smoke-project-hgraph-exec.sh` is the separate PR8A single-branch hosted
+`smoke-project-hgraph-exec.sh` is the separate PR8A/PR8B ordered hosted
 execution gate. It proves that the opt-in HGraph coordinator owns isolated
-materialization, typed prerequisite ordering, route settlement, sole-result
-selection, and an unsigned lifecycle trace for one `Explicit`/`Default`
-alternative. Nonzero settlement retains the ordinary result and conservative
-resource successor while withholding successful completion. It is not
-multipath execution, retry, placement, deployment, Governor/receipt
-integration, exactly-once effects, native or QEMU evidence, hardware isolation,
-G1, or G0--G13 passage.
+materialization, typed prerequisite ordering, route settlement, and unsigned
+lifecycle tracing for one `Explicit`/`Default` alternative plus serial
+`Fallback`/`AnySuccess`. The latter use a first-class ordered-prefix input
+policy, retain each attempted result, continue after nonzero or guard skip, and
+never start a later branch after the first success. Infrastructure abort stops
+without publishing a route result. This is not parallel race/cancellation,
+retry, placement, deployment, Governor/receipt integration, exactly-once
+effects, native or QEMU evidence, hardware isolation, G1, or G0--G13 passage.
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
 case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.

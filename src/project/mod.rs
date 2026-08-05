@@ -28,9 +28,10 @@ pub mod runtime;
 pub mod trace;
 
 pub use executor::{
-    execute_project_hgraph, execute_selection_with_configured_executor,
-    run_selection_with_configured_executor, write_project_attempt_trace,
-    ConfiguredProjectExecution, ProjectCoordinator, ProjectExecutionError, ProjectExecutionOutcome,
+    execute_project_hgraph, execute_project_hgraph_selection,
+    execute_selection_with_configured_executor, run_selection_with_configured_executor,
+    write_project_attempt_trace, ConfiguredProjectExecution, ProjectCoordinator,
+    ProjectExecutionError, ProjectExecutionOutcome,
 };
 pub use model::{
     Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,

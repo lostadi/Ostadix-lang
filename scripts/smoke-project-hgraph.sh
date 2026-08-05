@@ -215,6 +215,80 @@ if [[ -e "$PR7_NONEXEC_MARKER" ]]; then
 fi
 mark 'Generated project binary embedding and checked policy CLI: PASS'
 
+compiled_exec_log="$work_dir/compiled-project-execution-audit.log"
+compiled_exec_trace="$work_dir/compiled-project-execution-trace.json"
+compiled_exec_stdout="$work_dir/compiled-project-execution.log"
+run_logged "$compiled_exec_stdout" env \
+    PR7_REQUIRED_ENV=1 \
+    PR7_NONEXEC_MARKER="$compiled_exec_log" \
+    O_PROJECT_EXECUTOR=hgraph \
+    "$compiled_project" --route main --routes-policy any_success \
+    --project-trace-out "$compiled_exec_trace"
+grep -Fq 'route impl-a' "$compiled_exec_stdout"
+if grep -Fq 'route impl-b' "$compiled_exec_stdout"; then
+    printf 'compiled ordered execution printed an unstarted alternative\n' >&2
+    exit 1
+fi
+grep -Fqx 'PR7_PREP_EXECUTEDPR7_IMPL_A_EXECUTED' "$compiled_exec_log"
+python3 - "$compiled_exec_trace" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    trace = json.load(handle)
+assert trace["format_version"] == 2
+assert trace["header"]["policy"] == "any_success"
+events = trace["events"]
+assert any(
+    event["operation_label"] == "run-route:impl-a"
+    and event["state"] == "settled_success"
+    for event in events
+)
+assert not any(event.get("branch") == 1 for event in events)
+PY
+mark 'Generated project binary ordered hosted execution: PASS'
+
+compiled_continue_log="$work_dir/compiled-project-continuation-audit.log"
+compiled_continue_trace="$work_dir/compiled-project-continuation-trace.json"
+compiled_continue_stdout="$work_dir/compiled-project-continuation.log"
+run_logged "$compiled_continue_stdout" env \
+    PATH="$ROOT/tests/fixtures/project_hgraph_tools:$PATH" \
+    PR7_REQUIRED_ENV=1 \
+    PR7_NONEXEC_MARKER="$compiled_continue_log" \
+    O_PROJECT_EXECUTOR=hgraph \
+    "$compiled_project" --route main --routes-policy any_success \
+    --project-trace-out "$compiled_continue_trace"
+grep -Fqx \
+    'PR7_PREP_EXECUTEDPR7_IMPL_A_EXECUTEDPR7_PREP_EXECUTEDPR7_IMPL_B_EXECUTED' \
+    "$compiled_continue_log"
+python3 - "$compiled_continue_stdout" "$compiled_continue_trace" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    output = handle.read()
+first = output.index("route impl-a")
+second = output.index("route impl-b")
+assert first < second
+
+with open(sys.argv[2], "r", encoding="utf-8") as handle:
+    trace = json.load(handle)
+assert trace["format_version"] == 2
+assert trace["header"]["policy"] == "any_success"
+events = trace["events"]
+assert any(
+    event["operation_label"] == "run-route:impl-a"
+    and event["state"] == "settled_failure"
+    for event in events
+)
+assert any(
+    event["operation_label"] == "run-route:impl-b"
+    and event["state"] == "settled_success"
+    for event in events
+)
+PY
+mark 'Generated project binary nonzero-to-success continuation: PASS'
+
 for forbidden in \
     'project HGraph execution: PASS' \
     'project commands executed: PASS' \

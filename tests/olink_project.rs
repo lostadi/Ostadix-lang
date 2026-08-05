@@ -308,6 +308,77 @@ fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
 }
 
 #[test]
+fn olink_any_success_preserves_the_successful_attempt_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "olang.project.toml",
+        br#"[project]
+name = "olink-any-success-prefix"
+
+[[routes]]
+id = "first-failure"
+kind = "shell"
+command = ["sh", "-c", "exit 5"]
+
+[[routes]]
+id = "second-success"
+kind = "shell"
+command = ["sh", "-c", "exit 0"]
+
+[[routes]]
+id = "never-started"
+kind = "shell"
+command = ["sh", "-c", "exit 0"]
+
+[[route_sets]]
+provides = "service"
+alternatives = ["first-failure", "second-success", "never-started"]
+policy = "any_success"
+"#,
+    );
+    let external = tempfile::tempdir().unwrap();
+    let trace_path = external.path().join("olink-any-success-prefix.json");
+
+    let output = olink()
+        .arg("--project")
+        .arg(dir.path())
+        .arg("--run")
+        .args(["--route", "service"])
+        .arg("--project-trace-out")
+        .arg(&trace_path)
+        .env("O_PROJECT_EXECUTOR", "hgraph")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "o-link ordered HGraph run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout
+        .find("first-failure")
+        .unwrap_or_else(|| panic!("first result missing: {stdout}"));
+    let second = stdout
+        .find("second-success")
+        .unwrap_or_else(|| panic!("second result missing: {stdout}"));
+    assert!(first < second, "attempt prefix was reordered: {stdout}");
+    assert!(
+        !stdout.contains("never-started"),
+        "unstarted result was printed: {stdout}"
+    );
+
+    let trace = read_project_trace(&trace_path);
+    assert_eq!(trace["header"]["policy"], "any_success");
+    assert!(!trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["branch"] == 2));
+}
+
+#[test]
 fn olink_project_run_ambiguous_requires_selection() {
     let dir = tempfile::tempdir().unwrap();
     write(

@@ -8,7 +8,8 @@ use crate::ir::{ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 use crate::value::{Fidelity, OValue};
 
 use super::kinds::{
-    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, OpKind, RepFlags, ValueState,
+    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, OpKind, ReadyInputPolicy, RepFlags,
+    ValueState,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -198,6 +199,80 @@ pub struct ExecInfo {
     pub outputs: Vec<NodeId>,
     pub ordinal: u64,
     pub plan_node: PlanNodeId,
+}
+
+impl ExecInfo {
+    /// Derive the coordinator input policy from this exact graph operation.
+    /// Ordered first-success is admitted only for a nonempty ordered list of
+    /// ordinary values produced directly by `RunRoute` operations.
+    pub fn ready_input_policy(&self, graph: &HGraph) -> Result<ReadyInputPolicy, String> {
+        let registered = graph.op_for(self.plan_node).ok_or_else(|| {
+            format!(
+                "operation {} is absent from the supplied HGraph",
+                self.plan_node.0
+            )
+        })?;
+        if registered != self {
+            return Err(format!(
+                "operation {} does not match the supplied HGraph projection",
+                self.plan_node.0
+            ));
+        }
+        let edge = graph.exec_edge(self.edge).ok_or_else(|| {
+            format!(
+                "operation {} references missing executable edge {}",
+                self.plan_node.0, self.edge.0
+            )
+        })?;
+        let HEdgeKind::Execute(ExecutableOp::SelectRoute { policy }) = &edge.op else {
+            return Ok(ReadyInputPolicy::All);
+        };
+        if !matches!(policy.as_str(), "fallback" | "any_success") {
+            return Ok(ReadyInputPolicy::All);
+        }
+        if self.inputs.is_empty() {
+            return Err(format!(
+                "ordered first-success SelectRoute operation {} has no alternative-result inputs",
+                self.plan_node.0
+            ));
+        }
+        for (position, input) in self.inputs.iter().enumerate() {
+            let node = graph.node(*input).ok_or_else(|| {
+                format!(
+                    "ordered first-success SelectRoute operation {} references missing input node {}",
+                    self.plan_node.0, input.0
+                )
+            })?;
+            if !node.is_value() {
+                return Err(format!(
+                    "ordered first-success SelectRoute operation {} input {} (node {}) is not an ordinary Value",
+                    self.plan_node.0, position, input.0
+                ));
+            }
+            let producer = node.producer.ok_or_else(|| {
+                format!(
+                    "ordered first-success SelectRoute operation {} input {} (node {}) has no RunRoute producer",
+                    self.plan_node.0, position, input.0
+                )
+            })?;
+            let producer_edge = graph.exec_edge(producer).ok_or_else(|| {
+                format!(
+                    "ordered first-success SelectRoute operation {} input {} (node {}) references missing producer edge {}",
+                    self.plan_node.0, position, input.0, producer.0
+                )
+            })?;
+            if !matches!(
+                &producer_edge.op,
+                HEdgeKind::Execute(ExecutableOp::RunRoute { .. })
+            ) {
+                return Err(format!(
+                    "ordered first-success SelectRoute operation {} input {} (node {}) is not produced by RunRoute",
+                    self.plan_node.0, position, input.0
+                ));
+            }
+        }
+        Ok(ReadyInputPolicy::OrderedFirstSuccess)
+    }
 }
 
 /// One preserved source-sequence relation lowered through the predecessor's
@@ -585,11 +660,16 @@ impl HGraph {
                 HEdgeKind::Execute(op) => format!("{op:?}"),
                 HEdgeKind::Constraint(_) => "<invalid constraint>".to_string(),
             };
+            let input_policy = match info.ready_input_policy(self) {
+                Ok(ReadyInputPolicy::All) => "",
+                Ok(ReadyInputPolicy::OrderedFirstSuccess) => " input-policy=ordered-first-success",
+                Err(_) => " input-policy=invalid",
+            };
             let inputs = format_node_ids(&info.inputs);
             let outputs = format_node_ids(&info.outputs);
             writeln!(
                 out,
-                "execute e{} plan={} op={op} inputs=[{inputs}] -> outputs=[{outputs}] value=n{}",
+                "execute e{} plan={} op={op}{input_policy} inputs=[{inputs}] -> outputs=[{outputs}] value=n{}",
                 info.edge.0, info.plan_node.0, info.value_output.0
             )
             .expect("writing to a String cannot fail");
