@@ -4,10 +4,13 @@ The Rust hosted runtime executes OIR through a directed HGraph. The graph
 coordinator is the default; `O_EXECUTOR=serial` selects the reference OIR
 executor used by the differential conformance suite.
 
-Project inputs have a distinct, direct logical-planning surface:
+Project inputs have a distinct logical-planning and opt-in hosted execution
+surface:
 
 ```text
-ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan -> HGraph
+ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan
+              -> ProjectHGraph -> ReadySchedule -> ProjectCoordinator
+              -> OExecutionResult + ProjectAttemptTrace
 ```
 
 Routes are not synthesized as fake OIR. The project planner binds its source to
@@ -19,14 +22,33 @@ source plan and checks the exact operations, dependencies, effects, values, and
 graph projection. This closes a provenance gap that generic HGraph
 well-formedness and the intentionally OIR-only `source_plan` field cannot close.
 
-`olangc <project> --target ir|dot` is inspection only. The coordinator described
-below executes ordinary OIR graphs; it does not yet execute project HGraphs.
-Project script and compiled execution continue through `project::runtime`, and
-materialization/command operations remain fallible `HostWorld` work even if a
-manifest declares `pure=true`. Alternative dependencies are logically branched,
-but the project HGraph intentionally retains shared conservative
-ambient/resource state chains; those chains may serialize and cross-couple
-branches until a trusted, branch-scoped resource model exists.
+`olangc <project> --target ir|dot` remains inspection only. With
+`O_PROJECT_EXECUTOR=hgraph`, project script execution and compiled project
+binaries use `ProjectCoordinator` for exactly one resolved `Explicit` or
+`Default` alternative. The graph controls isolated materialization,
+prerequisite readiness, route execution, and sole-result selection. Unsupported
+multipath policies fail closed and never fall back to `run_selection`.
+
+The compatibility project runtime remains the default when the environment
+variable is unset. In either mode, materialization and commands remain
+fallible `HostWorld` work even if a manifest declares `pure=true`. Logical
+alternative branches still share conservative ambient/resource chains; the
+single-branch executor is not evidence of parallel or independently mediated
+branch execution.
+
+The normative World-v3 constitution and Hosted World profile are byte-sealed
+by the append-only G0 evidence ledger. Their older repository-status paragraphs
+are not rewritten by this hosted executor patch; changing those bytes requires
+a separate constitution-source refresh, a new schema-v3 G0 attestation, and an
+explicit supersession event. Nothing here claims G1.
+
+Project dependencies distinguish `Value(pN)` from `Success(pN)`. A settled
+nonzero route publishes its ordinary result and conservative resource
+successors, but not its successful-completion token. This lets selection inspect
+a terminal unsuccessful result while preventing a failed prerequisite from
+activating its dependent route. Guard skips preserve the compatibility
+runtime's successful progression semantics. Infrastructure aborts publish no
+route result, completion, or resource successor.
 
 ## Implemented operation shape
 
@@ -114,12 +136,20 @@ directed `HostWorld` chain.
 An operation's blockers are exactly the producers of its input nodes. There is
 no separately maintained actor or effect blocker in the final scheduler.
 
-The coordinator owns the mutable evaluator and process registry. It launches
-only verified pure inline renderer tasks on worker threads. After each success,
-it materializes the value, completion, and successor-state outputs and derives a
-fresh frontier. On failure, it emits none of those outputs and admits no later
-dependent operation. Root values and scope writes commit in deterministic source
-order, but commit order is not used to justify early side effects.
+The ordinary OIR coordinator owns the mutable evaluator and process registry.
+It launches only verified pure inline renderer tasks on worker threads. After
+each success, it materializes the value, completion, and successor-state
+outputs and derives a fresh frontier. On failure, it emits none of those
+outputs and admits no later dependent operation. Root values and scope writes
+commit in deterministic source order, but commit order is not used to justify
+early side effects.
+
+The separate hosted `ProjectCoordinator` is serial and launches ready project
+operations in stable ordinal order. Its terminal route states are
+`SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted`; non-route
+operations use `Finished`. Recording the terminal event, storing the operation
+value, and publishing the settlement-appropriate outputs is the coordinator's
+local linearization point. It does not establish exactly-once external effects.
 
 ## Validation and observability
 
@@ -128,6 +158,11 @@ exact value/completion shape, resource version monotonicity, completion-backed
 preserved sequence, and executable acyclicity. `olangc --target dot` renders
 ordinary, resource, actor, completion/control, executable, and constraint nodes
 with distinct styles and directed ports.
+
+`ProjectAttemptTrace` version 2 binds events to the project name, bundle digest,
+target, policy, logical graph digest, and a fresh execution-attempt identifier.
+`--project-trace-out PATH` stores the unsigned JSON diagnostic when HGraph mode
+is selected. It is not an OWRECEIPT or attestation.
 
 The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,

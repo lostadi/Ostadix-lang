@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::effects::{
     parse_declared_resource, EffectConfidence, EffectSummary, Fallibility, ResourceKey,
 };
-use crate::hgraph::{ExecutableOp, HEdgeKind, HGraph, HNode, NodeId};
+use crate::hgraph::{ExecutableOp, HEdgeKind, HGraph, HNode, HNodeKind, NodeId};
 use crate::ir::PlanNodeId;
 use crate::value::OValue;
 
@@ -73,13 +73,41 @@ impl RoutePlanFacts {
     }
 }
 
-/// One project operation and the logical predecessors whose ordinary values it
-/// consumes. `id` is planner-local; it is not an OIR `ExecutionPlan` identity.
+/// One typed dependency on a prior project operation.
+///
+/// `Value` waits for the predecessor's ordinary result, including a settled
+/// unsuccessful route result. `Success` waits for the predecessor's
+/// successful-completion token, so a nonzero prerequisite cannot release its
+/// dependent route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProjectDependency {
+    Value(PlanNodeId),
+    Success(PlanNodeId),
+}
+
+impl ProjectDependency {
+    /// Return the planner-local operation that produces this dependency.
+    pub const fn plan_node(self) -> PlanNodeId {
+        match self {
+            Self::Value(plan_node) | Self::Success(plan_node) => plan_node,
+        }
+    }
+
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Value(_) => "value",
+            Self::Success(_) => "success",
+        }
+    }
+}
+
+/// One project operation and its typed logical predecessors. `id` is
+/// planner-local; it is not an OIR `ExecutionPlan` identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectPlanOperation {
     pub id: PlanNodeId,
     pub op: ExecutableOp,
-    pub dependencies: Vec<PlanNodeId>,
+    pub dependencies: Vec<ProjectDependency>,
     pub effects: EffectSummary,
     /// Selected-alternative branch. It designates the isolated workspace used
     /// by the hosted runtime; residual HGraph resource chains remain global and
@@ -144,14 +172,20 @@ impl ProjectExecutionPlan {
         let selection_dependencies = if selection.policy == RoutePolicy::VerifyEquivalent {
             let compare = builder.push(
                 ExecutableOp::CompareRouteResults,
-                terminal_results,
+                terminal_results
+                    .into_iter()
+                    .map(ProjectDependency::Value)
+                    .collect(),
                 comparison_effects(),
                 None,
                 None,
             );
-            vec![compare]
+            vec![ProjectDependency::Value(compare)]
         } else {
             terminal_results
+                .into_iter()
+                .map(ProjectDependency::Value)
+                .collect()
         };
         let select = builder.push(
             ExecutableOp::SelectRoute {
@@ -243,16 +277,21 @@ impl ProjectExecutionPlan {
             }
             let mut dependencies = BTreeSet::new();
             for dependency in &operation.dependencies {
-                if dependency.0 >= index {
+                let predecessor = dependency.plan_node();
+                if predecessor.0 >= index {
                     return Err(format!(
-                        "project operation {} has non-preceding dependency {}",
-                        operation.id.0, dependency.0
+                        "project operation {} has non-preceding {} dependency {}",
+                        operation.id.0,
+                        dependency.token(),
+                        predecessor.0
                     ));
                 }
                 if !dependencies.insert(*dependency) {
                     return Err(format!(
-                        "project operation {} repeats dependency {}",
-                        operation.id.0, dependency.0
+                        "project operation {} repeats {} dependency {}",
+                        operation.id.0,
+                        dependency.token(),
+                        predecessor.0
                     ));
                 }
             }
@@ -409,7 +448,7 @@ impl ProjectExecutionPlan {
                         "project branch {branch} route `{route_id}` build/run facts differ"
                     ));
                 }
-                if build.dependencies != [materialize] {
+                if build.dependencies != [ProjectDependency::Value(materialize)] {
                     return Err(format!(
                         "project branch {branch} route `{route_id}` build does not depend only on its materialization"
                     ));
@@ -419,7 +458,7 @@ impl ProjectExecutionPlan {
                     .as_ref()
                     .expect("run facts were checked above");
                 let mut seen_prerequisites = BTreeSet::new();
-                let mut expected_run_dependencies = vec![build_id];
+                let mut expected_run_dependencies = vec![ProjectDependency::Value(build_id)];
                 for prerequisite in &facts.prerequisites {
                     if prerequisite.is_empty() || !seen_prerequisites.insert(prerequisite.clone()) {
                         return Err(format!(
@@ -434,7 +473,7 @@ impl ProjectExecutionPlan {
                                 "project branch {branch} route `{route_id}` lacks prerequisite `{prerequisite}`"
                             )
                         })?;
-                    expected_run_dependencies.push(prerequisite_run);
+                    expected_run_dependencies.push(ProjectDependency::Success(prerequisite_run));
                     pending.push(prerequisite.clone());
                 }
                 if run.dependencies != expected_run_dependencies {
@@ -463,13 +502,18 @@ impl ProjectExecutionPlan {
             return Err("project selection operation is not terminal".to_string());
         }
         let select_operation = &self.operations[select.0];
+        let terminal_values = terminal_results
+            .iter()
+            .copied()
+            .map(ProjectDependency::Value)
+            .collect::<Vec<_>>();
         if self.policy == RoutePolicy::VerifyEquivalent {
             let compare = comparison.ok_or_else(|| {
                 "verify-equivalent project plan has no comparison operation".to_string()
             })?;
             if compare.0 + 1 != select.0
-                || self.operations[compare.0].dependencies != terminal_results
-                || select_operation.dependencies != [compare]
+                || self.operations[compare.0].dependencies != terminal_values
+                || select_operation.dependencies != [ProjectDependency::Value(compare)]
             {
                 return Err(
                     "verify-equivalent comparison/selection topology is non-canonical".to_string(),
@@ -480,7 +524,7 @@ impl ProjectExecutionPlan {
                 "project policy {} must not contain a comparison operation",
                 self.policy.token()
             ));
-        } else if select_operation.dependencies != terminal_results {
+        } else if select_operation.dependencies != terminal_values {
             return Err("project selection dependencies differ from terminal alternatives".into());
         }
         if self.roots != [select] {
@@ -519,7 +563,7 @@ impl ProjectExecutionPlan {
             let dependencies = operation
                 .dependencies
                 .iter()
-                .map(|dependency| format!("p{}", dependency.0))
+                .map(|dependency| format!("{}:p{}", dependency.token(), dependency.plan_node().0))
                 .collect::<Vec<_>>()
                 .join(",");
             let branch = operation
@@ -585,11 +629,10 @@ impl ProjectExecutionPlan {
             let completion = graph.add_completion_node(operation.id)?;
             graph.set_effect_summary(operation.id, operation.effects.clone());
 
-            let mut inputs = operation
-                .dependencies
-                .iter()
-                .map(|dependency| values[dependency])
-                .collect::<Vec<_>>();
+            let mut inputs = Vec::with_capacity(operation.dependencies.len() + 1);
+            for dependency in &operation.dependencies {
+                inputs.push(project_dependency_node(&graph, &values, *dependency)?);
+            }
             if matches!(operation.op, ExecutableOp::MaterializeProject) {
                 inputs.push(bundle_value);
             }
@@ -701,20 +744,24 @@ impl ProjectExecutionPlan {
             let mut expected = operation
                 .dependencies
                 .iter()
-                .map(|dependency| values[dependency])
-                .collect::<BTreeSet<_>>();
+                .map(|dependency| project_dependency_node(graph, &values, *dependency))
+                .collect::<Result<BTreeSet<_>, _>>()?;
             if matches!(operation.op, ExecutableOp::MaterializeProject) {
                 expected.insert(bundle_literal);
             }
             let actual = info
                 .inputs
                 .iter()
-                .filter(|node| graph.node(**node).is_some_and(HNode::is_value))
+                .filter(|node| {
+                    graph.node(**node).is_some_and(|node| {
+                        matches!(&node.kind, HNodeKind::Value | HNodeKind::Completion { .. })
+                    })
+                })
                 .copied()
                 .collect::<BTreeSet<_>>();
             if actual != expected {
                 return Err(format!(
-                    "project operation {} value dependencies {:?} differ from {:?}",
+                    "project operation {} typed dependencies {:?} differ from {:?}",
                     operation.id.0, actual, expected
                 ));
             }
@@ -792,7 +839,7 @@ impl<'a> PlanBuilder<'a> {
     fn push(
         &mut self,
         op: ExecutableOp,
-        dependencies: Vec<PlanNodeId>,
+        dependencies: Vec<ProjectDependency>,
         effects: EffectSummary,
         branch: Option<usize>,
         route_facts: Option<RoutePlanFacts>,
@@ -832,13 +879,17 @@ impl<'a> PlanBuilder<'a> {
             ExecutableOp::BuildRoute {
                 route_id: route_id.to_string(),
             },
-            vec![materialize],
+            vec![ProjectDependency::Value(materialize)],
             EffectSummary::pure(),
             Some(branch),
             Some(facts.clone()),
         );
-        let mut run_dependencies = vec![build];
-        run_dependencies.extend(prerequisite_results);
+        let mut run_dependencies = vec![ProjectDependency::Value(build)];
+        run_dependencies.extend(
+            prerequisite_results
+                .into_iter()
+                .map(ProjectDependency::Success),
+        );
         let run = self.push(
             ExecutableOp::RunRoute {
                 route_id: route_id.to_string(),
@@ -1106,6 +1157,28 @@ fn add_resource_transitions(
         heads.insert(resource, (successor, next_version));
         inputs.push(prior);
         outputs.push(successor);
+    }
+}
+
+fn project_dependency_node(
+    graph: &HGraph,
+    values: &HashMap<PlanNodeId, NodeId>,
+    dependency: ProjectDependency,
+) -> Result<NodeId, String> {
+    let predecessor = dependency.plan_node();
+    match dependency {
+        ProjectDependency::Value(_) => values.get(&predecessor).copied().ok_or_else(|| {
+            format!(
+                "project value dependency {} has no preceding ordinary output",
+                predecessor.0
+            )
+        }),
+        ProjectDependency::Success(_) => graph.completion_node(predecessor).ok_or_else(|| {
+            format!(
+                "project success dependency {} has no preceding completion output",
+                predecessor.0
+            )
+        }),
     }
 }
 

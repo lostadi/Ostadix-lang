@@ -27,8 +27,8 @@ use crate::executor::CancellationToken;
 use super::bundle::sha256_hex;
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
-    Artifact, ExecutionProvenance, OExecutionResult, ProjectBundle, ResultCodec, RouteGuard,
-    RoutePolicy, RouteSpec,
+    Artifact, ExecutionProvenance, OExecutionResult, ProjectBundle, ResultCodec,
+    RouteExecutionDisposition, RouteGuard, RoutePolicy, RouteSpec,
 };
 
 /// How unmet guards are handled.
@@ -237,7 +237,7 @@ pub(crate) fn execute_route_in_workspace(
 }
 
 pub(crate) fn is_skipped_result(result: &OExecutionResult) -> bool {
-    result.exit_code.is_none() && result.stderr.starts_with(SKIP_MARKER.as_bytes())
+    result.was_guard_skipped()
 }
 
 fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OExecutionResult {
@@ -248,6 +248,7 @@ fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OEx
         stderr: format!("{SKIP_MARKER} {reason}\n").into_bytes(),
         value: None,
         artifacts: Vec::new(),
+        disposition: RouteExecutionDisposition::GuardSkipped,
         duration_ns: 0,
         provenance: ExecutionProvenance {
             workspace: workspace.root.clone(),
@@ -361,6 +362,7 @@ fn spawn_route(
         stderr,
         value,
         artifacts,
+        disposition: RouteExecutionDisposition::Executed,
         duration_ns,
         provenance: ExecutionProvenance {
             workspace: workspace.root.clone(),

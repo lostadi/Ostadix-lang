@@ -782,7 +782,7 @@ QEMU evidence, device assignment, DMA/IOMMU isolation, Governor authority,
 Acceptance gate A, G0/G1 passage, project placement, or a World-execution
 surface. `CapabilityState` is descriptive identity only and carries no grant.
 
-### Project HGraph hosted logical-planning gate
+### Project HGraph planning and single-branch hosted execution gates
 
 PR7 constructs real project operations from a directory or lifted
 `ProjectBundle` without running project commands:
@@ -803,15 +803,29 @@ environment key names, inputs, outputs, declared effects, cancellation, and
 equivalence policy remain visible in stable inspection output; command strings
 and environment values do not.
 
-This gate is hosted logical-planning evidence only. It does not execute project
-commands through the HGraph coordinator: script and compiled project execution
-still use the existing project runtime. Materialization and route commands
-remain fallible `HostWorld` operations even when a manifest says `pure=true`.
-The graph therefore preserves logical alternative branches while its shared
-ambient/resource state chains may conservatively serialize and cross-couple
-them; this is not proof of parallel branch execution.
-It supplies no graph-layer separation, placement, Governor authority, receipt,
-remote execution, native/QEMU/hardware evidence, G1, or G0--G13 passage.
+PR8A adds a separate, opt-in hosted executor for exactly one resolved
+`Explicit` or `Default` alternative:
+
+```bash
+./scripts/smoke-project-hgraph-exec.sh
+O_PROJECT_EXECUTOR=hgraph olangc tests/fixtures/project_hgraph_exec \
+    --target script --project-trace-out project-attempt.json
+```
+
+In this mode, the validated Project HGraph governs isolated workspace
+materialization, typed prerequisite ordering, route execution, and sole-result
+selection. A settled nonzero route publishes its result and conservative
+`HostWorld` successor, but not its success-completion token; infrastructure
+abort publishes no route result. The unsigned trace distinguishes
+`SettledSuccess`, `SettledFailure`, `Skipped`, and `Aborted` and binds each run
+to stable source/graph digests plus a fresh execution-attempt identifier. The
+compatibility runtime remains the default when `O_PROJECT_EXECUTOR` is unset.
+
+Materialization and route commands remain fallible `HostWorld` operations even
+when a manifest says `pure=true`. Unsupported multipath policies fail closed.
+This bounded hosted gate does not establish multipath execution, retry,
+placement, Governor authority, OWRECEIPT attestation, exactly-once effects,
+remote or native execution, QEMU/hardware evidence, G1, or G0--G13 passage.
 
 ### Docker
 
@@ -2213,8 +2227,11 @@ Project inputs take a direct, typed
 synthesizing OIR. The project-specific validator reconstructs the exact plan
 from the bundle and selected policy before checking its operation, dependency,
 effect, and HGraph projection. Unlike ordinary OIR execution, this project
-HGraph is not yet consumed by the coordinator; the hosted project runtime
-remains the command-execution path.
+HGraph has its own opt-in coordinator: `O_PROJECT_EXECUTOR=hgraph` executes one
+resolved `Explicit` or `Default` branch through graph-governed materialization,
+typed prerequisite readiness, route settlement, and selection. The compatibility
+hosted project runtime remains the default, and multipath policies are not yet
+implemented by the Project HGraph coordinator.
 
 OIR is not SSA and does not model native pointer mutation. Those semantics
 belong to O-core MIR.
