@@ -1994,11 +1994,11 @@ mod tests {
     }
 
     #[test]
-    fn solver_does_not_treat_synthetic_nodes_as_ovalues() {
+    fn solver_rejects_synthetic_dataflow_outputs() {
         let mut graph = HGraph::default();
         let input = graph.add_node(HNode::with_value(OValue::str_("value")));
         let synthetic = graph.add_node(HNode::resource_state(ResourceKey::HostWorld, 0));
-        graph.add_edge(HEdge::constraint(
+        let edge = graph.add_edge(HEdge::constraint(
             OpKind::DataFlow,
             vec![
                 Port {
@@ -2012,7 +2012,16 @@ mod tests {
             ],
         ));
 
-        crate::hgraph::solve::solve_types(&mut graph);
+        let error = crate::hgraph::solve::solve_types(&mut graph).unwrap_err();
+        assert_eq!(
+            error,
+            crate::hgraph::solve::SolveError::InvalidDataFlowShape {
+                edge,
+                value_inputs: 1,
+                value_outputs: 0,
+                non_value_ports: 1,
+            }
+        );
         let node = graph.node(synthetic).unwrap();
         assert!(node.value.is_none());
         assert!(node.domain.is_empty());

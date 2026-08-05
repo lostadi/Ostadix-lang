@@ -3188,7 +3188,8 @@ It is an architecture note against the existing `ocore` runtime and
 
 ## License
 
-GNU Lesser General Public License v2.1. See [LICENSE](LICENSE) for the full text.
+GNU Lesser General Public License v2.1 only (SPDX identifier
+`LGPL-2.1-only`). See [LICENSE](LICENSE) for the full text.
 
 ## Citation and authorship
 
@@ -3198,21 +3199,32 @@ Ostadix-lang / ^Ostadix_ was created by Lee Daghlar Ostadi.
 
 Citation metadata lives in the root-level [`CITATION.cff`](CITATION.cff)
 file, which GitHub surfaces through the repository's **"Cite this
-repository"** button. Until the first archival release mints a DOI, cite the
-canonical repository:
+repository"** button. For the paper and its supporting package, cite the
+existing Zenodo preprint/package record:
+
+    Lee Daghlar Ostadi. The Nesting Is the Interface: Recursive Evaluator
+    Composition for Whole-Program Polyglot Execution. Draft v0.2. Zenodo.
+    https://doi.org/10.5281/zenodo.21544345
+
+DOI `10.5281/zenodo.21544345` identifies that existing preprint/package
+record; it is not an archive of a tagged Ostadix-lang source release. When
+citing the current source before a separate tagged source-release DOI exists,
+identify the repository version and exact revision:
 
     Lee Daghlar Ostadi. Ostadix-lang: Recursive Evaluator Composition for
     Whole-Program Polyglot Execution. Version 0.2.0.
+    Commit: `FULL_COMMIT_SHA_USED`.
     https://github.com/lostadi/Ostadix-lang
 
-Once the Zenodo DOI exists, prefer citing the DOI of the exact archived
-release you used.
+Once Zenodo archives a future tagged source release, cite that separate,
+version-specific source-release DOI for the exact source snapshot used. The
+future DOI belongs in the top-level `doi` field of `CITATION.cff`; the existing
+preprint/package DOI remains under `preferred-citation`.
 
 ### Archival releases and DOI
 
-The publication path for the software follows the standard research-software
-sequence: tagged GitHub release → Zenodo archive with DOI → preprint →
-peer-reviewed paper. Concretely, for each archival release:
+The existing preprint/package DOI above and a future tagged source-release DOI
+identify different archived objects. For each archival source release:
 
 1. Choose the exact commit that represents the archival research release.
 2. Give it a real Git tag and a published GitHub release whose version
@@ -3220,8 +3232,9 @@ peer-reviewed paper. Concretely, for each archival release:
 3. With the repository connected to Zenodo's GitHub integration, publishing
    the release causes Zenodo to archive the repository state and mint a DOI
    for that release.
-4. Put the resulting DOI back into `CITATION.cff` (uncomment the `doi:`
-   field) and into this section of the README.
+4. Put the resulting source-release DOI into the top-level `doi` field of
+   `CITATION.cff` and into this section of the README. Do not replace the
+   existing preprint/package DOI under `preferred-citation`.
 
 Evaluation artifacts associated with any paper — benchmark scripts, inputs,
 raw results, and reproduction instructions — should be deposited on Zenodo as

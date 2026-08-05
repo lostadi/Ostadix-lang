@@ -39,7 +39,12 @@ bitflags::bitflags! {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpKind {
-    // Type-bearing relations.
+    // Type-bearing relations. The hosted OIR lowerer currently emits AbiFixed;
+    // the other seven relations in this block are reserved. Tests and callers
+    // may build them directly through the public HGraph API. A production
+    // producer must preserve the solver's monotone slot directions and add a
+    // convergence regression before making any of them reachable from
+    // lowering.
     Additive,
     Multiplicative,
     Bitwise,
@@ -50,6 +55,13 @@ pub enum OpKind {
     FieldAccess { field: String },
 
     // Scheduling-bearing relations.
+    // DataFlow is directional compatibility, not type equality. The solver
+    // intersects destination domain/representation possibilities, joins source
+    // fidelity loss into each destination, and performs a checked write-once
+    // value update; it does not refine the source. An existing destination
+    // value must equal the source value. Solver preflight requires one Value
+    // input, one or more distinct Value outputs, and at most one DataFlow
+    // producer per destination.
     DataFlow,
     StructuralBarrier,
     Sequence,
@@ -69,7 +81,9 @@ pub enum OpKind {
     // Backend value crossing.
     BackendCrossing { from_lang: String, to_lang: String },
 
-    // Native/lifted frontends.
+    // Reserved native/lifted frontend carriers. No production lowerer emits
+    // these variants and the type/fidelity solver currently treats both as
+    // no-ops; they do not yet constitute native type-inference rules.
     X86 { mnemonic: String },
     OcoreOp { kind: OcoreOpKind },
 }
@@ -190,7 +204,8 @@ pub enum ReadyInputPolicy {
 /// The constraint relations a constraint hyperedge can carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstraintOp {
-    /// A value flows from a producer node to a consumer node.
+    /// A value flows directionally from one producer node to one or more
+    /// consumer nodes; this is compatibility refinement rather than equality.
     DataFlow,
     /// A structural child → parent evaluation dependency.
     Structural,

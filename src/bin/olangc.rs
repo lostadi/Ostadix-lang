@@ -1153,7 +1153,8 @@ fn dump_dot(source: &str) -> Result<()> {
         .hgraph_for_plan(&plan)
         .map_err(anyhow::Error::msg)
         .context("failed to build HGraph for DOT target")?;
-    solve::solve_types(&mut graph);
+    solve::solve_types(&mut graph)
+        .context("failed to solve HGraph type and fidelity constraints for DOT target")?;
     print!("{}", hgraph_to_dot(&graph));
     Ok(())
 }
