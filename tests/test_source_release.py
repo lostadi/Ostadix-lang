@@ -74,6 +74,67 @@ FIXTURE_EVIDENCE_GATE_COUNT = (
     FIXTURE_REQUIRED_EVIDENCE_GATE_COUNT
     + release.EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES
 )
+FIXTURE_CARGO = f"""\
+[package]
+name = "release-fixture"
+version = "0.1.0"
+repository = "{release.ROOT_REPOSITORY}"
+license = "{release.ROOT_LICENSE_SPDX}"
+"""
+FIXTURE_CITATION = f"""\
+cff-version: 1.2.0
+message: "Cite this fixture."
+title: "Release fixture"
+type: software
+version: "0.1.0"
+license: {release.ROOT_LICENSE_SPDX}
+repository-code: "{release.ROOT_REPOSITORY}"
+preferred-citation:
+  type: article
+  title: "Fixture preprint"
+  doi: "{release.EXISTING_PREPRINT_DOI}"
+  url: "https://doi.org/{release.EXISTING_PREPRINT_DOI}"
+"""
+FIXTURE_LICENSE = """\
+GNU LESSER GENERAL PUBLIC LICENSE
+Version 2.1, February 1999
+fixture copy of the license text
+"""
+
+
+def fixture_readme(extra: str = "") -> str:
+    return f"""\
+# Release fixture
+
+committed [index](llms.txt)
+
+## License
+
+GNU Lesser General Public License v2.1 only (SPDX identifier
+`{release.ROOT_LICENSE_SPDX}`). See [LICENSE](LICENSE) for the full text.
+
+## Citation
+
+### How to cite
+
+Use the existing Zenodo preprint/package record:
+https://doi.org/{release.EXISTING_PREPRINT_DOI}
+
+DOI `{release.EXISTING_PREPRINT_DOI}` identifies that existing preprint/package record;
+it is not an archive of a tagged Ostadix-lang source release.
+
+Source citation: Version 0.1.0. Commit: `FULL_COMMIT_SHA_USED`.
+{release.ROOT_REPOSITORY}
+
+Once Zenodo archives a future tagged source release, put its separate DOI in the
+top-level `doi` field; the existing preprint/package DOI remains under
+`preferred-citation`.
+
+### Archival source releases
+
+The two records remain distinct.
+
+{extra}"""
 
 
 def fixture_evidence_manifest() -> str:
@@ -170,6 +231,97 @@ class ReleaseEvidenceTranscriptTests(unittest.TestCase):
             )
 
 
+class RootReleaseMetadataValidationTests(unittest.TestCase):
+    @staticmethod
+    def fixture_files() -> dict[str, bytes]:
+        return {
+            "Cargo.toml": FIXTURE_CARGO.encode(),
+            "CITATION.cff": FIXTURE_CITATION.encode(),
+            "LICENSE": FIXTURE_LICENSE.encode(),
+            "README.md": fixture_readme().encode(),
+        }
+
+    def test_live_repository_metadata_is_consistent(self) -> None:
+        files = {
+            path: (PROJECT_ROOT / path).read_bytes()
+            for path in ("Cargo.toml", "CITATION.cff", "LICENSE", "README.md")
+        }
+        release._validate_root_release_metadata(files)
+
+    def test_license_version_doi_and_prose_drift_fail_closed(self) -> None:
+        mutations = {
+            "cargo license": (
+                "Cargo.toml",
+                FIXTURE_CARGO.replace(release.ROOT_LICENSE_SPDX, "Apache-2.0"),
+                r"Cargo\.toml package\.license must be 'LGPL-2\.1-only'",
+            ),
+            "citation license": (
+                "CITATION.cff",
+                FIXTURE_CITATION.replace(
+                    f"license: {release.ROOT_LICENSE_SPDX}", "license: Apache-2.0"
+                ),
+                r"CITATION\.cff license must match Cargo\.toml",
+            ),
+            "citation version": (
+                "CITATION.cff",
+                FIXTURE_CITATION.replace('version: "0.1.0"', 'version: "9.9.9"'),
+                r"CITATION\.cff version must match Cargo\.toml",
+            ),
+            "license text": (
+                "LICENSE",
+                "Apache License\nVersion 2.0\n",
+                r"LICENSE does not contain the expected LGPL-2\.1 text",
+            ),
+            "preprint DOI": (
+                "CITATION.cff",
+                FIXTURE_CITATION.replace(
+                    release.EXISTING_PREPRINT_DOI, "10.5281/zenodo.99999999"
+                ),
+                r"preferred-citation DOI must remain the existing preprint/package DOI",
+            ),
+            "relocated preferred DOI": (
+                "CITATION.cff",
+                FIXTURE_CITATION.replace(
+                    f'  doi: "{release.EXISTING_PREPRINT_DOI}"\n', ""
+                ).replace(
+                    f'  url: "https://doi.org/{release.EXISTING_PREPRINT_DOI}"\n',
+                    "",
+                )
+                + (
+                    "unrelated-metadata:\n"
+                    f'  doi: "{release.EXISTING_PREPRINT_DOI}"\n'
+                    f'  url: "https://doi.org/{release.EXISTING_PREPRINT_DOI}"\n'
+                ),
+                r"CITATION\.cff is missing\s+doi:",
+            ),
+            "source DOI collision": (
+                "CITATION.cff",
+                FIXTURE_CITATION
+                + f'doi: "{release.EXISTING_PREPRINT_DOI}"\n',
+                r"top-level source-release DOI must differ.*preprint/package DOI",
+            ),
+            "README version": (
+                "README.md",
+                fixture_readme().replace("Version 0.1.0.", "Version 9.9.9."),
+                r"README\.md How to cite must contain 'Version 0\.1\.0\.'",
+            ),
+            "citation prose": (
+                "README.md",
+                fixture_readme().replace(
+                    "it is not an archive of a tagged Ostadix-lang source release.",
+                    "it is the source release.",
+                ),
+                r"README\.md How to cite must contain.*not an archive",
+            ),
+        }
+        for label, (path, replacement, message) in mutations.items():
+            with self.subTest(label=label):
+                files = self.fixture_files()
+                files[path] = replacement.encode()
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release._validate_root_release_metadata(files)
+
+
 class SourceReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -217,9 +369,10 @@ class SourceReleaseTests(unittest.TestCase):
             ".mcp.json": (
                 '{"mcpServers":{"ostadix":{"command":"ostadix-mcp","args":[]}}}\n'
             ),
-            "Cargo.toml": "[package]\nname = \"release-fixture\"\nversion = \"0.1.0\"\n",
-            "LICENSE": "GNU Lesser General Public License version 2.1\n",
-            "README.md": "committed [index](llms.txt)\n",
+            "CITATION.cff": FIXTURE_CITATION,
+            "Cargo.toml": FIXTURE_CARGO,
+            "LICENSE": FIXTURE_LICENSE,
+            "README.md": fixture_readme(),
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
@@ -495,6 +648,7 @@ class SourceReleaseTests(unittest.TestCase):
             names = set(archive.namelist())
             included = {
                 ".mcp.json",
+                "CITATION.cff",
                 "Cargo.toml",
                 "LICENSE",
                 "README.md",
@@ -679,7 +833,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_relative_document_links_must_resolve_inside_release(self) -> None:
         self._commit(
             {
-                "README.md": "[missing guide](docs/missing.md)\n",
+                "README.md": fixture_readme("[missing guide](docs/missing.md)\n"),
             }
         )
 
@@ -693,7 +847,8 @@ class SourceReleaseTests(unittest.TestCase):
         self._commit(
             {
                 "README.md": (
-                    "[guide](docs/guide.md#usage) [docs](docs/) "
+                    fixture_readme()
+                    + "[guide](docs/guide.md#usage) [docs](docs/) "
                     "[web](https://example.invalid/) [root](./)\n"
                     "[balanced](docs/target(foo).md) "
                     "[escaped](docs/escaped\\(name\\).md) "
@@ -724,7 +879,8 @@ class SourceReleaseTests(unittest.TestCase):
         self._commit(
             {
                 "README.md": (
-                    "[missing guide][guide]\n"
+                    fixture_readme()
+                    + "[missing guide][guide]\n"
                     "[guide]: docs/missing(reference).md\n"
                 )
             }
@@ -746,7 +902,9 @@ class SourceReleaseTests(unittest.TestCase):
                 path = item["path"]
                 data = archive.read(f"{prefix}/{path}")
                 if path == "README.md":
-                    data = b"[missing](docs/absent-after-packaging.md)\n"
+                    data = fixture_readme(
+                        "[missing](docs/absent-after-packaging.md)\n"
+                    ).encode()
                 entries.append(
                     release.SourceEntry(path=path, mode=item["mode"], data=data)
                 )
@@ -860,6 +1018,42 @@ class SourceReleaseTests(unittest.TestCase):
             release.ReleaseError, r"missing required path\(s\): LICENSE"
         ):
             self._build("missing-license.zip")
+
+    def test_root_citation_is_a_required_release_member(self) -> None:
+        self._commit()
+        self._git("rm", "CITATION.cff")
+        self._git("commit", "-q", "-m", "remove release citation")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError, r"missing required path\(s\): CITATION\.cff"
+        ):
+            self._build("missing-citation.zip")
+
+    def test_archive_verifier_revalidates_root_release_metadata(self) -> None:
+        result = self._build("valid-before-citation-tamper.zip", ref=self._commit())
+
+        def replace_citation_license(entry):
+            if entry.path == "CITATION.cff":
+                return release.SourceEntry(
+                    entry.path,
+                    entry.mode,
+                    entry.data.replace(
+                        f"license: {release.ROOT_LICENSE_SPDX}".encode(),
+                        b"license: Apache-2.0",
+                    ),
+                )
+            return entry
+
+        tampered = self._rewrite_self_consistent(
+            result.output,
+            "self-consistent-invalid-root-license.zip",
+            replace_citation_license,
+        )
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"CITATION\.cff license must match Cargo\.toml package\.license",
+        ):
+            release.verify_archive(tampered)
 
     def test_mcp_crate_config_and_transport_smoke_are_required(self) -> None:
         self._commit()
@@ -1653,7 +1847,7 @@ class SourceReleaseTests(unittest.TestCase):
         manifest = release.verify_archive(result.output)
         with zipfile.ZipFile(result.output) as archive:
             payload = archive.read(f"{manifest['prefix']}/README.md")
-            self.assertEqual(payload, b"committed [index](llms.txt)\n")
+            self.assertEqual(payload, fixture_readme().encode())
             self.assertNotIn(
                 f"{manifest['prefix']}/untracked.txt", set(archive.namelist())
             )

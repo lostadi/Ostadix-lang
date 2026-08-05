@@ -1559,7 +1559,8 @@ impl Evaluator {
             .hgraph_for_plan(&plan)
             .map_err(anyhow::Error::msg)
             .context("failed to project OIR execution plan into hypergraph")?;
-        crate::hgraph::solve::solve_types(&mut hgraph);
+        crate::hgraph::solve::solve_types(&mut hgraph)
+            .context("failed to solve OIR hypergraph type and fidelity constraints")?;
         let hgraph_schedule = crate::hgraph::schedule::try_schedule(&hgraph)
             .map_err(anyhow::Error::msg)
             .context("failed to schedule OIR hypergraph projection")?;

@@ -3,7 +3,9 @@
 This checklist is grounded in the current repository state: `Cargo.toml` version
 `0.2.0`, `CITATION.cff` version `0.2.0`, the README citation example, the CI
 workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
-`scripts/check_release_claims.sh`.
+`scripts/check_release_claims.sh`. The source-release builder and its tests
+also reject disagreement among the root LGPL-2.1-only license text, Cargo
+package metadata, `CITATION.cff`, and the live README citation prose.
 
 ## Pre-tag validation
 
@@ -214,10 +216,10 @@ Schema-v2 source reconstruction requires the coherent
 `c25d38c00283f2873eed1aa84dd89b437777e356` Git tree and is not archive-only
 proof.
 The allowlisted surface includes the separate `mcp/ostadix_lang_mcp_server`
-crate, the root LGPL-2.1 license, `.mcp.json`, its direct stdio smoke client, and
-the focused MCP/example regression tests. CI tests and lints that crate with its
-own lockfile, builds its release binary separately from the root package, and
-runs `scripts/smoke_ostadix_mcp.py` against the real transport.
+crate, the root LGPL-2.1-only license, `.mcp.json`, its direct stdio smoke client,
+and the focused MCP/example regression tests. CI tests and lints that crate with
+its own lockfile, builds its release binary separately from the root package,
+and runs `scripts/smoke_ostadix_mcp.py` against the real transport.
 
 ## Version synchronization points
 
@@ -227,6 +229,8 @@ Before tagging, verify all public version references agree:
 - `CITATION.cff` `version`.
 - The Git tag name, for example `v0.2.0`.
 - The README citation example in `README.md` under "How to cite".
+- `Cargo.toml` and `CITATION.cff` both declare `LGPL-2.1-only`, matching the root
+  `LICENSE`; the attribution-only `NOTICE` does not grant an alternate license.
 
 For the current release candidate these all point at `0.2.0`; do not tag while
 any one of them disagrees.
@@ -243,6 +247,11 @@ any one of them disagrees.
 7. Publish the GitHub release when the release notes and metadata are final.
 
 ## Zenodo DOI minting
+
+The existing DOI `10.5281/zenodo.21544345` identifies the preprint/package
+record. It is not an archive of a tagged Ostadix-lang source release and must
+remain the `preferred-citation` DOI. The steps below mint a separate DOI for a
+future tagged source snapshot:
 
 1. Enable the repository in Zenodo's GitHub integration.
 2. Confirm Zenodo sees `lostadi/Ostadix-lang` and is authorized to archive releases.
@@ -264,7 +273,8 @@ any one of them disagrees.
 
 After DOI minting:
 
-1. Fill the `doi` field in `CITATION.cff`.
+1. Fill the top-level `doi` field in `CITATION.cff` with the separate tagged
+   source-release DOI; do not replace the existing `preferred-citation` DOI.
 2. Set `date-released` to the actual release date.
 3. Update the README citation section to cite the DOI-bearing archived release.
 4. Re-tag, amend, or make a follow-up metadata release as appropriate for the
