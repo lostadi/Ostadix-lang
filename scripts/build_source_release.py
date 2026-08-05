@@ -1242,6 +1242,20 @@ def _validate_root_release_metadata(files: dict[str, bytes]) -> None:
         if phrase not in readme_compact:
             raise ReleaseError(f"README.md license prose must contain {phrase!r}")
 
+    for phrase in (
+        "Generated AOT build crates are `publish = false`",
+        "component-scoped Cargo metadata identifies the embedded Ostadix "
+        "runtime as LGPL-2.1-only",
+        "embedded user or project inputs as retaining the licensing attached "
+        "to their source",
+        "it does not declare one license for the mixed generated package",
+    ):
+        if phrase not in readme_compact:
+            raise ReleaseError(
+                "README.md generated-runtime license policy must contain "
+                f"{phrase!r}"
+            )
+
     how_to_cite = _readme_how_to_cite(readme)
     required_citation_phrases = (
         expected_preprint_url,

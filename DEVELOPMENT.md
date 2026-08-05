@@ -213,7 +213,7 @@ validation, required release surfaces, and tamper detection.
   Alpha attestation, Acceptance A, or G0--G13 passage.
 - Keep hosted ResourceKey PR6 claims precise: its smoke proves typed planner
   vocabulary, underlying identity helpers' caller-pair comparison, HGraph state
-  chaining, alias-aware grounding partitioning, source-forgery rejection, and
+  chaining, alias-aware grounding projection, source-forgery rejection, and
   residual `HostWorld`. Grounding only checks the bound World epoch/membership.
   This is not Mode 31, a wire ABI, production governed lowering, native/QEMU
   evidence, Governor authority, device assignment, DMA/IOMMU isolation,

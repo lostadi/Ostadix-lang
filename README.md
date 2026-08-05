@@ -769,7 +769,7 @@ Source `reads=`/`writes=` declarations cannot mint any governed key.
 
 The World ResourceKey hosted repository-conformance gate checks the exact
 vocabulary and display, underlying identity helpers' caller-pair stale/logical
-comparison, HGraph state chaining, alias-aware governed/ambient partitioning,
+comparison, HGraph state chaining, alias-aware governed/ambient projection,
 source-forgery rejection, and the real CLI's residual `HostWorld` output. The
 grounding report checks only the caller-supplied bound World epoch and World
 membership; it does not consult a live snapshot or prove authoritative nested
@@ -3190,6 +3190,11 @@ It is an architecture note against the existing `ocore` runtime and
 
 GNU Lesser General Public License v2.1 only (SPDX identifier
 `LGPL-2.1-only`). See [LICENSE](LICENSE) for the full text.
+
+Generated AOT build crates are `publish = false`. Their component-scoped Cargo
+metadata identifies the embedded Ostadix runtime as LGPL-2.1-only while marking
+embedded user or project inputs as retaining the licensing attached to their
+source; it does not declare one license for the mixed generated package.
 
 ## Citation and authorship
 
