@@ -1,4 +1,4 @@
-//! PR8A/PR8B hosted Project HGraph execution.
+//! ProjectExec-A/ProjectExec-B hosted Project HGraph execution.
 //!
 //! This corpus covers one resolved Explicit/Default alternative plus serial,
 //! ordered Fallback/AnySuccess short-circuiting. It is not parallel race,
@@ -31,10 +31,11 @@ fn fixture_path() -> PathBuf {
 }
 
 fn fixture_bundle(poison: &Path) -> ProjectBundle {
-    let mut bundle = project::assemble(&fixture_path(), "pr8a-project-hgraph-exec", &[]).unwrap();
+    let mut bundle =
+        project::assemble(&fixture_path(), "projectexec-a-project-hgraph-exec", &[]).unwrap();
     for route in &mut bundle.routes {
         route.environment.insert(
-            "PR8A_EXTERNAL_POISON_MARKER".to_string(),
+            "PROJECT_EXEC_A_EXTERNAL_POISON_MARKER".to_string(),
             poison.to_string_lossy().into_owned(),
         );
     }
@@ -65,7 +66,7 @@ fn read_cli_trace(path: &Path) -> serde_json::Value {
 fn assert_unsigned_diagnostic_trace(trace: &serde_json::Value) {
     let root = trace.as_object().expect("trace root must be a JSON object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 3);
+    assert_eq!(trace["format_version"], 4);
     assert!(trace["header"].is_object());
     let events = trace["events"]
         .as_array()
@@ -161,7 +162,7 @@ fn explicit_execution_runs_prerequisite_once_in_one_isolated_workspace() {
     let mut bundle = fixture_bundle(&poison);
     for route in &mut bundle.routes {
         route.environment.insert(
-            "PR8A_WORKSPACE_AUDIT_LOG".into(),
+            "PROJECT_EXEC_A_WORKSPACE_AUDIT_LOG".into(),
             audit_log.to_string_lossy().into_owned(),
         );
     }
@@ -350,26 +351,26 @@ fn deeper_prerequisite_chain_uses_the_same_branch_workspace() {
         r#"set -eu
 case "$PWD" in
   */olang-ws-*) ;;
-  *) printf '%s\n' outside > "$PR8A_EXTERNAL_POISON_MARKER"; exit 93 ;;
+  *) printf '%s\n' outside > "$PROJECT_EXEC_A_EXTERNAL_POISON_MARKER"; exit 93 ;;
 esac
 printf '%s\n' bootstrap > bootstrap.txt
-printf 'bootstrap\t%s\n' "$PWD" >> "$PR8A_WORKSPACE_AUDIT_LOG""#
+printf 'bootstrap\t%s\n' "$PWD" >> "$PROJECT_EXEC_A_WORKSPACE_AUDIT_LOG""#
             .into(),
     ];
     bootstrap.outputs = vec!["bootstrap.txt".into()];
     bootstrap.environment.insert(
-        "PR8A_EXTERNAL_POISON_MARKER".into(),
+        "PROJECT_EXEC_A_EXTERNAL_POISON_MARKER".into(),
         poison.to_string_lossy().into_owned(),
     );
     bootstrap.environment.insert(
-        "PR8A_WORKSPACE_AUDIT_LOG".into(),
+        "PROJECT_EXEC_A_WORKSPACE_AUDIT_LOG".into(),
         audit_log.to_string_lossy().into_owned(),
     );
     bundle.routes.push(bootstrap);
 
     for route in &mut bundle.routes {
         route.environment.insert(
-            "PR8A_WORKSPACE_AUDIT_LOG".into(),
+            "PROJECT_EXEC_A_WORKSPACE_AUDIT_LOG".into(),
             audit_log.to_string_lossy().into_owned(),
         );
     }
@@ -412,7 +413,7 @@ fn coordinator_rejects_source_and_projection_substitution_before_execution() {
     let mut bundle = fixture_bundle(&poison);
     for route in &mut bundle.routes {
         route.environment.insert(
-            "PR8A_EXECUTION_MARKER".into(),
+            "PROJECT_EXEC_A_EXECUTION_MARKER".into(),
             execution_marker.to_string_lossy().into_owned(),
         );
     }
@@ -475,10 +476,10 @@ fn failed_prerequisite_blocks_the_main_route() {
     main.command = vec![
         "sh".into(),
         "-c".into(),
-        "printf '%s\\n' ran > \"$PR8A_MAIN_EXECUTED_MARKER\"".into(),
+        "printf '%s\\n' ran > \"$PROJECT_EXEC_A_MAIN_EXECUTED_MARKER\"".into(),
     ];
     main.environment.insert(
-        "PR8A_MAIN_EXECUTED_MARKER".into(),
+        "PROJECT_EXEC_A_MAIN_EXECUTED_MARKER".into(),
         main_marker.to_string_lossy().into_owned(),
     );
 
@@ -639,7 +640,7 @@ fn infrastructure_abort_publishes_no_route_outputs() {
         .iter_mut()
         .find(|route| route.id == "main")
         .unwrap();
-    main.command = vec!["pr8a-executable-that-must-not-exist".into()];
+    main.command = vec!["projectexec-a-executable-that-must-not-exist".into()];
 
     let project = explicit_project(&bundle);
     let main_run = project
@@ -737,10 +738,10 @@ fn child_stderr_cannot_forge_guard_skip_completion() {
     main.command = vec![
         "sh".into(),
         "-c".into(),
-        "printf '%s\\n' ran > \"$PR8A_MAIN_EXECUTED_MARKER\"".into(),
+        "printf '%s\\n' ran > \"$PROJECT_EXEC_A_MAIN_EXECUTED_MARKER\"".into(),
     ];
     main.environment.insert(
-        "PR8A_MAIN_EXECUTED_MARKER".into(),
+        "PROJECT_EXEC_A_MAIN_EXECUTED_MARKER".into(),
         main_marker.to_string_lossy().into_owned(),
     );
 
@@ -779,15 +780,15 @@ fn unmet_guard_fails_without_launching_the_route_command() {
         .find(|route| route.id == "main")
         .unwrap();
     main.guards = vec![RouteGuard::CommandAvailable(
-        "pr8a-command-that-must-not-exist".into(),
+        "projectexec-a-command-that-must-not-exist".into(),
     )];
     main.command = vec![
         "sh".into(),
         "-c".into(),
-        "printf '%s\\n' ran > \"$PR8A_MAIN_EXECUTED_MARKER\"".into(),
+        "printf '%s\\n' ran > \"$PROJECT_EXEC_A_MAIN_EXECUTED_MARKER\"".into(),
     ];
     main.environment.insert(
-        "PR8A_MAIN_EXECUTED_MARKER".into(),
+        "PROJECT_EXEC_A_MAIN_EXECUTED_MARKER".into(),
         main_marker.to_string_lossy().into_owned(),
     );
 
@@ -879,7 +880,7 @@ fn guard_skip_has_normalized_legacy_parity() {
         .find(|route| route.id == "main")
         .unwrap()
         .guards = vec![RouteGuard::CommandAvailable(
-        "pr8a-command-that-must-not-exist".into(),
+        "projectexec-a-command-that-must-not-exist".into(),
     )];
     let opts = RunOptions {
         guard_behavior: o_lang::project::runtime::GuardBehavior::Skip,
@@ -1010,17 +1011,20 @@ fn trace_header_binds_stable_graph_context_and_fresh_attempt_identity() {
     assert_eq!(first_header.bundle_digest, project.plan.bundle_digest);
     assert_eq!(first_header.target, project.plan.target);
     assert_eq!(first_header.policy, project.plan.policy.token());
-    let mut logical_hasher = Sha256::new();
-    logical_hasher.update(b"ostadix.project-hgraph.logical/v1\0");
-    logical_hasher.update(project.to_text().as_bytes());
+    assert_eq!(first_header.logical_graph_schema, 1);
+    let expected_logical_digest = project.logical_v1().unwrap().digest().unwrap();
     assert_eq!(
         first_header.logical_graph_digest,
-        hex::encode(logical_hasher.finalize())
+        expected_logical_digest.as_sha256()
     );
     assert_eq!(first_header.project_name, second_header.project_name);
     assert_eq!(first_header.bundle_digest, second_header.bundle_digest);
     assert_eq!(first_header.target, second_header.target);
     assert_eq!(first_header.policy, second_header.policy);
+    assert_eq!(
+        first_header.logical_graph_schema,
+        second_header.logical_graph_schema
+    );
     assert_eq!(
         first_header.logical_graph_digest,
         second_header.logical_graph_digest
@@ -1044,10 +1048,10 @@ fn unsupported_policy_bundle(
         route.command = vec![
             "sh".into(),
             "-c".into(),
-            "printf '%s\\n' ran >> \"$PR8A_UNSUPPORTED_EXECUTION_MARKER\"".into(),
+            "printf '%s\\n' ran >> \"$PROJECT_EXEC_A_UNSUPPORTED_EXECUTION_MARKER\"".into(),
         ];
         route.environment = BTreeMap::from([(
-            "PR8A_UNSUPPORTED_EXECUTION_MARKER".into(),
+            "PROJECT_EXEC_A_UNSUPPORTED_EXECUTION_MARKER".into(),
             marker.to_string_lossy().into_owned(),
         )]);
         route.is_default = id == "first";
@@ -1078,13 +1082,13 @@ fn ordered_policy_bundle(
         route.command = vec![
             "sh".into(),
             "-c".into(),
-            "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"\nexit \"$PR8B_EXIT_CODE\"".into(),
+            "set -eu\nprintf '%s\\n' \"$PROJECT_EXEC_B_ROUTE_ID\" >> \"$PROJECT_EXEC_B_ATTEMPT_LOG\"\nexit \"$PROJECT_EXEC_B_EXIT_CODE\"".into(),
         ];
         route.environment = BTreeMap::from([
-            ("PR8B_ROUTE_ID".into(), (*id).to_string()),
-            ("PR8B_EXIT_CODE".into(), exit_code.to_string()),
+            ("PROJECT_EXEC_B_ROUTE_ID".into(), (*id).to_string()),
+            ("PROJECT_EXEC_B_EXIT_CODE".into(), exit_code.to_string()),
             (
-                "PR8B_ATTEMPT_LOG".into(),
+                "PROJECT_EXEC_B_ATTEMPT_LOG".into(),
                 audit_log.to_string_lossy().into_owned(),
             ),
         ]);
@@ -1364,7 +1368,7 @@ fn ordered_first_success_continues_after_a_guard_skip() {
         .find(|route| route.id == "guard-skipped")
         .unwrap()
         .guards = vec![RouteGuard::CommandAvailable(
-        "pr8b-guard-command-that-must-not-exist".into(),
+        "projectexec-b-guard-command-that-must-not-exist".into(),
     )];
     let options = RunOptions {
         guard_behavior: o_lang::project::runtime::GuardBehavior::Skip,
@@ -1422,12 +1426,13 @@ fn declared_idempotent_prerequisite_and_failure_admit_the_next_branch() {
     prerequisite.command = vec![
         "sh".into(),
         "-c".into(),
-        "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"".into(),
+        "set -eu\nprintf '%s\\n' \"$PROJECT_EXEC_B_ROUTE_ID\" >> \"$PROJECT_EXEC_B_ATTEMPT_LOG\""
+            .into(),
     ];
     prerequisite.environment = BTreeMap::from([
-        ("PR8B_ROUTE_ID".into(), "prepare".into()),
+        ("PROJECT_EXEC_B_ROUTE_ID".into(), "prepare".into()),
         (
-            "PR8B_ATTEMPT_LOG".into(),
+            "PROJECT_EXEC_B_ATTEMPT_LOG".into(),
             audit_log.to_string_lossy().into_owned(),
         ),
     ]);
@@ -1535,12 +1540,12 @@ fn failing_prerequisites_hard_stop_without_synthesizing_a_branch_decision() {
         prerequisite.command = vec![
             "sh".into(),
             "-c".into(),
-            "set -eu\nprintf '%s\\n' \"$PR8B_ROUTE_ID\" >> \"$PR8B_ATTEMPT_LOG\"\nexit 17".into(),
+            "set -eu\nprintf '%s\\n' \"$PROJECT_EXEC_B_ROUTE_ID\" >> \"$PROJECT_EXEC_B_ATTEMPT_LOG\"\nexit 17".into(),
         ];
         prerequisite.environment = BTreeMap::from([
-            ("PR8B_ROUTE_ID".into(), "prepare".into()),
+            ("PROJECT_EXEC_B_ROUTE_ID".into(), "prepare".into()),
             (
-                "PR8B_ATTEMPT_LOG".into(),
+                "PROJECT_EXEC_B_ATTEMPT_LOG".into(),
                 audit_log.to_string_lossy().into_owned(),
             ),
         ]);
@@ -1702,6 +1707,10 @@ fn continuation_trace_replay_rejects_tampered_evidence_and_route_inventory() {
         trace.events().to_vec(),
     )
     .is_err());
+
+    let mut wrong_schema = trace.header().clone();
+    wrong_schema.logical_graph_schema = 2;
+    assert!(ProjectAttemptTrace::try_from_events(wrong_schema, trace.events().to_vec()).is_err());
 }
 
 #[test]
@@ -2225,7 +2234,7 @@ fn ordered_first_success_aborts_without_starting_the_next_alternative() {
         .iter_mut()
         .find(|route| route.id == "cannot-spawn")
         .unwrap()
-        .command = vec!["pr8b-command-that-must-not-exist".into()];
+        .command = vec!["projectexec-b-command-that-must-not-exist".into()];
     let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
     let error =
         execute_project_hgraph_selection(&bundle, &project, &RunOptions::default()).unwrap_err();
@@ -2246,7 +2255,7 @@ fn ordered_first_success_aborts_without_starting_the_next_alternative() {
 
     let legacy_error =
         run_selection(&bundle, Some("service"), None, &RunOptions::default()).unwrap_err();
-    assert!(format!("{legacy_error:#}").contains("pr8b-command-that-must-not-exist"));
+    assert!(format!("{legacy_error:#}").contains("projectexec-b-command-that-must-not-exist"));
     assert!(!audit_log.exists());
 }
 
@@ -2293,7 +2302,7 @@ fn environment_opt_in_never_falls_back_for_an_unsupported_policy() {
         .arg(fixture_path())
         .args(["--target", "script", "--route", "application"])
         .env("O_PROJECT_EXECUTOR", "hgraph")
-        .env("PR8A_EXTERNAL_POISON_MARKER", &poison)
+        .env("PROJECT_EXEC_A_EXTERNAL_POISON_MARKER", &poison)
         .output()
         .unwrap();
     assert!(
@@ -2322,8 +2331,8 @@ fn environment_opt_in_never_falls_back_for_an_unsupported_policy() {
             "all",
         ])
         .env("O_PROJECT_EXECUTOR", "hgraph")
-        .env("PR8A_EXTERNAL_POISON_MARKER", &poison)
-        .env("PR8A_EXECUTION_MARKER", &unexpected_execution)
+        .env("PROJECT_EXEC_A_EXTERNAL_POISON_MARKER", &poison)
+        .env("PROJECT_EXEC_A_EXECUTION_MARKER", &unexpected_execution)
         .output()
         .unwrap();
     assert!(
@@ -2361,7 +2370,7 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
             .arg("--project-trace-out")
             .arg(&trace_path)
             .env("O_PROJECT_EXECUTOR", "hgraph")
-            .env("PR8A_EXTERNAL_POISON_MARKER", &poison)
+            .env("PROJECT_EXEC_A_EXTERNAL_POISON_MARKER", &poison)
             .output()
             .unwrap()
     };
@@ -2385,9 +2394,10 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
     let trace = read_cli_trace(&trace_path);
     assert_unsigned_diagnostic_trace(&trace);
     let header = &trace["header"];
-    assert_eq!(header["project_name"], "pr8a-project-hgraph-exec");
+    assert_eq!(header["project_name"], "projectexec-a-project-hgraph-exec");
     assert_eq!(header["target"], "application");
     assert_eq!(header["policy"], "default");
+    assert_eq!(header["logical_graph_schema"], 1);
     assert_sha256_json(&header["bundle_digest"], "bundle digest");
     assert_sha256_json(&header["logical_graph_digest"], "logical graph digest");
     assert_sha256_json(&header["execution_attempt_id"], "execution attempt id");
@@ -2437,7 +2447,7 @@ fn olangc_trace_out_without_hgraph_fails_before_route_execution() {
         .arg("--project-trace-out")
         .arg(&trace_path)
         .env_remove("O_PROJECT_EXECUTOR")
-        .env("PR8A_EXECUTION_MARKER", &execution_marker)
+        .env("PROJECT_EXEC_A_EXECUTION_MARKER", &execution_marker)
         .output()
         .unwrap();
 

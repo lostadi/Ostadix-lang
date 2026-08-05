@@ -261,7 +261,7 @@ fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
     let trace = read_project_trace(&trace_path);
     let root = trace.as_object().expect("trace root must be an object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 3);
+    assert_eq!(trace["format_version"], 4);
     let target = trace["header"]["target"]
         .as_str()
         .expect("trace header must name the selected route");
@@ -270,6 +270,7 @@ fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
         "unexpected Python route: {target}"
     );
     assert_eq!(trace["header"]["policy"], format!("explicit:{target}"));
+    assert_eq!(trace["header"]["logical_graph_schema"], 1);
     for field in [
         "bundle_digest",
         "logical_graph_digest",

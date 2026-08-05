@@ -1016,7 +1016,7 @@ pub fn execute_project_hgraph_selection(
 }
 
 fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHeader> {
-    let logical_graph_digest = project_logical_graph_digest(project);
+    let logical_graph_digest = project_logical_graph_digest(project)?;
 
     let mut attempt = [0_u8; 32];
     getrandom::fill(&mut attempt)
@@ -1027,6 +1027,7 @@ fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHe
         project.plan.bundle_digest.clone(),
         project.plan.target.clone(),
         project.plan.policy.token(),
+        super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
         logical_graph_digest,
         hex::encode(attempt),
     ))
@@ -1061,7 +1062,7 @@ pub fn execute_selection_with_configured_executor(
     }
 }
 
-/// Compatibility wrapper retaining the pre-PR8A result-only API.
+/// Compatibility wrapper retaining the pre-ProjectExec-A result-only API.
 pub fn run_selection_with_configured_executor(
     bundle: &ProjectBundle,
     target: Option<&str>,
@@ -1089,6 +1090,9 @@ pub fn write_project_attempt_trace(path: &Path, trace: &ProjectAttemptTrace) -> 
 fn route_plan_facts(route: &RouteSpec) -> RoutePlanFacts {
     RoutePlanFacts {
         kind: route.kind,
+        executable: route.command.first().cloned(),
+        evaluator: route.evaluator.clone(),
+        entrypoint: route.entrypoint.clone(),
         prerequisites: route.prerequisites.clone(),
         guards: route.guards.clone(),
         environment_keys: route.environment.keys().cloned().collect(),
