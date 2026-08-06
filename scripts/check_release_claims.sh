@@ -368,8 +368,8 @@ require_fixed docs/CLAIMS.md \
     'does not implement or prove a general' \
     'the native signature envelope could be misread as an Ed25519 verifier'
 require_fixed docs/CLAIMS.md \
-    'do not yet emit or consume it in live execution' \
-    'the offline receipt corpus could be misread as live receipt integration'
+    'The Mode 30 corpus is constructed' \
+    'the fixed Mode 30 corpus is no longer distinguished from live receipt integration'
 require_fixed docs/CLAIMS.md \
     'typed World Alpha attestation' \
     'the PR5 receipt could be misread as qualifying World Alpha evidence'
@@ -400,8 +400,8 @@ require_fixed README.md \
     'unsupported hosted policies remain' \
     'unsupported hosted policies could be misread as executable placements'
 require_fixed README.md \
-    'not consume snapshot-derived plans.' \
-    'the descriptive snapshot proposal could be misread as current executor input'
+    'A separate explicit hosted-reference World entry point consumes the exact' \
+    'the explicit snapshot-derived World executor input is missing'
 require_fixed README.md \
     'not a whitespace-insensitive' \
     'the logical graph digest could be misread as source-format-insensitive'
@@ -409,11 +409,11 @@ require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
     '`ProjectAttemptTrace` version 5 binds events' \
     'the executor plan still describes an obsolete project trace version'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
-    'hosted-unbound `DeploymentPlanV1` schema/digest' \
-    'trace v5 is missing its exact hosted-unbound deployment-artifact binding'
+    'reconstructs the ordinary hosted-unbound deployment' \
+    'trace v5 is missing its ordinary hosted-unbound deployment-artifact binding'
 require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
-    'This does not bind or' \
-    'the trace could be misread as binding a snapshot-derived provider proposal'
+    'The trace itself remains unsigned' \
+    'the trace could be misread as the signed World receipt'
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
@@ -451,8 +451,8 @@ require_fixed docs/CLAIMS.md \
     'unsupported hosted policies `Unresolved`' \
     'unsupported hosted policies could be promoted to executable placement'
 require_fixed docs/CLAIMS.md \
-    'does not consume snapshot-derived plans.' \
-    'snapshot-derived provider proposals could be promoted to current execution'
+    'explicit hosted-reference World entry point consumes it together' \
+    'the bounded snapshot-derived World entry point is missing'
 require_fixed docs/CLAIMS.md \
     'Architecture, package, and failure-domain' \
     'schema vocabulary could be promoted to active architecture/package/failure-domain constraints'
@@ -522,6 +522,27 @@ require_fixed README.md \
 require_fixed docs/OSTADIX_WORLD.md \
     'Only active evidence-ledger heads whose' \
     'the typed World evidence admission boundary is missing'
+require_fixed src/project/executor.rs \
+    'pub fn new_world_bound(' \
+    'the exact World launch no longer enters the project coordinator before execution'
+require_fixed src/project/world_execution.rs \
+    'ReceiptCommitFenceV1::Uncommitted' \
+    'the live project receipt is no longer explicitly uncommitted'
+require_fixed src/project/runtime_graph.rs \
+    'pub struct RuntimeGraphV1' \
+    'the terminal hosted project RuntimeGraph surface is missing'
+require_fixed ocore/kernel/smoke-world-project-receipt-qemu.sh \
+    'canonical structure only; no native execution or Ed25519 verification' \
+    'the native project-receipt comparison lost its bounded non-claim'
+require_fixed docs/OCORE.md \
+    'Mode 32 is the bounded native semantic-structure comparison' \
+    'the Mode 32 native receipt comparison boundary is missing'
+require_fixed evidence/gates.toml \
+    'script = "ocore/kernel/smoke-world-project-runtime-qemu.sh"' \
+    'the required evidence manifest no longer generates and compares a live hosted project receipt'
+require_fixed .github/workflows/ci.yml \
+    'run: ./boot-and-test.sh smoke' \
+    'CI no longer runs the manifest-driven portable QEMU evidence aggregate'
 
 for file in README.md llms.txt docs/CLAIMS.md docs/ODOMAIN_PLAN.md \
     okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md

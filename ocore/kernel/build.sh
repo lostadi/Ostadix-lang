@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 31" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 32" >&2
     exit 2
     ;;
 esac
@@ -167,19 +167,32 @@ WORLD_PROTOCOL_SOURCES=()
 WORLD_VALUE_SEMANTICS_SOURCE="$KERNEL_DIR/world_value_semantics_stub.oc"
 WORLD_VALUE_SOURCES=()
 WORLD_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_receipt_semantics_stub.oc"
+WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_project_receipt_semantics_stub.oc"
 WORLD_RECEIPT_SOURCES=()
 ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint.oc"
 if (( PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 )); then
   KERNEL_WORLD_BOOT_SOURCE="$ROOT/ocore/runtime/x86_64/kernel_world_boot.oc"
   KERNEL_WORLD_SEMANTICS_SOURCE="$KERNEL_DIR/kernel_world_semantics.oc"
 fi
-if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 )); then
+if (( PROBE_MODE == 19 || PROBE_MODE == 20 || PROBE_MODE == 21 || PROBE_MODE == 22 || PROBE_MODE == 23 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 32 )); then
   # Mode 19's direct memory-view oracle and the KernelWorld probes use neither
   # IPC queues nor endpoint lifecycle. Link a fail-closed API substitute that
-  # preserves common one-shot initialization. Mode 28 is likewise a direct
-  # freestanding codec oracle with no endpoint traffic. Other probes retain
-  # the full four-message endpoint implementation where required.
+  # preserves common one-shot initialization. Modes 28 and 32 are likewise
+  # direct freestanding codec oracles with no endpoint traffic. Other probes
+  # retain the full four-message endpoint implementation where required.
   ENDPOINT_SOURCE="$ROOT/ocore/runtime/x86_64/endpoint_probe_stub.oc"
+fi
+if (( PROBE_MODE == 32 )); then
+  WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_project_receipt_semantics.oc"
+  WORLD_RECEIPT_SOURCES=(
+    "$ROOT/ocore/world/identity.oc"
+    "$ROOT/ocore/world/protocol.oc"
+    "$ROOT/ocore/world/value.oc"
+    "$ROOT/ocore/world/sha256.oc"
+    "$ROOT/ocore/world/value_codec.oc"
+    "$ROOT/ocore/world/receipt.oc"
+    "$ROOT/ocore/world/receipt_codec.oc"
+  )
 fi
 if (( PROBE_MODE == 30 )); then
   WORLD_RECEIPT_SEMANTICS_SOURCE="$KERNEL_DIR/world_receipt_semantics.oc"
@@ -293,11 +306,11 @@ M2_SOURCE="$KERNEL_DIR/m2.oc"
 M3_SOURCE="$KERNEL_DIR/m3.oc"
 M3_LIVE_SOURCE="$KERNEL_DIR/m3_live.oc"
 M4_SOURCE="$KERNEL_DIR/m4.oc"
-if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 )); then
-  # Modes 25, 26, and 31 enter only kernel::m6, while Mode 28 enters only the
-  # World protocol oracle. Keep historical probes fail-closed without linking
-  # their unreachable harness bodies, preserving the hard bootstrap headroom
-  # assertion.
+if (( PROBE_MODE == 25 || PROBE_MODE == 26 || PROBE_MODE == 28 || PROBE_MODE == 29 || PROBE_MODE == 30 || PROBE_MODE == 31 || PROBE_MODE == 32 )); then
+  # Modes 25, 26, and 31 enter only kernel::m6, while Modes 28--30 and 32 enter
+  # only their World codec oracles. Keep historical probes fail-closed without
+  # linking their unreachable harness bodies, preserving the hard bootstrap
+  # headroom assertion.
   M1_SOURCE="$KERNEL_DIR/m1_mode25_stub.oc"
   M2_SOURCE="$KERNEL_DIR/m2_mode25_stub.oc"
   M3_SOURCE="$KERNEL_DIR/m3_mode25_stub.oc"
@@ -369,6 +382,7 @@ fi
   "$WORLD_PROTOCOL_SEMANTICS_SOURCE" \
   "$WORLD_VALUE_SEMANTICS_SOURCE" \
   "$WORLD_RECEIPT_SEMANTICS_SOURCE" \
+  "$WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \

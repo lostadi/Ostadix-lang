@@ -37,6 +37,7 @@ pub const MAX_WORLD_RECEIPT_BODY_BYTES: usize =
     MAX_WORLD_RECEIPT_BYTES - WORLD_RECEIPT_HEADER_BYTES - WORLD_RECEIPT_TRAILER_BYTES;
 pub const RECEIPT_SIGNING_DOMAIN_V1: &[u8; 21] = b"OSTADIX/OWRECEIPT/V1\0";
 pub const RECEIPT_SIGNING_PREFIX_BYTES: usize = 61;
+pub const PROJECT_RECEIPT_SEMANTIC_DOMAIN_V1: &[u8] = b"OSTADIX/PROJECT-RECEIPT-SEMANTICS/V1\0";
 
 const DIGEST_SOURCE: u8 = 1;
 const DIGEST_BUNDLE: u8 = 2;
@@ -202,6 +203,28 @@ pub fn receipt_signing_preimage_v1(record: &[u8]) -> Result<Vec<u8>, ReceiptErro
 pub fn receipt_v1_sha256(record: &[u8]) -> Result<[u8; 32], ReceiptError> {
     inspect_signed_receipt_v1(record)?;
     Ok(Sha256::digest(record).into())
+}
+
+/// Domain-separated semantic digest of one canonical OWRECEIPT body.
+///
+/// The signer key id and signature envelope are deliberately excluded. Since
+/// the unsigned body has already passed strict canonical decoding, equal
+/// digests compare the complete canonical receipt structure rather than a
+/// particular signer. This is a conformance fingerprint, not authorization,
+/// commit proof, or signature verification.
+pub fn project_receipt_semantic_sha256_v1(record: &[u8]) -> Result<[u8; 32], ReceiptError> {
+    let inspected = inspect_signed_receipt_v1(record)?;
+    let parsed = parse_envelope(inspected.bytes())?;
+    let body_length =
+        u32::try_from(parsed.body.len()).map_err(|_| ReceiptError::RecordTooLarge {
+            actual: parsed.body.len(),
+            maximum: u32::MAX as usize,
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECT_RECEIPT_SEMANTIC_DOMAIN_V1);
+    hasher.update(body_length.to_be_bytes());
+    hasher.update(parsed.body);
+    Ok(hasher.finalize().into())
 }
 
 fn build_preimage(body: &[u8], key_id: &[u8; 32]) -> Vec<u8> {

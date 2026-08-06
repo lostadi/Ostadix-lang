@@ -45,6 +45,7 @@ cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-value-qemu.sh
 cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
 python3 scripts/world_alpha_evidence.py
 python3 -m unittest -v tests.test_world_alpha_evidence
 ./boot-and-test.sh smoke
@@ -58,6 +59,24 @@ cmake -S c_cpp -B /tmp/olang-cmake-build -DCMAKE_BUILD_TYPE=Release && cmake --b
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 ```
+
+`smoke-world-project-runtime-qemu.sh` is the required no-argument Mode 32 gate.
+It runs the focused hosted World-project test to produce a fresh caller-signed
+receipt and semantic digest, then delegates to the direct vector interface. For
+an additional caller-selected vector, pass the emitted lowercase-hex file and
+hosted domain-separated unsigned-body semantic digest directly:
+
+```bash
+./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+```
+
+The two-argument gate is not a source of receipt fixtures or signing keys. It
+must fully decode and exactly re-encode the canonical receipt, construct the
+validated signing preimage, require `ReceiptCommitFenceV1::Uncommitted`, and
+match the hosted unsigned-body semantic SHA-256. It also reuses validation
+scratch after a successful record with a malformed envelope and requires the
+prior terminal/commit tags to have been reset. It does not execute the project
+or verify Ed25519 natively.
 
 The hosted World ResourceKey smoke is the bounded PR6 repository-conformance
 gate. It verifies typed governed vocabulary, underlying identity helpers'
@@ -106,21 +125,47 @@ route child executed or after every executed route declares
 `failure_continuation = "declared_idempotent"`; a failed prerequisite remains a
 hard stop. Bundle v2 carries that contract, and complete traces pass plan-aware
 semantic replay against the trusted HGraph. It is not parallel
-race/cancellation, retry, snapshot-plan execution, actual placement,
-runtime/recovery graphs, Governor/receipt integration, exactly-once effects,
-native/QEMU or hardware evidence, G1, or G0--G13 passage.
+race/cancellation, retry, authenticated placement, Governor authority,
+exactly-once effects, native execution, hardware evidence, G1, or G0--G13
+passage. The separate explicit World-bound adapter described below does not
+change those ordinary opt-in semantics.
 
 The snapshot-derived deployment record is a deterministic descriptive proposal
 from caller-supplied exact snapshot and task identities. It is not current or
 authenticated inventory, Governor admission, authority, dispatch, reservation,
-health, or execution, and the current executor does not consume it. Active
+health, or execution. Active
 compatibility checks cover the exact bundle plus bundle-scoped role/path
 declarations, runtime classes, executable/evaluator facts, platform and
 ambient-environment guards, authority absence, and residual `HostWorld`
 admission. Architecture, package, and failure-domain fields are currently
 unconstrained or empty schema vocabulary; `require_current_world` checks only
-World identity/epoch. No `RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`,
-native parity, or G1 evidence is claimed. G1 remains defined and unpassed.
+World identity/epoch. The ordinary executor does not consume this plan; the
+explicit hosted-reference World entry point does. It re-derives exact
+logical/deployment/snapshot bindings and fences caller-supplied current
+World/Governor; dedicated coordinator observer
+node/domain/optional-process; dedicated coordinator attempt; selected provider
+node/domain/optional-process/service and implementation; and every operation
+task attempt inside `ProjectCoordinator` before any workspace or child process.
+The coordinator attempt is distinct from all operation attempts and identifies
+the World-bound trace.
+
+Terminal `RuntimeGraphV1` is built only after plan-aware causal replay against
+the trusted HGraph and exact deployment. Its neutral `RouteSettlement` covers
+successful, nonzero, and guard-skipped results, and terminal residual
+`HostWorld` aggregates every observed started/terminal operation; never-started
+operations do not contribute. A caller-supplied Ed25519 signer then emits
+canonical OWRECEIPT with an unconditional `Uncommitted` fence. Receipt placement
+names the coordinator observer and the receipt context uses the coordinator
+attempt, not the proposed provider or a per-operation attempt. The receipt
+subject leaves package absent rather than storing the provider implementation.
+Only route success produces receipt success. Mode 32 performs the native
+canonical/unsigned-semantic comparison above.
+
+Release wording must retain the boundary: this is no Governor admission or
+commit, capability/lease grant, reservation, remote dispatch, recovery, or
+exactly-once protocol. It is no native project execution or native Ed25519
+verification; QEMU TCG is not physical hardware. It passes neither G1 nor
+Workstream A acceptance, and G1 remains defined and unpassed.
 
 The World Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a
@@ -154,7 +199,7 @@ their immutable source bytes from a later reachable commit, and shallow clones
 cannot establish that provenance.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
-The portable native release surface contains exactly **23** required
+The portable native release surface contains exactly **24** required
 QEMU gates. `evidence/gates.toml` is authoritative; the aggregate, CI, this
 checklist, and the README status table are validated projections. After each
 successful gate, the aggregate requires every manifest marker exactly once in
@@ -173,23 +218,24 @@ python3 scripts/release_evidence.py validate
 | 4 | `world-protocol-v1` | World protocol PR3 / Mode 28 | `portable_tcg` | `ocore/kernel/smoke-world-protocol-qemu.sh` |
 | 5 | `world-value-v1` | World OValue PR4 / Mode 29 | `portable_tcg` | `ocore/kernel/smoke-world-value-qemu.sh` |
 | 6 | `world-receipt-v1` | World receipt PR5 / Mode 30 | `portable_tcg` | `ocore/kernel/smoke-world-receipt-qemu.sh` |
-| 7 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
-| 8 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
-| 9 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
-| 10 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
-| 11 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
-| 12 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
-| 13 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
-| 14 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
-| 15 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
-| 16 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
-| 17 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
-| 18 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
-| 19 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
-| 20 | `m7b-logical-read-fallback-live` | M7B-1 native LogicalRead Mode 31 | `portable_tcg` | `ocore/kernel/smoke-m7b-logical-read-qemu.sh` |
-| 21 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
-| 22 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
-| 23 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
+| 7 | `world-project-runtime-mode32` | World project runtime / Mode 32 | `portable_tcg` | `ocore/kernel/smoke-world-project-runtime-qemu.sh` |
+| 8 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
+| 9 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
+| 10 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
+| 11 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
+| 12 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
+| 13 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
+| 14 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
+| 15 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
+| 16 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
+| 17 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
+| 18 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
+| 19 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
+| 20 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
+| 21 | `m7b-logical-read-fallback-live` | M7B-1 native LogicalRead Mode 31 | `portable_tcg` | `ocore/kernel/smoke-m7b-logical-read-qemu.sh` |
+| 22 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
+| 23 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
+| 24 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
 
 Supplemental hardware evidence is validated by the same manifest but is not
 executed by the portable aggregate:

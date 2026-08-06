@@ -19,6 +19,8 @@ use crate::hgraph::{
 use crate::ir::PlanNodeId;
 use anyhow::{anyhow, bail, Context, Result};
 
+use super::deployment::DeploymentPlanV1;
+use super::launch::{HostedWorldCurrentV1, HostedWorldLaunchV1};
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
     OExecutionResult, ProjectBundle, RouteFailureContinuation, RoutePolicy, RouteSpec,
@@ -28,9 +30,9 @@ use super::plan::{
 };
 use super::runtime::{execute_route_in_workspace, is_skipped_result, run_selection, RunOptions};
 use super::trace::{
-    project_hosted_deployment_digest, project_logical_graph_digest, ProjectAttemptIdentity,
-    ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectContinuationDecision,
-    ProjectContinuationEvidence, ProjectRouteOutcome,
+    project_deployment_digest, project_hosted_deployment_digest, project_logical_graph_digest,
+    ProjectAttemptIdentity, ProjectAttemptTrace, ProjectAttemptTraceHeader,
+    ProjectContinuationDecision, ProjectContinuationEvidence, ProjectRouteOutcome,
 };
 
 /// Opt-in selector for the hosted project HGraph executor.
@@ -181,6 +183,9 @@ pub struct ProjectCoordinator<'a> {
     failures: BTreeMap<PlanNodeId, String>,
     branch_assessments: BTreeMap<usize, Vec<BranchRouteAssessment>>,
     continuation_denied: bool,
+    /// Exact snapshot-derived deployment for the bounded World-hosted path.
+    /// `None` retains the compatibility hosted-unbound trace contract.
+    deployment: Option<&'a DeploymentPlanV1>,
     trace: ProjectAttemptTrace,
     cancel: CancellationToken,
 }
@@ -192,6 +197,47 @@ impl<'a> ProjectCoordinator<'a> {
         bundle: &'a ProjectBundle,
         project: &'a ProjectHGraph,
         opts: &'a RunOptions,
+    ) -> Result<Self> {
+        let header = project_trace_header(project)?;
+        Self::new_with_header(bundle, project, opts, None, header)
+    }
+
+    /// Enter the coordinator through one exact, current World-hosted launch.
+    ///
+    /// Trusted graph/deployment/snapshot equality and every current generation
+    /// are fenced here before schedule derivation, workspace materialization,
+    /// or child-process launch. The launch profile is descriptive and does not
+    /// confer Governor admission, reservation, dispatch, or effect authority.
+    pub fn new_world_bound(
+        bundle: &'a ProjectBundle,
+        project: &'a ProjectHGraph,
+        opts: &'a RunOptions,
+        deployment: &'a DeploymentPlanV1,
+        snapshot: &super::deployment::PlacementSnapshotV1,
+        launch: &HostedWorldLaunchV1,
+        current: &HostedWorldCurrentV1,
+    ) -> Result<Self> {
+        // Rebuild the logical contract from the exact coordinator input rather
+        // than trusting a separately supplied logical record.
+        let logical = project
+            .logical_v1()
+            .context("failed to derive trusted logical HGraph at World launch")?;
+        launch
+            .validate_trusted(&logical, deployment, snapshot)
+            .context("World-hosted project launch source validation failed")?;
+        launch
+            .validate_current(current)
+            .context("World-hosted project launch freshness fence failed")?;
+        let header = project_world_trace_header(project, deployment, launch)?;
+        Self::new_with_header(bundle, project, opts, Some(deployment), header)
+    }
+
+    fn new_with_header(
+        bundle: &'a ProjectBundle,
+        project: &'a ProjectHGraph,
+        opts: &'a RunOptions,
+        deployment: Option<&'a DeploymentPlanV1>,
+        header: ProjectAttemptTraceHeader,
     ) -> Result<Self> {
         // Reconstructing with the plan's fully resolved selection retains the
         // exact target, alternative order, policy, bundle digest, and graph
@@ -250,7 +296,7 @@ impl<'a> ProjectCoordinator<'a> {
             .iter()
             .filter_map(|(id, node)| (node.state == ValueState::Materialized).then_some(*id))
             .collect();
-        let trace = ProjectAttemptTrace::new(project_trace_header(project)?)
+        let trace = ProjectAttemptTrace::new(header)
             .context("failed to initialize project attempt trace")?;
 
         Ok(Self {
@@ -267,6 +313,7 @@ impl<'a> ProjectCoordinator<'a> {
             failures: BTreeMap::new(),
             branch_assessments: BTreeMap::new(),
             continuation_denied: false,
+            deployment,
             trace,
             cancel: CancellationToken::new(),
         })
@@ -351,11 +398,17 @@ impl<'a> ProjectCoordinator<'a> {
             Some(_) => bail!("project HGraph root does not contain a selected route result"),
             None => return Err(self.stall_error(&BTreeSet::new())),
         };
-        let trace = ProjectAttemptTrace::try_from_project_events(
-            self.project,
-            self.trace.header().clone(),
-            self.trace.events().to_vec(),
-        )
+        let header = self.trace.header().clone();
+        let events = self.trace.events().to_vec();
+        let trace = match self.deployment {
+            Some(deployment) => ProjectAttemptTrace::try_from_project_events_with_deployment(
+                self.project,
+                deployment,
+                header,
+                events,
+            ),
+            None => ProjectAttemptTrace::try_from_project_events(self.project, header, events),
+        }
         .context("coordinator-produced project trace failed semantic replay")?;
         Ok(ProjectCoordinatorOutcome {
             result,
@@ -1000,6 +1053,27 @@ pub fn execute_project_hgraph(
     ProjectCoordinator::new(bundle, project, opts)?.execute()
 }
 
+/// Execute through the bounded World-hosted coordinator entry point.
+///
+/// The supplied launch/current view is checked before any project execution.
+/// A successful result remains a residual `HostWorld` observation until the
+/// higher-level receipt adapter emits an explicitly uncommitted OWRECEIPT.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_project_hgraph_world_bound(
+    bundle: &ProjectBundle,
+    project: &ProjectHGraph,
+    opts: &RunOptions,
+    deployment: &DeploymentPlanV1,
+    snapshot: &super::deployment::PlacementSnapshotV1,
+    launch: &HostedWorldLaunchV1,
+    current: &HostedWorldCurrentV1,
+) -> Result<ProjectExecutionOutcome> {
+    ProjectCoordinator::new_world_bound(
+        bundle, project, opts, deployment, snapshot, launch, current,
+    )?
+    .execute()
+}
+
 /// Execute one validated hosted project HGraph while retaining the exact
 /// ordered alternative-result prefix expected by route-selection callers.
 /// Prerequisite route results remain in the trace and are not alternatives.
@@ -1033,6 +1107,28 @@ fn project_trace_header(project: &ProjectHGraph) -> Result<ProjectAttemptTraceHe
         super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
         deployment_plan_digest,
         hex::encode(attempt),
+    ))
+}
+
+fn project_world_trace_header(
+    project: &ProjectHGraph,
+    deployment: &DeploymentPlanV1,
+    launch: &HostedWorldLaunchV1,
+) -> Result<ProjectAttemptTraceHeader> {
+    let logical_graph_digest = project_logical_graph_digest(project)?;
+    let deployment_plan_digest = project_deployment_digest(deployment)?;
+    let execution_attempt_id = launch.coordinator_attempt().to_string();
+
+    Ok(ProjectAttemptTraceHeader::new(
+        project.plan.project_name.clone(),
+        project.plan.bundle_digest.clone(),
+        project.plan.target.clone(),
+        project.plan.policy.token(),
+        super::logical::LOGICAL_HGRAPH_SCHEMA_V1,
+        logical_graph_digest,
+        super::deployment::DEPLOYMENT_PLAN_SCHEMA_V1,
+        deployment_plan_digest,
+        execution_attempt_id,
     ))
 }
 

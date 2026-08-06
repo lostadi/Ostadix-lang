@@ -20,6 +20,7 @@ pub mod deployment;
 pub mod discover;
 pub mod ecosystems;
 pub mod executor;
+pub mod launch;
 pub mod logical;
 pub mod lower;
 pub mod manifest;
@@ -27,7 +28,9 @@ pub mod materialize;
 pub mod model;
 pub mod plan;
 pub mod runtime;
+pub mod runtime_graph;
 pub mod trace;
+pub mod world_execution;
 
 pub use deployment::{
     DeploymentArchitectureRequirementV1, DeploymentCompatibilityIssueV1,
@@ -40,10 +43,15 @@ pub use deployment::{
     PLACEMENT_SNAPSHOT_SCHEMA_V1,
 };
 pub use executor::{
-    execute_project_hgraph, execute_project_hgraph_selection,
+    execute_project_hgraph, execute_project_hgraph_selection, execute_project_hgraph_world_bound,
     execute_selection_with_configured_executor, run_selection_with_configured_executor,
     write_project_attempt_trace, ConfiguredProjectExecution, ProjectCoordinator,
     ProjectExecutionError, ProjectExecutionOutcome,
+};
+pub use launch::{
+    HostedWorldCoordinatorObserverV1, HostedWorldCurrentV1, HostedWorldLaunchError,
+    HostedWorldLaunchProfileV1, HostedWorldLaunchV1, HostedWorldOperationAttemptV1,
+    HOSTED_WORLD_CURRENT_SCHEMA_V1, HOSTED_WORLD_LAUNCH_SCHEMA_V1, MAX_HOSTED_WORLD_LAUNCH_BYTES,
 };
 pub use logical::{
     LogicalArtifactRefV1, LogicalArtifactRoleV1, LogicalAuthorityRequirementV1,
@@ -62,10 +70,19 @@ pub use plan::{
     build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
     ProjectHGraph, ProjectPlanOperation, RoutePlanFacts,
 };
+pub use runtime_graph::{
+    RuntimeGraphError, RuntimeGraphObservationV1, RuntimeGraphOperationV1, RuntimeGraphTerminalV1,
+    RuntimeGraphV1, MAX_RUNTIME_GRAPH_OBSERVATIONS, MAX_RUNTIME_GRAPH_OPERATIONS,
+    MAX_RUNTIME_GRAPH_RECORD_BYTES, RUNTIME_GRAPH_SCHEMA_V1,
+};
 pub use trace::{
     ProjectArtifactFingerprint, ProjectAttemptEvent, ProjectAttemptIdentity, ProjectAttemptState,
     ProjectAttemptTrace, ProjectAttemptTraceHeader, ProjectContinuationDecision,
     ProjectContinuationEvidence, ProjectRouteOutcome, ProjectTraceError,
+};
+pub use world_execution::{
+    execute_world_project_with_receipt, write_world_project_receipt_hex,
+    WorldProjectExecutionOutcome,
 };
 
 /// Derive a project name from a directory path.

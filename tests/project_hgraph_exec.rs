@@ -1791,7 +1791,7 @@ fn semantic_replay_rejects_an_omitted_unproven_successful_prerequisite() {
     assert!(
         error
             .to_string()
-            .contains("omits terminal lifecycle coverage for prerequisite"),
+            .contains("became Ready before its trusted graph inputs were published"),
         "unexpected semantic replay error: {error}"
     );
 }
@@ -1841,7 +1841,7 @@ fn semantic_replay_rejects_an_omitted_prerequisite_on_a_successful_explicit_path
     assert!(
         error
             .to_string()
-            .contains("omits terminal lifecycle coverage for prerequisite"),
+            .contains("became Ready before its trusted graph inputs were published"),
         "unexpected semantic replay error: {error}"
     );
 }

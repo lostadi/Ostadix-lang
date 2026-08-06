@@ -33,7 +33,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::hgraph::ExecutableOp;
+use crate::hgraph::{ExecutableOp, HNodeKind, NodeId, ReadyInputPolicy, ReadySchedule, ValueState};
 use crate::ir::PlanNodeId;
 
 use super::model::{Artifact, OExecutionResult, RouteFailureContinuation, RoutePolicy};
@@ -79,9 +79,15 @@ pub(crate) fn project_hosted_deployment_digest(
             "failed to construct canonical hosted DeploymentPlanV1: {error}"
         ))
     })?;
+    project_deployment_digest(&deployment)
+}
+
+pub(crate) fn project_deployment_digest(
+    deployment: &super::deployment::DeploymentPlanV1,
+) -> Result<String, ProjectTraceError> {
     let digest = deployment.digest().map_err(|error| {
         ProjectTraceError::InvalidMetadata(format!(
-            "failed to digest canonical hosted DeploymentPlanV1: {error}"
+            "failed to digest canonical DeploymentPlanV1: {error}"
         ))
     })?;
     Ok(digest.as_sha256().to_string())
@@ -107,6 +113,9 @@ pub struct ProjectAttemptTraceHeader {
 }
 
 impl ProjectAttemptTraceHeader {
+    // These fields form one fixed execution-context header. Keeping a single
+    // constructor prevents callers from assembling partially bound metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_name: impl Into<String>,
         bundle_digest: impl Into<String>,
@@ -668,7 +677,53 @@ impl ProjectAttemptTrace {
                 "trusted Project HGraph differs from its canonical plan projection".to_string(),
             ));
         }
-        validate_project_header(project, &header)?;
+        let expected_deployment_digest = project_hosted_deployment_digest(project)?;
+        validate_project_header(project, &header, &expected_deployment_digest)?;
+        let trace = Self::try_from_events(header, events)?;
+        trace.validate_project_semantics(project)?;
+        Ok(trace)
+    }
+
+    /// Rebuild a trace against one trusted Project HGraph and one exact
+    /// deployment artifact already admitted by the caller.
+    ///
+    /// This variant is used by the bounded World-hosted reference path. It
+    /// checks the snapshot-derived deployment digest rather than silently
+    /// reconstructing the unbound hosted profile. It does not itself establish
+    /// deployment authority, snapshot freshness, or provider admission.
+    pub fn try_from_project_events_with_deployment(
+        project: &ProjectHGraph,
+        deployment: &super::deployment::DeploymentPlanV1,
+        header: ProjectAttemptTraceHeader,
+        events: impl IntoIterator<Item = ProjectAttemptEvent>,
+    ) -> Result<Self, ProjectTraceError> {
+        let canonical_graph = project.plan.to_hgraph().map_err(|error| {
+            ProjectTraceError::InvalidMetadata(format!("trusted project plan is invalid: {error}"))
+        })?;
+        if canonical_graph != project.graph {
+            return Err(ProjectTraceError::InvalidMetadata(
+                "trusted Project HGraph differs from its canonical plan projection".to_string(),
+            ));
+        }
+        let logical = project.logical_v1().map_err(|error| {
+            ProjectTraceError::InvalidMetadata(format!(
+                "failed to derive trusted logical HGraph for deployment replay: {error}"
+            ))
+        })?;
+        let logical_digest = logical.digest().map_err(|error| {
+            ProjectTraceError::InvalidMetadata(format!(
+                "failed to digest trusted logical HGraph for deployment replay: {error}"
+            ))
+        })?;
+        if deployment.logical_hgraph_schema != super::logical::LOGICAL_HGRAPH_SCHEMA_V1
+            || deployment.logical_hgraph != logical_digest
+        {
+            return Err(ProjectTraceError::InvalidMetadata(
+                "deployment replay artifact differs from the trusted logical HGraph".to_string(),
+            ));
+        }
+        let expected_deployment_digest = project_deployment_digest(deployment)?;
+        validate_project_header(project, &header, &expected_deployment_digest)?;
         let trace = Self::try_from_events(header, events)?;
         trace.validate_project_semantics(project)?;
         Ok(trace)
@@ -940,6 +995,7 @@ impl ProjectAttemptTrace {
     }
 
     fn validate_project_semantics(&self, project: &ProjectHGraph) -> Result<(), ProjectTraceError> {
+        validate_observed_readiness(project, &self.events)?;
         for event in &self.events {
             let operation = project
                 .plan
@@ -1078,9 +1134,156 @@ impl ProjectAttemptTrace {
     }
 }
 
+/// Replay the exact coordinator readiness rule over the observed prefix.
+///
+/// This checks every graph input, including value, completion, resource-state,
+/// and ordered-branch control nodes. A partial coordinator-failure trace need
+/// not contain work that never became ready, but every observed `Ready` event
+/// must be justified by outputs published by earlier terminal events (or by an
+/// initially materialized graph node). This is what lets semantic replay accept
+/// honest prefixes without accepting causally impossible ones.
+fn validate_observed_readiness(
+    project: &ProjectHGraph,
+    events: &[ProjectAttemptEvent],
+) -> Result<(), ProjectTraceError> {
+    let schedule = ReadySchedule::derive(&project.graph).map_err(|error| {
+        ProjectTraceError::InvalidMetadata(format!(
+            "failed to derive trusted project ReadySchedule: {error}"
+        ))
+    })?;
+    let ready_by_plan = schedule
+        .ops
+        .iter()
+        .map(|ready| (ready.plan_node, ready))
+        .collect::<BTreeMap<_, _>>();
+    let output_producers = schedule
+        .ops
+        .iter()
+        .flat_map(|ready| {
+            ready
+                .outputs
+                .iter()
+                .copied()
+                .map(move |output| (output, ready.plan_node))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut materialized = project
+        .graph
+        .nodes
+        .iter()
+        .filter_map(|(node, value)| (value.state == ValueState::Materialized).then_some(*node))
+        .collect::<BTreeSet<_>>();
+    let mut terminal_states = BTreeMap::<PlanNodeId, ProjectAttemptState>::new();
+    let mut continuation_denied = false;
+
+    for event in events {
+        let ready = ready_by_plan
+            .get(&event.plan_node)
+            .copied()
+            .ok_or_else(|| {
+                ProjectTraceError::InvalidMetadata(format!(
+                    "trace references plan node {} outside the trusted ReadySchedule",
+                    event.plan_node.0
+                ))
+            })?;
+        if event.state == ProjectAttemptState::Ready {
+            let input_policy = ready.input_policy(&project.graph).map_err(|error| {
+                ProjectTraceError::InvalidMetadata(format!(
+                    "failed to derive input policy for plan node {}: {error}",
+                    event.plan_node.0
+                ))
+            })?;
+            let justified = match input_policy {
+                ReadyInputPolicy::All => ready
+                    .inputs
+                    .iter()
+                    .all(|input| materialized.contains(input)),
+                ReadyInputPolicy::OrderedFirstSuccess => {
+                    continuation_denied
+                        || ordered_selection_inputs_ready(
+                            ready.inputs.as_slice(),
+                            &materialized,
+                            &output_producers,
+                            &terminal_states,
+                        )?
+                }
+            };
+            if !justified {
+                return Err(ProjectTraceError::InvalidEvent(format!(
+                    "plan node {} became Ready before its trusted graph inputs were published",
+                    event.plan_node.0
+                )));
+            }
+        }
+
+        if event.state.is_terminal() {
+            for output in &ready.outputs {
+                let node = project.graph.node(*output).ok_or_else(|| {
+                    ProjectTraceError::InvalidMetadata(format!(
+                        "plan node {} names missing graph output N{}",
+                        event.plan_node.0, output.0
+                    ))
+                })?;
+                if terminal_publishes(&node.kind, event.state) {
+                    materialized.insert(*output);
+                }
+            }
+            terminal_states.insert(event.plan_node, event.state);
+            if event
+                .continuation
+                .as_ref()
+                .is_some_and(|decision| !decision.admitted)
+            {
+                continuation_denied = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ordered_selection_inputs_ready(
+    inputs: &[NodeId],
+    materialized: &BTreeSet<NodeId>,
+    output_producers: &BTreeMap<NodeId, PlanNodeId>,
+    terminal_states: &BTreeMap<PlanNodeId, ProjectAttemptState>,
+) -> Result<bool, ProjectTraceError> {
+    let mut saw_result = false;
+    for input in inputs {
+        if !materialized.contains(input) {
+            return Ok(false);
+        }
+        saw_result = true;
+        let producer = output_producers.get(input).ok_or_else(|| {
+            ProjectTraceError::InvalidMetadata(format!(
+                "ordered selection input N{} has no trusted operation producer",
+                input.0
+            ))
+        })?;
+        if terminal_states.get(producer) == Some(&ProjectAttemptState::SettledSuccess) {
+            return Ok(true);
+        }
+    }
+    Ok(saw_result)
+}
+
+fn terminal_publishes(kind: &HNodeKind, state: ProjectAttemptState) -> bool {
+    match state {
+        ProjectAttemptState::Finished
+        | ProjectAttemptState::SettledSuccess
+        | ProjectAttemptState::Skipped => true,
+        ProjectAttemptState::SettledFailure => {
+            matches!(kind, HNodeKind::Value | HNodeKind::ResourceState { .. })
+        }
+        ProjectAttemptState::Ready
+        | ProjectAttemptState::Started
+        | ProjectAttemptState::Aborted => false,
+    }
+}
+
 fn validate_project_header(
     project: &ProjectHGraph,
     header: &ProjectAttemptTraceHeader,
+    expected_deployment_digest: &str,
 ) -> Result<(), ProjectTraceError> {
     header.validate()?;
     let expected_policy = project.plan.policy.token();
@@ -1129,10 +1332,9 @@ fn validate_project_header(
             "trace deployment plan schema differs from DeploymentPlanV1".to_string(),
         ));
     }
-    let expected_deployment_digest = project_hosted_deployment_digest(project)?;
     if header.deployment_plan_digest != expected_deployment_digest {
         return Err(ProjectTraceError::InvalidMetadata(
-            "trace deployment plan digest differs from the trusted hosted deployment".to_string(),
+            "trace deployment plan digest differs from the trusted deployment".to_string(),
         ));
     }
     Ok(())
