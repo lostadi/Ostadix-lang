@@ -95,6 +95,11 @@ pub struct ReceiptValidationScratch {
     value_codec: *mut ValueCodecScratch,
     value_reencoded: *mut u8,
     value_reencoded_capacity: usize,
+    // Zero until one complete unsigned body has passed every canonical and
+    // semantic check.  The packed value keeps the public scratch ABI within
+    // its existing 16-word caller storage while making terminal/commit tags
+    // observable without exposing a partially parsed result.
+    validated_tags: u64,
 }
 
 pub unsafe fn validation_scratch_init(
@@ -139,6 +144,35 @@ pub unsafe fn validation_scratch_init(
     (*scratch).value_codec = value_codec;
     (*scratch).value_reencoded = value_reencoded;
     (*scratch).value_reencoded_capacity = value_reencoded_capacity;
+    (*scratch).validated_tags = 0;
+    return 1;
+}
+
+// Publish terminal and commit tags only from a completely validated body.
+// Commit tag zero is meaningful, so success is carried separately rather than
+// overloading the returned tag value with an invalid sentinel.
+pub unsafe fn validated_terminal_and_commit(
+    scratch: *const ReceiptValidationScratch,
+    terminal: *mut u64,
+    commit: *mut u64
+) -> u64 {
+    if scratch as usize == 0 || terminal as usize == 0 || commit as usize == 0
+        || terminal == commit || ((*scratch).validated_tags & 0x1_0000) == 0 {
+        return 0;
+    }
+    volatile_store(terminal, (*scratch).validated_tags & 0xff);
+    volatile_store(commit, ((*scratch).validated_tags >> 8) & 0xff);
+    return 1;
+}
+
+// Clear success-only observations before any new envelope/body admission. This
+// is public so the outer codec can fail closed even on header/length errors that
+// occur before `validate_unsigned_body` begins.
+pub unsafe fn reset_validation(
+    scratch: *mut ReceiptValidationScratch
+) -> u64 {
+    if scratch as usize == 0 { return 0; }
+    (*scratch).validated_tags = 0;
     return 1;
 }
 
@@ -300,12 +334,84 @@ unsafe fn take_count(reader: *mut BodyReader, maximum: usize) -> usize {
     return count;
 }
 
+// Validate the variable-size terminal, commit, and evidence tail outside the
+// already-large body walker. Returning the packed observation does not publish
+// it; the caller stores it only after also proving exact end-of-body coverage.
+unsafe fn validate_terminal_commit_evidence(
+    reader: *mut BodyReader,
+    scratch: *mut ReceiptValidationScratch
+) -> u64 {
+    let terminal: u64 = take_u8(reader);
+    if terminal < RECEIPT_TERMINAL_SUCCESS || terminal > RECEIPT_TERMINAL_STOPPED
+        || !take_zeros(reader, 3) {
+        return 0;
+    }
+    if terminal == RECEIPT_TERMINAL_SUCCESS {
+        let value_length: usize = take_u32(reader) as usize;
+        let value_source: *const u8 = take(reader, value_length);
+        if value_source as usize == 0 || value_length < WORLD_VALUE_MIN_BYTES
+            || value_length > WORLD_VALUE_MAX_BYTES
+            || decode_value(value_source, value_length, WORLD_VALUE_MAX_BYTES,
+                (*scratch).value, (*scratch).value_codec) != 1 {
+            return 0;
+        }
+        let mut reencoded_length: usize = 0;
+        if encode_value((*scratch).value as *const ValueArena,
+            (*scratch).value_reencoded, (*scratch).value_reencoded_capacity,
+            (&mut reencoded_length), (*scratch).value_codec) != 1
+            || reencoded_length != value_length
+            || !bytes_equal(value_source,
+                (*scratch).value_reencoded as *const u8,
+                value_length) {
+            return 0;
+        }
+    }
+    if terminal == RECEIPT_TERMINAL_FAILURE {
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token(reader, (&mut token), (&mut token_length))
+            || take_digest(reader) as usize == 0 {
+            return 0;
+        }
+    }
+
+    let commit: u64 = take_u8(reader);
+    if commit > RECEIPT_COMMIT_COMMITTED || !take_zeros(reader, 3) {
+        return 0;
+    }
+    if commit == RECEIPT_COMMIT_COMMITTED {
+        let mut raw: *const u8 = 0 as *const u8;
+        let mut raw_length: usize = 0;
+        if !take_identity(reader, IDENTITY_KIND_GOVERNOR,
+            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
+            || !governor_fence_matches(
+                (*scratch).governor as *const IdentityRecord,
+                (*scratch).current as *const IdentityRecord) {
+            return 0;
+        }
+    }
+
+    let evidence: u64 = take_u8(reader);
+    if evidence > 1 || !take_zeros(reader, 3) { return 0; }
+    if evidence == 1 {
+        let mut token: *const u8 = 0 as *const u8;
+        let mut token_length: usize = 0;
+        if !take_token(reader, (&mut token), (&mut token_length))
+            || take_digest(reader) as usize == 0 {
+            return 0;
+        }
+    }
+    return 0x1_0000 | (commit << 8) | terminal;
+}
+
 pub unsafe fn validate_unsigned_body(
     source: *const u8,
     length: usize,
     scratch: *mut ReceiptValidationScratch
 ) -> u64 {
-    if source as usize == 0 || scratch as usize == 0 || length == 0
+    // A failed validation after an earlier successful call must not leave the
+    // earlier terminal or commit observation visible to the caller.
+    if reset_validation(scratch) != 1 || source as usize == 0 || length == 0
         || length > WORLD_RECEIPT_MAX_UNSIGNED_BYTES {
         return 0;
     }
@@ -565,65 +671,13 @@ pub unsafe fn validate_unsigned_body(
         index += 1;
     }
 
-    let terminal: u64 = take_u8((&mut reader));
-    if terminal < RECEIPT_TERMINAL_SUCCESS || terminal > RECEIPT_TERMINAL_STOPPED
-        || !take_zeros((&mut reader), 3) {
+    let validated_tags: u64 = validate_terminal_commit_evidence(
+        (&mut reader), scratch);
+    if validated_tags == 0 || reader.failed != 0
+        || reader.cursor != reader.length {
         return 0;
     }
-    if terminal == RECEIPT_TERMINAL_SUCCESS {
-        let value_length: usize = take_u32((&mut reader)) as usize;
-        let value_source: *const u8 = take((&mut reader), value_length);
-        if value_source as usize == 0 || value_length < WORLD_VALUE_MIN_BYTES
-            || value_length > WORLD_VALUE_MAX_BYTES
-            || decode_value(value_source, value_length, WORLD_VALUE_MAX_BYTES,
-                (*scratch).value, (*scratch).value_codec) != 1 {
-            return 0;
-        }
-        let mut reencoded_length: usize = 0;
-        if encode_value((*scratch).value as *const ValueArena,
-            (*scratch).value_reencoded, (*scratch).value_reencoded_capacity,
-            (&mut reencoded_length), (*scratch).value_codec) != 1
-            || reencoded_length != value_length
-            || !bytes_equal(value_source,
-                (*scratch).value_reencoded as *const u8,
-                value_length) {
-            return 0;
-        }
-    }
-    if terminal == RECEIPT_TERMINAL_FAILURE {
-        let mut token: *const u8 = 0 as *const u8;
-        let mut token_length: usize = 0;
-        if !take_token((&mut reader), (&mut token), (&mut token_length))
-            || take_digest((&mut reader)) as usize == 0 {
-            return 0;
-        }
-    }
-
-    let commit: u64 = take_u8((&mut reader));
-    if commit > RECEIPT_COMMIT_COMMITTED || !take_zeros((&mut reader), 3) {
-        return 0;
-    }
-    if commit == RECEIPT_COMMIT_COMMITTED {
-        if !take_identity((&mut reader), IDENTITY_KIND_GOVERNOR,
-            (*scratch).current, scratch, (&mut raw), (&mut raw_length))
-            || !governor_fence_matches(
-                (*scratch).governor as *const IdentityRecord,
-                (*scratch).current as *const IdentityRecord) {
-            return 0;
-        }
-    }
-
-    let evidence: u64 = take_u8((&mut reader));
-    if evidence > 1 || !take_zeros((&mut reader), 3) { return 0; }
-    if evidence == 1 {
-        let mut token: *const u8 = 0 as *const u8;
-        let mut token_length: usize = 0;
-        if !take_token((&mut reader), (&mut token), (&mut token_length))
-            || take_digest((&mut reader)) as usize == 0 {
-            return 0;
-        }
-    }
-    if reader.failed != 0 || reader.cursor != reader.length { return 0; }
+    (*scratch).validated_tags = validated_tags;
     return 1;
 }
 

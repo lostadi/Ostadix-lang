@@ -348,7 +348,8 @@ fn hosted_profile_rejects_host_world_removal_and_effect_flag_tampering() {
         .retain(|resource| resource != &LogicalResourceV1::HostWorld);
     assert_structural_rejection(&missing_host_world_write);
 
-    let mut mutations: Vec<Box<dyn FnOnce(&mut LogicalHGraphV1)>> = vec![
+    type LogicalMutation = Box<dyn FnOnce(&mut LogicalHGraphV1)>;
+    let mut mutations: Vec<LogicalMutation> = vec![
         Box::new(move |graph| graph.operations[unknown_index].effects.unknown = false),
         Box::new(move |graph| graph.operations[unknown_index].effects.deterministic = true),
         Box::new(move |graph| graph.operations[unknown_index].effects.network = true),

@@ -14,6 +14,14 @@ ProjectBundle -> shared ResolvedSelection -> ProjectExecutionPlan
 
 ProjectHGraph -> LogicalHGraphV1 -> DeploymentPlanV1(hosted-unbound)
                                   -> ProjectAttemptTrace v5 header binding
+
+LogicalHGraphV1 + PlacementSnapshotV1 + DeploymentPlanV1(snapshot-derived)
+  -> HostedWorldLaunchV1 + HostedWorldCurrentV1
+     (coordinator observer + distinct coordinator attempt + operation attempts)
+  -> ProjectCoordinator::new_world_bound (all fences before workspace/child)
+  -> ProjectAttemptTrace -> causal replay -> terminal RuntimeGraphV1
+  -> caller-signed OWRECEIPT v1 (ReceiptCommitFenceV1::Uncommitted)
+  -> Mode 32 native canonical/semantic comparison
 ```
 
 Routes are not synthesized as fake OIR. The project planner binds its source to
@@ -76,12 +84,64 @@ exact `TaskIdentity` for each logical operation. It deterministically emits a
 `ProposedProvider` or `Unresolved` result from those descriptive facts. This is
 not current or authenticated inventory, Governor admission, authority,
 dispatch, reservation, provider health, or execution. `require_current_world`
-checks only World identity/epoch. The current executor does not consume
-snapshot-derived plans; it only records the hosted-unbound plan digest in the
-unsigned trace header.
+checks only World identity/epoch. The ordinary opt-in executor continues to use
+the hosted-unbound plan, but the separate hosted-reference World entry point
+does consume the exact snapshot-derived plan. `HostedWorldLaunchV1` binds the
+logical, deployment, snapshot, World, descriptive Governor position, selected
+provider, receipt identity, caller-supplied coordinator observer, dedicated
+coordinator attempt, and one exact task attempt per logical operation. The
+coordinator attempt must use a task distinct from every operation attempt.
+`HostedWorldCurrentV1` fences the World/Governor generations, observer
+node/domain/optional-process generations, coordinator attempt, provider
+node/domain/optional-process/service generations and implementation digest, and
+every operation attempt before `ProjectCoordinator` derives its schedule,
+materializes a workspace, or starts a child. This is a caller-supplied
+current-view comparison, not authenticated membership, proof that the host owns
+the observer identity, or Governor admission.
 
-This slice has no `RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native
-parity, or G1 evidence. G1 remains defined and unpassed.
+After coordinator completion or an observable coordinator failure,
+`RuntimeGraphV1` canonically binds the logical/deployment/launch/snapshot
+schemas and digests, exact World/observer/coordinator-attempt/provider and
+per-operation task-attempt context, normalized trace event ordinals and
+outcomes, and each operation's residual `HostWorld` truth. Construction first
+runs plan-aware causal replay against the trusted HGraph and exact deployment.
+Never-started operations retain empty observations. The neutral
+`RouteSettlement` terminal represents successful, nonzero, or guard-skipped
+route settlement; it is not synonymous with successful execution. Its residual
+`HostWorld` bit is aggregated across all actually observed started or terminal
+operations. The graph is terminal hosted-reference evidence, not mutable live
+state, authority, a recovery plan, or a commit decision.
+
+`execute_world_project_with_receipt` then uses a caller-supplied Ed25519 signer
+to emit canonical `OWRECEIPT` v1 with
+`ReceiptCommitFenceV1::Uncommitted`. The receipt placement is the coordinator
+observer and its attempt is the dedicated coordinator attempt, not the proposed
+provider or a per-operation attempt. The receipt subject binds the bundle and
+logical graph while leaving package absent; the provider implementation is not
+overloaded into that field. Route success maps to receipt success, while
+nonzero and guard-skipped settlements map to receipt failure. Signing protects
+integrity but does not turn the descriptive Governor/provider context into
+admission, authority, or a governed commit.
+
+Mode 32 accepts that emitted receipt as canonical lowercase hex, performs full
+native canonical decode, exact re-encoding, validated signing-preimage
+construction, requires the uncommitted fence, and compares the
+domain-separated SHA-256 of the complete unsigned canonical body with the
+hosted value. It also reuses successful validation scratch with a malformed
+envelope and requires stale terminal/commit tags to be cleared. The first
+command is the required no-argument end-to-end wrapper; the second is the
+direct two-argument vector interface:
+
+```bash
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
+./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+```
+
+This is no Governor admission/commit, capability grant, lease, reservation,
+remote dispatch, recovery, or exactly-once protocol. Mode 32 does not execute a
+project or verify Ed25519 natively. QEMU TCG is not physical-hardware evidence,
+and this slice passes neither G1 nor Workstream A acceptance. G1 remains defined
+and unpassed.
 
 Project dependencies distinguish `Value(pN)` from `Success(pN)`. A settled
 nonzero route publishes its ordinary result and conservative resource
@@ -227,9 +287,11 @@ with distinct styles and directed ports.
 
 `ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
 target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
-hosted-unbound `DeploymentPlanV1` schema/digest, and a fresh execution-attempt
-identifier. That identifier is diagnostic, not a World `TaskIdentity` or
-`TaskAttemptIdentity`.
+deployment schema/digest, and an execution-attempt identifier. The ordinary
+path binds the hosted-unbound plan and uses a fresh diagnostic identifier. The
+World-bound path binds the exact snapshot-derived plan and uses the launch's
+dedicated coordinator attempt identity, which is distinct from every logical
+operation attempt and remains descriptive and non-authorizing.
 For an unsuccessful ordered branch it also records the proposed next route,
 the assessed route prefix, the `no_execution`, `declared_idempotent`, or
 `unproven_effects` evidence class, and the allow/deny result.
@@ -237,15 +299,17 @@ the assessed route prefix, the `no_execution`, `declared_idempotent`, or
 is selected, including a denied decision before the command reports no
 successful route. Structural replay alone checks only event-local lifecycle
 invariants. Plan-aware replay against a trusted `ProjectHGraph` additionally
-checks all header bindings, reconstructs the hosted-unbound deployment artifact
-and rejects substitution of that artifact, checks exact operation identities,
+checks all header bindings, reconstructs the ordinary hosted-unbound deployment
+artifact or compares the explicitly supplied snapshot-derived artifact, rejects
+substitution, checks exact operation identities,
 requires the decision on the correct terminal alternative, requires complete
 causally ordered lifecycle coverage for every transitive route prerequisite,
 recomputes its evidence from `RoutePlanFacts`, checks the exact next alternative,
 and rejects later-branch events after denial. Every complete
 coordinator-produced trace passes that semantic replay before it is returned.
-This does not bind or execute a snapshot-derived provider proposal. The trace
-remains unsigned and is not an OWRECEIPT or attestation.
+The trace itself remains unsigned and is not an OWRECEIPT or attestation; only
+the separate terminal RuntimeGraph/receipt adapter emits the signed,
+uncommitted receipt described above.
 
 The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,

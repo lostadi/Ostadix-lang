@@ -532,6 +532,9 @@ pub struct DeploymentProviderRejectionV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+// Preserve the frozen inline v1 wire/API shape; boxing only the provider arm
+// would trade a public schema type change for an allocation-size lint.
+#[allow(clippy::large_enum_variant)]
 pub enum DeploymentOperationBindingV1 {
     /// Current in-process coordinator work. This carries no World placement.
     HostedCoordinator,

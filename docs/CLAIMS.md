@@ -463,13 +463,62 @@
   Receipt capability identities and rights remain descriptive data, not
   bearers, CSpace handles, delegation certificates, session tokens, or grants
   of authority. Signature validity does not establish authorization, trusted
-  signer policy, or current World state. The corpus is constructed offline: the
-  HGraph, project, live-system, KernelWorld, object, capability, O-Git, and
-  evidence paths do not yet emit or consume it in live execution. This slice
-  supplies no production key generation or custody, enrollment, rotation,
+  signer policy, or current World state. The Mode 30 corpus is constructed
+  offline and is not evidence that another subsystem emitted a receipt. This
+  slice supplies no production key generation or custody, enrollment, rotation,
   revocation, transport, authoritative replay/commit fencing, Governor,
   consensus, WorldFS, typed World Alpha attestation, Workstream A acceptance,
   or G0--G13 passage. QEMU TCG is not physical or hardware-isolation evidence.
+- The separate World-project hosted-reference slice consumes an exact
+  snapshot-derived `DeploymentPlanV1` through
+  `ProjectCoordinator::new_world_bound`. Before schedule derivation, workspace
+  materialization, or child-process launch, it re-derives the trusted logical,
+  deployment, and snapshot records and fences caller-supplied current
+  World/Governor identity; a dedicated coordinator observer
+  node/domain/optional-process; a dedicated coordinator attempt; selected
+  provider node/domain/optional-process/service generations and implementation
+  digest; and every logical operation's exact task attempt. The coordinator
+  attempt must use a task distinct from every operation attempt and becomes the
+  trace execution-attempt identity. The launch profile is explicitly
+  non-authorizing: these caller assertions are not authenticated membership,
+  proof that the host owns the observer identity, Governor admission,
+  capability or lease authority, provider reservation, or remote dispatch.
+  A terminal `RuntimeGraphV1` is admitted only after plan-aware causal replay
+  against the trusted `ProjectHGraph` and exact deployment. It binds the exact
+  logical/deployment/launch/snapshot schemas and digests,
+  World/observer/coordinator-attempt/provider/task-attempt context, normalized
+  trace ordinals and outcomes, and per-operation residual `HostWorld`.
+  Never-started operations have empty observations. Its neutral
+  `RouteSettlement` terminal covers success, nonzero settlement, and guard skip;
+  terminal residual `HostWorld` is aggregated across every actually observed
+  started or terminal operation rather than copied from only the selected route.
+  `execute_world_project_with_receipt` then uses a caller-supplied Ed25519 signer
+  to emit canonical OWRECEIPT v1 with
+  `ReceiptCommitFenceV1::Uncommitted`. The receipt context places the dedicated
+  coordinator observer and attempt, not the proposed provider or a route
+  attempt. Its subject leaves package absent instead of overloading that field
+  with the provider implementation. Only route success yields receipt success;
+  nonzero and guard-skipped settlements yield receipt failures. Signature
+  integrity is neither Governor authority nor a governed commit.
+- Native Mode 32 consumes that caller-generated receipt as one bounded canonical
+  lowercase-hex record. It performs full canonical decode, exact re-encoding,
+  validated signing-preimage construction, requires the uncommitted fence, and
+  compares a domain-separated SHA-256 over the complete unsigned canonical body
+  with the hosted value. It then reuses the successful validation scratch with
+  a malformed envelope and requires the old terminal/commit tags to be
+  unavailable. The required no-argument end-to-end gate generates the hosted
+  vector; the second command is the direct two-argument vector interface:
+
+  ```bash
+  ./ocore/kernel/smoke-world-project-runtime-qemu.sh
+  ./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+  ```
+
+  Mode 32 does not execute the project or verify Ed25519 natively. The complete
+  hosted-reference slice supplies no Governor admission/commit,
+  capability/lease issuance, reservation, remote dispatch, recovery, or
+  exactly-once protocol. QEMU TCG is not physical hardware or hardware-isolation
+  evidence, and this passes neither G1 nor Workstream A acceptance.
 
 ## Ostadix World native Alpha boundary
 
@@ -604,10 +653,21 @@
   `TaskIdentity` per logical operation. Canonical provider selection is a
   deterministic descriptive proposal, not authenticated or current inventory,
   Governor admission, authority, dispatch, reservation, health, or execution.
-  `require_current_world` checks only World identity/epoch. The current executor
-  does not consume snapshot-derived plans. There is no `RuntimeGraph`,
-  `RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 evidence; G1 remains
-  defined and unpassed.
+  `require_current_world` checks only World identity/epoch. The ordinary opt-in
+  executor does not consume this plan, but the
+  explicit hosted-reference World entry point consumes it together with
+  `HostedWorldLaunchV1` and a caller-supplied current view. The launch contains
+  a coordinator observer and a coordinator attempt distinct from the proposed
+  provider and every per-operation attempt. That bounded path produces a
+  causally replayed terminal `RuntimeGraphV1`, a caller-signed uncommitted
+  OWRECEIPT whose placement is the observer and whose package subject is absent,
+  and Mode 32 native canonical/semantic comparison as described above. It does
+  not implement
+  authenticated placement, a `RecoveryPlan`, Governor admission/commit,
+  capability or lease authority, reservation, remote dispatch, recovery,
+  exactly-once execution, native project execution, native Ed25519 verification,
+  physical-hardware evidence, G1, or Workstream A acceptance; G1 remains defined
+  and unpassed.
 - `scripts/smoke-project-hgraph.sh` is the composite Project HGraph hosted
   planning and generated-adapter gate. Its PR7 phase proves repository-owned
   `scripts/o-cli.sh plan` parity and deterministic, nonexecuting IR/DOT. Its
@@ -670,13 +730,14 @@
   `declared_idempotent` is an author declaration, not independently verified
   idempotency, sandboxing, effect journaling, fencing, compensation, or an
   exactly-once guarantee. This rule exists only in the opt-in hosted HGraph
-  coordinator and does not alter the default compatibility runtime. This is
-  not parallel race/cancellation, retry, snapshot-plan execution, actual
-  placement, runtime/recovery graphs, Governor or receipt integration, remote
-  execution, WorldFS, native/QEMU/hardware evidence, Linux or Plan 9 boot, a
-  general foreign ABI, KVM/SVM evidence, physical-device assignment,
-  PCI/DMA/IOMMU isolation, exactly-once effects, Acceptance A, G1, or passage of
-  any G0--G13 gate.
+  coordinator and does not alter the default compatibility runtime. The
+  ordinary opt-in path remains distinct from the explicit World-bound
+  hosted-reference adapter. Neither proves parallel race/cancellation, retry,
+  authenticated or actual remote placement, Governor admission/commit,
+  capability/lease enforcement, reservation, recovery, remote dispatch,
+  exactly-once effects, native project execution, native Ed25519 verification,
+  physical-device assignment, PCI/DMA/IOMMU isolation, physical hardware,
+  Workstream A acceptance, G1, or passage of any G0--G13 gate.
 - Neither the present repository nor the Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.

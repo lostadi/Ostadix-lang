@@ -435,6 +435,8 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/smoke-world-project-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-world-project-runtime-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-value-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-protocol-qemu.sh": "#!/bin/sh\nexit 0\n",
@@ -457,6 +459,12 @@ class SourceReleaseTests(unittest.TestCase):
             ),
             "ocore/kernel/world_identity_semantics_stub.oc": (
                 "module kernel::world_identity_semantics;\n"
+            ),
+            "ocore/kernel/world_project_receipt_semantics.oc": (
+                "module kernel::world_project_receipt_semantics;\n"
+            ),
+            "ocore/kernel/world_project_receipt_semantics_stub.oc": (
+                "module kernel::world_project_receipt_semantics;\n"
             ),
             "ocore/kernel/world_receipt_semantics.oc": (
                 "module kernel::world_receipt_semantics;\n"
@@ -499,12 +507,17 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
             "src/project/executor.rs": "// fixture project HGraph executor\n",
             "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
+            "src/project/launch.rs": "// fixture World-bound project launch\n",
             "src/project/logical.rs": "// fixture canonical project logical HGraph\n",
             "src/project/mod.rs": "pub mod plan;\n",
             "src/project/model.rs": "// fixture project model\n",
             "src/project/plan.rs": "// fixture project HGraph planner\n",
             "src/project/runtime.rs": "// fixture shared project selection\n",
+            "src/project/runtime_graph.rs": "// fixture observed project RuntimeGraph\n",
             "src/project/trace.rs": "// fixture project HGraph trace\n",
+            "src/project/world_execution.rs": (
+                "// fixture bounded World-project execution and receipt emission\n"
+            ),
             "src/world/grounding.rs": "// fixture World grounding projection\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
@@ -533,6 +546,7 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/project_hgraph_exec.rs": "#[test] fn project_hgraph_exec_fixture() {}\n",
             "tests/project_deployment_plan.rs": "#[test] fn project_deployment_plan_fixture() {}\n",
             "tests/project_logical_hgraph.rs": "#[test] fn project_logical_hgraph_fixture() {}\n",
+            "tests/project_world_runtime.rs": "#[test] fn project_world_runtime_fixture() {}\n",
             "tests/world_resource_keys.rs": "#[test] fn resource_key_fixture() {}\n",
             "tests/world_identity.rs": "#[test] fn identity_fixture() {}\n",
             "tests/world_identity_wire.rs": "#[test] fn wire_fixture() {}\n",
@@ -559,6 +573,8 @@ class SourceReleaseTests(unittest.TestCase):
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
+                    "ocore/kernel/smoke-world-project-receipt-qemu.sh",
+                    "ocore/kernel/smoke-world-project-runtime-qemu.sh",
                     "ocore/kernel/smoke-world-receipt-qemu.sh",
                     "ocore/kernel/smoke-world-value-qemu.sh",
                     "ocore/kernel/smoke-world-protocol-qemu.sh",
@@ -711,6 +727,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/build-aarch64-g2.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
+                "ocore/kernel/smoke-world-project-receipt-qemu.sh",
+                "ocore/kernel/smoke-world-project-runtime-qemu.sh",
                 "ocore/kernel/smoke-world-receipt-qemu.sh",
                 "ocore/kernel/smoke-world-value-qemu.sh",
                 "ocore/kernel/smoke-world-protocol-qemu.sh",
@@ -722,6 +740,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/world_value_semantics_stub.oc",
                 "ocore/kernel/world_identity_semantics.oc",
                 "ocore/kernel/world_identity_semantics_stub.oc",
+                "ocore/kernel/world_project_receipt_semantics.oc",
+                "ocore/kernel/world_project_receipt_semantics_stub.oc",
                 "ocore/kernel/world_receipt_semantics.oc",
                 "ocore/kernel/world_receipt_semantics_stub.oc",
                 "ocore/runtime/x86_64/trap.oc",
@@ -759,12 +779,15 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/hgraph/from_oir.rs",
                 "src/project/executor.rs",
                 "src/project/deployment.rs",
+                "src/project/launch.rs",
                 "src/project/logical.rs",
                 "src/project/mod.rs",
                 "src/project/model.rs",
                 "src/project/plan.rs",
                 "src/project/runtime.rs",
+                "src/project/runtime_graph.rs",
                 "src/project/trace.rs",
+                "src/project/world_execution.rs",
                 "src/world/grounding.rs",
                 "src/world/identity.rs",
                 "src/world/identity_wire.rs",
@@ -793,6 +816,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/project_hgraph_exec.rs",
                 "tests/project_deployment_plan.rs",
                 "tests/project_logical_hgraph.rs",
+                "tests/project_world_runtime.rs",
                 "tests/world_resource_keys.rs",
                 "tests/world_identity.rs",
                 "tests/world_identity_wire.rs",
@@ -839,6 +863,14 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(modes["boot-and-test.sh"], "100755")
             self.assertEqual(
                 modes["okernel-multikernel/boot-and-test.sh"], "100755"
+            )
+            self.assertEqual(
+                modes["ocore/kernel/smoke-world-project-receipt-qemu.sh"],
+                "100755",
+            )
+            self.assertEqual(
+                modes["ocore/kernel/smoke-world-project-runtime-qemu.sh"],
+                "100755",
             )
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
@@ -1373,6 +1405,32 @@ class SourceReleaseTests(unittest.TestCase):
             r"tests/project_hgraph_exec\.rs.*tests/project_logical_hgraph\.rs",
         ):
             self._build("missing-project-hgraph.zip")
+
+    def test_project_world_runtime_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "ocore/kernel/smoke-world-project-receipt-qemu.sh",
+            "ocore/kernel/smoke-world-project-runtime-qemu.sh",
+            "ocore/kernel/world_project_receipt_semantics.oc",
+            "ocore/kernel/world_project_receipt_semantics_stub.oc",
+            "src/project/launch.rs",
+            "src/project/runtime_graph.rs",
+            "src/project/world_execution.rs",
+            "tests/project_world_runtime.rs",
+        )
+        self._git("commit", "-q", "-m", "remove bounded World-project runtime")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*smoke-world-project-receipt-qemu\.sh.*"
+            r"smoke-world-project-runtime-qemu\.sh.*"
+            r"world_project_receipt_semantics\.oc.*"
+            r"world_project_receipt_semantics_stub\.oc.*"
+            r"src/project/launch\.rs.*src/project/runtime_graph\.rs.*"
+            r"src/project/world_execution\.rs.*tests/project_world_runtime\.rs",
+        ):
+            self._build("missing-project-world-runtime.zip")
 
     def test_world_normative_bytes_are_sealed_before_packaging(self) -> None:
         for path, data in WORLD_NORMATIVE_BYTES.items():

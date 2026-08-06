@@ -755,6 +755,43 @@ Governor, consensus, WorldFS, typed World Alpha attestation, Workstream A
 acceptance, or G0--G13 qualification. QEMU TCG is not physical or
 hardware-isolation evidence.
 
+Mode 32 is the bounded native semantic-structure comparison for a live
+hosted-reference project receipt. Its serial oracle accepts one lowercase-hex
+OWRECEIPT of at most 4,096 bytes, performs the complete native canonical
+decode, exact envelope reencode, and validated signing-preimage construction,
+then requires the receipt's commit tag to be `Uncommitted`. Native and hosted
+Rust compare
+`SHA256("OSTADIX/PROJECT-RECEIPT-SEMANTICS/V1\0" || u32_be(body_length) || canonical_unsigned_body)`;
+the signer key ID and signature remain outside that semantic fingerprint.
+After the successful comparison, the probe reuses the same receipt-validation
+scratch with a malformed envelope and requires
+`validated_terminal_and_commit` to fail, proving that early rejection cleared
+the prior success-only terminal and commit tags.
+
+The required release gate is the no-argument wrapper. It runs the focused
+hosted World-project test to generate a fresh receipt and semantic digest, then
+invokes the direct two-argument vector interface shown below it:
+
+```bash
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
+./ocore/kernel/smoke-world-project-receipt-qemu.sh \
+  RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+```
+
+Mode 32 proves native canonical receipt interpretation and unsigned-body
+semantic equality for that bounded record plus fail-closed scratch-tag reset.
+The hosted receipt's placement is a caller-supplied coordinator observer, not
+the deployment's proposed provider; its attempt is a dedicated coordinator
+attempt rather than a route attempt, and its subject leaves package absent
+instead of storing the provider implementation. Mode 32 does not independently
+validate those hosted architectural choices. It does not execute the project in
+O-core, verify Ed25519 natively, establish signer trust, authorize residual
+`HostWorld` effects, change the `Uncommitted` fence, or supply Governor
+admission/commit, authenticated membership, provider ownership or placement,
+capability/lease authority, reservation, remote dispatch, consensus, recovery,
+exactly-once execution, World Alpha acceptance, a G0--G13 gate,
+physical-hardware evidence, or hardware-isolation evidence.
+
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model
 gate. A host-side `VerifiedKernelWorld` produces a deterministic `OKWORLD1` V2
 normal form that keeps verified package and canonical manifest digests
