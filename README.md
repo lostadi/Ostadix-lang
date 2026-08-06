@@ -204,13 +204,16 @@ Each hosted backend uses the real local runtime named in the backend table.
 You only install the runtimes your `.O` program actually uses. Nix is needed
 for the Nix lattice and NixOS tests. Node.js is needed for `javascript^`.
 Racket is needed for `racket^`. Rust is needed for `rust^`. The same rule
-applies to the other language backends.
+applies to the other language backends. The automatic installer keeps Nix and
+native/kernel tooling behind explicit profiles so a normal hosted setup does
+not install them unexpectedly.
 
-The bootable O-core proof additionally needs:
+The portable O-core build and QEMU gates additionally need:
 
-- Clang with the `x86_64-unknown-none-elf` assembler target
+- Clang with the `x86_64-unknown-none-elf` and
+  `aarch64-unknown-none-elf` assembler targets
 - An LLD-compatible linker, either `rust-lld`, `ld.lld`, or Homebrew `lld`
-- QEMU for boot verification
+- ELF inspection tools, CMake/CTest, and x86_64 plus AArch64 QEMU
 
 The kernel build probes the active Rust toolchain, `PATH`, and common Homebrew
 LLD prefixes. If your linker lives somewhere custom, set
@@ -218,6 +221,13 @@ LLD prefixes. If your linker lives somewhere custom, set
 
 Python is used by the four-second QEMU smoke-test harness. It is not linked
 into the kernel and is not used after the machine starts executing O-core.
+
+Linux kernel development, foreign guest experiments, and O-core are separate
+scopes. The Linux-only kernel profile installs host build dependencies, not a
+Linux source tree, kernel, root filesystem, or boot image. Guest tooling is for
+user-supplied, checksum-pinned Linux, 9front, or OpenBSD media; installing it
+does not mean that O-core boots or supports those foreign kernels or operating
+systems.
 
 ### Option A: Automatic setup
 
@@ -231,25 +241,62 @@ cd Ostadix-lang
 ./setup.sh
 ```
 
-The script supports several levels of setup:
+The script supports composable setup profiles and non-installing checks:
 
 ```bash
-./setup.sh --minimal
-./setup.sh --full --verify
-./setup.sh --full --yes
+./setup.sh --minimal                         # hosted build without matplotlib
+./setup.sh --full --verify                   # full hosted profile + hosted checks
+./setup.sh --with-nix --deps-only            # Nix plus environment, no builds
+./setup.sh --with-ocore --verify-ocore       # tools + bounded x86 QEMU smoke
+./setup.sh --full --with-hosted-runtimes     # broad open-source backend pack
+./setup.sh --with-linux-kernel-tools --deps-only
+./setup.sh --with-guest-tools --with-ubuntu-vm --deps-only
+./setup.sh --with-ocore --check              # non-installing capability check
+./setup.sh --env-file /path/to/env.sh --persist-env
 ./setup.sh --no-wrappers
 ./setup.sh --no-mcp
 ./setup.sh --dry-run
 ./setup.sh --help
 ```
 
-`--minimal` skips optional Nix, matplotlib, and extra backend tools. `--full`
-adds optional runtimes such as Racket when the operating system package
-manager provides them. `--verify` runs the hosted implementations after the
-build. `--no-mcp` skips the separately locked `ostadix-mcp` crate. Each setup
+`--minimal` skips optional matplotlib while still allowing explicit
+`--with-*` profiles. `--full` adds the notebook, Racket, Nix, and the complete
+O-core build/QEMU tool set on the validated host package maps; use `--no-nix`
+to exclude Nix. It does **not**
+select guest tooling, install guest media, or select the Linux kernel tool
+profile.
+
+`--with-nix` installs or verifies Nix on supported macOS and Linux hosts.
+`--with-ocore` adds Clang, LLD, ELF tools, CMake/CTest, and x86_64/AArch64 QEMU.
+`--with-hosted-runtimes` is the deliberately heavy, currently macOS/Homebrew
+and Debian-family profile for Node.js, Ruby, Racket, GHC, OCaml, Common Lisp,
+Mono, GNU Octave, WABT, and Wasmtime. It excludes Java by local policy and does
+not install licensed MATLAB or Wolfram products; Octave covers only
+MATLAB-compatible code. Use `--with-hosted-runtimes --check` to inventory those
+executables without installing packages.
+`--with-linux-kernel-tools` is Linux-only and installs build prerequisites such
+as Bison, Flex, libelf/pahole, CPIO, rsync, and kmod; it does not fetch kernel
+sources. `--with-guest-tools` adds QEMU image and compression tools and prepares
+`${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests` for media supplied by the
+user. `--with-ubuntu-vm` also selects guest tools and installs Multipass for the
+`ubuntu_vm^` backend where the host package manager supports it.
+
+`--verify` checks the hosted Rust, C17, AOT, and Python forms after a build.
+`--verify-ocore` implies `--with-ocore` and runs the bounded x86_64 O-core
+QEMU/TCG smoke; it is not a foreign-OS test. `--check` performs a non-installing,
+no-persistent-change capability check for the selected profiles. `--deps-only` installs dependencies
+and writes the environment but skips all Ostadix builds, so it cannot be
+combined with either verification option.
+
+By default setup writes a managed environment file at
+`~/.config/ostadix/env.sh`. It exports `O_LANG_ROOT`, `O_BACKENDS_DIR`, the
+Ostadix/Cargo tool paths, detected Homebrew LLVM/LLD paths, and
+`OSTADIX_GUESTS_DIR`, and activates Nix when present. Use `--env-file PATH` to
+choose another location, `--no-env` to disable the file, or `--persist-env` to
+add an idempotent source block to `~/.zshrc` or `~/.bashrc`. Each normal setup
 run removes stale generated Ostadix-lang binaries before rebuilding them,
 refreshes installed Rust copies in `~/.cargo/bin`, and recreates wrappers in
-`~/.local/bin`.
+`~/.local/bin`; `--no-mcp` skips the separately locked `ostadix-mcp` crate.
 
 After setup:
 
@@ -287,7 +334,10 @@ C target, visible HTML graph, and DOT graph are written to
 `examples/group_pipeline/generated/`, and the receipt is written to
 `.ogit/receipts/semantic-receipt-001.json`.
 
-The usual package-manager prerequisites are:
+The usual package-manager prerequisites for a manual hosted build are below.
+For the validated O-core, Linux-kernel-build, or guest-lab
+dependency sets, prefer the corresponding `setup.sh --with-* --deps-only`
+profile; those optional sets are deliberately not all included here.
 
 #### macOS
 
