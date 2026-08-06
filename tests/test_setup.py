@@ -1,0 +1,302 @@
+"""Regression tests for the side-effect-free ``setup.sh`` planning interface."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SETUP = PROJECT_ROOT / "setup.sh"
+BASH = Path("/bin/bash")
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+class SetupScriptTests(unittest.TestCase):
+    maxDiff = None
+
+    def run_setup(
+        self,
+        *arguments: str,
+        home: Path,
+        platform: str = "linux",
+        distro: str = "debian",
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = {
+            "HOME": str(home),
+            "PATH": SYSTEM_PATH,
+            "LANG": "C",
+            "LC_ALL": "C",
+            "SHELL": str(BASH),
+            "TMPDIR": str(home),
+            "CARGO_HOME": str(home / "cargo"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "OSTADIX_ENV_FILE": str(home / "config" / "env.sh"),
+            "OSTADIX_GUESTS_DIR": str(home / "guests"),
+            "OSTADIX_SHELL_RC": str(home / "shellrc"),
+            "OSTADIX_SETUP_PLATFORM": platform,
+            "OSTADIX_SETUP_DISTRO": distro,
+            "OSTADIX_SETUP_TEST_OVERRIDES": "1",
+        }
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [str(BASH), str(SETUP), *arguments],
+            cwd=PROJECT_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+
+    @staticmethod
+    def combined_output(result: subprocess.CompletedProcess[str]) -> str:
+        return result.stdout + result.stderr
+
+    @staticmethod
+    def dry_run_packages(output: str, command: str) -> list[str]:
+        line = next(
+            candidate
+            for candidate in output.splitlines()
+            if candidate.startswith("[DRY]") and command in candidate
+        )
+        words = shlex.split(line)
+        marker = words.index("--no-install-recommends")
+        return words[marker + 1 :]
+
+    def test_unknown_option_exits_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup("--not-a-real-option", home=Path(temp_dir))
+
+        self.assertEqual(result.returncode, 2, self.combined_output(result))
+        self.assertIn("Unknown option: --not-a-real-option", result.stderr)
+
+    def test_platform_override_is_rejected_without_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup("--deps-only", home=Path(temp_dir))
+
+        self.assertEqual(result.returncode, 2, self.combined_output(result))
+        self.assertIn("test-only and require --dry-run", result.stderr)
+
+    def test_unmanaged_env_target_fails_before_package_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            env_file = home / "unmanaged.sh"
+            env_file.write_text("export USER_DATA=keep\n", encoding="utf-8")
+            result = self.run_setup(
+                "--dry-run",
+                "--deps-only",
+                "--env-file",
+                str(env_file),
+                home=home,
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("refusing to overwrite unmanaged environment file", output)
+        self.assertNotIn("apt-get", output)
+
+    def test_minimal_and_full_conflict_exits_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup("--minimal", "--full", home=Path(temp_dir))
+
+        self.assertEqual(result.returncode, 2, self.combined_output(result))
+        self.assertIn("--minimal and --full are mutually exclusive", result.stdout)
+
+    def test_full_macos_plan_has_ocore_and_nix_but_not_guest_lab(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--full",
+                "--yes",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+                platform="macos",
+                distro="unknown",
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        brew_line = next(
+            line
+            for line in output.splitlines()
+            if line.startswith("[DRY]") and "brew install --quiet" in line
+        )
+        brew_words = shlex.split(brew_line)
+        quiet_index = brew_words.index("--quiet")
+        self.assertEqual(
+            brew_words[quiet_index + 1 :],
+            [
+                "gcc",
+                "make",
+                "python@3.12",
+                "curl",
+                "git",
+                "pkg-config",
+                "openssl",
+                "sqlite",
+                "racket",
+                "llvm",
+                "lld",
+                "binutils",
+                "qemu",
+                "cmake",
+            ],
+        )
+        self.assertIn("nix=true", output)
+        self.assertIn("ocore=true", output)
+        self.assertIn("guest_tools=false", output)
+        self.assertIn("ubuntu_vm=false", output)
+        self.assertNotIn("Guest lab directory:", output)
+        self.assertNotIn("multipass", output.lower())
+
+    def test_debian_composed_native_kernel_guest_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-ocore",
+                "--with-linux-kernel-tools",
+                "--with-guest-tools",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(
+            self.dry_run_packages(output, "apt-get install"),
+            [
+                "build-essential",
+                "gcc",
+                "g++",
+                "make",
+                "python3",
+                "python3-pip",
+                "python3-venv",
+                "curl",
+                "git",
+                "pkg-config",
+                "libssl-dev",
+                "sqlite3",
+                "ca-certificates",
+                "perl",
+                "file",
+                "clang",
+                "lld",
+                "llvm",
+                "binutils",
+                "qemu-system-x86",
+                "qemu-system-arm",
+                "cmake",
+                "qemu-utils",
+                "gzip",
+                "xz-utils",
+                "zstd",
+                "openssl",
+                "bc",
+                "bison",
+                "flex",
+                "libelf-dev",
+                "dwarves",
+                "cpio",
+                "rsync",
+                "kmod",
+                "libncurses-dev",
+            ],
+        )
+        self.assertIn("ocore=true", output)
+        self.assertIn("linux_kernel_tools=true", output)
+        self.assertIn("guest_tools=true", output)
+        self.assertNotIn("multipass", output.lower())
+
+    def test_dry_run_does_not_create_env_hook_or_guest_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            env_file = home / "nested" / "ostadix-env.sh"
+            shell_rc = home / "custom-shell.rc"
+            guests_dir = home / "guest-media"
+            result = self.run_setup(
+                "--with-guest-tools",
+                "--persist-env",
+                "--dry-run",
+                "--deps-only",
+                "--env-file",
+                str(env_file),
+                home=home,
+                extra_env={
+                    "OSTADIX_SHELL_RC": str(shell_rc),
+                    "OSTADIX_GUESTS_DIR": str(guests_dir),
+                },
+            )
+            output = self.combined_output(result)
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(f"[DRY] write managed environment file: {env_file}", output)
+            self.assertIn(f"[DRY] append managed environment hook to {shell_rc}", output)
+            self.assertIn(f"[DRY] mkdir -p {guests_dir}", output)
+            self.assertFalse(env_file.exists())
+            self.assertFalse(shell_rc.exists())
+            self.assertFalse(guests_dir.exists())
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_guest_plan_states_explicit_nonclaim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-guest-tools",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn(
+            "Supply checksum-pinned Linux/9front/OpenBSD media explicitly.",
+            output,
+        )
+        self.assertIn(
+            "No foreign OS image is downloaded or booted by setup.sh.",
+            output,
+        )
+        self.assertIn(
+            "They do not establish Linux, Plan 9, or OpenBSD support in O-core.",
+            output,
+        )
+
+    def test_help_lists_profile_and_safety_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup("--help", home=Path(temp_dir))
+
+        self.assertEqual(result.returncode, 0, self.combined_output(result))
+        for option in (
+            "--minimal",
+            "--full",
+            "--with-nix",
+            "--no-nix",
+            "--with-ocore",
+            "--with-hosted-runtimes",
+            "--with-linux-kernel-tools",
+            "--with-guest-tools",
+            "--with-ubuntu-vm",
+            "--verify-ocore",
+            "--check",
+            "--deps-only",
+            "--env-file PATH",
+            "--no-env",
+            "--persist-env",
+            "--dry-run",
+        ):
+            with self.subTest(option=option):
+                self.assertIn(option, result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
