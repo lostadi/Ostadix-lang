@@ -1,0 +1,8 @@
+module kernel::world_project_receipt_semantics;
+
+// Historical probe modes link a fail-closed substitute. Only Mode 32 links
+// the streaming project-receipt canonical/semantic-structure oracle.
+pub unsafe fn start(mode: u64) -> never {
+    disable_interrupts();
+    loop { halt(); }
+}

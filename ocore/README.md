@@ -76,6 +76,7 @@ outside the normal Rust, `PATH`, or Homebrew locations.
 ./ocore/kernel/smoke-world-protocol-qemu.sh # mode-28 exact Rust/.oc OWPROTO v1 codec corpus
 ./ocore/kernel/smoke-world-value-qemu.sh # mode-29 exact Rust/.oc OWVALUE v1 byte/hash corpus
 ./ocore/kernel/smoke-world-receipt-qemu.sh # mode-30 exact Rust/.oc OWRECEIPT v1 receipt/preimage corpus
+./ocore/kernel/smoke-world-project-runtime-qemu.sh # mode-32 hosted receipt generation plus native semantic comparison
 ./ocore/kernel/smoke-kernel-world-qemu.sh # mode-20 native admission/nonexecuting VM objects
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh # mode-21 AMD SVM/NPT execution; requires nested SVM + /dev/kvm
 ./ocore/kernel/smoke-aarch64-g2-qemu.sh # World G2 native AArch64 EL0/IPC/capability/lifecycle gate under forced TCG
@@ -347,16 +348,34 @@ fixed two-record corpus is 3,239 bytes (6,478 lowercase hex digits) with SHA-256
 current and stale signing preimages are 1,575 and 1,546 bytes respectively.
 Hosted Rust verifies Ed25519 using a pinned public conformance key; native O-core
 validates the receipt and envelope structure but is not a general freestanding
-Ed25519 verifier. Modes 27 through 30 are byte-level schema oracles, not a
-transport, authenticated authority path, Governor, consensus system, or World Alpha
-qualification. Mode 29 uses a 4096-byte maximum, depth-16 and 128-node limits,
+Ed25519 verifier. Mode 32 consumes one live hosted-reference project receipt,
+fully decodes and canonically reencodes it, constructs its validated signing
+preimage, requires an `Uncommitted` fence, and compares the domain-separated
+SHA-256 of its canonical unsigned body with hosted Rust. It then reuses the
+successful validation scratch with a malformed envelope and proves the prior
+terminal/commit tags were cleared. The required no-argument gate is
+`smoke-world-project-runtime-qemu.sh`; it generates a hosted vector and calls
+the direct two-argument `smoke-world-project-receipt-qemu.sh` vector interface
+with `RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256`. Modes 27 through 30 and 32
+are byte-level schema/semantic oracles, not a transport,
+authenticated authority path, Governor, consensus system, or World Alpha
+qualification.
+Mode 29 uses a 4096-byte maximum, depth-16 and 128-node limits,
 canonical records and scalar-key maps, and root-only inert extensions. It
 rejects hosted authority, capsules, live references, requests, and other
 effectful forms; it does not make the full hosted `OValue` portable, change the
-hosted canonical-CBOR shim, or provide a live crossing. Mode 30 is also an
-offline corpus: current HGraph, project, live-system, KernelWorld, O-Git, and
-evidence paths do not emit or consume Mode 30 receipts, and its signature does
-not grant authority or establish current World state. The kernel remains
+hosted canonical-CBOR shim, or provide a live crossing. Mode 30 remains a fixed
+offline corpus; the separate hosted project adapter now emits a caller-signed
+OWRECEIPT bound to a terminal RuntimeGraph, but always with an explicit
+`Uncommitted` fence. That receipt places a caller-supplied coordinator observer,
+uses a dedicated coordinator attempt distinct from every operation attempt, and
+leaves its package subject absent; the proposed provider and implementation
+remain descriptive launch/RuntimeGraph fields rather than receipt placement or
+a fabricated package. The RuntimeGraph is causally replayed, uses neutral
+`RouteSettlement`, and aggregates residual `HostWorld` over observed execution.
+Mode 32 does not execute that project in O-core or verify Ed25519 natively, and
+neither signature nor semantic equality grants authority or establishes
+Governor admission/current World state. The kernel remains
 single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
 discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
 dynamic linker, writable general filesystem, general foreign ABI personality,

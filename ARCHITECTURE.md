@@ -179,8 +179,61 @@ conformance key drives real
 hosted Ed25519 sign/verify and tamper tests. Native `.oc` converges on receipt and
 signing-preimage bytes and rejects malformed signature envelopes, but does not
 claim a general freestanding Ed25519 verifier or trusted signer policy. The
-offline corpus is not yet emitted by the HGraph, project, live-system,
-KernelWorld, O-Git, or World evidence paths.
+Mode 30 corpus remains an offline conformance fixture. A separate bounded
+World-project hosted-reference path now emits a caller-signed canonical
+`OWRECEIPT` after terminal project coordination, always with
+`ReceiptCommitFenceV1::Uncommitted`.
+
+That path enters `ProjectCoordinator::new_world_bound` only after re-deriving
+the exact logical graph, snapshot-derived deployment, and placement snapshot and
+fencing the caller-supplied current World/Governor; dedicated coordinator
+observer node/domain/optional-process; dedicated coordinator attempt; selected
+provider node/domain/optional-process/service and implementation; and every
+operation task attempt. The coordinator attempt uses a task identity distinct
+from every operation attempt and becomes the trace execution-attempt identity.
+These checks occur before schedule derivation, workspace creation, or
+child-process launch.
+
+`RuntimeGraphV1` is constructed only after plan-aware causal replay of the trace
+against the trusted `ProjectHGraph` and exact deployment. It binds the launch,
+observer, coordinator attempt, proposed provider, per-operation attempts, and
+normalized lifecycle/outcome observations. Its neutral
+`RuntimeGraphTerminalV1::RouteSettlement` covers successful, nonzero, and
+guard-skipped route results; it does not relabel every coordinator-returned
+value as success. Terminal residual `HostWorld` is the aggregate over all
+operations that were actually observed as started or terminal, not merely the
+selected operation. Never-started operations remain present with empty
+observations and do not contribute to that aggregate.
+
+The OWRECEIPT context uses the caller-supplied coordinator observer as its
+placement and the distinct coordinator attempt as its attempt. The selected
+provider remains a descriptive proposal in the launch/RuntimeGraph; it is not
+substituted as receipt placement. The receipt subject binds the project bundle
+and logical graph with no package digest, so the provider implementation is not
+overloaded into the package field. Route success maps to a receipt success;
+nonzero and guard-skipped route settlements map to receipt failures. This is
+provenance/freshness evidence from a non-authorizing hosted reference profile,
+not Governor admission, provider reservation, capability or lease authority,
+remote dispatch, recovery, or exactly-once execution.
+
+Native Mode 32 accepts the emitted receipt as a bounded lowercase-hex record,
+performs full canonical decode, exact re-encoding, validated signing-preimage
+construction, requires the uncommitted fence, and compares the
+domain-separated SHA-256 of the complete unsigned canonical body. Its
+successful-record probe then reuses the validation scratch with a malformed
+envelope and proves that prior terminal/commit tags were cleared. The required
+no-argument gate generates the hosted vector and invokes the direct two-argument
+vector interface:
+
+```bash
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
+./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+```
+
+Mode 32 does not execute the project or verify Ed25519 natively. QEMU TCG is
+not physical hardware, and Mode 32 passes neither G1 nor Workstream A
+acceptance.
+
 The hosted PR6 `ResourceKey` vocabulary now distinguishes World, Governor,
 node, domain, process, generic resource, object, descriptive capability,
 namespace, task-attempt, artifact-publication, device, and accelerator state.
@@ -287,9 +340,23 @@ caller-supplied exact `PlacementSnapshotV1` and one caller-supplied exact
 `TaskIdentity` per logical operation. That result is a descriptive proposal,
 not current inventory, Governor admission, authority, dispatch, reservation,
 or execution. `require_current_world` checks only the referenced World identity
-and epoch. The current executor does not consume snapshot-derived plans.
-`RuntimeGraph`, `RecoveryPlan`, live `OWRECEIPT`, native parity, and G1 remain
-outside this slice; G1 remains defined and unpassed.
+and epoch. The ordinary opt-in executor still uses the hosted-unbound plan. The
+separate World-bound entry point consumes the exact snapshot-derived plan and a
+`HostedWorldLaunchV1`/`HostedWorldCurrentV1` pair before any workspace or child
+exists. The launch carries a caller-supplied coordinator observer and a
+coordinator attempt distinct from every operation attempt. It produces a
+causally replayed terminal `RuntimeGraphV1` observation with neutral route
+settlement and aggregate observed residual `HostWorld`, followed by a
+caller-signed, explicitly uncommitted receipt. Receipt placement names the
+observer, not the proposed provider, and the receipt does not misuse its package
+field for a provider implementation. Mode 32 compares that receipt's complete
+unsigned canonical semantics with native `.oc` decoding.
+
+This bounded addition does not implement a `RecoveryPlan`, authenticated
+membership, Governor admission or commit, capability/lease issuance,
+reservation, remote dispatch, recovery, exactly-once effects, native project
+execution, native Ed25519 verification, physical-hardware evidence, G1, or
+Workstream A acceptance. G1 remains defined and unpassed.
 
 ProjectExec-A adds an opt-in `ProjectCoordinator` path for one resolved
 `Explicit` or `Default` alternative. ProjectExec-B extends that path to serial
@@ -310,20 +377,21 @@ evidence. The default `unproven` route contract yields `unproven_effects`
 evidence and denies continuation; a failed prerequisite or infrastructure abort
 hard-stops. The unsigned trace v5 records this decision and binds both the
 canonical `LogicalHGraphV1` schema/digest and the exact canonical
-hosted-unbound `DeploymentPlanV1` schema/digest. Plan-aware replay reconstructs
-the hosted-unbound deployment artifact and rejects substitution of that
-artifact. It does not bind or execute a snapshot-derived provider proposal,
-and the trace is not an `OWRECEIPT` or attestation. The
+deployment schema/digest. Ordinary plan-aware replay reconstructs the
+hosted-unbound deployment artifact; World-bound replay compares the explicitly
+supplied snapshot-derived artifact. Both reject substitution. The trace itself
+is not an `OWRECEIPT` or attestation. The
 compatibility project runtime remains the default when the opt-in is absent.
 
 Materialization and command operations stay fallible and conservatively
 read/write `HostWorld`, regardless of untrusted manifest `pure=true` metadata.
 The logical alternative branches therefore share conservative ambient/resource
-state chains and may be serialized; the bounded executor is not a claim of
-parallel races or cancellation, retry, independently mediated host worlds,
-snapshot-plan execution, runtime or recovery graph layers, actual placement,
-Governor authority, receipts, remote execution, exactly-once effects, G1, or
-qualifying native evidence.
+state chains and may be serialized. The ordinary executor remains distinct from
+the explicit World-bound hosted-reference adapter. Neither path proves parallel
+races or cancellation, retry, independently mediated host worlds, actual remote
+placement, Governor authority or commit, capability/lease enforcement,
+reservation, recovery, exactly-once effects, native project execution, native
+Ed25519 verification, physical hardware, G1, or Workstream A acceptance.
 The native product boundary and G0--G13
 dependency ladder are fixed in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md) and mechanically classified by

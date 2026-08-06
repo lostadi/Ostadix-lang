@@ -193,6 +193,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/build-aarch64-g2.sh",
         "ocore/kernel/build.sh",
         "ocore/kernel/main.oc",
+        "ocore/kernel/smoke-world-project-receipt-qemu.sh",
+        "ocore/kernel/smoke-world-project-runtime-qemu.sh",
         "ocore/kernel/smoke-world-receipt-qemu.sh",
         "ocore/kernel/smoke-world-value-qemu.sh",
         "ocore/kernel/smoke-world-protocol-qemu.sh",
@@ -204,6 +206,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_protocol_semantics_stub.oc",
         "ocore/kernel/world_identity_semantics.oc",
         "ocore/kernel/world_identity_semantics_stub.oc",
+        "ocore/kernel/world_project_receipt_semantics.oc",
+        "ocore/kernel/world_project_receipt_semantics_stub.oc",
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/runtime/x86_64/trap.oc",
@@ -243,10 +247,13 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/project/model.rs",
         "src/project/executor.rs",
         "src/project/deployment.rs",
+        "src/project/launch.rs",
         "src/project/logical.rs",
         "src/project/plan.rs",
         "src/project/runtime.rs",
+        "src/project/runtime_graph.rs",
         "src/project/trace.rs",
+        "src/project/world_execution.rs",
         "src/world/grounding.rs",
         "src/world/identity.rs",
         "src/world/identity_wire.rs",
@@ -275,6 +282,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/project_hgraph_exec.rs",
         "tests/project_deployment_plan.rs",
         "tests/project_logical_hgraph.rs",
+        "tests/project_world_runtime.rs",
         "tests/world_resource_keys.rs",
         "tests/world_identity.rs",
         "tests/world_identity_wire.rs",
@@ -295,7 +303,7 @@ EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset(
     {"portable_tcg", "qemu_tcg_aarch64", "hardware_kvm"}
 )
-EXPECTED_REQUIRED_EVIDENCE_GATES = 23
+EXPECTED_REQUIRED_EVIDENCE_GATES = 24
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 EVIDENCE_COMMON_REQUIRED_TOOLS = frozenset(
     {"bash", "cargo", "rustc", "clang", "lld", "python3"}

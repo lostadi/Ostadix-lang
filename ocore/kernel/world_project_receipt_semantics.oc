@@ -1,0 +1,356 @@
+module kernel::world_project_receipt_semantics;
+
+use runtime::interrupts::ticks;
+use runtime::serial::try_read_byte;
+use runtime::serial::write;
+use world::identity::IdentityRecord;
+use world::sha256::Sha256Scratch;
+use world::sha256::scratch_init as sha_scratch_init;
+use world::sha256::compute as sha256_compute;
+use world::value::ValueArena;
+use world::value::arena_init;
+use world::value_codec::ValueCodecScratch;
+use world::value_codec::scratch_init as value_scratch_init;
+use world::receipt::SignedReceipt;
+use world::receipt::ReceiptValidationScratch;
+use world::receipt::RECEIPT_COMMIT_UNCOMMITTED;
+use world::receipt::WORLD_RECEIPT_SIGNING_PREFIX_BYTES;
+use world::receipt::unsigned_bytes;
+use world::receipt::unsigned_length;
+use world::receipt::validated_terminal_and_commit;
+use world::receipt::validation_scratch_init;
+use world::receipt_codec::ReceiptCodecScratch;
+use world::receipt_codec::scratch_init as receipt_scratch_init;
+use world::receipt_codec::decode_record as decode_receipt;
+use world::receipt_codec::reencode_envelope;
+use world::receipt_codec::build_validated_signing_preimage;
+
+const MODE_WORLD_PROJECT_RECEIPT: u64 = 32;
+// This streaming gate deliberately retains the Mode 30 4 KiB conformance
+// ceiling. It fully validates every admitted record inside that bound; it is
+// not a claim that the probe accepts the protocol's larger absolute maximum.
+const BUFFER_CAPACITY: usize = 4096;
+const SEMANTIC_DOMAIN_LENGTH: usize = 37;
+// Domain bytes followed by the canonical unsigned-body length as u32 big
+// endian, then the body itself. Rust uses the same signer-independent formula.
+const SEMANTIC_PREFIX_LENGTH: usize = 41;
+
+static SEMANTIC_DOMAIN: [u8; 37] =
+    b"OSTADIX/PROJECT-RECEIPT-SEMANTICS/V1\0";
+static READY_MESSAGE: [u8; 42] =
+    b"World project receipt native probe: ready\n";
+static HEX_MESSAGE: [u8; 52] =
+    b"World project receipt canonical lowercase hex: PASS\n";
+static DECODE_MESSAGE: [u8; 47] =
+    b"World project receipt full native decode: PASS\n";
+static REENCODE_MESSAGE: [u8; 53] =
+    b"World project receipt exact canonical reencode: PASS\n";
+static PREIMAGE_MESSAGE: [u8; 55] =
+    b"World project receipt validated signing preimage: PASS\n";
+static UNCOMMITTED_MESSAGE: [u8; 46] =
+    b"World project receipt uncommitted fence: PASS\n";
+static SEMANTIC_PREFIX: [u8; 38] =
+    b"WORLD_PROJECT_RECEIPT_SEMANTIC_SHA256=";
+static SEMANTIC_MESSAGE: [u8; 55] =
+    b"World project receipt semantic structure SHA-256: PASS\n";
+static COMPARISON_MESSAGE: [u8; 65] =
+    b"World project receipt native canonical/semantic comparison: PASS\n";
+static STALE_TAG_MESSAGE: [u8; 44] =
+    b"World project receipt stale tag reset: PASS\n";
+static BOUNDARY_MESSAGE: [u8; 102] =
+    b"World project receipt boundary: canonical structure only; no native execution or Ed25519 verification\n";
+static COMPLETE_MESSAGE: [u8; 41] =
+    b"World project receipt native probe: PASS\n";
+static REJECT_MESSAGE: [u8; 43] =
+    b"World project receipt native probe: REJECT\n";
+static POST_TICK_MESSAGE: [u8; 46] =
+    b"World project receipt post-test timer: online\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+static mut RECEIPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut WORLD_ID_STORAGE: [u64; 512] = [0; 512];
+static mut GOVERNOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut ATTEMPT_ID_STORAGE: [u64; 512] = [0; 512];
+static mut NODE_ID_STORAGE: [u64; 512] = [0; 512];
+static mut DOMAIN_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PROCESS_ID_STORAGE: [u64; 512] = [0; 512];
+static mut PRIOR_ID_STORAGE: [u64; 512] = [0; 512];
+static mut CURRENT_ID_STORAGE: [u64; 512] = [0; 512];
+
+static mut VALUE_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_BYTES: [u8; 4096] = [0; 4096];
+static mut VALUE_NODES: [u64; 1536] = [0; 1536];
+static mut VALUE_EDGES: [u64; 128] = [0; 128];
+static mut TEMP_ARENA_STORAGE: [u64; 16] = [0; 16];
+static mut TEMP_BYTES: [u8; 4096] = [0; 4096];
+static mut TEMP_NODES: [u64; 1536] = [0; 1536];
+static mut TEMP_EDGES: [u64; 512] = [0; 512];
+static mut VALUE_SCRATCH_STORAGE: [u64; 16] = [0; 16];
+static mut VALUE_STAGED: [u8; 4096] = [0; 4096];
+static mut VALUE_LENGTHS: [u64; 128] = [0; 128];
+static mut VALUE_FRAMES: [u64; 256] = [0; 256];
+static mut VALUE_PENDING: [u64; 512] = [0; 512];
+static mut VALUE_DIGEST: [u8; 32] = [0; 32];
+static mut VALUE_REENCODED: [u8; 4096] = [0; 4096];
+
+static mut SIGNED_STORAGE: [u64; 8] = [0; 8];
+static mut RECEIPT_SCRATCH_STORAGE: [u64; 8] = [0; 8];
+static mut VALIDATION_STORAGE: [u64; 16] = [0; 16];
+static mut RECEIPT_STAGED: [u8; 4096] = [0; 4096];
+static mut RECEIPT_COMMITTED: [u8; 4096] = [0; 4096];
+static mut RECEIPT_PREIMAGE: [u8; 4096] = [0; 4096];
+static mut IDENTITY_STAGED: [u8; 1024] = [0; 1024];
+static mut RECORD: [u8; 4096] = [0; 4096];
+static mut REENCODED: [u8; 4096] = [0; 4096];
+static mut SEMANTIC_INPUT: [u8; 4096] = [0; 4096];
+
+static mut SHA_STORAGE: [u64; 4] = [0; 4];
+static mut SHA_SCHEDULE: [u64; 64] = [0; 64];
+static mut SEMANTIC_DIGEST: [u8; 32] = [0; 32];
+static mut HEX_PAIR: [u8; 2] = [0; 2];
+
+unsafe fn receipt_identity() -> *mut IdentityRecord {
+    return ((&mut RECEIPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn world_identity() -> *mut IdentityRecord {
+    return ((&mut WORLD_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn governor_identity() -> *mut IdentityRecord {
+    return ((&mut GOVERNOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn attempt_identity() -> *mut IdentityRecord {
+    return ((&mut ATTEMPT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn node_identity() -> *mut IdentityRecord {
+    return ((&mut NODE_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn domain_identity() -> *mut IdentityRecord {
+    return ((&mut DOMAIN_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn process_identity() -> *mut IdentityRecord {
+    return ((&mut PROCESS_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn prior_identity() -> *mut IdentityRecord {
+    return ((&mut PRIOR_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn current_identity() -> *mut IdentityRecord {
+    return ((&mut CURRENT_ID_STORAGE[0]) as *mut u64) as *mut IdentityRecord;
+}
+unsafe fn value_arena() -> *mut ValueArena {
+    return ((&mut VALUE_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn temp_arena() -> *mut ValueArena {
+    return ((&mut TEMP_ARENA_STORAGE[0]) as *mut u64) as *mut ValueArena;
+}
+unsafe fn value_scratch() -> *mut ValueCodecScratch {
+    return ((&mut VALUE_SCRATCH_STORAGE[0]) as *mut u64) as *mut ValueCodecScratch;
+}
+unsafe fn signed_receipt() -> *mut SignedReceipt {
+    return ((&mut SIGNED_STORAGE[0]) as *mut u64) as *mut SignedReceipt;
+}
+unsafe fn receipt_scratch() -> *mut ReceiptCodecScratch {
+    return ((&mut RECEIPT_SCRATCH_STORAGE[0]) as *mut u64) as *mut ReceiptCodecScratch;
+}
+unsafe fn validation_scratch() -> *mut ReceiptValidationScratch {
+    return ((&mut VALIDATION_STORAGE[0]) as *mut u64) as *mut ReceiptValidationScratch;
+}
+unsafe fn sha_scratch() -> *mut Sha256Scratch {
+    return ((&mut SHA_STORAGE[0]) as *mut u64) as *mut Sha256Scratch;
+}
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn reject() -> never {
+    write((&REJECT_MESSAGE[0]), 43);
+    fail_closed();
+}
+
+unsafe fn initialize_storage() -> bool {
+    if arena_init(value_arena(), (&mut VALUE_BYTES[0]), 4096,
+        (&mut VALUE_NODES[0]), 1536, (&mut VALUE_EDGES[0]), 128) != 1
+        || arena_init(temp_arena(), (&mut TEMP_BYTES[0]), 4096,
+            (&mut TEMP_NODES[0]), 1536, (&mut TEMP_EDGES[0]), 512) != 1
+        || sha_scratch_init(sha_scratch(), (&mut SHA_SCHEDULE[0]), 64) != 1 {
+        return false;
+    }
+    if value_scratch_init(value_scratch(), (&mut VALUE_STAGED[0]), 4096,
+        (&mut VALUE_LENGTHS[0]), 128, (&mut VALUE_FRAMES[0]), 256,
+        (&mut VALUE_PENDING[0]), 512, temp_arena(), sha_scratch(),
+        (&mut VALUE_DIGEST[0]), 32) != 1
+        || receipt_scratch_init(receipt_scratch(), (&mut RECEIPT_STAGED[0]),
+            BUFFER_CAPACITY, (&mut RECEIPT_COMMITTED[0]), BUFFER_CAPACITY,
+            (&mut RECEIPT_PREIMAGE[0]), BUFFER_CAPACITY) != 1 {
+        return false;
+    }
+    return validation_scratch_init(validation_scratch(), receipt_identity(),
+        world_identity(), governor_identity(), attempt_identity(), node_identity(),
+        domain_identity(), process_identity(), prior_identity(), current_identity(),
+        (&mut IDENTITY_STAGED[0]), 1024, value_arena(), value_scratch(),
+        (&mut VALUE_REENCODED[0]), 4096) == 1;
+}
+
+unsafe fn hex_nibble(value: u8) -> u64 {
+    if value >= b'0' && value <= b'9' { return (value - b'0') as u64; }
+    if value >= b'a' && value <= b'f' {
+        return (value - b'a' + 10) as u64;
+    }
+    return 16;
+}
+
+unsafe fn read_canonical_hex_line() -> usize {
+    let mut length: usize = 0;
+    let mut high: u64 = 16;
+    loop {
+        let mut byte: u8 = 0;
+        while try_read_byte((&mut byte)) == 0 {
+            asm!("pause", options(nomem, nostack));
+        }
+        if byte == b'\n' {
+            if high != 16 { return 0; }
+            return length;
+        }
+        let nibble: u64 = hex_nibble(byte);
+        if nibble > 15 { return 0; }
+        if high == 16 {
+            high = nibble;
+        } else {
+            if length >= BUFFER_CAPACITY { return 0; }
+            volatile_store((&mut RECORD[length]), ((high << 4) | nibble) as u8);
+            length += 1;
+            high = 16;
+        }
+    }
+}
+
+unsafe fn bytes_equal(left: *const u8, right: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if volatile_load(left + index) != volatile_load(right + index) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn semantic_digest(receipt: *const SignedReceipt) -> bool {
+    let body: *const u8 = unsigned_bytes(receipt);
+    let body_length: usize = unsigned_length(receipt);
+    if body as usize == 0 || body_length > BUFFER_CAPACITY - SEMANTIC_PREFIX_LENGTH {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index < SEMANTIC_DOMAIN_LENGTH {
+        volatile_store((&mut SEMANTIC_INPUT[index]), SEMANTIC_DOMAIN[index]);
+        index += 1;
+    }
+    volatile_store((&mut SEMANTIC_INPUT[37]), (body_length >> 24) as u8);
+    volatile_store((&mut SEMANTIC_INPUT[38]), (body_length >> 16) as u8);
+    volatile_store((&mut SEMANTIC_INPUT[39]), (body_length >> 8) as u8);
+    volatile_store((&mut SEMANTIC_INPUT[40]), body_length as u8);
+    index = 0;
+    while index < body_length {
+        volatile_store((&mut SEMANTIC_INPUT[SEMANTIC_PREFIX_LENGTH + index]),
+            volatile_load(body + index));
+        index += 1;
+    }
+    return sha256_compute((&SEMANTIC_INPUT[0]),
+        SEMANTIC_PREFIX_LENGTH + body_length,
+        (&mut SEMANTIC_DIGEST[0]), sha_scratch()) == 1;
+}
+
+fn hex_digit(value: u8) -> u8 {
+    if value < 10 { return b'0' + value; }
+    return b'a' + (value - 10);
+}
+
+unsafe fn emit_semantic_digest() -> void {
+    write((&SEMANTIC_PREFIX[0]), 38);
+    let mut index: usize = 0;
+    while index < 32 {
+        let value: u8 = volatile_load((&SEMANTIC_DIGEST[index]));
+        HEX_PAIR[0] = hex_digit(value >> 4);
+        HEX_PAIR[1] = hex_digit(value & 15);
+        write((&HEX_PAIR[0]), 2);
+        index += 1;
+    }
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn start(mode: u64) -> never {
+    if mode != MODE_WORLD_PROJECT_RECEIPT || !initialize_storage() {
+        fail_closed();
+    }
+    disable_interrupts();
+    write((&READY_MESSAGE[0]), 42);
+    let record_length: usize = read_canonical_hex_line();
+    if record_length == 0 { reject(); }
+    write((&HEX_MESSAGE[0]), 52);
+
+    if decode_receipt((&RECORD[0]), record_length, signed_receipt(),
+        receipt_scratch(), validation_scratch()) != 1 {
+        reject();
+    }
+    write((&DECODE_MESSAGE[0]), 47);
+
+    let mut reencoded_length: usize = 0;
+    if reencode_envelope(signed_receipt() as *const SignedReceipt,
+        (&mut REENCODED[0]), BUFFER_CAPACITY, (&mut reencoded_length)) != 1
+        || reencoded_length != record_length
+        || !bytes_equal((&RECORD[0]), (&REENCODED[0]), record_length) {
+        reject();
+    }
+    write((&REENCODE_MESSAGE[0]), 53);
+
+    let mut preimage_length: usize = 0;
+    if build_validated_signing_preimage(signed_receipt() as *const SignedReceipt,
+        validation_scratch(), (&mut RECEIPT_PREIMAGE[0]), BUFFER_CAPACITY,
+        (&mut preimage_length)) != 1
+        || preimage_length != WORLD_RECEIPT_SIGNING_PREFIX_BYTES
+            + unsigned_length(signed_receipt() as *const SignedReceipt) {
+        reject();
+    }
+    write((&PREIMAGE_MESSAGE[0]), 55);
+
+    let mut terminal: u64 = 0;
+    let mut commit: u64 = 0;
+    if validated_terminal_and_commit(
+        validation_scratch() as *const ReceiptValidationScratch,
+        (&mut terminal), (&mut commit)) != 1
+        || terminal == 0 || commit != RECEIPT_COMMIT_UNCOMMITTED {
+        reject();
+    }
+    write((&UNCOMMITTED_MESSAGE[0]), 46);
+
+    if !semantic_digest(signed_receipt() as *const SignedReceipt) { reject(); }
+    emit_semantic_digest();
+    write((&SEMANTIC_MESSAGE[0]), 55);
+    write((&COMPARISON_MESSAGE[0]), 65);
+
+    // Reuse the exact successful validation scratch against a malformed
+    // envelope. Early header rejection must clear the prior success-only tags.
+    let prior_header: u8 = volatile_load((&RECORD[9]));
+    volatile_store((&mut RECORD[9]), 2);
+    terminal = 0;
+    commit = 0;
+    if decode_receipt((&RECORD[0]), record_length, signed_receipt(),
+        receipt_scratch(), validation_scratch()) != 0
+        || validated_terminal_and_commit(
+            validation_scratch() as *const ReceiptValidationScratch,
+            (&mut terminal), (&mut commit)) != 0 {
+        reject();
+    }
+    volatile_store((&mut RECORD[9]), prior_header);
+    write((&STALE_TAG_MESSAGE[0]), 44);
+    write((&BOUNDARY_MESSAGE[0]), 102);
+    write((&COMPLETE_MESSAGE[0]), 41);
+
+    let tick_before: u64 = ticks();
+    enable_interrupts();
+    while ticks() == tick_before { halt(); }
+    write((&POST_TICK_MESSAGE[0]), 46);
+    loop { halt(); }
+}
