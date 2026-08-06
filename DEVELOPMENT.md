@@ -107,6 +107,7 @@ cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh
 cargo test --test world_receipt
 ./ocore/kernel/smoke-world-receipt-qemu.sh
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
 ./ocore/kernel/smoke-m7b-logical-read-qemu.sh
 ./scripts/smoke-world-resource-keys.sh
 ./scripts/smoke-project-hgraph.sh
@@ -205,10 +206,59 @@ The snapshot constructor requires an exact caller-supplied
 a deterministic single-provider `ProposedProvider` or `Unresolved` record.
 Snapshot/provider facts are descriptive and do not prove current inventory,
 Governor admission, authority, dispatch, reservation, health, or execution.
-`require_current_world` checks only World identity/epoch. The current executor
-does not consume snapshot-derived plans; it binds only the canonical
-hosted-unbound plan into unsigned trace v5. There is no `RuntimeGraph`,
-`RecoveryPlan`, live `OWRECEIPT`, native parity, or G1 evidence, and G1 remains
+`require_current_world` checks only World identity/epoch. The ordinary opt-in
+executor binds the canonical hosted-unbound plan into unsigned trace v5. The
+separate hosted-reference World path instead consumes the exact
+snapshot-derived plan through `ProjectCoordinator::new_world_bound`.
+
+`src/project/launch.rs` defines the non-authorizing `HostedWorldLaunchV1` and
+caller-supplied `HostedWorldCurrentV1` boundary. It re-derives the logical,
+deployment, snapshot, provider, and operation task bindings and fences the exact
+World/Governor; caller-supplied coordinator observer
+node/domain/optional-process; dedicated coordinator attempt; provider
+node/domain/optional-process/service generations and implementation digest; and
+every operation task attempt before schedule derivation, workspace
+materialization, or child launch. The coordinator attempt must use a task
+identity distinct from all per-operation attempts and is the World-bound trace
+execution-attempt identity. These identity comparisons do not authenticate
+membership, prove the host process owns the observer identity, grant a
+capability or lease, reserve a provider, or record Governor admission.
+
+`src/project/runtime_graph.rs` builds terminal `RuntimeGraphV1` from the exact
+launch artifacts only after plan-aware causal replay of the normalized
+`ProjectAttemptTrace` against the trusted HGraph and exact deployment. It
+retains empty observations for never-started operations and records lifecycle
+ordinals, settlement/output hashes, and per-operation residual `HostWorld`.
+The neutral `RouteSettlement` terminal covers success, nonzero settlement, and
+guard skip; aggregate terminal residual `HostWorld` is true when any actually
+observed started/terminal operation retains it. The
+`src/project/world_execution.rs` adapter emits one canonical OWRECEIPT using the
+caller's Ed25519 signer and always sets
+`ReceiptCommitFenceV1::Uncommitted`. Receipt placement is the coordinator
+observer and the receipt context uses the dedicated coordinator attempt, not the
+proposed provider or a per-operation attempt. The subject leaves package absent
+instead of overloading it with the provider implementation. Only a successful
+route produces receipt success; nonzero and guard-skipped settlements produce
+receipt failures. Signature integrity is not Governor authority or a governed
+commit.
+
+Mode 32 performs full native canonical receipt decode, exact re-encoding,
+validated signing-preimage construction, uncommitted-fence checking, and a
+domain-separated unsigned-body semantic SHA-256 comparison. The required
+no-argument wrapper generates a receipt through the hosted test and passes it
+to the direct two-argument vector interface. The native probe also reuses its
+successful validation scratch on a malformed envelope and requires prior
+terminal/commit tags to have been reset:
+
+```bash
+./ocore/kernel/smoke-world-project-runtime-qemu.sh
+./ocore/kernel/smoke-world-project-receipt-qemu.sh RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256
+```
+
+This slice has no Governor admission/commit, capability/lease issuance,
+reservation, remote dispatch, recovery, or exactly-once protocol. Mode 32 does
+not execute the project or verify Ed25519 natively; QEMU TCG is not physical
+hardware. It passes neither G1 nor Workstream A acceptance, and G1 remains
 defined and unpassed.
 
 Keep the installed-wrapper directories before `target/release` in `PATH`; on a
@@ -216,7 +266,7 @@ case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 23 required portable QEMU gates in the
+The aggregate executes all 24 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive
@@ -249,12 +299,18 @@ validation, required release surfaces, and tamper detection.
   SHA-256. It does not make the full hosted `OValue` portable, change hosted
   canonical-CBOR shims, create authority or transport, satisfy Workstream A, or
   implement the PR 5 receipt.
-- Keep `OWRECEIPT` v1 claims precise: PR 5 is a bounded offline canonical
-  receipt/signing-preimage oracle. Hosted Rust performs Ed25519 sign/verify with
-  a pinned public conformance key; native Mode 30 validates only receipt and
-  signature-envelope structure. Neither path supplies production key custody,
-  trusted signer policy, live receipt emission, authoritative fencing, a World
-  Alpha attestation, Acceptance A, or G0--G13 passage.
+- Keep `OWRECEIPT` v1 claims precise: PR 5/Mode 30 remains the bounded offline
+  canonical corpus and hosted pinned-key conformance oracle. The separate
+  World-project hosted-reference path accepts a caller signer and emits a live
+  canonical receipt, but its commit fence is always `Uncommitted`. Mode 32 fully
+  decodes/re-encodes that record, reconstructs its signing preimage, and proves
+  stale terminal/commit tags are cleared when validation scratch is reused;
+  it does not verify Ed25519 or execute the project. Receipt placement names
+  the caller-supplied coordinator observer, while the proposed provider remains
+  descriptive and the package subject stays absent. None of these paths
+  supplies production key custody, trusted signer policy, Governor
+  admission/commit, authoritative fencing, Workstream A acceptance, G1, or
+  G0--G13 passage.
 - Keep hosted ResourceKey PR6 claims precise: its smoke proves typed planner
   vocabulary, underlying identity helpers' caller-pair comparison, HGraph state
   chaining, alias-aware grounding projection, source-forgery rejection, and

@@ -1,5 +1,5 @@
 schema_version = 2
-required_gate_count = 23
+required_gate_count = 24
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -136,7 +136,7 @@ nonclaims = [
   "OWRECEIPT v1 carries signed descriptive evidence; receipt capability identities and rights are not bearers, CSpace handles, delegation certificates, session tokens, or grants of authority, and signature validity does not establish authorization or current World state",
   "The pinned conformance key is public test material; this slice provides no production key generation, secure storage, hardware binding, enrollment, certificate chain, rotation, revocation, recovery, peer authentication, or trusted-signer policy",
   "Mode 30 proves canonical receipt bytes and signing-preimage convergence under QEMU plus hosted Ed25519 sign/verify; native O-core structurally validates the signature envelope but does not implement or prove a general freestanding Ed25519 verifier",
-  "The corpus is constructed offline; HGraph, project, live-system, KernelWorld, object, capability, and evidence components do not yet emit or consume this receipt in live execution, and the existing O-Git semantic receipt remains a separate unsigned JSON demo",
+  "The Mode 30 corpus is constructed offline and does not itself prove live emission; the separate World-project hosted-reference path emits a caller-signed uncommitted OWRECEIPT and Mode 32 consumes it for bounded canonical/semantic comparison, while live-system, KernelWorld, object, capability, and evidence components remain outside that path and the existing O-Git semantic receipt remains a separate unsigned JSON demo",
   "Local generation and commit-field checks are not an authoritative Governor snapshot, replay or commit-fencing service, transport, consensus, WorldFS, or Workstream A acceptance",
   "This gate is not the typed World Alpha attestation schema, does not admit evidence into evidence/world_alpha_gates.toml, passes no G0-G13 gate, and QEMU TCG is not physical, hardware-virtualization, or hardware-isolation evidence",
   "OWRECEIPT remains separate from frozen four-kind OWPROTO v1 and OWVALUE v1 and does not change the hosted canonical-CBOR shim wire format",
@@ -150,6 +150,41 @@ expected_markers = [
   "World receipt descriptive capability boundary: PASS",
   "World receipt bounded malformed rejection: PASS",
   "World receipt v1 native smoke: PASS",
+]
+
+[[gate]]
+id = "world-project-runtime-mode32"
+required = true
+milestone = "World project runtime / Mode 32"
+script = "ocore/kernel/smoke-world-project-runtime-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "python3", "qemu-system-x86_64"]
+positive_claims = [
+  "One focused hosted test enters the coordinator through an exact caller-supplied current-view World launch before workspace or child creation, observes a terminal RuntimeGraph, and emits a caller-signed OWRECEIPT with an unconditional Uncommitted fence",
+  "Native Mode 32 fully decodes and exactly re-encodes that live generated receipt, reconstructs its validated signing preimage, independently matches the signer-independent semantic SHA-256, rejects a malformed envelope, clears reused success-only validation tags, and reaches a later timer",
+]
+nonclaims = [
+  "The launch/current view and coordinator observer are caller-supplied descriptive identities, not authenticated Governor membership, admission, authority, reservation, provider placement, dispatch, recovery, or commit",
+  "Mode 32 compares canonical receipt structure and semantic content only; it neither executes the project natively nor verifies Ed25519 in freestanding O-core",
+  "The hosted execution retains residual HostWorld effects and provides no exactly-once guarantee, remote execution, physical-hardware evidence, G1 passage, Workstream A acceptance, or passage of any G0-G13 gate",
+]
+expected_markers = [
+  "World project runtime hosted fixture: PASS",
+  "World project receipt semantic digest preflight: PASS",
+  "World project receipt generated-frame ceiling: PASS",
+  "World project receipt canonical lowercase hex: PASS",
+  "World project receipt full native decode: PASS",
+  "World project receipt exact canonical reencode: PASS",
+  "World project receipt validated signing preimage: PASS",
+  "World project receipt uncommitted fence: PASS",
+  "World project receipt semantic structure SHA-256: PASS",
+  "World project receipt native canonical/semantic comparison: PASS",
+  "World project receipt stale tag reset: PASS",
+  "World project receipt boundary: canonical structure only; no native execution or Ed25519 verification",
+  "World project receipt native probe: PASS",
+  "World project receipt post-test timer: online",
+  "World project receipt malformed native rejection: PASS",
+  "World project receipt native semantic comparison: PASS",
 ]
 
 [[gate]]
