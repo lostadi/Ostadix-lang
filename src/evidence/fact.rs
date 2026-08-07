@@ -2,9 +2,9 @@ use crate::effects::ResourceKey;
 use crate::hgraph::AdmissionFactKind;
 use crate::ir::PlanNodeId;
 
-pub const EVIDENCE_SCHEMA_V1: &str = "oexec.evidence/v1";
-pub const ADMISSION_SCHEMA_V1: &str = "oexec.admission/v1";
-pub const ANALYZER_ID_V1: &str = "ostadix-oir-evidence-compiler/v1";
+pub const EVIDENCE_SCHEMA_V2: &str = "oexec.evidence/v2";
+pub const ADMISSION_SCHEMA_V2: &str = "oexec.admission/v2";
+pub const ANALYZER_ID_V2: &str = "ostadix-oir-evidence-compiler/v2";
 
 /// Strength and origin of a pre-execution fact. Declaration order is not used
 /// as an authorization lattice; callers must use the explicit predicates.
@@ -66,6 +66,30 @@ impl DispatchLaneV1 {
             Self::RemoteProvider => "remote-provider",
             Self::Ocore => "ocore",
         }
+    }
+}
+
+/// Stable preparation adapter selected by evidence analysis. The runtime may
+/// validate the bound adapter against the admitted OIR, but it may not choose
+/// a different adapter as a second scheduling authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchAdapterV1 {
+    CoordinatorV1,
+    OScopeLoadV1,
+    TrustedInlineRendererV1,
+}
+
+impl DispatchAdapterV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CoordinatorV1 => "coordinator/v1",
+            Self::OScopeLoadV1 => "o-scope-load/v1",
+            Self::TrustedInlineRendererV1 => "trusted-inline-renderer/v1",
+        }
+    }
+
+    pub const fn is_local_worker(self) -> bool {
+        !matches!(self, Self::CoordinatorV1)
     }
 }
 
@@ -149,6 +173,7 @@ pub struct EffectContractV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatchContractV1 {
     pub lane: DispatchLaneV1,
+    pub adapter: DispatchAdapterV1,
     /// The adapter can build a Send-only envelope after all value inputs are
     /// materialized. This is availability of a preparation contract, not a
     /// claim that the operation has already been prepared.
@@ -315,7 +340,7 @@ pub struct EvidenceBindingsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidenceBundleV1 {
+pub struct EvidenceBundleV2 {
     pub(crate) schema: &'static str,
     pub(crate) analyzer: &'static str,
     pub(crate) bindings: EvidenceBindingsV1,
@@ -323,7 +348,7 @@ pub struct EvidenceBundleV1 {
     pub(crate) nodes: Vec<NodeEvidence>,
 }
 
-impl EvidenceBundleV1 {
+impl EvidenceBundleV2 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }

@@ -252,11 +252,15 @@ EOF
         return
     fi
     for pattern in \
-        '^; ExecutionAdmission oexec\.admission/v1$' \
+        '^; ExecutionAdmission oexec\.admission/v2$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
         '^operation P[0-9]+ admitted=yes ' \
-        '^wave 0 \['; do
+        '^  dispatch lane=coordinator adapter=coordinator/v1 preparation=coordinator-owned$' \
+        '^wave 0 \[' \
+        '^admission-note waves describe the legal static frontier, not observed dispatch$' \
+        '^admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation$' \
+        '^admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises$'; do
         if ! grep -Eq -- "$pattern" "$STDOUT_FILE"; then
             fail "$desc" "(schedule explanation omitted pattern: $pattern)"
             return

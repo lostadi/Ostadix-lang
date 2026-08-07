@@ -349,7 +349,7 @@ pub struct Evaluator {
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
-    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV1>,
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV2>,
 
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
@@ -597,7 +597,7 @@ impl Evaluator {
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
-    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV1> {
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV2> {
         self.last_execution_admission.as_ref()
     }
 
@@ -610,6 +610,13 @@ impl Evaluator {
     /// graph coordinator to run each operation under its derived policy context.
     pub(crate) fn set_policy(&mut self, policy: Policy) -> Policy {
         std::mem::replace(&mut self.policy, policy)
+    }
+
+    /// Soft local task-count bound reused by the graph worker lane. This is a
+    /// machine-derived implementation cap, not evidence-backed CPU or memory
+    /// admission.
+    pub(crate) fn local_worker_parallelism(&self) -> usize {
+        self.scheduler.parallelism.max(1)
     }
 
     /// Whether the persistent backend actor `(lang, env)` is currently
@@ -7183,6 +7190,85 @@ python[0]^(O.eval($q, $captured))_python[0]
         assert!(
             overlap.peak() > 1,
             "independent graph operations did not overlap on renderer workers"
+        );
+    }
+
+    #[test]
+    fn graph_coordinator_dispatches_newly_ready_work_without_a_wave_barrier() {
+        let registry = BackendRegistry::global();
+        let text = registry.interface_for("text");
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Exec {
+                    lang: "text".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: text.clone(),
+                    body: vec![OIr::Exec {
+                        lang: "text".into(),
+                        env_id: u32::MAX,
+                        attr: None,
+                        backend: text.clone(),
+                        body: vec![OIr::Text("fast".into())],
+                    }],
+                },
+                OIr::Exec {
+                    lang: "text".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: text,
+                    body: vec![OIr::Text("blocked".into())],
+                },
+            ],
+        };
+        let plan = program.plan();
+        let downstream = plan.roots[0];
+        let blocked = plan.roots[1];
+        let pipeline = crate::executor::parallel::TestPipelineSession::begin(blocked, downstream);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect("completion-driven graph execution succeeds");
+
+        assert!(
+            pipeline.downstream_started_before_blocked_finished(),
+            "newly-ready downstream work waited for the prior readiness wave to drain"
+        );
+    }
+
+    #[test]
+    fn graph_coordinator_refills_a_worker_slot_before_lower_ordinal_settlement() {
+        let text = BackendRegistry::global().interface_for("text");
+        let renderer = |body: &str| OIr::Exec {
+            lang: "text".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: text.clone(),
+            body: vec![OIr::Text(body.into())],
+        };
+        let program = OIrProgram {
+            nodes: vec![
+                renderer("slow-first"),
+                renderer("fast-second"),
+                renderer("refill"),
+            ],
+        };
+        let plan = program.plan();
+        let blocked = plan.roots[0];
+        let refill = plan.roots[2];
+        let pipeline = crate::executor::parallel::TestPipelineSession::begin(blocked, refill);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect("completion-driven slot refill succeeds");
+
+        assert!(
+            pipeline.downstream_started_before_blocked_finished(),
+            "a free physical slot waited for lower-ordinal semantic settlement"
         );
     }
 

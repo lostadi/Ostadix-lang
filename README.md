@@ -1394,7 +1394,11 @@ Arbitrary hosted effects remain conservative: unknown operations are serialized
 through `HostWorld`, persistent evaluator state is carried by actor-state
 tokens, and worker dispatch is restricted to compiler-verified O-scope loads
 plus source-proven-preparable trees of four trusted pure inline renderers
-(`html`, `markdown`, `text`, and `latex`).
+(`html`, `markdown`, `text`, and `latex`). Evidence schema v2 binds those
+choices to stable preparation-adapter IDs before execution. A fixed-size local
+pool is created per graph run, reuses its threads across readiness frontiers,
+and reports completions individually; this does not admit arbitrary hosted
+code or make pool capacity an evidence-backed CPU or memory reservation.
 The serial OIR executor remains the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
@@ -1828,8 +1832,11 @@ parallelizing the Nix operations that can safely run on worker threads.
 The main graph executor follows the same ownership boundary. It represents
 unknown host effects with `HostWorld` state and persistent environments with
 actor-state versions, but executes shim operations on the evaluator owner
-thread. Only verified pure inline `html`, `markdown`, `text`, and `latex`
-renderers enter the graph worker pool.
+thread. Its local pool accepts only compiler-verified O-scope loads through
+`o-scope-load/v1` and source-closed `html`, `markdown`, `text`, and `latex`
+renderers through `trusted-inline-renderer/v1`; `coordinator/v1` retains every
+other operation. These IDs are evidence-bound adapter selections, not names
+rediscovered by the scheduler at dispatch time.
 
 ### Coordination groups
 
@@ -2393,9 +2400,16 @@ The validated plan is projected into a directed HGraph before execution.
 Ordinary results, successful completion, evaluator/host resource versions, and
 persistent actor state are nodes. Operations are directed hyperedges whose
 outputs include one ordinary value, one completion token, and successor state
-versions. The graph coordinator runs an operation exactly when every input node
-is materialized, then recomputes readiness after each completion. A failure
-produces no completion or successor state.
+versions. Evidence schema v2 admits each executable operation and binds its
+dispatch adapter before the coordinator accepts the graph. The coordinator
+marks an operation graph-ready exactly when every input node is materialized;
+dispatch additionally respects its admitted adapter, local-pool capacity, and
+the strict semantic settlement frontier. For admitted local-worker work, owned
+`PreparedTask` envelopes enter a fixed-size pool whose
+threads persist for one graph run; each accepted completion recomputes readiness
+without waiting for an unrelated earlier ready set to drain. Fallible outcomes
+may complete physically out of order but settle by serial topological ordinal.
+A failure produces no completion or successor state.
 
 Unknown hosted code reads and writes the shared `HostWorld` resource. Exact
 filesystem and network footprints are not inferred from arbitrary source.
@@ -2411,6 +2425,11 @@ executor used by graph/serial conformance tests.
 state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
+
+`olangc --target ir --explain-schedule` additionally prints the v2 admission
+digests, exact adapter IDs, provenance, blockers, and legal static waves without
+dispatching. Static waves describe graph legality only: they are not pool
+capacity, runtime batches, completion order, or proof of observed overlap.
 
 Project inputs take a direct, typed
 `ProjectBundle -> ProjectExecutionPlan -> HGraph` inspection path rather than

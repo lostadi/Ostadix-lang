@@ -137,6 +137,8 @@ const RUNTIME_EXECUTOR_CANCELLATION_RS: &str = include_str!("../executor/cancell
 const RUNTIME_EXECUTOR_COORDINATOR_RS: &str = include_str!("../executor/coordinator.rs");
 const RUNTIME_EXECUTOR_EFFECTS_RS: &str = include_str!("../executor/effects.rs");
 const RUNTIME_EXECUTOR_PARALLEL_RS: &str = include_str!("../executor/parallel.rs");
+const RUNTIME_EXECUTOR_POOL_RS: &str = include_str!("../executor/pool.rs");
+const RUNTIME_EXECUTOR_TASK_RS: &str = include_str!("../executor/task.rs");
 const RUNTIME_EXECUTOR_TRACE_RS: &str = include_str!("../executor/trace.rs");
 
 // project — first-class project/route/bundle model, embedded so compiled
@@ -1097,6 +1099,8 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
         executor_dir.join("parallel.rs"),
         RUNTIME_EXECUTOR_PARALLEL_RS,
     )?;
+    fs::write(executor_dir.join("pool.rs"), RUNTIME_EXECUTOR_POOL_RS)?;
+    fs::write(executor_dir.join("task.rs"), RUNTIME_EXECUTOR_TASK_RS)?;
     fs::write(executor_dir.join("trace.rs"), RUNTIME_EXECUTOR_TRACE_RS)?;
     Ok(())
 }
@@ -2141,6 +2145,8 @@ mod tests {
             "executor/coordinator.rs",
             "executor/effects.rs",
             "executor/parallel.rs",
+            "executor/pool.rs",
+            "executor/task.rs",
             "executor/trace.rs",
         ] {
             let content = fs::read_to_string(src_dir.join(path)).unwrap();
@@ -2158,6 +2164,16 @@ mod tests {
             fs::read_to_string(src_dir.join("evidence/admit.rs")).unwrap(),
             RUNTIME_EVIDENCE_ADMIT_RS,
             "generated runtimes must receive the admission compiler verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("executor/pool.rs")).unwrap(),
+            RUNTIME_EXECUTOR_POOL_RS,
+            "generated runtimes must receive the persistent worker pool verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("executor/task.rs")).unwrap(),
+            RUNTIME_EXECUTOR_TASK_RS,
+            "generated runtimes must receive the prepared-task contract verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("world/identity.rs")).unwrap(),

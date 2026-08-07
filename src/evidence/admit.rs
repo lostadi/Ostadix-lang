@@ -12,9 +12,9 @@ use super::analyze::{
     analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
 };
 use super::fact::{
-    BackendArtifactV1, DispatchLaneV1, EvidenceBindingsV1, EvidenceBundleV1, NodeEvidence,
-    RuntimeBindingV1, RuntimeSnapshotKindV1, ADMISSION_SCHEMA_V1, ANALYZER_ID_V1,
-    EVIDENCE_SCHEMA_V1,
+    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, EvidenceBindingsV1, EvidenceBundleV2,
+    NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    ADMISSION_SCHEMA_V2, ANALYZER_ID_V2, EVIDENCE_SCHEMA_V2,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,7 +84,7 @@ pub struct AdmittedOperationV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionAdmissionV1 {
+pub struct ExecutionAdmissionV2 {
     schema: &'static str,
     bindings: EvidenceBindingsV1,
     analyzer: &'static str,
@@ -99,7 +99,7 @@ pub struct ExecutionAdmissionV1 {
     waves: Vec<Vec<PlanNodeId>>,
 }
 
-impl ExecutionAdmissionV1 {
+impl ExecutionAdmissionV2 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
@@ -225,8 +225,9 @@ impl ExecutionAdmissionV1 {
             .expect("writing to a String cannot fail");
             writeln!(
                 out,
-                "  dispatch lane={} preparation={}",
+                "  dispatch lane={} adapter={} preparation={}",
                 evidence.dispatch_contract.lane.name(),
+                evidence.dispatch_contract.adapter.name(),
                 if evidence.dispatch_contract.send_only_preparation {
                     "deferred-materialized-input-check"
                 } else {
@@ -314,7 +315,13 @@ impl ExecutionAdmissionV1 {
             "admission-note waves describe the legal static frontier, not observed dispatch\n",
         );
         out.push_str(
-            "admission-note fallible local-worker dispatch is additionally gated to the contiguous unfinished serial-topological prefix\n",
+            "admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation\n",
+        );
+        out.push_str(
+            "admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises\n",
+        );
+        out.push_str(
+            "admission-note fallible local-worker outcomes may complete out of order but remain provisional and settle at the contiguous serial-topological prefix\n",
         );
         out.push_str(
             "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
@@ -323,16 +330,16 @@ impl ExecutionAdmissionV1 {
             "admission-note backend artifact states distinguish hashed, missing, non-regular, and unreadable paths\n",
         );
         out.push_str(
-            "admission-note adapter/environment rechecks are best-effort snapshots; v1 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
+            "admission-note adapter/environment rechecks are best-effort snapshots; v2 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
         );
         out.push_str(
             "admission-note backend binding does not cover live actor state/generation or external toolchain closure\n",
         );
         out.push_str(
-            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v1\n",
+            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v2\n",
         );
         out.push_str(
-            "admission-note local placement is descriptive in v1 and does not assert a current lease\n",
+            "admission-note local placement is descriptive in v2 and does not assert a current lease\n",
         );
         out
     }
@@ -346,7 +353,7 @@ pub struct AdmittedExecution<'a> {
     plan: &'a ExecutionPlan,
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV1,
+    admission: ExecutionAdmissionV2,
 }
 
 impl<'a> AdmittedExecution<'a> {
@@ -362,7 +369,7 @@ impl<'a> AdmittedExecution<'a> {
         &self.graph
     }
 
-    pub fn admission(&self) -> &ExecutionAdmissionV1 {
+    pub fn admission(&self) -> &ExecutionAdmissionV2 {
         &self.admission
     }
 
@@ -401,7 +408,7 @@ pub fn admit_execution<'a>(
     mut graph: HGraph,
     base_policy: Policy,
     runtime: RuntimeBindingV1,
-    evidence: EvidenceBundleV1,
+    evidence: EvidenceBundleV2,
 ) -> Result<AdmittedExecution<'a>> {
     if plan != &program.plan() {
         bail!(
@@ -412,7 +419,7 @@ pub fn admit_execution<'a>(
         .validate_execution_source(program, plan)
         .map_err(anyhow::Error::msg)
         .context("admission rejected OIR/plan/HGraph provenance")?;
-    if evidence.schema != EVIDENCE_SCHEMA_V1 || evidence.analyzer != ANALYZER_ID_V1 {
+    if evidence.schema != EVIDENCE_SCHEMA_V2 || evidence.analyzer != ANALYZER_ID_V2 {
         bail!("unsupported or untrusted evidence bundle schema/analyzer");
     }
     if evidence.runtime != runtime {
@@ -469,7 +476,7 @@ pub fn admit_execution<'a>(
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let admission_sha256 = digest_fields(
-        "ostadix-execution-admission/v1",
+        "ostadix-execution-admission/v2",
         &[
             &evidence_sha256,
             &admitted_graph_sha256,
@@ -477,10 +484,10 @@ pub fn admit_execution<'a>(
         ],
     );
 
-    let admission = ExecutionAdmissionV1 {
-        schema: ADMISSION_SCHEMA_V1,
+    let admission = ExecutionAdmissionV2 {
+        schema: ADMISSION_SCHEMA_V2,
         bindings: expected_bindings,
-        analyzer: ANALYZER_ID_V1,
+        analyzer: ANALYZER_ID_V2,
         runtime_snapshot_kind: runtime.snapshot_kind(),
         backend_artifacts: runtime.backend_artifacts().to_vec(),
         evidence_sha256,
@@ -575,16 +582,36 @@ fn validate_node_evidence(
             plan_node.0
         );
     }
-    if evidence.dispatch_contract.lane == DispatchLaneV1::LocalWorker
-        && (!(summary.is_verified_pure_infallible()
-            || evidence.failure_contract.class
-                == crate::evidence::FailureClassV1::MayFailNoExternalEffects)
-            || !evidence.dispatch_contract.send_only_preparation)
-    {
-        bail!(
-            "operation {} has an unsafe worker dispatch claim",
+    match evidence.dispatch_contract.lane {
+        DispatchLaneV1::LocalWorker => {
+            if !evidence.dispatch_contract.adapter.is_local_worker()
+                || !evidence.dispatch_contract.send_only_preparation
+                || evidence.placement != PlacementContractV1::LocalWorker
+                || !(summary.is_verified_pure_infallible()
+                    || evidence.failure_contract.class
+                        == crate::evidence::FailureClassV1::MayFailNoExternalEffects)
+            {
+                bail!(
+                    "operation {} has an unsafe worker dispatch claim",
+                    plan_node.0
+                );
+            }
+        }
+        DispatchLaneV1::Coordinator => {
+            if evidence.dispatch_contract.adapter != DispatchAdapterV1::CoordinatorV1
+                || evidence.dispatch_contract.send_only_preparation
+                || evidence.placement != PlacementContractV1::LocalCoordinator
+            {
+                bail!(
+                    "operation {} has an incoherent coordinator dispatch claim",
+                    plan_node.0
+                );
+            }
+        }
+        _ => bail!(
+            "operation {} selects an execution lane unsupported by this admission compiler",
             plan_node.0
-        );
+        ),
     }
     Ok(())
 }
@@ -818,7 +845,7 @@ mod tests {
     }
 
     fn legal_projection(
-        admission: &ExecutionAdmissionV1,
+        admission: &ExecutionAdmissionV2,
     ) -> (
         Vec<Vec<PlanNodeId>>,
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
@@ -883,10 +910,13 @@ mod tests {
         assert!(explanation
             .contains("runtime-snapshot kind=inspection dispatch-context=inspection-only"));
         assert!(explanation.contains("effects provenance="));
+        assert!(explanation.contains("adapter="));
         assert!(explanation.contains("evidence-inputs=["));
         assert!(explanation.contains("blockers=["));
         assert!(explanation.contains("wave 0 ["));
         assert!(explanation.contains("legal static frontier"));
+        assert!(explanation.contains("dispatch adapter IDs are evidence-bound"));
+        assert!(explanation.contains("fixed-size per-run pool with per-completion wakeups"));
     }
 
     #[test]
@@ -1043,6 +1073,32 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_dispatch_adapter_substitution() {
+        let program = reader_writer_program("adapter-substitution");
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "adapter-substitution");
+        let mut evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let load = evidence
+            .nodes
+            .iter_mut()
+            .find(|node| node.dispatch_contract.adapter == DispatchAdapterV1::OScopeLoadV1)
+            .expect("fixture must contain one admitted scope-load adapter");
+        load.dispatch_contract.adapter = DispatchAdapterV1::TrustedInlineRendererV1;
+
+        let error = admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence)
+            .err()
+            .expect("changing a hard preparation adapter must invalidate admission");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hard evidence differs from the trusted analyzer result"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn runtime_staleness_diagnostic_names_the_exact_changed_component() {
         let program = reader_writer_program("runtime-diagnostic");
         let plan = program.plan();
@@ -1105,7 +1161,7 @@ mod tests {
             assert_eq!(
                 facts,
                 AdmissionFactKind::ALL.into_iter().collect(),
-                "operation {} must consume exactly the seven v1 facts",
+                "operation {} must consume exactly the seven admission facts",
                 operation.plan_node.0
             );
         }
