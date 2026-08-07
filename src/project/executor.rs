@@ -903,6 +903,9 @@ impl<'a> ProjectCoordinator<'a> {
                         SettledRouteStatus::Succeeded | SettledRouteStatus::Skipped
                     )
                 }
+                // Admission evidence is an initially materialized input, never
+                // a route-produced settlement output.
+                HNodeKind::AdmissionEvidence { .. } => false,
             };
             if should_publish {
                 publish.push(*output);

@@ -18,6 +18,7 @@ Ostadix-lang/
 │   ├── ir.rs         #   OIR intermediate representation & backend registry
 │   ├── eval.rs       #   Recursive evaluator
 │   ├── effects.rs    #   Semantic effect/resource summaries
+│   ├── evidence/     #   Pre-execution analysis and admission compiler
 │   ├── executor/     #   Graph coordinator and serial oracle
 │   ├── hgraph/       #   Directed value/state/control hypergraph
 │   ├── value.rs      #   OValue universal type system
@@ -49,7 +50,7 @@ Ostadix-lang/
 
 ## Evaluation Pipeline
 
-Ostadix-lang processes hosted code through a 6-stage pipeline:
+Ostadix-lang processes hosted code through a 7-stage pipeline:
 
 1. **Parse** — Tokenize source into typed expression trees. Each expression
    carries a language tag (e.g., `python`, `html`, `nix`).
@@ -62,20 +63,30 @@ Ostadix-lang processes hosted code through a 6-stage pipeline:
    children to parents, sequence edges preserve source order, and data edges
    connect loads to their visible stores.
 
-4. **Project and execute** — Lower executable operations into a directed HGraph.
+4. **Project and solve** — Lower executable operations into a directed HGraph.
    Ordinary results, resource versions, actor state, and successful completion
-   are nodes. Operations are directed hyperedges and become runnable exactly
-   when every input node is materialized. `O_EXECUTOR=serial` retains the
-   topological OIR interpreter as the differential reference semantics.
+   are nodes, then solve the graph's type, representation, and fidelity
+   constraints.
 
-5. **Render, authorize, and dispatch** - Convert child values with the renderer
-   embedded in OIR, resolve the block's live backend capability against the
-   adapter's required rights, then run an inline value handler or send source
-   to a policy-keyed backend shim.
+5. **Analyze and admit** — Produce pre-execution type, effect, dispatch,
+   capability, placement, failure, and resource-demand evidence. Bind it to
+   the lowered OIR, plan, solved graph, backend artifacts, environment, and
+   descriptive ambient-World snapshot; compile it into an immutable
+   `AdmittedExecution`.
 
-6. **Schedule and cache** — Request values created by OIR carry compositional
-   fingerprints. The eager executor and autonomous scheduler apply the cache
-   and dependency semantics selected by the OIR operation.
+6. **Schedule, render, authorize, and dispatch** - The coordinator accepts only
+   that `AdmittedExecution`, derives the dynamic ready frontier, converts child
+   values with the renderer embedded in OIR, resolves the block's live backend
+   capability, and executes the selected operation. Request values created by
+   OIR carry compositional fingerprints into the existing eager/autonomous
+   request scheduler; that scheduler remains a separate authority in v1.
+
+7. **Settle and observe** — Materialize successful value, completion, and state
+   outputs, select deterministic failures, and emit traces or receipts only
+   after execution. `O_EXECUTOR=serial` retains the topological OIR interpreter
+   as the differential reference semantics after the same admission has been
+   compiled. Unifying Request and project execution under the admitted OIR
+   coordinator is future work.
 
 ## Intermediate Representation (OIR)
 
@@ -136,9 +147,14 @@ semantics from being conflated with OIR's backend dependency graph.
 `src/hgraph/from_oir.rs` derives one semantic effect summary before constructing
 each executable edge. Every executable edge has one distinguished OValue output,
 one successful-completion output, and zero or more successor resource-state
-outputs. Its inputs include ordinary child/data values plus the prior versions
-of every resource it accesses. Persistent shim operations also consume and
-produce `ActorState(canonical-language[environment])`.
+outputs. Its inputs include ordinary child/data values, materialized admission
+evidence after admission, and the state/control inputs required by its access
+mode. A read consumes the latest writer state without producing a successor
+version and adds its own completion to that resource's open-reader frontier. A
+write consumes the latest writer state and every open-reader completion,
+produces the next resource version, and clears the reader frontier. Persistent
+shim operations also consume and produce
+`ActorState(canonical-language[environment])`.
 
 Unknown hosted effects read and write `HostWorld`, which is a conservative
 umbrella for host-observable state. The graph does not infer exact filesystem or
@@ -146,6 +162,55 @@ network footprints from arbitrary hosted source. Source `reads=`, `writes=`,
 and `serial=host` declarations can add constraints, but cannot erase an unknown
 fallback. Likewise, `effects=pure` cannot upgrade an arbitrary shim into trusted
 worker-pool work.
+
+### Evidence-bound admission
+
+`src/evidence/` separates pre-execution certificates from post-execution
+observations. `EvidenceBundleV1` records per-operation type, effect, dispatch,
+capability, placement, failure, resource-demand, and cost contracts together
+with provenance. Hard contracts determine whether execution is legal. Cost
+estimates are soft evidence: they may eventually rank an already-legal
+frontier, but they do not remove dependencies or close an unknown effect
+footprint.
+
+The bundle is digest-bound to canonical lowered OIR, the validated plan, the
+solved analyzed graph, analyzer identity, resolved backend artifacts, the
+execution environment, and a descriptive ambient `HostWorld` snapshot. The
+current binding deliberately does not claim to hash original source bytes,
+because public evaluator entry points may receive an already-lowered
+`OIrProgram`. It also does not digest-bind the caller-owned initial scope shape
+or values; those are installed after admission and frozen only when a narrow
+O-scope `Load` task is prepared. Admission rejects stale or mismatched evidence, adds seven
+materialized `AdmissionEvidence` inputs to each executable edge, validates the
+result, and freezes it as `AdmittedExecution`. `Coordinator::new` accepts only
+that type and rechecks its runtime binding before execution can emit a started
+event.
+
+This authority boundary is currently the ordinary OIR execution path only.
+The buffered Request scheduler and `ProjectCoordinator` remain separate, and
+generic hosted prepared-task lanes, renewable-capacity selection, persistent
+worker pools, and actor-owned hosted environments remain future work. The
+current `LocalWorker` lane is deliberately narrow: compiler-verified O-scope
+`Load` operations and the trusted attribute-free `html`, `markdown`, `text`,
+and `latex` inline renderers with a source-proven preparable body execute through
+a scoped local-worker batch. Hosted
+reads and other ready operations remain coordinator-owned, so a graph wave does
+not by itself prove that every member ran on a worker thread. The backend
+binding distinguishes hashed files, missing paths, non-regular paths, and
+unreadable paths, and samples the current executable, cwd, and environment at
+analysis/dispatch checks; execution admission rejects an unhashed current
+executable. Those rechecks are path/environment-based best
+effort, not an immutable execution substrate: v1 does not pin an opened adapter
+or frozen child environment and cannot prove the bytes/environment observed at
+spawn. It also does not attest the opaque state or generation of an already-live
+actor, the complete external toolchain closure, or placement-lease freshness.
+`ActorResourceId` remains a
+serialization identity in v1, and unknown actor work cannot use this gap to
+remove `HostWorld` or actor dependencies.
+
+Post-execution `RuntimeGraphV1` and `ExecutionReceiptV1` artifacts remain typed
+observations with no scheduling authority. A historical receipt may inform a
+future soft profile, but it cannot admit a later execution.
 
 The governed-world identity foundation in `src/world/` now shares all 20
 constitutional identity atoms with `ocore/world/identity.oc`. It separates a
@@ -401,20 +466,30 @@ implementations remain useful only under the non-qualifying
 
 Ordinary source sequence is lowered as a predecessor completion-token input.
 That dependency is omitted only for direct members of an explicit concurrent
-group, or when both operations are verified, deterministic, infallible,
-resource-free inline renderers from the trusted `html`, `markdown`, `text`, and
-`latex` set, each complete structural subtree contains only literal text and
-recursively trusted renderers, and neither operation is a child of a structural
-`O` sequencing region. Unknown facts preserve sequence. Resource chains can
-still order members of a concurrent group when their effects conflict.
+group; for two compiler-verified, read-only O-level `Load` operations outside a
+left-to-right `O` region; or when both operations are verified, deterministic,
+infallible, resource-free inline renderers from the trusted `html`, `markdown`,
+`text`, and `latex` set, each complete structural subtree contains only literal
+text and recursively trusted renderers, and neither operation is a child of a
+structural `O` sequencing region. Unknown facts preserve sequence. Resource
+frontiers can still order members of a concurrent group when their effects
+conflict.
 
 `ReadySchedule` derives blockers only from producers of directed operation
 inputs. The coordinator materializes all outputs atomically after success,
 recomputes the frontier after each completion, and emits no completion or
 successor-state token after failure. Deterministic commit order does not stand
-in for effect ordering. Parallel worker dispatch remains limited to the
-verified pure inline renderer class. Broader read sharing and precise resource
-models are future optimizations.
+in for effect ordering. Parallel worker dispatch remains limited to
+compiler-verified O-scope loads and source-proven-preparable trees of the four
+trusted inline renderers. The
+coordinator freezes their materialized inputs into `Send`-only tasks and runs
+the current batch with scoped local threads. Same-binding loads share the latest
+writer frontier and demonstrably execute concurrently. Because a load may fail
+without external effects, all batch outcomes are buffered and settled by
+serial topological ordinal: fallible loads batch only as the contiguous
+unfinished semantic prefix, the lowest-ordinal failure wins, and every later
+speculative outcome is discarded. Infallible effect-free renderer work may
+speculate outside that prefix.
 
 ## Universal Value System (OValue)
 
@@ -559,9 +634,16 @@ is produced.
 
 **Target D — IR**: parses the program with the same front end, lowers the
 `ONode` forest to OIR (`src/ir.rs`), and prints the lowered program to
-stdout.  A debugging/inspection target — nothing is executed and no output
-file is produced. A directory or lifted project instead constructs its typed,
-exact-provenance `ProjectExecutionPlan` and HGraph without running any route.
+stdout. A debugging/inspection target — nothing is executed and no output
+file is produced. For an ordinary `.O` file, `--explain-schedule` additionally
+solves the graph, compiles evidence-bound admission, and prints its digests,
+provenance, blockers, retained sequence reasons, and legal static waves. A
+`runtime-snapshot kind=inspection` line makes explicit that this certificate
+preview is not interchangeable with an evaluator's dispatch-time execution
+snapshot. A directory or lifted project instead constructs its typed,
+exact-provenance
+`ProjectExecutionPlan` and HGraph without running any route; project admission
+explanation is deferred.
 
 **Target E — Dot**: parses and lowers to OIR, then builds the full
 `HGraph` hypergraph (`src/hgraph/`) from that OIR, runs the type solver, and

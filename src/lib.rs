@@ -12,6 +12,7 @@ pub mod backend;
 mod capability;
 pub mod effects;
 pub mod eval;
+pub mod evidence;
 pub mod executor;
 pub mod hgraph;
 pub mod ir;

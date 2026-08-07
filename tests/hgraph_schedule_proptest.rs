@@ -246,15 +246,21 @@ proptest! {
             prop_assert!(schedule.ops[successor].blocked_by.contains(&predecessor));
         }
 
-        // Every semantic resource access is a one-step state transition.
+        // Reads lease the current writer epoch without advancing it; writes
+        // alone publish the next resource version.
         for op in &schedule.ops {
             let summary = graph.effect_summary(op.plan_node).expect("effect summary");
-            for resource in summary.accessed_resources() {
+            let (reads, writes) = summary.scheduling_accesses();
+            for resource in reads.union(&writes) {
                 let inputs = resource_versions(&graph, &op.inputs, &resource);
                 let outputs = resource_versions(&graph, &op.outputs, &resource);
                 prop_assert_eq!(inputs.len(), 1, "missing {:?} input", resource);
-                prop_assert_eq!(outputs.len(), 1, "missing {:?} output", resource);
-                prop_assert_eq!(outputs[0], inputs[0] + 1);
+                if writes.contains(resource) {
+                    prop_assert_eq!(outputs.len(), 1, "missing {:?} write output", resource);
+                    prop_assert_eq!(outputs[0], inputs[0] + 1);
+                } else {
+                    prop_assert!(outputs.is_empty(), "read advanced {:?}", resource);
+                }
             }
         }
 

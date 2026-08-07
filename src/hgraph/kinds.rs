@@ -258,3 +258,42 @@ pub enum ValueState {
     /// The node is on a branch that a guard disabled.
     DisabledByBranch,
 }
+
+/// One pre-execution fact whose successful admission is a literal input to an
+/// executable HGraph operation.  These are ontology tags, not authority by
+/// themselves: the evidence module binds each materialized token to the exact
+/// analyzed program, plan, graph, backend set, and runtime snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AdmissionFactKind {
+    Type,
+    EffectFootprint,
+    Dispatch,
+    CapabilityPolicy,
+    Placement,
+    FailurePolicy,
+    ResourceBudget,
+}
+
+impl AdmissionFactKind {
+    pub const ALL: [Self; 7] = [
+        Self::Type,
+        Self::EffectFootprint,
+        Self::Dispatch,
+        Self::CapabilityPolicy,
+        Self::Placement,
+        Self::FailurePolicy,
+        Self::ResourceBudget,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::EffectFootprint => "effect-footprint",
+            Self::Dispatch => "dispatch",
+            Self::CapabilityPolicy => "capability-policy",
+            Self::Placement => "placement",
+            Self::FailurePolicy => "failure-policy",
+            Self::ResourceBudget => "resource-budget",
+        }
+    }
+}

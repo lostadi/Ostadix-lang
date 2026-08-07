@@ -168,7 +168,8 @@ Environment lifetime and request forcing are part of the stable language core:
 Every authoritative Rust execution entry point follows this path:
 
 ```text
-.O source -> ONode -> OIrProgram -> validated ExecutionPlan -> OIR evaluator
+.O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
+          -> EvidenceBundleV1 -> AdmittedExecution -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -189,23 +190,73 @@ execution order from the plan. Policy-changing Invoke instructions such as
 `lazy`, `autonomous`, `batch`, `all`, `any`, and `race` retain control over how
 their planned child regions are evaluated.
 
-The Rust execution engine MUST project executable OIR into a directed HGraph.
+The Rust execution engine MUST project executable OIR into a directed HGraph
+and solve its type, representation, and fidelity constraints before admission.
 Ordinary OValues, successful-completion tokens, resource-state versions, and
-persistent actor-state versions are graph nodes. Each evaluator invocation is a
-directed hyperedge consuming all of its ordinary and state/control inputs and
-producing one distinguished ordinary result, one completion token, and every
-successor resource state. An operation is runnable exactly when every input
-node is materialized. Failure produces none of its output tokens.
+persistent actor-state versions are draft graph nodes; an admitted graph
+additionally contains pre-materialized admission facts. Each evaluator
+invocation is a directed hyperedge consuming all of its ordinary and
+state/control inputs, plus its admission-evidence inputs after admission, and
+producing one distinguished ordinary result, one completion token, and each
+required successor resource state. An operation is runnable exactly when every
+input node is materialized. Failure produces none of its output tokens.
+
+Resource lowering MUST preserve access mode. A read MUST consume the current
+writer state, MUST NOT advance the resource version, and MUST place its
+completion token in the resource's open-reader frontier. A write MUST consume
+the current writer state and every completion in that frontier, MUST produce
+exactly the next writer-state version, and MUST clear the frontier. Thus reads
+of one version are legally concurrent, while a later writer waits for all of
+them. These rules apply after scheduler-visible alias expansion. An explicit or
+unknown `HostWorld` access remains exclusive and therefore fail-closed.
+
+Before either the graph coordinator or the serial differential oracle executes
+the plan, the runtime MUST produce an `EvidenceBundleV1` and compile it into an
+`AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
+validated plan, solved analyzed graph, analyzer identity, backend artifacts,
+environment, and descriptive ambient-World snapshot. This v1 binding does not
+claim the original source-byte digest when the entry point receives an already
+lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Each executable operation MUST consume admitted type,
+effect-footprint, dispatch, capability-policy, placement, failure-policy, and
+resource-budget facts. Stale or mismatched evidence MUST fail before execution
+starts. The ordinary graph `Coordinator` MUST accept only an
+`AdmittedExecution`, never a raw HGraph, and MUST revalidate the runtime binding
+before dispatch. Both the coordinator and serial oracle MUST recheck immediately
+before opaque/deferred execution.
+
+Hard pre-execution evidence MAY determine legality and graph blockers. Cost or
+historical measurements MAY rank operations only within an already-legal
+frontier; they MUST NOT remove a dependency, close an unknown effect footprint,
+or grant authority. Post-execution runtime graphs and execution receipts are
+observations, not certificates or admission decisions, and MUST NOT authorize a
+later execution.
 
 Hosted operations whose complete effect footprint is not verified MUST read and
 write `HostWorld`. Persistent `LANG[n]` shim operations MUST additionally read
 and write `ActorState(canonical-LANG[n])`. Ordinary sequence MUST consume the
 predecessor's completion token unless the operations are direct members of an
-explicit concurrent group or both are verified, deterministic, infallible,
-resource-free trusted inline renderers whose complete structural subtrees
-contain only literal text and recursively trusted renderers, outside a
-structural `O` sequencing region. Any unknown fact preserves sequence.
-Conflicting state chains still constrain explicit group members.
+explicit concurrent group; are two compiler-verified, read-only O-level loads;
+or are both verified, deterministic, infallible, resource-free trusted inline
+renderers whose complete structural subtrees contain only literal text and
+recursively trusted renderers. Both automatic cases are forbidden inside a
+structural left-to-right `O` sequencing region. Any unknown fact preserves
+sequence. Conflicting resource frontiers still constrain explicit group
+members.
+
+The v1 `LocalWorker` lane MUST accept only compiler-verified O-scope `Load`
+operations and attribute-free trusted inline-value renderers named `html`,
+`markdown`, `text`, or `latex` whose body is source-proven preparable: literal
+text, already-settled Store children, and recursively trusted renderers only.
+Preparation MUST freeze their materialized scope or splice inputs into a
+`Send`-only task before a scoped local-worker batch starts. Hosted reads,
+persistent language environments, and arbitrary
+user-declared reads MUST remain coordinator-owned. Loads are pure but may fail;
+their ordinal MUST be the serial topological execution rank, not preorder plan
+identity. The coordinator MAY batch fallible workers only when they form the
+contiguous unfinished semantic prefix. It MUST buffer those outcomes, settle
+them in semantic-ordinal order, select the lowest-ordinal failure, and discard
+every later speculative outcome. Infallible effect-free workers MAY speculate
+outside that prefix.
 
 Effect block attributes MAY add conservative constraints:
 
@@ -222,6 +273,29 @@ Modeled resources are `host:*`/`host:PATH`, `project:PATH`, `env:NAME`,
 unverified hosted operation to pure. Resource declarations add dependencies;
 they MUST NOT erase the conservative `HostWorld` fallback. Authority attributes
 describe permission, not an exact effect footprint.
+
+`olangc FILE --target ir --explain-schedule` MUST perform the type solve,
+analysis, and admission steps and print the digest bindings, per-operation
+evidence provenance, blockers, retained sequence reasons, and legal static
+waves without executing any operation. In v1 this inspection surface applies
+only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
+`inspection-only`, not as a dispatch-compatible execution context. A reported
+wave is evidence of legal readiness,
+not proof that every member used a worker. Within that wave, admitted O-scope
+loads and source-proven-preparable trees of the four trusted inline renderers
+do execute through the current
+scoped local-worker batch. Generic hosted prepared-task lanes, persistent pools,
+actor-owned environments, renewable-capacity allocation, and unification with
+the Request and project schedulers are not v1 behavior.
+The backend-set binding covers resolved adapter files and the current
+executable, and MUST distinguish hashed, missing, non-regular, and unreadable
+paths. Execution admission MUST reject an unhashed current executable. Runtime
+rechecks are path/environment snapshots, not an immutable execution substrate:
+v1 does not pin an opened adapter or frozen child environment and cannot prove
+the bytes/environment observed at spawn. The binding also excludes caller
+initial-scope shape/values, opaque live-actor state/generation, a complete
+external toolchain closure, and placement-lease freshness. Actor identity in v1 is a
+serialization constraint only and MUST NOT close an unknown hosted footprint.
 
 ---
 
