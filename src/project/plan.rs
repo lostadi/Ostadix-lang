@@ -637,7 +637,7 @@ impl ProjectExecutionPlan {
             self.bundle_digest
         ))));
         let mut values = HashMap::<PlanNodeId, NodeId>::new();
-        let mut resource_heads = BTreeMap::<ResourceKey, (NodeId, u64)>::new();
+        let mut resource_frontiers = BTreeMap::<ResourceKey, ProjectResourceFrontier>::new();
 
         for operation in &self.operations {
             let value = graph.add_node(HNode::fresh());
@@ -655,9 +655,10 @@ impl ProjectExecutionPlan {
             let mut outputs = vec![value, completion];
             add_resource_transitions(
                 &mut graph,
-                &mut resource_heads,
+                &mut resource_frontiers,
                 &operation.effects,
                 operation.id,
+                completion,
                 &mut inputs,
                 &mut outputs,
             );
@@ -1159,27 +1160,46 @@ fn validate_project_path(path: &str, label: &str) -> Result<(), String> {
 
 fn add_resource_transitions(
     graph: &mut HGraph,
-    heads: &mut BTreeMap<ResourceKey, (NodeId, u64)>,
+    frontiers: &mut BTreeMap<ResourceKey, ProjectResourceFrontier>,
     summary: &EffectSummary,
     producer: PlanNodeId,
+    completion: NodeId,
     inputs: &mut Vec<NodeId>,
     outputs: &mut Vec<NodeId>,
 ) {
-    for resource in summary.accessed_resources() {
-        let (prior, version) = heads.get(&resource).copied().unwrap_or_else(|| {
+    let (reads, writes) = summary.scheduling_accesses();
+    let resources = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
+    for resource in resources {
+        let frontier = frontiers.entry(resource.clone()).or_insert_with(|| {
             let initial = graph.add_node(HNode::resource_state(resource.clone(), 0));
-            (initial, 0)
+            ProjectResourceFrontier {
+                last_write: initial,
+                version: 0,
+                open_reads: BTreeSet::new(),
+            }
         });
-        let next_version = version + 1;
-        let successor = graph.add_node(HNode::resource_state(resource.clone(), next_version));
-        graph
-            .node_mut(successor)
-            .expect("fresh resource node exists")
-            .plan_node = Some(producer);
-        heads.insert(resource, (successor, next_version));
-        inputs.push(prior);
-        outputs.push(successor);
+        inputs.push(frontier.last_write);
+        if writes.contains(&resource) {
+            inputs.extend(std::mem::take(&mut frontier.open_reads));
+            let next_version = frontier.version + 1;
+            let successor = graph.add_node(HNode::resource_state(resource.clone(), next_version));
+            graph
+                .node_mut(successor)
+                .expect("fresh resource node exists")
+                .plan_node = Some(producer);
+            frontier.last_write = successor;
+            frontier.version = next_version;
+            outputs.push(successor);
+        } else {
+            frontier.open_reads.insert(completion);
+        }
     }
+}
+
+struct ProjectResourceFrontier {
+    last_write: NodeId,
+    version: u64,
+    open_reads: BTreeSet<NodeId>,
 }
 
 fn project_dependency_node(

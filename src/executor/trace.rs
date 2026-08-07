@@ -45,6 +45,12 @@ impl TraceSink {
             .push(TraceEvent::NodeFailed { id, message });
     }
 
+    pub fn discarded(&mut self, id: PlanNodeId, reason: String) {
+        self.trace
+            .events
+            .push(TraceEvent::NodeDiscarded { id, reason });
+    }
+
     /// Consume the sink, yielding the accumulated trace.
     pub fn into_trace(self) -> ExecutionTrace {
         self.trace

@@ -493,6 +493,11 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-world-g0-conformance.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
+            "src/evidence/admit.rs": "// fixture evidence admission compiler\n",
+            "src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
+            "src/evidence/fact.rs": "// fixture evidence contract vocabulary\n",
+            "src/evidence/mod.rs": "pub mod admit;\n",
+            "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
             "src/bin/olink.rs": "// fixture project linker CLI\n",
             "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
@@ -765,6 +770,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/smoke-world-g0-conformance.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
+                "src/evidence/admit.rs",
+                "src/evidence/analyze.rs",
+                "src/evidence/fact.rs",
+                "src/evidence/mod.rs",
+                "src/evidence/profile.rs",
                 "src/effects.rs",
                 "src/bin/olink.rs",
                 "src/bin/olangc.rs",
@@ -1355,6 +1365,26 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/world/grounding\.rs.*tests/world_resource_keys\.rs",
         ):
             self._build("missing-world-resource-keys.zip")
+
+    def test_evidence_bound_admission_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "src/evidence/admit.rs",
+            "src/evidence/analyze.rs",
+            "src/evidence/fact.rs",
+            "src/evidence/mod.rs",
+            "src/evidence/profile.rs",
+        )
+        self._git("commit", "-q", "-m", "remove evidence-bound admission surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*src/evidence/admit\.rs.*"
+            r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
+            r"src/evidence/mod\.rs.*src/evidence/profile\.rs",
+        ):
+            self._build("missing-evidence-bound-admission.zip")
 
     def test_project_hgraph_hosted_surface_is_required(self) -> None:
         self._commit()

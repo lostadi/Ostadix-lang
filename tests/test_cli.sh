@@ -233,6 +233,42 @@ check_olangc_grounding_report() {
     pass "$desc"
 }
 
+check_olangc_schedule_explanation() {
+    local desc="$1"
+    local source="$ARTIFACT_DIR/explain-do-not-run.O"
+    local marker="$ARTIFACT_DIR/explain-executed"
+
+    cat >"$source" <<EOF
+python^(
+from pathlib import Path
+Path(r"$marker").write_text("executed")
+__oval_result__ = 2
+)_python
+EOF
+
+    run_command "$OLANGC_BIN" "$source" --target ir --explain-schedule
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(schedule explanation failed with exit $RUN_EXIT)"
+        return
+    fi
+    for pattern in \
+        '^; ExecutionAdmission oexec\.admission/v1$' \
+        '^binding lowered-oir-sha256=' \
+        '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
+        '^operation P[0-9]+ admitted=yes ' \
+        '^wave 0 \['; do
+        if ! grep -Eq -- "$pattern" "$STDOUT_FILE"; then
+            fail "$desc" "(schedule explanation omitted pattern: $pattern)"
+            return
+        fi
+    done
+    if [ -e "$marker" ]; then
+        fail "$desc" "(--explain-schedule executed the inspected backend)"
+        return
+    fi
+    pass "$desc"
+}
+
 check_olink_hardened_round_trip() {
     local source="$ARTIFACT_DIR/link-source"
     local expected="$ARTIFACT_DIR/link-expected"
@@ -319,6 +355,11 @@ check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^(\[nu
 check_stdout_contains "plain Python has ambient process authority" 0 '^(\[number\] )?0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
+check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help
+check_olangc_schedule_explanation "olangc explains digest-bound admission without execution"
+check_nonzero_stderr_contains "olangc schedule explanation rejects a non-IR target" \
+    '--explain-schedule is available only with --target ir' \
+    "$OLANGC_BIN" examples/hello.O --target script --explain-schedule
 check_olangc_grounding_report "olangc grounding reports exact World and residual HostWorld"
 check_nonzero_stderr_contains "olangc grounding rejects a non-IR target" \
     '--grounding is available only with --target ir' \

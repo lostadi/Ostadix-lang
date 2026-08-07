@@ -8,8 +8,8 @@ use crate::ir::{ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 use crate::value::{Fidelity, OValue};
 
 use super::kinds::{
-    ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, OpKind, ReadyInputPolicy, RepFlags,
-    ValueState,
+    AdmissionFactKind, ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, OpKind,
+    ReadyInputPolicy, RepFlags, ValueState,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -32,9 +32,24 @@ pub struct ActorId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HNodeKind {
     Value,
-    ResourceState { resource: ResourceKey, version: u64 },
-    Completion { plan_node: PlanNodeId },
-    BranchControl { label: String, version: u64 },
+    ResourceState {
+        resource: ResourceKey,
+        version: u64,
+    },
+    Completion {
+        plan_node: PlanNodeId,
+    },
+    BranchControl {
+        label: String,
+        version: u64,
+    },
+    /// A successful, digest-bound pre-execution admission fact.  Admission
+    /// nodes are materialized before the coordinator receives the graph and
+    /// are ordinary readiness inputs with no runtime producer.
+    AdmissionEvidence {
+        plan_node: PlanNodeId,
+        fact: AdmissionFactKind,
+    },
 }
 
 /// A semantic graph node. Type/fidelity facts apply only to ordinary Value
@@ -125,6 +140,13 @@ impl HNode {
             } else {
                 ValueState::Unresolved
             },
+        )
+    }
+
+    pub fn admission_evidence(plan_node: PlanNodeId, fact: AdmissionFactKind) -> Self {
+        Self::synthetic(
+            HNodeKind::AdmissionEvidence { plan_node, fact },
+            ValueState::Materialized,
         )
     }
 
@@ -300,6 +322,10 @@ pub struct HGraph {
     pub completion_nodes: HashMap<PlanNodeId, NodeId>,
     /// Preserved sequence relations and the completion token implementing each.
     pub sequence_dependencies: Vec<SequenceDependency>,
+    /// `(operation, fact kind)` to its materialized pre-execution evidence
+    /// input. Draft/analyzed graphs leave this empty; admitted graphs contain
+    /// exactly one node for every required fact of every operation.
+    pub admission_evidence_nodes: BTreeMap<(PlanNodeId, AdmissionFactKind), NodeId>,
     pub bindings: HashMap<String, NodeId>,
     pub ir_map: HashMap<NodeId, OIr>,
     pub root_nodes: Vec<NodeId>,
@@ -533,6 +559,59 @@ impl HGraph {
         Ok(node)
     }
 
+    /// Materialize and attach one digest-bound admission fact to an existing
+    /// operation. Only the admission compiler should call this; graph
+    /// validation independently checks the resulting inventory.
+    pub(crate) fn add_admission_evidence_input(
+        &mut self,
+        plan_node: PlanNodeId,
+        fact: AdmissionFactKind,
+    ) -> Result<NodeId, String> {
+        if self
+            .admission_evidence_nodes
+            .contains_key(&(plan_node, fact))
+        {
+            return Err(format!(
+                "operation {} already has {} admission evidence",
+                plan_node.0,
+                fact.name()
+            ));
+        }
+        let edge = self
+            .op_map
+            .get(&plan_node)
+            .map(|info| info.edge)
+            .ok_or_else(|| format!("operation {} does not exist", plan_node.0))?;
+        let node = self.add_node(HNode::admission_evidence(plan_node, fact));
+
+        self.nodes
+            .get_mut(&node)
+            .expect("newly added evidence node exists")
+            .consumers
+            .push(edge);
+        self.nodes
+            .get_mut(&node)
+            .expect("newly added evidence node exists")
+            .incident
+            .push(edge);
+        self.exec_edges
+            .get_mut(&edge)
+            .expect("registered operation edge exists")
+            .ports
+            .push(Port {
+                node,
+                role: PortRole::Input,
+            });
+        self.op_map
+            .get_mut(&plan_node)
+            .expect("registered operation exists")
+            .inputs
+            .push(node);
+        self.admission_evidence_nodes
+            .insert((plan_node, fact), node);
+        Ok(node)
+    }
+
     pub fn record_sequence_dependency(
         &mut self,
         predecessor: PlanNodeId,
@@ -645,6 +724,9 @@ impl HGraph {
                 HNodeKind::BranchControl { label, version } => {
                     format!("BranchControl({label}@{version})")
                 }
+                HNodeKind::AdmissionEvidence { plan_node, fact } => {
+                    format!("AdmissionEvidence({}:P{})", fact.name(), plan_node.0)
+                }
             };
             writeln!(
                 out,
@@ -714,6 +796,66 @@ impl HGraph {
         self.validate_sequence_dependencies()?;
         self.validate_source_plan_dependencies()?;
         self.validate_executable_acyclicity()?;
+        Ok(())
+    }
+
+    /// Validate the additional invariant required at the coordinator
+    /// boundary: every operation consumes exactly one materialized token for
+    /// every admission fact kind, and no unattached/forged token exists.
+    pub fn validate_admitted_execution_graph(&self) -> Result<(), String> {
+        self.validate_execution_graph()?;
+        let expected = self
+            .op_map
+            .len()
+            .saturating_mul(AdmissionFactKind::ALL.len());
+        if self.admission_evidence_nodes.len() != expected {
+            return Err(format!(
+                "admitted graph has {} evidence nodes; expected {expected}",
+                self.admission_evidence_nodes.len()
+            ));
+        }
+        for plan_node in self.op_map.keys().copied() {
+            let info = &self.op_map[&plan_node];
+            for fact in AdmissionFactKind::ALL {
+                let node_id = self
+                    .admission_evidence_nodes
+                    .get(&(plan_node, fact))
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "operation {} lacks {} admission evidence",
+                            plan_node.0,
+                            fact.name()
+                        )
+                    })?;
+                let node = self.nodes.get(&node_id).ok_or_else(|| {
+                    format!("admission evidence node {} does not exist", node_id.0)
+                })?;
+                if node.kind != (HNodeKind::AdmissionEvidence { plan_node, fact })
+                    || node.state != ValueState::Materialized
+                    || node.producer.is_some()
+                    || node.consumers != [info.edge]
+                    || !info.inputs.contains(&node_id)
+                {
+                    return Err(format!(
+                        "operation {} has invalid {} admission evidence node {}",
+                        plan_node.0,
+                        fact.name(),
+                        node_id.0
+                    ));
+                }
+            }
+        }
+        for (node_id, node) in &self.nodes {
+            if let HNodeKind::AdmissionEvidence { plan_node, fact } = node.kind {
+                if self.admission_evidence_nodes.get(&(plan_node, fact)) != Some(node_id) {
+                    return Err(format!(
+                        "unregistered admission evidence node {} for operation {}",
+                        node_id.0, plan_node.0
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1050,12 +1192,22 @@ impl HGraph {
                 format!("operation {} has no semantic effect summary", plan_node.0)
             })?;
             self.validate_operation_semantics(info, edge, summary)?;
-            let mut required = summary.accessed_resources();
-            if let Some(actor) = &summary.actor_state {
-                required.insert(ResourceKey::ActorState(actor.clone()));
+            let (reads, writes) = summary.scheduling_accesses();
+            let required = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
+            let actual_inputs = resource_keys(self, &info.inputs);
+            let actual_outputs = resource_keys(self, &info.outputs);
+            if actual_inputs != required || actual_outputs != writes {
+                return Err(format!(
+                    "operation {} resource inputs/outputs {:?}/{:?} differ from admitted accesses {:?}/{:?}",
+                    plan_node.0, actual_inputs, actual_outputs, required, writes
+                ));
             }
             for resource in required {
-                self.validate_operation_resource_transition(info, &resource)?;
+                if writes.contains(&resource) {
+                    self.validate_operation_resource_write(info, &resource)?;
+                } else {
+                    self.validate_operation_resource_read(info, &resource)?;
+                }
             }
         }
 
@@ -1119,7 +1271,7 @@ impl HGraph {
                 }
                 for resource in [ResourceKey::HostWorld, ResourceKey::EvaluatorState] {
                     require_read_write(summary, &resource, info.plan_node)?;
-                    self.validate_operation_resource_transition(info, &resource)?;
+                    self.validate_operation_resource_write(info, &resource)?;
                 }
                 if *env != u32::MAX {
                     let actor = ActorResourceId::new(lang.clone(), *env);
@@ -1129,10 +1281,7 @@ impl HGraph {
                             info.plan_node.0, actor
                         ));
                     }
-                    self.validate_operation_resource_transition(
-                        info,
-                        &ResourceKey::ActorState(actor),
-                    )?;
+                    self.validate_operation_resource_write(info, &ResourceKey::ActorState(actor))?;
                 }
             }
             ExecutableOp::Invoke { .. }
@@ -1141,7 +1290,7 @@ impl HGraph {
             | ExecutableOp::Schedule { .. } => {
                 for resource in [ResourceKey::HostWorld, ResourceKey::EvaluatorState] {
                     require_read_write(summary, &resource, info.plan_node)?;
-                    self.validate_operation_resource_transition(info, &resource)?;
+                    self.validate_operation_resource_write(info, &resource)?;
                 }
             }
             ExecutableOp::MaterializeProject => {
@@ -1193,7 +1342,26 @@ impl HGraph {
         Ok(())
     }
 
-    fn validate_operation_resource_transition(
+    fn validate_operation_resource_read(
+        &self,
+        info: &ExecInfo,
+        resource: &ResourceKey,
+    ) -> Result<(), String> {
+        let input_versions = resource_versions(self, &info.inputs, resource);
+        let output_versions = resource_versions(self, &info.outputs, resource);
+        if input_versions.len() != 1 || !output_versions.is_empty() {
+            return Err(format!(
+                "operation {} requires exactly one {:?} read-state input and no output, found {}/{}",
+                info.plan_node.0,
+                resource,
+                input_versions.len(),
+                output_versions.len()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_operation_resource_write(
         &self,
         info: &ExecInfo,
         resource: &ResourceKey,
@@ -1506,6 +1674,102 @@ impl HGraph {
                 actual_sequences, expected_sequences
             ));
         }
+        self.validate_source_resource_frontiers(plan)?;
+        Ok(())
+    }
+
+    /// Replay the canonical reader/writer lowering from independently derived
+    /// source effects. Local version monotonicity alone cannot prove that a
+    /// writer drains every earlier reader completion, so this closes that
+    /// omission attack at validation time.
+    fn validate_source_resource_frontiers(&self, plan: &ExecutionPlan) -> Result<(), String> {
+        #[derive(Default)]
+        struct ExpectedFrontier {
+            last_write: Option<NodeId>,
+            open_reads: BTreeSet<NodeId>,
+            version: u64,
+        }
+
+        let mut initial = BTreeMap::new();
+        for (node_id, node) in &self.nodes {
+            if let HNodeKind::ResourceState {
+                resource,
+                version: 0,
+            } = &node.kind
+            {
+                if initial.insert(resource.clone(), *node_id).is_some() {
+                    return Err(format!(
+                        "resource {:?} has more than one initial state",
+                        resource
+                    ));
+                }
+            }
+        }
+
+        let mut frontiers: BTreeMap<ResourceKey, ExpectedFrontier> = BTreeMap::new();
+        for plan_node in plan.topological_order()? {
+            let Some(info) = self.op_map.get(&plan_node) else {
+                continue;
+            };
+            let summary = effect_summary_for_plan_node(plan_node, &plan.nodes[plan_node.0].kind)?;
+            let (reads, writes) = summary.scheduling_accesses();
+            let resources = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
+            let completion = self
+                .completion_node(plan_node)
+                .ok_or_else(|| format!("operation {} has no completion node", plan_node.0))?;
+
+            for resource in resources {
+                let frontier = frontiers.entry(resource.clone()).or_default();
+                let expected_state = match frontier.last_write {
+                    Some(node) => node,
+                    None => initial
+                        .get(&resource)
+                        .copied()
+                        .ok_or_else(|| format!("resource {:?} has no initial state", resource))?,
+                };
+                if !info.inputs.contains(&expected_state) {
+                    return Err(format!(
+                        "operation {} does not consume the current {:?} writer state node {}",
+                        plan_node.0, resource, expected_state.0
+                    ));
+                }
+
+                if writes.contains(&resource) {
+                    for reader in &frontier.open_reads {
+                        if !info.inputs.contains(reader) {
+                            return Err(format!(
+                                "operation {} {:?} write omits open reader completion node {}",
+                                plan_node.0, resource, reader.0
+                            ));
+                        }
+                    }
+                    let outputs = info
+                        .outputs
+                        .iter()
+                        .filter_map(|node_id| match &self.nodes[node_id].kind {
+                            HNodeKind::ResourceState {
+                                resource: candidate,
+                                version,
+                            } if candidate == &resource => Some((*node_id, *version)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if outputs.len() != 1 || outputs[0].1 != frontier.version + 1 {
+                        return Err(format!(
+                            "operation {} {:?} write does not produce version {}",
+                            plan_node.0,
+                            resource,
+                            frontier.version + 1
+                        ));
+                    }
+                    frontier.last_write = Some(outputs[0].0);
+                    frontier.version += 1;
+                    frontier.open_reads.clear();
+                } else {
+                    frontier.open_reads.insert(completion);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1586,6 +1850,16 @@ fn resource_versions(graph: &HGraph, nodes: &[NodeId], resource: &ResourceKey) -
                 resource: candidate,
                 version,
             } if candidate == resource => Some(*version),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resource_keys(graph: &HGraph, nodes: &[NodeId]) -> BTreeSet<ResourceKey> {
+    nodes
+        .iter()
+        .filter_map(|node| match &graph.nodes.get(node)?.kind {
+            HNodeKind::ResourceState { resource, .. } => Some(resource.clone()),
             _ => None,
         })
         .collect()
@@ -1788,14 +2062,23 @@ mod tests {
     #[test]
     fn source_plan_validation_detects_omitted_sequence_dependency() {
         let program = crate::ir::OIrProgram {
-            nodes: vec![OIr::Load("left".into()), OIr::Load("right".into())],
+            nodes: vec![
+                OIr::Store {
+                    name: "left".into(),
+                    expr: Box::new(OIr::Text("one".into())),
+                },
+                OIr::Store {
+                    name: "right".into(),
+                    expr: Box::new(OIr::Text("two".into())),
+                },
+            ],
         };
         let mut graph = program.hgraph();
         let dependency = graph
             .sequence_dependencies
             .first()
             .cloned()
-            .expect("two fallible loads preserve source sequence");
+            .expect("effectful stores preserve source sequence");
         let successor_edge = graph.op_map[&dependency.successor].edge;
 
         graph
