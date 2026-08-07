@@ -141,22 +141,36 @@ struct IgnoreRules {
     matcher: ignore::gitignore::Gitignore,
 }
 
-fn load_ignore_rules(dir: &Path, stack: &mut Vec<IgnoreRules>) -> usize {
+fn load_ignore_rules(dir: &Path, stack: &mut Vec<IgnoreRules>) -> Result<usize> {
     let start = stack.len();
     for name in [".gitignore", ".olinkignore"] {
         let source = dir.join(name);
-        if !source.is_file() {
+        let metadata = match std::fs::metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", source.display()))
+            }
+        };
+        if !metadata.is_file() {
             continue;
         }
         let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
-        if builder.add(&source).is_some() {
-            continue;
+        if let Some(error) = builder.add(&source) {
+            return Err(error).with_context(|| {
+                format!("failed to parse project ignore file {}", source.display())
+            });
         }
-        if let Ok(matcher) = builder.build() {
-            stack.push(IgnoreRules { matcher });
-        }
+        let matcher = builder.build().with_context(|| {
+            format!(
+                "failed to build project ignore rules from {}",
+                source.display()
+            )
+        })?;
+        stack.push(IgnoreRules { matcher });
     }
-    start
+    Ok(start)
 }
 
 fn ignored(stack: &[IgnoreRules], path: &Path, is_dir: bool) -> bool {
@@ -178,12 +192,12 @@ fn walk(
     ignore_stack: &mut Vec<IgnoreRules>,
     out: &mut Vec<ProjectFile>,
 ) -> Result<()> {
-    let added_from = load_ignore_rules(dir, ignore_stack);
+    let added_from = load_ignore_rules(dir, ignore_stack)?;
 
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
+    let directory =
+        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?;
+    let mut entries =
+        collect_entry_paths(directory.map(|entry| entry.map(|entry| entry.path())), dir)?;
     entries.sort();
 
     for entry in entries {
@@ -192,10 +206,7 @@ fn walk(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let meta = match std::fs::symlink_metadata(&entry) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let meta = walk_entry_metadata(&entry)?;
         let file_type = meta.file_type();
         let is_dir = file_type.is_dir();
 
@@ -223,6 +234,23 @@ fn walk(
 
     ignore_stack.truncate(added_from);
     Ok(())
+}
+
+fn collect_entry_paths<I>(entries: I, dir: &Path) -> Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
+    entries
+        .into_iter()
+        .map(|entry| {
+            entry.with_context(|| format!("failed to enumerate an entry in {}", dir.display()))
+        })
+        .collect()
+}
+
+fn walk_entry_metadata(path: &Path) -> Result<std::fs::Metadata> {
+    std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect project entry {}", path.display()))
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
@@ -486,5 +514,34 @@ pub fn deserialize(bytes: &[u8]) -> Result<ProjectBundle> {
         other => bail!(
             "unsupported project bundle format version {other} (expected 1 or {BUNDLE_FORMAT_VERSION})"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_entry_errors_abort_bundle_capture() {
+        let error = collect_entry_paths(
+            [Err(std::io::Error::other(
+                "injected directory entry failure",
+            ))],
+            Path::new("fixture"),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to enumerate an entry in fixture"));
+    }
+
+    #[test]
+    fn metadata_errors_abort_bundle_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("disappeared-after-enumeration");
+        let error = walk_entry_metadata(&missing).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to inspect project entry"));
     }
 }

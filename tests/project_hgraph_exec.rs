@@ -12,7 +12,7 @@ use std::process::Command;
 use o_lang::effects::{EffectSummary, Fallibility, ResourceKey};
 use o_lang::hgraph::{ExecutableOp, HGraph, HNode, HNodeKind, ReadyInputPolicy, ReadySchedule};
 use o_lang::ir::PlanNodeId;
-use o_lang::project::runtime::{run_route, run_selection, RunOptions};
+use o_lang::project::runtime::{run_route, run_selection, RouteExecutionError, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_project_hgraph, execute_project_hgraph_selection,
     ArtifactCaptureFailure, ArtifactCaptureStatus, DeploymentPlanV1, OExecutionResult,
@@ -1223,6 +1223,32 @@ fn ordered_policy_bundle(
         policy,
     });
     bundle
+}
+
+#[test]
+fn hgraph_route_execution_budget_is_checked_before_materialization() {
+    let external = tempfile::tempdir().unwrap();
+    let audit_log = external.path().join("hgraph-budget-must-not-launch.log");
+    let bundle = ordered_policy_bundle(
+        RoutePolicy::AnySuccess,
+        &[("first", 1, 0), ("second", 0, 0)],
+        &audit_log,
+    );
+    let project = build_project_hgraph(&bundle, Some("service"), None).unwrap();
+    let mut options = RunOptions::default();
+    options.limits.max_routes_per_selection = 1;
+
+    let error = execute_project_hgraph(&bundle, &project, &options).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Configuration { detail })
+            if detail.contains("could execute 2 routes including prerequisites")
+    ));
+    assert!(
+        !audit_log.exists(),
+        "HGraph budget failure launched a route"
+    );
 }
 
 fn attempted_route_ids(results: &[OExecutionResult]) -> Vec<&str> {

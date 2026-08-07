@@ -251,6 +251,15 @@ impl<'a> ProjectCoordinator<'a> {
             .map_err(anyhow::Error::msg)
             .context("project HGraph source/projection validation failed")?;
 
+        let potential_route_executions = project
+            .plan
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.op, ExecutableOp::RunRoute { .. }))
+            .count();
+        opts.limits
+            .validate_route_execution_set(potential_route_executions)?;
+
         match &project.plan.policy {
             RoutePolicy::Explicit(_) | RoutePolicy::Default => {
                 if project.plan.alternatives.len() != 1 {

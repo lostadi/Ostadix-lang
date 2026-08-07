@@ -10,15 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use o_lang::project::runtime::{GuardBehavior, RunOptions};
+use o_lang::project::runtime::{GuardBehavior, RouteExecutionError, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_world_project_with_receipt,
     write_world_project_receipt_hex, ArtifactCaptureFailure, ArtifactCaptureStatus,
     DeploymentArchitectureRequirementV1, DeploymentPlanV1, DeploymentProjectPathV1,
     DeploymentProviderBindingV1, DeploymentProviderSnapshotV1, HostedWorldCoordinatorObserverV1,
     HostedWorldCurrentV1, HostedWorldLaunchV1, LogicalOperationIdV1, PlacementSnapshotV1,
-    ProjectAttemptState, ProjectAttemptTrace, ProjectBundle, ProjectHGraph, RuntimeGraphTerminalV1,
-    RuntimeGraphV1,
+    ProjectAttemptState, ProjectAttemptTrace, ProjectBundle, ProjectContinuationDecision,
+    ProjectContinuationEvidence, ProjectHGraph, RuntimeGraphTerminalV1, RuntimeGraphV1,
 };
 use o_lang::world::{
     project_receipt_semantic_sha256_v1, ArtifactId, AttemptGeneration, AttemptIdentity,
@@ -408,7 +408,7 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
         )
         .unwrap();
     assert!(matches!(
-        outcome.runtime_graph.terminal,
+        &outcome.runtime_graph.terminal,
         RuntimeGraphTerminalV1::RouteSettlement {
             residual_host_world: true,
             ..
@@ -579,6 +579,34 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
 }
 
 #[test]
+fn world_bound_route_execution_budget_fails_before_launch_or_receipt() {
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("world-budget-must-not-launch.marker");
+    let fixture = fixture(&marker, RouteMode::Success);
+    let mut options = RunOptions::default();
+    options.limits.max_routes_per_selection = 1;
+
+    let error = execute_world_project_with_receipt(
+        &fixture.bundle,
+        &fixture.project,
+        &options,
+        &fixture.deployment,
+        &fixture.snapshot,
+        &fixture.launch,
+        &fixture.current,
+        &fixture.signer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Configuration { detail })
+            if detail.contains("could execute 2 routes including prerequisites")
+    ));
+    assert!(!marker.exists(), "World budget failure launched a route");
+}
+
+#[test]
 fn runtime_graph_decode_rejects_constructor_impossible_terminal_shapes() {
     let temp = TempDir::new().unwrap();
     let marker = temp.path().join("runtime-graph-negative.marker");
@@ -616,6 +644,37 @@ fn runtime_graph_decode_rejects_constructor_impossible_terminal_shapes() {
         residual_host_world,
     };
     assert_runtime_graph_rejected(&failure_after_completed_root, "completed SelectRoute root");
+
+    let mut completed_after_abort = valid.clone();
+    let aborted = completed_after_abort
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("prepare")
+                && observation.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    aborted.state = ProjectAttemptState::Aborted;
+    aborted.failure_sha256 = Some("a".repeat(64));
+    assert_runtime_graph_rejected(&completed_after_abort, "contains an aborted operation");
+
+    let mut completed_after_failed_prerequisite = valid.clone();
+    let failed_prerequisite = completed_after_failed_prerequisite
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("prepare")
+                && observation.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    failed_prerequisite.state = ProjectAttemptState::SettledFailure;
+    failed_prerequisite.outcome.as_mut().unwrap().exit_code = Some(7);
+    assert_runtime_graph_rejected(
+        &completed_after_failed_prerequisite,
+        "completes selection after a failed prerequisite",
+    );
 
     let mut settlement_without_root = valid.clone();
     settlement_without_root
@@ -665,6 +724,196 @@ fn runtime_graph_decode_rejects_constructor_impossible_terminal_shapes() {
     }
     assert_runtime_graph_rejected(&noncanonical_branch, "uses a nonzero branch");
 
+    let make_two_branch_any_success = |graph: &mut RuntimeGraphV1| {
+        graph.policy = "any_success".to_owned();
+        for observation in graph
+            .operations
+            .iter_mut()
+            .flat_map(|operation| operation.observations.iter_mut())
+        {
+            if observation.route_id.as_deref() == Some("main")
+                && observation.operation_label == "run-route:main"
+            {
+                observation.branch = Some(1);
+            }
+        }
+        for observation in &mut graph.operations.last_mut().unwrap().observations {
+            observation.operation_label = "select-route:any_success".to_owned();
+        }
+    };
+
+    let mut later_branch_after_success = valid.clone();
+    make_two_branch_any_success(&mut later_branch_after_success);
+    let (prepare_operation, prepare_residual, prepare_observation) = later_branch_after_success
+        .operations
+        .iter()
+        .find_map(|operation| {
+            operation
+                .observations
+                .last()
+                .filter(|observation| {
+                    observation.route_id.as_deref() == Some("prepare")
+                        && observation.state == ProjectAttemptState::SettledSuccess
+                })
+                .map(|observation| {
+                    (
+                        operation.logical_operation,
+                        operation.residual_host_world,
+                        observation.clone(),
+                    )
+                })
+        })
+        .unwrap();
+    later_branch_after_success.terminal = RuntimeGraphTerminalV1::RouteSettlement {
+        selected_operation: prepare_operation,
+        route_id: "prepare".to_owned(),
+        disposition: project::RouteExecutionDisposition::Executed,
+        settlement: ProjectAttemptState::SettledSuccess,
+        outcome: prepare_observation.outcome.unwrap(),
+        residual_host_world: prepare_residual,
+    };
+    assert_runtime_graph_rejected(
+        &later_branch_after_success,
+        "ordered RuntimeGraph observes a later branch after prior success",
+    );
+
+    let mut later_branch_without_admission = valid.clone();
+    make_two_branch_any_success(&mut later_branch_without_admission);
+    let prepare = later_branch_without_admission
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("prepare")
+                && observation.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    prepare.state = ProjectAttemptState::SettledFailure;
+    prepare.outcome.as_mut().unwrap().exit_code = Some(7);
+    assert_runtime_graph_rejected(
+        &later_branch_without_admission,
+        "ordered RuntimeGraph later branch lacks an admitted prior continuation",
+    );
+
+    let mut completed_with_unfollowed_admission = valid.clone();
+    completed_with_unfollowed_admission.policy = "any_success".to_owned();
+    for observation in &mut completed_with_unfollowed_admission
+        .operations
+        .last_mut()
+        .unwrap()
+        .observations
+    {
+        observation.operation_label = "select-route:any_success".to_owned();
+    }
+    let selected = completed_with_unfollowed_admission
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("main")
+                && observation.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    selected.state = ProjectAttemptState::SettledFailure;
+    selected.outcome.as_mut().unwrap().exit_code = Some(7);
+    selected.continuation = Some(
+        ProjectContinuationDecision::new(
+            "never-ran",
+            vec!["prepare".to_owned(), "main".to_owned()],
+            ProjectContinuationEvidence::DeclaredIdempotent,
+        )
+        .unwrap(),
+    );
+    let selected_outcome = selected.outcome.clone().unwrap();
+    match &mut completed_with_unfollowed_admission.terminal {
+        RuntimeGraphTerminalV1::RouteSettlement {
+            settlement,
+            outcome,
+            ..
+        } => {
+            *settlement = ProjectAttemptState::SettledFailure;
+            *outcome = selected_outcome;
+        }
+        RuntimeGraphTerminalV1::CoordinatorFailure { .. } => unreachable!(),
+    }
+    assert_runtime_graph_rejected(
+        &completed_with_unfollowed_admission,
+        "stops after admitting continuation",
+    );
+
+    let mut admitted_partial_final_branch = valid.clone();
+    admitted_partial_final_branch.policy = "any_success".to_owned();
+    admitted_partial_final_branch
+        .operations
+        .last_mut()
+        .unwrap()
+        .observations
+        .clear();
+    let prepare = admitted_partial_final_branch
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("prepare")
+                && observation.state == ProjectAttemptState::SettledSuccess
+        })
+        .unwrap();
+    prepare.state = ProjectAttemptState::SettledFailure;
+    prepare.outcome.as_mut().unwrap().exit_code = Some(7);
+    prepare.continuation = Some(
+        ProjectContinuationDecision::new(
+            "main2",
+            vec!["prepare".to_owned()],
+            ProjectContinuationEvidence::DeclaredIdempotent,
+        )
+        .unwrap(),
+    );
+    let partial_route = admitted_partial_final_branch
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation
+                .observations
+                .first()
+                .is_some_and(|observation| observation.operation_label == "run-route:main")
+        })
+        .unwrap();
+    partial_route.observations.pop();
+    for observation in &mut partial_route.observations {
+        observation.operation_label = "run-route:prep2".to_owned();
+        observation.route_id = Some("prep2".to_owned());
+        observation.branch = Some(1);
+    }
+    let mut ordinals = admitted_partial_final_branch
+        .operations
+        .iter()
+        .enumerate()
+        .flat_map(|(operation, value)| {
+            value
+                .observations
+                .iter()
+                .enumerate()
+                .map(move |(observation, value)| {
+                    (value.coordinator_ordinal, operation, observation)
+                })
+        })
+        .collect::<Vec<_>>();
+    ordinals.sort_unstable();
+    for (ordinal, (_, operation, observation)) in ordinals.into_iter().enumerate() {
+        admitted_partial_final_branch.operations[operation].observations[observation]
+            .coordinator_ordinal = u64::try_from(ordinal).unwrap();
+    }
+    admitted_partial_final_branch.terminal = RuntimeGraphTerminalV1::CoordinatorFailure {
+        detail_sha256: artifact("admitted-partial-final-branch"),
+        residual_host_world: true,
+    };
+    admitted_partial_final_branch.validate().unwrap();
+    assert_eq!(
+        RuntimeGraphV1::decode_canonical(&admitted_partial_final_branch.canonical_bytes().unwrap())
+            .unwrap(),
+        admitted_partial_final_branch
+    );
+
     let mut incomplete_success = valid.clone();
     let selected_outcome = incomplete_success
         .operations
@@ -685,6 +934,30 @@ fn runtime_graph_decode_rejects_constructor_impossible_terminal_shapes() {
         &incomplete_success,
         "exit-zero route outcome has incomplete artifact evidence",
     );
+
+    for invalid_path in ["../escape.bin", "/absolute.bin", "nested//file.bin"] {
+        let mut invalid_artifact_path = valid.clone();
+        let observation_outcome = invalid_artifact_path
+            .operations
+            .iter_mut()
+            .flat_map(|operation| operation.observations.iter_mut())
+            .find(|observation| {
+                observation.route_id.as_deref() == Some("main") && observation.outcome.is_some()
+            })
+            .and_then(|observation| observation.outcome.as_mut())
+            .unwrap();
+        observation_outcome.artifacts[0].path = invalid_path.to_owned();
+        match &mut invalid_artifact_path.terminal {
+            RuntimeGraphTerminalV1::RouteSettlement { outcome, .. } => {
+                outcome.artifacts[0].path = invalid_path.to_owned();
+            }
+            RuntimeGraphTerminalV1::CoordinatorFailure { .. } => unreachable!(),
+        }
+        assert_runtime_graph_rejected(
+            &invalid_artifact_path,
+            "artifact path must be a canonical relative workspace path",
+        );
+    }
 
     let mut impossible_empty_stream = valid.clone();
     let empty_stream = impossible_empty_stream
@@ -780,13 +1053,69 @@ fn guard_skip_has_distinct_failure_evidence_without_launching_selected_route() {
     assert!(outcome.result.as_ref().unwrap().was_guard_skipped());
     assert_eq!(fs::read_to_string(&marker).unwrap(), "prepare-executed\n");
     assert!(matches!(
-        outcome.runtime_graph.terminal,
+        &outcome.runtime_graph.terminal,
         RuntimeGraphTerminalV1::RouteSettlement {
             disposition: project::RouteExecutionDisposition::GuardSkipped,
             settlement: ProjectAttemptState::Skipped,
             ..
         }
     ));
+
+    let mut impossible_capture = outcome.runtime_graph.clone();
+    let mut forged_fingerprint = impossible_capture
+        .operations
+        .iter()
+        .flat_map(|operation| operation.observations.iter())
+        .filter_map(|observation| observation.outcome.as_ref())
+        .flat_map(|route_outcome| route_outcome.artifacts.iter())
+        .next()
+        .unwrap()
+        .clone();
+    forged_fingerprint.path = "result.txt".to_owned();
+    let skipped = impossible_capture
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| observation.state == ProjectAttemptState::Skipped)
+        .and_then(|observation| observation.outcome.as_mut())
+        .unwrap();
+    skipped.artifacts = vec![forged_fingerprint.clone()];
+    skipped.artifact_capture = ArtifactCaptureStatus::Complete;
+    match &mut impossible_capture.terminal {
+        RuntimeGraphTerminalV1::RouteSettlement { outcome, .. } => {
+            outcome.artifacts = vec![forged_fingerprint];
+            outcome.artifact_capture = ArtifactCaptureStatus::Complete;
+        }
+        RuntimeGraphTerminalV1::CoordinatorFailure { .. } => unreachable!(),
+    }
+    assert_runtime_graph_rejected(
+        &impossible_capture,
+        "skipped route settlement carries captured artifacts",
+    );
+
+    let mut impossible_stdout = outcome.runtime_graph.clone();
+    let skipped = impossible_stdout
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| observation.state == ProjectAttemptState::Skipped)
+        .and_then(|observation| observation.outcome.as_mut())
+        .unwrap();
+    skipped.stdout_sha256 = hex::encode(Sha256::digest(b"forged"));
+    skipped.stdout_total_observed_bytes = 6;
+    skipped.stdout_retained_bytes = 6;
+    match &mut impossible_stdout.terminal {
+        RuntimeGraphTerminalV1::RouteSettlement { outcome, .. } => {
+            outcome.stdout_sha256 = hex::encode(Sha256::digest(b"forged"));
+            outcome.stdout_total_observed_bytes = 6;
+            outcome.stdout_retained_bytes = 6;
+        }
+        RuntimeGraphTerminalV1::CoordinatorFailure { .. } => unreachable!(),
+    }
+    assert_runtime_graph_rejected(
+        &impossible_stdout,
+        "skipped route settlement must have an empty complete stdout stream",
+    );
 
     let resolver = ExactResolver {
         key_id: fixture.signer.key_id(),
