@@ -15,10 +15,11 @@ use o_lang::ir::PlanNodeId;
 use o_lang::project::runtime::{run_route, run_selection, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_project_hgraph, execute_project_hgraph_selection,
-    DeploymentPlanV1, OExecutionResult, ProjectAttemptIdentity, ProjectAttemptState,
-    ProjectAttemptTrace, ProjectBundle, ProjectContinuationDecision, ProjectContinuationEvidence,
-    ProjectExecutionError, ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition,
-    RouteFailureContinuation, RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
+    ArtifactCaptureFailure, ArtifactCaptureStatus, DeploymentPlanV1, OExecutionResult,
+    ProjectAttemptIdentity, ProjectAttemptState, ProjectAttemptTrace, ProjectBundle,
+    ProjectContinuationDecision, ProjectContinuationEvidence, ProjectExecutionError,
+    ProjectExecutionOutcome, ProjectHGraph, RouteExecutionDisposition, RouteFailureContinuation,
+    RouteGuard, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
 };
 use o_lang::value::OValue;
 use sha2::{Digest, Sha256};
@@ -66,7 +67,7 @@ fn read_cli_trace(path: &Path) -> serde_json::Value {
 fn assert_unsigned_diagnostic_trace(trace: &serde_json::Value) {
     let root = trace.as_object().expect("trace root must be a JSON object");
     assert_eq!(root.len(), 3, "unexpected trace root fields: {root:?}");
-    assert_eq!(trace["format_version"], 5);
+    assert_eq!(trace["format_version"], 6);
     assert!(trace["header"].is_object());
     let events = trace["events"]
         .as_array()
@@ -538,6 +539,19 @@ fn failed_prerequisite_blocks_the_main_route() {
             .exit_code,
         Some(23)
     );
+    assert!(matches!(
+        &settled_prepare
+            .outcome
+            .as_ref()
+            .expect("settled route must retain its normalized outcome")
+            .artifact_capture,
+        ArtifactCaptureStatus::Incomplete { failure }
+            if matches!(
+                failure.as_ref(),
+                ArtifactCaptureFailure::Missing { requirement }
+                    if requirement == "prepared.txt"
+            )
+    ));
     assert_eq!(
         failed_attempt
             .settled_result(prepare_value)
@@ -707,6 +721,74 @@ fn infrastructure_abort_publishes_no_route_outputs() {
         .chain(std::iter::once(main_completion))
         .chain(resource_successors)
     {
+        assert!(!failed_attempt.is_materialized(output));
+        assert!(failed_attempt.is_failed(output));
+    }
+    assert!(!poison.exists());
+}
+
+#[test]
+fn incomplete_required_artifact_aborts_without_success_evidence() {
+    let external = tempfile::tempdir().unwrap();
+    let poison = external
+        .path()
+        .join("artifact-abort-outside-workspace-poison");
+    let mut bundle = fixture_bundle(&poison);
+    bundle
+        .routes
+        .iter_mut()
+        .find(|route| route.id == "main")
+        .unwrap()
+        .outputs = vec!["required-but-not-produced.bin".into()];
+
+    let project = explicit_project(&bundle);
+    let main_run = project
+        .plan
+        .operations
+        .iter()
+        .find(|operation| {
+            matches!(
+                &operation.op,
+                ExecutableOp::RunRoute { route_id } if route_id == "main"
+            )
+        })
+        .unwrap();
+    let main_info = project.graph.op_for(main_run.id).unwrap();
+    let main_value = main_info.value_output;
+    let main_completion = project.graph.completion_node(main_run.id).unwrap();
+
+    let error = execute_project_hgraph(&bundle, &project, &RunOptions::default()).unwrap_err();
+    let failed_attempt = error
+        .downcast_ref::<ProjectExecutionError>()
+        .expect("artifact capture failure must retain coordinator state");
+    assert!(
+        failed_attempt
+            .message()
+            .contains("declared artifact `required-but-not-produced.bin` is missing"),
+        "unexpected failure: {}",
+        failed_attempt.message()
+    );
+    let lifecycle = failed_attempt
+        .trace
+        .events()
+        .iter()
+        .filter(|event| event.operation_label == "run-route:main")
+        .map(|event| event.state)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        [
+            ProjectAttemptState::Ready,
+            ProjectAttemptState::Started,
+            ProjectAttemptState::Aborted,
+        ]
+    );
+    assert!(!failed_attempt.trace.events().iter().any(|event| {
+        event.operation_label == "run-route:main"
+            && event.state == ProjectAttemptState::SettledSuccess
+    }));
+    assert!(failed_attempt.settled_result(main_value).is_none());
+    for output in [main_value, main_completion] {
         assert!(!failed_attempt.is_materialized(output));
         assert!(failed_attempt.is_failed(output));
     }
@@ -884,7 +966,7 @@ fn guard_skip_has_normalized_legacy_parity() {
     )];
     let opts = RunOptions {
         guard_behavior: o_lang::project::runtime::GuardBehavior::Skip,
-        inherit_env: true,
+        ..RunOptions::default()
     };
 
     let old = run_route(&bundle, "main", &opts).unwrap();
@@ -975,7 +1057,25 @@ fn every_operation_has_one_ready_started_and_terminal_event() {
     let normalized = terminal.outcome.as_ref().unwrap();
     assert_eq!(normalized.exit_code, Some(0));
     assert_eq!(normalized.stdout_sha256, sha256(EXPECTED_STDOUT));
+    assert_eq!(
+        normalized.stdout_total_observed_bytes,
+        EXPECTED_STDOUT.len() as u64
+    );
+    assert_eq!(
+        normalized.stdout_retained_bytes,
+        EXPECTED_STDOUT.len() as u64
+    );
+    assert!(!normalized.stdout_truncated);
     assert_eq!(normalized.stderr_sha256, sha256(EXPECTED_STDERR));
+    assert_eq!(
+        normalized.stderr_total_observed_bytes,
+        EXPECTED_STDERR.len() as u64
+    );
+    assert_eq!(
+        normalized.stderr_retained_bytes,
+        EXPECTED_STDERR.len() as u64
+    );
+    assert!(!normalized.stderr_truncated);
     assert_eq!(normalized.artifacts.len(), 1);
     assert_eq!(normalized.artifacts[0].path, "result.txt");
     assert_eq!(normalized.artifacts[0].bytes_len, 22);
@@ -2464,7 +2564,25 @@ fn olangc_hgraph_success_writes_an_unsigned_parseable_attempt_trace() {
     let outcome = &main_events.last().unwrap()["outcome"];
     assert_eq!(outcome["exit_code"], 0);
     assert_sha256_json(&outcome["stdout_sha256"], "stdout fingerprint");
+    assert_eq!(
+        outcome["stdout_total_observed_bytes"],
+        EXPECTED_STDOUT.len() as u64
+    );
+    assert_eq!(
+        outcome["stdout_retained_bytes"],
+        EXPECTED_STDOUT.len() as u64
+    );
+    assert_eq!(outcome["stdout_truncated"], false);
     assert_sha256_json(&outcome["stderr_sha256"], "stderr fingerprint");
+    assert_eq!(
+        outcome["stderr_total_observed_bytes"],
+        EXPECTED_STDERR.len() as u64
+    );
+    assert_eq!(
+        outcome["stderr_retained_bytes"],
+        EXPECTED_STDERR.len() as u64
+    );
+    assert_eq!(outcome["stderr_truncated"], false);
     assert_eq!(outcome["artifacts"].as_array().unwrap().len(), 1);
     assert_sha256_json(&outcome["artifacts"][0]["sha256"], "artifact fingerprint");
 }

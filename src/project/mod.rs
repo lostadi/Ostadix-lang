@@ -62,9 +62,10 @@ pub use logical::{
     LogicalRouteKindV1, LogicalRoutePolicyV1, LOGICAL_HGRAPH_SCHEMA_V1, MAX_LOGICAL_HGRAPH_BYTES,
 };
 pub use model::{
-    Artifact, ExecutionProvenance, FileRole, OExecutionResult, ProjectBundle, ProjectFile,
-    ResultCodec, RouteEffects, RouteExecutionDisposition, RouteFailureContinuation, RouteGuard,
-    RouteKind, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
+    Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, ExecutionProvenance, FileRole,
+    OExecutionResult, ProjectBundle, ProjectFile, ResultCodec, RouteEffects,
+    RouteExecutionDisposition, RouteFailureContinuation, RouteGuard, RouteKind, RoutePolicy,
+    RouteProvenance, RouteSet, RouteSpec,
 };
 pub use plan::{
     build_project_hgraph, ProjectCancellationSemantics, ProjectDependency, ProjectExecutionPlan,
