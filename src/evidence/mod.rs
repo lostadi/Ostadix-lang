@@ -12,7 +12,7 @@ mod fact;
 pub mod profile;
 
 pub use admit::{
-    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV1,
+    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV2,
     OperationBlockerV1, RetainedSequenceV1, SequenceRetentionReasonV1,
 };
 pub use analyze::{
@@ -20,8 +20,8 @@ pub use analyze::{
 };
 pub use fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
-    DispatchContractV1, DispatchLaneV1, EffectContractV1, EvidenceBindingsV1, EvidenceBundleV1,
-    EvidenceProvenance, FailureClassV1, FailureContractV1, NodeEvidence, PlacementContractV1,
-    ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1, TypeContractV1,
-    ADMISSION_SCHEMA_V1, ANALYZER_ID_V1, EVIDENCE_SCHEMA_V1,
+    DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, EffectContractV1, EvidenceBindingsV1,
+    EvidenceBundleV2, EvidenceProvenance, FailureClassV1, FailureContractV1, NodeEvidence,
+    PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    TypeContractV1, ADMISSION_SCHEMA_V2, ANALYZER_ID_V2, EVIDENCE_SCHEMA_V2,
 };

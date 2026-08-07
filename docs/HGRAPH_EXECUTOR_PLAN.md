@@ -6,7 +6,7 @@ executor used by the differential conformance suite.
 
 ```text
 .O -> OIR -> validated ExecutionPlan -> draft HGraph -> type/fidelity solve
-   -> EvidenceBundleV1 -> admission compiler -> AdmittedExecution
+   -> EvidenceBundleV2 -> admission compiler -> AdmittedExecution
    -> Coordinator
 ```
 
@@ -18,7 +18,7 @@ constructor are private to the digest-checking admission path. The evaluator
 also compiles this admission when `O_EXECUTOR=serial` selects the differential
 oracle, so changing the executor does not bypass pre-execution checking.
 
-`EvidenceBundleV1` is a pre-execution certificate bundle. For each executable
+`EvidenceBundleV2` is a pre-execution certificate bundle. For each executable
 operation it records type, effect-footprint, dispatch, capability-policy,
 placement, failure-policy, and resource-demand contracts, plus a separate soft
 cost estimate and the provenance of every fact. Only enforced,
@@ -31,7 +31,7 @@ The bundle binds canonical lowered OIR, the validated plan, the solved analyzed
 graph, analyzer identity, resolved backend artifacts, execution environment,
 and a descriptive ambient `HostWorld` snapshot. It deliberately labels the
 first digest `lowered-oir-sha256`: evaluator APIs can receive an existing
-`OIrProgram`, so v1 does not claim an original source-byte digest. Admission
+`OIrProgram`, so v2 does not claim an original source-byte digest. Admission
 rejects mismatched bindings, attaches seven pre-materialized
 `AdmissionEvidence` nodes to every executable edge, validates the resulting
 graph, and freezes it. Immediately before running, both the coordinator and
@@ -41,12 +41,12 @@ opaque/deferred operations.
 The backend artifact binding distinguishes hashed files, missing paths,
 non-regular paths, and unreadable paths, and includes the current executable;
 execution admission rejects an unhashed current executable. Runtime rechecks
-are path/environment snapshots, not an immutable execution substrate: v1 does
+are path/environment snapshots, not an immutable execution substrate: v2 does
 not pin an opened adapter or frozen child environment and cannot prove the
 bytes/environment observed at spawn. It also does not bind caller initial-scope
 shape/values, opaque state/generation inside an already-live actor, the full
 external interpreter/toolchain closure, or a placement lease.
-In v1, actor identity is only a serialization identity; all such hosted work
+In v2, actor identity is only a serialization identity; all such hosted work
 remains unknown, coordinator-lane, and conservatively attached to `HostWorld`.
 
 `olangc FILE --target ir --explain-schedule` exercises this solve, analysis,
@@ -54,12 +54,12 @@ and admission path without dispatch. It prints exact digest bindings,
 per-operation provenance, blockers, retained source-sequence reasons, and
 static legal waves. Its admission report identifies the runtime snapshot as
 `inspection-only`; it is not interchangeable with the evaluator's execution
-snapshot. The inspection surface is ordinary-OIR-only in v1.
+snapshot. The inspection surface is ordinary-OIR-only in v2.
 
 This admission is distinct from an observation or receipt. `RuntimeGraphV1`
 and `ExecutionReceiptV1` describe completed execution and carry no scheduling
 authority; a prior receipt cannot authorize a new run. Project HGraphs and the
-buffered Request scheduler also remain separate execution islands in v1.
+buffered Request scheduler also remain separate execution islands in v2.
 
 Project inputs have a distinct logical-planning and opt-in hosted execution
 surface:
@@ -333,22 +333,41 @@ and the attribute-free trusted `html`, `markdown`, `text`, and `latex` inline
 renderers whose bodies contain only literal text, already-settled Store
 children, and recursively trusted renderers. On the coordinator thread,
 preparation freezes the relevant scope or already-materialized splice inputs
-into immutable `Send`-only envelopes. The
-current implementation launches one scoped local worker per prepared task,
-including a singleton batch, so admitted `LocalWorker` placement is literal.
-It waits for the complete batch before deriving a fresh frontier, so this is
-neither a persistent worker pool nor a per-completion wakeup loop.
+into immutable owned `PreparedTask` envelopes. Evidence schema v2 binds each
+operation to exactly one adapter ID: `o-scope-load/v1`,
+`trusted-inline-renderer/v1`, or `coordinator/v1`. Runtime preparation validates
+that exact adapter against the admitted OIR; it cannot choose a different
+adapter as a second scheduling authority.
+
+For each graph execution containing local-worker operations, the coordinator
+creates one fixed-size pool and reuses its threads across changing readiness
+frontiers. Capacity is the evaluator's machine-derived local parallelism cap,
+bounded by the number of admitted worker operations. It is not evidence-backed
+CPU or memory admission. Each physical completion is delivered independently.
+The coordinator buffers the provisional outcome, settles every now-eligible
+semantic prefix result, recomputes readiness, and may submit newly exposed
+worker work while an unrelated prior task is still running. A reported static
+wave is therefore not a pool batch, capacity promise, or observed completion
+order. Coordinator-owned work remains single-owner and this bounded
+implementation waits for the local pool to become idle before executing it.
 
 Same-binding loads share the latest writer frontier and demonstrably execute at
-the same time in that scoped batch. Loads are pure but fallible. The coordinator
+the same time in the local pool. Loads are pure but fallible. The coordinator
 uses serial topological rank rather than preorder plan identity, and admits a
-fallible batch only when its members form the contiguous unfinished semantic
-prefix. It buffers all batch outcomes, visits them by `(semantic ordinal, plan
-node)`, and selects the first failure. Successful outcomes before it are
-materialized; the selected failure is reported; every later speculative outcome
-is recorded as discarded and publishes no graph outputs. Infallible effect-free
-workers may speculate outside the prefix. This preserves deterministic strict
-fail-stop selection without requiring adjacent pure reads to execute serially.
+fallible task only while it extends the contiguous unfinished semantic prefix.
+Physical completions may arrive in any order, but outcomes remain provisional
+until the semantic frontier reaches them. Successful outcomes before the first
+failure are materialized; the selected failure is reported; every later started
+outcome is drained, recorded as discarded, and publishes no graph outputs.
+Infallible effect-free workers may be dispatched outside the prefix. This
+preserves deterministic strict fail-stop selection without requiring adjacent
+pure reads to execute serially. Adapter-returned errors remain semantic
+outcomes. A broken pool mechanism is an infrastructure abort: the coordinator
+stops dispatch, drains every started task to one terminal trace event, and does
+not disguise the failure as `NodeFailed`. An unwind-capable build gives a caught
+worker panic the same treatment. The release profile uses `panic = "abort"`, so
+a release worker panic terminates the process before in-process recovery or
+terminal trace completion; v2 does not claim otherwise.
 
 After each accepted success, the coordinator materializes the value,
 completion, and written successor-state outputs. On a selected failure, it emits
@@ -425,18 +444,24 @@ The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,
 persistent Python and SQL state, environment mutation/read behavior, and full
 filesystem snapshots. Test-only rendezvous probes prove real worker overlap for
-both safe renderer tasks and same-binding O-scope loads. A fallible-load test
-also proves lowest-ordinal error selection and later-outcome discard.
+both safe renderer tasks and same-binding O-scope loads. Pool tests prove fixed
+capacity, thread reuse, singleton off-owner placement, independent completion
+delivery, and recovery after a caught worker panic. Coordinator tests prove
+that a fast worker can expose dependent worker work while an unrelated slow
+task remains active. Fallible-worker tests preserve lowest-semantic-ordinal
+failure selection and later-outcome discard while tasks overlap.
 
 ## Deliberately deferred optimization
 
-The reader-frontier topology now drives actual scoped-worker overlap for its
-narrow compiler-verified O-scope `Load` class. Generic hosted prepared-task
-lanes, a persistent worker pool with per-completion wakeups, actor-owned
-persistent environments, renewable CPU/memory/device capacity admission,
-critical-path or measured-cost ranking, transactional prepare/commit, and
-unified OIR/Request/project scheduling are future work. Broader dispatch also
-requires verified or enforced backend-specific effect and failure contracts.
+The reader-frontier topology now drives actual persistent-pool overlap for its
+narrow compiler-verified O-scope `Load` class, and per-completion wakeups remove
+the previous complete-wave barrier for worker-only progress. Generic hosted
+prepared-task lanes, actor-owned persistent environments, renewable
+CPU/memory/device capacity admission, critical-path or measured-cost ranking,
+transactional prepare/commit, overlap between coordinator-owned operations and
+outstanding worker tasks, and unified OIR/Request/project scheduling are future
+work. Broader dispatch also requires verified or enforced backend-specific
+effect and failure contracts.
 The runtime does not claim complete static effect inference, automatic path
 extraction from arbitrary hosted source, arbitrary hosted-read overlap, or safe
 arbitrary cross-runtime parallelism.
