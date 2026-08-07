@@ -324,6 +324,9 @@ impl ExecutionAdmissionV2 {
             "admission-note fallible local-worker outcomes may complete out of order but remain provisional and settle at the contiguous serial-topological prefix\n",
         );
         out.push_str(
+            "admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs\n",
+        );
+        out.push_str(
             "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
         );
         out.push_str(
@@ -815,7 +818,8 @@ mod tests {
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
     use crate::hgraph::{DomainFlags, ValueState};
-    use crate::ir::{OIr, OIrProgram, PlanNodeKind};
+    use crate::ir::{InvokeMode, OIr, OIrProgram, PlanNodeKind};
+    use crate::value::GroupMode;
 
     fn reader_writer_program(initial: &str) -> OIrProgram {
         OIrProgram {
@@ -844,12 +848,12 @@ mod tests {
         runtime_binding_from_adapter_bytes(plan, &[], &[("evidence-test", label)])
     }
 
-    fn legal_projection(
-        admission: &ExecutionAdmissionV2,
-    ) -> (
+    type LegalProjection = (
         Vec<Vec<PlanNodeId>>,
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
-    ) {
+    );
+
+    fn legal_projection(admission: &ExecutionAdmissionV2) -> LegalProjection {
         (
             admission.waves().to_vec(),
             admission
@@ -917,6 +921,8 @@ mod tests {
         assert!(explanation.contains("legal static frontier"));
         assert!(explanation.contains("dispatch adapter IDs are evidence-bound"));
         assert!(explanation.contains("fixed-size per-run pool with per-completion wakeups"));
+        assert!(explanation
+            .contains("verified-pure infallible local-worker outputs may provisionally unlock"));
     }
 
     #[test]
@@ -946,6 +952,73 @@ mod tests {
             error.to_string().contains("exact canonical solved HGraph"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn analyzer_rejects_forged_backend_metadata_before_issuing_evidence() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "python".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: crate::ir::BackendRegistry::global().interface_for("text"),
+                body: vec![OIr::Text("not python".into())],
+            }],
+        };
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "forged-backend-metadata");
+
+        let error = analyze_execution(&program, &plan, &graph, runtime)
+            .expect_err("analysis must reject an interface forged for another language");
+
+        assert!(
+            format!("{error:#}")
+                .contains("does not match the registered execution and authority policy"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn analyzer_rejects_forged_invocation_metadata_before_issuing_evidence() {
+        for (label, node) in [
+            (
+                "unknown-group-name",
+                OIr::Invoke {
+                    fn_name: "not-a-group".into(),
+                    mode: InvokeMode::Group(GroupMode::Batch),
+                    args: vec![OIr::Text("member".into())],
+                },
+            ),
+            (
+                "wrong-group-mode",
+                OIr::Invoke {
+                    fn_name: "batch".into(),
+                    mode: InvokeMode::Group(GroupMode::Race),
+                    args: vec![OIr::Text("member".into())],
+                },
+            ),
+            (
+                "reserved-name-marked-eager",
+                OIr::Invoke {
+                    fn_name: "lazy".into(),
+                    mode: InvokeMode::Eager,
+                    args: vec![OIr::Text("member".into())],
+                },
+            ),
+        ] {
+            let program = OIrProgram { nodes: vec![node] };
+            let plan = program.plan();
+            let graph = solved_graph(&program);
+            let runtime = inspection_runtime(&plan, label);
+
+            let error = analyze_execution(&program, &plan, &graph, runtime)
+                .expect_err("analysis must reject a forged invocation name/mode pair");
+            assert!(
+                format!("{error:#}").contains("canonical lowering requires"),
+                "{label}: {error:#}"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,10 @@
 //!
 //! A [`PreparedTask`] contains no evaluator borrow or mutable process-registry
 //! state. The coordinator issues the opaque [`TaskToken`]; worker code cannot
-//! choose or forge which admitted operation receives the result. Completion is
-//! provisional until the coordinator settles it in semantic order.
+//! choose or forge which admitted operation receives the result. Durable trace
+//! and commit remain provisional until the coordinator settles them in
+//! semantic order; a verified-pure infallible value may become visible earlier
+//! only to equally safe worker dependents.
 
 use anyhow::Result;
 
@@ -40,8 +42,9 @@ impl TaskSubmission {
     }
 }
 
-/// A physical worker completion. Its outcome is not semantically visible
-/// until the coordinator accepts it at the ordered settlement frontier.
+/// A physical worker completion. Its durable outcome is not semantically
+/// settled before the ordered frontier, although a verified-pure infallible
+/// value may provisionally unlock equally safe worker dependents.
 pub(crate) struct TaskCompletion {
     pub(crate) token: TaskToken,
     pub(crate) outcome: TaskOutcome,
@@ -51,7 +54,7 @@ impl TaskCompletion {
     pub(crate) fn completed(token: TaskToken, outcome: Result<OValue>) -> Self {
         Self {
             token,
-            outcome: TaskOutcome::Completed(outcome),
+            outcome: TaskOutcome::Completed(outcome.map(Box::new)),
         }
     }
 
@@ -63,9 +66,10 @@ impl TaskCompletion {
     }
 }
 
-/// Physical completion class. Adapter-returned errors are semantic outcomes;
-/// a broken worker execution mechanism must never masquerade as `NodeFailed`.
+/// Physical completion class. An adapter error is semantic only for an admitted
+/// fallible operation; an error from an admitted-infallible adapter is a broken
+/// execution contract and must never masquerade as `NodeFailed`.
 pub(crate) enum TaskOutcome {
-    Completed(Result<OValue>),
+    Completed(Result<Box<OValue>>),
     InfrastructureAbort(anyhow::Error),
 }

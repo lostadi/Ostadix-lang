@@ -252,8 +252,8 @@ proptest! {
             let summary = graph.effect_summary(op.plan_node).expect("effect summary");
             let (reads, writes) = summary.scheduling_accesses();
             for resource in reads.union(&writes) {
-                let inputs = resource_versions(&graph, &op.inputs, &resource);
-                let outputs = resource_versions(&graph, &op.outputs, &resource);
+                let inputs = resource_versions(&graph, &op.inputs, resource);
+                let outputs = resource_versions(&graph, &op.outputs, resource);
                 prop_assert_eq!(inputs.len(), 1, "missing {:?} input", resource);
                 if writes.contains(resource) {
                     prop_assert_eq!(outputs.len(), 1, "missing {:?} write output", resource);

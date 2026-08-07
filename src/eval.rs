@@ -89,7 +89,8 @@ pub enum TraceEvent {
         message: String,
     },
     /// The operation executed speculatively, but strict fail-stop settlement
-    /// withheld its result after an earlier semantic-ordinal failure.
+    /// withheld its result after an earlier semantic failure or infrastructure
+    /// abort.
     NodeDiscarded {
         id: PlanNodeId,
         reason: String,
@@ -1801,125 +1802,7 @@ impl Evaluator {
         _plan: &ExecutionPlan,
         flat: &[&OIr],
     ) -> Result<()> {
-        for node in flat {
-            match node {
-                OIr::Invoke {
-                    fn_name,
-                    mode: InvokeMode::Lazy,
-                    args,
-                } => {
-                    if args.len() != 1 {
-                        bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
-                    }
-                    if fn_name != "lazy" {
-                        bail!("lazy schedule node must be named lazy, got {fn_name}");
-                    }
-                }
-                OIr::Invoke {
-                    fn_name,
-                    mode: InvokeMode::Autonomous,
-                    args,
-                } => {
-                    if args.len() != 1 {
-                        bail!(
-                            "autonomous(expr) takes exactly 1 argument, got {}",
-                            args.len()
-                        );
-                    }
-                    if fn_name != "autonomous" {
-                        bail!("autonomous schedule node must be named autonomous, got {fn_name}");
-                    }
-                }
-                OIr::Invoke {
-                    fn_name,
-                    mode: InvokeMode::Group(_),
-                    args,
-                } => {
-                    if args.is_empty() {
-                        bail!("{}(...) takes at least 1 argument, got 0", fn_name);
-                    }
-                }
-                OIr::Exec {
-                    lang,
-                    attr,
-                    backend,
-                    ..
-                } => self.prevalidate_exec_metadata(lang, attr.as_deref(), backend)?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn prevalidate_exec_metadata(
-        &self,
-        lang: &str,
-        attr: Option<&str>,
-        backend: &BackendInterface,
-    ) -> Result<()> {
-        let registered_backend = BackendRegistry::global().interface_for(lang);
-        if backend != &registered_backend {
-            bail!(
-                "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
-            );
-        }
-
-        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
-            if attr.is_some() {
-                bail!("attributes are not valid on the structural `quote` backend");
-            }
-            return Ok(());
-        }
-
-        if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
-            if attr.is_some() {
-                bail!("attributes are not valid on the structural `O` backend");
-            }
-            return Ok(());
-        }
-
-        if backend.execution == ExecutionMode::InlineAst {
-            bail!(
-                "OIR backend `{}` declares inline_ast execution without an executor",
-                backend.canonical
-            );
-        }
-
-        let options = BlockOptions::parse(attr, lang)?;
-        if let Some(policy) = options.policy {
-            match policy {
-                BlockEvalPolicy::Lazy => {
-                    if lang == "nix_expr" {
-                        bail!(
-                            "`nix_expr{{lazy}}^` is redundant — nix_expr^ already \
-                             captures its expression lazily. Use bare nix_expr^ for \
-                             a captured Nix expression, or nix{{defer}}^ for a \
-                             non-cacheable deferred raw Nix evaluation."
-                        );
-                    }
-                    if !backend.pure {
-                        bail!(
-                            "`{lang}{{lazy}}^` is invalid because {lang} is not a \
-                             pure backend; caching a thunk that re-runs with side \
-                             effects would be unsound. Use `{lang}{{defer}}^` instead \
-                             — it captures the same thunk but never caches and \
-                             always re-runs on force.",
-                            lang = lang
-                        );
-                    }
-                }
-                BlockEvalPolicy::Defer => {
-                    if lang == "nix_expr" {
-                        bail!(
-                            "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
-                             lazy. If you want a non-cacheable deferred Nix eval, \
-                             write nix{{defer}}^."
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
+        validate_execution_metadata(flat)
     }
 
     pub(crate) fn execute_ready_plan_node(
@@ -2509,6 +2392,130 @@ impl Evaluator {
     fn render_child(&self, lang: &str, val: &OValue) -> String {
         render_with(BackendRegistry::global().renderer_for(lang), val)
     }
+}
+
+/// Validate the execution metadata embedded in lowered OIR before evidence is
+/// issued. This is intentionally evaluator-independent: admission must reject
+/// a forged backend interface or invocation contract instead of merely binding
+/// the invalid metadata to a digest and deferring rejection until dispatch.
+pub(crate) fn validate_execution_metadata(flat: &[&OIr]) -> Result<()> {
+    for node in flat {
+        match node {
+            OIr::Invoke {
+                fn_name,
+                mode,
+                args,
+            } => {
+                let canonical_mode = InvokeMode::for_name(fn_name);
+                if *mode != canonical_mode {
+                    bail!(
+                        "OIR invocation `{fn_name}` uses mode {}, but canonical lowering requires {}",
+                        mode.label(),
+                        canonical_mode.label()
+                    );
+                }
+                match mode {
+                    InvokeMode::Lazy => {
+                        if args.len() != 1 {
+                            bail!("lazy(expr) takes exactly 1 argument, got {}", args.len());
+                        }
+                    }
+                    InvokeMode::Autonomous => {
+                        if args.len() != 1 {
+                            bail!(
+                                "autonomous(expr) takes exactly 1 argument, got {}",
+                                args.len()
+                            );
+                        }
+                    }
+                    InvokeMode::Group(_) => {
+                        if args.is_empty() {
+                            bail!("{}(...) takes at least 1 argument, got 0", fn_name);
+                        }
+                    }
+                    InvokeMode::Eager => {}
+                }
+            }
+            OIr::Exec {
+                lang,
+                attr,
+                backend,
+                ..
+            } => validate_exec_metadata(lang, attr.as_deref(), backend)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_exec_metadata(
+    lang: &str,
+    attr: Option<&str>,
+    backend: &BackendInterface,
+) -> Result<()> {
+    let registered_backend = BackendRegistry::global().interface_for(lang);
+    if backend != &registered_backend {
+        bail!(
+            "OIR backend interface for `{lang}` does not match the registered execution and authority policy"
+        );
+    }
+
+    if backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote" {
+        if attr.is_some() {
+            bail!("attributes are not valid on the structural `quote` backend");
+        }
+        return Ok(());
+    }
+
+    if backend.execution == ExecutionMode::InlineAst && backend.canonical == "O" {
+        if attr.is_some() {
+            bail!("attributes are not valid on the structural `O` backend");
+        }
+        return Ok(());
+    }
+
+    if backend.execution == ExecutionMode::InlineAst {
+        bail!(
+            "OIR backend `{}` declares inline_ast execution without an executor",
+            backend.canonical
+        );
+    }
+
+    let options = BlockOptions::parse(attr, lang)?;
+    if let Some(policy) = options.policy {
+        match policy {
+            BlockEvalPolicy::Lazy => {
+                if lang == "nix_expr" {
+                    bail!(
+                        "`nix_expr{{lazy}}^` is redundant — nix_expr^ already \
+                         captures its expression lazily. Use bare nix_expr^ for \
+                         a captured Nix expression, or nix{{defer}}^ for a \
+                         non-cacheable deferred raw Nix evaluation."
+                    );
+                }
+                if !backend.pure {
+                    bail!(
+                        "`{lang}{{lazy}}^` is invalid because {lang} is not a \
+                         pure backend; caching a thunk that re-runs with side \
+                         effects would be unsound. Use `{lang}{{defer}}^` instead \
+                         — it captures the same thunk but never caches and \
+                         always re-runs on force.",
+                        lang = lang
+                    );
+                }
+            }
+            BlockEvalPolicy::Defer => {
+                if lang == "nix_expr" {
+                    bail!(
+                        "`nix_expr{{defer}}^` is redundant — nix_expr^ is already \
+                         lazy. If you want a non-cacheable deferred Nix eval, \
+                         write nix{{defer}}^."
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pair direct OIR children with the identities and order selected by the
@@ -7235,6 +7242,39 @@ python[0]^(O.eval($q, $captured))_python[0]
         assert!(
             pipeline.downstream_started_before_blocked_finished(),
             "newly-ready downstream work waited for the prior readiness wave to drain"
+        );
+    }
+
+    #[test]
+    fn graph_coordinator_publishes_infallible_dependency_before_earlier_settlement() {
+        let text = BackendRegistry::global().interface_for("text");
+        let render = |body: Vec<OIr>| OIr::Exec {
+            lang: "text".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: text.clone(),
+            body,
+        };
+        let program = OIrProgram {
+            nodes: vec![
+                render(vec![OIr::Text("blocked-a".into())]),
+                render(vec![render(vec![OIr::Text("fast-b".into())])]),
+            ],
+        };
+        let plan = program.plan();
+        let blocked = plan.roots[0];
+        let downstream = plan.roots[1];
+        let pipeline = crate::executor::parallel::TestPipelineSession::begin(blocked, downstream);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect("infallible dependent pipeline succeeds");
+
+        assert!(
+            pipeline.downstream_started_before_blocked_finished(),
+            "a physically completed infallible producer remained head-of-line blocked"
         );
     }
 

@@ -674,7 +674,7 @@ mod tests {
         let mut pool = WorkerPool::new(1).unwrap();
         pool.submit(TaskSubmission::new(TaskToken(0), Box::new(task)))
             .unwrap();
-        let results = vec![match pool.recv_completion().unwrap().outcome {
+        let results = [match pool.recv_completion().unwrap().outcome {
             TaskOutcome::Completed(result) => result,
             TaskOutcome::InfrastructureAbort(error) => {
                 panic!("renderer worker infrastructure failed: {error:#}")
