@@ -985,6 +985,35 @@ fn project_runtime_selection_output_budget_is_checked_before_launch() {
     );
 }
 
+#[test]
+fn project_runtime_selection_budget_counts_prerequisite_results() {
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("prerequisite-must-not-launch");
+    let mut prerequisite = shell_route("prepare", "printf launched > \"$MARKER\"");
+    prerequisite
+        .environment
+        .insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+    let mut main = shell_route("main", "printf main");
+    main.prerequisites.push("prepare".to_string());
+    let bundle = bundle_with_routes(vec![prerequisite, main]);
+    let mut options = RunOptions::default();
+    options.limits.max_retained_stdout_bytes = 8;
+    options.limits.max_retained_stderr_bytes = 8;
+    options.limits.max_selection_retained_output_bytes = 31;
+
+    let error = run_route(&bundle, "main", &options).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Configuration { detail })
+            if detail.contains("could retain 32 output bytes")
+    ));
+    assert!(
+        !marker.exists(),
+        "prerequisite budget failure launched a route"
+    );
+}
+
 fn bounded_runtime_options(timeout: Duration) -> RunOptions {
     let mut options = RunOptions::default();
     options.limits.wall_clock_timeout = timeout;
@@ -1048,6 +1077,28 @@ fn project_runtime_clear_environment_is_explicit_and_keeps_route_overlay() {
 
     let result = run_route(&bundle, "clear-env", &options).unwrap();
     assert_eq!(result.stdout, b"unset:visible");
+}
+
+#[test]
+fn project_runtime_rejects_zero_terminality_grace_before_launch() {
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("zero-grace-must-not-launch");
+    let mut route = shell_route("zero-grace", "printf launched > \"$MARKER\"");
+    route
+        .environment
+        .insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+    let bundle = bundle_with_routes(vec![route]);
+    let mut options = RunOptions::default();
+    options.limits.termination_grace_period = Duration::ZERO;
+
+    let error = run_route(&bundle, "zero-grace", &options).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Configuration { detail })
+            if detail.contains("termination grace period must be greater than zero")
+    ));
+    assert!(!marker.exists(), "zero-grace validation launched a route");
 }
 
 #[test]
@@ -1146,18 +1197,56 @@ fn project_runtime_success_has_no_live_owned_group_effects() {
         .unwrap()
         .parse::<libc::pid_t>()
         .unwrap();
-    // SAFETY: signal zero performs a liveness/permission probe only. This PID
-    // was reported by the route's direct owned descendant.
-    assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
+    assert!(
+        !process_is_active(descendant_pid),
+        "owned descendant remained active after successful settlement"
     );
     std::thread::sleep(Duration::from_millis(1_200));
     assert!(
         !leaked_effect.exists(),
         "owned descendant continued host effects after successful settlement"
     );
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_active(pid: libc::pid_t) -> bool {
+    // SAFETY: `information` is writable storage of the exact size supplied to
+    // libproc; failure is handled as disappearance or a test failure.
+    let mut information: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut information as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    assert_eq!(read, size, "failed to inspect descendant process state");
+    information.pbi_status != libc::SZOMB
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_active(pid: libc::pid_t) -> bool {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("failed to inspect descendant process state: {error}"),
+    };
+    let close = stat
+        .rfind(')')
+        .expect("descendant /proc stat has a command terminator");
+    stat[close + 1..].split_whitespace().next() != Some("Z")
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_is_active(pid: libc::pid_t) -> bool {
+    // SAFETY: signal zero only probes for a live PID.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 #[test]
