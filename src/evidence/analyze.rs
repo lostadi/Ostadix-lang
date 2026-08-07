@@ -19,10 +19,10 @@ use crate::value::GroupMode;
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
-    DispatchContractV1, DispatchLaneV1, EffectContractV1, EvidenceBindingsV1, EvidenceBundleV1,
-    EvidenceProvenance, FailureClassV1, FailureContractV1, NodeEvidence, PlacementContractV1,
-    ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1, TypeContractV1,
-    ANALYZER_ID_V1, EVIDENCE_SCHEMA_V1,
+    DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, EffectContractV1, EvidenceBindingsV1,
+    EvidenceBundleV2, EvidenceProvenance, FailureClassV1, FailureContractV1, NodeEvidence,
+    PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    TypeContractV1, ANALYZER_ID_V2, EVIDENCE_SCHEMA_V2,
 };
 
 /// Capture the exact adapter/runtime snapshot used by an evaluator backed by
@@ -215,7 +215,7 @@ pub fn analyze_execution(
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: RuntimeBindingV1,
-) -> Result<EvidenceBundleV1> {
+) -> Result<EvidenceBundleV2> {
     let current_executable = runtime
         .backend_artifacts
         .iter()
@@ -268,9 +268,13 @@ pub fn analyze_execution(
             .with_context(|| format!("operation {} has no effect summary", info.plan_node.0))?;
         let effect_provenance = effect_provenance(summary.confidence);
         let (reads, writes) = summary.scheduling_accesses();
-        let worker_candidate = parallel::classify(plan, flat[info.plan_node.0], info.plan_node)
-            .is_some()
-            && parallel::effect_contract_worker_safe(summary, flat[info.plan_node.0]);
+        let worker_kind = parallel::classify(plan, flat[info.plan_node.0], info.plan_node)
+            .filter(|_| parallel::effect_contract_worker_safe(summary, flat[info.plan_node.0]));
+        let worker_candidate = worker_kind.is_some();
+        let dispatch_adapter = worker_kind
+            .as_ref()
+            .map(parallel::TaskKind::adapter)
+            .unwrap_or(DispatchAdapterV1::CoordinatorV1);
         let (capability_disposition, capability_provenance) =
             capability_contract(&plan.nodes[info.plan_node.0].kind);
 
@@ -302,6 +306,7 @@ pub fn analyze_execution(
                 } else {
                     DispatchLaneV1::Coordinator
                 },
+                adapter: dispatch_adapter,
                 send_only_preparation: worker_candidate,
                 provenance: if worker_candidate {
                     EvidenceProvenance::TrustedAdapter
@@ -322,7 +327,7 @@ pub fn analyze_execution(
                 cancellation_safe: summary.is_verified_pure_infallible(),
                 provenance: effect_provenance,
             },
-            // V1 preserves the current coordinator/renderer behavior. Unknown
+            // V2 preserves the bounded coordinator/worker adapter set. Unknown
             // ceilings remain explicit and cannot remove topology edges.
             resource_demand: ResourceDemandContractV1 {
                 cpu_units: Some(1),
@@ -335,9 +340,9 @@ pub fn analyze_execution(
         });
     }
 
-    Ok(EvidenceBundleV1 {
-        schema: EVIDENCE_SCHEMA_V1,
-        analyzer: ANALYZER_ID_V1,
+    Ok(EvidenceBundleV2 {
+        schema: EVIDENCE_SCHEMA_V2,
+        analyzer: ANALYZER_ID_V2,
         bindings,
         runtime,
         nodes,
@@ -357,7 +362,7 @@ pub(crate) fn evidence_bindings(
         backend_set_sha256: runtime.backend_set_sha256.clone(),
         environment_sha256: runtime.environment_sha256.clone(),
         ambient_world_sha256: runtime.ambient_world_sha256.clone(),
-        analyzer_sha256: sha256_bytes(ANALYZER_ID_V1.as_bytes()),
+        analyzer_sha256: sha256_bytes(ANALYZER_ID_V2.as_bytes()),
     }
 }
 
@@ -492,8 +497,8 @@ pub(crate) fn graph_sha256(graph: &HGraph) -> String {
     hash.finish()
 }
 
-pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV1) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v1");
+pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV2) -> String {
+    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v2");
     hash.field(bundle.schema.as_bytes());
     hash.field(bundle.analyzer.as_bytes());
     for binding in [
@@ -525,6 +530,7 @@ pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV1) -> String {
         hash.bool(node.effect_contract.footprint_closed);
         hash.field(node.effect_contract.provenance.name().as_bytes());
         hash.field(node.dispatch_contract.lane.name().as_bytes());
+        hash.field(node.dispatch_contract.adapter.name().as_bytes());
         hash.bool(node.dispatch_contract.send_only_preparation);
         hash.field(node.dispatch_contract.provenance.name().as_bytes());
         hash.field(node.capability_disposition.name().as_bytes());

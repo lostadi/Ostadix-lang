@@ -245,6 +245,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/ocore/driver.rs",
         "src/ocore/mod.rs",
         "src/executor/mod.rs",
+        "src/executor/pool.rs",
+        "src/executor/task.rs",
         "src/hgraph/graph.rs",
         "src/hgraph/kinds.rs",
         "src/hgraph/from_oir.rs",

@@ -507,6 +507,8 @@ class SourceReleaseTests(unittest.TestCase):
             "src/ocore/driver.rs": "// fixture O-core target driver\n",
             "src/ocore/mod.rs": "// fixture O-core module exports\n",
             "src/executor/mod.rs": "// fixture public executor effects surface\n",
+            "src/executor/pool.rs": "// fixture persistent local-worker pool\n",
+            "src/executor/task.rs": "// fixture prepared-task contract\n",
             "src/hgraph/graph.rs": "// fixture HGraph validation\n",
             "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
@@ -784,6 +786,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/ocore/driver.rs",
                 "src/ocore/mod.rs",
                 "src/executor/mod.rs",
+                "src/executor/pool.rs",
+                "src/executor/task.rs",
                 "src/hgraph/graph.rs",
                 "src/hgraph/kinds.rs",
                 "src/hgraph/from_oir.rs",
@@ -1385,6 +1389,22 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/evidence/mod\.rs.*src/evidence/profile\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")
+
+    def test_prepared_task_pool_surface_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "src/executor/pool.rs",
+            "src/executor/task.rs",
+        )
+        self._git("commit", "-q", "-m", "remove prepared-task pool surface")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*src/executor/pool\.rs.*"
+            r"src/executor/task\.rs",
+        ):
+            self._build("missing-prepared-task-pool.zip")
 
     def test_project_hgraph_hosted_surface_is_required(self) -> None:
         self._commit()

@@ -79,7 +79,7 @@ Ostadix-lang processes hosted code through a 7-stage pipeline:
    values with the renderer embedded in OIR, resolves the block's live backend
    capability, and executes the selected operation. Request values created by
    OIR carry compositional fingerprints into the existing eager/autonomous
-   request scheduler; that scheduler remains a separate authority in v1.
+   request scheduler; that scheduler remains a separate authority in v2.
 
 7. **Settle and observe** — Materialize successful value, completion, and state
    outputs, select deterministic failures, and emit traces or receipts only
@@ -166,7 +166,7 @@ worker-pool work.
 ### Evidence-bound admission
 
 `src/evidence/` separates pre-execution certificates from post-execution
-observations. `EvidenceBundleV1` records per-operation type, effect, dispatch,
+observations. `EvidenceBundleV2` records per-operation type, effect, dispatch,
 capability, placement, failure, resource-demand, and cost contracts together
 with provenance. Hard contracts determine whether execution is legal. Cost
 estimates are soft evidence: they may eventually rank an already-legal
@@ -188,24 +188,28 @@ event.
 
 This authority boundary is currently the ordinary OIR execution path only.
 The buffered Request scheduler and `ProjectCoordinator` remain separate, and
-generic hosted prepared-task lanes, renewable-capacity selection, persistent
-worker pools, and actor-owned hosted environments remain future work. The
-current `LocalWorker` lane is deliberately narrow: compiler-verified O-scope
-`Load` operations and the trusted attribute-free `html`, `markdown`, `text`,
-and `latex` inline renderers with a source-proven preparable body execute through
-a scoped local-worker batch. Hosted
-reads and other ready operations remain coordinator-owned, so a graph wave does
-not by itself prove that every member ran on a worker thread. The backend
+generic hosted prepared-task lanes, renewable CPU/memory/device admission, and
+actor-owned hosted environments remain future work. Evidence schema v2 binds
+each dispatch contract to one stable preparation adapter ID. The runtime may
+validate that exact adapter against the admitted OIR, but cannot reclassify the
+operation through a second scheduling authority. The current `LocalWorker`
+lane remains deliberately narrow: `o-scope-load/v1` prepares
+compiler-verified O-scope `Load` operations, while
+`trusted-inline-renderer/v1` prepares the trusted attribute-free `html`,
+`markdown`, `text`, and `latex` inline renderers with source-closed bodies.
+`coordinator/v1` retains everything else. Hosted reads remain
+coordinator-owned, so a graph wave does not by itself prove that every member
+ran on a worker thread. The backend
 binding distinguishes hashed files, missing paths, non-regular paths, and
 unreadable paths, and samples the current executable, cwd, and environment at
 analysis/dispatch checks; execution admission rejects an unhashed current
 executable. Those rechecks are path/environment-based best
-effort, not an immutable execution substrate: v1 does not pin an opened adapter
+effort, not an immutable execution substrate: v2 does not pin an opened adapter
 or frozen child environment and cannot prove the bytes/environment observed at
 spawn. It also does not attest the opaque state or generation of an already-live
 actor, the complete external toolchain closure, or placement-lease freshness.
 `ActorResourceId` remains a
-serialization identity in v1, and unknown actor work cannot use this gap to
+serialization identity in v2, and unknown actor work cannot use this gap to
 remove `HostWorld` or actor dependencies.
 
 Post-execution `RuntimeGraphV1` and `ExecutionReceiptV1` artifacts remain typed
@@ -476,20 +480,29 @@ frontiers can still order members of a concurrent group when their effects
 conflict.
 
 `ReadySchedule` derives blockers only from producers of directed operation
-inputs. The coordinator materializes all outputs atomically after success,
-recomputes the frontier after each completion, and emits no completion or
-successor-state token after failure. Deterministic commit order does not stand
-in for effect ordering. Parallel worker dispatch remains limited to
-compiler-verified O-scope loads and source-proven-preparable trees of the four
-trusted inline renderers. The
-coordinator freezes their materialized inputs into `Send`-only tasks and runs
-the current batch with scoped local threads. Same-binding loads share the latest
-writer frontier and demonstrably execute concurrently. Because a load may fail
-without external effects, all batch outcomes are buffered and settled by
-serial topological ordinal: fallible loads batch only as the contiguous
-unfinished semantic prefix, the lowest-ordinal failure wins, and every later
-speculative outcome is discarded. Infallible effect-free renderer work may
-speculate outside that prefix.
+inputs. The coordinator materializes all outputs atomically after successful
+semantic settlement and emits no completion or successor-state token after
+failure. Deterministic settlement order does not stand in for effect ordering.
+Parallel worker dispatch remains limited to compiler-verified O-scope loads and
+source-proven-preparable trees of the four trusted inline renderers. The
+coordinator freezes their materialized inputs into owned `PreparedTask`
+envelopes and submits them to a fixed-size local pool created once per graph
+execution and reused across changing ready frontiers. Each physical completion
+wakes the coordinator independently; accepted settlement recomputes readiness
+without waiting for every unrelated task from the earlier frontier. Same-binding
+loads share the latest writer frontier and demonstrably execute concurrently.
+Because a load may fail without external effects, out-of-order outcomes remain
+provisional and settle by serial topological ordinal: fallible loads enter only
+as the contiguous unfinished semantic prefix, the lowest-ordinal failure wins,
+and every later started outcome is drained and discarded. Infallible
+effect-free renderer work may be dispatched outside that prefix. Coordinator
+owned operations remain single-owner and the current bounded implementation
+does not overlap them with outstanding local-worker tasks. Worker or pool
+mechanism failures are infrastructure aborts, not semantic program failures;
+started tasks are drained before the trace is finalized. In unwind-capable
+builds, caught worker panics use that path. The release profile uses
+`panic = "abort"`, so a release worker panic terminates the process and is not
+claimed to produce an in-process terminal trace.
 
 ## Universal Value System (OValue)
 
@@ -640,7 +653,9 @@ solves the graph, compiles evidence-bound admission, and prints its digests,
 provenance, blockers, retained sequence reasons, and legal static waves. A
 `runtime-snapshot kind=inspection` line makes explicit that this certificate
 preview is not interchangeable with an evaluator's dispatch-time execution
-snapshot. A directory or lifted project instead constructs its typed,
+snapshot. Those waves describe static legality, not the fixed pool's capacity,
+dynamic dispatch groups, completion order, or observed overlap. A directory or
+lifted project instead constructs its typed,
 exact-provenance
 `ProjectExecutionPlan` and HGraph without running any route; project admission
 explanation is deferred.

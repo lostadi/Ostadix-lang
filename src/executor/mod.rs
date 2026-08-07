@@ -13,6 +13,8 @@ pub mod cancellation;
 pub mod coordinator;
 pub mod effects;
 pub mod parallel;
+pub mod pool;
+pub mod task;
 pub mod trace;
 
 pub use actor::{ActorKey, ActorTable};
