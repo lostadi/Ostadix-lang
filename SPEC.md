@@ -169,7 +169,7 @@ Every authoritative Rust execution entry point follows this path:
 
 ```text
 .O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
-          -> EvidenceBundleV1 -> AdmittedExecution -> graph coordinator | serial oracle
+          -> EvidenceBundleV2 -> AdmittedExecution -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -198,8 +198,10 @@ additionally contains pre-materialized admission facts. Each evaluator
 invocation is a directed hyperedge consuming all of its ordinary and
 state/control inputs, plus its admission-evidence inputs after admission, and
 producing one distinguished ordinary result, one completion token, and each
-required successor resource state. An operation is runnable exactly when every
-input node is materialized. Failure produces none of its output tokens.
+required successor resource state. An operation is graph-ready exactly when
+every input node is materialized. Physical dispatch additionally requires its
+admitted adapter, local-pool capacity, and the strict semantic settlement
+frontier. Failure produces none of its output tokens.
 
 Resource lowering MUST preserve access mode. A read MUST consume the current
 writer state, MUST NOT advance the resource version, and MUST place its
@@ -211,10 +213,10 @@ them. These rules apply after scheduler-visible alias expansion. An explicit or
 unknown `HostWorld` access remains exclusive and therefore fail-closed.
 
 Before either the graph coordinator or the serial differential oracle executes
-the plan, the runtime MUST produce an `EvidenceBundleV1` and compile it into an
+the plan, the runtime MUST produce an `EvidenceBundleV2` and compile it into an
 `AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
-environment, and descriptive ambient-World snapshot. This v1 binding does not
+environment, and descriptive ambient-World snapshot. This v2 binding does not
 claim the original source-byte digest when the entry point receives an already
 lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Each executable operation MUST consume admitted type,
 effect-footprint, dispatch, capability-policy, placement, failure-policy, and
@@ -243,20 +245,40 @@ structural left-to-right `O` sequencing region. Any unknown fact preserves
 sequence. Conflicting resource frontiers still constrain explicit group
 members.
 
-The v1 `LocalWorker` lane MUST accept only compiler-verified O-scope `Load`
+The v2 `LocalWorker` lane MUST accept only compiler-verified O-scope `Load`
 operations and attribute-free trusted inline-value renderers named `html`,
 `markdown`, `text`, or `latex` whose body is source-proven preparable: literal
 text, already-settled Store children, and recursively trusted renderers only.
-Preparation MUST freeze their materialized scope or splice inputs into a
-`Send`-only task before a scoped local-worker batch starts. Hosted reads,
-persistent language environments, and arbitrary
-user-declared reads MUST remain coordinator-owned. Loads are pure but may fail;
-their ordinal MUST be the serial topological execution rank, not preorder plan
-identity. The coordinator MAY batch fallible workers only when they form the
-contiguous unfinished semantic prefix. It MUST buffer those outcomes, settle
-them in semantic-ordinal order, select the lowest-ordinal failure, and discard
-every later speculative outcome. Infallible effect-free workers MAY speculate
-outside that prefix.
+Every dispatch contract MUST name the stable adapter selected by evidence:
+`o-scope-load/v1`, `trusted-inline-renderer/v1`, or `coordinator/v1`. Runtime
+preparation MAY validate that exact adapter against the admitted OIR, but MUST
+NOT reclassify the operation or choose a different adapter. Preparation MUST
+freeze materialized scope or splice inputs into an owned `Send + 'static`
+`PreparedTask` before submission. Hosted reads, persistent language
+environments, and arbitrary user-declared reads MUST remain coordinator-owned.
+
+One fixed-size local-worker pool MUST be created for each graph-coordinator run
+that contains local-worker operations and MUST reuse its workers across changing
+ready frontiers. Its machine-derived task-count cap is execution policy, not
+evidence-backed CPU or memory admission. Each physical completion MUST wake the
+coordinator independently; the runtime MUST NOT wait for an entire previously
+ready set before considering newly exposed work. Physical completion alone MUST
+NOT publish HGraph outputs. Loads are pure but may fail; their ordinal MUST be
+the serial topological execution rank, not preorder plan identity. The
+coordinator MAY dispatch fallible workers only when they form the contiguous
+unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
+in semantic-ordinal order, select the lowest-ordinal failure, drain every
+started task, and discard every later provisional outcome. Infallible
+effect-free workers MAY be dispatched outside that prefix. Coordinator-owned
+operations MUST remain single-owner; this bounded v2 implementation does not
+run them while local-worker tasks are outstanding. Pool channel loss or
+submission failure MUST be treated as an infrastructure abort rather than a
+semantic program failure; the coordinator MUST stop new dispatch, drain every
+started task to one terminal trace event, and publish no later effect. In an
+unwind-capable build, a caught worker panic follows that same infrastructure
+path. The release profile currently uses `panic = "abort"`; such a panic
+terminates the process and is explicitly outside the in-process recovery and
+terminal-trace guarantee.
 
 Effect block attributes MAY add conservative constraints:
 
@@ -277,24 +299,25 @@ describe permission, not an exact effect footprint.
 `olangc FILE --target ir --explain-schedule` MUST perform the type solve,
 analysis, and admission steps and print the digest bindings, per-operation
 evidence provenance, blockers, retained sequence reasons, and legal static
-waves without executing any operation. In v1 this inspection surface applies
+waves without executing any operation. In v2 this inspection surface applies
 only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 `inspection-only`, not as a dispatch-compatible execution context. A reported
 wave is evidence of legal readiness,
-not proof that every member used a worker. Within that wave, admitted O-scope
-loads and source-proven-preparable trees of the four trusted inline renderers
-do execute through the current
-scoped local-worker batch. Generic hosted prepared-task lanes, persistent pools,
-actor-owned environments, renewable-capacity allocation, and unification with
-the Request and project schedulers are not v1 behavior.
+not proof that every member used a worker, ran together, or fit the pool. Static
+waves MUST NOT be presented as dynamic dispatch batches or observed completion
+order. Admitted O-scope loads and source-proven-preparable trees of the four
+trusted inline renderers execute through the per-run persistent pool. Generic
+hosted prepared-task lanes, actor-owned environments, renewable-capacity
+allocation, and unification with the Request and project schedulers are not v2
+behavior.
 The backend-set binding covers resolved adapter files and the current
 executable, and MUST distinguish hashed, missing, non-regular, and unreadable
 paths. Execution admission MUST reject an unhashed current executable. Runtime
 rechecks are path/environment snapshots, not an immutable execution substrate:
-v1 does not pin an opened adapter or frozen child environment and cannot prove
+v2 does not pin an opened adapter or frozen child environment and cannot prove
 the bytes/environment observed at spawn. The binding also excludes caller
 initial-scope shape/values, opaque live-actor state/generation, a complete
-external toolchain closure, and placement-lease freshness. Actor identity in v1 is a
+external toolchain closure, and placement-lease freshness. Actor identity in v2 is a
 serialization constraint only and MUST NOT close an unknown hosted footprint.
 
 ---
