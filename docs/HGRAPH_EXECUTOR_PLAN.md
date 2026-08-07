@@ -26,6 +26,9 @@ compiler-verified, or trusted-adapter evidence can establish a closed effect
 footprint. A user declaration can add conservative constraints but cannot
 erase unknown hosted effects. Historical observations and costs can inform a
 future ordering policy; they do not change which schedules are legal.
+Before issuing that bundle, the analyzer validates registered backend identity
+and special-invocation name/mode/arity, so digest consistency cannot admit
+forged execution metadata.
 
 The bundle binds canonical lowered OIR, the validated plan, the solved analyzed
 graph, analyzer identity, resolved backend artifacts, execution environment,
@@ -351,6 +354,17 @@ wave is therefore not a pool batch, capacity promise, or observed completion
 order. Coordinator-owned work remains single-owner and this bounded
 implementation waits for the local pool to become idle before executing it.
 
+A successful worker whose hard contract is both compiler-verified pure and
+infallible may publish its value and HGraph outputs provisionally before its
+deterministic trace frontier. This lets an infallible worker-only dependent
+pipeline advance behind an unrelated slow operation. If an earlier semantic or
+infrastructure failure wins, the coordinator removes every such output, clears
+the frame value, and records the provisionally published operation as
+discarded. `NodeFinished` remains the durable-settlement event, so a
+provisionally unlocked dependent may start before its producer's
+`NodeFinished`; the admission explanation makes that trace ordering explicit.
+Fallible outcomes never use this early-publication path.
+
 Same-binding loads share the latest writer frontier and demonstrably execute at
 the same time in the local pool. Loads are pure but fallible. The coordinator
 uses serial topological rank rather than preorder plan identity, and admits a
@@ -361,11 +375,13 @@ failure are materialized; the selected failure is reported; every later started
 outcome is drained, recorded as discarded, and publishes no graph outputs.
 Infallible effect-free workers may be dispatched outside the prefix. This
 preserves deterministic strict fail-stop selection without requiring adjacent
-pure reads to execute serially. Adapter-returned errors remain semantic
-outcomes. A broken pool mechanism is an infrastructure abort: the coordinator
-stops dispatch, drains every started task to one terminal trace event, and does
-not disguise the failure as `NodeFailed`. An unwind-capable build gives a caught
-worker panic the same treatment. The release profile uses `panic = "abort"`, so
+pure reads to execute serially. Errors returned by admitted fallible adapters
+remain semantic outcomes; an error from an admitted-infallible adapter is an
+infrastructure contract violation. A broken pool mechanism is likewise an
+infrastructure abort: the coordinator stops dispatch, drains every started task
+to one terminal trace event, and does not disguise the failure as `NodeFailed`.
+An unwind-capable build gives a caught worker panic the same treatment. The
+release profile uses `panic = "abort"`, so
 a release worker panic terminates the process before in-process recovery or
 terminal trace completion; v2 does not claim otherwise.
 
@@ -449,7 +465,10 @@ capacity, thread reuse, singleton off-owner placement, independent completion
 delivery, and recovery after a caught worker panic. Coordinator tests prove
 that a fast worker can expose dependent worker work while an unrelated slow
 task remains active. Fallible-worker tests preserve lowest-semantic-ordinal
-failure selection and later-outcome discard while tasks overlap.
+failure selection and later-outcome discard while tasks overlap. Additional
+regressions prove provisional-output revocation after an earlier failure and
+that an infallible-adapter error immediately enters the infrastructure-abort
+path without becoming `NodeFailed` or preempting an earlier semantic failure.
 
 ## Deliberately deferred optimization
 

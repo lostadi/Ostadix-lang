@@ -218,7 +218,10 @@ the plan, the runtime MUST produce an `EvidenceBundleV2` and compile it into an
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
 environment, and descriptive ambient-World snapshot. This v2 binding does not
 claim the original source-byte digest when the entry point receives an already
-lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Each executable operation MUST consume admitted type,
+lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
+issuing evidence, analysis MUST validate that every lowered backend interface
+matches the registered language policy and that special invocation metadata has
+canonical name/mode/arity. Each executable operation MUST consume admitted type,
 effect-footprint, dispatch, capability-policy, placement, failure-policy, and
 resource-budget facts. Stale or mismatched evidence MUST fail before execution
 starts. The ordinary graph `Coordinator` MUST accept only an
@@ -262,10 +265,19 @@ that contains local-worker operations and MUST reuse its workers across changing
 ready frontiers. Its machine-derived task-count cap is execution policy, not
 evidence-backed CPU or memory admission. Each physical completion MUST wake the
 coordinator independently; the runtime MUST NOT wait for an entire previously
-ready set before considering newly exposed work. Physical completion alone MUST
-NOT publish HGraph outputs. Loads are pure but may fail; their ordinal MUST be
-the serial topological execution rank, not preorder plan identity. The
-coordinator MAY dispatch fallible workers only when they form the contiguous
+ready set before considering newly exposed work. A physically successful worker
+whose hard contract is both compiler-verified pure and `Infallible` MAY publish
+its outputs provisionally to unlock only other safe local-worker tasks before
+the deterministic semantic frontier reaches it. Such outputs MUST be revoked,
+their frame values cleared, and their tasks traced as discarded if an earlier
+semantic or infrastructure failure wins. Every other physical completion MUST
+remain unpublished until semantic settlement. Because `NodeFinished` records
+durable settlement, a provisionally unlocked dependent `NodeStarted` MAY
+precede its producer's `NodeFinished` in the trace.
+The admission explanation MUST disclose this ordering rule. Loads are pure but
+may fail; their ordinal MUST be the serial topological execution rank, not
+preorder plan identity. The coordinator MAY dispatch fallible workers only
+when they form the contiguous
 unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
 in semantic-ordinal order, select the lowest-ordinal failure, drain every
 started task, and discard every later provisional outcome. Infallible
@@ -276,7 +288,9 @@ submission failure MUST be treated as an infrastructure abort rather than a
 semantic program failure; the coordinator MUST stop new dispatch, drain every
 started task to one terminal trace event, and publish no later effect. In an
 unwind-capable build, a caught worker panic follows that same infrastructure
-path. The release profile currently uses `panic = "abort"`; such a panic
+path. An `Err` returned by an admitted-`Infallible` adapter is likewise an
+infrastructure contract violation, never a semantic `NodeFailed`. The release
+profile currently uses `panic = "abort"`; such a panic
 terminates the process and is explicitly outside the in-process recovery and
 terminal-trace guarantee.
 
