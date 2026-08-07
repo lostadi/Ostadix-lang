@@ -16,19 +16,23 @@
 //! successfully, the one earliest in declaration order wins.
 
 use anyhow::{bail, Context, Result};
-use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc;
+use std::process::{Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 
 use crate::executor::CancellationToken;
 
-use super::bundle::sha256_hex;
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
-    Artifact, ExecutionProvenance, OExecutionResult, ProjectBundle, ResultCodec,
-    RouteExecutionDisposition, RouteGuard, RoutePolicy, RouteSpec,
+    Artifact, ArtifactCaptureFailure, ArtifactCaptureStatus, ExecutionProvenance, OExecutionResult,
+    OutputCapture, ProjectBundle, ResultCodec, RouteExecutionDisposition, RouteGuard, RoutePolicy,
+    RouteSpec,
 };
 
 /// How unmet guards are handled.
@@ -40,21 +44,340 @@ pub enum GuardBehavior {
     Skip,
 }
 
+/// Which ambient variables are visible to a route before its declared
+/// environment overlay is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentPolicy {
+    /// Preserve the historical behavior explicitly: inherit every host value.
+    InheritAll,
+    /// Start from an empty environment.
+    Clear,
+    /// Inherit only the named variables when they exist on the host.
+    AllowList(BTreeSet<String>),
+}
+
+/// Which OS process identity the coordinator owns and makes terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTreePolicy {
+    /// On Unix, own the fresh process group created for the route. Descendants
+    /// that deliberately leave that group are outside this policy's boundary.
+    OwnedProcessGroup,
+    /// Own only the directly spawned process. This is the explicit fallback on
+    /// platforms without the Unix process-group implementation.
+    LeaderOnly,
+}
+
+/// Coherent resource and host-interaction limits for one spawned route.
+///
+/// The defaults retain the historical environment behavior while making time,
+/// output, artifacts, and owned-process lifetime finite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    pub wall_clock_timeout: Duration,
+    pub termination_grace_period: Duration,
+    pub max_retained_stdout_bytes: usize,
+    pub max_retained_stderr_bytes: usize,
+    pub max_routes_per_selection: usize,
+    pub max_selection_retained_output_bytes: u64,
+    pub max_artifact_count: usize,
+    pub max_artifact_scan_entries: usize,
+    pub max_aggregate_artifact_bytes: u64,
+    pub max_single_artifact_bytes: u64,
+    pub environment_policy: EnvironmentPolicy,
+    pub process_tree_policy: ProcessTreePolicy,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            wall_clock_timeout: Duration::from_secs(30 * 60),
+            termination_grace_period: Duration::from_millis(250),
+            max_retained_stdout_bytes: 16 * 1024 * 1024,
+            max_retained_stderr_bytes: 16 * 1024 * 1024,
+            max_routes_per_selection: 64,
+            max_selection_retained_output_bytes: 512 * 1024 * 1024,
+            max_artifact_count: 4_096,
+            max_artifact_scan_entries: 1_000_000,
+            max_aggregate_artifact_bytes: 4 * 1024 * 1024 * 1024,
+            max_single_artifact_bytes: 1024 * 1024 * 1024,
+            environment_policy: EnvironmentPolicy::InheritAll,
+            process_tree_policy: if cfg!(unix) {
+                ProcessTreePolicy::OwnedProcessGroup
+            } else {
+                ProcessTreePolicy::LeaderOnly
+            },
+        }
+    }
+}
+
+impl ExecutionLimits {
+    fn validate(&self) -> std::result::Result<(), RouteExecutionError> {
+        if self.wall_clock_timeout.is_zero() {
+            return Err(RouteExecutionError::Configuration {
+                detail: "wall-clock timeout must be greater than zero".to_string(),
+            });
+        }
+        if self.max_single_artifact_bytes > self.max_aggregate_artifact_bytes {
+            return Err(RouteExecutionError::Configuration {
+                detail: "single-artifact limit exceeds aggregate-artifact limit".to_string(),
+            });
+        }
+        if self.max_routes_per_selection == 0 {
+            return Err(RouteExecutionError::Configuration {
+                detail: "route-selection limit must be greater than zero".to_string(),
+            });
+        }
+        if self.max_artifact_count > self.max_artifact_scan_entries {
+            return Err(RouteExecutionError::Configuration {
+                detail: "artifact count limit exceeds artifact scan-entry limit".to_string(),
+            });
+        }
+        #[cfg(not(unix))]
+        if self.process_tree_policy == ProcessTreePolicy::OwnedProcessGroup {
+            return Err(RouteExecutionError::Configuration {
+                detail: "owned-process-group policy is unsupported on this platform".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_route_execution_set(
+        &self,
+        potential_route_executions: usize,
+    ) -> std::result::Result<(), RouteExecutionError> {
+        self.validate()?;
+        if potential_route_executions > self.max_routes_per_selection {
+            return Err(RouteExecutionError::Configuration {
+                detail: format!(
+                    "route selection could execute {potential_route_executions} routes including prerequisites; configured maximum is {}",
+                    self.max_routes_per_selection
+                ),
+            });
+        }
+        let per_route = (self.max_retained_stdout_bytes as u128)
+            .checked_add(self.max_retained_stderr_bytes as u128)
+            .ok_or_else(|| RouteExecutionError::Configuration {
+                detail: "per-route retained-output bound overflowed".to_string(),
+            })?;
+        let selection_bound = per_route
+            .checked_mul(potential_route_executions as u128)
+            .ok_or_else(|| RouteExecutionError::Configuration {
+                detail: "route-selection retained-output bound overflowed".to_string(),
+            })?;
+        if selection_bound > u128::from(self.max_selection_retained_output_bytes) {
+            return Err(RouteExecutionError::Configuration {
+                detail: format!(
+                    "route selection could retain {selection_bound} output bytes; configured maximum is {}",
+                    self.max_selection_retained_output_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Options controlling route execution.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     /// How to treat unmet guards.
     pub guard_behavior: GuardBehavior,
-    /// Whether to inherit the parent process environment.
-    pub inherit_env: bool,
+    /// Bounded execution and explicit host-interaction policy.
+    pub limits: ExecutionLimits,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
             guard_behavior: GuardBehavior::Enforce,
-            inherit_env: true,
+            limits: ExecutionLimits::default(),
         }
+    }
+}
+
+/// Typed infrastructure failures from one route process.
+#[derive(Debug, Error)]
+pub enum RouteExecutionError {
+    #[error("route execution configuration is invalid: {detail}")]
+    Configuration { detail: String },
+    #[error("route `{route_id}` was canceled")]
+    Cancelled { route_id: String },
+    #[error("route `{route_id}` exceeded its wall-clock timeout of {timeout:?}")]
+    DeadlineExceeded { route_id: String, timeout: Duration },
+    #[error("failed to spawn `{command}`")]
+    Spawn {
+        command: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed waiting on `{command}`")]
+    Wait {
+        command: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("route `{route_id}` {stream} capture failed: {detail}")]
+    OutputCapture {
+        route_id: String,
+        stream: &'static str,
+        detail: String,
+    },
+    #[error("route `{route_id}` process terminality failed: {detail}")]
+    ProcessTreeTermination { route_id: String, detail: String },
+}
+
+/// Fail-closed outcomes while capturing declared route artifacts.
+///
+/// An [`Artifact`] is constructed only for the `Captured` case represented by
+/// `Ok`. Every other state remains a typed error, so missing or uncertain
+/// evidence cannot be confused with a legitimate empty file.
+#[derive(Debug, Error)]
+pub enum ArtifactCaptureError {
+    #[error("declared artifact `{requirement}` is missing")]
+    Missing { requirement: String },
+    #[error("cannot {operation} artifact `{path}`")]
+    Unreadable {
+        path: String,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("artifact `{path}` changed during capture: {detail}")]
+    ChangedDuringCapture { path: String, detail: String },
+    #[error("artifact `{path}` has an unsupported file type")]
+    UnsupportedFileType { path: String },
+    #[error("artifact path `{path}` is not valid UTF-8 and cannot be represented canonically")]
+    UnsupportedPathEncoding {
+        path: PathBuf,
+        relative_path_sha256: String,
+    },
+    #[error("artifact path `{path}` resolves outside the isolated workspace")]
+    OutsideArtifactRoot { path: String },
+    #[error(
+        "artifact scan exceeded configured entry limit {limit} (observed at least {observed_at_least})"
+    )]
+    ArtifactScanLimit {
+        limit: usize,
+        observed_at_least: usize,
+    },
+    #[error(
+        "artifact count exceeded configured limit {limit} (observed at least {observed_at_least})"
+    )]
+    ArtifactCountLimit {
+        limit: usize,
+        observed_at_least: usize,
+    },
+    #[error(
+        "artifact `{path}` exceeded configured single-artifact limit {limit} bytes (observed at least {observed_at_least})"
+    )]
+    SingleArtifactLimit {
+        path: String,
+        limit: u64,
+        observed_at_least: u64,
+    },
+    #[error(
+        "artifact `{path}` would exceed aggregate limit {limit} bytes after {captured_before} bytes (artifact bytes {artifact_bytes})"
+    )]
+    AggregateArtifactLimit {
+        path: String,
+        limit: u64,
+        captured_before: u64,
+        artifact_bytes: u64,
+    },
+    #[error("artifact capture was canceled")]
+    CaptureCancelled,
+    #[error("artifact capture exceeded the route wall-clock deadline")]
+    CaptureDeadlineExceeded,
+}
+
+impl ArtifactCaptureError {
+    fn evidence(&self) -> ArtifactCaptureFailure {
+        match self {
+            Self::Missing { requirement } => ArtifactCaptureFailure::Missing {
+                requirement: requirement.clone(),
+            },
+            Self::Unreadable {
+                path,
+                operation,
+                source,
+            } => ArtifactCaptureFailure::Unreadable {
+                path: path.clone(),
+                operation: (*operation).to_string(),
+                error_kind: io_error_kind_token(source.kind()).to_string(),
+            },
+            Self::ChangedDuringCapture { path, detail } => {
+                ArtifactCaptureFailure::ChangedDuringCapture {
+                    path: path.clone(),
+                    detail: detail.clone(),
+                }
+            }
+            Self::UnsupportedFileType { path } => {
+                ArtifactCaptureFailure::UnsupportedFileType { path: path.clone() }
+            }
+            Self::UnsupportedPathEncoding {
+                relative_path_sha256,
+                ..
+            } => ArtifactCaptureFailure::UnsupportedPathEncoding {
+                path_sha256: relative_path_sha256.clone(),
+            },
+            Self::OutsideArtifactRoot { path } => {
+                ArtifactCaptureFailure::OutsideArtifactRoot { path: path.clone() }
+            }
+            Self::ArtifactScanLimit {
+                limit,
+                observed_at_least,
+            } => ArtifactCaptureFailure::ArtifactScanLimit {
+                limit: *limit,
+                observed_at_least: *observed_at_least,
+            },
+            Self::ArtifactCountLimit {
+                limit,
+                observed_at_least,
+            } => ArtifactCaptureFailure::ArtifactCountLimit {
+                limit: *limit,
+                observed_at_least: *observed_at_least,
+            },
+            Self::SingleArtifactLimit {
+                path,
+                limit,
+                observed_at_least,
+            } => ArtifactCaptureFailure::SingleArtifactLimit {
+                path: path.clone(),
+                limit: *limit,
+                observed_at_least: *observed_at_least,
+            },
+            Self::AggregateArtifactLimit {
+                path,
+                limit,
+                captured_before,
+                artifact_bytes,
+            } => ArtifactCaptureFailure::AggregateArtifactLimit {
+                path: path.clone(),
+                limit: *limit,
+                captured_before: *captured_before,
+                artifact_bytes: *artifact_bytes,
+            },
+            Self::CaptureCancelled | Self::CaptureDeadlineExceeded => {
+                ArtifactCaptureFailure::NotAttempted {
+                    reason: "artifact_capture_interrupted".to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn io_error_kind_token(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::InvalidInput => "invalid_input",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::TimedOut => "timed_out",
+        io::ErrorKind::WriteZero => "write_zero",
+        io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        io::ErrorKind::Unsupported => "unsupported",
+        io::ErrorKind::OutOfMemory => "out_of_memory",
+        _ => "other",
     }
 }
 
@@ -67,6 +390,13 @@ const SKIP_MARKER: &str = "[olang:route-skipped]";
 
 /// Return the first unmet guard's description, if any.
 pub fn unmet_guard(route: &RouteSpec) -> Option<String> {
+    unmet_guard_with_environment(route, &EnvironmentPolicy::InheritAll)
+}
+
+fn unmet_guard_with_environment(
+    route: &RouteSpec,
+    environment_policy: &EnvironmentPolicy,
+) -> Option<String> {
     for guard in &route.guards {
         match guard {
             RouteGuard::PlatformOs(os) => {
@@ -78,12 +408,14 @@ pub fn unmet_guard(route: &RouteSpec) -> Option<String> {
                 }
             }
             RouteGuard::CommandAvailable(cmd) => {
-                if !command_on_path(cmd) {
+                if !command_on_path(cmd, route, environment_policy) {
                     return Some(format!("requires command `{cmd}` on PATH"));
                 }
             }
             RouteGuard::EnvVarSet(var) => {
-                if std::env::var(var).map(|v| v.is_empty()).unwrap_or(true) {
+                if effective_environment_value(route, environment_policy, var)
+                    .is_none_or(|value| value.is_empty())
+                {
                     return Some(format!("requires environment variable `{var}` to be set"));
                 }
             }
@@ -93,17 +425,33 @@ pub fn unmet_guard(route: &RouteSpec) -> Option<String> {
 }
 
 /// Resolve a command name against `PATH` (or accept an explicit path).
-fn command_on_path(cmd: &str) -> bool {
+fn command_on_path(cmd: &str, route: &RouteSpec, environment_policy: &EnvironmentPolicy) -> bool {
     if cmd.contains('/') {
         return Path::new(cmd).exists();
     }
-    let Ok(path) = std::env::var("PATH") else {
+    let Some(path) = effective_environment_value(route, environment_policy, "PATH") else {
         return false;
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join(cmd);
         candidate.is_file() && is_executable(&candidate)
     })
+}
+
+fn effective_environment_value(
+    route: &RouteSpec,
+    environment_policy: &EnvironmentPolicy,
+    key: &str,
+) -> Option<std::ffi::OsString> {
+    if let Some(value) = route.environment.get(key) {
+        return Some(value.into());
+    }
+    match environment_policy {
+        EnvironmentPolicy::InheritAll => std::env::var_os(key),
+        EnvironmentPolicy::Clear => None,
+        EnvironmentPolicy::AllowList(keys) if keys.contains(key) => std::env::var_os(key),
+        EnvironmentPolicy::AllowList(_) => None,
+    }
 }
 
 #[cfg(unix)]
@@ -152,9 +500,19 @@ pub fn run_route_cancellable(
     opts: &RunOptions,
     cancel: CancellationToken,
 ) -> Result<OExecutionResult> {
+    if cancel.is_cancelled() {
+        return Err(RouteExecutionError::Cancelled {
+            route_id: route_id.to_string(),
+        }
+        .into());
+    }
     if bundle.route(route_id).is_none() {
         bail!("no route named `{route_id}`");
     }
+    let selected = [route_id.to_string()];
+    let potential_route_executions = potential_route_execution_count(bundle, &selected)?;
+    opts.limits
+        .validate_route_execution_set(potential_route_executions)?;
     let workspace =
         materialize_isolated(bundle).context("failed to materialize an isolated workspace")?;
     let mut ctx = RunCtx {
@@ -224,7 +582,8 @@ pub(crate) fn execute_route_in_workspace(
     opts: &RunOptions,
     cancel: &CancellationToken,
 ) -> Result<OExecutionResult> {
-    if let Some(reason) = unmet_guard(route) {
+    opts.limits.validate()?;
+    if let Some(reason) = unmet_guard_with_environment(route, &opts.limits.environment_policy) {
         return match opts.guard_behavior {
             GuardBehavior::Enforce => {
                 bail!("route `{}` guard not satisfied: {reason}", route.id)
@@ -241,13 +600,28 @@ pub(crate) fn is_skipped_result(result: &OExecutionResult) -> bool {
 }
 
 fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OExecutionResult {
+    let stdout = Vec::new();
+    let stderr = format!("{SKIP_MARKER} {reason}\n").into_bytes();
+    let artifact_capture = if route.outputs.is_empty() {
+        ArtifactCaptureStatus::Complete
+    } else {
+        ArtifactCaptureStatus::Incomplete {
+            failure: Box::new(ArtifactCaptureFailure::NotAttempted {
+                reason: "route_guard_skipped".to_string(),
+            }),
+        }
+    };
     OExecutionResult {
         route_id: route.id.clone(),
         exit_code: None,
-        stdout: Vec::new(),
-        stderr: format!("{SKIP_MARKER} {reason}\n").into_bytes(),
+        stdout_capture: OutputCapture::complete(&stdout),
+        stdout,
+        stderr_capture: OutputCapture::complete(&stderr),
+        stderr,
         value: None,
         artifacts: Vec::new(),
+        artifact_requirements: route.outputs.clone(),
+        artifact_capture,
         disposition: RouteExecutionDisposition::GuardSkipped,
         duration_ns: 0,
         provenance: ExecutionProvenance {
@@ -258,12 +632,16 @@ fn skipped_result(route: &RouteSpec, workspace: &Workspace, reason: &str) -> OEx
     }
 }
 
-/// Marker message used in the error of a cancellation-terminated route.
-const CANCEL_MARKER: &str = "[olang:route-canceled]";
-
 /// Whether an error came from cooperative route cancellation.
 pub fn is_cancellation_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains(CANCEL_MARKER)
+    err.downcast_ref::<RouteExecutionError>()
+        .is_some_and(|error| matches!(error, RouteExecutionError::Cancelled { .. }))
+}
+
+/// Whether an error came from the route's wall-clock deadline.
+pub fn is_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RouteExecutionError>()
+        .is_some_and(|error| matches!(error, RouteExecutionError::DeadlineExceeded { .. }))
 }
 
 fn spawn_route(
@@ -277,10 +655,10 @@ fn spawn_route(
         bail!("route `{}` has an empty command", route.id);
     }
     if cancel.is_cancelled() {
-        bail!(
-            "{CANCEL_MARKER} route `{}` canceled before launch",
-            route.id
-        );
+        return Err(RouteExecutionError::Cancelled {
+            route_id: route.id.clone(),
+        }
+        .into());
     }
 
     let cwd = resolve_cwd(&workspace.root, &route.working_directory)?;
@@ -288,80 +666,233 @@ fn spawn_route(
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
     cmd.current_dir(&cwd);
-    if !opts.inherit_env {
-        cmd.env_clear();
-    }
-    for (key, value) in &route.environment {
-        cmd.env(key, value);
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    // Place the route in its own process group so cancellation can terminate
-    // the whole tree (e.g. a shell plus its children), not just the leader.
+    configure_child_environment(&mut cmd, route, &opts.limits.environment_policy);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // The owned-group policy is explicit. A descendant that deliberately
+    // creates another process group/session is outside this POSIX boundary.
     #[cfg(unix)]
-    {
+    if opts.limits.process_tree_policy == ProcessTreePolicy::OwnedProcessGroup {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
 
     let start = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn `{}`", command.join(" ")))?;
+    let deadline = start
+        .checked_add(opts.limits.wall_clock_timeout)
+        .ok_or_else(|| RouteExecutionError::Configuration {
+            detail: "wall-clock timeout overflows the monotonic clock".to_string(),
+        })?;
+    let child = cmd.spawn().map_err(|source| RouteExecutionError::Spawn {
+        command: command.join(" "),
+        source,
+    })?;
+    let mut process = OwnedRouteProcess::new(child, opts.limits.process_tree_policy);
 
     // Drain pipes on helper threads so the child never blocks on a full pipe
-    // while the coordinator polls for exit or cancellation.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || drain_pipe(stdout_pipe));
-    let stderr_handle = std::thread::spawn(move || drain_pipe(stderr_pipe));
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if cancel.is_cancelled() {
-                    kill_route_process(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-                    bail!("{CANCEL_MARKER} route `{}` canceled", route.id);
-                }
-                // Short poll keeps cancellation latency low; the sleeping
-                // coordinator thread costs no meaningful CPU between polls.
-                std::thread::sleep(Duration::from_millis(5));
+    // while the coordinator polls for exit, timeout, or cancellation. Unix
+    // read ends are nonblocking so an escaped pipe holder cannot trap a helper
+    // thread forever after the owned group has been terminated.
+    let stdout_pipe = match process.child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            terminate_after_coordinator_failure(
+                &mut process,
+                route,
+                opts.limits.termination_grace_period,
+            )?;
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: "stdout",
+                detail: "spawned child has no piped stdout".to_string(),
             }
-            Err(err) => {
-                kill_route_process(&mut child);
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                return Err(err)
-                    .with_context(|| format!("failed waiting on `{}`", command.join(" ")));
+            .into());
+        }
+    };
+    let stderr_pipe = match process.child.stderr.take() {
+        Some(pipe) => pipe,
+        None => {
+            terminate_after_coordinator_failure(
+                &mut process,
+                route,
+                opts.limits.termination_grace_period,
+            )?;
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: "stderr",
+                detail: "spawned child has no piped stderr".to_string(),
+            }
+            .into());
+        }
+    };
+    let terminal = Arc::new(AtomicBool::new(false));
+    let stdout_task = match spawn_pipe_drain(
+        stdout_pipe,
+        opts.limits.max_retained_stdout_bytes,
+        Arc::clone(&terminal),
+        opts.limits.termination_grace_period,
+        "stdout",
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            terminate_after_coordinator_failure(
+                &mut process,
+                route,
+                opts.limits.termination_grace_period,
+            )?;
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: "stdout",
+                detail: error.to_string(),
+            }
+            .into());
+        }
+    };
+    let stderr_task = match spawn_pipe_drain(
+        stderr_pipe,
+        opts.limits.max_retained_stderr_bytes,
+        Arc::clone(&terminal),
+        opts.limits.termination_grace_period,
+        "stderr",
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            let cleanup = terminate_after_coordinator_failure(
+                &mut process,
+                route,
+                opts.limits.termination_grace_period,
+            );
+            terminal.store(true, Ordering::Release);
+            let stdout = finish_pipe_drain(stdout_task, route, drain_finish_deadline(&opts.limits));
+            cleanup?;
+            stdout?;
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: "stderr",
+                detail: error.to_string(),
+            }
+            .into());
+        }
+    };
+
+    let stop = loop {
+        match process.exited_without_reaping() {
+            Ok(true) => break RouteStop::LeaderExited,
+            Ok(false) => {
+                if cancel.is_cancelled() {
+                    break RouteStop::Cancelled;
+                }
+                if Instant::now() >= deadline {
+                    break RouteStop::DeadlineExceeded;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(source) => {
+                let cleanup = terminate_after_coordinator_failure(
+                    &mut process,
+                    route,
+                    opts.limits.termination_grace_period,
+                );
+                terminal.store(true, Ordering::Release);
+                let finish_deadline = drain_finish_deadline(&opts.limits);
+                let stdout = finish_pipe_drain(stdout_task, route, finish_deadline);
+                let stderr = finish_pipe_drain(stderr_task, route, finish_deadline);
+                cleanup?;
+                stdout?;
+                stderr?;
+                return Err(RouteExecutionError::Wait {
+                    command: command.join(" "),
+                    source,
+                }
+                .into());
             }
         }
     };
-    let duration_ns = start.elapsed().as_nanos();
 
-    // A drain-thread panic (only possible via a std I/O bug) degrades to
-    // empty captured output rather than poisoning the route result.
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let terminal_result = match stop {
+        RouteStop::LeaderExited => {
+            process.finish_after_leader_exit(route, opts.limits.termination_grace_period)
+        }
+        RouteStop::Cancelled | RouteStop::DeadlineExceeded => {
+            process.terminate_with_grace(route, opts.limits.termination_grace_period)
+        }
+    };
+    terminal.store(true, Ordering::Release);
+    let finish_deadline = drain_finish_deadline(&opts.limits);
+    let stdout = finish_pipe_drain(stdout_task, route, finish_deadline);
+    let stderr = finish_pipe_drain(stderr_task, route, finish_deadline);
+    let status = terminal_result?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+
+    match stop {
+        RouteStop::Cancelled => {
+            return Err(RouteExecutionError::Cancelled {
+                route_id: route.id.clone(),
+            }
+            .into())
+        }
+        RouteStop::DeadlineExceeded => {
+            return Err(RouteExecutionError::DeadlineExceeded {
+                route_id: route.id.clone(),
+                timeout: opts.limits.wall_clock_timeout,
+            }
+            .into())
+        }
+        RouteStop::LeaderExited => {}
+    }
 
     let value = match route.result_codec {
-        ResultCodec::Json => serde_json::from_slice::<serde_json::Value>(&stdout).ok(),
+        ResultCodec::Json if !stdout.capture.truncated => {
+            serde_json::from_slice::<serde_json::Value>(&stdout.retained).ok()
+        }
         _ => None,
     };
 
-    let artifacts = collect_artifacts(&workspace.root, &route.outputs)?;
+    let artifact_budget = ArtifactCaptureBudget { deadline, cancel };
+    let (artifacts, artifact_capture) = match collect_artifacts(
+        &workspace.root,
+        &route.outputs,
+        &opts.limits,
+        &artifact_budget,
+    ) {
+        Ok(artifacts) => (artifacts, ArtifactCaptureStatus::Complete),
+        Err(ArtifactCaptureError::CaptureCancelled) => {
+            return Err(RouteExecutionError::Cancelled {
+                route_id: route.id.clone(),
+            }
+            .into())
+        }
+        Err(ArtifactCaptureError::CaptureDeadlineExceeded) => {
+            return Err(RouteExecutionError::DeadlineExceeded {
+                route_id: route.id.clone(),
+                timeout: opts.limits.wall_clock_timeout,
+            }
+            .into())
+        }
+        Err(error) if status.success() => return Err(error.into()),
+        Err(error) => (
+            Vec::new(),
+            ArtifactCaptureStatus::Incomplete {
+                failure: Box::new(error.evidence()),
+            },
+        ),
+    };
+    let duration_ns = start.elapsed().as_nanos();
 
     Ok(OExecutionResult {
         route_id: route.id.clone(),
         exit_code: status.code(),
-        stdout,
-        stderr,
+        stdout: stdout.retained,
+        stdout_capture: stdout.capture,
+        stderr: stderr.retained,
+        stderr_capture: stderr.capture,
         value,
         artifacts,
+        artifact_requirements: route.outputs.clone(),
+        artifact_capture,
         disposition: RouteExecutionDisposition::Executed,
         duration_ns,
         provenance: ExecutionProvenance {
@@ -372,32 +903,587 @@ fn spawn_route(
     })
 }
 
-/// Read a child pipe to completion, returning the captured bytes.
-fn drain_pipe(pipe: Option<impl Read>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut bytes);
-    }
-    bytes
+fn terminate_after_coordinator_failure(
+    process: &mut OwnedRouteProcess,
+    route: &RouteSpec,
+    grace: Duration,
+) -> std::result::Result<(), RouteExecutionError> {
+    process.terminate_with_grace(route, grace).map(drop)
 }
 
-/// Terminate a route's process tree. On unix the route runs in its own
-/// process group, so the whole group is signalled; elsewhere only the group
-/// leader can be killed.
-fn kill_route_process(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pgid = child.id() as i32;
-        // SAFETY: `kill` is a plain syscall with no memory-safety
-        // preconditions. The negative pid targets the whole process group,
-        // whose pgid equals the leader's pid because the route was spawned
-        // with `process_group(0)`, and the pid is valid: `child` has not been
-        // reaped yet (no `wait` has returned for it).
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
+fn configure_child_environment(
+    command: &mut std::process::Command,
+    route: &RouteSpec,
+    policy: &EnvironmentPolicy,
+) {
+    match policy {
+        EnvironmentPolicy::InheritAll => {}
+        EnvironmentPolicy::Clear => {
+            command.env_clear();
+        }
+        EnvironmentPolicy::AllowList(keys) => {
+            command.env_clear();
+            for key in keys {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
         }
     }
-    let _ = child.kill();
+    command.envs(&route.environment);
+}
+
+#[derive(Clone, Copy)]
+enum RouteStop {
+    LeaderExited,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+struct DrainedOutput {
+    retained: Vec<u8>,
+    capture: OutputCapture,
+    reached_eof: bool,
+}
+
+struct PipeDrainTask {
+    stream: &'static str,
+    receiver: mpsc::Receiver<io::Result<DrainedOutput>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+fn spawn_pipe_drain<R>(
+    pipe: R,
+    retained_limit: usize,
+    terminal: Arc<AtomicBool>,
+    close_grace: Duration,
+    stream: &'static str,
+) -> io::Result<PipeDrainTask>
+where
+    R: Read + std::os::fd::AsRawFd + Send + 'static,
+{
+    set_nonblocking(&pipe)?;
+    spawn_pipe_drain_inner(pipe, retained_limit, terminal, close_grace, stream)
+}
+
+#[cfg(not(unix))]
+fn spawn_pipe_drain<R>(
+    pipe: R,
+    retained_limit: usize,
+    terminal: Arc<AtomicBool>,
+    close_grace: Duration,
+    stream: &'static str,
+) -> io::Result<PipeDrainTask>
+where
+    R: Read + Send + 'static,
+{
+    spawn_pipe_drain_inner(pipe, retained_limit, terminal, close_grace, stream)
+}
+
+fn spawn_pipe_drain_inner<R>(
+    pipe: R,
+    retained_limit: usize,
+    terminal: Arc<AtomicBool>,
+    close_grace: Duration,
+    stream: &'static str,
+) -> io::Result<PipeDrainTask>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name(format!("olang-route-{stream}"))
+        .spawn(move || {
+            let result = drain_pipe(pipe, retained_limit, &terminal, close_grace);
+            let _ = sender.send(result);
+        })?;
+    Ok(PipeDrainTask {
+        stream,
+        receiver,
+        handle: Some(handle),
+    })
+}
+
+fn drain_pipe(
+    mut pipe: impl Read,
+    retained_limit: usize,
+    terminal: &AtomicBool,
+    close_grace: Duration,
+) -> io::Result<DrainedOutput> {
+    let mut retained = Vec::with_capacity(retained_limit.min(64 * 1024));
+    let mut total_observed_bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut terminal_observed_at = None;
+
+    let reached_eof = loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => break true,
+            Ok(count) => {
+                total_observed_bytes = total_observed_bytes
+                    .checked_add(count as u64)
+                    .ok_or_else(|| io::Error::other("observed output length overflowed u64"))?;
+                hasher.update(&buffer[..count]);
+                let remaining = retained_limit.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if terminal.load(Ordering::Acquire) {
+                    let observed = terminal_observed_at.get_or_insert_with(Instant::now);
+                    if observed.elapsed() >= close_grace {
+                        break false;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let retained_bytes = u64::try_from(retained.len())
+        .map_err(|_| io::Error::other("retained output length does not fit u64"))?;
+    Ok(DrainedOutput {
+        capture: OutputCapture {
+            total_observed_bytes,
+            retained_bytes,
+            truncated: total_observed_bytes > retained_bytes,
+            sha256: hex::encode(hasher.finalize()),
+        },
+        retained,
+        reached_eof,
+    })
+}
+
+fn finish_pipe_drain(
+    mut task: PipeDrainTask,
+    route: &RouteSpec,
+    deadline: Instant,
+) -> std::result::Result<DrainedOutput, RouteExecutionError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let received = task.receiver.recv_timeout(remaining);
+    let joined = match task.handle.take() {
+        Some(handle) if !matches!(received, Err(mpsc::RecvTimeoutError::Timeout)) => {
+            Some(handle.join())
+        }
+        _ => None,
+    };
+    if joined.is_some_and(|result| result.is_err()) {
+        return Err(RouteExecutionError::OutputCapture {
+            route_id: route.id.clone(),
+            stream: task.stream,
+            detail: "drain thread panicked".to_string(),
+        });
+    }
+    let output = match received {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: task.stream,
+                detail: error.to_string(),
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(RouteExecutionError::ProcessTreeTermination {
+                route_id: route.id.clone(),
+                detail: format!(
+                    "{} pipe remained open after the owned process became terminal",
+                    task.stream
+                ),
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(RouteExecutionError::OutputCapture {
+                route_id: route.id.clone(),
+                stream: task.stream,
+                detail: "drain thread disconnected without a result".to_string(),
+            })
+        }
+    };
+    if !output.reached_eof {
+        return Err(RouteExecutionError::ProcessTreeTermination {
+            route_id: route.id.clone(),
+            detail: format!(
+                "{} pipe did not reach EOF after the owned process group was terminated",
+                task.stream
+            ),
+        });
+    }
+    output
+        .capture
+        .validate_for_retained(&output.retained)
+        .map_err(|detail| RouteExecutionError::OutputCapture {
+            route_id: route.id.clone(),
+            stream: task.stream,
+            detail,
+        })?;
+    Ok(output)
+}
+
+fn drain_finish_deadline(limits: &ExecutionLimits) -> Instant {
+    Instant::now()
+        .checked_add(
+            limits
+                .termination_grace_period
+                .saturating_add(Duration::from_millis(250)),
+        )
+        .unwrap_or_else(Instant::now)
+}
+
+#[cfg(unix)]
+fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    // SAFETY: `descriptor` belongs to the live pipe value and both fcntl calls
+    // only inspect/update its file-status flags.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+struct OwnedRouteProcess {
+    child: Child,
+    policy: ProcessTreePolicy,
+    reaped_status: Option<ExitStatus>,
+}
+
+impl OwnedRouteProcess {
+    fn new(child: Child, policy: ProcessTreePolicy) -> Self {
+        Self {
+            child,
+            policy,
+            reaped_status: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn exited_without_reaping(&mut self) -> io::Result<bool> {
+        loop {
+            // SAFETY: waitid initializes siginfo for this exact direct child.
+            // WNOWAIT observes exit without releasing the PID that anchors the
+            // owned process-group identity.
+            let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id() as libc::id_t,
+                    &mut information,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                // SAFETY: successful waitid initialized `information`; si_pid
+                // is zero when WNOHANG found no waitable state.
+                return Ok(unsafe { information.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn exited_without_reaping(&mut self) -> io::Result<bool> {
+        if self.reaped_status.is_some() {
+            return Ok(true);
+        }
+        if let Some(status) = self.child.try_wait()? {
+            self.reaped_status = Some(status);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn finish_after_leader_exit(
+        &mut self,
+        route: &RouteSpec,
+        grace: Duration,
+    ) -> std::result::Result<ExitStatus, RouteExecutionError> {
+        let mut cleanup = if self.policy == ProcessTreePolicy::OwnedProcessGroup {
+            self.force_terminate()
+        } else {
+            Ok(())
+        };
+        #[cfg(target_os = "macos")]
+        if cleanup
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+            && self.policy == ProcessTreePolicy::OwnedProcessGroup
+        {
+            cleanup = self.normalize_darwin_zombie_group_error(cleanup);
+        }
+        if cleanup.is_ok() {
+            cleanup = self.wait_for_owned_group_quiescence(grace);
+        }
+        let status = self.wait().map_err(|source| RouteExecutionError::Wait {
+            command: route.full_command().join(" "),
+            source,
+        })?;
+        cleanup.map_err(|error| RouteExecutionError::ProcessTreeTermination {
+            route_id: route.id.clone(),
+            detail: error.to_string(),
+        })?;
+        Ok(status)
+    }
+
+    fn terminate_with_grace(
+        &mut self,
+        route: &RouteSpec,
+        grace: Duration,
+    ) -> std::result::Result<ExitStatus, RouteExecutionError> {
+        let graceful_error = self.signal_graceful().err();
+        if !grace.is_zero() {
+            std::thread::sleep(grace);
+        }
+        let leader_exited_after_grace = self.exited_without_reaping();
+        let force_result = self.force_terminate();
+        #[cfg(target_os = "macos")]
+        let force_result = if leader_exited_after_grace
+            .as_ref()
+            .is_ok_and(|exited| *exited)
+            && force_result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+            && self.policy == ProcessTreePolicy::OwnedProcessGroup
+        {
+            self.normalize_darwin_zombie_group_error(force_result)
+        } else {
+            force_result
+        };
+        let quiescence_result = if force_result.is_ok() {
+            self.wait_for_owned_group_quiescence(grace)
+        } else {
+            Ok(())
+        };
+        let force_error = force_result.err();
+        let status = self.wait().map_err(|source| RouteExecutionError::Wait {
+            command: route.full_command().join(" "),
+            source,
+        })?;
+        leader_exited_after_grace.map_err(|source| RouteExecutionError::Wait {
+            command: route.full_command().join(" "),
+            source,
+        })?;
+        quiescence_result.map_err(|error| RouteExecutionError::ProcessTreeTermination {
+            route_id: route.id.clone(),
+            detail: error.to_string(),
+        })?;
+        if let Some(error) = graceful_error.or(force_error) {
+            return Err(RouteExecutionError::ProcessTreeTermination {
+                route_id: route.id.clone(),
+                detail: error.to_string(),
+            });
+        }
+        Ok(status)
+    }
+
+    fn wait_for_owned_group_quiescence(&self, grace: Duration) -> io::Result<()> {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = grace;
+        if self.policy != ProcessTreePolicy::OwnedProcessGroup {
+            return Ok(());
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let deadline = Instant::now()
+                .checked_add(grace)
+                .ok_or_else(|| io::Error::other("process-group grace deadline overflowed"))?;
+            loop {
+                if self.owned_group_contains_only_leader()? {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "owned process group still contains a descendant after SIGKILL",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+        {
+            // POSIX has no portable process-group enumeration API. On these
+            // Unix targets, successful delivery of the uncatchable SIGKILL is
+            // the strongest portable terminality boundary available.
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn owned_group_contains_only_leader(&self) -> io::Result<bool> {
+        self.darwin_group_contains_only_leader()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_group_contains_only_leader(&self) -> io::Result<bool> {
+        let leader = i32::try_from(self.child.id())
+            .map_err(|_| io::Error::other("child pid does not fit Linux pid_t"))?;
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if pid == leader {
+                continue;
+            }
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let close = stat.rfind(')').ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
+            })?;
+            let mut fields = stat[close + 1..].split_whitespace();
+            let _state = fields.next();
+            let _parent = fields.next();
+            let group = fields
+                .next()
+                .and_then(|field| field.parse::<i32>().ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process group")
+                })?;
+            if group == leader {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(status) = &self.reaped_status {
+            return Ok(*status);
+        }
+        let status = self.child.wait()?;
+        self.reaped_status = Some(status);
+        Ok(status)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn normalize_darwin_zombie_group_error(&self, signal_result: io::Result<()>) -> io::Result<()> {
+        let Err(signal_error) = signal_result else {
+            return Ok(());
+        };
+        if signal_error.raw_os_error() != Some(libc::EPERM) {
+            return Err(signal_error);
+        }
+        match self.darwin_group_contains_only_leader() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(signal_error),
+            Err(inspection_error) => Err(io::Error::other(format!(
+                "{signal_error}; failed to prove Darwin process group contains only its zombie leader: {inspection_error}"
+            ))),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn darwin_group_contains_only_leader(&self) -> io::Result<bool> {
+        let leader = i32::try_from(self.child.id())
+            .map_err(|_| io::Error::other("child pid does not fit Darwin pid_t"))?;
+        // SAFETY: a null buffer asks libproc for a conservative PID capacity
+        // and does not dereference memory.
+        let capacity = unsafe { libc::proc_listpgrppids(leader, std::ptr::null_mut(), 0) };
+        if capacity <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut members = vec![0 as libc::pid_t; capacity as usize];
+        let bytes = members
+            .len()
+            .checked_mul(std::mem::size_of::<libc::pid_t>())
+            .and_then(|size| i32::try_from(size).ok())
+            .ok_or_else(|| io::Error::other("Darwin process-group buffer is too large"))?;
+        // SAFETY: `members` owns `bytes` writable bytes and remains alive for
+        // the complete libproc call.
+        let count = unsafe { libc::proc_listpgrppids(leader, members.as_mut_ptr().cast(), bytes) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| io::Error::other("Darwin process-group count does not fit usize"))?;
+        if count > members.len() {
+            return Err(io::Error::other(
+                "Darwin process-group enumeration exceeded its buffer",
+            ));
+        }
+        members.truncate(count);
+        Ok(members.as_slice() == [leader])
+    }
+
+    #[cfg(unix)]
+    fn signal_graceful(&mut self) -> io::Result<()> {
+        self.signal_unix(libc::SIGTERM)
+    }
+
+    #[cfg(not(unix))]
+    fn signal_graceful(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    #[cfg(unix)]
+    fn force_terminate(&mut self) -> io::Result<()> {
+        let group_result = self.signal_unix(libc::SIGKILL);
+        // Also target the direct child while it remains unreaped. For an owned
+        // group this covers a violated group invariant without weakening the
+        // group error into success.
+        let _ = self.child.kill();
+        group_result
+    }
+
+    #[cfg(not(unix))]
+    fn force_terminate(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    #[cfg(unix)]
+    fn signal_unix(&self, signal: libc::c_int) -> io::Result<()> {
+        let pid = i32::try_from(self.child.id())
+            .map_err(|_| io::Error::other("child pid does not fit Unix pid_t"))?;
+        let target = match self.policy {
+            ProcessTreePolicy::OwnedProcessGroup => -pid,
+            ProcessTreePolicy::LeaderOnly => pid,
+        };
+        // SAFETY: the target is either the live, unreaped child or the fresh
+        // process group anchored by that child. The leader remains unreaped
+        // until all configured signals have been issued.
+        if unsafe { libc::kill(target, signal) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+impl Drop for OwnedRouteProcess {
+    fn drop(&mut self) {
+        if self.reaped_status.is_none() {
+            let _ = self.force_terminate();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 /// Resolve a route's working directory inside the workspace, rejecting escapes.
@@ -426,48 +1512,833 @@ fn resolve_cwd(root: &Path, working_directory: &str) -> Result<PathBuf> {
 // Artifact collection & glob matching
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn collect_artifacts(root: &Path, patterns: &[String]) -> Result<Vec<Artifact>> {
+fn collect_artifacts(
+    root: &Path,
+    patterns: &[String],
+    limits: &ExecutionLimits,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<Vec<Artifact>, ArtifactCaptureError> {
+    budget.check()?;
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
-    let mut all_files = Vec::new();
-    collect_files(root, root, &mut all_files);
-    all_files.sort();
+    let canonical_root = std::fs::canonicalize(root).map_err(|source| {
+        classify_artifact_io_error(".".to_string(), "canonicalize artifact root", source, true)
+    })?;
+    let paths = discover_artifact_paths(
+        root,
+        &canonical_root,
+        patterns,
+        limits.max_artifact_count,
+        limits.max_artifact_scan_entries,
+        budget,
+    )?;
+    preflight_artifact_limits(root, &canonical_root, &paths, limits, budget)?;
 
-    let mut artifacts = Vec::new();
-    let mut seen = HashSet::new();
-    for pattern in patterns {
-        for rel in &all_files {
-            if glob_match(pattern, rel) && seen.insert(rel.clone()) {
-                let full = root.join(rel);
-                let bytes = std::fs::read(&full).unwrap_or_default();
-                artifacts.push(Artifact {
-                    path: rel.clone(),
-                    content_hash: sha256_hex(&bytes),
-                    bytes_len: bytes.len() as u64,
-                });
-            }
-        }
+    let mut artifacts = Vec::with_capacity(paths.len());
+    let mut aggregate_bytes = 0_u64;
+    for path in paths {
+        budget.check()?;
+        let artifact = capture_artifact(
+            root,
+            &canonical_root,
+            &path,
+            limits.max_single_artifact_bytes,
+            budget,
+        )?;
+        aggregate_bytes = checked_aggregate_artifact_bytes(
+            aggregate_bytes,
+            artifact.bytes_len,
+            &path,
+            limits.max_aggregate_artifact_bytes,
+        )?;
+        artifacts.push(artifact);
     }
     Ok(artifacts)
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_dir() {
-            collect_files(root, &path, out);
-        } else if meta.file_type().is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+fn discover_artifact_paths(
+    root: &Path,
+    canonical_root: &Path,
+    patterns: &[String],
+    max_artifact_count: usize,
+    max_scan_entries: usize,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<Vec<String>, ArtifactCaptureError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut matched_patterns = vec![false; patterns.len()];
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut scanned_entries = 0_usize;
+
+    while let Some(directory) = directories.pop() {
+        budget.check()?;
+        let directory_label = artifact_path_label(root, &directory);
+        ensure_artifact_directory_contained(root, canonical_root, &directory, &directory_label)?;
+        let entries = std::fs::read_dir(&directory).map_err(|source| {
+            classify_artifact_io_error(
+                directory_label.clone(),
+                "read artifact directory",
+                source,
+                true,
+            )
+        })?;
+        for entry in entries {
+            budget.check()?;
+            scanned_entries =
+                scanned_entries
+                    .checked_add(1)
+                    .ok_or(ArtifactCaptureError::ArtifactScanLimit {
+                        limit: max_scan_entries,
+                        observed_at_least: usize::MAX,
+                    })?;
+            if scanned_entries > max_scan_entries {
+                return Err(ArtifactCaptureError::ArtifactScanLimit {
+                    limit: max_scan_entries,
+                    observed_at_least: scanned_entries,
+                });
+            }
+            let entry = entry.map_err(|source| ArtifactCaptureError::Unreadable {
+                path: directory_label.clone(),
+                operation: "read artifact directory entry from",
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|source| {
+                classify_artifact_io_error(
+                    artifact_path_label(root, &path),
+                    "read artifact metadata for",
+                    source,
+                    true,
+                )
+            })?;
+            if metadata.file_type().is_dir() {
+                directories.push(path);
+                continue;
+            }
+
+            let relative = path.strip_prefix(root).map_err(|_| {
+                ArtifactCaptureError::ChangedDuringCapture {
+                    path: path.display().to_string(),
+                    detail: "discovered path escaped the artifact root".to_string(),
+                }
+            })?;
+            let Some(relative) = relative.to_str() else {
+                let lossy = relative.to_string_lossy().replace('\\', "/");
+                if patterns.iter().any(|pattern| glob_match(pattern, &lossy)) {
+                    return Err(ArtifactCaptureError::UnsupportedPathEncoding {
+                        path: relative.to_path_buf(),
+                        relative_path_sha256: artifact_path_sha256(relative),
+                    });
+                }
+                continue;
+            };
+            let relative = relative.replace('\\', "/");
+            let mut matched = false;
+            for (index, pattern) in patterns.iter().enumerate() {
+                if glob_match(pattern, &relative) {
+                    matched_patterns[index] = true;
+                    matched = true;
+                }
+            }
+            if matched && seen.insert(relative.clone()) {
+                if paths.len() >= max_artifact_count {
+                    return Err(ArtifactCaptureError::ArtifactCountLimit {
+                        limit: max_artifact_count,
+                        observed_at_least: max_artifact_count.saturating_add(1),
+                    });
+                }
+                paths.push(relative);
             }
         }
+    }
+
+    if let Some((index, _)) = matched_patterns
+        .iter()
+        .enumerate()
+        .find(|(_, matched)| !**matched)
+    {
+        return Err(ArtifactCaptureError::Missing {
+            requirement: patterns[index].clone(),
+        });
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn preflight_artifact_limits(
+    root: &Path,
+    canonical_root: &Path,
+    paths: &[String],
+    limits: &ExecutionLimits,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<(), ArtifactCaptureError> {
+    let mut aggregate_bytes = 0_u64;
+    for path in paths {
+        budget.check()?;
+        let full = root.join(path);
+        let canonical = canonical_artifact_path(canonical_root, &full, path)?;
+        let metadata = initial_artifact_metadata(&full, path)?;
+        let canonical_metadata = initial_artifact_metadata(&canonical, path)?;
+        if artifact_snapshot(&metadata, path)? != artifact_snapshot(&canonical_metadata, path)? {
+            return Err(ArtifactCaptureError::ChangedDuringCapture {
+                path: path.clone(),
+                detail: "artifact path identity changed during limit preflight".to_string(),
+            });
+        }
+        enforce_single_artifact_limit(path, metadata.len(), limits.max_single_artifact_bytes)?;
+        aggregate_bytes = checked_aggregate_artifact_bytes(
+            aggregate_bytes,
+            metadata.len(),
+            path,
+            limits.max_aggregate_artifact_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn capture_artifact(
+    root: &Path,
+    canonical_root: &Path,
+    relative: &str,
+    max_single_artifact_bytes: u64,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<Artifact, ArtifactCaptureError> {
+    budget.check()?;
+    let full = root.join(relative);
+    let canonical_before = canonical_artifact_path(canonical_root, &full, relative)?;
+    let path_before = initial_artifact_metadata(&full, relative)?;
+    let canonical_before_metadata = initial_artifact_metadata(&canonical_before, relative)?;
+    if artifact_snapshot(&path_before, relative)?
+        != artifact_snapshot(&canonical_before_metadata, relative)?
+    {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "artifact path identity changed before open".to_string(),
+        });
+    }
+    enforce_single_artifact_limit(relative, path_before.len(), max_single_artifact_bytes)?;
+
+    let mut file = std::fs::File::open(&full)
+        .map_err(|source| classify_artifact_io_error(relative.to_string(), "open", source, true))?;
+    capture_opened_artifact(
+        relative,
+        &mut file,
+        ArtifactPathState {
+            full: &full,
+            path_before: &path_before,
+            canonical_root,
+            canonical_before: &canonical_before,
+        },
+        max_single_artifact_bytes,
+        budget,
+    )
+}
+
+struct ArtifactPathState<'a> {
+    full: &'a Path,
+    path_before: &'a std::fs::Metadata,
+    canonical_root: &'a Path,
+    canonical_before: &'a Path,
+}
+
+fn capture_opened_artifact<R>(
+    relative: &str,
+    reader: &mut R,
+    path_state: ArtifactPathState<'_>,
+    max_single_artifact_bytes: u64,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<Artifact, ArtifactCaptureError>
+where
+    R: Read + ArtifactMetadata,
+{
+    let opened_before =
+        reader
+            .artifact_metadata()
+            .map_err(|source| ArtifactCaptureError::Unreadable {
+                path: relative.to_string(),
+                operation: "read opened-file metadata for",
+                source,
+            })?;
+    if !opened_before.file_type().is_file() {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "path stopped naming a regular file before it was opened".to_string(),
+        });
+    }
+    if artifact_snapshot(path_state.path_before, relative)?
+        != artifact_snapshot(&opened_before, relative)?
+    {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "path identity changed before the file was opened".to_string(),
+        });
+    }
+
+    let (content_hash, bytes_len) =
+        hash_artifact_reader(reader, relative, max_single_artifact_bytes, budget)?;
+    budget.check()?;
+    let opened_after =
+        reader
+            .artifact_metadata()
+            .map_err(|source| ArtifactCaptureError::Unreadable {
+                path: relative.to_string(),
+                operation: "re-read opened-file metadata for",
+                source,
+            })?;
+    let path_after = std::fs::symlink_metadata(path_state.full).map_err(|source| {
+        classify_artifact_io_error(relative.to_string(), "re-read metadata for", source, true)
+    })?;
+    if !path_after.file_type().is_file() {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "path stopped naming a regular file while it was hashed".to_string(),
+        });
+    }
+    let canonical_after =
+        canonical_artifact_path(path_state.canonical_root, path_state.full, relative)?;
+    if canonical_after != path_state.canonical_before {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "artifact canonical path changed while it was hashed".to_string(),
+        });
+    }
+    let canonical_after_metadata = initial_artifact_metadata(&canonical_after, relative)?;
+    let before = artifact_snapshot(&opened_before, relative)?;
+    if before != artifact_snapshot(&opened_after, relative)?
+        || before != artifact_snapshot(&path_after, relative)?
+        || before != artifact_snapshot(&canonical_after_metadata, relative)?
+    {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: "file identity, size, or modification time changed while hashing".to_string(),
+        });
+    }
+    if bytes_len != opened_after.len() {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: relative.to_string(),
+            detail: format!(
+                "streamed {bytes_len} bytes but stable metadata reports {}",
+                opened_after.len()
+            ),
+        });
+    }
+    Ok(Artifact {
+        path: relative.to_string(),
+        content_hash,
+        bytes_len,
+    })
+}
+
+trait ArtifactMetadata {
+    fn artifact_metadata(&self) -> io::Result<std::fs::Metadata>;
+}
+
+impl ArtifactMetadata for std::fs::File {
+    fn artifact_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.metadata()
+    }
+}
+
+fn hash_artifact_reader(
+    reader: &mut impl Read,
+    relative: &str,
+    max_single_artifact_bytes: u64,
+    budget: &ArtifactCaptureBudget<'_>,
+) -> std::result::Result<(String, u64), ArtifactCaptureError> {
+    let mut hasher = Sha256::new();
+    let mut bytes_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        budget.check()?;
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(ArtifactCaptureError::Unreadable {
+                    path: relative.to_string(),
+                    operation: "read content from",
+                    source,
+                })
+            }
+        };
+        budget.check()?;
+        bytes_len = bytes_len.checked_add(count as u64).ok_or_else(|| {
+            ArtifactCaptureError::SingleArtifactLimit {
+                path: relative.to_string(),
+                limit: max_single_artifact_bytes,
+                observed_at_least: u64::MAX,
+            }
+        })?;
+        enforce_single_artifact_limit(relative, bytes_len, max_single_artifact_bytes)?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok((hex::encode(hasher.finalize()), bytes_len))
+}
+
+struct ArtifactCaptureBudget<'a> {
+    deadline: Instant,
+    cancel: &'a CancellationToken,
+}
+
+impl ArtifactCaptureBudget<'_> {
+    fn check(&self) -> std::result::Result<(), ArtifactCaptureError> {
+        if self.cancel.is_cancelled() {
+            Err(ArtifactCaptureError::CaptureCancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(ArtifactCaptureError::CaptureDeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_artifact_directory_contained(
+    root: &Path,
+    canonical_root: &Path,
+    directory: &Path,
+    label: &str,
+) -> std::result::Result<(), ArtifactCaptureError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|source| {
+        classify_artifact_io_error(
+            label.to_string(),
+            "read artifact directory metadata for",
+            source,
+            true,
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ArtifactCaptureError::ChangedDuringCapture {
+            path: label.to_string(),
+            detail: "artifact directory stopped naming a directory".to_string(),
+        });
+    }
+    let canonical = std::fs::canonicalize(directory).map_err(|source| {
+        classify_artifact_io_error(
+            label.to_string(),
+            "canonicalize artifact directory",
+            source,
+            true,
+        )
+    })?;
+    if canonical != canonical_root && !canonical.starts_with(canonical_root) {
+        return Err(ArtifactCaptureError::OutsideArtifactRoot {
+            path: artifact_path_label(root, directory),
+        });
+    }
+    Ok(())
+}
+
+fn canonical_artifact_path(
+    canonical_root: &Path,
+    full: &Path,
+    relative: &str,
+) -> std::result::Result<PathBuf, ArtifactCaptureError> {
+    let canonical = std::fs::canonicalize(full).map_err(|source| {
+        classify_artifact_io_error(relative.to_string(), "canonicalize", source, true)
+    })?;
+    if canonical == canonical_root || !canonical.starts_with(canonical_root) {
+        return Err(ArtifactCaptureError::OutsideArtifactRoot {
+            path: relative.to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn artifact_path_sha256(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hex::encode(Sha256::digest(path.as_os_str().as_bytes()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut bytes = Vec::new();
+        for code_unit in path.as_os_str().encode_wide() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        hex::encode(Sha256::digest(&bytes))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        hex::encode(Sha256::digest(path.to_string_lossy().as_bytes()))
+    }
+}
+
+fn initial_artifact_metadata(
+    full: &Path,
+    relative: &str,
+) -> std::result::Result<std::fs::Metadata, ArtifactCaptureError> {
+    let metadata = std::fs::symlink_metadata(full).map_err(|source| {
+        // Every caller reached this path through declared-output discovery, so
+        // NotFound here is an observed disappearance rather than an output
+        // that was never produced.
+        classify_artifact_io_error(relative.to_string(), "read metadata for", source, true)
+    })?;
+    ensure_regular_artifact(relative, &metadata)?;
+    Ok(metadata)
+}
+
+fn ensure_regular_artifact(
+    relative: &str,
+    metadata: &std::fs::Metadata,
+) -> std::result::Result<(), ArtifactCaptureError> {
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(ArtifactCaptureError::UnsupportedFileType {
+            path: relative.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArtifactSnapshot {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+fn artifact_snapshot(
+    metadata: &std::fs::Metadata,
+    relative: &str,
+) -> std::result::Result<ArtifactSnapshot, ArtifactCaptureError> {
+    let modified = metadata
+        .modified()
+        .map_err(|source| ArtifactCaptureError::Unreadable {
+            path: relative.to_string(),
+            operation: "read modification time for",
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(ArtifactSnapshot {
+            len: metadata.len(),
+            modified,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ArtifactSnapshot {
+            len: metadata.len(),
+            modified,
+        })
+    }
+}
+
+fn enforce_single_artifact_limit(
+    path: &str,
+    observed_at_least: u64,
+    limit: u64,
+) -> std::result::Result<(), ArtifactCaptureError> {
+    if observed_at_least > limit {
+        Err(ArtifactCaptureError::SingleArtifactLimit {
+            path: path.to_string(),
+            limit,
+            observed_at_least,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_aggregate_artifact_bytes(
+    captured_before: u64,
+    artifact_bytes: u64,
+    path: &str,
+    limit: u64,
+) -> std::result::Result<u64, ArtifactCaptureError> {
+    match captured_before.checked_add(artifact_bytes) {
+        Some(total) if total <= limit => Ok(total),
+        _ => Err(ArtifactCaptureError::AggregateArtifactLimit {
+            path: path.to_string(),
+            limit,
+            captured_before,
+            artifact_bytes,
+        }),
+    }
+}
+
+fn classify_artifact_io_error(
+    path: String,
+    operation: &'static str,
+    source: io::Error,
+    existed_before: bool,
+) -> ArtifactCaptureError {
+    if source.kind() == io::ErrorKind::NotFound {
+        if existed_before {
+            ArtifactCaptureError::ChangedDuringCapture {
+                path,
+                detail: format!("path disappeared while attempting to {operation}"),
+            }
+        } else {
+            ArtifactCaptureError::Missing { requirement: path }
+        }
+    } else {
+        ArtifactCaptureError::Unreadable {
+            path,
+            operation,
+            source,
+        }
+    }
+}
+
+fn artifact_path_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| relative.replace('\\', "/"))
+        .unwrap_or_else(|| ".".to_string())
+}
+
+#[cfg(test)]
+mod artifact_capture_tests {
+    use super::*;
+
+    fn test_budget(cancel: &CancellationToken) -> ArtifactCaptureBudget<'_> {
+        ArtifactCaptureBudget {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancel,
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected artifact read failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn genuine_empty_artifact_has_the_empty_content_digest() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("empty.bin"), []).unwrap();
+
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+
+        let artifacts = collect_artifacts(
+            workspace.path(),
+            &["empty.bin".to_string()],
+            &ExecutionLimits::default(),
+            &budget,
+        )
+        .unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes_len, 0);
+        assert_eq!(
+            artifacts[0].content_hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn failed_artifact_read_never_constructs_an_empty_artifact() {
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+        let error =
+            hash_artifact_reader(&mut FailingReader, "failed.bin", 1024, &budget).unwrap_err();
+        match error {
+            ArtifactCaptureError::Unreadable {
+                path,
+                operation,
+                source,
+            } => {
+                assert_eq!(path, "failed.bin");
+                assert_eq!(operation, "read content from");
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("failed read produced the wrong evidence state: {other}"),
+        }
+    }
+
+    #[test]
+    fn missing_and_oversized_artifacts_are_distinct_typed_failures() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+        let missing = collect_artifacts(
+            workspace.path(),
+            &["required.bin".to_string()],
+            &ExecutionLimits::default(),
+            &budget,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing,
+            ArtifactCaptureError::Missing { requirement } if requirement == "required.bin"
+        ));
+
+        std::fs::write(workspace.path().join("large.bin"), b"12345").unwrap();
+        let limits = ExecutionLimits {
+            max_single_artifact_bytes: 4,
+            ..ExecutionLimits::default()
+        };
+        let oversized = collect_artifacts(
+            workspace.path(),
+            &["large.bin".to_string()],
+            &limits,
+            &budget,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            oversized,
+            ArtifactCaptureError::SingleArtifactLimit {
+                path,
+                limit: 4,
+                observed_at_least: 5,
+            } if path == "large.bin"
+        ));
+    }
+
+    #[test]
+    fn artifact_disappearance_after_discovery_is_not_reported_as_empty_or_never_produced() {
+        let workspace = tempfile::tempdir().unwrap();
+        let full = workspace.path().join("disappearing.bin");
+        std::fs::write(&full, b"evidence").unwrap();
+        let limits = ExecutionLimits::default();
+        let canonical_root = std::fs::canonicalize(workspace.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+        let paths = discover_artifact_paths(
+            workspace.path(),
+            &canonical_root,
+            &["disappearing.bin".to_string()],
+            limits.max_artifact_count,
+            limits.max_artifact_scan_entries,
+            &budget,
+        )
+        .unwrap();
+        std::fs::remove_file(full).unwrap();
+
+        let error =
+            preflight_artifact_limits(workspace.path(), &canonical_root, &paths, &limits, &budget)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactCaptureError::ChangedDuringCapture { path, .. }
+                if path == "disappearing.bin"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_after_open_is_detected_as_changed_during_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        let full = workspace.path().join("changing.bin");
+        std::fs::write(&full, b"old").unwrap();
+        let canonical_root = std::fs::canonicalize(workspace.path()).unwrap();
+        let canonical_before = std::fs::canonicalize(&full).unwrap();
+        let path_before = std::fs::symlink_metadata(&full).unwrap();
+        let mut opened = std::fs::File::open(&full).unwrap();
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+
+        std::fs::rename(&full, workspace.path().join("original.bin")).unwrap();
+        std::fs::write(&full, b"new").unwrap();
+
+        let error = capture_opened_artifact(
+            "changing.bin",
+            &mut opened,
+            ArtifactPathState {
+                full: &full,
+                path_before: &path_before,
+                canonical_root: &canonical_root,
+                canonical_before: &canonical_before,
+            },
+            1024,
+            &budget,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactCaptureError::ChangedDuringCapture { path, .. }
+                if path == "changing.bin"
+        ));
+    }
+
+    #[test]
+    fn artifact_scan_limit_bounds_nonmatching_directory_traversal() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("one.tmp"), b"1").unwrap();
+        std::fs::write(workspace.path().join("two.tmp"), b"2").unwrap();
+        let limits = ExecutionLimits {
+            max_artifact_scan_entries: 1,
+            max_artifact_count: 1,
+            ..ExecutionLimits::default()
+        };
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+
+        let error = collect_artifacts(
+            workspace.path(),
+            &["required.bin".to_string()],
+            &limits,
+            &budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactCaptureError::ArtifactScanLimit {
+                limit: 1,
+                observed_at_least: 2,
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_artifact_path_rejects_intermediate_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("secret.bin"), b"outside").unwrap();
+        symlink(external.path(), workspace.path().join("escape")).unwrap();
+        let canonical_root = std::fs::canonicalize(workspace.path()).unwrap();
+
+        let error = canonical_artifact_path(
+            &canonical_root,
+            &workspace.path().join("escape/secret.bin"),
+            "escape/secret.bin",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactCaptureError::OutsideArtifactRoot { path, .. }
+                if path == "escape/secret.bin"
+        ));
     }
 }
 
@@ -482,28 +2353,35 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 fn match_segments(pat: &[&str], text: &[&str]) -> bool {
-    match pat.split_first() {
-        None => text.is_empty(),
-        Some((&"**", rest)) => {
-            // `**` matches zero or more segments.
-            for i in 0..=text.len() {
-                if match_segments(rest, &text[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        Some((seg, rest)) => {
-            let Some((first, text_rest)) = text.split_first() else {
-                return false;
-            };
-            if segment_match(seg, first) {
-                match_segments(rest, text_rest)
-            } else {
-                false
-            }
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    let mut last_globstar = None;
+    let mut globstar_text_index = 0;
+
+    while text_index < text.len() {
+        if pattern_index < pat.len()
+            && pat[pattern_index] != "**"
+            && segment_match(pat[pattern_index], text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pat.len() && pat[pattern_index] == "**" {
+            last_globstar = Some(pattern_index);
+            pattern_index += 1;
+            globstar_text_index = text_index;
+        } else if let Some(globstar) = last_globstar {
+            globstar_text_index += 1;
+            text_index = globstar_text_index;
+            pattern_index = globstar + 1;
+        } else {
+            return false;
         }
     }
+
+    while pattern_index < pat.len() && pat[pattern_index] == "**" {
+        pattern_index += 1;
+    }
+    pattern_index == pat.len()
 }
 
 /// Match a single path segment against a pattern with `*` and `?`.
@@ -514,31 +2392,34 @@ fn segment_match(pat: &str, text: &str) -> bool {
 }
 
 fn wildcard(pat: &[char], text: &[char]) -> bool {
-    match pat.split_first() {
-        None => text.is_empty(),
-        Some(('*', rest)) => {
-            for i in 0..=text.len() {
-                if wildcard(rest, &text[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        Some(('?', rest)) => {
-            if text.is_empty() {
-                false
-            } else {
-                wildcard(rest, &text[1..])
-            }
-        }
-        Some((c, rest)) => {
-            if text.first() == Some(c) {
-                wildcard(rest, &text[1..])
-            } else {
-                false
-            }
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    let mut last_star = None;
+    let mut star_text_index = 0;
+
+    while text_index < text.len() {
+        if pattern_index < pat.len()
+            && (pat[pattern_index] == '?' || pat[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pat.len() && pat[pattern_index] == '*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if let Some(star) = last_star {
+            star_text_index += 1;
+            text_index = star_text_index;
+            pattern_index = star + 1;
+        } else {
+            return false;
         }
     }
+
+    while pattern_index < pat.len() && pat[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pat.len()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -681,6 +2562,35 @@ pub fn resolve_selection(
     })
 }
 
+fn potential_route_execution_count(
+    bundle: &ProjectBundle,
+    alternatives: &[String],
+) -> Result<usize> {
+    let mut total = 0_usize;
+    for alternative in alternatives {
+        // Each alternative owns an isolated workspace, so a shared
+        // prerequisite may execute once per alternative. Within one branch,
+        // RunCtx memoizes repeated prerequisites and cycles are counted once
+        // here before the existing lifecycle validator reports the cycle.
+        let mut pending = vec![alternative.as_str()];
+        let mut seen = HashSet::new();
+        while let Some(route_id) = pending.pop() {
+            if !seen.insert(route_id) {
+                continue;
+            }
+            total = total.checked_add(1).ok_or_else(|| {
+                RouteExecutionError::Configuration {
+                    detail: "potential route-execution count overflowed".to_string(),
+                }
+            })?;
+            if let Some(route) = bundle.route(route_id) {
+                pending.extend(route.prerequisites.iter().map(String::as_str));
+            }
+        }
+    }
+    Ok(total)
+}
+
 fn execute_policy(
     bundle: &ProjectBundle,
     alternatives: &[String],
@@ -690,6 +2600,9 @@ fn execute_policy(
     if alternatives.is_empty() {
         bail!("route set has no alternatives to run");
     }
+    let potential_route_executions = potential_route_execution_count(bundle, alternatives)?;
+    opts.limits
+        .validate_route_execution_set(potential_route_executions)?;
     match policy {
         RoutePolicy::Explicit(id) => {
             let id = alternatives
@@ -973,6 +2886,22 @@ fn race_alternatives(
 /// must match across all alternatives.
 fn verify_results_equivalent(results: &[OExecutionResult]) -> Result<()> {
     if results.len() < 2 {
+        return Ok(());
+    }
+    if results.iter().any(|result| result.stdout_capture.truncated) {
+        let reference = &results[0];
+        for other in &results[1..] {
+            if other.stdout_capture.sha256 != reference.stdout_capture.sha256
+                || other.stdout_capture.total_observed_bytes
+                    != reference.stdout_capture.total_observed_bytes
+            {
+                bail!(
+                    "verify_equivalent: route `{}` and route `{}` produced different stdout",
+                    reference.route_id,
+                    other.route_id
+                );
+            }
+        }
         return Ok(());
     }
     let all_json = results.iter().all(|r| r.value.is_some());

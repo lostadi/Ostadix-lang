@@ -36,7 +36,9 @@ use sha2::{Digest, Sha256};
 use crate::hgraph::{ExecutableOp, HNodeKind, NodeId, ReadyInputPolicy, ReadySchedule, ValueState};
 use crate::ir::PlanNodeId;
 
-use super::model::{Artifact, OExecutionResult, RouteFailureContinuation, RoutePolicy};
+use super::model::{
+    Artifact, ArtifactCaptureStatus, OExecutionResult, RouteFailureContinuation, RoutePolicy,
+};
 use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 
 /// Version of the deterministic project-attempt event vocabulary.
@@ -46,9 +48,12 @@ use super::plan::{ProjectDependency, ProjectHGraph, ProjectPlanOperation};
 /// decision evidence. Version 4 binds the trace to canonical
 /// `LogicalHGraphV1` schema bytes instead of human inspection text. Version 5
 /// also binds the canonical hosted-unbound `DeploymentPlanV1`; trusted replay
-/// rejects substitution of that artifact. It does not bind or execute a
-/// snapshot-derived provider proposal or attach World identity.
-pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 5;
+/// rejects substitution of that artifact. Version 6 distinguishes retained
+/// child-output prefixes from the complete drained streams by binding observed
+/// and retained lengths, truncation, full-stream digests, and declared-artifact
+/// completeness. It does not bind or execute a snapshot-derived provider
+/// proposal or attach World identity.
+pub const PROJECT_ATTEMPT_TRACE_VERSION: u32 = 6;
 
 pub(crate) fn project_logical_graph_digest(
     project: &ProjectHGraph,
@@ -273,18 +278,56 @@ impl ProjectArtifactFingerprint {
 pub struct ProjectRouteOutcome {
     /// Process exit code, or `None` when no process status was available.
     pub exit_code: Option<i32>,
-    /// Lowercase hexadecimal SHA-256 of exact captured stdout bytes.
+    /// Lowercase hexadecimal SHA-256 of the complete drained stdout stream.
     pub stdout_sha256: String,
-    /// Lowercase hexadecimal SHA-256 of exact captured stderr bytes.
+    /// Total stdout bytes observed, including any discarded suffix.
+    pub stdout_total_observed_bytes: u64,
+    /// Number of stdout bytes retained on the execution result.
+    pub stdout_retained_bytes: u64,
+    /// Whether the retained stdout is only a bounded prefix.
+    pub stdout_truncated: bool,
+    /// Lowercase hexadecimal SHA-256 of the complete drained stderr stream.
     pub stderr_sha256: String,
+    /// Total stderr bytes observed, including any discarded suffix.
+    pub stderr_total_observed_bytes: u64,
+    /// Number of stderr bytes retained on the execution result.
+    pub stderr_retained_bytes: u64,
+    /// Whether the retained stderr is only a bounded prefix.
+    pub stderr_truncated: bool,
     /// Deterministically ordered fingerprints of declared output artifacts.
     pub artifacts: Vec<ProjectArtifactFingerprint>,
+    /// Declared output patterns bound to this capture attempt.
+    pub artifact_requirements: Vec<String>,
+    /// Whether every declared output artifact was captured completely.
+    pub artifact_capture: ArtifactCaptureStatus,
 }
 
 impl ProjectRouteOutcome {
     /// Normalize an execution result into deterministic, content-addressed
     /// trace data.
     pub fn from_result(result: &OExecutionResult) -> Result<Self, ProjectTraceError> {
+        result
+            .stdout_capture
+            .validate_for_retained(&result.stdout)
+            .map_err(ProjectTraceError::InvalidOutcome)?;
+        result
+            .stderr_capture
+            .validate_for_retained(&result.stderr)
+            .map_err(ProjectTraceError::InvalidOutcome)?;
+        result
+            .artifact_capture
+            .validate()
+            .map_err(ProjectTraceError::InvalidOutcome)?;
+        if result.exit_code == Some(0) && !result.artifact_capture.is_complete() {
+            return Err(ProjectTraceError::InvalidOutcome(
+                "exit-zero route outcome has incomplete artifact evidence".to_string(),
+            ));
+        }
+        if !result.artifact_capture.is_complete() && !result.artifacts.is_empty() {
+            return Err(ProjectTraceError::InvalidOutcome(
+                "incomplete artifact evidence retains apparently complete artifacts".to_string(),
+            ));
+        }
         let mut artifacts = result
             .artifacts
             .iter()
@@ -299,17 +342,59 @@ impl ProjectRouteOutcome {
                 "route outcome contains a duplicate artifact path".to_string(),
             ));
         }
-        Ok(Self {
+        let outcome = Self {
             exit_code: result.exit_code,
-            stdout_sha256: sha256_hex(&result.stdout),
-            stderr_sha256: sha256_hex(&result.stderr),
+            stdout_sha256: result.stdout_capture.sha256.clone(),
+            stdout_total_observed_bytes: result.stdout_capture.total_observed_bytes,
+            stdout_retained_bytes: result.stdout_capture.retained_bytes,
+            stdout_truncated: result.stdout_capture.truncated,
+            stderr_sha256: result.stderr_capture.sha256.clone(),
+            stderr_total_observed_bytes: result.stderr_capture.total_observed_bytes,
+            stderr_retained_bytes: result.stderr_capture.retained_bytes,
+            stderr_truncated: result.stderr_capture.truncated,
             artifacts,
-        })
+            artifact_requirements: result.artifact_requirements.clone(),
+            artifact_capture: result.artifact_capture.clone(),
+        };
+        outcome.validate()?;
+        Ok(outcome)
     }
 
     fn validate(&self) -> Result<(), ProjectTraceError> {
-        validate_sha256(&self.stdout_sha256, "stdout fingerprint")?;
-        validate_sha256(&self.stderr_sha256, "stderr fingerprint")?;
+        validate_stream_fingerprint(
+            &self.stdout_sha256,
+            self.stdout_total_observed_bytes,
+            self.stdout_retained_bytes,
+            self.stdout_truncated,
+            "stdout",
+        )?;
+        validate_stream_fingerprint(
+            &self.stderr_sha256,
+            self.stderr_total_observed_bytes,
+            self.stderr_retained_bytes,
+            self.stderr_truncated,
+            "stderr",
+        )?;
+        self.artifact_capture
+            .validate()
+            .map_err(ProjectTraceError::InvalidOutcome)?;
+        if self.exit_code == Some(0) && !self.artifact_capture.is_complete() {
+            return Err(ProjectTraceError::InvalidOutcome(
+                "exit-zero route outcome has incomplete artifact evidence".to_string(),
+            ));
+        }
+        if !self.artifact_capture.is_complete() && !self.artifacts.is_empty() {
+            return Err(ProjectTraceError::InvalidOutcome(
+                "incomplete artifact evidence retains apparently complete artifacts".to_string(),
+            ));
+        }
+        for requirement in &self.artifact_requirements {
+            if requirement.is_empty() || requirement.contains('\0') {
+                return Err(ProjectTraceError::InvalidOutcome(
+                    "artifact requirement must be nonempty and contain no NUL".to_string(),
+                ));
+            }
+        }
         let mut prior: Option<&ProjectArtifactFingerprint> = None;
         for artifact in &self.artifacts {
             if artifact.path.is_empty() || artifact.path.contains('\0') {
@@ -330,8 +415,59 @@ impl ProjectRouteOutcome {
             }
             prior = Some(artifact);
         }
+        if self.artifact_capture.is_complete() {
+            for requirement in &self.artifact_requirements {
+                if !self
+                    .artifacts
+                    .iter()
+                    .any(|artifact| super::runtime::glob_match(requirement, &artifact.path))
+                {
+                    return Err(ProjectTraceError::InvalidOutcome(format!(
+                        "complete artifact evidence has no fingerprint matching `{requirement}`"
+                    )));
+                }
+            }
+            for artifact in &self.artifacts {
+                if !self
+                    .artifact_requirements
+                    .iter()
+                    .any(|requirement| super::runtime::glob_match(requirement, &artifact.path))
+                {
+                    return Err(ProjectTraceError::InvalidOutcome(format!(
+                        "artifact fingerprint `{}` matches no declared requirement",
+                        artifact.path
+                    )));
+                }
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_stream_fingerprint(
+    sha256: &str,
+    total_observed_bytes: u64,
+    retained_bytes: u64,
+    truncated: bool,
+    stream: &str,
+) -> Result<(), ProjectTraceError> {
+    validate_sha256(sha256, &format!("{stream} fingerprint"))?;
+    if total_observed_bytes < retained_bytes {
+        return Err(ProjectTraceError::InvalidOutcome(format!(
+            "{stream} observed fewer bytes than it retained"
+        )));
+    }
+    if truncated != (total_observed_bytes > retained_bytes) {
+        return Err(ProjectTraceError::InvalidOutcome(format!(
+            "{stream} truncation flag disagrees with observed and retained lengths"
+        )));
+    }
+    if total_observed_bytes == 0 && sha256 != sha256_hex(&[]) {
+        return Err(ProjectTraceError::InvalidOutcome(format!(
+            "empty {stream} stream has a nonempty-content fingerprint"
+        )));
+    }
+    Ok(())
 }
 
 impl TryFrom<&OExecutionResult> for ProjectRouteOutcome {
@@ -1015,6 +1151,22 @@ impl ProjectAttemptTrace {
                     event.plan_node.0
                 )));
             }
+            if matches!(operation.op, ExecutableOp::RunRoute { .. }) {
+                if let Some(outcome) = &event.outcome {
+                    let route_facts = operation.route_facts.as_ref().ok_or_else(|| {
+                        ProjectTraceError::InvalidMetadata(format!(
+                            "RunRoute plan node {} has no trusted RoutePlanFacts",
+                            event.plan_node.0
+                        ))
+                    })?;
+                    if outcome.artifact_requirements != route_facts.outputs {
+                        return Err(ProjectTraceError::InvalidEvent(format!(
+                            "route outcome artifact requirements for plan node {} differ from trusted RoutePlanFacts",
+                            event.plan_node.0
+                        )));
+                    }
+                }
+            }
         }
 
         let ordered = matches!(
@@ -1679,7 +1831,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::project::model::{ExecutionProvenance, RouteExecutionDisposition};
+    use crate::project::model::{ExecutionProvenance, OutputCapture, RouteExecutionDisposition};
 
     fn identity(node: usize) -> ProjectAttemptIdentity {
         ProjectAttemptIdentity::new(
@@ -1709,13 +1861,22 @@ mod tests {
     }
 
     fn result(artifacts: Vec<Artifact>) -> OExecutionResult {
+        let stdout = b"abc".to_vec();
+        let stderr = Vec::new();
         OExecutionResult {
             route_id: "test".to_string(),
             exit_code: Some(0),
-            stdout: b"abc".to_vec(),
-            stderr: Vec::new(),
+            stdout_capture: OutputCapture::complete(&stdout),
+            stdout,
+            stderr_capture: OutputCapture::complete(&stderr),
+            stderr,
             value: None,
+            artifact_requirements: artifacts
+                .iter()
+                .map(|artifact| artifact.path.clone())
+                .collect(),
             artifacts,
+            artifact_capture: ArtifactCaptureStatus::Complete,
             disposition: RouteExecutionDisposition::Executed,
             duration_ns: 999,
             provenance: ExecutionProvenance {
@@ -1748,10 +1909,16 @@ mod tests {
             outcome.stdout_sha256,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        assert_eq!(outcome.stdout_total_observed_bytes, 3);
+        assert_eq!(outcome.stdout_retained_bytes, 3);
+        assert!(!outcome.stdout_truncated);
         assert_eq!(
             outcome.stderr_sha256,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+        assert_eq!(outcome.stderr_total_observed_bytes, 0);
+        assert_eq!(outcome.stderr_retained_bytes, 0);
+        assert!(!outcome.stderr_truncated);
         assert_eq!(
             outcome
                 .artifacts
@@ -1763,13 +1930,58 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_artifact_evidence_cannot_form_a_success_outcome() {
+        let mut execution = result(Vec::new());
+        execution.artifact_capture = ArtifactCaptureStatus::Incomplete {
+            failure: Box::new(super::super::model::ArtifactCaptureFailure::Missing {
+                requirement: "required.bin".to_string(),
+            }),
+        };
+
+        assert!(!execution.succeeded());
+        let error = ProjectRouteOutcome::from_result(&execution).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exit-zero route outcome has incomplete artifact evidence"));
+
+        execution.exit_code = Some(9);
+        let outcome = ProjectRouteOutcome::from_result(&execution).unwrap();
+        outcome.validate().unwrap();
+        assert!(matches!(
+            outcome.artifact_capture,
+            ArtifactCaptureStatus::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn route_outcome_binds_complete_stream_when_retention_is_truncated() {
+        let mut result = result(Vec::new());
+        result.stdout = b"prefix".to_vec();
+        result.stdout_capture = OutputCapture {
+            total_observed_bytes: 13,
+            retained_bytes: 6,
+            truncated: true,
+            sha256: hex::encode(Sha256::digest(b"prefix-suffix")),
+        };
+
+        let outcome = ProjectRouteOutcome::from_result(&result).unwrap();
+        assert_eq!(outcome.stdout_total_observed_bytes, 13);
+        assert_eq!(outcome.stdout_retained_bytes, 6);
+        assert!(outcome.stdout_truncated);
+        assert_eq!(
+            outcome.stdout_sha256,
+            hex::encode(Sha256::digest(b"prefix-suffix"))
+        );
+    }
+
+    #[test]
     fn trace_requires_a_canonical_execution_header() {
         let expected = header();
         let trace = ProjectAttemptTrace::new(expected.clone()).unwrap();
         assert_eq!(trace.format_version(), PROJECT_ATTEMPT_TRACE_VERSION);
         assert_eq!(trace.header(), &expected);
         let serialized = serde_json::to_value(&trace).unwrap();
-        assert_eq!(serialized["format_version"], 5);
+        assert_eq!(serialized["format_version"], 6);
         assert_eq!(serialized["header"]["project_name"], "project");
         assert_eq!(serialized["header"]["logical_graph_schema"], 1);
         assert_eq!(serialized["header"]["deployment_plan_schema"], 1);

@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use o_lang::project::runtime::{GuardBehavior, RunOptions};
 use o_lang::project::{
     self, build_project_hgraph, execute_world_project_with_receipt,
-    write_world_project_receipt_hex, DeploymentArchitectureRequirementV1, DeploymentPlanV1,
-    DeploymentProjectPathV1, DeploymentProviderBindingV1, DeploymentProviderSnapshotV1,
-    HostedWorldCoordinatorObserverV1, HostedWorldCurrentV1, HostedWorldLaunchV1,
-    LogicalOperationIdV1, PlacementSnapshotV1, ProjectAttemptState, ProjectAttemptTrace,
-    ProjectBundle, ProjectHGraph, RuntimeGraphTerminalV1, RuntimeGraphV1,
+    write_world_project_receipt_hex, ArtifactCaptureFailure, ArtifactCaptureStatus,
+    DeploymentArchitectureRequirementV1, DeploymentPlanV1, DeploymentProjectPathV1,
+    DeploymentProviderBindingV1, DeploymentProviderSnapshotV1, HostedWorldCoordinatorObserverV1,
+    HostedWorldCurrentV1, HostedWorldLaunchV1, LogicalOperationIdV1, PlacementSnapshotV1,
+    ProjectAttemptState, ProjectAttemptTrace, ProjectBundle, ProjectHGraph, RuntimeGraphTerminalV1,
+    RuntimeGraphV1,
 };
 use o_lang::world::{
     project_receipt_semantic_sha256_v1, ArtifactId, AttemptGeneration, AttemptIdentity,
@@ -49,6 +50,7 @@ enum RouteMode {
     Success,
     NonZero,
     GuardSkipped,
+    MissingArtifact,
     SpawnAbort,
 }
 
@@ -256,6 +258,13 @@ fn fixture(marker: &Path, mode: RouteMode) -> WorldFixture {
         main.guards = vec![project::RouteGuard::CommandAvailable(
             "ostadix-command-that-cannot-exist".to_owned(),
         )];
+    } else if matches!(mode, RouteMode::MissingArtifact) {
+        let main = bundle
+            .routes
+            .iter_mut()
+            .find(|route| route.id == "main")
+            .unwrap();
+        main.outputs = vec!["required-but-not-produced.bin".to_owned()];
     }
 
     let project = build_project_hgraph(&bundle, Some("main"), None).unwrap();
@@ -315,6 +324,24 @@ fn execute(fixture: &WorldFixture) -> anyhow::Result<project::WorldProjectExecut
     )
 }
 
+fn assert_runtime_graph_rejected(graph: &RuntimeGraphV1, expected: &str) {
+    let validation = graph.validate().unwrap_err();
+    assert!(
+        validation.to_string().contains(expected),
+        "unexpected RuntimeGraph validation error: {validation}"
+    );
+
+    // Serialize directly because canonical_bytes() correctly refuses to encode
+    // an invalid graph. serde's struct-field order is the canonical candidate
+    // that an external decoder would otherwise be asked to accept.
+    let encoded = serde_json::to_vec(graph).unwrap();
+    let decoding = RuntimeGraphV1::decode_canonical(&encoded).unwrap_err();
+    assert!(
+        decoding.to_string().contains(expected),
+        "unexpected canonical RuntimeGraph decode error: {decoding}"
+    );
+}
+
 fn write_optional_native_fixture(outcome: &project::WorldProjectExecutionOutcome) {
     if let Some(path) = std::env::var_os("O_PROJECT_WORLD_RECEIPT_HEX_OUT") {
         write_world_project_receipt_hex(Path::new(&path), outcome).unwrap();
@@ -335,7 +362,11 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
     let fixture = fixture(&marker, RouteMode::Success);
     let outcome = execute(&fixture).unwrap();
 
-    assert!(outcome.coordinator_succeeded());
+    assert!(
+        outcome.coordinator_succeeded(),
+        "unexpected coordinator failure: {:?}",
+        outcome.coordinator_failure
+    );
     let result = outcome.result.as_ref().unwrap();
     assert_eq!(result.route_id, "main");
     assert!(result.succeeded());
@@ -434,8 +465,8 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
         )
         .is_err());
 
-    // A structurally plausible terminal copied from another exact observed
-    // route is not the selected project result and must fail trusted replay.
+    // A terminal copied from a prerequisite is not the route selected at the
+    // completed root. Both standalone decoding and trusted replay reject it.
     let (prepare_operation, prepare_residual, prepare_observation) = outcome
         .runtime_graph
         .operations
@@ -470,7 +501,16 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
         outcome: prepare_observation.outcome.unwrap(),
         residual_host_world: prepare_residual,
     };
-    terminal_substitution.validate().unwrap();
+    terminal_substitution.policy = "default".to_owned();
+    for observation in &mut terminal_substitution
+        .operations
+        .last_mut()
+        .unwrap()
+        .observations
+    {
+        observation.operation_label = "select-route:default".to_owned();
+    }
+    assert_runtime_graph_rejected(&terminal_substitution, "policy-selected top-level route");
     assert!(terminal_substitution
         .validate_trusted_project_result(
             &fixture.project,
@@ -536,6 +576,145 @@ fn world_bound_success_observes_runtime_graph_and_emits_uncommitted_receipt() {
         .is_err());
 
     write_optional_native_fixture(&outcome);
+}
+
+#[test]
+fn runtime_graph_decode_rejects_constructor_impossible_terminal_shapes() {
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("runtime-graph-negative.marker");
+    let fixture = fixture(&marker, RouteMode::Success);
+    let outcome = execute(&fixture).unwrap();
+    assert!(
+        outcome.coordinator_succeeded(),
+        "unexpected coordinator failure: {:?}",
+        outcome.coordinator_failure
+    );
+    let valid = outcome.runtime_graph;
+    valid.validate().unwrap();
+
+    let residual_host_world = match &valid.terminal {
+        RuntimeGraphTerminalV1::RouteSettlement {
+            residual_host_world,
+            ..
+        } => *residual_host_world,
+        RuntimeGraphTerminalV1::CoordinatorFailure { .. } => unreachable!(),
+    };
+
+    let mut no_started = valid.clone();
+    for operation in &mut no_started.operations {
+        operation.observations.clear();
+    }
+    no_started.terminal = RuntimeGraphTerminalV1::CoordinatorFailure {
+        detail_sha256: artifact("coordinator-failed-before-start"),
+        residual_host_world: false,
+    };
+    assert_runtime_graph_rejected(&no_started, "no observed started operation");
+
+    let mut failure_after_completed_root = valid.clone();
+    failure_after_completed_root.terminal = RuntimeGraphTerminalV1::CoordinatorFailure {
+        detail_sha256: artifact("failure-after-completed-root"),
+        residual_host_world,
+    };
+    assert_runtime_graph_rejected(&failure_after_completed_root, "completed SelectRoute root");
+
+    let mut settlement_without_root = valid.clone();
+    settlement_without_root
+        .operations
+        .last_mut()
+        .unwrap()
+        .observations
+        .clear();
+    assert_runtime_graph_rejected(&settlement_without_root, "completed SelectRoute root");
+
+    let mut inconsistent_residual = valid.clone();
+    match &mut inconsistent_residual.terminal {
+        RuntimeGraphTerminalV1::RouteSettlement {
+            residual_host_world,
+            ..
+        }
+        | RuntimeGraphTerminalV1::CoordinatorFailure {
+            residual_host_world,
+            ..
+        } => *residual_host_world = !*residual_host_world,
+    }
+    assert_runtime_graph_rejected(&inconsistent_residual, "residual HostWorld truth");
+
+    let mut impossible_lifecycle = valid.clone();
+    impossible_lifecycle
+        .operations
+        .iter_mut()
+        .find(|operation| !operation.observations.is_empty())
+        .unwrap()
+        .observations[0]
+        .state = ProjectAttemptState::Started;
+    assert_runtime_graph_rejected(&impossible_lifecycle, "invalid project attempt transition");
+
+    let mut noncanonical_policy = valid.clone();
+    noncanonical_policy.policy = "any".to_owned();
+    assert_runtime_graph_rejected(&noncanonical_policy, "canonical resolved policy token");
+
+    let mut noncanonical_branch = valid.clone();
+    for observation in noncanonical_branch
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+    {
+        if observation.branch.is_some() {
+            observation.branch = Some(99);
+        }
+    }
+    assert_runtime_graph_rejected(&noncanonical_branch, "uses a nonzero branch");
+
+    let mut incomplete_success = valid.clone();
+    let selected_outcome = incomplete_success
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .find(|observation| {
+            observation.route_id.as_deref() == Some("main") && observation.outcome.is_some()
+        })
+        .and_then(|observation| observation.outcome.as_mut())
+        .unwrap();
+    selected_outcome.artifact_capture = ArtifactCaptureStatus::Incomplete {
+        failure: Box::new(ArtifactCaptureFailure::Missing {
+            requirement: "forged-missing.bin".to_owned(),
+        }),
+    };
+    selected_outcome.artifacts.clear();
+    assert_runtime_graph_rejected(
+        &incomplete_success,
+        "exit-zero route outcome has incomplete artifact evidence",
+    );
+
+    let mut impossible_empty_stream = valid.clone();
+    let empty_stream = impossible_empty_stream
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.observations.iter_mut())
+        .filter_map(|observation| observation.outcome.as_mut())
+        .find(|outcome| outcome.stderr_total_observed_bytes == 0)
+        .unwrap();
+    empty_stream.stderr_sha256 = "0".repeat(64);
+    assert_runtime_graph_rejected(
+        &impossible_empty_stream,
+        "empty stderr stream has a nonempty-content fingerprint",
+    );
+
+    let mut forged_route_identity = valid;
+    let selected_route = forged_route_identity
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation
+                .observations
+                .last()
+                .is_some_and(|observation| observation.route_id.as_deref() == Some("main"))
+        })
+        .unwrap();
+    for observation in &mut selected_route.observations {
+        observation.operation_label = "run-route:forged-main".to_owned();
+    }
+    assert_runtime_graph_rejected(&forged_route_identity, "noncanonical operation label");
 }
 
 #[test]
@@ -782,4 +961,53 @@ fn coordinator_abort_after_start_emits_failure_graph_and_uncommitted_receipt() {
         project_receipt_semantic_sha256_v1(outcome.signed_receipt.bytes()).unwrap(),
         outcome.receipt_semantic_sha256
     );
+}
+
+#[test]
+fn incomplete_required_artifact_cannot_emit_a_success_receipt() {
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("incomplete-artifact.marker");
+    let fixture = fixture(&marker, RouteMode::MissingArtifact);
+    let outcome = execute(&fixture).unwrap();
+
+    assert!(!outcome.coordinator_succeeded());
+    assert!(outcome.result.is_none());
+    assert!(
+        outcome
+            .coordinator_failure
+            .as_deref()
+            .is_some_and(|failure| failure
+                .contains("declared artifact `required-but-not-produced.bin` is missing")),
+        "unexpected coordinator failure: {:?}",
+        outcome.coordinator_failure
+    );
+    assert!(outcome.trace.events().iter().any(|event| {
+        event.operation_label == "run-route:main" && event.state == ProjectAttemptState::Aborted
+    }));
+    assert!(!outcome.trace.events().iter().any(|event| {
+        event.operation_label == "run-route:main"
+            && event.state == ProjectAttemptState::SettledSuccess
+    }));
+    assert!(matches!(
+        outcome.runtime_graph.terminal,
+        RuntimeGraphTerminalV1::CoordinatorFailure {
+            residual_host_world: true,
+            ..
+        }
+    ));
+
+    let resolver = ExactResolver {
+        key_id: fixture.signer.key_id(),
+        public: fixture.signer.public_key_bytes(),
+    };
+    let verified = outcome.signed_receipt.clone().verify(&resolver).unwrap();
+    assert!(matches!(
+        verified.receipt().terminal(),
+        ReceiptTerminalV1::Failure { code, .. }
+            if code == "project-coordinator-failure"
+    ));
+    assert!(matches!(
+        verified.receipt().commit(),
+        ReceiptCommitFenceV1::Uncommitted
+    ));
 }

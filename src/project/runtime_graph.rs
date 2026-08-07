@@ -410,7 +410,10 @@ impl RuntimeGraphV1 {
     }
 
     /// Validate structure, canonical lifecycle prefixes, exact identity nesting,
-    /// and terminality. This cannot establish authority or live freshness.
+    /// and terminality. This cannot establish authority, live freshness, or
+    /// digest-bound dependency/deployment semantics absent the referenced
+    /// artifacts; callers with those trusted inputs must also use one of the
+    /// `validate_trusted_*` methods.
     pub fn validate(&self) -> Result<(), RuntimeGraphError> {
         if self.schema_version != RUNTIME_GRAPH_SCHEMA_V1 {
             return Err(invalid(format!(
@@ -439,6 +442,7 @@ impl RuntimeGraphV1 {
         validate_text(&self.project_name, "project name")?;
         validate_text(&self.target, "project target")?;
         validate_text(&self.policy, "project policy")?;
+        let policy = validate_runtime_policy_token(&self.policy)?;
         validate_text(
             &self.trace_execution_attempt_id,
             "trace execution attempt id",
@@ -532,6 +536,11 @@ impl RuntimeGraphV1 {
                 ));
             }
             for observation in &operation.observations {
+                validate_observation_operation_shape(
+                    observation,
+                    &self.policy,
+                    index + 1 == self.operations.len(),
+                )?;
                 if observation.logical_operation != operation.logical_operation
                     || observation.task != operation.task
                     || observation.attempt != operation.attempt
@@ -561,6 +570,9 @@ impl RuntimeGraphV1 {
             )));
         }
         trace_events.sort_by_key(|event| event.coordinator_ordinal);
+        let header = self.trace_header();
+        ProjectAttemptTrace::try_from_events(header, trace_events.iter().cloned())?;
+        validate_observed_branch_sequence(&trace_events, &policy)?;
         if matches!(
             &self.terminal,
             RuntimeGraphTerminalV1::RouteSettlement { .. }
@@ -579,6 +591,31 @@ impl RuntimeGraphV1 {
                 outcome,
                 residual_host_world,
             } => {
+                if !matches!(
+                    &policy,
+                    RoutePolicy::Explicit(_)
+                        | RoutePolicy::Default
+                        | RoutePolicy::Fallback
+                        | RoutePolicy::AnySuccess
+                ) {
+                    return Err(invalid(format!(
+                        "route-settlement RuntimeGraph uses unsupported policy `{}`",
+                        self.policy
+                    )));
+                }
+                if let RoutePolicy::Explicit(expected_route) = &policy {
+                    if route_id != expected_route {
+                        return Err(invalid(
+                            "explicit route-settlement terminal differs from its policy route",
+                        ));
+                    }
+                }
+                let selector_ready = validate_completed_selector_root(
+                    self.operations
+                        .last()
+                        .expect("operation inventory was checked as nonempty"),
+                    &self.policy,
+                )?;
                 validate_text(route_id, "terminal route id")?;
                 if !matches!(
                     settlement,
@@ -635,11 +672,40 @@ impl RuntimeGraphV1 {
                         "terminal result differs from the selected operation observation",
                     ));
                 }
+                let selected_settlement =
+                    policy_selected_route_settlement(&trace_events, selector_ready, &policy);
+                if selected_settlement.map(|event| event.coordinator_ordinal)
+                    != Some(observation.coordinator_ordinal)
+                {
+                    return Err(invalid(
+                        "route-settlement terminal is not the policy-selected top-level route before selector readiness",
+                    ));
+                }
             }
             RuntimeGraphTerminalV1::CoordinatorFailure {
                 detail_sha256,
                 residual_host_world,
             } => {
+                if !trace_events
+                    .iter()
+                    .any(|event| event.state == ProjectAttemptState::Started)
+                {
+                    return Err(invalid(
+                        "coordinator-failure RuntimeGraph has no observed started operation",
+                    ));
+                }
+                if self
+                    .operations
+                    .last()
+                    .expect("operation inventory was checked as nonempty")
+                    .observations
+                    .iter()
+                    .any(|observation| observation.state == ProjectAttemptState::Finished)
+                {
+                    return Err(invalid(
+                        "coordinator-failure RuntimeGraph contains a completed SelectRoute root",
+                    ));
+                }
                 validate_digest(detail_sha256, "coordinator failure detail")?;
                 let observed = self.operations.iter().any(|operation| {
                     operation.residual_host_world
@@ -662,9 +728,6 @@ impl RuntimeGraphV1 {
                 }
             }
         }
-
-        let header = self.trace_header();
-        ProjectAttemptTrace::try_from_events(header, trace_events)?;
         Ok(())
     }
 
@@ -1033,6 +1096,176 @@ fn observed_residual_host_world(
         }
     }
     Ok(false)
+}
+
+fn validate_runtime_policy_token(policy: &str) -> Result<RoutePolicy, RuntimeGraphError> {
+    let parsed = RoutePolicy::parse_checked(policy)
+        .map_err(|error| invalid(format!("project policy is invalid: {error}")))?;
+    if parsed.token() != policy
+        || matches!(&parsed, RoutePolicy::Explicit(route_id) if route_id.is_empty())
+    {
+        return Err(invalid(format!(
+            "project policy `{policy}` is not a canonical resolved policy token"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn validate_observed_branch_sequence(
+    events: &[ProjectAttemptEvent],
+    policy: &RoutePolicy,
+) -> Result<(), RuntimeGraphError> {
+    let branches = events
+        .iter()
+        .filter_map(|event| event.branch)
+        .collect::<Vec<_>>();
+    match policy {
+        RoutePolicy::Explicit(_) | RoutePolicy::Default => {
+            if branches.iter().any(|branch| *branch != 0) {
+                return Err(invalid(
+                    "single-alternative RuntimeGraph observation uses a nonzero branch",
+                ));
+            }
+        }
+        RoutePolicy::Fallback | RoutePolicy::AnySuccess => {
+            let mut highest = 0_usize;
+            let mut observed = BTreeSet::new();
+            for branch in branches {
+                if branch < highest {
+                    return Err(invalid(
+                        "ordered RuntimeGraph branch observations move backward",
+                    ));
+                }
+                highest = highest.max(branch);
+                observed.insert(branch);
+            }
+            if observed.iter().copied().ne(0..observed.len()) {
+                return Err(invalid(
+                    "ordered RuntimeGraph branches are not a contiguous prefix beginning at zero",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_observation_operation_shape(
+    observation: &RuntimeGraphObservationV1,
+    policy: &str,
+    is_root: bool,
+) -> Result<(), RuntimeGraphError> {
+    let label = observation.operation_label.as_str();
+    let shape_is = |branch: bool, route_id: Option<&str>| {
+        observation.branch.is_some() == branch && observation.route_id.as_deref() == route_id
+    };
+
+    if is_root {
+        if label != format!("select-route:{policy}") || !shape_is(false, None) {
+            return Err(invalid(
+                "terminal RuntimeGraph operation is not the canonical SelectRoute root",
+            ));
+        }
+        return Ok(());
+    }
+
+    if label == "materialize-project" && shape_is(true, None) {
+        return Ok(());
+    }
+    if label == "compare-route-results" && policy == "verify_equivalent" && shape_is(false, None) {
+        return Ok(());
+    }
+    if let Some(route_id) = label.strip_prefix("build-route:") {
+        if !route_id.is_empty() && shape_is(true, Some(route_id)) {
+            return Ok(());
+        }
+    }
+    if let Some(route_id) = label.strip_prefix("run-route:") {
+        if !route_id.is_empty() && shape_is(true, Some(route_id)) {
+            return Ok(());
+        }
+    }
+
+    Err(invalid(format!(
+        "runtime observation `{label}` has a noncanonical operation label, branch, or route identity"
+    )))
+}
+
+fn validate_completed_selector_root(
+    root: &RuntimeGraphOperationV1,
+    policy: &str,
+) -> Result<u64, RuntimeGraphError> {
+    let [ready, started, finished] = root.observations.as_slice() else {
+        return Err(invalid(
+            "route-settlement RuntimeGraph has no completed SelectRoute root",
+        ));
+    };
+    if ready.state != ProjectAttemptState::Ready
+        || started.state != ProjectAttemptState::Started
+        || finished.state != ProjectAttemptState::Finished
+        || ready.operation_label != format!("select-route:{policy}")
+    {
+        return Err(invalid(
+            "route-settlement RuntimeGraph has no canonical completed SelectRoute root",
+        ));
+    }
+    Ok(ready.coordinator_ordinal)
+}
+
+fn is_canonical_route_settlement(event: &ProjectAttemptEvent) -> bool {
+    matches!(
+        event.state,
+        ProjectAttemptState::SettledSuccess
+            | ProjectAttemptState::SettledFailure
+            | ProjectAttemptState::Skipped
+    ) && event
+        .route_id
+        .as_ref()
+        .is_some_and(|route_id| event.operation_label == format!("run-route:{route_id}"))
+}
+
+fn policy_selected_route_settlement<'a>(
+    events: &'a [ProjectAttemptEvent],
+    selector_ready: u64,
+    policy: &RoutePolicy,
+) -> Option<&'a ProjectAttemptEvent> {
+    // The planner emits prerequisite RunRoute nodes before the selected route
+    // for each branch. Consequently, the greatest observed RunRoute plan node
+    // in a branch is its top-level alternative. Retain trace order after that
+    // structural projection because fallback/any-success select the first
+    // successful alternative, or the last settled alternative if none succeeds.
+    let mut top_level_by_branch = BTreeMap::<usize, usize>::new();
+    for event in events.iter().filter(|event| {
+        event.coordinator_ordinal < selector_ready && is_canonical_route_settlement(event)
+    }) {
+        let branch = event.branch?;
+        top_level_by_branch
+            .entry(branch)
+            .and_modify(|plan_node| *plan_node = (*plan_node).max(event.plan_node.0))
+            .or_insert(event.plan_node.0);
+    }
+    let alternatives = events
+        .iter()
+        .filter(|event| {
+            event.coordinator_ordinal < selector_ready
+                && is_canonical_route_settlement(event)
+                && event.branch.is_some_and(|branch| {
+                    top_level_by_branch.get(&branch) == Some(&event.plan_node.0)
+                })
+        })
+        .collect::<Vec<_>>();
+
+    match policy {
+        RoutePolicy::Explicit(_) | RoutePolicy::Default => {
+            (alternatives.len() == 1).then(|| alternatives[0])
+        }
+        RoutePolicy::Fallback | RoutePolicy::AnySuccess => alternatives
+            .iter()
+            .copied()
+            .find(|event| event.state == ProjectAttemptState::SettledSuccess)
+            .or_else(|| alternatives.last().copied()),
+        _ => None,
+    }
 }
 
 fn validate_provider(
