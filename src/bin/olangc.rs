@@ -131,31 +131,74 @@ const RUNTIME_EXECUTOR_TRACE_RS: &str = include_str!("../executor/trace.rs");
 
 // project — first-class project/route/bundle model, embedded so compiled
 // project binaries can materialize and run their embedded routes.
-const RUNTIME_PROJECT_MOD_RS: &str = include_str!("../project/mod.rs");
-const RUNTIME_PROJECT_MODEL_RS: &str = include_str!("../project/model.rs");
-const RUNTIME_PROJECT_BUNDLE_RS: &str = include_str!("../project/bundle.rs");
-const RUNTIME_PROJECT_MATERIALIZE_RS: &str = include_str!("../project/materialize.rs");
-const RUNTIME_PROJECT_MANIFEST_RS: &str = include_str!("../project/manifest.rs");
-const RUNTIME_PROJECT_DISCOVER_RS: &str = include_str!("../project/discover.rs");
-const RUNTIME_PROJECT_LOWER_RS: &str = include_str!("../project/lower.rs");
-const RUNTIME_PROJECT_LOGICAL_RS: &str = include_str!("../project/logical.rs");
-const RUNTIME_PROJECT_DEPLOYMENT_RS: &str = include_str!("../project/deployment.rs");
-const RUNTIME_PROJECT_PLAN_RS: &str = include_str!("../project/plan.rs");
-const RUNTIME_PROJECT_EXECUTOR_RS: &str = include_str!("../project/executor.rs");
-const RUNTIME_PROJECT_RUNTIME_RS: &str = include_str!("../project/runtime.rs");
-const RUNTIME_PROJECT_TRACE_RS: &str = include_str!("../project/trace.rs");
-const RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS: &str = include_str!("../project/ecosystems/mod.rs");
-const RUNTIME_PROJECT_ECO_PYTHON_RS: &str = include_str!("../project/ecosystems/python.rs");
-const RUNTIME_PROJECT_ECO_JAVASCRIPT_RS: &str = include_str!("../project/ecosystems/javascript.rs");
-const RUNTIME_PROJECT_ECO_RUST_RS: &str = include_str!("../project/ecosystems/rust.rs");
-const RUNTIME_PROJECT_ECO_SHELL_RS: &str = include_str!("../project/ecosystems/shell.rs");
-const RUNTIME_PROJECT_ECO_GENERIC_RS: &str = include_str!("../project/ecosystems/generic.rs");
-const RUNTIME_PROJECT_ECO_C_FAMILY_RS: &str = include_str!("../project/ecosystems/c_family.rs");
-const RUNTIME_PROJECT_ECO_JAVA_RS: &str = include_str!("../project/ecosystems/java.rs");
-const RUNTIME_PROJECT_ECO_DOTNET_RS: &str = include_str!("../project/ecosystems/dotnet.rs");
-const RUNTIME_PROJECT_ECO_HASKELL_OCAML_RS: &str =
-    include_str!("../project/ecosystems/haskell_ocaml.rs");
-const RUNTIME_PROJECT_ECO_NIX_RS: &str = include_str!("../project/ecosystems/nix.rs");
+const RUNTIME_PROJECT_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../project/mod.rs")),
+    ("bundle.rs", include_str!("../project/bundle.rs")),
+    ("deployment.rs", include_str!("../project/deployment.rs")),
+    ("discover.rs", include_str!("../project/discover.rs")),
+    ("executor.rs", include_str!("../project/executor.rs")),
+    ("launch.rs", include_str!("../project/launch.rs")),
+    ("logical.rs", include_str!("../project/logical.rs")),
+    ("lower.rs", include_str!("../project/lower.rs")),
+    ("manifest.rs", include_str!("../project/manifest.rs")),
+    ("materialize.rs", include_str!("../project/materialize.rs")),
+    ("model.rs", include_str!("../project/model.rs")),
+    ("plan.rs", include_str!("../project/plan.rs")),
+    ("runtime.rs", include_str!("../project/runtime.rs")),
+    (
+        "runtime_graph.rs",
+        include_str!("../project/runtime_graph.rs"),
+    ),
+    ("trace.rs", include_str!("../project/trace.rs")),
+    (
+        "world_execution.rs",
+        include_str!("../project/world_execution.rs"),
+    ),
+    (
+        "ecosystems/mod.rs",
+        include_str!("../project/ecosystems/mod.rs"),
+    ),
+    (
+        "ecosystems/c_family.rs",
+        include_str!("../project/ecosystems/c_family.rs"),
+    ),
+    (
+        "ecosystems/dotnet.rs",
+        include_str!("../project/ecosystems/dotnet.rs"),
+    ),
+    (
+        "ecosystems/generic.rs",
+        include_str!("../project/ecosystems/generic.rs"),
+    ),
+    (
+        "ecosystems/haskell_ocaml.rs",
+        include_str!("../project/ecosystems/haskell_ocaml.rs"),
+    ),
+    (
+        "ecosystems/java.rs",
+        include_str!("../project/ecosystems/java.rs"),
+    ),
+    (
+        "ecosystems/javascript.rs",
+        include_str!("../project/ecosystems/javascript.rs"),
+    ),
+    (
+        "ecosystems/nix.rs",
+        include_str!("../project/ecosystems/nix.rs"),
+    ),
+    (
+        "ecosystems/python.rs",
+        include_str!("../project/ecosystems/python.rs"),
+    ),
+    (
+        "ecosystems/rust.rs",
+        include_str!("../project/ecosystems/rust.rs"),
+    ),
+    (
+        "ecosystems/shell.rs",
+        include_str!("../project/ecosystems/shell.rs"),
+    ),
+];
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
 // dependency versions on first build without a network round-trip.
@@ -596,38 +639,7 @@ fn compile_project_to_binary(
     is_wasm: bool,
 ) -> Result<()> {
     let bin_name = derive_bin_name(output);
-    let src_dir = build_dir.join("src");
-    let shim_dir = src_dir.join("shims");
-    fs::create_dir_all(&shim_dir)?;
-
-    write_runtime_sources(&src_dir)?;
-    write_project_sources(&src_dir)?;
-
-    // Embed the serialized bundle as bytes.
-    let bundle_bytes = o_lang::project::bundle::serialize(bundle)?;
-    fs::write(src_dir.join("project_bundle.json"), &bundle_bytes)?;
-
-    // Shim scripts.
-    let mut shim_include_lines = Vec::new();
-    for (name, content) in shims {
-        fs::write(shim_dir.join(name), content)?;
-        shim_include_lines.push(format!(
-            "    ({name:?}, include_bytes!({path:?})),",
-            name = name,
-            path = format!("shims/{name}"),
-        ));
-    }
-
-    let lib_rs = generate_lib_rs(true);
-    fs::write(src_dir.join("lib.rs"), &lib_rs)?;
-    let main_rs = generate_project_main_rs(&bin_name, &shim_include_lines);
-    fs::write(src_dir.join("main.rs"), &main_rs)?;
-
-    fs::write(
-        build_dir.join("Cargo.toml"),
-        generate_cargo_toml(&bin_name, true),
-    )?;
-    fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
+    write_project_cargo_project(bundle, shims, build_dir, &bin_name)?;
 
     let mut cargo_args = vec!["build", "--release"];
     if is_wasm {
@@ -662,49 +674,72 @@ fn compile_project_to_binary(
     Ok(())
 }
 
+/// Materialize the complete Cargo source tree used for a compiled project.
+///
+/// Keeping this separate from the Cargo invocation lets the closure regression
+/// compile exactly the same generated crate that production builds.
+fn write_project_cargo_project(
+    bundle: &o_lang::project::ProjectBundle,
+    shims: &[(String, Vec<u8>)],
+    build_dir: &Path,
+    bin_name: &str,
+) -> Result<()> {
+    let src_dir = build_dir.join("src");
+    let shim_dir = src_dir.join("shims");
+    fs::create_dir_all(&shim_dir)?;
+
+    write_runtime_sources(&src_dir)?;
+    write_project_sources(&src_dir)?;
+
+    // Embed the serialized bundle as bytes.
+    let bundle_bytes = o_lang::project::bundle::serialize(bundle)?;
+    fs::write(src_dir.join("project_bundle.json"), &bundle_bytes)?;
+
+    // Shim scripts.
+    let mut shim_include_lines = Vec::new();
+    for (name, content) in shims {
+        fs::write(shim_dir.join(name), content)?;
+        shim_include_lines.push(format!(
+            "    ({name:?}, include_bytes!({path:?})),",
+            name = name,
+            path = format!("shims/{name}"),
+        ));
+    }
+
+    let lib_rs = generate_lib_rs(true);
+    fs::write(src_dir.join("lib.rs"), &lib_rs)?;
+    let main_rs = generate_project_main_rs(bin_name, &shim_include_lines);
+    fs::write(src_dir.join("main.rs"), &main_rs)?;
+
+    fs::write(
+        build_dir.join("Cargo.toml"),
+        generate_cargo_toml(bin_name, true),
+    )?;
+    fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
+    Ok(())
+}
+
 /// Write the embedded `project` module tree into the generated `src/`.
 fn write_project_sources(src_dir: &Path) -> Result<()> {
     let project_dir = src_dir.join("project");
-    let eco_dir = project_dir.join("ecosystems");
-    fs::create_dir_all(&eco_dir)?;
-
-    fs::write(project_dir.join("mod.rs"), RUNTIME_PROJECT_MOD_RS)?;
-    fs::write(project_dir.join("model.rs"), RUNTIME_PROJECT_MODEL_RS)?;
-    fs::write(project_dir.join("bundle.rs"), RUNTIME_PROJECT_BUNDLE_RS)?;
-    fs::write(
-        project_dir.join("materialize.rs"),
-        RUNTIME_PROJECT_MATERIALIZE_RS,
-    )?;
-    fs::write(project_dir.join("manifest.rs"), RUNTIME_PROJECT_MANIFEST_RS)?;
-    fs::write(project_dir.join("discover.rs"), RUNTIME_PROJECT_DISCOVER_RS)?;
-    fs::write(project_dir.join("lower.rs"), RUNTIME_PROJECT_LOWER_RS)?;
-    fs::write(project_dir.join("logical.rs"), RUNTIME_PROJECT_LOGICAL_RS)?;
-    fs::write(
-        project_dir.join("deployment.rs"),
-        RUNTIME_PROJECT_DEPLOYMENT_RS,
-    )?;
-    fs::write(project_dir.join("plan.rs"), RUNTIME_PROJECT_PLAN_RS)?;
-    fs::write(project_dir.join("executor.rs"), RUNTIME_PROJECT_EXECUTOR_RS)?;
-    fs::write(project_dir.join("runtime.rs"), RUNTIME_PROJECT_RUNTIME_RS)?;
-    fs::write(project_dir.join("trace.rs"), RUNTIME_PROJECT_TRACE_RS)?;
-
-    fs::write(eco_dir.join("mod.rs"), RUNTIME_PROJECT_ECOSYSTEMS_MOD_RS)?;
-    fs::write(eco_dir.join("python.rs"), RUNTIME_PROJECT_ECO_PYTHON_RS)?;
-    fs::write(
-        eco_dir.join("javascript.rs"),
-        RUNTIME_PROJECT_ECO_JAVASCRIPT_RS,
-    )?;
-    fs::write(eco_dir.join("rust.rs"), RUNTIME_PROJECT_ECO_RUST_RS)?;
-    fs::write(eco_dir.join("shell.rs"), RUNTIME_PROJECT_ECO_SHELL_RS)?;
-    fs::write(eco_dir.join("generic.rs"), RUNTIME_PROJECT_ECO_GENERIC_RS)?;
-    fs::write(eco_dir.join("c_family.rs"), RUNTIME_PROJECT_ECO_C_FAMILY_RS)?;
-    fs::write(eco_dir.join("java.rs"), RUNTIME_PROJECT_ECO_JAVA_RS)?;
-    fs::write(eco_dir.join("dotnet.rs"), RUNTIME_PROJECT_ECO_DOTNET_RS)?;
-    fs::write(
-        eco_dir.join("haskell_ocaml.rs"),
-        RUNTIME_PROJECT_ECO_HASKELL_OCAML_RS,
-    )?;
-    fs::write(eco_dir.join("nix.rs"), RUNTIME_PROJECT_ECO_NIX_RS)?;
+    for &(relative_path, source) in RUNTIME_PROJECT_SOURCES {
+        let destination = project_dir.join(relative_path);
+        let parent = destination
+            .parent()
+            .with_context(|| format!("generated project source has no parent: {relative_path}"))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create generated project source directory {}",
+                parent.display()
+            )
+        })?;
+        fs::write(&destination, source).with_context(|| {
+            format!(
+                "failed to write generated project source {}",
+                destination.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -2056,46 +2091,42 @@ mod tests {
     }
 
     #[test]
-    fn generated_project_runtime_includes_project_plan_module() {
-        let build_dir = create_build_dir().unwrap();
-        let src_dir = build_dir.join("src");
+    fn generated_project_runtime_emits_every_embedded_source() {
+        let build_dir = tempfile::tempdir().unwrap();
+        let src_dir = build_dir.path().join("src");
         write_project_sources(&src_dir).unwrap();
-        assert_eq!(
-            fs::read_to_string(src_dir.join("project/logical.rs")).unwrap(),
-            RUNTIME_PROJECT_LOGICAL_RS,
-            "compiled project runtimes must receive LogicalHGraphV1 verbatim"
-        );
-        assert_eq!(
-            fs::read_to_string(src_dir.join("project/deployment.rs")).unwrap(),
-            RUNTIME_PROJECT_DEPLOYMENT_RS,
-            "compiled project runtimes must receive DeploymentPlanV1 verbatim"
-        );
-        assert_eq!(
-            fs::read_to_string(src_dir.join("project/plan.rs")).unwrap(),
-            RUNTIME_PROJECT_PLAN_RS,
-            "compiled project runtimes must receive the project HGraph planner verbatim"
-        );
-        assert_eq!(
-            fs::read_to_string(src_dir.join("project/executor.rs")).unwrap(),
-            RUNTIME_PROJECT_EXECUTOR_RS,
-            "compiled project runtimes must receive the project HGraph executor verbatim"
-        );
-        assert_eq!(
-            fs::read_to_string(src_dir.join("project/trace.rs")).unwrap(),
-            RUNTIME_PROJECT_TRACE_RS,
-            "compiled project runtimes must receive the project attempt trace verbatim"
-        );
-        let module = fs::read_to_string(src_dir.join("project/mod.rs")).unwrap();
-        for declaration in [
-            "pub mod logical;",
-            "pub mod deployment;",
-            "pub mod plan;",
-            "pub mod executor;",
-            "pub mod trace;",
-        ] {
-            assert!(module.contains(declaration), "missing `{declaration}`");
+        for &(relative_path, embedded) in RUNTIME_PROJECT_SOURCES {
+            let emitted = fs::read_to_string(src_dir.join("project").join(relative_path))
+                .unwrap_or_else(|error| panic!("missing generated {relative_path}: {error}"));
+            assert_eq!(
+                emitted, embedded,
+                "generated project source {relative_path} must match its embedded source"
+            );
         }
-        fs::remove_dir_all(build_dir).unwrap();
+    }
+
+    #[test]
+    fn generated_project_runtime_compiles_real_fixture() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/project_hgraph");
+        let bundle = o_lang::project::assemble(&fixture, "generated-project-closure", &[])
+            .expect("real project fixture must assemble");
+        let build_dir = tempfile::tempdir().unwrap();
+        write_project_cargo_project(&bundle, &[], build_dir.path(), "generated-project-closure")
+            .expect("real project fixture must generate a Cargo project");
+
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .args(["check", "--offline", "--color", "never"])
+            .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .current_dir(build_dir.path())
+            .output()
+            .expect("Cargo must be available to check the generated project");
+        assert!(
+            output.status.success(),
+            "generated project failed cargo check\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

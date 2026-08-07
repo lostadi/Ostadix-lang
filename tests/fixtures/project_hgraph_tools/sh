@@ -2,15 +2,29 @@
 set -eu
 
 # Test-only PATH shim for the generated-project smoke. Preserve the fixture
-# command's observable behavior, then force impl-a to settle nonzero so the
-# compiled AnySuccess coordinator must continue to impl-b.
+# command's observable behavior, materialize each route's declared output, and
+# optionally force impl-a nonzero so AnySuccess must continue to impl-b.
 if [ "${1-}" = "-c" ]; then
+    status=0
+    /bin/sh "$@" || status=$?
     case "${2-}" in
+        *PR7_PREP_EXECUTED*)
+            mkdir -p build
+            printf prepared > build/prepared
+            ;;
         *PR7_IMPL_A_EXECUTED*)
-            /bin/sh "$@"
-            exit 7
+            mkdir -p out
+            printf '{"variant":"a"}\n' > out/a.json
+            if [ "${PR7_FORCE_IMPL_A_FAILURE:-0}" = 1 ]; then
+                exit 7
+            fi
+            ;;
+        *PR7_IMPL_B_EXECUTED*)
+            mkdir -p out
+            printf '{"variant":"b"}\n' > out/b.json
             ;;
     esac
+    exit "$status"
 fi
 
 exec /bin/sh "$@"

@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
+use o_lang::executor::CancellationToken;
 use o_lang::project::bundle::{
     bundle_dir, bundle_dir_excluding, deserialize, serialize, serialize_pretty,
 };
@@ -12,11 +14,17 @@ use o_lang::project::lower::{extract_bundle_from_o, has_embedded_bundle, lower_t
 use o_lang::project::manifest::{apply_cli_overrides, apply_manifest, parse_route_decl};
 use o_lang::project::materialize::{materialize, materialize_isolated};
 use o_lang::project::model::{
-    FileRole, ProjectBundle, ProjectFile, ResultCodec, RouteFailureContinuation, RoutePolicy,
-    RouteProvenance, RouteSet, RouteSpec, BUNDLE_FORMAT_VERSION,
+    ArtifactCaptureFailure, ArtifactCaptureStatus, FileRole, ProjectBundle, ProjectFile,
+    ResultCodec, RouteFailureContinuation, RoutePolicy, RouteProvenance, RouteSet, RouteSpec,
+    BUNDLE_FORMAT_VERSION,
 };
-use o_lang::project::runtime::{glob_match, run_route, run_selection, GuardBehavior, RunOptions};
+use o_lang::project::runtime::{
+    glob_match, is_cancellation_error, is_timeout_error, run_route, run_route_cancellable,
+    run_selection, ArtifactCaptureError, EnvironmentPolicy, GuardBehavior, ProcessTreePolicy,
+    RouteExecutionError, RunOptions,
+};
 use o_lang::project::{assemble, discover, RouteGuard};
+use sha2::{Digest, Sha256};
 
 fn write(root: &Path, rel: &str, contents: &[u8]) {
     let path = root.join(rel);
@@ -555,6 +563,97 @@ fn project_runtime_collects_output_artifacts() {
         "artifacts: {:?}",
         result.artifacts
     );
+    let artifact = result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path == "dist/out.txt")
+        .unwrap();
+    assert_eq!(artifact.bytes_len, 3);
+    assert_eq!(artifact.content_hash, hex::encode(Sha256::digest(b"hi\n")));
+}
+
+#[test]
+fn project_runtime_missing_required_artifact_is_typed_failure() {
+    let mut route = shell_route("missing", "true");
+    route.outputs = vec!["required.bin".into()];
+    let bundle = bundle_with_routes(vec![route]);
+
+    let error = run_route(&bundle, "missing", &RunOptions::default()).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ArtifactCaptureError>(),
+        Some(ArtifactCaptureError::Missing { requirement })
+            if requirement == "required.bin"
+    ));
+}
+
+#[test]
+fn project_runtime_nonzero_missing_output_is_explicitly_incomplete() {
+    let mut route = shell_route("nonzero-missing", "exit 7");
+    route.outputs = vec!["required.bin".into()];
+    let bundle = bundle_with_routes(vec![route]);
+
+    let result = run_route(&bundle, "nonzero-missing", &RunOptions::default()).unwrap();
+    assert_eq!(result.exit_code, Some(7));
+    assert!(!result.succeeded());
+    assert!(result.artifacts.is_empty());
+    assert!(matches!(
+        result.artifact_capture,
+        ArtifactCaptureStatus::Incomplete { failure }
+            if matches!(
+                failure.as_ref(),
+                ArtifactCaptureFailure::Missing { requirement }
+                    if requirement == "required.bin"
+            )
+    ));
+}
+
+#[test]
+fn project_runtime_artifact_limits_are_typed_and_fail_closed() {
+    let mut oversized = shell_route("oversized", "printf '12345' > large.bin");
+    oversized.outputs = vec!["large.bin".into()];
+    let bundle = bundle_with_routes(vec![oversized]);
+    let mut options = RunOptions::default();
+    options.limits.max_single_artifact_bytes = 4;
+    let error = run_route(&bundle, "oversized", &options).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ArtifactCaptureError>(),
+        Some(ArtifactCaptureError::SingleArtifactLimit {
+            path,
+            limit: 4,
+            observed_at_least: 5,
+        }) if path == "large.bin"
+    ));
+
+    let mut too_many = shell_route("too-many", ": > a.bin; : > b.bin");
+    too_many.outputs = vec!["*.bin".into()];
+    let bundle = bundle_with_routes(vec![too_many]);
+    let mut options = RunOptions::default();
+    options.limits.max_artifact_count = 1;
+    let error = run_route(&bundle, "too-many", &options).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ArtifactCaptureError>(),
+        Some(ArtifactCaptureError::ArtifactCountLimit {
+            limit: 1,
+            observed_at_least: 2,
+        })
+    ));
+
+    let mut aggregate = shell_route("aggregate", "printf 'abc' > a.bin; printf 'def' > b.bin");
+    aggregate.outputs = vec!["*.bin".into()];
+    let bundle = bundle_with_routes(vec![aggregate]);
+    let mut options = RunOptions::default();
+    options.limits.max_single_artifact_bytes = 4;
+    options.limits.max_aggregate_artifact_bytes = 5;
+    let error = run_route(&bundle, "aggregate", &options).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ArtifactCaptureError>(),
+        Some(ArtifactCaptureError::AggregateArtifactLimit {
+            limit: 5,
+            captured_before: 3,
+            artifact_bytes: 3,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -606,7 +705,7 @@ fn project_runtime_guard_enforce_vs_skip() {
     // Skip → synthetic no-op result, command never runs.
     let opts = RunOptions {
         guard_behavior: GuardBehavior::Skip,
-        inherit_env: true,
+        ..RunOptions::default()
     };
     let result = run_route(&bundle, "guarded", &opts).unwrap();
     assert_eq!(result.exit_code, None);
@@ -851,6 +950,265 @@ fn project_runtime_benchmark_fails_when_nothing_succeeds() {
     );
 }
 
+#[test]
+fn project_runtime_selection_output_budget_is_checked_before_launch() {
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("must-not-launch");
+    let mut first = shell_route("first", "printf launched > \"$MARKER\"");
+    let mut second = shell_route("second", "printf launched > \"$MARKER\"");
+    for route in [&mut first, &mut second] {
+        route
+            .environment
+            .insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+    }
+    let mut bundle = bundle_with_routes(vec![first, second]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["first".into(), "second".into()],
+        policy: RoutePolicy::All,
+    });
+    let mut options = RunOptions::default();
+    options.limits.max_retained_stdout_bytes = 8;
+    options.limits.max_retained_stderr_bytes = 8;
+    options.limits.max_selection_retained_output_bytes = 31;
+
+    let error = run_selection(&bundle, Some("main"), None, &options).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Configuration { detail })
+            if detail.contains("could retain 32 output bytes")
+    ));
+    assert!(
+        !marker.exists(),
+        "selection budget failure launched a route"
+    );
+}
+
+fn bounded_runtime_options(timeout: Duration) -> RunOptions {
+    let mut options = RunOptions::default();
+    options.limits.wall_clock_timeout = timeout;
+    options.limits.termination_grace_period = Duration::from_millis(50);
+    options
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn project_runtime_short_success_preserves_complete_output() {
+    let route = shell_route(
+        "ordinary",
+        "printf 'ordinary-out'; printf 'ordinary-err' >&2",
+    );
+    let bundle = bundle_with_routes(vec![route]);
+    let result = run_route(&bundle, "ordinary", &RunOptions::default()).unwrap();
+
+    assert!(result.succeeded());
+    assert_eq!(result.stdout, b"ordinary-out");
+    assert_eq!(result.stderr, b"ordinary-err");
+    assert_eq!(result.stdout_capture.total_observed_bytes, 12);
+    assert_eq!(result.stdout_capture.retained_bytes, 12);
+    assert!(!result.stdout_capture.truncated);
+    assert_eq!(
+        result.stdout_capture.sha256,
+        hex::encode(Sha256::digest(b"ordinary-out"))
+    );
+    assert_eq!(result.stderr_capture.total_observed_bytes, 12);
+    assert!(!result.stderr_capture.truncated);
+    #[cfg(unix)]
+    assert_eq!(
+        RunOptions::default().limits.process_tree_policy,
+        ProcessTreePolicy::OwnedProcessGroup
+    );
+}
+
+#[test]
+fn project_runtime_clear_environment_is_explicit_and_keeps_route_overlay() {
+    let mut route = shell_route(
+        "clear-env",
+        "printf '%s:%s' \"${HOME-unset}\" \"$DECLARED_VALUE\"",
+    );
+    route.command[0] = "/bin/sh".to_string();
+    route
+        .environment
+        .insert("DECLARED_VALUE".to_string(), "visible".to_string());
+    let bundle = bundle_with_routes(vec![route]);
+    let mut options = RunOptions::default();
+    options.limits.environment_policy = EnvironmentPolicy::Clear;
+
+    let result = run_route(&bundle, "clear-env", &options).unwrap();
+    assert_eq!(result.stdout, b"unset:visible");
+}
+
+#[test]
+fn project_runtime_deadline_is_typed_and_terminates_process() {
+    let route = shell_route("deadline", "trap '' TERM; sleep 5");
+    let bundle = bundle_with_routes(vec![route]);
+    let options = bounded_runtime_options(Duration::from_millis(100));
+    let started = Instant::now();
+
+    let error = run_route(&bundle, "deadline", &options).unwrap_err();
+    assert!(is_timeout_error(&error), "unexpected error: {error:#}");
+    assert!(!is_cancellation_error(&error));
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::DeadlineExceeded { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "deadline termination took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn project_runtime_cancellation_is_distinct_from_deadline() {
+    let external = tempfile::tempdir().unwrap();
+    let ready = external.path().join("route-ready");
+    let mut route = shell_route(
+        "cancel",
+        "printf ready > \"$READY_MARKER\"; trap '' TERM; sleep 5",
+    );
+    route.environment.insert(
+        "READY_MARKER".to_string(),
+        ready.to_string_lossy().into_owned(),
+    );
+    let bundle = bundle_with_routes(vec![route]);
+    let options = bounded_runtime_options(Duration::from_secs(4));
+    let cancellation = CancellationToken::new();
+    let route_cancellation = cancellation.clone();
+    let worker = std::thread::spawn(move || {
+        run_route_cancellable(&bundle, "cancel", &options, route_cancellation)
+    });
+
+    wait_for_file(&ready, Duration::from_secs(1));
+    cancellation.cancel();
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(is_cancellation_error(&error), "unexpected error: {error:#}");
+    assert!(!is_timeout_error(&error));
+    assert!(matches!(
+        error.downcast_ref::<RouteExecutionError>(),
+        Some(RouteExecutionError::Cancelled { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_runtime_leader_exit_cannot_be_held_open_by_descendant_pipe() {
+    let route = shell_route("pipe-holder", "(trap '' HUP TERM; sleep 2) & exit 0");
+    let bundle = bundle_with_routes(vec![route]);
+    let options = bounded_runtime_options(Duration::from_secs(3));
+    let started = Instant::now();
+
+    let result = run_route(&bundle, "pipe-holder", &options).unwrap();
+    assert!(result.succeeded());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "descendant-held pipe delayed terminality for {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_runtime_success_has_no_live_owned_group_effects() {
+    let external = tempfile::tempdir().unwrap();
+    let leaked_effect = external.path().join("leaked-effect");
+    let descendant_pid = external.path().join("descendant-pid");
+    let mut route = shell_route(
+        "background",
+        "(trap '' HUP TERM; sleep 1; printf leaked > \"$LEAKED_EFFECT\") </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > \"$DESCENDANT_PID\"; exit 0",
+    );
+    route.environment.insert(
+        "LEAKED_EFFECT".to_string(),
+        leaked_effect.to_string_lossy().into_owned(),
+    );
+    route.environment.insert(
+        "DESCENDANT_PID".to_string(),
+        descendant_pid.to_string_lossy().into_owned(),
+    );
+    let bundle = bundle_with_routes(vec![route]);
+    let result = run_route(&bundle, "background", &RunOptions::default()).unwrap();
+
+    assert!(result.succeeded());
+    assert!(descendant_pid.exists(), "background child never started");
+    let descendant_pid = std::fs::read_to_string(&descendant_pid)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    // SAFETY: signal zero performs a liveness/permission probe only. This PID
+    // was reported by the route's direct owned descendant.
+    assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert!(
+        !leaked_effect.exists(),
+        "owned descendant continued host effects after successful settlement"
+    );
+}
+
+#[test]
+fn project_runtime_output_retention_is_bounded_but_fully_drained() {
+    const ITERATIONS: usize = 20_000;
+    const CHUNK: &[u8] = b"0123456789abcdef";
+    let route = shell_route(
+        "flood",
+        "i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef'; i=$((i + 1)); done; i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef' >&2; i=$((i + 1)); done",
+    );
+    let bundle = bundle_with_routes(vec![route]);
+    let mut options = bounded_runtime_options(Duration::from_secs(15));
+    options.limits.max_retained_stdout_bytes = 1_024;
+    options.limits.max_retained_stderr_bytes = 2_048;
+    let expected = CHUNK.repeat(ITERATIONS);
+
+    let result = run_route(&bundle, "flood", &options).unwrap();
+    assert!(result.succeeded(), "stderr: {}", result.stderr_text());
+    assert_eq!(result.stdout, expected[..1_024]);
+    assert_eq!(result.stderr, expected[..2_048]);
+    for (capture, retained) in [
+        (&result.stdout_capture, 1_024_u64),
+        (&result.stderr_capture, 2_048_u64),
+    ] {
+        assert_eq!(capture.total_observed_bytes, expected.len() as u64);
+        assert_eq!(capture.retained_bytes, retained);
+        assert!(capture.truncated);
+        assert_eq!(capture.sha256, hex::encode(Sha256::digest(&expected)));
+    }
+}
+
+#[test]
+fn project_runtime_verify_equivalent_uses_complete_truncated_streams() {
+    let a = shell_route("prefix-a", "printf 'same-A'");
+    let b = shell_route("prefix-b", "printf 'same-B'");
+    let mut bundle = bundle_with_routes(vec![a, b]);
+    bundle.route_sets.push(RouteSet {
+        provides: "main".into(),
+        alternatives: vec!["prefix-a".into(), "prefix-b".into()],
+        policy: RoutePolicy::VerifyEquivalent,
+    });
+    let mut options = RunOptions::default();
+    options.limits.max_retained_stdout_bytes = 4;
+
+    let error = run_selection(&bundle, Some("main"), None, &options).unwrap_err();
+    assert!(
+        error.to_string().contains("different stdout"),
+        "truncated prefixes were treated as equivalent: {error:#}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Glob matching
 // ─────────────────────────────────────────────────────────────────────────────
@@ -864,6 +1222,12 @@ fn project_glob_matcher() {
     assert!(!glob_match("*.rs", "src/main.rs"));
     assert!(glob_match("src/*.rs", "src/main.rs"));
     assert!(!glob_match("dist/**", "build/a.txt"));
+
+    // A long adversarial pattern must have bounded stack use and deterministic
+    // wildcard semantics; the matcher is iterative rather than recursive.
+    let repeated = "*a".repeat(4_096);
+    assert!(glob_match(&format!("{repeated}*"), &"a".repeat(4_096)));
+    assert!(!glob_match(&format!("{repeated}b"), &"a".repeat(4_096)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
