@@ -254,11 +254,7 @@ pub struct ProjectArtifactFingerprint {
 
 impl ProjectArtifactFingerprint {
     fn from_artifact(artifact: &Artifact) -> Result<Self, ProjectTraceError> {
-        if artifact.path.is_empty() || artifact.path.contains('\0') {
-            return Err(ProjectTraceError::InvalidOutcome(
-                "artifact path must be nonempty and contain no NUL".to_string(),
-            ));
-        }
+        validate_artifact_path(&artifact.path)?;
         validate_sha256(&artifact.content_hash, "artifact content hash")?;
         Ok(Self {
             path: artifact.path.clone(),
@@ -397,11 +393,7 @@ impl ProjectRouteOutcome {
         }
         let mut prior: Option<&ProjectArtifactFingerprint> = None;
         for artifact in &self.artifacts {
-            if artifact.path.is_empty() || artifact.path.contains('\0') {
-                return Err(ProjectTraceError::InvalidOutcome(
-                    "artifact path must be nonempty and contain no NUL".to_string(),
-                ));
-            }
+            validate_artifact_path(&artifact.path)?;
             validate_sha256(&artifact.sha256, "artifact fingerprint")?;
             if let Some(previous) = prior {
                 if previous >= artifact {
@@ -442,6 +434,24 @@ impl ProjectRouteOutcome {
         }
         Ok(())
     }
+}
+
+fn validate_artifact_path(path: &str) -> Result<(), ProjectTraceError> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(ProjectTraceError::InvalidOutcome(
+            "artifact path must be nonempty and contain no NUL".to_string(),
+        ));
+    }
+    if path.starts_with('/')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ProjectTraceError::InvalidOutcome(
+            "artifact path must be a canonical relative workspace path".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_stream_fingerprint(
@@ -726,6 +736,57 @@ impl ProjectAttemptEvent {
                         ));
                     }
                     _ => {}
+                }
+                if self.state == ProjectAttemptState::Skipped {
+                    let outcome = self
+                        .outcome
+                        .as_ref()
+                        .expect("route settlement outcome presence was checked");
+                    if !outcome.artifacts.is_empty() {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "skipped route settlement carries captured artifacts".to_string(),
+                        ));
+                    }
+                    if outcome.stdout_total_observed_bytes != 0
+                        || outcome.stdout_retained_bytes != 0
+                        || outcome.stdout_truncated
+                        || outcome.stdout_sha256 != sha256_hex(&[])
+                    {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "skipped route settlement must have an empty complete stdout stream"
+                                .to_string(),
+                        ));
+                    }
+                    if outcome.stderr_total_observed_bytes == 0
+                        || outcome.stderr_retained_bytes != outcome.stderr_total_observed_bytes
+                        || outcome.stderr_truncated
+                    {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "skipped route settlement must have a nonempty complete stderr marker"
+                                .to_string(),
+                        ));
+                    }
+                    if outcome.artifact_requirements.is_empty() {
+                        if !outcome.artifact_capture.is_complete() {
+                            return Err(ProjectTraceError::InvalidEvent(
+                                "skipped route without output requirements has incomplete artifact evidence"
+                                    .to_string(),
+                            ));
+                        }
+                    } else if !matches!(
+                        &outcome.artifact_capture,
+                        ArtifactCaptureStatus::Incomplete { failure }
+                            if matches!(
+                                failure.as_ref(),
+                                super::model::ArtifactCaptureFailure::NotAttempted { reason }
+                                    if reason == "route_guard_skipped"
+                            )
+                    ) {
+                        return Err(ProjectTraceError::InvalidEvent(
+                            "skipped route with output requirements must record route_guard_skipped incomplete evidence"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
             ProjectAttemptState::Aborted => {
@@ -1887,6 +1948,17 @@ mod tests {
         }
     }
 
+    fn skipped_outcome() -> ProjectRouteOutcome {
+        let mut skipped = result(Vec::new());
+        skipped.exit_code = None;
+        skipped.stdout.clear();
+        skipped.stdout_capture = OutputCapture::complete(&skipped.stdout);
+        skipped.stderr = b"[olang-project] skipped: test guard\n".to_vec();
+        skipped.stderr_capture = OutputCapture::complete(&skipped.stderr);
+        skipped.disposition = RouteExecutionDisposition::GuardSkipped;
+        ProjectRouteOutcome::from_result(&skipped).unwrap()
+    }
+
     #[test]
     fn route_outcome_hashes_bytes_and_sorts_artifacts() {
         let outcome = ProjectRouteOutcome::from_result(&result(vec![
@@ -2085,9 +2157,7 @@ mod tests {
                     trace.record_settled_failure(&route, failed).unwrap()
                 }
                 ProjectAttemptState::Skipped => {
-                    let mut skipped = outcome.clone();
-                    skipped.exit_code = None;
-                    trace.record_skipped(&route, skipped).unwrap()
+                    trace.record_skipped(&route, skipped_outcome()).unwrap()
                 }
                 _ => unreachable!(),
             }
