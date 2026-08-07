@@ -70,7 +70,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use o_lang::eval::Evaluator;
+use o_lang::eval::{Evaluator, Policy};
+use o_lang::evidence::{admit_execution, analyze_execution, runtime_binding_from_adapter_bytes};
 use o_lang::ir::OIrProgram;
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
@@ -98,6 +99,15 @@ const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
+
+// evidence — pre-execution facts and the admission compiler. These modules
+// are part of every generated runtime because eval.rs cannot construct a
+// Coordinator without an AdmittedExecution.
+const RUNTIME_EVIDENCE_MOD_RS: &str = include_str!("../evidence/mod.rs");
+const RUNTIME_EVIDENCE_FACT_RS: &str = include_str!("../evidence/fact.rs");
+const RUNTIME_EVIDENCE_ANALYZE_RS: &str = include_str!("../evidence/analyze.rs");
+const RUNTIME_EVIDENCE_ADMIT_RS: &str = include_str!("../evidence/admit.rs");
+const RUNTIME_EVIDENCE_PROFILE_RS: &str = include_str!("../evidence/profile.rs");
 
 // world — shared governed identities and the non-authorizing grounding view.
 const RUNTIME_WORLD_MOD_RS: &str = include_str!("../world/mod.rs");
@@ -292,6 +302,12 @@ struct Cli {
     #[arg(long)]
     grounding: bool,
 
+    /// Append the evidence-bound admission, per-operation provenance and
+    /// blockers, retained source-order reasons, and legal static ready waves.
+    /// This is non-executing and is currently available for ordinary .O IR.
+    #[arg(long)]
+    explain_schedule: bool,
+
     /// Bind grounding output to one logical World. Requires --world-epoch.
     #[arg(long)]
     world_id: Option<String>,
@@ -311,6 +327,7 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    validate_explain_schedule(&cli)?;
     let grounding_world = parse_grounding_world(&cli)?;
 
     let input_is_dir = cli.input.is_dir();
@@ -326,6 +343,11 @@ fn main() -> Result<()> {
     // lists and runs the same routes.
     let is_project = input_is_dir || o_lang::project::lower::has_embedded_bundle(&source);
     if is_project {
+        if cli.explain_schedule {
+            bail!(
+                "--explain-schedule currently admits ordinary .O HGraphs only; project HGraph admission is deferred"
+            );
+        }
         return compile_or_run_project(&cli, input_is_dir, &source);
     }
     if cli.route.is_some() || cli.routes_policy.is_some() || cli.project_trace_out.is_some() {
@@ -382,10 +404,23 @@ fn main() -> Result<()> {
         CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
         }
+        CompileTarget::Ir if cli.explain_schedule => dump_ir_with_admission(
+            &source,
+            cli.shim_dir.as_deref(),
+            cli.grounding,
+            grounding_world,
+        ),
         CompileTarget::Ir if cli.grounding => dump_ir_with_grounding(&source, grounding_world),
         CompileTarget::Ir => dump_ir(&source),
         CompileTarget::Dot => dump_dot(&source),
     }
+}
+
+fn validate_explain_schedule(cli: &Cli) -> Result<()> {
+    if cli.explain_schedule && cli.target != CompileTarget::Ir {
+        bail!("--explain-schedule is available only with --target ir");
+    }
+    Ok(())
 }
 
 fn parse_grounding_world(cli: &Cli) -> Result<Option<WorldIdentity>> {
@@ -1002,6 +1037,15 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
     fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
 
+    // ── evidence — evidence-bound execution admission ──────────────────────
+    let evidence_dir = src_dir.join("evidence");
+    fs::create_dir_all(&evidence_dir)?;
+    fs::write(evidence_dir.join("mod.rs"), RUNTIME_EVIDENCE_MOD_RS)?;
+    fs::write(evidence_dir.join("fact.rs"), RUNTIME_EVIDENCE_FACT_RS)?;
+    fs::write(evidence_dir.join("analyze.rs"), RUNTIME_EVIDENCE_ANALYZE_RS)?;
+    fs::write(evidence_dir.join("admit.rs"), RUNTIME_EVIDENCE_ADMIT_RS)?;
+    fs::write(evidence_dir.join("profile.rs"), RUNTIME_EVIDENCE_PROFILE_RS)?;
+
     // ── world — governed identity/effect vocabulary ────────────────────────
     let world_dir = src_dir.join("world");
     fs::create_dir_all(&world_dir)?;
@@ -1172,6 +1216,48 @@ fn dump_ir_with_grounding(source: &str, world: Option<WorldIdentity>) -> Result<
         graph.to_execution_text(),
         grounding.to_text()
     );
+    Ok(())
+}
+
+/// Compile and explain the exact pre-execution admission without dispatching
+/// any operation. Grounding is computed before evidence inputs are attached,
+/// because it validates the analyzed graph rather than the admitted graph.
+fn dump_ir_with_admission(
+    source: &str,
+    shim_dir: Option<&Path>,
+    include_grounding: bool,
+    world: Option<WorldIdentity>,
+) -> Result<()> {
+    use o_lang::hgraph::solve;
+
+    let (program, plan, mut graph) = inspect_ir(source)?;
+    solve::solve_types(&mut graph)
+        .context("failed to solve HGraph type and fidelity constraints for admission")?;
+    let grounding = include_grounding
+        .then(|| GroundingReport::analyze(&plan, &graph, world))
+        .transpose()
+        .context("failed to validate grounding plan/HGraph")?;
+
+    let adapters = read_shims(shim_dir)?;
+    let runtime = runtime_binding_from_adapter_bytes(
+        &plan,
+        &adapters,
+        &[("inspection-surface", "olangc-ir-explain")],
+    );
+    let evidence = analyze_execution(&program, &plan, &graph, runtime.clone())
+        .context("failed to establish pre-execution evidence")?;
+    let admitted = admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence)
+        .context("failed to compile execution admission")?;
+
+    print!(
+        "{}\n{}\n{}",
+        program.to_text(),
+        admitted.graph().to_execution_text(),
+        admitted.admission().to_explanation_text()
+    );
+    if let Some(grounding) = grounding {
+        print!("\n{}", grounding.to_text());
+    }
     Ok(())
 }
 
@@ -1416,6 +1502,10 @@ fn hnode_dot_appearance(
             format!("Control({label})@{version}\nN{}", id.0),
             DOT_CONTROL_STYLE,
         ),
+        HNodeKind::AdmissionEvidence { plan_node, fact } => (
+            format!("Evidence({}:P{})\nN{}", fact.name(), plan_node.0, id.0),
+            DOT_CONTROL_STYLE,
+        ),
     }
 }
 
@@ -1440,6 +1530,7 @@ fn hnode_port_label(node: Option<&o_lang::hgraph::HNode>) -> &'static str {
         Some(HNodeKind::ResourceState { .. }) => "resource-state",
         Some(HNodeKind::Completion { .. }) => "completion",
         Some(HNodeKind::BranchControl { .. }) => "control",
+        Some(HNodeKind::AdmissionEvidence { .. }) => "admission-evidence",
         None => "missing-node",
     }
 }
@@ -1592,6 +1683,7 @@ pub mod backend;
 pub mod parser;
 pub mod ir;
 pub mod effects;
+pub mod evidence;
 pub mod hgraph;
 pub mod executor;
 pub mod eval;
@@ -1982,6 +2074,30 @@ mod tests {
     }
 
     #[test]
+    fn explain_schedule_cli_is_an_ir_only_inspection_surface() {
+        let ir = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--target",
+            "ir",
+            "--explain-schedule",
+        ])
+        .unwrap();
+        assert!(ir.explain_schedule);
+        validate_explain_schedule(&ir).unwrap();
+
+        let script = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--target",
+            "script",
+            "--explain-schedule",
+        ])
+        .unwrap();
+        assert!(validate_explain_schedule(&script).is_err());
+    }
+
+    #[test]
     fn generated_runtime_includes_hgraph_modules() {
         let build_dir = create_build_dir().unwrap();
         let src_dir = build_dir.join("src");
@@ -1991,12 +2107,18 @@ mod tests {
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
+        assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
         assert!(lib_rs.contains("pub mod world;"));
 
         for path in [
             "effects.rs",
+            "evidence/mod.rs",
+            "evidence/fact.rs",
+            "evidence/analyze.rs",
+            "evidence/admit.rs",
+            "evidence/profile.rs",
             "world/mod.rs",
             "world/codec.rs",
             "world/identity.rs",
@@ -2031,6 +2153,11 @@ mod tests {
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,
             "generated runtimes must receive the shared semantic effect model verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("evidence/admit.rs")).unwrap(),
+            RUNTIME_EVIDENCE_ADMIT_RS,
+            "generated runtimes must receive the admission compiler verbatim"
         );
         assert_eq!(
             fs::read_to_string(src_dir.join("world/identity.rs")).unwrap(),

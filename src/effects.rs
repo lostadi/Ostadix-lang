@@ -365,6 +365,37 @@ impl EffectSummary {
         resources
     }
 
+    /// Canonical read/write leases consumed by executable HGraph lowering.
+    ///
+    /// This preserves access mode (unlike `resource_union`) and expands every
+    /// scheduler-visible alias. Precise host resources share a read lease on
+    /// `HostWorld`, while an explicit ambient `HostWorld` access is exclusive.
+    /// The latter matches the fail-closed compatibility predicate: unknown
+    /// ambient work cannot overlap even a precise host read, while two precise
+    /// disjoint host resources do not become aliases merely because they are
+    /// governed by the same umbrella.
+    pub fn scheduling_accesses(&self) -> (BTreeSet<ResourceKey>, BTreeSet<ResourceKey>) {
+        let mut reads = self.expanded_reads();
+        let mut writes = self.expanded_writes();
+        let touches_ambient_host =
+            reads.contains(&ResourceKey::HostWorld) || writes.contains(&ResourceKey::HostWorld);
+        let touches_precise_host = reads
+            .iter()
+            .chain(writes.iter())
+            .any(|resource| resource.is_host_resource() && *resource != ResourceKey::HostWorld);
+        if touches_precise_host {
+            reads.insert(ResourceKey::HostWorld);
+        }
+        if touches_ambient_host {
+            // Ambient HostWorld is deliberately an exclusive lease. Unknown
+            // hosted work already writes it; promoting an explicitly ambient
+            // read-only spelling keeps graph topology aligned with
+            // `conflicts_with` without making precise host paths exclusive.
+            writes.insert(ResourceKey::HostWorld);
+        }
+        (reads, writes)
+    }
+
     /// Compatibility-friendly alias for [`Self::resource_union`].
     pub fn resources(&self) -> BTreeSet<ResourceKey> {
         self.resource_union()
@@ -392,16 +423,6 @@ impl EffectSummary {
             && !self.clock
     }
 
-    fn touches_host_world(&self) -> bool {
-        self.reads.contains(&ResourceKey::HostWorld)
-            || self.writes.contains(&ResourceKey::HostWorld)
-    }
-
-    fn touches_any_host_resource(&self) -> bool {
-        self.reads.iter().any(ResourceKey::is_host_resource)
-            || self.writes.iter().any(ResourceKey::is_host_resource)
-    }
-
     /// Compatibility conflict predicate used by analysis and transition code.
     /// Production readiness should ultimately be derived from resource nodes.
     pub fn conflicts_with(&self, other: &EffectSummary) -> bool {
@@ -411,18 +432,8 @@ impl EffectSummary {
             }
         }
 
-        // HostWorld aliases every more precise host resource, not only another
-        // HostWorld key.
-        if (self.touches_host_world() && other.touches_any_host_resource())
-            || (other.touches_host_world() && self.touches_any_host_resource())
-        {
-            return true;
-        }
-
-        let self_reads = self.expanded_reads();
-        let self_writes = self.expanded_writes();
-        let other_reads = other.expanded_reads();
-        let other_writes = other.expanded_writes();
+        let (self_reads, self_writes) = self.scheduling_accesses();
+        let (other_reads, other_writes) = other.scheduling_accesses();
 
         resource_conflict(&self_writes, &other_writes)
             || resource_conflict(&self_writes, &other_reads)
@@ -831,6 +842,9 @@ pub fn effect_summary_for_plan_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::identity::{
+        ResourceGeneration, ResourceId, ResourceOwner, WorldEpoch, WorldId,
+    };
 
     #[test]
     fn resource_display_is_stable() {
@@ -884,5 +898,49 @@ mod tests {
         unknown_reader.reads.insert(ResourceKey::NetworkUnknown);
         assert!(other_exact_writer.conflicts_with(&unknown_reader));
         assert!(!unknown_reader.conflicts_with(&exact_reader));
+    }
+
+    #[test]
+    fn precise_host_resources_share_a_read_umbrella_without_aliasing_each_other() {
+        let mut left = EffectSummary::pure();
+        left.writes
+            .insert(ResourceKey::ProjectPath("left.json".into()));
+        let mut right = EffectSummary::pure();
+        right
+            .writes
+            .insert(ResourceKey::ProjectPath("right.json".into()));
+
+        let (left_reads, left_writes) = left.scheduling_accesses();
+        assert!(left_reads.contains(&ResourceKey::HostWorld));
+        assert!(!left_writes.contains(&ResourceKey::HostWorld));
+        assert!(!left.conflicts_with(&right));
+
+        let ambient = EffectSummary::unknown();
+        assert!(left.conflicts_with(&ambient));
+        assert!(right.conflicts_with(&ambient));
+    }
+
+    #[test]
+    fn governed_device_views_alias_their_generic_resource_state() {
+        let identity = ResourceIdentity::new(
+            ResourceOwner::World {
+                world: WorldIdentity::new(
+                    WorldId::new("test-world").unwrap(),
+                    WorldEpoch::new(1).unwrap(),
+                ),
+            },
+            ResourceId::new("device/test").unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+        );
+        let mut device_reader = EffectSummary::pure();
+        device_reader
+            .reads
+            .insert(ResourceKey::DeviceState(identity.clone()));
+        let mut generic_writer = EffectSummary::pure();
+        generic_writer
+            .writes
+            .insert(ResourceKey::GovernedResource(identity));
+
+        assert!(device_reader.conflicts_with(&generic_writer));
     }
 }

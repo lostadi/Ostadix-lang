@@ -86,6 +86,32 @@ fn resource_transition(
     (inputs[0].0, inputs[0].1, outputs[0].0, outputs[0].1)
 }
 
+fn resource_read_state(graph: &HGraph, info: &ExecInfo, resource: &ResourceKey) -> (NodeId, u64) {
+    let state = |node: NodeId| match &graph.node(node).expect("state node exists").kind {
+        HNodeKind::ResourceState {
+            resource: candidate,
+            version,
+        } if candidate == resource => Some(*version),
+        _ => None,
+    };
+    let inputs = info
+        .inputs
+        .iter()
+        .filter_map(|node| state(*node).map(|version| (*node, version)))
+        .collect::<Vec<_>>();
+    let outputs = info
+        .outputs
+        .iter()
+        .filter_map(|node| state(*node).map(|version| (*node, version)))
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 1, "missing unique {resource:?} read input");
+    assert!(
+        outputs.is_empty(),
+        "read unexpectedly advanced {resource:?}: {outputs:?}"
+    );
+    inputs[0]
+}
+
 #[test]
 fn every_operation_kind_lowers_to_an_execute_edge() {
     let program = OIrProgram {
@@ -461,7 +487,7 @@ fn data_dependencies_force_later_waves() {
 }
 
 #[test]
-fn reads_of_the_same_resource_advance_one_deterministic_state_chain() {
+fn reads_of_the_same_resource_share_the_current_writer_frontier() {
     let program = OIrProgram {
         nodes: vec![
             OIr::Store {
@@ -484,25 +510,140 @@ fn reads_of_the_same_resource_advance_one_deterministic_state_chain() {
     let resource = ResourceKey::ScopeBinding("shared".into());
     let first = graph.op_for(loads[0]).expect("first load has an op");
     let second = graph.op_for(loads[1]).expect("second load has an op");
-    let (first_prior, first_version, first_successor, first_next) =
-        resource_transition(&graph, first, &resource);
-    let (second_prior, second_version, _, second_next) =
-        resource_transition(&graph, second, &resource);
+    let (first_state, first_version) = resource_read_state(&graph, first, &resource);
+    let (second_state, second_version) = resource_read_state(&graph, second, &resource);
 
     // The preceding store has already advanced scope:shared from v0 to v1.
-    // Reads are state transitions too, so the second read consumes exactly the
-    // successor produced by the first instead of observing a shared mutable
-    // snapshot off-graph.
-    assert_eq!((first_version, first_next), (1, 2));
-    assert_eq!((second_version, second_next), (2, 3));
-    assert_eq!(first_successor, second_prior);
-    assert_ne!(first_prior, first_successor);
+    // Both reads consume that immutable writer epoch and emit only their own
+    // completion tokens; neither manufactures a resource successor.
+    assert_eq!((first_version, second_version), (1, 1));
+    assert_eq!(first_state, second_state);
 
     let schedule = ReadySchedule::derive(&graph).expect("schedule derives");
     let waves = schedule.waves().expect("acyclic");
+    assert_eq!(
+        wave_of(&waves, loads[0]),
+        wave_of(&waves, loads[1]),
+        "verified same-resource reads must share a legal ready frontier: {waves:?}"
+    );
+}
+
+#[test]
+fn writer_after_reads_drains_every_reader_and_advances_once() {
+    let program = OIrProgram {
+        nodes: vec![
+            OIr::Store {
+                name: "shared".into(),
+                expr: Box::new(OIr::Text("initial".into())),
+            },
+            OIr::Load("shared".into()),
+            OIr::Load("shared".into()),
+            OIr::Store {
+                name: "shared".into(),
+                expr: Box::new(OIr::Text("next".into())),
+            },
+            OIr::Load("shared".into()),
+        ],
+    };
+    let plan = program.plan();
+    let graph = build_program(&program);
+    let loads = plan
+        .nodes
+        .iter()
+        .filter_map(|node| matches!(node.kind, PlanNodeKind::Load { .. }).then_some(node.id))
+        .collect::<Vec<_>>();
+    let stores = plan
+        .nodes
+        .iter()
+        .filter_map(|node| matches!(node.kind, PlanNodeKind::Store { .. }).then_some(node.id))
+        .collect::<Vec<_>>();
+    assert_eq!(loads.len(), 3);
+    assert_eq!(stores.len(), 2);
+
+    let resource = ResourceKey::ScopeBinding("shared".into());
+    let writer = graph.op_for(stores[1]).expect("second store has an op");
+    let (prior, version, successor, next) = resource_transition(&graph, writer, &resource);
+    assert_eq!((version, next), (1, 2));
+    assert_ne!(prior, successor);
+    for reader in &loads[..2] {
+        let completion = graph.completion_node(*reader).expect("reader completion");
+        assert!(
+            writer.inputs.contains(&completion),
+            "writer omitted reader P{} completion N{}",
+            reader.0,
+            completion.0
+        );
+    }
+    let later = graph.op_for(loads[2]).expect("later load has an op");
+    assert_eq!(
+        resource_read_state(&graph, later, &resource),
+        (successor, 2)
+    );
+}
+
+#[test]
+fn validation_rejects_a_writer_that_omits_one_open_reader() {
+    let program = OIrProgram {
+        nodes: vec![
+            OIr::Store {
+                name: "shared".into(),
+                expr: Box::new(OIr::Text("initial".into())),
+            },
+            OIr::Load("shared".into()),
+            OIr::Load("shared".into()),
+            OIr::Store {
+                name: "shared".into(),
+                expr: Box::new(OIr::Text("next".into())),
+            },
+        ],
+    };
+    let plan = program.plan();
+    let mut graph = build_program(&program);
+    let loads = plan
+        .nodes
+        .iter()
+        .filter_map(|node| matches!(node.kind, PlanNodeKind::Load { .. }).then_some(node.id))
+        .collect::<Vec<_>>();
+    let writer = plan
+        .nodes
+        .iter()
+        .filter_map(|node| matches!(node.kind, PlanNodeKind::Store { .. }).then_some(node.id))
+        .nth(1)
+        .expect("second store");
+    let omitted = graph
+        .completion_node(loads[0])
+        .expect("first reader completion");
+    let edge = graph.op_for(writer).expect("writer op").edge;
+
+    graph
+        .op_map
+        .get_mut(&writer)
+        .expect("writer op remains registered")
+        .inputs
+        .retain(|node| *node != omitted);
+    graph
+        .exec_edges
+        .get_mut(&edge)
+        .expect("writer edge exists")
+        .ports
+        .retain(|port| port.node != omitted);
+    let reader_completion = graph
+        .nodes
+        .get_mut(&omitted)
+        .expect("reader completion exists");
+    reader_completion
+        .consumers
+        .retain(|candidate| *candidate != edge);
+    reader_completion
+        .incident
+        .retain(|candidate| *candidate != edge);
+
+    let error = graph
+        .validate_execution_source(&program, &plan)
+        .expect_err("writer admission must fail when one prior reader is omitted");
     assert!(
-        wave_of(&waves, loads[0]) < wave_of(&waves, loads[1]),
-        "same-resource reads must become ready in state-version order: {waves:?}"
+        error.contains("omits open reader completion"),
+        "unexpected validation error: {error}"
     );
 }
 

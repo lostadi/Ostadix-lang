@@ -125,7 +125,7 @@ fn add_execute_edges(
     // source ids here would create A -> C state edges against C -> A structural
     // edges for a nested effect and make the executable graph cyclic.
     let mut state = StateLowering::default();
-    for id in plan.topological_order()? {
+    for (ordinal, id) in plan.topological_order()?.into_iter().enumerate() {
         let plan_node = &plan.nodes[id.0];
         let Some(op) = executable_op(&plan_node.kind) else {
             continue;
@@ -154,11 +154,23 @@ fn add_execute_edges(
             inputs.push(predecessor_completion);
         }
 
-        add_resource_state_transitions(graph, &mut state, summary, id, &mut inputs, &mut outputs);
+        add_resource_state_transitions(
+            graph,
+            &mut state,
+            summary,
+            id,
+            completion,
+            &mut inputs,
+            &mut outputs,
+        );
 
         deduplicate_nodes(&mut inputs);
         deduplicate_nodes(&mut outputs);
-        graph.add_exec_edge(id, op, inputs, outputs, value_output, plan_node.id.0 as u64)?;
+        // The stable ordinal is the reference executor's topological
+        // execution rank, not preorder PlanNodeId. Nested parents are allocated
+        // before their children but execute after them; failure selection must
+        // follow the latter.
+        graph.add_exec_edge(id, op, inputs, outputs, value_output, ordinal as u64)?;
         for predecessor in preserved_sequences {
             let completion = graph
                 .completion_node(predecessor)
@@ -174,13 +186,21 @@ fn add_resource_state_transitions(
     state: &mut StateLowering,
     summary: &EffectSummary,
     producer: PlanNodeId,
+    completion: NodeId,
     inputs: &mut Vec<NodeId>,
     outputs: &mut Vec<NodeId>,
 ) {
-    for resource in summary.accessed_resources() {
-        let (prior, successor) = state.transition(graph, resource, producer);
-        inputs.push(prior);
-        outputs.push(successor);
+    let (reads, writes) = summary.scheduling_accesses();
+    let resources = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
+    for resource in resources {
+        if writes.contains(&resource) {
+            let (prior, open_reads, successor) = state.write(graph, resource, producer);
+            inputs.push(prior);
+            inputs.extend(open_reads);
+            outputs.push(successor);
+        } else {
+            inputs.push(state.read(graph, resource, completion));
+        }
     }
 }
 
@@ -190,33 +210,58 @@ struct ResourceHead {
     version: u64,
 }
 
+struct ResourceFrontier {
+    last_write: ResourceHead,
+    open_reads: BTreeSet<NodeId>,
+}
+
 #[derive(Default)]
 struct StateLowering {
-    heads: BTreeMap<ResourceKey, ResourceHead>,
+    frontiers: BTreeMap<ResourceKey, ResourceFrontier>,
 }
 
 impl StateLowering {
-    fn transition(
+    fn frontier<'a>(
+        &'a mut self,
+        graph: &mut HGraph,
+        resource: &ResourceKey,
+    ) -> &'a mut ResourceFrontier {
+        self.frontiers.entry(resource.clone()).or_insert_with(|| {
+            let node = graph.add_node(HNode::resource_state(resource.clone(), 0));
+            ResourceFrontier {
+                last_write: ResourceHead { node, version: 0 },
+                open_reads: BTreeSet::new(),
+            }
+        })
+    }
+
+    fn read(&mut self, graph: &mut HGraph, resource: ResourceKey, completion: NodeId) -> NodeId {
+        let frontier = self.frontier(graph, &resource);
+        frontier.open_reads.insert(completion);
+        frontier.last_write.node
+    }
+
+    fn write(
         &mut self,
         graph: &mut HGraph,
         resource: ResourceKey,
         producer: PlanNodeId,
-    ) -> (NodeId, NodeId) {
-        let head = self.heads.entry(resource.clone()).or_insert_with(|| {
-            let node = graph.add_node(HNode::resource_state(resource.clone(), 0));
-            ResourceHead { node, version: 0 }
-        });
-        let prior = head.node;
-        let next_version = head.version + 1;
+    ) -> (NodeId, Vec<NodeId>, NodeId) {
+        let frontier = self.frontier(graph, &resource);
+        let prior = frontier.last_write.node;
+        let open_reads = std::mem::take(&mut frontier.open_reads)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let next_version = frontier.last_write.version + 1;
         let successor = graph.add_node(HNode::resource_state(resource, next_version));
         if let Some(node) = graph.node_mut(successor) {
             node.plan_node = Some(producer);
         }
-        *head = ResourceHead {
+        frontier.last_write = ResourceHead {
             node: successor,
             version: next_version,
         };
-        (prior, successor)
+        (prior, open_reads, successor)
     }
 }
 
@@ -296,10 +341,32 @@ pub(super) fn sequence_can_relax(
     {
         return false;
     }
+    // O-level loads are compiler-verified, read-only, and leave no external
+    // effect when they fail. Their outcomes can therefore be selected in
+    // stable ordinal order by a future concurrent dispatcher without changing
+    // strict fail-stop effects. Keep this narrow: hosted/user-declared reads do
+    // not receive the same authority.
+    if matches!(plan.nodes[predecessor.0].kind, PlanNodeKind::Load { .. })
+        && matches!(plan.nodes[successor.0].kind, PlanNodeKind::Load { .. })
+        && verified_read_only(left)
+        && verified_read_only(right)
+    {
+        return true;
+    }
     left.is_verified_pure_infallible()
         && right.is_verified_pure_infallible()
         && verified_reorderable_inline(plan, predecessor, summaries, &mut HashSet::new())
         && verified_reorderable_inline(plan, successor, summaries, &mut HashSet::new())
+}
+
+fn verified_read_only(summary: &EffectSummary) -> bool {
+    summary.confidence == crate::effects::EffectConfidence::Verified
+        && !summary.unknown
+        && summary.actor_state.is_none()
+        && summary.writes.is_empty()
+        && !summary.network
+        && !summary.spawn
+        && !summary.clock
 }
 
 /// Structural `O` regions promise left-to-right child evaluation. Even a pair
@@ -632,15 +699,17 @@ mod world_resource_key_tests {
             .into_iter()
             .enumerate()
         {
+            let completion = graph.add_node(HNode::completion(PlanNodeId(plan_node)));
             add_resource_state_transitions(
                 &mut graph,
                 &mut lowering,
                 &summary,
                 PlanNodeId(plan_node),
+                completion,
                 &mut inputs,
                 &mut outputs,
             );
-            generic_heads.push(lowering.heads[&generic]);
+            generic_heads.push(lowering.frontiers[&generic].last_write);
         }
 
         assert_eq!(generic_heads[0].version, 1);
