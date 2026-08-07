@@ -272,6 +272,7 @@ compiled_exec_log="$work_dir/compiled-project-execution-audit.log"
 compiled_exec_trace="$work_dir/compiled-project-execution-trace.json"
 compiled_exec_stdout="$work_dir/compiled-project-execution.log"
 run_logged "$compiled_exec_stdout" env \
+    PATH="$ROOT/tests/fixtures/project_hgraph_tools:$PATH" \
     PR7_REQUIRED_ENV=1 \
     PR7_NONEXEC_MARKER="$compiled_exec_log" \
     O_PROJECT_EXECUTOR=hgraph \
@@ -289,7 +290,7 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 5
+assert trace["format_version"] == 6
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1
@@ -316,6 +317,7 @@ compiled_continue_stdout="$work_dir/compiled-project-continuation.log"
 run_logged "$compiled_continue_stdout" env \
     PATH="$ROOT/tests/fixtures/project_hgraph_tools:$PATH" \
     PR7_REQUIRED_ENV=1 \
+    PR7_FORCE_IMPL_A_FAILURE=1 \
     PR7_NONEXEC_MARKER="$compiled_continue_log" \
     O_PROJECT_EXECUTOR=hgraph \
     "$compiled_project" --route main --routes-policy any_success \
@@ -335,7 +337,7 @@ assert first < second
 
 with open(sys.argv[2], "r", encoding="utf-8") as handle:
     trace = json.load(handle)
-assert trace["format_version"] == 5
+assert trace["format_version"] == 6
 header = trace["header"]
 assert header["policy"] == "any_success"
 assert header["logical_graph_schema"] == 1

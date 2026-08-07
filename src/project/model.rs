@@ -6,6 +6,7 @@
 //! materialization, the route runtime, and the `.O` lowering.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -538,7 +539,10 @@ impl ProjectBundle {
 // Execution results
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A produced output artifact collected after a route runs.
+/// A completely captured output artifact collected after a route runs.
+///
+/// Missing, unreadable, changing, unsupported, and over-limit declared
+/// outputs are rejected before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     /// Path relative to the execution workspace.
@@ -547,6 +551,238 @@ pub struct Artifact {
     pub content_hash: String,
     /// Length of the artifact in bytes.
     pub bytes_len: u64,
+}
+
+/// Why declared artifact evidence is incomplete for a non-successful route.
+///
+/// This type deliberately contains stable semantic data rather than an opaque
+/// I/O string. Successful route results are never allowed to carry one of
+/// these states.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactCaptureFailure {
+    Missing {
+        requirement: String,
+    },
+    Unreadable {
+        path: String,
+        operation: String,
+        error_kind: String,
+    },
+    ChangedDuringCapture {
+        path: String,
+        detail: String,
+    },
+    UnsupportedFileType {
+        path: String,
+    },
+    UnsupportedPathEncoding {
+        path_sha256: String,
+    },
+    OutsideArtifactRoot {
+        path: String,
+    },
+    ArtifactScanLimit {
+        limit: usize,
+        observed_at_least: usize,
+    },
+    ArtifactCountLimit {
+        limit: usize,
+        observed_at_least: usize,
+    },
+    SingleArtifactLimit {
+        path: String,
+        limit: u64,
+        observed_at_least: u64,
+    },
+    AggregateArtifactLimit {
+        path: String,
+        limit: u64,
+        captured_before: u64,
+        artifact_bytes: u64,
+    },
+    NotAttempted {
+        reason: String,
+    },
+}
+
+impl ArtifactCaptureFailure {
+    pub fn validate(&self) -> Result<(), String> {
+        fn text(value: &str, label: &str) -> Result<(), String> {
+            if value.is_empty() || value.contains('\0') {
+                Err(format!(
+                    "artifact capture {label} must be nonempty and contain no NUL"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        match self {
+            Self::Missing { requirement } => text(requirement, "requirement"),
+            Self::Unreadable {
+                path,
+                operation,
+                error_kind,
+            } => {
+                text(path, "path")?;
+                text(operation, "operation")?;
+                text(error_kind, "error kind")
+            }
+            Self::ChangedDuringCapture { path, detail } => {
+                text(path, "path")?;
+                text(detail, "change detail")
+            }
+            Self::UnsupportedFileType { path } | Self::OutsideArtifactRoot { path } => {
+                text(path, "path")
+            }
+            Self::UnsupportedPathEncoding { path_sha256 } => {
+                if path_sha256.len() == 64
+                    && path_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    Ok(())
+                } else {
+                    Err("unsupported artifact path SHA-256 is not canonical".to_string())
+                }
+            }
+            Self::ArtifactScanLimit {
+                limit,
+                observed_at_least,
+            } => {
+                if observed_at_least <= limit {
+                    Err("artifact scan-limit failure does not exceed its limit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ArtifactCountLimit {
+                limit,
+                observed_at_least,
+            } => {
+                if observed_at_least <= limit {
+                    Err("artifact count-limit failure does not exceed its limit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::SingleArtifactLimit {
+                path,
+                limit,
+                observed_at_least,
+            } => {
+                text(path, "path")?;
+                if observed_at_least <= limit {
+                    Err("single-artifact failure does not exceed its limit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::AggregateArtifactLimit {
+                path,
+                limit,
+                captured_before,
+                artifact_bytes,
+            } => {
+                text(path, "path")?;
+                if captured_before
+                    .checked_add(*artifact_bytes)
+                    .is_some_and(|total| total <= *limit)
+                {
+                    Err("aggregate-artifact failure does not exceed its limit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::NotAttempted { reason } => text(reason, "not-attempted reason"),
+        }
+    }
+}
+
+/// Whether every declared artifact was captured completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ArtifactCaptureStatus {
+    Complete,
+    Incomplete {
+        failure: Box<ArtifactCaptureFailure>,
+    },
+}
+
+impl ArtifactCaptureStatus {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Complete => Ok(()),
+            Self::Incomplete { failure } => failure.validate(),
+        }
+    }
+}
+
+/// Evidence for one completely drained child-output stream.
+///
+/// `retained_bytes` describes the bounded prefix stored on
+/// [`OExecutionResult`], while `total_observed_bytes` and `sha256` bind the
+/// complete stream observed before the route became terminal. A truncated
+/// stream is therefore never confused with a complete short stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCapture {
+    /// Total bytes drained from the child pipe, including discarded suffixes.
+    pub total_observed_bytes: u64,
+    /// Bytes retained in the corresponding `stdout` or `stderr` vector.
+    pub retained_bytes: u64,
+    /// Whether bytes were discarded after reaching the retention limit.
+    pub truncated: bool,
+    /// Lowercase SHA-256 of the complete observed stream.
+    pub sha256: String,
+}
+
+impl OutputCapture {
+    /// Describe a complete, untruncated byte sequence.
+    pub fn complete(bytes: &[u8]) -> Self {
+        Self {
+            total_observed_bytes: bytes.len() as u64,
+            retained_bytes: bytes.len() as u64,
+            truncated: false,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    /// Check the metadata that can be verified from the retained prefix.
+    pub fn validate_for_retained(&self, retained: &[u8]) -> Result<(), String> {
+        let retained_bytes = u64::try_from(retained.len())
+            .map_err(|_| "retained output length does not fit u64".to_string())?;
+        if self.retained_bytes != retained_bytes {
+            return Err(format!(
+                "capture retained byte count {} disagrees with retained output length {retained_bytes}",
+                self.retained_bytes
+            ));
+        }
+        if self.total_observed_bytes < self.retained_bytes {
+            return Err("capture observed fewer bytes than it retained".to_string());
+        }
+        if self.truncated != (self.total_observed_bytes > self.retained_bytes) {
+            return Err(
+                "capture truncation flag disagrees with observed and retained lengths".to_string(),
+            );
+        }
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("capture SHA-256 must be 64 lowercase hexadecimal characters".to_string());
+        }
+        if !self.truncated && self.sha256 != hex::encode(Sha256::digest(retained)) {
+            return Err("complete capture SHA-256 disagrees with retained bytes".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Provenance of a single execution — where and how it ran.
@@ -583,13 +819,22 @@ pub struct OExecutionResult {
     /// Captured stdout bytes.
     #[serde(with = "b64_bytes")]
     pub stdout: Vec<u8>,
+    /// Complete-stream evidence for the retained stdout prefix.
+    pub stdout_capture: OutputCapture,
     /// Captured stderr bytes.
     #[serde(with = "b64_bytes")]
     pub stderr: Vec<u8>,
+    /// Complete-stream evidence for the retained stderr prefix.
+    pub stderr_capture: OutputCapture,
     /// Decoded structured value (only for `ResultCodec::Json`).
     pub value: Option<serde_json::Value>,
     /// Collected output artifacts.
     pub artifacts: Vec<Artifact>,
+    /// Declared output patterns whose capture status this result describes.
+    pub artifact_requirements: Vec<String>,
+    /// Whether the declared artifact set is complete. Incomplete evidence is
+    /// permitted only for an already non-successful or unattempted route.
+    pub artifact_capture: ArtifactCaptureStatus,
     /// Whether this result came from a child process or guard-skip synthesis.
     /// The default preserves decoding compatibility with older result JSON.
     #[serde(default)]
@@ -601,9 +846,9 @@ pub struct OExecutionResult {
 }
 
 impl OExecutionResult {
-    /// Whether the process exited successfully (exit code 0).
+    /// Whether the process exited successfully with complete artifact evidence.
     pub fn succeeded(&self) -> bool {
-        self.exit_code == Some(0)
+        self.exit_code == Some(0) && self.artifact_capture.is_complete()
     }
 
     /// Whether guard policy synthesized this result without launching a child.
@@ -648,12 +893,38 @@ impl OExecutionResult {
                 out.push_str(&format!("    {line}\n"));
             }
         }
+        if self.stdout_capture.truncated {
+            let digest_prefix = self
+                .stdout_capture
+                .sha256
+                .get(..self.stdout_capture.sha256.len().min(12))
+                .unwrap_or("<invalid>");
+            out.push_str(&format!(
+                "  stdout truncated: retained {} of {} bytes (sha256:{})\n",
+                self.stdout_capture.retained_bytes,
+                self.stdout_capture.total_observed_bytes,
+                digest_prefix,
+            ));
+        }
         let stderr = self.stderr_text();
         if !stderr.trim().is_empty() {
             out.push_str("  stderr:\n");
             for line in stderr.lines() {
                 out.push_str(&format!("    {line}\n"));
             }
+        }
+        if self.stderr_capture.truncated {
+            let digest_prefix = self
+                .stderr_capture
+                .sha256
+                .get(..self.stderr_capture.sha256.len().min(12))
+                .unwrap_or("<invalid>");
+            out.push_str(&format!(
+                "  stderr truncated: retained {} of {} bytes (sha256:{})\n",
+                self.stderr_capture.retained_bytes,
+                self.stderr_capture.total_observed_bytes,
+                digest_prefix,
+            ));
         }
         if let Some(value) = &self.value {
             out.push_str(&format!("  value: {value}\n"));
@@ -669,6 +940,9 @@ impl OExecutionResult {
                 ));
             }
         }
+        if let ArtifactCaptureStatus::Incomplete { failure } = &self.artifact_capture {
+            out.push_str(&format!("  artifact evidence incomplete: {failure:?}\n"));
+        }
         out
     }
 
@@ -680,9 +954,13 @@ impl OExecutionResult {
             "exit_code": self.exit_code,
             "succeeded": self.succeeded(),
             "stdout": self.stdout_text(),
+            "stdout_capture": self.stdout_capture,
             "stderr": self.stderr_text(),
+            "stderr_capture": self.stderr_capture,
             "value": self.value,
             "artifacts": self.artifacts,
+            "artifact_requirements": self.artifact_requirements,
+            "artifact_capture": self.artifact_capture,
             "disposition": self.disposition,
             "duration_ns": self.duration_ns.to_string(),
             "provenance": {
