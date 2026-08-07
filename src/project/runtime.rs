@@ -91,7 +91,10 @@ impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             wall_clock_timeout: Duration::from_secs(30 * 60),
-            termination_grace_period: Duration::from_millis(250),
+            // Allow a successfully force-signaled descendant to reach an
+            // inert kernel state even when the host test/build load delays
+            // scheduling. This remains a strict, configured upper bound.
+            termination_grace_period: Duration::from_secs(2),
             max_retained_stdout_bytes: 16 * 1024 * 1024,
             max_retained_stderr_bytes: 16 * 1024 * 1024,
             max_routes_per_selection: 64,
@@ -115,6 +118,11 @@ impl ExecutionLimits {
         if self.wall_clock_timeout.is_zero() {
             return Err(RouteExecutionError::Configuration {
                 detail: "wall-clock timeout must be greater than zero".to_string(),
+            });
+        }
+        if self.termination_grace_period.is_zero() {
+            return Err(RouteExecutionError::Configuration {
+                detail: "termination grace period must be greater than zero".to_string(),
             });
         }
         if self.max_single_artifact_bytes > self.max_aggregate_artifact_bytes {
@@ -777,15 +785,15 @@ fn spawn_route(
     };
 
     let stop = loop {
+        if cancel.is_cancelled() {
+            break RouteStop::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            break RouteStop::DeadlineExceeded;
+        }
         match process.exited_without_reaping() {
             Ok(true) => break RouteStop::LeaderExited,
             Ok(false) => {
-                if cancel.is_cancelled() {
-                    break RouteStop::Cancelled;
-                }
-                if Instant::now() >= deadline {
-                    break RouteStop::DeadlineExceeded;
-                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 std::thread::sleep(remaining.min(Duration::from_millis(5)));
             }
@@ -1153,6 +1161,31 @@ struct OwnedRouteProcess {
     reaped_status: Option<ExitStatus>,
 }
 
+struct ForcedTermination {
+    owned_group: Option<io::Result<()>>,
+    leader: io::Result<()>,
+}
+
+impl ForcedTermination {
+    fn into_policy_result(self, policy: ProcessTreePolicy) -> io::Result<()> {
+        match policy {
+            ProcessTreePolicy::OwnedProcessGroup => {
+                let group = self.owned_group.ok_or_else(|| {
+                    io::Error::other("owned process-group termination result is missing")
+                })?;
+                match (group, self.leader) {
+                    (Ok(()), _) => Ok(()),
+                    (Err(group_error), Ok(())) => Err(group_error),
+                    (Err(group_error), Err(leader_error)) => Err(io::Error::other(format!(
+                        "owned process-group SIGKILL failed: {group_error}; direct leader SIGKILL also failed: {leader_error}"
+                    ))),
+                }
+            }
+            ProcessTreePolicy::LeaderOnly => self.leader,
+        }
+    }
+}
+
 impl OwnedRouteProcess {
     fn new(child: Child, policy: ProcessTreePolicy) -> Self {
         Self {
@@ -1207,18 +1240,13 @@ impl OwnedRouteProcess {
         grace: Duration,
     ) -> std::result::Result<ExitStatus, RouteExecutionError> {
         let mut cleanup = if self.policy == ProcessTreePolicy::OwnedProcessGroup {
-            self.force_terminate()
+            let forced = self.force_terminate();
+            #[cfg(target_os = "macos")]
+            let forced = self.normalize_darwin_forced_group_error(forced);
+            forced.into_policy_result(self.policy)
         } else {
             Ok(())
         };
-        #[cfg(target_os = "macos")]
-        if cleanup
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
-            && self.policy == ProcessTreePolicy::OwnedProcessGroup
-        {
-            cleanup = self.normalize_darwin_zombie_group_error(cleanup);
-        }
         if cleanup.is_ok() {
             cleanup = self.wait_for_owned_group_quiescence(grace);
         }
@@ -1243,25 +1271,55 @@ impl OwnedRouteProcess {
             std::thread::sleep(grace);
         }
         let leader_exited_after_grace = self.exited_without_reaping();
-        let force_result = self.force_terminate();
+        let forced = self.force_terminate();
         #[cfg(target_os = "macos")]
-        let force_result = if leader_exited_after_grace
+        let forced = if leader_exited_after_grace
             .as_ref()
             .is_ok_and(|exited| *exited)
-            && force_result
-                .as_ref()
-                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
             && self.policy == ProcessTreePolicy::OwnedProcessGroup
         {
-            self.normalize_darwin_zombie_group_error(force_result)
+            self.normalize_darwin_forced_group_error(forced)
         } else {
-            force_result
+            forced
         };
+        let force_result = forced.into_policy_result(self.policy);
         let quiescence_result = if force_result.is_ok() {
             self.wait_for_owned_group_quiescence(grace)
         } else {
             Ok(())
         };
+        #[cfg(target_os = "macos")]
+        let graceful_error = if leader_exited_after_grace
+            .as_ref()
+            .is_ok_and(|exited| *exited)
+            && graceful_error
+                .as_ref()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::EPERM))
+            && force_result.is_ok()
+            && quiescence_result.is_ok()
+            && self.policy == ProcessTreePolicy::OwnedProcessGroup
+        {
+            // Darwin may report EPERM when a cancellation/deadline races a
+            // naturally exited, zombie-only group. A successful force signal
+            // plus explicit group enumeration proves that this stale graceful
+            // error does not represent a live descendant.
+            None
+        } else {
+            graceful_error
+        };
+        let leader_terminal_result = self.wait_for_leader_exit(grace);
+        if let Err(error) = leader_terminal_result {
+            let force_detail = force_result
+                .as_ref()
+                .err()
+                .map_or_else(String::new, |force| format!("; SIGKILL error: {force}"));
+            return Err(RouteExecutionError::ProcessTreeTermination {
+                route_id: route.id.clone(),
+                detail: format!(
+                    "route leader did not become waitable after termination: {error}{force_detail}"
+                ),
+            });
+        }
         let force_error = force_result.err();
         let status = self.wait().map_err(|source| RouteExecutionError::Wait {
             command: route.full_command().join(" "),
@@ -1284,6 +1342,24 @@ impl OwnedRouteProcess {
         Ok(status)
     }
 
+    fn wait_for_leader_exit(&mut self, grace: Duration) -> io::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| io::Error::other("leader-exit grace deadline overflowed"))?;
+        loop {
+            if self.exited_without_reaping()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "leader remained active after SIGKILL",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn wait_for_owned_group_quiescence(&self, grace: Duration) -> io::Result<()> {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _ = grace;
@@ -1296,13 +1372,13 @@ impl OwnedRouteProcess {
                 .checked_add(grace)
                 .ok_or_else(|| io::Error::other("process-group grace deadline overflowed"))?;
             loop {
-                if self.owned_group_contains_only_leader()? {
+                if self.owned_group_has_no_active_descendants()? {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "owned process group still contains a descendant after SIGKILL",
+                        "owned process group still contains an active descendant after SIGKILL",
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(2));
@@ -1322,12 +1398,12 @@ impl OwnedRouteProcess {
     }
 
     #[cfg(target_os = "macos")]
-    fn owned_group_contains_only_leader(&self) -> io::Result<bool> {
-        self.darwin_group_contains_only_leader()
+    fn owned_group_has_no_active_descendants(&self) -> io::Result<bool> {
+        self.darwin_group_has_no_active_descendants()
     }
 
     #[cfg(target_os = "linux")]
-    fn owned_group_contains_only_leader(&self) -> io::Result<bool> {
+    fn owned_group_has_no_active_descendants(&self) -> io::Result<bool> {
         let leader = i32::try_from(self.child.id())
             .map_err(|_| io::Error::other("child pid does not fit Linux pid_t"))?;
         for entry in std::fs::read_dir("/proc")? {
@@ -1355,7 +1431,7 @@ impl OwnedRouteProcess {
                 io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
             })?;
             let mut fields = stat[close + 1..].split_whitespace();
-            let _state = fields.next();
+            let state = fields.next();
             let _parent = fields.next();
             let group = fields
                 .next()
@@ -1363,7 +1439,12 @@ impl OwnedRouteProcess {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process group")
                 })?;
-            if group == leader {
+            // Orphaned grandchildren cannot be reaped by this coordinator.
+            // A zombie has no executable state and cannot retain route pipes,
+            // so it is terminal for the owned-process security boundary.
+            // Linux reports zombies as `Z` and may expose the transient dead
+            // states `X`/`x`. None can execute or retain a route pipe.
+            if group == leader && !matches!(state, Some("Z" | "X" | "x")) {
                 return Ok(false);
             }
         }
@@ -1387,17 +1468,36 @@ impl OwnedRouteProcess {
         if signal_error.raw_os_error() != Some(libc::EPERM) {
             return Err(signal_error);
         }
-        match self.darwin_group_contains_only_leader() {
+        match self.darwin_group_has_no_active_descendants() {
             Ok(true) => Ok(()),
             Ok(false) => Err(signal_error),
             Err(inspection_error) => Err(io::Error::other(format!(
-                "{signal_error}; failed to prove Darwin process group contains only its zombie leader: {inspection_error}"
+                "{signal_error}; failed to prove Darwin process group has no active descendants: {inspection_error}"
             ))),
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn darwin_group_contains_only_leader(&self) -> io::Result<bool> {
+    fn normalize_darwin_forced_group_error(
+        &self,
+        mut forced: ForcedTermination,
+    ) -> ForcedTermination {
+        if forced.owned_group.as_ref().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+        }) {
+            let group = forced
+                .owned_group
+                .take()
+                .expect("owned-group result presence was checked");
+            forced.owned_group = Some(self.normalize_darwin_zombie_group_error(group));
+        }
+        forced
+    }
+
+    #[cfg(target_os = "macos")]
+    fn darwin_group_has_no_active_descendants(&self) -> io::Result<bool> {
         let leader = i32::try_from(self.child.id())
             .map_err(|_| io::Error::other("child pid does not fit Darwin pid_t"))?;
         // SAFETY: a null buffer asks libproc for a conservative PID capacity
@@ -1426,7 +1526,42 @@ impl OwnedRouteProcess {
             ));
         }
         members.truncate(count);
-        Ok(members.as_slice() == [leader])
+        for member in members.into_iter().filter(|member| *member != leader) {
+            // SAFETY: `information` is valid writable storage of the exact
+            // size supplied to libproc for the queried PID.
+            let mut information: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+                .map_err(|_| io::Error::other("Darwin process info buffer is too large"))?;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    member,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut information as *mut libc::proc_bsdinfo).cast(),
+                    information_size,
+                )
+            };
+            if read <= 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if read != information_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Darwin returned a partial process info record",
+                ));
+            }
+            // The PID can disappear and be reused between group enumeration
+            // and inspection. Only a record still belonging to this anchored
+            // group is relevant. Zombies are inert and cannot retain pipes.
+            if information.pbi_pgid == leader as u32 && information.pbi_status != libc::SZOMB {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[cfg(unix)]
@@ -1440,18 +1575,25 @@ impl OwnedRouteProcess {
     }
 
     #[cfg(unix)]
-    fn force_terminate(&mut self) -> io::Result<()> {
-        let group_result = self.signal_unix(libc::SIGKILL);
+    fn force_terminate(&mut self) -> ForcedTermination {
+        let owned_group = (self.policy == ProcessTreePolicy::OwnedProcessGroup)
+            .then(|| self.signal_unix(libc::SIGKILL));
         // Also target the direct child while it remains unreaped. For an owned
         // group this covers a violated group invariant without weakening the
         // group error into success.
-        let _ = self.child.kill();
-        group_result
+        let leader = self.child.kill();
+        ForcedTermination {
+            owned_group,
+            leader,
+        }
     }
 
     #[cfg(not(unix))]
-    fn force_terminate(&mut self) -> io::Result<()> {
-        self.child.kill()
+    fn force_terminate(&mut self) -> ForcedTermination {
+        ForcedTermination {
+            owned_group: None,
+            leader: self.child.kill(),
+        }
     }
 
     #[cfg(unix)]
@@ -1480,8 +1622,11 @@ impl OwnedRouteProcess {
 impl Drop for OwnedRouteProcess {
     fn drop(&mut self) {
         if self.reaped_status.is_none() {
-            let _ = self.force_terminate();
-            let _ = self.child.wait();
+            let policy = self.policy;
+            let _ = self.force_terminate().into_policy_result(policy);
+            // Drop must never reintroduce an unbounded wait on an exceptional
+            // signal-delivery failure. Normal paths prove exit before reaping.
+            let _ = self.child.try_wait();
         }
     }
 }
@@ -1554,6 +1699,7 @@ fn collect_artifacts(
         )?;
         artifacts.push(artifact);
     }
+    budget.check()?;
     Ok(artifacts)
 }
 
@@ -1624,7 +1770,7 @@ fn discover_artifact_paths(
                 }
             })?;
             let Some(relative) = relative.to_str() else {
-                let lossy = relative.to_string_lossy().replace('\\', "/");
+                let lossy = normalize_artifact_separators(&relative.to_string_lossy());
                 if patterns.iter().any(|pattern| glob_match(pattern, &lossy)) {
                     return Err(ArtifactCaptureError::UnsupportedPathEncoding {
                         path: relative.to_path_buf(),
@@ -1633,7 +1779,7 @@ fn discover_artifact_paths(
                 }
                 continue;
             };
-            let relative = relative.replace('\\', "/");
+            let relative = normalize_artifact_separators(relative);
             let mut matched = false;
             for (index, pattern) in patterns.iter().enumerate() {
                 if glob_match(pattern, &relative) {
@@ -1823,6 +1969,7 @@ where
             ),
         });
     }
+    budget.check()?;
     Ok(Artifact {
         path: relative.to_string(),
         content_hash,
@@ -2111,8 +2258,19 @@ fn artifact_path_label(root: &Path, path: &Path) -> String {
         .ok()
         .and_then(Path::to_str)
         .filter(|relative| !relative.is_empty())
-        .map(|relative| relative.replace('\\', "/"))
+        .map(normalize_artifact_separators)
         .unwrap_or_else(|| ".".to_string())
+}
+
+fn normalize_artifact_separators(relative: &str) -> String {
+    #[cfg(windows)]
+    {
+        relative.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        relative.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2339,6 +2497,43 @@ mod artifact_capture_tests {
             ArtifactCaptureError::OutsideArtifactRoot { path, .. }
                 if path == "escape/secret.bin"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslash_filename_cannot_alias_a_nested_artifact() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a\\b"), b"backslash-file").unwrap();
+        std::fs::create_dir(workspace.path().join("a")).unwrap();
+        std::fs::write(workspace.path().join("a/b"), b"nested-file").unwrap();
+        let cancel = CancellationToken::new();
+        let budget = test_budget(&cancel);
+
+        let backslash = collect_artifacts(
+            workspace.path(),
+            &["a\\b".to_string()],
+            &ExecutionLimits::default(),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(backslash[0].path, "a\\b");
+        assert_eq!(
+            backslash[0].content_hash,
+            hex::encode(Sha256::digest(b"backslash-file"))
+        );
+
+        let nested = collect_artifacts(
+            workspace.path(),
+            &["a/b".to_string()],
+            &ExecutionLimits::default(),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(nested[0].path, "a/b");
+        assert_eq!(
+            nested[0].content_hash,
+            hex::encode(Sha256::digest(b"nested-file"))
+        );
     }
 }
 
@@ -2578,11 +2773,11 @@ fn potential_route_execution_count(
             if !seen.insert(route_id) {
                 continue;
             }
-            total = total.checked_add(1).ok_or_else(|| {
-                RouteExecutionError::Configuration {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| RouteExecutionError::Configuration {
                     detail: "potential route-execution count overflowed".to_string(),
-                }
-            })?;
+                })?;
             if let Some(route) = bundle.route(route_id) {
                 pending.extend(route.prerequisites.iter().map(String::as_str));
             }

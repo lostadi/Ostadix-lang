@@ -572,7 +572,25 @@ impl RuntimeGraphV1 {
         trace_events.sort_by_key(|event| event.coordinator_ordinal);
         let header = self.trace_header();
         ProjectAttemptTrace::try_from_events(header, trace_events.iter().cloned())?;
-        validate_observed_branch_sequence(&trace_events, &policy)?;
+        if matches!(
+            &self.terminal,
+            RuntimeGraphTerminalV1::RouteSettlement { .. }
+        ) && trace_events
+            .iter()
+            .any(|event| event.state == ProjectAttemptState::Aborted)
+        {
+            return Err(invalid(
+                "route-settlement RuntimeGraph contains an aborted operation before a completed selector",
+            ));
+        }
+        validate_observed_branch_sequence(
+            &trace_events,
+            &policy,
+            matches!(
+                &self.terminal,
+                RuntimeGraphTerminalV1::RouteSettlement { .. }
+            ),
+        )?;
         if matches!(
             &self.terminal,
             RuntimeGraphTerminalV1::RouteSettlement { .. }
@@ -1114,11 +1132,35 @@ fn validate_runtime_policy_token(policy: &str) -> Result<RoutePolicy, RuntimeGra
 fn validate_observed_branch_sequence(
     events: &[ProjectAttemptEvent],
     policy: &RoutePolicy,
+    selector_completed: bool,
 ) -> Result<(), RuntimeGraphError> {
     let branches = events
         .iter()
         .filter_map(|event| event.branch)
         .collect::<Vec<_>>();
+    // The planner emits prerequisite RunRoute nodes before the selected route
+    // for each branch, so the greatest observed RunRoute plan node is that
+    // branch's top-level alternative whenever the selector completed.
+    let mut top_level_by_branch = BTreeMap::<usize, (usize, &str)>::new();
+    for event in events.iter().filter(|event| {
+        event.branch.is_some()
+            && event.route_id.is_some()
+            && event.operation_label.starts_with("run-route:")
+    }) {
+        let branch = event.branch.expect("branch presence was checked");
+        let route_id = event
+            .route_id
+            .as_deref()
+            .expect("route presence was checked");
+        top_level_by_branch
+            .entry(branch)
+            .and_modify(|current| {
+                if event.plan_node.0 > current.0 {
+                    *current = (event.plan_node.0, route_id);
+                }
+            })
+            .or_insert((event.plan_node.0, route_id));
+    }
     match policy {
         RoutePolicy::Explicit(_) | RoutePolicy::Default => {
             if branches.iter().any(|branch| *branch != 0) {
@@ -1130,22 +1172,121 @@ fn validate_observed_branch_sequence(
         RoutePolicy::Fallback | RoutePolicy::AnySuccess => {
             let mut highest = 0_usize;
             let mut observed = BTreeSet::new();
-            for branch in branches {
-                if branch < highest {
+            for branch in &branches {
+                if *branch < highest {
                     return Err(invalid(
                         "ordered RuntimeGraph branch observations move backward",
                     ));
                 }
-                highest = highest.max(branch);
-                observed.insert(branch);
+                highest = highest.max(*branch);
+                observed.insert(*branch);
             }
             if observed.iter().copied().ne(0..observed.len()) {
                 return Err(invalid(
                     "ordered RuntimeGraph branches are not a contiguous prefix beginning at zero",
                 ));
             }
+
+            // Entering branch N+1 is possible only after branch N's top-level
+            // failure/skip explicitly admits continuation. A successful prior
+            // branch closes the selector.
+            for branch in 1..observed.len() {
+                let (prior_plan_node, _) =
+                    top_level_by_branch.get(&(branch - 1)).ok_or_else(|| {
+                        invalid("ordered RuntimeGraph later branch has no prior top-level route")
+                    })?;
+                let prior_settlement = events
+                    .iter()
+                    .find(|event| {
+                        event.branch == Some(branch - 1)
+                            && event.plan_node.0 == *prior_plan_node
+                            && is_canonical_route_settlement(event)
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            "ordered RuntimeGraph later branch precedes prior top-level settlement",
+                        )
+                    })?;
+                if !matches!(
+                    prior_settlement.state,
+                    ProjectAttemptState::SettledFailure | ProjectAttemptState::Skipped
+                ) {
+                    return Err(invalid(
+                        "ordered RuntimeGraph observes a later branch after prior success",
+                    ));
+                }
+                let continuation = prior_settlement
+                    .continuation
+                    .as_ref()
+                    .filter(|continuation| continuation.admitted)
+                    .ok_or_else(|| {
+                        invalid(
+                            "ordered RuntimeGraph later branch lacks an admitted prior continuation",
+                        )
+                    })?;
+                let current_branch_must_have_reached_its_top_level =
+                    selector_completed || branch + 1 < observed.len();
+                if current_branch_must_have_reached_its_top_level {
+                    let (_, current_route) = top_level_by_branch.get(&branch).ok_or_else(|| {
+                        invalid(
+                            "ordered RuntimeGraph completed branch has no top-level route observation",
+                        )
+                    })?;
+                    if continuation.next_route_id != *current_route {
+                        return Err(invalid(
+                            "ordered RuntimeGraph continuation names a different next top-level route",
+                        ));
+                    }
+                }
+            }
+            if selector_completed {
+                let last_branch = observed
+                    .last()
+                    .copied()
+                    .ok_or_else(|| invalid("completed ordered RuntimeGraph has no branch"))?;
+                let (last_plan_node, _) =
+                    top_level_by_branch.get(&last_branch).ok_or_else(|| {
+                        invalid("completed ordered RuntimeGraph has no final top-level route")
+                    })?;
+                let last_settlement = events
+                    .iter()
+                    .find(|event| {
+                        event.branch == Some(last_branch)
+                            && event.plan_node.0 == *last_plan_node
+                            && is_canonical_route_settlement(event)
+                    })
+                    .ok_or_else(|| {
+                        invalid("completed ordered RuntimeGraph has no final route settlement")
+                    })?;
+                if matches!(
+                    last_settlement.state,
+                    ProjectAttemptState::SettledFailure | ProjectAttemptState::Skipped
+                ) && last_settlement
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.admitted)
+                {
+                    return Err(invalid(
+                        "completed ordered RuntimeGraph stops after admitting continuation to another branch",
+                    ));
+                }
+            }
         }
         _ => {}
+    }
+    if selector_completed {
+        for (branch, (top_level_plan_node, _)) in &top_level_by_branch {
+            if events.iter().any(|event| {
+                event.branch == Some(*branch)
+                    && event.plan_node.0 < *top_level_plan_node
+                    && event.operation_label.starts_with("run-route:")
+                    && event.state == ProjectAttemptState::SettledFailure
+            }) {
+                return Err(invalid(
+                    "route-settlement RuntimeGraph completes selection after a failed prerequisite",
+                ));
+            }
+        }
     }
     Ok(())
 }
