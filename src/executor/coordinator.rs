@@ -35,6 +35,9 @@ enum OpRunState {
     Pending,
     InFlight,
     Buffered,
+    /// A verified-pure, admitted-infallible result whose outputs may unlock
+    /// more worker-only computation before its deterministic trace frontier.
+    Published,
     Settled,
 }
 
@@ -44,10 +47,21 @@ enum WorkerFailureKind {
     Infrastructure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerCompletionDisposition {
+    Continue,
+    AbortInfrastructure,
+}
+
 struct WorkerFailure {
     index: usize,
     error: anyhow::Error,
     kind: WorkerFailureKind,
+}
+
+struct WorkerPublication {
+    output_type: String,
+    fingerprint: Option<String>,
 }
 
 /// One committed-or-pending operation the coordinator tracks.
@@ -73,6 +87,7 @@ pub struct Coordinator<'a> {
     materialized: HashSet<NodeId>,
     failed_outputs: HashMap<NodeId, String>,
     worker_results: HashMap<usize, TaskOutcome>,
+    worker_publications: HashMap<usize, WorkerPublication>,
     frame: GraphEvalFrame,
     trace: TraceSink,
     base_policy: Policy,
@@ -168,6 +183,7 @@ impl<'a> Coordinator<'a> {
             materialized,
             failed_outputs: HashMap::new(),
             worker_results: HashMap::new(),
+            worker_publications: HashMap::new(),
             frame,
             trace: TraceSink::new(),
             base_policy,
@@ -267,13 +283,7 @@ impl<'a> Coordinator<'a> {
                             ));
                         }
                     };
-                    if let Err(error) = self.buffer_worker_completion(completion) {
-                        return Err(self.abort_after_worker_error(
-                            Some(pool),
-                            "local worker returned an invalid completion",
-                            error,
-                        ));
-                    }
+                    self.accept_worker_completion(pool, completion)?;
                 }
             }
 
@@ -362,13 +372,7 @@ impl<'a> Coordinator<'a> {
                         ));
                     }
                 };
-                if let Err(error) = self.buffer_worker_completion(completion) {
-                    return Err(self.abort_after_worker_error(
-                        Some(worker_pool),
-                        "local worker returned an invalid completion",
-                        error,
-                    ));
-                }
+                self.accept_worker_completion(worker_pool, completion)?;
                 continue;
             }
 
@@ -525,11 +529,35 @@ impl<'a> Coordinator<'a> {
         Ok(())
     }
 
-    fn buffer_worker_completion(&mut self, completion: TaskCompletion) -> Result<()> {
+    fn accept_worker_completion(
+        &mut self,
+        pool: &mut WorkerPool,
+        completion: TaskCompletion,
+    ) -> Result<()> {
+        match self.buffer_worker_completion(completion) {
+            Ok(WorkerCompletionDisposition::Continue) => Ok(()),
+            Ok(WorkerCompletionDisposition::AbortInfrastructure) => Err(self
+                .abort_after_worker_error(
+                    Some(pool),
+                    "local worker reported an infrastructure failure",
+                    anyhow::anyhow!("local worker reported an infrastructure failure"),
+                )),
+            Err(error) => Err(self.abort_after_worker_error(
+                Some(pool),
+                "local worker returned an invalid completion",
+                error,
+            )),
+        }
+    }
+
+    fn buffer_worker_completion(
+        &mut self,
+        completion: TaskCompletion,
+    ) -> Result<WorkerCompletionDisposition> {
         let index = completion.token.0;
         let op = self
             .ops
-            .get_mut(index)
+            .get(index)
             .ok_or_else(|| anyhow::anyhow!("local worker returned an unknown task token"))?;
         if op.state != OpRunState::InFlight {
             bail!(
@@ -538,15 +566,53 @@ impl<'a> Coordinator<'a> {
                 op.state
             );
         }
-        op.state = OpRunState::Buffered;
-        if self
-            .worker_results
-            .insert(index, completion.outcome)
-            .is_some()
+
+        let outcome = if self.ops[index].failure_class == FailureClassV1::Infallible {
+            match completion.outcome {
+                TaskOutcome::Completed(Ok(value)) => {
+                    if !self.ops[index].effect.is_verified_pure_infallible() {
+                        bail!(
+                            "operation {} has an incoherent infallible worker contract",
+                            self.ops[index].plan_node.0
+                        );
+                    }
+                    let id = self.ops[index].plan_node;
+                    let publication = WorkerPublication {
+                        output_type: value.type_name().to_string(),
+                        fingerprint: Evaluator::trace_fingerprint(&value),
+                    };
+                    self.frame.set_value(id, *value)?;
+                    self.publish_outputs(index);
+                    self.ops[index].state = OpRunState::Published;
+                    if self
+                        .worker_publications
+                        .insert(index, publication)
+                        .is_some()
+                    {
+                        bail!("local worker published task token {index} twice");
+                    }
+                    return Ok(WorkerCompletionDisposition::Continue);
+                }
+                outcome => outcome,
+            }
+        } else {
+            completion.outcome
+        };
+
+        let disposition = if matches!(&outcome, TaskOutcome::InfrastructureAbort(_))
+            || (self.ops[index].failure_class == FailureClassV1::Infallible
+                && matches!(&outcome, TaskOutcome::Completed(Err(_))))
         {
+            WorkerCompletionDisposition::AbortInfrastructure
+        } else {
+            WorkerCompletionDisposition::Continue
+        };
+
+        self.ops[index].state = OpRunState::Buffered;
+        if self.worker_results.insert(index, outcome).is_some() {
             bail!("local worker returned task token {index} twice");
         }
-        Ok(())
+        Ok(disposition)
     }
 
     /// Settle physical completions only at the deterministic semantic frontier.
@@ -554,9 +620,18 @@ impl<'a> Coordinator<'a> {
     /// completion expose a fresh dispatch frontier.
     fn settle_buffered_results(&mut self) -> Option<WorkerFailure> {
         loop {
-            let Some(index) = self.lowest_unsettled() else {
-                return None;
-            };
+            let index = self.lowest_unsettled()?;
+            if self.ops[index].state == OpRunState::Published {
+                let id = self.ops[index].plan_node;
+                let publication = self
+                    .worker_publications
+                    .remove(&index)
+                    .expect("published operation has one trace publication");
+                self.trace
+                    .finished(id, publication.output_type, publication.fingerprint);
+                self.ops[index].state = OpRunState::Settled;
+                continue;
+            }
             if self.ops[index].state != OpRunState::Buffered {
                 return None;
             }
@@ -569,7 +644,7 @@ impl<'a> Coordinator<'a> {
                 TaskOutcome::Completed(Ok(value)) => {
                     let output_type = value.type_name().to_string();
                     let fingerprint = Evaluator::trace_fingerprint(&value);
-                    if let Err(error) = self.frame.set_value(id, value) {
+                    if let Err(error) = self.frame.set_value(id, *value) {
                         return Some(WorkerFailure {
                             index,
                             error,
@@ -580,6 +655,16 @@ impl<'a> Coordinator<'a> {
                     self.materialize_success(index);
                 }
                 TaskOutcome::Completed(Err(error)) => {
+                    if self.ops[index].failure_class == FailureClassV1::Infallible {
+                        return Some(WorkerFailure {
+                            index,
+                            error: error.context(format!(
+                                "admitted infallible operation {} returned an error",
+                                id.0
+                            )),
+                            kind: WorkerFailureKind::Infrastructure,
+                        });
+                    }
                     self.trace.failed(id, error.to_string());
                     self.record_failure(index, &error.to_string());
                     return Some(WorkerFailure {
@@ -617,13 +702,18 @@ impl<'a> Coordinator<'a> {
             .filter(|&index| {
                 matches!(
                     self.ops[index].state,
-                    OpRunState::InFlight | OpRunState::Buffered
+                    OpRunState::InFlight | OpRunState::Buffered | OpRunState::Published
                 )
             })
             .collect::<Vec<_>>();
         started.sort_by_key(|&index| (self.ops[index].ordinal, self.ops[index].plan_node.0));
         for index in started {
             self.worker_results.remove(&index);
+            self.worker_publications.remove(&index);
+            for output in &self.ops[index].outputs {
+                self.materialized.remove(output);
+            }
+            self.frame.values[self.ops[index].plan_node.0] = None;
             self.trace
                 .discarded(self.ops[index].plan_node, reason.to_string());
             self.ops[index].state = OpRunState::Settled;
@@ -711,13 +801,17 @@ impl<'a> Coordinator<'a> {
     /// perspective. Effects have already happened by this point; deterministic
     /// commit order is not used as a substitute for their graph ordering.
     fn materialize_success(&mut self, index: usize) {
+        self.publish_outputs(index);
+        self.ops[index].state = OpRunState::Settled;
+    }
+
+    fn publish_outputs(&mut self, index: usize) {
         debug_assert!(self.ops[index]
             .outputs
             .contains(&self.ops[index].value_output));
         for output in self.ops[index].outputs.clone() {
             self.materialized.insert(output);
         }
-        self.ops[index].state = OpRunState::Settled;
     }
 
     fn record_failure(&mut self, index: usize, message: &str) {
@@ -768,6 +862,14 @@ mod tests {
     impl PreparedTask for PanicPreparedTask {
         fn execute(self: Box<Self>) -> Result<OValue> {
             panic!("coordinator infrastructure test panic")
+        }
+    }
+
+    struct ErrorPreparedTask;
+
+    impl PreparedTask for ErrorPreparedTask {
+        fn execute(self: Box<Self>) -> Result<OValue> {
+            bail!("infallible adapter contract violated")
         }
     }
 
@@ -955,6 +1057,58 @@ mod tests {
     }
 
     #[test]
+    fn later_infrastructure_completion_stops_dispatch_without_preempting_earlier_failure() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Load("missing_first".into()),
+                OIr::Load("missing_second".into()),
+            ],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let evaluator = Evaluator::new("/tmp".into());
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        let mut pool = WorkerPool::new(1).unwrap();
+        let first = 0;
+        let second = 1;
+        let first_id = coordinator.ops[first].plan_node;
+        let task = parallel::prepare(
+            coordinator.ops[first].dispatch_adapter,
+            &coordinator.frame,
+            &plan,
+            first_id,
+            coordinator.flat[first_id.0],
+        )
+        .unwrap();
+        pool.submit(TaskSubmission::new(TaskToken(first), task))
+            .unwrap();
+        coordinator.ops[first].state = OpRunState::InFlight;
+        coordinator.ops[second].state = OpRunState::InFlight;
+
+        let error = coordinator
+            .accept_worker_completion(
+                &mut pool,
+                TaskCompletion::infrastructure_abort(
+                    TaskToken(second),
+                    anyhow::anyhow!("later worker panicked"),
+                ),
+            )
+            .expect_err("infrastructure completion must immediately enter the abort path");
+
+        assert!(error.to_string().contains("missing_first"), "{error:#}");
+        assert!(
+            !error.to_string().contains("later worker panicked"),
+            "{error:#}"
+        );
+        assert_eq!(coordinator.ops[second].state, OpRunState::Settled);
+    }
+
+    #[test]
     fn caught_worker_panic_is_discarded_as_infrastructure_not_node_failure() {
         let program = OIrProgram {
             nodes: vec![OIr::Exec {
@@ -984,14 +1138,10 @@ mod tests {
         coordinator.ops[0].state = OpRunState::InFlight;
         coordinator.trace.started(id);
         let completion = pool.recv_completion().unwrap();
-        coordinator.buffer_worker_completion(completion).unwrap();
-
-        let failure = coordinator
-            .settle_buffered_results()
-            .expect("caught panic must become an infrastructure abort");
-        assert_eq!(failure.kind, WorkerFailureKind::Infrastructure);
-        assert!(failure.error.to_string().contains("panicked"));
-        coordinator.discard_started_workers(None, "worker infrastructure abort");
+        let error = coordinator
+            .accept_worker_completion(&mut pool, completion)
+            .expect_err("caught panic must immediately enter infrastructure abort");
+        assert!(error.to_string().contains("panicked"), "{error:#}");
 
         let trace = std::mem::take(&mut coordinator.trace).into_trace();
         let events = &trace.events;
@@ -1002,6 +1152,132 @@ mod tests {
         assert!(!events.iter().any(|event| matches!(
             event,
             crate::eval::TraceEvent::NodeFailed { id: event_id, .. } if *event_id == id
+        )));
+    }
+
+    #[test]
+    fn infallible_adapter_error_is_infrastructure_not_node_failure() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "text".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("text"),
+                body: vec![OIr::Text("infallible".into())],
+            }],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let evaluator = Evaluator::new("/tmp".into());
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        let id = coordinator.ops[0].plan_node;
+        let mut pool = WorkerPool::new(1).unwrap();
+        pool.submit(TaskSubmission::new(
+            TaskToken(0),
+            Box::new(ErrorPreparedTask),
+        ))
+        .unwrap();
+        coordinator.ops[0].state = OpRunState::InFlight;
+        coordinator.trace.started(id);
+        let completion = pool.recv_completion().unwrap();
+        let error = coordinator
+            .accept_worker_completion(&mut pool, completion)
+            .expect_err("an admitted-infallible error must immediately abort infrastructure");
+        assert!(
+            format!("{error:#}").contains("admitted infallible operation"),
+            "{error:#}"
+        );
+
+        let trace = std::mem::take(&mut coordinator.trace).into_trace();
+        assert!(trace.events.iter().any(|event| matches!(
+            event,
+            crate::eval::TraceEvent::NodeDiscarded { id: event_id, .. } if *event_id == id
+        )));
+        assert!(!trace.events.iter().any(|event| matches!(
+            event,
+            crate::eval::TraceEvent::NodeFailed { id: event_id, .. } if *event_id == id
+        )));
+    }
+
+    #[test]
+    fn provisional_infallible_publication_is_revoked_after_earlier_failure() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Load("missing".into()),
+                OIr::Exec {
+                    lang: "text".into(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: BackendRegistry::global().interface_for("text"),
+                    body: vec![OIr::Text("speculative".into())],
+                },
+            ],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let evaluator = Evaluator::new("/tmp".into());
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        let earlier = coordinator
+            .ops
+            .iter()
+            .position(|op| op.plan_node == plan.roots[0])
+            .unwrap();
+        let later = coordinator
+            .ops
+            .iter()
+            .position(|op| op.plan_node == plan.roots[1])
+            .unwrap();
+        let later_id = coordinator.ops[later].plan_node;
+        let later_outputs = coordinator.ops[later].outputs.clone();
+
+        coordinator.ops[later].state = OpRunState::InFlight;
+        coordinator.trace.started(later_id);
+        let disposition = coordinator
+            .buffer_worker_completion(TaskCompletion::completed(
+                TaskToken(later),
+                Ok(OValue::str_("speculative")),
+            ))
+            .unwrap();
+        assert_eq!(disposition, WorkerCompletionDisposition::Continue);
+        assert_eq!(coordinator.ops[later].state, OpRunState::Published);
+        assert!(later_outputs
+            .iter()
+            .all(|output| coordinator.materialized.contains(output)));
+        assert!(coordinator.frame.values[later_id.0].is_some());
+
+        coordinator.ops[earlier].state = OpRunState::Buffered;
+        coordinator.worker_results.insert(
+            earlier,
+            TaskOutcome::Completed(Err(anyhow::anyhow!("earlier failure"))),
+        );
+        let failure = coordinator
+            .settle_buffered_results()
+            .expect("the earlier fallible result must select failure");
+        assert_eq!(failure.kind, WorkerFailureKind::Semantic);
+        coordinator.discard_started_workers(None, "earlier operation failed");
+
+        assert!(later_outputs
+            .iter()
+            .all(|output| !coordinator.materialized.contains(output)));
+        assert!(coordinator.frame.values[later_id.0].is_none());
+        let trace = std::mem::take(&mut coordinator.trace).into_trace();
+        assert!(trace.events.iter().any(|event| matches!(
+            event,
+            crate::eval::TraceEvent::NodeDiscarded { id, .. } if *id == later_id
+        )));
+        assert!(!trace.events.iter().any(|event| matches!(
+            event,
+            crate::eval::TraceEvent::NodeFinished { id, .. } if *id == later_id
         )));
     }
 

@@ -44,7 +44,7 @@ pub enum InvokeMode {
 }
 
 impl InvokeMode {
-    fn for_name(name: &str) -> Self {
+    pub(crate) fn for_name(name: &str) -> Self {
         match name {
             "lazy" => Self::Lazy,
             "autonomous" => Self::Autonomous,
@@ -56,7 +56,7 @@ impl InvokeMode {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Eager => "eager",
             Self::Lazy => "lazy",

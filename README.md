@@ -2392,6 +2392,10 @@ topological root schedule and direct-child schedules used by every `Store`,
 `Invoke`, and `Exec`. The most recent runtime plan is available through
 `Evaluator::last_execution_plan()`.
 
+Evidence analysis independently verifies that each embedded backend interface
+matches the registered language policy and that special invocation metadata has
+canonical name/mode/arity before it can issue an admission bundle.
+
 `Invoke` is also typed during lowering as eager, lazy, autonomous, or a
 specific coordination-group mode. The evaluator does not rediscover special
 form policy from an unrelated name table after planning.
@@ -2409,7 +2413,14 @@ the strict semantic settlement frontier. For admitted local-worker work, owned
 threads persist for one graph run; each accepted completion recomputes readiness
 without waiting for an unrelated earlier ready set to drain. Fallible outcomes
 may complete physically out of order but settle by serial topological ordinal.
-A failure produces no completion or successor state.
+A successful verified-pure, admitted-infallible result may provisionally expose
+its outputs to other safe worker tasks; an earlier failure revokes those outputs
+and discards the provisional work. Because `NodeFinished` denotes durable
+settlement, a provisionally unlocked dependent may emit `NodeStarted` before
+its producer's `NodeFinished`; `--explain-schedule` reports this rule. An error
+returned by an admitted-infallible adapter is an infrastructure contract
+violation, not `NodeFailed`. A semantic failure produces no completion or
+successor state.
 
 Unknown hosted code reads and writes the shared `HostWorld` resource. Exact
 filesystem and network footprints are not inferred from arbitrary source.

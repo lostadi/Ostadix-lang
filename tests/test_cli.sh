@@ -260,7 +260,8 @@ EOF
         '^wave 0 \[' \
         '^admission-note waves describe the legal static frontier, not observed dispatch$' \
         '^admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation$' \
-        '^admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises$'; do
+        '^admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises$' \
+        '^admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs$'; do
         if ! grep -Eq -- "$pattern" "$STDOUT_FILE"; then
             fail "$desc" "(schedule explanation omitted pattern: $pattern)"
             return

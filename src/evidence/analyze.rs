@@ -237,6 +237,9 @@ pub fn analyze_execution(
             "evidence analyzer requires the canonical ExecutionPlan derived from the exact lowered OIR"
         );
     }
+    let flat = program.flatten_for_plan();
+    crate::eval::validate_execution_metadata(&flat)
+        .context("evidence analyzer rejected invalid OIR execution metadata")?;
     graph
         .validate_execution_source(program, plan)
         .map_err(anyhow::Error::msg)
@@ -254,7 +257,6 @@ pub fn analyze_execution(
     }
 
     let bindings = evidence_bindings(program, plan, graph, &runtime);
-    let flat = program.flatten_for_plan();
     let mut nodes = Vec::with_capacity(graph.op_map.len());
     for info in graph.exec_ops_ordered() {
         let output = graph.node(info.value_output).with_context(|| {
