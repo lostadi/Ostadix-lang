@@ -88,6 +88,12 @@ pub enum TraceEvent {
         id: PlanNodeId,
         message: String,
     },
+    /// The operation executed speculatively, but strict fail-stop settlement
+    /// withheld its result after an earlier semantic-ordinal failure.
+    NodeDiscarded {
+        id: PlanNodeId,
+        reason: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +347,10 @@ pub struct Evaluator {
     /// Deterministic lifecycle trace for the most recent OIR execution.
     last_execution_trace: Option<ExecutionTrace>,
 
+    /// Digest-bound pre-execution decision that authorized the most recent
+    /// graph run (or was compiled for the serial differential oracle).
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV1>,
+
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
     /// dispatch still interprets OIR, but graph construction, type solving,
@@ -404,7 +414,7 @@ impl GraphEvalFrame {
         Ok(())
     }
 
-    fn scope_from_data_edges(
+    pub(crate) fn scope_from_data_edges(
         &self,
         node_id: PlanNodeId,
         plan: &ExecutionPlan,
@@ -551,6 +561,7 @@ impl Evaluator {
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
+            last_execution_admission: None,
             last_hgraph_schedule: None,
             activation_authorities: HashMap::new(),
             backend_authorities,
@@ -585,6 +596,11 @@ impl Evaluator {
         self.last_execution_trace.as_ref()
     }
 
+    /// Evidence-bound admission compiled before the most recent execution.
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV1> {
+        self.last_execution_admission.as_ref()
+    }
+
     /// The hypergraph schedule that was built for the most recent document.
     pub fn last_hgraph_schedule(&self) -> Option<&crate::hgraph::Schedule> {
         self.last_hgraph_schedule.as_ref()
@@ -616,6 +632,35 @@ impl Evaluator {
             | OValue::Group { fingerprint, .. } => Some(fingerprint.clone()),
             _ => None,
         }
+    }
+
+    /// Capture the process-local runtime facts bound by ordinary OIR
+    /// admission. The opaque capability identity participates only through the
+    /// environment digest; it is never exposed by the evidence artifact.
+    pub(crate) fn admission_runtime_binding(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> crate::evidence::RuntimeBindingV1 {
+        let mut registered = self.registered_backends.iter().cloned().collect::<Vec<_>>();
+        registered.sort();
+        let registered = registered.join(",");
+        let policy = match self.policy {
+            Policy::Eager => "eager",
+            Policy::Lazy => "lazy",
+            Policy::Autonomous => "autonomous",
+        };
+        crate::evidence::runtime_binding_from_directory(
+            plan,
+            &self.shim_dir,
+            &[
+                ("policy", policy),
+                ("registered-backends", registered.as_str()),
+                (
+                    "default-backend-authority",
+                    self.default_backend_authority.as_str(),
+                ),
+            ],
+        )
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1554,6 +1599,13 @@ impl Evaluator {
             .context("failed to derive OIR root order from execution plan")?;
         self.last_execution_plan = Some(plan.clone());
         self.last_execution_trace = Some(ExecutionTrace::new());
+        self.last_execution_admission = None;
+        self.last_hgraph_schedule = None;
+
+        let flat = program.flatten_for_plan();
+        // Preserve the precise policy/arity/backend diagnostic while still
+        // rejecting invalid metadata before analysis or admission begins.
+        self.prevalidate_graph_execution(&plan, &flat)?;
 
         let mut hgraph = program
             .hgraph_for_plan(&plan)
@@ -1561,9 +1613,23 @@ impl Evaluator {
             .context("failed to project OIR execution plan into hypergraph")?;
         crate::hgraph::solve::solve_types(&mut hgraph)
             .context("failed to solve OIR hypergraph type and fidelity constraints")?;
-        let hgraph_schedule = crate::hgraph::schedule::try_schedule(&hgraph)
+
+        let runtime_binding = self.admission_runtime_binding(&plan);
+        let evidence =
+            crate::evidence::analyze_execution(program, &plan, &hgraph, runtime_binding.clone())
+                .context("failed to establish pre-execution evidence")?;
+        let admitted = crate::evidence::admit_execution(
+            program,
+            &plan,
+            hgraph,
+            self.policy,
+            runtime_binding,
+            evidence,
+        )
+        .context("failed to admit OIR execution")?;
+        let hgraph_schedule = crate::hgraph::schedule::try_schedule(admitted.graph())
             .map_err(anyhow::Error::msg)
-            .context("failed to schedule OIR hypergraph projection")?;
+            .context("failed to schedule admitted OIR hypergraph projection")?;
 
         // Semantic projection check (replaces the former strict "projected root
         // order == plan root order" assertion). Under the graph executor,
@@ -1572,14 +1638,14 @@ impl Evaluator {
         // value, and that commits are applied in `root_schedule` order (the
         // coordinator's commit step guarantees the latter). We additionally
         // require the ready-operation schedule to be acyclic.
-        crate::hgraph::schedule::ReadySchedule::derive(&hgraph)
+        crate::hgraph::schedule::ReadySchedule::derive(admitted.graph())
             .and_then(|schedule| schedule.launch_order().map(|_| ()))
             .map_err(anyhow::Error::msg)
             .context("ready-operation schedule is not executable")?;
         for &root_index in &root_schedule {
             let root = plan.roots[root_index];
             let materialized = matches!(plan.nodes[root.0].kind, PlanNodeKind::Text)
-                || hgraph.op_for(root).is_some();
+                || admitted.graph().op_for(root).is_some();
             if !materialized {
                 bail!(
                     "hypergraph projection is missing an operation or value for plan root {}",
@@ -1588,6 +1654,7 @@ impl Evaluator {
             }
         }
         self.last_hgraph_schedule = Some(hgraph_schedule);
+        self.last_execution_admission = Some(admitted.admission().clone());
 
         // The state-complete graph coordinator is the default. The serial
         // executor remains an explicit differential oracle. A forced test
@@ -1605,9 +1672,10 @@ impl Evaluator {
         };
         let use_serial = select_serial_executor(forced, configured.as_deref())?;
         if use_serial {
-            self.execute_plan_serial(program, &plan, scope)
+            admitted.verify_runtime(&self.admission_runtime_binding(&plan))?;
+            self.execute_plan_serial(&admitted, scope)
         } else {
-            self.execute_plan_graph(program, &plan, &hgraph, scope)
+            self.execute_plan_graph(admitted, scope)
         }
     }
 
@@ -1617,23 +1685,20 @@ impl Evaluator {
     /// concurrently and are committed in deterministic root order.
     fn execute_plan_graph(
         &mut self,
-        program: &OIrProgram,
-        plan: &ExecutionPlan,
-        hgraph: &crate::hgraph::HGraph,
+        admitted: crate::evidence::AdmittedExecution<'_>,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
-        let base_policy = self.policy;
-        let mut coordinator =
-            crate::executor::Coordinator::new(program, plan, hgraph, base_policy)?;
+        let coordinator = crate::executor::Coordinator::new(admitted)?;
         coordinator.run(self, scope)
     }
 
     fn execute_plan_serial(
         &mut self,
-        program: &OIrProgram,
-        plan: &ExecutionPlan,
+        admitted: &crate::evidence::AdmittedExecution<'_>,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
+        let program = admitted.program();
+        let plan = admitted.plan();
         let flat = program.flatten_for_plan();
         if flat.len() != plan.nodes.len() {
             bail!(
@@ -1653,6 +1718,17 @@ impl Evaluator {
         };
 
         for id in plan.topological_order().map_err(anyhow::Error::msg)? {
+            let opaque_or_deferred = matches!(plan.nodes[id.0].kind, PlanNodeKind::Exec { .. })
+                || admitted
+                    .graph()
+                    .effect_summary(id)
+                    .is_some_and(|summary| summary.unknown);
+            if opaque_or_deferred {
+                // The serial oracle is diagnostic, not an authority bypass:
+                // opaque/deferred work receives the same last-moment runtime
+                // freshness check as coordinator-owned work.
+                admitted.verify_runtime(&self.admission_runtime_binding(plan))?;
+            }
             frame.trace.events.push(TraceEvent::NodeReady(id));
             frame.trace.events.push(TraceEvent::NodeStarted(id));
 
@@ -7110,6 +7186,72 @@ python[0]^(O.eval($q, $captured))_python[0]
         );
     }
 
+    #[test]
+    fn graph_coordinator_executes_same_binding_reads_concurrently() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Store {
+                    name: "shared".into(),
+                    expr: Box::new(OIr::Text("frozen".into())),
+                },
+                OIr::Load("shared".into()),
+                OIr::Load("shared".into()),
+            ],
+        };
+        let overlap = crate::executor::parallel::TestOverlapSession::begin(2);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        let value = evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect("same-version reads succeed");
+
+        assert_eq!(value, OValue::str_("frozen"));
+        assert_eq!(scope.get("shared"), Some(&OValue::str_("frozen")));
+        assert!(
+            overlap.peak() > 1,
+            "same-resource reads did not overlap on local workers"
+        );
+    }
+
+    #[test]
+    fn graph_coordinator_discards_later_worker_results_after_first_failure() {
+        let program = OIrProgram {
+            nodes: vec![
+                OIr::Load("missing_first".into()),
+                OIr::Load("missing_second".into()),
+            ],
+        };
+        let overlap = crate::executor::parallel::TestOverlapSession::begin(2);
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let mut scope = HashMap::new();
+
+        let error = evaluator
+            .eval_ir_program_forcing(&program, &mut scope, false)
+            .expect_err("the first missing binding must win")
+            .to_string();
+
+        assert!(error.contains("missing_first"), "got: {error}");
+        assert!(overlap.peak() > 1, "fallible workers did not overlap");
+        let trace = evaluator
+            .last_execution_trace()
+            .expect("failed execution retains a complete trace");
+        assert!(trace.events.iter().any(|event| matches!(
+            event,
+            TraceEvent::NodeFailed {
+                id: PlanNodeId(0),
+                message,
+            } if message.contains("missing_first")
+        )));
+        assert!(trace.events.iter().any(|event| matches!(
+            event,
+            TraceEvent::NodeDiscarded {
+                id: PlanNodeId(1),
+                ..
+            }
+        )));
+    }
+
     fn nested_python_effect_program(path: &std::path::Path, fail_first: bool) -> OIrProgram {
         let registry = BackendRegistry::global();
         let path = format!("{:?}", path);
@@ -7281,5 +7423,42 @@ python[0]^(O.eval($q, $captured))_python[0]
             .unwrap_err()
             .to_string();
         assert!(err.contains("Undefined variable"), "got: {err}");
+    }
+
+    #[test]
+    fn later_fallible_worker_cannot_preempt_earlier_coordinator_failure() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "batch".into(),
+                mode: InvokeMode::Group(GroupMode::Batch),
+                args: vec![
+                    OIr::Invoke {
+                        fn_name: "definitely_unknown_builtin".into(),
+                        mode: InvokeMode::Eager,
+                        args: Vec::new(),
+                    },
+                    OIr::Load("missing_later".into()),
+                ],
+            }],
+        };
+
+        let mut serial = Evaluator::new("/tmp".into());
+        let serial_error = serial
+            .eval_ir_program_forcing(&program, &mut HashMap::new(), true)
+            .unwrap_err()
+            .to_string();
+        let mut graph = Evaluator::new("/tmp".into());
+        let graph_error = graph
+            .eval_ir_program_forcing(&program, &mut HashMap::new(), false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(serial_error.contains("definitely_unknown_builtin"));
+        assert_eq!(graph_error, serial_error);
+        let trace = graph.last_execution_trace().unwrap();
+        assert!(!trace
+            .events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::NodeStarted(PlanNodeId(2)))));
     }
 }

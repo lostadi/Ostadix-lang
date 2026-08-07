@@ -1392,7 +1392,9 @@ whole-program execution representation. The current Rust implementation
 derives, validates, analyzes, and executes a directed state-complete HGraph.
 Arbitrary hosted effects remain conservative: unknown operations are serialized
 through `HostWorld`, persistent evaluator state is carried by actor-state
-tokens, and worker dispatch is restricted to verified pure inline renderers.
+tokens, and worker dispatch is restricted to compiler-verified O-scope loads
+plus source-proven-preparable trees of four trusted pure inline renderers
+(`html`, `markdown`, `text`, and `latex`).
 The serial OIR executor remains the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
