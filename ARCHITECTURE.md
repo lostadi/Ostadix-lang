@@ -176,6 +176,9 @@ footprint.
 The bundle is digest-bound to canonical lowered OIR, the validated plan, the
 solved analyzed graph, analyzer identity, resolved backend artifacts, the
 execution environment, and a descriptive ambient `HostWorld` snapshot. The
+analyzer first rejects lowered backend interfaces that do not match the
+registered language policy and noncanonical special-invocation metadata, so a
+digest cannot turn a consistently forged interface into valid evidence. The
 current binding deliberately does not claim to hash original source bytes,
 because public evaluator entry points may receive an already-lowered
 `OIrProgram`. It also does not digest-bind the caller-owned initial scope shape
@@ -480,17 +483,26 @@ frontiers can still order members of a concurrent group when their effects
 conflict.
 
 `ReadySchedule` derives blockers only from producers of directed operation
-inputs. The coordinator materializes all outputs atomically after successful
-semantic settlement and emits no completion or successor-state token after
-failure. Deterministic settlement order does not stand in for effect ordering.
+inputs. The coordinator durably accepts all outputs atomically at successful
+semantic settlement and emits no completion or successor-state token after a
+selected failure. The one earlier visibility class is explicitly revocable:
+verified-pure admitted-infallible worker outputs may provisionally feed other
+safe workers as described below. Deterministic settlement order does not stand
+in for effect ordering.
 Parallel worker dispatch remains limited to compiler-verified O-scope loads and
 source-proven-preparable trees of the four trusted inline renderers. The
 coordinator freezes their materialized inputs into owned `PreparedTask`
 envelopes and submits them to a fixed-size local pool created once per graph
 execution and reused across changing ready frontiers. Each physical completion
-wakes the coordinator independently; accepted settlement recomputes readiness
-without waiting for every unrelated task from the earlier frontier. Same-binding
-loads share the latest writer frontier and demonstrably execute concurrently.
+wakes the coordinator independently. A successful compiler-verified pure,
+admitted-infallible task may provisionally materialize its value and graph
+outputs before the deterministic semantic frontier reaches it, allowing an
+infallible worker-only dependent pipeline to refill a free slot. If an earlier
+failure wins, those outputs and frame values are revoked and the provisionally
+published task is discarded. `NodeFinished` denotes durable settlement, so a
+provisionally unlocked dependent may emit `NodeStarted` before the producer's
+`NodeFinished`; the admission explanation states this rule. Same-binding loads
+share the latest writer frontier and demonstrably execute concurrently.
 Because a load may fail without external effects, out-of-order outcomes remain
 provisional and settle by serial topological ordinal: fallible loads enter only
 as the contiguous unfinished semantic prefix, the lowest-ordinal failure wins,
@@ -500,7 +512,9 @@ owned operations remain single-owner and the current bounded implementation
 does not overlap them with outstanding local-worker tasks. Worker or pool
 mechanism failures are infrastructure aborts, not semantic program failures;
 started tasks are drained before the trace is finalized. In unwind-capable
-builds, caught worker panics use that path. The release profile uses
+builds, caught worker panics use that path. An error returned by an
+admitted-infallible adapter is also an infrastructure contract violation rather
+than `NodeFailed`. The release profile uses
 `panic = "abort"`, so a release worker panic terminates the process and is not
 claimed to produce an in-process terminal trace.
 
