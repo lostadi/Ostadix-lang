@@ -111,8 +111,12 @@ build_pass() {
 check_elf() {
   local elf="$1"
   local marker="$2"
-  if ! objdump -f "$elf" | grep -Fq 'file format elf64-x86-64' \
-      || ! objdump -f "$elf" | grep -Fq 'start address: 0x0000000002000000' \
+  local file_headers
+  local entry_address
+  file_headers="$(objdump -f "$elf")"
+  entry_address="$(printf '%s\n' "$file_headers" | awk '$1 == "start" && ($2 == "address" || $2 == "address:") { print $NF }')"
+  if ! grep -Fq 'file format elf64-x86-64' <<<"$file_headers" \
+      || [[ "$entry_address" != 0x0000000002000000 ]] \
       || [[ "$(objdump -p "$elf" | grep -Ec '^   STACK ')" != 1 ]] \
       || objdump -p "$elf" | grep -Eq 'NEEDED|RPATH|RUNPATH|INTERP' \
       || objdump -p "$elf" | grep -Eq 'flags [^[:space:]]*w[^[:space:]]*x|flags [^[:space:]]*x[^[:space:]]*w' \
