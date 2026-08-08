@@ -6,7 +6,8 @@ use serde_json::{Map, Number, Value};
 
 const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
 
-pub(crate) fn write_frame<W, T>(writer: &mut W, message: &T) -> Result<()>
+/// Encode one canonical CBOR message with the O backend frame prefix.
+pub fn write_frame<W, T>(writer: &mut W, message: &T) -> Result<()>
 where
     W: Write,
     T: Serialize,
@@ -49,7 +50,8 @@ fn write_frame_payload<W: Write>(writer: &mut W, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>>
+/// Decode one length-prefixed canonical CBOR backend message.
+pub fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>>
 where
     R: Read,
     T: DeserializeOwned,

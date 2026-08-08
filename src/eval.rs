@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -386,6 +387,11 @@ pub struct Evaluator {
     /// tries to run a new command on an actor already suspended awaiting its
     /// own eval result is a precise error rather than a hang.
     suspended_actors: HashSet<(String, u32)>,
+
+    /// Deadline inherited from an admitted worker's `O.eval` callback. Only
+    /// recursive work uses this field; ordinary top-level evaluation retains
+    /// its existing execution contract.
+    callback_operation_deadline: Option<Instant>,
 }
 
 struct IrExecRegion<'a> {
@@ -575,6 +581,7 @@ impl Evaluator {
             backend_authorities,
             default_backend_authority,
             suspended_actors: HashSet::new(),
+            callback_operation_deadline: None,
         }
     }
 
@@ -668,6 +675,10 @@ impl Evaluator {
         &self,
         plan: &ExecutionPlan,
     ) -> crate::evidence::RuntimeBindingV1 {
+        crate::process::lifecycle_trace(
+            "evidence.runtime_binding_started",
+            format!("plan_nodes={}", plan.nodes.len()),
+        );
         let mut registered = self.registered_backends.iter().cloned().collect::<Vec<_>>();
         registered.sort();
         let registered = registered.join(",");
@@ -676,7 +687,7 @@ impl Evaluator {
             Policy::Lazy => "lazy",
             Policy::Autonomous => "autonomous",
         };
-        crate::evidence::runtime_binding_from_directory(
+        let binding = crate::evidence::runtime_binding_from_directory(
             plan,
             &self.shim_dir,
             &[
@@ -687,7 +698,12 @@ impl Evaluator {
                     self.default_backend_authority.as_str(),
                 ),
             ],
-        )
+        );
+        crate::process::lifecycle_trace(
+            "evidence.runtime_binding_finished",
+            format!("plan_nodes={}", plan.nodes.len()),
+        );
+        binding
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1597,6 +1613,23 @@ impl Evaluator {
         outcome
     }
 
+    pub(crate) fn eval_source_with_scope_until(
+        &mut self,
+        src: &str,
+        caller_scope: &HashMap<String, OValue>,
+        deadline: Instant,
+    ) -> Result<OValue> {
+        let outer_deadline = self.callback_operation_deadline;
+        self.callback_operation_deadline = Some(
+            outer_deadline
+                .map(|outer| outer.min(deadline))
+                .unwrap_or(deadline),
+        );
+        let outcome = self.eval_source_with_scope(src, caller_scope);
+        self.callback_operation_deadline = outer_deadline;
+        outcome
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Public API
     // ─────────────────────────────────────────────────────────────────────────
@@ -1774,7 +1807,11 @@ impl Evaluator {
         };
 
         for id in plan.topological_order().map_err(anyhow::Error::msg)? {
-            let opaque_or_deferred = matches!(plan.nodes[id.0].kind, PlanNodeKind::Exec { .. })
+            let launches_backend = matches!(
+                flat[id.0],
+                OIr::Exec { backend, .. } if backend.execution == ExecutionMode::Shim
+            );
+            let opaque_or_deferred = launches_backend
                 || admitted
                     .graph()
                     .effect_summary(id)
@@ -2120,10 +2157,22 @@ impl Evaluator {
             .with_context(|| format!("[{}]", env_label))?;
 
         let result: Result<OValue> = loop {
-            let step = self
-                .registry
-                .recv_exec_step(runtime_lang, env_id, &sandbox)
-                .with_context(|| format!("[{}]", env_label))?;
+            let step = if let Some(deadline) = self.callback_operation_deadline {
+                let remaining =
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or_else(|| {
+                            crate::process::infrastructure_error(anyhow::anyhow!(
+                                "[{}] inherited O.eval callback deadline expired",
+                                env_label
+                            ))
+                        })?;
+                self.registry
+                    .recv_exec_step_timeout(runtime_lang, env_id, &sandbox, remaining)
+            } else {
+                self.registry.recv_exec_step(runtime_lang, env_id, &sandbox)
+            }
+            .with_context(|| format!("[{}]", env_label))?;
 
             match step {
                 ExecStep::Done(v) => break Ok(v),

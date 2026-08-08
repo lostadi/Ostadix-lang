@@ -213,6 +213,9 @@ def command_loop(handle_exec, handle_cleanup=None, handle_ping=None):
                     handle_cleanup()
                 else:
                     send_ok({"t": "null"})
+            elif tag == "shutdown":
+                send_ok({"t": "null"})
+                break
             elif tag == "ping":
                 if handle_ping is not None:
                     handle_ping()

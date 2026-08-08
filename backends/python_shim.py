@@ -550,6 +550,9 @@ while True:
             handle_exec(cmd)
         elif tag == "cleanup":
             handle_cleanup()
+        elif tag == "shutdown":
+            send_ok(None)
+            break
         elif tag == "ping":
             handle_ping()
         else:
