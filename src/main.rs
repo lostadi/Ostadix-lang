@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             && io::stderr().is_terminal() =>
         {
             let (shim_dir, _shim_guard) = resolve_shim_dir(None)?;
-            return run_repl(shim_dir, backends, &backend_grants);
+            return run_repl(shim_dir, backends, &backend_grants, local_workers);
         }
         None if eval_source.is_none() => {
             print_usage(&mut io::stderr())?;
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
                 print_usage(&mut io::stderr())?;
                 bail!("unexpected extra argument after --repl: {}", extra);
             }
-            return run_repl(shim_dir, backends, &backend_grants);
+            return run_repl(shim_dir, backends, &backend_grants, local_workers);
         }
         _ => {}
     }
@@ -223,7 +223,7 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  O --workers N <input.O> [backends_dir]        # bound graph local-worker concurrency"
+        "  O --workers N <input.O> [backends_dir]        # override graph local-worker concurrency"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;
@@ -251,9 +251,17 @@ fn resolve_shim_dir(explicit: Option<PathBuf>) -> Result<(PathBuf, Option<Extrac
 
 // ─── REPL ─────────────────────────────────────────────────────────────────────
 
-fn run_repl(shim_dir: PathBuf, backends: HashSet<String>, backend_grants: &[String]) -> Result<()> {
+fn run_repl(
+    shim_dir: PathBuf,
+    backends: HashSet<String>,
+    backend_grants: &[String],
+    local_workers: Option<usize>,
+) -> Result<()> {
     let color = io::stderr().is_terminal();
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+    if let Some(workers) = local_workers {
+        evaluator = evaluator.with_local_worker_parallelism(workers);
+    }
     let mut scope: HashMap<String, OValue> = HashMap::new();
     for grant in backend_grants {
         evaluator.install_backend_grant(grant, &mut scope)?;

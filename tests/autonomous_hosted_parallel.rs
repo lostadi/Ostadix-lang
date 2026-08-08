@@ -24,7 +24,7 @@ fn python_available() -> bool {
         .unwrap_or(false)
 }
 
-fn run_graph_bounded(source: &str) -> RunOutcome {
+fn run_graph_bounded(source: &str, workers: usize) -> RunOutcome {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workdir = tempfile::tempdir().expect("create isolated test directory");
     let program = workdir.path().join("program.O");
@@ -35,7 +35,7 @@ fn run_graph_bounded(source: &str) -> RunOutcome {
         .arg("--executor")
         .arg("graph")
         .arg("--workers")
-        .arg("2")
+        .arg(workers.to_string())
         .arg(&program)
         .arg(root.join("backends"))
         .current_dir(workdir.path())
@@ -84,6 +84,30 @@ fn run_graph_bounded(source: &str) -> RunOutcome {
     }
 }
 
+const INTERVAL_BATCH: &str = r#"autonomous(batch(
+python^(
+from pathlib import Path
+import os
+import time
+start = time.monotonic_ns()
+time.sleep(0.75)
+end = time.monotonic_ns()
+(Path(os.environ["O_TEST_WORKDIR"]) / "left.interval").write_text(f"{start} {end}\n", encoding="utf-8")
+__oval_result__ = "left"
+)_python,
+python^(
+from pathlib import Path
+import os
+import time
+start = time.monotonic_ns()
+time.sleep(0.75)
+end = time.monotonic_ns()
+(Path(os.environ["O_TEST_WORKDIR"]) / "right.interval").write_text(f"{start} {end}\n", encoding="utf-8")
+__oval_result__ = "right"
+)_python
+))
+"#;
+
 fn assert_success(run: &RunOutcome, context: &str) {
     assert!(
         run.output.status.success(),
@@ -116,31 +140,7 @@ fn explicit_autonomous_ephemeral_python_blocks_overlap() {
         return;
     }
 
-    let run = run_graph_bounded(
-        r#"autonomous(batch(
-python^(
-from pathlib import Path
-import os
-import time
-start = time.monotonic_ns()
-time.sleep(0.75)
-end = time.monotonic_ns()
-(Path(os.environ["O_TEST_WORKDIR"]) / "left.interval").write_text(f"{start} {end}\n", encoding="utf-8")
-__oval_result__ = "left"
-)_python,
-python^(
-from pathlib import Path
-import os
-import time
-start = time.monotonic_ns()
-time.sleep(0.75)
-end = time.monotonic_ns()
-(Path(os.environ["O_TEST_WORKDIR"]) / "right.interval").write_text(f"{start} {end}\n", encoding="utf-8")
-__oval_result__ = "right"
-)_python
-))
-"#,
-    );
+    let run = run_graph_bounded(INTERVAL_BATCH, 2);
     assert_success(&run, "autonomous Python batch");
 
     let left = read_interval(&run.workdir.path().join("left.interval"));
@@ -162,6 +162,24 @@ __oval_result__ = "right"
 }
 
 #[test]
+fn explicit_one_worker_override_serializes_autonomous_blocks() {
+    if !python_available() {
+        eprintln!("skipping: python3 backend runtime is unavailable");
+        return;
+    }
+
+    let run = run_graph_bounded(INTERVAL_BATCH, 1);
+    assert_success(&run, "single-worker autonomous Python batch");
+
+    let left = read_interval(&run.workdir.path().join("left.interval"));
+    let right = read_interval(&run.workdir.path().join("right.interval"));
+    assert!(
+        left.1 <= right.0 || right.1 <= left.0,
+        "one-worker override allowed overlap: left={left:?}, right={right:?}"
+    );
+}
+
+#[test]
 fn ordinary_ephemeral_python_preserves_strict_fail_stop() {
     if !python_available() {
         eprintln!("skipping: python3 backend runtime is unavailable");
@@ -179,6 +197,7 @@ import os
 __oval_result__ = "unexpected"
 )_python
 "#,
+        2,
     );
 
     assert!(
@@ -216,6 +235,7 @@ __oval_result__ = value
 )_python
 ))
 "#,
+        2,
     );
     assert_success(&run, "autonomous worker O.eval callback");
 

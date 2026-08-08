@@ -144,10 +144,55 @@ impl ExecutionAdmissionV3 {
         &self.waves
     }
 
-    /// Stable, non-executing explanation of the exact admitted scheduling
-    /// geometry. Unknown cost/capacity facts remain explicit; waves describe
-    /// legal readiness, not observed worker overlap.
+    pub fn admitted_static_max_wave_width(&self) -> usize {
+        self.waves.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    /// Widest legal static frontier among operations admitted to the local
+    /// worker lane. Coordinator-owned operations do not consume worker slots
+    /// and therefore do not contribute to this bound.
+    pub fn admitted_max_wave_width(&self) -> usize {
+        let local_workers = self
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                (operation.evidence.dispatch_contract.lane == DispatchLaneV1::LocalWorker)
+                    .then_some(operation.plan_node)
+            })
+            .collect::<BTreeSet<_>>();
+        self.waves
+            .iter()
+            .map(|wave| {
+                wave.iter()
+                    .filter(|plan_node| local_workers.contains(plan_node))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Resolve the local-worker count after admission has established the
+    /// widest legal worker frontier. A CLI override is authoritative execution
+    /// policy; otherwise the machine and admitted graph jointly set the bound.
+    pub fn resolved_worker_count(&self, cli_override: Option<usize>) -> usize {
+        resolve_worker_count(
+            cli_override,
+            available_parallelism(),
+            self.admitted_max_wave_width(),
+        )
+    }
+
+    /// Non-executing explanation of the exact admitted scheduling geometry.
+    /// The evidence-bound admission text is stable, while the explicitly
+    /// advisory realizability marker samples the inspection host's current
+    /// parallelism. Waves describe legal readiness, not observed overlap.
     pub fn to_explanation_text(&self) -> String {
+        self.to_explanation_text_with_worker_override(None)
+    }
+
+    /// Render the admission together with a descriptive worker-capacity
+    /// realizability marker. The marker is not part of the admission digest.
+    pub fn to_explanation_text_with_worker_override(&self, cli_override: Option<usize>) -> String {
         let mut out = format!("; ExecutionAdmission {}\n", self.schema);
         writeln!(
             out,
@@ -204,6 +249,33 @@ impl ExecutionAdmissionV3 {
         }
         writeln!(out, "policy {}", policy_name(self.base_policy))
             .expect("writing to a String cannot fail");
+        let available = available_parallelism();
+        let admitted_max_wave_width = self.admitted_max_wave_width();
+        let selected_workers =
+            resolve_worker_count(cli_override, available, admitted_max_wave_width);
+        let worker_count_covers_static_wave = if admitted_max_wave_width == 0 {
+            "not-applicable"
+        } else if selected_workers >= admitted_max_wave_width {
+            "yes"
+        } else {
+            "no"
+        };
+        out.push_str("; ScheduleRealizability oexec.realizability/v1\n");
+        writeln!(
+            out,
+            "realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave={} runtime-readiness=unknown placement-lease=none observed-overlap=not-run source={} available-parallelism={} admitted-static-max-wave-width={} admitted-max-local-worker-wave-width={} selected-workers={}",
+            worker_count_covers_static_wave,
+            if cli_override.is_some() {
+                "cli-override"
+            } else {
+                "machine-default"
+            },
+            available,
+            self.admitted_static_max_wave_width(),
+            admitted_max_wave_width,
+            selected_workers
+        )
+        .expect("writing to a String cannot fail");
 
         for operation in &self.operations {
             let evidence = &operation.evidence;
@@ -316,6 +388,12 @@ impl ExecutionAdmissionV3 {
             "admission-note waves describe the legal static frontier, not observed dispatch\n",
         );
         out.push_str(
+            "admission-note worker-count-covers-static-wave checks local-worker count only; execution realizability remains unknown and no simultaneous dispatch, CPU or memory fit, or overlap is proved\n",
+        );
+        out.push_str(
+            "admission-note admitted maximum local-worker wave width is a static Kahn-wave capacity heuristic, not a bound on the completion-driven dynamic frontier\n",
+        );
+        out.push_str(
             "admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation\n",
         );
         out.push_str(
@@ -350,6 +428,21 @@ impl ExecutionAdmissionV3 {
         );
         out
     }
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+fn resolve_worker_count(
+    cli_override: Option<usize>,
+    available_parallelism: usize,
+    admitted_max_wave_width: usize,
+) -> usize {
+    cli_override
+        .unwrap_or_else(|| std::cmp::min(available_parallelism, admitted_max_wave_width).max(1))
 }
 
 /// Frozen authority boundary consumed by the coordinator. Its fields and
@@ -947,6 +1040,42 @@ mod tests {
         assert!(explanation.contains("fixed-size per-run pool with per-completion wakeups"));
         assert!(explanation
             .contains("verified-pure infallible local-worker outputs may provisionally unlock"));
+        assert_eq!(admitted_a.admission().admitted_max_wave_width(), 2);
+        assert!(explanation.contains(
+            "runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=machine-default"
+        ));
+    }
+
+    #[test]
+    fn default_worker_count_is_bounded_by_machine_and_admitted_width() {
+        assert_eq!(resolve_worker_count(None, 12, 3), 3);
+        assert_eq!(resolve_worker_count(None, 2, 7), 2);
+        assert_eq!(resolve_worker_count(None, 12, 0), 1);
+        assert_eq!(resolve_worker_count(Some(9), 2, 3), 9);
+    }
+
+    #[test]
+    fn coordinator_only_admission_has_no_local_worker_wave() {
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "python".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: crate::ir::BackendRegistry::global().interface_for("python"),
+                body: vec![OIr::Text("__oval_result__ = 1".into())],
+            }],
+        };
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "coordinator-only-width");
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+
+        assert_eq!(admitted.admission().admitted_max_wave_width(), 0);
+        assert!(admitted.admission().to_explanation_text().contains(
+            "worker-count-covers-static-wave=not-applicable runtime-readiness=unknown placement-lease=none observed-overlap=not-run"
+        ));
     }
 
     #[test]
@@ -1211,7 +1340,7 @@ mod tests {
                 args: vec![OIr::Invoke {
                     fn_name: "batch".into(),
                     mode: InvokeMode::Group(GroupMode::Batch),
-                    args: vec![python(1), python(2)],
+                    args: vec![python(1), python(2), python(3), python(4)],
                 }],
             }],
         };
@@ -1226,7 +1355,7 @@ mod tests {
                 node.dispatch_contract.adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
             })
             .collect::<Vec<_>>();
-        assert_eq!(hosted.len(), 2);
+        assert_eq!(hosted.len(), 4);
         assert!(hosted.iter().all(|node| {
             node.dispatch_contract.semantics == DispatchSemanticsV1::ExplicitAutonomousUnordered
                 && node.failure_contract.class
@@ -1234,7 +1363,7 @@ mod tests {
                 && !node.effect_contract.footprint_closed
         }));
 
-        let explanation = admit_execution(
+        let admitted = admit_execution(
             &program,
             &plan,
             graph,
@@ -1242,11 +1371,17 @@ mod tests {
             runtime.clone(),
             evidence.clone(),
         )
-        .unwrap()
-        .admission()
-        .to_explanation_text();
+        .unwrap();
+        assert_eq!(admitted.admission().admitted_max_wave_width(), 4);
+        let explanation = admitted
+            .admission()
+            .to_explanation_text_with_worker_override(Some(2));
         assert!(explanation.contains("adapter=autonomous-ephemeral-shim/v1"));
         assert!(explanation.contains("semantics=explicit-autonomous-unordered"));
+        assert!(explanation.contains(
+            "worker-count-covers-static-wave=no runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=cli-override"
+        ));
+        assert!(explanation.contains("admitted-max-local-worker-wave-width=4 selected-workers=2"));
 
         let mut forged = evidence;
         forged

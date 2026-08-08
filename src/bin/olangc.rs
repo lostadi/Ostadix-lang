@@ -310,6 +310,11 @@ struct Cli {
     #[arg(long)]
     explain_schedule: bool,
 
+    /// Override the local-worker count used by the non-executing schedule
+    /// realizability marker. Requires --target ir --explain-schedule.
+    #[arg(long, value_name = "N")]
+    workers: Option<usize>,
+
     /// Bind grounding output to one logical World. Requires --world-epoch.
     #[arg(long)]
     world_id: Option<String>,
@@ -411,6 +416,7 @@ fn main() -> Result<()> {
             cli.shim_dir.as_deref(),
             cli.grounding,
             grounding_world,
+            cli.workers,
         ),
         CompileTarget::Ir if cli.grounding => dump_ir_with_grounding(&source, grounding_world),
         CompileTarget::Ir => dump_ir(&source),
@@ -421,6 +427,12 @@ fn main() -> Result<()> {
 fn validate_explain_schedule(cli: &Cli) -> Result<()> {
     if cli.explain_schedule && cli.target != CompileTarget::Ir {
         bail!("--explain-schedule is available only with --target ir");
+    }
+    if cli.workers == Some(0) {
+        bail!("--workers must be at least 1");
+    }
+    if cli.workers.is_some() && !cli.explain_schedule {
+        bail!("--workers requires --explain-schedule --target ir");
     }
     Ok(())
 }
@@ -1231,6 +1243,7 @@ fn dump_ir_with_admission(
     shim_dir: Option<&Path>,
     include_grounding: bool,
     world: Option<WorldIdentity>,
+    worker_override: Option<usize>,
 ) -> Result<()> {
     use o_lang::hgraph::solve;
 
@@ -1257,7 +1270,9 @@ fn dump_ir_with_admission(
         "{}\n{}\n{}",
         program.to_text(),
         admitted.graph().to_execution_text(),
-        admitted.admission().to_explanation_text()
+        admitted
+            .admission()
+            .to_explanation_text_with_worker_override(worker_override)
     );
     if let Some(grounding) = grounding {
         print!("\n{}", grounding.to_text());
@@ -2088,7 +2103,38 @@ mod tests {
         ])
         .unwrap();
         assert!(ir.explain_schedule);
+        assert_eq!(ir.workers, None);
         validate_explain_schedule(&ir).unwrap();
+
+        let overridden = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--target",
+            "ir",
+            "--explain-schedule",
+            "--workers",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(overridden.workers, Some(3));
+        validate_explain_schedule(&overridden).unwrap();
+
+        let zero = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--target",
+            "ir",
+            "--explain-schedule",
+            "--workers",
+            "0",
+        ])
+        .unwrap();
+        assert!(validate_explain_schedule(&zero).is_err());
+
+        let without_explanation =
+            Cli::try_parse_from(["olangc", "example.O", "--target", "ir", "--workers", "3"])
+                .unwrap();
+        assert!(validate_explain_schedule(&without_explanation).is_err());
 
         let script = Cli::try_parse_from([
             "olangc",

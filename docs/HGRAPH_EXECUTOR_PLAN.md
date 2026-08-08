@@ -354,9 +354,12 @@ adapter as a second scheduling authority.
 
 For each graph execution containing local-worker operations, the coordinator
 creates one fixed-size pool and reuses its threads across changing readiness
-frontiers. Capacity is the evaluator's machine-derived local parallelism cap,
-bounded by the number of admitted worker operations. It is not evidence-backed
-CPU or memory admission. Each physical completion is delivered independently.
+frontiers. Without an explicit override, capacity is
+`min(available_parallelism, admitted_max_local_worker_wave_width).max(1)`;
+the admitted quantity counts only local-worker operations in each static Kahn
+wave. It is a sizing heuristic and not evidence-backed CPU or memory admission
+or a bound on the completion-driven dynamic frontier. Each physical completion
+is delivered independently.
 The coordinator buffers the provisional outcome, settles every now-eligible
 semantic prefix result, recomputes readiness, and may submit newly exposed
 worker work while an unrelated prior task is still running. A reported static
@@ -441,7 +444,12 @@ operation. `olangc --target dot` renders the solved draft graph's ordinary,
 resource, actor, completion/control, executable, and constraint nodes with
 distinct styles and directed ports. The separate
 `--target ir --explain-schedule` surface compiles admission and reports its
-evidence inputs and digest bindings without execution.
+evidence inputs and digest bindings without execution. It also emits an
+advisory `ScheduleRealizability` marker with the live inspection-host capacity,
+admitted total and local-worker static widths, and selected default or explicit
+worker count. This marker is intentionally outside the admission digest and
+states that runtime availability is unknown, no placement lease exists, and no
+dispatch or overlap was observed.
 
 `ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
 target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
@@ -486,8 +494,12 @@ regressions prove provisional-output revocation after an earlier failure and
 that an infallible-adapter error immediately enters the infrastructure-abort
 path without becoming `NodeFailed` or preempting an earlier semantic failure.
 `scripts/benchmark_hgraph_hosted.sh` alternates release-mode serial and graph
-runs and reports descriptive timing distributions without imposing a speedup
-threshold or treating one machine measurement as a portability claim.
+runs across four fixed shapes: heterogeneous Python/Bash/Node work, a width-one
+dependency chain, a `1 -> 4 -> 1` diamond, and a staged realistic pipeline. It
+reports predicted structural width and unit-cost hosted span, timing
+distributions, and exact serial/graph/expected-output equivalence without
+imposing a speedup threshold or treating one machine measurement as a
+portability claim.
 
 ## Deliberately deferred optimization
 

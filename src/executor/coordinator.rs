@@ -258,15 +258,14 @@ impl<'a> Coordinator<'a> {
             .iter()
             .filter(|op| op.dispatch_lane == DispatchLaneV1::LocalWorker)
             .count();
-        let worker_capacity = evaluator
-            .local_worker_parallelism()
-            .max(1)
-            .min(worker_operations.max(1));
+        let worker_capacity = self
+            .admitted
+            .admission()
+            .resolved_worker_count(evaluator.local_worker_parallelism_override());
         #[cfg(test)]
         let worker_capacity = parallel::worker_count_hint()
             .unwrap_or(worker_capacity)
-            .max(1)
-            .min(worker_operations.max(1));
+            .max(1);
         let mut pool = (worker_operations > 0)
             .then(|| WorkerPool::new(worker_capacity))
             .transpose()?;

@@ -563,6 +563,8 @@ class SourceReleaseTests(unittest.TestCase):
         }
         for path in WORLD_EVIDENCE_RELEASE_PATHS:
             contents[path] = (PROJECT_ROOT / path).read_bytes()
+        for path in release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS:
+            contents[path] = (PROJECT_ROOT / path).read_bytes()
         if files:
             contents.update(files)
         for index in range(FIXTURE_EVIDENCE_GATE_COUNT):
@@ -588,6 +590,7 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/smoke-world-identity-qemu.sh",
                     "ocore/kernel/smoke-aarch64-g2-qemu.sh",
                     "scripts/o-cli.sh",
+                    "scripts/benchmark_hgraph_hosted.sh",
                     "scripts/install-o-cli-wrapper.sh",
                     "scripts/smoke-project-hgraph-exec.sh",
                     "scripts/smoke-project-hgraph.sh",
@@ -641,6 +644,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "assets/logo.bin": b"intentional asset",
                 "backends/__pycache__/shim.pyc": b"bytecode",
                 "backends/shim.py": "print('source')\n",
+                "benchmarks/scratch.txt": "not an exact benchmark release path\n",
                 "c_cpp/O": b"native executable",
                 "c_cpp/src/eval.c": "int eval(void) { return 0; }\n",
                 "c_cpp/src/eval.o": b"object file",
@@ -853,10 +857,12 @@ class SourceReleaseTests(unittest.TestCase):
                 f"ocore/kernel/fixture-evidence-{index:02}.sh"
                 for index in range(FIXTURE_EVIDENCE_GATE_COUNT)
             )
+            included.update(release.HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS)
             excluded = {
                 ".DS_Store",
                 ".ocore-repair-backups/run/typeck.rs",
                 "backends/__pycache__/shim.pyc",
+                "benchmarks/scratch.txt",
                 "c_cpp/O",
                 "c_cpp/src/eval.o",
                 "codebase_tape.md",
@@ -887,6 +893,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "100755",
             )
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
+            self.assertEqual(
+                modes["scripts/benchmark_hgraph_hosted.sh"], "100755"
+            )
             checksums = archive.read(f"{prefix}/{release.CHECKSUMS_NAME}").decode()
             cargo_digest = hashlib.sha256(
                 archive.read(f"{prefix}/Cargo.toml")
@@ -1075,6 +1084,23 @@ class SourceReleaseTests(unittest.TestCase):
             r"missing required path\(s\): boot-and-test\.sh",
         ):
             self._build("missing-launcher.zip")
+
+    def test_hosted_hgraph_benchmark_is_a_required_release_closure(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "benchmarks/hgraph_hosted/heterogeneous.O",
+            "scripts/benchmark_hgraph_hosted.sh",
+            "tests/test_benchmark_hgraph_hosted.py",
+        )
+        self._git("commit", "-q", "-m", "remove hosted benchmark closure")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*heterogeneous\.O.*"
+            r"benchmark_hgraph_hosted\.sh.*test_benchmark_hgraph_hosted\.py",
+        ):
+            self._build("missing-hosted-benchmark.zip")
 
     def test_root_license_is_a_required_release_member(self) -> None:
         self._commit()
