@@ -337,6 +337,10 @@ pub struct Evaluator {
     /// requests.
     scheduler: AutonomousScheduler,
 
+    /// Independent cap for evidence-admitted HGraph local-worker tasks. This
+    /// must not tune the legacy buffered Request scheduler as a side effect.
+    local_worker_parallelism: usize,
+
     /// STEP-4: buffer of non-Eval Requests constructed under
     /// Policy::Autonomous. Flushed by flush_autonomous_buffer() at force
     /// points: end of autonomous(expr) block, explicit now(), document end.
@@ -350,7 +354,7 @@ pub struct Evaluator {
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
-    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV2>,
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV3>,
 
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
@@ -429,7 +433,7 @@ impl GraphEvalFrame {
         Ok(scope)
     }
 
-    fn exec_scope(
+    pub(crate) fn exec_scope(
         &self,
         node_id: PlanNodeId,
         plan: &ExecutionPlan,
@@ -551,6 +555,9 @@ impl Evaluator {
             ),
             Err(err) => panic!("failed to issue default backend authority: {err}"),
         };
+        let local_worker_parallelism = thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(4);
         Evaluator {
             registry: ProcessRegistry::new(),
             shim_dir,
@@ -559,6 +566,7 @@ impl Evaluator {
             executor: Box::new(ImmediateExecutor::new()),
             eval_cache: HashMap::new(),
             scheduler: AutonomousScheduler::new(),
+            local_worker_parallelism,
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
@@ -576,6 +584,14 @@ impl Evaluator {
     /// after construction with the same set passed to the Parser.
     pub fn with_registered_backends(mut self, backends: HashSet<String>) -> Self {
         self.registered_backends = backends;
+        self
+    }
+
+    /// Override the graph executor's process-local worker bound. Hard graph
+    /// dependencies and admission contracts still determine which operations
+    /// are legal to overlap; this only caps the feasible local subset.
+    pub fn with_local_worker_parallelism(mut self, workers: usize) -> Self {
+        self.local_worker_parallelism = workers.max(1);
         self
     }
 
@@ -598,7 +614,7 @@ impl Evaluator {
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
-    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV2> {
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV3> {
         self.last_execution_admission.as_ref()
     }
 
@@ -617,7 +633,11 @@ impl Evaluator {
     /// machine-derived implementation cap, not evidence-backed CPU or memory
     /// admission.
     pub(crate) fn local_worker_parallelism(&self) -> usize {
-        self.scheduler.parallelism.max(1)
+        self.local_worker_parallelism
+    }
+
+    pub(crate) fn shim_path(&self, language: &str) -> PathBuf {
+        BackendRegistry::global().resolve_shim_path(&self.shim_dir, language)
     }
 
     /// Whether the persistent backend actor `(lang, env)` is currently
@@ -834,6 +854,26 @@ impl Evaluator {
         permissions.extend(backend.required_authorities.iter().copied());
         permissions.extend(explicit_permissions.iter().copied());
         BackendSandboxPolicy::new(permissions)
+    }
+
+    /// Resolve the same live authority gate used by coordinator-owned shim
+    /// execution before an explicitly autonomous ephemeral task is handed to
+    /// a worker. The returned immutable sandbox policy travels with the task;
+    /// workers never manufacture authority locally.
+    pub(crate) fn authorize_autonomous_ephemeral_shim(
+        &self,
+        backend: &BackendInterface,
+        authority_scope: &HashMap<String, OValue>,
+    ) -> Result<BackendSandboxPolicy> {
+        let options = BlockOptions::parse(None, &backend.canonical)?;
+        let sandbox = self.backend_sandbox_policy(backend, &options);
+        self.resolve_backend_authority(
+            &backend.canonical,
+            &options,
+            sandbox.permissions(),
+            authority_scope,
+        )?;
+        Ok(sandbox)
     }
 
     /// Auto-resolve a Request under the current policy.
@@ -1531,7 +1571,7 @@ impl Evaluator {
     // caller. Persistent backend environments remain live independently.
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn eval_source_with_scope(
+    pub(crate) fn eval_source_with_scope(
         &mut self,
         src: &str,
         caller_scope: &HashMap<String, OValue>,
@@ -1546,7 +1586,16 @@ impl Evaluator {
             })?;
         let program = OIrProgram::lower(&nodes);
         let mut snapshot = caller_scope.clone();
-        self.eval_ir_program_with_scope(&program, &mut snapshot)
+        let outer_plan = self.last_execution_plan.take();
+        let outer_trace = self.last_execution_trace.take();
+        let outer_admission = self.last_execution_admission.take();
+        let outer_schedule = self.last_hgraph_schedule.take();
+        let outcome = self.eval_ir_program_with_scope(&program, &mut snapshot);
+        self.last_execution_plan = outer_plan;
+        self.last_execution_trace = outer_trace;
+        self.last_execution_admission = outer_admission;
+        self.last_hgraph_schedule = outer_schedule;
+        outcome
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3731,6 +3780,21 @@ mod tests {
         assert!(select_serial_executor(None, Some("legacy")).is_err());
     }
 
+    #[test]
+    fn graph_worker_override_does_not_reconfigure_request_scheduler() {
+        let evaluator = Evaluator::new("/tmp".into());
+        let request_parallelism = evaluator.scheduler.parallelism;
+        let evaluator = evaluator.with_local_worker_parallelism(request_parallelism + 3);
+        assert_eq!(
+            evaluator.scheduler.parallelism, request_parallelism,
+            "the HGraph worker cap must not mutate the separate Request scheduler"
+        );
+        assert_eq!(
+            evaluator.local_worker_parallelism(),
+            request_parallelism + 3
+        );
+    }
+
     // ── render_child: Python ──────────────────────────────────────────────────
 
     #[test]
@@ -5016,6 +5080,29 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_worker_shim_cannot_manufacture_revoked_authority() {
+        let mut evaluator = Evaluator::new("/definitely/missing/shims".into());
+        let default_capability = OValue::capability(
+            CapabilityKind::BackendExecution,
+            evaluator.default_backend_authority.clone(),
+            HashMap::new(),
+        );
+        evaluator
+            .revoke_backend_execution_capability(&default_capability)
+            .unwrap();
+        let backend = BackendRegistry::global().interface_for("python");
+        let error = evaluator
+            .authorize_autonomous_ephemeral_shim(&backend, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("default backend authority")
+                || error.contains("forged, revoked, or from another evaluator"),
+            "unexpected authority diagnostic: {error}"
+        );
+    }
+
+    #[test]
     fn legacy_backend_capability_attrs_do_not_reduce_default_authority() {
         let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
         let mut evaluator = Evaluator::new(shim_dir);
@@ -5860,6 +5947,55 @@ python[0]^(O.eval($q))_python[0]
             !scope.contains_key("callback_only"),
             "O.eval bindings must not mutate the caller's lexical scope"
         );
+    }
+
+    #[test]
+    fn autonomous_worker_callback_restores_outer_execution_artifacts() {
+        let backends = BackendRegistry::global().registered_backend_tags();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let source = r#"
+let lexical = text^(outer-artifact)_text
+let quoted = quote^(text^($lexical)_text)_quote
+autonomous(batch(
+python^(__oval_result__ = O.eval(quoted))_python
+))
+"#;
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+        let expected_plan = OIrProgram::lower(&nodes).plan();
+
+        evaluator.eval_document(nodes).unwrap();
+
+        let plan = evaluator
+            .last_execution_plan()
+            .expect("outer plan remains observable after callback");
+        assert_eq!(plan, &expected_plan);
+        assert!(plan.roots.iter().any(|root| matches!(
+            plan.nodes[root.0].kind,
+            PlanNodeKind::Schedule {
+                kind: crate::ir::PlanScheduleKind::Autonomous,
+                ..
+            }
+        )));
+        let admission = evaluator
+            .last_execution_admission()
+            .expect("outer admission remains observable after callback");
+        assert!(admission
+            .operations()
+            .iter()
+            .all(|operation| operation.plan_node.0 < plan.nodes.len()));
+        let trace = evaluator
+            .last_execution_trace()
+            .expect("outer trace remains observable after callback");
+        assert!(trace.events.iter().all(|event| {
+            let id = match event {
+                TraceEvent::NodeReady(id) | TraceEvent::NodeStarted(id) => *id,
+                TraceEvent::NodeFinished { id, .. }
+                | TraceEvent::NodeFailed { id, .. }
+                | TraceEvent::NodeDiscarded { id, .. } => *id,
+            };
+            id.0 < plan.nodes.len()
+        }));
     }
 
     #[test]

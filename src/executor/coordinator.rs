@@ -27,7 +27,9 @@ use crate::value::OValue;
 
 use super::parallel;
 use super::pool::WorkerPool;
-use super::task::{TaskCompletion, TaskOutcome, TaskSubmission, TaskToken};
+use super::task::{
+    TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken, WorkerEvent,
+};
 use super::trace::TraceSink;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,8 +274,8 @@ impl<'a> Coordinator<'a> {
         loop {
             if let Some(pool) = pool.as_mut() {
                 loop {
-                    let completion = match pool.try_recv_completion() {
-                        Ok(Some(completion)) => completion,
+                    let event = match pool.try_recv_event() {
+                        Ok(Some(event)) => event,
                         Ok(None) => break,
                         Err(error) => {
                             return Err(self.abort_after_worker_error(
@@ -283,7 +285,7 @@ impl<'a> Coordinator<'a> {
                             ));
                         }
                     };
-                    self.accept_worker_completion(pool, completion)?;
+                    self.accept_worker_event_or_abort(evaluator, pool, event)?;
                 }
             }
 
@@ -330,7 +332,7 @@ impl<'a> Coordinator<'a> {
                 let candidates =
                     self.worker_dispatch_candidates(&ready, worker_pool.available_slots());
                 if !candidates.is_empty() {
-                    if let Err(error) = self.dispatch_workers(worker_pool, &candidates) {
+                    if let Err(error) = self.dispatch_workers(evaluator, worker_pool, &candidates) {
                         return Err(self.abort_after_worker_error(
                             Some(worker_pool),
                             "scheduler aborted while submitting prepared local-worker tasks",
@@ -362,8 +364,8 @@ impl<'a> Coordinator<'a> {
             }
 
             if let Some(worker_pool) = pool.as_mut().filter(|pool| pool.outstanding() > 0) {
-                let completion = match worker_pool.recv_completion() {
-                    Ok(completion) => completion,
+                let event = match worker_pool.recv_event() {
+                    Ok(event) => event,
                     Err(error) => {
                         return Err(self.abort_after_worker_error(
                             Some(worker_pool),
@@ -372,7 +374,7 @@ impl<'a> Coordinator<'a> {
                         ));
                     }
                 };
-                self.accept_worker_completion(worker_pool, completion)?;
+                self.accept_worker_event_or_abort(evaluator, worker_pool, event)?;
                 continue;
             }
 
@@ -424,8 +426,12 @@ impl<'a> Coordinator<'a> {
         if !parallel::effect_contract_worker_safe(&self.ops[index].effect, self.flat[id.0]) {
             return false;
         }
-        parallel::adapter_matches(self.ops[index].dispatch_adapter, self.flat[id.0])
-            && parallel::render_inputs_pure(&self.frame, self.plan, id)
+        parallel::adapter_matches(
+            self.ops[index].dispatch_adapter,
+            self.plan,
+            id,
+            self.flat[id.0],
+        ) && parallel::render_inputs_pure(&self.frame, self.plan, id)
     }
 
     fn lowest_unsettled(&self) -> Option<usize> {
@@ -454,6 +460,51 @@ impl<'a> Coordinator<'a> {
             // Do not let preparation of a later speculative task become an
             // observable error before a ready coordinator-frontier operation.
             return Vec::new();
+        }
+
+        // Unknown hosted effects may overlap only among direct members of the
+        // same explicitly autonomous group, and only after every earlier
+        // semantic operation outside that group has settled. This prevents an
+        // autonomous region from leaking speculative effects backward across
+        // its source-order boundary.
+        let mut autonomous_ready = ready
+            .iter()
+            .copied()
+            .filter_map(|index| {
+                (self.ops[index].dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+                    && self.is_worker_safe(index))
+                .then(|| {
+                    crate::hgraph::from_oir::autonomous_ephemeral_group(
+                        self.plan,
+                        self.ops[index].plan_node,
+                        self.flat[self.ops[index].plan_node.0],
+                    )
+                    .map(|group| (index, group))
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        autonomous_ready
+            .sort_by_key(|(index, _)| (self.ops[*index].ordinal, self.ops[*index].plan_node.0));
+        if let Some((first, group)) = autonomous_ready.first().copied() {
+            let boundary_clear = (0..self.ops.len()).all(|index| {
+                self.ops[index].state == OpRunState::Settled
+                    || self.ops[index].ordinal >= self.ops[first].ordinal
+                    || crate::hgraph::from_oir::autonomous_ephemeral_group(
+                        self.plan,
+                        self.ops[index].plan_node,
+                        self.flat[self.ops[index].plan_node.0],
+                    ) == Some(group)
+            });
+            if boundary_clear {
+                return autonomous_ready
+                    .into_iter()
+                    .filter_map(|(index, candidate_group)| {
+                        (candidate_group == group).then_some(index)
+                    })
+                    .take(slots)
+                    .collect();
+            }
         }
 
         // Reserve the front of the pool for the strict fallible prefix before
@@ -506,7 +557,21 @@ impl<'a> Coordinator<'a> {
         selected
     }
 
-    fn dispatch_workers(&mut self, pool: &mut WorkerPool, selected: &[usize]) -> Result<()> {
+    fn dispatch_workers(
+        &mut self,
+        evaluator: &Evaluator,
+        pool: &mut WorkerPool,
+        selected: &[usize],
+    ) -> Result<()> {
+        if selected.iter().any(|&index| {
+            self.ops[index].dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+        }) {
+            // Opaque adapters are rebound immediately before preparation, just
+            // like coordinator-owned shim execution. A path that changed after
+            // admission must fail before Ready/Started is observable.
+            let current_runtime = evaluator.admission_runtime_binding(self.plan);
+            self.admitted.verify_runtime(&current_runtime)?;
+        }
         let mut prepared = Vec::with_capacity(selected.len());
         for &index in selected {
             let id = self.ops[index].plan_node;
@@ -516,6 +581,21 @@ impl<'a> Coordinator<'a> {
                 self.plan,
                 id,
                 self.flat[id.0],
+                match self.ops[index].dispatch_adapter {
+                    DispatchAdapterV1::AutonomousEphemeralShimV1 => {
+                        let OIr::Exec { backend, .. } = self.flat[id.0] else {
+                            unreachable!("ephemeral shim adapter requires an Exec node")
+                        };
+                        let authority_scope = self.frame.scope_from_data_edges(id, self.plan)?;
+                        let sandbox = evaluator
+                            .authorize_autonomous_ephemeral_shim(backend, &authority_scope)?;
+                        Some(parallel::EphemeralShimRuntime::new(
+                            evaluator.shim_path(&backend.canonical),
+                            sandbox,
+                        ))
+                    }
+                    _ => None,
+                },
             )?;
             prepared.push((index, id, task));
         }
@@ -548,6 +628,65 @@ impl<'a> Coordinator<'a> {
                 error,
             )),
         }
+    }
+
+    fn accept_worker_event(
+        &mut self,
+        evaluator: &mut Evaluator,
+        pool: &mut WorkerPool,
+        event: WorkerEvent,
+    ) -> Result<()> {
+        match event {
+            WorkerEvent::Completion(completion) => self.accept_worker_completion(pool, completion),
+            WorkerEvent::EvalRequest(request) => {
+                self.handle_worker_eval_request(evaluator, request)
+            }
+        }
+    }
+
+    /// A malformed callback/completion is a scheduler-infrastructure fault.
+    /// Drain every other started task before returning so a worker blocked on
+    /// its callback reply cannot be stranded during pool destruction.
+    fn accept_worker_event_or_abort(
+        &mut self,
+        evaluator: &mut Evaluator,
+        pool: &mut WorkerPool,
+        event: WorkerEvent,
+    ) -> Result<()> {
+        match self.accept_worker_event(evaluator, pool, event) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.abort_after_worker_error(
+                Some(pool),
+                "scheduler aborted while handling a local-worker event",
+                error,
+            )),
+        }
+    }
+
+    fn handle_worker_eval_request(
+        &mut self,
+        evaluator: &mut Evaluator,
+        request: TaskEvalRequest,
+    ) -> Result<()> {
+        let index = request.token.0;
+        let valid = self.ops.get(index).is_some_and(|op| {
+            op.state == OpRunState::InFlight
+                && op.dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+        });
+        if !valid {
+            request.respond(Err(format!(
+                "local worker requested O.eval for invalid task token {index}"
+            )))?;
+            bail!("local worker requested O.eval for invalid task token {index}");
+        }
+
+        let policy = self.frame.node_policy[self.ops[index].plan_node.0];
+        let saved = evaluator.set_policy(policy);
+        let outcome = evaluator
+            .eval_source_with_scope(&request.src, &request.scope)
+            .map_err(|error| format!("{error:#}"));
+        evaluator.set_policy(saved);
+        request.respond(outcome)
     }
 
     fn buffer_worker_completion(
@@ -689,9 +828,12 @@ impl<'a> Coordinator<'a> {
     fn discard_started_workers(&mut self, pool: Option<&mut WorkerPool>, reason: &str) {
         if let Some(pool) = pool {
             while pool.outstanding() > 0 {
-                match pool.recv_completion() {
-                    Ok(completion) => {
+                match pool.recv_event() {
+                    Ok(WorkerEvent::Completion(completion)) => {
                         let _ = self.buffer_worker_completion(completion);
+                    }
+                    Ok(WorkerEvent::EvalRequest(request)) => {
+                        let _ = request.respond(Err(reason.to_string()));
                     }
                     Err(_) => break,
                 }
@@ -732,11 +874,19 @@ impl<'a> Coordinator<'a> {
         let mut drain_error = None;
         if let Some(pool) = pool {
             while pool.outstanding() > 0 {
-                match pool.recv_completion() {
-                    Ok(completion) => {
+                match pool.recv_event() {
+                    Ok(WorkerEvent::Completion(completion)) => {
                         if let Err(error) = self.buffer_worker_completion(completion) {
-                            drain_error = Some(error);
-                            break;
+                            if drain_error.is_none() {
+                                drain_error = Some(error);
+                            }
+                        }
+                    }
+                    Ok(WorkerEvent::EvalRequest(request)) => {
+                        if let Err(error) = request.respond(Err(reason.to_string())) {
+                            if drain_error.is_none() {
+                                drain_error = Some(error);
+                            }
                         }
                     }
                     Err(error) => {
@@ -848,6 +998,7 @@ impl<'a> Coordinator<'a> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use super::*;
     use crate::evidence::{admit_execution, analyze_execution};
@@ -860,7 +1011,10 @@ mod tests {
     struct PanicPreparedTask;
 
     impl PreparedTask for PanicPreparedTask {
-        fn execute(self: Box<Self>) -> Result<OValue> {
+        fn execute(
+            self: Box<Self>,
+            _context: &crate::executor::task::TaskContext,
+        ) -> Result<OValue> {
             panic!("coordinator infrastructure test panic")
         }
     }
@@ -868,8 +1022,25 @@ mod tests {
     struct ErrorPreparedTask;
 
     impl PreparedTask for ErrorPreparedTask {
-        fn execute(self: Box<Self>) -> Result<OValue> {
+        fn execute(
+            self: Box<Self>,
+            _context: &crate::executor::task::TaskContext,
+        ) -> Result<OValue> {
             bail!("infallible adapter contract violated")
+        }
+    }
+
+    struct CallbackTask {
+        delay: Duration,
+    }
+
+    impl PreparedTask for CallbackTask {
+        fn execute(
+            self: Box<Self>,
+            context: &crate::executor::task::TaskContext,
+        ) -> Result<OValue> {
+            std::thread::sleep(self.delay);
+            context.eval_o_source("text^(callback)_text".to_string(), HashMap::new())
         }
     }
 
@@ -1037,6 +1208,7 @@ mod tests {
             &plan,
             id,
             coordinator.flat[id.0],
+            None,
         )
         .unwrap();
         pool.submit(TaskSubmission::new(TaskToken(first), task))
@@ -1052,6 +1224,74 @@ mod tests {
         assert!(error.to_string().contains("missing_first"), "{error:#}");
         assert!(
             !error.to_string().contains("later pool submission failed"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_callback_event_drains_other_callback_waiters() {
+        let python = |value| OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: BackendRegistry::global().interface_for("python"),
+            body: vec![OIr::Text(format!("__oval_result__ = {value}"))],
+        };
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "autonomous".into(),
+                mode: crate::ir::InvokeMode::Autonomous,
+                args: vec![OIr::Invoke {
+                    fn_name: "batch".into(),
+                    mode: crate::ir::InvokeMode::Group(crate::value::GroupMode::Batch),
+                    args: vec![python(1), python(2)],
+                }],
+            }],
+        };
+        let plan = program.plan();
+        let mut graph = build_program(&program);
+        solve_types(&mut graph).unwrap();
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let runtime = evaluator.admission_runtime_binding(&plan);
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+        let mut coordinator = Coordinator::new(admitted).unwrap();
+        let valid = coordinator
+            .ops
+            .iter()
+            .position(|op| op.dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1)
+            .expect("autonomous hosted operation");
+        coordinator.ops[valid].state = OpRunState::InFlight;
+        coordinator.trace.started(coordinator.ops[valid].plan_node);
+
+        let mut pool = WorkerPool::new(2).unwrap();
+        pool.submit(TaskSubmission::new(
+            TaskToken(usize::MAX),
+            Box::new(CallbackTask {
+                delay: Duration::ZERO,
+            }),
+        ))
+        .unwrap();
+        pool.submit(TaskSubmission::new(
+            TaskToken(valid),
+            Box::new(CallbackTask {
+                delay: Duration::from_millis(50),
+            }),
+        ))
+        .unwrap();
+
+        let event = pool.recv_event().unwrap();
+        let error = coordinator
+            .accept_worker_event_or_abort(&mut evaluator, &mut pool, event)
+            .expect_err("an invalid callback token must abort the worker lane");
+
+        assert_eq!(pool.outstanding(), 0, "every started worker was drained");
+        assert_eq!(coordinator.ops[valid].state, OpRunState::Settled);
+        assert!(
+            error
+                .to_string()
+                .contains("scheduler aborted while handling a local-worker event"),
             "{error:#}"
         );
     }
@@ -1083,6 +1323,7 @@ mod tests {
             &plan,
             first_id,
             coordinator.flat[first_id.0],
+            None,
         )
         .unwrap();
         pool.submit(TaskSubmission::new(TaskToken(first), task))

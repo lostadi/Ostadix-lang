@@ -43,7 +43,7 @@ pub enum ONode {
     /// Introduced in STEP 2 as the surface syntax for the rung-climb operators
     /// `instantiate(expr)`, `realise(drv)`, and the explicit performer `now(req)`.
     /// Each arg is itself an ONode — args can be VarRef, nested Call, or a
-    /// TypedExpr (the latter only at let-binding RHS today).
+    /// TypedExpr.
     ///
     /// Parsed at two positions for step 2:
     ///   1. The RHS of a let-binding:                  `let drv = instantiate($expr)`
@@ -326,10 +326,10 @@ impl<'a> Parser<'a> {
     /// malformed mid-parse (we commit to the call path once we've seen
     /// `name(`).
     ///
-    /// Arguments are themselves ONodes — currently restricted to VarRef
-    /// (`$name`) and nested Call. STEP3 may extend args to include
-    /// TypedExpr (e.g. `instantiate(nix_expr^(...)_nix_expr)`) once the
-    /// surrounding lifecycle is sorted.
+    /// Arguments are themselves ONodes: VarRef (`$name`), nested Call, or a
+    /// typed backend expression. The typed-expression case is what lets an
+    /// explicit coordination group own the operations it coordinates instead
+    /// of forcing users to evaluate them first in separate `let` bindings.
     fn try_parse_call(&mut self) -> Result<Option<ONode>> {
         let original_pos = self.pos;
         let original_line = self.line;
@@ -360,7 +360,7 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Each arg is either a VarRef ($name) or a nested Call (name(...)).
+            // Each arg is a VarRef, nested Call, or typed backend expression.
             let arg = if self.current_byte() == Some(b'$') {
                 let var = self.try_parse_var_ref()?.ok_or_else(|| {
                     anyhow::anyhow!("Line {}: expected variable reference after $", self.line)
@@ -368,9 +368,17 @@ impl<'a> Parser<'a> {
                 ONode::VarRef(var)
             } else if let Some(nested) = self.try_parse_call()? {
                 nested
+            } else if let Some(tag) = self.try_parse_opener()? {
+                let body = self.parse_until(Some(&tag))?;
+                ONode::TypedExpr {
+                    lang: tag.lang,
+                    env_id: tag.env_id,
+                    attr: tag.attr,
+                    body,
+                }
             } else {
                 bail!(
-                    "Line {}: in call `{}(...)`, expected $var or nested call",
+                    "Line {}: in call `{}(...)`, expected $var, nested call, or typed expression",
                     self.line,
                     name
                 );
@@ -830,6 +838,28 @@ mod tests {
         let src = "python^(6 * 7)_python";
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
+        assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn call_arguments_accept_and_roundtrip_typed_expressions() {
+        let src = "autonomous(batch(python^(6 * 7)_python, python^(7 * 8)_python))";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        let ONode::Call { args, .. } = &nodes[0] else {
+            panic!("expected outer autonomous call")
+        };
+        let ONode::Call {
+            fn_name,
+            args: members,
+        } = &args[0]
+        else {
+            panic!("expected nested batch call")
+        };
+        assert_eq!(fn_name, "batch");
+        assert!(members
+            .iter()
+            .all(|member| matches!(member, ONode::TypedExpr { lang, .. } if lang == "python")));
         assert_eq!(reconstruct_source(&nodes), src);
     }
 

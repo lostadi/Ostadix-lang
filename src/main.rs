@@ -23,10 +23,11 @@ fn main() -> Result<()> {
     let mut json_output = false;
     let mut check_only = false;
     let mut eval_source: Option<String> = None;
+    let mut local_workers = None;
     while args.front().is_some_and(|arg| {
         matches!(
             arg.as_str(),
-            "--backend-grant" | "--executor" | "--json" | "--check" | "--eval" | "-e"
+            "--backend-grant" | "--executor" | "--workers" | "--json" | "--check" | "--eval" | "-e"
         )
     }) {
         match args.pop_front().unwrap().as_str() {
@@ -51,6 +52,18 @@ fn main() -> Result<()> {
                     "graph" => env::set_var("O_EXECUTOR", "graph"),
                     other => bail!("unknown --executor value `{other}` (expected serial or graph)"),
                 }
+            }
+            "--workers" => {
+                let raw = args
+                    .pop_front()
+                    .context("--workers requires a positive integer")?;
+                let workers = raw
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --workers value `{raw}`"))?;
+                if workers == 0 {
+                    bail!("--workers must be at least 1");
+                }
+                local_workers = Some(workers);
             }
             _ => unreachable!(),
         }
@@ -129,6 +142,9 @@ fn main() -> Result<()> {
     }
 
     let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends);
+    if let Some(workers) = local_workers {
+        evaluator = evaluator.with_local_worker_parallelism(workers);
+    }
     let mut scope = HashMap::new();
     for grant in &backend_grants {
         evaluator.install_backend_grant(grant, &mut scope)?;
@@ -204,6 +220,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  O --executor serial|graph <input.O> [backends_dir]  # select execution engine (default: graph)"
+    )?;
+    writeln!(
+        out,
+        "  O --workers N <input.O> [backends_dir]        # bound graph local-worker concurrency"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;

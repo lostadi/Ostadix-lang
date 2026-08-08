@@ -955,7 +955,7 @@ mod tests {
             nodes: vec![
                 OIr::Exec {
                     lang: "python".into(),
-                    env_id: u32::MAX,
+                    env_id: 0,
                     attr: None,
                     backend: registry.interface_for("python"),
                     body: vec![OIr::Exec {
@@ -968,7 +968,7 @@ mod tests {
                 },
                 OIr::Exec {
                     lang: "python".into(),
-                    env_id: u32::MAX,
+                    env_id: 0,
                     attr: None,
                     backend: registry.interface_for("python"),
                     body: vec![OIr::Text("B".into())],
@@ -1005,7 +1005,7 @@ mod tests {
         let registry = BackendRegistry::global();
         let python = || OIr::Exec {
             lang: "python".into(),
-            env_id: u32::MAX,
+            env_id: 0,
             attr: None,
             backend: registry.interface_for("python"),
             body: vec![OIr::Text("__oval_result__ = 1".into())],
@@ -1022,6 +1022,83 @@ mod tests {
                 vec![crate::ir::PlanNodeId(3)],
             ]
         );
+    }
+
+    #[test]
+    fn ready_schedule_parallelizes_explicit_autonomous_ephemeral_group() {
+        let registry = BackendRegistry::global();
+        let python = |value| OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: registry.interface_for("python"),
+            body: vec![OIr::Text(format!("__oval_result__ = {value}"))],
+        };
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "autonomous".into(),
+                mode: InvokeMode::Autonomous,
+                args: vec![OIr::Invoke {
+                    fn_name: "batch".into(),
+                    mode: InvokeMode::Group(GroupMode::Batch),
+                    args: vec![python(1), python(2), python(3), python(4)],
+                }],
+            }],
+        };
+
+        let graph = program.hgraph();
+        let waves = ReadySchedule::derive(&graph).unwrap().waves().unwrap();
+        assert_eq!(
+            waves.first(),
+            Some(&vec![
+                crate::ir::PlanNodeId(2),
+                crate::ir::PlanNodeId(4),
+                crate::ir::PlanNodeId(6),
+                crate::ir::PlanNodeId(8),
+            ])
+        );
+    }
+
+    #[test]
+    fn inner_lazy_policy_blocks_outer_autonomous_hosted_dispatch() {
+        let registry = BackendRegistry::global();
+        let python = |value| OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: registry.interface_for("python"),
+            body: vec![OIr::Text(format!("__oval_result__ = {value}"))],
+        };
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "autonomous".into(),
+                mode: InvokeMode::Autonomous,
+                args: vec![OIr::Invoke {
+                    fn_name: "lazy".into(),
+                    mode: InvokeMode::Lazy,
+                    args: vec![OIr::Invoke {
+                        fn_name: "batch".into(),
+                        mode: InvokeMode::Group(GroupMode::Batch),
+                        args: vec![python(1), python(2)],
+                    }],
+                }],
+            }],
+        };
+        let plan = program.plan();
+        let flat = program.flatten_for_plan();
+        for node in &plan.nodes {
+            if matches!(node.kind, crate::ir::PlanNodeKind::Exec { .. }) {
+                assert_eq!(
+                    crate::hgraph::from_oir::autonomous_ephemeral_group(
+                        &plan,
+                        node.id,
+                        flat[node.id.0]
+                    ),
+                    None,
+                    "an inner lazy(...) policy must override an outer autonomous(...)"
+                );
+            }
+        }
     }
 
     #[test]
