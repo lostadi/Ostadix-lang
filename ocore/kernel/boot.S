@@ -1766,8 +1766,15 @@ ocore_user_probe_nx:
 .globl ocore_user_probe_noncanonical
 .type ocore_user_probe_noncanonical, @function
 ocore_user_probe_noncanonical:
+  // IRETQ performs the architecturally required canonicality check before
+  // committing this same-CPL return. Older QEMU releases incorrectly report
+  // an indirect jump to this address as #PF rather than the expected #GP.
+  sub rsp, 0x20
+  pushfq
+  push 0x23
   movabs rax, 0x0000800000000000
-  jmp rax
+  push rax
+  iretq
 .size ocore_user_probe_noncanonical, .-ocore_user_probe_noncanonical
 
 .globl ocore_user_probe_bad_return
