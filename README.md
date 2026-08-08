@@ -4,7 +4,7 @@
 
 # Ostadix-lang
 
-*By Lee Ostadi*
+*By Lee Daghlar Ostadi*
 
 [![CI](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/ci.yml)
 [![Parser fuzz campaign](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml/badge.svg)](https://github.com/lostadi/Ostadix-lang/actions/workflows/fuzz.yml)
@@ -2501,6 +2501,18 @@ The marker is live, advisory, and outside the admission digest. In particular,
 `K >= W`; it does not prove simultaneous dispatch, CPU, memory, device or I/O
 fit, backend readiness, placement, or observed speedup. Static waves describe
 graph legality only; they are not runtime batches or completion order.
+
+The same explanation also emits one machine-readable
+`oexec.schedule-prediction/v1` record. It projects the exact admitted dependency
+DAG onto shim-backed hosted execution: hosted operations have unit cost and all
+other admitted operations have zero cost. Weighted longest-path depth defines
+the emitted hosted-task layers; `predicted-width` is the largest layer and
+`predicted-span` is the number of layers. The record includes its admission
+SHA-256 and exact layer membership. It is derived after admission and remains
+outside that digest; `admission-sha256` is a reference to the enclosing
+admission rather than a circular self-binding. This is a static topology model,
+not a duration estimate, resource-capacity proof, dispatch trace, or overlap
+claim.
 
 The reproducible four-shape hosted benchmark, expected outputs, methodology,
 and single-core wait-overlap caveat are documented in

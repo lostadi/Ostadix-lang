@@ -10,6 +10,7 @@ workers=${HGRAPH_BENCH_WORKERS:-4}
 selected_shape=${HGRAPH_BENCH_SHAPE:-all}
 missing_runtime_policy=${HGRAPH_BENCH_MISSING_RUNTIME:-skip}
 o_bin=${O_RELEASE_BIN:-$ROOT/target/release/O}
+olangc_bin=${OLANGC_RELEASE_BIN:-$(dirname -- "$o_bin")/olangc}
 backends_dir=${O_BACKENDS_DIR:-$ROOT/backends}
 fixture_dir=$ROOT/benchmarks/hgraph_hosted
 
@@ -37,6 +38,7 @@ Environment overrides:
   HGRAPH_BENCH_SHAPE
   HGRAPH_BENCH_MISSING_RUNTIME
   O_RELEASE_BIN
+  OLANGC_RELEASE_BIN
   O_BACKENDS_DIR
 EOF
 }
@@ -178,28 +180,15 @@ if [[ ! -x "$o_bin" ]]; then
     printf 'build it with: cargo build --release --locked --bin O\n' >&2
     exit 1
 fi
+if [[ ! -x "$olangc_bin" ]]; then
+    printf 'release olangc binary is missing or not executable: %s\n' "$olangc_bin" >&2
+    printf 'build it with: cargo build --release --locked --bin olangc\n' >&2
+    exit 1
+fi
 if [[ ! -d "$backends_dir" ]]; then
     printf 'backend directory does not exist: %s\n' "$backends_dir" >&2
     exit 1
 fi
-
-shape_width() {
-    case "$1" in
-        heterogeneous) printf '3\n' ;;
-        chained) printf '1\n' ;;
-        mixed_width) printf '4\n' ;;
-        realistic) printf '2\n' ;;
-    esac
-}
-
-shape_span() {
-    case "$1" in
-        heterogeneous) printf '1\n' ;;
-        chained) printf '4\n' ;;
-        mixed_width) printf '3\n' ;;
-        realistic) printf '3\n' ;;
-    esac
-}
 
 shape_runtimes() {
     case "$1" in
@@ -280,6 +269,171 @@ if "__SLEEP_" in text:
     raise SystemExit(f"fixture contains an unresolved timing placeholder: {source}")
 destination.write_text(text, encoding="utf-8")
 PY
+}
+
+analyze_fixture() {
+    local shape=$1 program=$2 shape_dir=$3
+    local explanation=$shape_dir/explain-schedule.txt
+    local fields=$shape_dir/prediction-fields.txt
+
+    if ! "$olangc_bin" "$program" \
+        --target ir \
+        --explain-schedule \
+        --workers "$workers" \
+        --shim-dir "$backends_dir" >"$explanation"
+    then
+        printf 'shape=%s schedule_analysis=failed\n' "$shape" >&2
+        return 1
+    fi
+
+    if ! python3 - "$explanation" >"$fields" <<'PY'
+import re
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+admission_schema = "oexec.admission/v3"
+admission_header = f"; ExecutionAdmission {admission_schema}"
+admission_headers = [
+    line for line in lines if line.startswith("; ExecutionAdmission ")
+]
+if admission_headers != [admission_header]:
+    raise SystemExit(f"expected exactly one {admission_header!r} marker")
+
+digest_pattern = r"[0-9a-f]{64}"
+binding_pattern = re.compile(
+    rf"binding analyzer-sha256=({digest_pattern}) "
+    rf"evidence-sha256=({digest_pattern}) "
+    rf"admitted-graph-sha256=({digest_pattern}) "
+    rf"admission-sha256=({digest_pattern})"
+)
+admission_binding_lines = [
+    line for line in lines if line.startswith("binding analyzer-sha256=")
+]
+if len(admission_binding_lines) != 1:
+    raise SystemExit("expected exactly one canonical admission digest binding")
+admission_binding = binding_pattern.fullmatch(admission_binding_lines[0])
+if admission_binding is None:
+    raise SystemExit("malformed canonical admission digest binding")
+admission_sha256 = admission_binding.group(4)
+
+schema = "oexec.schedule-prediction/v1"
+header = f"; SchedulePrediction {schema}"
+prediction_headers = [
+    line for line in lines if line.startswith("; SchedulePrediction ")
+]
+if prediction_headers != [header]:
+    raise SystemExit(f"expected exactly one {header!r} marker")
+
+summaries = [line for line in lines if line.startswith("schedule-prediction ")]
+if len(summaries) != 1:
+    raise SystemExit("expected exactly one schedule-prediction record")
+
+fields = {}
+for item in summaries[0].split()[1:]:
+    if "=" not in item:
+        raise SystemExit(f"malformed schedule-prediction field: {item!r}")
+    key, value = item.split("=", 1)
+    if key in fields:
+        raise SystemExit(f"duplicate schedule-prediction field: {key}")
+    fields[key] = value
+
+required = {
+    "schema",
+    "status",
+    "provenance",
+    "model",
+    "admission-sha256",
+    "task-count",
+    "predicted-width",
+    "predicted-span",
+    "span-unit",
+}
+if set(fields) != required:
+    raise SystemExit(
+        "schedule-prediction fields differ from the v1 contract: "
+        f"missing={sorted(required - set(fields))}, "
+        f"unexpected={sorted(set(fields) - required)}"
+    )
+if fields["schema"] != schema:
+    raise SystemExit(f"unsupported schedule-prediction schema: {fields['schema']}")
+if fields["status"] != "admitted-static":
+    raise SystemExit(f"unexpected prediction status: {fields['status']}")
+if fields["provenance"] != "evidence-bound-admission":
+    raise SystemExit(f"unexpected prediction provenance: {fields['provenance']}")
+if fields["model"] != "unit-cost-shim-hosted-tasks":
+    raise SystemExit(f"unexpected prediction model: {fields['model']}")
+if fields["span-unit"] != "hosted-task-layers":
+    raise SystemExit(f"unexpected prediction span unit: {fields['span-unit']}")
+if re.fullmatch(r"[0-9a-f]{64}", fields["admission-sha256"]) is None:
+    raise SystemExit("prediction admission digest is not lowercase SHA-256")
+if fields["admission-sha256"] != admission_sha256:
+    raise SystemExit("prediction digest does not match the enclosing admission")
+
+numeric = {}
+for key in ("task-count", "predicted-width", "predicted-span"):
+    if re.fullmatch(r"[1-9][0-9]*", fields[key]) is None:
+        raise SystemExit(f"{key} must be a positive integer")
+    numeric[key] = int(fields[key])
+
+layer_pattern = re.compile(
+    r"schedule-prediction-layer index=([1-9][0-9]*) operations=\[(P[0-9]+(?:,P[0-9]+)*)\]"
+)
+layers = []
+seen_operations = set()
+for line in lines:
+    if not line.startswith("schedule-prediction-layer "):
+        continue
+    match = layer_pattern.fullmatch(line)
+    if match is None:
+        raise SystemExit(f"malformed schedule-prediction layer: {line!r}")
+    index = int(match.group(1))
+    if index != len(layers) + 1:
+        raise SystemExit("schedule-prediction layer indices are not contiguous")
+    operations = match.group(2).split(",")
+    duplicate = seen_operations.intersection(operations)
+    if duplicate:
+        raise SystemExit(f"hosted operation appears in multiple layers: {sorted(duplicate)}")
+    seen_operations.update(operations)
+    layers.append(operations)
+
+if len(layers) != numeric["predicted-span"]:
+    raise SystemExit("predicted span does not match the emitted layer count")
+if sum(map(len, layers)) != numeric["task-count"]:
+    raise SystemExit("predicted task count does not match the emitted layers")
+if max(map(len, layers)) != numeric["predicted-width"]:
+    raise SystemExit("predicted width does not match the emitted layers")
+
+print(
+    "\t".join(
+        [
+            fields["schema"],
+            fields["provenance"],
+            fields["model"],
+            fields["admission-sha256"],
+            fields["task-count"],
+            fields["predicted-width"],
+            fields["predicted-span"],
+            fields["span-unit"],
+        ]
+    )
+)
+PY
+    then
+        printf 'shape=%s schedule_prediction=invalid\n' "$shape" >&2
+        return 1
+    fi
+
+    IFS=$'\t' read -r \
+        prediction_schema \
+        prediction_provenance \
+        prediction_model \
+        prediction_admission_sha256 \
+        predicted_hosted_tasks \
+        predicted_width \
+        predicted_span \
+        predicted_span_unit <"$fields"
 }
 
 run_once() {
@@ -365,6 +519,8 @@ run_pair() {
         printf '%s\n' "$serial_ms" >>"$shape_dir/serial-ms.txt"
         printf '%s\n' "$graph_ms" >>"$shape_dir/graph-ms.txt"
     fi
+    printf 'shape=%s pair_phase=%s pair_ordinal=%s order=%s,%s serial_elapsed_ms=%s graph_elapsed_ms=%s semantic_equivalence=true expected_output_match=true\n' \
+        "$shape" "$phase" "$ordinal" "$first" "$second" "$serial_ms" "$graph_ms" >&2
 }
 
 canonicalize_expected_output() {
@@ -444,11 +600,39 @@ if [[ -z "$memory_bytes" || "$memory_bytes" == unknown ]] && [[ -r /proc/meminfo
 fi
 [[ -n "$memory_bytes" ]] || memory_bytes=unknown
 
-binary_sha256=unknown
-if command -v shasum >/dev/null 2>&1; then
-    binary_sha256=$(shasum -a 256 "$o_bin" | awk '{print $1}')
-elif command -v sha256sum >/dev/null 2>&1; then
-    binary_sha256=$(sha256sum "$o_bin" | awk '{print $1}')
+sha256_file() {
+    python3 - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+digest = hashlib.sha256()
+try:
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+except OSError as exc:
+    raise SystemExit(f"cannot hash executable {path}: {exc}")
+print(digest.hexdigest())
+PY
+}
+
+if ! binary_sha256=$(sha256_file "$o_bin"); then
+    printf 'failed to hash O binary: %s\n' "$o_bin" >&2
+    exit 1
+fi
+if ! olangc_binary_sha256=$(sha256_file "$olangc_bin"); then
+    printf 'failed to hash olangc binary: %s\n' "$olangc_bin" >&2
+    exit 1
+fi
+if [[ ! "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'O binary hash is not lowercase SHA-256: %s\n' "$binary_sha256" >&2
+    exit 1
+fi
+if [[ ! "$olangc_binary_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'olangc binary hash is not lowercase SHA-256: %s\n' "$olangc_binary_sha256" >&2
+    exit 1
 fi
 
 git_commit=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
@@ -471,6 +655,8 @@ printf 'git_commit=%s\n' "$git_commit"
 printf 'git_tree_state=%s\n' "$git_tree_state"
 printf 'o_binary=%s\n' "$o_bin"
 printf 'o_binary_sha256=%s\n' "$binary_sha256"
+printf 'olangc_binary=%s\n' "$olangc_bin"
+printf 'olangc_binary_sha256=%s\n' "$olangc_binary_sha256"
 printf 'backends_dir=%s\n' "$backends_dir"
 printf 'warmups=%s\n' "$warmups"
 printf 'repetitions=%s\n' "$repetitions"
@@ -504,16 +690,28 @@ for shape in "${shapes[@]}"; do
     fi
     required=$(shape_runtimes "$shape")
     missing=$(missing_runtimes_for "$required")
-    width=$(shape_width "$shape")
-    span=$(shape_span "$shape")
+    shape_dir=$work_dir/$shape
+    mkdir -p "$shape_dir"
+    program=$shape_dir/$shape.O
+    expected_semantic=$shape_dir/expected-semantic.json
+    render_fixture "$fixture" "$program"
+    if ! analyze_fixture "$shape" "$program" "$shape_dir"; then
+        exit 1
+    fi
 
     printf '\nshape=%s.O\n' "$shape"
     printf 'fixture=%s\n' "$fixture"
     printf 'required_runtimes=%s\n' "$required"
     printf 'missing_runtimes=%s\n' "$missing"
-    printf 'predicted_width=%s\n' "$width"
-    printf 'predicted_span=%s\n' "$span"
-    printf 'predicted_span_unit=hosted-task-layers\n'
+    printf 'prediction_source=olangc--explain-schedule\n'
+    printf 'prediction_schema=%s\n' "$prediction_schema"
+    printf 'prediction_provenance=%s\n' "$prediction_provenance"
+    printf 'prediction_model=%s\n' "$prediction_model"
+    printf 'prediction_admission_sha256=%s\n' "$prediction_admission_sha256"
+    printf 'predicted_hosted_tasks=%s\n' "$predicted_hosted_tasks"
+    printf 'predicted_width=%s\n' "$predicted_width"
+    printf 'predicted_span=%s\n' "$predicted_span"
+    printf 'predicted_span_unit=%s\n' "$predicted_span_unit"
 
     if [[ "$missing" != none ]]; then
         printf 'status=skipped\n'
@@ -528,11 +726,6 @@ for shape in "${shapes[@]}"; do
         continue
     fi
 
-    shape_dir=$work_dir/$shape
-    mkdir -p "$shape_dir"
-    program=$shape_dir/$shape.O
-    expected_semantic=$shape_dir/expected-semantic.json
-    render_fixture "$fixture" "$program"
     canonicalize_expected_output "$expected_output" "$expected_semantic"
     : >"$shape_dir/serial-ms.txt"
     : >"$shape_dir/graph-ms.txt"

@@ -508,10 +508,13 @@ path without becoming `NodeFailed` or preempting an earlier semantic failure.
 `scripts/benchmark_hgraph_hosted.sh` alternates release-mode serial and graph
 runs across four fixed shapes: heterogeneous Python/Bash/Node work, a width-one
 dependency chain, a `1 -> 4 -> 1` diamond, and a staged realistic pipeline. It
-reports predicted structural width and unit-cost hosted span, timing
-distributions, and exact serial/graph/expected-output equivalence without
-imposing a speedup threshold or treating one machine measurement as a
-portability claim.
+feeds each exact rendered fixture through the non-executing evidence/admission
+path and consumes the versioned `oexec.schedule-prediction/v1` hosted-task
+width/span projection before timing. It fails closed on an invalid prediction,
+records the analyzer and execution-binary digests plus the prediction's
+admission digest, emits per-pair timings and distributions, and checks exact
+serial/graph/expected-output equivalence without imposing a speedup threshold
+or treating one machine measurement as a portability claim.
 
 ## Deliberately deferred optimization
 

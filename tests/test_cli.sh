@@ -257,6 +257,9 @@ EOF
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
         '^; ScheduleRealizability oexec\.realizability/v1$' \
         '^realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave=not-applicable runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=machine-default available-parallelism=[1-9][0-9]* admitted-static-max-wave-width=[0-9]+ admitted-max-local-worker-wave-width=0 selected-workers=1$' \
+        '^; SchedulePrediction oexec\.schedule-prediction/v1$' \
+        '^schedule-prediction schema=oexec\.schedule-prediction/v1 status=admitted-static provenance=evidence-bound-admission model=unit-cost-shim-hosted-tasks admission-sha256=[0-9a-f]{64} task-count=1 predicted-width=1 predicted-span=1 span-unit=hosted-task-layers$' \
+        '^schedule-prediction-layer index=1 operations=\[P[0-9]+\]$' \
         '^operation P[0-9]+ admitted=yes ' \
         '^  dispatch lane=coordinator adapter=coordinator/v1 semantics=strict-equivalent preparation=coordinator-owned$' \
         '^wave 0 \[' \
@@ -296,6 +299,10 @@ EOF
     fi
     if ! grep -Eq -- '^realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave=no runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=cli-override available-parallelism=[1-9][0-9]* admitted-static-max-wave-width=[0-9]+ admitted-max-local-worker-wave-width=2 selected-workers=1$' "$STDOUT_FILE"; then
         fail "$desc" "(schedule explanation omitted the two-worker capacity marker)"
+        return
+    fi
+    if ! grep -Eq -- '^schedule-prediction schema=oexec\.schedule-prediction/v1 status=admitted-static provenance=evidence-bound-admission model=unit-cost-shim-hosted-tasks admission-sha256=[0-9a-f]{64} task-count=2 predicted-width=2 predicted-span=1 span-unit=hosted-task-layers$' "$STDOUT_FILE"; then
+        fail "$desc" "(schedule explanation omitted the admitted hosted-task prediction)"
         return
     fi
     if [ "$(grep -Ec '^  dispatch lane=local-worker adapter=autonomous-ephemeral-shim/v1 semantics=explicit-autonomous-unordered preparation=deferred-materialized-input-check$' "$STDOUT_FILE")" -ne 2 ]; then
