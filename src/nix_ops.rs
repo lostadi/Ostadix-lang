@@ -127,7 +127,7 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
 /// Parse the outputs array from `nix derivation show` JSON.
 ///
 /// The shape is:
-///   { "/nix/store/<hash>-<name>.drv": { "outputs": { "out": {...}, "dev": {...} } } }
+/// `{ "/nix/store/<hash>-<name>.drv": { "outputs": { "out": {...}, "dev": {...} } } }`
 ///
 /// We return the keys of the inner `outputs` map.
 fn parse_outputs_from_show(json_bytes: &[u8], drv_path: &str) -> Result<Vec<String>> {

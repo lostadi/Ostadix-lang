@@ -289,8 +289,13 @@ that contains local-worker operations and MUST reuse its workers across changing
 ready frontiers. Let `W` be the maximum count of `LocalWorker` operations in
 any admitted static Kahn wave. Unless the caller supplies a positive explicit
 override, pool capacity MUST be
-`min(std::thread::available_parallelism(), W).max(1)`. An explicit override
-MUST replace that derived value. The resulting task-count cap is execution
+`min(std::thread::available_parallelism(), W).max(1)`. If
+`std::thread::available_parallelism()` cannot report a value, the implementation
+MUST substitute one before applying that formula. An explicit override MUST
+replace the derived value without an additional host- or wave-width clamp. A
+graph with no `LocalWorker` operations MUST NOT create a pool, even though the
+shared count resolver returns its minimum value of one. The resulting
+task-count cap is execution
 policy, not evidence-backed CPU or memory admission; `W` is a conservative
 capacity heuristic, not a bound on the completion-driven dynamic frontier.
 Each physical completion MUST wake the coordinator independently; the runtime
@@ -349,12 +354,32 @@ only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 wave is evidence of legal readiness,
 not proof that every member used a worker, ran together, or fit the pool. Static
 waves MUST NOT be presented as dynamic dispatch batches or observed completion
-order. The explanation MUST include an advisory realizability marker containing
-the inspection host's available parallelism, the maximum total static-wave
-width, the maximum local-worker static-wave width, and the selected default or
-explicit override. That marker MUST remain outside the admission digest and
-MUST report that dispatch was not run, external-runtime readiness is unknown,
-no placement lease was established, and overlap was not observed. Admitted
+order. The explanation MUST include an advisory realizability marker with
+schema ID `oexec.realizability/v1`, headed by
+`; ScheduleRealizability oexec.realizability/v1`. Its single `realizability`
+record MUST have the following fields and meanings:
+
+| Field | Required value or meaning |
+|---|---|
+| `status` | `inspection-only`; this is not a dispatch snapshot. |
+| `execution-realizable` | `unknown`; the record MUST NOT assert execution feasibility. |
+| `dispatch` | `not-run`; inspection dispatches no operation. |
+| `scope` | `local-worker-static-wave`; only the worker subset of static Kahn waves is compared with capacity. |
+| `worker-count-covers-static-wave` | `not-applicable` when `W=0`; otherwise `yes` exactly when `selected-workers >= W`, and `no` otherwise. |
+| `runtime-readiness` | `unknown`; external runtime availability is not established. |
+| `placement-lease` | `none`; no current placement authority is minted. |
+| `observed-overlap` | `not-run`; inspection provides no overlap observation. |
+| `source` | `machine-default` for the derived count or `cli-override` for the inspection-only `--workers N` value. |
+| `available-parallelism` | The inspection host's reported value, or `1` when that platform query fails. |
+| `admitted-static-max-wave-width` | Maximum total operation count in an admitted static wave, including coordinator-owned operations; it is not a worker-slot demand. |
+| `admitted-max-local-worker-wave-width` | `W`, the maximum `LocalWorker` subset of an admitted static wave; it is a sizing heuristic, not a dynamic-frontier bound. |
+| `selected-workers` | The positive derived or explicit pool-capacity value. If `W=0`, it is still reported as at least one although execution creates no pool. |
+
+That marker MUST remain outside the admission digest. Neither
+`worker-count-covers-static-wave=yes` nor any width/count field proves
+simultaneous dispatch, CPU or memory fit, device or I/O capacity, backend
+readiness, placement, overlap, or execution realizability. An explicit
+inspection override MUST NOT be presented as a host-capacity fact. Admitted
 O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
