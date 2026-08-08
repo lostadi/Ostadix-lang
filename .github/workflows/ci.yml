@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [master, main]
   pull_request:
@@ -297,7 +298,9 @@ jobs:
   # ── O-core architectural and allocator proof ───────────────────────────────
   ocore-qemu:
     name: O-core QEMU proof
-    runs-on: ubuntu-latest
+    # Use the supported QEMU 9.2+ floor containing the real-mode NPT fix.
+    # Ubuntu 24.04 ships the affected QEMU 8.2.2 release.
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -312,6 +315,7 @@ jobs:
           command -v llvm-objdump
           command -v nm
           command -v qemu-system-aarch64
+          qemu-system-x86_64 --version
 
       - name: Verify isolated minimal Linux personality corpus
         run: ocore/kernel/check-linux-minimal-slice.sh
