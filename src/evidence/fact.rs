@@ -2,9 +2,9 @@ use crate::effects::ResourceKey;
 use crate::hgraph::AdmissionFactKind;
 use crate::ir::PlanNodeId;
 
-pub const EVIDENCE_SCHEMA_V2: &str = "oexec.evidence/v2";
-pub const ADMISSION_SCHEMA_V2: &str = "oexec.admission/v2";
-pub const ANALYZER_ID_V2: &str = "ostadix-oir-evidence-compiler/v2";
+pub const EVIDENCE_SCHEMA_V3: &str = "oexec.evidence/v3";
+pub const ADMISSION_SCHEMA_V3: &str = "oexec.admission/v3";
+pub const ANALYZER_ID_V3: &str = "ostadix-oir-evidence-compiler/v3";
 
 /// Strength and origin of a pre-execution fact. Declaration order is not used
 /// as an authorization lattice; callers must use the explicit predicates.
@@ -77,6 +77,7 @@ pub enum DispatchAdapterV1 {
     CoordinatorV1,
     OScopeLoadV1,
     TrustedInlineRendererV1,
+    AutonomousEphemeralShimV1,
 }
 
 impl DispatchAdapterV1 {
@@ -85,6 +86,7 @@ impl DispatchAdapterV1 {
             Self::CoordinatorV1 => "coordinator/v1",
             Self::OScopeLoadV1 => "o-scope-load/v1",
             Self::TrustedInlineRendererV1 => "trusted-inline-renderer/v1",
+            Self::AutonomousEphemeralShimV1 => "autonomous-ephemeral-shim/v1",
         }
     }
 
@@ -93,10 +95,28 @@ impl DispatchAdapterV1 {
     }
 }
 
+/// Whether dispatch preserves strict serial observability or relies on an
+/// explicit source-level opt-in to unordered external effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchSemanticsV1 {
+    StrictEquivalent,
+    ExplicitAutonomousUnordered,
+}
+
+impl DispatchSemanticsV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StrictEquivalent => "strict-equivalent",
+            Self::ExplicitAutonomousUnordered => "explicit-autonomous-unordered",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClassV1 {
     Infallible,
     MayFailNoExternalEffects,
+    MayFailUnorderedExternalEffects,
     Transactional,
     Idempotent,
     Compensatable,
@@ -109,6 +129,7 @@ impl FailureClassV1 {
         match self {
             Self::Infallible => "infallible",
             Self::MayFailNoExternalEffects => "may-fail-no-external-effects",
+            Self::MayFailUnorderedExternalEffects => "may-fail-unordered-external-effects",
             Self::Transactional => "transactional",
             Self::Idempotent => "idempotent",
             Self::Compensatable => "compensatable",
@@ -174,6 +195,7 @@ pub struct EffectContractV1 {
 pub struct DispatchContractV1 {
     pub lane: DispatchLaneV1,
     pub adapter: DispatchAdapterV1,
+    pub semantics: DispatchSemanticsV1,
     /// The adapter can build a Send-only envelope after all value inputs are
     /// materialized. This is availability of a preparation contract, not a
     /// claim that the operation has already been prepared.
@@ -340,7 +362,7 @@ pub struct EvidenceBindingsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidenceBundleV2 {
+pub struct EvidenceBundleV3 {
     pub(crate) schema: &'static str,
     pub(crate) analyzer: &'static str,
     pub(crate) bindings: EvidenceBindingsV1,
@@ -348,7 +370,7 @@ pub struct EvidenceBundleV2 {
     pub(crate) nodes: Vec<NodeEvidence>,
 }
 
-impl EvidenceBundleV2 {
+impl EvidenceBundleV3 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }

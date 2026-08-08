@@ -19,10 +19,10 @@ use crate::value::GroupMode;
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
-    DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, EffectContractV1, EvidenceBindingsV1,
-    EvidenceBundleV2, EvidenceProvenance, FailureClassV1, FailureContractV1, NodeEvidence,
-    PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    TypeContractV1, ANALYZER_ID_V2, EVIDENCE_SCHEMA_V2,
+    DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
+    EvidenceBindingsV1, EvidenceBundleV3, EvidenceProvenance, FailureClassV1, FailureContractV1,
+    NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
+    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V3, EVIDENCE_SCHEMA_V3,
 };
 
 /// Capture the exact adapter/runtime snapshot used by an evaluator backed by
@@ -215,7 +215,7 @@ pub fn analyze_execution(
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: RuntimeBindingV1,
-) -> Result<EvidenceBundleV2> {
+) -> Result<EvidenceBundleV3> {
     let current_executable = runtime
         .backend_artifacts
         .iter()
@@ -309,6 +309,11 @@ pub fn analyze_execution(
                     DispatchLaneV1::Coordinator
                 },
                 adapter: dispatch_adapter,
+                semantics: if dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1 {
+                    DispatchSemanticsV1::ExplicitAutonomousUnordered
+                } else {
+                    DispatchSemanticsV1::StrictEquivalent
+                },
                 send_only_preparation: worker_candidate,
                 provenance: if worker_candidate {
                     EvidenceProvenance::TrustedAdapter
@@ -325,26 +330,29 @@ pub fn analyze_execution(
             },
             placement_provenance: EvidenceProvenance::CompilerVerified,
             failure_contract: FailureContractV1 {
-                class: failure_class(summary),
+                class: failure_class(summary, dispatch_adapter),
                 cancellation_safe: summary.is_verified_pure_infallible(),
                 provenance: effect_provenance,
             },
-            // V2 preserves the bounded coordinator/worker adapter set. Unknown
+            // V3 preserves a bounded, evidence-bound adapter set. Unknown
             // ceilings remain explicit and cannot remove topology edges.
             resource_demand: ResourceDemandContractV1 {
                 cpu_units: Some(1),
                 hard_memory_bytes: None,
-                file_descriptors: None,
-                process_slots: None,
+                file_descriptors: (dispatch_adapter
+                    == DispatchAdapterV1::AutonomousEphemeralShimV1)
+                    .then_some(3),
+                process_slots: (dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1)
+                    .then_some(1),
                 provenance: EvidenceProvenance::Unknown,
             },
             cost_estimate: CostEstimateV1::unknown(),
         });
     }
 
-    Ok(EvidenceBundleV2 {
-        schema: EVIDENCE_SCHEMA_V2,
-        analyzer: ANALYZER_ID_V2,
+    Ok(EvidenceBundleV3 {
+        schema: EVIDENCE_SCHEMA_V3,
+        analyzer: ANALYZER_ID_V3,
         bindings,
         runtime,
         nodes,
@@ -364,7 +372,7 @@ pub(crate) fn evidence_bindings(
         backend_set_sha256: runtime.backend_set_sha256.clone(),
         environment_sha256: runtime.environment_sha256.clone(),
         ambient_world_sha256: runtime.ambient_world_sha256.clone(),
-        analyzer_sha256: sha256_bytes(ANALYZER_ID_V2.as_bytes()),
+        analyzer_sha256: sha256_bytes(ANALYZER_ID_V3.as_bytes()),
     }
 }
 
@@ -499,8 +507,8 @@ pub(crate) fn graph_sha256(graph: &HGraph) -> String {
     hash.finish()
 }
 
-pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV2) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v2");
+pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV3) -> String {
+    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v3");
     hash.field(bundle.schema.as_bytes());
     hash.field(bundle.analyzer.as_bytes());
     for binding in [
@@ -533,6 +541,7 @@ pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV2) -> String {
         hash.field(node.effect_contract.provenance.name().as_bytes());
         hash.field(node.dispatch_contract.lane.name().as_bytes());
         hash.field(node.dispatch_contract.adapter.name().as_bytes());
+        hash.field(node.dispatch_contract.semantics.name().as_bytes());
         hash.bool(node.dispatch_contract.send_only_preparation);
         hash.field(node.dispatch_contract.provenance.name().as_bytes());
         hash.field(node.capability_disposition.name().as_bytes());
@@ -583,9 +592,16 @@ fn effect_provenance(confidence: EffectConfidence) -> EvidenceProvenance {
     }
 }
 
-fn failure_class(summary: &EffectSummary) -> FailureClassV1 {
+fn failure_class(summary: &EffectSummary, dispatch_adapter: DispatchAdapterV1) -> FailureClassV1 {
     match summary.fallibility {
         Fallibility::Infallible => FailureClassV1::Infallible,
+        Fallibility::MayFail
+            if dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+                && summary.unknown
+                && summary.actor_state.is_none() =>
+        {
+            FailureClassV1::MayFailUnorderedExternalEffects
+        }
         Fallibility::MayFail
             if summary.writes.is_empty()
                 && !summary.unknown

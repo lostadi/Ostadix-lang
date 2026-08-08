@@ -95,7 +95,7 @@ pub fn build_program_with_plan(
     }
 
     add_plan_semantics(&mut graph, plan, &node_map);
-    add_execute_edges(&mut graph, plan, &node_map)?;
+    add_execute_edges(&mut graph, plan, &node_map, &oir_nodes)?;
     graph.validate_execution_graph()?;
     Ok(graph)
 }
@@ -108,6 +108,7 @@ fn add_execute_edges(
     graph: &mut HGraph,
     plan: &ExecutionPlan,
     node_map: &HashMap<PlanNodeId, NodeId>,
+    oir_nodes: &[&OIr],
 ) -> Result<(), String> {
     let mut summaries: HashMap<PlanNodeId, EffectSummary> = HashMap::new();
     for plan_node in &plan.nodes {
@@ -154,15 +155,21 @@ fn add_execute_edges(
             inputs.push(predecessor_completion);
         }
 
-        add_resource_state_transitions(
-            graph,
-            &mut state,
-            summary,
-            id,
-            completion,
-            &mut inputs,
-            &mut outputs,
-        );
+        // Only direct members of a group inside an explicit autonomous region
+        // may opt into non-strict hosted-effect overlap. Ordinary ephemeral
+        // blocks retain HostWorld/EvaluatorState state chains and strict source
+        // sequencing exactly like the serial reference executor.
+        if autonomous_ephemeral_group(plan, id, oir_nodes[id.0]).is_none() {
+            add_resource_state_transitions(
+                graph,
+                &mut state,
+                summary,
+                id,
+                completion,
+                &mut inputs,
+                &mut outputs,
+            );
+        }
 
         deduplicate_nodes(&mut inputs);
         deduplicate_nodes(&mut outputs);
@@ -341,6 +348,7 @@ pub(super) fn sequence_can_relax(
     {
         return false;
     }
+
     // O-level loads are compiler-verified, read-only, and leave no external
     // effect when they fail. Their outcomes can therefore be selected in
     // stable ordinal order by a future concurrent dispatcher without changing
@@ -357,6 +365,85 @@ pub(super) fn sequence_can_relax(
         && right.is_verified_pure_infallible()
         && verified_reorderable_inline(plan, predecessor, summaries, &mut HashSet::new())
         && verified_reorderable_inline(plan, successor, summaries, &mut HashSet::new())
+}
+
+/// Return the explicit concurrent group that authorizes non-strict execution
+/// of one bare hosted shim.
+///
+/// This is deliberately narrower than "ephemeral": the operation must be a
+/// direct member of a coordination group nested under `autonomous(...)`, must
+/// carry no effect/capability attributes, and must have a source body that can
+/// be prepared without forcing an O value on a worker. Unknown hosted effects
+/// remain unknown; the returned group is an explicit semantic opt-in, not an
+/// effect-independence proof.
+pub(crate) fn autonomous_ephemeral_group(
+    plan: &ExecutionPlan,
+    node: PlanNodeId,
+    oir: &OIr,
+) -> Option<PlanNodeId> {
+    let OIr::Exec {
+        env_id,
+        attr,
+        backend,
+        body,
+        ..
+    } = oir
+    else {
+        return None;
+    };
+    if *env_id != u32::MAX
+        || attr.is_some()
+        || backend.execution != ExecutionMode::Shim
+        || !body
+            .iter()
+            .all(|child| matches!(child, OIr::Text(_) | OIr::Store { .. }))
+    {
+        return None;
+    }
+
+    let group = plan.edges.iter().find_map(|edge| {
+        (edge.kind == PlanEdgeKind::Structural
+            && edge.from == node
+            && matches!(plan.nodes[edge.to.0].kind, PlanNodeKind::Group { .. }))
+        .then_some(edge.to)
+    })?;
+
+    nearest_policy_schedule_is_autonomous(plan, group).then_some(group)
+}
+
+/// Policy schedules override outer schedules. Walk the unique structural
+/// ancestry from the group outward and accept only when the nearest Lazy-or-
+/// Autonomous schedule is Autonomous. This mirrors `derive_policy_contexts`
+/// without treating `autonomous(lazy(batch(...)))` as autonomous work.
+fn nearest_policy_schedule_is_autonomous(plan: &ExecutionPlan, node: PlanNodeId) -> bool {
+    let mut current = node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return false;
+        }
+        let parents = plan
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                (edge.kind == PlanEdgeKind::Structural && edge.from == current).then_some(edge.to)
+            })
+            .collect::<Vec<_>>();
+        let [parent] = parents.as_slice() else {
+            return false;
+        };
+        match plan.nodes[parent.0].kind {
+            PlanNodeKind::Schedule {
+                kind: PlanScheduleKind::Autonomous,
+                ..
+            } => return true,
+            PlanNodeKind::Schedule {
+                kind: PlanScheduleKind::Lazy,
+                ..
+            } => return false,
+            _ => current = *parent,
+        }
+    }
 }
 
 fn verified_read_only(summary: &EffectSummary) -> bool {

@@ -1193,9 +1193,24 @@ impl HGraph {
             })?;
             self.validate_operation_semantics(info, edge, summary)?;
             let (reads, writes) = summary.scheduling_accesses();
-            let required = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
             let actual_inputs = resource_keys(self, &info.inputs);
             let actual_outputs = resource_keys(self, &info.outputs);
+            let autonomous_ephemeral = self.source_plan.as_ref().is_some_and(|plan| {
+                self.ir_map.get(&info.value_output).is_some_and(|oir| {
+                    crate::hgraph::from_oir::autonomous_ephemeral_group(plan, info.plan_node, oir)
+                        .is_some()
+                })
+            });
+            let required = if autonomous_ephemeral {
+                BTreeSet::new()
+            } else {
+                reads.union(&writes).cloned().collect::<BTreeSet<_>>()
+            };
+            let writes = if autonomous_ephemeral {
+                BTreeSet::new()
+            } else {
+                writes
+            };
             if actual_inputs != required || actual_outputs != writes {
                 return Err(format!(
                     "operation {} resource inputs/outputs {:?}/{:?} differ from admitted accesses {:?}/{:?}",
@@ -1269,9 +1284,21 @@ impl HGraph {
                         info.plan_node.0
                     ));
                 }
+                let autonomous_ephemeral = self.source_plan.as_ref().is_some_and(|plan| {
+                    self.ir_map.get(&info.value_output).is_some_and(|oir| {
+                        crate::hgraph::from_oir::autonomous_ephemeral_group(
+                            plan,
+                            info.plan_node,
+                            oir,
+                        )
+                        .is_some()
+                    })
+                });
                 for resource in [ResourceKey::HostWorld, ResourceKey::EvaluatorState] {
                     require_read_write(summary, &resource, info.plan_node)?;
-                    self.validate_operation_resource_write(info, &resource)?;
+                    if !autonomous_ephemeral {
+                        self.validate_operation_resource_write(info, &resource)?;
+                    }
                 }
                 if *env != u32::MAX {
                     let actor = ActorResourceId::new(lang.clone(), *env);
@@ -1712,6 +1739,12 @@ impl HGraph {
                 continue;
             };
             let summary = effect_summary_for_plan_node(plan_node, &plan.nodes[plan_node.0].kind)?;
+            let oir = self.ir_map.get(&info.value_output).ok_or_else(|| {
+                format!("operation {} has no recorded OIR value node", plan_node.0)
+            })?;
+            if crate::hgraph::from_oir::autonomous_ephemeral_group(plan, plan_node, oir).is_some() {
+                continue;
+            }
             let (reads, writes) = summary.scheduling_accesses();
             let resources = reads.union(&writes).cloned().collect::<BTreeSet<_>>();
             let completion = self
