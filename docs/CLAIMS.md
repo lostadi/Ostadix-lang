@@ -755,7 +755,10 @@
   on bounded workers with evidence-labeled
   `explicit-autonomous-unordered` semantics. This preserves explicit dataflow,
   live capability checks, and deterministic outcome selection, but does not
-  claim rollback or ordering of already-started hidden host effects.
+  claim rollback or ordering of already-started hidden host effects. The
+  default pool size is bounded by both live host parallelism and the widest
+  admitted local-worker static wave; this is a capacity heuristic, not a CPU or
+  memory reservation or evidence of observed overlap.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue

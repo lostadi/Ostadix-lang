@@ -1,0 +1,32 @@
+# Width-one negative control: every hosted operation consumes its predecessor.
+let stage_1 = autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = 1
+)_python
+))
+
+let stage_2 = autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = stage_1[0] + 1
+)_python
+))
+
+let stage_3 = autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = stage_2[0] + 1
+)_python
+))
+
+autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = stage_3[0] + 1
+)_python
+))

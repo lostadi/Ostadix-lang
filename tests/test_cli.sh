@@ -255,10 +255,13 @@ EOF
         '^; ExecutionAdmission oexec\.admission/v3$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
+        '^; ScheduleRealizability oexec\.realizability/v1$' \
+        '^realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave=not-applicable runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=machine-default available-parallelism=[1-9][0-9]* admitted-static-max-wave-width=[0-9]+ admitted-max-local-worker-wave-width=0 selected-workers=1$' \
         '^operation P[0-9]+ admitted=yes ' \
         '^  dispatch lane=coordinator adapter=coordinator/v1 semantics=strict-equivalent preparation=coordinator-owned$' \
         '^wave 0 \[' \
         '^admission-note waves describe the legal static frontier, not observed dispatch$' \
+        '^admission-note admitted maximum local-worker wave width is a static Kahn-wave capacity heuristic, not a bound on the completion-driven dynamic frontier$' \
         '^admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation$' \
         '^admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises$' \
         '^admission-note verified-pure infallible local-worker outputs may provisionally unlock only equally safe worker dependents; dependent NodeStarted may precede producer NodeFinished, durable settlement remains serial-topological, and any earlier failure revokes provisionally published outputs$'; do
@@ -269,6 +272,38 @@ EOF
     done
     if [ -e "$marker" ]; then
         fail "$desc" "(--explain-schedule executed the inspected backend)"
+        return
+    fi
+
+    cat >"$source" <<EOF
+autonomous(batch(
+    python^(
+from pathlib import Path
+Path(r"$marker").write_text("executed")
+__oval_result__ = 1
+    )_python,
+    python^(
+from pathlib import Path
+Path(r"$marker").write_text("executed")
+__oval_result__ = 2
+    )_python
+))
+EOF
+    run_command "$OLANGC_BIN" "$source" --target ir --explain-schedule --workers 1
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(autonomous realizability explanation failed with exit $RUN_EXIT)"
+        return
+    fi
+    if ! grep -Eq -- '^realizability status=inspection-only execution-realizable=unknown dispatch=not-run scope=local-worker-static-wave worker-count-covers-static-wave=no runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=cli-override available-parallelism=[1-9][0-9]* admitted-static-max-wave-width=[0-9]+ admitted-max-local-worker-wave-width=2 selected-workers=1$' "$STDOUT_FILE"; then
+        fail "$desc" "(schedule explanation omitted the two-worker capacity marker)"
+        return
+    fi
+    if [ "$(grep -Ec '^  dispatch lane=local-worker adapter=autonomous-ephemeral-shim/v1 semantics=explicit-autonomous-unordered preparation=deferred-materialized-input-check$' "$STDOUT_FILE")" -ne 2 ]; then
+        fail "$desc" "(schedule explanation did not admit both autonomous members to the local-worker lane)"
+        return
+    fi
+    if [ -e "$marker" ]; then
+        fail "$desc" "(--explain-schedule executed an autonomous backend)"
         return
     fi
     pass "$desc"
@@ -363,6 +398,9 @@ check_stdout_contains "O help advertises graph worker bound" 0 '--workers N' "$O
 check_nonzero_stderr_contains "O rejects a zero graph worker bound" '--workers must be at least 1' "$O_BIN" --workers 0 examples/hello.O backends/
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help
+check_stdout_contains "olangc help advertises schedule worker override" 0 '--workers <N>' "$OLANGC_BIN" --help
+check_nonzero_stderr_contains "olangc rejects schedule workers without explanation" '--workers requires --explain-schedule --target ir' "$OLANGC_BIN" examples/hello.O --target ir --workers 2
+check_nonzero_stderr_contains "olangc rejects a zero schedule worker override" '--workers must be at least 1' "$OLANGC_BIN" examples/hello.O --target ir --explain-schedule --workers 0
 check_olangc_schedule_explanation "olangc explains digest-bound admission without execution"
 check_nonzero_stderr_contains "olangc schedule explanation rejects a non-IR target" \
     '--explain-schedule is available only with --target ir' \

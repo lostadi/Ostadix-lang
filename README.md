@@ -2437,7 +2437,12 @@ settlement are preserved; hidden external effects from already-started members
 may race and are not rolled back. Indexed persistent environments such as
 `python[0]^(...)_python[0]` retain actor and host-state serialization.
 `O_EXECUTOR=serial` selects the ordered reference executor, while `--workers N`
-caps only the graph local-worker lane.
+overrides only the graph local-worker lane. Without that override, the pool
+size is `min(available_parallelism, admitted_max_local_worker_wave_width)`,
+with a minimum of one when any worker task exists. The admitted width is the
+widest local-worker subset of a conservative static Kahn wave; it is a sizing
+heuristic, not a CPU or memory reservation and not a bound on the
+completion-driven dynamic frontier.
 
 `olangc --target ir` prints the same executable program, plan, and textual
 state-complete HGraph used by the runtime. `olangc --target dot` shows both
@@ -2446,8 +2451,16 @@ actor, and completion/control nodes.
 
 `olangc --target ir --explain-schedule` additionally prints the v3 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
-dispatching. Static waves describe graph legality only: they are not pool
-capacity, runtime batches, completion order, or proof of observed overlap.
+dispatching. Its `ScheduleRealizability` marker reports the inspection host's
+available parallelism, admitted local-worker static width, and derived default
+or `--workers N` override. That live marker is advisory and outside the
+admission digest: external-runtime readiness remains unknown, no placement
+lease is created, and no overlap is observed. Static waves describe graph
+legality only; they are not runtime batches or completion order.
+
+The reproducible four-shape hosted benchmark, expected outputs, methodology,
+and single-core wait-overlap caveat are documented in
+[`benchmarks/hgraph_hosted/README.md`](benchmarks/hgraph_hosted/README.md).
 
 Project inputs take a direct, typed
 `ProjectBundle -> ProjectExecutionPlan -> HGraph` inspection path rather than

@@ -1,0 +1,17 @@
+# Width-three heterogeneous autonomous batch: Python, Bash, and Node.js.
+autonomous(batch(
+python^(
+import time
+time.sleep(__SLEEP_SECONDS__)
+__oval_result__ = "python"
+)_python,
+bash^(
+sleep __SLEEP_SECONDS__
+printf 'bash\n'
+)_bash,
+javascript^(
+setTimeout(() => {
+  console.log("node");
+}, __SLEEP_MILLISECONDS__);
+)_javascript
+))
