@@ -1711,7 +1711,7 @@ pub mod nix_ops;
 pub mod nixos_ops;
 pub mod scheduler;
 pub mod world;
-{project_mod}pub(crate) mod wire;
+{project_mod}pub mod wire;
 "
     )
 }
@@ -1898,6 +1898,9 @@ lto           = "fat"
 codegen-units = 1
 panic         = "abort"
 strip         = "symbols"
+
+[profile.dev.package.sha2]
+opt-level = 3
 "#,
         bin_name = bin_name,
         lib_name = bin_name.replace('-', "_"),

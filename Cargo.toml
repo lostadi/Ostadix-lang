@@ -123,3 +123,10 @@ codegen-units   = 1         # Single codegen unit for maximum optimization surfa
 panic           = "abort"   # No unwinding overhead
 strip           = "symbols" # Strip debug symbols from release binary
 overflow-checks = false     # No overflow panics in release (panic=abort anyway)
+
+# Evidence admission intentionally re-hashes exact backend artifacts at
+# freshness boundaries. Keep that cryptographic work representative in debug
+# and integration-test binaries instead of running SHA-256's software rounds
+# entirely unoptimized.
+[profile.dev.package.sha2]
+opt-level = 3

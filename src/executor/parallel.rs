@@ -25,7 +25,7 @@ use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
 use crate::eval::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
 use crate::ir::{ExecutionMode, ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
-use crate::process::{ExecStep, ProcessRegistry};
+use crate::process::run_ephemeral_with_eval_callback;
 use crate::value::OValue;
 
 use super::task::{PreparedTask, TaskContext};
@@ -703,28 +703,25 @@ fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue
             shim,
             sandbox,
         } => {
-            let mut registry = ProcessRegistry::new();
-            registry.send_exec(language, u32::MAX, code, bindings.clone(), shim, sandbox)?;
-            loop {
-                match registry.recv_exec_step(language, u32::MAX, sandbox)? {
-                    ExecStep::Done(value) => break Ok(value),
-                    ExecStep::EvalRequest {
-                        src,
-                        scope: explicit_scope,
-                    } => {
-                        let callback_scope = match explicit_scope {
-                            None => bindings.clone(),
-                            Some(OValue::Scope { bindings }) => bindings,
-                            Some(other) => bail!(
-                                "O.eval explicit scope must be an OScope, got {}",
-                                other.type_name()
-                            ),
-                        };
-                        let value = context.eval_o_source(src, callback_scope)?;
-                        registry.send_eval_result(language, u32::MAX, value, sandbox)?;
-                    }
-                }
-            }
+            let lexical_bindings = bindings.clone();
+            run_ephemeral_with_eval_callback(
+                language,
+                code,
+                bindings.clone(),
+                shim,
+                sandbox,
+                |src, explicit_scope, remaining| {
+                    let callback_scope = match explicit_scope {
+                        None => lexical_bindings.clone(),
+                        Some(OValue::Scope { bindings }) => bindings,
+                        Some(other) => bail!(
+                            "O.eval explicit scope must be an OScope, got {}",
+                            other.type_name()
+                        ),
+                    };
+                    context.eval_o_source_with_timeout(src, callback_scope, remaining)
+                },
+            )
         }
     }
 }
