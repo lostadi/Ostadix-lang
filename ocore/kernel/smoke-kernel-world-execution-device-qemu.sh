@@ -17,6 +17,23 @@ for tool in qemu-system-x86_64 python3; do
   fi
 done
 
+qemu_version_line="$(qemu-system-x86_64 --version | head -n 1)"
+qemu_version="$(
+  sed -nE 's/^QEMU emulator version ([0-9]+)\.([0-9]+)(\.[0-9]+)?.*/\1 \2/p' \
+    <<<"$qemu_version_line"
+)"
+if [[ ! "$qemu_version" =~ ^[0-9]+\ [0-9]+$ ]]; then
+  echo "error: could not parse QEMU version from: $qemu_version_line" >&2
+  exit 2
+fi
+read -r qemu_major qemu_minor <<<"$qemu_version"
+if (( qemu_major < 9 || (qemu_major == 9 && qemu_minor < 2) )); then
+  echo "error: Mode 23 requires the supported QEMU 9.2+ real-mode NPT floor; found: $qemu_version_line" >&2
+  echo "error: Ubuntu 24.04's QEMU 8.2.2 omits this NPT walk (upstream fix b56617bb)" >&2
+  exit 2
+fi
+printf 'Mode 23 emulator prerequisite: %s\n' "$qemu_version_line"
+
 OCORE_PROBE_MODE=23 OCORE_BUILD_DIR="$BUILD_DIR" \
   "$ROOT/ocore/kernel/build.sh" >/dev/null
 
