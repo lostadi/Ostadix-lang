@@ -286,10 +286,16 @@ arbitrary user-declared reads MUST remain coordinator-owned.
 
 One fixed-size local-worker pool MUST be created for each graph-coordinator run
 that contains local-worker operations and MUST reuse its workers across changing
-ready frontiers. Its machine-derived task-count cap is execution policy, not
-evidence-backed CPU or memory admission. Each physical completion MUST wake the
-coordinator independently; the runtime MUST NOT wait for an entire previously
-ready set before considering newly exposed work. A physically successful worker
+ready frontiers. Let `W` be the maximum count of `LocalWorker` operations in
+any admitted static Kahn wave. Unless the caller supplies a positive explicit
+override, pool capacity MUST be
+`min(std::thread::available_parallelism(), W).max(1)`. An explicit override
+MUST replace that derived value. The resulting task-count cap is execution
+policy, not evidence-backed CPU or memory admission; `W` is a conservative
+capacity heuristic, not a bound on the completion-driven dynamic frontier.
+Each physical completion MUST wake the coordinator independently; the runtime
+MUST NOT wait for an entire previously ready set before considering newly
+exposed work. A physically successful worker
 whose hard contract is both compiler-verified pure and `Infallible` MAY publish
 its outputs provisionally to unlock only other safe local-worker tasks before
 the deterministic semantic frontier reaches it. Such outputs MUST be revoked,
@@ -343,7 +349,13 @@ only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 wave is evidence of legal readiness,
 not proof that every member used a worker, ran together, or fit the pool. Static
 waves MUST NOT be presented as dynamic dispatch batches or observed completion
-order. Admitted O-scope loads, source-proven-preparable trees of the four trusted
+order. The explanation MUST include an advisory realizability marker containing
+the inspection host's available parallelism, the maximum total static-wave
+width, the maximum local-worker static-wave width, and the selected default or
+explicit override. That marker MUST remain outside the admission digest and
+MUST report that dispatch was not run, external-runtime readiness is unknown,
+no placement lease was established, and overlap was not observed. Admitted
+O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
 actor-owned persistent environments, renewable-capacity allocation, and

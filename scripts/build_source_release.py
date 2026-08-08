@@ -61,14 +61,33 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
     }
 )
 
-# Keep nested exceptions exact so adding the mirrored aggregate launcher does
-# not implicitly publish every file under a new top-level directory.
+# Keep nested exceptions exact so publishing one reviewed surface does not
+# implicitly publish every file under a new top-level directory.
+HOSTED_HGRAPH_BENCHMARK_PATHS = frozenset(
+    {
+        "benchmarks/hgraph_hosted/README.md",
+        "benchmarks/hgraph_hosted/chained.O",
+        "benchmarks/hgraph_hosted/chained.expected.json",
+        "benchmarks/hgraph_hosted/heterogeneous.O",
+        "benchmarks/hgraph_hosted/heterogeneous.expected.json",
+        "benchmarks/hgraph_hosted/mixed_width.O",
+        "benchmarks/hgraph_hosted/mixed_width.expected.json",
+        "benchmarks/hgraph_hosted/realistic.O",
+        "benchmarks/hgraph_hosted/realistic.expected.json",
+    }
+)
+HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS = HOSTED_HGRAPH_BENCHMARK_PATHS | frozenset(
+    {
+        "scripts/benchmark_hgraph_hosted.sh",
+        "tests/test_benchmark_hgraph_hosted.py",
+    }
+)
 ALLOWED_EXACT_PATHS = frozenset(
     {
         "okernel-multikernel/boot-and-test.sh",
         "okernel-multikernel/MULTIKERNEL_PERSONALITY_PROPOSAL.md",
     }
-)
+) | HOSTED_HGRAPH_BENCHMARK_PATHS
 
 ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
     {
@@ -297,7 +316,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/world_receipt.rs",
         "tests/world_value.rs",
     }
-)
+) | HOSTED_HGRAPH_BENCHMARK_RELEASE_PATHS
 VALID_GIT_MODES = frozenset({"100644", "100755"})
 SAFE_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")

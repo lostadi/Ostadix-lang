@@ -673,8 +673,14 @@ solves the graph, compiles evidence-bound admission, and prints its digests,
 provenance, blockers, retained sequence reasons, and legal static waves. A
 `runtime-snapshot kind=inspection` line makes explicit that this certificate
 preview is not interchangeable with an evaluator's dispatch-time execution
-snapshot. Those waves describe static legality, not the fixed pool's capacity,
-dynamic dispatch groups, completion order, or observed overlap. A directory or
+snapshot. A separate advisory `ScheduleRealizability` marker samples the
+inspection host and derives the default worker count as
+`min(available_parallelism, admitted_max_local_worker_wave_width).max(1)`;
+`olangc FILE --target ir --explain-schedule --workers N` shows an explicit
+override. The marker is outside the
+admission digest and establishes neither external-runtime readiness nor a
+placement lease or observed overlap. Those waves describe static legality, not
+dynamic dispatch groups or completion order. A directory or
 lifted project instead constructs its typed,
 exact-provenance
 `ProjectExecutionPlan` and HGraph without running any route; project admission

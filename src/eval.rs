@@ -337,9 +337,11 @@ pub struct Evaluator {
     /// requests.
     scheduler: AutonomousScheduler,
 
-    /// Independent cap for evidence-admitted HGraph local-worker tasks. This
-    /// must not tune the legacy buffered Request scheduler as a side effect.
-    local_worker_parallelism: usize,
+    /// Optional CLI/API override for evidence-admitted HGraph local-worker
+    /// tasks. Without it, the coordinator resolves the count from the current
+    /// machine and the admitted maximum worker-wave width. This must not tune
+    /// the legacy buffered Request scheduler as a side effect.
+    local_worker_parallelism_override: Option<usize>,
 
     /// STEP-4: buffer of non-Eval Requests constructed under
     /// Policy::Autonomous. Flushed by flush_autonomous_buffer() at force
@@ -555,9 +557,6 @@ impl Evaluator {
             ),
             Err(err) => panic!("failed to issue default backend authority: {err}"),
         };
-        let local_worker_parallelism = thread::available_parallelism()
-            .map(|count| count.get().min(8))
-            .unwrap_or(4);
         Evaluator {
             registry: ProcessRegistry::new(),
             shim_dir,
@@ -566,7 +565,7 @@ impl Evaluator {
             executor: Box::new(ImmediateExecutor::new()),
             eval_cache: HashMap::new(),
             scheduler: AutonomousScheduler::new(),
-            local_worker_parallelism,
+            local_worker_parallelism_override: None,
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
@@ -591,7 +590,7 @@ impl Evaluator {
     /// dependencies and admission contracts still determine which operations
     /// are legal to overlap; this only caps the feasible local subset.
     pub fn with_local_worker_parallelism(mut self, workers: usize) -> Self {
-        self.local_worker_parallelism = workers.max(1);
+        self.local_worker_parallelism_override = Some(workers.max(1));
         self
     }
 
@@ -629,11 +628,11 @@ impl Evaluator {
         std::mem::replace(&mut self.policy, policy)
     }
 
-    /// Soft local task-count bound reused by the graph worker lane. This is a
-    /// machine-derived implementation cap, not evidence-backed CPU or memory
-    /// admission.
-    pub(crate) fn local_worker_parallelism(&self) -> usize {
-        self.local_worker_parallelism
+    /// Explicit local-worker override, if one was supplied. The graph
+    /// coordinator combines the absence of an override with admitted width and
+    /// current machine parallelism only after evidence-bound admission.
+    pub(crate) fn local_worker_parallelism_override(&self) -> Option<usize> {
+        self.local_worker_parallelism_override
     }
 
     pub(crate) fn shim_path(&self, language: &str) -> PathBuf {
@@ -3783,6 +3782,7 @@ mod tests {
     #[test]
     fn graph_worker_override_does_not_reconfigure_request_scheduler() {
         let evaluator = Evaluator::new("/tmp".into());
+        assert_eq!(evaluator.local_worker_parallelism_override(), None);
         let request_parallelism = evaluator.scheduler.parallelism;
         let evaluator = evaluator.with_local_worker_parallelism(request_parallelism + 3);
         assert_eq!(
@@ -3790,8 +3790,8 @@ mod tests {
             "the HGraph worker cap must not mutate the separate Request scheduler"
         );
         assert_eq!(
-            evaluator.local_worker_parallelism(),
-            request_parallelism + 3
+            evaluator.local_worker_parallelism_override(),
+            Some(request_parallelism + 3)
         );
     }
 

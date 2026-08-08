@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "type": "list",
+  "value": {
+    "t": "list",
+    "v": [
+      {"t": "text", "v": {"encoding": "utf-8", "utf8": "python"}},
+      {"t": "text", "v": {"encoding": "utf-8", "utf8": "bash"}},
+      {"t": "text", "v": {"encoding": "utf-8", "utf8": "node"}}
+    ]
+  }
+}
