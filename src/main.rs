@@ -223,7 +223,7 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  O --workers N <input.O> [backends_dir]        # override graph local-worker concurrency"
+        "  O --workers N <input.O> [backends_dir]        # override graph local-worker pool capacity"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;

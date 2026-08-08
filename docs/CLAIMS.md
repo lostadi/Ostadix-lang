@@ -757,8 +757,23 @@
   live capability checks, and deterministic outcome selection, but does not
   claim rollback or ordering of already-started hidden host effects. The
   default pool size is bounded by both live host parallelism and the widest
-  admitted local-worker static wave; this is a capacity heuristic, not a CPU or
-  memory reservation or evidence of observed overlap.
+  admitted local-worker static wave, with a conservative host fallback of one
+  if parallelism cannot be queried. An explicit runtime `O --workers N`
+  override replaces that default and is pool capacity only: it is not clamped
+  to the reported host count or wave width and does not override graph
+  readiness or prove that `N` tasks can execute together. Coordinator-only
+  graphs create no worker pool.
+- `olangc --target ir --explain-schedule` is non-executing inspection. Its
+  advisory `oexec.realizability/v1` marker is outside the admission digest;
+  `--workers N` there changes only the displayed capacity comparison, not any
+  execution. The marker distinguishes the maximum total static-wave width from
+  its local-worker subset. `worker-count-covers-static-wave=yes` means only
+  that the selected count is at least that local subset; `no` means it is not,
+  and `not-applicable` means there are no local-worker operations. Every case
+  retains `execution-realizable=unknown`: no value proves simultaneous
+  dispatch, CPU/memory fit, external-runtime readiness, placement, or observed
+  overlap. Static widths are neither runtime batches nor dynamic-frontier
+  bounds.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue

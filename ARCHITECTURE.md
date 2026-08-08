@@ -498,9 +498,11 @@ in for effect ordering.
 Parallel worker dispatch remains limited to compiler-verified O-scope loads and
 source-proven-preparable trees of the four trusted inline renderers. The
 coordinator freezes their materialized inputs into owned `PreparedTask`
-envelopes and submits them to a fixed-size local pool created once per graph
-execution and reused across changing ready frontiers. Each physical completion
-wakes the coordinator independently. A successful compiler-verified pure,
+envelopes and, only when the admitted graph contains `LocalWorker` operations,
+submits them to a fixed-size local pool created once for that graph execution
+and reused across changing ready frontiers. A coordinator-only graph creates no
+pool. Each physical completion wakes the coordinator independently. A
+successful compiler-verified pure,
 admitted-infallible task may provisionally materialize its value and graph
 outputs before the deterministic semantic frontier reaches it, allowing an
 infallible worker-only dependent pipeline to refill a free slot. If an earlier
@@ -677,10 +679,18 @@ snapshot. A separate advisory `ScheduleRealizability` marker samples the
 inspection host and derives the default worker count as
 `min(available_parallelism, admitted_max_local_worker_wave_width).max(1)`;
 `olangc FILE --target ir --explain-schedule --workers N` shows an explicit
-override. The marker is outside the
-admission digest and establishes neither external-runtime readiness nor a
-placement lease or observed overlap. Those waves describe static legality, not
-dynamic dispatch groups or completion order. A directory or
+override without clamping it to the reported host value or static width. A
+failed host `available_parallelism` query is represented conservatively as one.
+The marker schema ID is `oexec.realizability/v1`; its total width includes all
+operations in the widest static wave, whereas its local-worker width counts
+only operations that consume pool slots. `worker-count-covers-static-wave` is
+`not-applicable` for zero local-worker width and otherwise reports the
+arithmetic comparison between selected count and local-worker width. Even
+`yes` leaves `execution-realizable=unknown`: the marker is outside the admission
+digest and establishes neither simultaneous dispatch, CPU/memory fit,
+external-runtime readiness, a placement lease, nor observed overlap. Those
+waves describe static legality, not dynamic dispatch groups or completion
+order. A directory or
 lifted project instead constructs its typed,
 exact-provenance
 `ProjectExecutionPlan` and HGraph without running any route; project admission

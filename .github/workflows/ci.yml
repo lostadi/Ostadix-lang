@@ -34,6 +34,11 @@ jobs:
       - name: Build
         run: cargo build --all-targets --all-features --verbose
 
+      - name: Build Rust API documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+
       - name: Verify every declared binary target
         run: bash scripts/check_declared_bins.sh
 

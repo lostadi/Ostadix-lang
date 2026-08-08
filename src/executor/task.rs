@@ -1,8 +1,8 @@
 //! Owned task contract crossing from admission-aware preparation into a local
 //! execution lane.
 //!
-//! A [`PreparedTask`] contains no evaluator borrow or mutable process-registry
-//! state. The coordinator issues the opaque [`TaskToken`]; worker code cannot
+//! A `PreparedTask` contains no evaluator borrow or mutable process-registry
+//! state. The coordinator issues the opaque `TaskToken`; worker code cannot
 //! choose or forge which admitted operation receives the result. Durable trace
 //! and commit remain provisional until the coordinator settles them in
 //! semantic order; a verified-pure infallible value may become visible earlier

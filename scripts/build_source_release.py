@@ -66,6 +66,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
 HOSTED_HGRAPH_BENCHMARK_PATHS = frozenset(
     {
         "benchmarks/hgraph_hosted/README.md",
+        "benchmarks/hgraph_hosted/RESULTS-2026-08-08-be68dfef.md",
         "benchmarks/hgraph_hosted/chained.O",
         "benchmarks/hgraph_hosted/chained.expected.json",
         "benchmarks/hgraph_hosted/heterogeneous.O",

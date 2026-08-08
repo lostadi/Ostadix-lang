@@ -1397,10 +1397,12 @@ compiler-verified O-scope loads plus source-proven-preparable trees of four
 trusted pure inline renderers (`html`, `markdown`, `text`, and `latex`). Direct
 ephemeral members of an explicitly autonomous group may separately opt into
 non-strict, unordered host effects. Evidence schema v3 binds those choices and
-their dispatch semantics to stable preparation-adapter IDs before execution. A fixed-size local
-pool is created per graph run, reuses its threads across readiness frontiers,
-and reports completions individually; this does not admit arbitrary hosted
-code or make pool capacity an evidence-backed CPU or memory reservation.
+their dispatch semantics to stable preparation-adapter IDs before execution. A
+fixed-size local pool is created only when a graph run contains admitted
+`LocalWorker` operations, reuses its threads across readiness frontiers, and
+reports completions individually; a coordinator-only graph creates no worker
+pool. This does not admit arbitrary hosted code or make pool capacity an
+evidence-backed CPU or memory reservation.
 The serial OIR executor remains the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
@@ -2437,12 +2439,17 @@ settlement are preserved; hidden external effects from already-started members
 may race and are not rolled back. Indexed persistent environments such as
 `python[0]^(...)_python[0]` retain actor and host-state serialization.
 `O_EXECUTOR=serial` selects the ordered reference executor, while `--workers N`
-overrides only the graph local-worker lane. Without that override, the pool
-size is `min(available_parallelism, admitted_max_local_worker_wave_width)`,
-with a minimum of one when any worker task exists. The admitted width is the
-widest local-worker subset of a conservative static Kahn wave; it is a sizing
-heuristic, not a CPU or memory reservation and not a bound on the
-completion-driven dynamic frontier.
+overrides only the graph local-worker pool capacity. It does not override graph
+readiness, effect or actor ordering, or runtime availability, and it may exceed
+either the execution host's reported parallelism or the admitted static
+worker width. Without that override, the pool
+size is
+`min(available_parallelism, admitted_max_local_worker_wave_width).max(1)`; if
+the platform cannot report `available_parallelism`, O conservatively
+substitutes one. A graph with no admitted `LocalWorker` operations creates no
+pool. The admitted width is the widest local-worker subset of a conservative
+static Kahn wave; it is a sizing heuristic, not a CPU or memory reservation and
+not a bound on the completion-driven dynamic frontier.
 
 `olangc --target ir` prints the same executable program, plan, and textual
 state-complete HGraph used by the runtime. `olangc --target dot` shows both
@@ -2451,12 +2458,29 @@ actor, and completion/control nodes.
 
 `olangc --target ir --explain-schedule` additionally prints the v3 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
-dispatching. Its `ScheduleRealizability` marker reports the inspection host's
-available parallelism, admitted local-worker static width, and derived default
-or `--workers N` override. That live marker is advisory and outside the
-admission digest: external-runtime readiness remains unknown, no placement
-lease is created, and no overlap is observed. Static waves describe graph
-legality only; they are not runtime batches or completion order.
+dispatching. Its advisory marker has schema ID
+`oexec.realizability/v1`, introduced by the line
+`; ScheduleRealizability oexec.realizability/v1`. The marker fields mean:
+
+| Field | Meaning |
+|---|---|
+| `status=inspection-only` | The values describe this `olangc` inspection, not a dispatch-time snapshot. |
+| `execution-realizable=unknown` | The marker does not establish that the inspected execution can run now. |
+| `dispatch=not-run`, `observed-overlap=not-run` | No operation was dispatched and no overlap was measured. |
+| `scope=local-worker-static-wave` | The capacity comparison concerns only admitted `LocalWorker` operations in static Kahn waves. |
+| `worker-count-covers-static-wave=yes\|no\|not-applicable` | `yes` means the selected count is at least the maximum local-worker static-wave width; `no` means it is smaller; `not-applicable` means that width is zero. |
+| `runtime-readiness=unknown`, `placement-lease=none` | External-runtime availability was not established and no current placement lease was created. |
+| `source=machine-default\|cli-override` | The count came from the default formula or the inspection-only `olangc --workers N` argument. |
+| `available-parallelism=A` | The inspection host reported `A`; if the platform query fails, the displayed fallback is `1`. |
+| `admitted-static-max-wave-width=T` | `T` is the largest total operation count in any admitted static wave, including coordinator-owned operations. It is not worker demand. |
+| `admitted-max-local-worker-wave-width=W` | `W` is the largest `LocalWorker` subset in any admitted static wave and is the default sizing heuristic. It is not a dynamic-frontier bound. |
+| `selected-workers=K` | `K` is the derived or explicitly supplied pool capacity; when `W=0`, the reported minimum remains one although execution creates no pool. |
+
+The marker is live, advisory, and outside the admission digest. In particular,
+`worker-count-covers-static-wave=yes` proves only the arithmetic comparison
+`K >= W`; it does not prove simultaneous dispatch, CPU, memory, device or I/O
+fit, backend readiness, placement, or observed speedup. Static waves describe
+graph legality only; they are not runtime batches or completion order.
 
 The reproducible four-shape hosted benchmark, expected outputs, methodology,
 and single-core wait-overlap caveat are documented in
