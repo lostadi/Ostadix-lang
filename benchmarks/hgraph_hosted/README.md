@@ -13,11 +13,15 @@ results, but it does not enforce a speedup threshold.
 | `mixed_width.O` | one Python seed, four Python branches, one Python aggregate | 4 | 3 | `python3` |
 | `realistic.O` | Python fetch/parse, Bash and Node transforms, Python aggregate | 2 | 3 | `python3`, `bash`, `node` |
 
-The span unit is **unit-cost hosted-task layers**, not milliseconds. It omits
-scope loads, stores, group/schedule bookkeeping, process startup, and teardown.
-Width is the shape's structural maximum. The explicit `--workers` limit and
-graph readiness bound selected concurrency; hardware capacity affects observed
-execution but is not admitted or reserved.
+The width and span values are manually declared fixture predictions obtained by
+reviewing the intended topology. The runner emits these declarations; it does
+not derive them from the parser, admission graph, or `--explain-schedule`, and
+they are not observations of runtime overlap. The span unit is **unit-cost
+hosted-task layers**, not milliseconds. It omits scope loads, stores,
+group/schedule bookkeeping, process startup, and teardown. Width is the shape's
+predicted structural maximum. The explicit `--workers` limit and graph readiness
+bound selected concurrency; hardware capacity affects observed execution but is
+not admitted or reserved.
 
 The middle stages use each backend's injected lexical bindings (`seed`,
 `${fetched}`, and `fetched`) deliberately. An O-level `$name` splice inside an
@@ -29,9 +33,10 @@ network access.
 
 ## Run
 
-Build the release runtime first, then run all shapes:
+Build the release runtime through the canonical setup path, then run all shapes:
 
 ```bash
+./setup.sh -y --minimal
 scripts/benchmark_hgraph_hosted.sh \
   --warmups 1 \
   --repetitions 5 \
@@ -55,8 +60,24 @@ ranges, and checks every sample in two ways:
 2. that canonical triple must match the fixture's checked-in
    `*.expected.json` result.
 
+This semantic-equivalence check is deliberately narrower than complete
+observational equivalence. It does **not** compare filesystem or network
+effects, scope snapshots, traces, event timing, or external-effect ordering.
+These four fixtures return deterministic values and do not claim equivalence
+for effects outside that returned-value boundary.
+
+The CI invocation uses zero hosted delay. It validates that every real fixture
+executes and that the serial, graph, and checked-in results agree; it is a
+semantic smoke test, not a performance gate. CI does not enforce a speedup.
+
 Timing includes hosted process startup and protocol overhead. Speedup on a
 single CPU core can still occur because sleeping hosted subprocesses overlap;
 that is wait concurrency, not evidence of parallel CPU computation. Treat
 reported ratios as measurements of this fixture/runtime/machine combination,
 not as a general scheduler-performance claim.
+
+The dated [2026-08-08 M1 Max result record](RESULTS-2026-08-08-be68dfef.md)
+binds the retained medians to the measured source commit and release-binary
+digest, states the interpretation limits, and gives a capture procedure for
+future runs. Keep future records append-only: do not replace an older result
+when the source, binary, machine, runtime, or parameters change.

@@ -394,7 +394,7 @@ check_stdout_contains "legacy backend cap attrs run without a host grant" 0 '^(\
 check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^(\[number\] )?0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
 check_stdout_contains "plain Python has ambient process authority" 0 '^(\[number\] )?0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
-check_stdout_contains "O help advertises graph worker bound" 0 '--workers N' "$O_BIN" --help
+check_stdout_contains "O help defines graph worker pool capacity" 0 'local-worker pool capacity' "$O_BIN" --help
 check_nonzero_stderr_contains "O rejects a zero graph worker bound" '--workers must be at least 1' "$O_BIN" --workers 0 examples/hello.O backends/
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help

@@ -1089,6 +1089,7 @@ class SourceReleaseTests(unittest.TestCase):
         self._commit()
         self._git(
             "rm",
+            "benchmarks/hgraph_hosted/RESULTS-2026-08-08-be68dfef.md",
             "benchmarks/hgraph_hosted/heterogeneous.O",
             "scripts/benchmark_hgraph_hosted.sh",
             "tests/test_benchmark_hgraph_hosted.py",
@@ -1097,7 +1098,8 @@ class SourceReleaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"missing required path\(s\): .*heterogeneous\.O.*"
+            r"missing required path\(s\): .*RESULTS-2026-08-08-be68dfef\.md.*"
+            r"heterogeneous\.O.*"
             r"benchmark_hgraph_hosted\.sh.*test_benchmark_hgraph_hosted\.py",
         ):
             self._build("missing-hosted-benchmark.zip")
