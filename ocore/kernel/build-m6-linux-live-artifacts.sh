@@ -135,6 +135,7 @@ check_principal_elf() {
   local file_headers
   local program_headers
   local section_headers
+  local entry_address
   local flags
   local load_count
   local text_vma
@@ -142,13 +143,14 @@ check_principal_elf() {
   file_headers="$(objdump -f "$elf")"
   program_headers="$(objdump -p "$elf")"
   section_headers="$(objdump -h "$elf")"
+  entry_address="$(printf '%s\n' "$file_headers" | awk '$1 == "start" && ($2 == "address" || $2 == "address:") { print $NF }')"
   flags="$(printf '%s\n' "$program_headers" | awk '/ flags / { print $NF }')"
   load_count="$(grep -Ec '^    LOAD ' <<<"$program_headers")"
   text_vma="$(printf '%s\n' "$section_headers" | awk '$2 == ".text" { print $4 }')"
   rodata_vma="$(printf '%s\n' "$section_headers" | awk '$2 == ".rodata" { print $4 }')"
   if ! grep -Fq 'file format elf64-x86-64' <<<"$file_headers" \
       || ! grep -Eq 'architecture: (x86_64|i386:x86-64)' <<<"$file_headers" \
-      || ! grep -Fq 'start address: 0x0000000002000000' <<<"$file_headers" \
+      || [[ "$entry_address" != 0x0000000002000000 ]] \
       || [[ "$(grep -Ec '^   STACK ' <<<"$program_headers")" != 1 ]] \
       || grep -Eq 'flags [^[:space:]]*w[^[:space:]]*x|flags [^[:space:]]*x[^[:space:]]*w' <<<"$program_headers" \
       || grep -Eq 'NEEDED|RPATH|RUNPATH|INTERP' <<<"$program_headers" \
