@@ -252,11 +252,11 @@ EOF
         return
     fi
     for pattern in \
-        '^; ExecutionAdmission oexec\.admission/v2$' \
+        '^; ExecutionAdmission oexec\.admission/v3$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
         '^operation P[0-9]+ admitted=yes ' \
-        '^  dispatch lane=coordinator adapter=coordinator/v1 preparation=coordinator-owned$' \
+        '^  dispatch lane=coordinator adapter=coordinator/v1 semantics=strict-equivalent preparation=coordinator-owned$' \
         '^wave 0 \[' \
         '^admission-note waves describe the legal static frontier, not observed dispatch$' \
         '^admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation$' \
@@ -359,6 +359,8 @@ check_stdout_contains "legacy backend cap attrs run without a host grant" 0 '^(\
 check_stdout_contains "backend grants remain accepted but unnecessary" 0 '^(\[number\] )?0$' "$O_BIN" --backend-grant runner=python:process "$CAPABILITY_SOURCE" backends/
 check_stdout_contains "plain Python has ambient process authority" 0 '^(\[number\] )?0$' "$O_BIN" "$AMBIENT_AUTHORITY_SOURCE" backends/
 check_stdout_contains "O --help shows usage" 0 '^Usage:' "$O_BIN" --help
+check_stdout_contains "O help advertises graph worker bound" 0 '--workers N' "$O_BIN" --help
+check_nonzero_stderr_contains "O rejects a zero graph worker bound" '--workers must be at least 1' "$O_BIN" --workers 0 examples/hello.O backends/
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help
 check_olangc_schedule_explanation "olangc explains digest-bound admission without execution"

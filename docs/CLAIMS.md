@@ -747,9 +747,15 @@
 - Graph construction, multi-output validation, type/fidelity solving, explicit
   resource and completion lowering, scheduling, and readiness-driven dispatch
   are implemented in `src/hgraph/`, `src/effects.rs`, and `src/executor/`.
-- Parallel dispatch is correctness-first. Only verified pure, deterministic,
-  infallible, state-free inline renderers run on workers. Arbitrary Eval/shim
-  operations stay on the evaluator owner thread and are ordered by graph state.
+- Strict-equivalent parallel dispatch is correctness-first: compiler-verified
+  O-scope reads and verified pure, deterministic, infallible, state-free inline
+  renderers run on workers. Ordinary Eval/shim operations stay on the evaluator
+  owner thread and are ordered by graph state. Separately, direct attribute-free
+  ephemeral shim members of a group under effective `autonomous(...)` may run
+  on bounded workers with evidence-labeled
+  `explicit-autonomous-unordered` semantics. This preserves explicit dataflow,
+  live capability checks, and deterministic outcome selection, but does not
+  claim rollback or ordering of already-started hidden host effects.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue
@@ -761,8 +767,9 @@
   resource models that safely reduce `HostWorld` serialization.
 - Runtime plugin registration beyond the current static `BackendRegistry` table
   in `src/ir.rs`.
-- Fingerprint-complete effect tracking and verified backend analyzers that could
-  safely broaden `{lazy}` and graph parallelism beyond trusted inline backends.
+- Fingerprint-complete effect tracking, enforced sandboxes, and verified backend
+  analyzers that could broaden strict-equivalent graph parallelism beyond the
+  trusted inline/read-only set.
 - More precise backend morphism proofs and fidelity accounting for OValue
   crossings, extending the current `Fidelity` and `BackendMorphism` vocabulary
   in `src/value.rs`.
