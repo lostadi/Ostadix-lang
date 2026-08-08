@@ -97,6 +97,7 @@ pub struct ExecutionAdmissionV3 {
     operations: Vec<AdmittedOperationV1>,
     retained_sequences: Vec<RetainedSequenceV1>,
     waves: Vec<Vec<PlanNodeId>>,
+    hosted_task_layers: Vec<Vec<PlanNodeId>>,
 }
 
 impl ExecutionAdmissionV3 {
@@ -146,6 +147,29 @@ impl ExecutionAdmissionV3 {
 
     pub fn admitted_static_max_wave_width(&self) -> usize {
         self.waves.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    /// Widest unit-cost hosted-task layer in the admitted dependency graph.
+    /// Coordinator bookkeeping has zero weight; every shim-backed execution
+    /// operation has unit weight. This is a topology prediction, not a claim
+    /// that the whole layer can be dispatched together on this machine.
+    pub fn admitted_hosted_task_max_wave_width(&self) -> usize {
+        self.hosted_task_layers
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Longest admitted dependency path measured in unit-cost shim-backed
+    /// hosted operations. Zero-cost coordinator bookkeeping does not inflate
+    /// the result, so the unit is hosted-task layers.
+    pub fn admitted_hosted_task_wave_count(&self) -> usize {
+        self.hosted_task_layers.len()
+    }
+
+    pub fn admitted_hosted_task_layers(&self) -> &[Vec<PlanNodeId>] {
+        &self.hosted_task_layers
     }
 
     /// Widest legal static frontier among operations admitted to the local
@@ -276,6 +300,30 @@ impl ExecutionAdmissionV3 {
             selected_workers
         )
         .expect("writing to a String cannot fail");
+        out.push_str("; SchedulePrediction oexec.schedule-prediction/v1\n");
+        writeln!(
+            out,
+            "schedule-prediction schema=oexec.schedule-prediction/v1 status=admitted-static provenance=evidence-bound-admission model=unit-cost-shim-hosted-tasks admission-sha256={} task-count={} predicted-width={} predicted-span={} span-unit=hosted-task-layers",
+            self.admission_sha256,
+            self.hosted_task_layers.iter().map(Vec::len).sum::<usize>(),
+            self.admitted_hosted_task_max_wave_width(),
+            self.admitted_hosted_task_wave_count()
+        )
+        .expect("writing to a String cannot fail");
+        for (index, layer) in self.hosted_task_layers.iter().enumerate() {
+            let operations = layer
+                .iter()
+                .map(|node| format!("P{}", node.0))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                out,
+                "schedule-prediction-layer index={} operations=[{}]",
+                index + 1,
+                operations
+            )
+            .expect("writing to a String cannot fail");
+        }
 
         for operation in &self.operations {
             let evidence = &operation.evidence;
@@ -386,6 +434,9 @@ impl ExecutionAdmissionV3 {
         }
         out.push_str(
             "admission-note waves describe the legal static frontier, not observed dispatch\n",
+        );
+        out.push_str(
+            "admission-note hosted-task prediction assigns unit cost to shim-backed execution and zero cost to other admitted operations; it predicts topology, not duration, capacity fit, dispatch, or observed overlap\n",
         );
         out.push_str(
             "admission-note worker-count-covers-static-wave checks local-worker count only; execution realizability remains unknown and no simultaneous dispatch, CPU or memory fit, or overlap is proved\n",
@@ -574,6 +625,7 @@ pub fn admit_execution<'a>(
         .map_err(anyhow::Error::msg)
         .context("admitted graph has no executable ready schedule")?;
     let waves = schedule.waves().map_err(anyhow::Error::msg)?;
+    let hosted_task_layers = explain_hosted_task_layers(plan, &schedule, &waves)?;
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let admission_sha256 = digest_fields(
@@ -598,6 +650,7 @@ pub fn admit_execution<'a>(
         operations,
         retained_sequences,
         waves,
+        hosted_task_layers,
     };
     Ok(AdmittedExecution {
         program,
@@ -733,6 +786,79 @@ fn validate_node_evidence(
         ),
     }
     Ok(())
+}
+
+/// Project the admitted dependency DAG onto unit-cost shim-backed hosted
+/// operations. Every other operation has zero weight, so structural stores,
+/// groups, schedule controls, and scope loads preserve causality without
+/// inflating the hosted-task span.
+fn explain_hosted_task_layers(
+    plan: &ExecutionPlan,
+    schedule: &ReadySchedule,
+    waves: &[Vec<PlanNodeId>],
+) -> Result<Vec<Vec<PlanNodeId>>> {
+    let hosted_tasks = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            PlanNodeKind::Exec { backend, .. }
+                if backend.execution == crate::ir::ExecutionMode::Shim =>
+            {
+                Some(node.id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let op_indices = schedule
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| (operation.plan_node, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut weighted_depth = vec![0usize; schedule.ops.len()];
+    let mut layers = BTreeMap::<usize, Vec<PlanNodeId>>::new();
+    let mut observed = BTreeSet::new();
+
+    // `waves` is a validated topological order over every potential blocker.
+    // Within a wave there are no dependency edges, so predecessor depths are
+    // complete before the wave is visited.
+    for wave in waves {
+        for plan_node in wave {
+            let operation_index = *op_indices.get(plan_node).with_context(|| {
+                format!(
+                    "admitted static wave references unknown operation {}",
+                    plan_node.0
+                )
+            })?;
+            let operation = &schedule.ops[operation_index];
+            let predecessor_depth = operation
+                .blocked_by
+                .iter()
+                .map(|predecessor| weighted_depth[*predecessor])
+                .max()
+                .unwrap_or(0);
+            let hosted = hosted_tasks.contains(plan_node);
+            let depth = predecessor_depth + usize::from(hosted);
+            weighted_depth[operation_index] = depth;
+            if hosted {
+                observed.insert(*plan_node);
+                layers.entry(depth).or_default().push(*plan_node);
+            }
+        }
+    }
+
+    if observed != hosted_tasks {
+        bail!("hosted-task schedule projection differs from the shim-backed execution inventory");
+    }
+    let max_depth = layers.keys().next_back().copied().unwrap_or(0);
+    let mut result = Vec::with_capacity(max_depth);
+    for depth in 1..=max_depth {
+        let layer = layers
+            .remove(&depth)
+            .with_context(|| format!("hosted-task schedule projection omitted layer {depth}"))?;
+        result.push(layer);
+    }
+    Ok(result)
 }
 
 fn explain_operations(
@@ -934,7 +1060,8 @@ mod tests {
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
     use crate::hgraph::{DomainFlags, ValueState};
-    use crate::ir::{InvokeMode, OIr, OIrProgram, PlanNodeKind};
+    use crate::ir::{BackendRegistry, InvokeMode, OIr, OIrProgram, PlanNodeKind};
+    use crate::parser::Parser;
     use crate::value::GroupMode;
 
     fn reader_writer_program(initial: &str) -> OIrProgram {
@@ -1057,13 +1184,7 @@ mod tests {
     #[test]
     fn coordinator_only_admission_has_no_local_worker_wave() {
         let program = OIrProgram {
-            nodes: vec![OIr::Exec {
-                lang: "python".into(),
-                env_id: u32::MAX,
-                attr: None,
-                backend: crate::ir::BackendRegistry::global().interface_for("python"),
-                body: vec![OIr::Text("__oval_result__ = 1".into())],
-            }],
+            nodes: vec![OIr::Text("coordinator-only".into())],
         };
         let plan = program.plan();
         let graph = solved_graph(&program);
@@ -1073,9 +1194,16 @@ mod tests {
             admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
 
         assert_eq!(admitted.admission().admitted_max_wave_width(), 0);
-        assert!(admitted.admission().to_explanation_text().contains(
+        let explanation = admitted.admission().to_explanation_text();
+        assert!(explanation.contains(
             "worker-count-covers-static-wave=not-applicable runtime-readiness=unknown placement-lease=none observed-overlap=not-run"
         ));
+        assert!(explanation.contains(
+            "task-count=0 predicted-width=0 predicted-span=0 span-unit=hosted-task-layers"
+        ));
+        assert!(!explanation
+            .lines()
+            .any(|line| line.starts_with("schedule-prediction-layer ")));
     }
 
     #[test]
@@ -1382,6 +1510,17 @@ mod tests {
             "worker-count-covers-static-wave=no runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=cli-override"
         ));
         assert!(explanation.contains("admitted-max-local-worker-wave-width=4 selected-workers=2"));
+        assert_eq!(
+            admitted.admission().admitted_hosted_task_max_wave_width(),
+            4
+        );
+        assert_eq!(admitted.admission().admitted_hosted_task_wave_count(), 1);
+        assert!(explanation.contains(
+            "schedule-prediction schema=oexec.schedule-prediction/v1 status=admitted-static"
+        ));
+        assert!(explanation.contains(
+            "task-count=4 predicted-width=4 predicted-span=1 span-unit=hosted-task-layers"
+        ));
 
         let mut forged = evidence;
         forged
@@ -1409,6 +1548,131 @@ mod tests {
                 .contains("hard evidence differs from the trusted analyzer result"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn hosted_task_prediction_collapses_zero_cost_bookkeeping() {
+        let source = r#"
+let seed = python^(
+__oval_result__ = 10
+)_python
+let branches = autonomous(batch(
+python^(__oval_result__ = seed + 1)_python,
+python^(__oval_result__ = seed + 2)_python,
+python^(__oval_result__ = seed + 3)_python,
+python^(__oval_result__ = seed + 4)_python
+))
+python^(__oval_result__ = sum(branches))_python
+"#;
+        let backends = BackendRegistry::global().registered_backend_tags();
+        let nodes = Parser::new(source, &backends).parse().unwrap();
+        let program = OIrProgram::lower(&nodes);
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "hosted-task-prediction");
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+
+        assert_eq!(
+            admitted.admission().admitted_hosted_task_max_wave_width(),
+            4
+        );
+        assert_eq!(admitted.admission().admitted_hosted_task_wave_count(), 3);
+        assert_eq!(
+            admitted
+                .admission()
+                .admitted_hosted_task_layers()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 1]
+        );
+        let explanation = admitted.admission().to_explanation_text();
+        assert!(explanation.contains(
+            "task-count=6 predicted-width=4 predicted-span=3 span-unit=hosted-task-layers"
+        ));
+        assert_eq!(
+            explanation
+                .lines()
+                .filter(|line| line.starts_with("schedule-prediction-layer "))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn hosted_benchmark_fixtures_match_their_reviewed_topologies() {
+        let fixtures = [
+            (
+                "heterogeneous",
+                include_str!("../../benchmarks/hgraph_hosted/heterogeneous.O"),
+                3,
+                3,
+                1,
+            ),
+            (
+                "chained",
+                include_str!("../../benchmarks/hgraph_hosted/chained.O"),
+                4,
+                1,
+                4,
+            ),
+            (
+                "mixed_width",
+                include_str!("../../benchmarks/hgraph_hosted/mixed_width.O"),
+                6,
+                4,
+                3,
+            ),
+            (
+                "realistic",
+                include_str!("../../benchmarks/hgraph_hosted/realistic.O"),
+                4,
+                2,
+                3,
+            ),
+        ];
+
+        for (name, source, task_count, width, span) in fixtures {
+            let source = source
+                .replace("__SLEEP_SECONDS__", "0")
+                .replace("__SLEEP_MILLISECONDS__", "0");
+            let backends = BackendRegistry::global().registered_backend_tags();
+            let nodes = Parser::new(&source, &backends)
+                .parse()
+                .unwrap_or_else(|error| panic!("parse {name}: {error:#}"));
+            let program = OIrProgram::lower(&nodes);
+            let plan = program.plan();
+            let graph = solved_graph(&program);
+            let runtime = inspection_runtime(&plan, name);
+            let evidence = analyze_execution(&program, &plan, &graph, runtime.clone())
+                .unwrap_or_else(|error| panic!("analyze {name}: {error:#}"));
+            let admitted =
+                admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence)
+                    .unwrap_or_else(|error| panic!("admit {name}: {error:#}"));
+
+            assert_eq!(
+                admitted
+                    .admission()
+                    .admitted_hosted_task_layers()
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                task_count,
+                "{name} hosted task count"
+            );
+            assert_eq!(
+                admitted.admission().admitted_hosted_task_max_wave_width(),
+                width,
+                "{name} predicted width"
+            );
+            assert_eq!(
+                admitted.admission().admitted_hosted_task_wave_count(),
+                span,
+                "{name} predicted span"
+            );
+        }
     }
 
     #[test]
