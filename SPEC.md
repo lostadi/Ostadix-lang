@@ -379,8 +379,43 @@ That marker MUST remain outside the admission digest. Neither
 `worker-count-covers-static-wave=yes` nor any width/count field proves
 simultaneous dispatch, CPU or memory fit, device or I/O capacity, backend
 readiness, placement, overlap, or execution realizability. An explicit
-inspection override MUST NOT be presented as a host-capacity fact. Admitted
-O-scope loads, source-proven-preparable trees of the four trusted
+inspection override MUST NOT be presented as a host-capacity fact.
+
+The explanation MUST also include the nonexecuting hosted-topology prediction
+schema `oexec.schedule-prediction/v1`, headed by
+`; SchedulePrediction oexec.schedule-prediction/v1`. This record is derived
+after admission and remains outside the admission digest; its
+`admission-sha256` field MUST equal the digest on the enclosing v3 admission's
+canonical digest-binding line. Its single `schedule-prediction` record has the
+following fields:
+
+| Field | Required value or meaning |
+|---|---|
+| `schema` | `oexec.schedule-prediction/v1`. |
+| `status` | `admitted-static`; no execution was performed. |
+| `provenance` | `evidence-bound-admission`; the topology comes from the admitted plan and blockers. |
+| `model` | `unit-cost-shim-hosted-tasks`. |
+| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v3` record. |
+| `task-count` | Number of admitted shim-backed hosted `Exec` operations, regardless of execution lane. |
+| `predicted-width` | Maximum hosted-operation cardinality of any weighted-depth layer, or zero when `task-count=0`. |
+| `predicted-span` | Number of nonempty hosted-task layers, or zero when `task-count=0`. |
+| `span-unit` | `hosted-task-layers`; this is not time. |
+
+Each admitted shim-backed hosted `Exec` operation MUST have unit weight and
+every other admitted operation MUST have zero weight. An operation's depth is
+its own weight plus the maximum depth of its admitted blockers; roots begin at
+their own weight. Operations with unit weight MUST be grouped by positive depth.
+For each nonempty group, the explanation MUST emit exactly one
+`schedule-prediction-layer index=N operations=[P...]` record. Layer indices
+MUST be contiguous and one-based, every listed Plan ID MUST be unique, and the
+union of the layers MUST equal the hosted-task inventory. A zero-task
+prediction MUST emit width and span zero and no layer records.
+
+The prediction models static dependency geometry only. It MUST NOT be treated
+as a duration estimate, resource-capacity proof, dispatch decision, runtime or
+placement readiness fact, observed overlap, or execution-realizability claim.
+
+Admitted O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
 actor-owned persistent environments, renewable-capacity allocation, and
@@ -869,4 +904,4 @@ This spec is v0.2.0. The v0.2 bump reflects:
 Breaking changes to OValue or the Backend protocol
 will bump the minor version until v1.0.
 
-Author: Lee Ostadi
+Author: Lee Daghlar Ostadi

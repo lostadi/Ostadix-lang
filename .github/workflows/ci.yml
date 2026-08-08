@@ -74,6 +74,21 @@ jobs:
             "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
+      - name: Prove lingering backend descendants are reaped
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        timeout-minutes: 2
+        env:
+          O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-descendant.log
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test \
+            --test autonomous_hosted_parallel \
+            autonomous_lingering_same_group_descendant_fails_and_is_reaped \
+            -- \
+            --exact \
+            --nocapture \
+            --test-threads=1
+
       - name: Run production Python backend-proxy lifecycle gate
         timeout-minutes: 2
         env:
@@ -112,6 +127,7 @@ jobs:
       - name: Run hosted HGraph benchmark semantic smoke
         run: |
           O_RELEASE_BIN="$PWD/target/debug/O" \
+            OLANGC_RELEASE_BIN="$PWD/target/debug/olangc" \
             scripts/benchmark_hgraph_hosted.sh \
             --warmups 0 \
             --repetitions 1 \

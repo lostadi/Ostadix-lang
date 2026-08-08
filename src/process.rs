@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -243,6 +243,158 @@ fn duration_from_env(name: &str, default: Duration, maximum: Duration) -> Durati
         .map(Duration::from_millis)
         .map(|duration| duration.min(maximum))
         .unwrap_or(default)
+}
+
+fn bounded_deadline(timeout: Duration, subject: &str) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("{subject} deadline overflowed"))
+}
+
+/// Ostadix POSIX v1 containment governs descendants that remain in the
+/// backend's inherited process group. A descendant that deliberately creates
+/// a new session or process group (for example with `setsid`) escapes this v1
+/// boundary; complete containment requires a stronger OS facility such as a
+/// Linux cgroup or a Windows job object.
+#[cfg(target_os = "linux")]
+fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == group {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let close = stat.rfind(')').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
+        })?;
+        let mut fields = stat[close + 1..].split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let candidate_group = fields
+            .next()
+            .and_then(|field| field.parse::<i32>().ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process group")
+            })?;
+        // Orphaned grandchildren cannot be waited by this process. Zombies
+        // and Linux's transient dead states have no executable state and
+        // cannot retain backend protocol descriptors, so they are terminal
+        // for this physical-completion boundary.
+        if candidate_group == group && !matches!(state, Some("Z" | "X" | "x")) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
+    // SAFETY: a null buffer asks libproc for a conservative PID capacity and
+    // does not dereference memory.
+    let capacity = unsafe { libc::proc_listpgrppids(group, std::ptr::null_mut(), 0) };
+    if capacity <= 0 {
+        let enumeration_error = io::Error::last_os_error();
+        // After the anchored leader is reaped, libproc can report no result
+        // without a useful errno. Confirm absence through the process-group
+        // namespace before treating that as quiescence.
+        // SAFETY: signal zero performs existence/permission checks only.
+        if unsafe { libc::kill(-group, 0) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return Ok(true);
+        }
+        return Err(enumeration_error);
+    }
+    let mut members = vec![0 as libc::pid_t; capacity as usize];
+    let bytes = members
+        .len()
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|size| i32::try_from(size).ok())
+        .ok_or_else(|| io::Error::other("Darwin process-group buffer is too large"))?;
+    // SAFETY: `members` owns `bytes` writable bytes and remains alive for the
+    // complete libproc call.
+    let count = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), bytes) };
+    if count <= 0 {
+        let enumeration_error = io::Error::last_os_error();
+        // SAFETY: signal zero performs existence/permission checks only.
+        if unsafe { libc::kill(-group, 0) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return Ok(true);
+        }
+        return Err(enumeration_error);
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| io::Error::other("Darwin process-group count does not fit usize"))?;
+    if count > members.len() {
+        return Err(io::Error::other(
+            "Darwin process-group enumeration exceeded its buffer",
+        ));
+    }
+    members.truncate(count);
+    for member in members.into_iter().filter(|member| *member != group) {
+        // SAFETY: `information` is valid writable storage of the exact size
+        // supplied to libproc for the queried PID.
+        let mut information: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let information_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| io::Error::other("Darwin process info buffer is too large"))?;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                member,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut information as *mut libc::proc_bsdinfo).cast(),
+                information_size,
+            )
+        };
+        if read <= 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error);
+        }
+        if read != information_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Darwin returned a partial process info record",
+            ));
+        }
+        // Revalidate the PGID after enumeration to reject PID reuse. Zombies
+        // are inert and cannot retain backend protocol descriptors.
+        if information.pbi_pgid == group as u32 && information.pbi_status != libc::SZOMB {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn owned_group_has_no_active_descendants(_group: i32) -> io::Result<bool> {
+    // POSIX exposes group signalling but no portable membership-enumeration
+    // API. The shutdown path still kills the inherited group on failure, but
+    // the stronger active-descendant proof is currently Linux/Darwin only.
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn owned_group_has_no_active_descendants(_group: i32) -> io::Result<bool> {
+    Ok(true)
 }
 
 fn signal_owned_process_group(child: &mut Child) -> Result<()> {
@@ -608,6 +760,7 @@ impl BackendProcess {
     }
 
     fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = bounded_deadline(timeout, "backend shutdown")?;
         if let Err(error) = self.send_command(&OWireCommand::Shutdown) {
             let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
             return match termination {
@@ -625,7 +778,7 @@ impl BackendProcess {
         // pipe now guarantees EOF even for an older proxy or shim.
         self.stdin.take();
 
-        match self.recv_step_timeout(timeout) {
+        match self.recv_shutdown_step_before(deadline, timeout) {
             Ok(ExecStep::Done(OValue::Null)) => lifecycle_trace(
                 "worker.shutdown_acknowledged",
                 format!("language={} backend_pid={}", self.language, self.child.id()),
@@ -667,42 +820,111 @@ impl BackendProcess {
         // An acknowledgement is the backend's final protocol action. A
         // conforming backend exits naturally after it; avoiding an eager
         // signal also avoids conflating Darwin's zombie-only process-group
-        // race with successful shutdown. Timeout still fails closed and
-        // force-terminates the entire owned group.
-        if let Err(natural_exit) = self.wait_for_exit(timeout) {
+        // race with successful shutdown. The same absolute deadline governs
+        // acknowledgement, leader exit, reader completion, and proof that no
+        // active descendant remains in the owned process group.
+        if let Err(natural_exit) = self.finish_graceful_shutdown(deadline, timeout) {
             let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
             return match termination {
-                Ok(()) => Err(natural_exit.context("backend acknowledged shutdown but did not exit")),
+                Ok(()) => Err(natural_exit.context(
+                    "backend acknowledged shutdown but did not terminate cleanly",
+                )),
                 Err(termination) => Err(anyhow!(
-                    "backend acknowledged shutdown but did not exit: {natural_exit:#}; forced termination also failed: {termination:#}"
+                    "backend acknowledged shutdown but did not terminate cleanly: {natural_exit:#}; forced termination also failed: {termination:#}"
                 )),
             };
         }
         Ok(())
     }
 
+    fn recv_shutdown_step_before(
+        &mut self,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<ExecStep> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                anyhow!(
+                    "backend `{}` did not answer within {} ms",
+                    self.language,
+                    timeout.as_millis()
+                )
+            })?;
+        let response = self
+            .responses
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => anyhow!(
+                    "backend `{}` did not answer within {} ms",
+                    self.language,
+                    timeout.as_millis()
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    anyhow!("backend process closed stdout unexpectedly")
+                }
+            })?
+            .map_err(anyhow::Error::msg)?;
+        Self::response_step(response)
+    }
+
+    fn finish_graceful_shutdown(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
+        self.wait_for_leader_exit_before(deadline, timeout)?;
+        self.finish_reader_before(deadline, timeout)?;
+        self.wait_for_owned_group_quiescence_before(deadline, timeout)?;
+        self.reap_leader_and_mark_terminal()
+    }
+
     fn force_terminate(&mut self, timeout: Duration) -> Result<()> {
+        if self.terminal {
+            return self.finish_reader_bounded(timeout);
+        }
+        let deadline = bounded_deadline(timeout, "forced backend termination")?;
         self.stdin.take();
-        let signal_result = signal_owned_process_group(&mut self.child);
-        let wait_result = self.wait_for_exit(timeout);
-        match (signal_result, wait_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(signal), Ok(())) => Err(signal),
-            (Ok(()), Err(wait)) => Err(wait),
-            (Err(signal), Err(wait)) => {
-                Err(anyhow!("{signal:#}; backend wait also failed: {wait:#}"))
+        let mut failures = Vec::new();
+        if let Err(error) = signal_owned_process_group(&mut self.child) {
+            failures.push(format!("backend SIGKILL failed: {error:#}"));
+        }
+
+        let leader_exited = match self.wait_for_leader_exit_before(deadline, timeout) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!("backend leader wait failed: {error:#}"));
+                false
             }
+        };
+        let reader_finished = match self.finish_reader_before(deadline, timeout) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!("backend response-reader wait failed: {error:#}"));
+                false
+            }
+        };
+        let group_quiescent = match self.wait_for_owned_group_quiescence_before(deadline, timeout) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!("backend process-group wait failed: {error:#}"));
+                false
+            }
+        };
+        if leader_exited && reader_finished && group_quiescent {
+            if let Err(error) = self.reap_leader_and_mark_terminal() {
+                failures.push(format!("backend leader reap failed: {error:#}"));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(failures.join("; ")))
         }
     }
 
-    fn wait_for_exit(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow!("backend termination deadline overflowed"))?;
+    fn wait_for_leader_exit_before(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
         loop {
-            if self.child.try_wait()?.is_some() {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                return self.mark_terminal(remaining);
+            if self.leader_exited_without_reaping()? {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -712,13 +934,80 @@ impl BackendProcess {
                     timeout.as_millis()
                 ));
             }
-            thread::sleep(Duration::from_millis(2));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(Duration::from_millis(2).min(remaining));
         }
     }
 
-    fn mark_terminal(&mut self, reader_timeout: Duration) -> Result<()> {
+    #[cfg(unix)]
+    fn leader_exited_without_reaping(&mut self) -> Result<bool> {
+        loop {
+            // SAFETY: `waitid` initializes siginfo for this exact direct child.
+            // WNOWAIT observes exit without releasing the PID that anchors the
+            // owned process-group identity while descendants are inspected.
+            let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id() as libc::id_t,
+                    &mut information,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                // SAFETY: successful waitid initialized `information`; si_pid
+                // is zero when WNOHANG found no waitable state.
+                return Ok(unsafe { information.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("failed to inspect backend leader state");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn leader_exited_without_reaping(&mut self) -> Result<bool> {
+        self.child
+            .try_wait()
+            .context("failed to inspect backend leader state")
+            .map(|status| status.is_some())
+    }
+
+    fn wait_for_owned_group_quiescence_before(
+        &self,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<()> {
+        let group = i32::try_from(self.child.id())
+            .map_err(|_| anyhow!("backend pid does not fit process-group identifier"))?;
+        loop {
+            if owned_group_has_no_active_descendants(group).with_context(|| {
+                format!(
+                    "failed to inspect backend `{}` process group {group}",
+                    self.language
+                )
+            })? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "backend `{}` process group {} still contains an active descendant after {} ms",
+                    self.language,
+                    group,
+                    timeout.as_millis()
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(Duration::from_millis(2).min(remaining));
+        }
+    }
+
+    fn reap_leader_and_mark_terminal(&mut self) -> Result<()> {
+        self.child
+            .wait()
+            .context("failed to reap backend leader after termination")?;
         self.terminal = true;
-        self.finish_reader_bounded(reader_timeout)?;
         lifecycle_trace(
             "worker.backend_wait_returned",
             format!("language={} backend_pid={}", self.language, self.child.id()),
@@ -727,9 +1016,11 @@ impl BackendProcess {
     }
 
     fn finish_reader_bounded(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow!("backend response-reader deadline overflowed"))?;
+        let deadline = bounded_deadline(timeout, "backend response-reader")?;
+        self.finish_reader_before(deadline, timeout)
+    }
+
+    fn finish_reader_before(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
         while self
             .reader
             .as_ref()
@@ -743,7 +1034,8 @@ impl BackendProcess {
                     timeout.as_millis()
                 ));
             }
-            thread::sleep(Duration::from_millis(2));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(Duration::from_millis(2).min(remaining));
         }
         if let Some(reader) = self.reader.take() {
             reader
@@ -1225,6 +1517,95 @@ mod tests {
         assert!(
             process.child.try_wait()?.is_some(),
             "backend {pid} was not reaped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_timeout_is_one_deadline_across_acknowledgement_and_exit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let shim = temp.path().join("delayed_shutdown.py");
+        let common = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/o_shim_common.py");
+        std::fs::copy(&common, temp.path().join("o_shim_common.py"))?;
+
+        let source = std::fs::read_to_string(python_shim_path())?;
+        let original = concat!(
+            "        elif tag == \"shutdown\":\n",
+            "            send_ok(None)\n",
+            "            break\n",
+        );
+        let delayed = concat!(
+            "        elif tag == \"shutdown\":\n",
+            "            __import__(\"time\").sleep(0.2)\n",
+            "            send_ok(None)\n",
+            "            __import__(\"time\").sleep(0.4)\n",
+            "            break\n",
+        );
+        assert!(
+            source.contains(original),
+            "Python shim shutdown branch changed; update the deadline fixture"
+        );
+        std::fs::write(&shim, source.replacen(original, delayed, 1))?;
+
+        let mut process = BackendProcess::new("python", &shim, &BackendSandboxPolicy::none())?;
+        let started = Instant::now();
+        let error = process
+            .shutdown(Duration::from_millis(500))
+            .expect_err("acknowledgement and exit must share one 500 ms deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(2), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("did not terminate within 500 ms"),
+            "{error:#}"
+        );
+        assert!(process.terminal, "forced termination did not reap backend");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graceful_shutdown_force_kills_lingering_same_group_descendant() -> Result<()> {
+        use crate::value::BackendAuthority;
+
+        // DEVNULL is opened read/write by Python's subprocess module, so the
+        // fixture needs FileWrite in addition to the Process authority that
+        // permits the descendant spawn itself.
+        let mut process =
+            spawn_python_shim_with([BackendAuthority::Process, BackendAuthority::FileWrite])?;
+        let group = i32::try_from(process.child.id())?;
+        let value = process.exec(
+            concat!(
+                "import subprocess\n",
+                "_o_lingering_child = subprocess.Popen(\n",
+                "    ['/bin/sleep', '60'],\n",
+                "    stdin=subprocess.DEVNULL,\n",
+                "    stdout=subprocess.DEVNULL,\n",
+                "    stderr=subprocess.DEVNULL,\n",
+                ")\n",
+                "__oval_result__ = _o_lingering_child.pid",
+            ),
+            HashMap::new(),
+        )?;
+        let descendant = i32::try_from(value.as_int()?)?;
+        // SAFETY: `getpgid` only inspects the live PID returned by Popen.
+        assert_eq!(unsafe { libc::getpgid(descendant) }, group);
+
+        let error = process
+            .shutdown(Duration::from_millis(500))
+            .expect_err("a lingering active descendant must fail graceful shutdown");
+
+        assert!(
+            format!("{error:#}").contains("still contains an active descendant"),
+            "{error:#}"
+        );
+        assert!(process.terminal, "forced group termination did not settle");
+        assert!(
+            owned_group_has_no_active_descendants(group)?,
+            "backend group {group} retained an active descendant after forced shutdown"
+        );
+        assert!(
+            process.child.try_wait()?.is_some(),
+            "backend group leader was not reaped"
         );
         Ok(())
     }
