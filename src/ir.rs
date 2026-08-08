@@ -883,6 +883,10 @@ impl PlanBuilder {
                 body,
                 ..
             } => {
+                // Every shim receives the complete visible O scope as native
+                // bindings. Keep those dependencies even for an ephemeral
+                // process: fresh interpreter state does not erase lexical
+                // dataflow.
                 if backend.execution == ExecutionMode::Shim {
                     for source in visible_scope_sources(scope_stack) {
                         self.add_edge(source, id, PlanEdgeKind::Data);
@@ -1508,6 +1512,7 @@ impl BackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::Parser;
 
     fn typed(lang: &str, body: Vec<ONode>) -> ONode {
         ONode::TypedExpr {
@@ -1602,6 +1607,39 @@ mod tests {
                 OIr::Invoke { mode, .. } if *mode == expected
             ));
         }
+    }
+
+    #[test]
+    fn source_lowers_typed_group_members_into_direct_exec_arguments() {
+        let source = "autonomous(batch(python^(1)_python, python^(2)_python))";
+        let backends = BackendRegistry::global().registered_backend_tags();
+        let parsed = Parser::new(source, &backends).parse().unwrap();
+        let program = OIrProgram::lower(&parsed);
+        let OIr::Invoke {
+            mode: InvokeMode::Autonomous,
+            args: autonomous_args,
+            ..
+        } = &program.nodes[0]
+        else {
+            panic!("expected autonomous invocation")
+        };
+        let OIr::Invoke {
+            mode: InvokeMode::Group(GroupMode::Batch),
+            args: members,
+            ..
+        } = &autonomous_args[0]
+        else {
+            panic!("expected nested batch invocation")
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| matches!(
+            member,
+            OIr::Exec {
+                env_id: u32::MAX,
+                backend,
+                ..
+            } if backend.canonical == "python"
+        )));
     }
 
     #[test]

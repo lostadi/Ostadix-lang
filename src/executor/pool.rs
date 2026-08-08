@@ -12,14 +12,14 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use super::task::{TaskCompletion, TaskSubmission};
+use super::task::{TaskCompletion, TaskContext, TaskSubmission, WorkerEvent};
 
 /// A bounded pool of persistent local workers.
 pub(crate) struct WorkerPool {
     capacity: usize,
     outstanding: usize,
     submissions: Option<SyncSender<TaskSubmission>>,
-    completions: Receiver<TaskCompletion>,
+    events: Receiver<WorkerEvent>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -31,15 +31,15 @@ impl WorkerPool {
 
         let (submission_tx, submission_rx) = mpsc::sync_channel(capacity);
         let submission_rx = Arc::new(Mutex::new(submission_rx));
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let mut workers = Vec::with_capacity(capacity);
 
         for index in 0..capacity {
             let submissions = Arc::clone(&submission_rx);
-            let completions = completion_tx.clone();
+            let events = event_tx.clone();
             let spawn = thread::Builder::new()
                 .name(format!("ostadix-local-worker-{index}"))
-                .spawn(move || worker_loop(submissions, completions));
+                .spawn(move || worker_loop(submissions, events));
             match spawn {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -51,13 +51,13 @@ impl WorkerPool {
                 }
             }
         }
-        drop(completion_tx);
+        drop(event_tx);
 
         Ok(Self {
             capacity,
             outstanding: 0,
             submissions: Some(submission_tx),
-            completions: completion_rx,
+            events: event_rx,
             workers,
         })
     }
@@ -86,27 +86,47 @@ impl WorkerPool {
         Ok(())
     }
 
-    /// Wait for one physical task completion.
-    pub(crate) fn recv_completion(&mut self) -> Result<TaskCompletion> {
-        let completion = self
-            .completions
+    /// Wait for one physical worker event. Callback requests keep the worker
+    /// outstanding; only a completion returns capacity to the pool.
+    pub(crate) fn recv_event(&mut self) -> Result<WorkerEvent> {
+        let event = self
+            .events
             .recv()
             .map_err(|_| anyhow!("local worker pool disconnected with tasks outstanding"))?;
-        self.accept_completion()?;
-        Ok(completion)
+        if matches!(event, WorkerEvent::Completion(_)) {
+            self.accept_completion()?;
+        }
+        Ok(event)
     }
 
-    /// Receive one already-available completion without blocking.
-    pub(crate) fn try_recv_completion(&mut self) -> Result<Option<TaskCompletion>> {
-        match self.completions.try_recv() {
-            Ok(completion) => {
-                self.accept_completion()?;
-                Ok(Some(completion))
+    /// Receive one already-available worker event without blocking.
+    pub(crate) fn try_recv_event(&mut self) -> Result<Option<WorkerEvent>> {
+        match self.events.try_recv() {
+            Ok(event) => {
+                if matches!(event, WorkerEvent::Completion(_)) {
+                    self.accept_completion()?;
+                }
+                Ok(Some(event))
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) if self.outstanding == 0 => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 bail!("local worker pool disconnected with tasks outstanding")
+            }
+        }
+    }
+
+    /// Completion-only convenience used by effect-free adapter and pool tests.
+    /// Interactive tasks must be driven through `recv_event` by the coordinator.
+    #[cfg(test)]
+    pub(crate) fn recv_completion(&mut self) -> Result<TaskCompletion> {
+        match self.recv_event()? {
+            WorkerEvent::Completion(completion) => Ok(completion),
+            WorkerEvent::EvalRequest(request) => {
+                request.respond(Err(
+                    "O.eval callback requires the graph coordinator".to_string()
+                ))?;
+                bail!("unexpected O.eval callback in completion-only worker consumer")
             }
         }
     }
@@ -132,7 +152,7 @@ impl Drop for WorkerPool {
 
 fn worker_loop(
     submissions: Arc<Mutex<Receiver<TaskSubmission>>>,
-    completions: mpsc::Sender<TaskCompletion>,
+    events: mpsc::Sender<WorkerEvent>,
 ) {
     loop {
         let submission = submissions
@@ -143,17 +163,19 @@ fn worker_loop(
             return;
         };
         let (token, task) = submission.into_parts();
+        let context = TaskContext::new(token, events.clone());
         // This converts panics only in unwind-capable profiles. A panic-abort
         // build terminates the process before Rust can produce a completion.
         let completion =
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.execute())) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.execute(&context)))
+            {
                 Ok(outcome) => TaskCompletion::completed(token, outcome),
                 Err(_) => TaskCompletion::infrastructure_abort(
                     token,
                     anyhow!("prepared local-worker task panicked"),
                 ),
             };
-        if completions.send(completion).is_err() {
+        if events.send(WorkerEvent::Completion(completion)).is_err() {
             return;
         }
     }
@@ -173,7 +195,7 @@ mod tests {
     }
 
     impl PreparedTask for RecordingTask {
-        fn execute(self: Box<Self>) -> Result<OValue> {
+        fn execute(self: Box<Self>, _context: &TaskContext) -> Result<OValue> {
             self.threads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -187,7 +209,7 @@ mod tests {
     }
 
     impl PreparedTask for BlockingTask {
-        fn execute(self: Box<Self>) -> Result<OValue> {
+        fn execute(self: Box<Self>, _context: &TaskContext) -> Result<OValue> {
             let (released, changed) = &*self.gate;
             let released = released
                 .lock()
@@ -203,7 +225,7 @@ mod tests {
     struct PanicTask;
 
     impl PreparedTask for PanicTask {
-        fn execute(self: Box<Self>) -> Result<OValue> {
+        fn execute(self: Box<Self>, _context: &TaskContext) -> Result<OValue> {
             panic!("test worker panic")
         }
     }

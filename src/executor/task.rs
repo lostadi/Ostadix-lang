@@ -8,7 +8,10 @@
 //! semantic order; a verified-pure infallible value may become visible earlier
 //! only to equally safe worker dependents.
 
-use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Sender, SyncSender};
+
+use anyhow::{anyhow, Result};
 
 use crate::value::OValue;
 
@@ -18,11 +21,46 @@ pub(crate) struct TaskToken(pub(crate) usize);
 
 /// An owned, `Send`-only computation prepared from already-materialized inputs.
 ///
-/// Implementations perform computation only. They do not materialize HGraph
-/// outputs, advance resource state, emit settlement trace events, or commit
-/// externally visible effects.
+/// Implementations do not materialize HGraph outputs, advance graph resource
+/// state, or emit settlement trace events. Most adapters are effect-free. An
+/// explicitly autonomous hosted adapter may perform unordered external effects
+/// under its separately admitted non-strict contract.
 pub(crate) trait PreparedTask: Send + 'static {
-    fn execute(self: Box<Self>) -> Result<OValue>;
+    fn execute(self: Box<Self>, context: &TaskContext) -> Result<OValue>;
+}
+
+/// Worker-side access to coordinator-owned services. The first supported
+/// service is recursive `O.eval`: the hosted process stays on its worker while
+/// the coordinator evaluates the quoted O source and sends the value back.
+pub(crate) struct TaskContext {
+    token: TaskToken,
+    events: Sender<WorkerEvent>,
+}
+
+impl TaskContext {
+    pub(crate) fn new(token: TaskToken, events: Sender<WorkerEvent>) -> Self {
+        Self { token, events }
+    }
+
+    pub(crate) fn eval_o_source(
+        &self,
+        src: String,
+        scope: HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.events
+            .send(WorkerEvent::EvalRequest(TaskEvalRequest {
+                token: self.token,
+                src,
+                scope,
+                reply,
+            }))
+            .map_err(|_| anyhow!("local worker callback channel disconnected"))?;
+        result
+            .recv()
+            .map_err(|_| anyhow!("local worker callback reply channel disconnected"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 /// One task submitted to a worker lane. The token is kept outside the task so
@@ -72,4 +110,26 @@ impl TaskCompletion {
 pub(crate) enum TaskOutcome {
     Completed(Result<Box<OValue>>),
     InfrastructureAbort(anyhow::Error),
+}
+
+/// One physical event from a worker. Callback requests do not free a worker
+/// slot; only `Completion` decrements the pool's outstanding-task count.
+pub(crate) enum WorkerEvent {
+    Completion(TaskCompletion),
+    EvalRequest(TaskEvalRequest),
+}
+
+pub(crate) struct TaskEvalRequest {
+    pub(crate) token: TaskToken,
+    pub(crate) src: String,
+    pub(crate) scope: HashMap<String, OValue>,
+    reply: SyncSender<std::result::Result<OValue, String>>,
+}
+
+impl TaskEvalRequest {
+    pub(crate) fn respond(self, result: std::result::Result<OValue, String>) -> Result<()> {
+        self.reply
+            .send(result)
+            .map_err(|_| anyhow!("local worker abandoned an O.eval callback reply"))
+    }
 }

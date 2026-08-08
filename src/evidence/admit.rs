@@ -12,9 +12,9 @@ use super::analyze::{
     analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
 };
 use super::fact::{
-    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, EvidenceBindingsV1, EvidenceBundleV2,
-    NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    ADMISSION_SCHEMA_V2, ANALYZER_ID_V2, EVIDENCE_SCHEMA_V2,
+    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV1,
+    EvidenceBundleV3, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    ADMISSION_SCHEMA_V3, ANALYZER_ID_V3, EVIDENCE_SCHEMA_V3,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,7 +84,7 @@ pub struct AdmittedOperationV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionAdmissionV2 {
+pub struct ExecutionAdmissionV3 {
     schema: &'static str,
     bindings: EvidenceBindingsV1,
     analyzer: &'static str,
@@ -99,7 +99,7 @@ pub struct ExecutionAdmissionV2 {
     waves: Vec<Vec<PlanNodeId>>,
 }
 
-impl ExecutionAdmissionV2 {
+impl ExecutionAdmissionV3 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
@@ -225,9 +225,10 @@ impl ExecutionAdmissionV2 {
             .expect("writing to a String cannot fail");
             writeln!(
                 out,
-                "  dispatch lane={} adapter={} preparation={}",
+                "  dispatch lane={} adapter={} semantics={} preparation={}",
                 evidence.dispatch_contract.lane.name(),
                 evidence.dispatch_contract.adapter.name(),
+                evidence.dispatch_contract.semantics.name(),
                 if evidence.dispatch_contract.send_only_preparation {
                     "deferred-materialized-input-check"
                 } else {
@@ -318,6 +319,9 @@ impl ExecutionAdmissionV2 {
             "admission-note dispatch adapter IDs are evidence-bound; runtime preparation may validate but cannot reclassify an operation\n",
         );
         out.push_str(
+            "admission-note explicit-autonomous-unordered dispatch is a source-level semantic opt-in; deterministic result settlement does not roll back external effects from already-started hosted tasks\n",
+        );
+        out.push_str(
             "admission-note local-worker runtime uses a fixed-size per-run pool with per-completion wakeups; static waves are not pool batches or capacity promises\n",
         );
         out.push_str(
@@ -333,16 +337,16 @@ impl ExecutionAdmissionV2 {
             "admission-note backend artifact states distinguish hashed, missing, non-regular, and unreadable paths\n",
         );
         out.push_str(
-            "admission-note adapter/environment rechecks are best-effort snapshots; v2 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
+            "admission-note adapter/environment rechecks are best-effort snapshots; v3 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
         );
         out.push_str(
             "admission-note backend binding does not cover live actor state/generation or external toolchain closure\n",
         );
         out.push_str(
-            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v2\n",
+            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v3\n",
         );
         out.push_str(
-            "admission-note local placement is descriptive in v2 and does not assert a current lease\n",
+            "admission-note local placement is descriptive in v3 and does not assert a current lease\n",
         );
         out
     }
@@ -356,7 +360,7 @@ pub struct AdmittedExecution<'a> {
     plan: &'a ExecutionPlan,
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV2,
+    admission: ExecutionAdmissionV3,
 }
 
 impl<'a> AdmittedExecution<'a> {
@@ -372,7 +376,7 @@ impl<'a> AdmittedExecution<'a> {
         &self.graph
     }
 
-    pub fn admission(&self) -> &ExecutionAdmissionV2 {
+    pub fn admission(&self) -> &ExecutionAdmissionV3 {
         &self.admission
     }
 
@@ -411,7 +415,7 @@ pub fn admit_execution<'a>(
     mut graph: HGraph,
     base_policy: Policy,
     runtime: RuntimeBindingV1,
-    evidence: EvidenceBundleV2,
+    evidence: EvidenceBundleV3,
 ) -> Result<AdmittedExecution<'a>> {
     if plan != &program.plan() {
         bail!(
@@ -422,7 +426,7 @@ pub fn admit_execution<'a>(
         .validate_execution_source(program, plan)
         .map_err(anyhow::Error::msg)
         .context("admission rejected OIR/plan/HGraph provenance")?;
-    if evidence.schema != EVIDENCE_SCHEMA_V2 || evidence.analyzer != ANALYZER_ID_V2 {
+    if evidence.schema != EVIDENCE_SCHEMA_V3 || evidence.analyzer != ANALYZER_ID_V3 {
         bail!("unsupported or untrusted evidence bundle schema/analyzer");
     }
     if evidence.runtime != runtime {
@@ -452,11 +456,12 @@ pub fn admit_execution<'a>(
     if by_plan.keys().copied().collect::<BTreeSet<_>>() != expected_operations {
         bail!("evidence operation inventory does not match the executable graph");
     }
+    let flat = program.flatten_for_plan();
     for (plan_node, node) in &by_plan {
         let expected = baseline_by_plan
             .get(plan_node)
             .with_context(|| format!("trusted analyzer omitted operation {}", plan_node.0))?;
-        validate_node_evidence(&graph, *plan_node, node, expected)?;
+        validate_node_evidence(&graph, plan, flat[plan_node.0], *plan_node, node, expected)?;
     }
 
     let evidence_sha256 = evidence_bundle_sha256(&evidence);
@@ -479,7 +484,7 @@ pub fn admit_execution<'a>(
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let admission_sha256 = digest_fields(
-        "ostadix-execution-admission/v2",
+        "ostadix-execution-admission/v3",
         &[
             &evidence_sha256,
             &admitted_graph_sha256,
@@ -487,10 +492,10 @@ pub fn admit_execution<'a>(
         ],
     );
 
-    let admission = ExecutionAdmissionV2 {
-        schema: ADMISSION_SCHEMA_V2,
+    let admission = ExecutionAdmissionV3 {
+        schema: ADMISSION_SCHEMA_V3,
         bindings: expected_bindings,
-        analyzer: ANALYZER_ID_V2,
+        analyzer: ANALYZER_ID_V3,
         runtime_snapshot_kind: runtime.snapshot_kind(),
         backend_artifacts: runtime.backend_artifacts().to_vec(),
         evidence_sha256,
@@ -512,6 +517,8 @@ pub fn admit_execution<'a>(
 
 fn validate_node_evidence(
     graph: &HGraph,
+    plan: &ExecutionPlan,
+    oir: &crate::ir::OIr,
     plan_node: PlanNodeId,
     evidence: &NodeEvidence,
     expected: &NodeEvidence,
@@ -587,12 +594,27 @@ fn validate_node_evidence(
     }
     match evidence.dispatch_contract.lane {
         DispatchLaneV1::LocalWorker => {
+            let explicitly_autonomous_shim = evidence.dispatch_contract.adapter
+                == DispatchAdapterV1::AutonomousEphemeralShimV1
+                && crate::hgraph::from_oir::autonomous_ephemeral_group(plan, plan_node, oir)
+                    .is_some()
+                && summary.unknown
+                && !evidence.effect_contract.footprint_closed;
+            let strict_semantics =
+                evidence.dispatch_contract.semantics == DispatchSemanticsV1::StrictEquivalent;
+            let autonomous_semantics = evidence.dispatch_contract.semantics
+                == DispatchSemanticsV1::ExplicitAutonomousUnordered;
             if !evidence.dispatch_contract.adapter.is_local_worker()
                 || !evidence.dispatch_contract.send_only_preparation
                 || evidence.placement != PlacementContractV1::LocalWorker
-                || !(summary.is_verified_pure_infallible()
-                    || evidence.failure_contract.class
-                        == crate::evidence::FailureClassV1::MayFailNoExternalEffects)
+                || !((strict_semantics
+                    && (summary.is_verified_pure_infallible()
+                        || evidence.failure_contract.class
+                            == crate::evidence::FailureClassV1::MayFailNoExternalEffects))
+                    || (explicitly_autonomous_shim
+                        && autonomous_semantics
+                        && evidence.failure_contract.class
+                            == crate::evidence::FailureClassV1::MayFailUnorderedExternalEffects))
             {
                 bail!(
                     "operation {} has an unsafe worker dispatch claim",
@@ -602,6 +624,7 @@ fn validate_node_evidence(
         }
         DispatchLaneV1::Coordinator => {
             if evidence.dispatch_contract.adapter != DispatchAdapterV1::CoordinatorV1
+                || evidence.dispatch_contract.semantics != DispatchSemanticsV1::StrictEquivalent
                 || evidence.dispatch_contract.send_only_preparation
                 || evidence.placement != PlacementContractV1::LocalCoordinator
             {
@@ -853,7 +876,7 @@ mod tests {
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
     );
 
-    fn legal_projection(admission: &ExecutionAdmissionV2) -> LegalProjection {
+    fn legal_projection(admission: &ExecutionAdmissionV3) -> LegalProjection {
         (
             admission.waves().to_vec(),
             admission
@@ -915,6 +938,7 @@ mod tests {
             .contains("runtime-snapshot kind=inspection dispatch-context=inspection-only"));
         assert!(explanation.contains("effects provenance="));
         assert!(explanation.contains("adapter="));
+        assert!(explanation.contains("semantics=strict-equivalent"));
         assert!(explanation.contains("evidence-inputs=["));
         assert!(explanation.contains("blockers=["));
         assert!(explanation.contains("wave 0 ["));
@@ -1163,6 +1187,87 @@ mod tests {
             .err()
             .expect("changing a hard preparation adapter must invalidate admission");
 
+        assert!(
+            error
+                .to_string()
+                .contains("hard evidence differs from the trusted analyzer result"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn autonomous_hosted_dispatch_is_explicitly_non_strict_and_evidence_bound() {
+        let python = |value| OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+            body: vec![OIr::Text(format!("__oval_result__ = {value}"))],
+        };
+        let program = OIrProgram {
+            nodes: vec![OIr::Invoke {
+                fn_name: "autonomous".into(),
+                mode: InvokeMode::Autonomous,
+                args: vec![OIr::Invoke {
+                    fn_name: "batch".into(),
+                    mode: InvokeMode::Group(GroupMode::Batch),
+                    args: vec![python(1), python(2)],
+                }],
+            }],
+        };
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "autonomous-hosted-semantics");
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let hosted = evidence
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.dispatch_contract.adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hosted.len(), 2);
+        assert!(hosted.iter().all(|node| {
+            node.dispatch_contract.semantics == DispatchSemanticsV1::ExplicitAutonomousUnordered
+                && node.failure_contract.class
+                    == crate::evidence::FailureClassV1::MayFailUnorderedExternalEffects
+                && !node.effect_contract.footprint_closed
+        }));
+
+        let explanation = admit_execution(
+            &program,
+            &plan,
+            graph,
+            Policy::Eager,
+            runtime.clone(),
+            evidence.clone(),
+        )
+        .unwrap()
+        .admission()
+        .to_explanation_text();
+        assert!(explanation.contains("adapter=autonomous-ephemeral-shim/v1"));
+        assert!(explanation.contains("semantics=explicit-autonomous-unordered"));
+
+        let mut forged = evidence;
+        forged
+            .nodes
+            .iter_mut()
+            .find(|node| {
+                node.dispatch_contract.adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+            })
+            .unwrap()
+            .dispatch_contract
+            .semantics = DispatchSemanticsV1::StrictEquivalent;
+        let error = admit_execution(
+            &program,
+            &plan,
+            solved_graph(&program),
+            Policy::Eager,
+            runtime,
+            forged,
+        )
+        .err()
+        .expect("dispatch semantics are hard evidence and cannot be substituted");
         assert!(
             error
                 .to_string()

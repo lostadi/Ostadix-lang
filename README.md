@@ -1390,12 +1390,14 @@ registry-extensible family of independently implemented runtimes with a
 language-neutral value boundary and source-derived lowering into a unified
 whole-program execution representation. The current Rust implementation
 derives, validates, analyzes, and executes a directed state-complete HGraph.
-Arbitrary hosted effects remain conservative: unknown operations are serialized
-through `HostWorld`, persistent evaluator state is carried by actor-state
-tokens, and worker dispatch is restricted to compiler-verified O-scope loads
-plus source-proven-preparable trees of four trusted pure inline renderers
-(`html`, `markdown`, `text`, and `latex`). Evidence schema v2 binds those
-choices to stable preparation-adapter IDs before execution. A fixed-size local
+Arbitrary hosted effects remain conservative: ordinary unknown operations are
+serialized through `HostWorld`, persistent evaluator state is carried by
+actor-state tokens, and strict-equivalent worker dispatch is restricted to
+compiler-verified O-scope loads plus source-proven-preparable trees of four
+trusted pure inline renderers (`html`, `markdown`, `text`, and `latex`). Direct
+ephemeral members of an explicitly autonomous group may separately opt into
+non-strict, unordered host effects. Evidence schema v3 binds those choices and
+their dispatch semantics to stable preparation-adapter IDs before execution. A fixed-size local
 pool is created per graph run, reuses its threads across readiness frontiers,
 and reports completions individually; this does not admit arbitrary hosted
 code or make pool capacity an evidence-backed CPU or memory reservation.
@@ -2404,7 +2406,7 @@ The validated plan is projected into a directed HGraph before execution.
 Ordinary results, successful completion, evaluator/host resource versions, and
 persistent actor state are nodes. Operations are directed hyperedges whose
 outputs include one ordinary value, one completion token, and successor state
-versions. Evidence schema v2 admits each executable operation and binds its
+versions. Evidence schema v3 admits each executable operation and binds its
 dispatch adapter before the coordinator accepts the graph. The coordinator
 marks an operation graph-ready exactly when every input node is materialized;
 dispatch additionally respects its admitted adapter, local-pool capacity, and
@@ -2422,22 +2424,27 @@ returned by an admitted-infallible adapter is an infrastructure contract
 violation, not `NodeFailed`. A semantic failure produces no completion or
 successor state.
 
-Unknown hosted code reads and writes the shared `HostWorld` resource. Exact
-filesystem and network footprints are not inferred from arbitrary source.
-Source effect declarations can add constraints, but `effects=pure` cannot
-upgrade an unknown shim. Ordinary sequence becomes a completion-token input
-unless direct concurrent-group semantics apply or both operations are verified,
-infallible, state-free trusted inline renderers whose complete structural
-subtrees contain only literals and recursively trusted renderers, outside a
-structural `O` sequencing region. `O_EXECUTOR=serial` selects the reference
-executor used by graph/serial conformance tests.
+Unknown hosted code still reports reads and writes against `HostWorld` and
+`EvaluatorState`; exact filesystem and network footprints are not inferred.
+Ordinary hosted blocks therefore remain coordinator-owned and strict. A narrow
+source-level opt-in is available for direct, attribute-free ephemeral members
+of a coordination group under the effective `autonomous(...)` policy, for
+example `autonomous(batch(python^(...)_python, python^(...)_python))`. Those
+members use the `autonomous-ephemeral-shim/v1` adapter and evidence records
+`explicit-autonomous-unordered` semantics. Explicit O dataflow, lexical scope,
+live capability checks, bounded worker capacity, and deterministic result/error
+settlement are preserved; hidden external effects from already-started members
+may race and are not rolled back. Indexed persistent environments such as
+`python[0]^(...)_python[0]` retain actor and host-state serialization.
+`O_EXECUTOR=serial` selects the ordered reference executor, while `--workers N`
+caps only the graph local-worker lane.
 
 `olangc --target ir` prints the same executable program, plan, and textual
 state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
 
-`olangc --target ir --explain-schedule` additionally prints the v2 admission
+`olangc --target ir --explain-schedule` additionally prints the v3 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
 dispatching. Static waves describe graph legality only: they are not pool
 capacity, runtime batches, completion order, or proof of observed overlap.

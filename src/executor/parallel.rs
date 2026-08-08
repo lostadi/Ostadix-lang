@@ -1,15 +1,18 @@
 //! Parallel worker pool for provably-safe operations.
 //!
-//! Only compiler-verified O-level loads and pure, attribute-free inline value
-//! renderers (`html`, `markdown`, `text`, `latex`) are dispatched here. Their
-//! inputs are already materialized `OValue`s, so preparation produces an
-//! immutable Send-only envelope: no reference to the `!Send` evaluator crosses
-//! a thread boundary. Results and failures settle through the coordinator in
-//! deterministic semantic order.
+//! Compiler-verified O-level loads, pure inline renderers, and direct ephemeral
+//! members of an explicitly autonomous coordination group are dispatched here.
+//! The hosted path is deliberately non-strict: explicit O-value dependencies
+//! are preserved, but hidden host effects among already-started members are
+//! unordered. Ordinary ephemeral shims remain coordinator-owned and strict.
+//! Every task receives owned materialized inputs, so no reference to the
+//! `!Send` evaluator crosses a thread boundary. Results and failures still
+//! settle through the coordinator in deterministic O order.
 
 use anyhow::{bail, Result};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -17,13 +20,15 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
 
+use crate::capability::BackendSandboxPolicy;
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
 use crate::eval::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
 use crate::ir::{ExecutionMode, ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
+use crate::process::{ExecStep, ProcessRegistry};
 use crate::value::OValue;
 
-use super::task::PreparedTask;
+use super::task::{PreparedTask, TaskContext};
 
 /// A statically-determined parallel task classification for a plan node.
 #[derive(Clone, Debug)]
@@ -35,6 +40,10 @@ pub enum TaskKind {
     Load {
         name: String,
     },
+    EphemeralShim {
+        language: String,
+        renderer: SpliceRenderer,
+    },
 }
 
 impl TaskKind {
@@ -42,6 +51,7 @@ impl TaskKind {
         match self {
             Self::Renderer { .. } => DispatchAdapterV1::TrustedInlineRendererV1,
             Self::Load { .. } => DispatchAdapterV1::OScopeLoadV1,
+            Self::EphemeralShim { .. } => DispatchAdapterV1::AutonomousEphemeralShimV1,
         }
     }
 }
@@ -69,6 +79,27 @@ enum ParallelTaskBody {
         name: String,
         scope: Arc<HashMap<String, OValue>>,
     },
+    EphemeralShim {
+        language: String,
+        code: String,
+        bindings: HashMap<String, OValue>,
+        shim: PathBuf,
+        sandbox: BackendSandboxPolicy,
+    },
+}
+
+/// Live runtime data captured only after the coordinator validates the backend
+/// artifact and resolves the process-local capability bearer.
+#[derive(Clone, Debug)]
+pub(crate) struct EphemeralShimRuntime {
+    shim: PathBuf,
+    sandbox: BackendSandboxPolicy,
+}
+
+impl EphemeralShimRuntime {
+    pub(crate) fn new(shim: PathBuf, sandbox: BackendSandboxPolicy) -> Self {
+        Self { shim, sandbox }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -355,7 +386,7 @@ impl Drop for TestOverlapGuard {
 }
 
 /// Classify a plan node when a local Send-only task adapter is available.
-pub(crate) fn classify(_plan: &ExecutionPlan, oir: &OIr, _id: PlanNodeId) -> Option<TaskKind> {
+pub(crate) fn classify(plan: &ExecutionPlan, oir: &OIr, id: PlanNodeId) -> Option<TaskKind> {
     match oir {
         OIr::Load(name) => Some(TaskKind::Load { name: name.clone() }),
         OIr::Exec { attr, backend, .. }
@@ -372,6 +403,14 @@ pub(crate) fn classify(_plan: &ExecutionPlan, oir: &OIr, _id: PlanNodeId) -> Opt
                 _ => None,
             }
         }
+        OIr::Exec { backend, .. }
+            if crate::hgraph::from_oir::autonomous_ephemeral_group(plan, id, oir).is_some() =>
+        {
+            Some(TaskKind::EphemeralShim {
+                language: backend.canonical.clone(),
+                renderer: backend.renderer,
+            })
+        }
         _ => None,
     }
 }
@@ -379,10 +418,18 @@ pub(crate) fn classify(_plan: &ExecutionPlan, oir: &OIr, _id: PlanNodeId) -> Opt
 /// Validate that the exact adapter selected by admission still matches the
 /// admitted OIR shape. This is a consistency check, not a second adapter
 /// selection step.
-pub(crate) fn adapter_matches(adapter: DispatchAdapterV1, oir: &OIr) -> bool {
+pub(crate) fn adapter_matches(
+    adapter: DispatchAdapterV1,
+    plan: &ExecutionPlan,
+    id: PlanNodeId,
+    oir: &OIr,
+) -> bool {
     match adapter {
         DispatchAdapterV1::OScopeLoadV1 => matches!(oir, OIr::Load(_)),
         DispatchAdapterV1::TrustedInlineRendererV1 => renderer_inputs_statically_preparable(oir),
+        DispatchAdapterV1::AutonomousEphemeralShimV1 => {
+            crate::hgraph::from_oir::autonomous_ephemeral_group(plan, id, oir).is_some()
+        }
         DispatchAdapterV1::CoordinatorV1 => false,
     }
 }
@@ -420,6 +467,13 @@ fn renderer_inputs_statically_preparable(oir: &OIr) -> bool {
 /// buffered; hosted or user-declared reads never enter this class.
 pub(crate) fn effect_contract_worker_safe(summary: &EffectSummary, oir: &OIr) -> bool {
     match oir {
+        OIr::Exec {
+            env_id, backend, ..
+        } if *env_id == u32::MAX && backend.execution == ExecutionMode::Shim => {
+            summary.unknown
+                && summary.fallibility == Fallibility::MayFail
+                && summary.actor_state.is_none()
+        }
         OIr::Load(_) => {
             summary.confidence == EffectConfidence::Verified
                 && summary.deterministic
@@ -478,6 +532,7 @@ fn build_task(
     plan: &ExecutionPlan,
     id: PlanNodeId,
     kind: TaskKind,
+    shim_runtime: Option<EphemeralShimRuntime>,
 ) -> Result<ParallelTask> {
     let body = match kind {
         TaskKind::Load { name } => {
@@ -486,6 +541,34 @@ fn build_task(
             // concurrently without sharing the mutable evaluator frame.
             let scope = Arc::new(frame.scope_from_data_edges(id, plan)?);
             ParallelTaskBody::Load { name, scope }
+        }
+        TaskKind::EphemeralShim { language, renderer } => {
+            let EphemeralShimRuntime { shim, sandbox } = shim_runtime.ok_or_else(|| {
+                anyhow::anyhow!("ephemeral shim adapter requires an authorized runtime binding")
+            })?;
+            let children = plan.child_schedule(id).map_err(anyhow::Error::msg)?;
+            let bindings = frame.exec_scope(id, plan)?;
+            let mut code = String::new();
+            for child in children {
+                match &plan.nodes[child.0].kind {
+                    PlanNodeKind::Store { .. } => {}
+                    PlanNodeKind::Text => {
+                        if let OValue::Text { v } = frame.value(child)? {
+                            code.push_str(&v.utf8);
+                        } else {
+                            bail!("text plan node {} did not materialize a string", child.0);
+                        }
+                    }
+                    _ => code.push_str(&render_with(renderer, frame.value(child)?)),
+                }
+            }
+            ParallelTaskBody::EphemeralShim {
+                language,
+                code,
+                bindings,
+                shim,
+                sandbox,
+            }
         }
         TaskKind::Renderer {
             renderer,
@@ -537,6 +620,7 @@ pub(crate) fn prepare(
     plan: &ExecutionPlan,
     id: PlanNodeId,
     oir: &OIr,
+    shim_runtime: Option<EphemeralShimRuntime>,
 ) -> Result<Box<dyn PreparedTask>> {
     let kind = match adapter {
         DispatchAdapterV1::OScopeLoadV1 => match oir {
@@ -558,17 +642,30 @@ pub(crate) fn prepare(
                 canonical: backend.canonical.clone(),
             }
         }
-        DispatchAdapterV1::TrustedInlineRendererV1 | DispatchAdapterV1::CoordinatorV1 => bail!(
+        DispatchAdapterV1::AutonomousEphemeralShimV1 if adapter_matches(adapter, plan, id, oir) => {
+            let OIr::Exec { backend, .. } = oir else {
+                unreachable!("ephemeral shim adapter requires an Exec node")
+            };
+            TaskKind::EphemeralShim {
+                language: backend.canonical.clone(),
+                renderer: backend.renderer,
+            }
+        }
+        DispatchAdapterV1::TrustedInlineRendererV1
+        | DispatchAdapterV1::AutonomousEphemeralShimV1
+        | DispatchAdapterV1::CoordinatorV1 => bail!(
             "operation {} no longer matches admitted adapter {}",
             id.0,
             adapter.name()
         ),
     };
-    Ok(Box::new(build_task(frame, plan, id, kind)?))
+    Ok(Box::new(build_task(frame, plan, id, kind, shim_runtime)?))
 }
 
-/// Compute one prepared task. Pure; safe to run on a worker thread.
-fn execute_prepared(task: &ParallelTask) -> Result<OValue> {
+/// Execute one owned prepared task on a worker thread. Strict adapters are
+/// effect-free; the explicit autonomous shim adapter may perform the unordered
+/// hosted effects recorded by its admission contract.
+fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue> {
     #[cfg(test)]
     let _overlap_guard = task.overlap_probe.as_ref().map(TestOverlapProbe::enter);
     #[cfg(test)]
@@ -599,12 +696,42 @@ fn execute_prepared(task: &ParallelTask) -> Result<OValue> {
                 other => bail!("inline OIR backend `{other}` has no value executor"),
             }
         }
+        ParallelTaskBody::EphemeralShim {
+            language,
+            code,
+            bindings,
+            shim,
+            sandbox,
+        } => {
+            let mut registry = ProcessRegistry::new();
+            registry.send_exec(language, u32::MAX, code, bindings.clone(), shim, sandbox)?;
+            loop {
+                match registry.recv_exec_step(language, u32::MAX, sandbox)? {
+                    ExecStep::Done(value) => break Ok(value),
+                    ExecStep::EvalRequest {
+                        src,
+                        scope: explicit_scope,
+                    } => {
+                        let callback_scope = match explicit_scope {
+                            None => bindings.clone(),
+                            Some(OValue::Scope { bindings }) => bindings,
+                            Some(other) => bail!(
+                                "O.eval explicit scope must be an OScope, got {}",
+                                other.type_name()
+                            ),
+                        };
+                        let value = context.eval_o_source(src, callback_scope)?;
+                        registry.send_eval_result(language, u32::MAX, value, sandbox)?;
+                    }
+                }
+            }
+        }
     }
 }
 
 impl PreparedTask for ParallelTask {
-    fn execute(self: Box<Self>) -> Result<OValue> {
-        execute_prepared(&self)
+    fn execute(self: Box<Self>, context: &TaskContext) -> Result<OValue> {
+        execute_prepared(&self, context)
     }
 }
 
@@ -709,6 +836,7 @@ mod tests {
             &plan,
             id,
             &program.nodes[0],
+            None,
         )
         .err()
         .expect("a renderer adapter cannot prepare an O scope load");
@@ -722,8 +850,11 @@ mod tests {
             &plan,
             id,
             &program.nodes[0],
+            None,
         )
         .expect("the admitted scope-load adapter remains preparable");
-        assert_eq!(task.execute().unwrap(), OValue::str_("value"));
+        let (events, _event_rx) = std::sync::mpsc::channel();
+        let context = TaskContext::new(TaskToken(0), events);
+        assert_eq!(task.execute(&context).unwrap(), OValue::str_("value"));
     }
 }

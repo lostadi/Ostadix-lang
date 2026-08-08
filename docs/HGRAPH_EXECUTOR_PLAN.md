@@ -6,7 +6,7 @@ executor used by the differential conformance suite.
 
 ```text
 .O -> OIR -> validated ExecutionPlan -> draft HGraph -> type/fidelity solve
-   -> EvidenceBundleV2 -> admission compiler -> AdmittedExecution
+   -> EvidenceBundleV3 -> admission compiler -> AdmittedExecution
    -> Coordinator
 ```
 
@@ -18,7 +18,7 @@ constructor are private to the digest-checking admission path. The evaluator
 also compiles this admission when `O_EXECUTOR=serial` selects the differential
 oracle, so changing the executor does not bypass pre-execution checking.
 
-`EvidenceBundleV2` is a pre-execution certificate bundle. For each executable
+`EvidenceBundleV3` is a pre-execution certificate bundle. For each executable
 operation it records type, effect-footprint, dispatch, capability-policy,
 placement, failure-policy, and resource-demand contracts, plus a separate soft
 cost estimate and the provenance of every fact. Only enforced,
@@ -34,7 +34,7 @@ The bundle binds canonical lowered OIR, the validated plan, the solved analyzed
 graph, analyzer identity, resolved backend artifacts, execution environment,
 and a descriptive ambient `HostWorld` snapshot. It deliberately labels the
 first digest `lowered-oir-sha256`: evaluator APIs can receive an existing
-`OIrProgram`, so v2 does not claim an original source-byte digest. Admission
+`OIrProgram`, so v3 does not claim an original source-byte digest. Admission
 rejects mismatched bindings, attaches seven pre-materialized
 `AdmissionEvidence` nodes to every executable edge, validates the resulting
 graph, and freezes it. Immediately before running, both the coordinator and
@@ -44,12 +44,12 @@ opaque/deferred operations.
 The backend artifact binding distinguishes hashed files, missing paths,
 non-regular paths, and unreadable paths, and includes the current executable;
 execution admission rejects an unhashed current executable. Runtime rechecks
-are path/environment snapshots, not an immutable execution substrate: v2 does
+are path/environment snapshots, not an immutable execution substrate: v3 does
 not pin an opened adapter or frozen child environment and cannot prove the
 bytes/environment observed at spawn. It also does not bind caller initial-scope
 shape/values, opaque state/generation inside an already-live actor, the full
 external interpreter/toolchain closure, or a placement lease.
-In v2, actor identity is only a serialization identity; all such hosted work
+In v3, actor identity is only a serialization identity; all persistent hosted work
 remains unknown, coordinator-lane, and conservatively attached to `HostWorld`.
 
 `olangc FILE --target ir --explain-schedule` exercises this solve, analysis,
@@ -57,12 +57,12 @@ and admission path without dispatch. It prints exact digest bindings,
 per-operation provenance, blockers, retained source-sequence reasons, and
 static legal waves. Its admission report identifies the runtime snapshot as
 `inspection-only`; it is not interchangeable with the evaluator's execution
-snapshot. The inspection surface is ordinary-OIR-only in v2.
+snapshot. The inspection surface is ordinary-OIR-only in v3.
 
 This admission is distinct from an observation or receipt. `RuntimeGraphV1`
 and `ExecutionReceiptV1` describe completed execution and carry no scheduling
 authority; a prior receipt cannot authorize a new run. Project HGraphs and the
-buffered Request scheduler also remain separate execution islands in v2.
+buffered Request scheduler also remain separate execution islands in v3.
 
 Project inputs have a distinct logical-planning and opt-in hosted execution
 surface:
@@ -258,8 +258,13 @@ currently modeled resource keys are:
 - object versions, descriptive capability identities, task attempts, and
   artifact publication state
 
-Unknown hosted operations read and write `HostWorld` and evaluator-local state.
-An explicit or unknown `HostWorld` access is lowered as exclusive. A precise
+Unknown hosted operations report reads and writes of `HostWorld` and
+evaluator-local state. Ordinary unknown access is lowered as exclusive. The
+narrow exception is a direct, attribute-free ephemeral member of a group whose
+effective source policy is explicitly `autonomous`: its open, unknown evidence
+remains visible, but `explicit-autonomous-unordered` semantics permit those
+implicit state ports to be omitted. This allows already-started members to race
+external effects and provides no rollback guarantee. A precise
 host access additionally holds a shared `HostWorld` read lease: this prevents
 overlap with ambient unknown work without serializing two disjoint precise host
 resources merely because both are host-visible. A persistent shim also consumes
@@ -312,9 +317,11 @@ relaxed only in these cases:
    recursively trusted renderers; and neither operation is a child of a
    structural `O` sequencing region.
 
-If any fact is unknown, the completion dependency remains. Explicit group
-topology does not override resource conflicts: unknown members still share the
-directed `HostWorld` chain.
+Outside explicit group semantics, any unknown fact retains the completion
+dependency. Group topology does not normally override resource conflicts. Only
+the explicitly autonomous ephemeral contract above omits its implicit
+`HostWorld`/evaluator frontier, and that is a semantic opt-in rather than proof
+of independent effects.
 
 ## Scheduling and failure
 
@@ -331,14 +338,17 @@ bypassing readiness.
 
 The ordinary OIR coordinator owns the mutable evaluator and process registry.
 It can be constructed only from an `AdmittedExecution`. Its `LocalWorker` lane
-admits exactly two task families: compiler-verified O-scope `Load` operations
-and the attribute-free trusted `html`, `markdown`, `text`, and `latex` inline
-renderers whose bodies contain only literal text, already-settled Store
-children, and recursively trusted renderers. On the coordinator thread,
-preparation freezes the relevant scope or already-materialized splice inputs
-into immutable owned `PreparedTask` envelopes. Evidence schema v2 binds each
+admits compiler-verified O-scope `Load` operations; attribute-free trusted
+`html`, `markdown`, `text`, and `latex` inline renderers whose bodies contain
+only literal text, already-settled Store children, and recursively trusted
+renderers; and the explicit non-strict hosted contract described above. On the
+coordinator thread, preparation freezes the relevant scope or already-
+materialized splice inputs into immutable owned `PreparedTask` envelopes.
+Evidence schema v3 binds each
 operation to exactly one adapter ID: `o-scope-load/v1`,
-`trusted-inline-renderer/v1`, or `coordinator/v1`. Runtime preparation validates
+`trusted-inline-renderer/v1`, `autonomous-ephemeral-shim/v1`, or
+`coordinator/v1`. Dispatch evidence also records `strict-equivalent` or
+`explicit-autonomous-unordered` semantics. Runtime preparation validates
 that exact adapter against the admitted OIR; it cannot choose a different
 adapter as a second scheduling authority.
 
@@ -383,14 +393,17 @@ to one terminal trace event, and does not disguise the failure as `NodeFailed`.
 An unwind-capable build gives a caught worker panic the same treatment. The
 release profile uses `panic = "abort"`, so
 a release worker panic terminates the process before in-process recovery or
-terminal trace completion; v2 does not claim otherwise.
+terminal trace completion; v3 does not claim otherwise.
 
 After each accepted success, the coordinator materializes the value,
 completion, and written successor-state outputs. On a selected failure, it emits
 none of that operation's outputs and admits no later dependent operation. Root
 values and scope writes commit in deterministic source order, but commit order
-is not used to justify early external effects. Hosted reads and persistent
-language environments remain coordinator-owned.
+is not used to justify early external effects. Ordinary hosted reads and all
+persistent language environments remain coordinator-owned. Before an admitted
+autonomous hosted task is submitted, the coordinator revalidates runtime
+artifacts, resolves live backend authority, and freezes the sandbox policy into
+the task.
 
 The separate hosted `ProjectCoordinator` is serial and uses the conservative
 launch rank plus stable ordinal as its baseline/tie-break order. For ordered
@@ -460,7 +473,10 @@ The integration suite runs graph and serial execution in isolated working
 directories and compares exit status, stdout, normalized stderr, final values,
 persistent Python and SQL state, environment mutation/read behavior, and full
 filesystem snapshots. Test-only rendezvous probes prove real worker overlap for
-both safe renderer tasks and same-binding O-scope loads. Pool tests prove fixed
+safe renderer tasks and same-binding O-scope loads; isolated CLI integration
+tests use monotonic intervals to prove overlap for explicitly autonomous
+ephemeral Python members while retaining ordinary strict fail-stop behavior and
+worker-side `O.eval` lexical scope. Pool tests prove fixed
 capacity, thread reuse, singleton off-owner placement, independent completion
 delivery, and recovery after a caught worker panic. Coordinator tests prove
 that a fast worker can expose dependent worker work while an unrelated slow
@@ -469,13 +485,17 @@ failure selection and later-outcome discard while tasks overlap. Additional
 regressions prove provisional-output revocation after an earlier failure and
 that an infallible-adapter error immediately enters the infrastructure-abort
 path without becoming `NodeFailed` or preempting an earlier semantic failure.
+`scripts/benchmark_hgraph_hosted.sh` alternates release-mode serial and graph
+runs and reports descriptive timing distributions without imposing a speedup
+threshold or treating one machine measurement as a portability claim.
 
 ## Deliberately deferred optimization
 
 The reader-frontier topology now drives actual persistent-pool overlap for its
-narrow compiler-verified O-scope `Load` class, and per-completion wakeups remove
-the previous complete-wave barrier for worker-only progress. Generic hosted
-prepared-task lanes, actor-owned persistent environments, renewable
+narrow compiler-verified O-scope `Load` class, per-completion wakeups remove the
+previous complete-wave barrier, and explicit autonomous groups can opt bare
+ephemeral hosted members into non-strict worker overlap. Enforced strict hosted
+effect contracts, actor-owned persistent environments, renewable
 CPU/memory/device capacity admission, critical-path or measured-cost ranking,
 transactional prepare/commit, overlap between coordinator-owned operations and
 outstanding worker tasks, and unified OIR/Request/project scheduling are future

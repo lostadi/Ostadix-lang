@@ -79,7 +79,7 @@ Ostadix-lang processes hosted code through a 7-stage pipeline:
    values with the renderer embedded in OIR, resolves the block's live backend
    capability, and executes the selected operation. Request values created by
    OIR carry compositional fingerprints into the existing eager/autonomous
-   request scheduler; that scheduler remains a separate authority in v2.
+   request scheduler; that scheduler remains a separate authority in v3.
 
 7. **Settle and observe** — Materialize successful value, completion, and state
    outputs, select deterministic failures, and emit traces or receipts only
@@ -158,15 +158,20 @@ shim operations also consume and produce
 
 Unknown hosted effects read and write `HostWorld`, which is a conservative
 umbrella for host-observable state. The graph does not infer exact filesystem or
-network footprints from arbitrary hosted source. Source `reads=`, `writes=`,
-and `serial=host` declarations can add constraints, but cannot erase an unknown
-fallback. Likewise, `effects=pure` cannot upgrade an arbitrary shim into trusted
-worker-pool work.
+network footprints from arbitrary hosted source, so ordinary hosted blocks stay
+strictly ordered. The narrow execution-topology exception is a direct,
+attribute-free ephemeral shim member of a group under the effective
+`autonomous(...)` policy. Its evidence remains open and unknown, while the
+source opt-in permits omission of implicit host/evaluator topology edges and
+selects `explicit-autonomous-unordered` dispatch. Explicit O dataflow remains
+ordered; already-started filesystem, network, process, and evaluator effects
+may race and are not rolled back. Persistent indexed environments retain host
+and actor-state serialization.
 
 ### Evidence-bound admission
 
 `src/evidence/` separates pre-execution certificates from post-execution
-observations. `EvidenceBundleV2` records per-operation type, effect, dispatch,
+observations. `EvidenceBundleV3` records per-operation type, effect, dispatch,
 capability, placement, failure, resource-demand, and cost contracts together
 with provenance. Hard contracts determine whether execution is legal. Cost
 estimates are soft evidence: they may eventually rank an already-legal
@@ -191,8 +196,8 @@ event.
 
 This authority boundary is currently the ordinary OIR execution path only.
 The buffered Request scheduler and `ProjectCoordinator` remain separate, and
-generic hosted prepared-task lanes, renewable CPU/memory/device admission, and
-actor-owned hosted environments remain future work. Evidence schema v2 binds
+enforced strict hosted effect contracts, renewable CPU/memory/device admission,
+and actor-owned persistent environments remain future work. Evidence schema v3 binds
 each dispatch contract to one stable preparation adapter ID. The runtime may
 validate that exact adapter against the admitted OIR, but cannot reclassify the
 operation through a second scheduling authority. The current `LocalWorker`
@@ -200,19 +205,20 @@ lane remains deliberately narrow: `o-scope-load/v1` prepares
 compiler-verified O-scope `Load` operations, while
 `trusted-inline-renderer/v1` prepares the trusted attribute-free `html`,
 `markdown`, `text`, and `latex` inline renderers with source-closed bodies.
-`coordinator/v1` retains everything else. Hosted reads remain
-coordinator-owned, so a graph wave does not by itself prove that every member
-ran on a worker thread. The backend
+`autonomous-ephemeral-shim/v1` prepares only direct source-opted-in hosted group
+members and carries a coordinator-resolved live sandbox policy.
+`coordinator/v1` retains everything else, so a graph wave does not by itself
+prove that every member ran on a worker thread. The backend
 binding distinguishes hashed files, missing paths, non-regular paths, and
 unreadable paths, and samples the current executable, cwd, and environment at
 analysis/dispatch checks; execution admission rejects an unhashed current
 executable. Those rechecks are path/environment-based best
-effort, not an immutable execution substrate: v2 does not pin an opened adapter
+effort, not an immutable execution substrate: v3 does not pin an opened adapter
 or frozen child environment and cannot prove the bytes/environment observed at
 spawn. It also does not attest the opaque state or generation of an already-live
 actor, the complete external toolchain closure, or placement-lease freshness.
 `ActorResourceId` remains a
-serialization identity in v2, and unknown actor work cannot use this gap to
+serialization identity in v3, and unknown actor work cannot use this gap to
 remove `HostWorld` or actor dependencies.
 
 Post-execution `RuntimeGraphV1` and `ExecutionReceiptV1` artifacts remain typed

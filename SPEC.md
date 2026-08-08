@@ -169,7 +169,7 @@ Every authoritative Rust execution entry point follows this path:
 
 ```text
 .O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
-          -> EvidenceBundleV2 -> AdmittedExecution -> graph coordinator | serial oracle
+          -> EvidenceBundleV3 -> AdmittedExecution -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -200,8 +200,9 @@ state/control inputs, plus its admission-evidence inputs after admission, and
 producing one distinguished ordinary result, one completion token, and each
 required successor resource state. An operation is graph-ready exactly when
 every input node is materialized. Physical dispatch additionally requires its
-admitted adapter, local-pool capacity, and the strict semantic settlement
-frontier. Failure produces none of its output tokens.
+admitted adapter, local-pool capacity, and the settlement boundary required by
+its admitted dispatch semantics. Failure produces none of its graph output
+tokens.
 
 Resource lowering MUST preserve access mode. A read MUST consume the current
 writer state, MUST NOT advance the resource version, and MUST place its
@@ -213,10 +214,10 @@ them. These rules apply after scheduler-visible alias expansion. An explicit or
 unknown `HostWorld` access remains exclusive and therefore fail-closed.
 
 Before either the graph coordinator or the serial differential oracle executes
-the plan, the runtime MUST produce an `EvidenceBundleV2` and compile it into an
+the plan, the runtime MUST produce an `EvidenceBundleV3` and compile it into an
 `AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
-environment, and descriptive ambient-World snapshot. This v2 binding does not
+environment, and descriptive ambient-World snapshot. This v3 binding does not
 claim the original source-byte digest when the entry point receives an already
 lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
 issuing evidence, analysis MUST validate that every lowered backend interface
@@ -236,29 +237,52 @@ or grant authority. Post-execution runtime graphs and execution receipts are
 observations, not certificates or admission decisions, and MUST NOT authorize a
 later execution.
 
-Hosted operations whose complete effect footprint is not verified MUST read and
-write `HostWorld`. Persistent `LANG[n]` shim operations MUST additionally read
-and write `ActorState(canonical-LANG[n])`. Ordinary sequence MUST consume the
-predecessor's completion token unless the operations are direct members of an
-explicit concurrent group; are two compiler-verified, read-only O-level loads;
-or are both verified, deterministic, infallible, resource-free trusted inline
-renderers whose complete structural subtrees contain only literal text and
-recursively trusted renderers. Both automatic cases are forbidden inside a
-structural left-to-right `O` sequencing region. Any unknown fact preserves
-sequence. Conflicting resource frontiers still constrain explicit group
-members.
+Hosted operations whose complete effect footprint is not verified MUST report
+reads and writes of `HostWorld` in their effect evidence. Persistent `LANG[n]`
+shim operations MUST additionally read and write
+`ActorState(canonical-LANG[n])`. Those effects MUST produce conservative
+resource-state topology except for the explicit non-strict exception below.
+Ordinary sequence MUST consume the predecessor's completion token unless the
+operations are direct members of an explicit concurrent group; are two
+compiler-verified, read-only O-level loads; or are both verified,
+deterministic, infallible, resource-free trusted inline renderers whose complete
+structural subtrees contain only literal text and recursively trusted renderers.
+Both automatic cases are forbidden inside a structural left-to-right `O`
+sequencing region. Outside the explicit autonomous contract below, any unknown
+fact preserves sequence. Conflicting resource frontiers still constrain
+explicit group members unless that group member has the following contract.
 
-The v2 `LocalWorker` lane MUST accept only compiler-verified O-scope `Load`
-operations and attribute-free trusted inline-value renderers named `html`,
+The v3 `LocalWorker` lane MAY also accept an unknown hosted operation only when
+it is an attribute-free ephemeral shim, is a direct typed-expression member of
+a coordination group, and the nearest enclosing `lazy` or `autonomous` policy
+schedule is `autonomous`. Its complete body MUST be preparable from literal Text
+and already-settled Store children without forcing a Request. Evidence MUST keep
+its effect footprint open and unknown, MUST classify failure as
+`MayFailUnorderedExternalEffects`, MUST name the
+`autonomous-ephemeral-shim/v1` adapter, and MUST record
+`explicit-autonomous-unordered` dispatch semantics. For only those operations,
+lowering MAY omit implicit `HostWorld` and `EvaluatorState` resource-frontier
+ports so direct members of the same group can overlap. This is a source-level
+semantic opt-in, not an effect-independence proof: deterministic result and
+failure selection MUST be preserved, but external effects from already-started
+members MAY race and need not be rolled back.
+
+All other v3 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
+operations or attribute-free trusted inline-value renderers named `html`,
 `markdown`, `text`, or `latex` whose body is source-proven preparable: literal
 text, already-settled Store children, and recursively trusted renderers only.
 Every dispatch contract MUST name the stable adapter selected by evidence:
-`o-scope-load/v1`, `trusted-inline-renderer/v1`, or `coordinator/v1`. Runtime
+`o-scope-load/v1`, `trusted-inline-renderer/v1`,
+`autonomous-ephemeral-shim/v1`, or `coordinator/v1`, and MUST record either
+`strict-equivalent` or `explicit-autonomous-unordered` semantics. Runtime
 preparation MAY validate that exact adapter against the admitted OIR, but MUST
 NOT reclassify the operation or choose a different adapter. Preparation MUST
 freeze materialized scope or splice inputs into an owned `Send + 'static`
-`PreparedTask` before submission. Hosted reads, persistent language
-environments, and arbitrary user-declared reads MUST remain coordinator-owned.
+`PreparedTask` before submission. Before an autonomous shim task is submitted,
+the coordinator MUST revalidate the bound runtime artifacts, resolve the same
+live backend capability required by coordinator-owned execution, and freeze the
+resulting sandbox policy into the task. Persistent language environments and
+arbitrary user-declared reads MUST remain coordinator-owned.
 
 One fixed-size local-worker pool MUST be created for each graph-coordinator run
 that contains local-worker operations and MUST reuse its workers across changing
@@ -282,7 +306,7 @@ unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
 in semantic-ordinal order, select the lowest-ordinal failure, drain every
 started task, and discard every later provisional outcome. Infallible
 effect-free workers MAY be dispatched outside that prefix. Coordinator-owned
-operations MUST remain single-owner; this bounded v2 implementation does not
+operations MUST remain single-owner; this bounded v3 implementation does not
 run them while local-worker tasks are outstanding. Pool channel loss or
 submission failure MUST be treated as an infrastructure abort rather than a
 semantic program failure; the coordinator MUST stop new dispatch, drain every
@@ -313,25 +337,25 @@ describe permission, not an exact effect footprint.
 `olangc FILE --target ir --explain-schedule` MUST perform the type solve,
 analysis, and admission steps and print the digest bindings, per-operation
 evidence provenance, blockers, retained sequence reasons, and legal static
-waves without executing any operation. In v2 this inspection surface applies
+waves without executing any operation. In v3 this inspection surface applies
 only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 `inspection-only`, not as a dispatch-compatible execution context. A reported
 wave is evidence of legal readiness,
 not proof that every member used a worker, ran together, or fit the pool. Static
 waves MUST NOT be presented as dynamic dispatch batches or observed completion
-order. Admitted O-scope loads and source-proven-preparable trees of the four
-trusted inline renderers execute through the per-run persistent pool. Generic
-hosted prepared-task lanes, actor-owned environments, renewable-capacity
-allocation, and unification with the Request and project schedulers are not v2
-behavior.
+order. Admitted O-scope loads, source-proven-preparable trees of the four trusted
+inline renderers, and explicitly autonomous ephemeral group members execute
+through the per-run persistent pool. Enforced strict hosted footprints,
+actor-owned persistent environments, renewable-capacity allocation, and
+unification with the Request and project schedulers are not v3 behavior.
 The backend-set binding covers resolved adapter files and the current
 executable, and MUST distinguish hashed, missing, non-regular, and unreadable
 paths. Execution admission MUST reject an unhashed current executable. Runtime
 rechecks are path/environment snapshots, not an immutable execution substrate:
-v2 does not pin an opened adapter or frozen child environment and cannot prove
+v3 does not pin an opened adapter or frozen child environment and cannot prove
 the bytes/environment observed at spawn. The binding also excludes caller
 initial-scope shape/values, opaque live-actor state/generation, a complete
-external toolchain closure, and placement-lease freshness. Actor identity in v2 is a
+external toolchain closure, and placement-lease freshness. Actor identity in v3 is a
 serialization constraint only and MUST NOT close an unknown hosted footprint.
 
 ---
