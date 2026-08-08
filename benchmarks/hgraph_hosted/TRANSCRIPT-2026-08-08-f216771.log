@@ -1,0 +1,471 @@
+benchmark=hgraph-hosted-ephemeral-autonomous-batch
+timestamp_utc=2026-08-08T20:59:56Z
+os=Darwin 25.5.0 arm64
+cpu_model=Apple M1 Max
+logical_cpus=10
+memory_bytes=68719476736
+git_commit=f216771376194e930b213e2250948ffb6d173c51
+git_tree_state=clean
+o_binary=/Users/ustad/Ostadix-lang/target/release/O
+o_binary_sha256=edec6ba2cefdceb343abe201a5037c8dfd116a308fa60f10418c26feb56583b3
+olangc_binary=/Users/ustad/Ostadix-lang/target/release/olangc
+olangc_binary_sha256=49754ff418454ad153e6195aaacada0b399f89c84ca41149739c23bdc75ad722
+backends_dir=/Users/ustad/Ostadix-lang/backends
+warmups=1
+repetitions=5
+sleep_seconds=0.25
+worker_tasks=1
+selected_shape=all
+missing_runtime_policy=fail
+runtime_python3=/opt/homebrew/bin/python3
+runtime_python3_version=Python 3.14.6
+runtime_bash=/bin/bash
+runtime_bash_version=GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
+runtime_node=/opt/homebrew/bin/node
+runtime_node_version=v26.7.0
+
+shape=heterogeneous.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/heterogeneous.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=d9a156304afac55e3240024f002408903e89a6023290c2b3ba2a56f812a725ff
+predicted_hosted_tasks=3
+predicted_width=3
+predicted_span=1
+predicted_span_unit=hosted-task-layers
+shape=heterogeneous warmup=1 order=serial,graph
+shape=heterogeneous pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=994 graph_elapsed_ms=982 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=1 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=984 graph_elapsed_ms=1040 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=2 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=996 graph_elapsed_ms=1005 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=3 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=996 graph_elapsed_ms=983 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=4 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=991 graph_elapsed_ms=1023 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=5 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1015 graph_elapsed_ms=1002 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=996 min=984 max=1015
+graph_elapsed_ms median=1005 min=983 max=1040
+median_speedup_serial_over_graph=0.991045
+
+shape=chained.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/chained.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=c1c1622d81053632fe652be42ee8cd2e9042cd75482641f098869fcd35fff035
+predicted_hosted_tasks=4
+predicted_width=1
+predicted_span=4
+predicted_span_unit=hosted-task-layers
+shape=chained warmup=1 order=serial,graph
+shape=chained pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1442 graph_elapsed_ms=1418 semantic_equivalence=true expected_output_match=true
+shape=chained sample=1 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1425 graph_elapsed_ms=1427 semantic_equivalence=true expected_output_match=true
+shape=chained sample=2 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1448 graph_elapsed_ms=1454 semantic_equivalence=true expected_output_match=true
+shape=chained sample=3 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1443 graph_elapsed_ms=1420 semantic_equivalence=true expected_output_match=true
+shape=chained sample=4 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1444 graph_elapsed_ms=1419 semantic_equivalence=true expected_output_match=true
+shape=chained sample=5 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1424 graph_elapsed_ms=1452 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1443 min=1424 max=1448
+graph_elapsed_ms median=1427 min=1419 max=1454
+median_speedup_serial_over_graph=1.011212
+
+shape=mixed_width.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/mixed_width.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=d6cf6fbdb31bf2eb38c09392a05a24e6475452315c4394637fc4eab2c730f0f5
+predicted_hosted_tasks=6
+predicted_width=4
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=mixed_width warmup=1 order=serial,graph
+shape=mixed_width pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=2101 graph_elapsed_ms=2114 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=1 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=2115 graph_elapsed_ms=2069 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=2 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=2099 graph_elapsed_ms=2109 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=3 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=2141 graph_elapsed_ms=2101 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=4 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=2099 graph_elapsed_ms=2124 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=5 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=2120 graph_elapsed_ms=2099 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=2115 min=2099 max=2141
+graph_elapsed_ms median=2101 min=2069 max=2124
+median_speedup_serial_over_graph=1.006663
+
+shape=realistic.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/realistic.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=adb5caadb768dc5acbe1c6c564990484773b2bdbc6e4f6157e5b3658a81a53ae
+predicted_hosted_tasks=4
+predicted_width=2
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=realistic warmup=1 order=serial,graph
+shape=realistic pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1353 graph_elapsed_ms=1330 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=1 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1332 graph_elapsed_ms=1319 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=2 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1316 graph_elapsed_ms=1379 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=3 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1321 graph_elapsed_ms=1331 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=4 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1330 graph_elapsed_ms=1341 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=5 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1346 graph_elapsed_ms=1348 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1330 min=1316 max=1346
+graph_elapsed_ms median=1341 min=1319 max=1379
+median_speedup_serial_over_graph=0.991797
+benchmark=hgraph-hosted-ephemeral-autonomous-batch
+timestamp_utc=2026-08-08T21:01:10Z
+os=Darwin 25.5.0 arm64
+cpu_model=Apple M1 Max
+logical_cpus=10
+memory_bytes=68719476736
+git_commit=f216771376194e930b213e2250948ffb6d173c51
+git_tree_state=clean
+o_binary=/Users/ustad/Ostadix-lang/target/release/O
+o_binary_sha256=edec6ba2cefdceb343abe201a5037c8dfd116a308fa60f10418c26feb56583b3
+olangc_binary=/Users/ustad/Ostadix-lang/target/release/olangc
+olangc_binary_sha256=49754ff418454ad153e6195aaacada0b399f89c84ca41149739c23bdc75ad722
+backends_dir=/Users/ustad/Ostadix-lang/backends
+warmups=1
+repetitions=5
+sleep_seconds=0.25
+worker_tasks=4
+selected_shape=all
+missing_runtime_policy=fail
+runtime_python3=/opt/homebrew/bin/python3
+runtime_python3_version=Python 3.14.6
+runtime_bash=/bin/bash
+runtime_bash_version=GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
+runtime_node=/opt/homebrew/bin/node
+runtime_node_version=v26.7.0
+
+shape=heterogeneous.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/heterogeneous.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=f71407047219e4d869ab283b828401f155a59effb761e4cf97445b865b273ae0
+predicted_hosted_tasks=3
+predicted_width=3
+predicted_span=1
+predicted_span_unit=hosted-task-layers
+shape=heterogeneous warmup=1 order=serial,graph
+shape=heterogeneous pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=989 graph_elapsed_ms=356 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=1 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1006 graph_elapsed_ms=365 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=2 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=999 graph_elapsed_ms=361 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=3 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1007 graph_elapsed_ms=348 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=4 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1000 graph_elapsed_ms=352 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=5 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1030 graph_elapsed_ms=354 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1006 min=999 max=1030
+graph_elapsed_ms median=354 min=348 max=365
+median_speedup_serial_over_graph=2.841808
+
+shape=chained.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/chained.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=04cf269e5ef6a4389e587c711d220854dbc9c302143ff3b63537e4e5e35688ce
+predicted_hosted_tasks=4
+predicted_width=1
+predicted_span=4
+predicted_span_unit=hosted-task-layers
+shape=chained warmup=1 order=serial,graph
+shape=chained pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1451 graph_elapsed_ms=1429 semantic_equivalence=true expected_output_match=true
+shape=chained sample=1 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1468 graph_elapsed_ms=1423 semantic_equivalence=true expected_output_match=true
+shape=chained sample=2 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1443 graph_elapsed_ms=1437 semantic_equivalence=true expected_output_match=true
+shape=chained sample=3 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1432 graph_elapsed_ms=1440 semantic_equivalence=true expected_output_match=true
+shape=chained sample=4 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1424 graph_elapsed_ms=1427 semantic_equivalence=true expected_output_match=true
+shape=chained sample=5 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1454 graph_elapsed_ms=1407 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1443 min=1424 max=1468
+graph_elapsed_ms median=1427 min=1407 max=1440
+median_speedup_serial_over_graph=1.011212
+
+shape=mixed_width.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/mixed_width.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=9924e8bb0569d9b3422649d534e1a434f8e176a80368e5b5a2806a1bb5e57616
+predicted_hosted_tasks=6
+predicted_width=4
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=mixed_width warmup=1 order=serial,graph
+shape=mixed_width pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=2074 graph_elapsed_ms=1065 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=1 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=2110 graph_elapsed_ms=1045 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=2 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=2083 graph_elapsed_ms=1039 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=3 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=2118 graph_elapsed_ms=1052 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=4 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=2069 graph_elapsed_ms=1064 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=5 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=2070 graph_elapsed_ms=1040 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=2083 min=2069 max=2118
+graph_elapsed_ms median=1045 min=1039 max=1064
+median_speedup_serial_over_graph=1.993301
+
+shape=realistic.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/realistic.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=540a9a1e9efc773423a7aa714655e3395d209880b7d7debe157bbe963983d6f1
+predicted_hosted_tasks=4
+predicted_width=2
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=realistic warmup=1 order=serial,graph
+shape=realistic pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1353 graph_elapsed_ms=1042 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=1 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1332 graph_elapsed_ms=1039 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=2 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1351 graph_elapsed_ms=1021 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=3 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1363 graph_elapsed_ms=1041 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=4 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1320 graph_elapsed_ms=1057 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=5 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1364 graph_elapsed_ms=1058 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1351 min=1320 max=1364
+graph_elapsed_ms median=1041 min=1021 max=1058
+median_speedup_serial_over_graph=1.297791
+benchmark=hgraph-hosted-ephemeral-autonomous-batch
+timestamp_utc=2026-08-08T21:02:12Z
+os=Darwin 25.5.0 arm64
+cpu_model=Apple M1 Max
+logical_cpus=10
+memory_bytes=68719476736
+git_commit=f216771376194e930b213e2250948ffb6d173c51
+git_tree_state=clean
+o_binary=/Users/ustad/Ostadix-lang/target/release/O
+o_binary_sha256=edec6ba2cefdceb343abe201a5037c8dfd116a308fa60f10418c26feb56583b3
+olangc_binary=/Users/ustad/Ostadix-lang/target/release/olangc
+olangc_binary_sha256=49754ff418454ad153e6195aaacada0b399f89c84ca41149739c23bdc75ad722
+backends_dir=/Users/ustad/Ostadix-lang/backends
+warmups=1
+repetitions=5
+sleep_seconds=0.25
+worker_tasks=8
+selected_shape=all
+missing_runtime_policy=fail
+runtime_python3=/opt/homebrew/bin/python3
+runtime_python3_version=Python 3.14.6
+runtime_bash=/bin/bash
+runtime_bash_version=GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
+runtime_node=/opt/homebrew/bin/node
+runtime_node_version=v26.7.0
+
+shape=heterogeneous.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/heterogeneous.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=65fb62835d874d0237a77c573b1b0dba954392cfceb328be1504a743f84747a4
+predicted_hosted_tasks=3
+predicted_width=3
+predicted_span=1
+predicted_span_unit=hosted-task-layers
+shape=heterogeneous warmup=1 order=serial,graph
+shape=heterogeneous pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=997 graph_elapsed_ms=342 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=1 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=980 graph_elapsed_ms=358 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=2 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=998 graph_elapsed_ms=353 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=3 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=988 graph_elapsed_ms=364 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=4 order=graph,serial
+shape=heterogeneous pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=992 graph_elapsed_ms=351 semantic_equivalence=true expected_output_match=true
+shape=heterogeneous sample=5 order=serial,graph
+shape=heterogeneous pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=996 graph_elapsed_ms=355 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=992 min=980 max=998
+graph_elapsed_ms median=355 min=351 max=364
+median_speedup_serial_over_graph=2.794366
+
+shape=chained.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/chained.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=9dbc34031317452db2a7382fab19c608aa8de172a535f3de5084bba010601cd6
+predicted_hosted_tasks=4
+predicted_width=1
+predicted_span=4
+predicted_span_unit=hosted-task-layers
+shape=chained warmup=1 order=serial,graph
+shape=chained pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1436 graph_elapsed_ms=1423 semantic_equivalence=true expected_output_match=true
+shape=chained sample=1 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1460 graph_elapsed_ms=1413 semantic_equivalence=true expected_output_match=true
+shape=chained sample=2 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1434 graph_elapsed_ms=1442 semantic_equivalence=true expected_output_match=true
+shape=chained sample=3 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1446 graph_elapsed_ms=1458 semantic_equivalence=true expected_output_match=true
+shape=chained sample=4 order=graph,serial
+shape=chained pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1424 graph_elapsed_ms=1420 semantic_equivalence=true expected_output_match=true
+shape=chained sample=5 order=serial,graph
+shape=chained pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1427 graph_elapsed_ms=1408 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1434 min=1424 max=1460
+graph_elapsed_ms median=1420 min=1408 max=1458
+median_speedup_serial_over_graph=1.009859
+
+shape=mixed_width.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/mixed_width.O
+required_runtimes=python3
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=24101e123dbf93ccbcf8ce688ed8e740076c86ffce3082553a2299e271ad17ce
+predicted_hosted_tasks=6
+predicted_width=4
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=mixed_width warmup=1 order=serial,graph
+shape=mixed_width pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=2134 graph_elapsed_ms=1062 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=1 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=2084 graph_elapsed_ms=1069 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=2 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=2085 graph_elapsed_ms=1068 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=3 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=2094 graph_elapsed_ms=1085 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=4 order=graph,serial
+shape=mixed_width pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=2054 graph_elapsed_ms=1050 semantic_equivalence=true expected_output_match=true
+shape=mixed_width sample=5 order=serial,graph
+shape=mixed_width pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=2118 graph_elapsed_ms=1058 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=2085 min=2054 max=2118
+graph_elapsed_ms median=1068 min=1050 max=1085
+median_speedup_serial_over_graph=1.952247
+
+shape=realistic.O
+fixture=/Users/ustad/Ostadix-lang/benchmarks/hgraph_hosted/realistic.O
+required_runtimes=python3,bash,node
+missing_runtimes=none
+prediction_source=olangc--explain-schedule
+prediction_schema=oexec.schedule-prediction/v1
+prediction_provenance=evidence-bound-admission
+prediction_model=unit-cost-shim-hosted-tasks
+prediction_admission_sha256=78ad377e133625515f9c332d49f7cb9ab4782f5765fde9accb03970a59be231a
+predicted_hosted_tasks=4
+predicted_width=2
+predicted_span=3
+predicted_span_unit=hosted-task-layers
+shape=realistic warmup=1 order=serial,graph
+shape=realistic pair_phase=warmup pair_ordinal=1 order=serial,graph serial_elapsed_ms=1359 graph_elapsed_ms=1024 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=1 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=1 order=serial,graph serial_elapsed_ms=1346 graph_elapsed_ms=1051 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=2 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=2 order=graph,serial serial_elapsed_ms=1320 graph_elapsed_ms=1032 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=3 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=3 order=serial,graph serial_elapsed_ms=1341 graph_elapsed_ms=1050 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=4 order=graph,serial
+shape=realistic pair_phase=sample pair_ordinal=4 order=graph,serial serial_elapsed_ms=1347 graph_elapsed_ms=1043 semantic_equivalence=true expected_output_match=true
+shape=realistic sample=5 order=serial,graph
+shape=realistic pair_phase=sample pair_ordinal=5 order=serial,graph serial_elapsed_ms=1313 graph_elapsed_ms=1058 semantic_equivalence=true expected_output_match=true
+status=measured
+semantic_equivalence=true
+semantic_equivalence_basis=ok+type+canonical-o-value-json
+expected_output_match=true
+serial_elapsed_ms median=1341 min=1313 max=1347
+graph_elapsed_ms median=1050 min=1032 max=1058
+median_speedup_serial_over_graph=1.277143

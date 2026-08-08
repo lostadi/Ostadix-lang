@@ -1104,6 +1104,22 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-hosted-benchmark.zip")
 
+    def test_analyzer_bound_hosted_benchmark_evidence_is_required(self) -> None:
+        self._commit()
+        self._git(
+            "rm",
+            "benchmarks/hgraph_hosted/RESULTS-2026-08-08-f216771.md",
+            "benchmarks/hgraph_hosted/TRANSCRIPT-2026-08-08-f216771.log",
+        )
+        self._git("commit", "-q", "-m", "remove analyzer-bound benchmark evidence")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"missing required path\(s\): .*RESULTS-2026-08-08-f216771\.md.*"
+            r"TRANSCRIPT-2026-08-08-f216771\.log",
+        ):
+            self._build("missing-analyzer-bound-benchmark-evidence.zip")
+
     def test_root_license_is_a_required_release_member(self) -> None:
         self._commit()
         self._git("rm", "LICENSE")
