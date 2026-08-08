@@ -15,6 +15,11 @@ jobs:
     name: Rust authoritative runtime
     runs-on: ubuntu-latest
     steps:
+      - name: Start Rust lane duration clock
+        run: |
+          mkdir -p "$RUNNER_TEMP/ostadix-lifecycle"
+          date +%s > "$RUNNER_TEMP/ostadix-lifecycle/rust-lane-started-at"
+
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -34,6 +39,64 @@ jobs:
       - name: Build
         run: cargo build --all-targets --all-features --verbose
 
+      - name: Run fast autonomous worker lifecycle gates
+        timeout-minutes: 3
+        env:
+          O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/autonomous-workers.log
+          RUST_BACKTRACE: "1"
+        run: |
+          started_at="$(date +%s)"
+          status=0
+          for test_name in \
+            ordinary_ephemeral_python_preserves_strict_fail_stop \
+            explicit_one_worker_override_serializes_autonomous_blocks \
+            explicit_autonomous_ephemeral_python_blocks_overlap \
+            autonomous_worker_o_eval_sees_lexical_scope \
+            autonomous_worker_o_eval_failure_terminates_backend \
+            autonomous_worker_nested_hosted_callback_inherits_deadline \
+            autonomous_nonresponsive_backend_fails_within_configured_bound
+          do
+            cargo test \
+              --test autonomous_hosted_parallel \
+              "$test_name" \
+              -- \
+              --exact \
+              --nocapture \
+              --test-threads=1 || {
+                status=$?
+                break
+              }
+          done
+          elapsed_seconds=$(( $(date +%s) - started_at ))
+          echo "fast_hosted_lifecycle_seconds=$elapsed_seconds"
+          printf -- '- Fast hosted lifecycle gates: `%s s`\n' \
+            "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Run production Python backend-proxy lifecycle gate
+        timeout-minutes: 2
+        env:
+          O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-proxy.log
+          RUST_BACKTRACE: "1"
+        run: |
+          started_at="$(date +%s)"
+          status=0
+          cargo test \
+            --test autonomous_hosted_parallel \
+            production_python_backend_proxy_shutdown_reaps_shim \
+            -- \
+            --exact \
+            --nocapture \
+            --test-threads=1 || status=$?
+          elapsed_seconds=$(( $(date +%s) - started_at ))
+          echo "production_backend_proxy_lifecycle_seconds=$elapsed_seconds"
+          printf -- '- Production backend-proxy lifecycle gate: `%s s`\n' \
+            "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Run broad Rust test suite
+        run: cargo test --all-targets --all-features --verbose
+
       - name: Build Rust API documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
@@ -41,9 +104,6 @@ jobs:
 
       - name: Verify every declared binary target
         run: bash scripts/check_declared_bins.sh
-
-      - name: Run tests
-        run: cargo test --all-targets --all-features --verbose
 
       - name: Run manifest-selected Rust example semantics
         run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
@@ -84,6 +144,31 @@ jobs:
 
       - name: Clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Report Rust lane duration
+        if: always()
+        run: |
+          clock_file="$RUNNER_TEMP/ostadix-lifecycle/rust-lane-started-at"
+          if [[ -f "$clock_file" ]]; then
+            started_at="$(cat "$clock_file")"
+            elapsed_seconds=$(( $(date +%s) - started_at ))
+            echo "rust_lane_elapsed_seconds=$elapsed_seconds"
+            printf -- '- Rust lane elapsed time: `%s s`\n' \
+              "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "rust_lane_elapsed_seconds=unavailable"
+            printf -- '- Rust lane elapsed time: unavailable (clock did not start)\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload hosted lifecycle traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-lifecycle-traces-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ostadix-lifecycle
+          if-no-files-found: warn
+          retention-days: 14
 
   # ── Python reference runtime ───────────────────────────────────────────────
   python:
