@@ -62,6 +62,7 @@ fn run_graph_bounded_with_operation_timeout(
         .current_dir(workdir.path())
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("O_TEST_WORKDIR", workdir.path())
+        .env("O_BACKEND_SHUTDOWN_TIMEOUT_MS", "2000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(timeout) = operation_timeout {
@@ -562,6 +563,51 @@ __oval_result__ = "unreachable"
     let trace = fs::read_to_string(&run.trace_path).expect("read timeout lifecycle trace");
     assert!(trace.contains("outcome=infrastructure_failure"), "{trace}");
     #[cfg(unix)]
+    assert_traced_backend_groups_reaped(&run);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn autonomous_lingering_same_group_descendant_fails_and_is_reaped() {
+    if !python_available() {
+        eprintln!("skipping: python3 backend runtime is unavailable");
+        return;
+    }
+
+    let started = Instant::now();
+    let run = run_graph_bounded(
+        r#"autonomous(batch(
+python^(
+import subprocess
+subprocess.Popen(
+    ["/bin/sleep", "60"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+__oval_result__ = "parent-complete"
+)_python
+))
+"#,
+        1,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "lingering backend descendant exceeded the bounded shutdown window"
+    );
+    assert!(
+        !run.output.status.success(),
+        "an autonomous backend with a lingering descendant unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        stderr.contains("still contains an active descendant")
+            && stderr.contains("did not shut down cleanly"),
+        "process-group shutdown failure was not reported\nstderr:\n{stderr}"
+    );
+    let trace = fs::read_to_string(&run.trace_path).expect("read descendant lifecycle trace");
+    assert!(trace.contains("event=worker.done_received"), "{trace}");
+    assert!(trace.contains("outcome=infrastructure_failure"), "{trace}");
     assert_traced_backend_groups_reaped(&run);
 }
 
