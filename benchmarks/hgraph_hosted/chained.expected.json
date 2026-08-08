@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "type": "list",
+  "value": {
+    "t": "list",
+    "v": [
+      {"t": "number", "v": {"kind": "int", "v": "4"}}
+    ]
+  }
+}

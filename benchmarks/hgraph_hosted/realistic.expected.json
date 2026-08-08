@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "type": "text",
+  "value": {
+    "t": "text",
+    "v": {
+      "encoding": "utf-8",
+      "utf8": "aggregate|transform:alpha-beta-gamma|format:ALPHA-BETA-GAMMA"
+    }
+  }
+}

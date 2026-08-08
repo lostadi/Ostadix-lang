@@ -43,6 +43,16 @@ jobs:
       - name: Run manifest-selected Rust example semantics
         run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
 
+      - name: Run hosted HGraph benchmark semantic smoke
+        run: |
+          O_RELEASE_BIN="$PWD/target/debug/O" \
+            scripts/benchmark_hgraph_hosted.sh \
+            --warmups 0 \
+            --repetitions 1 \
+            --sleep 0 \
+            --workers 4 \
+            --missing-runtime fail
+
       - name: Run hosted Live-World reference smoke
         run: bash scripts/smoke-hosted-live-reference.sh
 
@@ -89,6 +99,9 @@ jobs:
         run: |
           python3 tests/example_manifest.py validate
           python3 -m unittest -v tests.test_example_manifest
+
+      - name: Validate hosted HGraph benchmark contracts
+        run: python3 -m unittest -v tests.test_benchmark_hgraph_hosted
 
       - name: Evaluator tests
         run: python3 -m tests.test_evaluator
