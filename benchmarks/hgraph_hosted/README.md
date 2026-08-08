@@ -89,7 +89,12 @@ that is wait concurrency, not evidence of parallel CPU computation. Treat
 reported ratios as measurements of this fixture/runtime/machine combination,
 not as a general scheduler-performance claim.
 
-The historical [2026-08-08 M1 Max result
+The current [analyzer-bound 2026-08-08 M1 Max result
+record](RESULTS-2026-08-08-f216771.md) links its complete
+[raw transcript](TRANSCRIPT-2026-08-08-f216771.log) and binds the analyzer,
+executor, admission, source, machine, runtime, and measurement identities.
+
+The historical [earlier 2026-08-08 M1 Max result
 record](RESULTS-2026-08-08-be68dfef.md) binds its retained medians to the
 measured source commit and `O` digest. It predates analyzer-derived predictions
 and correctly labels its width/span values as manual. Keep result records
