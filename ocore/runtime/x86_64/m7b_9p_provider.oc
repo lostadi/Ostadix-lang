@@ -20,6 +20,7 @@ const GENERATION_OFFSET: usize = 24;
 const ORDINAL_OFFSET: usize = 32;
 const EXPECTED_CLIENT_OFFSET: usize = 40;
 const ACTIVATION_OFFSET: usize = 48;
+const FAULT_READY_OFFSET: usize = 56;
 const MESSAGE_OFFSET: usize = 128;
 const MESSAGE_SIZE: u64 = 32;
 
@@ -149,6 +150,19 @@ unsafe fn wait_for_activation() -> void {
             return;
         }
         if activation != 0 {
+            stop();
+        }
+        yield_once();
+    }
+}
+
+unsafe fn wait_for_fault_readiness() -> void {
+    loop {
+        let readiness: u64 = config(FAULT_READY_OFFSET);
+        if readiness == 1 {
+            return;
+        }
+        if readiness != 0 {
             stop();
         }
         yield_once();
@@ -549,9 +563,11 @@ unsafe fn run_provider(
                                 reply_unavailable(reply, tag);
                                 emit(report, (&A_UNAVAILABLE[0]), 35);
                                 progress(6);
-                                // Let the client consume all four terminal
-                                // response fragments before entering #UD.
-                                yield_once();
+                                // The kernel opens this gate only after the
+                                // client has consumed all terminal response
+                                // fragments and published progress 2.  A
+                                // single yield is not evidence of either fact.
+                                wait_for_fault_readiness();
                                 emit(report, (&A_FAULT[0]), 35);
                                 progress(7);
                                 asm!("ud2", options(nomem, nostack));
