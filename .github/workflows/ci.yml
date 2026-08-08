@@ -310,6 +310,14 @@ jobs:
 
       - name: Install freestanding build, ELF inspection, and QEMU tools
         run: |
+          # The ubuntu-26.04 preview image currently carries optional Microsoft
+          # feeds that return HTTP 403. They are unrelated to this job and make
+          # apt reject otherwise healthy Ubuntu indexes.
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [[ -f "$source" ]] && grep -qF packages.microsoft.com "$source"; then
+              sudo mv "$source" "$source.disabled"
+            fi
+          done
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm
           command -v llvm-objdump
