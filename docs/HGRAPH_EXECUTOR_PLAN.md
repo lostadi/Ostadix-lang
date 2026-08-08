@@ -356,10 +356,14 @@ For each graph execution containing local-worker operations, the coordinator
 creates one fixed-size pool and reuses its threads across changing readiness
 frontiers. Without an explicit override, capacity is
 `min(available_parallelism, admitted_max_local_worker_wave_width).max(1)`;
-the admitted quantity counts only local-worker operations in each static Kahn
-wave. It is a sizing heuristic and not evidence-backed CPU or memory admission
-or a bound on the completion-driven dynamic frontier. Each physical completion
-is delivered independently.
+if the host query fails, `available_parallelism` falls back to one. An explicit
+override replaces the derived value and is not clamped to either the reported
+host count or the admitted width. A graph with no admitted local-worker
+operations creates no pool, even though the shared count resolver has a minimum
+result of one. The admitted quantity counts only local-worker operations in
+each static Kahn wave. It is a sizing heuristic and not evidence-backed CPU or
+memory admission or a bound on the completion-driven dynamic frontier. Each
+physical completion is delivered independently.
 The coordinator buffers the provisional outcome, settles every now-eligible
 semantic prefix result, recomputes readiness, and may submit newly exposed
 worker work while an unrelated prior task is still running. A reported static
@@ -445,11 +449,19 @@ resource, actor, completion/control, executable, and constraint nodes with
 distinct styles and directed ports. The separate
 `--target ir --explain-schedule` surface compiles admission and reports its
 evidence inputs and digest bindings without execution. It also emits an
-advisory `ScheduleRealizability` marker with the live inspection-host capacity,
-admitted total and local-worker static widths, and selected default or explicit
-worker count. This marker is intentionally outside the admission digest and
-states that runtime availability is unknown, no placement lease exists, and no
-dispatch or overlap was observed.
+advisory `ScheduleRealizability` marker under schema
+`oexec.realizability/v1`. `admitted-static-max-wave-width` counts all operations
+in the widest admitted static Kahn wave; `admitted-max-local-worker-wave-width`
+counts only its `LocalWorker` subset and drives default pool sizing.
+`worker-count-covers-static-wave` is `not-applicable` when the latter width is
+zero, `yes` when `selected-workers` covers it, and `no` otherwise. The marker
+also distinguishes `machine-default` from an unclamped `cli-override`; a failed
+host parallelism query is displayed as the conservative fallback `1`. This
+marker is intentionally outside the admission digest and states
+`execution-realizable=unknown`, runtime availability unknown, no placement
+lease, and no dispatch or overlap observed. Even a `yes` coverage value proves
+no simultaneous dispatch, CPU/memory fit, runtime readiness, placement, or
+dynamic-frontier bound.
 
 `ProjectAttemptTrace` version 5 binds events to the project name, bundle digest,
 target, policy, canonical `LogicalHGraphV1` schema/digest, exact canonical
