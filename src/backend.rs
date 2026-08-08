@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,12 +74,32 @@ pub fn run_backend(lang: &str) -> Result<()> {
     let mut writer = stdout.lock();
 
     while let Some(command) = wire::read_frame::<_, OWireCommand>(&mut reader)? {
+        if matches!(&command, OWireCommand::Shutdown) {
+            match backend.shutdown() {
+                Ok(()) => {
+                    wire::write_frame(&mut writer, &OWireResponse::ok(OValue::Null))?;
+                    crate::process::lifecycle_trace(
+                        "backend.shutdown_acknowledged",
+                        format!("language={lang}"),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    wire::write_frame(
+                        &mut writer,
+                        &OWireResponse::err(format!("backend shutdown failed: {error:#}")),
+                    )?;
+                    return Err(error).context("backend shutdown failed");
+                }
+            }
+        }
         let response = match command {
             OWireCommand::Exec { code, bindings } => match backend.exec(lang, &code, bindings) {
                 Ok(value) => OWireResponse::ok(value),
                 Err(error) => OWireResponse::err(format!("{error:#}")),
             },
             OWireCommand::Cleanup => OWireResponse::ok(OValue::Null),
+            OWireCommand::Shutdown => unreachable!("shutdown handled before dispatch"),
             OWireCommand::Ping => OWireResponse::ok(OValue::Null),
             OWireCommand::EvalResult { .. } => {
                 OWireResponse::err("backend received eval_result without a pending eval request")
@@ -105,8 +125,8 @@ struct RustBackend {
 /// multi-block `sql[0]^(…)_sql[0]` programs match the Python shim semantics.
 struct SqlState {
     _dir: TempDir,
-    _child: Child,
-    stdin: BufWriter<ChildStdin>,
+    child: Child,
+    stdin: Option<BufWriter<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
     stderr_rx: Receiver<String>,
 }
@@ -158,6 +178,13 @@ impl RustBackend {
         }
         Ok(self.sql.as_mut().expect("sql state was just initialized"))
     }
+
+    fn shutdown(&mut self) -> Result<()> {
+        if let Some(mut sql) = self.sql.take() {
+            sql.shutdown(crate::process::backend_shutdown_timeout())?;
+        }
+        Ok(())
+    }
 }
 
 impl SqlState {
@@ -207,8 +234,8 @@ impl SqlState {
 
         let mut state = Self {
             _dir: dir,
-            _child: child,
-            stdin,
+            child,
+            stdin: Some(stdin),
             stdout,
             stderr_rx,
         };
@@ -220,13 +247,25 @@ impl SqlState {
     }
 
     fn write_raw(&mut self, text: &str) -> Result<()> {
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("sqlite3 session command pipe is closed"))?;
+        stdin
             .write_all(text.as_bytes())
             .context("failed to write to sqlite3 session")?;
-        self.stdin
-            .flush()
-            .context("failed to flush sqlite3 session")?;
+        stdin.flush().context("failed to flush sqlite3 session")?;
         Ok(())
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        self.stdin.take();
+        let status = reap_legacy_child(&mut self.child, timeout)?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("sqlite3 session exited with status {status} during shutdown")
+        }
     }
 
     fn drain_stderr(&self) -> String {
@@ -297,6 +336,13 @@ impl SqlState {
     }
 }
 
+impl Drop for SqlState {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = reap_legacy_child(&mut self.child, Duration::from_millis(250));
+    }
+}
+
 fn sql_stderr_is_error(err: &str) -> bool {
     let trimmed = err.trim();
     if trimmed.is_empty() {
@@ -329,50 +375,122 @@ fn proxy_legacy_backend(lang: &str) -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to spawn legacy backend shim: {}", shim.display()))?;
+    crate::process::lifecycle_trace(
+        "proxy.shim_spawned",
+        format!("language={lang} shim_pid={}", child.id()),
+    );
 
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .context("legacy backend did not provide stdin")?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .context("legacy backend did not provide stdout")?;
+    let child_stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let cleanup = reap_legacy_child(&mut child, Duration::from_millis(250));
+            return match cleanup {
+                Ok(_) => Err(anyhow!("legacy backend did not provide stdin")),
+                Err(cleanup) => Err(anyhow!(
+                    "legacy backend did not provide stdin; cleanup also failed: {cleanup:#}"
+                )),
+            };
+        }
+    };
+    let child_stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            drop(child_stdin);
+            let cleanup = reap_legacy_child(&mut child, Duration::from_millis(250));
+            return match cleanup {
+                Ok(_) => Err(anyhow!("legacy backend did not provide stdout")),
+                Err(cleanup) => Err(anyhow!(
+                    "legacy backend did not provide stdout; cleanup also failed: {cleanup:#}"
+                )),
+            };
+        }
+    };
+    let mut child_stdin = Some(BufWriter::new(child_stdin));
+    let mut child_stdout = BufReader::new(child_stdout);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
 
-    let stdin_thread = thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let _ = copy_and_flush(&mut stdin, &mut child_stdin);
-    });
-    let stdout_thread = thread::spawn(move || {
-        let mut stdout = io::stdout().lock();
-        let _ = copy_and_flush(&mut child_stdout, &mut stdout);
-    });
+    while let Some(command) = wire::read_frame::<_, OWireCommand>(&mut reader)? {
+        if matches!(&command, OWireCommand::Shutdown) {
+            crate::process::lifecycle_trace(
+                "proxy.shutdown_received",
+                format!("language={lang} shim_pid={}", child.id()),
+            );
+            // Legacy shims already exit on command-channel EOF. The proxy owns
+            // that compatibility translation, so every shim gets one uniform
+            // terminal command without duplicating protocol branches.
+            child_stdin.take();
+            let status = reap_legacy_child(&mut child, crate::process::backend_shutdown_timeout())?;
+            if !status.success() {
+                wire::write_frame(
+                    &mut writer,
+                    &OWireResponse::err(format!(
+                        "legacy backend shim exited with status {status} during shutdown"
+                    )),
+                )?;
+                bail!("legacy backend shim exited with status {status} during shutdown");
+            }
+            crate::process::lifecycle_trace(
+                "proxy.shim_reaped",
+                format!("language={lang} shim_pid={}", child.id()),
+            );
+            wire::write_frame(&mut writer, &OWireResponse::ok(OValue::Null))?;
+            crate::process::lifecycle_trace(
+                "proxy.shutdown_acknowledged",
+                format!("language={lang}"),
+            );
+            return Ok(());
+        }
 
-    let status = child.wait()?;
-    let _ = stdin_thread.join();
-    let _ = stdout_thread.join();
-    if !status.success() {
-        bail!("legacy backend shim exited with status {status}");
+        wire::write_frame(
+            child_stdin
+                .as_mut()
+                .context("legacy backend command pipe is closed")?,
+            &command,
+        )?;
+        let response = wire::read_frame::<_, OWireResponse>(&mut child_stdout)?
+            .ok_or_else(|| anyhow!("legacy backend shim closed stdout unexpectedly"))?;
+        wire::write_frame(&mut writer, &response)?;
     }
-    Ok(())
+
+    child_stdin.take();
+    let status = reap_legacy_child(&mut child, Duration::from_millis(250))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("legacy backend shim exited with status {status}")
+    }
 }
 
-fn copy_and_flush<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
-where
-    R: Read,
-    W: Write,
-{
-    let mut total = 0;
-    let mut buffer = [0_u8; 8192];
+fn reap_legacy_child(child: &mut Child, grace: Duration) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now()
+        .checked_add(grace)
+        .ok_or_else(|| anyhow!("legacy backend shutdown deadline overflowed"))?;
     loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            writer.flush()?;
-            return Ok(total);
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
         }
-        writer.write_all(&buffer[..n])?;
-        writer.flush()?;
-        total += n as u64;
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let forced_deadline = std::time::Instant::now()
+                .checked_add(Duration::from_millis(250))
+                .ok_or_else(|| anyhow!("legacy backend forced-reap deadline overflowed"))?;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= forced_deadline {
+                    bail!(
+                        "legacy backend shim {} did not become waitable after termination",
+                        child.id()
+                    );
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 

@@ -44,9 +44,7 @@ impl WorkerPool {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
                     drop(submission_tx);
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
+                    join_workers(workers);
                     return Err(error).context("failed to create local worker pool");
                 }
             }
@@ -123,9 +121,9 @@ impl WorkerPool {
         match self.recv_event()? {
             WorkerEvent::Completion(completion) => Ok(completion),
             WorkerEvent::EvalRequest(request) => {
-                request.respond(Err(
-                    "O.eval callback requires the graph coordinator".to_string()
-                ))?;
+                request.respond(Err(super::task::TaskCallbackFailure::Infrastructure(
+                    "O.eval callback requires the graph coordinator".to_string(),
+                )))?;
                 bail!("unexpected O.eval callback in completion-only worker consumer")
             }
         }
@@ -144,9 +142,15 @@ impl Drop for WorkerPool {
     fn drop(&mut self) {
         // Disconnect the queue before joining so idle workers leave recv().
         self.submissions.take();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        crate::process::lifecycle_trace("pool.submission_channel_closed", "");
+        join_workers(self.workers.drain(..));
+    }
+}
+
+fn join_workers(workers: impl IntoIterator<Item = JoinHandle<()>>) {
+    for (index, worker) in workers.into_iter().enumerate() {
+        let _ = worker.join();
+        crate::process::lifecycle_trace("pool.worker_joined", format!("worker={index}"));
     }
 }
 
@@ -163,12 +167,16 @@ fn worker_loop(
             return;
         };
         let (token, task) = submission.into_parts();
+        crate::process::lifecycle_trace("worker.task_received", format!("token={}", token.0));
         let context = TaskContext::new(token, events.clone());
         // This converts panics only in unwind-capable profiles. A panic-abort
         // build terminates the process before Rust can produce a completion.
         let completion =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.execute(&context)))
             {
+                Ok(Err(error)) if crate::process::is_infrastructure_error(&error) => {
+                    TaskCompletion::infrastructure_abort(token, error)
+                }
                 Ok(outcome) => TaskCompletion::completed(token, outcome),
                 Err(_) => TaskCompletion::infrastructure_abort(
                     token,
@@ -178,6 +186,7 @@ fn worker_loop(
         if events.send(WorkerEvent::Completion(completion)).is_err() {
             return;
         }
+        crate::process::lifecycle_trace("worker.completion_emitted", format!("token={}", token.0));
     }
 }
 
@@ -227,6 +236,16 @@ mod tests {
     impl PreparedTask for PanicTask {
         fn execute(self: Box<Self>, _context: &TaskContext) -> Result<OValue> {
             panic!("test worker panic")
+        }
+    }
+
+    struct InfrastructureErrorTask;
+
+    impl PreparedTask for InfrastructureErrorTask {
+        fn execute(self: Box<Self>, _context: &TaskContext) -> Result<OValue> {
+            Err(crate::process::infrastructure_error(anyhow!(
+                "backend teardown failed"
+            )))
         }
     }
 
@@ -344,5 +363,21 @@ mod tests {
             pool.recv_completion().unwrap().outcome,
             TaskOutcome::Completed(Ok(_))
         ));
+    }
+
+    #[test]
+    fn typed_backend_lifecycle_error_remains_infrastructure() {
+        let mut pool = WorkerPool::new(1).unwrap();
+        pool.submit(TaskSubmission::new(
+            TaskToken(0),
+            Box::new(InfrastructureErrorTask),
+        ))
+        .unwrap();
+
+        let completion = pool.recv_completion().unwrap();
+        let TaskOutcome::InfrastructureAbort(error) = completion.outcome else {
+            panic!("typed backend lifecycle fault became a semantic completion")
+        };
+        assert!(error.to_string().contains("backend teardown failed"));
     }
 }

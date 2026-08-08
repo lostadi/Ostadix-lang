@@ -28,7 +28,8 @@ use crate::value::OValue;
 use super::parallel;
 use super::pool::WorkerPool;
 use super::task::{
-    TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken, WorkerEvent,
+    TaskCallbackFailure, TaskCompletion, TaskEvalRequest, TaskOutcome, TaskSubmission, TaskToken,
+    WorkerEvent,
 };
 use super::trace::TraceSink;
 
@@ -596,11 +597,19 @@ impl<'a> Coordinator<'a> {
                     _ => None,
                 },
             )?;
+            crate::process::lifecycle_trace(
+                "coordinator.task_prepared",
+                format!("token={index} plan_node={}", id.0),
+            );
             prepared.push((index, id, task));
         }
 
         for (index, id, task) in prepared {
             pool.submit(TaskSubmission::new(TaskToken(index), task))?;
+            crate::process::lifecycle_trace(
+                "coordinator.task_submitted",
+                format!("token={index} plan_node={}", id.0),
+            );
             self.ops[index].state = OpRunState::InFlight;
             self.trace.ready(id);
             self.trace.started(id);
@@ -636,7 +645,13 @@ impl<'a> Coordinator<'a> {
         event: WorkerEvent,
     ) -> Result<()> {
         match event {
-            WorkerEvent::Completion(completion) => self.accept_worker_completion(pool, completion),
+            WorkerEvent::Completion(completion) => {
+                crate::process::lifecycle_trace(
+                    "coordinator.completion_received",
+                    format!("token={}", completion.token.0),
+                );
+                self.accept_worker_completion(pool, completion)
+            }
             WorkerEvent::EvalRequest(request) => {
                 self.handle_worker_eval_request(evaluator, request)
             }
@@ -668,24 +683,39 @@ impl<'a> Coordinator<'a> {
         request: TaskEvalRequest,
     ) -> Result<()> {
         let index = request.token.0;
+        crate::process::lifecycle_trace("coordinator.callback_received", format!("token={index}"));
         let valid = self.ops.get(index).is_some_and(|op| {
             op.state == OpRunState::InFlight
                 && op.dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
         });
         if !valid {
-            request.respond(Err(format!(
+            request.respond(Err(TaskCallbackFailure::Infrastructure(format!(
                 "local worker requested O.eval for invalid task token {index}"
-            )))?;
+            ))))?;
             bail!("local worker requested O.eval for invalid task token {index}");
         }
 
         let policy = self.frame.node_policy[self.ops[index].plan_node.0];
         let saved = evaluator.set_policy(policy);
-        let outcome = evaluator
-            .eval_source_with_scope(&request.src, &request.scope)
-            .map_err(|error| format!("{error:#}"));
+        let outcome = match evaluator.eval_source_with_scope_until(
+            &request.src,
+            &request.scope,
+            request.deadline,
+        ) {
+            Ok(value) => Ok(value),
+            Err(error) if crate::process::is_infrastructure_error(&error) => {
+                Err(TaskCallbackFailure::Infrastructure(format!("{error:#}")))
+            }
+            Err(error) => Err(TaskCallbackFailure::Semantic(format!("{error:#}"))),
+        };
         evaluator.set_policy(saved);
-        request.respond(outcome)
+        let succeeded = outcome.is_ok();
+        request.respond(outcome)?;
+        crate::process::lifecycle_trace(
+            "coordinator.callback_replied",
+            format!("token={index} success={succeeded}"),
+        );
+        Ok(())
     }
 
     fn buffer_worker_completion(
@@ -750,6 +780,10 @@ impl<'a> Coordinator<'a> {
         if self.worker_results.insert(index, outcome).is_some() {
             bail!("local worker returned task token {index} twice");
         }
+        crate::process::lifecycle_trace(
+            "coordinator.result_buffered",
+            format!("token={index} plan_node={}", self.ops[index].plan_node.0),
+        );
         Ok(disposition)
     }
 
@@ -768,6 +802,10 @@ impl<'a> Coordinator<'a> {
                 self.trace
                     .finished(id, publication.output_type, publication.fingerprint);
                 self.ops[index].state = OpRunState::Settled;
+                crate::process::lifecycle_trace(
+                    "coordinator.result_settled",
+                    format!("token={index} plan_node={} outcome=success", id.0),
+                );
                 continue;
             }
             if self.ops[index].state != OpRunState::Buffered {
@@ -783,6 +821,13 @@ impl<'a> Coordinator<'a> {
                     let output_type = value.type_name().to_string();
                     let fingerprint = Evaluator::trace_fingerprint(&value);
                     if let Err(error) = self.frame.set_value(id, *value) {
+                        crate::process::lifecycle_trace(
+                            "coordinator.result_settled",
+                            format!(
+                                "token={index} plan_node={} outcome=infrastructure_failure",
+                                id.0
+                            ),
+                        );
                         return Some(WorkerFailure {
                             index,
                             error,
@@ -791,9 +836,20 @@ impl<'a> Coordinator<'a> {
                     }
                     self.trace.finished(id, output_type, fingerprint);
                     self.materialize_success(index);
+                    crate::process::lifecycle_trace(
+                        "coordinator.result_settled",
+                        format!("token={index} plan_node={} outcome=success", id.0),
+                    );
                 }
                 TaskOutcome::Completed(Err(error)) => {
                     if self.ops[index].failure_class == FailureClassV1::Infallible {
+                        crate::process::lifecycle_trace(
+                            "coordinator.result_settled",
+                            format!(
+                                "token={index} plan_node={} outcome=infrastructure_failure",
+                                id.0
+                            ),
+                        );
                         return Some(WorkerFailure {
                             index,
                             error: error.context(format!(
@@ -805,6 +861,10 @@ impl<'a> Coordinator<'a> {
                     }
                     self.trace.failed(id, error.to_string());
                     self.record_failure(index, &error.to_string());
+                    crate::process::lifecycle_trace(
+                        "coordinator.result_settled",
+                        format!("token={index} plan_node={} outcome=semantic_failure", id.0),
+                    );
                     return Some(WorkerFailure {
                         index,
                         error,
@@ -812,6 +872,13 @@ impl<'a> Coordinator<'a> {
                     });
                 }
                 TaskOutcome::InfrastructureAbort(error) => {
+                    crate::process::lifecycle_trace(
+                        "coordinator.result_settled",
+                        format!(
+                            "token={index} plan_node={} outcome=infrastructure_failure",
+                            id.0
+                        ),
+                    );
                     return Some(WorkerFailure {
                         index,
                         error,
@@ -832,7 +899,8 @@ impl<'a> Coordinator<'a> {
                         let _ = self.buffer_worker_completion(completion);
                     }
                     Ok(WorkerEvent::EvalRequest(request)) => {
-                        let _ = request.respond(Err(reason.to_string()));
+                        let _ = request
+                            .respond(Err(TaskCallbackFailure::Infrastructure(reason.to_string())));
                     }
                     Err(_) => break,
                 }
@@ -858,6 +926,13 @@ impl<'a> Coordinator<'a> {
             self.trace
                 .discarded(self.ops[index].plan_node, reason.to_string());
             self.ops[index].state = OpRunState::Settled;
+            crate::process::lifecycle_trace(
+                "coordinator.result_discarded",
+                format!(
+                    "token={index} plan_node={} reason={}",
+                    self.ops[index].plan_node.0, reason
+                ),
+            );
         }
     }
 
@@ -882,7 +957,9 @@ impl<'a> Coordinator<'a> {
                         }
                     }
                     Ok(WorkerEvent::EvalRequest(request)) => {
-                        if let Err(error) = request.respond(Err(reason.to_string())) {
+                        if let Err(error) = request
+                            .respond(Err(TaskCallbackFailure::Infrastructure(reason.to_string())))
+                        {
                             if drain_error.is_none() {
                                 drain_error = Some(error);
                             }
@@ -908,12 +985,15 @@ impl<'a> Coordinator<'a> {
     /// policy context, and commit its value into the frame.
     fn run_coordinator_op(&mut self, evaluator: &mut Evaluator, index: usize) -> Result<()> {
         let id = self.ops[index].plan_node;
-        if self.ops[index].effect.unknown
-            || matches!(self.plan.nodes[id.0].kind, PlanNodeKind::Exec { .. })
-        {
+        let launches_backend = matches!(
+            self.flat[id.0],
+            OIr::Exec { backend, .. } if backend.execution == crate::ir::ExecutionMode::Shim
+        );
+        if self.ops[index].effect.unknown || launches_backend {
             // Re-resolve backend artifacts and the environment immediately
-            // before opaque/deferred work. A stale adapter must fail before
-            // this operation emits Ready or Started, not merely at admission.
+            // before opaque/deferred work or a real shim launch. Inline
+            // renderers execute in the already-bound current process and do
+            // not consume a backend artifact at this operation boundary.
             let current_runtime = evaluator.admission_runtime_binding(self.plan);
             self.admitted.verify_runtime(&current_runtime)?;
         }

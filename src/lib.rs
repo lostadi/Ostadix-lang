@@ -27,5 +27,5 @@ pub mod project;
 pub mod scheduler;
 pub mod shims;
 pub mod value;
-pub(crate) mod wire;
+pub mod wire;
 pub mod world;

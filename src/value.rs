@@ -2980,8 +2980,7 @@ impl fmt::Display for OValue {
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 7: Wire protocol message types
 //
-// These are the three message types that O's runtime sends to backend
-// subprocess shims. The shims respond with OWireResponse.
+// These command and response types form O's backend subprocess protocol.
 //
 // The protocol is synchronous and binary-framed:
 //   → 4-byte big-endian payload length + canonical CBOR command
@@ -3002,9 +3001,13 @@ pub enum OWireCommand {
         bindings: HashMap<String, OValue>,
     },
 
-    /// Clear the backend's environment and release all resources.
-    /// Sent when a persistent env `[n]` is garbage collected, or on shutdown.
+    /// Clear the backend's environment while keeping its command loop alive.
     Cleanup,
+
+    /// Acknowledge one final response, close the command loop, and terminate.
+    /// Physical process teardown is not complete until the runtime reaps the
+    /// backend and its governed descendants after receiving this response.
+    Shutdown,
 
     /// Optional protocol probe for diagnostics and direct tests.
     /// Backend startup sends real work directly; there is no health-check gate.
@@ -3262,6 +3265,10 @@ mod tests {
         let encoded = wire::encode_message(&eval_result).unwrap();
         let decoded: OWireCommand = wire::decode_message(&encoded).unwrap();
         assert!(matches!(decoded, OWireCommand::EvalResult { .. }));
+
+        let encoded = wire::encode_message(&OWireCommand::Shutdown).unwrap();
+        let decoded: OWireCommand = wire::decode_message(&encoded).unwrap();
+        assert!(matches!(decoded, OWireCommand::Shutdown));
     }
 
     #[test]

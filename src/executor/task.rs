@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender, SyncSender};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
@@ -42,24 +43,66 @@ impl TaskContext {
         Self { token, events }
     }
 
+    #[cfg(test)]
     pub(crate) fn eval_o_source(
         &self,
         src: String,
         scope: HashMap<String, OValue>,
     ) -> Result<OValue> {
+        self.eval_o_source_with_timeout(src, scope, crate::process::backend_operation_timeout())
+    }
+
+    /// Request a coordinator-owned recursive evaluation while retaining the
+    /// deadline of the physical backend operation that initiated it.
+    pub(crate) fn eval_o_source_with_timeout(
+        &self,
+        src: String,
+        scope: HashMap<String, OValue>,
+        timeout: Duration,
+    ) -> Result<OValue> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            crate::process::infrastructure_error(anyhow!(
+                "local worker callback deadline overflowed"
+            ))
+        })?;
         let (reply, result) = mpsc::sync_channel(1);
         self.events
             .send(WorkerEvent::EvalRequest(TaskEvalRequest {
                 token: self.token,
                 src,
                 scope,
+                deadline,
                 reply,
             }))
-            .map_err(|_| anyhow!("local worker callback channel disconnected"))?;
-        result
-            .recv()
-            .map_err(|_| anyhow!("local worker callback reply channel disconnected"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(|_| {
+                crate::process::infrastructure_error(anyhow!(
+                    "local worker callback channel disconnected"
+                ))
+            })?;
+        crate::process::lifecycle_trace(
+            "worker.callback_requested",
+            format!("token={}", self.token.0),
+        );
+        let result = result.recv_timeout(timeout).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => crate::process::infrastructure_error(anyhow!(
+                "local worker O.eval callback did not settle within {} ms",
+                timeout.as_millis()
+            )),
+            mpsc::RecvTimeoutError::Disconnected => crate::process::infrastructure_error(anyhow!(
+                "local worker callback reply channel disconnected"
+            )),
+        })?;
+        crate::process::lifecycle_trace(
+            "worker.callback_received",
+            format!("token={} success={}", self.token.0, result.is_ok()),
+        );
+        match result {
+            Ok(value) => Ok(value),
+            Err(TaskCallbackFailure::Semantic(message)) => Err(anyhow!(message)),
+            Err(TaskCallbackFailure::Infrastructure(message)) => {
+                Err(crate::process::infrastructure_error(anyhow!(message)))
+            }
+        }
     }
 }
 
@@ -123,13 +166,22 @@ pub(crate) struct TaskEvalRequest {
     pub(crate) token: TaskToken,
     pub(crate) src: String,
     pub(crate) scope: HashMap<String, OValue>,
-    reply: SyncSender<std::result::Result<OValue, String>>,
+    pub(crate) deadline: Instant,
+    reply: SyncSender<std::result::Result<OValue, TaskCallbackFailure>>,
 }
 
 impl TaskEvalRequest {
-    pub(crate) fn respond(self, result: std::result::Result<OValue, String>) -> Result<()> {
+    pub(crate) fn respond(
+        self,
+        result: std::result::Result<OValue, TaskCallbackFailure>,
+    ) -> Result<()> {
         self.reply
             .send(result)
             .map_err(|_| anyhow!("local worker abandoned an O.eval callback reply"))
     }
+}
+
+pub(crate) enum TaskCallbackFailure {
+    Semantic(String),
+    Infrastructure(String),
 }
