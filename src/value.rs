@@ -3005,8 +3005,10 @@ pub enum OWireCommand {
     Cleanup,
 
     /// Acknowledge one final response, close the command loop, and terminate.
-    /// Physical process teardown is not complete until the runtime reaps the
-    /// backend and its governed descendants after receiving this response.
+    /// Physical teardown is not complete until the runtime reaps the direct
+    /// backend leader after receiving this response. Linux and macOS also
+    /// require active-descendant quiescence in the inherited process group;
+    /// deliberate new-session/process-group escape is outside that v1 bound.
     Shutdown,
 
     /// Optional protocol probe for diagnostics and direct tests.

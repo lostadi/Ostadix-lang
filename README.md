@@ -2367,16 +2367,22 @@ callback bindings do not leak into the caller. When the request carries an
 explicit OScope, that value replaces the implicit call-site snapshot.
 
 Ephemeral worker operations use a one-shot process owner. A successful result
-is not reported to the coordinator until `shutdown` is acknowledged and the
-owned backend process group is reaped. `O_BACKEND_OPERATION_TIMEOUT_MS` and
-`O_BACKEND_SHUTDOWN_TIMEOUT_MS` set bounded operation and shutdown deadlines;
-their defaults are 60,000 ms and 2,000 ms. The same absolute operation deadline
-is inherited by recursive `O.eval` callbacks. Native backends and the primary
-Python shim acknowledge `shutdown` directly; the production compatibility
-proxy translates it into command-channel EOF for older standalone shims.
+is not reported to the coordinator until `shutdown` is acknowledged, the direct
+backend leader exits and is reaped, and the response reader finishes. On Linux
+and macOS, completion additionally requires proof that no active descendant
+remains in the leader's inherited process group. A descendant that deliberately
+creates a new session or process group is outside this v1 boundary; other
+platforms do not receive the stronger group-quiescence claim.
+`O_BACKEND_OPERATION_TIMEOUT_MS` and `O_BACKEND_SHUTDOWN_TIMEOUT_MS` set bounded
+operation and shutdown deadlines; their defaults are 60,000 ms and 2,000 ms.
+The same absolute operation deadline is inherited by recursive `O.eval`
+callbacks. Native backends and the primary Python shim acknowledge `shutdown`
+directly; the production compatibility proxy translates it into command-channel
+EOF for older standalone shims.
 `ProcessRegistry::shutdown_all` is the explicit, error-reporting persistent
 backend shutdown path. Registry destructors never perform protocol I/O: each
-remaining process only receives a bounded best-effort termination/reap attempt.
+remaining process only receives a bounded best-effort termination and
+direct-leader reap attempt.
 
 Set `O_LIFECYCLE_TRACE=/absolute/path/to/trace.log` for an append-only
 diagnostic timeline of admission hashing, task preparation/submission, worker

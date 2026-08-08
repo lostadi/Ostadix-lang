@@ -259,7 +259,7 @@ fn process_or_group_exists(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn assert_traced_backend_groups_reaped(run: &RunOutcome) {
+fn assert_traced_backend_groups_quiescent(run: &RunOutcome) {
     let trace = fs::read_to_string(&run.trace_path).unwrap_or_else(|error| {
         panic!("read lifecycle trace {}: {error}", run.trace_path.display())
     });
@@ -447,7 +447,7 @@ __oval_result__ = value
         );
     }
     #[cfg(unix)]
-    assert_traced_backend_groups_reaped(&run);
+    assert_traced_backend_groups_quiescent(&run);
 }
 
 #[test]
@@ -479,7 +479,7 @@ __oval_result__ = O.eval(quoted)
     let trace = fs::read_to_string(&run.trace_path).expect("read callback failure trace");
     assert!(trace.contains("outcome=semantic_failure"), "{trace}");
     #[cfg(unix)]
-    assert_traced_backend_groups_reaped(&run);
+    assert_traced_backend_groups_quiescent(&run);
 }
 
 #[test]
@@ -524,7 +524,7 @@ __oval_result__ = O.eval(quoted)
     let trace = fs::read_to_string(&run.trace_path).expect("read nested callback trace");
     assert!(trace.contains("outcome=infrastructure_failure"), "{trace}");
     #[cfg(unix)]
-    assert_traced_backend_groups_reaped(&run);
+    assert_traced_backend_groups_quiescent(&run);
 }
 
 #[test]
@@ -563,12 +563,12 @@ __oval_result__ = "unreachable"
     let trace = fs::read_to_string(&run.trace_path).expect("read timeout lifecycle trace");
     assert!(trace.contains("outcome=infrastructure_failure"), "{trace}");
     #[cfg(unix)]
-    assert_traced_backend_groups_reaped(&run);
+    assert_traced_backend_groups_quiescent(&run);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn autonomous_lingering_same_group_descendant_fails_and_is_reaped() {
+fn autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent() {
     if !python_available() {
         eprintln!("skipping: python3 backend runtime is unavailable");
         return;
@@ -608,7 +608,7 @@ __oval_result__ = "parent-complete"
     let trace = fs::read_to_string(&run.trace_path).expect("read descendant lifecycle trace");
     assert!(trace.contains("event=worker.done_received"), "{trace}");
     assert!(trace.contains("outcome=infrastructure_failure"), "{trace}");
-    assert_traced_backend_groups_reaped(&run);
+    assert_traced_backend_groups_quiescent(&run);
 }
 
 #[test]

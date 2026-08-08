@@ -74,7 +74,7 @@ jobs:
             "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
-      - name: Prove lingering backend descendants are reaped
+      - name: Prove same-group active descendants become quiescent
         if: runner.os == 'Linux' || runner.os == 'macOS'
         timeout-minutes: 2
         env:
@@ -83,7 +83,7 @@ jobs:
         run: |
           cargo test \
             --test autonomous_hosted_parallel \
-            autonomous_lingering_same_group_descendant_fails_and_is_reaped \
+            autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent \
             -- \
             --exact \
             --nocapture \
