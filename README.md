@@ -2355,6 +2355,8 @@ Runtime -> backend: u32be_len || cbor({"cmd":"exec","code":"...","bindings":{...
 Backend -> runtime: u32be_len || cbor({"status":"ok","value":{"t":"int","v":42}})
 Backend -> runtime: u32be_len || cbor({"status":"eval_request","src":"...","scope":{...}})
 Runtime -> backend: u32be_len || cbor({"cmd":"eval_result","value":{...}})
+Runtime -> backend: u32be_len || cbor({"cmd":"cleanup"})  # reset; keep serving
+Runtime -> backend: u32be_len || cbor({"cmd":"shutdown"}) # final acknowledgement; exit
 ```
 
 The callback forms are what allow Python's `O.eval` to re-enter the O
@@ -2363,6 +2365,24 @@ receives a snapshot of the O bindings visible at the call site. The snapshot is
 used as the callback's lexical root, so reads see caller bindings while new
 callback bindings do not leak into the caller. When the request carries an
 explicit OScope, that value replaces the implicit call-site snapshot.
+
+Ephemeral worker operations use a one-shot process owner. A successful result
+is not reported to the coordinator until `shutdown` is acknowledged and the
+owned backend process group is reaped. `O_BACKEND_OPERATION_TIMEOUT_MS` and
+`O_BACKEND_SHUTDOWN_TIMEOUT_MS` set bounded operation and shutdown deadlines;
+their defaults are 60,000 ms and 2,000 ms. The same absolute operation deadline
+is inherited by recursive `O.eval` callbacks. Native backends and the primary
+Python shim acknowledge `shutdown` directly; the production compatibility
+proxy translates it into command-channel EOF for older standalone shims.
+`ProcessRegistry::shutdown_all` is the explicit, error-reporting persistent
+backend shutdown path. Registry destructors never perform protocol I/O: each
+remaining process only receives a bounded best-effort termination/reap attempt.
+
+Set `O_LIFECYCLE_TRACE=/absolute/path/to/trace.log` for an append-only
+diagnostic timeline of admission hashing, task preparation/submission, worker
+callbacks, backend/proxy PIDs, shutdown acknowledgement, result settlement,
+and worker-pool joins. The trace excludes source and OValue payloads and never
+changes execution when it cannot be written.
 
 ### OIR and ExecutionPlan
 
