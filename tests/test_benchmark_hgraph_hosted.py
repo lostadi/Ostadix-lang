@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -16,6 +19,8 @@ import unittest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "scripts" / "benchmark_hgraph_hosted.sh"
 FIXTURES = PROJECT_ROOT / "benchmarks" / "hgraph_hosted"
+CURRENT_RESULT = FIXTURES / "RESULTS-2026-08-08-f216771.md"
+CURRENT_TRANSCRIPT = FIXTURES / "TRANSCRIPT-2026-08-08-f216771.log"
 BASH = Path("/bin/bash")
 SHAPES = {
     "heterogeneous": (3, 1),
@@ -221,6 +226,242 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
         self.assertIn("const source = fetched;", realistic)
         self.assertNotIn('"$fetched"', realistic)
         self.assertIn('"aggregate|" + "|".join(parts)', realistic)
+
+    def test_analyzer_bound_result_matches_its_raw_transcript(self) -> None:
+        transcript_bytes = CURRENT_TRANSCRIPT.read_bytes()
+        transcript = transcript_bytes.decode("utf-8")
+        result = CURRENT_RESULT.read_text(encoding="utf-8")
+        digest = hashlib.sha256(transcript_bytes).hexdigest()
+
+        self.assertIn(f"| Raw transcript bytes | `{len(transcript_bytes)}` |", result)
+        self.assertIn(f"| Raw transcript SHA-256 | `{digest}` |", result)
+        marker = "benchmark=hgraph-hosted-ephemeral-autonomous-batch\n"
+        sections = transcript.split(marker)[1:]
+        self.assertEqual(len(sections), 3)
+
+        def exact_field(text: str, key: str) -> str:
+            values = re.findall(rf"(?m)^{re.escape(key)}=(.*)$", text)
+            self.assertEqual(len(values), 1, f"{key}: {values!r}")
+            return values[0]
+
+        pair_pattern = re.compile(
+            r"^shape=(\w+) pair_phase=(warmup|sample) pair_ordinal=([0-9]+) "
+            r"order=(serial,graph|graph,serial) serial_elapsed_ms=([0-9]+) "
+            r"graph_elapsed_ms=([0-9]+) semantic_equivalence=true "
+            r"expected_output_match=true$",
+            re.MULTILINE,
+        )
+        rows = []
+        headers = []
+        observed_pair_keys = set()
+        expected_shapes = list(SHAPES)
+        invariant_header_keys = (
+            "os",
+            "cpu_model",
+            "logical_cpus",
+            "memory_bytes",
+            "git_commit",
+            "git_tree_state",
+            "o_binary",
+            "o_binary_sha256",
+            "olangc_binary",
+            "olangc_binary_sha256",
+            "backends_dir",
+            "warmups",
+            "repetitions",
+            "sleep_seconds",
+            "selected_shape",
+            "missing_runtime_policy",
+            "runtime_python3",
+            "runtime_python3_version",
+            "runtime_bash",
+            "runtime_bash_version",
+            "runtime_node",
+            "runtime_node_version",
+        )
+
+        for section in sections:
+            header = {key: exact_field(section, key) for key in invariant_header_keys}
+            header["timestamp_utc"] = exact_field(section, "timestamp_utc")
+            header["worker_tasks"] = exact_field(section, "worker_tasks")
+            headers.append(header)
+            workers = int(header["worker_tasks"])
+            shape_headers = list(re.finditer(r"(?m)^shape=(\w+)\.O$", section))
+            self.assertEqual(
+                [shape.group(1) for shape in shape_headers], expected_shapes
+            )
+            for index, header in enumerate(shape_headers):
+                body_end = (
+                    shape_headers[index + 1].start()
+                    if index + 1 < len(shape_headers)
+                    else len(section)
+                )
+                body = section[header.end() : body_end]
+                shape = header.group(1)
+                self.assertEqual(exact_field(body, "status"), "measured")
+                self.assertEqual(exact_field(body, "semantic_equivalence"), "true")
+                self.assertEqual(exact_field(body, "expected_output_match"), "true")
+                self.assertEqual(
+                    exact_field(body, "prediction_schema"),
+                    "oexec.schedule-prediction/v1",
+                )
+                self.assertEqual(
+                    exact_field(body, "prediction_model"),
+                    "unit-cost-shim-hosted-tasks",
+                )
+
+                pairs = list(pair_pattern.finditer(body))
+                self.assertEqual(len(pairs), 6, f"workers={workers} shape={shape}")
+                actual_pairs = {(pair.group(2), int(pair.group(3))) for pair in pairs}
+                expected_pairs = {("warmup", 1)} | {
+                    ("sample", ordinal) for ordinal in range(1, 6)
+                }
+                self.assertEqual(actual_pairs, expected_pairs)
+                for pair in pairs:
+                    phase = pair.group(2)
+                    ordinal = int(pair.group(3))
+                    self.assertEqual(pair.group(1), shape)
+                    self.assertEqual(
+                        pair.group(4),
+                        "serial,graph" if ordinal % 2 == 1 else "graph,serial",
+                    )
+                    key = (workers, shape, phase, ordinal)
+                    self.assertNotIn(key, observed_pair_keys)
+                    observed_pair_keys.add(key)
+
+                samples = sorted(
+                    (pair for pair in pairs if pair.group(2) == "sample"),
+                    key=lambda pair: int(pair.group(3)),
+                )
+                serial_samples = [int(pair.group(5)) for pair in samples]
+                graph_samples = [int(pair.group(6)) for pair in samples]
+                serial_median = statistics.median(serial_samples)
+                graph_median = statistics.median(graph_samples)
+                serial_summary = (
+                    f"{serial_median:g}",
+                    str(min(serial_samples)),
+                    str(max(serial_samples)),
+                )
+                graph_summary = (
+                    f"{graph_median:g}",
+                    str(min(graph_samples)),
+                    str(max(graph_samples)),
+                )
+
+                def timing_summary(executor: str) -> tuple[str, str, str]:
+                    matches = re.findall(
+                        rf"(?m)^{executor}_elapsed_ms median=([^ ]+) "
+                        r"min=([0-9]+) max=([0-9]+)$",
+                        body,
+                    )
+                    self.assertEqual(len(matches), 1)
+                    return matches[0]
+
+                self.assertEqual(timing_summary("serial"), serial_summary)
+                self.assertEqual(timing_summary("graph"), graph_summary)
+                speedup = f"{serial_median / graph_median:.6f}"
+                self.assertEqual(
+                    exact_field(body, "median_speedup_serial_over_graph"), speedup
+                )
+
+                rows.append(
+                    {
+                        "shape": shape,
+                        "workers": workers,
+                        "tasks": int(exact_field(body, "predicted_hosted_tasks")),
+                        "width": int(exact_field(body, "predicted_width")),
+                        "span": int(exact_field(body, "predicted_span")),
+                        "admission": exact_field(
+                            body, "prediction_admission_sha256"
+                        ),
+                        "serial": serial_summary[0],
+                        "graph": graph_summary[0],
+                        "speedup": speedup,
+                    }
+                )
+
+        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(observed_pair_keys), 72)
+        self.assertEqual([int(header["worker_tasks"]) for header in headers], [1, 4, 8])
+        baseline = {key: headers[0][key] for key in invariant_header_keys}
+        for header in headers:
+            self.assertEqual(
+                {key: header[key] for key in invariant_header_keys}, baseline
+            )
+
+        self.assertEqual(baseline["git_tree_state"], "clean")
+        self.assertEqual(baseline["warmups"], "1")
+        self.assertEqual(baseline["repetitions"], "5")
+        self.assertEqual(baseline["sleep_seconds"], "0.25")
+        self.assertEqual(baseline["selected_shape"], "all")
+        self.assertEqual(baseline["missing_runtime_policy"], "fail")
+        self.assertRegex(baseline["git_commit"], r"^[0-9a-f]{40}$")
+        self.assertRegex(baseline["o_binary_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(baseline["olangc_binary_sha256"], r"^[0-9a-f]{64}$")
+
+        timestamps = ", ".join(f'`{header["timestamp_utc"]}`' for header in headers)
+        self.assertIn(f"| Run-start timestamps | {timestamps} |", result)
+        self.assertIn(f'| Source commit | `{baseline["git_commit"]}` |', result)
+        self.assertIn("| Source tree during every run | `clean` |", result)
+        self.assertIn(
+            f'| `target/release/O` SHA-256 | `{baseline["o_binary_sha256"]}` |',
+            result,
+        )
+        self.assertIn(
+            "| `target/release/olangc` SHA-256 | "
+            f'`{baseline["olangc_binary_sha256"]}` |',
+            result,
+        )
+        memory_bytes = int(baseline["memory_bytes"])
+        self.assertEqual(memory_bytes % (1024**3), 0)
+        self.assertIn(
+            f'| Machine | {baseline["cpu_model"]}, {memory_bytes // (1024**3)} GiB |',
+            result,
+        )
+        self.assertIn(f'| OS | {baseline["os"]} |', result)
+        self.assertIn(
+            f'| Harness-reported logical CPUs | {baseline["logical_cpus"]} |', result
+        )
+        for label, runtime in (("Python", "python3"), ("Bash", "bash"), ("Node.js", "node")):
+            self.assertIn(
+                f'| {label} | {baseline[f"runtime_{runtime}_version"]} at '
+                f'`{baseline[f"runtime_{runtime}"]}` |',
+                result,
+            )
+        self.assertIn("| Warmup pairs per shape and capacity | 1 |", result)
+        self.assertIn("| Measured pairs per shape and capacity | 5 |", result)
+        self.assertIn("| Hosted delay per task | 0.25 seconds |", result)
+        self.assertIn("| Graph worker overrides | 1, 4, and 8 |", result)
+        self.assertIn("| Missing-runtime policy | `fail` |", result)
+
+        predictions_by_shape = {}
+        for row in rows:
+            predictions_by_shape.setdefault(row["shape"], set()).add(
+                (row["tasks"], row["width"], row["span"])
+            )
+        self.assertEqual(set(predictions_by_shape), set(SHAPES))
+        self.assertTrue(all(len(values) == 1 for values in predictions_by_shape.values()))
+        self.assertEqual(max(row["width"] for row in rows), 4)
+        self.assertTrue(all(4 >= row["width"] for row in rows))
+        self.assertTrue(all(8 > row["width"] for row in rows))
+
+        for row in rows:
+            capacity_line = (
+                f'| `{row["shape"]}.O` | {row["workers"]} | {row["serial"]} | '
+                f'{row["graph"]} | {row["speedup"]}× |'
+            )
+            self.assertIn(capacity_line, result)
+            if row["workers"] == 4:
+                ideal_speedup = row["tasks"] / row["span"]
+                main_line = (
+                    f'| `{row["shape"]}.O` | {row["tasks"]} | {row["width"]} | '
+                    f'{row["span"]} | {ideal_speedup:.2f}× | {row["serial"]} | '
+                    f'{row["graph"]} | {row["speedup"]}× | true | true |'
+                )
+                self.assertIn(main_line, result)
+                self.assertIn(
+                    f'| `{row["shape"]}.O` | `{row["admission"]}` |', result
+                )
 
     def test_runner_reports_all_shapes_and_checks_exact_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
