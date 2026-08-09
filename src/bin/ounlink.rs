@@ -23,7 +23,7 @@
 // recognised block or path comment) is written back to the output file.
 //
 // Round-trip properties:
-//   o-link src/ -o project.O && o-unlink project.O -o src2/ && diff -r src/ src2/
+//   o-link --project src/ -o project.O && o-unlink project.O -o src2/ && diff -r src/ src2/
 // restores the safe project bundle losslessly, including binary bytes, empty
 // files, modes, and in-root symlinks. `o-link src/ --literal` retains the
 // older UTF-8 section format.

@@ -2,10 +2,10 @@
 // o-link: the Ostadix-lang linker / combiner compiler
 //
 // Accepts explicit scripts/source files or whole codebases and links them into
-// a single .O file. Directory inputs are lifted as lossless project bundles by
-// default, so merely evaluating the resulting document cannot execute every
-// setup, test, migration, or bootstrap script in the tree. The old sequential
-// per-file behavior remains available only through the explicit --literal flag.
+// a single .O file. A bare single-directory invocation uses the full literal
+// function by default: it links every selected UTF-8 file and immediately runs
+// the resulting program. Safe lossless project lifting remains available with
+// the explicit --project flag.
 //
 // In literal mode, each input file is wrapped in the typed-expression block of
 // the backend that matches its extension:
@@ -29,8 +29,8 @@
 // Literal directories are walked recursively; every UTF-8 text file is
 // included in sorted order so the output is deterministic. Unknown and
 // extensionless files use the inert text backend unless --lang selects another
-// backend. Safe project mode instead captures the whole tree losslessly and
-// executes only an explicitly selected discovered/manifest route.
+// backend. Explicit project mode instead captures the whole tree losslessly
+// and executes only an explicitly selected discovered/manifest route.
 //
 // Any text inside a wrapped file that would collide with Ostadix-lang syntax:
 // a registered opener like `python^(`, the wrapping block's own closer
@@ -41,13 +41,14 @@
 //
 // Usage:
 //   o-link a.py b.sh c.html -o program.O      # link three scripts
-//   o-link src/ -o project.O                  # safely lift a whole codebase
-//   o-link src/ --run                          # run its unambiguous project route
-//   o-link src/ --literal -o sequential.O     # legacy: execute every text file
+//   o-link src/                                # link + run every selected source
+//   o-link src/ --literal -o sequential.O     # literal link only (do not run)
+//   o-link src/ --project -o project.O        # safely lift a whole codebase
+//   o-link src/ --project --run                # run its project default route
 //   o-link a.py --lang txt=markdown -o out.O  # extra extension mapping
 //   o-link a.py --stdout                      # write to stdout instead
 //   o-link a.py b.sh --run                    # link, then execute in-process
-//   o-link src/ -o app.O --shebang            # safe lifted project + shebang
+//   o-link src/ --project -o app.O --shebang  # safe lifted project + shebang
 //   o-link src/ --literal --verbose-skips      # report literal-mode exclusions
 //
 // Robustness guarantees:
@@ -65,6 +66,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser as ClapParser;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -144,11 +146,12 @@ struct WalkState<'a> {
 #[derive(Debug, ClapParser)]
 #[command(
     name = "o-link",
-    about = "Link explicit scripts or safely lift codebases into one .O file"
+    about = "Link scripts into one .O program; bare directories link and run by default"
 )]
 struct Cli {
-    /// Input files and/or directories. A single directory is safely lifted as
-    /// a project bundle unless --literal is given.
+    /// Input files and/or directories. A bare single directory is linked
+    /// literally and run; use --literal for link-only or --project for a safe
+    /// route-preserving bundle.
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
@@ -173,18 +176,20 @@ struct Cli {
     #[arg(long = "no-validate")]
     no_validate: bool,
 
-    /// Execute the combined program in-process after linking.
+    /// Execute the combined program in-process after linking. This is inferred
+    /// for a bare single-directory invocation.
     #[arg(long = "run")]
     run: bool,
 
-    /// Shim directory used by --run (defaults to ./backends).
-    #[arg(long = "shim-dir", default_value = "backends")]
-    shim_dir: PathBuf,
+    /// Shim directory used by execution. Defaults to O_BACKENDS_DIR,
+    /// BACKENDS_DIR, then ./backends.
+    #[arg(long = "shim-dir")]
+    shim_dir: Option<PathBuf>,
 
     /// Compatibility hook for --run; normal shim backends already have default
     /// host authority. Format:
     /// `NAME=LANG[:fs_read,fs_write,network,process]`.
-    #[arg(long = "backend-grant", requires = "run")]
+    #[arg(long = "backend-grant")]
     backend_grants: Vec<String>,
 
     /// Prepend `#!/usr/bin/env o` and mark the output executable, so the
@@ -192,14 +197,14 @@ struct Cli {
     #[arg(long = "shebang", conflicts_with = "to_stdout")]
     shebang: bool,
 
-    /// Force project mode. This is now the default for a single directory or
-    /// an already-lifted project .O file; the flag remains for compatibility.
+    /// Safely lift a directory as a route-preserving project bundle. With
+    /// --run, execute only the selected/default project route.
     #[arg(long = "project")]
     project: bool,
 
-    /// Use the legacy sequential linker: wrap every selected UTF-8 file as an
-    /// executable backend block. Required for mixed/multiple directory inputs.
-    /// Running the result executes every wrapped source file in order.
+    /// Wrap every selected UTF-8 file as an executable backend block without
+    /// implicitly running it. Required for mixed/multiple directory inputs.
+    /// Add --run to execute every wrapped source file in order.
     #[arg(long, visible_alias = "execute-all")]
     literal: bool,
 
@@ -235,16 +240,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let backends = registered_backends();
 
-    // ── Safe project mode vs explicit literal mode ───────────────────────────
-    // A codebase is not semantically one sequential program. Treating a whole
-    // directory literally used to execute setup scripts, migrations, test
-    // harnesses, and bootstrap installers simply because they were text files.
-    // Single directories and already-lifted project documents therefore enter
-    // project mode automatically. `--literal` is the explicit opt-in for the
-    // historical per-file sequential behavior.
+    // ── Default literal execution vs explicit project mode ───────────────────
+    // A bare single directory intentionally selects the full literal function:
+    // link every selected UTF-8 file and run the combined program. `--literal`
+    // keeps the same linker but explicitly suppresses the inferred run, while
+    // `--project` retains the lossless, route-preserving safe path.
     if cli.literal && (cli.project || cli.list_routes) {
         bail!("--literal/--execute-all cannot be combined with --project or --list-routes");
     }
@@ -255,42 +258,50 @@ fn main() -> Result<()> {
         bail!("--route and --routes-policy require --run");
     }
 
+    let project_intent = cli.project
+        || cli.list_routes
+        || cli.route.is_some()
+        || cli.routes_policy.is_some()
+        || cli.project_trace_out.is_some()
+        || !cli.route_decls.is_empty();
+    let implicit_literal_run =
+        !project_intent && !cli.literal && cli.inputs.len() == 1 && cli.inputs[0].is_dir();
+    if implicit_literal_run {
+        if cli.to_stdout {
+            bail!(
+                "bare single-directory mode runs by default and cannot be combined with --stdout; add --literal for link-only output or --project for a safe project bundle"
+            );
+        }
+        cli.literal = true;
+        cli.run = true;
+        eprintln!("warning: bare single-directory mode defaults to --literal --run");
+        eprintln!(
+            "warning: every selected executable backend block will run; use --project for safe project lifting or --literal for literal link-only output"
+        );
+    }
+
+    if !cli.backend_grants.is_empty() && !cli.run {
+        bail!("--backend-grant requires --run");
+    }
+
     if cli.list_routes {
         ensure_project_compatible_flags(&cli)?;
         return list_routes_mode(&cli);
     }
 
-    let implicit_project = implicit_project_input(&cli)?;
-    if cli.project || implicit_project {
+    let implicit_project = implicit_lifted_project_input(&cli)?;
+    if project_intent || implicit_project {
         ensure_project_compatible_flags(&cli)?;
-        if implicit_project && !cli.project {
-            eprintln!(
-                "o-link: using safe project mode; direct evaluation will not execute project files"
-            );
-            eprintln!(
-                "o-link: use --run [--route <id>] for one project route, or --literal for legacy sequential wrapping"
-            );
-        }
         return project_mode(&cli);
-    }
-
-    if cli.route.is_some()
-        || cli.routes_policy.is_some()
-        || cli.project_trace_out.is_some()
-        || !cli.route_decls.is_empty()
-    {
-        bail!(
-            "--route/--routes-policy/--project-trace-out/--route-decl require a project directory, a lifted project .O file, or --project"
-        );
     }
 
     if !cli.literal && cli.inputs.iter().any(|input| input.is_dir()) {
         bail!(
-            "multiple or mixed directory inputs require --literal; safe project mode accepts exactly one project directory"
+            "multiple or mixed directory inputs require --literal; use --project with exactly one directory for safe project lifting"
         );
     }
 
-    if cli.literal && cli.inputs.iter().any(|input| input.is_dir()) {
+    if !implicit_literal_run && cli.literal && cli.inputs.iter().any(|input| input.is_dir()) {
         eprintln!(
             "warning: --literal/--execute-all directory mode wraps every selected UTF-8 file as executable backend code"
         );
@@ -363,10 +374,25 @@ fn main() -> Result<()> {
     }
 
     if cli.run {
-        run_combined(&combined, cli.shim_dir, backends, &cli.backend_grants)?;
+        run_combined(
+            &combined,
+            resolve_shim_dir(cli.shim_dir),
+            backends,
+            &cli.backend_grants,
+        )?;
     }
 
     Ok(())
+}
+
+fn resolve_shim_dir(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| {
+            env::var_os("O_BACKENDS_DIR")
+                .or_else(|| env::var_os("BACKENDS_DIR"))
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("backends"))
 }
 
 /// Execute the combined program in-process, the same way the `O` interpreter
@@ -405,17 +431,14 @@ fn run_combined(
     Ok(())
 }
 
-/// True when the CLI's single input should use the first-class project model
-/// without requiring the legacy `--project` spelling.
-fn implicit_project_input(cli: &Cli) -> Result<bool> {
+/// True when a previously lifted project document should retain its first-class
+/// project semantics without requiring the `--project` spelling again.
+fn implicit_lifted_project_input(cli: &Cli) -> Result<bool> {
     if cli.literal || cli.inputs.len() != 1 {
         return Ok(false);
     }
 
     let input = &cli.inputs[0];
-    if input.is_dir() {
-        return Ok(true);
-    }
     if !input.is_file() {
         return Ok(false);
     }
@@ -427,7 +450,7 @@ fn implicit_project_input(cli: &Cli) -> Result<bool> {
 
 /// Project mode has different semantics from literal per-file wrapping. Reject
 /// options that would otherwise be silently ignored rather than surprising the
-/// user or accidentally weakening the safe-directory default.
+/// user or accidentally weakening explicit project semantics.
 fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
     let mut incompatible = Vec::new();
     if !cli.lang.is_empty() {
@@ -439,7 +462,7 @@ fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
     if cli.no_validate {
         incompatible.push("--no-validate");
     }
-    if cli.shim_dir != Path::new("backends") {
+    if cli.shim_dir.is_some() {
         incompatible.push("--shim-dir");
     }
     if !cli.backend_grants.is_empty() {
@@ -448,7 +471,7 @@ fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
 
     if !incompatible.is_empty() {
         bail!(
-            "{} configure literal per-file linking and cannot be used in project mode; add --literal to opt into sequential execution",
+            "{} configure literal per-file linking and cannot be used in project mode; remove --project or add --literal to select literal link-only mode",
             incompatible.join(", ")
         );
     }
