@@ -1026,8 +1026,12 @@ docker build -t o-lang .
 
 docker run --rm -v "$PWD:/work" o-lang examples/hello.O
 docker run --rm -it o-lang --repl
+# Bare directory mode literal-links and runs immediately.
 docker run --rm -v "$PWD:/work" --entrypoint o-link \
     o-lang src/ -o app.O
+# Use --project when only an inert route-preserving bundle is wanted.
+docker run --rm -v "$PWD:/work" --entrypoint o-link \
+    o-lang --project src/ -o project.O
 ```
 
 The O-core QEMU proof is intended to run directly on the host because it
@@ -1040,7 +1044,7 @@ needs QEMU and the local Rust linker toolchain.
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
-| `o-link` | `target/release/o-link` | Safely lifts codebases into route-preserving project bundles, or combines explicit scripts in literal mode. |
+| `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
@@ -1591,8 +1595,8 @@ cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o target/kernel.o
 cargo run --bin o-link -- calc.py page.html app.O -o target/program.O
 cargo run -- target/program.O
 
-# One directory is lifted safely as a route-preserving project bundle.
-cargo run --bin o-link -- src/ -o target/project.O
+# Safe project lifting is explicit; the resulting bundle is inert.
+cargo run --bin o-link -- --project src/ -o target/project.O
 cargo run --bin o-link -- --list-routes target/project.O
 
 cargo run --bin o-unlink -- target/project.O -o target/restored/
@@ -2132,26 +2136,35 @@ native hosted binaries as a compatibility hook. Compiled binaries mint fresh
 process-local default backend authority at startup instead of embedding
 serialized authority.
 
-### `o-link`: safe projects and explicit sequential programs
+### `o-link`: default literal execution and explicit safe projects
 
-`o-link` distinguishes a **codebase** from a **sequence of scripts**. That
-separation matters because recursively wrapping every text file in an arbitrary
-repository can execute setup programs, migrations, test harnesses, installers,
-and obsolete bootstraps merely because they were discovered by a directory
-walk.
-
-A single directory therefore uses safe project mode by default:
+`o-link` treats a bare single directory as a **sequence of scripts**: it
+recursively literal-links every selected UTF-8 file, writes `combined.O`, and
+immediately executes that combined program. This is intentionally an unsafe
+default because setup programs, migrations, test harnesses, installers, and
+obsolete bootstraps can run merely because a directory walk discovered them:
 
 ```bash
-o-link src/ -o project.O
+o-link src/                         # writes combined.O and runs it now
+o-link src/ -o sequential.O        # writes sequential.O and runs it now
+
+# Explicit --literal retains the same linker but suppresses the inferred run:
+o-link src/ --literal -o sequential.O
+```
+
+Use explicit `--project` whenever the directory must be captured without
+executing arbitrary files:
+
+```bash
+o-link src/ --project -o project.O
 o-link --list-routes project.O
 o-link project.O --run --route py-main
 
 # When discovery or a manifest establishes one unambiguous default route:
-o-link src/ --run
+o-link src/ --project --run
 ```
 
-Safe project mode captures the selected tree as one lossless project bundle,
+Explicit project mode captures the selected tree as one lossless project bundle,
 discovers ecosystem and manifest routes, and embeds the bundle as inert text.
 Neither linking the directory nor evaluating the generated document executes a
 source file or route:
@@ -2161,9 +2174,9 @@ O project.O
 # Ostadix project bundle loaded safely. No project route was executed.
 ```
 
-Execution is an explicit project-runtime operation through `--run`. The legacy
-`--project` spelling remains accepted, and an already-lifted project `.O` file
-is detected automatically.
+Project execution is an explicit operation through `--project --run`. An
+already-lifted project `.O` file remains self-identifying and is detected
+automatically.
 
 Project planning is a separate nonexecuting inspection path. Select a route or
 route set with `--route`; an optional checked `--routes-policy` override accepts
@@ -2198,7 +2211,7 @@ runs. Because this mode is deliberately lossless for non-ignored content,
 secrets should be listed in `.gitignore` or `.olinkignore` before a bundle is
 distributed.
 
-Explicit files still use the sequential typed-block linker:
+Explicit files remain link-only unless `--run` is supplied:
 
 ```bash
 o-link calc.py page.html app.O -o program.O
@@ -2206,8 +2219,8 @@ o-link notes.txt --lang txt=markdown --stdout
 o-link calc.py --run
 ```
 
-To apply that same behavior recursively to a directory, opt in with
-`--literal` -- also exposed as `--execute-all`:
+For a single directory, explicit `--literal` (also exposed as `--execute-all`)
+is the literal **link-only** spelling and therefore disables the inferred run:
 
 ```bash
 o-link src/ --literal -o sequential.O
@@ -2215,12 +2228,17 @@ o-link src/ --literal -o sequential.O
 o-link src/ --execute-all -o sequential.O
 ```
 
-This flag is intentionally explicit. Running `sequential.O` executes every
-selected executable backend block in dependency order. Multiple or mixed
-directory inputs also require `--literal`. Options that configure per-file
-wrapping -- including `--lang`, `--verbose-skips`, `--no-validate`,
-`--shim-dir`, and `--backend-grant` -- are rejected in project mode rather
-than being silently ignored.
+Add `--run` when using the explicit spelling to execute immediately. Running
+the generated `sequential.O` later executes every selected executable backend
+block in dependency order. Multiple or mixed directory inputs still require
+`--literal`. Options that configure per-file wrapping -- including `--lang`,
+`--verbose-skips`, `--no-validate`, `--shim-dir`, and `--backend-grant` -- are
+rejected under `--project` rather than being silently ignored.
+
+Literal directory wrapping does not infer that unrelated source files are safe
+to reorder. Ordinary wrapped files retain dependency/source order. Explicit
+`.O` inputs keep authored `autonomous(batch(...))` regions intact, so those
+regions still reach evidence admission and the graph worker scheduler.
 
 Literal mode retains these correctness properties:
 
