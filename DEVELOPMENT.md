@@ -270,7 +270,7 @@ case-insensitive host the raw `O` release binary is otherwise also found as
 lowercase `o` and shadows the dispatcher.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_DEVELOPMENT -->
-The aggregate executes all 24 required portable QEMU gates in the
+The aggregate executes all 26 required portable QEMU gates in the
 order declared by `evidence/gates.toml`, streams their output, and requires
 every declared marker exactly once in each captured live transcript. The
 manifest also records each gate's milestone, tools, evidence class, positive

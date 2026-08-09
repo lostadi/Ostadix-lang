@@ -210,11 +210,12 @@ jobs:
       - name: Validate hosted HGraph benchmark contracts
         run: python3 -m unittest -v tests.test_benchmark_hgraph_hosted
 
-      - name: Validate deterministic OSTADIX boot media and writer safety
+      - name: Validate deterministic OSTADIX media, writer, and observation safety
         run: |
           python3 -m unittest -v \
             tests.test_ostadix_boot_media \
             tests.test_ostadix_media_writer \
+            tests.test_ostadix_physical_evidence \
             tests.test_setup
 
       - name: Evaluator tests

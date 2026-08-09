@@ -1,0 +1,13 @@
+module kernel::smp_probe;
+
+// Non-SMP builds retain a link-compatible, fail-closed surface.  Mode 34 is
+// the only build that substitutes smp_probe.oc and can reach the AP startup
+// machinery.
+pub unsafe fn start(multiboot_info: usize) -> never {
+    let ignored: usize = multiboot_info;
+    if ignored != 0 {
+        disable_interrupts();
+    }
+    disable_interrupts();
+    loop { halt(); }
+}

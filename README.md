@@ -453,6 +453,19 @@ o kernel gates
 o kernel doctor-media
 o kernel media
 o kernel smoke-media
+o kernel smoke-boot-info
+o kernel smoke-smp
+
+# Capacity-bound removable-media and authority-free observation workflow.
+o kernel prepare-write --image "$IMAGE" --device "$DEVICE"
+o kernel write-media --image "$IMAGE" --device "$DEVICE" --confirm "$TOKEN"
+o kernel boot-challenge
+o kernel prepare-physical --image "$IMAGE" --media-write write.json \
+  --machine machine.json --profile mode0 --expected-cpus 1 --output intent.json
+o kernel record-physical --intent intent.json --transcript serial.log \
+  --image "$IMAGE" \
+  --assert-physical I-OBSERVED-OSTADIX-ON-PHYSICAL-X86_64 \
+  --output observation.json
 ```
 
 `o kernel console` builds probe mode 16 and prints the exact embedded package
@@ -471,10 +484,26 @@ asserted alternative suitable for automation.
 
 For the OVMF path and confirmation-gated removable-media writer, see
 [OSTADIX Alpha x86_64 UEFI boot media](docs/OSTADIX_BOOT.md). That image is
-structurally suitable for raw physical media, but writer v1 deliberately
-requires an exact-capacity external target because it does not yet relocate
-the backup GPT for a larger device. Current automated results remain QEMU/TCG
-evidence; they do not establish a physical-machine boot or SMP.
+structurally suitable for raw physical media. Writer v2 derives a
+capacity-bound `ostadix.boot-media-target-plan/v2`, relocates the backup GPT to
+a larger target's final LBA, and writes and verifies only its exact admitted
+extents through one held device descriptor. `target_plan_sha256` binds that
+mutation; `target_image_sha256` is `null` when sparse unwritten ranges remain,
+and those ranges can retain recoverable prior data. A stable, nonempty device
+identity is mandatory; depending on the platform it must be a device serial,
+WWN, or media UUID. USB-port topology alone is rejected, and accepted identity
+values are not necessarily unclonable hardware identities. The physical-intent
+and observation commands produce unkeyed,
+authority-free, replayable operator records; even with the exact
+`--assert-physical` phrase, they do not authenticate a physical-machine boot,
+trusted source build, or physical SMP execution.
+
+`o kernel smoke-smp` is the separate Mode 34 control. It boots one challenged
+image under QEMU q35/TCG + OVMF with exactly four vCPUs, starts three APs with
+x2APIC INIT/SIPI, verifies distinct APIC identities and stacks across one
+atomic barrier, and then reruns the same bytes with one vCPU as a fail-closed
+negative control. APs park after that barrier: this proves bounded bring-up,
+not a general SMP scheduler or a physical-machine boot.
 
 The lower-level compiler and boot scripts remain available:
 
@@ -744,7 +773,7 @@ or live-system claims above. See
 [`docs/HOSTED_LIVE_REFERENCE.md`](docs/HOSTED_LIVE_REFERENCE.md) for its exact
 boundary and lifecycle CLI.
 
-### OSTADIX World native constitution
+### OSTADIX Alpha native constitution
 
 The normative target is a native, replicated, capability-governed World whose
 boundary is governed membership rather than a chassis. The full-stack program,
@@ -2860,8 +2889,10 @@ the bootstrap page allocator stops below them.
 The runtime modules provide:
 
 - COM1 initialization and polled serial writes.
-- A reclaiming registry for the 3,072 physical frames in the fixed 4..16 MiB
-  supervisor-only QEMU window, with typed generation handles, reference counts,
+- A reclaiming registry for the admitted supervisor-only physical-frame pool.
+  Legacy direct/PVH gates use the fixed 3,072-frame 4..16 MiB range;
+  Multiboot2/UEFI selects a firmware-covered aligned subwindow of at least
+  4 MiB inside it, with typed generation handles, reference counts,
   zero-before-reuse, quotas, and checked rollback.
 - A packed 256-entry IDT and IDTR with normalized assembly stubs for vectors
   0 through 31.
@@ -3177,7 +3208,7 @@ standalone native port, the Python edition as the semantic reference, and
 O-core as the freestanding systems language.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE -->
-The 24 required portable QEMU release gates and 1
+The 26 required portable QEMU release gates and 1
 supplemental hardware-dependent gate are defined once in
 [`evidence/gates.toml`](evidence/gates.toml). The aggregate reads that manifest
 at runtime, selects only `required = true`, streams each gate's output, and
@@ -3187,6 +3218,8 @@ is a checked projection.
 | Gate | Required | Milestone | Evidence | Establishes | Explicit non-claims |
 |------|----------|-----------|----------|-------------|---------------------|
 | `ocore-bootstrap` | yes | M0.1-M0.3 | [ocore/kernel/smoke-qemu.sh](ocore/kernel/smoke-qemu.sh) (`portable_tcg`) | CPL3 entry, SYSCALL return, IRQ0 return, and a later heartbeat execute in QEMU<br>W^X pages, frame reclamation, typed memory objects, and capability denials pass the bounded bootstrap corpus | This one-process bootstrap is not multi-process isolation, IPC, or a foreign ABI<br>It is not evidence of Linux, Plan 9, or a foreign-kernel boot |
+| `ostadix-x86_64-boot-info` | yes | OSTADIX Alpha x86_64 BootInfo / Mode 33 | [ocore/kernel/smoke-x86_64-boot-info-qemu.sh](ocore/kernel/smoke-x86_64-boot-info-qemu.sh) (`portable_tcg`) | A challenged x86_64 UEFI/Multiboot2 handoff is strictly normalized into bounded kernel-owned BootInfo facts and causally selects one page-aligned allocator subwindow from the firmware memory map<br>The temporary firmware inspection aperture is closed before the W^X check, and the same challenged mode-0 image reaches CPL3 entry, timer return, and a later heartbeat<br>The transcript grammar accepts the exact challenge and source commit in causal order and rejects a wrong challenge | This QEMU TCG and OVMF gate is not physical-machine, KVM, Secure Boot, measured-boot, or hardware-trust evidence<br>The bounded Multiboot2 parser and ACPI status validation are not a general ACPI consumer, initrd loader, firmware service, or general physical-memory allocator<br>It provides no SMP, PCI/device assignment, DMA isolation, IOMMU isolation, interrupt remapping, or hardware-reset evidence |
+| `ostadix-x86_64-smp4` | yes | OSTADIX Alpha x86_64 bounded SMP / Mode 34 | [ocore/kernel/smoke-x86_64-smp-qemu.sh](ocore/kernel/smoke-x86_64-smp-qemu.sh) (`portable_tcg`) | One challenged QEMU q35/TCG and OVMF boot admits an exact four-CPU ACPI/MADT topology, validates PIT progress before x2APIC INIT/SIPI, and brings three APs into kernel RX text on distinct stacks<br>The low trampoline follows an RW/NX copy, R/X execution, erased-and-unmapped retirement sequence without a writable-and-executable mapping<br>Four unique APIC identities cross one atomic BSP/AP release-and-progress barrier and reach a later PIT transition and heartbeat; the same image under one vCPU rejects before startup success markers | This is exactly a four-vCPU QEMU TCG and OVMF proof using bounded type-0 8-bit APIC identities; it is not physical-machine, KVM, or arbitrary-topology evidence<br>APs park after one barrier; this is not a general SMP scheduler, IPI service, interrupt balancer, per-CPU allocator, concurrent syscall path, or SMP-safe version of every existing O-core subsystem<br>It provides no Secure Boot, measured boot, PCI/device assignment, DMA isolation, IOMMU isolation, interrupt remapping, or hardware-reset evidence |
 | `world-g2-aarch64-native` | yes | World G2 / AArch64 native compiler | [ocore/kernel/smoke-aarch64-g2-qemu.sh](ocore/kernel/smoke-aarch64-g2-qemu.sh) (`qemu_tcg_aarch64`) | One O-core kernel compiled for AArch64 retains EL2, enters host EL1, completes one domain-separated HVC return with register and stack integrity, and in one live QEMU TCG run executes native EL0 process, IPC, capability, lifecycle, stale-generation, reclamation, and bounded post-lifecycle counter-progress checks | This single-vCPU QEMU TCG gate is not physical AArch64, KVM/SVM, SMP, or G3 evidence<br>It does not boot Linux or Plan 9 and does not establish a general foreign ABI<br>It provides no PCI or physical-device assignment, DMA isolation, or IOMMU/SMMU evidence |
 | `world-identity-v1` | yes | World identity PR2 / Mode 27 | [ocore/kernel/smoke-world-identity-qemu.sh](ocore/kernel/smoke-world-identity-qemu.sh) (`portable_tcg`) | All 20 constitutional World identity atoms have shared typed Rust and O-core definitions with strict nonzero generation, version, term, and index rules<br>A bounded OWIDENT v1 identity-only corpus converges byte-for-byte between the Rust oracle and native O-core under QEMU; strict decode rejects malformed or zero-valued records, and hierarchical current/reference comparison rejects stale generations and same-generation logical mismatches | Serialized capability IDs are descriptive non-authority; this gate creates no bearer, CSpace handle, delegation, or authenticated authority<br>OWIDENT v1 remains the identity-only nested format and does not itself provide OWPROTO framing, transport, schema negotiation, an OValue envelope, a receipt codec, a Governor, or consensus<br>This repository-conformance slice does not pass G0 or any G0-G13 gate, and QEMU TCG is not physical or hardware-isolation evidence |
 | `world-protocol-v1` | yes | World protocol PR3 / Mode 28 | [ocore/kernel/smoke-world-protocol-qemu.sh](ocore/kernel/smoke-world-protocol-qemu.sh) (`portable_tcg`) | The architecture-independent OWPROTO v1 record codec uses deterministic big-endian framing, four fixed record kinds, a 16 KiB hard maximum, caller/negotiated record bounds, and strict exact-length, reserved-field, kind, schema, and nested-identity validation<br>A fixed 20-record, 1254-byte corpus containing two offers, one canonical v1 selection, one disjoint rejection, and all 16 OWIDENT v1 conformance records converges byte-for-byte between the Rust oracle and native O-core under QEMU; version negotiation deterministically selects the highest common version and smaller record limit or an exact contextual rejection | OWPROTO v1 is a record codec with an offline bounded negotiation function, not a stream or network transport, live peer handshake, authenticated session, encryption, replay protection, membership protocol, or multiplexing layer<br>Identity and capability descriptions remain inert metadata; decoding or negotiating a record grants no bearer, CSpace handle, delegation, authenticated authority, or ambient process identity<br>This PR3 slice does not implement PR4 OValue or extension envelopes, PR5 receipts, a Governor, consensus, WorldFS, or Workstream A acceptance, and it passes no G0-G13 gate; QEMU TCG is not physical or hardware-isolation evidence |
@@ -3510,10 +3543,13 @@ features that are already present:
   foreign ABI, and full Milestone 6 remain future work. Mode 25 separately
   admits one exact static Linux x86-64 ELF with only two writes, one unknown
   syscall, and `exit_group(42)`.
-- O-core remains fixed-capacity and single-CPU. It provides no general Linux
-  ABI, foreign root filesystem, native compiler/self-hosting, framebuffer, or
-  nested-kernel execution. The hosted capability bridge remains a tested
-  transport boundary, not a live connection to this QEMU kernel.
+- Outside the bounded Mode 34 AP-startup/barrier probe, O-core's general
+  scheduler, process, IPC, and syscall paths remain fixed-capacity and
+  single-CPU; Mode 34 does not establish SMP locking or subsystem-wide SMP
+  safety. O-core provides no general Linux ABI, foreign root filesystem,
+  native compiler/self-hosting, framebuffer, or nested-kernel execution. The
+  hosted capability bridge remains a tested transport boundary, not a live
+  connection to this QEMU kernel.
 - The exact per-mode `KernelWorld` evidence boundaries are projected in the
   generated status table above from `evidence/gates.toml`; detailed contracts
   remain in `docs/KERNEL_WORLD_CONTRACT.md`. Hardware-only Mode 21 is

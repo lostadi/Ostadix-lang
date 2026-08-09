@@ -1182,6 +1182,7 @@ check_capabilities() {
     check_any_tool "GRUB x86_64 EFI builder" x86_64-elf-grub-mkstandalone grub-mkstandalone
     check_any_tool "FAT formatter" mformat
     check_any_tool "FAT copier" mcopy
+    check_any_tool "committed source snapshot extractor" tar
     local firmware_candidate=""
     for firmware_candidate in \
       "${OSTADIX_OVMF_CODE:-}" \
