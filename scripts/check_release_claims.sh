@@ -417,6 +417,15 @@ require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
 require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
+require_fixed scripts/o-cli.sh \
+    'exec "$KERNEL_CLI_BIN" "$@"' \
+    'the repository-owned o kernel dispatcher no longer reaches the kernel operator CLI'
+require_fixed scripts/o-kernel.sh \
+    'OCORE_PROBE_MODE=16' \
+    'the O-core operator CLI no longer selects the native console probe for interactive console boots'
+require_fixed scripts/o-kernel.sh \
+    'exec "$SMOKE_LIVE_SCRIPT"' \
+    'the O-core operator CLI no longer exposes the bounded native-console proof'
 require_fixed setup.sh \
     '"$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"' \
     'the cargo-bin lowercase o wrapper no longer delegates to the repository installer'

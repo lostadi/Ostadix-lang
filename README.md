@@ -414,6 +414,42 @@ the notebook, and O-core.
 ### Option D: Build and boot O-core
 
 ```bash
+# Non-installing host capability check.
+o kernel doctor
+
+# Build and inspect the baseline freestanding ELF.
+o kernel build
+o kernel image
+
+# Bounded automated boot proof.
+o kernel smoke
+
+# Interactive baseline boot, or the native capability-gated `o> ` console.
+o kernel boot
+o kernel console
+
+# Drive the console lifecycle automatically, or run the complete portable set.
+o kernel smoke-live
+o kernel gates
+```
+
+`o kernel console` builds probe mode 16 and prints the exact embedded package
+digest plus the currently usable commands before entering QEMU:
+
+```text
+o> status
+o> install <printed-sha256> 5 1
+o> activate <printed-sha256>
+```
+
+Use `Ctrl-A X` to leave either interactive QEMU session. The native console is
+a bounded control plane, not a general shell: installation and activation are
+the implemented interactive lifecycle. The smoke command is the finite,
+asserted alternative suitable for automation.
+
+The lower-level compiler and boot scripts remain available:
+
+```bash
 cargo build --bin ocorec
 
 # Compile one or more O-core modules to an ELF relocatable object.
@@ -1042,6 +1078,7 @@ needs QEMU and the local Rust linker toolchain.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Runs repository commands such as `o plan` and `o kernel`; unknown command forms retain lowercase evaluator compatibility. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
