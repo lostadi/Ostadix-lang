@@ -54,6 +54,27 @@ The build script accepts `rust-lld`, `ld.lld`, or Homebrew `lld`. Set
 `OCORE_LLD=/absolute/path/to/rust-lld-or-ld.lld` if your linker is installed
 outside the normal Rust, `PATH`, or Homebrew locations.
 
+The public operator surface delegates to the same build and smoke scripts used
+below:
+
+```bash
+o kernel doctor       # non-installing compiler/linker/QEMU check
+o kernel build        # target/ocore-kernel/kernel.elf
+o kernel image        # rebuild + path/size/SHA-256
+o kernel smoke        # bounded asserted baseline boot
+o kernel boot         # interactive baseline serial boot
+o kernel console      # mode-16 native `o> ` control process
+o kernel smoke-live   # automatically verify that control lifecycle
+o kernel gates        # every manifest-defined portable QEMU gate
+```
+
+Both interactive commands exit with `Ctrl-A X`. `console` prints the exact
+content digest required by its `install` and `activate` commands before QEMU
+starts. It is a fixed-capacity native control plane, not a general shell or a
+claim of physical-machine, SMP, foreign-kernel, or device-isolation support.
+
+The direct implementation scripts are:
+
 ```bash
 ./ocore/kernel/build.sh       # build target/ocore-kernel/kernel.elf
 ./ocore/kernel/run-qemu.sh    # interactive serial console

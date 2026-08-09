@@ -247,6 +247,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/smoke_ostadix_mcp.py",
         "scripts/install-o-cli-wrapper.sh",
         "scripts/o-cli.sh",
+        "scripts/o-kernel.sh",
         "scripts/smoke-project-hgraph-exec.sh",
         "scripts/smoke-project-hgraph.sh",
         "scripts/smoke-world-resource-keys.sh",

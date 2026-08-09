@@ -31,10 +31,18 @@ else
     OLINK_BIN="./target/release/o-link"
 fi
 OUNLINK_BIN="./target/release/o-unlink"
+O_CLI="./scripts/o-cli.sh"
+O_KERNEL_CLI="./scripts/o-kernel.sh"
 
 for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
     if [ ! -x "$bin" ]; then
         echo "Missing executable: $bin" >&2
+        exit 1
+    fi
+done
+for script in "$O_CLI" "$O_KERNEL_CLI"; do
+    if [ ! -x "$script" ]; then
+        echo "Missing executable: $script" >&2
         exit 1
     fi
 done
@@ -437,6 +445,16 @@ check_olangc_compile_and_run "olangc compiles hello.O and the output runs"
 check_olangc_capability_compile_and_run "olangc compiles legacy backend cap attrs without a host grant"
 check_stdout_contains "ocorec --help shows usage" 0 '^Usage: ocorec' "$OCOREC_BIN" --help
 check_ocore_compile "ocorec emits x86-64 freestanding ELF object"
+check_stdout_contains "lowercase o help advertises the kernel CLI" 0 \
+    'kernel <command>' "$O_CLI" help
+check_stdout_contains "lowercase o dispatches kernel help" 0 \
+    '^Usage: o kernel <command>' "$O_CLI" kernel help
+check_stdout_contains "kernel CLI with no command is non-booting help" 0 \
+    '^Usage: o kernel <command>' "$O_KERNEL_CLI"
+check_nonzero_stderr_contains "kernel CLI rejects an unknown command" \
+    "unknown kernel command 'warp'" "$O_KERNEL_CLI" warp
+check_nonzero_stderr_contains "kernel boot rejects arguments before launching QEMU" \
+    'command does not accept arguments' "$O_KERNEL_CLI" boot unexpected
 check_stdout_contains "ogit demo help lists semantic receipt" 0 'semantic-receipt' "$OGIT_BIN" demo --help
 check_stdout_contains "ogit semantic diff detects policy change" 0 'runtime demand model changed' \
     "$OGIT_BIN" diff-semantic examples/group_pipeline/main.O examples/group_pipeline/main.eager.O
