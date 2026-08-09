@@ -12,6 +12,22 @@ case "$PROBE_MODE" in
     exit 2
     ;;
 esac
+
+BOOT_INFO_ENABLED="${OCORE_BOOT_INFO_ENABLED:-}"
+if [[ -z "$BOOT_INFO_ENABLED" ]]; then
+  BOOT_INFO_ENABLED=0
+  if (( PROBE_MODE == 33 || PROBE_MODE == 34 )); then
+    BOOT_INFO_ENABLED=1
+  fi
+fi
+if [[ "$BOOT_INFO_ENABLED" != 0 && "$BOOT_INFO_ENABLED" != 1 ]]; then
+  echo "error: OCORE_BOOT_INFO_ENABLED must be 0 or 1" >&2
+  exit 2
+fi
+if (( PROBE_MODE == 33 || PROBE_MODE == 34 )) && (( BOOT_INFO_ENABLED != 1 )); then
+  echo "error: OCORE probe mode $PROBE_MODE requires the real BootInfo implementation" >&2
+  exit 2
+fi
 mkdir -p "$BUILD_DIR"
 
 cargo build --manifest-path "$ROOT/Cargo.toml" --bin ocorec
@@ -42,6 +58,11 @@ fi
 SMP_PROBE_SOURCE="$KERNEL_DIR/smp_probe_stub.oc"
 if (( PROBE_MODE == 34 )); then
   SMP_PROBE_SOURCE="$KERNEL_DIR/smp_probe.oc"
+fi
+
+BOOT_INFO_SOURCE="$KERNEL_DIR/x86_64/boot_info_stub.oc"
+if (( BOOT_INFO_ENABLED == 1 )); then
+  BOOT_INFO_SOURCE="$KERNEL_DIR/x86_64/boot_info.oc"
 fi
 
 if (( PROBE_MODE == 16 )); then
@@ -329,7 +350,7 @@ fi
   ${WORLD_VALUE_SOURCES[@]+"${WORLD_VALUE_SOURCES[@]}"} \
   ${WORLD_RECEIPT_SOURCES[@]+"${WORLD_RECEIPT_SOURCES[@]}"} \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
-  "$KERNEL_DIR/x86_64/boot_info.oc" \
+  "$BOOT_INFO_SOURCE" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
   "$ROOT/ocore/runtime/x86_64/domain_namespace.oc" \
@@ -399,6 +420,7 @@ fi
 
 clang -target x86_64-unknown-none-elf -c -x assembler-with-cpp \
   -DOCORE_PROBE_MODE="$PROBE_MODE" \
+  -DOCORE_BOOT_INFO_ENABLED="$BOOT_INFO_ENABLED" \
   "$M4_IMAGE_DEFINE" \
   "$M5_IMAGE_DEFINE" \
   "$M6_IMAGE_DEFINE" \

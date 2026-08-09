@@ -245,6 +245,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/kernel/x86_64/grub.cfg",
         "ocore/kernel/x86_64/boot_info.oc",
+        "ocore/kernel/x86_64/boot_info_stub.oc",
         "ocore/runtime/x86_64/trap.oc",
         "ocore/runtime/aarch64/g2_kernel.oc",
         "ocore/runtime/aarch64/g2_user_a.oc",
