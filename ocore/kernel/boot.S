@@ -396,7 +396,9 @@ percpu_entry:
 .extern kernel_timer_dispatch
 .extern kernel_scheduler_complete_continue
 .extern kernel_scheduler_syscall
+#if OCORE_BOOT_INFO_ENABLED == 1
 .extern ocore_boot_info_aperture_closed
+#endif
 _start:
   cli
   mov dword ptr [bootloader_magic_saved], eax
@@ -439,6 +441,7 @@ _start:
   cmp ecx, 8
   jne .map_kernel_data_huge
 
+#if OCORE_BOOT_INFO_ENABLED == 1
   // 20..128 MiB: temporary supervisor RW/NX inspection window. Multiboot2
   // permits its information record anywhere in available RAM; the bounded
   // freestanding normalizer accepts only this mapped prefix. kernel_main must
@@ -468,6 +471,7 @@ _start:
   inc ecx
   cmp ecx, 64
   jne .map_boot_info_alias
+#endif
 
   // 16..18 MiB: user image through 4 KiB PTEs. Its first 64 KiB are RX and
   // its zero-fill tail is R/NX. Probe mode 9 deliberately omits the final leaf
@@ -666,6 +670,7 @@ long_mode_start:
 .globl ocore_boot_info_close_window
 .type ocore_boot_info_close_window, @function
 ocore_boot_info_close_window:
+#if OCORE_BOOT_INFO_ENABLED == 1
   lea rcx, [rip + p2_table]
   mov edx, 10
 .close_boot_info_identity_page:
@@ -714,6 +719,11 @@ ocore_boot_info_close_window:
 .boot_info_aperture_halt:
   hlt
   jmp .boot_info_aperture_halt
+#else
+  // Direct/PVH probes never mapped a Multiboot2 inspection aperture. Keep one
+  // link-compatible no-op instead of carrying the firmware-close protocol.
+  ret
+#endif
 .size ocore_boot_info_close_window, .-ocore_boot_info_close_window
 
 #if OCORE_PROBE_MODE == 34
@@ -1738,12 +1748,14 @@ ocore_boot_protection_check:
   // 1 GiB identity RWX map remains.
   cmp qword ptr [rip + p2_table + 10 * 8], 0
   jne .protection_check_failed
+#if OCORE_BOOT_INFO_ENABLED == 1
   cmp qword ptr [rip + p2_table + 63 * 8], 0
   jne .protection_check_failed
   cmp qword ptr [rip + p2_table + 64 * 8], 0
   jne .protection_check_failed
   cmp qword ptr [rip + p2_table + 127 * 8], 0
   jne .protection_check_failed
+#endif
   mov eax, 1
   ret
 .protection_check_failed:

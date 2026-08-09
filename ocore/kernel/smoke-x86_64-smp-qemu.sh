@@ -6,8 +6,32 @@ SMOKE_ROOT="${OSTADIX_SMP_SMOKE_ROOT:-$ROOT/target/ostadix-smp-smoke}"
 QEMU_BIN="${OCORE_QEMU_BIN:-qemu-system-x86_64}"
 TIMEOUT="${OSTADIX_SMP_TIMEOUT_SECONDS:-10}"
 IMAGE="$SMOKE_ROOT/ostadix-smp4.img"
-POSITIVE_TRANSCRIPT="$SMOKE_ROOT/smp4.serial"
-NEGATIVE_TRANSCRIPT="$SMOKE_ROOT/smp1-negative.serial"
+RUN_ROOT=""
+POSITIVE_TRANSCRIPT=""
+NEGATIVE_TRANSCRIPT=""
+TRANSCRIPT_CHECK=""
+TRANSCRIPT_CHECK_STDOUT=""
+
+cleanup_run() {
+  local status=$?
+  if [[ -z "$RUN_ROOT" ]]; then
+    return
+  fi
+  if (( status == 0 )); then
+    # Remove only the exact files created beneath this invocation's mktemp
+    # directory. If an unexpected file exists, rmdir fails closed and leaves
+    # the unique directory intact rather than recursively deleting it.
+    rm -f -- \
+      "$POSITIVE_TRANSCRIPT" \
+      "$NEGATIVE_TRANSCRIPT" \
+      "$TRANSCRIPT_CHECK" \
+      "$TRANSCRIPT_CHECK_STDOUT"
+    rmdir -- "$RUN_ROOT" 2>/dev/null || true
+  else
+    printf 'OSTADIX SMP run artifacts retained: %s\n' "$RUN_ROOT" >&2
+  fi
+}
+trap cleanup_run EXIT
 
 if [[ $# -ne 0 ]]; then
   echo "usage: smoke-x86_64-smp-qemu.sh" >&2
@@ -51,6 +75,11 @@ if [[ -z "${OSTADIX_OVMF_CODE:-}" || ! -f "$OSTADIX_OVMF_CODE" ]]; then
 fi
 
 mkdir -p "$SMOKE_ROOT"
+RUN_ROOT="$(mktemp -d "$SMOKE_ROOT/run.XXXXXX")"
+POSITIVE_TRANSCRIPT="$RUN_ROOT/smp4.serial"
+NEGATIVE_TRANSCRIPT="$RUN_ROOT/smp1-negative.serial"
+TRANSCRIPT_CHECK="$RUN_ROOT/transcript-check.json"
+TRANSCRIPT_CHECK_STDOUT="$RUN_ROOT/transcript-check.stdout"
 OCORE_MEDIA_PROBE_MODE=34 \
 OSTADIX_BOOT_CHALLENGE="$OSTADIX_BOOT_CHALLENGE" \
 OSTADIX_MEDIA_ROOT="$SMOKE_ROOT/media-build" \
@@ -214,8 +243,8 @@ PY
   --challenge "$OSTADIX_BOOT_CHALLENGE" \
   --source-commit "$SOURCE_COMMIT" \
   --expected-cpus 4 \
-  --output "$SMOKE_ROOT/transcript-check.json" \
-  >"$SMOKE_ROOT/transcript-check.stdout"
+  --output "$TRANSCRIPT_CHECK" \
+  >"$TRANSCRIPT_CHECK_STDOUT"
 
 printf '%s\n' \
   "OSTADIX SMP transcript grammar: PASS" \

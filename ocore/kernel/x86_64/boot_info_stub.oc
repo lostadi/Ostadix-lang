@@ -1,0 +1,49 @@
+module kernel::boot_info;
+
+// Direct/PVH legacy gates do not receive a Multiboot2 handoff.  Keep their
+// link surface fail-closed without carrying the real bounded parser and its
+// firmware tables into every probe image.  UEFI media builds explicitly
+// select boot_info.oc; Modes 33 and 34 require it automatically.
+pub const MULTIBOOT2_MAGIC: u32 = 0x36d7_6289;
+
+pub unsafe fn normalize(
+    boot_magic: u32,
+    source: usize,
+    require_challenge: bool
+) -> u64 {
+    let ignored_magic: u32 = boot_magic;
+    let ignored_source: usize = source;
+    let ignored_challenge: bool = require_challenge;
+    if ignored_magic == 0 && ignored_source == 0 && ignored_challenge {
+        return 0;
+    }
+    return 0;
+}
+
+@export
+@no_mangle
+pub unsafe fn ocore_boot_info_aperture_closed(aperture_verified: u64) -> u64 {
+    let ignored: u64 = aperture_verified;
+    if ignored != 0 {
+        return 0;
+    }
+    return 0;
+}
+
+pub unsafe fn rejection_self_test() -> u64 { return 0; }
+pub unsafe fn is_valid() -> bool { return false; }
+pub unsafe fn inspection_released() -> bool { return false; }
+pub unsafe fn allocator_window_covered() -> bool { return false; }
+pub unsafe fn allocator_start() -> usize { return 0; }
+pub unsafe fn allocator_end() -> usize { return 0; }
+pub unsafe fn acpi_status() -> u64 { return 0; }
+pub unsafe fn efi64_exited_boot_services() -> bool { return false; }
+pub unsafe fn challenge_present() -> bool { return false; }
+pub unsafe fn source_commit_present() -> bool { return false; }
+
+pub unsafe fn emit_rejection() -> void { return; }
+pub unsafe fn emit_self_test_pass() -> void { return; }
+pub unsafe fn emit_normalized_summary() -> void { return; }
+pub unsafe fn emit_allocator_admission() -> void { return; }
+pub unsafe fn emit_challenge() -> void { return; }
+pub unsafe fn emit_handoff_pass() -> void { return; }
