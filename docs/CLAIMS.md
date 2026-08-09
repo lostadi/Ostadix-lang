@@ -41,7 +41,7 @@
   archive member. Relative Markdown links outside code/comments must resolve to
   files, directories, or the root inside that archive. Verification also checks
   canonical ZIP metadata/layout and inertly validates the MCP configuration,
-  crate license, example/evidence manifest schemas, sealed World Alpha
+  crate license, example/evidence manifest schemas, sealed OSTADIX Alpha
   constitution-v3/profile/composed-contract/registry-v4 bytes, exact historical
   attestation and ledger-event bytes, current released-source digests, and
   archive-local references; it never imports or executes archive payloads.
@@ -467,7 +467,7 @@
   offline and is not evidence that another subsystem emitted a receipt. This
   slice supplies no production key generation or custody, enrollment, rotation,
   revocation, transport, authoritative replay/commit fencing, Governor,
-  consensus, WorldFS, typed World Alpha attestation, Workstream A acceptance,
+  consensus, WorldFS, typed OSTADIX Alpha attestation, Workstream A acceptance,
   or G0--G13 passage. QEMU TCG is not physical or hardware-isolation evidence.
 - The separate World-project hosted-reference slice consumes an exact
   snapshot-derived `DeploymentPlanV1` through
@@ -520,7 +520,7 @@
   exactly-once protocol. QEMU TCG is not physical hardware or hardware-isolation
   evidence, and this passes neither G1 nor Workstream A acceptance.
 
-## Ostadix World native Alpha boundary
+## OSTADIX Alpha native boundary
 
 - [`OSTADIX_WORLD.md`](OSTADIX_WORLD.md) is the normative native constitution.
   It fixes the replicated-Governor model, OValue/capability/capsule crossings,
@@ -545,7 +545,7 @@
   G13 and the other 11 gates remain `defined`.
 - [`O_MACHINE_CONTRACT.md`](O_MACHINE_CONTRACT.md) settles the future G7/G8
   machine boundary as resource-class-specific and asynchronous. G7 gives no
-  machine handle or Ostadix HVC to the guest and carries no handle MAC/key
+  machine handle or OSTADIX HVC to the guest and carries no handle MAC/key
   lifecycle. `MachineMemory` revocation is terminal teardown; a graceful guest
   error must instead come from a device-native path such as virtio-blk `EIO` or
   a negotiated 9P error. This contract is not evidence that stage-2 teardown,
@@ -738,7 +738,7 @@
   exactly-once effects, native project execution, native Ed25519 verification,
   physical-device assignment, PCI/DMA/IOMMU isolation, physical hardware,
   Workstream A acceptance, G1, or passage of any G0--G13 gate.
-- Neither the present repository nor the Alpha target claims coherent
+- Neither the present repository nor the OSTADIX Alpha target claims coherent
   cross-node RAM, transparent remote pointers, arbitrary Linux compatibility,
   universal hardware support, or transparent migration of every process.
 

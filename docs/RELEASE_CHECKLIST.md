@@ -1,5 +1,10 @@
 # DOI-ready release checklist
 
+This checklist covers the **Ostadix-lang** component source archive. The
+umbrella system release is named **OSTADIX Alpha**; an Ostadix-lang tag or DOI
+does not by itself qualify that system release. OSTADIX Alpha additionally
+requires G13 and the evidence bound by the qualification registry below.
+
 This checklist is grounded in the current repository state: `Cargo.toml` version
 `0.2.0`, `CITATION.cff` version `0.2.0`, the README citation example, the CI
 workflow in `.github/workflows/ci.yml`, and the active release-claim guard in
@@ -167,7 +172,7 @@ exactly-once protocol. It is no native project execution or native Ed25519
 verification; QEMU TCG is not physical hardware. It passes neither G1 nor
 Workstream A acceptance, and G1 remains defined and unpassed.
 
-The World Alpha registry in
+The OSTADIX Alpha registry in
 [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) is a
 qualification schema, not an additional set of portable release commands. Its
 checked-in ledger view must report 14 defined entries--G0 plus 13 integration
@@ -283,7 +288,7 @@ members, and verification requires the writer's canonical ZIP metadata and
 layout. It also parses, without importing or executing released code,
 `.mcp.json`, the MCP crate metadata/license, `examples/manifest.json`, and
 `evidence/gates.toml`, then proves their required archive-local references. For
-World Alpha constitution version 3 it also verifies sealed bytes for the
+OSTADIX Alpha constitution version 3 it also verifies sealed bytes for the
 native constitution, hosted reference profile, composed executable G0
 contracts, and typed `evidence/world_alpha_gates.toml`; it inertly validates
 exact-byte-sealed historical attestations and ledger events plus their retained

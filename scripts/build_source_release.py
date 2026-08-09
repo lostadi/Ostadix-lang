@@ -184,6 +184,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "boot-and-test.sh",
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
         "docs/O_MACHINE_CONTRACT.md",
+        "docs/OSTADIX_BOOT.md",
         "docs/OSTADIX_WORLD.md",
         "evidence/gates.toml",
         "evidence/world_alpha_gates.toml",
@@ -196,6 +197,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
         "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
         "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
+        "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
+        "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
         "evidence/world/g2-aarch64-qemu.toml",
         "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
         "evidence/world/g2-derivation-rederive-2026-08-03.toml",
@@ -203,6 +206,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "evidence/world/transcripts/g0-repository-conformance.log",
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
         "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
+        "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
         "evidence/world/transcripts/g2-aarch64-qemu.log",
         "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
         "examples/manifest.json",
@@ -213,8 +217,11 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/aarch64/linker.ld",
         "ocore/kernel/aarch64/vectors.S",
         "ocore/kernel/build-aarch64-g2.sh",
+        "ocore/kernel/build-x86_64-uefi-media.sh",
         "ocore/kernel/build.sh",
         "ocore/kernel/main.oc",
+        "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+        "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
         "ocore/kernel/smoke-world-project-receipt-qemu.sh",
         "ocore/kernel/smoke-world-project-runtime-qemu.sh",
         "ocore/kernel/smoke-world-receipt-qemu.sh",
@@ -232,6 +239,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_project_receipt_semantics_stub.oc",
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
+        "ocore/kernel/x86_64/grub.cfg",
         "ocore/runtime/x86_64/trap.oc",
         "ocore/runtime/aarch64/g2_kernel.oc",
         "ocore/runtime/aarch64/g2_user_a.oc",
@@ -248,6 +256,8 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/install-o-cli-wrapper.sh",
         "scripts/o-cli.sh",
         "scripts/o-kernel.sh",
+        "scripts/ostadix_boot_media.py",
+        "scripts/ostadix_media_writer.py",
         "scripts/smoke-project-hgraph-exec.sh",
         "scripts/smoke-project-hgraph.sh",
         "scripts/smoke-world-resource-keys.sh",
@@ -265,6 +275,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/bin/ocorec.rs",
         "src/ocore/codegen.rs",
         "src/ocore/codegen_aarch64.rs",
+        "src/ocore/boot_info.rs",
         "src/ocore/driver.rs",
         "src/ocore/mod.rs",
         "src/executor/mod.rs",
@@ -307,6 +318,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_example_manifest.py",
         "tests/test_mcp_smoke.py",
         "tests/test_release_evidence.py",
+        "tests/test_ostadix_boot_media.py",
+        "tests/test_ostadix_media_writer.py",
+        "tests/test_setup.py",
         "tests/test_world_alpha_evidence.py",
         "tests/project_hgraph.rs",
         "tests/project_hgraph_exec.rs",
@@ -378,19 +392,19 @@ G2_AARCH64_EXPECTED_MARKERS = (
 # below.  Any intentional constitutional edit requires an explicit seal update.
 SEALED_WORLD_ALPHA_SHA256 = {
     "docs/OSTADIX_WORLD.md": (
-        "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
+        "e7d47d7a8e0e8f6d35bf3bb6b1f86f2bddffe27a67a3415c3d4ea8c76e13bcea"
     ),
     "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
-        "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
+        "647da49edfc4b7d53a9248e8fdcda5cdb62be3c47756c59b7523ee09461d2e1d"
     ),
     "evidence/world_alpha_gates.toml": (
-        "1407755260bc59317ea6a28e7178e7774c58e4b7ad13d54f2ab579c4dedbb81c"
+        "1ba4091c43b8e5ba868f3366bfaba675ccabf6bb9950429cafff12c5faa65b6c"
     ),
     "evidence/world_contract_v1.toml": (
         "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
     ),
     "evidence/world_contract_v2.toml": (
-        "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+        "af1334bb4d0aca30e7f722890e819c0a597c4c4b42db0006c452dec2e755b74b"
     ),
     "docs/O_MACHINE_CONTRACT.md": (
         "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
@@ -400,7 +414,7 @@ SEALED_WORLD_ALPHA_SHA256 = {
     ),
 }
 WORLD_CONTRACT_V2_SEMANTICS_SHA256 = (
-    "d2faa552ddb549c600566651a8978f524019c76231703226c33b57b6a8cc1727"
+    "fedbb397c5b874bf389a376744e1ceb58d9bf418f14fdd155273e8dc561c7bc8"
 )
 WORLD_MACHINE_CONTRACT_SEMANTICS_SHA256 = (
     "d67c050831b1b52bbb3ec6569d775ce8b0782c6610acc7a8e2e92658af599bf2"
@@ -415,7 +429,7 @@ WORLD_DERIVATION_HASH = (
     "sha256:3a017fee12f6cc7b3c9ef9ec099407f39b5bb143251c21b9937abe47409c9d06"
 )
 WORLD_VALIDATOR_SHA256 = (
-    "996429367acc37db22bde50f2b3283279bb242b4299d6fa1ab3a8f8a3cb868db"
+    "d8c5cc22bdbb9a0f854689fbb423731473b2da8976b36dd1244036fb3669c602"
 )
 WORLD_REDERIVE_PAYLOAD_DOMAIN = "ostadix.world.evidence.rederive.v1"
 WORLD_WITNESS_PAYLOAD_DOMAIN = "ostadix.world.evidence.witness.v1"
@@ -426,6 +440,9 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     "evidence/world/g0-repository-conformance-2026-08-03.toml": (
         "a057ec3ab8fb9eac618be635133d106342aff13e85335c74d3e6522e8e46d425"
     ),
+    "evidence/world/g0-repository-conformance-2026-08-03-v2.toml": (
+        "0016e953bbd353f28b771e8e2d0cfe34867bc7f6561e06c7e1c86fb908a9a8c4"
+    ),
     "evidence/world/g2-aarch64-qemu.toml": (
         "99414f1cf356b3666c163e0e28172eaf2b46e3f14c8f13f2ce12fa24cc9d30d7"
     ),
@@ -434,14 +451,17 @@ WORLD_HISTORICAL_ATTESTATION_SHA256 = {
     ),
 }
 WORLD_CURRENT_ATTESTATION_SHA256 = {
-    "evidence/world/g0-repository-conformance-2026-08-03-v2.toml": (
-        "0016e953bbd353f28b771e8e2d0cfe34867bc7f6561e06c7e1c86fb908a9a8c4"
+    "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml": (
+        "32b76b190aab1c51ba73beccee350ea2a20928798605e980173c86da916450df"
     ),
 }
 # Repository-authored lifecycle and derivation events are immutable ledger
 # records.  The release verifier seals their complete bytes independently of
 # the payload hash carried by a rederive event.
 WORLD_EVIDENCE_EVENT_SHA256 = {
+    "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml": (
+        "132a60bb1e42d6debfe68294276e3f8cdea47aa862e0c2f5ca657489191c2227"
+    ),
     "evidence/world/g0-derivation-rederive-2026-08-03.toml": (
         "80a0f4805fb4ebf63f6e22d70aa7d01dc5d84856df1bbc2fe4626fca8ac08f7c"
     ),
@@ -459,7 +479,7 @@ WORLD_EVIDENCE_EVENT_SHA256 = {
     ),
 }
 WORLD_REGISTRY_SEMANTICS_SHA256 = (
-    "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea"
+    "23ead9813a067917ac5ea5d08c7be34616865286e9f45622212eb0ff3676686e"
 )
 WORLD_LEGACY_ACTIVE_SCHEMA2_IDS = frozenset(
     {"g2-aarch64-qemu-tcg-2026-08-03"}
@@ -1712,7 +1732,7 @@ def _sealed_world_alpha_text(
     actual = hashlib.sha256(files[path]).hexdigest()
     if actual != expected:
         raise ReleaseError(
-            f"{path} SHA-256 differs from sealed World Alpha constitutional bytes; "
+            f"{path} SHA-256 differs from sealed OSTADIX Alpha constitutional bytes; "
             f"expected {expected}, got {actual}"
         )
     try:
@@ -1928,6 +1948,7 @@ def _validate_world_attestation_release_surface(
             )
         if hashlib.sha256(files[path]).hexdigest() != expected_historical_digest:
             raise ReleaseError(f"{path} historical attestation bytes differ from seal")
+    current_attestation = path in WORLD_CURRENT_ATTESTATION_SHA256
     if schema_version == 1:
         version_keys = {"claims"}
     else:
@@ -2002,6 +2023,7 @@ def _validate_world_attestation_release_surface(
     if not isinstance(sources, list) or not sources:
         raise ReleaseError(f"{path}.source must contain content digests")
     seen_sources: set[str] = set()
+    source_digests: dict[str, str] = {}
     for index, source in enumerate(sources):
         owner = f"{path}.source[{index}]"
         if not isinstance(source, dict) or set(source) != {"path", "sha256"}:
@@ -2015,11 +2037,12 @@ def _validate_world_attestation_release_surface(
             raise ReleaseError(f"{owner}.sha256 must be a SHA-256 digest")
         if source_path not in files:
             raise ReleaseError(f"{owner} references absent released {source_path}")
-        # Schema-v1/v2 records describe immutable historical working trees;
-        # their source bytes are not falsely claimed to be the current ZIP
-        # members.  A schema-v3 record on the current derivation is a current
-        # release attestation and must bind the released bytes exactly.
-        if schema_version == 3 and attestation["derivation_hash"] == WORLD_DERIVATION_HASH:
+        source_digests[source_path] = digest
+        # Historical records describe immutable prior working trees; their
+        # source bytes are not falsely claimed to be the current ZIP members.
+        # Only the exact-byte-sealed current attestation must bind released
+        # members directly, regardless of the historical schema version.
+        if current_attestation:
             if hashlib.sha256(files[source_path]).hexdigest() != digest:
                 raise ReleaseError(f"{owner} does not match released {source_path}")
 
@@ -2047,7 +2070,13 @@ def _validate_world_attestation_release_surface(
         if artifact["retained"]:
             artifact_path = _normalized_reference(artifact["path"], f"{owner}.path")
             artifact_bindings.add((name, kind, artifact_path))
-            if artifact_path not in files or hashlib.sha256(files[artifact_path]).hexdigest() != digest:
+            if artifact_path not in files:
+                raise ReleaseError(f"{owner} references absent retained {artifact_path}")
+            current_digest = hashlib.sha256(files[artifact_path]).hexdigest()
+            historical_digest = source_digests.get(artifact_path)
+            if current_digest != digest and (
+                current_attestation or historical_digest != digest
+            ):
                 raise ReleaseError(f"{owner} does not match retained {artifact_path}")
         else:
             if artifact["path"] != "":
@@ -2115,7 +2144,7 @@ def _validate_world_attestation_release_surface(
                 derivation_hash[len("sha256:") :]
             ) is None:
                 raise ReleaseError(f"{path}.derivation_hash must be a SHA-256 identifier")
-            if derivation_hash == WORLD_DERIVATION_HASH:
+            if current_attestation:
                 if validator_digest != WORLD_VALIDATOR_SHA256:
                     raise ReleaseError(
                         f"{path}.validator_sha256 differs from the trusted validator bytes"
@@ -2665,20 +2694,20 @@ def _validate_world_alpha_release_surface(
         )
     required_document_markers = {
         "docs/OSTADIX_WORLD.md": (
-            "# Ostadix World: Full-Stack Machine-Constructor Roadmap",
-            "**Status:** normative native Alpha constitution and implementation program,",
+            "# OSTADIX World: Full-Stack Machine-Constructor Roadmap",
+            "**Status:** normative OSTADIX Alpha constitution and implementation program,",
             "| **G0 -- constitutional baseline** |",
-            "| **G13 -- eight-node World Alpha** |",
+            "| **G13 -- eight-node OSTADIX Alpha** |",
             "validator derives claims and current",
-            "# 28. Alpha non-claims",
+            "# 28. OSTADIX Alpha non-claims",
         ),
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": (
             "# Hosted World Reference Profile",
             "**Status:** design/reference profile with partial hosted foundations;",
-            "non-qualifying for native Ostadix World release gates.",
+            "non-qualifying for native OSTADIX Alpha release gates.",
             "cannot satisfy G0 through G13",
             "## Non-claims",
-            "G12, G13, or the name **Ostadix World Alpha**.",
+            "G12, G13, or the name **OSTADIX Alpha**.",
         ),
         "docs/O_MACHINE_CONTRACT.md": (
             "# O-Machine EL2 and O-core Resource Contract",
@@ -2693,7 +2722,7 @@ def _validate_world_alpha_release_surface(
     for path, markers in required_document_markers.items():
         for marker in markers:
             if marker not in texts[path]:
-                raise ReleaseError(f"{path} is missing required World Alpha marker {marker!r}")
+                raise ReleaseError(f"{path} is missing required OSTADIX Alpha marker {marker!r}")
 
     wrapper_path = "evidence/world_contract_v2.toml"
     wrapper = _strict_toml(files[wrapper_path], wrapper_path)

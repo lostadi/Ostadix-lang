@@ -2,7 +2,7 @@ schema = "ostadix.world-contract/v2"
 schema_version = 2
 constitution_version = 3
 constitution = "docs/OSTADIX_WORLD.md"
-constitution_sha256 = "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
+constitution_sha256 = "e7d47d7a8e0e8f6d35bf3bb6b1f86f2bddffe27a67a3415c3d4ea8c76e13bcea"
 world_gate_registry = "evidence/world_alpha_gates.toml"
 
 # Constitution v3 composes the byte-frozen v1 World vocabulary with the
