@@ -20,7 +20,7 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "evidence/gates.toml"
 EXPECTED_SCHEMA = 2
-EXPECTED_REQUIRED_GATE_COUNT = 24
+EXPECTED_REQUIRED_GATE_COUNT = 26
 EXPECTED_SUPPLEMENTAL_GATE_COUNT = 1
 ALLOWED_EVIDENCE_CLASSES = {
     "portable_tcg",

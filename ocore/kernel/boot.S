@@ -157,7 +157,126 @@ ocore_kernel_world_record_bytes_start:
 .globl ocore_kernel_world_record_bytes_end
 ocore_kernel_world_record_bytes_end:
 
+#if OCORE_PROBE_MODE == 34
+// APs begin at physical 0x8000 in 16-bit real mode.  This template contains
+// no bootloader pointer and no stack-dependent instruction.  The BSP copies
+// it only after the Multiboot2 memory map admits the complete 4 KiB page.
+.balign 16
+smp_trampoline_template_start:
+.code16
+  cli
+  cld
+  xor ax, ax
+  mov ds, ax
+  mov es, ax
+  mov ss, ax
+  in al, 0x92
+  or al, 0x02
+  and al, 0xfe
+  out 0x92, al
+  lgdt [SMP_TRAMPOLINE_GDT_POINTER_ADDRESS]
+  mov eax, cr0
+  or eax, 0x01
+  mov cr0, eax
+  .byte 0xea
+  .word SMP_TRAMPOLINE_PROTECTED_ADDRESS
+  .word 0x08
+
+.code32
+smp_trampoline_protected:
+  mov ax, 0x10
+  mov ds, ax
+  mov es, ax
+  mov ss, ax
+  mov eax, dword ptr [SMP_TRAMPOLINE_CR3_ADDRESS]
+  mov cr3, eax
+  mov eax, cr4
+  or eax, 1 << 5
+  mov cr4, eax
+  mov ecx, 0xc0000080
+  rdmsr
+  or eax, (1 << 8) | (1 << 11)
+  wrmsr
+  mov eax, cr0
+  or eax, (1 << 31) | (1 << 16)
+  mov cr0, eax
+  .byte 0xea
+  .long smp_ap_entry64
+  .word 0x18
+
+.balign 8
+smp_trampoline_gdt:
+  .quad 0
+  .quad 0x00cf9a000000ffff
+  .quad 0x00cf92000000ffff
+  .quad 0x00af9a000000ffff
+smp_trampoline_gdt_end:
+smp_trampoline_gdt_pointer:
+  .word smp_trampoline_gdt_end - smp_trampoline_gdt - 1
+  .long 0x8000 + smp_trampoline_gdt - smp_trampoline_template_start
+smp_trampoline_cr3:
+  .long 0
+smp_trampoline_template_end:
+.set SMP_TRAMPOLINE_GDT_POINTER_ADDRESS, 0x8000 + smp_trampoline_gdt_pointer - smp_trampoline_template_start
+.set SMP_TRAMPOLINE_PROTECTED_ADDRESS, 0x8000 + smp_trampoline_protected - smp_trampoline_template_start
+.set SMP_TRAMPOLINE_CR3_ADDRESS, 0x8000 + smp_trampoline_cr3 - smp_trampoline_template_start
+.set SMP_TRAMPOLINE_CR3_OFFSET, smp_trampoline_cr3 - smp_trampoline_template_start
+.set SMP_TRAMPOLINE_TEMPLATE_BYTES, smp_trampoline_template_end - smp_trampoline_template_start
+.code64
+#endif
+
 .section .bss,"aw",@nobits
+.balign 8
+// Capture the architectural Multiboot2 handoff before page-table setup
+// reuses EAX and EBX.  The O-core normalizer copies every admitted fact out of
+// bootloader memory before the temporary inspection mapping is removed.
+bootloader_magic_saved:
+  .long 0
+bootloader_info_saved:
+  .long 0
+
+#if OCORE_PROBE_MODE == 34
+// One cache-line-separated, BSP-owned startup record.  APs may publish only
+// into the fixed slot selected by their firmware-admitted APIC identity.
+.balign 64
+smp_expected_ids:
+  .skip 24
+smp_stack_tops:
+  .skip 24
+smp_observed_ids:
+  .skip 32
+smp_observed_stacks:
+  .skip 32
+smp_arrived:
+  .long 0
+smp_release:
+  .long 0
+smp_progress:
+  .long 0
+smp_failure:
+  .long 0
+smp_claimed:
+  .long 0
+  .long 0
+  .long 0
+  .long 0
+smp_control_end:
+.set SMP_CONTROL_QWORDS, (smp_control_end - smp_expected_ids) / 8
+
+.balign 4096
+smp_ap_stack1_bottom:
+  .skip 16384
+smp_ap_stack1_top:
+.balign 4096
+smp_ap_stack2_bottom:
+  .skip 16384
+smp_ap_stack2_top:
+.balign 4096
+smp_ap_stack3_bottom:
+  .skip 16384
+smp_ap_stack3_top:
+#endif
+
 .balign 4096
 svm_region:
   // Mode 21 uses one boot-CPU SVM context: HSAVE, VMCB, four NPT levels,
@@ -277,9 +396,11 @@ percpu_entry:
 .extern kernel_timer_dispatch
 .extern kernel_scheduler_complete_continue
 .extern kernel_scheduler_syscall
+.extern ocore_boot_info_aperture_closed
 _start:
   cli
-  mov esi, ebx
+  mov dword ptr [bootloader_magic_saved], eax
+  mov dword ptr [bootloader_info_saved], ebx
 
   lea eax, [p3_table]
   // Upper-level U/S bits permit traversal. Leaf PDEs still keep every kernel
@@ -317,6 +438,36 @@ _start:
   inc ecx
   cmp ecx, 8
   jne .map_kernel_data_huge
+
+  // 20..128 MiB: temporary supervisor RW/NX inspection window. Multiboot2
+  // permits its information record anywhere in available RAM; the bounded
+  // freestanding normalizer accepts only this mapped prefix. kernel_main must
+  // remove and flush these entries before its W^X check and allocator init.
+  mov ecx, 10
+.map_boot_info_huge:
+  mov eax, ecx
+  shl eax, 21
+  or eax, 0x83
+  mov dword ptr [p2_table + ecx * 8], eax
+  mov dword ptr [p2_table + ecx * 8 + 4], 0x80000000
+  inc ecx
+  cmp ecx, 64
+  jne .map_boot_info_huge
+
+  // 128..256 MiB: a complete temporary alias of physical 0..128 MiB. The
+  // bounded normalizer reads the Multiboot2 record only through this alias, so
+  // low physical source pages can be released without unmapping permanent
+  // kernel, allocator, or user mappings below 20 MiB.
+  xor ecx, ecx
+.map_boot_info_alias:
+  mov eax, ecx
+  shl eax, 21
+  or eax, 0x83
+  mov dword ptr [p2_table + 64 * 8 + ecx * 8], eax
+  mov dword ptr [p2_table + 64 * 8 + ecx * 8 + 4], 0x80000000
+  inc ecx
+  cmp ecx, 64
+  jne .map_boot_info_alias
 
   // 16..18 MiB: user image through 4 KiB PTEs. Its first 64 KiB are RX and
   // its zero-fill tail is R/NX. Probe mode 9 deliberately omits the final leaf
@@ -494,7 +645,10 @@ long_mode_start:
   lea rsp, [stack_top]
   and rsp, -16
   xor rbp, rbp
-  mov edi, esi
+  mov edi, dword ptr [rip + bootloader_magic_saved]
+  mov esi, dword ptr [rip + bootloader_info_saved]
+  mov dword ptr [rip + bootloader_magic_saved], 0
+  mov dword ptr [rip + bootloader_info_saved], 0
   call kernel_main
 
 .halt_forever:
@@ -502,6 +656,533 @@ long_mode_start:
   hlt
   jmp .halt_forever
 .size _start, .-_start
+
+// Close the bounded boot-information inspection mappings after normalization.
+// Entries 10..63 are the temporary physical identity tail needed by Mode 34's
+// ACPI consumer. Entries 64..127 are the normalizer's complete alias of
+// physical 0..128 MiB, including source pages below 20 MiB. Permanent kernel,
+// allocator, and user mappings remain intact. Reloading CR3 invalidates every
+// removed translation before the O-core callback publishes the release marker.
+.globl ocore_boot_info_close_window
+.type ocore_boot_info_close_window, @function
+ocore_boot_info_close_window:
+  lea rcx, [rip + p2_table]
+  mov edx, 10
+.close_boot_info_identity_page:
+  mov qword ptr [rcx + rdx * 8], 0
+  inc edx
+  cmp edx, 64
+  jne .close_boot_info_identity_page
+  mov edx, 64
+.close_boot_info_alias_page:
+  mov qword ptr [rcx + rdx * 8], 0
+  inc edx
+  cmp edx, 128
+  jne .close_boot_info_alias_page
+  mov rax, cr3
+  mov cr3, rax
+
+  // Scan every entry rather than trusting the loop bounds. The callback also
+  // requires the O-core parser cursor to be zero before it emits evidence.
+  mov edx, 10
+.verify_boot_info_identity_closed:
+  cmp qword ptr [rcx + rdx * 8], 0
+  jne .boot_info_aperture_failed
+  inc edx
+  cmp edx, 64
+  jne .verify_boot_info_identity_closed
+  mov edx, 64
+.verify_boot_info_alias_closed:
+  cmp qword ptr [rcx + rdx * 8], 0
+  jne .boot_info_aperture_failed
+  inc edx
+  cmp edx, 128
+  jne .verify_boot_info_alias_closed
+  cmp dword ptr [rip + bootloader_magic_saved], 0
+  jne .boot_info_aperture_failed
+  cmp dword ptr [rip + bootloader_info_saved], 0
+  jne .boot_info_aperture_failed
+  mov edi, 1
+  sub rsp, 8
+  call ocore_boot_info_aperture_closed
+  add rsp, 8
+  test rax, rax
+  jz .boot_info_aperture_failed
+  ret
+.boot_info_aperture_failed:
+  cli
+.boot_info_aperture_halt:
+  hlt
+  jmp .boot_info_aperture_halt
+.size ocore_boot_info_close_window, .-ocore_boot_info_close_window
+
+#if OCORE_PROBE_MODE == 34
+// The AP's first paged instruction is in the kernel RX segment, never on the
+// writable/NX low-memory trampoline page.  Each AP enables x2APIC locally,
+// claims exactly one firmware-selected slot, publishes its actual APIC ID and
+// assigned stack, then crosses the BSP-owned two-phase barrier.
+.balign 16
+smp_ap_entry64:
+  mov ax, 0x10
+  mov ds, ax
+  mov es, ax
+  mov ss, ax
+  xor ax, ax
+  mov fs, ax
+  mov gs, ax
+
+  mov eax, 1
+  cpuid
+  test edx, 1 << 9
+  jz .smp_ap_failed
+  test ecx, 1 << 21
+  jz .smp_ap_failed
+  mov ecx, 0x1b
+  rdmsr
+  test eax, 1 << 11
+  jz .smp_ap_failed
+  or eax, (1 << 10) | (1 << 11)
+  wrmsr
+  mov ecx, 0x802
+  rdmsr
+  mov r8d, eax
+
+  cmp r8, qword ptr [rip + smp_expected_ids]
+  je .smp_ap_slot1
+  cmp r8, qword ptr [rip + smp_expected_ids + 8]
+  je .smp_ap_slot2
+  cmp r8, qword ptr [rip + smp_expected_ids + 16]
+  je .smp_ap_slot3
+  jmp .smp_ap_failed
+
+.smp_ap_slot1:
+  mov r9d, 1
+  lea rsp, [rip + smp_ap_stack1_top]
+  jmp .smp_ap_publish
+.smp_ap_slot2:
+  mov r9d, 2
+  lea rsp, [rip + smp_ap_stack2_top]
+  jmp .smp_ap_publish
+.smp_ap_slot3:
+  mov r9d, 3
+  lea rsp, [rip + smp_ap_stack3_top]
+
+.smp_ap_publish:
+  and rsp, -16
+  lock bts dword ptr [rip + smp_claimed], r9d
+  jc .smp_ap_failed
+  lea r10, [rip + smp_observed_ids]
+  mov qword ptr [r10 + r9 * 8], r8
+  lea r10, [rip + smp_observed_stacks]
+  mov qword ptr [r10 + r9 * 8], rsp
+  mfence
+  lock inc dword ptr [rip + smp_arrived]
+.smp_ap_barrier:
+  cmp dword ptr [rip + smp_release], 1
+  je .smp_ap_released
+  pause
+  jmp .smp_ap_barrier
+.smp_ap_released:
+  lock inc dword ptr [rip + smp_progress]
+  cli
+.smp_ap_park:
+  hlt
+  jmp .smp_ap_park
+
+.smp_ap_failed:
+  lock or dword ptr [rip + smp_failure], 1
+  cli
+.smp_ap_failed_park:
+  hlt
+  jmp .smp_ap_failed_park
+
+// Verify that the bounded firmware inspection aperture remains available
+// while Mode 34 consumes ACPI.  The probe itself closes this aperture before
+// any AP starts.
+.globl ocore_smp_map_firmware_window
+.type ocore_smp_map_firmware_window, @function
+ocore_smp_map_firmware_window:
+  cmp qword ptr [rip + p2_table + 10 * 8], 0
+  je .smp_map_unavailable
+  cmp qword ptr [rip + p2_table + 63 * 8], 0
+  je .smp_map_unavailable
+  cmp qword ptr [rip + p2_table + 64 * 8], 0
+  je .smp_map_unavailable
+  cmp qword ptr [rip + p2_table + 127 * 8], 0
+  je .smp_map_unavailable
+  mov eax, 1
+  ret
+.smp_map_unavailable:
+  xor eax, eax
+  ret
+.size ocore_smp_map_firmware_window, .-ocore_smp_map_firmware_window
+
+// Leaf-1 CPUID supplies the initial 8-bit APIC identity corresponding to the
+// bounded MADT type-0 topology accepted by the O-core parser.
+.globl ocore_smp_bsp_apic_id
+.type ocore_smp_bsp_apic_id, @function
+ocore_smp_bsp_apic_id:
+  push rbx
+  mov eax, 1
+  cpuid
+  test edx, 1 << 9
+  jz .smp_bsp_id_failed
+  mov eax, ebx
+  shr eax, 24
+  pop rbx
+  ret
+.smp_bsp_id_failed:
+  mov rax, -1
+  pop rbx
+  ret
+.size ocore_smp_bsp_apic_id, .-ocore_smp_bsp_apic_id
+
+// One-shot PIT channel-2 interval.  Success requires the hardware OUT signal
+// to transition; a bounded poll fails closed if the device never advances.
+.type smp_pit_wait, @function
+smp_pit_wait:
+  test rdi, rdi
+  jz .smp_pit_failed
+  cmp rdi, 0xffff
+  ja .smp_pit_failed
+  mov r8d, edi
+  mov dx, 0x61
+  in al, dx
+  and al, 0xfc
+  out dx, al
+  mov dx, 0x43
+  mov al, 0xb0
+  out dx, al
+  mov dx, 0x42
+  mov eax, r8d
+  out dx, al
+  shr eax, 8
+  out dx, al
+  mov dx, 0x61
+  in al, dx
+  or al, 0x01
+  and al, 0xfd
+  out dx, al
+  mov ecx, 0x04000000
+.smp_pit_poll:
+  in al, dx
+  test al, 0x20
+  jnz .smp_pit_complete
+  pause
+  dec ecx
+  jne .smp_pit_poll
+.smp_pit_failed:
+  xor eax, eax
+  ret
+.smp_pit_complete:
+  mov eax, 1
+  ret
+.size smp_pit_wait, .-smp_pit_wait
+
+.globl ocore_smp_timer_wait
+.type ocore_smp_timer_wait, @function
+ocore_smp_timer_wait:
+  jmp smp_pit_wait
+.size ocore_smp_timer_wait, .-ocore_smp_timer_wait
+
+// Prepare an exact three-AP startup set.  The ACPI LAPIC base must agree with
+// IA32_APIC_BASE, CPUID must advertise APIC+x2APIC, and the low trampoline PTE
+// must remain supervisor RW/NX.  No AP has been signalled when this returns.
+.globl ocore_smp_prepare
+.type ocore_smp_prepare, @function
+ocore_smp_prepare:
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  mov r12, rdi
+  mov r13, rsi
+  mov r14, rdx
+  mov r15, rcx
+  cmp r12, 0x00100000
+  jb .smp_prepare_failed
+  mov eax, 0xfffff000
+  cmp r12, rax
+  ja .smp_prepare_failed
+  test r12, 0xfff
+  jne .smp_prepare_failed
+  cmp r13, 0xff
+  ja .smp_prepare_failed
+  cmp r14, 0xff
+  ja .smp_prepare_failed
+  cmp r15, 0xff
+  ja .smp_prepare_failed
+  cmp r13, r14
+  je .smp_prepare_failed
+  cmp r13, r15
+  je .smp_prepare_failed
+  cmp r14, r15
+  je .smp_prepare_failed
+
+  mov eax, 1
+  cpuid
+  test edx, 1 << 9
+  jz .smp_prepare_failed
+  test ecx, 1 << 21
+  jz .smp_prepare_failed
+  mov ecx, 0x1b
+  rdmsr
+  test eax, 1 << 11
+  jz .smp_prepare_failed
+  mov r10d, eax
+  mov r8, rdx
+  shl r8, 32
+  or r8, rax
+  mov r9, r8
+  mov eax, 0xfffff000
+  and r9, rax
+  cmp r9, r12
+  jne .smp_prepare_failed
+  mov eax, r10d
+  or eax, (1 << 10) | (1 << 11)
+  wrmsr
+  mov ecx, 0x802
+  rdmsr
+  mov r11d, eax
+  cmp r11, r13
+  je .smp_prepare_failed
+  cmp r11, r14
+  je .smp_prepare_failed
+  cmp r11, r15
+  je .smp_prepare_failed
+
+  // The admitted 0x8000 page is writable and non-executable after paging.
+  mov rax, qword ptr [rip + p1_kernel_table + 8 * 8]
+  mov rdx, rax
+  and edx, 0x03
+  cmp edx, 0x03
+  jne .smp_prepare_failed
+  bt rax, 63
+  jnc .smp_prepare_failed
+
+  lea rdi, [rip + smp_expected_ids]
+  xor eax, eax
+  mov ecx, offset SMP_CONTROL_QWORDS
+  rep stosq
+  mov qword ptr [rip + smp_expected_ids], r13
+  mov qword ptr [rip + smp_expected_ids + 8], r14
+  mov qword ptr [rip + smp_expected_ids + 16], r15
+  lea rax, [rip + smp_ap_stack1_top]
+  mov qword ptr [rip + smp_stack_tops], rax
+  lea rax, [rip + smp_ap_stack2_top]
+  mov qword ptr [rip + smp_stack_tops + 8], rax
+  lea rax, [rip + smp_ap_stack3_top]
+  mov qword ptr [rip + smp_stack_tops + 16], rax
+  mov qword ptr [rip + smp_observed_ids], r11
+  lea rax, [rip + stack_top]
+  and rax, -16
+  mov qword ptr [rip + smp_observed_stacks], rax
+  mov dword ptr [rip + smp_claimed], 1
+
+  // Clear the admitted page before copying the complete bounded template.
+  mov edi, 0x8000
+  xor eax, eax
+  mov ecx, 512
+  rep stosq
+  lea rsi, [rip + smp_trampoline_template_start]
+  mov edi, 0x8000
+  mov ecx, offset SMP_TRAMPOLINE_TEMPLATE_BYTES
+  cmp ecx, 4096
+  ja .smp_prepare_failed
+  rep movsb
+  mov rax, cr3
+  mov edi, 0x8000
+  mov dword ptr [rdi + SMP_TRAMPOLINE_CR3_OFFSET], eax
+  mfence
+  // Phase the page from RW/NX to R/X only after the complete copy is stable.
+  // No writable-and-executable trampoline mapping exists at any point.
+  mov eax, 0x00008001
+  mov qword ptr [rip + p1_kernel_table + 8 * 8], rax
+  mov rax, cr3
+  mov cr3, rax
+  mov eax, 1
+  jmp .smp_prepare_return
+.smp_prepare_failed:
+  xor eax, eax
+.smp_prepare_return:
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.size ocore_smp_prepare, .-ocore_smp_prepare
+
+.type smp_send_icr, @function
+smp_send_icr:
+  mov ecx, 0x830
+  mov eax, esi
+  mov edx, edi
+  wrmsr
+  ret
+.size smp_send_icr, .-smp_send_icr
+
+// Intel's universal startup sequence: one INIT, a measured 10 ms delay, one
+// SIPI, a measured 200 us delay, and a second SIPI for each admitted AP.
+.globl ocore_smp_launch
+.type ocore_smp_launch, @function
+ocore_smp_launch:
+  cmp dword ptr [rip + smp_claimed], 1
+  jne .smp_launch_failed
+  cmp dword ptr [rip + smp_failure], 0
+  jne .smp_launch_failed
+  mov esi, 0x0000c500
+  mov edi, dword ptr [rip + smp_expected_ids]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 8]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 16]
+  call smp_send_icr
+  mov edi, 11932
+  call smp_pit_wait
+  cmp eax, 1
+  jne .smp_launch_failed
+
+  mov esi, 0x00000608
+  mov edi, dword ptr [rip + smp_expected_ids]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 8]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 16]
+  call smp_send_icr
+  mov edi, 239
+  call smp_pit_wait
+  cmp eax, 1
+  jne .smp_launch_failed
+
+  mov esi, 0x00000608
+  mov edi, dword ptr [rip + smp_expected_ids]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 8]
+  call smp_send_icr
+  mov edi, dword ptr [rip + smp_expected_ids + 16]
+  call smp_send_icr
+
+  mov r10d, 100
+.smp_wait_arrival:
+  cmp dword ptr [rip + smp_failure], 0
+  jne .smp_launch_failed
+  cmp dword ptr [rip + smp_arrived], 3
+  je .smp_arrival_complete
+  mov edi, 1193
+  call smp_pit_wait
+  cmp eax, 1
+  jne .smp_launch_failed
+  dec r10d
+  jne .smp_wait_arrival
+  jmp .smp_launch_failed
+.smp_arrival_complete:
+  cmp dword ptr [rip + smp_claimed], 0x0f
+  jne .smp_launch_failed
+  // Every AP now executes from kernel RX text.  Restore RW/NX, erase the
+  // one-shot bytes, then make the low page non-present and flush again.
+  mov rax, 0x8000000000008003
+  mov qword ptr [rip + p1_kernel_table + 8 * 8], rax
+  mov rax, cr3
+  mov cr3, rax
+  mov edi, 0x8000
+  xor eax, eax
+  mov ecx, 512
+  rep stosq
+  mov qword ptr [rip + p1_kernel_table + 8 * 8], 0
+  mov rax, cr3
+  mov cr3, rax
+  mov eax, 1
+  ret
+.smp_launch_failed:
+  xor eax, eax
+  ret
+.size ocore_smp_launch, .-ocore_smp_launch
+
+.globl ocore_smp_release_barrier
+.type ocore_smp_release_barrier, @function
+ocore_smp_release_barrier:
+  cmp dword ptr [rip + smp_arrived], 3
+  jne .smp_release_failed
+  mov dword ptr [rip + smp_release], 1
+  mfence
+  mov r10d, 100
+.smp_wait_progress:
+  cmp dword ptr [rip + smp_failure], 0
+  jne .smp_release_failed
+  cmp dword ptr [rip + smp_progress], 3
+  je .smp_progress_complete
+  mov edi, 1193
+  call smp_pit_wait
+  cmp eax, 1
+  jne .smp_release_failed
+  dec r10d
+  jne .smp_wait_progress
+  jmp .smp_release_failed
+.smp_progress_complete:
+  mov rax, qword ptr [rip + smp_observed_ids + 8]
+  cmp rax, qword ptr [rip + smp_expected_ids]
+  jne .smp_release_failed
+  mov rax, qword ptr [rip + smp_observed_ids + 16]
+  cmp rax, qword ptr [rip + smp_expected_ids + 8]
+  jne .smp_release_failed
+  mov rax, qword ptr [rip + smp_observed_ids + 24]
+  cmp rax, qword ptr [rip + smp_expected_ids + 16]
+  jne .smp_release_failed
+  mov rax, qword ptr [rip + smp_observed_stacks + 8]
+  cmp rax, qword ptr [rip + smp_stack_tops]
+  jne .smp_release_failed
+  mov rax, qword ptr [rip + smp_observed_stacks + 16]
+  cmp rax, qword ptr [rip + smp_stack_tops + 8]
+  jne .smp_release_failed
+  mov rax, qword ptr [rip + smp_observed_stacks + 24]
+  cmp rax, qword ptr [rip + smp_stack_tops + 16]
+  jne .smp_release_failed
+  mov eax, 1
+  ret
+.smp_release_failed:
+  xor eax, eax
+  ret
+.size ocore_smp_release_barrier, .-ocore_smp_release_barrier
+
+.globl ocore_smp_cpu_apic_id
+.type ocore_smp_cpu_apic_id, @function
+ocore_smp_cpu_apic_id:
+  cmp rdi, 3
+  ja .smp_cpu_value_failed
+  lea rax, [rip + smp_observed_ids]
+  mov rax, qword ptr [rax + rdi * 8]
+  ret
+.size ocore_smp_cpu_apic_id, .-ocore_smp_cpu_apic_id
+
+.globl ocore_smp_cpu_stack
+.type ocore_smp_cpu_stack, @function
+ocore_smp_cpu_stack:
+  cmp rdi, 3
+  ja .smp_cpu_value_failed
+  lea rax, [rip + smp_observed_stacks]
+  mov rax, qword ptr [rax + rdi * 8]
+  ret
+.smp_cpu_value_failed:
+  mov rax, -1
+  ret
+.size ocore_smp_cpu_stack, .-ocore_smp_cpu_stack
+
+.globl ocore_smp_arrival_count
+.type ocore_smp_arrival_count, @function
+ocore_smp_arrival_count:
+  mov eax, dword ptr [rip + smp_arrived]
+  ret
+.size ocore_smp_arrival_count, .-ocore_smp_arrival_count
+
+.globl ocore_smp_progress_count
+.type ocore_smp_progress_count, @function
+ocore_smp_progress_count:
+  mov eax, dword ptr [rip + smp_progress]
+  ret
+.size ocore_smp_progress_count, .-ocore_smp_progress_count
+#endif
 
 // Return the trusted entry-stack top for the kernel-owned PCB metadata.
 .globl ocore_kernel_stack_top
@@ -1052,9 +1733,16 @@ ocore_boot_protection_check:
   and rdx, -97
   jne .protection_check_failed
 
-  // Bootstrap mappings stop at 20 MiB and no residual 1 GiB identity RWX map
-  // remains.
+  // Both temporary Multiboot2 windows have been removed: the physical identity
+  // tail and the complete 0..128 MiB inspection alias are absent. No residual
+  // 1 GiB identity RWX map remains.
   cmp qword ptr [rip + p2_table + 10 * 8], 0
+  jne .protection_check_failed
+  cmp qword ptr [rip + p2_table + 63 * 8], 0
+  jne .protection_check_failed
+  cmp qword ptr [rip + p2_table + 64 * 8], 0
+  jne .protection_check_failed
+  cmp qword ptr [rip + p2_table + 127 * 8], 0
   jne .protection_check_failed
   mov eax, 1
   ret

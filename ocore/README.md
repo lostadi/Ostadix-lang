@@ -69,14 +69,35 @@ o kernel gates        # every manifest-defined portable QEMU gate
 o kernel doctor-media # check optional GRUB/mtools/OVMF dependencies
 o kernel media        # deterministic x86_64 GPT/UEFI disk image
 o kernel smoke-media  # exact disk booted through OVMF/QEMU
+o kernel smoke-boot-info # bounded challenged BootInfo + mode-0 lifecycle
+o kernel smoke-smp    # bounded challenged four-vCPU INIT/SIPI + barrier
+o kernel prepare-write --image IMAGE --device DEVICE # plan, no mutation
+o kernel write-media --image IMAGE --device DEVICE --confirm TOKEN
+o kernel boot-challenge # caller-held random observation challenge
+o kernel prepare-physical --image IMAGE --media-write write.json \
+  --machine machine.json --profile mode0 --expected-cpus 1 --output intent.json
+o kernel record-physical --intent intent.json --transcript serial.log \
+  --assert-physical I-OBSERVED-OSTADIX-ON-PHYSICAL-X86_64 \
+  --output observation.json
 ```
 
 Both interactive commands exit with `Ctrl-A X`. `console` prints the exact
 content digest required by its `install` and `activate` commands before QEMU
 starts. It is a fixed-capacity native control plane, not a general shell or a
-claim of physical-machine, SMP, foreign-kernel, or device-isolation support.
+claim of physical-machine, general SMP, foreign-kernel, or device-isolation support.
 See [`docs/OSTADIX_BOOT.md`](../docs/OSTADIX_BOOT.md) for the physical-media
-write guard, serial procedure, and exact nonclaims.
+write guard, serial procedure, and exact nonclaims. Writer v2 binds one stable
+external-device identity and capacity to
+`ostadix.boot-media-target-plan/v2`, relocates the backup GPT for larger
+targets, and writes and reads back only the plan's exact extents through one
+held device descriptor. `target_plan_sha256` is the mutation authority;
+`target_image_sha256` is `null` for sparse targets, whose explicitly unwritten
+ranges remain unhashed, unverified, and potentially recoverable. Physical
+intent and observation JSON are unkeyed, authority-free operator records, not
+attestations, authenticators, replay protection, trusted-build proof, release
+admission, or independent physical-SMP evidence. The separate `smoke-smp`
+gate proves only an exact four-vCPU QEMU/TCG bring-up; APs park after one
+barrier and the rest of O-core is not thereby made SMP safe.
 
 The direct implementation scripts are:
 
@@ -84,6 +105,8 @@ The direct implementation scripts are:
 ./ocore/kernel/build.sh       # build target/ocore-kernel/kernel.elf
 ./ocore/kernel/run-qemu.sh    # interactive serial console
 ./ocore/kernel/smoke-qemu.sh  # four-second asserted smoke test
+./ocore/kernel/smoke-x86_64-boot-info-qemu.sh # challenged firmware handoff
+./ocore/kernel/smoke-x86_64-smp-qemu.sh # four-vCPU positive + one-vCPU negative
 ./ocore/kernel/smoke-faults-qemu.sh # fault and user-copy recovery matrix
 ./ocore/kernel/smoke-processes-qemu.sh # M1 isolation and teardown matrix
 ./ocore/kernel/smoke-scheduler-qemu.sh # M2 thread/scheduler lifecycle
@@ -169,8 +192,11 @@ rights values before invoking a session transport. Its public API is
 operation-specific, so callers cannot understate rights or choose a different
 syscall while asking the broker to authorize it.
 
-The physical allocator now tracks and reclaims the 3,072 frames in the fixed
-4..16 MiB supervisor-only QEMU bootstrap window. Frame and memory-object handles
+The physical allocator tracks and reclaims every frame in its admitted
+supervisor-only bootstrap window. Legacy direct/PVH gates retain the fixed
+4..16 MiB, 3,072-frame contract. A Multiboot2/UEFI boot instead selects one
+firmware-covered, page-aligned subwindow of at least 4 MiB within that same
+aperture after excluding the BootInfo source pages. Frame and memory-object handles
 have disjoint internal namespace tags and generations. Final release zeros a
 page, and executable, anonymous, shared, kernel, page-table, and rejected device
 kinds cannot be confused by integer coincidence. The default smoke test
@@ -401,15 +427,17 @@ a fabricated package. The RuntimeGraph is causally replayed, uses neutral
 `RouteSettlement`, and aggregates residual `HostWorld` over observed execution.
 Mode 32 does not execute that project in O-core or verify Ed25519 natively, and
 neither signature nor semantic equality grants authority or establishes
-Governor admission/current World state. The kernel remains
-single-CPU, fixed-window, static-ELF, and host-built: there is no firmware RAM
-discovery, demand paging, general user mapping, SMP locking, FPU/SIMD context,
-dynamic linker, writable general filesystem, general foreign ABI personality,
-foreign root filesystem, native compiler/self-hosting, general guest-agent
-transport, or live hosted-broker transport into QEMU. Modes 24 through 26 do
-not boot Linux or Plan 9. Mode 25 covers only its pinned four-call success path
-and fifth failure-only exit site; Mode 26 adds one exact native 9P2000 client
-and server corpus rather than a Plan 9 binary or general namespace.
+Governor admission/current World state. Outside the bounded Mode 34 AP-startup
+and barrier probe, the general scheduler, process, IPC, and syscall paths remain
+single-CPU, fixed-window, static-ELF, and host-built. Mode 34 does not establish
+SMP locking or subsystem-wide SMP safety. There is no firmware RAM discovery,
+demand paging, general user mapping, FPU/SIMD context, dynamic linker, writable
+general filesystem, general foreign ABI personality, foreign root filesystem,
+native compiler/self-hosting, general guest-agent transport, or live
+hosted-broker transport into QEMU. Modes 24 through 26 do not boot Linux or
+Plan 9. Mode 25 covers only its pinned four-call success path and fifth
+failure-only exit site; Mode 26 adds one exact native 9P2000 client and server
+corpus rather than a Plan 9 binary or general namespace.
 The early bootstrap/fault gates still use a linked `native[0]` payload; later
 claims have separate bounded gates.
 

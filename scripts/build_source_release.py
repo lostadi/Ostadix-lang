@@ -220,7 +220,11 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/build-x86_64-uefi-media.sh",
         "ocore/kernel/build.sh",
         "ocore/kernel/main.oc",
+        "ocore/kernel/smp_probe.oc",
+        "ocore/kernel/smp_probe_stub.oc",
         "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+        "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
+        "ocore/kernel/smoke-x86_64-smp-qemu.sh",
         "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
         "ocore/kernel/smoke-world-project-receipt-qemu.sh",
         "ocore/kernel/smoke-world-project-runtime-qemu.sh",
@@ -240,6 +244,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/kernel/world_receipt_semantics.oc",
         "ocore/kernel/world_receipt_semantics_stub.oc",
         "ocore/kernel/x86_64/grub.cfg",
+        "ocore/kernel/x86_64/boot_info.oc",
         "ocore/runtime/x86_64/trap.oc",
         "ocore/runtime/aarch64/g2_kernel.oc",
         "ocore/runtime/aarch64/g2_user_a.oc",
@@ -258,6 +263,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/o-kernel.sh",
         "scripts/ostadix_boot_media.py",
         "scripts/ostadix_media_writer.py",
+        "scripts/ostadix_physical_evidence.py",
         "scripts/smoke-project-hgraph-exec.sh",
         "scripts/smoke-project-hgraph.sh",
         "scripts/smoke-world-resource-keys.sh",
@@ -320,6 +326,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_release_evidence.py",
         "tests/test_ostadix_boot_media.py",
         "tests/test_ostadix_media_writer.py",
+        "tests/test_ostadix_physical_evidence.py",
         "tests/test_setup.py",
         "tests/test_world_alpha_evidence.py",
         "tests/project_hgraph.rs",
@@ -347,7 +354,7 @@ EXAMPLE_MODES = frozenset({"interpreter", "aot"})
 EVIDENCE_CLASSES = frozenset(
     {"portable_tcg", "qemu_tcg_aarch64", "hardware_kvm"}
 )
-EXPECTED_REQUIRED_EVIDENCE_GATES = 24
+EXPECTED_REQUIRED_EVIDENCE_GATES = 26
 EXPECTED_SUPPLEMENTAL_EVIDENCE_GATES = 1
 EVIDENCE_COMMON_REQUIRED_TOOLS = frozenset(
     {"bash", "cargo", "rustc", "clang", "lld", "python3"}
