@@ -173,8 +173,8 @@ Every authoritative Rust execution entry point follows this path:
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
-`olangc --target script`, `o-link --run`, compiled hosted binaries, and source
-fragments received through `O.eval`.
+`olangc --target script`, bare-directory `o-link`, explicit `o-link --run`,
+compiled hosted binaries, and source fragments received through `O.eval`.
 
 OIR instructions are `Text`, `Load`, `Store`, `Invoke`, and `Exec`. Each Exec
 owns a `BackendInterface` containing its canonical backend name, purity,
