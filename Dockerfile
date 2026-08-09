@@ -11,9 +11,10 @@
 # Run a .O program from the host:
 #   docker run --rm -v "$PWD:/work" o-lang my_program.O
 #
-# Link a codebase into one .O file, then run it:
+# Literal-link a bare directory and run it immediately:
 #   docker run --rm -v "$PWD:/work" --entrypoint o-link o-lang src/ -o app.O
-#   docker run --rm -v "$PWD:/work" o-lang app.O
+# Safe, nonexecuting project lift:
+#   docker run --rm -v "$PWD:/work" --entrypoint o-link o-lang --project src/ -o project.O
 #
 # Drop into an interactive REPL:
 #   docker run --rm -it o-lang --repl

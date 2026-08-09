@@ -1,4 +1,4 @@
-//! End-to-end tests for safe project-mode defaults and explicit literal mode.
+//! End-to-end tests for default literal execution and explicit safe projects.
 
 use std::fs;
 use std::path::Path;
@@ -48,6 +48,7 @@ fn olink_rejects_unknown_project_policy_before_execution() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/project_hgraph");
     let output = olink()
         .args([
+            "--project",
             "--run",
             "--route",
             "main",
@@ -85,13 +86,15 @@ fn olink_list_routes_for_directory() {
 }
 
 #[test]
-fn olink_directory_defaults_to_safe_project_document() {
-    let dir = python_project();
-    let out_file = dir.path().join("lifted.O");
+fn olink_bare_single_directory_defaults_to_literal_and_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    write(&source, "main.O", b"text^(BARE_DIRECTORY_EXECUTED)_text\n");
+
     let out = olink()
-        .arg(dir.path())
-        .arg("-o")
-        .arg(&out_file)
+        .current_dir(temp.path())
+        .arg(&source)
         .output()
         .unwrap();
     assert!(
@@ -101,27 +104,43 @@ fn olink_directory_defaults_to_safe_project_document() {
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("safe project mode"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("defaults to --literal --run"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("o-link scan:"), "stderr:\n{stderr}");
 
-    let lifted = fs::read_to_string(&out_file).unwrap();
-    assert!(lifted.contains("O-PROJECT-BUNDLE-V1"), "sentinel missing");
-    assert!(lifted.contains("No project route was executed"));
-    // Source files are data in one payload, never per-file executable blocks.
-    assert!(!lifted.contains("python[0]^("));
-    assert!(!lifted.contains("bash[0]^("));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BARE_DIRECTORY_EXECUTED"),
+        "stdout:\n{stdout}"
+    );
 
-    // Auto-detection also works when reading the lifted file back.
-    let listed = olink()
-        .arg("--list-routes")
-        .arg(&out_file)
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    assert!(String::from_utf8_lossy(&listed.stdout).contains("py-main"));
+    let combined = fs::read_to_string(temp.path().join("combined.O")).unwrap();
+    assert!(combined.starts_with("# Linked by o-link"));
+    assert!(combined.contains("text^(BARE_DIRECTORY_EXECUTED)_text"));
+    assert!(!combined.contains("O-PROJECT-BUNDLE-V1"));
 }
 
 #[test]
-fn direct_evaluation_of_directory_bundle_is_inert() {
+fn olink_bare_directory_rejects_stdout_mixed_with_implicit_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "main.O", b"text^(SHOULD_NOT_EXECUTE)_text\n");
+
+    let out = olink().arg(dir.path()).arg("--stdout").output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must not contain mixed source/output"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("runs by default"), "stderr:\n{stderr}");
+    assert!(stderr.contains("add --literal"), "stderr:\n{stderr}");
+    assert!(stderr.contains("--project"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn explicit_project_document_and_direct_evaluation_are_inert() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("DANGEROUS_SCRIPT_RAN");
     write(
@@ -139,6 +158,7 @@ fn direct_evaluation_of_directory_bundle_is_inert() {
     let lifted = dir.path().join("lifted.O");
 
     let linked = olink()
+        .arg("--project")
         .arg(dir.path())
         .arg("-o")
         .arg(&lifted)
@@ -148,6 +168,10 @@ fn direct_evaluation_of_directory_bundle_is_inert() {
         linked.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&linked.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "project linking unexpectedly ran a script"
     );
 
     let evaluated = o_interpreter().arg(&lifted).output().unwrap();
@@ -172,6 +196,7 @@ fn project_output_is_not_recaptured_on_rerun() {
 
     for _ in 0..2 {
         let out = olink()
+            .arg("--project")
             .arg(dir.path())
             .arg("-o")
             .arg(&lifted)
@@ -205,20 +230,34 @@ fn olink_explicit_project_flag_remains_compatible() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(fs::read_to_string(out_file)
+    assert!(fs::read_to_string(&out_file)
         .unwrap()
         .contains("O-PROJECT-BUNDLE-V1"));
+
+    // A lifted project document remains self-identifying on later commands.
+    let listed = olink()
+        .arg("--list-routes")
+        .arg(&out_file)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("py-main"));
 }
 
 #[test]
-fn olink_directory_run_uses_project_default_route() {
+fn olink_explicit_project_run_uses_default_route() {
     // Requires python3 on PATH; skip cleanly if unavailable.
     if which_python3().is_none() {
         eprintln!("skipping: python3 not available");
         return;
     }
     let dir = python_project();
-    let out = olink().arg(dir.path()).arg("--run").output().unwrap();
+    let out = olink()
+        .arg("--project")
+        .arg(dir.path())
+        .arg("--run")
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -395,7 +434,12 @@ fn olink_project_run_ambiguous_requires_selection() {
         "b.py",
         b"if __name__ == \"__main__\":\n    print('b')\n",
     );
-    let out = olink().arg(dir.path()).arg("--run").output().unwrap();
+    let out = olink()
+        .arg("--project")
+        .arg(dir.path())
+        .arg("--run")
+        .output()
+        .unwrap();
     // No default among multiple candidates -> non-zero exit and guidance.
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -409,6 +453,7 @@ fn olink_project_run_ambiguous_requires_selection() {
 fn olink_route_selection_requires_run() {
     let dir = python_project();
     let out = olink()
+        .arg("--project")
         .arg("--route")
         .arg("py-main")
         .arg(dir.path())
@@ -422,6 +467,7 @@ fn olink_route_selection_requires_run() {
 fn project_mode_rejects_literal_only_flags_instead_of_ignoring_them() {
     let dir = python_project();
     let out = olink()
+        .arg("--project")
         .arg(dir.path())
         .arg("--lang")
         .arg("txt=text")
@@ -436,10 +482,11 @@ fn project_mode_rejects_literal_only_flags_instead_of_ignoring_them() {
 #[test]
 fn olink_execute_all_alias_enters_explicit_legacy_mode() {
     let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("EXECUTED_DURING_LITERAL_LINK");
     write(
         dir.path(),
         "bootstrap.sh",
-        b"echo should-not-run-during-link\n",
+        format!("printf ran > '{}'\n", marker.display()).as_bytes(),
     );
     write(dir.path(), "app.py", b"print('also not run during link')\n");
     let output = dir.path().join("literal.O");
@@ -463,6 +510,10 @@ fn olink_execute_all_alias_enters_explicit_legacy_mode() {
     assert!(source.contains("bash[0]^("));
     assert!(source.contains("python[0]^("));
     assert!(!source.contains("O-PROJECT-BUNDLE-V1"));
+    assert!(
+        !marker.exists(),
+        "explicit --literal/--execute-all unexpectedly inferred --run"
+    );
 }
 
 #[test]
@@ -488,6 +539,7 @@ fn ounlink_restores_safe_lifted_project_including_binary_files() {
     write(&source, "assets/blob.bin", &[0, 1, 2, 3, 255]);
 
     let linked = olink()
+        .arg("--project")
         .arg(&source)
         .arg("-o")
         .arg(&lifted)
