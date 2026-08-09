@@ -484,6 +484,7 @@ class SourceReleaseTests(unittest.TestCase):
             ),
             "ocore/kernel/x86_64/grub.cfg": "multiboot2 /boot/okernel.elf\n",
             "ocore/kernel/x86_64/boot_info.oc": "module kernel::boot_info;\n",
+            "ocore/kernel/x86_64/boot_info_stub.oc": "module kernel::boot_info;\n",
             "ocore/runtime/x86_64/trap.oc": "module runtime::trap;\n",
             "ocore/runtime/aarch64/g2_kernel.oc": "module runtime::g2_kernel;\n",
             "ocore/runtime/aarch64/g2_user_a.oc": "module runtime::g2_user_a;\n",
@@ -798,6 +799,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/world_receipt_semantics_stub.oc",
                 "ocore/kernel/x86_64/grub.cfg",
                 "ocore/kernel/x86_64/boot_info.oc",
+                "ocore/kernel/x86_64/boot_info_stub.oc",
                 "ocore/runtime/x86_64/trap.oc",
                 "ocore/runtime/aarch64/g2_kernel.oc",
                 "ocore/runtime/aarch64/g2_user_a.oc",
@@ -957,6 +959,7 @@ class SourceReleaseTests(unittest.TestCase):
                 self.assertEqual(modes[executable_path], "100755")
             self.assertEqual(modes["ocore/kernel/x86_64/grub.cfg"], "100644")
             self.assertEqual(modes["ocore/kernel/x86_64/boot_info.oc"], "100644")
+            self.assertEqual(modes["ocore/kernel/x86_64/boot_info_stub.oc"], "100644")
             self.assertEqual(modes["src/ocore/boot_info.rs"], "100644")
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             self.assertEqual(
@@ -1304,6 +1307,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/smp_probe_stub.oc",
             "ocore/kernel/x86_64/grub.cfg",
             "ocore/kernel/x86_64/boot_info.oc",
+            "ocore/kernel/x86_64/boot_info_stub.oc",
             "scripts/ostadix_boot_media.py",
             "scripts/ostadix_media_writer.py",
             "scripts/ostadix_physical_evidence.py",
