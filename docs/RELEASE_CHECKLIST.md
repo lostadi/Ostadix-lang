@@ -204,7 +204,7 @@ their immutable source bytes from a later reachable commit, and shallow clones
 cannot establish that provenance.
 
 <!-- BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CHECKLIST -->
-The portable native release surface contains exactly **24** required
+The portable native release surface contains exactly **26** required
 QEMU gates. `evidence/gates.toml` is authoritative; the aggregate, CI, this
 checklist, and the README status table are validated projections. After each
 successful gate, the aggregate requires every manifest marker exactly once in
@@ -218,29 +218,31 @@ python3 scripts/release_evidence.py validate
 | Order | Gate | Milestone | Class | Script |
 |------:|------|-----------|-------|--------|
 | 1 | `ocore-bootstrap` | M0.1-M0.3 | `portable_tcg` | `ocore/kernel/smoke-qemu.sh` |
-| 2 | `world-g2-aarch64-native` | World G2 / AArch64 native compiler | `qemu_tcg_aarch64` | `ocore/kernel/smoke-aarch64-g2-qemu.sh` |
-| 3 | `world-identity-v1` | World identity PR2 / Mode 27 | `portable_tcg` | `ocore/kernel/smoke-world-identity-qemu.sh` |
-| 4 | `world-protocol-v1` | World protocol PR3 / Mode 28 | `portable_tcg` | `ocore/kernel/smoke-world-protocol-qemu.sh` |
-| 5 | `world-value-v1` | World OValue PR4 / Mode 29 | `portable_tcg` | `ocore/kernel/smoke-world-value-qemu.sh` |
-| 6 | `world-receipt-v1` | World receipt PR5 / Mode 30 | `portable_tcg` | `ocore/kernel/smoke-world-receipt-qemu.sh` |
-| 7 | `world-project-runtime-mode32` | World project runtime / Mode 32 | `portable_tcg` | `ocore/kernel/smoke-world-project-runtime-qemu.sh` |
-| 8 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
-| 9 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
-| 10 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
-| 11 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
-| 12 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
-| 13 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
-| 14 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
-| 15 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
-| 16 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
-| 17 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
-| 18 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
-| 19 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
-| 20 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
-| 21 | `m7b-logical-read-fallback-live` | M7B-1 native LogicalRead Mode 31 | `portable_tcg` | `ocore/kernel/smoke-m7b-logical-read-qemu.sh` |
-| 22 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
-| 23 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
-| 24 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
+| 2 | `ostadix-x86_64-boot-info` | OSTADIX Alpha x86_64 BootInfo / Mode 33 | `portable_tcg` | `ocore/kernel/smoke-x86_64-boot-info-qemu.sh` |
+| 3 | `ostadix-x86_64-smp4` | OSTADIX Alpha x86_64 bounded SMP / Mode 34 | `portable_tcg` | `ocore/kernel/smoke-x86_64-smp-qemu.sh` |
+| 4 | `world-g2-aarch64-native` | World G2 / AArch64 native compiler | `qemu_tcg_aarch64` | `ocore/kernel/smoke-aarch64-g2-qemu.sh` |
+| 5 | `world-identity-v1` | World identity PR2 / Mode 27 | `portable_tcg` | `ocore/kernel/smoke-world-identity-qemu.sh` |
+| 6 | `world-protocol-v1` | World protocol PR3 / Mode 28 | `portable_tcg` | `ocore/kernel/smoke-world-protocol-qemu.sh` |
+| 7 | `world-value-v1` | World OValue PR4 / Mode 29 | `portable_tcg` | `ocore/kernel/smoke-world-value-qemu.sh` |
+| 8 | `world-receipt-v1` | World receipt PR5 / Mode 30 | `portable_tcg` | `ocore/kernel/smoke-world-receipt-qemu.sh` |
+| 9 | `world-project-runtime-mode32` | World project runtime / Mode 32 | `portable_tcg` | `ocore/kernel/smoke-world-project-runtime-qemu.sh` |
+| 10 | `m02-fault-recovery` | M0.2 | `portable_tcg` | `ocore/kernel/smoke-faults-qemu.sh` |
+| 11 | `m1-process-isolation` | M1 | `portable_tcg` | `ocore/kernel/smoke-processes-qemu.sh` |
+| 12 | `m2-scheduler` | M2 | `portable_tcg` | `ocore/kernel/smoke-scheduler-qemu.sh` |
+| 13 | `m3-ipc-foundation` | M3 foundation | `portable_tcg` | `ocore/kernel/smoke-ipc-foundation-qemu.sh` |
+| 14 | `m3-public-ipc` | M3 | `portable_tcg` | `ocore/kernel/smoke-ipc-qemu.sh` |
+| 15 | `m4-native-loader` | M4 | `portable_tcg` | `ocore/kernel/smoke-loader-qemu.sh` |
+| 16 | `m5-native-live` | M5 | `portable_tcg` | `ocore/kernel/smoke-live-qemu.sh` |
+| 17 | `m5-supervisor-semantics` | M5 semantics | `portable_tcg` | `ocore/kernel/smoke-live-semantics-qemu.sh` |
+| 18 | `m6a-scalar-personality` | M6A | `portable_tcg` | `ocore/kernel/smoke-personality-qemu.sh` |
+| 19 | `m6b-bounded-copy` | M6B mechanism | `portable_tcg` | `ocore/kernel/smoke-m6b-qemu.sh` |
+| 20 | `m6b-live-bounded-personality` | M6B Mode 24 live | `portable_tcg` | `ocore/kernel/smoke-live-bounded-personality-qemu.sh` |
+| 21 | `m6-linux-minimal-live` | M6 Linux Mode 25 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-personality-qemu.sh` |
+| 22 | `m7-linux-plan9-9p2000-live` | M7 Linux/Plan 9 Mode 26 live | `portable_tcg` | `ocore/kernel/smoke-live-linux-plan9-qemu.sh` |
+| 23 | `m7b-logical-read-fallback-live` | M7B-1 native LogicalRead Mode 31 | `portable_tcg` | `ocore/kernel/smoke-m7b-logical-read-qemu.sh` |
+| 24 | `kernel-world-mode20-objects` | KernelWorld Mode 20 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-qemu.sh` |
+| 25 | `kernel-world-mode22-live` | KernelWorld Mode 22 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-live-qemu.sh` |
+| 26 | `kernel-world-mode23-execution-device` | KernelWorld Mode 23 | `portable_tcg` | `ocore/kernel/smoke-kernel-world-execution-device-qemu.sh` |
 
 Supplemental hardware evidence is validated by the same manifest but is not
 executed by the portable aggregate:

@@ -6,9 +6,9 @@ KERNEL_DIR="$ROOT/ocore/kernel"
 BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
 PROBE_MODE="${OCORE_PROBE_MODE:-0}"
 case "$PROBE_MODE" in
-  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32) ;;
+  0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34) ;;
   *)
-    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 32" >&2
+    echo "error: OCORE_PROBE_MODE must be an integer from 0 through 34" >&2
     exit 2
     ;;
 esac
@@ -37,6 +37,11 @@ if (( PROBE_MODE == 15 )); then
     exit 1
   fi
   M4_IMAGE_DEFINE="-DOCORE_M4_IMAGE_PATH=\"$M4_IMAGE_PATH\""
+fi
+
+SMP_PROBE_SOURCE="$KERNEL_DIR/smp_probe_stub.oc"
+if (( PROBE_MODE == 34 )); then
+  SMP_PROBE_SOURCE="$KERNEL_DIR/smp_probe.oc"
 fi
 
 if (( PROBE_MODE == 16 )); then
@@ -324,6 +329,7 @@ fi
   ${WORLD_VALUE_SOURCES[@]+"${WORLD_VALUE_SOURCES[@]}"} \
   ${WORLD_RECEIPT_SOURCES[@]+"${WORLD_RECEIPT_SOURCES[@]}"} \
   "$ROOT/ocore/runtime/x86_64/serial.oc" \
+  "$KERNEL_DIR/x86_64/boot_info.oc" \
   "$ROOT/ocore/runtime/x86_64/pages.oc" \
   "$ROOT/ocore/runtime/x86_64/user_memory.oc" \
   "$ROOT/ocore/runtime/x86_64/domain_namespace.oc" \
@@ -383,6 +389,7 @@ fi
   "$WORLD_VALUE_SEMANTICS_SOURCE" \
   "$WORLD_RECEIPT_SEMANTICS_SOURCE" \
   "$WORLD_PROJECT_RECEIPT_SEMANTICS_SOURCE" \
+  "$SMP_PROBE_SOURCE" \
   "$KERNEL_DIR/scheduler_bridge.oc" \
   "$KERNEL_DIR/main.oc" \
   --target x86_64-unknown-none \

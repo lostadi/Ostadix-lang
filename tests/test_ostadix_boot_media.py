@@ -1,8 +1,12 @@
 import importlib.util
+import io
 import os
 from pathlib import Path
+import stat
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +14,7 @@ MODULE_PATH = ROOT / "scripts" / "ostadix_boot_media.py"
 SPEC = importlib.util.spec_from_file_location("ostadix_boot_media", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MEDIA = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MEDIA
 SPEC.loader.exec_module(MEDIA)
 
 
@@ -22,12 +27,140 @@ class OstadixBootMediaTests(unittest.TestCase):
         esp[510:512] = b"\x55\xaa"
         return bytes(esp)
 
+    @staticmethod
+    def _materialize_plan(
+        source: bytes, plan: object, *, unwritten_byte: int = 0
+    ) -> bytes:
+        target = bytearray([unwritten_byte]) * plan.target_bytes
+        for extent in plan.extents:
+            if extent.source_offset is not None:
+                content = source[
+                    extent.source_offset : extent.source_offset + extent.bytes
+                ]
+            else:
+                content = extent.data
+            assert content is not None
+            assert len(content) == extent.bytes
+            target[
+                extent.target_offset : extent.target_offset + extent.bytes
+            ] = content
+        return bytes(target)
+
     def test_pack_is_reproducible_and_round_trips(self) -> None:
         first, first_meta = MEDIA.build_image(self._esp())
         second, second_meta = MEDIA.build_image(self._esp())
         self.assertEqual(first, second)
         self.assertEqual(first_meta, second_meta)
         self.assertEqual(MEDIA.inspect_image(first), first_meta)
+
+    def test_exact_capacity_plan_reconstructs_canonical_image(self) -> None:
+        image, metadata = MEDIA.build_image(self._esp())
+        first = MEDIA.plan_target_image(image, len(image))
+        second = MEDIA.plan_target_image(image, len(image))
+        self.assertEqual(first, second)
+        self.assertEqual(first.source_sha256, metadata["sha256"])
+        self.assertEqual(first.target_bytes, len(image))
+        self.assertEqual(first.unwritten_ranges, ())
+        self.assertEqual(first.target_image_sha256, first.source_sha256)
+        self.assertEqual(self._materialize_plan(image, first, unwritten_byte=0xA5), image)
+        self.assertEqual(first.public()["target_plan_sha256"], first.target_plan_sha256)
+
+    def test_larger_capacity_plans_relocate_mirrored_gpt_and_keep_esp(self) -> None:
+        image, metadata = MEDIA.build_image(self._esp())
+        esp_start = int(metadata["esp_first_lba"]) * MEDIA.SECTOR_SIZE
+        esp_end = (int(metadata["esp_last_lba"]) + 1) * MEDIA.SECTOR_SIZE
+        digests: set[str] = set()
+        for extra_sectors in (1, 17, 33, 4096):
+            with self.subTest(extra_sectors=extra_sectors):
+                target_bytes = len(image) + extra_sectors * MEDIA.SECTOR_SIZE
+                plan = MEDIA.plan_target_image(image, target_bytes)
+                materialized = self._materialize_plan(
+                    image, plan, unwritten_byte=0xA5
+                )
+                sectors = target_bytes // MEDIA.SECTOR_SIZE
+                primary = MEDIA._validated_header(materialized, 1)
+                backup = MEDIA._validated_header(materialized, sectors - 1)
+                self.assertEqual(primary["backup"], sectors - 1)
+                self.assertEqual(backup["backup"], 1)
+                self.assertEqual(primary["entries"], backup["entries"])
+                self.assertEqual(primary["last_usable"], sectors - 34)
+                self.assertEqual(backup["last_usable"], sectors - 34)
+                self.assertEqual(materialized[esp_start:esp_end], image[esp_start:esp_end])
+                if not plan.unwritten_ranges:
+                    self.assertEqual(
+                        plan.target_image_sha256,
+                        MEDIA.hashlib.sha256(materialized).hexdigest(),
+                    )
+                else:
+                    self.assertIsNone(plan.target_image_sha256)
+                self.assertEqual(
+                    materialized[510:512], b"\x55\xaa"
+                )
+                _, _, _, _, _, mbr_sectors = MEDIA.struct.unpack_from(
+                    "<B3sB3sII", materialized, 446
+                )
+                self.assertEqual(mbr_sectors, min(sectors - 1, 0xFFFF_FFFF))
+                digests.add(plan.target_plan_sha256)
+        self.assertEqual(len(digests), 4)
+
+    def test_one_sector_larger_retires_only_nonoverlapping_old_backup_prefix(self) -> None:
+        image, _ = MEDIA.build_image(self._esp())
+        plan = MEDIA.plan_target_image(image, len(image) + MEDIA.SECTOR_SIZE)
+        retired = [
+            extent
+            for extent in plan.extents
+            if extent.kind == "retired-source-backup-gpt"
+        ]
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].bytes, MEDIA.SECTOR_SIZE)
+        self.assertEqual(retired[0].data, bytes(MEDIA.SECTOR_SIZE))
+        for left, right in zip(plan.extents, plan.extents[1:]):
+            self.assertLessEqual(
+                left.target_offset + left.bytes, right.target_offset
+            )
+
+    def test_large_capacity_plan_is_constant_space_and_bounded(self) -> None:
+        image, _ = MEDIA.build_image(self._esp())
+        plan = MEDIA.plan_target_image(image, MEDIA.MAX_TARGET_BYTES)
+        self.assertEqual(plan.target_bytes, MEDIA.MAX_TARGET_BYTES)
+        self.assertEqual(
+            plan.target_backup_header_lba,
+            MEDIA.MAX_TARGET_BYTES // MEDIA.SECTOR_SIZE - 1,
+        )
+        self.assertGreater(sum(size for _, size in plan.unwritten_ranges), 0)
+        self.assertLess(
+            sum(extent.bytes for extent in plan.extents),
+            len(image) + 2 * (MEDIA.PARTITION_TABLE_BYTES + MEDIA.SECTOR_SIZE),
+        )
+        with self.assertRaisesRegex(MEDIA.MediaError, "bounded.*maximum"):
+            MEDIA.plan_target_image(
+                image, MEDIA.MAX_TARGET_BYTES + MEDIA.SECTOR_SIZE
+            )
+
+    def test_target_capacity_rejects_smaller_and_unaligned_values(self) -> None:
+        image, _ = MEDIA.build_image(self._esp())
+        for target_bytes, message in (
+            (len(image) - MEDIA.SECTOR_SIZE, "smaller"),
+            (len(image) + 1, "multiple of 512"),
+        ):
+            with self.subTest(target_bytes=target_bytes):
+                with self.assertRaisesRegex(MEDIA.MediaError, message):
+                    MEDIA.plan_target_image(image, target_bytes)
+
+    def test_target_plan_still_requires_canonical_source_tail(self) -> None:
+        image, _ = MEDIA.build_image(self._esp())
+        noncanonical = image + bytes(MEDIA.SECTOR_SIZE)
+        with self.assertRaises(MEDIA.MediaError):
+            MEDIA.plan_target_image(noncanonical, len(noncanonical))
+
+    def test_materialized_target_crc_tamper_is_detected(self) -> None:
+        image, _ = MEDIA.build_image(self._esp())
+        plan = MEDIA.plan_target_image(image, len(image) + 64 * MEDIA.SECTOR_SIZE)
+        materialized = bytearray(self._materialize_plan(image, plan))
+        backup_offset = plan.target_backup_header_lba * MEDIA.SECTOR_SIZE
+        materialized[backup_offset + 24] ^= 1
+        with self.assertRaisesRegex(MEDIA.MediaError, "header CRC"):
+            MEDIA._validated_header(bytes(materialized), plan.target_backup_header_lba)
 
     def test_esp_must_be_nonempty_bounded_and_sector_aligned(self) -> None:
         for value in (b"", b"x", b"x" * 513):
@@ -172,6 +305,72 @@ class OstadixBootMediaTests(unittest.TestCase):
             with self.assertRaisesRegex(MEDIA.MediaError, "not a regular file"):
                 MEDIA._write_atomic(output, b"replacement")
             self.assertTrue(output.is_dir())
+
+    def test_bounded_input_rejects_symlink_without_reading_target(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            target = directory / "target.img"
+            target.write_bytes(b"secret")
+            source = directory / "source.img"
+            source.symlink_to(target)
+            with self.assertRaisesRegex(MEDIA.MediaError, "without following links"):
+                MEDIA._read_bounded(source, 1024)
+
+    @staticmethod
+    def _fake_stat(*, size: int, inode: int = 10, modified_ns: int = 20) -> object:
+        return mock.Mock(
+            st_mode=stat.S_IFREG | 0o600,
+            st_dev=1,
+            st_ino=inode,
+            st_size=size,
+            st_mtime_ns=modified_ns,
+            st_ctime_ns=modified_ns,
+        )
+
+    def test_bounded_input_rejects_growth_after_admitted_size(self) -> None:
+        class FakeFile(io.BytesIO):
+            def fileno(self) -> int:
+                return 42
+
+        before = self._fake_stat(size=4)
+        with (
+            mock.patch.object(MEDIA.os, "open", return_value=42),
+            mock.patch.object(MEDIA.os, "fdopen", return_value=FakeFile(b"datax")),
+            mock.patch.object(MEDIA.os, "fstat", return_value=before),
+        ):
+            with self.assertRaisesRegex(MEDIA.MediaError, "grew beyond"):
+                MEDIA._read_bounded(Path("/fixture/source.img"), 1024)
+
+    def test_bounded_input_rejects_metadata_change_during_read(self) -> None:
+        class FakeFile(io.BytesIO):
+            def fileno(self) -> int:
+                return 42
+
+        before = self._fake_stat(size=4, modified_ns=20)
+        after = self._fake_stat(size=4, modified_ns=21)
+        with (
+            mock.patch.object(MEDIA.os, "open", return_value=42),
+            mock.patch.object(MEDIA.os, "fdopen", return_value=FakeFile(b"data")),
+            mock.patch.object(MEDIA.os, "fstat", side_effect=[before, after]),
+        ):
+            with self.assertRaisesRegex(MEDIA.MediaError, "changed while"):
+                MEDIA._read_bounded(Path("/fixture/source.img"), 1024)
+
+    def test_bounded_input_rejects_path_replacement_after_read(self) -> None:
+        class FakeFile(io.BytesIO):
+            def fileno(self) -> int:
+                return 42
+
+        before = self._fake_stat(size=4, inode=10)
+        replacement = self._fake_stat(size=4, inode=11)
+        with (
+            mock.patch.object(MEDIA.os, "open", return_value=42),
+            mock.patch.object(MEDIA.os, "fdopen", return_value=FakeFile(b"data")),
+            mock.patch.object(MEDIA.os, "fstat", side_effect=[before, before]),
+            mock.patch.object(MEDIA.os, "stat", return_value=replacement),
+        ):
+            with self.assertRaisesRegex(MEDIA.MediaError, "replaced"):
+                MEDIA._read_bounded(Path("/fixture/source.img"), 1024)
 
 
 if __name__ == "__main__":

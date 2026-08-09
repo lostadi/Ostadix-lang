@@ -1,0 +1,559 @@
+module kernel::smp_probe;
+
+use runtime::serial::write;
+
+const PHYSICAL_LIMIT: usize = 0x0800_0000;
+const MAX_TABLE_BYTES: usize = 0x0010_0000;
+const TRAMPOLINE_START: usize = 0x0000_8000;
+const TRAMPOLINE_END: usize = 0x0000_9000;
+
+const MB2_TAG_END: u64 = 0;
+const MB2_TAG_MODULE: u64 = 3;
+const MB2_TAG_MMAP: u64 = 6;
+const MB2_TAG_ACPI_OLD: u64 = 14;
+const MB2_TAG_ACPI_NEW: u64 = 15;
+
+const ACPI_RSDT: u64 = 0x5444_5352;
+const ACPI_XSDT: u64 = 0x5444_5358;
+const ACPI_MADT: u64 = 0x4349_5041;
+
+static MB2_MESSAGE: [u8; 43] =
+    b"SMP firmware Multiboot2/ACPI handoff: PASS\n";
+static MEMORY_MESSAGE: [u8; 42] =
+    b"SMP low-memory trampoline admission: PASS\n";
+static MADT_MESSAGE: [u8; 39] =
+    b"SMP firmware MADT 4-CPU topology: PASS\n";
+static TYPE0_MESSAGE: [u8; 40] =
+    b"SMP MADT enabled type-9 rejection: PASS\n";
+static TIMER_MESSAGE: [u8; 33] =
+    b"SMP timing source PIT: validated\n";
+static IDENTITIES_MESSAGE: [u8; 40] =
+    b"SMP AP hardware identities unique: PASS\n";
+static STACKS_MESSAGE: [u8; 29] =
+    b"SMP AP stacks isolated: PASS\n";
+static BARRIER_MESSAGE: [u8; 32] =
+    b"SMP BSP/AP barrier: 4 CPUs PASS\n";
+static POST_TIMER_MESSAGE: [u8; 31] =
+    b"SMP post-barrier timer: online\n";
+static HEARTBEAT_MESSAGE: [u8; 35] =
+    b"SMP post-barrier heartbeat: online\n";
+static WINDOW_MESSAGE: [u8; 40] =
+    b"SMP boot inspection window closed: PASS\n";
+static PROTECTION_MESSAGE: [u8; 33] =
+    b"SMP page protections: W^X online\n";
+static STARTUP_MESSAGE: [u8; 27] =
+    b"SMP x2APIC INIT/SIPI: PASS\n";
+static PREPARED_MESSAGE: [u8; 29] =
+    b"SMP x2APIC preparation: PASS\n";
+static CPU_PREFIX: [u8; 24] = b"OSTADIX SMP CPU logical=";
+static APIC_PREFIX: [u8; 6] = b" apic=";
+static STACK_PREFIX: [u8; 9] = b" stack=0x";
+static ONLINE_SUFFIX: [u8; 8] = b" online\n";
+static REJECT_MESSAGE: [u8; 18] = b"SMP probe: REJECT\n";
+static HEX_DIGITS: [u8; 16] = b"0123456789abcdef";
+static RSDP_SIGNATURE: [u8; 8] = b"RSD PTR ";
+static mut DECIMAL_BUFFER: [u8; 20] = [0; 20];
+static mut HEX_BUFFER: [u8; 16] = [0; 16];
+
+static mut CPU_IDS: [u64; 4] = [0; 4];
+static mut CPU_COUNT: usize = 0;
+static mut LAPIC_BASE: u64 = 0;
+
+extern "sysv64" fn ocore_smp_map_firmware_window() -> u64;
+extern "sysv64" fn ocore_boot_info_close_window() -> void;
+extern "sysv64" fn ocore_boot_protection_check() -> u64;
+extern "sysv64" fn ocore_smp_bsp_apic_id() -> u64;
+extern "sysv64" fn ocore_smp_timer_wait(count: u64) -> u64;
+extern "sysv64" fn ocore_smp_prepare(
+    lapic_base: u64,
+    apic_id_0: u64,
+    apic_id_1: u64,
+    apic_id_2: u64
+) -> u64;
+extern "sysv64" fn ocore_smp_launch() -> u64;
+extern "sysv64" fn ocore_smp_release_barrier() -> u64;
+extern "sysv64" fn ocore_smp_cpu_apic_id(logical: u64) -> u64;
+extern "sysv64" fn ocore_smp_cpu_stack(logical: u64) -> u64;
+extern "sysv64" fn ocore_smp_arrival_count() -> u64;
+extern "sysv64" fn ocore_smp_progress_count() -> u64;
+
+unsafe fn fail_closed() -> never {
+    disable_interrupts();
+    loop { halt(); }
+}
+
+unsafe fn reject() -> never {
+    write((&REJECT_MESSAGE[0]), 18);
+    fail_closed();
+}
+
+unsafe fn emit_decimal(value: u64) -> void {
+    let mut remaining: u64 = value;
+    let mut cursor: usize = 20;
+    if remaining == 0 {
+        cursor = 19;
+        DECIMAL_BUFFER[cursor] = b'0';
+    }
+    while remaining != 0 {
+        cursor -= 1;
+        DECIMAL_BUFFER[cursor] = (b'0' as u64 + remaining % 10) as u8;
+        remaining = remaining / 10;
+    }
+    write((&DECIMAL_BUFFER[cursor]), 20 - cursor);
+}
+
+unsafe fn emit_hex(value: u64) -> void {
+    let mut remaining: u64 = value;
+    let mut cursor: usize = 16;
+    while cursor != 0 {
+        cursor -= 1;
+        HEX_BUFFER[cursor] = HEX_DIGITS[(remaining & 15) as usize];
+        remaining = remaining >> 4;
+    }
+    write((&HEX_BUFFER[0]), 16);
+}
+
+unsafe fn emit_cpu(logical: u64) -> bool {
+    let apic: u64 = ocore_smp_cpu_apic_id(logical);
+    let stack: u64 = ocore_smp_cpu_stack(logical);
+    if apic > 0xff || stack == 0 || (stack & 15) != 0 {
+        return false;
+    }
+    write((&CPU_PREFIX[0]), 24);
+    emit_decimal(logical);
+    write((&APIC_PREFIX[0]), 6);
+    emit_decimal(apic);
+    write((&STACK_PREFIX[0]), 9);
+    emit_hex(stack);
+    write((&ONLINE_SUFFIX[0]), 8);
+    return true;
+}
+
+unsafe fn emit_cpu_set() -> bool {
+    let mut logical: u64 = 0;
+    while logical < 4 {
+        if !emit_cpu(logical) {
+            return false;
+        }
+        logical += 1;
+    }
+    return true;
+}
+
+fn range_valid(address: usize, length: usize, limit: usize) -> bool {
+    if length == 0 || address >= limit || length > limit - address {
+        return false;
+    }
+    return true;
+}
+
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize
+) -> bool {
+    return left_start < right_end && right_start < left_end;
+}
+
+unsafe fn read_u8(address: usize) -> u64 {
+    return volatile_load(address as *const u8) as u64;
+}
+
+unsafe fn read_u16(address: usize) -> u64 {
+    return read_u8(address) | (read_u8(address + 1) << 8);
+}
+
+unsafe fn read_u32(address: usize) -> u64 {
+    return read_u16(address) | (read_u16(address + 2) << 16);
+}
+
+unsafe fn read_u64(address: usize) -> u64 {
+    return read_u32(address) | (read_u32(address + 4) << 32);
+}
+
+unsafe fn bytes_equal(address: usize, expected: *const u8, length: usize) -> bool {
+    let mut index: usize = 0;
+    while index < length {
+        if read_u8(address + index) != volatile_load(expected + index) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+unsafe fn checksum_zero(address: usize, length: usize) -> bool {
+    if !range_valid(address, length, PHYSICAL_LIMIT) {
+        return false;
+    }
+    let mut sum: u64 = 0;
+    let mut index: usize = 0;
+    while index < length {
+        sum = (sum + read_u8(address + index)) & 0xff;
+        index += 1;
+    }
+    return sum == 0;
+}
+
+unsafe fn add_cpu(apic_id: u64) -> bool {
+    if apic_id > 0xff || CPU_COUNT >= 4 {
+        return false;
+    }
+    let mut prior: usize = 0;
+    while prior < CPU_COUNT {
+        if CPU_IDS[prior] == apic_id {
+            return false;
+        }
+        prior += 1;
+    }
+    CPU_IDS[CPU_COUNT] = apic_id;
+    CPU_COUNT += 1;
+    return true;
+}
+
+fn enabled_processor_type_admitted(kind: u64) -> bool {
+    // Mode 34 deliberately binds the startup identity to the bounded, 8-bit
+    // Local APIC record used by its CPUID and trampoline path.  An enabled
+    // x2APIC record must not silently enter that narrower contract.
+    return kind == 0;
+}
+
+unsafe fn add_enabled_processor(kind: u64, apic_id: u64) -> bool {
+    return enabled_processor_type_admitted(kind) && add_cpu(apic_id);
+}
+
+fn enabled_processor_type_self_test() -> bool {
+    return enabled_processor_type_admitted(0)
+        && !enabled_processor_type_admitted(9);
+}
+
+unsafe fn validate_low_memory_mmap(tag: usize, size: usize) -> bool {
+    if size < 40 {
+        return false;
+    }
+    let entry_size: usize = read_u32(tag + 8) as usize;
+    if entry_size < 24 || (size - 16) % entry_size != 0 {
+        return false;
+    }
+    let mut cursor: usize = tag + 16;
+    let end: usize = tag + size;
+    while cursor < end {
+        let base: u64 = read_u64(cursor);
+        let length: u64 = read_u64(cursor + 8);
+        let kind: u64 = read_u32(cursor + 16);
+        if kind == 1
+            && base <= TRAMPOLINE_START as u64
+            && length >= (TRAMPOLINE_END as u64) - base {
+            return true;
+        }
+        cursor += entry_size;
+    }
+    return false;
+}
+
+unsafe fn validate_rsdp(address: usize, available: usize, revision_two: bool) -> u64 {
+    if available < 20 || !bytes_equal(address, (&RSDP_SIGNATURE[0]), 8)
+        || !checksum_zero(address, 20) {
+        return 0;
+    }
+    if revision_two {
+        if available < 36 || read_u8(address + 15) < 2 {
+            return 0;
+        }
+        let length: usize = read_u32(address + 20) as usize;
+        if length < 36 || length > available || !checksum_zero(address, length) {
+            return 0;
+        }
+        let xsdt: u64 = read_u64(address + 24);
+        if xsdt != 0 {
+            return xsdt;
+        }
+    }
+    return read_u32(address + 16);
+}
+
+unsafe fn parse_madt(address: usize) -> bool {
+    if !range_valid(address, 44, PHYSICAL_LIMIT)
+        || read_u32(address) != ACPI_MADT {
+        return false;
+    }
+    let length: usize = read_u32(address + 4) as usize;
+    if length < 44 || length > MAX_TABLE_BYTES
+        || !range_valid(address, length, PHYSICAL_LIMIT)
+        || !checksum_zero(address, length) {
+        return false;
+    }
+
+    CPU_COUNT = 0;
+    LAPIC_BASE = read_u32(address + 36);
+    let mut override_seen: bool = false;
+    let mut cursor: usize = address + 44;
+    let end: usize = address + length;
+    while cursor < end {
+        if end - cursor < 2 {
+            return false;
+        }
+        let kind: u64 = read_u8(cursor);
+        let record_length: usize = read_u8(cursor + 1) as usize;
+        if record_length < 2 || record_length > end - cursor {
+            return false;
+        }
+        if kind == 0 {
+            if record_length != 8 {
+                return false;
+            }
+            let flags: u64 = read_u32(cursor + 4);
+            if (flags & 1) != 0
+                && !add_enabled_processor(kind, read_u8(cursor + 3)) {
+                return false;
+            }
+        }
+        if kind == 5 {
+            if record_length != 12 || override_seen {
+                return false;
+            }
+            LAPIC_BASE = read_u64(cursor + 4);
+            override_seen = true;
+        }
+        if kind == 9 {
+            if record_length != 16 {
+                return false;
+            }
+            let flags: u64 = read_u32(cursor + 8);
+            if (flags & 1) != 0
+                && !add_enabled_processor(kind, read_u32(cursor + 4)) {
+                return false;
+            }
+        }
+        cursor += record_length;
+    }
+    return cursor == end
+        && CPU_COUNT == 4
+        && LAPIC_BASE >= 0x0010_0000
+        && LAPIC_BASE <= 0xffff_f000
+        && (LAPIC_BASE & 0xfff) == 0;
+}
+
+unsafe fn parse_acpi_root(address: usize) -> bool {
+    let root: usize = address;
+    if !range_valid(root, 36, PHYSICAL_LIMIT) {
+        return false;
+    }
+    let signature: u64 = read_u32(root);
+    let mut entry_size: usize = 4;
+    if signature == ACPI_XSDT {
+        entry_size = 8;
+    }
+    if signature != ACPI_XSDT && signature != ACPI_RSDT {
+        return false;
+    }
+    let length: usize = read_u32(root + 4) as usize;
+    if length < 36 || length > MAX_TABLE_BYTES
+        || !range_valid(root, length, PHYSICAL_LIMIT)
+        || (length - 36) % entry_size != 0
+        || !checksum_zero(root, length) {
+        return false;
+    }
+
+    let mut cursor: usize = root + 36;
+    let end: usize = root + length;
+    let mut madt: usize = 0;
+    while cursor < end {
+        let mut table: u64 = read_u32(cursor);
+        if entry_size == 8 {
+            table = read_u64(cursor);
+        }
+        if table > 0 && table < PHYSICAL_LIMIT as u64 {
+            let table_address: usize = table as usize;
+            if range_valid(table_address, 4, PHYSICAL_LIMIT)
+                && read_u32(table_address) == ACPI_MADT {
+                if madt != 0 {
+                    return false;
+                }
+                madt = table_address;
+            }
+        }
+        cursor += entry_size;
+    }
+    return madt != 0 && parse_madt(madt);
+}
+
+unsafe fn parse_multiboot(multiboot_info: usize) -> bool {
+    if (multiboot_info & 7) != 0
+        || !range_valid(multiboot_info, 16, PHYSICAL_LIMIT) {
+        return false;
+    }
+    let total: usize = read_u32(multiboot_info) as usize;
+    if total < 16 || total > MAX_TABLE_BYTES || (total & 7) != 0
+        || !range_valid(multiboot_info, total, PHYSICAL_LIMIT)
+        || read_u32(multiboot_info + 4) != 0
+        || ranges_overlap(multiboot_info, multiboot_info + total,
+            TRAMPOLINE_START, TRAMPOLINE_END) {
+        return false;
+    }
+
+    let mut cursor: usize = multiboot_info + 8;
+    let end: usize = multiboot_info + total;
+    let mut mmap_seen: bool = false;
+    let mut acpi_old: usize = 0;
+    let mut acpi_old_size: usize = 0;
+    let mut acpi_new: usize = 0;
+    let mut acpi_new_size: usize = 0;
+    let mut end_seen: bool = false;
+    while cursor < end {
+        if end - cursor < 8 {
+            return false;
+        }
+        let kind: u64 = read_u32(cursor);
+        let size: usize = read_u32(cursor + 4) as usize;
+        if size < 8 || size > end - cursor {
+            return false;
+        }
+        let aligned: usize = (size + 7) & 0xffff_fff8;
+        if aligned < size || aligned > end - cursor {
+            return false;
+        }
+        if kind == MB2_TAG_END {
+            if size != 8 || cursor + aligned != end {
+                return false;
+            }
+            end_seen = true;
+        }
+        if kind == MB2_TAG_MODULE {
+            if size < 16 {
+                return false;
+            }
+            let module_start: usize = read_u32(cursor + 8) as usize;
+            let module_end: usize = read_u32(cursor + 12) as usize;
+            if module_start >= module_end
+                || ranges_overlap(module_start, module_end,
+                    TRAMPOLINE_START, TRAMPOLINE_END) {
+                return false;
+            }
+        }
+        if kind == MB2_TAG_MMAP {
+            if mmap_seen || !validate_low_memory_mmap(cursor, size) {
+                return false;
+            }
+            mmap_seen = true;
+        }
+        if kind == MB2_TAG_ACPI_OLD {
+            if acpi_old != 0 || size < 28 {
+                return false;
+            }
+            acpi_old = cursor + 8;
+            acpi_old_size = size - 8;
+        }
+        if kind == MB2_TAG_ACPI_NEW {
+            if acpi_new != 0 || size < 44 {
+                return false;
+            }
+            acpi_new = cursor + 8;
+            acpi_new_size = size - 8;
+        }
+        cursor += aligned;
+    }
+    if cursor != end || !end_seen || !mmap_seen {
+        return false;
+    }
+
+    let mut root: u64 = 0;
+    if acpi_new != 0 {
+        root = validate_rsdp(acpi_new, acpi_new_size, true);
+    }
+    if root == 0 && acpi_old != 0 {
+        root = validate_rsdp(acpi_old, acpi_old_size, false);
+    }
+    return root != 0 && root < PHYSICAL_LIMIT as u64
+        && parse_acpi_root(root as usize);
+}
+
+unsafe fn select_application_processors(bsp_id: u64) -> bool {
+    let mut found_bsp: bool = false;
+    let mut selected: [u64; 3] = [0; 3];
+    let mut selected_count: usize = 0;
+    let mut index: usize = 0;
+    while index < 4 {
+        let current: u64 = CPU_IDS[index];
+        if current == bsp_id {
+            if found_bsp {
+                return false;
+            }
+            found_bsp = true;
+        } else {
+            if selected_count >= 3 {
+                return false;
+            }
+            selected[selected_count] = current;
+            selected_count += 1;
+        }
+        index += 1;
+    }
+    if !found_bsp || selected_count != 3 {
+        return false;
+    }
+    CPU_IDS[0] = bsp_id;
+    CPU_IDS[1] = selected[0];
+    CPU_IDS[2] = selected[1];
+    CPU_IDS[3] = selected[2];
+    return true;
+}
+
+pub unsafe fn start(multiboot_info: usize) -> never {
+    let processor_type_contract: bool = enabled_processor_type_self_test();
+    let mapped: bool = ocore_smp_map_firmware_window() == 1;
+    let parsed: bool = processor_type_contract
+        && mapped
+        && parse_multiboot(multiboot_info);
+    ocore_boot_info_close_window();
+    if !parsed || ocore_boot_protection_check() != 1 {
+        reject();
+    }
+    write((&WINDOW_MESSAGE[0]), 40);
+    write((&PROTECTION_MESSAGE[0]), 33);
+    write((&MB2_MESSAGE[0]), 43);
+    write((&TYPE0_MESSAGE[0]), 40);
+    write((&MEMORY_MESSAGE[0]), 42);
+
+    let bsp_id: u64 = ocore_smp_bsp_apic_id();
+    if !select_application_processors(bsp_id) {
+        reject();
+    }
+    write((&MADT_MESSAGE[0]), 39);
+
+    // This validated PIT transition precedes every INIT/SIPI write.  The same
+    // bounded device primitive supplies the architectural startup delays.
+    if ocore_smp_timer_wait(11932) != 1 {
+        reject();
+    }
+    write((&TIMER_MESSAGE[0]), 33);
+
+    if ocore_smp_prepare(LAPIC_BASE, CPU_IDS[1], CPU_IDS[2], CPU_IDS[3]) != 1 {
+        reject();
+    }
+    write((&PREPARED_MESSAGE[0]), 29);
+    if ocore_smp_launch() != 1 {
+        reject();
+    }
+    if ocore_smp_arrival_count() != 3 {
+        reject();
+    }
+    write((&STARTUP_MESSAGE[0]), 27);
+    write((&IDENTITIES_MESSAGE[0]), 40);
+    write((&STACKS_MESSAGE[0]), 29);
+
+    if ocore_smp_release_barrier() != 1
+        || ocore_smp_progress_count() != 3
+        || !emit_cpu_set() {
+        reject();
+    }
+    write((&BARRIER_MESSAGE[0]), 32);
+
+    if ocore_smp_timer_wait(11932) != 1 {
+        reject();
+    }
+    write((&POST_TIMER_MESSAGE[0]), 31);
+    write((&HEARTBEAT_MESSAGE[0]), 35);
+    fail_closed();
+}

@@ -14,8 +14,11 @@ GATES_SCRIPT=${O_KERNEL_GATES_SCRIPT:-"$ROOT/boot-and-test.sh"}
 MEDIA_BUILD_SCRIPT=${O_KERNEL_MEDIA_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-uefi-media.sh"}
 MEDIA_BOOT_SCRIPT=${O_KERNEL_MEDIA_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-uefi-media-qemu.sh"}
 MEDIA_SMOKE_SCRIPT=${O_KERNEL_MEDIA_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-uefi-media-qemu.sh"}
+BOOT_INFO_SMOKE_SCRIPT=${O_KERNEL_BOOT_INFO_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-boot-info-qemu.sh"}
+SMP_SMOKE_SCRIPT=${O_KERNEL_SMP_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-smp-qemu.sh"}
 MEDIA_INSPECT_SCRIPT=${O_KERNEL_MEDIA_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_media.py"}
 MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
+PHYSICAL_EVIDENCE_SCRIPT=${O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT:-"$ROOT/scripts/ostadix_physical_evidence.py"}
 
 usage() {
     cat <<'USAGE'
@@ -32,11 +35,16 @@ Commands:
   inspect-media  Strictly inspect a generated OSTADIX disk image
   prepare-write  Inspect external media and derive a bound confirmation token
   write-media   Write and verify external media using that exact token
+  boot-challenge  Generate a fresh challenge for one physical boot attempt
+  prepare-physical  Bind challenged media to one declared machine profile
+  record-physical   Validate and record one authority-free serial observation
   boot         Boot the baseline kernel with an interactive serial terminal
   boot-media   Boot the generated disk through edk2/OVMF (no QEMU -kernel)
   console      Boot the bounded native M5 `o> ` control console
   smoke        Run the bounded baseline boot assertion
   smoke-media  Prove deterministic media rebuild and UEFI disk boot
+  smoke-boot-info  Prove bounded firmware handoff and challenged mode-0 lifecycle
+  smoke-smp    Prove bounded challenged four-vCPU INIT/SIPI and barrier progress
   smoke-live   Drive and verify the native M5 console lifecycle
   gates        Run every manifest-defined portable O-core QEMU evidence gate
   help         Show this help
@@ -44,8 +52,9 @@ Commands:
 Interactive QEMU escape: Ctrl-A X
 
 The media path builds a physical-writeable GPT image but validates it under
-QEMU/TCG. It is not yet physical-machine, SMP, Linux/Plan 9, or device-isolation
-evidence.
+QEMU/TCG. Mode 34 proves only bounded four-vCPU startup and one barrier; neither
+the media path nor that probe is general or physical SMP, Linux/Plan 9, or
+device-isolation evidence.
 USAGE
 }
 
@@ -154,6 +163,19 @@ case "$command_name" in
         require_executable "$MEDIA_WRITER_SCRIPT"
         exec "$MEDIA_WRITER_SCRIPT" write "$@"
         ;;
+    boot-challenge)
+        require_no_args "$@"
+        require_executable "$PHYSICAL_EVIDENCE_SCRIPT"
+        exec "$PHYSICAL_EVIDENCE_SCRIPT" challenge --raw
+        ;;
+    prepare-physical)
+        require_executable "$PHYSICAL_EVIDENCE_SCRIPT"
+        exec "$PHYSICAL_EVIDENCE_SCRIPT" prepare "$@"
+        ;;
+    record-physical)
+        require_executable "$PHYSICAL_EVIDENCE_SCRIPT"
+        exec "$PHYSICAL_EVIDENCE_SCRIPT" verify "$@"
+        ;;
     boot)
         require_no_args "$@"
         require_executable "$BOOT_SCRIPT"
@@ -184,6 +206,16 @@ case "$command_name" in
         require_no_args "$@"
         require_executable "$MEDIA_SMOKE_SCRIPT"
         exec "$MEDIA_SMOKE_SCRIPT"
+        ;;
+    smoke-boot-info)
+        require_no_args "$@"
+        require_executable "$BOOT_INFO_SMOKE_SCRIPT"
+        exec "$BOOT_INFO_SMOKE_SCRIPT"
+        ;;
+    smoke-smp)
+        require_no_args "$@"
+        require_executable "$SMP_SMOKE_SCRIPT"
+        exec "$SMP_SMOKE_SCRIPT"
         ;;
     smoke-live)
         require_no_args "$@"
