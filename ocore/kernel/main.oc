@@ -1,5 +1,23 @@
 module kernel::main;
 
+use kernel::boot_info::acpi_status as boot_acpi_status;
+use kernel::boot_info::allocator_end as boot_allocator_end;
+use kernel::boot_info::allocator_start as boot_allocator_start;
+use kernel::boot_info::allocator_window_covered;
+use kernel::boot_info::challenge_present as boot_challenge_present;
+use kernel::boot_info::efi64_exited_boot_services;
+use kernel::boot_info::emit_allocator_admission;
+use kernel::boot_info::emit_challenge;
+use kernel::boot_info::emit_handoff_pass;
+use kernel::boot_info::emit_normalized_summary;
+use kernel::boot_info::emit_rejection as emit_boot_info_rejection;
+use kernel::boot_info::emit_self_test_pass as emit_boot_info_self_test_pass;
+use kernel::boot_info::is_valid as boot_info_valid;
+use kernel::boot_info::normalize as normalize_boot_info;
+use kernel::boot_info::rejection_self_test as boot_info_rejection_self_test;
+use kernel::boot_info::source_commit_present as boot_source_commit_present;
+use kernel::boot_info::MULTIBOOT2_MAGIC;
+use kernel::smp_probe::start as start_smp_probe;
 use kernel::m1::start as start_m1;
 use kernel::m2::start as start_m2;
 use kernel::m3::start as start_m3;
@@ -68,6 +86,7 @@ extern "sysv64" fn ocore_syscall_init() -> void;
 extern "sysv64" fn ocore_kernel_stack_top() -> usize;
 extern "sysv64" fn ocore_current_cr3() -> usize;
 extern "sysv64" fn ocore_boot_protection_check() -> u64;
+extern "sysv64" fn ocore_boot_info_close_window() -> void;
 extern "sysv64" fn ocore_boot_probe_mode() -> u64;
 extern "sysv64" fn ocore_copy_from_user(
     destination: *mut u8,
@@ -93,6 +112,7 @@ static COPY_MESSAGE: [u8; 28] = b"user copy faults: recovered\n";
 static ENTRY_MESSAGE: [u8; 30] = b"entry state: CPU-local online\n";
 static PROBE_MESSAGE: [u8; 22] = b"M02 probe: armed CPL3\n";
 static PROTECTION_MESSAGE: [u8; 29] = b"page protections: W^X online\n";
+static BOOT_INFO_REJECTED_MESSAGE: [u8; 21] = b"BootInfoV1: rejected\n";
 static FRAME_RECLAIM_MESSAGE: [u8; 25] = b"M03 frames: reclaim PASS\n";
 static FRAME_ZERO_MESSAGE: [u8; 28] = b"M03 frames: zero-reuse PASS\n";
 static FRAME_STALE_MESSAGE: [u8; 37] = b"M03 frames: stale-double-free denied\n";
@@ -160,24 +180,99 @@ unsafe fn start_portable_world_probe(probe_mode: u64) -> void {
 @export
 @no_mangle
 @link_section(".text.kernel")
-pub unsafe fn kernel_main(multiboot_info: usize) -> never {
+pub unsafe fn kernel_main(boot_magic: u32, multiboot_info: usize) -> never {
     serial_init();
     write((&START_MESSAGE[0]), 29);
+    let probe_mode: u64 = ocore_boot_probe_mode();
+    let mut multiboot_admitted: bool = false;
+    if boot_magic == MULTIBOOT2_MAGIC {
+        if boot_info_rejection_self_test() == 0
+            || normalize_boot_info(
+                boot_magic,
+                multiboot_info,
+                probe_mode == 33 || probe_mode == 34
+            ) == 0
+            || !boot_info_valid() {
+            ocore_boot_info_close_window();
+            emit_boot_info_rejection();
+            write((&BOOT_INFO_REJECTED_MESSAGE[0]), 21);
+            fail_closed();
+        }
+        multiboot_admitted = true;
+        emit_boot_info_self_test_pass();
+    }
+
+    // Mode 34 is the only path that retains the raw firmware handoff after
+    // normalization. The dedicated probe revalidates the bounded ACPI/MADT
+    // topology, then closes the inspection mapping before INIT/SIPI.
+    if probe_mode == 34 {
+        if !multiboot_admitted
+            || !allocator_window_covered()
+            || boot_acpi_status() == 0
+            || !efi64_exited_boot_services()
+            || !boot_challenge_present()
+            || !boot_source_commit_present() {
+            ocore_boot_info_close_window();
+            write((&BOOT_INFO_REJECTED_MESSAGE[0]), 21);
+            fail_closed();
+        }
+        emit_normalized_summary();
+        emit_allocator_admission();
+        emit_challenge();
+        start_smp_probe(multiboot_info);
+    }
+
+    // No bootloader-owned byte remains live beyond this point. Direct-QEMU
+    // Xen/PVH historical probes retain their bounded fixed-window contract;
+    // every true Multiboot2 path must pass the stricter firmware admission.
+    ocore_boot_info_close_window();
+    if multiboot_admitted {
+        emit_normalized_summary();
+    }
+    if (probe_mode == 33 && !multiboot_admitted)
+        || (multiboot_admitted && !allocator_window_covered()) {
+        write((&BOOT_INFO_REJECTED_MESSAGE[0]), 21);
+        fail_closed();
+    }
     if ocore_boot_protection_check() != 1 {
         fail_closed();
     }
     write((&PROTECTION_MESSAGE[0]), 29);
-    let probe_mode: u64 = ocore_boot_probe_mode();
+    if probe_mode == 33 && (
+        boot_acpi_status() == 0
+        || !efi64_exited_boot_services()
+        || !boot_challenge_present()
+        || !boot_source_commit_present()
+    ) {
+        write((&BOOT_INFO_REJECTED_MESSAGE[0]), 21);
+        fail_closed();
+    }
 
-    // This fixed QEMU bootstrap window is mapped supervisor RW/NX and excludes
-    // both the kernel image and linked user regions. General firmware memory
-    // discovery and arbitrary reservation remain outside this bounded slice.
-    if pages_init(0x00400000, 0x01000000) == 0
-        || pages_init(0x00400000, 0x01000000) != 0
+    // Legacy PVH probes retain the historical fixed range. A Multiboot2 boot
+    // instead consumes the normalized, page-aligned contiguous subwindow that
+    // firmware evidence admitted inside the same 4--16 MiB mapping aperture.
+    let mut allocator_start: usize = 0x00400000;
+    let mut allocator_end: usize = 0x01000000;
+    if multiboot_admitted {
+        allocator_start = boot_allocator_start();
+        allocator_end = boot_allocator_end();
+    }
+    if pages_init(allocator_start, allocator_end) == 0
+        || pages_init(allocator_start, allocator_end) != 0
         || !page_invariants_hold() {
         fail_closed();
     }
     write((&PAGE_MESSAGE[0]), 23);
+    if multiboot_admitted {
+        emit_allocator_admission();
+    }
+    if multiboot_admitted && boot_challenge_present() {
+        emit_challenge();
+    }
+    if probe_mode == 33 {
+        emit_handoff_pass();
+        fail_closed();
+    }
     if probe_mode == 0 {
         if test_exhaustion_and_reclaim() == 0 {
             fail_closed();

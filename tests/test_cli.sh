@@ -593,7 +593,10 @@ setup_kernel_media_cli_fixture() {
     KERNEL_MEDIA_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/media-inspect"
     KERNEL_MEDIA_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/media-boot"
     KERNEL_MEDIA_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/media-smoke"
+    KERNEL_BOOT_INFO_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/boot-info-smoke"
+    KERNEL_SMP_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/smp-smoke"
     KERNEL_MEDIA_WRITER_STUB="$KERNEL_MEDIA_STUB_DIR/media-writer"
+    KERNEL_PHYSICAL_EVIDENCE_STUB="$KERNEL_MEDIA_STUB_DIR/physical-evidence"
 
     mkdir -p "$KERNEL_MEDIA_STUB_DIR"
     cat >"$KERNEL_MEDIA_BUILD_STUB" <<'EOF'
@@ -612,14 +615,20 @@ EOF
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SETUP_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_BOOT_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_BOOT_INFO_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_SMP_SMOKE_STUB"
     cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_WRITER_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_PHYSICAL_EVIDENCE_STUB"
     chmod +x \
         "$KERNEL_MEDIA_BUILD_STUB" \
         "$KERNEL_MEDIA_SETUP_STUB" \
         "$KERNEL_MEDIA_INSPECT_STUB" \
         "$KERNEL_MEDIA_BOOT_STUB" \
         "$KERNEL_MEDIA_SMOKE_STUB" \
-        "$KERNEL_MEDIA_WRITER_STUB"
+        "$KERNEL_BOOT_INFO_SMOKE_STUB" \
+        "$KERNEL_SMP_SMOKE_STUB" \
+        "$KERNEL_MEDIA_WRITER_STUB" \
+        "$KERNEL_PHYSICAL_EVIDENCE_STUB"
 }
 
 run_kernel_media_cli() {
@@ -631,7 +640,10 @@ run_kernel_media_cli() {
         O_KERNEL_MEDIA_INSPECT_SCRIPT="$KERNEL_MEDIA_INSPECT_STUB" \
         O_KERNEL_MEDIA_BOOT_SCRIPT="$KERNEL_MEDIA_BOOT_STUB" \
         O_KERNEL_MEDIA_SMOKE_SCRIPT="$KERNEL_MEDIA_SMOKE_STUB" \
+        O_KERNEL_BOOT_INFO_SMOKE_SCRIPT="$KERNEL_BOOT_INFO_SMOKE_STUB" \
+        O_KERNEL_SMP_SMOKE_SCRIPT="$KERNEL_SMP_SMOKE_STUB" \
         O_KERNEL_MEDIA_WRITER_SCRIPT="$KERNEL_MEDIA_WRITER_STUB" \
+        O_KERNEL_PHYSICAL_EVIDENCE_SCRIPT="$KERNEL_PHYSICAL_EVIDENCE_STUB" \
         "$O_KERNEL_CLI" "$@"
 }
 
@@ -798,6 +810,18 @@ check_kernel_media_dispatch "kernel smoke-media dispatches its exact smoke scrip
 check_kernel_media_rejection "kernel smoke-media rejects arguments" \
     'command does not accept arguments' \
     smoke-media unexpected
+check_kernel_media_dispatch "kernel smoke-boot-info dispatches its exact smoke script" \
+    $'script=boot-info-smoke\nargc=0' \
+    smoke-boot-info
+check_kernel_media_rejection "kernel smoke-boot-info rejects arguments" \
+    'command does not accept arguments' \
+    smoke-boot-info unexpected
+check_kernel_media_dispatch "kernel smoke-smp dispatches its exact smoke script" \
+    $'script=smp-smoke\nargc=0' \
+    smoke-smp
+check_kernel_media_rejection "kernel smoke-smp rejects arguments" \
+    'command does not accept arguments' \
+    smoke-smp unexpected
 check_kernel_media_dispatch "kernel prepare-write forwards exact writer arguments" \
     $'script=media-writer\nargc=4\narg=prepare\narg=--device\narg=/dev/disk9\narg=--json' \
     prepare-write --device /dev/disk9 --json
@@ -805,6 +829,20 @@ check_kernel_media_dispatch "kernel write-media forwards exact writer arguments"
     "$(printf 'script=media-writer\nargc=7\narg=write\narg=--device\narg=/dev/disk9\narg=--image\narg=%s\narg=--confirm\narg=bound-token' "$KERNEL_MEDIA_OUTPUT")" \
     write-media --device /dev/disk9 --image "$KERNEL_MEDIA_OUTPUT" \
     --confirm bound-token
+check_kernel_media_dispatch "kernel boot-challenge requests one raw challenge" \
+    $'script=physical-evidence\nargc=2\narg=challenge\narg=--raw' \
+    boot-challenge
+check_kernel_media_rejection "kernel boot-challenge rejects arguments" \
+    'command does not accept arguments' \
+    boot-challenge unexpected
+check_kernel_media_dispatch "kernel prepare-physical forwards the exact intent arguments" \
+    "$(printf 'script=physical-evidence\nargc=11\narg=prepare\narg=--image\narg=%s\narg=--media-write\narg=write.json\narg=--machine\narg=machine.json\narg=--profile\narg=smp4\narg=--expected-cpus\narg=4' "$KERNEL_MEDIA_OUTPUT")" \
+    prepare-physical --image "$KERNEL_MEDIA_OUTPUT" --media-write write.json \
+    --machine machine.json --profile smp4 --expected-cpus 4
+check_kernel_media_dispatch "kernel record-physical forwards the exact observation arguments" \
+    $'script=physical-evidence\nargc=7\narg=verify\narg=--intent\narg=intent.json\narg=--transcript\narg=serial.log\narg=--assert-physical\narg=literal' \
+    record-physical --intent intent.json --transcript serial.log \
+    --assert-physical literal
 check_kernel_qemu_mode_and_build_dir_propagation
 check_kernel_qemu_runner_rejects_direct_args
 check_kernel_qemu_runner_preflights_before_build

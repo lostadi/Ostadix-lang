@@ -1,5 +1,5 @@
 schema_version = 2
-required_gate_count = 24
+required_gate_count = 26
 supplemental_gate_count = 1
 portable_command = "./boot-and-test.sh smoke"
 
@@ -24,6 +24,56 @@ expected_markers = [
   "timer CPL3 return: online",
   "CPL3 heartbeat: online",
   "QEMU smoke: PASS",
+]
+
+[[gate]]
+id = "ostadix-x86_64-boot-info"
+required = true
+milestone = "OSTADIX Alpha x86_64 BootInfo / Mode 33"
+script = "ocore/kernel/smoke-x86_64-boot-info-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "cmp", "git", "python3", "qemu-system-x86_64", "shasum", "tar"]
+positive_claims = [
+  "A challenged x86_64 UEFI/Multiboot2 handoff is strictly normalized into bounded kernel-owned BootInfo facts and causally selects one page-aligned allocator subwindow from the firmware memory map",
+  "The temporary firmware inspection aperture is closed before the W^X check, and the same challenged mode-0 image reaches CPL3 entry, timer return, and a later heartbeat",
+  "The transcript grammar accepts the exact challenge and source commit in causal order and rejects a wrong challenge",
+]
+nonclaims = [
+  "This QEMU TCG and OVMF gate is not physical-machine, KVM, Secure Boot, measured-boot, or hardware-trust evidence",
+  "The bounded Multiboot2 parser and ACPI status validation are not a general ACPI consumer, initrd loader, firmware service, or general physical-memory allocator",
+  "It provides no SMP, PCI/device assignment, DMA isolation, IOMMU isolation, interrupt remapping, or hardware-reset evidence",
+]
+expected_markers = [
+  "OSTADIX bounded freestanding BootInfo: PASS",
+  "OSTADIX challenged mode-0 CPL3 lifecycle: PASS",
+  "OSTADIX challenged transcript grammar: PASS",
+]
+
+[[gate]]
+id = "ostadix-x86_64-smp4"
+required = true
+milestone = "OSTADIX Alpha x86_64 bounded SMP / Mode 34"
+script = "ocore/kernel/smoke-x86_64-smp-qemu.sh"
+evidence_class = "portable_tcg"
+required_tools = ["bash", "cargo", "rustc", "clang", "lld", "git", "python3", "qemu-system-x86_64", "tar"]
+positive_claims = [
+  "One challenged QEMU q35/TCG and OVMF boot admits an exact four-CPU ACPI/MADT topology, validates PIT progress before x2APIC INIT/SIPI, and brings three APs into kernel RX text on distinct stacks",
+  "The low trampoline follows an RW/NX copy, R/X execution, erased-and-unmapped retirement sequence without a writable-and-executable mapping",
+  "Four unique APIC identities cross one atomic BSP/AP release-and-progress barrier and reach a later PIT transition and heartbeat; the same image under one vCPU rejects before startup success markers",
+]
+nonclaims = [
+  "This is exactly a four-vCPU QEMU TCG and OVMF proof using bounded type-0 8-bit APIC identities; it is not physical-machine, KVM, or arbitrary-topology evidence",
+  "APs park after one barrier; this is not a general SMP scheduler, IPI service, interrupt balancer, per-CPU allocator, concurrent syscall path, or SMP-safe version of every existing O-core subsystem",
+  "It provides no Secure Boot, measured boot, PCI/device assignment, DMA isolation, IOMMU isolation, interrupt remapping, or hardware-reset evidence",
+]
+expected_markers = [
+  "SMP x2APIC INIT/SIPI: PASS",
+  "SMP BSP/AP barrier: 4 CPUs PASS",
+  "SMP post-barrier timer: online",
+  "SMP post-barrier heartbeat: online",
+  "OSTADIX x86_64 UEFI SMP positive control: PASS",
+  "OSTADIX x86_64 UEFI SMP one-CPU negative control: PASS",
+  "OSTADIX SMP transcript grammar: PASS",
 ]
 
 [[gate]]

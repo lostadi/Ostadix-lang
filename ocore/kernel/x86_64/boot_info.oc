@@ -1,0 +1,708 @@
+module kernel::boot_info;
+
+use runtime::serial::write;
+
+// This is a deliberately bounded freestanding projection of Multiboot2. It
+// selects one fully covered subwindow inside the existing bootstrap aperture;
+// it is not a general firmware allocator. The source record is read only
+// through a temporary virtual alias and that alias cursor is erased before the
+// normalized record becomes valid.
+pub const MULTIBOOT2_MAGIC: u32 = 0x36d7_6289;
+pub const INSPECTION_WINDOW_END: usize = 0x0800_0000;
+pub const INSPECTION_APERTURE_BASE: usize = 0x0800_0000;
+pub const ALLOCATOR_SEARCH_START: u64 = 0x0040_0000;
+pub const ALLOCATOR_SEARCH_END: u64 = 0x0100_0000;
+
+const MAX_INFORMATION_BYTES: usize = 65536;
+const MAX_TAGS: usize = 64;
+const MAX_MEMORY_ENTRIES: usize = 128;
+const MAX_COMMAND_LINE_BYTES: usize = 1024;
+const MIN_ALLOCATOR_BYTES: u64 = 0x0040_0000;
+const PAGE_SIZE: u64 = 4096;
+
+const TAG_END: u64 = 0;
+const TAG_COMMAND_LINE: u64 = 1;
+const TAG_MODULE: u64 = 3;
+const TAG_MEMORY_MAP: u64 = 6;
+const TAG_EFI32_SYSTEM_TABLE: u64 = 11;
+const TAG_EFI64_SYSTEM_TABLE: u64 = 12;
+const TAG_ACPI_OLD: u64 = 14;
+const TAG_ACPI_NEW: u64 = 15;
+const TAG_EFI_MEMORY_MAP: u64 = 17;
+const TAG_EFI_BOOT_SERVICES: u64 = 18;
+
+static CHALLENGE_NAME: [u8; 17] = b"ostadix.challenge";
+static SOURCE_COMMIT_NAME: [u8; 21] = b"ostadix.source_commit";
+static RSDP_SIGNATURE: [u8; 8] = b"RSD PTR ";
+static NORMALIZED_MESSAGE: [u8; 34] = b"BootInfoV1: Multiboot2 normalized\n";
+static USABLE_REGIONS_PREFIX: [u8; 27] = b"BootInfoV1 usable regions: ";
+static USABLE_BYTES_PREFIX: [u8; 25] = b"BootInfoV1 usable bytes: ";
+static ALLOCATOR_START_PREFIX: [u8; 28] = b"BootInfoV1 allocator start: ";
+static ALLOCATOR_END_PREFIX: [u8; 26] = b"BootInfoV1 allocator end: ";
+static ACPI_MESSAGE: [u8; 30] = b"BootInfoV1: ACPI status valid\n";
+static EFI_MESSAGE: [u8; 39] = b"BootInfoV1: EFI64 boot services exited\n";
+static ALLOCATOR_MESSAGE: [u8; 47] =
+    b"BootInfoV1: firmware allocator window admitted\n";
+static CHALLENGE_PREFIX: [u8; 24] = b"OSTADIX boot challenge: ";
+static SOURCE_COMMIT_PREFIX: [u8; 23] = b"OSTADIX source commit: ";
+static PASS_MESSAGE: [u8; 30] = b"BootInfoV1: boot handoff PASS\n";
+static REJECTION_PREFIX: [u8; 27] = b"BootInfoV1 rejection code: ";
+static SELF_TEST_MESSAGE: [u8; 39] = b"BootInfoV1: malformed fixture rejected\n";
+static RELEASE_MESSAGE: [u8; 59] =
+    b"BootInfoV1: source pointer and temporary aperture released\n";
+static NEWLINE: [u8; 1] = b"\n";
+
+@align(8)
+static MALFORMED_FIXTURE: [u8; 16] = [
+    16, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 7, 0, 0, 0
+];
+
+static mut SOURCE: usize = 0;
+static mut LENGTH: usize = 0;
+static mut FAILED: u8 = 0;
+static mut VALID: u8 = 0;
+static mut LAST_ERROR: u64 = 0;
+static mut MAGIC: u32 = 0;
+static mut TOTAL_SIZE: usize = 0;
+static mut TAG_COUNT: usize = 0;
+static mut MEMORY_ENTRY_COUNT: usize = 0;
+static mut USABLE_REGION_COUNT: u64 = 0;
+static mut USABLE_BYTES: u64 = 0;
+static mut ACPI_STATUS: u8 = 0;
+static mut EFI_STATUS: u8 = 0;
+static mut EFI_MEMORY_MAP: u8 = 0;
+static mut EFI_BOOT_SERVICES: u8 = 0;
+static mut ALLOCATOR_COVERED: u8 = 0;
+static mut ALLOCATOR_START: u64 = 0;
+static mut ALLOCATOR_END: u64 = 0;
+static mut CHALLENGE_PRESENT: u8 = 0;
+static mut CHALLENGE: [u8; 64] = [0; 64];
+static mut SOURCE_COMMIT_PRESENT: u8 = 0;
+static mut SOURCE_COMMIT: [u8; 40] = [0; 40];
+static mut INSPECTION_RELEASED: u8 = 0;
+static mut DECIMAL_BUFFER: [u8; 20] = [0; 20];
+
+unsafe fn clear() -> void {
+    SOURCE = 0;
+    LENGTH = 0;
+    FAILED = 0;
+    VALID = 0;
+    MAGIC = 0;
+    TOTAL_SIZE = 0;
+    TAG_COUNT = 0;
+    MEMORY_ENTRY_COUNT = 0;
+    USABLE_REGION_COUNT = 0;
+    USABLE_BYTES = 0;
+    ACPI_STATUS = 0;
+    EFI_STATUS = 0;
+    EFI_MEMORY_MAP = 0;
+    EFI_BOOT_SERVICES = 0;
+    ALLOCATOR_COVERED = 0;
+    ALLOCATOR_START = 0;
+    ALLOCATOR_END = 0;
+    CHALLENGE_PRESENT = 0;
+    SOURCE_COMMIT_PRESENT = 0;
+    INSPECTION_RELEASED = 0;
+    let mut index: usize = 0;
+    while index < 64 {
+        CHALLENGE[index] = 0;
+        if index < 40 {
+            SOURCE_COMMIT[index] = 0;
+        }
+        index += 1;
+    }
+}
+
+unsafe fn reject(code: u64) -> u64 {
+    clear();
+    LAST_ERROR = code;
+    return 0;
+}
+
+unsafe fn initial_u32(address: usize) -> u64 {
+    let mut value: u64 = 0;
+    let mut byte: usize = 0;
+    while byte < 4 {
+        value = value | ((volatile_load((address + byte) as *const u8) as u64)
+            << (byte * 8));
+        byte += 1;
+    }
+    return value;
+}
+
+unsafe fn byte(offset: usize) -> u64 {
+    if FAILED != 0 || offset >= LENGTH {
+        FAILED = 1;
+        return 0;
+    }
+    return volatile_load((SOURCE + offset) as *const u8) as u64;
+}
+
+unsafe fn u32_at(offset: usize) -> u64 {
+    if offset > LENGTH || LENGTH - offset < 4 {
+        FAILED = 1;
+        return 0;
+    }
+    return byte(offset)
+        | (byte(offset + 1) << 8)
+        | (byte(offset + 2) << 16)
+        | (byte(offset + 3) << 24);
+}
+
+unsafe fn u64_at(offset: usize) -> u64 {
+    if offset > LENGTH || LENGTH - offset < 8 {
+        FAILED = 1;
+        return 0;
+    }
+    return u32_at(offset) | (u32_at(offset + 4) << 32);
+}
+
+unsafe fn checksum_zero(offset: usize, length: usize) -> bool {
+    if offset > LENGTH || length > LENGTH - offset {
+        return false;
+    }
+    let mut sum: u64 = 0;
+    let mut index: usize = 0;
+    while index < length {
+        sum = (sum + byte(offset + index)) & 0xff;
+        index += 1;
+    }
+    return FAILED == 0 && sum == 0;
+}
+
+unsafe fn rsdp_signature(offset: usize) -> bool {
+    let mut index: usize = 0;
+    while index < 8 {
+        if byte(offset + index) != volatile_load((&RSDP_SIGNATURE[index])) as u64 {
+            return false;
+        }
+        index += 1;
+    }
+    return FAILED == 0;
+}
+
+unsafe fn parse_command_line(offset: usize, tag_size: usize) -> bool {
+    if tag_size < 9 || tag_size - 8 > MAX_COMMAND_LINE_BYTES {
+        return false;
+    }
+    let length: usize = tag_size - 8;
+    let start: usize = offset + 8;
+    if byte(start + length - 1) != 0 {
+        return false;
+    }
+    let mut index: usize = 0;
+    while index + 1 < length {
+        let value: u64 = byte(start + index);
+        if value < 0x20 || value > 0x7e {
+            return false;
+        }
+        index += 1;
+    }
+
+    index = 0;
+    while index + 1 < length {
+        while index + 1 < length && byte(start + index) == 0x20 {
+            index += 1;
+        }
+        let token_start: usize = index;
+        while index + 1 < length && byte(start + index) != 0x20 {
+            index += 1;
+        }
+        let token_length: usize = index - token_start;
+        if token_length >= 17 {
+            let mut prefix_matches: bool = true;
+            let mut name_index: usize = 0;
+            while name_index < 17 {
+                if byte(start + token_start + name_index)
+                    != volatile_load((&CHALLENGE_NAME[name_index])) as u64 {
+                    prefix_matches = false;
+                }
+                name_index += 1;
+            }
+            if prefix_matches {
+                if CHALLENGE_PRESENT != 0
+                    || token_length != 82
+                    || byte(start + token_start + 17) != 0x3d {
+                    return false;
+                }
+                let mut digit: usize = 0;
+                let mut nonzero: u8 = 0;
+                while digit < 64 {
+                    let value: u64 = byte(start + token_start + 18 + digit);
+                    if !((value >= 0x30 && value <= 0x39)
+                        || (value >= 0x61 && value <= 0x66)) {
+                        return false;
+                    }
+                    if value != 0x30 {
+                        nonzero = 1;
+                    }
+                    CHALLENGE[digit] = value as u8;
+                    digit += 1;
+                }
+                if nonzero == 0 {
+                    return false;
+                }
+                CHALLENGE_PRESENT = 1;
+            }
+        }
+        if token_length >= 21 {
+            let mut prefix_matches: bool = true;
+            let mut name_index: usize = 0;
+            while name_index < 21 {
+                if byte(start + token_start + name_index)
+                    != volatile_load((&SOURCE_COMMIT_NAME[name_index])) as u64 {
+                    prefix_matches = false;
+                }
+                name_index += 1;
+            }
+            if prefix_matches {
+                if SOURCE_COMMIT_PRESENT != 0
+                    || token_length != 62
+                    || byte(start + token_start + 21) != 0x3d {
+                    return false;
+                }
+                let mut digit: usize = 0;
+                let mut nonzero: u8 = 0;
+                while digit < 40 {
+                    let value: u64 = byte(start + token_start + 22 + digit);
+                    if !((value >= 0x30 && value <= 0x39)
+                        || (value >= 0x61 && value <= 0x66)) {
+                        return false;
+                    }
+                    if value != 0x30 {
+                        nonzero = 1;
+                    }
+                    SOURCE_COMMIT[digit] = value as u8;
+                    digit += 1;
+                }
+                if nonzero == 0 {
+                    return false;
+                }
+                SOURCE_COMMIT_PRESENT = 1;
+            }
+        }
+    }
+    return FAILED == 0;
+}
+
+unsafe fn parse_memory_map(offset: usize, tag_size: usize) -> bool {
+    if tag_size < 40 || u32_at(offset + 8) != 24 || u32_at(offset + 12) != 0 {
+        return false;
+    }
+    let entries_bytes: usize = tag_size - 16;
+    if entries_bytes == 0 || entries_bytes % 24 != 0 {
+        return false;
+    }
+    let entry_count: usize = entries_bytes / 24;
+    if entry_count > MAX_MEMORY_ENTRIES {
+        return false;
+    }
+
+    let mut previous_end: u64 = 0;
+    let mut usable_count: u64 = 0;
+    let mut usable_bytes: u64 = 0;
+    let mut entry: usize = 0;
+    while entry < entry_count {
+        let entry_offset: usize = offset + 16 + entry * 24;
+        let base: u64 = u64_at(entry_offset);
+        let region_length: u64 = u64_at(entry_offset + 8);
+        let kind: u64 = u32_at(entry_offset + 16);
+        let reserved: u64 = u32_at(entry_offset + 20);
+        if FAILED != 0
+            || region_length == 0
+            || base > 0xffff_ffff_ffff_ffff - region_length
+            || (entry != 0 && base < previous_end)
+            || reserved != 0 {
+            return false;
+        }
+        let region_end: u64 = base + region_length;
+        previous_end = region_end;
+        if kind == 1 {
+            if usable_bytes > 0xffff_ffff_ffff_ffff - region_length {
+                return false;
+            }
+            usable_count += 1;
+            usable_bytes += region_length;
+            let mut candidate_start: u64 = base;
+            let mut candidate_end: u64 = region_end;
+            if candidate_start < ALLOCATOR_SEARCH_START {
+                candidate_start = ALLOCATOR_SEARCH_START;
+            }
+            if candidate_end > ALLOCATOR_SEARCH_END {
+                candidate_end = ALLOCATOR_SEARCH_END;
+            }
+            if candidate_start <= 0xffff_ffff_ffff_ffff - (PAGE_SIZE - 1) {
+                candidate_start = (candidate_start + PAGE_SIZE - 1)
+                    & 0xffff_ffff_ffff_f000;
+            } else {
+                candidate_start = candidate_end;
+            }
+            candidate_end = candidate_end & 0xffff_ffff_ffff_f000;
+            if candidate_start < candidate_end {
+                // The normalized record is copied before allocation, but its
+                // source pages remain excluded so admission never depends on
+                // reclaiming the very evidence that authorized the window.
+                let physical_source: usize = SOURCE - INSPECTION_APERTURE_BASE;
+                let info_start: u64 = (physical_source as u64)
+                    & 0xffff_ffff_ffff_f000;
+                let info_end: u64 = ((physical_source + LENGTH + 4095) as u64)
+                    & 0xffff_ffff_ffff_f000;
+                if info_start < candidate_end && info_end > candidate_start {
+                    if candidate_start < info_start
+                        && info_start - candidate_start > ALLOCATOR_END - ALLOCATOR_START {
+                        ALLOCATOR_START = candidate_start;
+                        ALLOCATOR_END = info_start;
+                    }
+                    if info_end < candidate_end
+                        && candidate_end - info_end > ALLOCATOR_END - ALLOCATOR_START {
+                        ALLOCATOR_START = info_end;
+                        ALLOCATOR_END = candidate_end;
+                    }
+                } else if candidate_end - candidate_start
+                    > ALLOCATOR_END - ALLOCATOR_START {
+                    ALLOCATOR_START = candidate_start;
+                    ALLOCATOR_END = candidate_end;
+                }
+            }
+        }
+        entry += 1;
+    }
+    if usable_count == 0 || usable_bytes == 0 {
+        return false;
+    }
+    MEMORY_ENTRY_COUNT = entry_count;
+    USABLE_REGION_COUNT = usable_count;
+    USABLE_BYTES = usable_bytes;
+    if ALLOCATOR_END > ALLOCATOR_START
+        && ALLOCATOR_END - ALLOCATOR_START >= MIN_ALLOCATOR_BYTES {
+        ALLOCATOR_COVERED = 1;
+    }
+    return true;
+}
+
+unsafe fn parse_acpi_old(offset: usize, tag_size: usize) -> bool {
+    return tag_size == 28
+        && rsdp_signature(offset + 8)
+        && checksum_zero(offset + 8, 20);
+}
+
+unsafe fn parse_acpi_new(offset: usize, tag_size: usize) -> bool {
+    if tag_size < 44
+        || !rsdp_signature(offset + 8)
+        || byte(offset + 8 + 15) < 2 {
+        return false;
+    }
+    let rsdp_length: usize = u32_at(offset + 8 + 20) as usize;
+    return rsdp_length >= 36
+        && rsdp_length <= 64
+        && tag_size == 8 + rsdp_length
+        && checksum_zero(offset + 8, 20)
+        && checksum_zero(offset + 8, rsdp_length);
+}
+
+unsafe fn parse_efi_memory_map(offset: usize, tag_size: usize) -> bool {
+    if tag_size < 56 {
+        return false;
+    }
+    let descriptor_size: usize = u32_at(offset + 8) as usize;
+    let descriptor_bytes: usize = tag_size - 16;
+    return descriptor_size >= 40
+        && descriptor_size % 8 == 0
+        && descriptor_bytes >= descriptor_size
+        && descriptor_bytes % descriptor_size == 0;
+}
+
+pub unsafe fn normalize(
+    boot_magic: u32,
+    information_address: usize,
+    require_challenge: bool
+) -> u64 {
+    clear();
+    LAST_ERROR = 0;
+    if boot_magic != MULTIBOOT2_MAGIC
+        || information_address == 0
+        || (information_address & 7) != 0
+        || information_address > INSPECTION_WINDOW_END - 16 {
+        LAST_ERROR = 1;
+        return 0;
+    }
+    let aperture_address: usize = INSPECTION_APERTURE_BASE + information_address;
+    let total_size: usize = initial_u32(aperture_address) as usize;
+    if total_size < 16
+        || total_size > MAX_INFORMATION_BYTES
+        || (total_size & 7) != 0
+        || total_size > INSPECTION_WINDOW_END - information_address {
+        LAST_ERROR = 2;
+        return 0;
+    }
+    SOURCE = aperture_address;
+    LENGTH = total_size;
+    if u32_at(4) != 0 {
+        return reject(3);
+    }
+
+    let mut offset: usize = 8;
+    let mut memory_map_seen: u8 = 0;
+    let mut command_line_seen: u8 = 0;
+    let mut acpi_old_seen: u8 = 0;
+    let mut acpi_new_seen: u8 = 0;
+    let mut efi32_seen: u8 = 0;
+    let mut efi64_seen: u8 = 0;
+    let mut efi_memory_seen: u8 = 0;
+    let mut efi_boot_services_seen: u8 = 0;
+    let mut end_seen: u8 = 0;
+    let mut tags: usize = 0;
+
+    while offset < total_size {
+        if (offset & 7) != 0 || total_size - offset < 8 || tags >= MAX_TAGS {
+            return reject(4);
+        }
+        let tag_type: u64 = u32_at(offset);
+        let tag_size: usize = u32_at(offset + 4) as usize;
+        if FAILED != 0 || tag_size < 8 || tag_size > total_size - offset {
+            return reject(5);
+        }
+        tags += 1;
+        if tag_type == TAG_END {
+            if tag_size != 8 || offset + 8 != total_size {
+                return reject(6);
+            }
+            end_seen = 1;
+            offset = total_size;
+        } else {
+            if tag_type == TAG_COMMAND_LINE {
+                if command_line_seen != 0 || !parse_command_line(offset, tag_size) {
+                    return reject(7);
+                }
+                command_line_seen = 1;
+            }
+            if tag_type == TAG_MEMORY_MAP {
+                if memory_map_seen != 0 || !parse_memory_map(offset, tag_size) {
+                    return reject(8);
+                }
+                memory_map_seen = 1;
+            }
+            // This v1 handoff has no initrd consumer. Reject rather than let
+            // a module occupy memory later offered to the frame allocator.
+            if tag_type == TAG_MODULE {
+                return reject(21);
+            }
+            if tag_type == TAG_EFI32_SYSTEM_TABLE {
+                if efi32_seen != 0 || tag_size != 12 || u32_at(offset + 8) == 0 {
+                    return reject(9);
+                }
+                efi32_seen = 1;
+            }
+            if tag_type == TAG_EFI64_SYSTEM_TABLE {
+                if efi64_seen != 0 || tag_size != 16 || u64_at(offset + 8) == 0 {
+                    return reject(10);
+                }
+                efi64_seen = 1;
+            }
+            if tag_type == TAG_ACPI_OLD {
+                if acpi_old_seen != 0 || !parse_acpi_old(offset, tag_size) {
+                    return reject(11);
+                }
+                acpi_old_seen = 1;
+            }
+            if tag_type == TAG_ACPI_NEW {
+                if acpi_new_seen != 0 || !parse_acpi_new(offset, tag_size) {
+                    return reject(12);
+                }
+                acpi_new_seen = 1;
+            }
+            if tag_type == TAG_EFI_MEMORY_MAP {
+                if efi_memory_seen != 0 || !parse_efi_memory_map(offset, tag_size) {
+                    return reject(13);
+                }
+                efi_memory_seen = 1;
+            }
+            if tag_type == TAG_EFI_BOOT_SERVICES {
+                if efi_boot_services_seen != 0 || tag_size != 8 {
+                    return reject(14);
+                }
+                efi_boot_services_seen = 1;
+            }
+            let aligned_size: usize = (tag_size + 7) & 0xffff_ffff_ffff_fff8;
+            if aligned_size < tag_size || aligned_size > total_size - offset {
+                return reject(15);
+            }
+            offset += aligned_size;
+        }
+    }
+
+    if FAILED != 0 || end_seen == 0 || memory_map_seen != 1 {
+        return reject(16);
+    }
+    // Firmware may publish independently valid ACPI 1.0 and 2.0 roots. This
+    // bounded handoff records their checked presence but does not select or
+    // dereference either table, so distinct RSDT addresses are not authority
+    // ambiguity here. A future ACPI consumer must make that choice explicitly.
+    if efi32_seen != 0 && efi64_seen != 0 {
+        return reject(18);
+    }
+    if (efi_memory_seen != 0 || efi_boot_services_seen != 0)
+        && efi32_seen == 0 && efi64_seen == 0 {
+        return reject(19);
+    }
+    if (CHALLENGE_PRESENT == 0 && SOURCE_COMMIT_PRESENT != 0)
+        || (CHALLENGE_PRESENT != 0 && SOURCE_COMMIT_PRESENT == 0) {
+        return reject(20);
+    }
+    if require_challenge && CHALLENGE_PRESENT == 0 {
+        return reject(22);
+    }
+
+    MAGIC = boot_magic;
+    TOTAL_SIZE = total_size;
+    TAG_COUNT = tags;
+    if acpi_new_seen != 0 {
+        ACPI_STATUS = 2;
+    }
+    if acpi_old_seen != 0 && acpi_new_seen == 0 {
+        ACPI_STATUS = 1;
+    }
+    if acpi_old_seen != 0 && acpi_new_seen != 0 {
+        ACPI_STATUS = 3;
+    }
+    if efi64_seen != 0 {
+        EFI_STATUS = 2;
+    }
+    if efi32_seen != 0 {
+        EFI_STATUS = 1;
+    }
+    EFI_MEMORY_MAP = efi_memory_seen;
+    EFI_BOOT_SERVICES = efi_boot_services_seen;
+    // No bootloader address survives admission. Mode 34 receives the original
+    // address only as kernel_main's local argument and consumes it before the
+    // assembly aperture teardown. Every normalized fact used after this point
+    // resides in the bounded kernel-owned fields above.
+    SOURCE = 0;
+    LENGTH = 0;
+    VALID = 1;
+    return 1;
+}
+
+// Assembly calls this only after clearing and scanning every temporary
+// inspection PDE and reloading CR3. A successful Multiboot2 normalization may
+// publish the marker exactly once, and only if its parser cursor was erased.
+@export
+@no_mangle
+pub unsafe fn ocore_boot_info_aperture_closed(aperture_verified: u64) -> u64 {
+    if VALID == 0 {
+        return 1;
+    }
+    if aperture_verified != 1 || SOURCE != 0 || LENGTH != 0 {
+        return 0;
+    }
+    if INSPECTION_RELEASED == 0 {
+        INSPECTION_RELEASED = 1;
+        write((&RELEASE_MESSAGE[0]), 59);
+    }
+    return 1;
+}
+
+// Exercise a real malformed tag-size rejection before admitting firmware.
+// The fixture is kernel-owned and mapped, so failure cannot be attributed to
+// an absent page or an untrusted bootloader.
+pub unsafe fn rejection_self_test() -> u64 {
+    if normalize(
+        MULTIBOOT2_MAGIC,
+        (&MALFORMED_FIXTURE[0]) as usize,
+        false
+    ) != 0 {
+        return 0;
+    }
+    return 1;
+}
+
+pub unsafe fn is_valid() -> bool { return VALID != 0; }
+pub unsafe fn inspection_released() -> bool {
+    return VALID != 0
+        && INSPECTION_RELEASED != 0
+        && SOURCE == 0
+        && LENGTH == 0;
+}
+pub unsafe fn allocator_window_covered() -> bool {
+    return VALID != 0 && ALLOCATOR_COVERED != 0;
+}
+pub unsafe fn allocator_start() -> usize { return ALLOCATOR_START as usize; }
+pub unsafe fn allocator_end() -> usize { return ALLOCATOR_END as usize; }
+pub unsafe fn acpi_status() -> u64 { return ACPI_STATUS as u64; }
+pub unsafe fn efi64_exited_boot_services() -> bool {
+    return VALID != 0
+        && EFI_STATUS == 2
+        && EFI_MEMORY_MAP != 0
+        && EFI_BOOT_SERVICES == 0;
+}
+pub unsafe fn challenge_present() -> bool {
+    return VALID != 0 && CHALLENGE_PRESENT != 0;
+}
+pub unsafe fn source_commit_present() -> bool {
+    return VALID != 0 && SOURCE_COMMIT_PRESENT != 0;
+}
+
+unsafe fn emit_decimal(value: u64) -> void {
+    let mut remaining: u64 = value;
+    let mut cursor: usize = 20;
+    if remaining == 0 {
+        cursor = 19;
+        DECIMAL_BUFFER[cursor] = b'0';
+    }
+    while remaining != 0 {
+        cursor -= 1;
+        DECIMAL_BUFFER[cursor] = (b'0' as u64 + remaining % 10) as u8;
+        remaining = remaining / 10;
+    }
+    write((&DECIMAL_BUFFER[cursor]), 20 - cursor);
+}
+
+pub unsafe fn emit_rejection() -> void {
+    write((&REJECTION_PREFIX[0]), 27);
+    emit_decimal(LAST_ERROR);
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn emit_self_test_pass() -> void {
+    write((&SELF_TEST_MESSAGE[0]), 39);
+}
+
+pub unsafe fn emit_normalized_summary() -> void {
+    write((&NORMALIZED_MESSAGE[0]), 34);
+    write((&USABLE_REGIONS_PREFIX[0]), 27);
+    emit_decimal(USABLE_REGION_COUNT);
+    write((&NEWLINE[0]), 1);
+    write((&USABLE_BYTES_PREFIX[0]), 25);
+    emit_decimal(USABLE_BYTES);
+    write((&NEWLINE[0]), 1);
+    write((&ALLOCATOR_START_PREFIX[0]), 28);
+    emit_decimal(ALLOCATOR_START);
+    write((&NEWLINE[0]), 1);
+    write((&ALLOCATOR_END_PREFIX[0]), 26);
+    emit_decimal(ALLOCATOR_END);
+    write((&NEWLINE[0]), 1);
+    if ACPI_STATUS != 0 {
+        write((&ACPI_MESSAGE[0]), 30);
+    }
+    if EFI_STATUS == 2 && EFI_MEMORY_MAP != 0 && EFI_BOOT_SERVICES == 0 {
+        write((&EFI_MESSAGE[0]), 39);
+    }
+}
+
+pub unsafe fn emit_allocator_admission() -> void {
+    write((&ALLOCATOR_MESSAGE[0]), 47);
+}
+
+pub unsafe fn emit_challenge() -> void {
+    write((&CHALLENGE_PREFIX[0]), 24);
+    write((&CHALLENGE[0]), 64);
+    write((&NEWLINE[0]), 1);
+    write((&SOURCE_COMMIT_PREFIX[0]), 23);
+    write((&SOURCE_COMMIT[0]), 40);
+    write((&NEWLINE[0]), 1);
+}
+
+pub unsafe fn emit_handoff_pass() -> void {
+    write((&PASS_MESSAGE[0]), 30);
+}
