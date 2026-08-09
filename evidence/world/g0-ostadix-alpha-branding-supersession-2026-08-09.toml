@@ -1,0 +1,9 @@
+schema_version = 1
+id = "g0-ostadix-alpha-branding-supersession-2026-08-09"
+event = "supersede"
+subject = "g0-repository-conformance-2026-08-03-v2"
+replacement = "g0-ostadix-alpha-branding-2026-08-09"
+reason_code = "release-identity-rename"
+reason = "The umbrella release identity is OSTADIX Alpha while World remains the runtime ontology; the prior G0 record remains immutable and is superseded by conformance evidence over the renamed constitutional surface."
+source_commit = "40b5a471ca378da1384d584e70673dfa5cd823fa"
+signatures = []

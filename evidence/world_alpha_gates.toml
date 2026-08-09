@@ -8,7 +8,7 @@ alpha_gate = "G13"
 gate_count = 14
 
 # This registry defines qualification requirements. It is separate from
-# gates.toml, whose 21 required QEMU-TCG gates and one supplemental KVM gate
+# gates.toml, whose 24 required QEMU-TCG gates and one supplemental KVM gate
 # are executable evidence for narrower, already implemented O-core slices.
 # Schema v4 contains definitions only. The validator discovers the append-only
 # evidence ledger under evidence/world, derives claims from typed transcript
@@ -24,7 +24,7 @@ description = "Executable schema, compiler, protocol, and claim-drift checks run
 [[evidence_class]]
 id = "hosted_reference"
 scope = "reference_only"
-description = "Linux-hosted simulator, differential oracle, protocol fuzzer, or development console; never qualifying World Alpha evidence."
+description = "Linux-hosted simulator, differential oracle, protocol fuzzer, or development console; never qualifying OSTADIX Alpha evidence."
 
 [[evidence_class]]
 id = "qemu_tcg_x86_64"
@@ -155,7 +155,7 @@ title = "real KernelWorld"
 depends_on = ["G0"]
 required_classes = ["qemu_virtualization"]
 one_of_classes = []
-acceptance = "A pinned real Linux kernel boots under O-core without a guest-issued Ostadix/O-Machine authority hypercall or resource-handle ABI, negotiates health through a bounded virtio/shared-queue MMIO contract, exports one governed service, and consumes a deterministic native device error from a class-specific asynchronous withdrawal. Both that guest observation and the composite host acknowledgment precede separate terminal memory teardown, which removes guest and host-broker mappings and pins before page reclamation."
+acceptance = "A pinned real Linux kernel boots under O-core without a guest-issued OSTADIX/O-Machine authority hypercall or resource-handle ABI, negotiates health through a bounded virtio/shared-queue MMIO contract, exports one governed service, and consumes a deterministic native device error from a class-specific asynchronous withdrawal. Both that guest observation and the composite host acknowledgment precede separate terminal memory teardown, which removes guest and host-broker mappings and pins before page reclamation."
 prohibited_substitutes = ["The Mode 21 or Mode 23 synthetic guest", "A Linux ABI ELF running at CPL3", "Administrative boot state with no guest entry", "Removing a guest page and treating the resulting abort or panic as graceful device revocation", "An unrestricted host-EL1 direct map of World-owned frames"]
 
 [[gate]]
@@ -205,7 +205,7 @@ prohibited_substitutes = ["Separate demonstrations on separate branches", "Linux
 
 [[gate]]
 id = "G13"
-title = "eight-node World Alpha"
+title = "eight-node OSTADIX Alpha"
 depends_on = ["G12"]
 required_classes = ["multinode_physical", "hardware_aarch64", "fault_injection", "security_adversarial", "performance_characterization"]
 one_of_classes = []

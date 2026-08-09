@@ -324,6 +324,11 @@ o kernel boot
 o kernel console
 o kernel smoke-live
 o kernel gates
+o kernel doctor-media
+o kernel media
+o kernel inspect-media
+o kernel boot-media
+o kernel smoke-media
 ```
 
 `boot` selects the baseline probe mode. `console` selects mode 16, builds the
@@ -338,6 +343,10 @@ Interactive images are loaded by QEMU and use a multiplexed serial terminal;
 `gates` executes the manifest-defined portable evidence set. These commands
 prove only their documented QEMU/TCG boundaries, not a physical-machine boot,
 SMP, Linux or Plan 9 boot, or hardware-device isolation.
+
+The deterministic x86_64 GPT/UEFI path and guarded external-media workflow are
+documented in [OSTADIX_BOOT.md](OSTADIX_BOOT.md). Their current automated smoke
+boots the exact disk through OVMF/QEMU and is not physical or SMP evidence.
 
 ## 11. Implemented bounded O-core milestone boundary
 
@@ -696,7 +705,7 @@ Run the native World-identity evidence gate with:
 Serialized capability IDs remain descriptive non-authority: they are not
 bearers, CSpace handles, or delegation. `OWIDENT` v1 remains the identity-only
 nested format rather than a transport, OValue envelope, or receipt codec. The
-gate supplies no Governor, consensus, native membership, or Alpha
+gate supplies no Governor, consensus, native membership, or OSTADIX Alpha
 qualification; it passes no G0--G13 gate, and QEMU TCG is not physical or
 hardware-isolation evidence.
 
@@ -780,7 +789,7 @@ remain descriptive rather than bearer authority. The offline corpus is not a
 live execution receipt emitted by HGraph, project, live-system, KernelWorld,
 O-Git, or evidence components. It supplies no production key lifecycle,
 trusted-signer policy, authoritative replay/commit fencing, transport,
-Governor, consensus, WorldFS, typed World Alpha attestation, Workstream A
+Governor, consensus, WorldFS, typed OSTADIX Alpha attestation, Workstream A
 acceptance, or G0--G13 qualification. QEMU TCG is not physical or
 hardware-isolation evidence.
 
@@ -818,7 +827,7 @@ O-core, verify Ed25519 natively, establish signer trust, authorize residual
 `HostWorld` effects, change the `Uncommitted` fence, or supply Governor
 admission/commit, authenticated membership, provider ownership or placement,
 capability/lease authority, reservation, remote dispatch, consensus, recovery,
-exactly-once execution, World Alpha acceptance, a G0--G13 gate,
+exactly-once execution, OSTADIX Alpha acceptance, a G0--G13 gate,
 physical-hardware evidence, or hardware-isolation evidence.
 
 Mode 20 is a separate bounded KernelWorld supervisor-admission and object-model

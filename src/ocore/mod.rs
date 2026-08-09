@@ -5,6 +5,7 @@
 //! computation.
 
 pub mod ast;
+pub mod boot_info;
 pub mod capability_bridge;
 pub mod codegen;
 pub mod codegen_aarch64;

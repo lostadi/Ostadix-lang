@@ -33,6 +33,7 @@ fi
 OUNLINK_BIN="./target/release/o-unlink"
 O_CLI="./scripts/o-cli.sh"
 O_KERNEL_CLI="./scripts/o-kernel.sh"
+O_KERNEL_QEMU_RUNNER="./ocore/kernel/run-qemu.sh"
 
 for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OLINK_BIN" "$OUNLINK_BIN"; do
     if [ ! -x "$bin" ]; then
@@ -40,7 +41,7 @@ for bin in "$O_BIN" "$OLANGC_BIN" "$OCOREC_BIN" "$OGIT_BIN" "$OLINK_BIN" "$OUNLI
         exit 1
     fi
 done
-for script in "$O_CLI" "$O_KERNEL_CLI"; do
+for script in "$O_CLI" "$O_KERNEL_CLI" "$O_KERNEL_QEMU_RUNNER"; do
     if [ ! -x "$script" ]; then
         echo "Missing executable: $script" >&2
         exit 1
@@ -367,6 +368,313 @@ check_olink_hardened_round_trip() {
     fi
 }
 
+setup_kernel_qemu_runner_fixture() {
+    KERNEL_RUNNER_ROOT="$ARTIFACT_DIR/kernel-runner-root"
+    KERNEL_RUNNER="$KERNEL_RUNNER_ROOT/ocore/kernel/run-qemu.sh"
+    KERNEL_BUILD_LOG="$ARTIFACT_DIR/kernel-build.log"
+    KERNEL_QEMU_ARGS_LOG="$ARTIFACT_DIR/kernel-qemu-args.log"
+    KERNEL_RUNNER_HOME="$KERNEL_RUNNER_ROOT/operator-home"
+    KERNEL_QEMU_STUB="$KERNEL_RUNNER_ROOT/bin/qemu-system-x86_64"
+
+    mkdir -p \
+        "$KERNEL_RUNNER_ROOT/ocore/kernel" \
+        "$KERNEL_RUNNER_ROOT/bin" \
+        "$KERNEL_RUNNER_HOME"
+    cp "$O_KERNEL_QEMU_RUNNER" "$KERNEL_RUNNER"
+
+    cat >"$KERNEL_RUNNER_ROOT/ocore/kernel/build.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${KERNEL_BUILD_LOG:?}"
+: "${OCORE_BUILD_DIR:?}"
+: "${OCORE_PROBE_MODE:?}"
+printf 'mode=%s\nbuild-dir=%s\n' \
+    "$OCORE_PROBE_MODE" "$OCORE_BUILD_DIR" >"$KERNEL_BUILD_LOG"
+mkdir -p "$OCORE_BUILD_DIR"
+: >"$OCORE_BUILD_DIR/kernel.elf"
+echo "stub kernel build"
+if [[ "$OCORE_PROBE_MODE" == "16" ]]; then
+    echo "m5-sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+fi
+EOF
+
+    cat >"$KERNEL_QEMU_STUB" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${KERNEL_QEMU_ARGS_LOG:?}"
+printf '%s\n' "$@" >"$KERNEL_QEMU_ARGS_LOG"
+EOF
+    chmod +x \
+        "$KERNEL_RUNNER" \
+        "$KERNEL_RUNNER_ROOT/ocore/kernel/build.sh" \
+        "$KERNEL_QEMU_STUB"
+}
+
+check_kernel_qemu_mode_and_build_dir_propagation() {
+    local mode
+    local build_dir
+
+    for mode in 0 16; do
+        build_dir="$KERNEL_RUNNER_ROOT/build-mode-$mode"
+        rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG"
+        run_command env \
+            HOME="$KERNEL_RUNNER_HOME" \
+            KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+            KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+            OCORE_BUILD_DIR="$build_dir" \
+            OCORE_PROBE_MODE="$mode" \
+            OCORE_QEMU_BIN="$KERNEL_QEMU_STUB" \
+            "$KERNEL_RUNNER"
+        if [[ "$RUN_EXIT" -ne 0 ]]; then
+            fail "kernel QEMU runner propagates interactive modes and build directories" \
+                "(mode $mode exited $RUN_EXIT)"
+            return
+        fi
+        if ! grep -Fqx -- "mode=$mode" "$KERNEL_BUILD_LOG" \
+            || ! grep -Fqx -- "build-dir=$build_dir" "$KERNEL_BUILD_LOG"; then
+            fail "kernel QEMU runner propagates interactive modes and build directories" \
+                "(mode or build directory was not propagated to build.sh)"
+            return
+        fi
+        if [[ ! -s "$KERNEL_QEMU_ARGS_LOG" ]]; then
+            fail "kernel QEMU runner propagates interactive modes and build directories" \
+                "(QEMU stub was not launched for mode $mode)"
+            return
+        fi
+    done
+    pass "kernel QEMU runner propagates interactive modes and build directories"
+}
+
+check_kernel_qemu_runner_rejects_direct_args() {
+    local build_dir="$KERNEL_RUNNER_ROOT/direct-arg-build"
+
+    rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG"
+    run_command env \
+        HOME="$KERNEL_RUNNER_HOME" \
+        KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+        KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+        OCORE_BUILD_DIR="$build_dir" \
+        OCORE_PROBE_MODE=0 \
+        OCORE_QEMU_BIN="$KERNEL_QEMU_STUB" \
+        "$KERNEL_RUNNER" unexpected
+    if [[ "$RUN_EXIT" -eq 2 ]] \
+        && grep -Fq -- 'run-qemu.sh does not accept arguments' "$STDERR_FILE" \
+        && [[ ! -e "$KERNEL_BUILD_LOG" ]] \
+        && [[ ! -e "$KERNEL_QEMU_ARGS_LOG" ]]; then
+        pass "kernel QEMU runner rejects direct arguments before side effects"
+    else
+        fail "kernel QEMU runner rejects direct arguments before side effects" \
+            "(expected exit 2 without invoking build or QEMU)"
+    fi
+}
+
+check_kernel_qemu_runner_preflights_before_build() {
+    local build_dir="$KERNEL_RUNNER_ROOT/preflight-build"
+    local missing_qemu="$KERNEL_RUNNER_ROOT/bin/missing-qemu"
+
+    rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG" "$missing_qemu"
+    run_command env \
+        HOME="$KERNEL_RUNNER_HOME" \
+        KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+        KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+        OCORE_BUILD_DIR="$build_dir" \
+        OCORE_PROBE_MODE=0 \
+        OCORE_QEMU_BIN="$missing_qemu" \
+        "$KERNEL_RUNNER"
+    if [[ "$RUN_EXIT" -eq 127 ]] \
+        && grep -Fq -- 'QEMU executable is not installed' "$STDERR_FILE" \
+        && [[ ! -e "$KERNEL_BUILD_LOG" ]] \
+        && [[ ! -e "$build_dir" ]]; then
+        pass "kernel QEMU runner preflights QEMU before building"
+    else
+        fail "kernel QEMU runner preflights QEMU before building" \
+            "(expected exit 127 without invoking build.sh)"
+    fi
+}
+
+check_kernel_qemu_runner_restricts_modes() {
+    local build_dir="$KERNEL_RUNNER_ROOT/rejected-mode-build"
+
+    rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG"
+    run_command env \
+        HOME="$KERNEL_RUNNER_HOME" \
+        KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+        KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+        OCORE_BUILD_DIR="$build_dir" \
+        OCORE_PROBE_MODE=32 \
+        OCORE_QEMU_BIN="$KERNEL_QEMU_STUB" \
+        "$KERNEL_RUNNER"
+    if [[ "$RUN_EXIT" -eq 2 ]] \
+        && grep -Fq -- 'supports only OCORE_PROBE_MODE=0 or 16' "$STDERR_FILE" \
+        && [[ ! -e "$KERNEL_BUILD_LOG" ]] \
+        && [[ ! -e "$KERNEL_QEMU_ARGS_LOG" ]]; then
+        pass "kernel QEMU runner rejects non-interactive probe modes"
+    else
+        fail "kernel QEMU runner rejects non-interactive probe modes" \
+            "(expected mode 32 to fail before build or QEMU)"
+    fi
+}
+
+check_kernel_qemu_runner_rejects_unsafe_build_dirs() {
+    local build_dir
+
+    for build_dir in "/" "$KERNEL_RUNNER_ROOT" "$KERNEL_RUNNER_HOME"; do
+        rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG"
+        run_command env \
+            HOME="$KERNEL_RUNNER_HOME" \
+            KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+            KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+            OCORE_BUILD_DIR="$build_dir" \
+            OCORE_PROBE_MODE=0 \
+            OCORE_QEMU_BIN="$KERNEL_QEMU_STUB" \
+            "$KERNEL_RUNNER"
+        if [[ "$RUN_EXIT" -ne 2 ]] \
+            || ! grep -Fq -- 'unsafe OCORE_BUILD_DIR' "$STDERR_FILE" \
+            || [[ -e "$KERNEL_BUILD_LOG" ]] \
+            || [[ -e "$KERNEL_QEMU_ARGS_LOG" ]]; then
+            fail "kernel QEMU runner rejects unsafe build directories" \
+                "(unsafe build directory was not rejected: $build_dir)"
+            return
+        fi
+    done
+    pass "kernel QEMU runner rejects filesystem, repository, and home roots"
+}
+
+check_kernel_qemu_runner_safe_flags() {
+    local build_dir="$KERNEL_RUNNER_ROOT/safe-flags-build"
+    local expected_args="$ARTIFACT_DIR/kernel-qemu-args.expected"
+
+    rm -f "$KERNEL_BUILD_LOG" "$KERNEL_QEMU_ARGS_LOG"
+    run_command env \
+        HOME="$KERNEL_RUNNER_HOME" \
+        KERNEL_BUILD_LOG="$KERNEL_BUILD_LOG" \
+        KERNEL_QEMU_ARGS_LOG="$KERNEL_QEMU_ARGS_LOG" \
+        OCORE_BUILD_DIR="$build_dir" \
+        OCORE_PROBE_MODE=0 \
+        OCORE_QEMU_BIN="$KERNEL_QEMU_STUB" \
+        "$KERNEL_RUNNER"
+    if [[ "$RUN_EXIT" -ne 0 ]]; then
+        fail "kernel QEMU runner uses the exact minimal safe device set" \
+            "(runner exited $RUN_EXIT)"
+        return
+    fi
+
+    cat >"$expected_args" <<EOF
+-machine
+q35
+-m
+128M
+-nodefaults
+-nic
+none
+-kernel
+$build_dir/kernel.elf
+-display
+none
+-serial
+mon:stdio
+-no-reboot
+-no-shutdown
+EOF
+    if diff -u "$expected_args" "$KERNEL_QEMU_ARGS_LOG" \
+        >"$STDOUT_FILE" 2>"$STDERR_FILE"; then
+        pass "kernel QEMU runner uses the exact minimal safe device set"
+    else
+        fail "kernel QEMU runner uses the exact minimal safe device set" \
+            "(QEMU arguments differed from the safe allowlist)"
+    fi
+}
+
+setup_kernel_media_cli_fixture() {
+    KERNEL_MEDIA_STUB_DIR="$ARTIFACT_DIR/kernel-media-stubs"
+    KERNEL_MEDIA_LOG="$ARTIFACT_DIR/kernel-media.log"
+    KERNEL_MEDIA_BUILD_STUB="$KERNEL_MEDIA_STUB_DIR/media-build"
+    KERNEL_MEDIA_SETUP_STUB="$KERNEL_MEDIA_STUB_DIR/media-setup"
+    KERNEL_MEDIA_INSPECT_STUB="$KERNEL_MEDIA_STUB_DIR/media-inspect"
+    KERNEL_MEDIA_BOOT_STUB="$KERNEL_MEDIA_STUB_DIR/media-boot"
+    KERNEL_MEDIA_SMOKE_STUB="$KERNEL_MEDIA_STUB_DIR/media-smoke"
+    KERNEL_MEDIA_WRITER_STUB="$KERNEL_MEDIA_STUB_DIR/media-writer"
+
+    mkdir -p "$KERNEL_MEDIA_STUB_DIR"
+    cat >"$KERNEL_MEDIA_BUILD_STUB" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${KERNEL_MEDIA_LOG:?}"
+{
+    printf 'script=%s\n' "${0##*/}"
+    printf 'argc=%s\n' "$#"
+    for arg in "$@"; do
+        printf 'arg=%s\n' "$arg"
+    done
+} >"$KERNEL_MEDIA_LOG"
+EOF
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_INSPECT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SETUP_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_BOOT_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_SMOKE_STUB"
+    cp "$KERNEL_MEDIA_BUILD_STUB" "$KERNEL_MEDIA_WRITER_STUB"
+    chmod +x \
+        "$KERNEL_MEDIA_BUILD_STUB" \
+        "$KERNEL_MEDIA_SETUP_STUB" \
+        "$KERNEL_MEDIA_INSPECT_STUB" \
+        "$KERNEL_MEDIA_BOOT_STUB" \
+        "$KERNEL_MEDIA_SMOKE_STUB" \
+        "$KERNEL_MEDIA_WRITER_STUB"
+}
+
+run_kernel_media_cli() {
+    rm -f "$KERNEL_MEDIA_LOG"
+    run_command env \
+        KERNEL_MEDIA_LOG="$KERNEL_MEDIA_LOG" \
+        O_KERNEL_MEDIA_BUILD_SCRIPT="$KERNEL_MEDIA_BUILD_STUB" \
+        O_KERNEL_SETUP_SCRIPT="$KERNEL_MEDIA_SETUP_STUB" \
+        O_KERNEL_MEDIA_INSPECT_SCRIPT="$KERNEL_MEDIA_INSPECT_STUB" \
+        O_KERNEL_MEDIA_BOOT_SCRIPT="$KERNEL_MEDIA_BOOT_STUB" \
+        O_KERNEL_MEDIA_SMOKE_SCRIPT="$KERNEL_MEDIA_SMOKE_STUB" \
+        O_KERNEL_MEDIA_WRITER_SCRIPT="$KERNEL_MEDIA_WRITER_STUB" \
+        "$O_KERNEL_CLI" "$@"
+}
+
+check_kernel_media_dispatch() {
+    local desc="$1"
+    local expected_log="$2"
+    shift 2
+
+    run_kernel_media_cli "$@"
+    if [[ "$RUN_EXIT" -ne 0 ]]; then
+        fail "$desc" "(kernel media command exited $RUN_EXIT)"
+        return
+    fi
+    if [[ ! -f "$KERNEL_MEDIA_LOG" ]]; then
+        fail "$desc" "(expected media delegate was not dispatched)"
+        return
+    fi
+    if [[ "$(cat "$KERNEL_MEDIA_LOG")" == "$expected_log" ]]; then
+        pass "$desc"
+    else
+        printf '%s\n' "expected:" >"$STDOUT_FILE"
+        printf '%s\n' "$expected_log" >>"$STDOUT_FILE"
+        printf '%s\n' "actual:" >>"$STDOUT_FILE"
+        cat "$KERNEL_MEDIA_LOG" >>"$STDOUT_FILE"
+        fail "$desc" "(media delegate or arguments differed from the exact expectation)"
+    fi
+}
+
+check_kernel_media_rejection() {
+    local desc="$1"
+    local pattern="$2"
+    shift 2
+
+    run_kernel_media_cli "$@"
+    if [[ "$RUN_EXIT" -ne 0 ]] \
+        && grep -Fq -- "$pattern" "$STDERR_FILE" \
+        && [[ ! -e "$KERNEL_MEDIA_LOG" ]]; then
+        pass "$desc"
+    else
+        fail "$desc" "(expected rejection before dispatching a media delegate)"
+    fi
+}
+
 # --- Test inputs --- #
 
 INVALID_SOURCE="$ARTIFACT_DIR/invalid.O"
@@ -399,6 +707,9 @@ unsafe fn kernel_main() -> never {
     loop { unsafe { halt(); } }
 }
 EOF
+
+setup_kernel_qemu_runner_fixture
+setup_kernel_media_cli_fixture
 
 # --- CLI integration tests --- #
 
@@ -455,6 +766,51 @@ check_nonzero_stderr_contains "kernel CLI rejects an unknown command" \
     "unknown kernel command 'warp'" "$O_KERNEL_CLI" warp
 check_nonzero_stderr_contains "kernel boot rejects arguments before launching QEMU" \
     'command does not accept arguments' "$O_KERNEL_CLI" boot unexpected
+check_kernel_media_dispatch "kernel doctor-media checks the exact optional profile" \
+    $'script=media-setup\nargc=3\narg=--with-ocore-media\narg=--check\narg=--no-env' \
+    doctor-media
+check_kernel_media_dispatch "kernel media accepts no output path" \
+    $'script=media-build\nargc=0' \
+    media
+KERNEL_MEDIA_OUTPUT="$ARTIFACT_DIR/custom-ostadix.img"
+check_kernel_media_dispatch "kernel media forwards one output path" \
+    "$(printf 'script=media-build\nargc=1\narg=%s' "$KERNEL_MEDIA_OUTPUT")" \
+    media "$KERNEL_MEDIA_OUTPUT"
+check_kernel_media_rejection "kernel media rejects extra output paths" \
+    'command accepts at most one path argument' \
+    media "$KERNEL_MEDIA_OUTPUT" "$ARTIFACT_DIR/unexpected.img"
+KERNEL_MEDIA_DEFAULT="$ROOT/target/ostadix-media/x86_64/ostadix-x86_64-uefi.img"
+check_kernel_media_dispatch "kernel inspect-media forwards the default image path" \
+    "$(printf 'script=media-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_MEDIA_DEFAULT")" \
+    inspect-media
+check_kernel_media_dispatch "kernel inspect-media forwards an explicit image path" \
+    "$(printf 'script=media-inspect\nargc=2\narg=inspect\narg=%s' "$KERNEL_MEDIA_OUTPUT")" \
+    inspect-media "$KERNEL_MEDIA_OUTPUT"
+check_kernel_media_dispatch "kernel boot-media dispatches its exact boot script" \
+    $'script=media-boot\nargc=0' \
+    boot-media
+check_kernel_media_rejection "kernel boot-media rejects arguments" \
+    'command does not accept arguments' \
+    boot-media unexpected
+check_kernel_media_dispatch "kernel smoke-media dispatches its exact smoke script" \
+    $'script=media-smoke\nargc=0' \
+    smoke-media
+check_kernel_media_rejection "kernel smoke-media rejects arguments" \
+    'command does not accept arguments' \
+    smoke-media unexpected
+check_kernel_media_dispatch "kernel prepare-write forwards exact writer arguments" \
+    $'script=media-writer\nargc=4\narg=prepare\narg=--device\narg=/dev/disk9\narg=--json' \
+    prepare-write --device /dev/disk9 --json
+check_kernel_media_dispatch "kernel write-media forwards exact writer arguments" \
+    "$(printf 'script=media-writer\nargc=7\narg=write\narg=--device\narg=/dev/disk9\narg=--image\narg=%s\narg=--confirm\narg=bound-token' "$KERNEL_MEDIA_OUTPUT")" \
+    write-media --device /dev/disk9 --image "$KERNEL_MEDIA_OUTPUT" \
+    --confirm bound-token
+check_kernel_qemu_mode_and_build_dir_propagation
+check_kernel_qemu_runner_rejects_direct_args
+check_kernel_qemu_runner_preflights_before_build
+check_kernel_qemu_runner_restricts_modes
+check_kernel_qemu_runner_rejects_unsafe_build_dirs
+check_kernel_qemu_runner_safe_flags
 check_stdout_contains "ogit demo help lists semantic receipt" 0 'semantic-receipt' "$OGIT_BIN" demo --help
 check_stdout_contains "ogit semantic diff detects policy change" 0 'runtime demand model changed' \
     "$OGIT_BIN" diff-semantic examples/group_pipeline/main.O examples/group_pipeline/main.eager.O
