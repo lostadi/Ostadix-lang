@@ -1,8 +1,8 @@
-# Ostadix World: Full-Stack Machine-Constructor Roadmap
+# OSTADIX World: Full-Stack Machine-Constructor Roadmap
 
-## The ambitious native path from the current Ostadix kernel to an elastic eight-node computer
+## The ambitious native path from the current OSTADIX kernel to an elastic eight-node computer
 
-**Status:** normative native Alpha constitution and implementation program,
+**Status:** normative OSTADIX Alpha constitution and implementation program,
 version 3. The machine-readable qualification registry is
 [`evidence/world_alpha_gates.toml`](../evidence/world_alpha_gates.toml).
 Its executable constitutional composition is
@@ -17,7 +17,7 @@ The normative host-EL1-to-EL2 machine-resource and revocation ABI is
 
 > A computer is not a box. A computer is a governed structure of computational resources.
 
-This document deliberately does **not** optimize for the quickest hosted demonstration. It defines the direct path toward the machine Ostadix is intended to become: multiple physical machines booting O-core, contributing typed resources to one replicated World, reusing foreign kernels as capability-governed hardware and compatibility organs, exposing a Linux-compatible Debian environment, and continuing coherently as membership changes.
+This document deliberately does **not** optimize for the quickest hosted demonstration. It defines the direct path toward the machine OSTADIX is intended to become: multiple physical machines booting O-core, contributing typed resources to one replicated World, reusing foreign kernels as capability-governed hardware and compatibility organs, exposing a Linux-compatible Debian environment, and continuing coherently as membership changes.
 
 Hosted Linux implementations remain valuable as simulators, differential oracles, protocol fuzz targets, and development consoles. They do not satisfy the native release gates in this roadmap.
 
@@ -37,7 +37,7 @@ The previous roadmap was coherent but strategically too conservative. It made a 
 - distributed execution and recovery on physical O-core nodes; and
 - a federated accelerator service.
 
-That plan would have proved the fabric semantics while leaving the actual operating system as a substrate swap for later. Ostadix is not merely a substrate-neutral orchestration protocol. Its strongest proposition is that O-core becomes the constitutional layer beneath foreign kernels, distributed resources, and familiar user environments.
+That plan would have proved the fabric semantics while leaving the actual operating system as a substrate swap for later. OSTADIX is not merely a substrate-neutral orchestration protocol. Its strongest proposition is that O-core becomes the constitutional layer beneath foreign kernels, distributed resources, and familiar user environments.
 
 The revised strategy is therefore:
 
@@ -49,9 +49,9 @@ This is not a rejection of sequencing. It is a rejection of sequencing that quie
 
 # 2. The non-negotiable end state
 
-## 2.1 Ostadix World Alpha qualifying gate
+## 2.1 OSTADIX Alpha qualifying gate
 
-The first release allowed to call itself **Ostadix World Alpha** must demonstrate all of the following in one integrated system:
+The first release allowed to call itself **OSTADIX Alpha** must demonstrate all of the following in one integrated system:
 
 1. **At least three physical machines boot O-core as the sovereign kernel.**
    - At least one target must be AArch64.
@@ -74,7 +74,7 @@ The first release allowed to call itself **Ostadix World Alpha** must demonstrat
 
 5. **A real foreign Linux kernel runs as a contained KernelWorld.**
    - It boots from a pinned kernel image and initramfs.
-   - A bounded Ostadix guest agent performs health negotiation.
+   - A bounded OSTADIX guest agent performs health negotiation.
    - Its generation and authority are governed by O-core.
 
 6. **A real physical device is controlled through the foreign-kernel machinery.**
@@ -84,8 +84,8 @@ The first release allowed to call itself **Ostadix World Alpha** must demonstrat
 
 7. **A Linux-compatible personality runs dynamically linked programs from a pinned Debian root filesystem.**
    - A shell, core file utilities, process creation, signals, virtual memory, pipes, terminal I/O, and networking work.
-   - `dpkg` works before the Alpha gate.
-   - `apt` over the World network service is part of the Alpha gate, not an indefinite postscript.
+   - `dpkg` works before the OSTADIX Alpha gate.
+   - `apt` over the World network service is part of the OSTADIX Alpha gate, not an indefinite postscript.
 
 8. **The HGraph becomes a distributed execution model.**
    - A project lowers to a logical HGraph.
@@ -113,9 +113,9 @@ The first release allowed to call itself **Ostadix World Alpha** must demonstrat
 
 ## 2.2 What does not count as completion
 
-None of the following alone qualifies as Ostadix World Alpha:
+None of the following alone qualifies as OSTADIX Alpha:
 
-- several Linux machines running an Ostadix daemon;
+- several Linux machines running an OSTADIX daemon;
 - a single authoritative Governor;
 - a mock 9P tree over in-memory objects;
 - a synthetic guest that never boots Linux;
@@ -184,7 +184,7 @@ The implementation position is conservative and epistemic:
 
 ## 3.3 The mesh is canonical; the Linux face is a projection
 
-Ostadix should provide two simultaneous truths:
+OSTADIX should provide two simultaneous truths:
 
 - a familiar Linux-compatible environment in which ordinary users can work; and
 - an inspectable World view that exposes membership, locality, authority, generations, and failures.
@@ -211,7 +211,7 @@ The authoritative plane uses a three-replica Raft-style consensus group.
 - A minority partition enters **island mode**. It may continue explicitly local, noncommitting work, preserve local state, and serve local diagnostics. It may not mint globally valid capabilities, mutate the global namespace, or commit globally visible results.
 - Rejoining does not resurrect the old node generation. The node is readmitted and stale work remains fenced.
 
-This gives Ostadix graceful shrink without allowing split-brain authority.
+This gives OSTADIX graceful shrink without allowing split-brain authority.
 
 ## 3.5 The four planes are separate by design
 
@@ -220,7 +220,7 @@ Namespace and control plane
     9P2000 / 9P2000.L-derived names, mounts, inspection, control
 
 Authority plane
-    generation-bound Ostadix capabilities and delegation proofs
+    generation-bound OSTADIX capabilities and delegation proofs
 
 Execution plane
     Governor operations, HGraph deployment, attempts, checkpoints, commits
@@ -233,7 +233,7 @@ Bulk data plane
 
 ## 3.6 The memory model is aggregate and explicit, not transparent DSM
 
-Ostadix World does not promise a uniform shared-memory machine over Ethernet. It provides globally governed capacity through explicit object kinds:
+An OSTADIX World does not promise a uniform shared-memory machine over Ethernet. It provides globally governed capacity through explicit object kinds:
 
 - `OArtifact` -- immutable, content-addressed, replicable data;
 - `OBlob` -- immutable chunked data with streaming transfer;
@@ -416,7 +416,7 @@ A single logical project executed through the hosted oracle and through O-core m
 
 ## Objective
 
-Turn the current x86_64-specific O-core compiler into a multi-target systems compiler capable of producing the native kernel and user services for the actual SBC class Ostadix is meant to inhabit.
+Turn the current x86_64-specific O-core compiler into a multi-target systems compiler capable of producing the native kernel and user services for the actual SBC class OSTADIX is meant to inhabit.
 
 ## Concrete construction
 
@@ -659,7 +659,7 @@ Three physical O-core nodes discover one another, establish mutually authenticat
 
 ## Objective
 
-Build the constitutional authority of Ostadix World as a native replicated service, not a single-process scheduler.
+Build the constitutional authority of an OSTADIX World as a native replicated service, not a single-process scheduler.
 
 ## Reference and native implementations
 
@@ -745,7 +745,7 @@ Turn the bounded Mode 26 exchange into the live compositional namespace through 
 2. Implement a reusable codec with bounded allocation and adversarial length checks.
 3. Implement the core request set: version, auth, attach, walk, open, create, read, write, clunk, remove, stat, and wstat.
 4. Implement the Linux-oriented operations required from 9P2000.L, including getattr, setattr, readdir, readlink, symlink, mkdir, rename, unlink, fsync, lock, and xattr operations as needed by the Linux personality.
-5. Add an Ostadix capability-binding extension, versioned separately, in which opening a control or service endpoint negotiates a generation-bound capability or data channel.
+5. Add an OSTADIX capability-binding extension, versioned separately, in which opening a control or service endpoint negotiates a generation-bound capability or data channel.
 6. Support local IPC, shared-memory, and network transports under the same server contract.
 
 ## Namespace model
@@ -855,7 +855,7 @@ For x86_64:
 - inject interrupts through governed virtual interrupt state; and
 - expose only explicitly declared standard virtio devices through trapped MMIO
   or PCI doorbells; and
-- expose no Ostadix-specific guest hypercall or paravirtual authority/control
+- expose no OSTADIX-specific guest hypercall or paravirtual authority/control
   ABI at G7.
 
 For AArch64:
@@ -978,7 +978,7 @@ for guest consumption before ordering memory teardown. Retained terminal bytes
 and the already-enqueued notification are inert observations, not continuing
 old-generation machine authority.
 
-## Ostadix guest agent
+## OSTADIX guest agent
 
 Build a tiny, auditable `ostadix-agent` placed in the initramfs. It must:
 
@@ -996,7 +996,7 @@ Build a tiny, auditable `ostadix-agent` placed in the initramfs. It must:
 ## Shared queue contract
 
 At G7 these queues are reached through a standard virtio MMIO/PCI transport.
-They do not expose O-Machine handles or an Ostadix-specific guest HVC.
+They do not expose O-Machine handles or an OSTADIX-specific guest HVC.
 
 Every descriptor should contain at least:
 
@@ -1041,7 +1041,7 @@ Exports become visible only after health. Failure withdraws them before memory o
 ## Acceptance gate G
 
 A real Linux kernel boots under O-core on x86_64 and AArch64 virtual hardware
-without an Ostadix-specific guest hypercall or paravirtual control ABI. The
+without an OSTADIX-specific guest hypercall or paravirtual control ABI. The
 guest agent becomes healthy over a bounded virtio transport and a service is
 exported through a capability. A `MachineBlock` or `Machine9P` endpoint is
 withdrawn while a request is in flight; evidence records both the composite
@@ -1060,7 +1060,7 @@ guest cannot substitute for the device-error observation.
 
 Make Linux a governed hardware-compatibility organ rather than the sovereign host.
 
-Ostadix should support two complementary reuse paths.
+OSTADIX should support two complementary reuse paths.
 
 ## Path H1 -- binary-contained Linux driver domain
 
@@ -1169,7 +1169,7 @@ contract rather than inherit unexamined reset or failure semantics.
 
 Provide a familiar Linux-compatible user environment above O-core without confusing a Linux userspace personality with a Linux-hosted container.
 
-The personality is a translation and service layer inside Ostadix. Linux may separately exist as a driver KernelWorld, but it is not the kernel serving the Debian processes.
+The personality is a translation and service layer inside OSTADIX. Linux may separately exist as a driver KernelWorld, but it is not the kernel serving the Debian processes.
 
 ## Process semantics
 
@@ -1181,7 +1181,7 @@ Freeze these rules early:
 - Distributed work is expressed as multiple processes, HGraph operations, services, objects, or explicit World APIs.
 - A file descriptor may refer to a remote service through a capability-backed proxy.
 - The global process namespace maps World identities to node-local process generations.
-- Ostadix does not silently turn ordinary pointers or futex words into network operations.
+- OSTADIX does not silently turn ordinary pointers or futex words into network operations.
 
 This preserves Linux compatibility where it is meaningful while keeping distribution honest.
 
@@ -1307,7 +1307,7 @@ Milestone ladder:
 7. run network resolution and HTTPS through the World network service;
 8. run `apt update` against a pinned repository snapshot;
 9. install a package with `apt`; and
-10. start selected long-running services under an Ostadix-native service manager or a supported subset of systemd semantics.
+10. start selected long-running services under an OSTADIX-native service manager or a supported subset of systemd semantics.
 
 Full systemd compatibility is a later hardening target because it pulls in cgroups, namespaces, udev, D-Bus, netlink, and extensive `/proc` and `/sys` behavior. It is not required to prove that a Debian environment works, but its dependencies should be tracked rather than ignored.
 
@@ -1431,7 +1431,7 @@ Every operation or route declares one of:
 - **transactional** -- external effect requires a Governor commit token; or
 - **compensatable** -- failure invokes a declared compensating operation.
 
-Exactly-once execution is not assumed. Ostadix provides exactly-one **global commit** where the operation contract permits it.
+Exactly-once execution is not assumed. OSTADIX provides exactly-one **global commit** where the operation contract permits it.
 
 ## Native execution agents
 
@@ -1558,7 +1558,7 @@ The descriptor records architecture, supported intermediate representations, mem
 
 ## Initial implementation path
 
-Use a contained Linux driver domain to own the physical GPU and userspace driver stack. Export a bounded compute service through the Ostadix guest agent.
+Use a contained Linux driver domain to own the physical GPU and userspace driver stack. Export a bounded compute service through the OSTADIX guest agent.
 
 The first portable API should favor Vulkan compute and SPIR-V because they provide an explicit command, buffer, and synchronization model across vendors. Vendor-specific CUDA, ROCm, Metal translation, or OpenCL adapters can follow as additional personalities.
 
@@ -1969,13 +1969,13 @@ The workstreams proceed in parallel, but the following gates define convergence.
 | **G4 -- native World transport** | three physical O-core nodes communicate through authenticated native transport | O-core can join a network without a Linux host | Linux-hosted node daemons |
 | **G5 -- replicated authority** | three native Governor replicas preserve one log across leader loss and partition | the World is logically singular without one physical point of failure | one Governor plus a backup process |
 | **G6 -- WorldFS** | per-process namespaces mount live resources from multiple physical nodes and survive churn | Plan 9-style composition has become the World interface | a static directory tree or FUSE mount above Linux |
-| **G7 -- real KernelWorld** | a pinned, fully virtualized Linux kernel boots without an Ostadix-specific guest HVC/paravirtual control ABI, exports a healthy virtio-backed service, and consumes a protocol-native error from a class-specific asynchronous withdrawal; both guest consumption and host acknowledgment precede memory teardown, including guest and broker mappings/pins | foreign-kernel containment and graceful virtual-device withdrawal are operational | a synthetic guest, syscall emulator, published-but-unconsumed completion, unrestricted host direct map, or page removal presented as deterministic device failure |
+| **G7 -- real KernelWorld** | a pinned, fully virtualized Linux kernel boots without an OSTADIX-specific guest HVC/paravirtual control ABI, exports a healthy virtio-backed service, and consumes a protocol-native error from a class-specific asynchronous withdrawal; both guest consumption and host acknowledgment precede memory teardown, including guest and broker mappings/pins | foreign-kernel containment and graceful virtual-device withdrawal are operational | a synthetic guest, syscall emulator, published-but-unconsumed completion, unrestricted host direct map, or page removal presented as deterministic device failure |
 | **G8 -- real driver service** | Linux controls a physical device and O-core consumes it through a revocable capability; one concrete class freezes and qualifies quiesce -> DMA fence/unmap/drain -> interrupt withdrawal/drain -> reset -> generation retirement -> host acknowledgment, plus replacement and an explicit guest-interface decision with MAC/key evidence only when guest-presented handles exist | the driver-reuse thesis has crossed into hardware | virtio-only or kernel-internal fake devices, a generic revoke verb, an unresolved guest-interface decision, or missing key-lifecycle evidence when guest-presented handles are enabled |
 | **G9 -- native Debian personality** | dynamically linked Debian userland, `dpkg`, networking, and `apt` run under O-core | the familiar operating environment is a true personality | a container or chroot on Linux |
 | **G10 -- distributed execution** | logical HGraph placement, objects, checkpoints, and exactly-one commit work across physical nodes | the Governor governs computation, not just names | SSH fan-out or an external batch system |
 | **G11 -- accelerator fabric** | at least two accelerators execute one governed workload with explicit buffer locality and recovery | GPUs are resources in the World rather than separately administered devices | independent scripts on each GPU |
 | **G12 -- three-node native World** | all preceding core mechanisms coexist on three physical O-core nodes | the architecture has converged into one computer | separate demos on separate branches |
-| **G13 -- eight-node World Alpha** | eight SBC-class nodes form one elastic World, provide Debian, driver domains, objects, distributed execution, and visible failure recovery | Ostadix has constructed the intended new unit of computation | any hosted or simulated aggregate |
+| **G13 -- eight-node OSTADIX Alpha** | eight SBC-class nodes form one elastic World, provide Debian, driver domains, objects, distributed execution, and visible failure recovery | OSTADIX has constructed the intended new unit of computation | any hosted or simulated aggregate |
 
 ## Gate dependency structure
 
@@ -2098,7 +2098,7 @@ and evidence paths do not yet emit or consume it in live operation. Descriptive
 capability identities and rights grant no authority, and a valid signature does
 not establish signer trust, authorization, current World state, or replay/commit
 fencing. Mode 30 supplies no production key lifecycle, transport, Governor,
-consensus, WorldFS, typed Alpha attestation, Acceptance gate A, or G0--G13
+consensus, WorldFS, typed OSTADIX Alpha attestation, Acceptance gate A, or G0--G13
 passage. QEMU TCG is not physical or hardware-isolation evidence.
 
 ### PR 6 -- governed `ResourceKey` expansion
@@ -2328,7 +2328,7 @@ resource-class-specific O-Machine withdrawal contracts.
 
 Replace the synthetic Mode 23 guest with a pinned, fully virtualized Linux
 kernel and initramfs under AMD SVM. Use trapped virtio MMIO/PCI doorbells and
-no Ostadix-specific guest hypercall or paravirtual control ABI; add VMX after
+no OSTADIX-specific guest hypercall or paravirtual control ABI; add VMX after
 the interface stabilizes.
 
 ### PR 45 -- AArch64 Linux guest boot
@@ -2337,7 +2337,7 @@ Boot the same guest-agent contract at guest EL1 under O-core at host EL1 and
 O-Machine at EL2 with stage-2 translation. Architecture platform calls carry
 no resource handles and do not create a guest authority ABI.
 
-### PR 46 -- Ostadix guest agent and shared rings
+### PR 46 -- OSTADIX guest agent and shared rings
 
 Implement health negotiation, service discovery, bounded descriptors,
 cancellation, deadlines, and terminal-state reporting over standard virtio
@@ -2391,7 +2391,7 @@ Support glibc threading, shell job control, pipelines, event loops, and interact
 
 ### PR 55 -- sockets and network-facing Linux ABI
 
-Map sockets, DNS, Unix sockets, eventing, and bounded netlink subsets onto Ostadix network services.
+Map sockets, DNS, Unix sockets, eventing, and bounded netlink subsets onto OSTADIX network services.
 
 ### PR 56 -- `/proc`, `/sys`, `/dev`, and ioctl families
 
@@ -2451,7 +2451,7 @@ Pass G12 with replicated Governor, WorldFS, Debian, a real Linux driver service,
 
 Build reproducible images and enrollment manifests for the final SBC fabric.
 
-### PR 70 -- Ostadix World Alpha gate
+### PR 70 -- OSTADIX Alpha gate
 
 Pass G13, publish the full signed evidence bundle, and cut the first release that may call itself the machine constructor.
 
@@ -2822,9 +2822,9 @@ This is not a reduction in ambition. It concentrates ambition on the parts that 
 
 ---
 
-# 28. Alpha non-claims
+# 28. OSTADIX Alpha non-claims
 
-Even the ambitious Alpha must remain precise. Passing G13 would not yet prove:
+Even OSTADIX Alpha must remain precise. Passing G13 would not yet prove:
 
 - uniform coherent RAM across nodes;
 - remote pointer transparency;
@@ -2845,9 +2845,9 @@ It would prove something more structurally important:
 
 ---
 
-# 29. Beyond Alpha: Ostadix World 1.0
+# 29. Beyond OSTADIX Alpha: OSTADIX 1.0
 
-After the eight-node Alpha, the road to 1.0 is not “add more nodes.” It is hardening the machine as an ecosystem.
+After the eight-node OSTADIX Alpha, the road to 1.0 is not “add more nodes.” It is hardening the machine as an ecosystem.
 
 World 1.0 should add:
 
@@ -2870,7 +2870,7 @@ World 1.0 should add:
 - reproducible board-support kits; and
 - a public conformance suite that third-party nodes and personalities can run.
 
-The long-term ecosystem goal is that a new node, driver world, evaluator, or operating-system personality can join through published contracts rather than through privileged edits to the center of Ostadix.
+The long-term ecosystem goal is that a new node, driver world, evaluator, or operating-system personality can join through published contracts rather than through privileged edits to the center of OSTADIX.
 
 ---
 
@@ -2892,7 +2892,7 @@ The project has crossed from research architecture into a new computing capabili
 - every result carries a receipt; and
 - every public claim is bounded by executable evidence.
 
-At that point, Ostadix is not a cluster manager wearing an operating-system costume. It is not a Linux distribution spread over several IP addresses. It is not Plan 9 with a different shell. It is not a hypervisor with a global dashboard.
+At that point, OSTADIX is not a cluster manager wearing an operating-system costume. It is not a Linux distribution spread over several IP addresses. It is not Plan 9 with a different shell. It is not a hypervisor with a global dashboard.
 
 It is the operational form of the original proposition:
 
@@ -2909,7 +2909,7 @@ This constitution was reconciled against canonical repository commit
 HGraph, project runtime, effects, capability bridge, hosted lifecycle,
 KernelWorld identity and lifecycle code, x86_64 O-core runtime, bounded Linux
 personality, bounded Linux/9P composition, QEMU gate scripts, and the bounded
-`evidence/gates.toml` manifest. This revision adds the separate World Alpha
+`evidence/gates.toml` manifest. This revision adds the separate OSTADIX Alpha
 registry.
 
 The validator and repository suites run separately from this prose. A future

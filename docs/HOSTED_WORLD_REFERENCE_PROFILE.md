@@ -1,7 +1,7 @@
 # Hosted World Reference Profile
 
 **Status:** design/reference profile with partial hosted foundations;
-non-qualifying for native Ostadix World release gates.
+non-qualifying for native OSTADIX Alpha release gates.
 
 This profile preserves the useful hosted design that preceded the native
 full-stack constitution in [`OSTADIX_WORLD.md`](OSTADIX_WORLD.md). It specifies
@@ -99,7 +99,7 @@ A conformance signature authenticates bytes under its pinned test key; it does
 not grant authority, establish trusted signer policy, or prove current World
 state. The repository does not yet have a live replicated
 Governor, an authoritative World snapshot service, governed distributed lowering, native World transport,
-WorldFS, physical multinode convergence, or an Alpha evidence bundle. No
+WorldFS, physical multinode convergence, or an OSTADIX Alpha evidence bundle. No
 production lowering currently eliminates ambient `HostWorld` for arbitrary
 hosted effects.
 
@@ -138,7 +138,7 @@ establishes:
   or hardware reset;
 - transparent remote pointers, coherent distributed RAM, or transparent
   migration; or
-- G12, G13, or the name **Ostadix World Alpha**.
+- G12, G13, or the name **OSTADIX Alpha**.
 
 Modes 20 through 30 remain separately scoped native or QEMU evidence. Their
 bounded claims and exclusions are recorded in [`CLAIMS.md`](CLAIMS.md) and

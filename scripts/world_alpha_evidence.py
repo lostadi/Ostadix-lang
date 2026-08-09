@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Ostadix World Alpha G0-G13 qualification registry.
+"""Validate the OSTADIX Alpha G0-G13 qualification registry.
 
 This registry defines future integrated release gates. It is intentionally
 separate from evidence/gates.toml, which records executable evidence for the
@@ -25,17 +25,26 @@ MANIFEST = ROOT / "evidence/world_alpha_gates.toml"
 EXPECTED_SCHEMA_VERSION = 4
 EXPECTED_CONSTITUTION_VERSION = 3
 IMPORTED_WORLD_CONTRACT_CONSTITUTION_VERSION = 2
-EXPECTED_CONSTITUTION_SHA256 = "26c0937e8476a747ceb36c76147e6bcedc553a47bc0d49f6da4ee85de17b5371"
-EXPECTED_HOSTED_PROFILE_SHA256 = "4d4681039ff8a9d1c92509356f7ee76444b133b9ee3e026d08b7b815e723777f"
+EXPECTED_CONSTITUTION_SHA256 = "e7d47d7a8e0e8f6d35bf3bb6b1f86f2bddffe27a67a3415c3d4ea8c76e13bcea"
+EXPECTED_HOSTED_PROFILE_SHA256 = "647da49edfc4b7d53a9248e8fdcda5cdb62be3c47756c59b7523ee09461d2e1d"
 EXPECTED_WORLD_CONTRACT_V1_SHA256 = "4b2d92596ab46294894a4127cc5c603b121a3a3d7e942f0013dd419330921bf8"
-EXPECTED_WORLD_CONTRACT_V2_SHA256 = "91c34804d12a3afc85a83d60a4541292776c8ac3b68222180048719cd2f612f7"
+EXPECTED_WORLD_CONTRACT_V2_SHA256 = "af1334bb4d0aca30e7f722890e819c0a597c4c4b42db0006c452dec2e755b74b"
 EXPECTED_MACHINE_CONTRACT_SHA256 = "eb759ce5695e8080baa3acbd0fcb3f97fc2a97e430679cd8c836aba3a3d2be50"
 EXPECTED_MACHINE_SPEC_SHA256 = "7958677cbf178003b47f475a265857a42dc6e3b51a33fe408c1863b8afa64880"
 EXPECTED_IMPORTED_CONSTITUTION_V2_SHA256 = (
     "2a56a9b54297c9b6190505055bad3f2e8760a501498b1a55da72a0fd4d298643"
 )
 EXPECTED_REGISTRY_SEMANTICS_SHA256 = (
-    "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea"
+    "23ead9813a067917ac5ea5d08c7be34616865286e9f45622212eb0ff3676686e"
+)
+# Append-only attestations retain the registry identity under which they were
+# produced. The prior identity differs only in the retired release-facing name;
+# supersession, not record rewriting, moves G0 to the current identity.
+ACCEPTED_REGISTRY_SEMANTICS_SHA256 = frozenset(
+    {
+        "bcc377e68c3b0d35c879430181b9b9763111fd9507ee903142030050447000ea",
+        EXPECTED_REGISTRY_SEMANTICS_SHA256,
+    }
 )
 EXPECTED_GATE_IDS = tuple(f"G{number}" for number in range(14))
 EXPECTED_CLASS_SCOPES = {
@@ -790,7 +799,7 @@ EXPECTED_MACHINE_CONTRACT = {
 
 
 class WorldEvidenceError(RuntimeError):
-    """The World Alpha qualification registry is malformed or overclaims."""
+    """The OSTADIX Alpha qualification registry is malformed or overclaims."""
 
 
 def _require_string(value: Any, location: str) -> str:
@@ -1741,9 +1750,16 @@ def _validate_attestation(
             artifact_text, artifact_path = _repo_file(
                 root, artifact["path"], f"{owner}.path"
             )
-            if hashlib.sha256(artifact_path.read_bytes()).hexdigest() != digest:
+            current_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            # A superseded attestation may retain a path whose current bytes
+            # belong to a later constitutional revision. Its immutable source
+            # snapshot still has to bind the exact historical artifact digest;
+            # never require append-only evidence records to rewrite that path.
+            historical_digest = source_digests.get(artifact_text)
+            if current_digest != digest and historical_digest != digest:
                 raise WorldEvidenceError(
-                    f"{owner} digest does not match retained {artifact_text}"
+                    f"{owner} digest matches neither current nor source-snapshot "
+                    f"bytes for retained {artifact_text}"
                 )
         else:
             if artifact["path"] != "":
@@ -1777,9 +1793,9 @@ def _validate_attestation(
             raise WorldEvidenceError(
                 f"{path_text}.claim_rule_policy_sha256 differs from claim rules"
             )
-        if registry_semantics_sha256_value != registry_semantics_sha256:
+        if registry_semantics_sha256_value not in ACCEPTED_REGISTRY_SEMANTICS_SHA256:
             raise WorldEvidenceError(
-                f"{path_text}.registry_semantics_sha256 differs from current qualification policy"
+                f"{path_text}.registry_semantics_sha256 is not an accepted immutable registry identity"
             )
     return {
         "id": attestation_id,
@@ -2240,11 +2256,11 @@ def _validate_constitution(data: dict[str, Any], root: Path) -> None:
     except UnicodeDecodeError as error:
         raise WorldEvidenceError("World constitution documents must be UTF-8") from error
     required_constitution_text = (
-        "normative native Alpha constitution",
+        "normative OSTADIX Alpha constitution",
         "They do not satisfy the native release gates in this roadmap.",
         "# 21. Integration gate ladder",
-        "G13 -- eight-node World Alpha",
-        "# 28. Alpha non-claims",
+        "G13 -- eight-node OSTADIX Alpha",
+        "# 28. OSTADIX Alpha non-claims",
         "not transparent DSM",
     )
     for required in required_constitution_text:
@@ -2258,9 +2274,9 @@ def _validate_constitution(data: dict[str, Any], root: Path) -> None:
                 f"constitution does not define integration gate {gate_id}"
             )
     for required in (
-        "non-qualifying for native Ostadix",
+        "non-qualifying for native OSTADIX Alpha",
         "cannot satisfy G0 through G13",
-        "G12, G13, or the name **Ostadix World Alpha**",
+        "G12, G13, or the name **OSTADIX Alpha**",
     ):
         if required not in hosted:
             raise WorldEvidenceError(
@@ -2575,7 +2591,7 @@ def validated_gates(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="validate the Ostadix World Alpha G0-G13 registry"
+        description="validate the OSTADIX Alpha G0-G13 registry"
     )
     parser.add_argument(
         "--manifest",
@@ -2601,13 +2617,13 @@ def main(argv: list[str] | None = None) -> int:
             definitions_only=args.definitions_only,
         )
     except WorldEvidenceError as error:
-        print(f"World Alpha evidence error: {error}", file=sys.stderr)
+        print(f"OSTADIX Alpha evidence error: {error}", file=sys.stderr)
         return 1
     if not args.quiet:
         passed = sum(gate["status"] == "passed" for gate in gates)
         alpha = next(gate for gate in gates if gate["id"] == "G13")
         print(
-            "World Alpha gate registry: "
+            "OSTADIX Alpha gate registry: "
             f"{len(gates)}/{len(gates)} gates defined, {passed} passed; "
             f"G13 {alpha['status'].upper()} (registry schema v4 derived ledger view)"
         )

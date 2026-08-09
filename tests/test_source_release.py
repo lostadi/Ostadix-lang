@@ -33,12 +33,14 @@ WORLD_ATTESTATION_PATHS = (
     "evidence/world/g0-repository-conformance.toml",
     "evidence/world/g0-repository-conformance-2026-08-03.toml",
     "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
+    "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
     "evidence/world/g2-aarch64-qemu.toml",
     "evidence/world/g2-aarch64-qemu-2026-08-03.toml",
 )
 WORLD_EVIDENCE_EVENT_PATHS = {
     "evidence/world/g0-derivation-rederive-2026-08-03.toml",
     "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
+    "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
     "evidence/world/g0-schema-v3-supersession-2026-08-03.toml",
     "evidence/world/g2-derivation-rederive-2026-08-03.toml",
     "evidence/world/g2-counter-wording-supersession-2026-08-03.toml",
@@ -396,6 +398,7 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/O_MACHINE_CONTRACT.md": WORLD_NORMATIVE_BYTES[
                 "docs/O_MACHINE_CONTRACT.md"
             ],
+            "docs/OSTADIX_BOOT.md": "# Fixture OSTADIX boot contract\n",
             "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
                 "docs/OSTADIX_WORLD.md"
             ],
@@ -433,8 +436,11 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/aarch64/linker.ld": "ENTRY(_start)\n",
             "ocore/kernel/aarch64/vectors.S": ".section .text\n",
             "ocore/kernel/build-aarch64-g2.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/run-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
+            "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-project-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-project-runtime-qemu.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/smoke-world-receipt-qemu.sh": "#!/bin/sh\nexit 0\n",
@@ -472,6 +478,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/world_receipt_semantics_stub.oc": (
                 "module kernel::world_receipt_semantics;\n"
             ),
+            "ocore/kernel/x86_64/grub.cfg": "multiboot2 /boot/okernel.elf\n",
             "ocore/runtime/x86_64/trap.oc": "module runtime::trap;\n",
             "ocore/runtime/aarch64/g2_kernel.oc": "module runtime::g2_kernel;\n",
             "ocore/runtime/aarch64/g2_user_a.oc": "module runtime::g2_user_a;\n",
@@ -488,6 +495,8 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/o-kernel.sh": "#!/usr/bin/env bash\nexec true\n",
+            "scripts/ostadix_boot_media.py": "#!/usr/bin/env python3\n",
+            "scripts/ostadix_media_writer.py": "#!/usr/bin/env python3\n",
             "scripts/smoke-project-hgraph-exec.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-project-hgraph.sh": "#!/usr/bin/env bash\n",
             "scripts/smoke-world-resource-keys.sh": "#!/usr/bin/env bash\n",
@@ -505,6 +514,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/bin/ocorec.rs": "// fixture O-core compiler CLI\n",
             "src/ocore/codegen.rs": "// fixture x86_64 O-core code generator\n",
             "src/ocore/codegen_aarch64.rs": "// fixture AArch64 O-core code generator\n",
+            "src/ocore/boot_info.rs": "// fixture BootInfoV1 contract\n",
             "src/ocore/driver.rs": "// fixture O-core target driver\n",
             "src/ocore/mod.rs": "// fixture O-core module exports\n",
             "src/executor/mod.rs": "// fixture public executor effects surface\n",
@@ -548,7 +558,10 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
+            "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
+            "tests/test_ostadix_media_writer.py": "# fixture media-writer tests\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
+            "tests/test_setup.py": "# fixture setup tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
             "tests/project_hgraph.rs": "#[test] fn project_hgraph_fixture() {}\n",
             "tests/project_hgraph_exec.rs": "#[test] fn project_hgraph_exec_fixture() {}\n",
@@ -583,6 +596,9 @@ class SourceReleaseTests(unittest.TestCase):
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
+                    "ocore/kernel/build-x86_64-uefi-media.sh",
+                    "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+                    "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                     "ocore/kernel/smoke-world-project-receipt-qemu.sh",
                     "ocore/kernel/smoke-world-project-runtime-qemu.sh",
                     "ocore/kernel/smoke-world-receipt-qemu.sh",
@@ -592,6 +608,8 @@ class SourceReleaseTests(unittest.TestCase):
                     "ocore/kernel/smoke-aarch64-g2-qemu.sh",
                     "scripts/o-cli.sh",
                     "scripts/o-kernel.sh",
+                    "scripts/ostadix_boot_media.py",
+                    "scripts/ostadix_media_writer.py",
                     "scripts/benchmark_hgraph_hosted.sh",
                     "scripts/install-o-cli-wrapper.sh",
                     "scripts/smoke-project-hgraph-exec.sh",
@@ -704,6 +722,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
+                "docs/OSTADIX_BOOT.md",
                 "docs/OSTADIX_WORLD.md",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
@@ -712,6 +731,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world_contract_v2.toml",
                 "evidence/world/g0-derivation-rederive-2026-08-03.toml",
                 "evidence/world/g0-machine-contract-supersession-2026-08-03.toml",
+                "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml",
+                "evidence/world/g0-ostadix-alpha-branding-supersession-2026-08-09.toml",
                 "evidence/world/g0-repository-conformance.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03.toml",
                 "evidence/world/g0-repository-conformance-2026-08-03-v2.toml",
@@ -723,6 +744,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/transcripts/g0-repository-conformance.log",
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03.log",
                 "evidence/world/transcripts/g0-repository-conformance-2026-08-03-v2.log",
+                "evidence/world/transcripts/g0-ostadix-alpha-branding-2026-08-09.log",
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
@@ -738,8 +760,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/aarch64/linker.ld",
                 "ocore/kernel/aarch64/vectors.S",
                 "ocore/kernel/build-aarch64-g2.sh",
+                "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
+                "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+                "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
                 "ocore/kernel/smoke-world-project-receipt-qemu.sh",
                 "ocore/kernel/smoke-world-project-runtime-qemu.sh",
                 "ocore/kernel/smoke-world-receipt-qemu.sh",
@@ -757,6 +782,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/world_project_receipt_semantics_stub.oc",
                 "ocore/kernel/world_receipt_semantics.oc",
                 "ocore/kernel/world_receipt_semantics_stub.oc",
+                "ocore/kernel/x86_64/grub.cfg",
                 "ocore/runtime/x86_64/trap.oc",
                 "ocore/runtime/aarch64/g2_kernel.oc",
                 "ocore/runtime/aarch64/g2_user_a.oc",
@@ -773,6 +799,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
                 "scripts/o-kernel.sh",
+                "scripts/ostadix_boot_media.py",
+                "scripts/ostadix_media_writer.py",
                 "scripts/smoke-project-hgraph-exec.sh",
                 "scripts/smoke-project-hgraph.sh",
                 "scripts/smoke-world-resource-keys.sh",
@@ -790,6 +818,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/bin/ocorec.rs",
                 "src/ocore/codegen.rs",
                 "src/ocore/codegen_aarch64.rs",
+                "src/ocore/boot_info.rs",
                 "src/ocore/driver.rs",
                 "src/ocore/mod.rs",
                 "src/executor/mod.rs",
@@ -831,7 +860,10 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
                 "tests/test_mcp_smoke.py",
+                "tests/test_ostadix_boot_media.py",
+                "tests/test_ostadix_media_writer.py",
                 "tests/test_release_evidence.py",
+                "tests/test_setup.py",
                 "tests/test_world_alpha_evidence.py",
                 "tests/project_hgraph.rs",
                 "tests/project_hgraph_exec.rs",
@@ -895,6 +927,16 @@ class SourceReleaseTests(unittest.TestCase):
                 modes["ocore/kernel/smoke-world-project-runtime-qemu.sh"],
                 "100755",
             )
+            for executable_path in (
+                "ocore/kernel/build-x86_64-uefi-media.sh",
+                "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+                "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
+                "scripts/ostadix_boot_media.py",
+                "scripts/ostadix_media_writer.py",
+            ):
+                self.assertEqual(modes[executable_path], "100755")
+            self.assertEqual(modes["ocore/kernel/x86_64/grub.cfg"], "100644")
+            self.assertEqual(modes["src/ocore/boot_info.rs"], "100644")
             self.assertEqual(modes["tests/fixtures/project_hgraph_tools/sh"], "100755")
             self.assertEqual(
                 modes["scripts/benchmark_hgraph_hosted.sh"], "100755"
@@ -1229,6 +1271,31 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-evidence.zip")
 
+    def test_boot_media_and_bootinfo_surface_is_required(self) -> None:
+        required = (
+            "docs/OSTADIX_BOOT.md",
+            "ocore/kernel/build-x86_64-uefi-media.sh",
+            "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
+            "ocore/kernel/smoke-x86_64-uefi-media-qemu.sh",
+            "ocore/kernel/x86_64/grub.cfg",
+            "scripts/ostadix_boot_media.py",
+            "scripts/ostadix_media_writer.py",
+            "src/ocore/boot_info.rs",
+            "tests/test_ostadix_boot_media.py",
+            "tests/test_ostadix_media_writer.py",
+            "tests/test_setup.py",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove boot-media release surface")
+
+        with self.assertRaises(release.ReleaseError) as raised:
+            self._build("missing-boot-media.zip")
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for required_path in required:
+            self.assertIn(required_path, message)
+
     def test_g2_aarch64_compiler_boot_and_gate_surface_is_required(self) -> None:
         self._commit()
         self._git(
@@ -1539,7 +1606,7 @@ class SourceReleaseTests(unittest.TestCase):
                 message = str(raised.exception)
                 self.assertIn(path, message)
                 self.assertIn(
-                    "SHA-256 differs from sealed World Alpha constitutional bytes",
+                    "SHA-256 differs from sealed OSTADIX Alpha constitutional bytes",
                     message,
                 )
 
@@ -1565,7 +1632,7 @@ class SourceReleaseTests(unittest.TestCase):
                 message = str(raised.exception)
                 self.assertIn(path, message)
                 self.assertIn(
-                    "SHA-256 differs from sealed World Alpha constitutional bytes",
+                    "SHA-256 differs from sealed OSTADIX Alpha constitutional bytes",
                     message,
                 )
 
@@ -1807,7 +1874,7 @@ class SourceReleaseTests(unittest.TestCase):
             release._validate_release_rederive_ledger([attestation], [])
 
     def test_fresh_attestation_cannot_couple_replace_the_trusted_validator(self) -> None:
-        path = "evidence/world/g0-repository-conformance-2026-08-03-v2.toml"
+        path = "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")
@@ -1842,7 +1909,7 @@ class SourceReleaseTests(unittest.TestCase):
             )
 
     def test_fresh_attestation_seal_rejects_coupled_transcript_rewrite(self) -> None:
-        path = "evidence/world/g0-repository-conformance-2026-08-03-v2.toml"
+        path = "evidence/world/g0-ostadix-alpha-branding-2026-08-09.toml"
         source_path = PROJECT_ROOT / path
         if not source_path.is_file():
             self.skipTest("fresh schema-v3 G0 attestation has not been minted yet")

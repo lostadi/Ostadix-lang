@@ -34,6 +34,7 @@ WITH_NIX=false
 NIX_EXPLICIT=false
 SKIP_NIX=false
 WITH_OCORE=false
+WITH_OCORE_MEDIA=false
 WITH_HOSTED_RUNTIMES=false
 WITH_LINUX_KERNEL_TOOLS=false
 WITH_GUEST_TOOLS=false
@@ -67,6 +68,7 @@ Options:
   --with-nix                  Install/verify Nix using the official installer when absent
   --no-nix                    Exclude Nix even when --full is selected
   --with-ocore                Install Clang, LLD, ELF tools, and x86/AArch64 QEMU
+  --with-ocore-media          Also install deterministic x86_64 UEFI-media tools
   --with-hosted-runtimes      Open-source backend runtimes (macOS/Debian; excludes Java/licensed tools)
   --with-linux-kernel-tools   Linux-only kernel development dependencies (tools, not sources)
   --with-guest-tools          QEMU image/compression tools for user-supplied guest media
@@ -86,6 +88,7 @@ Examples:
   ./setup.sh --minimal --verify
   ./setup.sh --full -y
   ./setup.sh --with-ocore --verify-ocore
+  ./setup.sh --with-ocore-media --deps-only
   ./setup.sh --full --with-hosted-runtimes
   ./setup.sh --with-linux-kernel-tools --deps-only
   ./setup.sh --with-guest-tools --with-ubuntu-vm --deps-only
@@ -108,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --with-nix) WITH_NIX=true; NIX_EXPLICIT=true; SKIP_NIX=false; shift ;;
     --no-nix) SKIP_NIX=true; WITH_NIX=false; shift ;;
     --with-ocore) WITH_OCORE=true; shift ;;
+    --with-ocore-media) WITH_OCORE_MEDIA=true; WITH_OCORE=true; shift ;;
     --with-hosted-runtimes) WITH_HOSTED_RUNTIMES=true; shift ;;
     --with-linux-kernel-tools) WITH_LINUX_KERNEL_TOOLS=true; shift ;;
     --with-guest-tools) WITH_GUEST_TOOLS=true; shift ;;
@@ -169,7 +173,7 @@ fi
 echo "=== O-lang cross-platform setup ==="
 echo "Project root: $PROJECT_ROOT"
 echo "Host: $(uname -a)"
-echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY nix=$WITH_NIX ocore=$WITH_OCORE hosted_runtimes=$WITH_HOSTED_RUNTIMES linux_kernel_tools=$WITH_LINUX_KERNEL_TOOLS guest_tools=$WITH_GUEST_TOOLS ubuntu_vm=$WITH_UBUNTU_VM verify_ocore=$VERIFY_OCORE check=$CHECK_ONLY deps_only=$DEPS_ONLY env=$WRITE_ENV persist_env=$PERSIST_ENV wrappers=$INSTALL_WRAPPERS mcp=$INSTALL_MCP dry_run=$DRY_RUN"
+echo "Options: minimal=$MINIMAL full=$FULL yes=$YES verify=$VERIFY nix=$WITH_NIX ocore=$WITH_OCORE ocore_media=$WITH_OCORE_MEDIA hosted_runtimes=$WITH_HOSTED_RUNTIMES linux_kernel_tools=$WITH_LINUX_KERNEL_TOOLS guest_tools=$WITH_GUEST_TOOLS ubuntu_vm=$WITH_UBUNTU_VM verify_ocore=$VERIFY_OCORE check=$CHECK_ONLY deps_only=$DEPS_ONLY env=$WRITE_ENV persist_env=$PERSIST_ENV wrappers=$INSTALL_WRAPPERS mcp=$INSTALL_MCP dry_run=$DRY_RUN"
 echo
 
 # --- OS / Distro Detection ---
@@ -246,6 +250,13 @@ if $WITH_HOSTED_RUNTIMES && ! $CHECK_ONLY && \
     [[ "$PLATFORM" != "macos" && !( "$PLATFORM" == "linux" && "$DISTRO" == "debian" ) ]]; then
   echo "Error: automatic --with-hosted-runtimes package installation is currently validated only for macOS/Homebrew and Debian-family hosts." >&2
   echo "Use --check on this host to inventory the required executables." >&2
+  exit 2
+fi
+
+if $WITH_OCORE_MEDIA && ! $CHECK_ONLY && \
+    [[ "$PLATFORM" != "macos" && !( "$PLATFORM" == "linux" && "$DISTRO" == "debian" ) ]]; then
+  echo "Error: automatic --with-ocore-media installation is currently validated only for macOS/Homebrew and Debian-family hosts." >&2
+  echo "Install GRUB x86_64 EFI, mtools, and OVMF manually, then use --check." >&2
   exit 2
 fi
 
@@ -407,6 +418,9 @@ install_system_deps() {
       if $WITH_OCORE; then
         append_unique mac_packages llvm lld binutils qemu cmake
       fi
+      if $WITH_OCORE_MEDIA; then
+        append_unique mac_packages x86_64-elf-grub mtools
+      fi
       if $WITH_HOSTED_RUNTIMES; then
         append_unique mac_packages node ruby racket ghc ocaml sbcl mono wabt wasmtime
       fi
@@ -441,6 +455,9 @@ install_system_deps() {
           fi
           if $WITH_OCORE; then
             append_unique debian_packages clang lld llvm binutils qemu-system-x86 qemu-system-arm cmake
+          fi
+          if $WITH_OCORE_MEDIA; then
+            append_unique debian_packages grub-efi-amd64-bin mtools ovmf
           fi
           if $WITH_HOSTED_RUNTIMES; then
             append_unique debian_packages nodejs ruby racket ghc ocaml sbcl mono-devel octave wabt
@@ -1161,6 +1178,28 @@ check_capabilities() {
     check_clang_target aarch64-unknown-none-elf
   fi
 
+  if $WITH_OCORE_MEDIA; then
+    check_any_tool "GRUB x86_64 EFI builder" x86_64-elf-grub-mkstandalone grub-mkstandalone
+    check_any_tool "FAT formatter" mformat
+    check_any_tool "FAT copier" mcopy
+    local firmware_candidate=""
+    for firmware_candidate in \
+      "${OSTADIX_OVMF_CODE:-}" \
+      /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
+      /usr/local/opt/qemu/share/qemu/edk2-x86_64-code.fd \
+      /usr/share/OVMF/OVMF_CODE.fd \
+      /usr/share/edk2/x64/OVMF_CODE.fd; do
+      if [[ -f "$firmware_candidate" ]]; then
+        printf '  [ok] %-28s %s\n' "OVMF/edk2 firmware" "$firmware_candidate"
+        break
+      fi
+    done
+    if [[ ! -f "$firmware_candidate" ]]; then
+      echo "  [missing] OVMF/edk2 x86_64 code firmware" >&2
+      ((CHECK_FAILURES+=1))
+    fi
+  fi
+
   if $WITH_GUEST_TOOLS; then
     check_any_tool "QEMU image tool" qemu-img
     check_any_tool "gzip" gzip
@@ -1529,6 +1568,12 @@ fi
 if $WITH_OCORE; then
   echo "  ./setup.sh --with-ocore --check       # inspect native/QEMU capabilities"
   echo "  ./setup.sh --with-ocore --verify-ocore # bounded x86_64 QEMU/TCG smoke"
+fi
+if $WITH_OCORE_MEDIA; then
+  echo "  o kernel media                         # deterministic GPT/UEFI image"
+  echo "  o kernel smoke-media                   # exact image under OVMF/QEMU"
+  echo "  o kernel prepare-write --image IMAGE --device DEVICE"
+  echo "  # QEMU validation is not physical-machine or SMP evidence."
 fi
 if $WITH_GUEST_TOOLS; then
   echo "  Guest tools are for explicit, user-supplied media under:"

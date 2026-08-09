@@ -1,7 +1,7 @@
 //! Canonical World PR8-1 project-profile LogicalHGraph coverage.
 //!
 //! These tests exercise a hosted logical schema only. They do not constitute
-//! placement, runtime, recovery, native/O-core, Governor, or World Alpha
+//! placement, runtime, recovery, native/O-core, Governor, or OSTADIX Alpha
 //! evidence.
 
 use std::path::{Path, PathBuf};

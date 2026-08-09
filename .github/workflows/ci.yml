@@ -210,6 +210,13 @@ jobs:
       - name: Validate hosted HGraph benchmark contracts
         run: python3 -m unittest -v tests.test_benchmark_hgraph_hosted
 
+      - name: Validate deterministic OSTADIX boot media and writer safety
+        run: |
+          python3 -m unittest -v \
+            tests.test_ostadix_boot_media \
+            tests.test_ostadix_media_writer \
+            tests.test_setup
+
       - name: Evaluator tests
         run: python3 -m tests.test_evaluator
 
@@ -295,7 +302,7 @@ jobs:
       - name: Check active docs for stale claims
         run: bash scripts/check_release_claims.sh
 
-      - name: Test World Alpha gate substitution rules
+      - name: Test OSTADIX Alpha gate substitution rules
         run: python3 -m unittest -v tests.test_world_alpha_evidence
 
       - name: Test native release-evidence registry
@@ -335,7 +342,10 @@ jobs:
             fi
           done
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm
+          sudo apt-get install --yes --no-install-recommends \
+            clang lld llvm binutils \
+            qemu-system-x86 qemu-system-arm \
+            grub-efi-amd64-bin mtools ovmf
           command -v llvm-objdump
           command -v nm
           command -v qemu-system-aarch64
@@ -343,6 +353,9 @@ jobs:
 
       - name: Verify isolated minimal Linux personality corpus
         run: ocore/kernel/check-linux-minimal-slice.sh
+
+      - name: Prove deterministic x86_64 UEFI media boot through OVMF
+        run: ocore/kernel/smoke-x86_64-uefi-media-qemu.sh
 
       # BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CI
       - name: Validate central release-evidence manifest
