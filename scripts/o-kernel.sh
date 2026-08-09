@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Repository-owned O-core kernel operator CLI. This file intentionally delegates
+# compilation, linking, QEMU launch, and evidence assertions to the scripts that
+# already own those contracts.
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SETUP_SCRIPT=${O_KERNEL_SETUP_SCRIPT:-"$ROOT/setup.sh"}
+BUILD_SCRIPT=${O_KERNEL_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build.sh"}
+BOOT_SCRIPT=${O_KERNEL_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-qemu.sh"}
+SMOKE_SCRIPT=${O_KERNEL_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-qemu.sh"}
+SMOKE_LIVE_SCRIPT=${O_KERNEL_SMOKE_LIVE_SCRIPT:-"$ROOT/ocore/kernel/smoke-live-qemu.sh"}
+GATES_SCRIPT=${O_KERNEL_GATES_SCRIPT:-"$ROOT/boot-and-test.sh"}
+
+usage() {
+    cat <<'USAGE'
+Usage: o kernel <command>
+
+Build and boot the freestanding O-core kernel under local QEMU.
+
+Commands:
+  doctor       Check the O-core compiler, linker, ELF, and QEMU prerequisites
+  build        Build the baseline kernel image
+  image        Rebuild and describe the baseline kernel ELF
+  boot         Boot the baseline kernel with an interactive serial terminal
+  console      Boot the bounded native M5 `o> ` control console
+  smoke        Run the bounded baseline boot assertion
+  smoke-live   Drive and verify the native M5 console lifecycle
+  gates        Run every manifest-defined portable O-core QEMU evidence gate
+  help         Show this help
+
+Interactive QEMU escape: Ctrl-A X
+
+This is a QEMU/TCG boot of the freestanding O-core image. It is not a physical
+machine, SMP, Linux/Plan 9, or hardware-device isolation claim.
+USAGE
+}
+
+die_usage() {
+    printf 'error: %s\n\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+require_no_args() {
+    if [[ $# -ne 0 ]]; then
+        die_usage "command does not accept arguments: $*"
+    fi
+}
+
+require_executable() {
+    if [[ ! -x "$1" ]]; then
+        printf 'error: required O-core script is missing or not executable: %s\n' "$1" >&2
+        exit 1
+    fi
+}
+
+baseline_build_dir() {
+    printf '%s\n' "${OCORE_BUILD_DIR:-$ROOT/target/ocore-kernel}"
+}
+
+run_baseline_build() {
+    local build_dir
+    build_dir=$(baseline_build_dir)
+    require_executable "$BUILD_SCRIPT"
+    OCORE_PROBE_MODE=0 OCORE_BUILD_DIR="$build_dir" "$BUILD_SCRIPT"
+}
+
+describe_image() {
+    local build_dir image bytes digest
+    build_dir=$(baseline_build_dir)
+    run_baseline_build
+    image="$build_dir/kernel.elf"
+    if [[ ! -f "$image" ]]; then
+        printf 'error: kernel build completed without producing %s\n' "$image" >&2
+        exit 1
+    fi
+    bytes=$(wc -c <"$image" | tr -d ' ')
+    if command -v shasum >/dev/null 2>&1; then
+        digest=$(shasum -a 256 "$image" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$image" | awk '{print $1}')
+    else
+        printf 'error: shasum or sha256sum is required to describe the kernel image\n' >&2
+        exit 127
+    fi
+    printf 'profile=baseline\nprobe_mode=0\nimage=%s\nbytes=%s\nsha256=%s\n' \
+        "$image" "$bytes" "$digest"
+}
+
+command_name=${1:-help}
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+case "$command_name" in
+    help|-h|--help)
+        require_no_args "$@"
+        usage
+        ;;
+    doctor|check)
+        require_no_args "$@"
+        require_executable "$SETUP_SCRIPT"
+        exec "$SETUP_SCRIPT" --with-ocore --check --no-env
+        ;;
+    build)
+        require_no_args "$@"
+        run_baseline_build
+        ;;
+    image)
+        require_no_args "$@"
+        describe_image
+        ;;
+    boot)
+        require_no_args "$@"
+        require_executable "$BOOT_SCRIPT"
+        exec env \
+            OCORE_PROBE_MODE=0 \
+            OCORE_BUILD_DIR="$(baseline_build_dir)" \
+            "$BOOT_SCRIPT"
+        ;;
+    console)
+        require_no_args "$@"
+        require_executable "$BOOT_SCRIPT"
+        exec env \
+            OCORE_PROBE_MODE=16 \
+            OCORE_BUILD_DIR="${OCORE_BUILD_DIR:-$ROOT/target/ocore-m5-native}" \
+            "$BOOT_SCRIPT"
+        ;;
+    smoke)
+        require_no_args "$@"
+        require_executable "$SMOKE_SCRIPT"
+        exec "$SMOKE_SCRIPT"
+        ;;
+    smoke-live)
+        require_no_args "$@"
+        require_executable "$SMOKE_LIVE_SCRIPT"
+        exec "$SMOKE_LIVE_SCRIPT"
+        ;;
+    gates)
+        require_no_args "$@"
+        require_executable "$GATES_SCRIPT"
+        exec "$GATES_SCRIPT" smoke
+        ;;
+    *)
+        die_usage "unknown kernel command '$command_name'"
+        ;;
+esac

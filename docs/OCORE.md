@@ -310,6 +310,35 @@ not legal inside `.oc` source and are not linked into freestanding artifacts.
 This preserves O-lang's polyglot model without making Python, Rust, Nix, JSON,
 or subprocess execution part of the kernel trusted computing base.
 
+### 10.1 Operator CLI and boot boundary
+
+The repository-owned lowercase CLI exposes the authoritative build and QEMU
+paths without reimplementing them:
+
+```text
+o kernel doctor
+o kernel build
+o kernel image
+o kernel smoke
+o kernel boot
+o kernel console
+o kernel smoke-live
+o kernel gates
+```
+
+`boot` selects the baseline probe mode. `console` selects mode 16, builds the
+content-addressed M5 service image, prints its exact SHA-256, and boots the real
+capability-gated CPL3 `o> ` control process. Its implemented interactive
+surface is `status`, exact-digest `install`, and exact-digest `activate`.
+The launcher does not promote the parser's reserved or incomplete command
+spellings into supported behavior.
+
+Interactive images are loaded by QEMU and use a multiplexed serial terminal;
+`Ctrl-A X` exits. `smoke` and `smoke-live` are finite asserted alternatives.
+`gates` executes the manifest-defined portable evidence set. These commands
+prove only their documented QEMU/TCG boundaries, not a physical-machine boot,
+SMP, Linux or Plan 9 boot, or hardware-device isolation.
+
 ## 11. Implemented bounded O-core milestone boundary
 
 The broad compiler/kernel target remains `x86_64-unknown-none`; G2 adds a

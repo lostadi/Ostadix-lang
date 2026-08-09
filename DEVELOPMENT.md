@@ -102,6 +102,10 @@ cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
 # O-core executable milestone evidence (requires Clang, LLD, Python, and QEMU x86_64)
+./scripts/o-cli.sh kernel doctor
+./scripts/o-cli.sh kernel build
+./scripts/o-cli.sh kernel smoke
+./scripts/o-cli.sh kernel smoke-live
 python3 scripts/release_evidence.py validate
 cargo test --test world_identity_wire
 ./ocore/kernel/smoke-world-identity-qemu.sh

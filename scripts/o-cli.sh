@@ -6,8 +6,26 @@ set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 OLANGC_BIN=${O_LANG_OLANGC_BIN:-"$ROOT/target/release/olangc"}
 O_BIN=${O_LANG_EVALUATOR_BIN:-"$ROOT/target/release/O"}
+KERNEL_CLI_BIN=${O_LANG_KERNEL_CLI_BIN:-"$ROOT/scripts/o-kernel.sh"}
+
+usage() {
+    cat <<'USAGE'
+Usage: o <command> [arguments]
+
+Repository commands:
+  plan <project-or-.O> [options]  Print the OIR and execution plan
+  kernel <command>               Build, boot, or verify the O-core kernel
+  help                           Show this help
+
+Any other arguments retain the historical lowercase evaluator behavior and
+are forwarded to O. Uppercase O always invokes the evaluator directly.
+USAGE
+}
 
 case "${1:-}" in
+    help)
+        usage
+        ;;
     plan)
         shift
         if [[ $# -eq 0 ]]; then
@@ -15,6 +33,14 @@ case "${1:-}" in
             exit 2
         fi
         exec "$OLANGC_BIN" "$1" --target ir "${@:2}"
+        ;;
+    kernel)
+        shift
+        if [[ ! -x "$KERNEL_CLI_BIN" ]]; then
+            printf 'error: O-core kernel CLI is missing or not executable: %s\n' "$KERNEL_CLI_BIN" >&2
+            exit 1
+        fi
+        exec "$KERNEL_CLI_BIN" "$@"
         ;;
     *)
         export O_BACKENDS_DIR="${O_BACKENDS_DIR:-$ROOT/backends}"
