@@ -282,6 +282,7 @@ class SetupScriptTests(unittest.TestCase):
             "--with-nix",
             "--no-nix",
             "--with-ocore",
+            "--with-ocore-media",
             "--with-hosted-runtimes",
             "--with-linux-kernel-tools",
             "--with-guest-tools",
@@ -296,6 +297,49 @@ class SetupScriptTests(unittest.TestCase):
         ):
             with self.subTest(option=option):
                 self.assertIn(option, result.stdout)
+
+    def test_macos_ocore_media_profile_is_explicit_and_composable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-ocore-media",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+                platform="macos",
+                distro="unknown",
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        brew_line = next(
+            line
+            for line in output.splitlines()
+            if line.startswith("[DRY]") and "brew install --quiet" in line
+        )
+        packages = shlex.split(brew_line)
+        self.assertIn("x86_64-elf-grub", packages)
+        self.assertIn("mtools", packages)
+        self.assertIn("qemu", packages)
+        self.assertIn("ocore=true", output)
+        self.assertIn("ocore_media=true", output)
+
+    def test_debian_ocore_media_profile_has_firmware_and_fat_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--with-ocore-media",
+                "--dry-run",
+                "--deps-only",
+                "--no-env",
+                home=Path(temp_dir),
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        packages = self.dry_run_packages(output, "apt-get install")
+        self.assertIn("grub-efi-amd64-bin", packages)
+        self.assertIn("mtools", packages)
+        self.assertIn("ovmf", packages)
 
 
 if __name__ == "__main__":

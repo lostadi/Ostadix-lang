@@ -2,7 +2,7 @@
 //!
 //! This proves deterministic logical construction and exact source
 //! provenance. It does not execute project commands, perform placement, or
-//! constitute native/O-core/World Alpha evidence.
+//! constitute native/O-core/OSTADIX Alpha evidence.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

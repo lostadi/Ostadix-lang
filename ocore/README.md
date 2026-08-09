@@ -66,12 +66,17 @@ o kernel boot         # interactive baseline serial boot
 o kernel console      # mode-16 native `o> ` control process
 o kernel smoke-live   # automatically verify that control lifecycle
 o kernel gates        # every manifest-defined portable QEMU gate
+o kernel doctor-media # check optional GRUB/mtools/OVMF dependencies
+o kernel media        # deterministic x86_64 GPT/UEFI disk image
+o kernel smoke-media  # exact disk booted through OVMF/QEMU
 ```
 
 Both interactive commands exit with `Ctrl-A X`. `console` prints the exact
 content digest required by its `install` and `activate` commands before QEMU
 starts. It is a fixed-capacity native control plane, not a general shell or a
 claim of physical-machine, SMP, foreign-kernel, or device-isolation support.
+See [`docs/OSTADIX_BOOT.md`](../docs/OSTADIX_BOOT.md) for the physical-media
+write guard, serial procedure, and exact nonclaims.
 
 The direct implementation scripts are:
 
@@ -379,7 +384,7 @@ terminal/commit tags were cleared. The required no-argument gate is
 the direct two-argument `smoke-world-project-receipt-qemu.sh` vector interface
 with `RECEIPT_HEX_FILE EXPECTED_SEMANTIC_SHA256`. Modes 27 through 30 and 32
 are byte-level schema/semantic oracles, not a transport,
-authenticated authority path, Governor, consensus system, or World Alpha
+authenticated authority path, Governor, consensus system, or OSTADIX Alpha
 qualification.
 Mode 29 uses a 4096-byte maximum, depth-16 and 128-node limits,
 canonical records and scalar-key maps, and root-only inert extensions. It

@@ -214,7 +214,7 @@ check_current_ocore_docs \
 check 'direct [`]*HostedSupervisor[`]* API[^.]*(do(es)? not|has no)[^.]*(revision|stale.writer)|direct supervisor API has no persisted-revision' \
     "the hosted supervisor API now rejects stale active-set writers by persisted revision"
 
-# Ostadix World has one native constitution plus one explicitly non-qualifying
+# OSTADIX has one native World constitution plus one explicitly non-qualifying
 # hosted reference profile. Pin both truths so a hosted demo or bounded native
 # mode cannot silently acquire G0-G13 or Alpha credit.
 require_fixed() {
@@ -234,7 +234,7 @@ require_fixed() {
 }
 
 require_fixed docs/OSTADIX_WORLD.md \
-    'normative native Alpha constitution and implementation program' \
+    'normative OSTADIX Alpha constitution and implementation program' \
     'the native constitutional status is missing'
 require_fixed docs/OSTADIX_WORLD.md \
     'A computer is not a box. A computer is a governed structure of computational resources.' \
@@ -243,7 +243,7 @@ require_fixed docs/OSTADIX_WORLD.md \
     'They do not satisfy the native release gates in this roadmap.' \
     'the hosted-reference release exclusion is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '## 2.1 Ostadix World Alpha qualifying gate' \
+    '## 2.1 OSTADIX Alpha qualifying gate' \
     'the native Alpha qualification section is missing'
 require_fixed docs/OSTADIX_WORLD.md \
     '**At least three physical machines boot O-core as the sovereign kernel.**' \
@@ -276,10 +276,10 @@ require_fixed docs/OSTADIX_WORLD.md \
     '**G0 -- constitutional baseline**' \
     'the G0 definition is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '**G13 -- eight-node World Alpha**' \
+    '**G13 -- eight-node OSTADIX Alpha**' \
     'the G13 definition is missing'
 require_fixed docs/OSTADIX_WORLD.md \
-    '# 28. Alpha non-claims' \
+    '# 28. OSTADIX Alpha non-claims' \
     'the Alpha non-claim section is missing'
 require_fixed docs/OSTADIX_WORLD.md \
     '- uniform coherent RAM across nodes;' \
@@ -289,14 +289,57 @@ require_fixed docs/OSTADIX_WORLD.md \
     'the definition-is-not-evidence rule is missing'
 
 require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
-    'non-qualifying for native Ostadix' \
+    'non-qualifying for native OSTADIX Alpha' \
     'the hosted profile is not explicitly non-qualifying'
 require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
     'cannot satisfy G0 through G13' \
     'the hosted profile could be misread as gate evidence'
 require_fixed docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
-    'G12, G13, or the name **Ostadix World Alpha**' \
+    'G12, G13, or the name **OSTADIX Alpha**' \
     'the hosted profile Alpha non-claim is missing'
+
+# World remains the runtime ontology, but the release/qualification name is
+# OSTADIX Alpha. Historical append-only evidence records keep their original
+# bytes and are intentionally outside this presentation guard.
+for file in \
+    README.md \
+    docs/CLAIMS.md \
+    docs/HOSTED_WORLD_REFERENCE_PROFILE.md \
+    docs/OCORE.md \
+    docs/OSTADIX_WORLD.md \
+    docs/RELEASE_CHECKLIST.md \
+    ocore/README.md \
+    evidence/gates.toml \
+    evidence/world_alpha_gates.toml \
+    scripts/world_alpha_evidence.py \
+    scripts/build_source_release.py
+do
+    if grep -nHE -- 'Ostadix World Alpha|World Alpha' "$file" >"$HITS_FILE"; then
+        echo "OSTADIX ALPHA BRAND DRIFT: legacy release name remains"
+        sed 's/^/  /' "$HITS_FILE"
+        echo
+        fail=1
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            echo "error: grep failed while scanning $file" >&2
+            exit 2
+        fi
+    fi
+done
+
+# The release author identity is one coherent public metadata fact.  Pin the
+# full middle name on each active root surface so a future packaging edit
+# cannot silently shorten the author while leaving the other files unchanged.
+require_fixed README.md \
+    '*By Lee Daghlar Ostadi*' \
+    'the README byline does not use the full release author name'
+require_fixed Cargo.toml \
+    'authors     = ["Lee Daghlar Ostadi"]' \
+    'Cargo package metadata does not use the full release author name'
+require_fixed CITATION.cff \
+    'given-names: Lee Daghlar' \
+    'CITATION.cff does not use the full release author given names'
 
 require_fixed docs/CLAIMS.md \
     'Only G0 and G2 currently derive `passed`' \
@@ -371,8 +414,8 @@ require_fixed docs/CLAIMS.md \
     'The Mode 30 corpus is constructed' \
     'the fixed Mode 30 corpus is no longer distinguished from live receipt integration'
 require_fixed docs/CLAIMS.md \
-    'typed World Alpha attestation' \
-    'the PR5 receipt could be misread as qualifying World Alpha evidence'
+    'typed OSTADIX Alpha attestation' \
+    'the PR5 receipt could be misread as qualifying OSTADIX Alpha evidence'
 require_fixed docs/CLAIMS.md \
     'Hosted ResourceKey PR6 now supplies typed World, Governor, node,' \
     'the complete hosted PR6 ResourceKey vocabulary is missing'

@@ -11,6 +11,11 @@ BOOT_SCRIPT=${O_KERNEL_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-qemu.sh"}
 SMOKE_SCRIPT=${O_KERNEL_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-qemu.sh"}
 SMOKE_LIVE_SCRIPT=${O_KERNEL_SMOKE_LIVE_SCRIPT:-"$ROOT/ocore/kernel/smoke-live-qemu.sh"}
 GATES_SCRIPT=${O_KERNEL_GATES_SCRIPT:-"$ROOT/boot-and-test.sh"}
+MEDIA_BUILD_SCRIPT=${O_KERNEL_MEDIA_BUILD_SCRIPT:-"$ROOT/ocore/kernel/build-x86_64-uefi-media.sh"}
+MEDIA_BOOT_SCRIPT=${O_KERNEL_MEDIA_BOOT_SCRIPT:-"$ROOT/ocore/kernel/run-x86_64-uefi-media-qemu.sh"}
+MEDIA_SMOKE_SCRIPT=${O_KERNEL_MEDIA_SMOKE_SCRIPT:-"$ROOT/ocore/kernel/smoke-x86_64-uefi-media-qemu.sh"}
+MEDIA_INSPECT_SCRIPT=${O_KERNEL_MEDIA_INSPECT_SCRIPT:-"$ROOT/scripts/ostadix_boot_media.py"}
+MEDIA_WRITER_SCRIPT=${O_KERNEL_MEDIA_WRITER_SCRIPT:-"$ROOT/scripts/ostadix_media_writer.py"}
 
 usage() {
     cat <<'USAGE'
@@ -20,19 +25,27 @@ Build and boot the freestanding O-core kernel under local QEMU.
 
 Commands:
   doctor       Check the O-core compiler, linker, ELF, and QEMU prerequisites
+  doctor-media Check the optional GRUB, FAT, firmware, and O-core media tools
   build        Build the baseline kernel image
   image        Rebuild and describe the baseline kernel ELF
+  media        Build a deterministic x86_64 GPT/UEFI disk image
+  inspect-media  Strictly inspect a generated OSTADIX disk image
+  prepare-write  Inspect external media and derive a bound confirmation token
+  write-media   Write and verify external media using that exact token
   boot         Boot the baseline kernel with an interactive serial terminal
+  boot-media   Boot the generated disk through edk2/OVMF (no QEMU -kernel)
   console      Boot the bounded native M5 `o> ` control console
   smoke        Run the bounded baseline boot assertion
+  smoke-media  Prove deterministic media rebuild and UEFI disk boot
   smoke-live   Drive and verify the native M5 console lifecycle
   gates        Run every manifest-defined portable O-core QEMU evidence gate
   help         Show this help
 
 Interactive QEMU escape: Ctrl-A X
 
-This is a QEMU/TCG boot of the freestanding O-core image. It is not a physical
-machine, SMP, Linux/Plan 9, or hardware-device isolation claim.
+The media path builds a physical-writeable GPT image but validates it under
+QEMU/TCG. It is not yet physical-machine, SMP, Linux/Plan 9, or device-isolation
+evidence.
 USAGE
 }
 
@@ -45,6 +58,12 @@ die_usage() {
 require_no_args() {
     if [[ $# -ne 0 ]]; then
         die_usage "command does not accept arguments: $*"
+    fi
+}
+
+require_at_most_one_arg() {
+    if [[ $# -gt 1 ]]; then
+        die_usage "command accepts at most one path argument: $*"
     fi
 }
 
@@ -103,6 +122,11 @@ case "$command_name" in
         require_executable "$SETUP_SCRIPT"
         exec "$SETUP_SCRIPT" --with-ocore --check --no-env
         ;;
+    doctor-media)
+        require_no_args "$@"
+        require_executable "$SETUP_SCRIPT"
+        exec "$SETUP_SCRIPT" --with-ocore-media --check --no-env
+        ;;
     build)
         require_no_args "$@"
         run_baseline_build
@@ -111,6 +135,25 @@ case "$command_name" in
         require_no_args "$@"
         describe_image
         ;;
+    media)
+        require_at_most_one_arg "$@"
+        require_executable "$MEDIA_BUILD_SCRIPT"
+        exec "$MEDIA_BUILD_SCRIPT" "$@"
+        ;;
+    inspect-media)
+        require_at_most_one_arg "$@"
+        require_executable "$MEDIA_INSPECT_SCRIPT"
+        media_path=${1:-"$ROOT/target/ostadix-media/x86_64/ostadix-x86_64-uefi.img"}
+        exec "$MEDIA_INSPECT_SCRIPT" inspect "$media_path"
+        ;;
+    prepare-write)
+        require_executable "$MEDIA_WRITER_SCRIPT"
+        exec "$MEDIA_WRITER_SCRIPT" prepare "$@"
+        ;;
+    write-media)
+        require_executable "$MEDIA_WRITER_SCRIPT"
+        exec "$MEDIA_WRITER_SCRIPT" write "$@"
+        ;;
     boot)
         require_no_args "$@"
         require_executable "$BOOT_SCRIPT"
@@ -118,6 +161,11 @@ case "$command_name" in
             OCORE_PROBE_MODE=0 \
             OCORE_BUILD_DIR="$(baseline_build_dir)" \
             "$BOOT_SCRIPT"
+        ;;
+    boot-media)
+        require_no_args "$@"
+        require_executable "$MEDIA_BOOT_SCRIPT"
+        exec "$MEDIA_BOOT_SCRIPT"
         ;;
     console)
         require_no_args "$@"
@@ -131,6 +179,11 @@ case "$command_name" in
         require_no_args "$@"
         require_executable "$SMOKE_SCRIPT"
         exec "$SMOKE_SCRIPT"
+        ;;
+    smoke-media)
+        require_no_args "$@"
+        require_executable "$MEDIA_SMOKE_SCRIPT"
+        exec "$MEDIA_SMOKE_SCRIPT"
         ;;
     smoke-live)
         require_no_args "$@"
