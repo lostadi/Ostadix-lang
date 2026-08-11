@@ -239,6 +239,14 @@ impl AutonomousScheduler {
         let parallelism = thread::available_parallelism()
             .map(|n| n.get().min(8))
             .unwrap_or(4);
+        // No disk cache under wasm: WASI preview1 has no meaningful
+        // persistent disk without explicit preopens, and `default_dir()`'s
+        // `std::env::temp_dir()` fallback panics (`unreachable`) there. A
+        // missing disk cache degrades gracefully to mem-cache-only, same as
+        // any other environment where the cache dir can't be created.
+        #[cfg(target_family = "wasm")]
+        let disk_cache = None;
+        #[cfg(not(target_family = "wasm"))]
         let disk_cache = DiskCache::new(DiskCache::default_dir()).ok();
         Self {
             mem_cache: HashMap::new(),
