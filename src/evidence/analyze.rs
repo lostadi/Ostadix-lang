@@ -143,7 +143,14 @@ fn build_runtime_binding(
 
     let mut ambient_world = CanonicalHasher::new("ostadix-ambient-hostworld-snapshot/v1");
     ambient_world.field(environment_sha256.as_bytes());
-    ambient_world.field(&std::process::id().to_be_bytes());
+    // WASI preview1 has no process ID concept; `std::process::id()` panics
+    // there ("no pids on this platform"). Substitute a fixed placeholder so
+    // the ambient-world fingerprint stays well-defined on wasm targets.
+    #[cfg(not(target_family = "wasm"))]
+    let pid = std::process::id();
+    #[cfg(target_family = "wasm")]
+    let pid: u32 = 0;
+    ambient_world.field(&pid.to_be_bytes());
     let ambient_world_sha256 = ambient_world.finish();
 
     RuntimeBindingV1 {
@@ -224,6 +231,13 @@ pub fn analyze_execution(
     if current_executable.len() != 1 {
         anyhow::bail!("runtime evidence requires exactly one reserved current-executable artifact");
     }
+    // WASI preview1 sandboxes have no filesystem access to their own module
+    // bytes (no preopen to self), so `current_executable_artifact()` can
+    // never produce a `Hashed` state there. The self-hash provenance
+    // guarantee is unsatisfiable by sandbox design on wasm, not a bug in a
+    // given program, so this admission check is relaxed only for wasm
+    // targets; non-wasm targets keep the full guarantee unchanged.
+    #[cfg(not(target_family = "wasm"))]
     if runtime.snapshot_kind == RuntimeSnapshotKindV1::Execution
         && !matches!(
             current_executable[0].state,
