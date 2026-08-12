@@ -2642,6 +2642,44 @@ admission rather than a circular self-binding. This is a static topology model,
 not a duration estimate, resource-capacity proof, dispatch trace, or overlap
 claim.
 
+For a focused explanation of one admitted plan operation, use:
+
+```bash
+o why FILE.O P3 [olangc options]
+# exact compiler spelling:
+olangc FILE.O --target ir --why P3 [olangc options]
+```
+
+The repository `o` command is only a dispatcher for that compiler invocation;
+it does not parse or independently derive scheduler evidence. `--why` and
+`--explain-schedule` are mutually exclusive. The focused report projects the
+selected operation, its exact admitted HGraph blocker/producer witnesses,
+immediate dependents, retained source-sequence constraints, and its static
+wave/layer context. It is inspection-only: it dispatches nothing and reports no
+observed runtime readiness, timing, worker identity, or overlap.
+
+Any source origin printed beside the result is a descriptive sidecar for the
+exact `.O` input parsed by that inspection. Source locations do not enter OIR,
+the execution plan, evidence, or admission digests and do not authorize
+execution. Plan IDs and source spans may move after an edit; this surface makes
+no cross-edit identity or incremental-invalidation claim.
+
+To exercise the same query on a nontrivial program actually assembled by
+`o-link`, run the bounded demonstration:
+
+```bash
+./setup.sh -y --minimal
+scripts/demo_o_link_schedule_why.sh --workers 4
+```
+
+It links four ordinary `.O` stages into a reviewed `1 -> 4 -> 3 -> 1` hosted
+pipeline, checks its full admission, selects a layer-3 operation for focused
+`why`, and compares serial/graph returned-value semantics. It also links two
+ordinary `.py` files as a negative control: their generated `python[0]` and
+`python[1]` environments remain coordinator-owned. Evidence is retained under
+`target/tmp/o_link_schedule_why_demo/`; timings are descriptive wait-overlap
+measurements, not a CPU-parallelism claim.
+
 The reproducible four-shape hosted benchmark, expected outputs, methodology,
 and single-core wait-overlap caveat are documented in
 [`benchmarks/hgraph_hosted/README.md`](benchmarks/hgraph_hosted/README.md).

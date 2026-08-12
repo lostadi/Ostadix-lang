@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 
-use crate::ir::BackendRegistry;
+use crate::ir::{BackendRegistry, ExecutionMode, PlanNodeId};
 
 /// Languages whose bodies are SEQUENCED (children are O-level statements)
 /// rather than SPLICED (children are raw source text for a target backend).
@@ -58,8 +58,66 @@ pub enum ONode {
     },
 }
 
+/// Half-open location of one executable syntax node in the exact UTF-8 source
+/// handed to [`Parser`]. Byte offsets are zero-based; lines and columns are
+/// one-based. Columns count Unicode scalar values, and the end position is the
+/// first position after the node.
+///
+/// This is descriptive source provenance only. It deliberately does not live
+/// in [`ONode`], OIR, or `ExecutionPlan`, so source layout cannot change their
+/// structural equality or evidence/admission digests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceSpanV1 {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl SourceSpanV1 {
+    /// The exact half-open byte range in the source passed to [`Parser::new`].
+    pub fn byte_range(self) -> std::ops::Range<usize> {
+        self.start_byte..self.end_byte
+    }
+}
+
+/// Additive parse result carrying the unchanged syntax tree plus a source-span
+/// sidecar in canonical executable-plan preorder.
+///
+/// `plan_origins()[PlanNodeId.0]` corresponds to the OIR node returned at the
+/// same index by `OIrProgram::flatten_for_plan`. Bodies owned by `quote` are
+/// intentionally absent because they are captured syntax, not executable plan
+/// nodes. A caller associates this parser-relative map with its own source path
+/// and/or source digest; neither is inferred here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedDocumentV1 {
+    pub nodes: Vec<ONode>,
+    plan_origins: Vec<SourceSpanV1>,
+}
+
+impl ParsedDocumentV1 {
+    pub fn plan_origins(&self) -> &[SourceSpanV1] {
+        &self.plan_origins
+    }
+
+    pub fn origin_for_plan_index(&self, plan_index: usize) -> Option<&SourceSpanV1> {
+        self.plan_origins.get(plan_index)
+    }
+
+    pub fn origin_for_plan_node(&self, plan_node: PlanNodeId) -> Option<&SourceSpanV1> {
+        self.origin_for_plan_index(plan_node.0)
+    }
+
+    pub fn into_nodes(self) -> Vec<ONode> {
+        self.nodes
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Tag {
+    start: usize,
     lang: String,
     env_id: u32,
     /// Optional attribute list on the language tag. The normalized string is
@@ -75,6 +133,9 @@ pub struct Parser<'a> {
     source: &'a str,
     pos: usize,
     line: usize,
+    line_starts: Option<Vec<usize>>,
+    plan_origins: Option<Vec<SourceSpanV1>>,
+    origin_suppression_depth: usize,
     registered_backends: &'a HashSet<String>,
 }
 
@@ -84,12 +145,41 @@ impl<'a> Parser<'a> {
             source,
             pos: 0,
             line: 1,
+            line_starts: None,
+            plan_origins: None,
+            origin_suppression_depth: 0,
             registered_backends,
         }
     }
 
     pub fn parse(&mut self) -> Result<Vec<ONode>> {
+        self.line_starts = None;
+        self.plan_origins = None;
         self.parse_until(None)
+    }
+
+    /// Parse the unchanged [`ONode`] forest and record one source span for each
+    /// node that canonical OIR lowering will allocate into `ExecutionPlan`.
+    pub fn parse_with_origins(&mut self) -> Result<ParsedDocumentV1> {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            self.source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        self.line_starts = Some(line_starts);
+        self.plan_origins = Some(Vec::new());
+        self.origin_suppression_depth = 0;
+        let nodes = self.parse_until(None)?;
+        let plan_origins = self
+            .plan_origins
+            .take()
+            .expect("source-origin recording was enabled for this parse");
+        Ok(ParsedDocumentV1 {
+            nodes,
+            plan_origins,
+        })
     }
 
     fn parse_until(&mut self, expected_closer: Option<&Tag>) -> Result<Vec<ONode>> {
@@ -125,8 +215,14 @@ impl<'a> Parser<'a> {
             // into an ONode::LetBinding.
             if inside_sequencing && self.starts_with_let_keyword() {
                 let let_start = self.pos;
+                let origin_checkpoint = self.origin_count();
                 if let Some(binding) = self.try_parse_let_binding()? {
-                    self.flush_text(&mut nodes, text_start, let_start);
+                    self.flush_text_before_recorded(
+                        &mut nodes,
+                        text_start,
+                        let_start,
+                        origin_checkpoint,
+                    );
                     nodes.push(binding);
                     text_start = self.pos;
                     continue;
@@ -153,7 +249,9 @@ impl<'a> Parser<'a> {
                         // push the literal opener text
                         if let Some(ONode::RawText(s)) = nodes.last_mut() {
                             s.push_str(&literal);
+                            self.extend_last_origin(self.pos);
                         } else {
+                            self.record_origin(temp_pos, self.pos);
                             nodes.push(ONode::RawText(literal));
                         }
                         text_start = self.pos;
@@ -174,7 +272,9 @@ impl<'a> Parser<'a> {
                             self.pos = after_bs + closer.len();
                             if let Some(ONode::RawText(s)) = nodes.last_mut() {
                                 s.push_str(&closer);
+                                self.extend_last_origin(self.pos);
                             } else {
+                                self.record_origin(temp_pos, self.pos);
                                 nodes.push(ONode::RawText(closer));
                             }
                             text_start = self.pos;
@@ -190,7 +290,9 @@ impl<'a> Parser<'a> {
                         self.flush_text(&mut nodes, text_start, temp_pos);
                         if let Some(ONode::RawText(s)) = nodes.last_mut() {
                             s.push('$');
+                            self.extend_last_origin(after_bs + 1);
                         } else {
+                            self.record_origin(temp_pos, after_bs + 1);
                             nodes.push(ONode::RawText("$".to_string()));
                         }
                         self.pos = after_bs + 1;
@@ -202,7 +304,9 @@ impl<'a> Parser<'a> {
 
             if self.current_byte() == Some(b'$') {
                 if let Some(name) = self.try_parse_var_ref()? {
-                    self.flush_text(&mut nodes, text_start, self.pos_before_var(&name));
+                    let var_start = self.pos_before_var(&name);
+                    self.flush_text(&mut nodes, text_start, var_start);
+                    self.record_origin(var_start, self.pos);
                     nodes.push(ONode::VarRef(name));
                     text_start = self.pos;
                     continue;
@@ -210,16 +314,9 @@ impl<'a> Parser<'a> {
             }
 
             if let Some(tag) = self.try_parse_opener()? {
-                let opener_start = self.last_opener_start(tag.raw.len());
+                let opener_start = tag.start;
                 self.flush_text(&mut nodes, text_start, opener_start);
-
-                let body = self.parse_until(Some(&tag))?;
-                nodes.push(ONode::TypedExpr {
-                    lang: tag.lang,
-                    env_id: tag.env_id,
-                    attr: tag.attr,
-                    body,
-                });
+                nodes.push(self.parse_typed_expr(tag)?);
 
                 text_start = self.pos;
                 continue;
@@ -232,8 +329,14 @@ impl<'a> Parser<'a> {
             // that source text destined for a backend isn't reinterpreted.
             if inside_sequencing {
                 let stmt_start = self.pos;
+                let origin_checkpoint = self.origin_count();
                 if let Some(call) = self.try_parse_call()? {
-                    self.flush_text(&mut nodes, text_start, stmt_start);
+                    self.flush_text_before_recorded(
+                        &mut nodes,
+                        text_start,
+                        stmt_start,
+                        origin_checkpoint,
+                    );
                     nodes.push(call);
                     text_start = self.pos;
                     continue;
@@ -253,6 +356,31 @@ impl<'a> Parser<'a> {
 
         self.flush_text(&mut nodes, text_start, self.pos);
         Ok(nodes)
+    }
+
+    /// Finish a typed expression after its opener has been consumed. Recording
+    /// the parent before descending reproduces `ExecutionPlan`'s preorder.
+    fn parse_typed_expr(&mut self, tag: Tag) -> Result<ONode> {
+        let origin = self.begin_origin(tag.start);
+        let owns_quoted_syntax = {
+            let backend = BackendRegistry::global().interface_for(&tag.lang);
+            backend.execution == ExecutionMode::InlineAst && backend.canonical == "quote"
+        };
+        if owns_quoted_syntax {
+            self.origin_suppression_depth += 1;
+        }
+        let body = self.parse_until(Some(&tag));
+        if owns_quoted_syntax {
+            self.origin_suppression_depth -= 1;
+        }
+        let body = body?;
+        self.finish_origin(origin, self.pos);
+        Ok(ONode::TypedExpr {
+            lang: tag.lang,
+            env_id: tag.env_id,
+            attr: tag.attr,
+            body,
+        })
     }
 
     fn try_parse_let_binding(&mut self) -> Result<Option<ONode>> {
@@ -281,12 +409,14 @@ impl<'a> Parser<'a> {
         }
 
         self.advance_one_byte();
+        let origin = self.begin_origin(original_pos);
         self.skip_whitespace();
 
         // STEP-2: a let RHS may now be a Call (instantiate(...), realise(...))
         // in addition to a typed expression. Try Call first; on miss, fall
         // through to the typed-expression path.
         if let Some(call) = self.try_parse_call()? {
+            self.finish_origin(origin, self.pos);
             return Ok(Some(ONode::LetBinding {
                 name,
                 expr: Box::new(call),
@@ -305,16 +435,12 @@ impl<'a> Parser<'a> {
             }
         };
 
-        let body = self.parse_until(Some(&tag))?;
+        let expr = self.parse_typed_expr(tag)?;
+        self.finish_origin(origin, self.pos);
 
         Ok(Some(ONode::LetBinding {
             name,
-            expr: Box::new(ONode::TypedExpr {
-                lang: tag.lang,
-                env_id: tag.env_id,
-                attr: tag.attr,
-                body,
-            }),
+            expr: Box::new(expr),
         }))
     }
 
@@ -350,6 +476,7 @@ impl<'a> Parser<'a> {
         }
 
         // Commit: from here on, errors are real errors.
+        let origin = self.begin_origin(original_pos);
         self.advance_one_byte(); // consume '('
         self.skip_whitespace();
 
@@ -362,20 +489,16 @@ impl<'a> Parser<'a> {
 
             // Each arg is a VarRef, nested Call, or typed backend expression.
             let arg = if self.current_byte() == Some(b'$') {
+                let start = self.pos;
                 let var = self.try_parse_var_ref()?.ok_or_else(|| {
                     anyhow::anyhow!("Line {}: expected variable reference after $", self.line)
                 })?;
+                self.record_origin(start, self.pos);
                 ONode::VarRef(var)
             } else if let Some(nested) = self.try_parse_call()? {
                 nested
             } else if let Some(tag) = self.try_parse_opener()? {
-                let body = self.parse_until(Some(&tag))?;
-                ONode::TypedExpr {
-                    lang: tag.lang,
-                    env_id: tag.env_id,
-                    attr: tag.attr,
-                    body,
-                }
+                self.parse_typed_expr(tag)?
             } else {
                 bail!(
                     "Line {}: in call `{}(...)`, expected $var, nested call, or typed expression",
@@ -403,6 +526,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.finish_origin(origin, self.pos);
         Ok(Some(ONode::Call {
             fn_name: name,
             args,
@@ -563,6 +687,7 @@ impl<'a> Parser<'a> {
             // closer `)_py` still matches its opener.
             let lang = BackendRegistry::global().canonical(&lang).to_string();
             Ok(Some(Tag {
+                start,
                 lang,
                 env_id,
                 attr,
@@ -643,10 +768,124 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn flush_text(&self, nodes: &mut Vec<ONode>, start: usize, end: usize) {
+    fn flush_text(&mut self, nodes: &mut Vec<ONode>, start: usize, end: usize) {
         if end > start {
+            self.record_origin(start, end);
             nodes.push(ONode::RawText(self.source[start..end].to_string()));
         }
+    }
+
+    /// Let-bindings and calls are parsed speculatively before the preceding raw
+    /// text can be flushed. Insert that text's span before the origins recorded
+    /// by the successful parse so sidecar order still matches syntax preorder.
+    fn flush_text_before_recorded(
+        &mut self,
+        nodes: &mut Vec<ONode>,
+        start: usize,
+        end: usize,
+        origin_checkpoint: usize,
+    ) {
+        if end <= start {
+            return;
+        }
+        if self.origin_suppression_depth == 0 && self.plan_origins.is_some() {
+            let span = self.source_span(start, end);
+            if let Some(origins) = self.plan_origins.as_mut() {
+                origins.insert(origin_checkpoint, span);
+            }
+        }
+        nodes.push(ONode::RawText(self.source[start..end].to_string()));
+    }
+
+    fn origin_count(&self) -> usize {
+        self.plan_origins.as_ref().map_or(0, Vec::len)
+    }
+
+    fn begin_origin(&mut self, start: usize) -> Option<usize> {
+        if self.origin_suppression_depth != 0 || self.plan_origins.is_none() {
+            return None;
+        }
+        let span = self.source_span(start, start);
+        let origins = self
+            .plan_origins
+            .as_mut()
+            .expect("origin inventory was checked above");
+        let index = origins.len();
+        origins.push(span);
+        Some(index)
+    }
+
+    fn finish_origin(&mut self, index: Option<usize>, end: usize) {
+        let Some(index) = index else {
+            return;
+        };
+        let (_, end_line, end_column) = self.source_position(end);
+        let origin = &mut self
+            .plan_origins
+            .as_mut()
+            .expect("an active origin must have an inventory")[index];
+        origin.end_byte = end;
+        origin.end_line = end_line;
+        origin.end_column = end_column;
+    }
+
+    fn record_origin(&mut self, start: usize, end: usize) {
+        if self.origin_suppression_depth != 0 || self.plan_origins.is_none() {
+            return;
+        }
+        let span = self.source_span(start, end);
+        self.plan_origins
+            .as_mut()
+            .expect("origin inventory was checked above")
+            .push(span);
+    }
+
+    /// Escaped syntax is appended to the parser's preceding RawText node. Its
+    /// sidecar therefore expands to the same bounding source extent.
+    fn extend_last_origin(&mut self, end: usize) {
+        if self.origin_suppression_depth != 0 || self.plan_origins.is_none() {
+            return;
+        }
+        let (_, end_line, end_column) = self.source_position(end);
+        let Some(origin) = self
+            .plan_origins
+            .as_mut()
+            .expect("origin inventory was checked above")
+            .last_mut()
+        else {
+            return;
+        };
+        origin.end_byte = end;
+        origin.end_line = end_line;
+        origin.end_column = end_column;
+    }
+
+    fn source_span(&self, start: usize, end: usize) -> SourceSpanV1 {
+        let (start_byte, start_line, start_column) = self.source_position(start);
+        let (end_byte, end_line, end_column) = self.source_position(end);
+        SourceSpanV1 {
+            start_byte,
+            end_byte,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        }
+    }
+
+    fn source_position(&self, byte: usize) -> (usize, usize, usize) {
+        debug_assert!(byte <= self.source.len());
+        debug_assert!(self.source.is_char_boundary(byte));
+        let line_starts = self
+            .line_starts
+            .as_ref()
+            .expect("source positions are only requested while recording origins");
+        let line_index = line_starts
+            .partition_point(|line_start| *line_start <= byte)
+            .saturating_sub(1);
+        let line_start = line_starts[line_index];
+        let column = self.source[line_start..byte].chars().count() + 1;
+        (byte, line_index + 1, column)
     }
 
     fn starts_with(&self, pat: &str) -> bool {
@@ -678,10 +917,6 @@ impl<'a> Parser<'a> {
         for _ in 0..n {
             self.advance_one_byte();
         }
-    }
-
-    fn last_opener_start(&self, raw_len: usize) -> usize {
-        self.pos - raw_len - 2
     }
 
     fn pos_before_var(&self, name: &str) -> usize {
@@ -831,6 +1066,134 @@ mod tests {
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn source_origin_sidecar_preserves_existing_syntax_and_oir() {
+        let source = "prefix\nlet answer = python^(40 + 2)_python\nautonomous(batch(python^($answer)_python, quote^(python^(hidden)_python)_quote))";
+        let backends = make_backends(&["python", "quote"]);
+        let ordinary = Parser::new(source, &backends).parse().unwrap();
+        let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
+
+        assert_eq!(sourced.nodes, ordinary);
+        let ordinary_oir = crate::ir::OIrProgram::lower(&ordinary);
+        let sourced_oir = crate::ir::OIrProgram::lower(&sourced.nodes);
+        assert_eq!(sourced_oir, ordinary_oir);
+        assert_eq!(sourced_oir.to_text(), ordinary_oir.to_text());
+        assert_eq!(
+            sourced.plan_origins().len(),
+            sourced_oir.flatten_for_plan().len()
+        );
+    }
+
+    #[test]
+    fn source_origins_follow_canonical_plan_preorder_and_exclude_quote_bodies() {
+        let source = "quote^(python^($hidden)_python)_quote\npython^($visible)_python";
+        let backends = make_backends(&["python", "quote"]);
+        let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
+        let program = crate::ir::OIrProgram::lower(&sourced.nodes);
+        let plan = program.plan();
+
+        let slices = sourced
+            .plan_origins()
+            .iter()
+            .map(|origin| &source[origin.byte_range()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slices,
+            [
+                "quote^(python^($hidden)_python)_quote",
+                "\n",
+                "python^($visible)_python",
+                "$visible",
+            ]
+        );
+        assert_eq!(sourced.plan_origins().len(), plan.nodes.len());
+        assert_eq!(program.flatten_for_plan().len(), plan.nodes.len());
+        assert_eq!(
+            sourced.origin_for_plan_node(PlanNodeId(2)),
+            sourced.origin_for_plan_index(2)
+        );
+        assert!(sourced.origin_for_plan_node(PlanNodeId(4)).is_none());
+    }
+
+    #[test]
+    fn source_origins_report_half_open_utf8_byte_line_and_scalar_columns() {
+        let source = "é\npython^(\n$x\n)_python";
+        let backends = make_backends(&["python"]);
+        let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
+        let origins = sourced.plan_origins();
+
+        assert_eq!(
+            origins,
+            [
+                SourceSpanV1 {
+                    start_byte: 0,
+                    end_byte: 3,
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 2,
+                    end_column: 1,
+                },
+                SourceSpanV1 {
+                    start_byte: 3,
+                    end_byte: 23,
+                    start_line: 2,
+                    start_column: 1,
+                    end_line: 4,
+                    end_column: 9,
+                },
+                SourceSpanV1 {
+                    start_byte: 11,
+                    end_byte: 12,
+                    start_line: 2,
+                    start_column: 9,
+                    end_line: 3,
+                    end_column: 1,
+                },
+                SourceSpanV1 {
+                    start_byte: 12,
+                    end_byte: 14,
+                    start_line: 3,
+                    start_column: 1,
+                    end_line: 3,
+                    end_column: 3,
+                },
+                SourceSpanV1 {
+                    start_byte: 14,
+                    end_byte: 15,
+                    start_line: 3,
+                    start_column: 3,
+                    end_line: 4,
+                    end_column: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_origins_keep_raw_text_before_speculatively_parsed_nodes_in_order() {
+        let source = "raw let x = python^(1)_python tail autonomous($x)";
+        let backends = make_backends(&["python"]);
+        let sourced = Parser::new(source, &backends).parse_with_origins().unwrap();
+        let slices = sourced
+            .plan_origins()
+            .iter()
+            .map(|origin| &source[origin.byte_range()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            slices,
+            [
+                "raw ",
+                "let x = python^(1)_python",
+                "python^(1)_python",
+                "1",
+                " tail ",
+                "autonomous($x)",
+                "$x",
+            ]
+        );
     }
 
     #[test]

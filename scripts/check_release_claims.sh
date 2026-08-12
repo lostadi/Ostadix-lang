@@ -461,6 +461,12 @@ require_fixed scripts/o-cli.sh \
     'exec "$OLANGC_BIN" "$1" --target ir "${@:2}"' \
     'the repository-owned o plan dispatcher no longer reaches project IR planning'
 require_fixed scripts/o-cli.sh \
+    'exec "$OLANGC_BIN" "$1" --target ir --why "$2" "${@:3}"' \
+    'the repository-owned o why dispatcher no longer reaches the focused admission query'
+require_fixed docs/HGRAPH_EXECUTOR_PLAN.md \
+    '`olangc FILE.O --target ir --why P3` projects the same evidence-bound admission' \
+    'the focused schedule explanation and its non-executing boundary are undocumented'
+require_fixed scripts/o-cli.sh \
     'exec "$KERNEL_CLI_BIN" "$@"' \
     'the repository-owned o kernel dispatcher no longer reaches the kernel operator CLI'
 require_fixed scripts/o-kernel.sh \
