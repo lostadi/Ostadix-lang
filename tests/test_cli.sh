@@ -325,6 +325,88 @@ EOF
     pass "$desc"
 }
 
+check_olangc_schedule_why() {
+    local desc="$1"
+    local source="$ARTIFACT_DIR/why-do-not-run.O"
+    local marker="$ARTIFACT_DIR/why-executed"
+    local why_direct="$ARTIFACT_DIR/why-direct"
+    local why_dispatch="$ARTIFACT_DIR/why-dispatch"
+    local why_direct_normalized="$ARTIFACT_DIR/why-direct-normalized"
+    local why_dispatch_normalized="$ARTIFACT_DIR/why-dispatch-normalized"
+
+    cat >"$source" <<EOF
+autonomous(batch(
+python^(
+from pathlib import Path
+Path(r"$marker").write_text("executed")
+__oval_result__ = 1
+)_python,
+python^(
+__oval_result__ = 2
+)_python
+))
+EOF
+
+    run_command "$OLANGC_BIN" "$source" --target ir --explain-schedule
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(could not discover an admitted operation with exit $RUN_EXIT)"
+        return
+    fi
+    local target
+    target=$(sed -n 's/^operation \(P[0-9][0-9]*\) admitted=yes .*/\1/p' "$STDOUT_FILE" | head -n 1)
+    if [[ ! "$target" =~ ^P[0-9]+$ ]]; then
+        fail "$desc" "(schedule explanation did not identify an admitted operation)"
+        return
+    fi
+
+    run_command env O_LANG_OLANGC_BIN="$OLANGC_BIN" \
+        "$OLANGC_BIN" "$source" --target ir --why "$target"
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        fail "$desc" "(focused schedule explanation failed with exit $RUN_EXIT)"
+        return
+    fi
+    cp "$STDOUT_FILE" "$why_direct"
+    for pattern in \
+        '^; ExecutionAdmissionWhy oexec\.admission-why/v1$' \
+        "^why operation=$target status=admitted-static inspection-only=yes dispatch=not-run admission-sha256=[0-9a-f]{64}$" \
+        '^binding lowered-oir-sha256=' \
+        "^plan-node $target kind=" \
+        "^operation $target admitted=yes ordinal=" \
+        '^wave index=[0-9]+ operations=\[' \
+        '^; SourceOrigin oexec\.source-origin/v1$' \
+        '^source-binding sha256=[0-9a-f]{64} bytes=[0-9]+ path=' \
+        "^source-origin operation=$target bytes=[0-9]+\.\.[0-9]+ start=[0-9]+:[0-9]+ end=[0-9]+:[0-9]+$" \
+        '^source-origin-note coordinates and source SHA-256 are descriptive sidecar provenance;'; do
+        if ! grep -Eq -- "$pattern" "$STDOUT_FILE"; then
+            fail "$desc" "(focused schedule explanation omitted pattern: $pattern)"
+            return
+        fi
+    done
+    if grep -Eq -- '^; (OIrProgram|HGraph)$' "$STDOUT_FILE"; then
+        fail "$desc" "(--why emitted the unrelated whole-program IR/HGraph view)"
+        return
+    fi
+    if [ -e "$marker" ]; then
+        fail "$desc" "(--why executed the inspected backend)"
+        return
+    fi
+
+    RUN_EXIT=0
+    O_LANG_OLANGC_BIN="$OLANGC_BIN" "$O_CLI" why "$source" "$target" \
+        >"$why_dispatch" 2>"$STDERR_FILE" || RUN_EXIT=$?
+    sed -E 's/[0-9a-f]{64}/<digest>/g' "$why_direct" >"$why_direct_normalized"
+    sed -E 's/[0-9a-f]{64}/<digest>/g' "$why_dispatch" >"$why_dispatch_normalized"
+    if [ "$RUN_EXIT" -ne 0 ] || ! cmp -s "$why_direct_normalized" "$why_dispatch_normalized"; then
+        fail "$desc" "(o why did not preserve the typed olangc query after normalizing per-process digests)"
+        return
+    fi
+    if [ -e "$marker" ]; then
+        fail "$desc" "(o why executed the inspected backend)"
+        return
+    fi
+    pass "$desc"
+}
+
 check_olink_hardened_round_trip() {
     local source="$ARTIFACT_DIR/link-source"
     local expected="$ARTIFACT_DIR/link-expected"
@@ -736,10 +818,27 @@ check_stdout_contains "O help defines graph worker pool capacity" 0 'local-worke
 check_nonzero_stderr_contains "O rejects a zero graph worker bound" '--workers must be at least 1' "$O_BIN" --workers 0 examples/hello.O backends/
 check_stdout_contains "olangc --help shows usage" 0 '^Usage: olangc' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule explanation" 0 '--explain-schedule' "$OLANGC_BIN" --help
+check_stdout_contains "olangc help advertises focused schedule why" 0 '--why <PLAN_NODE>' "$OLANGC_BIN" --help
 check_stdout_contains "olangc help advertises schedule worker override" 0 '--workers <N>' "$OLANGC_BIN" --help
 check_nonzero_stderr_contains "olangc rejects schedule workers without explanation" '--workers requires --explain-schedule --target ir' "$OLANGC_BIN" examples/hello.O --target ir --workers 2
 check_nonzero_stderr_contains "olangc rejects a zero schedule worker override" '--workers must be at least 1' "$OLANGC_BIN" examples/hello.O --target ir --explain-schedule --workers 0
 check_olangc_schedule_explanation "olangc explains digest-bound admission without execution"
+check_olangc_schedule_why "olangc and o explain one admitted operation without execution"
+check_nonzero_stderr_contains "olangc schedule why rejects a non-IR target" \
+    '--why is available only with --target ir' \
+    "$OLANGC_BIN" examples/hello.O --target script --why P0
+check_nonzero_stderr_contains "olangc schedule why rejects a malformed plan identity" \
+    'expected a canonical plan node such as P3' \
+    "$OLANGC_BIN" examples/hello.O --target ir --why p0
+check_nonzero_stderr_contains "olangc schedule why rejects the whole admission view" \
+    '--why and --explain-schedule are distinct inspection views' \
+    "$OLANGC_BIN" examples/hello.O --target ir --why P0 --explain-schedule
+check_nonzero_stderr_contains "olangc schedule why rejects non-executable plan text" \
+    'P1 exists in the ExecutionPlan as `text` but is not an admitted executable operation' \
+    "$OLANGC_BIN" examples/hello.O --target ir --why P1
+check_nonzero_stderr_contains "olangc schedule why rejects project HGraphs" \
+    '--explain-schedule and --why currently admit ordinary .O HGraphs only' \
+    "$OLANGC_BIN" examples/group_pipeline --target ir --why P0
 check_nonzero_stderr_contains "olangc schedule explanation rejects a non-IR target" \
     '--explain-schedule is available only with --target ir' \
     "$OLANGC_BIN" examples/hello.O --target script --explain-schedule

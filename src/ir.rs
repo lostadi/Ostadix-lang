@@ -706,7 +706,7 @@ impl PlanNodeKind {
         }
     }
 
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             PlanNodeKind::Text => "text".to_string(),
             PlanNodeKind::Load { name } => format!("load ${name}"),

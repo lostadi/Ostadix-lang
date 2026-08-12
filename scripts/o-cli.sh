@@ -14,6 +14,7 @@ Usage: o <command> [arguments]
 
 Repository commands:
   plan <project-or-.O> [options]  Print the OIR and execution plan
+  why FILE.O P<N> [options]       Explain one admitted plan operation
   kernel <command>               Build, boot, or verify the O-core kernel
   help                           Show this help
 
@@ -33,6 +34,14 @@ case "${1:-}" in
             exit 2
         fi
         exec "$OLANGC_BIN" "$1" --target ir "${@:2}"
+        ;;
+    why)
+        shift
+        if [[ $# -lt 2 ]]; then
+            printf 'usage: o why FILE.O P<N> [olangc options]\n' >&2
+            exit 2
+        fi
+        exec "$OLANGC_BIN" "$1" --target ir --why "$2" "${@:3}"
         ;;
     kernel)
         shift
