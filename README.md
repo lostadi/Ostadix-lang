@@ -100,13 +100,15 @@ The repository also includes `ostadix-mcp`, a local stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server under
 `mcp/ostadix_lang_mcp_server/`. It exposes a small, typed tool surface over the
 existing local `O` and `olangc` binaries so an MCP-capable agent can discover
-the Ostadix environment, run a smoke test, execute a `.O` program, or inspect a
-compiler target without reconstructing the backend path by hand.
+the Ostadix environment and all canonical backend runtime requirements, run a
+smoke test, execute a `.O` program, or inspect a compiler target without
+reconstructing executable and backend paths by hand.
 
 | MCP tool | Current behavior |
 |----------|------------------|
-| `o_env` | Reports the resolved Ostadix root, backend directory, `O` and `olangc` paths, and Python shim status. |
-| `o_doctor` | Checks the local toolchain and inventories compatibility shims. |
+| `o_env` | Reports the resolved Ostadix root, backend directory, `O` and `olangc` paths, Python shim status, and a 30-backend runtime summary. |
+| `o_runtimes` | Discovers executable requirements for every canonical backend, including alternative runtime sets, without failing because an optional runtime is absent. |
+| `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
 | `o_run` | Runs one local `.O` file with an explicit working directory and timeout. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
@@ -134,14 +136,15 @@ The second command writes
 deliberately separate from the root Cargo package, so a root `cargo build` or
 `cargo test` does not build or test it. Its dedicated CI job uses the crate's
 own lockfile, rejects Clippy warnings, and exercises initialization, exact tool
-discovery, `o_env`, and `o_smoke` over the real stdio transport with
-`scripts/smoke_ostadix_mcp.py`. That smoke also calls `o_run` with both forms of
-relative path and calls `o_olangc`, so transport discovery alone cannot mask a
-broken execution tool. Use `./setup.sh --no-mcp` when the MCP server is not
-wanted. The deterministic source release includes `mcp/`, `.mcp.json`, and the
-smoke client, and its link/schema/metadata verifier rejects an incomplete MCP
-release surface without executing archive payloads. The separate crate uses the
-repository's LGPL-2.1-only license.
+and object-schema discovery, `o_env`, `o_runtimes`, and `o_smoke` over the real
+stdio transport with `scripts/smoke_ostadix_mcp.py`. The smoke launches the
+server with a system-only `PATH`, then calls `o_run` with both forms of relative
+path and calls `o_olangc`; transport discovery alone therefore cannot mask a
+broken runtime-path recovery or execution tool. Use `./setup.sh --no-mcp` when
+the MCP server is not wanted. The deterministic source release includes `mcp/`,
+`.mcp.json`, and the smoke client, and its link/schema/metadata verifier rejects
+an incomplete MCP release surface without executing archive payloads. The
+separate crate uses the repository's LGPL-2.1-only license.
 
 The checked-in `.mcp.json` registers the server as `ostadix` using the
 `ostadix-mcp` wrapper. MCP clients that support repository-local stdio server
@@ -173,6 +176,7 @@ short discovery-to-execution workflow such as:
 
 ```text
 o_env {}
+o_runtimes {}
 o_smoke {}
 o_run {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O"}
 o_olangc {"path":"/absolute/path/to/Ostadix-lang/examples/hello.O","target":"ir"}
@@ -183,10 +187,15 @@ should return `SMOKE_OK` and show the program result `2`.
 
 `ostadix-mcp` is a local child process, not a hosted service. It has no network
 listener or authentication layer and executes local programs with the
-authority and `PATH` inherited from the MCP client. Its current tool surface
-does not expose `o-link`, `o-unlink`, `ocorec`, kernel boot gates, repository
-editing, or a separate arbitrary-shell tool. A `.O` program run through
-`o_run` can still invoke any configured backend, including shell backends.
+authority inherited from the MCP client. It preserves the client's `PATH`,
+then appends existing local Homebrew, Nix, language-manager, and per-runtime
+locations so GUI-launched clients can see the same runtimes as terminal tools.
+Set `OSTADIX_RUNTIME_PATH` to add explicit search directories. Discovery checks
+executable presence; the selected backend adapter remains the execution
+authority and reports launch or runtime failures. The MCP surface does not
+expose `o-link`, `o-unlink`, `ocorec`, kernel boot gates, repository editing, or
+a separate arbitrary-shell tool. A `.O` program run through `o_run` can still
+invoke any configured backend, including shell backends.
 
 ---
 

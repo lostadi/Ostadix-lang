@@ -152,18 +152,27 @@ fn runtime_search_path_from(
         home.join(".rbenv/shims"),
         home.join(".asdf/shims"),
         home.join(".local/share/mise/shims"),
+        home.join(".local/share/fnm/aliases/default/bin"),
         home.join(".ghcup/bin"),
         home.join(".cabal/bin"),
         home.join(".opam/default/bin"),
+        home.join(".dotnet"),
         home.join(".dotnet/tools"),
+        home.join(".wasmtime/bin"),
+        home.join(".wasmer/bin"),
+        home.join(".bun/bin"),
+        home.join(".sdkman/candidates/java/current/bin"),
         home.join("miniforge3/bin"),
         home.join("miniconda3/bin"),
         home.join("anaconda3/bin"),
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/opt/homebrew/opt/openjdk/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/usr/local/opt/openjdk/bin"),
         PathBuf::from("/nix/var/nix/profiles/default/bin"),
+        PathBuf::from("/run/current-system/sw/bin"),
         PathBuf::from("/Library/Frameworks/Mono.framework/Versions/Current/Commands"),
         PathBuf::from("/usr/bin"),
         PathBuf::from("/bin"),
@@ -324,17 +333,17 @@ struct RuntimeDiscovery {
     lines: Vec<String>,
     backend_count: usize,
     builtin_backends: usize,
-    ready_backends: usize,
+    located_backends: usize,
     missing_backends: usize,
 }
 
 impl RuntimeDiscovery {
     fn summary(&self) -> String {
         format!(
-            "runtime-summary backend-count={} builtin-backends={} ready-backends={} missing-backends={}",
+            "runtime-summary backend-count={} builtin-backends={} located-backends={} missing-backends={}",
             self.backend_count,
             self.builtin_backends,
-            self.ready_backends,
+            self.located_backends,
             self.missing_backends
         )
     }
@@ -362,7 +371,7 @@ fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
         "runtime backends={} status=builtin selected=ostadix-runtime",
         BUILTIN_BACKENDS.join(",")
     )];
-    let mut ready_backends = 0;
+    let mut located_backends = 0;
     let mut missing_backends = 0;
 
     for spec in RUNTIME_SPECS {
@@ -380,7 +389,7 @@ fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
         let backend_names = spec.backends.join(",");
         match selected {
             Some(resolved) => {
-                ready_backends += spec.backends.len();
+                located_backends += spec.backends.len();
                 let commands = resolved
                     .iter()
                     .map(|(command, _)| *command)
@@ -392,7 +401,7 @@ fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
                     .collect::<Vec<_>>()
                     .join(",");
                 lines.push(format!(
-                    "runtime backends={backend_names} status=ready selected={commands} paths=[{paths}]"
+                    "runtime backends={backend_names} status=located selected={commands} paths=[{paths}]"
                 ));
             }
             None => {
@@ -419,7 +428,7 @@ fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
                 .map(|spec| spec.backends.len())
                 .sum::<usize>(),
         builtin_backends: BUILTIN_BACKENDS.len(),
-        ready_backends,
+        located_backends,
         missing_backends,
     }
 }
@@ -595,9 +604,29 @@ fn format_run(code: i32, stdout: &str, stderr: &str) -> String {
 
 // Empty args for zero-parameter tools — emits `type: object` so strict MCP
 // clients (OpenCode, TS SDK) accept tools/list instead of rejecting `{}`.
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-#[schemars(description = "No parameters")]
+#[derive(Debug, Default, Deserialize)]
 struct EmptyArgs {}
+
+impl schemars::JsonSchema for EmptyArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "EmptyArgs".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Schemars omits an empty object `properties` map. Some
+        // strict MCP clients require the keyword even for zero-argument tools,
+        // so construct the exact zero-argument object contract explicitly.
+        schemars::json_schema!({
+            "type": "object",
+            "description": "No parameters",
+            "properties": {}
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunOArgs {
@@ -647,7 +676,7 @@ struct SearchRunArgs {
 #[tool_router]
 impl OstadixMcp {
     #[tool(
-        description = "Report O-lang / Ostadix-lang environment: O_LANG_ROOT, backends, O/olangc paths, shim presence"
+        description = "Report O-lang / Ostadix-lang environment: roots, tools, shim presence, and all-runtime summary"
     )]
     async fn o_env(
         &self,
@@ -658,16 +687,29 @@ impl OstadixMcp {
         let o_bin = resolve_o_bin(&root);
         let olangc = resolve_olangc(&root);
         let shim = backends.join("python_shim.py");
+        let runtimes = discover_runtimes(&root);
         let msg = format!(
-            "O_LANG_ROOT={}\nO_BACKENDS_DIR={}\nO_bin={}\nolangc={}\npython_shim={} ({})\nnote=always pass absolute backends dir to O; never bare \"backends\" from unrelated cwd; never put $VAR inside .O sources\n",
+            "O_LANG_ROOT={}\nO_BACKENDS_DIR={}\nO_bin={}\nolangc={}\npython_shim={} ({})\n{}\nnote=always pass absolute backends dir to O; never bare \"backends\" from unrelated cwd; never put $VAR inside .O sources\n",
             root.display(),
             backends.display(),
             o_bin.display(),
             olangc.display(),
             shim.display(),
-            if shim.is_file() { "ok" } else { "MISSING" }
+            if shim.is_file() { "ok" } else { "MISSING" },
+            runtimes.summary()
         );
         text_ok(msg)
+    }
+
+    #[tool(
+        description = "Discover executable requirements for every canonical Ostadix backend without blocking on missing optional runtimes"
+    )]
+    async fn o_runtimes(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = resolve_lang_root();
+        text_ok(discover_runtimes(&root).to_text())
     }
 
     #[tool(
@@ -819,7 +861,7 @@ impl OstadixMcp {
     }
 
     #[tool(
-        description = "Toolchain doctor: check O, olangc, backends, python_shim, and optional a18re search/o-run"
+        description = "Toolchain doctor: check O, olangc, backends, shims, all backend runtimes, and optional a18re search/o-run"
     )]
     async fn o_doctor(
         &self,
@@ -856,6 +898,7 @@ impl OstadixMcp {
             a18.is_dir(),
             a18.join("search/o-run").is_file()
         ));
+        lines.push(discover_runtimes(&root).to_text().trim_end().to_string());
         text_ok(lines.join("\n") + "\n")
     }
 
@@ -950,7 +993,7 @@ impl ServerHandler for OstadixMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_doctor first. \
+                "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_runtimes/o_doctor first. \
 Always run .O programs via o_run or o_search_run so backends is absolute. \
 Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (O splices $IDENT)."
                     .into(),
@@ -963,6 +1006,12 @@ Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // GUI/MCP clients often launch with a system-only PATH. Restore known
+    // local runtime locations once so discovery and every child backend see
+    // the same executable universe.
+    let root = resolve_lang_root();
+    std::env::set_var("PATH", runtime_search_path(&root));
+
     // stderr only — stdout is MCP
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -980,7 +1029,12 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_lang_root, resolve_directory, resolve_file, resolve_run_target, run_cmd};
+    use super::{
+        is_lang_root, resolve_directory, resolve_file, resolve_run_target, run_cmd,
+        runtime_search_path_from, EmptyArgs, BUILTIN_BACKENDS, RUNTIME_SPECS,
+    };
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1071,6 +1125,78 @@ mod tests {
                 .canonicalize()
                 .expect("canonical program parent")
         );
+    }
+
+    #[test]
+    fn runtime_inventory_covers_every_canonical_backend() {
+        let registry_source = include_str!("../../../src/ir.rs");
+        let registry_table = registry_source
+            .split_once("const BACKEND_SPECS: &[BackendSpec] = &[")
+            .expect("find canonical backend table")
+            .1
+            .split_once("\n];")
+            .expect("find canonical backend table end")
+            .0;
+        let canonical = registry_table
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|tail| tail.split_once('"'))
+                    .map(|(name, _)| name)
+            })
+            .collect::<BTreeSet<_>>();
+        let discovered = BUILTIN_BACKENDS
+            .iter()
+            .copied()
+            .chain(
+                RUNTIME_SPECS
+                    .iter()
+                    .flat_map(|spec| spec.backends.iter().copied()),
+            )
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(canonical.len(), 30, "canonical backend count changed");
+        assert_eq!(discovered, canonical);
+    }
+
+    #[test]
+    fn runtime_path_preserves_client_order_then_adds_local_fallbacks() {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        let first = fixture.0.join("client-first");
+        let second = fixture.0.join("client-second");
+        let explicit = fixture.0.join("explicit-extra");
+        for directory in [
+            home.join(".local/bin"),
+            fixture.0.join("target/release"),
+            first.clone(),
+            second.clone(),
+            explicit.clone(),
+        ] {
+            fs::create_dir_all(directory).expect("create runtime path fixture");
+        }
+        let inherited = std::env::join_paths([&first, &second]).expect("join inherited PATH");
+        let explicit_path = std::env::join_paths([&explicit]).expect("join explicit PATH");
+        let encoded = runtime_search_path_from(
+            &fixture.0,
+            &home,
+            Some(OsStr::new(&inherited)),
+            Some(OsStr::new(&explicit_path)),
+        );
+        let paths = std::env::split_paths(&encoded).collect::<Vec<_>>();
+
+        assert_eq!(&paths[..3], &[first, second, explicit]);
+        assert!(paths.contains(&fixture.0.join("target/release")));
+        assert!(paths.contains(&home.join(".local/bin")));
+        assert_eq!(paths.iter().collect::<BTreeSet<_>>().len(), paths.len());
+    }
+
+    #[test]
+    fn empty_tool_args_emit_strict_object_schema() {
+        let schema = rmcp::handler::server::tool::schema_for_type::<EmptyArgs>();
+        assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
+        assert_eq!(schema.get("properties"), Some(&serde_json::json!({})));
     }
 
     #[cfg(unix)]

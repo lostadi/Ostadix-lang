@@ -15,13 +15,12 @@
   "mcp": {
     "olang": {
       "type": "local",
-      "command": ["/Users/ustad/.local/bin/ostadix-mcp-compat"],
+      "command": ["/Users/ustad/.local/bin/ostadix-mcp"],
       "enabled": true,
       "timeout": 600000,
       "env": {
         "O_LANG_ROOT": "/Users/ustad/Ostadix-lang",
-        "O_BACKENDS_DIR": "/Users/ustad/Ostadix-lang/backends",
-        "PATH": "/Users/ustad/.local/bin:/Users/ustad/Ostadix-lang/target/release:/usr/bin:/bin:/usr/sbin:/sbin"
+        "O_BACKENDS_DIR": "/Users/ustad/Ostadix-lang/backends"
       }
     }
   },
