@@ -22,6 +22,7 @@ EXPECTED_TOOLS = {
     "o_env",
     "o_olangc",
     "o_run",
+    "o_runtimes",
     "o_search_run",
     "o_smoke",
 }
@@ -148,6 +149,12 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     environment.pop("O_LANG_ROOT", None)
     environment.pop("O_BACKENDS_DIR", None)
     environment.pop("OLANG", None)
+    environment.pop("OSTADIX_RUNTIME_PATH", None)
+    # Model the restricted environment used by GUI-launched MCP clients. The
+    # server must restore local runtime locations without shell startup files.
+    environment["PATH"] = os.pathsep.join(
+        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    )
     environment["RUST_LOG"] = "warn"
     stderr_capture = tempfile.TemporaryFile()
     process = subprocess.Popen(
@@ -210,6 +217,19 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
             raise SmokeError(
                 f"unexpected MCP tool set: expected {sorted(EXPECTED_TOOLS)}, got {sorted(names)}"
             )
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise SmokeError(f"tools/list returned a non-object tool: {tool!r}")
+            schema = tool.get("inputSchema")
+            if (
+                not isinstance(schema, dict)
+                or schema.get("type") != "object"
+                or not isinstance(schema.get("properties"), dict)
+            ):
+                raise SmokeError(
+                    f"{tool.get('name', '<unnamed>')} has a non-object input schema: "
+                    f"{schema!r}"
+                )
 
         _send(
             process,
@@ -230,6 +250,8 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         }
         if not all(value in environment_text for value in required_environment):
             raise SmokeError(f"o_env returned unexpected paths:\n{environment_text}")
+        if "runtime-summary backend-count=30" not in environment_text:
+            raise SmokeError(f"o_env omitted the all-runtime summary:\n{environment_text}")
 
         _send(
             process,
@@ -237,10 +259,35 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
+                "params": {"name": "o_runtimes", "arguments": {}},
+            },
+        )
+        runtimes_result = responses.response(4, timeout)
+        runtimes_text = _content_text(runtimes_result)
+        if runtimes_result.get("isError") is True:
+            raise SmokeError(f"o_runtimes returned an MCP tool error:\n{runtimes_text}")
+        required_runtime_markers = {
+            "runtime-summary backend-count=30",
+            "runtime backends=python status=located",
+            "runtime backends=java status=",
+            "runtime backends=webassembly status=",
+        }
+        if not all(marker in runtimes_text for marker in required_runtime_markers):
+            raise SmokeError(
+                "o_runtimes omitted required backend discovery markers:\n"
+                f"{runtimes_text}"
+            )
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
                 "params": {"name": "o_smoke", "arguments": {}},
             },
         )
-        smoke_result = responses.response(4, timeout)
+        smoke_result = responses.response(5, timeout)
         smoke_text = _content_text(smoke_result)
         if smoke_result.get("isError") is True or "SMOKE_OK" not in smoke_text:
             raise SmokeError(f"o_smoke failed:\n{smoke_text}")
@@ -249,19 +296,19 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
 
         calls = [
             (
-                5,
+                6,
                 "o_run",
                 {"path": "examples/hello.O", "timeout_secs": 45},
                 "[number] 2",
             ),
             (
-                6,
+                7,
                 "o_run",
                 {"path": "hello.O", "cwd": "examples", "timeout_secs": 45},
                 "[number] 2",
             ),
             (
-                7,
+                8,
                 "o_olangc",
                 {"path": "examples/hello.O", "target": "ir", "timeout_secs": 45},
                 "; OIrProgram",
