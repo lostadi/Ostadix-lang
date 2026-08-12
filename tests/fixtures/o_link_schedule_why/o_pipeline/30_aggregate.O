@@ -1,0 +1,6 @@
+# Stage 3: force the preceding list through an explicit O splice and aggregate.
+python^(
+import time
+time.sleep(0.02)
+__oval_result__ = sum($stage_two)
+)_python

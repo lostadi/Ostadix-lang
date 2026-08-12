@@ -1,0 +1,18 @@
+# Stage 2: a dependent width-three autonomous frontier.
+let stage_two = autonomous(batch(
+python^(
+import time
+time.sleep(0.04)
+__oval_result__ = sum(stage_one)
+)_python,
+python^(
+import time
+time.sleep(0.04)
+__oval_result__ = max(stage_one) * 2
+)_python,
+python^(
+import time
+time.sleep(0.04)
+__oval_result__ = min(stage_one) * 3
+)_python
+))

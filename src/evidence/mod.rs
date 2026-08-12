@@ -13,7 +13,8 @@ pub mod profile;
 
 pub use admit::{
     admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV3,
-    OperationBlockerV1, RetainedSequenceV1, SequenceRetentionReasonV1,
+    OperationBlockerV1, RetainedSequenceV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,
+    ScheduleWhyWitnessV1, SequenceRetentionReasonV1, SCHEDULE_WHY_SCHEMA_V1,
 };
 pub use analyze::{
     analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,

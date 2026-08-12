@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::effects::{EffectSummary, ResourceKey};
 use crate::eval::Policy;
-use crate::hgraph::{AdmissionFactKind, HGraph, HNodeKind, NodeId, ReadySchedule};
+use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 
 use super::analyze::{
@@ -83,6 +83,49 @@ pub struct AdmittedOperationV1 {
     pub blockers: Vec<OperationBlockerV1>,
 }
 
+pub const SCHEDULE_WHY_SCHEMA_V1: &str = "oexec.admission-why/v1";
+
+/// One exact HGraph input/producer correspondence behind a blocker.
+///
+/// Unlike the compact predecessor aggregation in [`OperationBlockerV1`], a
+/// witness retains the actual value/control/resource node consumed by the
+/// selected operation.  It is a read-only projection of the admitted graph;
+/// it does not participate in admission hashing or dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWhyWitnessV1 {
+    pub predecessor: PlanNodeId,
+    pub input: NodeId,
+    pub producer_edge: EdgeId,
+    pub input_kind: HNodeKind,
+    pub reasons: Vec<BlockerReasonV1>,
+}
+
+/// A later admitted operation whose readiness directly depends on the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWhyDependentV1 {
+    pub operation: PlanNodeId,
+    pub witnesses: Vec<ScheduleWhyWitnessV1>,
+}
+
+/// Smallest currently implemented admission projection that explains one
+/// canonical plan operation and its immediate scheduling neighborhood.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWhyViewV1 {
+    pub schema: &'static str,
+    pub bindings: EvidenceBindingsV1,
+    pub evidence_sha256: String,
+    pub admitted_graph_sha256: String,
+    pub admission_sha256: String,
+    pub plan_kind: PlanNodeKind,
+    pub operation: AdmittedOperationV1,
+    pub blocker_witnesses: Vec<ScheduleWhyWitnessV1>,
+    pub dependents: Vec<ScheduleWhyDependentV1>,
+    pub retained_sequences: Vec<RetainedSequenceV1>,
+    pub wave_index: usize,
+    pub wave: Vec<PlanNodeId>,
+    pub hosted_task_layer: Option<(usize, Vec<PlanNodeId>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionAdmissionV3 {
     schema: &'static str,
@@ -143,6 +186,10 @@ impl ExecutionAdmissionV3 {
 
     pub fn waves(&self) -> &[Vec<PlanNodeId>] {
         &self.waves
+    }
+
+    pub fn retained_sequences(&self) -> &[RetainedSequenceV1] {
+        &self.retained_sequences
     }
 
     pub fn admitted_static_max_wave_width(&self) -> usize {
@@ -326,91 +373,7 @@ impl ExecutionAdmissionV3 {
         }
 
         for operation in &self.operations {
-            let evidence = &operation.evidence;
-            writeln!(
-                out,
-                "operation P{} admitted=yes ordinal={}",
-                operation.plan_node.0, operation.ordinal
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "  type constraints-solved={} provenance={} domain-bounds=0x{:04x} representation-bounds=0x{:04x} fidelity-bound={}",
-                yes_no(evidence.type_contract.constraints_solved),
-                evidence.type_contract.provenance.name(),
-                evidence.type_contract.output_domain_bits,
-                evidence.type_contract.output_representation_bits,
-                evidence.type_contract.output_fidelity
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "  dispatch lane={} adapter={} semantics={} preparation={}",
-                evidence.dispatch_contract.lane.name(),
-                evidence.dispatch_contract.adapter.name(),
-                evidence.dispatch_contract.semantics.name(),
-                if evidence.dispatch_contract.send_only_preparation {
-                    "deferred-materialized-input-check"
-                } else {
-                    "coordinator-owned"
-                }
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "  effects provenance={} closed={} failure={} reads=[{}] writes=[{}]",
-                evidence.effect_contract.provenance.name(),
-                yes_no(evidence.effect_contract.footprint_closed),
-                evidence.failure_contract.class.name(),
-                resources_text(&evidence.effect_contract.reads),
-                resources_text(&evidence.effect_contract.writes)
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "  capability={} provenance={} placement={} provenance={}",
-                evidence.capability_disposition.name(),
-                evidence.capability_provenance.name(),
-                evidence.placement.name(),
-                evidence.placement_provenance.name()
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "  demand cpu={} memory={} file-descriptors={} process-slots={} provenance={} cost={} cost-provenance={}",
-                optional_number(evidence.resource_demand.cpu_units),
-                optional_number(evidence.resource_demand.hard_memory_bytes),
-                optional_number(evidence.resource_demand.file_descriptors),
-                optional_number(evidence.resource_demand.process_slots),
-                evidence.resource_demand.provenance.name(),
-                optional_number(evidence.cost_estimate.expected_duration_micros),
-                evidence.cost_estimate.provenance.name()
-            )
-            .expect("writing to a String cannot fail");
-            let facts = AdmissionFactKind::ALL
-                .iter()
-                .map(|fact| format!("{}:{}", fact.name(), evidence.provenance_for(*fact).name()))
-                .collect::<Vec<_>>()
-                .join(",");
-            writeln!(out, "  evidence-inputs=[{facts}]").expect("writing to a String cannot fail");
-            let blockers = operation
-                .blockers
-                .iter()
-                .map(|blocker| {
-                    format!(
-                        "P{}:{}",
-                        blocker.predecessor.0,
-                        blocker
-                            .reasons
-                            .iter()
-                            .map(BlockerReasonV1::label)
-                            .collect::<Vec<_>>()
-                            .join("+")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            writeln!(out, "  blockers=[{blockers}]").expect("writing to a String cannot fail");
+            render_operation(&mut out, operation);
         }
 
         for sequence in &self.retained_sequences {
@@ -481,6 +444,221 @@ impl ExecutionAdmissionV3 {
     }
 }
 
+impl ScheduleWhyViewV1 {
+    /// Stable, non-executing text form for the focused admission projection.
+    pub fn to_text(&self) -> String {
+        let mut out = format!("; ExecutionAdmissionWhy {}\n", self.schema);
+        writeln!(
+            out,
+            "why operation=P{} status=admitted-static inspection-only=yes dispatch=not-run admission-sha256={}",
+            self.operation.plan_node.0, self.admission_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding lowered-oir-sha256={} plan-sha256={} analyzed-graph-sha256={}",
+            self.bindings.oir_sha256,
+            self.bindings.plan_sha256,
+            self.bindings.analyzed_graph_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} admission-sha256={}",
+            self.bindings.analyzer_sha256,
+            self.evidence_sha256,
+            self.admitted_graph_sha256,
+            self.admission_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "plan-node P{} kind={}",
+            self.operation.plan_node.0,
+            self.plan_kind.describe()
+        )
+        .expect("writing to a String cannot fail");
+        render_operation(&mut out, &self.operation);
+
+        for witness in &self.blocker_witnesses {
+            render_witness(&mut out, "blocker-witness", witness);
+        }
+        for dependent in &self.dependents {
+            writeln!(out, "dependent operation=P{}", dependent.operation.0)
+                .expect("writing to a String cannot fail");
+            for witness in &dependent.witnesses {
+                render_witness(&mut out, "dependent-witness", witness);
+            }
+        }
+        for sequence in &self.retained_sequences {
+            writeln!(
+                out,
+                "sequence P{} -> P{} retained reason={} token=N{}",
+                sequence.predecessor.0,
+                sequence.successor.0,
+                sequence.reason.name(),
+                sequence.completion.0
+            )
+            .expect("writing to a String cannot fail");
+        }
+        writeln!(
+            out,
+            "wave index={} operations=[{}]",
+            self.wave_index,
+            plan_nodes_text(&self.wave)
+        )
+        .expect("writing to a String cannot fail");
+        if let Some((index, operations)) = &self.hosted_task_layer {
+            writeln!(
+                out,
+                "hosted-task-layer index={} operations=[{}]",
+                index,
+                plan_nodes_text(operations)
+            )
+            .expect("writing to a String cannot fail");
+        } else {
+            out.push_str("hosted-task-layer none\n");
+        }
+        out.push_str(
+            "why-note this view is derived from the evidence-bound admitted HGraph and does not dispatch the program\n",
+        );
+        out.push_str(
+            "why-note blockers and waves describe admitted static readiness, not observed execution, timing, worker identity, or overlap\n",
+        );
+        out
+    }
+}
+
+fn render_operation(out: &mut String, operation: &AdmittedOperationV1) {
+    let evidence = &operation.evidence;
+    writeln!(
+        out,
+        "operation P{} admitted=yes ordinal={}",
+        operation.plan_node.0, operation.ordinal
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  type constraints-solved={} provenance={} domain-bounds=0x{:04x} representation-bounds=0x{:04x} fidelity-bound={}",
+        yes_no(evidence.type_contract.constraints_solved),
+        evidence.type_contract.provenance.name(),
+        evidence.type_contract.output_domain_bits,
+        evidence.type_contract.output_representation_bits,
+        evidence.type_contract.output_fidelity
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  dispatch lane={} adapter={} semantics={} preparation={}",
+        evidence.dispatch_contract.lane.name(),
+        evidence.dispatch_contract.adapter.name(),
+        evidence.dispatch_contract.semantics.name(),
+        if evidence.dispatch_contract.send_only_preparation {
+            "deferred-materialized-input-check"
+        } else {
+            "coordinator-owned"
+        }
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  effects provenance={} closed={} failure={} reads=[{}] writes=[{}]",
+        evidence.effect_contract.provenance.name(),
+        yes_no(evidence.effect_contract.footprint_closed),
+        evidence.failure_contract.class.name(),
+        resources_text(&evidence.effect_contract.reads),
+        resources_text(&evidence.effect_contract.writes)
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  capability={} provenance={} placement={} provenance={}",
+        evidence.capability_disposition.name(),
+        evidence.capability_provenance.name(),
+        evidence.placement.name(),
+        evidence.placement_provenance.name()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "  demand cpu={} memory={} file-descriptors={} process-slots={} provenance={} cost={} cost-provenance={}",
+        optional_number(evidence.resource_demand.cpu_units),
+        optional_number(evidence.resource_demand.hard_memory_bytes),
+        optional_number(evidence.resource_demand.file_descriptors),
+        optional_number(evidence.resource_demand.process_slots),
+        evidence.resource_demand.provenance.name(),
+        optional_number(evidence.cost_estimate.expected_duration_micros),
+        evidence.cost_estimate.provenance.name()
+    )
+    .expect("writing to a String cannot fail");
+    let facts = AdmissionFactKind::ALL
+        .iter()
+        .map(|fact| format!("{}:{}", fact.name(), evidence.provenance_for(*fact).name()))
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, "  evidence-inputs=[{facts}]").expect("writing to a String cannot fail");
+    let blockers = operation
+        .blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "P{}:{}",
+                blocker.predecessor.0,
+                blocker
+                    .reasons
+                    .iter()
+                    .map(BlockerReasonV1::label)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, "  blockers=[{blockers}]").expect("writing to a String cannot fail");
+}
+
+fn render_witness(out: &mut String, label: &str, witness: &ScheduleWhyWitnessV1) {
+    writeln!(
+        out,
+        "{label} predecessor=P{} input=N{} producer=E{} kind={} reasons=[{}]",
+        witness.predecessor.0,
+        witness.input.0,
+        witness.producer_edge.0,
+        hnode_kind_text(&witness.input_kind),
+        witness
+            .reasons
+            .iter()
+            .map(BlockerReasonV1::label)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .expect("writing to a String cannot fail");
+}
+
+fn hnode_kind_text(kind: &HNodeKind) -> String {
+    match kind {
+        HNodeKind::Value => "value".to_string(),
+        HNodeKind::ResourceState { resource, version } => {
+            format!("resource-state:{resource}:v{version}")
+        }
+        HNodeKind::Completion { plan_node } => format!("completion:P{}", plan_node.0),
+        HNodeKind::BranchControl { label, version } => {
+            format!("branch-control:{label}:v{version}")
+        }
+        HNodeKind::AdmissionEvidence { plan_node, fact } => {
+            format!("admission-evidence:P{}:{}", plan_node.0, fact.name())
+        }
+    }
+}
+
+fn plan_nodes_text(nodes: &[PlanNodeId]) -> String {
+    nodes
+        .iter()
+        .map(|node| format!("P{}", node.0))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -522,6 +700,116 @@ impl<'a> AdmittedExecution<'a> {
 
     pub fn admission(&self) -> &ExecutionAdmissionV3 {
         &self.admission
+    }
+
+    /// Project one canonical plan operation and its immediate admitted
+    /// dependency neighborhood without dispatching any work.
+    pub fn schedule_why(&self, target: PlanNodeId) -> Result<ScheduleWhyViewV1> {
+        let Some(plan_node) = self
+            .plan
+            .nodes
+            .get(target.0)
+            .filter(|node| node.id == target)
+        else {
+            if self.plan.nodes.is_empty() {
+                bail!("cannot explain P{}: the ExecutionPlan is empty", target.0);
+            }
+            bail!(
+                "cannot explain P{}: the ExecutionPlan contains {} nodes (valid range P0..P{})",
+                target.0,
+                self.plan.nodes.len(),
+                self.plan.nodes.len() - 1
+            );
+        };
+        let operation = self
+            .admission
+            .operations
+            .iter()
+            .find(|operation| operation.plan_node == target)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "P{} exists in the ExecutionPlan as `{}` but is not an admitted executable operation",
+                    target.0,
+                    plan_node.kind.describe()
+                )
+            })?;
+
+        let producer_by_edge = self
+            .graph
+            .op_map
+            .values()
+            .map(|operation| (operation.edge, operation.plan_node))
+            .collect::<BTreeMap<_, _>>();
+        let sequences = self
+            .graph
+            .sequence_dependencies
+            .iter()
+            .map(|dependency| (dependency.predecessor, dependency.successor))
+            .collect::<BTreeSet<_>>();
+        let blocker_witnesses =
+            schedule_why_witnesses(&self.graph, target, &producer_by_edge, &sequences)?;
+
+        let mut dependents = Vec::new();
+        for candidate in self.graph.exec_ops_ordered() {
+            if candidate.plan_node == target {
+                continue;
+            }
+            let witnesses = schedule_why_witnesses(
+                &self.graph,
+                candidate.plan_node,
+                &producer_by_edge,
+                &sequences,
+            )?
+            .into_iter()
+            .filter(|witness| witness.predecessor == target)
+            .collect::<Vec<_>>();
+            if !witnesses.is_empty() {
+                dependents.push(ScheduleWhyDependentV1 {
+                    operation: candidate.plan_node,
+                    witnesses,
+                });
+            }
+        }
+
+        let retained_sequences = self
+            .admission
+            .retained_sequences
+            .iter()
+            .filter(|sequence| sequence.predecessor == target || sequence.successor == target)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (wave_index, wave) = self
+            .admission
+            .waves
+            .iter()
+            .enumerate()
+            .find(|(_, wave)| wave.contains(&target))
+            .map(|(index, wave)| (index, wave.clone()))
+            .with_context(|| format!("admission static waves omit operation P{}", target.0))?;
+        let hosted_task_layer = self
+            .admission
+            .hosted_task_layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.contains(&target))
+            .map(|(index, layer)| (index + 1, layer.clone()));
+
+        Ok(ScheduleWhyViewV1 {
+            schema: SCHEDULE_WHY_SCHEMA_V1,
+            bindings: self.admission.bindings.clone(),
+            evidence_sha256: self.admission.evidence_sha256.clone(),
+            admitted_graph_sha256: self.admission.admitted_graph_sha256.clone(),
+            admission_sha256: self.admission.admission_sha256.clone(),
+            plan_kind: plan_node.kind.clone(),
+            operation,
+            blocker_witnesses,
+            dependents,
+            retained_sequences,
+            wave_index,
+            wave,
+            hosted_task_layer,
+        })
     }
 
     pub(crate) fn verify_runtime(&self, current: &RuntimeBindingV1) -> Result<()> {
@@ -891,40 +1179,10 @@ fn explain_operations(
                 continue;
             };
             let predecessor = schedule.ops[producer_index].plan_node;
-            let reasons = match &node.kind {
-                HNodeKind::Value => vec![BlockerReasonV1::ValueDependency],
-                HNodeKind::Completion { .. } => {
-                    let mut reasons = Vec::new();
-                    if sequences.contains(&(predecessor, op.plan_node)) {
-                        reasons.push(BlockerReasonV1::SourceCompletion);
-                    }
-                    let (predecessor_reads, _) = graph
-                        .effect_summary(predecessor)
-                        .expect("validated blocker producer has effects")
-                        .scheduling_accesses();
-                    let (_, successor_writes) = graph
-                        .effect_summary(op.plan_node)
-                        .expect("validated blocker consumer has effects")
-                        .scheduling_accesses();
-                    reasons.extend(
-                        predecessor_reads
-                            .intersection(&successor_writes)
-                            .cloned()
-                            .map(BlockerReasonV1::ReaderDrain),
-                    );
-                    reasons
-                }
-                HNodeKind::ResourceState {
-                    resource: ResourceKey::ActorState(actor),
-                    ..
-                } => vec![BlockerReasonV1::ActorVersion(actor.to_string())],
-                HNodeKind::ResourceState { resource, .. } => {
-                    vec![BlockerReasonV1::ResourceVersion(resource.clone())]
-                }
-                HNodeKind::BranchControl { label, .. } => {
-                    vec![BlockerReasonV1::BranchControl(label.clone())]
-                }
-                HNodeKind::AdmissionEvidence { .. } => continue,
+            let Some(reasons) =
+                blocker_reasons(graph, &sequences, predecessor, op.plan_node, &node.kind)?
+            else {
+                continue;
             };
             blockers.entry(predecessor).or_default().extend(reasons);
         }
@@ -945,6 +1203,93 @@ fn explain_operations(
         });
     }
     Ok(operations)
+}
+
+fn schedule_why_witnesses(
+    graph: &HGraph,
+    consumer: PlanNodeId,
+    producer_by_edge: &BTreeMap<EdgeId, PlanNodeId>,
+    sequences: &BTreeSet<(PlanNodeId, PlanNodeId)>,
+) -> Result<Vec<ScheduleWhyWitnessV1>> {
+    let operation = graph
+        .op_for(consumer)
+        .with_context(|| format!("admitted graph omits operation P{}", consumer.0))?;
+    let mut witnesses = Vec::new();
+    for input in &operation.inputs {
+        let node = graph.node(*input).with_context(|| {
+            format!(
+                "operation P{} references missing input N{}",
+                consumer.0, input.0
+            )
+        })?;
+        let Some(producer_edge) = node.producer else {
+            continue;
+        };
+        let Some(predecessor) = producer_by_edge.get(&producer_edge).copied() else {
+            continue;
+        };
+        let Some(reasons) = blocker_reasons(graph, sequences, predecessor, consumer, &node.kind)?
+        else {
+            continue;
+        };
+        witnesses.push(ScheduleWhyWitnessV1 {
+            predecessor,
+            input: *input,
+            producer_edge,
+            input_kind: node.kind.clone(),
+            reasons,
+        });
+    }
+    Ok(witnesses)
+}
+
+fn blocker_reasons(
+    graph: &HGraph,
+    sequences: &BTreeSet<(PlanNodeId, PlanNodeId)>,
+    predecessor: PlanNodeId,
+    successor: PlanNodeId,
+    input_kind: &HNodeKind,
+) -> Result<Option<Vec<BlockerReasonV1>>> {
+    let reasons = match input_kind {
+        HNodeKind::Value => vec![BlockerReasonV1::ValueDependency],
+        HNodeKind::Completion { .. } => {
+            let mut reasons = Vec::new();
+            if sequences.contains(&(predecessor, successor)) {
+                reasons.push(BlockerReasonV1::SourceCompletion);
+            }
+            let (predecessor_reads, _) = graph
+                .effect_summary(predecessor)
+                .with_context(|| {
+                    format!("blocker producer P{} has no effect summary", predecessor.0)
+                })?
+                .scheduling_accesses();
+            let (_, successor_writes) = graph
+                .effect_summary(successor)
+                .with_context(|| {
+                    format!("blocker consumer P{} has no effect summary", successor.0)
+                })?
+                .scheduling_accesses();
+            reasons.extend(
+                predecessor_reads
+                    .intersection(&successor_writes)
+                    .cloned()
+                    .map(BlockerReasonV1::ReaderDrain),
+            );
+            reasons
+        }
+        HNodeKind::ResourceState {
+            resource: ResourceKey::ActorState(actor),
+            ..
+        } => vec![BlockerReasonV1::ActorVersion(actor.to_string())],
+        HNodeKind::ResourceState { resource, .. } => {
+            vec![BlockerReasonV1::ResourceVersion(resource.clone())]
+        }
+        HNodeKind::BranchControl { label, .. } => {
+            vec![BlockerReasonV1::BranchControl(label.clone())]
+        }
+        HNodeKind::AdmissionEvidence { .. } => return Ok(None),
+    };
+    Ok(Some(reasons))
 }
 
 fn explain_sequences(plan: &ExecutionPlan, graph: &HGraph) -> Vec<RetainedSequenceV1> {
@@ -1807,6 +2152,118 @@ python^(__oval_result__ = sum(branches))_python
                 loads[1].0
             )),
             "{explanation}"
+        );
+    }
+
+    #[test]
+    fn schedule_why_preserves_exact_blocker_nodes_and_reverse_dependents() {
+        let program = reader_writer_program("initial");
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "focused-why");
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+
+        let loads = plan
+            .nodes
+            .iter()
+            .filter_map(|node| matches!(node.kind, PlanNodeKind::Load { .. }).then_some(node.id))
+            .collect::<Vec<_>>();
+        let writer = plan
+            .nodes
+            .iter()
+            .filter_map(|node| matches!(node.kind, PlanNodeKind::Store { .. }).then_some(node.id))
+            .nth(1)
+            .expect("fixture must contain a second writer");
+
+        let why = admitted.schedule_why(writer).unwrap();
+        assert_eq!(why.schema, SCHEDULE_WHY_SCHEMA_V1);
+        assert_eq!(why.operation.plan_node, writer);
+        for reader in &loads {
+            let witness = why
+                .blocker_witnesses
+                .iter()
+                .find(|witness| witness.predecessor == *reader)
+                .unwrap_or_else(|| panic!("focused why omitted reader P{}", reader.0));
+            assert!(matches!(
+                witness.input_kind,
+                HNodeKind::Completion { plan_node } if plan_node == *reader
+            ));
+            assert_eq!(
+                admitted.graph().node(witness.input).unwrap().producer,
+                Some(witness.producer_edge)
+            );
+            assert!(witness.reasons.contains(&BlockerReasonV1::ReaderDrain(
+                ResourceKey::ScopeBinding("shared".into())
+            )));
+        }
+
+        let reader_why = admitted.schedule_why(loads[0]).unwrap();
+        assert!(reader_why.dependents.iter().any(|dependent| {
+            dependent.operation == writer
+                && dependent
+                    .witnesses
+                    .iter()
+                    .any(|witness| witness.predecessor == loads[0])
+        }));
+
+        let text = why.to_text();
+        assert!(text.contains("; ExecutionAdmissionWhy oexec.admission-why/v1"));
+        assert!(text.contains("inspection-only=yes dispatch=not-run"));
+        assert!(text.contains("blocker-witness predecessor=P"));
+        assert!(text.contains("producer=E"));
+        assert!(text.contains("kind=completion:P"));
+        assert!(text.contains("why-note blockers and waves describe admitted static readiness"));
+        assert!(!text.contains("; OIrProgram"));
+        assert!(!text.contains("; HGraph"));
+    }
+
+    #[test]
+    fn schedule_why_rejects_plan_nodes_outside_the_exact_admission() {
+        let program = reader_writer_program("initial");
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let runtime = inspection_runtime(&plan, "focused-why-range");
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone()).unwrap();
+        let admitted =
+            admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence).unwrap();
+
+        let target = PlanNodeId(plan.nodes.len());
+        let error = admitted.schedule_why(target).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "ExecutionPlan contains {} nodes (valid range P0..P{})",
+                plan.nodes.len(),
+                plan.nodes.len() - 1
+            )),
+            "{error:#}"
+        );
+
+        let text_program = OIrProgram {
+            nodes: vec![OIr::Text("materialized literal".into())],
+        };
+        let text_plan = text_program.plan();
+        let text_graph = solved_graph(&text_program);
+        let text_runtime = inspection_runtime(&text_plan, "focused-why-non-executable");
+        let text_evidence =
+            analyze_execution(&text_program, &text_plan, &text_graph, text_runtime.clone())
+                .unwrap();
+        let text_admitted = admit_execution(
+            &text_program,
+            &text_plan,
+            text_graph,
+            Policy::Eager,
+            text_runtime,
+            text_evidence,
+        )
+        .unwrap();
+        let error = text_admitted.schedule_why(PlanNodeId(0)).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "P0 exists in the ExecutionPlan as `text` but is not an admitted executable operation"
+            ),
+            "{error:#}"
         );
     }
 

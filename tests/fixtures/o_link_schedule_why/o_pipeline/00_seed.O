@@ -1,0 +1,6 @@
+# Stage 0: one coordinator-owned seed operation.
+let seed = python^(
+import time
+time.sleep(0.02)
+__oval_result__ = 10
+)_python

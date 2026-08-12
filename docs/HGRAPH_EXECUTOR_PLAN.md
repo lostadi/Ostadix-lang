@@ -59,6 +59,17 @@ static legal waves. Its admission report identifies the runtime snapshot as
 `inspection-only`; it is not interchangeable with the evaluator's execution
 snapshot. The inspection surface is ordinary-OIR-only in v3.
 
+`olangc FILE.O --target ir --why P3` projects the same evidence-bound admission
+onto one plan operation and its immediate dependency neighborhood; repository
+command `o why FILE.O P3` is a thin route to that compiler surface and performs
+no scheduler parsing. `--why` is mutually exclusive with
+`--explain-schedule`. The result is inspection-only and nonexecuting: static
+waves/layers are not runtime batches, and the query observes no readiness,
+timing, worker identity, or overlap. Its source origin is a descriptive sidecar
+for the exact parsed input, outside OIR, plan, evidence, and admission digests;
+it neither authorizes execution nor promises stable identity or incremental
+invalidation across edits.
+
 This admission is distinct from an observation or receipt. `RuntimeGraphV1`
 and `ExecutionReceiptV1` describe completed execution and carry no scheduling
 authority; a prior receipt cannot authorize a new run. Project HGraphs and the

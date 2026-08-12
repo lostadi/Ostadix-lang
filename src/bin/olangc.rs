@@ -11,6 +11,7 @@
 //   olangc <input.O> --target wasm                # wasm32-wasip1
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
+//   olangc <input.O> --target ir --why P3         # explain one admitted operation
 //   olangc <input.O> --target dot                 # Graphviz DOT hypergraph
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
 //
@@ -65,6 +66,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser as ClapParser, ValueEnum};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,7 +74,7 @@ use std::process::Command;
 
 use o_lang::eval::{Evaluator, Policy};
 use o_lang::evidence::{admit_execution, analyze_execution, runtime_binding_from_adapter_bytes};
-use o_lang::ir::OIrProgram;
+use o_lang::ir::{OIrProgram, PlanNodeId};
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
 use o_lang::value::OValue;
@@ -310,6 +312,12 @@ struct Cli {
     #[arg(long)]
     explain_schedule: bool,
 
+    /// Explain why one canonical plan operation is statically admitted or
+    /// blocked. Accepts an exact plan identity such as P3. This is a focused,
+    /// non-executing ordinary-.O admission view and requires --target ir.
+    #[arg(long, value_name = "PLAN_NODE", value_parser = parse_plan_node_selector)]
+    why: Option<PlanNodeId>,
+
     /// Override the local-worker count used by the non-executing schedule
     /// realizability marker. Requires --target ir --explain-schedule.
     #[arg(long, value_name = "N")]
@@ -334,7 +342,7 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    validate_explain_schedule(&cli)?;
+    validate_admission_inspection(&cli)?;
     let grounding_world = parse_grounding_world(&cli)?;
 
     let input_is_dir = cli.input.is_dir();
@@ -350,9 +358,9 @@ fn main() -> Result<()> {
     // lists and runs the same routes.
     let is_project = input_is_dir || o_lang::project::lower::has_embedded_bundle(&source);
     if is_project {
-        if cli.explain_schedule {
+        if cli.explain_schedule || cli.why.is_some() {
             bail!(
-                "--explain-schedule currently admits ordinary .O HGraphs only; project HGraph admission is deferred"
+                "--explain-schedule and --why currently admit ordinary .O HGraphs only; project HGraph admission is deferred"
             );
         }
         return compile_or_run_project(&cli, input_is_dir, &source);
@@ -411,6 +419,13 @@ fn main() -> Result<()> {
         CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
         }
+        CompileTarget::Ir if cli.why.is_some() => dump_schedule_why(
+            &cli.input,
+            &source,
+            cli.shim_dir.as_deref(),
+            cli.why
+                .expect("IR why branch requires a validated selector"),
+        ),
         CompileTarget::Ir if cli.explain_schedule => dump_ir_with_admission(
             &source,
             cli.shim_dir.as_deref(),
@@ -424,7 +439,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn validate_explain_schedule(cli: &Cli) -> Result<()> {
+fn validate_admission_inspection(cli: &Cli) -> Result<()> {
     if cli.explain_schedule && cli.target != CompileTarget::Ir {
         bail!("--explain-schedule is available only with --target ir");
     }
@@ -434,7 +449,32 @@ fn validate_explain_schedule(cli: &Cli) -> Result<()> {
     if cli.workers.is_some() && !cli.explain_schedule {
         bail!("--workers requires --explain-schedule --target ir");
     }
+    if cli.why.is_some() && cli.target != CompileTarget::Ir {
+        bail!("--why is available only with --target ir");
+    }
+    if cli.why.is_some() && cli.explain_schedule {
+        bail!("--why and --explain-schedule are distinct inspection views and cannot be combined");
+    }
+    if cli.why.is_some() && (cli.grounding || cli.world_id.is_some() || cli.world_epoch.is_some()) {
+        bail!("--why cannot be combined with --grounding, --world-id, or --world-epoch");
+    }
     Ok(())
+}
+
+fn parse_plan_node_selector(value: &str) -> std::result::Result<PlanNodeId, String> {
+    let digits = value
+        .strip_prefix('P')
+        .ok_or_else(|| "expected a canonical plan node such as P3".to_string())?;
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return Err("expected a canonical plan node such as P3".to_string());
+    }
+    digits
+        .parse::<usize>()
+        .map(PlanNodeId)
+        .map_err(|_| format!("plan node `{value}` is outside this platform's supported range"))
 }
 
 fn parse_grounding_world(cli: &Cli) -> Result<Option<WorldIdentity>> {
@@ -1245,26 +1285,13 @@ fn dump_ir_with_admission(
     world: Option<WorldIdentity>,
     worker_override: Option<usize>,
 ) -> Result<()> {
-    use o_lang::hgraph::solve;
-
-    let (program, plan, mut graph) = inspect_ir(source)?;
-    solve::solve_types(&mut graph)
-        .context("failed to solve HGraph type and fidelity constraints for admission")?;
+    let (program, plan, graph) = inspect_ir(source)?;
+    let graph = solve_ir_admission_graph(graph)?;
     let grounding = include_grounding
         .then(|| GroundingReport::analyze(&plan, &graph, world))
         .transpose()
         .context("failed to validate grounding plan/HGraph")?;
-
-    let adapters = read_shims(shim_dir)?;
-    let runtime = runtime_binding_from_adapter_bytes(
-        &plan,
-        &adapters,
-        &[("inspection-surface", "olangc-ir-explain")],
-    );
-    let evidence = analyze_execution(&program, &plan, &graph, runtime.clone())
-        .context("failed to establish pre-execution evidence")?;
-    let admitted = admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence)
-        .context("failed to compile execution admission")?;
+    let admitted = admit_ir_for_inspection(&program, &plan, graph, shim_dir)?;
 
     print!(
         "{}\n{}\n{}",
@@ -1277,6 +1304,113 @@ fn dump_ir_with_admission(
     if let Some(grounding) = grounding {
         print!("\n{}", grounding.to_text());
     }
+    Ok(())
+}
+
+/// Explain one canonical plan operation from the exact admitted HGraph. This
+/// path performs parsing, lowering, solving, evidence analysis, and admission,
+/// but deliberately never constructs a coordinator or dispatches an operation.
+fn dump_schedule_why(
+    input: &Path,
+    source: &str,
+    shim_dir: Option<&Path>,
+    target: PlanNodeId,
+) -> Result<()> {
+    let (program, plan, graph, origins) = inspect_ir_with_origins(source)?;
+    if origins.len() != plan.nodes.len() {
+        bail!(
+            "source-origin sidecar has {} entries but the canonical ExecutionPlan has {} nodes",
+            origins.len(),
+            plan.nodes.len()
+        );
+    }
+    let graph = solve_ir_admission_graph(graph)?;
+    let admitted = admit_ir_for_inspection(&program, &plan, graph, shim_dir)?;
+    let why = admitted.schedule_why(target)?;
+
+    print!("{}", why.to_text());
+    print_schedule_why_origins(input, source, &why, &origins)?;
+    Ok(())
+}
+
+fn solve_ir_admission_graph(mut graph: o_lang::hgraph::HGraph) -> Result<o_lang::hgraph::HGraph> {
+    o_lang::hgraph::solve::solve_types(&mut graph)
+        .context("failed to solve HGraph type and fidelity constraints for admission")?;
+    Ok(graph)
+}
+
+fn admit_ir_for_inspection<'a>(
+    program: &'a OIrProgram,
+    plan: &'a o_lang::ir::ExecutionPlan,
+    graph: o_lang::hgraph::HGraph,
+    shim_dir: Option<&Path>,
+) -> Result<o_lang::evidence::AdmittedExecution<'a>> {
+    let adapters = read_shims(shim_dir)?;
+    let runtime = runtime_binding_from_adapter_bytes(
+        plan,
+        &adapters,
+        // Both whole-admission and focused-why renderers are lenses over this
+        // same inspection admission. Selecting a view must not alter its digest.
+        &[("inspection-surface", "olangc-ir-explain")],
+    );
+    let evidence = analyze_execution(program, plan, &graph, runtime.clone())
+        .context("failed to establish pre-execution evidence")?;
+    admit_execution(program, plan, graph, Policy::Eager, runtime, evidence)
+        .context("failed to compile execution admission")
+}
+
+fn print_schedule_why_origins(
+    input: &Path,
+    source: &str,
+    why: &o_lang::evidence::ScheduleWhyViewV1,
+    origins: &[o_lang::parser::SourceSpanV1],
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut referenced = BTreeSet::from([why.operation.plan_node]);
+    referenced.extend(
+        why.blocker_witnesses
+            .iter()
+            .map(|witness| witness.predecessor),
+    );
+    referenced.extend(why.dependents.iter().map(|dependent| dependent.operation));
+    referenced.extend(
+        why.retained_sequences
+            .iter()
+            .flat_map(|sequence| [sequence.predecessor, sequence.successor]),
+    );
+
+    let source_sha256 = hex::encode(Sha256::digest(source.as_bytes()));
+    let path_json = serde_json::to_string(&input.display().to_string())
+        .context("failed to render source path for schedule explanation")?;
+    println!("; SourceOrigin oexec.source-origin/v1");
+    println!(
+        "source-binding sha256={} bytes={} path={}",
+        source_sha256,
+        source.len(),
+        path_json
+    );
+    for plan_node in referenced {
+        let origin = origins.get(plan_node.0).with_context(|| {
+            format!(
+                "source-origin sidecar omits referenced plan operation P{}",
+                plan_node.0
+            )
+        })?;
+        println!(
+            "source-origin operation=P{} bytes={}..{} start={}:{} end={}:{}",
+            plan_node.0,
+            origin.start_byte,
+            origin.end_byte,
+            origin.start_line,
+            origin.start_column,
+            origin.end_line,
+            origin.end_column
+        );
+    }
+    println!(
+        "source-origin-note coordinates and source SHA-256 are descriptive sidecar provenance; they are not admission authority and do not alter OIR, plan, graph, or admission digests"
+    );
     Ok(())
 }
 
@@ -1300,6 +1434,29 @@ fn inspect_ir(
         .map_err(anyhow::Error::msg)
         .context("failed to build HGraph for IR target")?;
     Ok((program, plan, graph))
+}
+
+fn inspect_ir_with_origins(
+    source: &str,
+) -> Result<(
+    OIrProgram,
+    o_lang::ir::ExecutionPlan,
+    o_lang::hgraph::HGraph,
+    Vec<o_lang::parser::SourceSpanV1>,
+)> {
+    let registered_backends = registered_backends();
+    let mut parser = Parser::new(source, &registered_backends);
+    let parsed = parser
+        .parse_with_origins()
+        .context("failed to parse .O source with source origins")?;
+    let origins = parsed.plan_origins().to_vec();
+    let program = OIrProgram::lower(&parsed.nodes);
+    let plan = program.plan();
+    let graph = program
+        .hgraph_for_plan(&plan)
+        .map_err(anyhow::Error::msg)
+        .context("failed to build HGraph for IR target")?;
+    Ok((program, plan, graph, origins))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2107,7 +2264,7 @@ mod tests {
         .unwrap();
         assert!(ir.explain_schedule);
         assert_eq!(ir.workers, None);
-        validate_explain_schedule(&ir).unwrap();
+        validate_admission_inspection(&ir).unwrap();
 
         let overridden = Cli::try_parse_from([
             "olangc",
@@ -2120,7 +2277,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(overridden.workers, Some(3));
-        validate_explain_schedule(&overridden).unwrap();
+        validate_admission_inspection(&overridden).unwrap();
 
         let zero = Cli::try_parse_from([
             "olangc",
@@ -2132,12 +2289,12 @@ mod tests {
             "0",
         ])
         .unwrap();
-        assert!(validate_explain_schedule(&zero).is_err());
+        assert!(validate_admission_inspection(&zero).is_err());
 
         let without_explanation =
             Cli::try_parse_from(["olangc", "example.O", "--target", "ir", "--workers", "3"])
                 .unwrap();
-        assert!(validate_explain_schedule(&without_explanation).is_err());
+        assert!(validate_admission_inspection(&without_explanation).is_err());
 
         let script = Cli::try_parse_from([
             "olangc",
@@ -2147,7 +2304,72 @@ mod tests {
             "--explain-schedule",
         ])
         .unwrap();
-        assert!(validate_explain_schedule(&script).is_err());
+        assert!(validate_admission_inspection(&script).is_err());
+    }
+
+    #[test]
+    fn why_cli_requires_a_canonical_plan_id_and_ir_only_flags() {
+        for (text, expected) in [("P0", 0), ("P7", 7), ("P184", 184)] {
+            assert_eq!(
+                parse_plan_node_selector(text).unwrap(),
+                PlanNodeId(expected)
+            );
+        }
+        for malformed in ["", "P", "p1", "N1", "1", "P01", "P-1", "P 1"] {
+            assert!(
+                parse_plan_node_selector(malformed).is_err(),
+                "accepted malformed selector {malformed:?}"
+            );
+        }
+
+        let why =
+            Cli::try_parse_from(["olangc", "example.O", "--target", "ir", "--why", "P7"]).unwrap();
+        assert_eq!(why.why, Some(PlanNodeId(7)));
+        validate_admission_inspection(&why).unwrap();
+
+        for args in [
+            vec!["olangc", "example.O", "--target", "script", "--why", "P1"],
+            vec![
+                "olangc",
+                "example.O",
+                "--target",
+                "ir",
+                "--why",
+                "P1",
+                "--explain-schedule",
+            ],
+            vec![
+                "olangc",
+                "example.O",
+                "--target",
+                "ir",
+                "--why",
+                "P1",
+                "--grounding",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_admission_inspection(&cli).is_err());
+        }
+
+        assert!(
+            Cli::try_parse_from(["olangc", "example.O", "--target", "ir", "--why", "p1"]).is_err()
+        );
+    }
+
+    #[test]
+    fn why_source_origins_keep_original_shebang_coordinates() {
+        let source = "#!/usr/bin/env O\npython^(\n40 + 2\n)_python\n";
+        let (program, plan, _graph, origins) = inspect_ir_with_origins(source).unwrap();
+
+        assert_eq!(origins.len(), plan.nodes.len());
+        assert_eq!(origins.len(), program.flatten_for_plan().len());
+        assert_eq!(
+            &source[origins[0].byte_range()],
+            "python^(\n40 + 2\n)_python"
+        );
+        assert_eq!(origins[0].start_line, 2);
+        assert_eq!(origins[0].start_column, 1);
     }
 
     #[test]
