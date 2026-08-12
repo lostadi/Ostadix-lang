@@ -18,7 +18,7 @@ copy those numbers. It renders the exact timed source, invokes the release
 `olangc --target ir --explain-schedule`, and consumes the versioned
 `oexec.schedule-prediction/v1` record produced by the evidence-bound admission.
 That record is derived after admission and lies outside the admission digest;
-its `admission-sha256` field must match the enclosing v3 admission binding.
+its `admission-sha256` field must match the enclosing v4 admission binding.
 Missing, duplicated, malformed, or internally inconsistent prediction records
 or a mismatched admission reference fail before either executor runs.
 

@@ -3,6 +3,7 @@ import io
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -371,6 +372,99 @@ class OstadixBootMediaTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MEDIA.MediaError, "replaced"):
                 MEDIA._read_bounded(Path("/fixture/source.img"), 1024)
+
+
+class OvmfResolverTests(unittest.TestCase):
+    resolver = ROOT / "ocore" / "kernel" / "resolve-x86_64-ovmf-code.sh"
+
+    def _resolve(
+        self, qemu: Path, *, explicit: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["PATH"] = os.pathsep.join(("/usr/bin", "/bin"))
+        if explicit is None:
+            environment.pop("OSTADIX_OVMF_CODE", None)
+        else:
+            environment["OSTADIX_OVMF_CODE"] = str(explicit)
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'set -u; source "$1"; resolve_ostadix_x86_64_ovmf_code "$2"',
+                "ovmf-resolver-test",
+                str(self.resolver),
+                str(qemu),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    def test_explicit_firmware_has_precedence_and_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            firmware = root / "caller-selected.fd"
+            firmware.write_bytes(b"fixture")
+            result = self._resolve(root / "missing-qemu", explicit=firmware)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(firmware))
+        self.assertIn(
+            f"source=explicit candidate={firmware} status=selected", result.stderr
+        )
+        self.assertIn(
+            f"result=resolved source=explicit path={firmware} searched=1",
+            result.stderr,
+        )
+
+    def test_invalid_explicit_firmware_fails_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.fd"
+            result = self._resolve(Path(directory) / "missing-qemu", explicit=missing)
+
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(f"candidate={missing} status=missing", result.stderr)
+        self.assertIn("explicit OSTADIX_OVMF_CODE is not a file", result.stderr)
+        self.assertNotIn("source=known-layout", result.stderr)
+
+    def test_qemu_prefix_candidate_is_dynamically_searched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory)
+            qemu = prefix / "bin" / "qemu-system-x86_64"
+            firmware = prefix / "share" / "qemu" / "edk2-x86_64-code.fd"
+            qemu.parent.mkdir(parents=True)
+            firmware.parent.mkdir(parents=True)
+            qemu.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            qemu.chmod(0o755)
+            firmware.write_bytes(b"fixture")
+            result = self._resolve(qemu)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(
+            result.stderr,
+            rf"source=qemu-prefix candidate={firmware} "
+            r"status=(selected|available-not-selected)",
+        )
+        self.assertIn("ovmf-discovery result=resolved", result.stderr)
+
+    def test_qemu_prefix_discovery_is_bash_32_nounset_safe(self) -> None:
+        """The real UEFI runners source the resolver after `set -euo pipefail`."""
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory)
+            qemu = prefix / "bin" / "qemu-system-x86_64"
+            firmware = prefix / "share" / "qemu" / "edk2-x86_64-code.fd"
+            qemu.parent.mkdir(parents=True)
+            firmware.parent.mkdir(parents=True)
+            qemu.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            qemu.chmod(0o755)
+            firmware.write_bytes(b"fixture")
+            result = self._resolve(qemu)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(Path(result.stdout.strip()).is_file(), result.stdout)
+        self.assertNotIn("unbound variable", result.stderr)
 
 
 if __name__ == "__main__":

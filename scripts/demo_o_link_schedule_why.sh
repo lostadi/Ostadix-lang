@@ -187,8 +187,8 @@ printf '\n== Explain one admitted 1 -> 4 -> 3 -> 1 hosted topology ==\n'
 "$olangc_bin" "$positive_program" \
     --target ir --explain-schedule --workers "$workers" --shim-dir "$backends_dir" \
     >"$positive_explain"
-require_count "$positive_explain" '^; ExecutionAdmission oexec\.admission/v3$' 1 \
-    "missing unique v3 admission"
+require_count "$positive_explain" '^; ExecutionAdmission oexec\.admission/v4$' 1 \
+    "missing unique v4 admission"
 require_count "$positive_explain" '^; SchedulePrediction oexec\.schedule-prediction/v1$' 1 \
     "missing unique hosted-task prediction"
 require_pattern "$positive_explain" \

@@ -76,22 +76,9 @@ if observed_uuid != first["fat-uuid"]:
 print(f"OSTADIX x86_64 UEFI media FAT identity {observed_uuid}: PASS")
 PY
 
-if [[ -z "${OSTADIX_OVMF_CODE:-}" ]]; then
-  for candidate in \
-    /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-    /usr/local/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-    /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/edk2/x64/OVMF_CODE.fd; do
-    if [[ -f "$candidate" ]]; then
-      OSTADIX_OVMF_CODE="$candidate"
-      break
-    fi
-  done
-fi
-if [[ -z "${OSTADIX_OVMF_CODE:-}" || ! -f "$OSTADIX_OVMF_CODE" ]]; then
-  echo "error: UEFI firmware not found; set OSTADIX_OVMF_CODE" >&2
-  exit 127
-fi
+# shellcheck source=resolve-x86_64-ovmf-code.sh
+source "$ROOT/ocore/kernel/resolve-x86_64-ovmf-code.sh"
+OSTADIX_OVMF_CODE="$(resolve_ostadix_x86_64_ovmf_code "$QEMU_BIN")"
 
 python3 - "$QEMU_BIN" "$OSTADIX_OVMF_CODE" "$FIRST" "$TIMEOUT" <<'PY'
 import subprocess

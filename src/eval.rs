@@ -357,7 +357,7 @@ pub struct Evaluator {
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
-    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV3>,
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV4>,
 
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
@@ -620,7 +620,7 @@ impl Evaluator {
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
-    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV3> {
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV4> {
         self.last_execution_admission.as_ref()
     }
 
@@ -1653,6 +1653,33 @@ impl Evaluator {
         self.eval_ir_program_with_scope(&program, scope)
     }
 
+    /// Lower and execute a top-level document only if its freshly recomputed,
+    /// authority-free execution intent matches both required digests. This
+    /// gate is deliberately one-shot: nested `O.eval` callbacks continue
+    /// through ordinary live admission instead of inheriting the outer
+    /// source's identity. A successful match never bypasses or replaces the
+    /// fresh `AdmittedExecution` compiled below.
+    pub fn eval_document_with_scope_requiring_execution_intent(
+        &mut self,
+        nodes: Vec<ONode>,
+        scope: &mut HashMap<String, OValue>,
+        actual_source_sha256: &str,
+        expected_source_sha256: &str,
+        expected_execution_intent_sha256: &str,
+    ) -> Result<OValue> {
+        let program = OIrProgram::lower(&nodes);
+        self.eval_ir_program_with_mode(
+            &program,
+            scope,
+            None,
+            Some((
+                actual_source_sha256,
+                expected_source_sha256,
+                expected_execution_intent_sha256,
+            )),
+        )
+    }
+
     /// Execute a lowered program through its validated ExecutionPlan.
     pub fn eval_ir_program(&mut self, program: &OIrProgram) -> Result<OValue> {
         let mut scope = HashMap::new();
@@ -1664,7 +1691,7 @@ impl Evaluator {
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
     ) -> Result<OValue> {
-        self.eval_ir_program_with_mode(program, scope, None)
+        self.eval_ir_program_with_mode(program, scope, None, None)
     }
 
     /// Project, validate, and execute a lowered program. `forced` overrides the
@@ -1677,6 +1704,7 @@ impl Evaluator {
         program: &OIrProgram,
         scope: &mut HashMap<String, OValue>,
         forced: Option<bool>,
+        required_execution_intent: Option<(&str, &str, &str)>,
     ) -> Result<OValue> {
         let plan = program.plan();
         plan.validate(program.nodes.len())
@@ -1702,6 +1730,35 @@ impl Evaluator {
             .context("failed to project OIR execution plan into hypergraph")?;
         crate::hgraph::solve::solve_types(&mut hgraph)
             .context("failed to solve OIR hypergraph type and fidelity constraints")?;
+
+        if let Some((
+            actual_source_sha256,
+            expected_source_sha256,
+            expected_execution_intent_sha256,
+        )) = required_execution_intent
+        {
+            let configured = match std::env::var("O_EXECUTOR") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    bail!("O_EXECUTOR is not valid Unicode; expected `graph` or `serial`")
+                }
+            };
+            if select_serial_executor(forced, configured.as_deref())? {
+                bail!("required execution-intent gating is available only for graph execution");
+            }
+            let intent = crate::evidence::ExecutionIntentV1::compile_with_source_sha256(
+                actual_source_sha256,
+                program,
+                &plan,
+                &hgraph,
+                self.policy,
+            )
+            .context("failed to recompute required execution intent")?;
+            intent
+                .verify_required(expected_source_sha256, expected_execution_intent_sha256)
+                .context("execution rejected before admission and dispatch")?;
+        }
 
         let runtime_binding = self.admission_runtime_binding(&plan);
         let evidence =
@@ -2241,7 +2298,7 @@ impl Evaluator {
         scope: &mut HashMap<String, OValue>,
         serial: bool,
     ) -> Result<OValue> {
-        self.eval_ir_program_with_mode(program, scope, Some(serial))
+        self.eval_ir_program_with_mode(program, scope, Some(serial), None)
     }
 
     /// Test-only compatibility entry point. It proves individual legacy test

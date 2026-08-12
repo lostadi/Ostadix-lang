@@ -6,7 +6,7 @@ executor used by the differential conformance suite.
 
 ```text
 .O -> OIR -> validated ExecutionPlan -> draft HGraph -> type/fidelity solve
-   -> EvidenceBundleV3 -> admission compiler -> AdmittedExecution
+   -> EvidenceBundleV4 -> admission compiler -> AdmittedExecution
    -> Coordinator
 ```
 
@@ -18,7 +18,7 @@ constructor are private to the digest-checking admission path. The evaluator
 also compiles this admission when `O_EXECUTOR=serial` selects the differential
 oracle, so changing the executor does not bypass pre-execution checking.
 
-`EvidenceBundleV3` is a pre-execution certificate bundle. For each executable
+`EvidenceBundleV4` is a pre-execution certificate bundle. For each executable
 operation it records type, effect-footprint, dispatch, capability-policy,
 placement, failure-policy, and resource-demand contracts, plus a separate soft
 cost estimate and the provenance of every fact. Only enforced,
@@ -31,10 +31,14 @@ and special-invocation name/mode/arity, so digest consistency cannot admit
 forged execution metadata.
 
 The bundle binds canonical lowered OIR, the validated plan, the solved analyzed
-graph, analyzer identity, resolved backend artifacts, execution environment,
-and a descriptive ambient `HostWorld` snapshot. It deliberately labels the
+graph, analyzer identity, the canonical backend-catalog specifications
+referenced by the plan, the current executable and consumed legacy Python shim
+artifacts, execution environment, and
+a descriptive ambient `HostWorld` snapshot. The catalog projection establishes
+specification identity only; it does not establish runtime discovery, health,
+authorization, capacity, or readiness. The bundle deliberately labels the
 first digest `lowered-oir-sha256`: evaluator APIs can receive an existing
-`OIrProgram`, so v3 does not claim an original source-byte digest. Admission
+`OIrProgram`, so v4 does not claim an original source-byte digest. Admission
 rejects mismatched bindings, attaches seven pre-materialized
 `AdmissionEvidence` nodes to every executable edge, validates the resulting
 graph, and freezes it. Immediately before running, both the coordinator and
@@ -44,12 +48,12 @@ opaque/deferred operations.
 The backend artifact binding distinguishes hashed files, missing paths,
 non-regular paths, and unreadable paths, and includes the current executable;
 execution admission rejects an unhashed current executable. Runtime rechecks
-are path/environment snapshots, not an immutable execution substrate: v3 does
+are path/environment snapshots, not an immutable execution substrate: v4 does
 not pin an opened adapter or frozen child environment and cannot prove the
 bytes/environment observed at spawn. It also does not bind caller initial-scope
 shape/values, opaque state/generation inside an already-live actor, the full
 external interpreter/toolchain closure, or a placement lease.
-In v3, actor identity is only a serialization identity; all persistent hosted work
+In v4, actor identity is only a serialization identity; all persistent hosted work
 remains unknown, coordinator-lane, and conservatively attached to `HostWorld`.
 
 `olangc FILE --target ir --explain-schedule` exercises this solve, analysis,
@@ -57,7 +61,7 @@ and admission path without dispatch. It prints exact digest bindings,
 per-operation provenance, blockers, retained source-sequence reasons, and
 static legal waves. Its admission report identifies the runtime snapshot as
 `inspection-only`; it is not interchangeable with the evaluator's execution
-snapshot. The inspection surface is ordinary-OIR-only in v3.
+snapshot. The inspection surface is ordinary-OIR-only in v4.
 
 `olangc FILE.O --target ir --why P3` projects the same evidence-bound admission
 onto one plan operation and its immediate dependency neighborhood; repository
@@ -73,7 +77,7 @@ invalidation across edits.
 This admission is distinct from an observation or receipt. `RuntimeGraphV1`
 and `ExecutionReceiptV1` describe completed execution and carry no scheduling
 authority; a prior receipt cannot authorize a new run. Project HGraphs and the
-buffered Request scheduler also remain separate execution islands in v3.
+buffered Request scheduler also remain separate execution islands in v4.
 
 Project inputs have a distinct logical-planning and opt-in hosted execution
 surface:
@@ -355,7 +359,7 @@ only literal text, already-settled Store children, and recursively trusted
 renderers; and the explicit non-strict hosted contract described above. On the
 coordinator thread, preparation freezes the relevant scope or already-
 materialized splice inputs into immutable owned `PreparedTask` envelopes.
-Evidence schema v3 binds each
+Evidence schema v4 binds each
 operation to exactly one adapter ID: `o-scope-load/v1`,
 `trusted-inline-renderer/v1`, `autonomous-ephemeral-shim/v1`, or
 `coordinator/v1`. Dispatch evidence also records `strict-equivalent` or
@@ -411,7 +415,7 @@ to one terminal trace event, and does not disguise the failure as `NodeFailed`.
 An unwind-capable build gives a caught worker panic the same treatment. The
 release profile uses `panic = "abort"`, so
 a release worker panic terminates the process before in-process recovery or
-terminal trace completion; v3 does not claim otherwise.
+terminal trace completion; v4 does not claim otherwise.
 
 After each accepted success, the coordinator materializes the value,
 completion, and written successor-state outputs. On a selected failure, it emits
