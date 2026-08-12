@@ -1562,7 +1562,7 @@ echo "  cargo run -- examples/hello.O"
 echo "  ./c_cpp/O examples/hello.O ./backends"
 echo "  ./c_cpp/olangc examples/hello.O -o /tmp/h && /tmp/h"
 echo "  python3 -m o_lang examples/hello.O"
-echo "  ostadix-mcp                           # MCP stdio server (agent tools: o_env, o_runtimes, o_doctor, o_run, o_olangc, o_search_run)"
+echo "  ostadix-mcp                           # MCP stdio server (includes o_runtimes, o_analyze_intent, o_execute_intent, o_run, and diagnostics)"
 if $WRITE_ENV; then
   printf '  source %q                         # activate O_LANG_ROOT/tool paths now\n' "$ENV_FILE"
 fi

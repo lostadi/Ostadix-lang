@@ -9,10 +9,11 @@
 mod admit;
 mod analyze;
 mod fact;
+mod intent;
 pub mod profile;
 
 pub use admit::{
-    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV3,
+    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV4,
     OperationBlockerV1, RetainedSequenceV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,
     ScheduleWhyWitnessV1, SequenceRetentionReasonV1, SCHEDULE_WHY_SCHEMA_V1,
 };
@@ -22,7 +23,8 @@ pub use analyze::{
 pub use fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
-    EvidenceBindingsV1, EvidenceBundleV3, EvidenceProvenance, FailureClassV1, FailureContractV1,
+    EvidenceBindingsV2, EvidenceBundleV4, EvidenceProvenance, FailureClassV1, FailureContractV1,
     NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
-    RuntimeSnapshotKindV1, TypeContractV1, ADMISSION_SCHEMA_V3, ANALYZER_ID_V3, EVIDENCE_SCHEMA_V3,
+    RuntimeSnapshotKindV1, TypeContractV1, ADMISSION_SCHEMA_V4, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
 };
+pub use intent::{source_sha256, ExecutionIntentV1, EXECUTION_INTENT_SCHEMA_V1};

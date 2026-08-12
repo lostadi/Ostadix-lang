@@ -107,10 +107,12 @@ reconstructing executable and backend paths by hand.
 | MCP tool | Current behavior |
 |----------|------------------|
 | `o_env` | Reports the resolved Ostadix root, backend directory, `O` and `olangc` paths, Python shim status, and a 30-backend runtime summary. |
-| `o_runtimes` | Discovers executable requirements for every canonical backend, including alternative runtime sets, without failing because an optional runtime is absent. |
+| `o_runtimes` | Discovers executable requirements from the canonical backend catalog compiled into that MCP binary, including alternative runtime sets, without failing because an optional runtime is absent. Rebuild MCP with O after catalog changes. |
 | `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
-| `o_run` | Runs one local `.O` file with an explicit working directory and timeout. |
+| `o_analyze_intent` | Nonexecutingly creates a bounded one-use handle for an exact source and stable analyzed graph intent. |
+| `o_execute_intent` | Consumes that handle, requires O to recompute the same intent, then performs a fresh V4 admission before dispatch. |
+| `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout; this remains an ungated compatibility path. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
 | `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
 
@@ -1504,8 +1506,10 @@ actor-state tokens, and strict-equivalent worker dispatch is restricted to
 compiler-verified O-scope loads plus source-proven-preparable trees of four
 trusted pure inline renderers (`html`, `markdown`, `text`, and `latex`). Direct
 ephemeral members of an explicitly autonomous group may separately opt into
-non-strict, unordered host effects. Evidence schema v3 binds those choices and
-their dispatch semantics to stable preparation-adapter IDs before execution. A
+non-strict, unordered host effects. Evidence schema v4 binds those choices,
+their dispatch semantics, and the plan-referenced canonical backend-catalog
+specifications before execution. That catalog identity is not runtime
+discovery, health, authorization, capacity, or readiness evidence. A
 fixed-size local pool is created only when a graph run contains admitted
 `LocalWorker` operations, reuses its threads across readiness frontiers, and
 reports completions individually; a coordinator-only graph creates no worker
@@ -2552,11 +2556,20 @@ canonical name/mode/arity before it can issue an admission bundle.
 specific coordination-group mode. The evaluator does not rediscover special
 form policy from an unrelated name table after planning.
 
+For inspect-then-run tooling, `olangc --target ir --execution-intent-json`
+emits an authority-free `oexec.execution-intent/v1` identity over exact source,
+OIR, plan, solved graph, the plan-specific backend-catalog projection, analyzer,
+and base policy. `O --require-source-sha256 ...
+--require-execution-intent-sha256 ...` recomputes this identity before any
+dispatch and still constructs a fresh live V4 admission. The intent is not a
+capability, runtime-health proof, capacity lease, or serializable replacement
+for `AdmittedExecution`.
+
 The validated plan is projected into a directed HGraph before execution.
 Ordinary results, successful completion, evaluator/host resource versions, and
 persistent actor state are nodes. Operations are directed hyperedges whose
 outputs include one ordinary value, one completion token, and successor state
-versions. Evidence schema v3 admits each executable operation and binds its
+versions. Evidence schema v4 admits each executable operation and binds its
 dispatch adapter before the coordinator accepts the graph. The coordinator
 marks an operation graph-ready exactly when every input node is materialized;
 dispatch additionally respects its admitted adapter, local-pool capacity, and
@@ -2604,7 +2617,7 @@ state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
 
-`olangc --target ir --explain-schedule` additionally prints the v3 admission
+`olangc --target ir --explain-schedule` additionally prints the v4 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
 dispatching. Its advisory marker has schema ID
 `oexec.realizability/v1`, introduced by the line

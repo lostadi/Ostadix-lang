@@ -18,8 +18,10 @@ from typing import Any, BinaryIO
 
 PROTOCOL_VERSION = "2025-03-26"
 EXPECTED_TOOLS = {
+    "o_analyze_intent",
     "o_doctor",
     "o_env",
+    "o_execute_intent",
     "o_olangc",
     "o_run",
     "o_runtimes",
@@ -133,6 +135,16 @@ def _content_text(result: dict[str, Any]) -> str:
     return "\n".join(pieces)
 
 
+def _record_field(text: str, key: str) -> str:
+    prefix = f"{key}="
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            value = line[len(prefix) :]
+            if value:
+                return value
+    raise SmokeError(f"MCP result omitted nonempty {key}= record:\n{text}")
+
+
 def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     config = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
     registered = config.get("mcpServers", {}).get("ostadix", {})
@@ -150,6 +162,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     environment.pop("O_BACKENDS_DIR", None)
     environment.pop("OLANG", None)
     environment.pop("OSTADIX_RUNTIME_PATH", None)
+    environment["OSTADIX_RUNTIME_PATH_MODE"] = "discover-local"
     # Model the restricted environment used by GUI-launched MCP clients. The
     # server must restore local runtime locations without shell startup files.
     environment["PATH"] = os.pathsep.join(
@@ -157,6 +170,23 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
     )
     environment["RUST_LOG"] = "warn"
     stderr_capture = tempfile.TemporaryFile()
+    intent_fixture = tempfile.TemporaryDirectory(
+        prefix=".mcp-intent-smoke-", dir=root
+    )
+    intent_program = Path(intent_fixture.name) / "intent.O"
+    intent_marker = Path(intent_fixture.name) / "executed.marker"
+
+    def write_intent_fixture(label: str) -> None:
+        intent_program.write_text(
+            "python^(\n"
+            "from pathlib import Path\n"
+            f"Path({json.dumps(os.fspath(intent_marker))}).write_text({label!r})\n"
+            f"__oval_result__ = {label!r}\n"
+            ")_python\n",
+            encoding="utf-8",
+        )
+
+    write_intent_fixture("intent-original")
     process = subprocess.Popen(
         [os.fspath(binary)],
         cwd=root,
@@ -267,10 +297,18 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         if runtimes_result.get("isError") is True:
             raise SmokeError(f"o_runtimes returned an MCP tool error:\n{runtimes_text}")
         required_runtime_markers = {
+            "runtime-catalog-schema=ostadix.backend-catalog/v1",
+            "runtime-catalog-projection=compiled-mcp-snapshot",
+            "runtime-search-mode=discover-local",
+            "runtime-search-entry index=0 source=inherited:0 path=/usr/bin",
             "runtime-summary backend-count=30",
             "runtime backends=python status=located",
             "runtime backends=java status=",
             "runtime backends=webassembly status=",
+            "precision=conservative-all-sources",
+            "invocable=not-probed",
+            "admitted=operation-scoped-not-evaluated",
+            "path-sources=[python3=",
         }
         if not all(marker in runtimes_text for marker in required_runtime_markers):
             raise SmokeError(
@@ -331,6 +369,217 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
                     f"{tool} relative-path smoke failed; expected {marker!r}:\n"
                     f"{result_text}"
                 )
+
+        # Analyze is nonexecuting; mutation after analysis must be rejected by
+        # O's recomputation, and the failed attempt must still consume the
+        # handle so it cannot be replayed.
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_analyze_intent",
+                    "arguments": {
+                        "path": os.fspath(intent_program),
+                        "ttl_secs": 60,
+                        "timeout_secs": 45,
+                    },
+                },
+            },
+        )
+        analyzed = responses.response(9, timeout)
+        analyzed_text = _content_text(analyzed)
+        if analyzed.get("isError") is True:
+            raise SmokeError(f"o_analyze_intent failed:\n{analyzed_text}")
+        handle = _record_field(analyzed_text, "intent-handle")
+        if "intent-schema=oexec.execution-intent/v1" not in analyzed_text:
+            raise SmokeError(
+                f"o_analyze_intent omitted the stable schema:\n{analyzed_text}"
+            )
+        if len(_record_field(analyzed_text, "source-sha256")) != 64:
+            raise SmokeError(f"o_analyze_intent emitted a bad source digest:\n{analyzed_text}")
+        if intent_marker.exists():
+            raise SmokeError("o_analyze_intent executed the inspected Python backend")
+
+        write_intent_fixture("intent-mutated")
+        execute_arguments = {
+            "handle": handle,
+            "path": os.fspath(intent_program),
+            "timeout_secs": 45,
+        }
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": execute_arguments,
+                },
+            },
+        )
+        mutated = responses.response(10, timeout)
+        mutated_text = _content_text(mutated)
+        if mutated.get("isError") is not True or not (
+            "source" in mutated_text.lower() and "mismatch" in mutated_text.lower()
+        ):
+            raise SmokeError(
+                "o_execute_intent did not reject source mutation with a source mismatch:\n"
+                f"{mutated_text}"
+            )
+        if intent_marker.exists():
+            raise SmokeError("rejected source mutation dispatched the Python backend")
+
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": execute_arguments,
+                },
+            },
+        )
+        replay = responses.response(11, timeout)
+        replay_text = _content_text(replay)
+        if replay.get("isError") is not True or "already-consumed" not in replay_text:
+            raise SmokeError(f"consumed intent handle was replayable:\n{replay_text}")
+
+        # A fresh handle over the mutated source succeeds exactly once.
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_analyze_intent",
+                    "arguments": {
+                        "path": os.fspath(intent_program),
+                        "timeout_secs": 45,
+                    },
+                },
+            },
+        )
+        fresh = responses.response(12, timeout)
+        fresh_text = _content_text(fresh)
+        if fresh.get("isError") is True:
+            raise SmokeError(f"fresh o_analyze_intent failed:\n{fresh_text}")
+        fresh_handle = _record_field(fresh_text, "intent-handle")
+        fresh_arguments = {
+            "handle": fresh_handle,
+            "path": os.fspath(intent_program),
+            "timeout_secs": 45,
+        }
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": fresh_arguments,
+                },
+            },
+        )
+        executed = responses.response(13, timeout)
+        executed_text = _content_text(executed)
+        if (
+            executed.get("isError") is True
+            or "intent-consumed=true" not in executed_text
+            or "intent-mutated" not in executed_text
+        ):
+            raise SmokeError(f"fresh intent execution failed:\n{executed_text}")
+        if intent_marker.read_text(encoding="utf-8") != "intent-mutated":
+            raise SmokeError("matching intent did not commit the expected backend effect")
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": fresh_arguments,
+                },
+            },
+        )
+        successful_replay = responses.response(14, timeout)
+        successful_replay_text = _content_text(successful_replay)
+        if (
+            successful_replay.get("isError") is not True
+            or "already-consumed" not in successful_replay_text
+        ):
+            raise SmokeError(
+                f"successfully consumed intent handle was replayable:\n{successful_replay_text}"
+            )
+
+        # Echoed target arguments are part of the handle binding. A mismatch
+        # is rejected before O starts and consumes the attempted handle.
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_analyze_intent",
+                    "arguments": {"path": os.fspath(intent_program)},
+                },
+            },
+        )
+        mismatch_analysis = responses.response(15, timeout)
+        mismatch_text = _content_text(mismatch_analysis)
+        mismatch_handle = _record_field(mismatch_text, "intent-handle")
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 16,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": {
+                        "handle": mismatch_handle,
+                        "path": "examples/hello.O",
+                    },
+                },
+            },
+        )
+        mismatched = responses.response(16, timeout)
+        mismatched_text = _content_text(mismatched)
+        if mismatched.get("isError") is not True or "program mismatch" not in mismatched_text:
+            raise SmokeError(f"intent target mismatch was accepted:\n{mismatched_text}")
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 17,
+                "method": "tools/call",
+                "params": {
+                    "name": "o_execute_intent",
+                    "arguments": {
+                        "handle": mismatch_handle,
+                        "path": os.fspath(intent_program),
+                    },
+                },
+            },
+        )
+        mismatch_replay = responses.response(17, timeout)
+        mismatch_replay_text = _content_text(mismatch_replay)
+        if (
+            mismatch_replay.get("isError") is not True
+            or "already-consumed" not in mismatch_replay_text
+        ):
+            raise SmokeError(
+                f"mismatched intent attempt did not consume its handle:\n{mismatch_replay_text}"
+            )
     finally:
         if process.stdin is not None:
             try:
@@ -347,6 +596,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         stderr_capture.seek(0)
         stderr = stderr_capture.read().decode("utf-8", "replace")
         stderr_capture.close()
+        intent_fixture.cleanup()
         if process.returncode != 0:
             raise SmokeError(
                 f"ostadix-mcp exited {process.returncode}; stderr:\n{stderr}"

@@ -1470,6 +1470,53 @@ mod tests {
     }
 
     #[test]
+    fn exec_python_set_result_uses_structural_unordered_set() -> Result<()> {
+        use crate::value::SetKind;
+
+        let mut process = spawn_python_shim()?;
+
+        let value = process.exec("__oval_result__ = {1, 2}", HashMap::new())?;
+
+        match value {
+            OValue::Set { kind, mut items } => {
+                assert_eq!(kind, SetKind::Unordered);
+                items.sort_by_key(OValue::canonical_bytes);
+                assert_eq!(items, vec![OValue::int(1), OValue::int(2)]);
+            }
+            other => panic!("expected structural set OValue, got {other:?}"),
+        }
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_python_unsupported_object_fails_instead_of_stringifying() -> Result<()> {
+        let mut process = spawn_python_shim()?;
+
+        let error = process
+            .exec(
+                concat!(
+                    "class HiddenState:\n",
+                    "    def __str__(self):\n",
+                    "        return 'silently-erased-object'\n",
+                    "__oval_result__ = HiddenState()\n",
+                ),
+                HashMap::new(),
+            )
+            .expect_err("an unsupported Python object must not cross as O text");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("unsupported Python value for OValue projection:")
+                && message.contains("HiddenState"),
+            "{message}"
+        );
+        assert!(!message.contains("silently-erased-object"), "{message}");
+        process.shutdown(backend_shutdown_timeout())?;
+        Ok(())
+    }
+
+    #[test]
     fn exec_with_string_binding_round_trips_through_shim() -> Result<()> {
         let mut process = spawn_python_shim()?;
         let bindings = HashMap::from([("msg".to_string(), OValue::str_("hello"))]);

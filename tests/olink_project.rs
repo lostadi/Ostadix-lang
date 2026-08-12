@@ -6,6 +6,8 @@ use std::process::Command;
 
 use o_lang::project::lower::extract_bundle_from_o;
 
+mod support;
+
 fn olink() -> Command {
     Command::new(env!("CARGO_BIN_EXE_o-link"))
 }
@@ -246,9 +248,7 @@ fn olink_explicit_project_flag_remains_compatible() {
 
 #[test]
 fn olink_explicit_project_run_uses_default_route() {
-    // Requires python3 on PATH; skip cleanly if unavailable.
-    if which_python3().is_none() {
-        eprintln!("skipping: python3 not available");
+    if !support::require_runtime("python3") {
         return;
     }
     let dir = python_project();
@@ -273,9 +273,7 @@ fn olink_explicit_project_run_uses_default_route() {
 
 #[test]
 fn olink_explicit_project_hgraph_run_writes_unsigned_attempt_trace() {
-    // The discovered project route invokes python3 directly.
-    if which_python3().is_none() {
-        eprintln!("skipping: python3 not available");
+    if !support::require_runtime("python3") {
         return;
     }
     let dir = python_project();
@@ -570,15 +568,4 @@ fn ounlink_restores_safe_lifted_project_including_binary_files() {
         fs::read(restored.join("assets/blob.bin")).unwrap(),
         fs::read(source.join("assets/blob.bin")).unwrap()
     );
-}
-
-fn which_python3() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("python3");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }

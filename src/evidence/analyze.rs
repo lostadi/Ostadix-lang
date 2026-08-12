@@ -13,27 +13,29 @@ use crate::hgraph::{
     HEdgeKind, HGraph, HNodeKind, MemOrder, OcoreOpKind, OpKind, PortRole, ValueState,
 };
 use crate::ir::{
-    BackendRegistry, ExecutionMode, ExecutionPlan, InvokeMode, OIrProgram, PlanNodeKind,
+    BackendAdapterKind, BackendRegistry, ExecutionPlan, InvokeMode, OIrProgram, PlanNodeKind,
+    BACKEND_CATALOG_SCHEMA_V1,
 };
 use crate::value::GroupMode;
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
-    EvidenceBindingsV1, EvidenceBundleV3, EvidenceProvenance, FailureClassV1, FailureContractV1,
+    EvidenceBindingsV2, EvidenceBundleV4, EvidenceProvenance, FailureClassV1, FailureContractV1,
     NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
-    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V3, EVIDENCE_SCHEMA_V3,
+    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
 };
 
-/// Capture the exact adapter/runtime snapshot used by an evaluator backed by
-/// a shim directory. Missing adapters are represented explicitly instead of
-/// changing the historical error timing during conservative coordinator work.
+/// Capture the current executable plus each separate compatibility-shim
+/// artifact actually selected by the plan's canonical adapter kinds. Missing
+/// legacy shims are represented explicitly instead of changing the historical
+/// error timing during conservative coordinator work.
 pub fn runtime_binding_from_directory(
     plan: &ExecutionPlan,
     shim_dir: &Path,
     context: &[(&str, &str)],
 ) -> RuntimeBindingV1 {
-    let backends = shim_backends(plan);
+    let backends = legacy_python_shim_backends(plan);
     let artifacts = backends
         .into_iter()
         .map(|backend| {
@@ -45,7 +47,12 @@ pub fn runtime_binding_from_directory(
             }
         })
         .collect::<Vec<_>>();
-    build_runtime_binding(RuntimeSnapshotKindV1::Execution, artifacts, context)
+    build_runtime_binding(
+        RuntimeSnapshotKindV1::Execution,
+        artifacts,
+        backend_catalog_projection_sha256(plan),
+        context,
+    )
 }
 
 /// Capture the non-executing `olangc --target ir` adapter snapshot. The input
@@ -57,7 +64,7 @@ pub fn runtime_binding_from_adapter_bytes(
     context: &[(&str, &str)],
 ) -> RuntimeBindingV1 {
     let by_name = adapters.iter().cloned().collect::<BTreeMap<_, _>>();
-    let artifacts = shim_backends(plan)
+    let artifacts = legacy_python_shim_backends(plan)
         .into_iter()
         .map(|backend| {
             let candidates = [
@@ -83,14 +90,92 @@ pub fn runtime_binding_from_adapter_bytes(
             }
         })
         .collect::<Vec<_>>();
-    build_runtime_binding(RuntimeSnapshotKindV1::Inspection, artifacts, context)
+    build_runtime_binding(
+        RuntimeSnapshotKindV1::Inspection,
+        artifacts,
+        backend_catalog_projection_sha256(plan),
+        context,
+    )
 }
 
-fn shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
+/// Bind only the canonical backend specifications actually referenced by the
+/// plan. This projection is deliberately capacity-neutral: it performs no
+/// executable lookup, PATH scan, invocation, health probe, or authorization
+/// check. Unknown extension backends remain explicit instead of being
+/// confused with a registered builtin.
+pub(crate) fn backend_catalog_projection_sha256(plan: &ExecutionPlan) -> String {
+    let backends = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            PlanNodeKind::Exec { backend, .. } => Some(backend.canonical.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let registry = BackendRegistry::global();
+    let mut hash = CanonicalHasher::new("ostadix-backend-catalog-projection/v1");
+    hash.field(BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+    for backend in backends {
+        hash.field(backend.as_bytes());
+        match registry.specification_sha256(backend) {
+            Some(specification_sha256) => {
+                hash.tag("registered");
+                hash.field(specification_sha256.as_bytes());
+            }
+            None => hash.tag("unregistered"),
+        }
+    }
+    hash.finish()
+}
+
+/// Validate and rebuild the exact solved static graph used by both stable
+/// execution-intent projection and live evidence admission. Keeping this
+/// routine shared prevents a descriptive intent from blessing a graph that
+/// the admission analyzer would later reject as noncanonical.
+pub(crate) fn validate_canonical_solved_graph(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+    graph: &HGraph,
+) -> Result<()> {
+    if plan != &program.plan() {
+        anyhow::bail!(
+            "analysis requires the canonical ExecutionPlan derived from the exact lowered OIR"
+        );
+    }
+    let flat = program.flatten_for_plan();
+    crate::eval::validate_execution_metadata(&flat)
+        .context("analysis rejected invalid OIR execution metadata")?;
+    graph
+        .validate_execution_source(program, plan)
+        .map_err(anyhow::Error::msg)
+        .context("analysis rejected OIR/plan/HGraph provenance")?;
+    let mut canonical = program
+        .hgraph_for_plan(plan)
+        .map_err(anyhow::Error::msg)
+        .context("analysis could not rebuild the canonical HGraph")?;
+    crate::hgraph::solve::solve_types(&mut canonical)
+        .context("analysis could not solve the canonical HGraph")?;
+    if graph_sha256(&canonical) != graph_sha256(graph) {
+        anyhow::bail!(
+            "analysis requires the exact canonical solved HGraph; caller graph is unsolved or structurally divergent"
+        );
+    }
+    Ok(())
+}
+
+/// Return only backends whose canonical adapter actually consumes a Python
+/// shim artifact. `ExecutionMode::Shim` is intentionally not enough here:
+/// native Rust backends also use framed hosted execution, but their adapter is
+/// part of the already-bound current Ostadix executable.
+fn legacy_python_shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
+    let registry = BackendRegistry::global();
     plan.nodes
         .iter()
         .filter_map(|node| match &node.kind {
-            PlanNodeKind::Exec { backend, .. } if backend.execution == ExecutionMode::Shim => {
+            PlanNodeKind::Exec { backend, .. }
+                if registry.adapter_for(&backend.canonical)
+                    == BackendAdapterKind::LegacyPythonShim =>
+            {
                 Some(backend.canonical.clone())
             }
             _ => None,
@@ -101,6 +186,7 @@ fn shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
 fn build_runtime_binding(
     snapshot_kind: RuntimeSnapshotKindV1,
     mut backend_artifacts: Vec<BackendArtifactV1>,
+    backend_catalog_projection_sha256: String,
     context: &[(&str, &str)],
 ) -> RuntimeBindingV1 {
     backend_artifacts.push(current_executable_artifact());
@@ -156,6 +242,7 @@ fn build_runtime_binding(
     RuntimeBindingV1 {
         snapshot_kind,
         backend_artifacts,
+        backend_catalog_projection_sha256,
         backend_set_sha256,
         environment_sha256,
         ambient_world_sha256,
@@ -222,7 +309,12 @@ pub fn analyze_execution(
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: RuntimeBindingV1,
-) -> Result<EvidenceBundleV3> {
+) -> Result<EvidenceBundleV4> {
+    if runtime.backend_catalog_projection_sha256 != backend_catalog_projection_sha256(plan) {
+        anyhow::bail!(
+            "runtime evidence backend catalog projection is stale or belongs to another ExecutionPlan"
+        );
+    }
     let current_executable = runtime
         .backend_artifacts
         .iter()
@@ -246,29 +338,9 @@ pub fn analyze_execution(
     {
         anyhow::bail!("execution evidence requires a readable, hash-bound current executable");
     }
-    if plan != &program.plan() {
-        anyhow::bail!(
-            "evidence analyzer requires the canonical ExecutionPlan derived from the exact lowered OIR"
-        );
-    }
+    validate_canonical_solved_graph(program, plan, graph)
+        .context("evidence analyzer rejected noncanonical static execution input")?;
     let flat = program.flatten_for_plan();
-    crate::eval::validate_execution_metadata(&flat)
-        .context("evidence analyzer rejected invalid OIR execution metadata")?;
-    graph
-        .validate_execution_source(program, plan)
-        .map_err(anyhow::Error::msg)
-        .context("evidence analyzer rejected OIR/plan/HGraph provenance")?;
-    let mut canonical = program
-        .hgraph_for_plan(plan)
-        .map_err(anyhow::Error::msg)
-        .context("evidence analyzer could not rebuild the canonical HGraph")?;
-    crate::hgraph::solve::solve_types(&mut canonical)
-        .context("evidence analyzer could not solve the canonical HGraph")?;
-    if graph_sha256(&canonical) != graph_sha256(graph) {
-        anyhow::bail!(
-            "evidence analyzer requires the exact canonical solved HGraph; caller graph is unsolved or structurally divergent"
-        );
-    }
 
     let bindings = evidence_bindings(program, plan, graph, &runtime);
     let mut nodes = Vec::with_capacity(graph.op_map.len());
@@ -348,7 +420,7 @@ pub fn analyze_execution(
                 cancellation_safe: summary.is_verified_pure_infallible(),
                 provenance: effect_provenance,
             },
-            // V3 preserves a bounded, evidence-bound adapter set. Unknown
+            // V4 preserves a bounded, evidence-bound adapter set. Unknown
             // ceilings remain explicit and cannot remove topology edges.
             resource_demand: ResourceDemandContractV1 {
                 cpu_units: Some(1),
@@ -364,9 +436,9 @@ pub fn analyze_execution(
         });
     }
 
-    Ok(EvidenceBundleV3 {
-        schema: EVIDENCE_SCHEMA_V3,
-        analyzer: ANALYZER_ID_V3,
+    Ok(EvidenceBundleV4 {
+        schema: EVIDENCE_SCHEMA_V4,
+        analyzer: ANALYZER_ID_V4,
         bindings,
         runtime,
         nodes,
@@ -378,15 +450,16 @@ pub(crate) fn evidence_bindings(
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: &RuntimeBindingV1,
-) -> EvidenceBindingsV1 {
-    EvidenceBindingsV1 {
+) -> EvidenceBindingsV2 {
+    EvidenceBindingsV2 {
         oir_sha256: oir_sha256(program),
         plan_sha256: sha256_bytes(plan.to_text().as_bytes()),
         analyzed_graph_sha256: graph_sha256(graph),
+        backend_catalog_projection_sha256: runtime.backend_catalog_projection_sha256.clone(),
         backend_set_sha256: runtime.backend_set_sha256.clone(),
         environment_sha256: runtime.environment_sha256.clone(),
         ambient_world_sha256: runtime.ambient_world_sha256.clone(),
-        analyzer_sha256: sha256_bytes(ANALYZER_ID_V3.as_bytes()),
+        analyzer_sha256: sha256_bytes(ANALYZER_ID_V4.as_bytes()),
     }
 }
 
@@ -521,14 +594,15 @@ pub(crate) fn graph_sha256(graph: &HGraph) -> String {
     hash.finish()
 }
 
-pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV3) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v3");
+pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV4) -> String {
+    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v4");
     hash.field(bundle.schema.as_bytes());
     hash.field(bundle.analyzer.as_bytes());
     for binding in [
         &bundle.bindings.oir_sha256,
         &bundle.bindings.plan_sha256,
         &bundle.bindings.analyzed_graph_sha256,
+        &bundle.bindings.backend_catalog_projection_sha256,
         &bundle.bindings.backend_set_sha256,
         &bundle.bindings.environment_sha256,
         &bundle.bindings.ambient_world_sha256,
@@ -589,7 +663,7 @@ pub(crate) fn digest_fields(domain: &str, fields: &[&str]) -> String {
     hash.finish()
 }
 
-fn oir_sha256(program: &OIrProgram) -> String {
+pub(crate) fn oir_sha256(program: &OIrProgram) -> String {
     let mut hash = CanonicalHasher::new("ostadix-lowered-oir-source/v1");
     // The OIR text contains every lowered body byte and a canonical plan dump.
     // The separate plan digest prevents this lowered-source identity from
@@ -1085,12 +1159,143 @@ mod tests {
                     resolved_identity: "path:/adapter.py".to_string(),
                     state,
                 }],
+                "catalog-projection-test".to_string(),
                 &[("artifact-state-test", "v1")],
             )
         };
         assert_ne!(
             runtime(missing).backend_set_sha256(),
             runtime(non_regular).backend_set_sha256()
+        );
+    }
+
+    fn program_for_backend(lang: &str, count: usize) -> OIrProgram {
+        OIrProgram {
+            nodes: (0..count)
+                .map(|_| crate::ir::OIr::Exec {
+                    lang: lang.to_string(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: BackendRegistry::global().interface_for(lang),
+                    body: vec![crate::ir::OIr::Text("catalog projection".to_string())],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn native_adapter_does_not_bind_a_same_named_legacy_shim_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim_path = temp.path().join("bash_shim.py");
+        fs::write(&shim_path, b"# unused native-backend decoy v1\n").unwrap();
+        let program = program_for_backend("bash", 1);
+        let plan = program.plan();
+        let first = runtime_binding_from_directory(
+            &plan,
+            temp.path(),
+            &[("adapter-binding-test", "native")],
+        );
+
+        assert_eq!(first.backend_artifacts().len(), 1);
+        assert_eq!(
+            first.backend_artifacts()[0].canonical_backend,
+            "__ostadix_current_executable__"
+        );
+
+        fs::write(&shim_path, b"# unused native-backend decoy v2\n").unwrap();
+        let second = runtime_binding_from_directory(
+            &plan,
+            temp.path(),
+            &[("adapter-binding-test", "native")],
+        );
+        assert_eq!(first.backend_set_sha256(), second.backend_set_sha256());
+    }
+
+    #[test]
+    fn legacy_python_adapter_binds_the_consumed_shim_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim_path = temp.path().join("python_shim.py");
+        fs::write(&shim_path, b"# consumed legacy shim v1\n").unwrap();
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let first = runtime_binding_from_directory(
+            &plan,
+            temp.path(),
+            &[("adapter-binding-test", "legacy-python")],
+        );
+
+        assert!(first.backend_artifacts().iter().any(|artifact| {
+            artifact.canonical_backend == "python"
+                && matches!(artifact.state, BackendArtifactStateV1::Hashed { .. })
+        }));
+
+        fs::write(&shim_path, b"# consumed legacy shim v2\n").unwrap();
+        let second = runtime_binding_from_directory(
+            &plan,
+            temp.path(),
+            &[("adapter-binding-test", "legacy-python")],
+        );
+        assert_ne!(first.backend_set_sha256(), second.backend_set_sha256());
+    }
+
+    #[test]
+    fn unknown_backend_retains_the_legacy_python_shim_fallback_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim_path = temp.path().join("research_backend_shim.py");
+        fs::write(&shim_path, b"# extension shim\n").unwrap();
+        let program = program_for_backend("research_backend", 1);
+        let runtime = runtime_binding_from_directory(
+            &program.plan(),
+            temp.path(),
+            &[("adapter-binding-test", "unknown")],
+        );
+
+        assert!(runtime.backend_artifacts().iter().any(|artifact| {
+            artifact.canonical_backend == "research_backend"
+                && matches!(artifact.state, BackendArtifactStateV1::Hashed { .. })
+        }));
+    }
+
+    #[test]
+    fn catalog_projection_is_plan_specific_canonical_and_capacity_neutral() {
+        let python = program_for_backend("python", 1);
+        let duplicate_python = program_for_backend("python", 2);
+        let alias_python = program_for_backend("py", 1);
+        let javascript = program_for_backend("javascript", 1);
+        let context = &[("catalog-projection-test", "v1")];
+
+        let snapshot = |program: &OIrProgram| {
+            runtime_binding_from_adapter_bytes(&program.plan(), &[], context)
+                .backend_catalog_projection_sha256()
+                .to_string()
+        };
+
+        assert_eq!(snapshot(&python), snapshot(&duplicate_python));
+        assert_eq!(snapshot(&python), snapshot(&alias_python));
+        assert_ne!(snapshot(&python), snapshot(&javascript));
+        assert_eq!(snapshot(&python).len(), 64);
+    }
+
+    #[test]
+    fn analyzer_rejects_a_forged_catalog_projection_before_issuing_evidence() {
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let mut graph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let mut runtime = runtime_binding_from_adapter_bytes(
+            &plan,
+            &[],
+            &[("catalog-projection-test", "forged")],
+        );
+        runtime.backend_catalog_projection_sha256 = "00".repeat(32);
+
+        let error = analyze_execution(&program, &plan, &graph, runtime)
+            .expect_err("a caller cannot substitute a catalog projection");
+        assert!(
+            error
+                .to_string()
+                .contains("backend catalog projection is stale"),
+            "{error:#}"
         );
     }
 
@@ -1111,6 +1316,7 @@ mod tests {
                     sha256: "00".repeat(32),
                 },
             }],
+            backend_catalog_projection_sha256(&plan),
             &[("reserved-artifact-test", "v1")],
         );
 

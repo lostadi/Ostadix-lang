@@ -6,9 +6,14 @@
   expression syntax described in `README.md`, lowered from parser nodes to OIR in
   `src/ir.rs`, and executed by the Rust evaluator in `src/eval.rs`.
 - The accepted evaluator tags are registry-extensible at compile time through
-  `BackendRegistry` and `BACKEND_SPECS` in `src/ir.rs`; this table is the single
-  source for accepted canonical tags, aliases, purity metadata, splice
-  rendering, execution mode, shim fallback, and backend authority requirements.
+  the declarative catalog in `src/backend_catalog.inc.rs`. `BackendRegistry`,
+  native-adapter dispatch, generated-runtime source emission, and MCP runtime
+  discovery are compile-time projections of that one catalog; no runtime source
+  parser or independently maintained MCP backend table is involved. The catalog
+  records canonical tags, aliases, purity metadata, splice rendering, execution
+  mode, adapter ownership, backend authority requirements, and descriptive
+  executable alternatives. Executable presence is not health, authorization,
+  capacity, or operation admission.
 - `OValue` is the language-neutral value boundary (`src/value.rs`) used by the
   Rust hosted runtime, the C17 edition in `c_cpp/`, and the Python reference in
   `o_lang/`.
@@ -166,6 +171,14 @@
   projects it into a directed state-complete HGraph. The graph coordinator is
   the default executor; `O_EXECUTOR=serial` retains the topological OIR
   interpreter as a differential oracle.
+- `oexec.execution-intent/v1` is a process-stable, authority-free identity over
+  exact source bytes, lowered OIR, plan, solved graph, the referenced canonical
+  backend specifications, analyzer, and base policy. The MCP server can retain
+  a bounded, expiring, one-use opaque handle and require `O` to recompute that
+  same intent before dispatch. This is a local same-intent gate, not a
+  capability, runtime-health result, retained admission, or authorization; `O`
+  still constructs and rechecks a fresh process-local V4 admission, and direct
+  `o_run` remains an explicitly ungated compatibility surface.
 - HGraph represents ordinary results, successful completion, evaluator state,
   host-resource state, and persistent actor state as nodes. Executable
   operations are directed, multi-output hyperedges. Readiness follows only from
@@ -774,6 +787,18 @@
   dispatch, CPU/memory fit, external-runtime readiness, placement, or observed
   overlap. Static widths are neither runtime batches nor dynamic-frontier
   bounds.
+- `olangc --target ir --execution-intent-json` emits the authority-free
+  `oexec.execution-intent/v1` projection. It binds exact source bytes, lowered
+  OIR, canonical plan, solved analyzed graph, the plan-specific backend-catalog
+  projection, analyzer identity, and base policy. Supplying its source and
+  intent digests with `O --require-source-sha256` and
+  `--require-execution-intent-sha256` makes graph execution recompute and
+  compare that projection before dispatch; a match still proceeds through a
+  fresh process-local V4 `AdmittedExecution`. The stable intent deliberately
+  excludes runtime discovery, backend artifacts, environment and PID state,
+  capacity, authority, and live admission, so it is sameness evidence rather
+  than a capability or reusable admission token. The gate adds no work to an
+  ordinary `O` invocation when its two flags are absent.
 - Ordinary source sequence is preserved by completion dependencies unless an
   explicit concurrent group or the narrow verified-inline rule removes it.
 - Full N-language communication soundness is not established; native OValue

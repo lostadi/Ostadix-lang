@@ -12,9 +12,9 @@ use super::analyze::{
     analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
 };
 use super::fact::{
-    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV1,
-    EvidenceBundleV3, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    ADMISSION_SCHEMA_V3, ANALYZER_ID_V3, EVIDENCE_SCHEMA_V3,
+    BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV2,
+    EvidenceBundleV4, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    ADMISSION_SCHEMA_V4, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,7 +112,7 @@ pub struct ScheduleWhyDependentV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduleWhyViewV1 {
     pub schema: &'static str,
-    pub bindings: EvidenceBindingsV1,
+    pub bindings: EvidenceBindingsV2,
     pub evidence_sha256: String,
     pub admitted_graph_sha256: String,
     pub admission_sha256: String,
@@ -127,9 +127,9 @@ pub struct ScheduleWhyViewV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionAdmissionV3 {
+pub struct ExecutionAdmissionV4 {
     schema: &'static str,
-    bindings: EvidenceBindingsV1,
+    bindings: EvidenceBindingsV2,
     analyzer: &'static str,
     runtime_snapshot_kind: RuntimeSnapshotKindV1,
     backend_artifacts: Vec<BackendArtifactV1>,
@@ -143,12 +143,12 @@ pub struct ExecutionAdmissionV3 {
     hosted_task_layers: Vec<Vec<PlanNodeId>>,
 }
 
-impl ExecutionAdmissionV3 {
+impl ExecutionAdmissionV4 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
 
-    pub fn bindings(&self) -> &EvidenceBindingsV1 {
+    pub fn bindings(&self) -> &EvidenceBindingsV2 {
         &self.bindings
     }
 
@@ -275,7 +275,8 @@ impl ExecutionAdmissionV3 {
         .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "binding backend-set-sha256={} environment-sha256={} ambient-world-sha256={}",
+            "binding backend-catalog-projection-sha256={} backend-set-sha256={} environment-sha256={} ambient-world-sha256={}",
+            self.bindings.backend_catalog_projection_sha256,
             self.bindings.backend_set_sha256,
             self.bindings.environment_sha256,
             self.bindings.ambient_world_sha256
@@ -426,19 +427,22 @@ impl ExecutionAdmissionV3 {
             "admission-note ambient-world-sha256 is descriptive HostWorld context, not governed authority\n",
         );
         out.push_str(
+            "admission-note backend-catalog-projection-sha256 binds only canonical specifications referenced by this plan; it is not runtime discovery, health, authorization, capacity, or readiness evidence\n",
+        );
+        out.push_str(
             "admission-note backend artifact states distinguish hashed, missing, non-regular, and unreadable paths\n",
         );
         out.push_str(
-            "admission-note adapter/environment rechecks are best-effort snapshots; v3 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
+            "admission-note adapter/environment rechecks are best-effort snapshots; v4 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
         );
         out.push_str(
             "admission-note backend binding does not cover live actor state/generation or external toolchain closure\n",
         );
         out.push_str(
-            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v3\n",
+            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v4\n",
         );
         out.push_str(
-            "admission-note local placement is descriptive in v3 and does not assert a current lease\n",
+            "admission-note local placement is descriptive in v4 and does not assert a current lease\n",
         );
         out
     }
@@ -469,6 +473,12 @@ impl ScheduleWhyViewV1 {
             self.evidence_sha256,
             self.admitted_graph_sha256,
             self.admission_sha256
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "binding backend-catalog-projection-sha256={}",
+            self.bindings.backend_catalog_projection_sha256
         )
         .expect("writing to a String cannot fail");
         writeln!(
@@ -682,7 +692,7 @@ pub struct AdmittedExecution<'a> {
     plan: &'a ExecutionPlan,
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV3,
+    admission: ExecutionAdmissionV4,
 }
 
 impl<'a> AdmittedExecution<'a> {
@@ -698,7 +708,7 @@ impl<'a> AdmittedExecution<'a> {
         &self.graph
     }
 
-    pub fn admission(&self) -> &ExecutionAdmissionV3 {
+    pub fn admission(&self) -> &ExecutionAdmissionV4 {
         &self.admission
     }
 
@@ -814,19 +824,34 @@ impl<'a> AdmittedExecution<'a> {
 
     pub(crate) fn verify_runtime(&self, current: &RuntimeBindingV1) -> Result<()> {
         let mut changed = Vec::new();
-        if self.runtime.snapshot_kind != current.snapshot_kind {
+        let snapshot_kind_changed = self.runtime.snapshot_kind != current.snapshot_kind;
+        let backend_artifacts_changed = self.runtime.backend_artifacts != current.backend_artifacts;
+        let backend_set_changed = self.runtime.backend_set_sha256 != current.backend_set_sha256;
+        let environment_changed = self.runtime.environment_sha256 != current.environment_sha256;
+
+        if snapshot_kind_changed {
             changed.push("snapshot kind");
         }
-        if self.runtime.backend_artifacts != current.backend_artifacts {
+        if backend_artifacts_changed {
             changed.push("backend artifacts");
         }
-        if self.runtime.backend_set_sha256 != current.backend_set_sha256 {
+        if self.runtime.backend_catalog_projection_sha256
+            != current.backend_catalog_projection_sha256
+        {
+            changed.push("backend catalog projection digest");
+        }
+        // Report the earliest changed source in each deterministic digest
+        // chain. A changed artifact necessarily changes backend-set,
+        // environment, and ambient-World digests; repeating every downstream
+        // consequence obscures the actionable freshness failure.
+        if !backend_artifacts_changed && backend_set_changed {
             changed.push("backend-set digest");
         }
-        if self.runtime.environment_sha256 != current.environment_sha256 {
+        if !snapshot_kind_changed && !backend_set_changed && environment_changed {
             changed.push("environment digest");
         }
-        if self.runtime.ambient_world_sha256 != current.ambient_world_sha256 {
+        if !environment_changed && self.runtime.ambient_world_sha256 != current.ambient_world_sha256
+        {
             changed.push("ambient World digest");
         }
         if !changed.is_empty() {
@@ -847,7 +872,7 @@ pub fn admit_execution<'a>(
     mut graph: HGraph,
     base_policy: Policy,
     runtime: RuntimeBindingV1,
-    evidence: EvidenceBundleV3,
+    evidence: EvidenceBundleV4,
 ) -> Result<AdmittedExecution<'a>> {
     if plan != &program.plan() {
         bail!(
@@ -858,7 +883,7 @@ pub fn admit_execution<'a>(
         .validate_execution_source(program, plan)
         .map_err(anyhow::Error::msg)
         .context("admission rejected OIR/plan/HGraph provenance")?;
-    if evidence.schema != EVIDENCE_SCHEMA_V3 || evidence.analyzer != ANALYZER_ID_V3 {
+    if evidence.schema != EVIDENCE_SCHEMA_V4 || evidence.analyzer != ANALYZER_ID_V4 {
         bail!("unsupported or untrusted evidence bundle schema/analyzer");
     }
     if evidence.runtime != runtime {
@@ -867,7 +892,7 @@ pub fn admit_execution<'a>(
     let expected_bindings = evidence_bindings(program, plan, &graph, &runtime);
     if evidence.bindings != expected_bindings {
         bail!(
-            "evidence digest binding mismatch: lowered OIR, plan, graph, backend, environment, or ambient World changed"
+            "evidence digest binding mismatch: lowered OIR, plan, graph, backend catalog projection, backend artifacts, environment, or ambient World changed"
         );
     }
     let baseline = analyze_execution(program, plan, &graph, runtime.clone())
@@ -917,7 +942,7 @@ pub fn admit_execution<'a>(
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let admission_sha256 = digest_fields(
-        "ostadix-execution-admission/v3",
+        "ostadix-execution-admission/v4",
         &[
             &evidence_sha256,
             &admitted_graph_sha256,
@@ -925,10 +950,10 @@ pub fn admit_execution<'a>(
         ],
     );
 
-    let admission = ExecutionAdmissionV3 {
-        schema: ADMISSION_SCHEMA_V3,
+    let admission = ExecutionAdmissionV4 {
+        schema: ADMISSION_SCHEMA_V4,
         bindings: expected_bindings,
-        analyzer: ANALYZER_ID_V3,
+        analyzer: ANALYZER_ID_V4,
         runtime_snapshot_kind: runtime.snapshot_kind(),
         backend_artifacts: runtime.backend_artifacts().to_vec(),
         evidence_sha256,
@@ -1400,7 +1425,8 @@ fn yes_no(value: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::evidence::{
-        analyze_execution, runtime_binding_from_adapter_bytes, CostEstimateV1, EvidenceProvenance,
+        analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
+        BackendArtifactStateV1, CostEstimateV1, EvidenceProvenance,
     };
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
@@ -1441,7 +1467,7 @@ mod tests {
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
     );
 
-    fn legal_projection(admission: &ExecutionAdmissionV3) -> LegalProjection {
+    fn legal_projection(admission: &ExecutionAdmissionV4) -> LegalProjection {
         (
             admission.waves().to_vec(),
             admission
@@ -1464,6 +1490,8 @@ mod tests {
 
         let evidence_a = analyze_execution(&program, &plan, &graph_a, runtime_a.clone()).unwrap();
         let evidence_b = analyze_execution(&program, &plan, &graph_b, runtime_b.clone()).unwrap();
+        assert_eq!(evidence_a.schema(), EVIDENCE_SCHEMA_V4);
+        assert_eq!(evidence_a.analyzer(), ANALYZER_ID_V4);
         assert_eq!(evidence_a.bindings(), evidence_b.bindings());
         assert_eq!(
             evidence_bundle_sha256(&evidence_a),
@@ -1498,7 +1526,17 @@ mod tests {
             admitted_b.admission().to_explanation_text()
         );
         let explanation = admitted_a.admission().to_explanation_text();
+        assert!(explanation.starts_with("; ExecutionAdmission oexec.admission/v4\n"));
         assert!(explanation.contains("binding lowered-oir-sha256="));
+        assert!(explanation.contains("binding backend-catalog-projection-sha256="));
+        assert_eq!(
+            admitted_a
+                .admission()
+                .bindings()
+                .backend_catalog_projection_sha256
+                .len(),
+            64
+        );
         assert!(explanation
             .contains("runtime-snapshot kind=inspection dispatch-context=inspection-only"));
         assert!(explanation.contains("effects provenance="));
@@ -1509,6 +1547,9 @@ mod tests {
         assert!(explanation.contains("wave 0 ["));
         assert!(explanation.contains("legal static frontier"));
         assert!(explanation.contains("dispatch adapter IDs are evidence-bound"));
+        assert!(explanation.contains(
+            "it is not runtime discovery, health, authorization, capacity, or readiness evidence"
+        ));
         assert!(explanation.contains("fixed-size per-run pool with per-completion wakeups"));
         assert!(explanation
             .contains("verified-pure infallible local-worker outputs may provisionally unlock"));
@@ -1575,7 +1616,7 @@ mod tests {
         let error = analyze_execution(&program, &plan, &graph, runtime)
             .expect_err("analysis must own the canonical type-solve boundary");
         assert!(
-            error.to_string().contains("exact canonical solved HGraph"),
+            format!("{error:#}").contains("exact canonical solved HGraph"),
             "{error:#}"
         );
     }
@@ -1667,7 +1708,7 @@ mod tests {
         let error = analyze_execution(&program, &altered_plan, &graph, runtime)
             .expect_err("admission analysis must reject noncanonical dependencies");
         assert!(
-            error.to_string().contains("canonical ExecutionPlan"),
+            format!("{error:#}").contains("canonical ExecutionPlan"),
             "{error:#}"
         );
     }
@@ -1763,12 +1804,10 @@ mod tests {
             .verify_runtime(&changed_runtime)
             .expect_err("a frozen admission must reject runtime drift before execution");
         let diagnostic = error.to_string();
-        assert!(
-            diagnostic.contains("runtime binding is stale"),
-            "{diagnostic}"
+        assert_eq!(
+            diagnostic,
+            "execution admission runtime binding is stale; changed components: environment digest"
         );
-        assert!(diagnostic.contains("environment digest"), "{diagnostic}");
-        assert!(diagnostic.contains("ambient World digest"), "{diagnostic}");
     }
 
     #[test]
@@ -2039,6 +2078,61 @@ python^(__oval_result__ = sum(branches))_python
         assert_eq!(
             error.to_string(),
             "execution admission runtime binding is stale; changed components: backend-set digest"
+        );
+
+        let mut changed_runtime = admitted.runtime.clone();
+        changed_runtime.backend_catalog_projection_sha256 = "changed-catalog".to_string();
+        let error = admitted
+            .verify_runtime(&changed_runtime)
+            .expect_err("the changed catalog projection must invalidate admission");
+        assert_eq!(
+            error.to_string(),
+            "execution admission runtime binding is stale; changed components: backend catalog projection digest"
+        );
+    }
+
+    #[test]
+    fn runtime_recheck_rejects_replaced_shim_artifact_before_execution() {
+        let shim_dir = tempfile::tempdir().expect("create isolated shim directory");
+        let shim_path = shim_dir.path().join("python_shim.py");
+        std::fs::write(&shim_path, b"# admitted shim bytes\n")
+            .expect("write the initially admitted shim artifact");
+
+        let program = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "python".to_string(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("python"),
+                body: vec![OIr::Text("artifact freshness".to_string())],
+            }],
+        };
+        let plan = program.plan();
+        let graph = solved_graph(&program);
+        let context = &[("artifact-drift-test", "v1")];
+        let runtime = runtime_binding_from_directory(&plan, shim_dir.path(), context);
+        assert!(
+            runtime.backend_artifacts().iter().any(|artifact| {
+                artifact.canonical_backend == "python"
+                    && matches!(artifact.state, BackendArtifactStateV1::Hashed { .. })
+            }),
+            "expected a hashed Python shim binding, got {:#?}",
+            runtime.backend_artifacts()
+        );
+        let evidence = analyze_execution(&program, &plan, &graph, runtime.clone())
+            .expect("analyze against the initial shim bytes");
+        let admitted = admit_execution(&program, &plan, graph, Policy::Eager, runtime, evidence)
+            .expect("admit without dispatching the hosted operation");
+
+        std::fs::write(&shim_path, b"# adversarially replaced shim bytes\n")
+            .expect("replace the shim after admission");
+        let current = runtime_binding_from_directory(&plan, shim_dir.path(), context);
+        let error = admitted
+            .verify_runtime(&current)
+            .expect_err("artifact replacement must stale the admission before dispatch");
+        assert_eq!(
+            error.to_string(),
+            "execution admission runtime binding is stale; changed components: backend artifacts"
         );
     }
 

@@ -11,6 +11,7 @@
 //   olangc <input.O> --target wasm                # wasm32-wasip1
 //   olangc <input.O> --target script              # run in-process
 //   olangc <input.O> --target ir                  # dump the lowered OIR
+//   olangc <input.O> --target ir --execution-intent-json
 //   olangc <input.O> --target ir --why P3         # explain one admitted operation
 //   olangc <input.O> --target dot                 # Graphviz DOT hypergraph
 //   olangc <input.O> --shim-dir ./backends        # custom shim directory
@@ -73,7 +74,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use o_lang::eval::{Evaluator, Policy};
-use o_lang::evidence::{admit_execution, analyze_execution, runtime_binding_from_adapter_bytes};
+use o_lang::evidence::{
+    admit_execution, analyze_execution, runtime_binding_from_adapter_bytes, ExecutionIntentV1,
+};
 use o_lang::ir::{OIrProgram, PlanNodeId};
 use o_lang::parser::Parser;
 use o_lang::shims::read_shims;
@@ -93,6 +96,7 @@ const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
 const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
 const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
+const RUNTIME_BACKEND_CATALOG_RS: &str = include_str!("../backend_catalog.inc.rs");
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
@@ -109,6 +113,7 @@ const RUNTIME_EVIDENCE_MOD_RS: &str = include_str!("../evidence/mod.rs");
 const RUNTIME_EVIDENCE_FACT_RS: &str = include_str!("../evidence/fact.rs");
 const RUNTIME_EVIDENCE_ANALYZE_RS: &str = include_str!("../evidence/analyze.rs");
 const RUNTIME_EVIDENCE_ADMIT_RS: &str = include_str!("../evidence/admit.rs");
+const RUNTIME_EVIDENCE_INTENT_RS: &str = include_str!("../evidence/intent.rs");
 const RUNTIME_EVIDENCE_PROFILE_RS: &str = include_str!("../evidence/profile.rs");
 
 // world — shared governed identities and the non-authorizing grounding view.
@@ -312,6 +317,13 @@ struct Cli {
     #[arg(long)]
     explain_schedule: bool,
 
+    /// Emit one authority-free, stable JSON identity for the exact source,
+    /// lowered OIR, plan, solved graph, canonical backend-catalog projection,
+    /// analyzer, and base policy. This does not inspect runtime availability,
+    /// authorize execution, or replace fresh AdmittedExecution validation.
+    #[arg(long)]
+    execution_intent_json: bool,
+
     /// Explain why one canonical plan operation is statically admitted or
     /// blocked. Accepts an exact plan identity such as P3. This is a focused,
     /// non-executing ordinary-.O admission view and requires --target ir.
@@ -361,6 +373,11 @@ fn main() -> Result<()> {
         if cli.explain_schedule || cli.why.is_some() {
             bail!(
                 "--explain-schedule and --why currently admit ordinary .O HGraphs only; project HGraph admission is deferred"
+            );
+        }
+        if cli.execution_intent_json {
+            bail!(
+                "--execution-intent-json currently identifies ordinary .O HGraphs only; project HGraph intent is deferred"
             );
         }
         return compile_or_run_project(&cli, input_is_dir, &source);
@@ -419,6 +436,7 @@ fn main() -> Result<()> {
         CompileTarget::Script => {
             run_as_script(&source, cli.shim_dir.as_deref(), &cli.backend_grants)
         }
+        CompileTarget::Ir if cli.execution_intent_json => dump_execution_intent_json(&source),
         CompileTarget::Ir if cli.why.is_some() => dump_schedule_why(
             &cli.input,
             &source,
@@ -454,6 +472,21 @@ fn validate_admission_inspection(cli: &Cli) -> Result<()> {
     }
     if cli.why.is_some() && cli.explain_schedule {
         bail!("--why and --explain-schedule are distinct inspection views and cannot be combined");
+    }
+    if cli.execution_intent_json && cli.target != CompileTarget::Ir {
+        bail!("--execution-intent-json is available only with --target ir");
+    }
+    if cli.execution_intent_json
+        && (cli.explain_schedule
+            || cli.why.is_some()
+            || cli.grounding
+            || cli.workers.is_some()
+            || cli.world_id.is_some()
+            || cli.world_epoch.is_some())
+    {
+        bail!(
+            "--execution-intent-json is a standalone JSON inspection view and cannot be combined with schedule, why, grounding, worker, or World inspection options"
+        );
     }
     if cli.why.is_some() && (cli.grounding || cli.world_id.is_some() || cli.world_epoch.is_some()) {
         bail!("--why cannot be combined with --grounding, --world-id, or --world-epoch");
@@ -1082,6 +1115,10 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
     fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
     fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
+    fs::write(
+        src_dir.join("backend_catalog.inc.rs"),
+        RUNTIME_BACKEND_CATALOG_RS,
+    )?;
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
@@ -1098,6 +1135,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(evidence_dir.join("fact.rs"), RUNTIME_EVIDENCE_FACT_RS)?;
     fs::write(evidence_dir.join("analyze.rs"), RUNTIME_EVIDENCE_ANALYZE_RS)?;
     fs::write(evidence_dir.join("admit.rs"), RUNTIME_EVIDENCE_ADMIT_RS)?;
+    fs::write(evidence_dir.join("intent.rs"), RUNTIME_EVIDENCE_INTENT_RS)?;
     fs::write(evidence_dir.join("profile.rs"), RUNTIME_EVIDENCE_PROFILE_RS)?;
 
     // ── world — governed identity/effect vocabulary ────────────────────────
@@ -1259,6 +1297,22 @@ fn run_as_script(
 fn dump_ir(source: &str) -> Result<()> {
     let (program, _plan, graph) = inspect_ir(source)?;
     print!("{}\n{}", program.to_text(), graph.to_execution_text());
+    Ok(())
+}
+
+/// Emit a process-stable identity of the analyzed computation without
+/// inspecting adapters or compiling execution authority. The O runtime may
+/// compare this identity before dispatch, but it must still create and verify
+/// a fresh live `AdmittedExecution` in that execution process.
+fn dump_execution_intent_json(source: &str) -> Result<()> {
+    let (program, plan, graph) = inspect_ir(source)?;
+    let graph = solve_ir_admission_graph(graph)?;
+    let intent =
+        ExecutionIntentV1::compile(source.as_bytes(), &program, &plan, &graph, Policy::Eager)?;
+    println!(
+        "{}",
+        serde_json::to_string(&intent).context("failed to serialize execution intent")?
+    );
     Ok(())
 }
 
@@ -2308,6 +2362,48 @@ mod tests {
     }
 
     #[test]
+    fn execution_intent_json_cli_is_a_standalone_ir_view() {
+        let intent = Cli::try_parse_from([
+            "olangc",
+            "example.O",
+            "--target",
+            "ir",
+            "--execution-intent-json",
+        ])
+        .unwrap();
+        validate_admission_inspection(&intent).unwrap();
+
+        for args in [
+            vec![
+                "olangc",
+                "example.O",
+                "--target",
+                "script",
+                "--execution-intent-json",
+            ],
+            vec![
+                "olangc",
+                "example.O",
+                "--target",
+                "ir",
+                "--execution-intent-json",
+                "--explain-schedule",
+            ],
+            vec![
+                "olangc",
+                "example.O",
+                "--target",
+                "ir",
+                "--execution-intent-json",
+                "--grounding",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_admission_inspection(&cli).is_err());
+        }
+    }
+
+    #[test]
     fn why_cli_requires_a_canonical_plan_id_and_ir_only_flags() {
         for (text, expected) in [("P0", 0), ("P7", 7), ("P184", 184)] {
             assert_eq!(
@@ -2388,11 +2484,13 @@ mod tests {
         assert!(lib_rs.contains("pub mod world;"));
 
         for path in [
+            "backend_catalog.inc.rs",
             "effects.rs",
             "evidence/mod.rs",
             "evidence/fact.rs",
             "evidence/analyze.rs",
             "evidence/admit.rs",
+            "evidence/intent.rs",
             "evidence/profile.rs",
             "world/mod.rs",
             "world/codec.rs",
@@ -2426,6 +2524,11 @@ mod tests {
                 "generated runtime file {path} must not be empty"
             );
         }
+        assert_eq!(
+            fs::read_to_string(src_dir.join("backend_catalog.inc.rs")).unwrap(),
+            RUNTIME_BACKEND_CATALOG_RS,
+            "generated runtimes must receive the canonical backend catalog verbatim"
+        );
         assert_eq!(
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,

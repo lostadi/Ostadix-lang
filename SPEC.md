@@ -169,7 +169,7 @@ Every authoritative Rust execution entry point follows this path:
 
 ```text
 .O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
-          -> EvidenceBundleV3 -> AdmittedExecution -> graph coordinator | serial oracle
+          -> EvidenceBundleV4 -> AdmittedExecution -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -214,15 +214,18 @@ them. These rules apply after scheduler-visible alias expansion. An explicit or
 unknown `HostWorld` access remains exclusive and therefore fail-closed.
 
 Before either the graph coordinator or the serial differential oracle executes
-the plan, the runtime MUST produce an `EvidenceBundleV3` and compile it into an
+the plan, the runtime MUST produce an `EvidenceBundleV4` and compile it into an
 `AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
-environment, and descriptive ambient-World snapshot. This v3 binding does not
-claim the original source-byte digest when the entry point receives an already
-lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
-issuing evidence, analysis MUST validate that every lowered backend interface
-matches the registered language policy and that special invocation metadata has
-canonical name/mode/arity. Each executable operation MUST consume admitted type,
+the plan-projected canonical backend specifications, environment, and
+descriptive ambient-World snapshot. The catalog projection binds specification
+identity only; it does not assert runtime discovery, health, authorization,
+capacity, or readiness. This v4 binding does not claim the original source-byte
+digest when the entry point receives an already lowered `OIrProgram`, nor does
+it bind caller initial-scope shape/values. Before issuing evidence, analysis
+MUST validate that every lowered backend interface matches the registered
+language policy and that special invocation metadata has canonical
+name/mode/arity. Each executable operation MUST consume admitted type,
 effect-footprint, dispatch, capability-policy, placement, failure-policy, and
 resource-budget facts. Stale or mismatched evidence MUST fail before execution
 starts. The ordinary graph `Coordinator` MUST accept only an
@@ -252,7 +255,7 @@ sequencing region. Outside the explicit autonomous contract below, any unknown
 fact preserves sequence. Conflicting resource frontiers still constrain
 explicit group members unless that group member has the following contract.
 
-The v3 `LocalWorker` lane MAY also accept an unknown hosted operation only when
+The v4 `LocalWorker` lane MAY also accept an unknown hosted operation only when
 it is an attribute-free ephemeral shim, is a direct typed-expression member of
 a coordination group, and the nearest enclosing `lazy` or `autonomous` policy
 schedule is `autonomous`. Its complete body MUST be preparable from literal Text
@@ -267,7 +270,7 @@ semantic opt-in, not an effect-independence proof: deterministic result and
 failure selection MUST be preserved, but external effects from already-started
 members MAY race and need not be rolled back.
 
-All other v3 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
+All other v4 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
 operations or attribute-free trusted inline-value renderers named `html`,
 `markdown`, `text`, or `latex` whose body is source-proven preparable: literal
 text, already-settled Store children, and recursively trusted renderers only.
@@ -317,7 +320,7 @@ unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
 in semantic-ordinal order, select the lowest-ordinal failure, drain every
 started task, and discard every later provisional outcome. Infallible
 effect-free workers MAY be dispatched outside that prefix. Coordinator-owned
-operations MUST remain single-owner; this bounded v3 implementation does not
+operations MUST remain single-owner; this bounded v4 implementation does not
 run them while local-worker tasks are outstanding. Pool channel loss or
 submission failure MUST be treated as an infrastructure abort rather than a
 semantic program failure; the coordinator MUST stop new dispatch, drain every
@@ -348,7 +351,7 @@ describe permission, not an exact effect footprint.
 `olangc FILE --target ir --explain-schedule` MUST perform the type solve,
 analysis, and admission steps and print the digest bindings, per-operation
 evidence provenance, blockers, retained sequence reasons, and legal static
-waves without executing any operation. In v3 this inspection surface applies
+waves without executing any operation. In v4 this inspection surface applies
 only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 `inspection-only`, not as a dispatch-compatible execution context. A reported
 wave is evidence of legal readiness,
@@ -385,7 +388,7 @@ The explanation MUST also include the nonexecuting hosted-topology prediction
 schema `oexec.schedule-prediction/v1`, headed by
 `; SchedulePrediction oexec.schedule-prediction/v1`. This record is derived
 after admission and remains outside the admission digest; its
-`admission-sha256` field MUST equal the digest on the enclosing v3 admission's
+`admission-sha256` field MUST equal the digest on the enclosing v4 admission's
 canonical digest-binding line. Its single `schedule-prediction` record has the
 following fields:
 
@@ -395,7 +398,7 @@ following fields:
 | `status` | `admitted-static`; no execution was performed. |
 | `provenance` | `evidence-bound-admission`; the topology comes from the admitted plan and blockers. |
 | `model` | `unit-cost-shim-hosted-tasks`. |
-| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v3` record. |
+| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v4` record. |
 | `task-count` | Number of admitted shim-backed hosted `Exec` operations, regardless of execution lane. |
 | `predicted-width` | Maximum hosted-operation cardinality of any weighted-depth layer, or zero when `task-count=0`. |
 | `predicted-span` | Number of nonempty hosted-task layers, or zero when `task-count=0`. |
@@ -419,15 +422,15 @@ Admitted O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
 actor-owned persistent environments, renewable-capacity allocation, and
-unification with the Request and project schedulers are not v3 behavior.
+unification with the Request and project schedulers are not v4 behavior.
 The backend-set binding covers resolved adapter files and the current
 executable, and MUST distinguish hashed, missing, non-regular, and unreadable
 paths. Execution admission MUST reject an unhashed current executable. Runtime
 rechecks are path/environment snapshots, not an immutable execution substrate:
-v3 does not pin an opened adapter or frozen child environment and cannot prove
+v4 does not pin an opened adapter or frozen child environment and cannot prove
 the bytes/environment observed at spawn. The binding also excludes caller
 initial-scope shape/values, opaque live-actor state/generation, a complete
-external toolchain closure, and placement-lease freshness. Actor identity in v3 is a
+external toolchain closure, and placement-lease freshness. Actor identity in v4 is a
 serialization constraint only and MUST NOT close an unknown hosted footprint.
 
 ---

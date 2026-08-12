@@ -7,22 +7,16 @@
 //! compiled CLI under both `--executor graph` (default) and
 //! `--executor serial`, and asserts the reentrant results are identical.
 //!
-//! The test is skipped when the python backend is unavailable in the
-//! environment (no python3, or the shim cannot start), rather than failing on
-//! unrelated infrastructure gaps.
+//! Developer runs may explicitly skip when Python is absent; release-evidence
+//! CI requires it. Once Python is present, launch or shim failures are test
+//! failures rather than silently accepted infrastructure gaps.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-fn python_available() -> bool {
-    Command::new("python3")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+mod support;
 
-fn run(executor: &str) -> Option<std::process::Output> {
+fn run(executor: &str) -> std::process::Output {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let example = root.join("examples/meta_eval.O");
     let backends = root.join("backends");
@@ -32,31 +26,23 @@ fn run(executor: &str) -> Option<std::process::Output> {
         .arg(&example)
         .arg(&backends)
         .output()
-        .ok()
+        .expect("launch compiled O binary")
 }
 
 #[test]
 fn meta_eval_reentrancy_matches_across_executors() {
-    if !python_available() {
-        eprintln!("skipping: python3 not available");
+    if !support::require_runtime("python3") {
         return;
     }
 
-    let Some(graph) = run("graph") else {
-        eprintln!("skipping: could not launch O binary");
-        return;
-    };
-    if !graph.status.success() {
-        // Backend may be unavailable in this sandbox; don't fail the suite on
-        // unrelated infrastructure gaps.
-        eprintln!(
-            "skipping: graph run did not succeed: {}",
-            String::from_utf8_lossy(&graph.stderr)
-        );
-        return;
-    }
+    let graph = run("graph");
+    assert!(
+        graph.status.success(),
+        "graph executor failed: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
 
-    let serial = run("serial").expect("serial run launches");
+    let serial = run("serial");
     assert!(
         serial.status.success(),
         "serial executor failed: {}",

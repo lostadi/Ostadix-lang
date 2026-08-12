@@ -439,6 +439,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/kernel/build-x86_64-uefi-media.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/build.sh": "#!/bin/sh\nexit 0\n",
             "ocore/kernel/main.oc": "module kernel::main;\n",
+            "ocore/kernel/resolve-x86_64-ovmf-code.sh": "# resolver fixture\n",
             "ocore/kernel/smp_probe.oc": "module kernel::smp_probe;\n",
             "ocore/kernel/smp_probe_stub.oc": "module kernel::smp_probe;\n",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh": "#!/bin/sh\nexit 0\n",
@@ -510,9 +511,11 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/smoke-world-g0-conformance.sh": "#!/usr/bin/env bash\n",
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
+            "src/backend_catalog.inc.rs": "// fixture canonical backend catalog\n",
             "src/evidence/admit.rs": "// fixture evidence admission compiler\n",
             "src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
             "src/evidence/fact.rs": "// fixture evidence contract vocabulary\n",
+            "src/evidence/intent.rs": "// fixture stable execution-intent projection\n",
             "src/evidence/mod.rs": "pub mod admit;\n",
             "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
@@ -774,6 +777,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/kernel/build-x86_64-uefi-media.sh",
                 "ocore/kernel/build.sh",
                 "ocore/kernel/main.oc",
+                "ocore/kernel/resolve-x86_64-ovmf-code.sh",
                 "ocore/kernel/smp_probe.oc",
                 "ocore/kernel/smp_probe_stub.oc",
                 "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
@@ -825,9 +829,11 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/smoke-world-g0-conformance.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
+                "src/backend_catalog.inc.rs",
                 "src/evidence/admit.rs",
                 "src/evidence/analyze.rs",
                 "src/evidence/fact.rs",
+                "src/evidence/intent.rs",
                 "src/evidence/mod.rs",
                 "src/evidence/profile.rs",
                 "src/effects.rs",
@@ -1299,6 +1305,7 @@ class SourceReleaseTests(unittest.TestCase):
         required = (
             "docs/OSTADIX_BOOT.md",
             "ocore/kernel/build-x86_64-uefi-media.sh",
+            "ocore/kernel/resolve-x86_64-ovmf-code.sh",
             "ocore/kernel/run-x86_64-uefi-media-qemu.sh",
             "ocore/kernel/smoke-x86_64-boot-info-qemu.sh",
             "ocore/kernel/smoke-x86_64-smp-qemu.sh",
@@ -1523,16 +1530,19 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/admit.rs",
             "src/evidence/analyze.rs",
             "src/evidence/fact.rs",
+            "src/evidence/intent.rs",
             "src/evidence/mod.rs",
             "src/evidence/profile.rs",
+            "src/backend_catalog.inc.rs",
         )
         self._git("commit", "-q", "-m", "remove evidence-bound admission surface")
 
         with self.assertRaisesRegex(
             release.ReleaseError,
-            r"missing required path\(s\): .*src/evidence/admit\.rs.*"
+            r"missing required path\(s\): .*src/backend_catalog\.inc\.rs.*"
+            r"src/evidence/admit\.rs.*"
             r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
-            r"src/evidence/mod\.rs.*src/evidence/profile\.rs",
+            r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")
 
