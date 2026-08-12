@@ -8,8 +8,9 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 
 | Tool | Purpose |
 |------|---------|
-| `o_env` | Print `O_LANG_ROOT`, backends, `O` / `olangc` paths, shim presence |
-| `o_doctor` | Existence checks + shim inventory + a18re `search/o-run` |
+| `o_env` | Print roots, `O` / `olangc` paths, shim presence, and the 30-backend runtime summary |
+| `o_runtimes` | Report executable discovery for every canonical backend and each supported alternative runtime set |
+| `o_doctor` | Existence checks + shim inventory + complete runtime report + a18re `search/o-run` |
 | `o_smoke` | `O examples/hello.O <absolute-backends>` — expect `2` |
 | `o_run` | Run any `.O` with absolute backends; relative input resolves once against `cwd` or the repository root, while an absolute path with no `cwd` runs from its parent directory |
 | `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root |
@@ -33,9 +34,11 @@ python3 scripts/smoke_ostadix_mcp.py
 ```
 
 The last command performs a real MCP initialize/list/call exchange and requires
-the root release `O` and `olangc` binaries. It calls `o_smoke`, both supported
-relative-path forms of `o_run`, and relative-path `o_olangc`. The client drains
-stdout/stderr concurrently and retains out-of-order JSON-RPC replies by id.
+the root release `O` and `olangc` binaries. Under a deliberately system-only
+`PATH`, it validates every tool's object schema, calls `o_runtimes`, `o_smoke`,
+both supported relative-path forms of `o_run`, and relative-path `o_olangc`.
+The client drains stdout/stderr concurrently and retains out-of-order JSON-RPC
+replies by id.
 
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its
@@ -43,6 +46,21 @@ working directory or an ancestor by checking the root Cargo package, Python
 shim, and hello example. It does not contain a developer-specific absolute
 fallback. The crate is distributed under `LGPL-2.1-only`, matching the root
 license shipped in the source release.
+
+## Runtime discovery
+
+At startup, the server preserves the client's `PATH` order and appends existing
+local runtime locations commonly omitted by GUI/MCP launchers: repository and
+user bins, Homebrew, Nix profiles, mise/asdf/pyenv/rbenv, Conda, Volta/fnm,
+GHCup/OPAM, .NET, Wasmtime/Wasmer, and SDKMAN Java. Set
+`OSTADIX_RUNTIME_PATH` to append additional explicit directories.
+
+`o_runtimes` reports all 30 names in the canonical `BACKEND_SPECS` registry.
+Builtin backends are identified separately; external backends report the first
+complete executable alternative found, or every acceptable alternative when
+missing. This is a non-executing presence check, not a permission grant or a
+runtime health claim. The backend adapter still validates and launches the
+selected tools.
 
 ## Grok config (`~/.grok/config.toml`)
 
@@ -52,13 +70,13 @@ command = "/Users/ustad/.local/bin/ostadix-mcp"
 args = []
 env = {
   O_LANG_ROOT = "/Users/ustad/Ostadix-lang",
-  O_BACKENDS_DIR = "/Users/ustad/Ostadix-lang/backends",
-  PATH = "/Users/ustad/.local/bin:/Users/ustad/Ostadix-lang/target/release:/usr/bin:/bin"
+  O_BACKENDS_DIR = "/Users/ustad/Ostadix-lang/backends"
 }
 enabled = true
 ```
 
-Reload MCP / restart the session so tools appear as `olang__o_run`, etc.
+Reload MCP / restart the session so tools appear as `olang__o_runtimes`,
+`olang__o_run`, etc.
 
 ## Agent rules (encoded in tool instructions)
 
