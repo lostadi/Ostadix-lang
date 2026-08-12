@@ -17,19 +17,13 @@ use std::time::{Duration, Instant};
 use o_lang::value::{OValue, OWireCommand, OWireResponse};
 use o_lang::wire;
 
+mod support;
+
 struct RunOutcome {
     output: Output,
     workdir: tempfile::TempDir,
     pid: u32,
     trace_path: PathBuf,
-}
-
-fn python_available() -> bool {
-    Command::new("python3")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 fn run_graph_bounded(source: &str, workers: usize) -> RunOutcome {
@@ -147,6 +141,35 @@ __oval_result__ = "right"
 )_python
 ))
 "#;
+
+const STRESS_TASK_COUNT: usize = 24;
+const STRESS_WORKERS: usize = 4;
+
+fn stress_interval_batch() -> String {
+    let mut source = String::from("autonomous(batch(\n");
+    for index in 0..STRESS_TASK_COUNT {
+        if index > 0 {
+            source.push_str(",\n");
+        }
+        // Staggered, short waits exercise several completion/refill cycles
+        // without turning this bounded capacity proof into a benchmark.
+        let delay_seconds = 0.040 + f64::from((index % 5) as u8) * 0.010;
+        source.push_str(&format!(
+            r#"python^(
+from pathlib import Path
+import os
+import time
+start = time.monotonic_ns()
+time.sleep({delay_seconds:.3})
+end = time.monotonic_ns()
+(Path(os.environ["O_TEST_WORKDIR"]) / "stress-{index:02}.interval").write_text(str(start) + " " + str(end) + "\n", encoding="utf-8")
+__oval_result__ = "stress-{index:02}"
+)_python"#
+        ));
+    }
+    source.push_str("\n))\n");
+    source
+}
 
 fn assert_success(run: &RunOutcome, context: &str) {
     assert!(
@@ -299,10 +322,39 @@ fn read_interval(path: &Path) -> (u128, u128) {
     (values[0], values[1])
 }
 
+fn peak_interval_concurrency(intervals: &[(u128, u128)]) -> usize {
+    let mut events = Vec::with_capacity(intervals.len() * 2);
+    for &(start, end) in intervals {
+        events.push((start, 1_i8));
+        events.push((end, -1_i8));
+    }
+    // At an exact boundary, account for the completed interval before the new
+    // one starts so touching intervals are not reported as overlapping.
+    events.sort_unstable_by_key(|&(time, delta)| (time, delta));
+
+    let mut active = 0_i32;
+    let mut peak = 0_i32;
+    for (_, delta) in events {
+        active += i32::from(delta);
+        assert!(active >= 0, "interval event sequence became negative");
+        peak = peak.max(active);
+    }
+    assert_eq!(active, 0, "interval event sequence did not close");
+    usize::try_from(peak).expect("non-negative interval concurrency")
+}
+
+fn trace_event_count(trace: &str, parent_pid: u32, event: &str) -> usize {
+    let prefix = format!("pid={parent_pid} ");
+    let marker = format!("event={event}");
+    trace
+        .lines()
+        .filter(|line| line.contains(&prefix) && line.contains(&marker))
+        .count()
+}
+
 #[test]
 fn explicit_autonomous_ephemeral_python_blocks_overlap() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -335,9 +387,59 @@ fn explicit_autonomous_ephemeral_python_blocks_overlap() {
 }
 
 #[test]
+fn autonomous_worker_pool_refills_24_tasks_without_exceeding_capacity() {
+    if !support::require_runtime("python3") {
+        return;
+    }
+
+    let run = run_graph_bounded(&stress_interval_batch(), STRESS_WORKERS);
+    assert_success(&run, "24-task autonomous worker-capacity stress");
+
+    let intervals = (0..STRESS_TASK_COUNT)
+        .map(|index| {
+            read_interval(
+                &run.workdir
+                    .path()
+                    .join(format!("stress-{index:02}.interval")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let peak = peak_interval_concurrency(&intervals);
+    assert!(
+        peak > 1,
+        "24-task stress never observed overlapping hosted execution"
+    );
+    assert!(
+        peak <= STRESS_WORKERS,
+        "observed peak {peak} exceeded the configured {STRESS_WORKERS}-worker capacity"
+    );
+
+    let trace = fs::read_to_string(&run.trace_path).expect("read 24-task lifecycle trace");
+    for event in [
+        "worker.task_received",
+        "worker.backend_spawned",
+        "worker.done_received",
+        "worker.completion_emitted",
+    ] {
+        assert_eq!(
+            trace_event_count(&trace, run.pid, event),
+            STRESS_TASK_COUNT,
+            "unexpected event count for {event}\ntrace:\n{trace}"
+        );
+    }
+    assert_eq!(
+        trace_event_count(&trace, run.pid, "pool.worker_joined"),
+        STRESS_WORKERS,
+        "the configured persistent workers were not all joined\ntrace:\n{trace}"
+    );
+
+    #[cfg(unix)]
+    assert_traced_backend_groups_quiescent(&run);
+}
+
+#[test]
 fn explicit_one_worker_override_serializes_autonomous_blocks() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -359,8 +461,7 @@ fn explicit_one_worker_override_serializes_autonomous_blocks() {
 
 #[test]
 fn ordinary_ephemeral_python_preserves_strict_fail_stop() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -395,8 +496,7 @@ __oval_result__ = "unexpected"
 
 #[test]
 fn autonomous_worker_o_eval_sees_lexical_scope() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -452,8 +552,7 @@ __oval_result__ = value
 
 #[test]
 fn autonomous_worker_o_eval_failure_terminates_backend() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -484,8 +583,7 @@ __oval_result__ = O.eval(quoted)
 
 #[test]
 fn autonomous_worker_nested_hosted_callback_inherits_deadline() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -529,8 +627,7 @@ __oval_result__ = O.eval(quoted)
 
 #[test]
 fn autonomous_nonresponsive_backend_fails_within_configured_bound() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -569,8 +666,7 @@ __oval_result__ = "unreachable"
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 
@@ -613,8 +709,7 @@ __oval_result__ = "parent-complete"
 
 #[test]
 fn production_python_backend_proxy_shutdown_reaps_shim() {
-    if !python_available() {
-        eprintln!("skipping: python3 backend runtime is unavailable");
+    if !support::require_runtime("python3") {
         return;
     }
 

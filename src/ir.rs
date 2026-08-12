@@ -25,6 +25,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
+
 use crate::parser::ONode;
 use crate::value::{BackendAuthority, GroupMode};
 
@@ -1041,8 +1043,88 @@ pub enum SpliceRenderer {
     Default,
 }
 
-/// Static metadata for one backend: the single source of truth for purity,
-/// splice rendering strategy, and shim filename hints.
+impl SpliceRenderer {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Html => "html",
+            Self::Latex => "latex",
+            Self::Markdown => "markdown",
+            Self::Nix => "nix",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// The concrete implementation boundary used after an operation has selected
+/// its high-level [`ExecutionMode`]. `Shim` means framed hosted execution; it
+/// does not by itself say whether the current Rust executable implements that
+/// backend or proxies a compatibility Python shim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAdapterKind {
+    /// Implemented entirely inside the evaluator; no backend process is used.
+    Inline,
+    /// Implemented by `src/backend.rs` inside the current Ostadix executable.
+    NativeRust,
+    /// Implemented by a Python compatibility shim reached through the Rust
+    /// backend proxy.
+    LegacyPythonShim,
+}
+
+impl BackendAdapterKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::NativeRust => "native-rust",
+            Self::LegacyPythonShim => "legacy-python-shim",
+        }
+    }
+}
+
+/// How precisely a backend-wide executable requirement describes every source
+/// body for that backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRequirementPrecision {
+    /// Exact for ordinary OIR dispatch through the backend's declared
+    /// `ExecutionMode`. Auxiliary/direct wire endpoints are outside this
+    /// backend-wide discovery projection.
+    Exact,
+    /// A safe backend-wide over-approximation. Operation-specific analysis may
+    /// later prove that a subset of these commands is sufficient.
+    ConservativeAllSources,
+}
+
+impl RuntimeRequirementPrecision {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::ConservativeAllSources => "conservative-all-sources",
+        }
+    }
+}
+
+/// One reusable executable requirement group. Alternatives are an ordered OR
+/// of ordered AND command sets: `[["dotnet"], ["mcs", "mono"]]` means
+/// `dotnet` OR (`mcs` AND `mono`). This is descriptive availability metadata;
+/// it does not grant authority or establish runtime health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeRequirementSpec {
+    pub key: &'static str,
+    pub builtin: bool,
+    pub precision: RuntimeRequirementPrecision,
+    pub alternatives: &'static [&'static [&'static str]],
+}
+
+const UNKNOWN_RUNTIME_REQUIREMENT: RuntimeRequirementSpec = RuntimeRequirementSpec {
+    key: "unknown-legacy-python-shim",
+    builtin: false,
+    precision: RuntimeRequirementPrecision::ConservativeAllSources,
+    alternatives: &[&["python3"]],
+};
+
+/// Static metadata for one backend: the single source of truth for aliases,
+/// purity, rendering, execution mode, authority, adapter ownership, and
+/// executable requirements.
 #[derive(Debug, Clone, Copy)]
 pub struct BackendSpec {
     /// Canonical backend name as it appears in a language tag.
@@ -1070,328 +1152,136 @@ pub struct BackendSpec {
     /// the Bash adapter must start `bash`, while Python evaluation itself does
     /// not require a child process.
     pub required_authorities: &'static [BackendAuthority],
+    /// Concrete adapter ownership. This refines `execution` without changing
+    /// the OIR-level execution contract.
+    pub adapter: BackendAdapterKind,
+    /// Key into the canonical runtime-requirement catalog.
+    pub runtime_requirement_key: &'static str,
 }
 
 impl BackendSpec {
-    const fn new(
-        name: &'static str,
-        aliases: &'static [&'static str],
-        pure: bool,
-        renderer: SpliceRenderer,
-        execution: ExecutionMode,
-    ) -> Self {
-        Self {
-            name,
-            aliases,
-            pure,
-            renderer,
-            execution,
-            required_authorities: &[],
-        }
-    }
-
-    const fn with_authority(
-        name: &'static str,
-        aliases: &'static [&'static str],
-        pure: bool,
-        renderer: SpliceRenderer,
-        execution: ExecutionMode,
-        required_authorities: &'static [BackendAuthority],
-    ) -> Self {
-        Self {
-            name,
-            aliases,
-            pure,
-            renderer,
-            execution,
-            required_authorities,
-        }
-    }
-
     fn matches(&self, lang: &str) -> bool {
         self.name == lang || self.aliases.contains(&lang)
     }
 }
 
-/// Centralized backend metadata table. Purity values reproduce the former
-/// PURE_BACKENDS list in eval.rs; renderer values reproduce the former
-/// render_child match arms. Backends not listed here fall back to
-/// `BackendRegistry::DEFAULT_SPEC` (impure, default renderer).
-const BACKEND_SPECS: &[BackendSpec] = &[
-    // Sequencing / host languages.
-    BackendSpec::new(
-        "O",
-        &["o"],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::InlineAst,
-    ),
-    BackendSpec::new(
-        "quote",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::InlineAst,
-    ),
-    // Nix family — shim-backed and NOT cache-safe under generic `{lazy}`.
-    // `nix` currently runs with impure evaluation and can observe
-    // filesystem/environment state that the `{lazy}` fingerprint does not
-    // capture; `nix_store`/`nixos_test` interact with external mutable
-    // stores, processes, networks, files, or VM state. Use `{defer}` for
-    // deferred non-cacheable evaluation.
-    BackendSpec::with_authority(
-        "nix",
-        &[],
-        false,
-        SpliceRenderer::Nix,
-        ExecutionMode::Shim,
-        &[
-            BackendAuthority::FileRead,
-            BackendAuthority::FileWrite,
-            BackendAuthority::Network,
-            BackendAuthority::Process,
-        ],
-    ),
-    // nix_expr captures an expression *value* deterministically without
-    // evaluating it — no shim runs, so capture is trivially cache-safe.
-    // Generic `{lazy}` and `{defer}` are rejected for it as redundant, so
-    // `pure: true` here is NOT a claim about arbitrary Nix evaluation. It
-    // splices via the default representation (its body is assembled before
-    // any Nix evaluation happens).
-    BackendSpec::new(
-        "nix_expr",
-        &[],
-        true,
-        SpliceRenderer::Default,
-        ExecutionMode::InlineValue,
-    ),
-    BackendSpec::with_authority(
-        "nix_store",
-        &[],
-        false,
-        SpliceRenderer::Nix,
-        ExecutionMode::Shim,
-        &[
-            BackendAuthority::FileRead,
-            BackendAuthority::FileWrite,
-            BackendAuthority::Network,
-            BackendAuthority::Process,
-        ],
-    ),
-    BackendSpec::with_authority(
-        "nixos_test",
-        &[],
-        false,
-        SpliceRenderer::Nix,
-        ExecutionMode::Shim,
-        &[
-            BackendAuthority::FileRead,
-            BackendAuthority::FileWrite,
-            BackendAuthority::Network,
-            BackendAuthority::Process,
-        ],
-    ),
-    // Cache-safe inline representation handlers: the runtime itself
-    // assembles the value deterministically from the block body and splices
-    // — no external process or hidden state is involved.
-    BackendSpec::new(
-        "html",
-        &[],
-        true,
-        SpliceRenderer::Html,
-        ExecutionMode::InlineValue,
-    ),
-    BackendSpec::new(
-        "markdown",
-        &["md"],
-        true,
-        SpliceRenderer::Markdown,
-        ExecutionMode::InlineValue,
-    ),
-    BackendSpec::new(
-        "latex",
-        &["tex"],
-        true,
-        SpliceRenderer::Latex,
-        ExecutionMode::InlineValue,
-    ),
-    BackendSpec::new(
-        "text",
-        &["plain"],
-        true,
-        SpliceRenderer::Default,
-        ExecutionMode::InlineValue,
-    ),
-    // SQL keeps a persistent SQLite connection per environment (see
-    // backends/sql_shim.py), so blocks can create and mutate state that the
-    // `{lazy}` fingerprint does not capture. It must stay impure until the
-    // database snapshot/revision participates in the request identity.
-    BackendSpec::new(
-        "sql",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-    ),
-    // Haskell/OCaml/WebAssembly blocks are arbitrary programs executed via
-    // unrestricted shims: they may perform I/O, read clocks/environment
-    // variables, use randomness, receive host capabilities (WASI), or
-    // mutate external state. The runtime does not enforce a closed,
-    // deterministic, fully fingerprinted execution environment, so they are
-    // not cache-safe under generic `{lazy}`; use `{defer}`.
-    BackendSpec::with_authority(
-        "haskell",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "ocaml",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "webassembly",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    // General-purpose, impure backends.
-    BackendSpec::new(
-        "python",
-        &["py"],
-        false,
-        SpliceRenderer::Python,
-        ExecutionMode::Shim,
-    ),
-    BackendSpec::with_authority(
-        "ubuntu_vm",
-        &["ubuntu"],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "bash",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "shell",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "rust",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "racket",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "csharp",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "c",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "cpp",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "lisp",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "common_lisp",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "ruby",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "matlab",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "mathematica",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "java",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-    BackendSpec::with_authority(
-        "javascript",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[BackendAuthority::FileWrite, BackendAuthority::Process],
-    ),
-];
+macro_rules! runtime_requirement_catalog {
+    (
+        $(
+            {
+                key: $key:literal,
+                builtin: $builtin:literal,
+                precision: $precision:ident,
+                alternatives: [$([$($command:literal),* $(,)?]),* $(,)?],
+            }
+        ),* $(,)?
+    ) => {
+        const RUNTIME_REQUIREMENT_SPECS: &[RuntimeRequirementSpec] = &[
+            $(
+                RuntimeRequirementSpec {
+                    key: $key,
+                    builtin: $builtin,
+                    precision: RuntimeRequirementPrecision::$precision,
+                    alternatives: &[$(&[$($command),*]),*],
+                },
+            )*
+        ];
+    };
+}
+
+macro_rules! backend_catalog_metadata {
+    (schema: $schema:literal $(,)?) => {
+        /// Domain separator for deterministic canonical backend-catalog digests.
+        pub const BACKEND_CATALOG_SCHEMA_V1: &str = $schema;
+    };
+}
+
+macro_rules! backend_catalog {
+    (
+        $(
+            {
+                name: $name:literal,
+                aliases: [$($alias:literal),* $(,)?],
+                pure: $pure:literal,
+                renderer: $renderer:ident,
+                execution: $execution:ident,
+                authorities: [$($authority:ident),* $(,)?],
+                adapter: $adapter:ident,
+                runtime: $runtime:literal,
+            }
+        ),* $(,)?
+    ) => {
+        const BACKEND_SPECS: &[BackendSpec] = &[
+            $(
+                BackendSpec {
+                    name: $name,
+                    aliases: &[$($alias),*],
+                    pure: $pure,
+                    renderer: SpliceRenderer::$renderer,
+                    execution: ExecutionMode::$execution,
+                    required_authorities: &[$(BackendAuthority::$authority),*],
+                    adapter: BackendAdapterKind::$adapter,
+                    runtime_requirement_key: $runtime,
+                },
+            )*
+        ];
+    };
+}
+
+// The included file is pure declarative data and is also embedded verbatim by
+// olangc so emitted runtime projects compile from the identical catalog.
+include!("backend_catalog.inc.rs");
+
+fn catalog_hash_field(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
+fn catalog_hash_count(hash: &mut Sha256, count: usize) {
+    hash.update((count as u64).to_be_bytes());
+}
+
+fn hash_runtime_requirement(hash: &mut Sha256, requirement: &RuntimeRequirementSpec) {
+    catalog_hash_field(hash, requirement.key.as_bytes());
+    catalog_hash_field(
+        hash,
+        if requirement.builtin {
+            b"builtin"
+        } else {
+            b"external"
+        },
+    );
+    catalog_hash_field(hash, requirement.precision.name().as_bytes());
+    catalog_hash_count(hash, requirement.alternatives.len());
+    for alternative in requirement.alternatives {
+        catalog_hash_count(hash, alternative.len());
+        for command in *alternative {
+            catalog_hash_field(hash, command.as_bytes());
+        }
+    }
+}
+
+fn hash_backend_spec(hash: &mut Sha256, spec: &BackendSpec, requirement: &RuntimeRequirementSpec) {
+    catalog_hash_field(hash, spec.name.as_bytes());
+    catalog_hash_count(hash, spec.aliases.len());
+    for alias in spec.aliases {
+        catalog_hash_field(hash, alias.as_bytes());
+    }
+    catalog_hash_field(hash, if spec.pure { b"pure" } else { b"impure" });
+    catalog_hash_field(hash, spec.renderer.label().as_bytes());
+    catalog_hash_field(hash, spec.execution.label().as_bytes());
+    catalog_hash_count(hash, spec.required_authorities.len());
+    for authority in spec.required_authorities {
+        catalog_hash_field(hash, authority.name().as_bytes());
+    }
+    catalog_hash_field(hash, spec.adapter.name().as_bytes());
+    catalog_hash_field(hash, spec.runtime_requirement_key.as_bytes());
+    hash_runtime_requirement(hash, requirement);
+}
+
+fn finish_catalog_hash(hash: Sha256) -> String {
+    hex::encode(hash.finalize())
+}
 
 /// Lookup table over `BackendSpec`s plus the centralized shim path
 /// resolution rule. Today the table is static; `BackendRegistry` is the
@@ -1404,19 +1294,21 @@ pub struct BackendRegistry {
 impl BackendRegistry {
     /// Fallback metadata for backends with no entry in the table:
     /// impure, conservative cross-language splice representation.
-    const DEFAULT_SPEC: BackendSpec = BackendSpec::with_authority(
-        "",
-        &[],
-        false,
-        SpliceRenderer::Default,
-        ExecutionMode::Shim,
-        &[
+    const DEFAULT_SPEC: BackendSpec = BackendSpec {
+        name: "",
+        aliases: &[],
+        pure: false,
+        renderer: SpliceRenderer::Default,
+        execution: ExecutionMode::Shim,
+        required_authorities: &[
             BackendAuthority::FileRead,
             BackendAuthority::FileWrite,
             BackendAuthority::Network,
             BackendAuthority::Process,
         ],
-    );
+        adapter: BackendAdapterKind::LegacyPythonShim,
+        runtime_requirement_key: "unknown-legacy-python-shim",
+    };
 
     /// The process-wide registry over the static spec table.
     pub fn global() -> &'static BackendRegistry {
@@ -1429,6 +1321,70 @@ impl BackendRegistry {
     /// Look up a backend by canonical name or alias.
     pub fn get(&self, lang: &str) -> Option<&BackendSpec> {
         self.specs.iter().find(|s| s.matches(lang))
+    }
+
+    /// Canonical backend specifications in their stable catalog order.
+    pub fn canonical_specs(&self) -> &'static [BackendSpec] {
+        self.specs
+    }
+
+    /// Reusable executable requirement groups in their stable discovery order.
+    pub fn runtime_requirement_specs(&self) -> &'static [RuntimeRequirementSpec] {
+        RUNTIME_REQUIREMENT_SPECS
+    }
+
+    /// Resolve descriptive executable requirements for a canonical name or
+    /// alias. Unknown tags retain the conservative legacy-Python fallback.
+    pub fn runtime_requirements_for(&self, lang: &str) -> &'static RuntimeRequirementSpec {
+        let key = self
+            .get(lang)
+            .map_or(Self::DEFAULT_SPEC.runtime_requirement_key, |spec| {
+                spec.runtime_requirement_key
+            });
+        RUNTIME_REQUIREMENT_SPECS
+            .iter()
+            .find(|requirement| requirement.key == key)
+            .unwrap_or(&UNKNOWN_RUNTIME_REQUIREMENT)
+    }
+
+    /// Concrete adapter ownership for a canonical name or alias. Unknown tags
+    /// remain conservative compatibility-shim backends.
+    pub fn adapter_for(&self, lang: &str) -> BackendAdapterKind {
+        self.get(lang)
+            .map_or(Self::DEFAULT_SPEC.adapter, |spec| spec.adapter)
+    }
+
+    /// Deterministic SHA-256 of the complete ordered canonical catalog. This
+    /// identifies descriptive metadata only; it is not runtime readiness or
+    /// execution authority.
+    pub fn catalog_sha256(&self) -> String {
+        static DIGEST: OnceLock<String> = OnceLock::new();
+        DIGEST
+            .get_or_init(|| {
+                let mut hash = Sha256::new();
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+                catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
+                for requirement in RUNTIME_REQUIREMENT_SPECS {
+                    hash_runtime_requirement(&mut hash, requirement);
+                }
+                catalog_hash_count(&mut hash, self.specs.len());
+                for spec in self.specs {
+                    let requirement = self.runtime_requirements_for(spec.name);
+                    hash_backend_spec(&mut hash, spec, requirement);
+                }
+                finish_catalog_hash(hash)
+            })
+            .clone()
+    }
+
+    /// Deterministic SHA-256 of one canonical backend specification and its
+    /// referenced runtime requirements. Aliases resolve to the same digest.
+    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
+        let spec = self.get(lang)?;
+        let mut hash = Sha256::new();
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+        hash_backend_spec(&mut hash, spec, self.runtime_requirements_for(spec.name));
+        Some(finish_catalog_hash(hash))
     }
 
     /// Resolve a language tag (canonical name or alias) to its canonical
@@ -1740,6 +1696,134 @@ mod tests {
         // Owned-tag convenience view agrees.
         let owned = reg.registered_backend_tags();
         assert_eq!(owned.len(), names.len());
+    }
+
+    #[test]
+    fn canonical_catalog_links_every_backend_to_one_runtime_requirement() {
+        let registry = BackendRegistry::global();
+        let requirements = registry.runtime_requirement_specs();
+        let requirement_keys = requirements
+            .iter()
+            .map(|requirement| requirement.key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(requirement_keys.len(), requirements.len());
+
+        let mut referenced = std::collections::BTreeSet::new();
+        assert_eq!(registry.canonical_specs().len(), 30);
+        for spec in registry.canonical_specs() {
+            assert!(
+                requirement_keys.contains(spec.runtime_requirement_key),
+                "backend {} references missing runtime requirement {}",
+                spec.name,
+                spec.runtime_requirement_key
+            );
+            referenced.insert(spec.runtime_requirement_key);
+            let requirement = registry.runtime_requirements_for(spec.name);
+            match spec.adapter {
+                BackendAdapterKind::Inline => {
+                    assert_ne!(spec.execution, ExecutionMode::Shim, "{}", spec.name);
+                    assert!(requirement.builtin, "{}", spec.name);
+                    assert!(requirement.alternatives.is_empty(), "{}", spec.name);
+                }
+                BackendAdapterKind::NativeRust => {
+                    if spec.execution == ExecutionMode::Shim {
+                        assert!(!requirement.builtin, "{}", spec.name);
+                    } else {
+                        assert_eq!(spec.name, "nix_expr");
+                        assert!(requirement.builtin, "{}", spec.name);
+                    }
+                }
+                BackendAdapterKind::LegacyPythonShim => {
+                    assert_eq!(spec.execution, ExecutionMode::Shim, "{}", spec.name);
+                    assert!(!requirement.builtin, "{}", spec.name);
+                    assert!(
+                        requirement
+                            .alternatives
+                            .iter()
+                            .any(|alternative| alternative.contains(&"python3")),
+                        "legacy Python adapter {} must declare python3",
+                        spec.name
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            referenced, requirement_keys,
+            "runtime requirement groups must not be orphaned"
+        );
+    }
+
+    #[test]
+    fn runtime_requirement_alternatives_preserve_or_of_and_semantics() {
+        let registry = BackendRegistry::global();
+        let rendered = |lang: &str| {
+            registry
+                .runtime_requirements_for(lang)
+                .alternatives
+                .iter()
+                .map(|alternative| alternative.join("+"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+
+        assert_eq!(rendered("java"), "javac+java");
+        assert_eq!(rendered("haskell"), "runghc|ghc");
+        assert_eq!(rendered("csharp"), "dotnet|mcs+mono");
+        assert_eq!(rendered("webassembly"), "wat2wasm+wasmtime|wat2wasm+wasmer");
+        assert_eq!(rendered("unregistered_backend"), "python3");
+        assert_eq!(
+            registry.runtime_requirements_for("webassembly").precision,
+            RuntimeRequirementPrecision::ConservativeAllSources
+        );
+    }
+
+    #[test]
+    fn catalog_adapter_projection_distinguishes_execution_implementations() {
+        let registry = BackendRegistry::global();
+        for lang in ["O", "quote", "html", "markdown", "latex", "text"] {
+            assert_eq!(
+                registry.adapter_for(lang),
+                BackendAdapterKind::Inline,
+                "{lang}"
+            );
+        }
+        for lang in ["python", "py", "nixos_test", "ubuntu_vm", "ubuntu"] {
+            assert_eq!(
+                registry.adapter_for(lang),
+                BackendAdapterKind::LegacyPythonShim,
+                "{lang}"
+            );
+        }
+        for lang in ["bash", "sql", "java", "webassembly", "common_lisp"] {
+            assert_eq!(
+                registry.adapter_for(lang),
+                BackendAdapterKind::NativeRust,
+                "{lang}"
+            );
+        }
+        assert_eq!(
+            registry.adapter_for("nix_expr"),
+            BackendAdapterKind::NativeRust
+        );
+        assert_eq!(
+            registry.adapter_for("unknown"),
+            BackendAdapterKind::LegacyPythonShim
+        );
+    }
+
+    #[test]
+    fn catalog_digests_are_stable_canonical_projections() {
+        let registry = BackendRegistry::global();
+        let catalog = registry.catalog_sha256();
+        assert_eq!(catalog.len(), 64);
+        assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(catalog, registry.catalog_sha256());
+
+        let python = registry.specification_sha256("python").unwrap();
+        assert_eq!(python, registry.specification_sha256("py").unwrap());
+        assert_ne!(python, registry.specification_sha256("bash").unwrap());
+        assert_eq!(python.len(), 64);
+        assert!(registry.specification_sha256("unknown").is_none());
     }
 
     #[test]

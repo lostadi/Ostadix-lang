@@ -2,9 +2,9 @@ use crate::effects::ResourceKey;
 use crate::hgraph::AdmissionFactKind;
 use crate::ir::PlanNodeId;
 
-pub const EVIDENCE_SCHEMA_V3: &str = "oexec.evidence/v3";
-pub const ADMISSION_SCHEMA_V3: &str = "oexec.admission/v3";
-pub const ANALYZER_ID_V3: &str = "ostadix-oir-evidence-compiler/v3";
+pub const EVIDENCE_SCHEMA_V4: &str = "oexec.evidence/v4";
+pub const ADMISSION_SCHEMA_V4: &str = "oexec.admission/v4";
+pub const ANALYZER_ID_V4: &str = "ostadix-oir-evidence-compiler/v4";
 
 /// Strength and origin of a pre-execution fact. Declaration order is not used
 /// as an authorization lattice; callers must use the explicit predicates.
@@ -318,6 +318,10 @@ pub struct BackendArtifactV1 {
 pub struct RuntimeBindingV1 {
     pub(crate) snapshot_kind: RuntimeSnapshotKindV1,
     pub(crate) backend_artifacts: Vec<BackendArtifactV1>,
+    /// Digest of the canonical backend specifications referenced by the
+    /// exact ExecutionPlan. This is catalog identity, not runtime discovery,
+    /// health, authorization, or execution-readiness evidence.
+    pub(crate) backend_catalog_projection_sha256: String,
     pub(crate) backend_set_sha256: String,
     pub(crate) environment_sha256: String,
     /// Descriptive digest of the ambient HostWorld process snapshot. This is
@@ -334,6 +338,10 @@ impl RuntimeBindingV1 {
         &self.backend_artifacts
     }
 
+    pub fn backend_catalog_projection_sha256(&self) -> &str {
+        &self.backend_catalog_projection_sha256
+    }
+
     pub fn backend_set_sha256(&self) -> &str {
         &self.backend_set_sha256
     }
@@ -348,13 +356,14 @@ impl RuntimeBindingV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidenceBindingsV1 {
+pub struct EvidenceBindingsV2 {
     /// Digest of the canonical lowered OIR text. The original source bytes are
     /// intentionally not claimed here because evaluator entry points may be
     /// handed an already-lowered `OIrProgram`.
     pub oir_sha256: String,
     pub plan_sha256: String,
     pub analyzed_graph_sha256: String,
+    pub backend_catalog_projection_sha256: String,
     pub backend_set_sha256: String,
     pub environment_sha256: String,
     pub ambient_world_sha256: String,
@@ -362,15 +371,15 @@ pub struct EvidenceBindingsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidenceBundleV3 {
+pub struct EvidenceBundleV4 {
     pub(crate) schema: &'static str,
     pub(crate) analyzer: &'static str,
-    pub(crate) bindings: EvidenceBindingsV1,
+    pub(crate) bindings: EvidenceBindingsV2,
     pub(crate) runtime: RuntimeBindingV1,
     pub(crate) nodes: Vec<NodeEvidence>,
 }
 
-impl EvidenceBundleV3 {
+impl EvidenceBundleV4 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
@@ -379,7 +388,7 @@ impl EvidenceBundleV3 {
         self.analyzer
     }
 
-    pub fn bindings(&self) -> &EvidenceBindingsV1 {
+    pub fn bindings(&self) -> &EvidenceBindingsV2 {
         &self.bindings
     }
 

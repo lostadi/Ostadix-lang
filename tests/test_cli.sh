@@ -261,7 +261,7 @@ EOF
         return
     fi
     for pattern in \
-        '^; ExecutionAdmission oexec\.admission/v3$' \
+        '^; ExecutionAdmission oexec\.admission/v4$' \
         '^binding lowered-oir-sha256=' \
         '^runtime-snapshot kind=inspection dispatch-context=inspection-only$' \
         '^; ScheduleRealizability oexec\.realizability/v1$' \

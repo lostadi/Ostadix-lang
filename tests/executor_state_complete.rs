@@ -5,18 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 struct RunOutcome {
     output: Output,
     files: BTreeMap<String, Vec<u8>>,
     workdir: tempfile::TempDir,
-}
-
-fn runtime_available(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 fn run_source(source: &str, executor: &str) -> RunOutcome {
@@ -126,7 +120,7 @@ fn assert_equivalent(serial: &RunOutcome, graph: &RunOutcome) {
 
 #[test]
 fn nested_earlier_effect_preserves_full_file_order() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"python^(
@@ -158,7 +152,7 @@ __oval_result__ = "B"
 
 #[test]
 fn bash_file_writes_preserve_exact_source_order() {
-    if !runtime_available("bash") {
+    if !support::require_runtime("bash") {
         return;
     }
     let source = r#"bash^(
@@ -183,7 +177,7 @@ printf '%s\n' B >> "\$O_TEST_WORKDIR/order-bash.txt"
 
 #[test]
 fn earlier_failure_prevents_later_irreversible_effect() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"python^(
@@ -208,7 +202,7 @@ __oval_result__ = "wrong"
 
 #[test]
 fn operation_stderr_order_matches_serial_bytes() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"python^(
@@ -240,7 +234,7 @@ __oval_result__ = "B"
 
 #[test]
 fn persistent_python_state_matches_serial() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"python[0]^(
@@ -267,7 +261,7 @@ __oval_result__ = counter
 
 #[test]
 fn persistent_environment_mutation_and_read_match_serial() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"python[0]^(
@@ -295,7 +289,7 @@ __oval_result__ = os.environ["O_STATE_COMPLETE_TEST"]
 
 #[test]
 fn persistent_sql_state_matches_serial() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let source = r#"sql[0]^(
@@ -323,7 +317,7 @@ SELECT value FROM values_table;
 /// sqlite3 session across blocks so a later `sql[0]` block still sees `t.*`.
 #[test]
 fn persistent_sql_attach_survives_across_blocks() {
-    if !runtime_available("python3") || !runtime_available("sqlite3") {
+    if !support::require_runtimes(&["python3", "sqlite3"]) {
         return;
     }
     let source = r#"
@@ -366,7 +360,7 @@ SELECT addr FROM t.insns
 
 #[test]
 fn ephemeral_evaluators_and_coordination_modes_match_serial() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let cases = [
@@ -391,7 +385,7 @@ fn ephemeral_evaluators_and_coordination_modes_match_serial() {
 
 #[test]
 fn deferred_group_member_failures_match_serial() {
-    if !runtime_available("python3") {
+    if !support::require_runtime("python3") {
         return;
     }
     let cases = [
