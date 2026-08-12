@@ -13,6 +13,8 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -108,6 +110,318 @@ fn resolve_olangc(root: &Path) -> PathBuf {
         return release;
     }
     which::which("olangc").unwrap_or_else(|_| PathBuf::from("olangc"))
+}
+
+fn append_existing_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if candidate.is_dir() && !paths.contains(&candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn append_path_list(paths: &mut Vec<PathBuf>, encoded: Option<&OsStr>) {
+    let Some(encoded) = encoded else {
+        return;
+    };
+    for candidate in std::env::split_paths(encoded) {
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+}
+
+/// Preserve the client's PATH, then append local runtime locations commonly
+/// omitted by GUI/MCP launchers. Appending rather than prepending ensures this
+/// discovery fallback never silently replaces an explicitly selected runtime.
+fn runtime_search_path_from(
+    root: &Path,
+    home: &Path,
+    inherited: Option<&OsStr>,
+    explicit_extra: Option<&OsStr>,
+) -> OsString {
+    let mut paths = Vec::new();
+    append_path_list(&mut paths, inherited);
+    append_path_list(&mut paths, explicit_extra);
+
+    for candidate in [
+        root.join("target/release"),
+        home.join(".local/bin"),
+        home.join(".cargo/bin"),
+        home.join(".nix-profile/bin"),
+        home.join(".volta/bin"),
+        home.join(".pyenv/shims"),
+        home.join(".rbenv/shims"),
+        home.join(".asdf/shims"),
+        home.join(".local/share/mise/shims"),
+        home.join(".ghcup/bin"),
+        home.join(".cabal/bin"),
+        home.join(".opam/default/bin"),
+        home.join(".dotnet/tools"),
+        home.join("miniforge3/bin"),
+        home.join("miniconda3/bin"),
+        home.join("anaconda3/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/nix/var/nix/profiles/default/bin"),
+        PathBuf::from("/Library/Frameworks/Mono.framework/Versions/Current/Commands"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
+    ] {
+        append_existing_path(&mut paths, candidate);
+    }
+
+    std::env::join_paths(&paths).unwrap_or_else(|_| inherited.unwrap_or_default().to_os_string())
+}
+
+fn append_environment_runtime_paths(paths: &mut Vec<PathBuf>) {
+    for variable in ["NVM_BIN", "PNPM_HOME"] {
+        if let Some(path) = std::env::var_os(variable) {
+            append_existing_path(paths, PathBuf::from(path));
+        }
+    }
+    for variable in [
+        "CONDA_PREFIX",
+        "VIRTUAL_ENV",
+        "JAVA_HOME",
+        "OPAM_SWITCH_PREFIX",
+        "CARGO_HOME",
+        "VOLTA_HOME",
+        "GEM_HOME",
+    ] {
+        if let Some(prefix) = std::env::var_os(variable) {
+            append_existing_path(paths, PathBuf::from(prefix).join("bin"));
+        }
+    }
+    for variable in ["PYENV_ROOT", "RBENV_ROOT"] {
+        if let Some(prefix) = std::env::var_os(variable) {
+            append_existing_path(paths, PathBuf::from(prefix).join("shims"));
+        }
+    }
+    if let Some(root) = std::env::var_os("DOTNET_ROOT") {
+        append_existing_path(paths, PathBuf::from(root));
+    }
+}
+
+fn runtime_search_path(root: &Path) -> OsString {
+    let inherited = std::env::var_os("PATH");
+    let explicit_extra = std::env::var_os("OSTADIX_RUNTIME_PATH");
+    let base = runtime_search_path_from(
+        root,
+        &home_dir(),
+        inherited.as_deref(),
+        explicit_extra.as_deref(),
+    );
+    let mut paths = std::env::split_paths(&base).collect::<Vec<_>>();
+    append_environment_runtime_paths(&mut paths);
+    std::env::join_paths(&paths).unwrap_or(base)
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeSpec {
+    backends: &'static [&'static str],
+    alternatives: &'static [&'static [&'static str]],
+}
+
+const BUILTIN_BACKENDS: &[&str] = &[
+    "O", "quote", "nix_expr", "html", "markdown", "latex", "text",
+];
+
+/// Descriptive runtime requirements for every non-builtin canonical backend
+/// in `src/ir.rs::BACKEND_SPECS`. This inventory does not authorize execution;
+/// the selected backend adapter still validates and launches the actual tool.
+const RUNTIME_SPECS: &[RuntimeSpec] = &[
+    RuntimeSpec {
+        backends: &["python"],
+        alternatives: &[&["python3"]],
+    },
+    RuntimeSpec {
+        backends: &["bash"],
+        alternatives: &[&["bash"]],
+    },
+    RuntimeSpec {
+        backends: &["shell"],
+        alternatives: &[&["sh"]],
+    },
+    RuntimeSpec {
+        backends: &["javascript"],
+        alternatives: &[&["node"]],
+    },
+    RuntimeSpec {
+        backends: &["ruby"],
+        alternatives: &[&["ruby"]],
+    },
+    RuntimeSpec {
+        backends: &["rust"],
+        alternatives: &[&["rustc"]],
+    },
+    RuntimeSpec {
+        backends: &["c"],
+        alternatives: &[&["cc"]],
+    },
+    RuntimeSpec {
+        backends: &["cpp"],
+        alternatives: &[&["g++"]],
+    },
+    RuntimeSpec {
+        backends: &["java"],
+        alternatives: &[&["javac", "java"]],
+    },
+    RuntimeSpec {
+        backends: &["nix", "nix_store"],
+        alternatives: &[&["nix"]],
+    },
+    RuntimeSpec {
+        backends: &["nixos_test"],
+        alternatives: &[&["python3", "nix"]],
+    },
+    RuntimeSpec {
+        backends: &["sql"],
+        alternatives: &[&["sqlite3"]],
+    },
+    RuntimeSpec {
+        backends: &["haskell"],
+        alternatives: &[&["runghc"], &["ghc"]],
+    },
+    RuntimeSpec {
+        backends: &["ocaml"],
+        alternatives: &[&["ocaml"], &["ocamlopt"], &["ocamlc"]],
+    },
+    RuntimeSpec {
+        backends: &["racket"],
+        alternatives: &[&["racket"]],
+    },
+    RuntimeSpec {
+        backends: &["lisp", "common_lisp"],
+        alternatives: &[&["sbcl"], &["clisp"]],
+    },
+    RuntimeSpec {
+        backends: &["csharp"],
+        alternatives: &[&["dotnet"], &["mcs", "mono"]],
+    },
+    RuntimeSpec {
+        backends: &["matlab"],
+        alternatives: &[&["octave"], &["matlab"]],
+    },
+    RuntimeSpec {
+        backends: &["mathematica"],
+        alternatives: &[&["wolframscript"]],
+    },
+    RuntimeSpec {
+        backends: &["webassembly"],
+        alternatives: &[&["wat2wasm", "wasmtime"], &["wat2wasm", "wasmer"]],
+    },
+    RuntimeSpec {
+        backends: &["ubuntu_vm"],
+        alternatives: &[&["python3", "multipass"]],
+    },
+];
+
+struct RuntimeDiscovery {
+    search_path: OsString,
+    lines: Vec<String>,
+    backend_count: usize,
+    builtin_backends: usize,
+    ready_backends: usize,
+    missing_backends: usize,
+}
+
+impl RuntimeDiscovery {
+    fn summary(&self) -> String {
+        format!(
+            "runtime-summary backend-count={} builtin-backends={} ready-backends={} missing-backends={}",
+            self.backend_count,
+            self.builtin_backends,
+            self.ready_backends,
+            self.missing_backends
+        )
+    }
+
+    fn to_text(&self) -> String {
+        let mut out = format!(
+            "runtime-search-path={}\n{}\n",
+            self.search_path.to_string_lossy(),
+            self.summary()
+        );
+        for line in &self.lines {
+            writeln!(out, "{line}").expect("writing to a String cannot fail");
+        }
+        out.push_str(
+            "runtime-note discovery is descriptive; missing optional runtimes do not block unrelated backends\n",
+        );
+        out
+    }
+}
+
+fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
+    let search_path = runtime_search_path(root);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let mut lines = vec![format!(
+        "runtime backends={} status=builtin selected=ostadix-runtime",
+        BUILTIN_BACKENDS.join(",")
+    )];
+    let mut ready_backends = 0;
+    let mut missing_backends = 0;
+
+    for spec in RUNTIME_SPECS {
+        let selected = spec.alternatives.iter().find_map(|alternative| {
+            let resolved = alternative
+                .iter()
+                .map(|command| {
+                    which::which_in(command, Some(&search_path), &cwd)
+                        .ok()
+                        .map(|path| (*command, path))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(resolved)
+        });
+        let backend_names = spec.backends.join(",");
+        match selected {
+            Some(resolved) => {
+                ready_backends += spec.backends.len();
+                let commands = resolved
+                    .iter()
+                    .map(|(command, _)| *command)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                let paths = resolved
+                    .iter()
+                    .map(|(command, path)| format!("{command}={}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                lines.push(format!(
+                    "runtime backends={backend_names} status=ready selected={commands} paths=[{paths}]"
+                ));
+            }
+            None => {
+                missing_backends += spec.backends.len();
+                let alternatives = spec
+                    .alternatives
+                    .iter()
+                    .map(|alternative| alternative.join("+"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                lines.push(format!(
+                    "runtime backends={backend_names} status=missing alternatives=[{alternatives}]"
+                ));
+            }
+        }
+    }
+
+    RuntimeDiscovery {
+        search_path,
+        lines,
+        backend_count: BUILTIN_BACKENDS.len()
+            + RUNTIME_SPECS
+                .iter()
+                .map(|spec| spec.backends.len())
+                .sum::<usize>(),
+        builtin_backends: BUILTIN_BACKENDS.len(),
+        ready_backends,
+        missing_backends,
+    }
 }
 
 fn text_ok(s: impl Into<String>) -> Result<CallToolResult, McpError> {
@@ -279,14 +593,22 @@ fn format_run(code: i32, stdout: &str, stderr: &str) -> String {
     s
 }
 
+// Empty args for zero-parameter tools — emits `type: object` so strict MCP
+// clients (OpenCode, TS SDK) accept tools/list instead of rejecting `{}`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(description = "No parameters")]
+struct EmptyArgs {}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunOArgs {
     #[schemars(
         description = "Path to a .O program (absolute paths default cwd to their parent; relative paths use cwd/O_LANG_ROOT)"
     )]
     path: String,
+    #[serde(default)]
     #[schemars(description = "Optional working directory (relative paths use O_LANG_ROOT)")]
     cwd: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Timeout seconds (default 120)")]
     timeout_secs: Option<u64>,
 }
@@ -295,12 +617,15 @@ struct RunOArgs {
 struct OlangcArgs {
     #[schemars(description = "Path to a .O program (relative paths use O_LANG_ROOT)")]
     path: String,
+    #[serde(default)]
     #[schemars(
         description = "olangc target: ir | dot | script | wasm | or omit for default AOT analysis"
     )]
     target: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Optional -o output path (relative paths use O_LANG_ROOT)")]
     output: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Timeout seconds (default 180)")]
     timeout_secs: Option<u64>,
 }
@@ -311,8 +636,10 @@ struct SearchRunArgs {
         description = "Search tool name without .O, e.g. sptm_retype_catalog, nscramble_mine, lab_pipeline"
     )]
     name: String,
+    #[serde(default)]
     #[schemars(description = "a18re work root (default A18_WORK or ~/a18re)")]
     work: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Timeout seconds (default 300)")]
     timeout_secs: Option<u64>,
 }
@@ -322,7 +649,10 @@ impl OstadixMcp {
     #[tool(
         description = "Report O-lang / Ostadix-lang environment: O_LANG_ROOT, backends, O/olangc paths, shim presence"
     )]
-    async fn o_env(&self) -> Result<CallToolResult, McpError> {
+    async fn o_env(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
@@ -343,7 +673,10 @@ impl OstadixMcp {
     #[tool(
         description = "Smoke-test O toolchain: run examples/hello.O (expect 2) with correct backends path"
     )]
-    async fn o_smoke(&self) -> Result<CallToolResult, McpError> {
+    async fn o_smoke(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
@@ -488,7 +821,10 @@ impl OstadixMcp {
     #[tool(
         description = "Toolchain doctor: check O, olangc, backends, python_shim, and optional a18re search/o-run"
     )]
-    async fn o_doctor(&self) -> Result<CallToolResult, McpError> {
+    async fn o_doctor(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let root = resolve_lang_root();
         let backends = resolve_backends(&root);
         let o_bin = resolve_o_bin(&root);
