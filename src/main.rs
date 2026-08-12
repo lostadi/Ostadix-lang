@@ -24,10 +24,20 @@ fn main() -> Result<()> {
     let mut check_only = false;
     let mut eval_source: Option<String> = None;
     let mut local_workers = None;
+    let mut required_source_sha256: Option<String> = None;
+    let mut required_execution_intent_sha256: Option<String> = None;
     while args.front().is_some_and(|arg| {
         matches!(
             arg.as_str(),
-            "--backend-grant" | "--executor" | "--workers" | "--json" | "--check" | "--eval" | "-e"
+            "--backend-grant"
+                | "--executor"
+                | "--workers"
+                | "--json"
+                | "--check"
+                | "--eval"
+                | "-e"
+                | "--require-source-sha256"
+                | "--require-execution-intent-sha256"
         )
     }) {
         match args.pop_front().unwrap().as_str() {
@@ -65,7 +75,52 @@ fn main() -> Result<()> {
                 }
                 local_workers = Some(workers);
             }
+            "--require-source-sha256" => {
+                if required_source_sha256.is_some() {
+                    bail!("--require-source-sha256 may be supplied only once");
+                }
+                required_source_sha256 = Some(
+                    args.pop_front()
+                        .context("--require-source-sha256 requires a SHA-256 digest")?,
+                );
+            }
+            "--require-execution-intent-sha256" => {
+                if required_execution_intent_sha256.is_some() {
+                    bail!("--require-execution-intent-sha256 may be supplied only once");
+                }
+                required_execution_intent_sha256 = Some(
+                    args.pop_front()
+                        .context("--require-execution-intent-sha256 requires a SHA-256 digest")?,
+                );
+            }
             _ => unreachable!(),
+        }
+    }
+
+    let required_execution_intent = match (
+        required_source_sha256.as_deref(),
+        required_execution_intent_sha256.as_deref(),
+    ) {
+        (Some(source), Some(intent)) => Some((source, intent)),
+        (Some(_), None) | (None, Some(_)) => bail!(
+            "--require-source-sha256 and --require-execution-intent-sha256 must be supplied together"
+        ),
+        (None, None) => None,
+    };
+    if required_execution_intent.is_some() {
+        if eval_source.is_some()
+            || check_only
+            || matches!(
+                args.front().map(String::as_str),
+                None | Some("--repl") | Some("-i")
+            )
+        {
+            bail!("required execution-intent gating accepts a .O input file only");
+        }
+        if !backend_grants.is_empty() {
+            bail!(
+                "required execution-intent gating does not accept --backend-grant because caller-owned initial authority is outside execution-intent/v1"
+            );
         }
     }
 
@@ -109,6 +164,9 @@ fn main() -> Result<()> {
             (path, text)
         }
     };
+    let source_sha256 = required_execution_intent
+        .is_some()
+        .then(|| o_lang::evidence::source_sha256(source.as_bytes()));
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.pop_front().map(PathBuf::from))?;
     if let Some(extra) = args.pop_front() {
         print_usage(&mut io::stderr())?;
@@ -149,7 +207,20 @@ fn main() -> Result<()> {
     for grant in &backend_grants {
         evaluator.install_backend_grant(grant, &mut scope)?;
     }
-    let result = match evaluator.eval_document_with_scope(nodes, &mut scope) {
+    let evaluation = match required_execution_intent {
+        Some((expected_source_sha256, expected_execution_intent_sha256)) => evaluator
+            .eval_document_with_scope_requiring_execution_intent(
+                nodes,
+                &mut scope,
+                source_sha256
+                    .as_deref()
+                    .expect("required intent pair computes the source digest"),
+                expected_source_sha256,
+                expected_execution_intent_sha256,
+            ),
+        None => evaluator.eval_document_with_scope(nodes, &mut scope),
+    };
+    let result = match evaluation {
         Ok(result) => result,
         Err(e) => return fail_stage(json_output, "eval", e),
     };
@@ -224,6 +295,10 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  O --workers N <input.O> [backends_dir]        # override graph local-worker pool capacity"
+    )?;
+    writeln!(
+        out,
+        "  O --require-source-sha256 HEX --require-execution-intent-sha256 HEX <input.O> [backends_dir]"
     )?;
     writeln!(out, "  O --help")?;
     writeln!(out)?;

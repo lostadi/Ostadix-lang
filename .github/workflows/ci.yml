@@ -15,6 +15,10 @@ jobs:
   rust:
     name: Rust authoritative runtime
     runs-on: ubuntu-latest
+    env:
+      # Hosted-runtime integration gates must fail, rather than silently return,
+      # when a prerequisite promised by this release-evidence lane is absent.
+      OSTADIX_TEST_RUNTIME_POLICY: required
     steps:
       - name: Start Rust lane duration clock
         run: |
@@ -25,6 +29,22 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify required hosted evidence runtimes
+        run: |
+          set -euo pipefail
+          for runtime in python3 bash sqlite3; do
+            executable="$(command -v "$runtime")" || {
+              echo "runtime-evidence status=missing-required policy=required runtime=$runtime" >&2
+              exit 1
+            }
+            version="$("$executable" --version 2>&1)" || {
+              echo "runtime-evidence status=not-invocable policy=required runtime=$runtime path=$executable" >&2
+              exit 1
+            }
+            first_line="${version%%$'\n'*}"
+            echo "runtime-evidence status=invocable policy=required runtime=$runtime path=$executable version=$first_line"
+          done
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -52,6 +72,7 @@ jobs:
             ordinary_ephemeral_python_preserves_strict_fail_stop \
             explicit_one_worker_override_serializes_autonomous_blocks \
             explicit_autonomous_ephemeral_python_blocks_overlap \
+            autonomous_worker_pool_refills_24_tasks_without_exceeding_capacity \
             autonomous_worker_o_eval_sees_lexical_scope \
             autonomous_worker_o_eval_failure_terminates_backend \
             autonomous_worker_nested_hosted_callback_inherits_deadline \

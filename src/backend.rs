@@ -12,10 +12,35 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::BigInt;
 use serde_json::Value;
 
+use crate::ir::{BackendAdapterKind, BackendRegistry};
 use crate::value::{FloatFormat, ONumber, OValue, OWireCommand, OWireResponse};
 use crate::wire;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+const NATIVE_BACKEND_HANDLERS: &[&str] = &[
+    "bash",
+    "shell",
+    "javascript",
+    "ruby",
+    "rust",
+    "c",
+    "cpp",
+    "java",
+    "nix",
+    "nix_expr",
+    "nix_store",
+    "sql",
+    "haskell",
+    "ocaml",
+    "racket",
+    "lisp",
+    "common_lisp",
+    "csharp",
+    "matlab",
+    "mathematica",
+    "webassembly",
+];
 
 pub fn run_backend_from_env_args() -> Result<bool> {
     let mut args = std::env::args();
@@ -36,30 +61,7 @@ pub fn run_backend_from_env_args() -> Result<bool> {
 }
 
 pub fn has_native_backend(lang: &str) -> bool {
-    matches!(
-        lang,
-        "bash"
-            | "shell"
-            | "javascript"
-            | "ruby"
-            | "rust"
-            | "c"
-            | "cpp"
-            | "java"
-            | "nix"
-            | "nix_expr"
-            | "nix_store"
-            | "sql"
-            | "haskell"
-            | "ocaml"
-            | "racket"
-            | "lisp"
-            | "common_lisp"
-            | "csharp"
-            | "matlab"
-            | "mathematica"
-            | "webassembly"
-    )
+    BackendRegistry::global().adapter_for(lang) == BackendAdapterKind::NativeRust
 }
 
 pub fn run_backend(lang: &str) -> Result<()> {
@@ -1242,5 +1244,45 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_native_backend;
+
+    #[test]
+    fn native_backend_dispatch_is_projected_from_the_canonical_catalog() {
+        let catalog_native = crate::ir::BackendRegistry::global()
+            .canonical_specs()
+            .iter()
+            .filter(|spec| spec.adapter == crate::ir::BackendAdapterKind::NativeRust)
+            .map(|spec| spec.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let implemented = super::NATIVE_BACKEND_HANDLERS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(catalog_native, implemented);
+
+        for backend in super::NATIVE_BACKEND_HANDLERS {
+            assert!(has_native_backend(backend), "{backend}");
+        }
+
+        for backend in [
+            "O",
+            "quote",
+            "html",
+            "markdown",
+            "latex",
+            "text",
+            "python",
+            "py",
+            "nixos_test",
+            "ubuntu_vm",
+            "unknown",
+        ] {
+            assert!(!has_native_backend(backend), "{backend}");
+        }
     }
 }

@@ -419,6 +419,13 @@ def py_to_oval(x):
     if isinstance(x, list):
         return {"t": "list", "v": [py_to_oval(i) for i in x]}
 
+    if isinstance(x, (set, frozenset)):
+        return {
+            "t": "set",
+            "kind": "unordered",
+            "items": [py_to_oval(i) for i in x],
+        }
+
     if isinstance(x, dict):
         if all(isinstance(k, str) for k in x):
             return {"t": "map", "v": {k: py_to_oval(v) for k, v in x.items()}}
@@ -427,7 +434,14 @@ def py_to_oval(x):
             "entries": [[py_to_oval(k), py_to_oval(v)] for k, v in x.items()],
         }
 
-    return {"t": "str", "v": str(x)}
+    # Never turn an unknown Python object into apparently lossless O text.
+    # A native capsule would need an explicit codec, lifetime, identity, and
+    # rehydration contract. Until such a contract exists, this crossing is
+    # unsupported and must fail visibly rather than erase those semantics.
+    raise TypeError(
+        "unsupported Python value for OValue projection: "
+        f"{type(x).__module__}.{type(x).__qualname__}"
+    )
 
 def send_ok(value=None):
     write_wire_message({"status": "ok", "value": py_to_oval(value)}, _real_stdout.buffer)

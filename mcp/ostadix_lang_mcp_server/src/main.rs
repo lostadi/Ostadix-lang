@@ -13,25 +13,241 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+const INTENT_SCHEMA_V1: &str = "oexec.execution-intent/v1";
+const DEFAULT_INTENT_TTL_SECS: u64 = 120;
+const MAX_INTENT_TTL_SECS: u64 = 900;
+const MAX_INTENT_OPERATION_TIMEOUT_SECS: u64 = 900;
+const MAX_LIVE_INTENTS: usize = 64;
 
 #[derive(Clone)]
 struct OstadixMcp {
     tool_router: ToolRouter<Self>,
+    runtime_search: RuntimeSearchPath,
+    intents: Arc<Mutex<IntentStore>>,
 }
 
 impl OstadixMcp {
-    fn new() -> Self {
+    fn new(runtime_search: RuntimeSearchPath) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            runtime_search,
+            intents: Arc::new(Mutex::new(IntentStore::default())),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct IntentLease {
+    program: PathBuf,
+    cwd: PathBuf,
+    root: PathBuf,
+    backends: PathBuf,
+    source_sha256: String,
+    execution_intent_sha256: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct IntentStore {
+    leases: BTreeMap<String, IntentLease>,
+    reservations: BTreeSet<String>,
+}
+
+impl IntentStore {
+    fn prune_expired(&mut self, now: Instant) {
+        self.leases.retain(|_, lease| lease.expires_at > now);
+    }
+
+    fn reserve(&mut self, handle: String, now: Instant) -> Result<(), String> {
+        self.prune_expired(now);
+        if self.leases.len() + self.reservations.len() >= MAX_LIVE_INTENTS {
+            return Err(format!(
+                "execution-intent store is full (maximum {MAX_LIVE_INTENTS} live or in-progress handles)"
+            ));
+        }
+        if self.leases.contains_key(&handle) || self.reservations.contains(&handle) {
+            return Err("execution-intent handle collision".to_string());
+        }
+        self.reservations.insert(handle);
+        Ok(())
+    }
+
+    fn cancel_reservation(&mut self, handle: &str) {
+        self.reservations.remove(handle);
+    }
+
+    fn insert_reserved(&mut self, handle: String, lease: IntentLease) -> Result<(), String> {
+        if !self.reservations.remove(&handle) {
+            return Err("execution-intent reservation expired or was not established".to_string());
+        }
+        if self.leases.contains_key(&handle) {
+            return Err("execution-intent handle collision".to_string());
+        }
+        self.leases.insert(handle, lease);
+        Ok(())
+    }
+
+    /// Atomically consume a handle before target validation or dispatch. A
+    /// failed execution attempt cannot replay the same bearer handle.
+    fn take(&mut self, handle: &str, now: Instant) -> Result<IntentLease, String> {
+        let lease = self
+            .leases
+            .remove(handle)
+            .ok_or_else(|| "unknown or already-consumed execution-intent handle".to_string())?;
+        if lease.expires_at <= now {
+            return Err("execution-intent handle expired".to_string());
+        }
+        Ok(lease)
+    }
+}
+
+/// Cancellation-safe reservation for one expensive intent analysis. The store
+/// uses a standard mutex because every critical section is in-memory and
+/// nonblocking; this lets Drop release a reservation even if an async MCP call
+/// is cancelled while `olangc` is running.
+struct IntentReservation {
+    store: Arc<Mutex<IntentStore>>,
+    handle: String,
+    active: bool,
+}
+
+impl IntentReservation {
+    fn acquire(
+        store: Arc<Mutex<IntentStore>>,
+        handle: String,
+        now: Instant,
+    ) -> Result<Self, String> {
+        store
+            .lock()
+            .map_err(|_| "execution-intent store lock is poisoned".to_string())?
+            .reserve(handle.clone(), now)?;
+        Ok(Self {
+            store,
+            handle,
+            active: true,
+        })
+    }
+
+    fn commit(mut self, lease: IntentLease) -> Result<(), String> {
+        self.store
+            .lock()
+            .map_err(|_| "execution-intent store lock is poisoned".to_string())?
+            .insert_reserved(self.handle.clone(), lease)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for IntentReservation {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut store) = self.store.lock() {
+                store.cancel_reservation(&self.handle);
+            }
+        }
+    }
+}
+
+fn random_intent_handle() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    fill_handle_entropy(&mut bytes)?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
+}
+
+#[cfg(unix)]
+fn fill_handle_entropy(bytes: &mut [u8]) -> Result<(), String> {
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(bytes))
+        .map_err(|error| format!("obtain handle entropy from /dev/urandom: {error}"))
+}
+
+#[cfg(not(unix))]
+fn fill_handle_entropy(_bytes: &mut [u8]) -> Result<(), String> {
+    Err(
+        "execution-intent handles require an operating-system entropy source on this platform"
+            .to_string(),
+    )
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutionIntentDocument {
+    schema: String,
+    source_sha256: String,
+    execution_intent_sha256: String,
+}
+
+fn parse_execution_intent(stdout: &str) -> Result<ExecutionIntentDocument, String> {
+    let document: ExecutionIntentDocument = serde_json::from_str(stdout)
+        .map_err(|error| format!("olangc returned invalid execution-intent JSON: {error}"))?;
+    if document.schema != INTENT_SCHEMA_V1 {
+        return Err(format!(
+            "olangc returned unsupported execution-intent schema {:?}",
+            document.schema
+        ));
+    }
+    if !is_sha256(&document.source_sha256) || !is_sha256(&document.execution_intent_sha256) {
+        return Err("olangc returned a malformed execution-intent digest".to_string());
+    }
+    Ok(document)
+}
+
+fn validate_intent_target(
+    lease: &IntentLease,
+    program: &Path,
+    cwd: &Path,
+    root: &Path,
+    backends: &Path,
+) -> Result<(), String> {
+    if lease.program != program {
+        return Err(format!(
+            "execution-intent program mismatch: analyzed={} requested={}",
+            lease.program.display(),
+            program.display()
+        ));
+    }
+    if lease.cwd != cwd {
+        return Err(format!(
+            "execution-intent cwd mismatch: analyzed={} requested={}",
+            lease.cwd.display(),
+            cwd.display()
+        ));
+    }
+    if lease.root != root {
+        return Err(format!(
+            "execution-intent root mismatch: analyzed={} current={}",
+            lease.root.display(),
+            root.display()
+        ));
+    }
+    if lease.backends != backends {
+        return Err(format!(
+            "execution-intent backends mismatch: analyzed={} current={}",
+            lease.backends.display(),
+            backends.display()
+        ));
+    }
+    Ok(())
 }
 
 fn home_dir() -> PathBuf {
@@ -112,83 +328,223 @@ fn resolve_olangc(root: &Path) -> PathBuf {
     which::which("olangc").unwrap_or_else(|_| PathBuf::from("olangc"))
 }
 
-fn append_existing_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if candidate.is_dir() && !paths.contains(&candidate) {
-        paths.push(candidate);
+const RUNTIME_PATH_MODE_ENV: &str = "OSTADIX_RUNTIME_PATH_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimePathMode {
+    InheritedOnly,
+    InheritedPlusExplicit,
+    DiscoverLocal,
+}
+
+impl RuntimePathMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::InheritedOnly => "inherited-only",
+            Self::InheritedPlusExplicit => "inherited-plus-explicit",
+            Self::DiscoverLocal => "discover-local",
+        }
     }
 }
 
-fn append_path_list(paths: &mut Vec<PathBuf>, encoded: Option<&OsStr>) {
+impl FromStr for RuntimePathMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "inherited-only" => Ok(Self::InheritedOnly),
+            "inherited-plus-explicit" => Ok(Self::InheritedPlusExplicit),
+            "discover-local" => Ok(Self::DiscoverLocal),
+            _ => anyhow::bail!(
+                "invalid {RUNTIME_PATH_MODE_ENV}={value:?}; expected inherited-only, inherited-plus-explicit, or discover-local"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimePathEntry {
+    directory: PathBuf,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSearchPath {
+    mode: RuntimePathMode,
+    entries: Vec<RuntimePathEntry>,
+    encoded: OsString,
+}
+
+impl RuntimeSearchPath {
+    fn new(mode: RuntimePathMode, entries: Vec<RuntimePathEntry>) -> anyhow::Result<Self> {
+        let encoded = std::env::join_paths(entries.iter().map(|entry| &entry.directory))
+            .map_err(|error| anyhow::anyhow!("cannot encode runtime search PATH: {error}"))?;
+        Ok(Self {
+            mode,
+            entries,
+            encoded,
+        })
+    }
+
+    fn source_for_executable(&self, executable: &Path) -> &str {
+        let parent = executable.parent();
+        self.entries
+            .iter()
+            .find(|entry| {
+                parent == Some(entry.directory.as_path())
+                    || parent
+                        .and_then(|path| path.canonicalize().ok())
+                        .zip(entry.directory.canonicalize().ok())
+                        .is_some_and(|(left, right)| left == right)
+            })
+            .map_or("untracked", |entry| entry.source.as_str())
+    }
+}
+
+fn append_runtime_path(
+    entries: &mut Vec<RuntimePathEntry>,
+    candidate: PathBuf,
+    source: impl Into<String>,
+) {
+    if !entries.iter().any(|entry| entry.directory == candidate) {
+        entries.push(RuntimePathEntry {
+            directory: candidate,
+            source: source.into(),
+        });
+    }
+}
+
+fn append_existing_runtime_path(
+    entries: &mut Vec<RuntimePathEntry>,
+    candidate: PathBuf,
+    source: impl Into<String>,
+) {
+    if candidate.is_dir() {
+        append_runtime_path(entries, candidate, source);
+    }
+}
+
+fn append_path_list(entries: &mut Vec<RuntimePathEntry>, encoded: Option<&OsStr>, source: &str) {
     let Some(encoded) = encoded else {
         return;
     };
-    for candidate in std::env::split_paths(encoded) {
-        if !paths.contains(&candidate) {
-            paths.push(candidate);
-        }
+    for (ordinal, candidate) in std::env::split_paths(encoded).enumerate() {
+        append_runtime_path(entries, candidate, format!("{source}:{ordinal}"));
     }
 }
 
 /// Preserve the client's PATH, then append local runtime locations commonly
 /// omitted by GUI/MCP launchers. Appending rather than prepending ensures this
 /// discovery fallback never silently replaces an explicitly selected runtime.
-fn runtime_search_path_from(
+#[cfg(test)]
+fn runtime_search_path_with_mode(
     root: &Path,
     home: &Path,
     inherited: Option<&OsStr>,
     explicit_extra: Option<&OsStr>,
-) -> OsString {
-    let mut paths = Vec::new();
-    append_path_list(&mut paths, inherited);
-    append_path_list(&mut paths, explicit_extra);
-
-    for candidate in [
-        root.join("target/release"),
-        home.join(".local/bin"),
-        home.join(".cargo/bin"),
-        home.join(".nix-profile/bin"),
-        home.join(".volta/bin"),
-        home.join(".pyenv/shims"),
-        home.join(".rbenv/shims"),
-        home.join(".asdf/shims"),
-        home.join(".local/share/mise/shims"),
-        home.join(".local/share/fnm/aliases/default/bin"),
-        home.join(".ghcup/bin"),
-        home.join(".cabal/bin"),
-        home.join(".opam/default/bin"),
-        home.join(".dotnet"),
-        home.join(".dotnet/tools"),
-        home.join(".wasmtime/bin"),
-        home.join(".wasmer/bin"),
-        home.join(".bun/bin"),
-        home.join(".sdkman/candidates/java/current/bin"),
-        home.join("miniforge3/bin"),
-        home.join("miniconda3/bin"),
-        home.join("anaconda3/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/opt/homebrew/sbin"),
-        PathBuf::from("/opt/homebrew/opt/openjdk/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/local/sbin"),
-        PathBuf::from("/usr/local/opt/openjdk/bin"),
-        PathBuf::from("/nix/var/nix/profiles/default/bin"),
-        PathBuf::from("/run/current-system/sw/bin"),
-        PathBuf::from("/Library/Frameworks/Mono.framework/Versions/Current/Commands"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/sbin"),
-        PathBuf::from("/sbin"),
-    ] {
-        append_existing_path(&mut paths, candidate);
-    }
-
-    std::env::join_paths(&paths).unwrap_or_else(|_| inherited.unwrap_or_default().to_os_string())
+    mode: RuntimePathMode,
+) -> anyhow::Result<RuntimeSearchPath> {
+    runtime_search_path_with_mode_and_manager_environment(
+        root,
+        home,
+        inherited,
+        explicit_extra,
+        mode,
+        &[],
+    )
 }
 
-fn append_environment_runtime_paths(paths: &mut Vec<PathBuf>) {
+fn runtime_search_path_with_mode_and_manager_environment(
+    root: &Path,
+    home: &Path,
+    inherited: Option<&OsStr>,
+    explicit_extra: Option<&OsStr>,
+    mode: RuntimePathMode,
+    manager_environment: &[(OsString, OsString)],
+) -> anyhow::Result<RuntimeSearchPath> {
+    let mut entries = Vec::new();
+    append_path_list(&mut entries, inherited, "inherited");
+    if mode != RuntimePathMode::InheritedOnly {
+        append_path_list(&mut entries, explicit_extra, "explicit");
+    }
+
+    if mode == RuntimePathMode::DiscoverLocal {
+        append_existing_runtime_path(
+            &mut entries,
+            root.join("target/release"),
+            "repository-release",
+        );
+        for (relative, label) in [
+            (".local/bin", "home-local-bin"),
+            (".cargo/bin", "home-cargo-bin"),
+            (".nix-profile/bin", "home-nix-profile"),
+            (".volta/bin", "home-volta"),
+            (".pyenv/shims", "home-pyenv"),
+            (".rbenv/shims", "home-rbenv"),
+            (".asdf/shims", "home-asdf"),
+            (".local/share/mise/shims", "home-mise"),
+            (".local/share/fnm/aliases/default/bin", "home-fnm"),
+            (".ghcup/bin", "home-ghcup"),
+            (".cabal/bin", "home-cabal"),
+            (".opam/default/bin", "home-opam"),
+            (".dotnet", "home-dotnet"),
+            (".dotnet/tools", "home-dotnet-tools"),
+            (".wasmtime/bin", "home-wasmtime"),
+            (".wasmer/bin", "home-wasmer"),
+            (".bun/bin", "home-bun"),
+            (".sdkman/candidates/java/current/bin", "home-sdkman-java"),
+            ("miniforge3/bin", "home-miniforge"),
+            ("miniconda3/bin", "home-miniconda"),
+            ("anaconda3/bin", "home-anaconda"),
+        ] {
+            append_existing_runtime_path(&mut entries, home.join(relative), label);
+        }
+        // Explicit runtime-manager roots are more specific than generic
+        // machine fallbacks and therefore retain precedence over them.
+        append_environment_runtime_paths(&mut entries, manager_environment);
+        for candidate in [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/opt/homebrew/opt/openjdk/bin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/local/opt/openjdk/bin",
+            "/nix/var/nix/profiles/default/bin",
+            "/run/current-system/sw/bin",
+            "/Library/Frameworks/Mono.framework/Versions/Current/Commands",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ] {
+            append_existing_runtime_path(
+                &mut entries,
+                PathBuf::from(candidate),
+                format!("system-fallback:{candidate}"),
+            );
+        }
+    }
+
+    RuntimeSearchPath::new(mode, entries)
+}
+
+fn append_environment_runtime_paths(
+    entries: &mut Vec<RuntimePathEntry>,
+    environment: &[(OsString, OsString)],
+) {
+    let value = |name: &str| {
+        environment
+            .iter()
+            .find(|(key, _)| key == OsStr::new(name))
+            .map(|(_, value)| value.as_os_str())
+    };
     for variable in ["NVM_BIN", "PNPM_HOME"] {
-        if let Some(path) = std::env::var_os(variable) {
-            append_existing_path(paths, PathBuf::from(path));
+        if let Some(path) = value(variable) {
+            append_existing_runtime_path(
+                entries,
+                PathBuf::from(path),
+                format!("manager-env:{variable}"),
+            );
         }
     }
     for variable in [
@@ -200,136 +556,162 @@ fn append_environment_runtime_paths(paths: &mut Vec<PathBuf>) {
         "VOLTA_HOME",
         "GEM_HOME",
     ] {
-        if let Some(prefix) = std::env::var_os(variable) {
-            append_existing_path(paths, PathBuf::from(prefix).join("bin"));
+        if let Some(prefix) = value(variable) {
+            append_existing_runtime_path(
+                entries,
+                PathBuf::from(prefix).join("bin"),
+                format!("manager-env:{variable}"),
+            );
         }
     }
     for variable in ["PYENV_ROOT", "RBENV_ROOT"] {
-        if let Some(prefix) = std::env::var_os(variable) {
-            append_existing_path(paths, PathBuf::from(prefix).join("shims"));
+        if let Some(prefix) = value(variable) {
+            append_existing_runtime_path(
+                entries,
+                PathBuf::from(prefix).join("shims"),
+                format!("manager-env:{variable}"),
+            );
         }
     }
-    if let Some(root) = std::env::var_os("DOTNET_ROOT") {
-        append_existing_path(paths, PathBuf::from(root));
+    if let Some(root) = value("DOTNET_ROOT") {
+        append_existing_runtime_path(entries, PathBuf::from(root), "manager-env:DOTNET_ROOT");
     }
 }
 
-fn runtime_search_path(root: &Path) -> OsString {
+fn runtime_search_path(root: &Path) -> anyhow::Result<RuntimeSearchPath> {
+    let mode = std::env::var_os(RUNTIME_PATH_MODE_ENV)
+        .map(|value| value.to_string_lossy().parse())
+        .transpose()?
+        .unwrap_or(RuntimePathMode::DiscoverLocal);
     let inherited = std::env::var_os("PATH");
     let explicit_extra = std::env::var_os("OSTADIX_RUNTIME_PATH");
-    let base = runtime_search_path_from(
+    let manager_environment = runtime_manager_environment();
+    runtime_search_path_with_mode_and_manager_environment(
         root,
         &home_dir(),
         inherited.as_deref(),
         explicit_extra.as_deref(),
-    );
-    let mut paths = std::env::split_paths(&base).collect::<Vec<_>>();
-    append_environment_runtime_paths(&mut paths);
-    std::env::join_paths(&paths).unwrap_or(base)
+        mode,
+        &manager_environment,
+    )
 }
 
-#[derive(Clone, Copy)]
-struct RuntimeSpec {
-    backends: &'static [&'static str],
+fn runtime_manager_environment() -> Vec<(OsString, OsString)> {
+    [
+        "NVM_BIN",
+        "PNPM_HOME",
+        "CONDA_PREFIX",
+        "VIRTUAL_ENV",
+        "JAVA_HOME",
+        "OPAM_SWITCH_PREFIX",
+        "CARGO_HOME",
+        "VOLTA_HOME",
+        "GEM_HOME",
+        "PYENV_ROOT",
+        "RBENV_ROOT",
+        "DOTNET_ROOT",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+    .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CatalogRuntimeRequirement {
+    key: &'static str,
+    builtin: bool,
+    precision: &'static str,
     alternatives: &'static [&'static [&'static str]],
 }
 
-const BUILTIN_BACKENDS: &[&str] = &[
-    "O", "quote", "nix_expr", "html", "markdown", "latex", "text",
-];
+#[derive(Clone, Copy, Debug)]
+struct CatalogBackendRuntime {
+    name: &'static str,
+    requirement_key: &'static str,
+}
 
-/// Descriptive runtime requirements for every non-builtin canonical backend
-/// in `src/ir.rs::BACKEND_SPECS`. This inventory does not authorize execution;
-/// the selected backend adapter still validates and launches the actual tool.
-const RUNTIME_SPECS: &[RuntimeSpec] = &[
-    RuntimeSpec {
-        backends: &["python"],
-        alternatives: &[&["python3"]],
-    },
-    RuntimeSpec {
-        backends: &["bash"],
-        alternatives: &[&["bash"]],
-    },
-    RuntimeSpec {
-        backends: &["shell"],
-        alternatives: &[&["sh"]],
-    },
-    RuntimeSpec {
-        backends: &["javascript"],
-        alternatives: &[&["node"]],
-    },
-    RuntimeSpec {
-        backends: &["ruby"],
-        alternatives: &[&["ruby"]],
-    },
-    RuntimeSpec {
-        backends: &["rust"],
-        alternatives: &[&["rustc"]],
-    },
-    RuntimeSpec {
-        backends: &["c"],
-        alternatives: &[&["cc"]],
-    },
-    RuntimeSpec {
-        backends: &["cpp"],
-        alternatives: &[&["g++"]],
-    },
-    RuntimeSpec {
-        backends: &["java"],
-        alternatives: &[&["javac", "java"]],
-    },
-    RuntimeSpec {
-        backends: &["nix", "nix_store"],
-        alternatives: &[&["nix"]],
-    },
-    RuntimeSpec {
-        backends: &["nixos_test"],
-        alternatives: &[&["python3", "nix"]],
-    },
-    RuntimeSpec {
-        backends: &["sql"],
-        alternatives: &[&["sqlite3"]],
-    },
-    RuntimeSpec {
-        backends: &["haskell"],
-        alternatives: &[&["runghc"], &["ghc"]],
-    },
-    RuntimeSpec {
-        backends: &["ocaml"],
-        alternatives: &[&["ocaml"], &["ocamlopt"], &["ocamlc"]],
-    },
-    RuntimeSpec {
-        backends: &["racket"],
-        alternatives: &[&["racket"]],
-    },
-    RuntimeSpec {
-        backends: &["lisp", "common_lisp"],
-        alternatives: &[&["sbcl"], &["clisp"]],
-    },
-    RuntimeSpec {
-        backends: &["csharp"],
-        alternatives: &[&["dotnet"], &["mcs", "mono"]],
-    },
-    RuntimeSpec {
-        backends: &["matlab"],
-        alternatives: &[&["octave"], &["matlab"]],
-    },
-    RuntimeSpec {
-        backends: &["mathematica"],
-        alternatives: &[&["wolframscript"]],
-    },
-    RuntimeSpec {
-        backends: &["webassembly"],
-        alternatives: &[&["wat2wasm", "wasmtime"], &["wat2wasm", "wasmer"]],
-    },
-    RuntimeSpec {
-        backends: &["ubuntu_vm"],
-        alternatives: &[&["python3", "multipass"]],
-    },
-];
+macro_rules! backend_catalog_metadata {
+    (schema: $schema:literal $(,)?) => {
+        const CATALOG_SCHEMA: &str = $schema;
+    };
+}
+
+macro_rules! runtime_requirement_precision_name {
+    (Exact) => {
+        "exact"
+    };
+    (ConservativeAllSources) => {
+        "conservative-all-sources"
+    };
+}
+
+macro_rules! runtime_requirement_catalog {
+    (
+        $(
+            {
+                key: $key:literal,
+                builtin: $builtin:literal,
+                precision: $precision:ident,
+                alternatives: [$([$($command:literal),* $(,)?]),* $(,)?],
+            }
+        ),* $(,)?
+    ) => {
+        const CATALOG_RUNTIME_REQUIREMENTS: &[CatalogRuntimeRequirement] = &[
+            $(
+                CatalogRuntimeRequirement {
+                    key: $key,
+                    builtin: $builtin,
+                    precision: runtime_requirement_precision_name!($precision),
+                    alternatives: &[$(&[$($command),*]),*],
+                },
+            )*
+        ];
+    };
+}
+
+macro_rules! backend_catalog {
+    (
+        $(
+            {
+                name: $name:literal,
+                aliases: [$($alias:literal),* $(,)?],
+                pure: $pure:literal,
+                renderer: $renderer:ident,
+                execution: $execution:ident,
+                authorities: [$($authority:ident),* $(,)?],
+                adapter: $adapter:ident,
+                runtime: $runtime:literal,
+            }
+        ),* $(,)?
+    ) => {
+        const CATALOG_BACKEND_RUNTIMES: &[CatalogBackendRuntime] = &[
+            $(
+                CatalogBackendRuntime {
+                    name: $name,
+                    requirement_key: $runtime,
+                },
+            )*
+        ];
+    };
+}
+
+// Compile-time projection of the root catalog. The MCP crate remains
+// dependency-isolated while consuming the identical backend declarations.
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../src/backend_catalog.inc.rs"
+));
+
+fn catalog_backends_for(requirement_key: &str) -> Vec<&'static str> {
+    CATALOG_BACKEND_RUNTIMES
+        .iter()
+        .filter(|backend| backend.requirement_key == requirement_key)
+        .map(|backend| backend.name)
+        .collect()
+}
 
 struct RuntimeDiscovery {
-    search_path: OsString,
+    search: RuntimeSearchPath,
     lines: Vec<String>,
     backend_count: usize,
     builtin_backends: usize,
@@ -350,46 +732,71 @@ impl RuntimeDiscovery {
 
     fn to_text(&self) -> String {
         let mut out = format!(
-            "runtime-search-path={}\n{}\n",
-            self.search_path.to_string_lossy(),
+            "runtime-catalog-schema={CATALOG_SCHEMA}\nruntime-catalog-projection=compiled-mcp-snapshot\nruntime-search-mode={}\nruntime-search-path={}\n{}\n",
+            self.search.mode.name(),
+            self.search.encoded.to_string_lossy(),
             self.summary()
         );
+        for (index, entry) in self.search.entries.iter().enumerate() {
+            writeln!(
+                out,
+                "runtime-search-entry index={index} source={} path={}",
+                entry.source,
+                entry.directory.display()
+            )
+            .expect("writing to a String cannot fail");
+        }
         for line in &self.lines {
             writeln!(out, "{line}").expect("writing to a String cannot fail");
         }
         out.push_str(
             "runtime-note discovery is descriptive; missing optional runtimes do not block unrelated backends\n",
         );
+        out.push_str(
+            "runtime-note only declared and located are established here; invocability, compatibility, authorization, health, and per-operation admission require separate evidence\n",
+        );
         out
     }
 }
 
-fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
-    let search_path = runtime_search_path(root);
+fn discover_runtimes(search: &RuntimeSearchPath, root: &Path) -> RuntimeDiscovery {
     let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let builtin_backends = CATALOG_RUNTIME_REQUIREMENTS
+        .iter()
+        .filter(|requirement| requirement.builtin)
+        .flat_map(|requirement| catalog_backends_for(requirement.key))
+        .collect::<Vec<_>>();
+    let builtin_precision = CATALOG_RUNTIME_REQUIREMENTS
+        .iter()
+        .find(|requirement| requirement.builtin)
+        .map_or("unknown", |requirement| requirement.precision);
     let mut lines = vec![format!(
-        "runtime backends={} status=builtin selected=ostadix-runtime",
-        BUILTIN_BACKENDS.join(",")
+        "runtime backends={} status=builtin precision={builtin_precision} declared=catalog located=not-required invocable=not-probed compatible=not-probed authorized=operation-scoped-deferred healthy=not-probed admitted=operation-scoped-not-evaluated selected=ostadix-runtime",
+        builtin_backends.join(",")
     )];
     let mut located_backends = 0;
     let mut missing_backends = 0;
 
-    for spec in RUNTIME_SPECS {
-        let selected = spec.alternatives.iter().find_map(|alternative| {
+    for requirement in CATALOG_RUNTIME_REQUIREMENTS
+        .iter()
+        .filter(|requirement| !requirement.builtin)
+    {
+        let backends = catalog_backends_for(requirement.key);
+        let selected = requirement.alternatives.iter().find_map(|alternative| {
             let resolved = alternative
                 .iter()
                 .map(|command| {
-                    which::which_in(command, Some(&search_path), &cwd)
+                    which::which_in(command, Some(&search.encoded), &cwd)
                         .ok()
                         .map(|path| (*command, path))
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(resolved)
         });
-        let backend_names = spec.backends.join(",");
+        let backend_names = backends.join(",");
         match selected {
             Some(resolved) => {
-                located_backends += spec.backends.len();
+                located_backends += backends.len();
                 let commands = resolved
                     .iter()
                     .map(|(command, _)| *command)
@@ -400,34 +807,39 @@ fn discover_runtimes(root: &Path) -> RuntimeDiscovery {
                     .map(|(command, path)| format!("{command}={}", path.display()))
                     .collect::<Vec<_>>()
                     .join(",");
+                let path_sources = resolved
+                    .iter()
+                    .map(|(command, path)| {
+                        format!("{command}={}", search.source_for_executable(path))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
                 lines.push(format!(
-                    "runtime backends={backend_names} status=located selected={commands} paths=[{paths}]"
+                    "runtime backends={backend_names} status=located precision={} declared=catalog located=satisfied invocable=not-probed compatible=not-probed authorized=operation-scoped-deferred healthy=not-probed admitted=operation-scoped-not-evaluated selected={commands} paths=[{paths}] path-sources=[{path_sources}]",
+                    requirement.precision
                 ));
             }
             None => {
-                missing_backends += spec.backends.len();
-                let alternatives = spec
+                missing_backends += backends.len();
+                let alternatives = requirement
                     .alternatives
                     .iter()
                     .map(|alternative| alternative.join("+"))
                     .collect::<Vec<_>>()
                     .join("|");
                 lines.push(format!(
-                    "runtime backends={backend_names} status=missing alternatives=[{alternatives}]"
+                    "runtime backends={backend_names} status=missing precision={} declared=catalog located=unsatisfied invocable=not-probed compatible=not-probed authorized=operation-scoped-deferred healthy=not-probed admitted=operation-scoped-not-evaluated alternatives=[{alternatives}]",
+                    requirement.precision
                 ));
             }
         }
     }
 
     RuntimeDiscovery {
-        search_path,
+        search: search.clone(),
         lines,
-        backend_count: BUILTIN_BACKENDS.len()
-            + RUNTIME_SPECS
-                .iter()
-                .map(|spec| spec.backends.len())
-                .sum::<usize>(),
-        builtin_backends: BUILTIN_BACKENDS.len(),
+        backend_count: CATALOG_BACKEND_RUNTIMES.len(),
+        builtin_backends: builtin_backends.len(),
         located_backends,
         missing_backends,
     }
@@ -643,6 +1055,39 @@ struct RunOArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AnalyzeIntentArgs {
+    #[schemars(
+        description = "Path to a .O program (absolute paths default cwd to their parent; relative paths use cwd/O_LANG_ROOT)"
+    )]
+    path: String,
+    #[serde(default)]
+    #[schemars(description = "Optional working directory (relative paths use O_LANG_ROOT)")]
+    cwd: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "One-use handle lifetime in seconds (default 120; maximum 900)")]
+    ttl_secs: Option<u64>,
+    #[serde(default)]
+    #[schemars(description = "Analysis timeout seconds (default 120)")]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExecuteIntentArgs {
+    #[schemars(description = "Opaque one-use handle returned by o_analyze_intent")]
+    handle: String,
+    #[schemars(description = "Path resolving to the same canonical .O program analyzed earlier")]
+    path: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Working directory resolving to the same canonical cwd analyzed earlier"
+    )]
+    cwd: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Execution timeout seconds (default 120)")]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OlangcArgs {
     #[schemars(description = "Path to a .O program (relative paths use O_LANG_ROOT)")]
     path: String,
@@ -687,7 +1132,7 @@ impl OstadixMcp {
         let o_bin = resolve_o_bin(&root);
         let olangc = resolve_olangc(&root);
         let shim = backends.join("python_shim.py");
-        let runtimes = discover_runtimes(&root);
+        let runtimes = discover_runtimes(&self.runtime_search, &root);
         let msg = format!(
             "O_LANG_ROOT={}\nO_BACKENDS_DIR={}\nO_bin={}\nolangc={}\npython_shim={} ({})\n{}\nnote=always pass absolute backends dir to O; never bare \"backends\" from unrelated cwd; never put $VAR inside .O sources\n",
             root.display(),
@@ -709,7 +1154,7 @@ impl OstadixMcp {
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
         let root = resolve_lang_root();
-        text_ok(discover_runtimes(&root).to_text())
+        text_ok(discover_runtimes(&self.runtime_search, &root).to_text())
     }
 
     #[tool(
@@ -799,6 +1244,166 @@ impl OstadixMcp {
                 }
             }
             Err(e) => text_err(e),
+        }
+    }
+
+    #[tool(
+        description = "Analyze a .O program without executing it and issue a bounded, expiring, one-use same-intent handle (not authorization or a capability)"
+    )]
+    async fn o_analyze_intent(
+        &self,
+        Parameters(args): Parameters<AnalyzeIntentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = resolve_lang_root();
+        let backends = resolve_backends(&root);
+        let olangc = resolve_olangc(&root);
+        let (program, cwd) = match resolve_run_target(&root, &args.path, args.cwd.as_deref()) {
+            Ok(target) => target,
+            Err(error) => return text_err(error),
+        };
+        if !backends.is_dir() {
+            return text_err(format!("backends missing: {}", backends.display()));
+        }
+        let ttl_secs = args.ttl_secs.unwrap_or(DEFAULT_INTENT_TTL_SECS);
+        if !(1..=MAX_INTENT_TTL_SECS).contains(&ttl_secs) {
+            return text_err(format!(
+                "ttl_secs must be between 1 and {MAX_INTENT_TTL_SECS}"
+            ));
+        }
+        let timeout = args.timeout_secs.unwrap_or(120);
+        if !(1..=MAX_INTENT_OPERATION_TIMEOUT_SECS).contains(&timeout) {
+            return text_err(format!(
+                "timeout_secs must be between 1 and {MAX_INTENT_OPERATION_TIMEOUT_SECS}"
+            ));
+        }
+        let handle = match random_intent_handle() {
+            Ok(handle) => handle,
+            Err(error) => return text_err(error),
+        };
+        let reservation_now = Instant::now();
+        let reservation =
+            match IntentReservation::acquire(self.intents.clone(), handle.clone(), reservation_now)
+            {
+                Ok(reservation) => reservation,
+                Err(error) => return text_err(error),
+            };
+        let argv = [
+            program.to_string_lossy().into_owned(),
+            "--target".to_string(),
+            "ir".to_string(),
+            "--shim-dir".to_string(),
+            backends.to_string_lossy().into_owned(),
+            "--execution-intent-json".to_string(),
+        ];
+        let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let analysis = run_cmd(
+            &olangc,
+            &refs,
+            Some(&cwd),
+            &[
+                ("O_LANG_ROOT", root.display().to_string()),
+                ("O_BACKENDS_DIR", backends.display().to_string()),
+                ("A18_WORK", cwd.display().to_string()),
+            ],
+            timeout,
+        )
+        .await;
+        let (code, stdout, stderr) = match analysis {
+            Ok(output) => output,
+            Err(error) => return text_err(error),
+        };
+        if code != 0 {
+            return text_err(format_run(code, &stdout, &stderr));
+        }
+        let document = match parse_execution_intent(&stdout) {
+            Ok(document) => document,
+            Err(error) => return text_err(error),
+        };
+        let now = Instant::now();
+        let lease = IntentLease {
+            program: program.clone(),
+            cwd: cwd.clone(),
+            root: root.clone(),
+            backends: backends.clone(),
+            source_sha256: document.source_sha256.clone(),
+            execution_intent_sha256: document.execution_intent_sha256.clone(),
+            expires_at: now + Duration::from_secs(ttl_secs),
+        };
+        if let Err(error) = reservation.commit(lease) {
+            return text_err(error);
+        }
+        text_ok(format!(
+            "intent-handle={handle}\nintent-schema={}\nsource-sha256={}\nexecution-intent-sha256={}\nprogram={}\ncwd={}\nroot={}\nbackends={}\nexpires-in-seconds={ttl_secs}\nintent-note=same-intent gate only; not authorization, a capability, runtime health, capacity, or a retained AdmittedExecution\n",
+            document.schema,
+            document.source_sha256,
+            document.execution_intent_sha256,
+            program.display(),
+            cwd.display(),
+            root.display(),
+            backends.display(),
+        ))
+    }
+
+    #[tool(
+        description = "Consume a one-use o_analyze_intent handle and ask O to recompute the same stable intent before fresh V4 admission and dispatch"
+    )]
+    async fn o_execute_intent(
+        &self,
+        Parameters(args): Parameters<ExecuteIntentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Consume first: expiry, mismatched arguments, mutation, admission
+        // rejection, timeout, and runtime failure all make the handle unusable.
+        let lease = match self
+            .intents
+            .lock()
+            .map_err(|_| "execution-intent store lock is poisoned".to_string())
+            .and_then(|mut store| store.take(args.handle.trim(), Instant::now()))
+        {
+            Ok(lease) => lease,
+            Err(error) => return text_err(error),
+        };
+        let root = resolve_lang_root();
+        let backends = resolve_backends(&root);
+        let o_bin = resolve_o_bin(&root);
+        let (program, cwd) = match resolve_run_target(&root, &args.path, args.cwd.as_deref()) {
+            Ok(target) => target,
+            Err(error) => return text_err(error),
+        };
+        if let Err(error) = validate_intent_target(&lease, &program, &cwd, &root, &backends) {
+            return text_err(error);
+        }
+        let argv = [
+            "--require-source-sha256".to_string(),
+            lease.source_sha256,
+            "--require-execution-intent-sha256".to_string(),
+            lease.execution_intent_sha256,
+            program.to_string_lossy().into_owned(),
+            backends.to_string_lossy().into_owned(),
+        ];
+        let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let timeout = args.timeout_secs.unwrap_or(120);
+        match run_cmd(
+            &o_bin,
+            &refs,
+            Some(&cwd),
+            &[
+                ("O_LANG_ROOT", root.display().to_string()),
+                ("O_BACKENDS_DIR", backends.display().to_string()),
+                ("A18_WORK", cwd.display().to_string()),
+            ],
+            timeout,
+        )
+        .await
+        {
+            Ok((code, stdout, stderr)) => {
+                let body = format_run(code, &stdout, &stderr);
+                if code == 0 {
+                    text_ok(format!("intent-consumed=true\n{body}"))
+                } else {
+                    text_err(format!("intent-consumed=true\n{body}"))
+                }
+            }
+            Err(error) => text_err(format!("intent-consumed=true\n{error}")),
         }
     }
 
@@ -898,7 +1503,12 @@ impl OstadixMcp {
             a18.is_dir(),
             a18.join("search/o-run").is_file()
         ));
-        lines.push(discover_runtimes(&root).to_text().trim_end().to_string());
+        lines.push(
+            discover_runtimes(&self.runtime_search, &root)
+                .to_text()
+                .trim_end()
+                .to_string(),
+        );
         text_ok(lines.join("\n") + "\n")
     }
 
@@ -994,7 +1604,8 @@ impl ServerHandler for OstadixMcp {
         ServerInfo {
             instructions: Some(
                 "Ostadix-lang / O-lang MCP (Rust). Use o_env/o_runtimes/o_doctor first. \
-Always run .O programs via o_run or o_search_run so backends is absolute. \
+Use o_analyze_intent then o_execute_intent for a one-use same-intent gate; o_run remains direct ungated compatibility execution. \
+Always run .O programs through an MCP O tool so backends is absolute. \
 Never pass the literal string O_BACKENDS_DIR; never put $VAR inside .O sources (O splices $IDENT)."
                     .into(),
             ),
@@ -1010,7 +1621,8 @@ async fn main() -> anyhow::Result<()> {
     // local runtime locations once so discovery and every child backend see
     // the same executable universe.
     let root = resolve_lang_root();
-    std::env::set_var("PATH", runtime_search_path(&root));
+    let runtime_search = runtime_search_path(&root)?;
+    std::env::set_var("PATH", &runtime_search.encoded);
 
     // stderr only — stdout is MCP
     tracing_subscriber::fmt()
@@ -1021,7 +1633,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let server = OstadixMcp::new();
+    let server = OstadixMcp::new(runtime_search);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -1030,14 +1642,18 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_lang_root, resolve_directory, resolve_file, resolve_run_target, run_cmd,
-        runtime_search_path_from, EmptyArgs, BUILTIN_BACKENDS, RUNTIME_SPECS,
+        catalog_backends_for, is_lang_root, parse_execution_intent, random_intent_handle,
+        resolve_directory, resolve_file, resolve_run_target, run_cmd,
+        runtime_search_path_with_mode, runtime_search_path_with_mode_and_manager_environment,
+        validate_intent_target, EmptyArgs, IntentLease, IntentReservation, IntentStore, OstadixMcp,
+        RuntimePathMode, CATALOG_BACKEND_RUNTIMES, CATALOG_RUNTIME_REQUIREMENTS, CATALOG_SCHEMA,
+        INTENT_SCHEMA_V1, MAX_LIVE_INTENTS,
     };
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct Fixture(PathBuf);
 
@@ -1128,36 +1744,88 @@ mod tests {
     }
 
     #[test]
-    fn runtime_inventory_covers_every_canonical_backend() {
-        let registry_source = include_str!("../../../src/ir.rs");
-        let registry_table = registry_source
-            .split_once("const BACKEND_SPECS: &[BackendSpec] = &[")
-            .expect("find canonical backend table")
-            .1
-            .split_once("\n];")
-            .expect("find canonical backend table end")
-            .0;
-        let canonical = registry_table
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix('"')
-                    .and_then(|tail| tail.split_once('"'))
-                    .map(|(name, _)| name)
-            })
-            .collect::<BTreeSet<_>>();
-        let discovered = BUILTIN_BACKENDS
+    fn runtime_inventory_is_a_complete_catalog_projection() {
+        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v1");
+        let requirement_keys = CATALOG_RUNTIME_REQUIREMENTS
             .iter()
-            .copied()
-            .chain(
-                RUNTIME_SPECS
-                    .iter()
-                    .flat_map(|spec| spec.backends.iter().copied()),
-            )
+            .map(|requirement| requirement.key)
             .collect::<BTreeSet<_>>();
+        assert_eq!(
+            requirement_keys.len(),
+            CATALOG_RUNTIME_REQUIREMENTS.len(),
+            "canonical runtime requirement keys must be unique"
+        );
 
-        assert_eq!(canonical.len(), 30, "canonical backend count changed");
-        assert_eq!(discovered, canonical);
+        let backend_names = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .map(|backend| backend.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            backend_names.len(),
+            CATALOG_BACKEND_RUNTIMES.len(),
+            "canonical backend names must be unique"
+        );
+
+        for backend in CATALOG_BACKEND_RUNTIMES {
+            assert!(
+                requirement_keys.contains(backend.requirement_key),
+                "backend {} references missing runtime requirement {}",
+                backend.name,
+                backend.requirement_key
+            );
+        }
+        for requirement in CATALOG_RUNTIME_REQUIREMENTS {
+            assert!(
+                !catalog_backends_for(requirement.key).is_empty(),
+                "runtime requirement {} is not referenced by a backend",
+                requirement.key
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_inventory_preserves_catalog_group_and_requirement_order() {
+        assert_eq!(
+            CATALOG_RUNTIME_REQUIREMENTS
+                .iter()
+                .map(|requirement| requirement.key)
+                .collect::<Vec<_>>(),
+            [
+                "builtin",
+                "python",
+                "bash",
+                "shell",
+                "javascript",
+                "ruby",
+                "rust",
+                "c",
+                "cpp",
+                "java",
+                "nix",
+                "nixos_test",
+                "sql",
+                "haskell",
+                "ocaml",
+                "racket",
+                "common_lisp",
+                "csharp",
+                "matlab",
+                "mathematica",
+                "webassembly",
+                "ubuntu_vm",
+            ]
+        );
+        assert_eq!(
+            catalog_backends_for("builtin"),
+            ["O", "quote", "nix_expr", "html", "markdown", "latex", "text"]
+        );
+        assert_eq!(catalog_backends_for("nix"), ["nix", "nix_store"]);
+        assert_eq!(catalog_backends_for("common_lisp"), ["lisp", "common_lisp"]);
+        let webassembly = CATALOG_RUNTIME_REQUIREMENTS
+            .iter()
+            .find(|requirement| requirement.key == "webassembly")
+            .expect("canonical WebAssembly runtime requirement");
+        assert_eq!(webassembly.precision, "conservative-all-sources");
     }
 
     #[test]
@@ -1178,18 +1846,158 @@ mod tests {
         }
         let inherited = std::env::join_paths([&first, &second]).expect("join inherited PATH");
         let explicit_path = std::env::join_paths([&explicit]).expect("join explicit PATH");
-        let encoded = runtime_search_path_from(
+        let search = runtime_search_path_with_mode(
             &fixture.0,
             &home,
             Some(OsStr::new(&inherited)),
             Some(OsStr::new(&explicit_path)),
-        );
-        let paths = std::env::split_paths(&encoded).collect::<Vec<_>>();
+            RuntimePathMode::DiscoverLocal,
+        )
+        .expect("construct discover-local runtime path");
+        let paths = search
+            .entries
+            .iter()
+            .map(|entry| entry.directory.clone())
+            .collect::<Vec<_>>();
 
         assert_eq!(&paths[..3], &[first, second, explicit]);
         assert!(paths.contains(&fixture.0.join("target/release")));
         assert!(paths.contains(&home.join(".local/bin")));
         assert_eq!(paths.iter().collect::<BTreeSet<_>>().len(), paths.len());
+        assert_eq!(search.mode, RuntimePathMode::DiscoverLocal);
+        assert_eq!(search.entries[0].source, "inherited:0");
+        assert_eq!(search.entries[2].source, "explicit:0");
+        assert_eq!(search.entries[3].source, "repository-release");
+    }
+
+    #[test]
+    fn runtime_path_modes_have_exact_visibility_and_provenance() {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        let inherited_dir = fixture.0.join("inherited");
+        let explicit_dir = fixture.0.join("explicit");
+        for directory in [
+            home.join(".local/bin"),
+            fixture.0.join("target/release"),
+            inherited_dir.clone(),
+            explicit_dir.clone(),
+        ] {
+            fs::create_dir_all(directory).expect("create runtime path fixture");
+        }
+        let inherited = std::env::join_paths([&inherited_dir]).expect("join inherited PATH");
+        let explicit = std::env::join_paths([&explicit_dir]).expect("join explicit PATH");
+
+        let inherited_only = runtime_search_path_with_mode(
+            &fixture.0,
+            &home,
+            Some(OsStr::new(&inherited)),
+            Some(OsStr::new(&explicit)),
+            RuntimePathMode::InheritedOnly,
+        )
+        .expect("construct inherited-only path");
+        assert_eq!(
+            inherited_only.entries,
+            [super::RuntimePathEntry {
+                directory: inherited_dir.clone(),
+                source: "inherited:0".to_string(),
+            }]
+        );
+
+        let inherited_plus_explicit = runtime_search_path_with_mode(
+            &fixture.0,
+            &home,
+            Some(OsStr::new(&inherited)),
+            Some(OsStr::new(&explicit)),
+            RuntimePathMode::InheritedPlusExplicit,
+        )
+        .expect("construct inherited-plus-explicit path");
+        assert_eq!(inherited_plus_explicit.entries.len(), 2);
+        assert_eq!(inherited_plus_explicit.entries[1].directory, explicit_dir);
+        assert_eq!(inherited_plus_explicit.entries[1].source, "explicit:0");
+
+        let discover_local = runtime_search_path_with_mode(
+            &fixture.0,
+            &home,
+            Some(OsStr::new(&inherited)),
+            Some(OsStr::new(&explicit)),
+            RuntimePathMode::DiscoverLocal,
+        )
+        .expect("construct discover-local path");
+        assert_eq!(discover_local.entries[0].directory, inherited_dir);
+        assert_eq!(discover_local.entries[1].directory, explicit_dir);
+        assert!(discover_local
+            .entries
+            .iter()
+            .any(|entry| entry.source == "repository-release"));
+        assert!(discover_local
+            .entries
+            .iter()
+            .any(|entry| entry.source == "home-local-bin"));
+    }
+
+    #[test]
+    fn runtime_path_deduplication_preserves_first_source() {
+        let fixture = Fixture::new();
+        let shared = fixture.0.join("shared");
+        fs::create_dir_all(&shared).expect("create shared runtime directory");
+        let inherited = std::env::join_paths([&shared]).expect("join inherited PATH");
+        let explicit = std::env::join_paths([&shared]).expect("join explicit PATH");
+        let search = runtime_search_path_with_mode(
+            &fixture.0,
+            &fixture.0.join("home"),
+            Some(OsStr::new(&inherited)),
+            Some(OsStr::new(&explicit)),
+            RuntimePathMode::InheritedPlusExplicit,
+        )
+        .expect("construct deduplicated runtime path");
+
+        assert_eq!(search.entries.len(), 1);
+        assert_eq!(search.entries[0].source, "inherited:0");
+        assert_eq!(
+            search.source_for_executable(&shared.join("python3")),
+            "inherited:0"
+        );
+    }
+
+    #[test]
+    fn runtime_manager_environment_precedes_generic_system_fallbacks() {
+        let fixture = Fixture::new();
+        let java_home = fixture.0.join("selected-java");
+        fs::create_dir_all(java_home.join("bin")).expect("create selected JAVA_HOME bin");
+        let manager_environment = vec![(
+            std::ffi::OsString::from("JAVA_HOME"),
+            java_home.as_os_str().to_os_string(),
+        )];
+        let search = runtime_search_path_with_mode_and_manager_environment(
+            &fixture.0,
+            &fixture.0.join("home"),
+            None,
+            None,
+            RuntimePathMode::DiscoverLocal,
+            &manager_environment,
+        )
+        .expect("construct discover-local path with selected manager root");
+        let manager_index = search
+            .entries
+            .iter()
+            .position(|entry| entry.source == "manager-env:JAVA_HOME")
+            .expect("JAVA_HOME must be represented");
+        let first_system_index = search
+            .entries
+            .iter()
+            .position(|entry| entry.source.starts_with("system-fallback:"))
+            .expect("at least one generic system fallback exists on the test host");
+        assert!(manager_index < first_system_index);
+    }
+
+    #[test]
+    fn runtime_path_mode_rejects_unknown_values() {
+        let error = "implicit-cloud"
+            .parse::<RuntimePathMode>()
+            .expect_err("unknown runtime path policy must fail closed");
+        assert!(error
+            .to_string()
+            .contains("invalid OSTADIX_RUNTIME_PATH_MODE"));
     }
 
     #[test]
@@ -1197,6 +2005,147 @@ mod tests {
         let schema = rmcp::handler::server::tool::schema_for_type::<EmptyArgs>();
         assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
         assert_eq!(schema.get("properties"), Some(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn parses_only_well_formed_v1_execution_intents() {
+        let digest = "a".repeat(64);
+        let document = parse_execution_intent(&format!(
+            "{{\"schema\":\"{INTENT_SCHEMA_V1}\",\"source_sha256\":\"{digest}\",\"execution_intent_sha256\":\"{digest}\"}}"
+        ))
+        .expect("parse valid execution intent");
+        assert_eq!(document.schema, INTENT_SCHEMA_V1);
+
+        let wrong_schema = parse_execution_intent(&format!(
+            "{{\"schema\":\"oexec.execution-intent/v999\",\"source_sha256\":\"{digest}\",\"execution_intent_sha256\":\"{digest}\"}}"
+        ))
+        .expect_err("unknown schema must fail closed");
+        assert!(wrong_schema.contains("unsupported execution-intent schema"));
+
+        let malformed = parse_execution_intent(&format!(
+            "{{\"schema\":\"{INTENT_SCHEMA_V1}\",\"source_sha256\":\"short\",\"execution_intent_sha256\":\"{digest}\"}}"
+        ))
+        .expect_err("malformed digest must fail closed");
+        assert!(malformed.contains("malformed execution-intent digest"));
+    }
+
+    #[test]
+    fn intent_store_is_expiring_and_one_use() {
+        let fixture = Fixture::new();
+        let now = Instant::now();
+        let lease = IntentLease {
+            program: fixture.0.join("examples/hello.O"),
+            cwd: fixture.0.clone(),
+            root: fixture.0.clone(),
+            backends: fixture.0.join("backends"),
+            source_sha256: "a".repeat(64),
+            execution_intent_sha256: "b".repeat(64),
+            expires_at: now + Duration::from_secs(1),
+        };
+        let mut store = IntentStore::default();
+        store
+            .reserve("one".to_string(), now)
+            .expect("reserve lease slot");
+        store
+            .insert_reserved("one".to_string(), lease.clone())
+            .expect("insert lease");
+        let taken = store.take("one", now).expect("consume lease once");
+        assert_eq!(taken.execution_intent_sha256, "b".repeat(64));
+        assert!(store.take("one", now).unwrap_err().contains("consumed"));
+
+        let mut expired = lease;
+        expired.expires_at = now;
+        store
+            .reserve("expired".to_string(), now - Duration::from_secs(1))
+            .expect("reserve expired lease slot before its expiry");
+        store
+            .insert_reserved("expired".to_string(), expired)
+            .expect("insert lease before its expiry");
+        assert_eq!(
+            store.take("expired", now).unwrap_err(),
+            "execution-intent handle expired"
+        );
+    }
+
+    #[test]
+    fn intent_store_reservations_bound_in_progress_analysis_capacity() {
+        let now = Instant::now();
+        let mut store = IntentStore::default();
+        for index in 0..MAX_LIVE_INTENTS {
+            store
+                .reserve(format!("reservation-{index}"), now)
+                .expect("reserve bounded in-progress intent analysis");
+        }
+        assert!(store
+            .reserve("overflow".to_string(), now)
+            .unwrap_err()
+            .contains("store is full"));
+
+        store.cancel_reservation("reservation-0");
+        store
+            .reserve("replacement".to_string(), now)
+            .expect("released reservation restores one capacity slot");
+    }
+
+    #[test]
+    fn dropped_intent_reservation_releases_in_progress_capacity() {
+        let runtime_search = super::RuntimeSearchPath::new(RuntimePathMode::InheritedOnly, vec![])
+            .expect("construct empty runtime search path");
+        let server = OstadixMcp::new(runtime_search);
+        {
+            let _reservation = IntentReservation::acquire(
+                server.intents.clone(),
+                "cancelled".to_string(),
+                Instant::now(),
+            )
+            .expect("reserve intent analysis capacity");
+            assert_eq!(server.intents.lock().unwrap().reservations.len(), 1);
+        }
+        assert!(server.intents.lock().unwrap().reservations.is_empty());
+    }
+
+    #[test]
+    fn intent_target_comparison_binds_program_cwd_root_and_backends() {
+        let fixture = Fixture::new();
+        let program = fixture
+            .0
+            .join("examples/hello.O")
+            .canonicalize()
+            .expect("canonical program");
+        let cwd = fixture.0.canonicalize().expect("canonical root");
+        let backends = fixture
+            .0
+            .join("backends")
+            .canonicalize()
+            .expect("canonical backends");
+        let lease = IntentLease {
+            program: program.clone(),
+            cwd: cwd.clone(),
+            root: cwd.clone(),
+            backends: backends.clone(),
+            source_sha256: "a".repeat(64),
+            execution_intent_sha256: "b".repeat(64),
+            expires_at: Instant::now() + Duration::from_secs(1),
+        };
+        validate_intent_target(&lease, &program, &cwd, &cwd, &backends).expect("matching target");
+        let mismatch = validate_intent_target(
+            &lease,
+            &fixture.0.join("examples/space dir/demo.O"),
+            &cwd,
+            &cwd,
+            &backends,
+        )
+        .expect_err("program mismatch must fail closed");
+        assert!(mismatch.contains("program mismatch"));
+    }
+
+    #[test]
+    fn intent_handles_use_os_entropy_and_fixed_hex_encoding() {
+        let first = random_intent_handle().expect("first handle");
+        let second = random_intent_handle().expect("second handle");
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[cfg(unix)]

@@ -14,22 +14,9 @@ if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
   exit 127
 fi
 
-if [[ -z "${OSTADIX_OVMF_CODE:-}" ]]; then
-  for candidate in \
-    /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-    /usr/local/opt/qemu/share/qemu/edk2-x86_64-code.fd \
-    /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/edk2/x64/OVMF_CODE.fd; do
-    if [[ -f "$candidate" ]]; then
-      OSTADIX_OVMF_CODE="$candidate"
-      break
-    fi
-  done
-fi
-if [[ -z "${OSTADIX_OVMF_CODE:-}" || ! -f "$OSTADIX_OVMF_CODE" ]]; then
-  echo "error: UEFI firmware not found; set OSTADIX_OVMF_CODE to an OVMF/edk2 x86_64 code image" >&2
-  exit 127
-fi
+# shellcheck source=resolve-x86_64-ovmf-code.sh
+source "$ROOT/ocore/kernel/resolve-x86_64-ovmf-code.sh"
+OSTADIX_OVMF_CODE="$(resolve_ostadix_x86_64_ovmf_code "$QEMU_BIN")"
 
 "$ROOT/ocore/kernel/build-x86_64-uefi-media.sh" "$MEDIA"
 cat >&2 <<EOF
