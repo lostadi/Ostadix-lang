@@ -111,7 +111,7 @@ reconstructing executable and backend paths by hand.
 | `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
 | `o_analyze_intent` | Nonexecutingly creates a bounded one-use handle for an exact source and stable analyzed graph intent. |
-| `o_execute_intent` | Consumes that handle, requires O to recompute the same intent, then performs a fresh V4 admission before dispatch. |
+| `o_execute_intent` | Consumes that handle, requires O to recompute the same intent, then performs a fresh V5 admission before dispatch. |
 | `o_run` | Runs one local `.O` file directly with an explicit working directory and timeout; this remains an ungated compatibility path. |
 | `o_olangc` | Runs `olangc` with the resolved shim directory; supports `ir`, `dot`, `script`, and `wasm`, or the default target. |
 | `o_search_run` | Runs a named search program from an external `a18re` work tree when that optional tree is present. |
@@ -2561,7 +2561,7 @@ emits an authority-free `oexec.execution-intent/v1` identity over exact source,
 OIR, plan, solved graph, the plan-specific backend-catalog projection, analyzer,
 and base policy. `O --require-source-sha256 ...
 --require-execution-intent-sha256 ...` recomputes this identity before any
-dispatch and still constructs a fresh live V4 admission. The intent is not a
+dispatch and still constructs a fresh live V5 admission. The intent is not a
 capability, runtime-health proof, capacity lease, or serializable replacement
 for `AdmittedExecution`.
 
@@ -2617,7 +2617,7 @@ state-complete HGraph used by the runtime. `olangc --target dot` shows both
 constraint hyperedges and the directed operation ports for ordinary, resource,
 actor, and completion/control nodes.
 
-`olangc --target ir --explain-schedule` additionally prints the v4 admission
+`olangc --target ir --explain-schedule` additionally prints the v5 admission
 digests, exact adapter IDs, provenance, blockers, and legal static waves without
 dispatching. Its advisory marker has schema ID
 `oexec.realizability/v1`, introduced by the line

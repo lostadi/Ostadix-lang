@@ -293,7 +293,7 @@ import sys
 
 path = Path(sys.argv[1])
 lines = path.read_text(encoding="utf-8").splitlines()
-admission_schema = "oexec.admission/v4"
+admission_schema = "oexec.admission/v5"
 admission_header = f"; ExecutionAdmission {admission_schema}"
 admission_headers = [
     line for line in lines if line.startswith("; ExecutionAdmission ")

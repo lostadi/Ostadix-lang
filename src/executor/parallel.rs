@@ -85,6 +85,7 @@ enum ParallelTaskBody {
         bindings: HashMap<String, OValue>,
         shim: PathBuf,
         sandbox: BackendSandboxPolicy,
+        executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
     },
 }
 
@@ -94,11 +95,20 @@ enum ParallelTaskBody {
 pub(crate) struct EphemeralShimRuntime {
     shim: PathBuf,
     sandbox: BackendSandboxPolicy,
+    executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
 }
 
 impl EphemeralShimRuntime {
-    pub(crate) fn new(shim: PathBuf, sandbox: BackendSandboxPolicy) -> Self {
-        Self { shim, sandbox }
+    pub(crate) fn new(
+        shim: PathBuf,
+        sandbox: BackendSandboxPolicy,
+        executable_leases: Arc<crate::runtime_exec::ExecutableLeaseSet>,
+    ) -> Self {
+        Self {
+            shim,
+            sandbox,
+            executable_leases,
+        }
     }
 }
 
@@ -543,7 +553,11 @@ fn build_task(
             ParallelTaskBody::Load { name, scope }
         }
         TaskKind::EphemeralShim { language, renderer } => {
-            let EphemeralShimRuntime { shim, sandbox } = shim_runtime.ok_or_else(|| {
+            let EphemeralShimRuntime {
+                shim,
+                sandbox,
+                executable_leases,
+            } = shim_runtime.ok_or_else(|| {
                 anyhow::anyhow!("ephemeral shim adapter requires an authorized runtime binding")
             })?;
             let children = plan.child_schedule(id).map_err(anyhow::Error::msg)?;
@@ -568,6 +582,7 @@ fn build_task(
                 bindings,
                 shim,
                 sandbox,
+                executable_leases,
             }
         }
         TaskKind::Renderer {
@@ -702,6 +717,7 @@ fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue
             bindings,
             shim,
             sandbox,
+            executable_leases,
         } => {
             let lexical_bindings = bindings.clone();
             run_ephemeral_with_eval_callback(
@@ -710,6 +726,7 @@ fn execute_prepared(task: &ParallelTask, context: &TaskContext) -> Result<OValue
                 bindings.clone(),
                 shim,
                 sandbox,
+                Some(executable_leases),
                 |src, explicit_scope, remaining| {
                     let callback_scope = match explicit_scope {
                         None => lexical_bindings.clone(),

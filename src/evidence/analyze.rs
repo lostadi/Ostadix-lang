@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -16,27 +17,62 @@ use crate::ir::{
     BackendAdapterKind, BackendRegistry, ExecutionPlan, InvokeMode, OIrProgram, PlanNodeKind,
     BACKEND_CATALOG_SCHEMA_V1,
 };
+use crate::runtime_exec::{
+    capture_execution_manifest, inspection_executable_manifest, ExecutableLeaseSet,
+    ExecutableManifestV1,
+};
 use crate::value::GroupMode;
 
 use super::fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
-    EvidenceBindingsV2, EvidenceBundleV4, EvidenceProvenance, FailureClassV1, FailureContractV1,
+    EvidenceBindingsV2, EvidenceBundleV5, EvidenceProvenance, FailureClassV1, FailureContractV1,
     NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
-    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
+    RuntimeSnapshotKindV1, TypeContractV1, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
 };
 
-/// Capture the current executable plus each separate compatibility-shim
-/// artifact actually selected by the plan's canonical adapter kinds. Missing
-/// legacy shims are represented explicitly instead of changing the historical
-/// error timing during conservative coordinator work.
+/// Capture each compatibility shim plus the direct executable launch manifest
+/// selected by the plan's canonical adapter kinds. Missing legacy shims remain
+/// explicit, while a missing direct launcher rejects admission before dispatch.
 pub fn runtime_binding_from_directory(
     plan: &ExecutionPlan,
     shim_dir: &Path,
     context: &[(&str, &str)],
-) -> RuntimeBindingV1 {
+) -> Result<RuntimeBindingV1> {
     let backends = legacy_python_shim_backends(plan);
     let artifacts = backends
+        .into_iter()
+        .map(|backend| {
+            let path = BackendRegistry::global().resolve_shim_path(shim_dir, &backend);
+            BackendArtifactV1 {
+                canonical_backend: backend,
+                resolved_identity: path_identity(&path),
+                state: backend_artifact_state(&path),
+            }
+        })
+        .collect::<Vec<_>>();
+    let (executable_manifest, executable_leases) = capture_execution_manifest(plan)?;
+    Ok(build_runtime_binding(
+        RuntimeSnapshotKindV1::Execution,
+        artifacts,
+        executable_manifest,
+        Some(executable_leases),
+        backend_catalog_projection_sha256(plan),
+        context,
+    ))
+}
+
+/// Re-capture mutable shim/environment context while reusing an already
+/// admitted direct-executable manifest. This keeps last-moment freshness
+/// checks constant-time with respect to compiler/runtime binary size; live
+/// executable identity is enforced separately by retained leases.
+pub fn runtime_binding_from_directory_reusing_executables(
+    plan: &ExecutionPlan,
+    shim_dir: &Path,
+    context: &[(&str, &str)],
+    executable_manifest: ExecutableManifestV1,
+) -> RuntimeBindingV1 {
+    let artifacts = legacy_python_shim_backends(plan)
         .into_iter()
         .map(|backend| {
             let path = BackendRegistry::global().resolve_shim_path(shim_dir, &backend);
@@ -50,6 +86,8 @@ pub fn runtime_binding_from_directory(
     build_runtime_binding(
         RuntimeSnapshotKindV1::Execution,
         artifacts,
+        executable_manifest,
+        None,
         backend_catalog_projection_sha256(plan),
         context,
     )
@@ -93,6 +131,8 @@ pub fn runtime_binding_from_adapter_bytes(
     build_runtime_binding(
         RuntimeSnapshotKindV1::Inspection,
         artifacts,
+        inspection_executable_manifest(plan),
+        None,
         backend_catalog_projection_sha256(plan),
         context,
     )
@@ -186,10 +226,11 @@ fn legacy_python_shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
 fn build_runtime_binding(
     snapshot_kind: RuntimeSnapshotKindV1,
     mut backend_artifacts: Vec<BackendArtifactV1>,
+    executable_manifest: ExecutableManifestV1,
+    executable_leases: Option<Arc<ExecutableLeaseSet>>,
     backend_catalog_projection_sha256: String,
     context: &[(&str, &str)],
 ) -> RuntimeBindingV1 {
-    backend_artifacts.push(current_executable_artifact());
     backend_artifacts.sort_by(|left, right| {
         (&left.canonical_backend, &left.resolved_identity)
             .cmp(&(&right.canonical_backend, &right.resolved_identity))
@@ -203,28 +244,33 @@ fn build_runtime_binding(
     }
     let backend_set_sha256 = backend_hash.finish();
 
-    let mut environment = CanonicalHasher::new("ostadix-execution-environment/v1");
-    environment.field(snapshot_kind.name().as_bytes());
-    environment.field(backend_set_sha256.as_bytes());
+    let mut launch_context = CanonicalHasher::new("ostadix-backend-launch-context/v1");
     if let Ok(current_dir) = std::env::current_dir() {
-        environment.field(&os_bytes(current_dir.as_os_str()));
+        launch_context.field(&os_bytes(current_dir.as_os_str()));
     } else {
-        environment.field(b"current-dir-unavailable");
+        launch_context.field(b"current-dir-unavailable");
     }
     let mut vars = std::env::vars_os()
         .map(|(key, value)| (os_bytes(&key).into_owned(), os_bytes(&value).into_owned()))
         .collect::<Vec<_>>();
     vars.sort();
     for (key, value) in vars {
-        environment.field(&key);
-        environment.field(&value);
+        launch_context.field(&key);
+        launch_context.field(&value);
     }
     let mut context = context.to_vec();
     context.sort_unstable();
     for (key, value) in context {
-        environment.field(key.as_bytes());
-        environment.field(value.as_bytes());
+        launch_context.field(key.as_bytes());
+        launch_context.field(value.as_bytes());
     }
+    let launch_context_sha256 = launch_context.finish();
+
+    let mut environment = CanonicalHasher::new("ostadix-execution-environment/v2");
+    environment.field(snapshot_kind.name().as_bytes());
+    environment.field(backend_set_sha256.as_bytes());
+    environment.field(executable_manifest.sha256().as_bytes());
+    environment.field(launch_context_sha256.as_bytes());
     let environment_sha256 = environment.finish();
 
     let mut ambient_world = CanonicalHasher::new("ostadix-ambient-hostworld-snapshot/v1");
@@ -242,27 +288,13 @@ fn build_runtime_binding(
     RuntimeBindingV1 {
         snapshot_kind,
         backend_artifacts,
+        executable_manifest,
+        executable_leases,
         backend_catalog_projection_sha256,
         backend_set_sha256,
+        launch_context_sha256,
         environment_sha256,
         ambient_world_sha256,
-    }
-}
-
-fn current_executable_artifact() -> BackendArtifactV1 {
-    match std::env::current_exe() {
-        Ok(path) => BackendArtifactV1 {
-            canonical_backend: "__ostadix_current_executable__".to_string(),
-            resolved_identity: path_identity(&path),
-            state: backend_artifact_state(&path),
-        },
-        Err(error) => BackendArtifactV1 {
-            canonical_backend: "__ostadix_current_executable__".to_string(),
-            resolved_identity: "current-executable:unavailable".to_string(),
-            state: BackendArtifactStateV1::Unreadable {
-                error_kind: format!("CurrentExe::{:?}", error.kind()),
-            },
-        },
     }
 }
 
@@ -309,34 +341,34 @@ pub fn analyze_execution(
     plan: &ExecutionPlan,
     graph: &HGraph,
     runtime: RuntimeBindingV1,
-) -> Result<EvidenceBundleV4> {
+) -> Result<EvidenceBundleV5> {
     if runtime.backend_catalog_projection_sha256 != backend_catalog_projection_sha256(plan) {
         anyhow::bail!(
             "runtime evidence backend catalog projection is stale or belongs to another ExecutionPlan"
         );
     }
-    let current_executable = runtime
-        .backend_artifacts
-        .iter()
-        .filter(|artifact| artifact.canonical_backend == "__ostadix_current_executable__")
-        .collect::<Vec<_>>();
-    if current_executable.len() != 1 {
-        anyhow::bail!("runtime evidence requires exactly one reserved current-executable artifact");
-    }
-    // WASI preview1 sandboxes have no filesystem access to their own module
-    // bytes (no preopen to self), so `current_executable_artifact()` can
-    // never produce a `Hashed` state there. The self-hash provenance
-    // guarantee is unsatisfiable by sandbox design on wasm, not a bug in a
-    // given program, so this admission check is relaxed only for wasm
-    // targets; non-wasm targets keep the full guarantee unchanged.
-    #[cfg(not(target_family = "wasm"))]
-    if runtime.snapshot_kind == RuntimeSnapshotKindV1::Execution
-        && !matches!(
-            current_executable[0].state,
-            BackendArtifactStateV1::Hashed { .. }
-        )
-    {
-        anyhow::bail!("execution evidence requires a readable, hash-bound current executable");
+    if runtime.snapshot_kind == RuntimeSnapshotKindV1::Execution {
+        runtime
+            .executable_manifest
+            .validate_execution()
+            .context("execution evidence rejected malformed direct executable manifest")?;
+        let leases = runtime
+            .executable_leases
+            .as_ref()
+            .context("execution evidence requires retained direct-executable lease authority")?;
+        if leases.manifest() != &runtime.executable_manifest {
+            anyhow::bail!("execution evidence executable leases do not match their manifest");
+        }
+        leases
+            .verify_all()
+            .context("execution evidence rejected stale direct executable identity")?;
+    } else if runtime.executable_leases.is_some() {
+        anyhow::bail!("inspection evidence must not carry executable lease authority");
+    } else {
+        runtime
+            .executable_manifest
+            .validate_inspection()
+            .context("inspection evidence rejected malformed non-probing executable manifest")?;
     }
     validate_canonical_solved_graph(program, plan, graph)
         .context("evidence analyzer rejected noncanonical static execution input")?;
@@ -420,7 +452,7 @@ pub fn analyze_execution(
                 cancellation_safe: summary.is_verified_pure_infallible(),
                 provenance: effect_provenance,
             },
-            // V4 preserves a bounded, evidence-bound adapter set. Unknown
+            // V5 preserves a bounded, evidence-bound adapter set. Unknown
             // ceilings remain explicit and cannot remove topology edges.
             resource_demand: ResourceDemandContractV1 {
                 cpu_units: Some(1),
@@ -436,9 +468,9 @@ pub fn analyze_execution(
         });
     }
 
-    Ok(EvidenceBundleV4 {
-        schema: EVIDENCE_SCHEMA_V4,
-        analyzer: ANALYZER_ID_V4,
+    Ok(EvidenceBundleV5 {
+        schema: EVIDENCE_SCHEMA_V5,
+        analyzer: ANALYZER_ID_V5,
         bindings,
         runtime,
         nodes,
@@ -457,9 +489,11 @@ pub(crate) fn evidence_bindings(
         analyzed_graph_sha256: graph_sha256(graph),
         backend_catalog_projection_sha256: runtime.backend_catalog_projection_sha256.clone(),
         backend_set_sha256: runtime.backend_set_sha256.clone(),
+        executable_manifest_sha256: runtime.executable_manifest.sha256().to_string(),
+        launch_context_sha256: runtime.launch_context_sha256.clone(),
         environment_sha256: runtime.environment_sha256.clone(),
         ambient_world_sha256: runtime.ambient_world_sha256.clone(),
-        analyzer_sha256: sha256_bytes(ANALYZER_ID_V4.as_bytes()),
+        analyzer_sha256: sha256_bytes(ANALYZER_ID_V5.as_bytes()),
     }
 }
 
@@ -594,8 +628,8 @@ pub(crate) fn graph_sha256(graph: &HGraph) -> String {
     hash.finish()
 }
 
-pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV4) -> String {
-    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v4");
+pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV5) -> String {
+    let mut hash = CanonicalHasher::new("ostadix-evidence-bundle/v5");
     hash.field(bundle.schema.as_bytes());
     hash.field(bundle.analyzer.as_bytes());
     for binding in [
@@ -604,6 +638,8 @@ pub(crate) fn evidence_bundle_sha256(bundle: &EvidenceBundleV4) -> String {
         &bundle.bindings.analyzed_graph_sha256,
         &bundle.bindings.backend_catalog_projection_sha256,
         &bundle.bindings.backend_set_sha256,
+        &bundle.bindings.executable_manifest_sha256,
+        &bundle.bindings.launch_context_sha256,
         &bundle.bindings.environment_sha256,
         &bundle.bindings.ambient_world_sha256,
         &bundle.bindings.analyzer_sha256,
@@ -1159,6 +1195,8 @@ mod tests {
                     resolved_identity: "path:/adapter.py".to_string(),
                     state,
                 }],
+                ExecutableManifestV1::finish(Vec::new()),
+                None,
                 "catalog-projection-test".to_string(),
                 &[("artifact-state-test", "v1")],
             )
@@ -1194,20 +1232,36 @@ mod tests {
             &plan,
             temp.path(),
             &[("adapter-binding-test", "native")],
-        );
+        )
+        .unwrap();
 
-        assert_eq!(first.backend_artifacts().len(), 1);
-        assert_eq!(
-            first.backend_artifacts()[0].canonical_backend,
-            "__ostadix_current_executable__"
-        );
+        assert!(first.backend_artifacts().is_empty());
+        assert!(first
+            .executable_manifest()
+            .artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.canonical_backend == "bash"
+                    && artifact.logical_command == "bash"
+                    && artifact.role == "direct-launcher"
+            }));
+        assert!(first
+            .executable_manifest()
+            .artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.canonical_backend == "bash"
+                    && artifact.logical_command == crate::runtime_exec::CURRENT_O_LOGICAL_COMMAND
+                    && artifact.role == "ostadix-proxy"
+            }));
 
         fs::write(&shim_path, b"# unused native-backend decoy v2\n").unwrap();
         let second = runtime_binding_from_directory(
             &plan,
             temp.path(),
             &[("adapter-binding-test", "native")],
-        );
+        )
+        .unwrap();
         assert_eq!(first.backend_set_sha256(), second.backend_set_sha256());
     }
 
@@ -1222,7 +1276,8 @@ mod tests {
             &plan,
             temp.path(),
             &[("adapter-binding-test", "legacy-python")],
-        );
+        )
+        .unwrap();
 
         assert!(first.backend_artifacts().iter().any(|artifact| {
             artifact.canonical_backend == "python"
@@ -1234,7 +1289,8 @@ mod tests {
             &plan,
             temp.path(),
             &[("adapter-binding-test", "legacy-python")],
-        );
+        )
+        .unwrap();
         assert_ne!(first.backend_set_sha256(), second.backend_set_sha256());
     }
 
@@ -1248,7 +1304,8 @@ mod tests {
             &program.plan(),
             temp.path(),
             &[("adapter-binding-test", "unknown")],
-        );
+        )
+        .unwrap();
 
         assert!(runtime.backend_artifacts().iter().any(|artifact| {
             artifact.canonical_backend == "research_backend"
@@ -1300,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_rejects_a_duplicate_reserved_current_executable_artifact() {
+    fn analyzer_rejects_an_execution_snapshot_without_executable_leases() {
         let program = OIrProgram {
             nodes: vec![crate::ir::OIr::Text("inert".to_string())],
         };
@@ -1308,22 +1365,44 @@ mod tests {
         let mut graph = program.hgraph();
         crate::hgraph::solve::solve_types(&mut graph).unwrap();
         let runtime = build_runtime_binding(
-            RuntimeSnapshotKindV1::Inspection,
-            vec![BackendArtifactV1 {
-                canonical_backend: "__ostadix_current_executable__".to_string(),
-                resolved_identity: "forged:collision".to_string(),
-                state: BackendArtifactStateV1::Hashed {
-                    sha256: "00".repeat(32),
-                },
-            }],
+            RuntimeSnapshotKindV1::Execution,
+            Vec::new(),
+            inspection_executable_manifest(&plan),
+            None,
             backend_catalog_projection_sha256(&plan),
-            &[("reserved-artifact-test", "v1")],
+            &[("missing-lease-test", "v1")],
         );
 
         let error = analyze_execution(&program, &plan, &graph, runtime).unwrap_err();
         assert!(error
             .to_string()
-            .contains("exactly one reserved current-executable artifact"));
+            .contains("requires retained direct-executable lease authority"));
+    }
+
+    #[test]
+    fn analyzer_rejects_probed_state_in_an_inspection_manifest() {
+        let program = program_for_backend("python", 1);
+        let plan = program.plan();
+        let mut graph = program.hgraph();
+        crate::hgraph::solve::solve_types(&mut graph).unwrap();
+        let mut runtime = runtime_binding_from_adapter_bytes(
+            &plan,
+            &[],
+            &[("inspection-manifest-test", "forged")],
+        );
+        runtime.executable_manifest.artifacts[0].state =
+            crate::runtime_exec::ExecutableArtifactStateV1::LocatedHashed;
+        runtime.executable_manifest =
+            ExecutableManifestV1::finish(runtime.executable_manifest.artifacts.clone());
+
+        let error = analyze_execution(&program, &plan, &graph, runtime)
+            .expect_err("inspection evidence cannot carry partially probed executable state");
+        assert!(
+            error
+                .to_string()
+                .contains("malformed non-probing executable manifest"),
+            "{error:#}"
+        );
     }
 
     #[cfg(unix)]

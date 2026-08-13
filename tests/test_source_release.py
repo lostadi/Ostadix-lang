@@ -519,6 +519,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/mod.rs": "pub mod admit;\n",
             "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
+            "src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
             "src/bin/olink.rs": "// fixture project linker CLI\n",
             "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
             "src/bin/ocorec.rs": "// fixture O-core compiler CLI\n",
@@ -837,6 +838,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/evidence/mod.rs",
                 "src/evidence/profile.rs",
                 "src/effects.rs",
+                "src/runtime_exec.rs",
                 "src/bin/olink.rs",
                 "src/bin/olangc.rs",
                 "src/bin/ocorec.rs",
@@ -1534,6 +1536,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/mod.rs",
             "src/evidence/profile.rs",
             "src/backend_catalog.inc.rs",
+            "src/runtime_exec.rs",
         )
         self._git("commit", "-q", "-m", "remove evidence-bound admission surface")
 
@@ -1542,7 +1545,8 @@ class SourceReleaseTests(unittest.TestCase):
             r"missing required path\(s\): .*src/backend_catalog\.inc\.rs.*"
             r"src/evidence/admit\.rs.*"
             r"src/evidence/analyze\.rs.*src/evidence/fact\.rs.*"
-            r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs",
+            r"src/evidence/intent\.rs.*src/evidence/mod\.rs.*src/evidence/profile\.rs.*"
+            r"src/runtime_exec\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")
 
