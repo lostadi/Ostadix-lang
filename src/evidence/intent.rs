@@ -10,10 +10,11 @@ use super::analyze::{
     backend_catalog_projection_sha256, digest_fields, graph_sha256, oir_sha256,
     validate_canonical_solved_graph,
 };
-use super::fact::ANALYZER_ID_V4;
-
 pub const EXECUTION_INTENT_SCHEMA_V1: &str = "oexec.execution-intent/v1";
 const EXECUTION_INTENT_DIGEST_DOMAIN_V1: &str = "ostadix-execution-intent/v1";
+// Preserve V1 byte identity across live admission schema evolution. This is a
+// stable descriptive projection identifier, not the live V5 evidence analyzer.
+const EXECUTION_INTENT_ANALYZER_ID_V1: &str = "ostadix-oir-evidence-compiler/v4";
 
 /// Stable, authority-free identity of one analyzed source-level execution
 /// intent. This projection deliberately excludes runtime discovery, backend
@@ -71,8 +72,8 @@ impl ExecutionIntentV1 {
             plan_sha256: sha256_bytes(plan.to_text().as_bytes()),
             analyzed_graph_sha256: graph_sha256(graph),
             backend_catalog_projection_sha256: backend_catalog_projection_sha256(plan),
-            analyzer_id: ANALYZER_ID_V4.to_string(),
-            analyzer_sha256: sha256_bytes(ANALYZER_ID_V4.as_bytes()),
+            analyzer_id: EXECUTION_INTENT_ANALYZER_ID_V1.to_string(),
+            analyzer_sha256: sha256_bytes(EXECUTION_INTENT_ANALYZER_ID_V1.as_bytes()),
             base_policy: policy_name(base_policy).to_string(),
             execution_intent_sha256: String::new(),
         };
@@ -105,9 +106,9 @@ impl ExecutionIntentV1 {
         ] {
             validate_sha256(label, digest)?;
         }
-        if self.analyzer_id != ANALYZER_ID_V4 {
+        if self.analyzer_id != EXECUTION_INTENT_ANALYZER_ID_V1 {
             bail!(
-                "execution intent names unsupported analyzer `{}` (expected `{ANALYZER_ID_V4}`)",
+                "execution intent names unsupported analyzer `{}` (expected `{EXECUTION_INTENT_ANALYZER_ID_V1}`)",
                 self.analyzer_id
             );
         }
@@ -128,7 +129,7 @@ impl ExecutionIntentV1 {
 
     /// Compare an expected same-intent gate against this freshly recomputed
     /// projection. This is intentionally only a mismatch check; it neither
-    /// authorizes execution nor replaces live V4 admission.
+    /// authorizes execution nor replaces live V5 admission.
     pub fn verify_required(
         &self,
         expected_source_sha256: &str,

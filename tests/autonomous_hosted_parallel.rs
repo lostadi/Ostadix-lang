@@ -7,6 +7,8 @@
 use std::fs;
 use std::io::{BufReader, BufWriter, Read};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -14,6 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use o_lang::ir::{BackendRegistry, OIr, OIrProgram};
 use o_lang::value::{OValue, OWireCommand, OWireResponse};
 use o_lang::wire;
 
@@ -43,7 +46,17 @@ fn run_graph_bounded_with_operation_timeout(
     let trace_path = std::env::var_os("O_LIFECYCLE_TRACE")
         .map(PathBuf::from)
         .unwrap_or_else(|| workdir.path().join("lifecycle.log"));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_O"));
+    // Cargo may relink `target/debug/O` while another integration-test binary
+    // is already exercising it. Use an operation-private immutable copy so
+    // executable-drift evidence cannot mistake Cargo's unrelated build output
+    // replacement for mutation by the program under test.
+    let private_o = workdir.path().join("O-under-test");
+    fs::copy(env!("CARGO_BIN_EXE_O"), &private_o).expect("copy O integration-test executable");
+    let mut private_o_permissions = fs::metadata(&private_o).unwrap().permissions();
+    #[cfg(unix)]
+    private_o_permissions.set_mode(0o755);
+    fs::set_permissions(&private_o, private_o_permissions).unwrap();
+    let mut command = Command::new(&private_o);
     command
         .env_remove("O_EXECUTOR")
         .env("O_LIFECYCLE_TRACE", &trace_path)
@@ -714,17 +727,45 @@ fn production_python_backend_proxy_shutdown_reaps_shim() {
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let proxy_plan = OIrProgram {
+        nodes: vec![OIr::Exec {
+            lang: "python".into(),
+            env_id: u32::MAX,
+            attr: None,
+            backend: BackendRegistry::global().interface_for("python"),
+            body: vec![OIr::Text("__oval_result__ = None".into())],
+        }],
+    }
+    .plan();
     let workdir = tempfile::tempdir().expect("create proxy lifecycle directory");
     let trace_path = std::env::var_os("O_LIFECYCLE_TRACE")
         .map(PathBuf::from)
         .unwrap_or_else(|| workdir.path().join("proxy-lifecycle.log"));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_O"));
+    let private_o = workdir.path().join("O-proxy-under-test");
+    fs::copy(env!("CARGO_BIN_EXE_O"), &private_o).expect("copy O proxy executable");
+    let mut private_o_permissions = fs::metadata(&private_o).unwrap().permissions();
+    #[cfg(unix)]
+    private_o_permissions.set_mode(0o755);
+    fs::set_permissions(&private_o, private_o_permissions).unwrap();
+    let (_, executable_leases) =
+        o_lang::runtime_exec::capture_execution_manifest_with_current_executable(
+            &proxy_plan,
+            &private_o,
+        )
+        .expect("capture admitted Python direct executable manifest");
+    let mut command = Command::new(&private_o);
     command
         .arg("--o-backend")
         .arg("python")
         .env(
             "O_BACKEND_LEGACY_SHIM",
             root.join("backends/python_shim.py"),
+        )
+        .env(
+            o_lang::runtime_exec::ADMITTED_EXECUTABLE_MANIFEST_ENV,
+            executable_leases
+                .backend_manifest_json("python")
+                .expect("serialize admitted Python manifest"),
         )
         .env("O_LIFECYCLE_TRACE", &trace_path)
         .stdin(Stdio::piped())

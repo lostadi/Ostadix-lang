@@ -79,7 +79,7 @@ Ostadix-lang processes hosted code through a 7-stage pipeline:
    values with the renderer embedded in OIR, resolves the block's live backend
    capability, and executes the selected operation. Request values created by
    OIR carry compositional fingerprints into the existing eager/autonomous
-   request scheduler; that scheduler remains a separate authority in v4.
+   request scheduler; that scheduler remains a separate authority in V5.
 
 7. **Settle and observe** — Materialize successful value, completion, and state
    outputs, select deterministic failures, and emit traces or receipts only
@@ -171,7 +171,7 @@ and actor-state serialization.
 ### Evidence-bound admission
 
 `src/evidence/` separates pre-execution certificates from post-execution
-observations. `EvidenceBundleV4` records per-operation type, effect, dispatch,
+observations. `EvidenceBundleV5` records per-operation type, effect, dispatch,
 capability, placement, failure, resource-demand, and cost contracts together
 with provenance. Hard contracts determine whether execution is legal. Cost
 estimates are soft evidence: they may eventually rank an already-legal
@@ -180,13 +180,20 @@ footprint.
 
 The bundle is digest-bound to canonical lowered OIR, the validated plan, the
 solved analyzed graph, analyzer identity, the canonical backend-catalog
-specifications referenced by the plan, the current Ostadix executable and any
-legacy Python shim files actually consumed by the plan, the execution
-environment, and a descriptive ambient `HostWorld` snapshot. Native adapter
-subcommands resolved later through `PATH` are not individually artifact-bound;
-the environment binds the `PATH` value but not directory contents. The
-catalog projection establishes specification identity only; it does not
-establish runtime discovery, health, authorization, capacity, or readiness.
+specifications referenced by the plan, consumed legacy Python shim files, a
+V5 direct-executable manifest, the execution environment, and a descriptive
+ambient `HostWorld` snapshot. For an execution snapshot, the manifest selects
+each plan-used shim backend's direct launchers once, preserves their absolute
+invocation paths, opens and hashes each canonical target once, records Unix
+identity, and retains the handles through dispatch. On non-Unix platforms the
+portable fallback re-hashes the canonical target immediately before launch
+rather than removing backend capacity. It includes the current O proxy and the
+macOS sandbox wrapper when consumed. The same backend-scoped manifest reaches
+the proxy, so backend commands use admitted absolute paths instead of resolving
+another `PATH` candidate. Inspection emits unprobed requirement rows and keeps
+runtime readiness unknown. The catalog projection establishes specification
+identity only; it does not establish health, authorization, capacity, or
+readiness.
 The analyzer first rejects lowered backend interfaces that do not match the
 registered language policy and noncanonical special-invocation metadata, so a
 digest cannot turn a consistently forged interface into valid evidence. The
@@ -203,7 +210,7 @@ event.
 This authority boundary is currently the ordinary OIR execution path only.
 The buffered Request scheduler and `ProjectCoordinator` remain separate, and
 enforced strict hosted effect contracts, renewable CPU/memory/device admission,
-and actor-owned persistent environments remain future work. Evidence schema v4 binds
+and actor-owned persistent environments remain future work. Evidence schema V5 binds
 each dispatch contract to one stable preparation adapter ID. The runtime may
 validate that exact adapter against the admitted OIR, but cannot reclassify the
 operation through a second scheduling authority. The current `LocalWorker`
@@ -216,15 +223,28 @@ members and carries a coordinator-resolved live sandbox policy.
 `coordinator/v1` retains everything else, so a graph wave does not by itself
 prove that every member ran on a worker thread. The backend
 binding distinguishes hashed files, missing paths, non-regular paths, and
-unreadable paths, and samples the current executable, cwd, and environment at
-analysis/dispatch checks; execution admission rejects an unhashed current
-executable. Those rechecks are path/environment-based best
-effort, not an immutable execution substrate: v4 does not pin an opened adapter
-or frozen child environment and cannot prove the bytes/environment observed at
-spawn. It also does not attest the opaque state or generation of an already-live
-actor, the complete external toolchain closure, or placement-lease freshness.
+unreadable paths. The direct-executable lease checks retained-handle and
+canonical-path identity immediately before spawn, detecting replacement and
+in-place metadata drift; persistent actors are keyed by a backend launch
+generation over their backend-scoped executable set, matching legacy shim
+artifacts, and plan-independent child launch context. They are retired when
+that generation changes, while unrelated backend additions do not restart
+them. This closes ambient `PATH`
+alternative reselection, but it is not an immutable execution substrate. V5
+uses path execution on every platform, so a final same-principal
+verification-to-exec micro-window remains. macOS has no general public
+handle-exec primitive; Linux handle-exec is intentionally not used because it
+cannot uniformly preserve scripts, multicall `argv[0]`, and self-location or
+`$ORIGIN` behavior. The manifest covers direct
+launchers only, not shebang interpreters, compiler-driver subtools, dynamic
+libraries, or descendants launched by hosted code. Because `ExecutionPlan`
+omits WebAssembly body shape, V5 conservatively binds the complete `wat2wasm`
+plus runtime alternative rather than under-admitting a later WAT conversion. V5 also
+does not attest a frozen child environment, the opaque state or generation of
+an already-live actor, Request/project execution authority, or placement-lease
+freshness.
 `ActorResourceId` remains a
-serialization identity in v4, and unknown actor work cannot use this gap to
+serialization identity in V5, and unknown actor work cannot use this gap to
 remove `HostWorld` or actor dependencies.
 
 Post-execution `RuntimeGraphV1` and `ExecutionReceiptV1` artifacts remain typed

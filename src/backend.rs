@@ -13,6 +13,7 @@ use num_bigint::BigInt;
 use serde_json::Value;
 
 use crate::ir::{BackendAdapterKind, BackendRegistry};
+use crate::runtime_exec::BackendToolchain;
 use crate::value::{FloatFormat, ONumber, OValue, OWireCommand, OWireResponse};
 use crate::wire;
 
@@ -65,11 +66,13 @@ pub fn has_native_backend(lang: &str) -> bool {
 }
 
 pub fn run_backend(lang: &str) -> Result<()> {
+    let tools = BackendToolchain::from_env(lang)?;
+    tools.verify_all()?;
     if !has_native_backend(lang) {
-        return proxy_legacy_backend(lang);
+        return proxy_legacy_backend(lang, &tools);
     }
 
-    let mut backend = RustBackend::default();
+    let mut backend = RustBackend::new(tools);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -113,9 +116,9 @@ pub fn run_backend(lang: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
 struct RustBackend {
     sql: Option<SqlState>,
+    tools: BackendToolchain,
 }
 
 /// Persistent `sqlite3` CLI session.
@@ -134,6 +137,10 @@ struct SqlState {
 }
 
 impl RustBackend {
+    fn new(tools: BackendToolchain) -> Self {
+        Self { sql: None, tools }
+    }
+
     fn exec(
         &mut self,
         lang: &str,
@@ -141,25 +148,44 @@ impl RustBackend {
         bindings: HashMap<String, OValue>,
     ) -> Result<OValue> {
         match lang {
-            "bash" => run_shell("bash", &["-c", code], Some(scalar_env(bindings))),
-            "shell" => run_shell("sh", &["-c", code], Some(scalar_env(bindings))),
-            "javascript" => run_script("javascript", "js", &javascript_preamble(&bindings), code),
-            "ruby" => run_script("ruby", "rb", &ruby_preamble(&bindings), code),
-            "rust" => run_rust(code),
-            "c" => run_c(code),
-            "cpp" => run_cpp(code),
-            "java" => run_java(code),
-            "nix" | "nix_expr" => run_nix(code),
-            "nix_store" => run_nix_store(code),
+            "bash" => run_shell(
+                &self.tools,
+                "bash",
+                &["-c", code],
+                Some(scalar_env(bindings)),
+            ),
+            "shell" => run_shell(&self.tools, "sh", &["-c", code], Some(scalar_env(bindings))),
+            "javascript" => run_script(
+                &self.tools,
+                "javascript",
+                "node",
+                "js",
+                &javascript_preamble(&bindings),
+                code,
+            ),
+            "ruby" => run_script(
+                &self.tools,
+                "ruby",
+                "ruby",
+                "rb",
+                &ruby_preamble(&bindings),
+                code,
+            ),
+            "rust" => run_rust(&self.tools, code),
+            "c" => run_c(&self.tools, code),
+            "cpp" => run_cpp(&self.tools, code),
+            "java" => run_java(&self.tools, code),
+            "nix" | "nix_expr" => run_nix(&self.tools, code),
+            "nix_store" => run_nix_store(&self.tools, code),
             "sql" => self.run_sql(code),
-            "haskell" => run_haskell(code),
-            "ocaml" => run_ocaml(code),
-            "racket" => run_file_command("racket", "rkt", code, "racket", &["{file}"]),
-            "lisp" | "common_lisp" => run_common_lisp(code),
-            "csharp" => run_csharp(code),
-            "matlab" => run_matlab(code),
-            "mathematica" => run_mathematica(code),
-            "webassembly" => run_webassembly(code),
+            "haskell" => run_haskell(&self.tools, code),
+            "ocaml" => run_ocaml(&self.tools, code),
+            "racket" => run_file_command(&self.tools, "racket", "racket", "rkt", code, &["{file}"]),
+            "lisp" | "common_lisp" => run_common_lisp(&self.tools, code),
+            "csharp" => run_csharp(&self.tools, code),
+            "matlab" => run_matlab(&self.tools, code),
+            "mathematica" => run_mathematica(&self.tools, code),
+            "webassembly" => run_webassembly(&self.tools, code),
             other => bail!("backend `{other}` is not implemented by the Rust backend runner"),
         }
     }
@@ -176,7 +202,7 @@ impl RustBackend {
 
     fn sql_state(&mut self) -> Result<&mut SqlState> {
         if self.sql.is_none() {
-            self.sql = Some(SqlState::spawn()?);
+            self.sql = Some(SqlState::spawn(&self.tools)?);
         }
         Ok(self.sql.as_mut().expect("sql state was just initialized"))
     }
@@ -190,21 +216,22 @@ impl RustBackend {
 }
 
 impl SqlState {
-    fn spawn() -> Result<Self> {
+    fn spawn(tools: &BackendToolchain) -> Result<Self> {
         let dir = TempDir::new("o-backend-sql")?;
         let db_path = dir.path().join("state.sqlite3");
         // Ensure the file exists so sqlite3 opens a durable on-disk DB.
         fs::File::create(&db_path)
             .with_context(|| format!("failed to create sql state db {}", db_path.display()))?;
 
-        let mut child = Command::new("sqlite3")
+        let mut command = tools.command("sqlite3")?;
+        let mut child = command
             .arg("-batch")
             .arg(&db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("sqlite3 is not installed or not in PATH")?;
+            .context("failed to launch admitted sqlite3 executable")?;
 
         let stdin = BufWriter::new(
             child
@@ -357,7 +384,7 @@ fn sql_stderr_is_error(err: &str) -> bool {
         || lower.starts_with("usage:")
 }
 
-fn proxy_legacy_backend(lang: &str) -> Result<()> {
+fn proxy_legacy_backend(lang: &str, tools: &BackendToolchain) -> Result<()> {
     let shim = std::env::var_os("O_BACKEND_LEGACY_SHIM")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("backend `{lang}` has no Rust adapter and no legacy shim path"))?;
@@ -368,15 +395,19 @@ fn proxy_legacy_backend(lang: &str) -> Result<()> {
         );
     }
 
-    let python =
-        which::which("python3").context("python3 is required for legacy backend bridge")?;
-    let mut child = Command::new(python)
+    let mut command = tools.command("python3")?;
+    let mut child = command
         .arg(&shim)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to spawn legacy backend shim: {}", shim.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to launch admitted Python executable for legacy backend shim: {}",
+                shim.display()
+            )
+        })?;
     crate::process::lifecycle_trace(
         "proxy.shim_spawned",
         format!("language={lang} shim_pid={}", child.id()),
@@ -496,8 +527,13 @@ fn reap_legacy_child(child: &mut Child, grace: Duration) -> Result<std::process:
     }
 }
 
-fn run_shell(program: &str, args: &[&str], env: Option<HashMap<String, String>>) -> Result<OValue> {
-    let mut command = Command::new(program);
+fn run_shell(
+    tools: &BackendToolchain,
+    program: &str,
+    args: &[&str],
+    env: Option<HashMap<String, String>>,
+) -> Result<OValue> {
+    let mut command = tools.command(program)?;
     command.args(args);
     if let Some(env) = env {
         command.envs(env);
@@ -506,40 +542,44 @@ fn run_shell(program: &str, args: &[&str], env: Option<HashMap<String, String>>)
         program,
         command
             .output()
-            .with_context(|| format!("{program} is not installed or not in PATH"))?,
+            .with_context(|| format!("failed to launch admitted `{program}` executable"))?,
     )
 }
 
-fn run_script(lang: &str, suffix: &str, preamble: &str, code: &str) -> Result<OValue> {
+fn run_script(
+    tools: &BackendToolchain,
+    lang: &str,
+    program: &str,
+    suffix: &str,
+    preamble: &str,
+    code: &str,
+) -> Result<OValue> {
     let temp = TempDir::new("o-backend-script")?;
     let source = temp.path().join(format!("main.{suffix}"));
     fs::write(&source, format!("{preamble}{code}"))?;
-    let program = match lang {
-        "javascript" => "node",
-        "ruby" => "ruby",
-        _ => lang,
-    };
+    let mut command = tools.command(program)?;
     output_to_value(
-        program,
-        Command::new(program)
+        lang,
+        command
             .arg(&source)
             .output()
-            .with_context(|| format!("{program} is not installed or not in PATH"))?,
+            .with_context(|| format!("failed to launch admitted `{program}` executable"))?,
     )
 }
 
 fn run_file_command(
+    tools: &BackendToolchain,
     label: &str,
+    program: &str,
     suffix: &str,
     code: &str,
-    program: &str,
     args: &[&str],
 ) -> Result<OValue> {
     let temp = TempDir::new("o-backend-file")?;
     let source = temp.path().join(format!("main.{suffix}"));
     fs::write(&source, code)?;
     let source_text = source.to_string_lossy();
-    let mut command = Command::new(program);
+    let mut command = tools.command(program)?;
     for arg in args {
         if *arg == "{file}" {
             command.arg(source_text.as_ref());
@@ -551,23 +591,24 @@ fn run_file_command(
         label,
         command
             .output()
-            .with_context(|| format!("{program} is not installed or not in PATH"))?,
+            .with_context(|| format!("failed to launch admitted `{program}` executable"))?,
     )
 }
 
-fn run_rust(code: &str) -> Result<OValue> {
+fn run_rust(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-rust")?;
     let source = temp.path().join("main.rs");
     let binary = temp.path().join("main");
     fs::write(&source, code)?;
+    let mut compiler = tools.command("rustc")?;
     expect_success(
         "rustc compilation failed",
-        Command::new("rustc")
+        compiler
             .arg(&source)
             .arg("-o")
             .arg(&binary)
             .output()
-            .context("rustc is not installed or not in PATH")?,
+            .context("failed to launch admitted rustc executable")?,
     )?;
     output_to_value(
         "rust program",
@@ -577,20 +618,21 @@ fn run_rust(code: &str) -> Result<OValue> {
     )
 }
 
-fn run_c(code: &str) -> Result<OValue> {
+fn run_c(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-c")?;
     let source = temp.path().join("main.c");
     let binary = temp.path().join("main");
     fs::write(&source, code)?;
+    let mut compiler = tools.command("cc")?;
     expect_success(
         "cc compilation failed",
-        Command::new("cc")
+        compiler
             .arg("-std=c17")
             .arg("-o")
             .arg(&binary)
             .arg(&source)
             .output()
-            .context("cc is not installed or not in PATH")?,
+            .context("failed to launch admitted cc executable")?,
     )?;
     output_to_value(
         "C program",
@@ -600,20 +642,21 @@ fn run_c(code: &str) -> Result<OValue> {
     )
 }
 
-fn run_cpp(code: &str) -> Result<OValue> {
+fn run_cpp(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-cpp")?;
     let source = temp.path().join("main.cpp");
     let binary = temp.path().join("main");
     fs::write(&source, code)?;
+    let mut compiler = tools.command("g++")?;
     expect_success(
         "g++ compilation failed",
-        Command::new("g++")
+        compiler
             .arg("-std=c++17")
             .arg("-o")
             .arg(&binary)
             .arg(&source)
             .output()
-            .context("g++ is not installed or not in PATH")?,
+            .context("failed to launch admitted g++ executable")?,
     )?;
     output_to_value(
         "C++ program",
@@ -623,31 +666,34 @@ fn run_cpp(code: &str) -> Result<OValue> {
     )
 }
 
-fn run_java(code: &str) -> Result<OValue> {
+fn run_java(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-java")?;
     let class_name = java_class_name(code);
     let source = temp.path().join(format!("{class_name}.java"));
     fs::write(&source, code)?;
+    let mut compiler = tools.command("javac")?;
     expect_success(
         "javac compilation failed",
-        Command::new("javac")
+        compiler
             .arg(&source)
             .output()
-            .context("javac is not installed or not in PATH")?,
+            .context("failed to launch admitted javac executable")?,
     )?;
+    let mut runtime = tools.command("java")?;
     output_to_value(
         "java",
-        Command::new("java")
+        runtime
             .arg("-cp")
             .arg(temp.path())
             .arg(class_name)
             .output()
-            .context("java is not installed or not in PATH")?,
+            .context("failed to launch admitted java executable")?,
     )
 }
 
-fn run_nix(code: &str) -> Result<OValue> {
-    let output = Command::new("nix")
+fn run_nix(tools: &BackendToolchain, code: &str) -> Result<OValue> {
+    let mut command = tools.command("nix")?;
+    let output = command
         .args([
             "--extra-experimental-features",
             "nix-command",
@@ -658,15 +704,16 @@ fn run_nix(code: &str) -> Result<OValue> {
             code,
         ])
         .output()
-        .context("nix is not installed or not in PATH")?;
+        .context("failed to launch admitted nix executable")?;
     expect_success("nix eval failed", output.clone())?;
     let json: Value =
         serde_json::from_slice(&output.stdout).context("nix eval returned non-JSON")?;
     json_value_to_ovalue(json)
 }
 
-fn run_nix_store(code: &str) -> Result<OValue> {
-    let output = Command::new("nix")
+fn run_nix_store(tools: &BackendToolchain, code: &str) -> Result<OValue> {
+    let mut command = tools.command("nix")?;
+    let output = command
         .args([
             "--extra-experimental-features",
             "nix-command",
@@ -677,7 +724,7 @@ fn run_nix_store(code: &str) -> Result<OValue> {
             code,
         ])
         .output()
-        .context("nix is not installed or not in PATH")?;
+        .context("failed to launch admitted nix executable")?;
     expect_success("nix eval --raw failed", output.clone())?;
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !path.starts_with("/nix/store/") {
@@ -686,29 +733,31 @@ fn run_nix_store(code: &str) -> Result<OValue> {
     Ok(OValue::store_path(path))
 }
 
-fn run_haskell(code: &str) -> Result<OValue> {
+fn run_haskell(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-haskell")?;
     let source = temp.path().join("Main.hs");
     fs::write(&source, code)?;
-    if which::which("runghc").is_ok() {
+    if tools.contains("runghc") {
+        let mut command = tools.command("runghc")?;
         return output_to_value(
             "Haskell",
-            Command::new("runghc")
+            command
                 .arg(&source)
                 .output()
-                .context("failed to execute runghc")?,
+                .context("failed to launch admitted runghc executable")?,
         );
     }
-    if which::which("ghc").is_ok() {
+    if tools.contains("ghc") {
         let binary = temp.path().join("Main");
+        let mut compiler = tools.command("ghc")?;
         expect_success(
             "ghc compilation failed",
-            Command::new("ghc")
+            compiler
                 .arg("-o")
                 .arg(&binary)
                 .arg(&source)
                 .output()
-                .context("failed to execute ghc")?,
+                .context("failed to launch admitted ghc executable")?,
         )?;
         return output_to_value(
             "Haskell",
@@ -717,41 +766,43 @@ fn run_haskell(code: &str) -> Result<OValue> {
                 .context("failed to execute compiled Haskell program")?,
         );
     }
-    bail!("Neither runghc nor ghc found in PATH. Install GHC.")
+    bail!("admitted Haskell runtime alternative contains neither `runghc` nor `ghc`")
 }
 
-fn run_ocaml(code: &str) -> Result<OValue> {
+fn run_ocaml(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-ocaml")?;
     let source = temp.path().join("main.ml");
     fs::write(&source, code)?;
-    if which::which("ocaml").is_ok() {
+    if tools.contains("ocaml") {
+        let mut command = tools.command("ocaml")?;
         return output_to_value(
             "OCaml",
-            Command::new("ocaml")
+            command
                 .arg(&source)
                 .output()
-                .context("failed to execute ocaml")?,
+                .context("failed to launch admitted ocaml executable")?,
         );
     }
-    let compiler = if which::which("ocamlopt").is_ok() {
+    let compiler = if tools.contains("ocamlopt") {
         Some("ocamlopt")
-    } else if which::which("ocamlc").is_ok() {
+    } else if tools.contains("ocamlc") {
         Some("ocamlc")
     } else {
         None
     };
     let Some(compiler) = compiler else {
-        bail!("ocaml is not installed or not in PATH");
+        bail!("admitted OCaml runtime alternative contains no supported executable");
     };
     let binary = temp.path().join("main");
+    let mut compiler_command = tools.command(compiler)?;
     expect_success(
         format!("{compiler} compilation failed"),
-        Command::new(compiler)
+        compiler_command
             .arg("-o")
             .arg(&binary)
             .arg(&source)
             .output()
-            .with_context(|| format!("failed to execute {compiler}"))?,
+            .with_context(|| format!("failed to launch admitted {compiler} executable"))?,
     )?;
     output_to_value(
         "OCaml",
@@ -761,154 +812,166 @@ fn run_ocaml(code: &str) -> Result<OValue> {
     )
 }
 
-fn run_common_lisp(code: &str) -> Result<OValue> {
+fn run_common_lisp(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-lisp")?;
     let source = temp.path().join("main.lisp");
     fs::write(&source, code)?;
-    if which::which("sbcl").is_ok() {
+    if tools.contains("sbcl") {
+        let mut command = tools.command("sbcl")?;
         return output_to_value(
             "Common Lisp",
-            Command::new("sbcl")
+            command
                 .arg("--script")
                 .arg(&source)
                 .output()
-                .context("failed to execute sbcl")?,
+                .context("failed to launch admitted sbcl executable")?,
         );
     }
-    if which::which("clisp").is_ok() {
+    if tools.contains("clisp") {
+        let mut command = tools.command("clisp")?;
         return output_to_value(
             "Common Lisp",
-            Command::new("clisp")
+            command
                 .arg(&source)
                 .output()
-                .context("failed to execute clisp")?,
+                .context("failed to launch admitted clisp executable")?,
         );
     }
-    bail!("Neither sbcl nor clisp found in PATH. Install a Common Lisp runtime.")
+    bail!("admitted Common Lisp runtime alternative contains neither `sbcl` nor `clisp`")
 }
 
-fn run_csharp(code: &str) -> Result<OValue> {
+fn run_csharp(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-csharp")?;
-    if which::which("dotnet").is_ok() {
+    if tools.contains("dotnet") {
+        let mut project_command = tools.command("dotnet")?;
         expect_success(
             "dotnet project creation failed",
-            Command::new("dotnet")
+            project_command
                 .args(["new", "console", "--force", "-o"])
                 .arg(temp.path())
                 .output()
-                .context("failed to execute dotnet")?,
+                .context("failed to launch admitted dotnet executable")?,
         )?;
         fs::write(temp.path().join("Program.cs"), code)?;
+        let mut run_command = tools.command("dotnet")?;
         return output_to_value(
             "C#",
-            Command::new("dotnet")
+            run_command
                 .arg("run")
                 .arg("--project")
                 .arg(temp.path())
                 .output()
-                .context("failed to execute dotnet run")?,
+                .context("failed to launch admitted dotnet executable for `dotnet run`")?,
         );
     }
-    if which::which("mcs").is_ok() && which::which("mono").is_ok() {
+    if tools.contains("mcs") && tools.contains("mono") {
         let source = temp.path().join("Program.cs");
         let binary = temp.path().join("Program.exe");
         fs::write(&source, code)?;
+        let mut compiler = tools.command("mcs")?;
         expect_success(
             "mcs compilation failed",
-            Command::new("mcs")
+            compiler
                 .arg(format!("-out:{}", binary.display()))
                 .arg(&source)
                 .output()
-                .context("failed to execute mcs")?,
+                .context("failed to launch admitted mcs executable")?,
         )?;
+        let mut runtime = tools.command("mono")?;
         return output_to_value(
             "C#",
-            Command::new("mono")
+            runtime
                 .arg(&binary)
                 .output()
-                .context("failed to execute mono")?,
+                .context("failed to launch admitted mono executable")?,
         );
     }
-    bail!("No C# compiler found. Install .NET SDK (dotnet) or Mono (mcs/mono).")
+    bail!("admitted C# runtime alternative is neither `dotnet` nor `mcs + mono`")
 }
 
-fn run_matlab(code: &str) -> Result<OValue> {
+fn run_matlab(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-matlab")?;
     let source = temp.path().join("script.m");
     fs::write(&source, code)?;
-    if which::which("octave").is_ok() {
+    if tools.contains("octave") {
+        let mut command = tools.command("octave")?;
         return output_to_value(
             "MATLAB/Octave",
-            Command::new("octave")
+            command
                 .args(["--no-gui", "--norc", "--silent"])
                 .arg(&source)
                 .output()
-                .context("failed to execute octave")?,
+                .context("failed to launch admitted octave executable")?,
         );
     }
-    if which::which("matlab").is_ok() {
+    if tools.contains("matlab") {
         let script_dir = temp.path().to_string_lossy();
+        let mut command = tools.command("matlab")?;
         return output_to_value(
             "MATLAB",
-            Command::new("matlab")
+            command
                 .arg("-batch")
                 .arg(format!("addpath('{script_dir}'); script"))
                 .output()
-                .context("failed to execute matlab")?,
+                .context("failed to launch admitted matlab executable")?,
         );
     }
-    bail!("Neither GNU Octave nor MATLAB found in PATH.")
+    bail!("admitted MATLAB runtime alternative contains neither `octave` nor `matlab`")
 }
 
-fn run_mathematica(code: &str) -> Result<OValue> {
+fn run_mathematica(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     run_file_command(
+        tools,
         "Mathematica",
+        "wolframscript",
         "wls",
         code,
-        "wolframscript",
         &["-file", "{file}"],
     )
 }
 
-fn run_webassembly(code: &str) -> Result<OValue> {
+fn run_webassembly(tools: &BackendToolchain, code: &str) -> Result<OValue> {
     let temp = TempDir::new("o-backend-wasm")?;
     let wasm = temp.path().join("module.wasm");
     if code.trim_start().starts_with("(module") || code.trim_start().starts_with("(func") {
         let wat = temp.path().join("module.wat");
         fs::write(&wat, code)?;
+        let mut converter = tools.command("wat2wasm")?;
         expect_success(
             "wat2wasm failed",
-            Command::new("wat2wasm")
+            converter
                 .arg(&wat)
                 .arg("-o")
                 .arg(&wasm)
                 .output()
-                .context("wat2wasm is not installed or not in PATH")?,
+                .context("failed to launch admitted wat2wasm executable")?,
         )?;
     } else {
         fs::write(&wasm, code.as_bytes())?;
     }
 
-    if which::which("wasmtime").is_ok() {
+    if tools.contains("wasmtime") {
+        let mut command = tools.command("wasmtime")?;
         return output_to_value(
             "wasmtime",
-            Command::new("wasmtime")
+            command
                 .arg(&wasm)
                 .output()
-                .context("failed to execute wasmtime")?,
+                .context("failed to launch admitted wasmtime executable")?,
         );
     }
-    if which::which("wasmer").is_ok() {
+    if tools.contains("wasmer") {
+        let mut command = tools.command("wasmer")?;
         return output_to_value(
             "wasmer",
-            Command::new("wasmer")
+            command
                 .arg("run")
                 .arg(&wasm)
                 .output()
-                .context("failed to execute wasmer")?,
+                .context("failed to launch admitted wasmer executable")?,
         );
     }
-    bail!("No WebAssembly runtime found. Install wasmtime or wasmer.")
+    bail!("admitted WebAssembly runtime alternative contains neither `wasmtime` nor `wasmer`")
 }
 
 fn output_to_value(label: &str, output: Output) -> Result<OValue> {
@@ -1250,6 +1313,27 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::has_native_backend;
+
+    #[test]
+    fn production_native_launches_cannot_reselect_from_ambient_path() {
+        let source = include_str!("backend.rs");
+        let (production, _) = source
+            .rsplit_once("#[cfg(test)]\nmod tests")
+            .expect("backend unit-test module remains the final source section");
+
+        assert!(
+            !production.contains("which::which"),
+            "production backend dispatch must never reselect an executable from PATH"
+        );
+        for (offset, _) in production.match_indices("Command::new(") {
+            let launch = &production[offset..];
+            assert!(
+                launch.starts_with("Command::new(&binary)"),
+                "only freshly compiled absolute temp binaries may bypass the admitted toolchain: {}",
+                launch.lines().next().unwrap_or_default()
+            );
+        }
+    }
 
     #[test]
     fn native_backend_dispatch_is_projected_from_the_canonical_catalog() {

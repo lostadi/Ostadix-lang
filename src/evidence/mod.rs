@@ -13,18 +13,19 @@ mod intent;
 pub mod profile;
 
 pub use admit::{
-    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV4,
+    admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV5,
     OperationBlockerV1, RetainedSequenceV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,
     ScheduleWhyWitnessV1, SequenceRetentionReasonV1, SCHEDULE_WHY_SCHEMA_V1,
 };
 pub use analyze::{
     analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
+    runtime_binding_from_directory_reusing_executables,
 };
 pub use fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,
     DispatchAdapterV1, DispatchContractV1, DispatchLaneV1, DispatchSemanticsV1, EffectContractV1,
-    EvidenceBindingsV2, EvidenceBundleV4, EvidenceProvenance, FailureClassV1, FailureContractV1,
+    EvidenceBindingsV2, EvidenceBundleV5, EvidenceProvenance, FailureClassV1, FailureContractV1,
     NodeEvidence, PlacementContractV1, ResourceDemandContractV1, RuntimeBindingV1,
-    RuntimeSnapshotKindV1, TypeContractV1, ADMISSION_SCHEMA_V4, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
+    RuntimeSnapshotKindV1, TypeContractV1, ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
 };
 pub use intent::{source_sha256, ExecutionIntentV1, EXECUTION_INTENT_SCHEMA_V1};

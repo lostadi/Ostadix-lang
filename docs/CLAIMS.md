@@ -177,7 +177,7 @@
   a bounded, expiring, one-use opaque handle and require `O` to recompute that
   same intent before dispatch. This is a local same-intent gate, not a
   capability, runtime-health result, retained admission, or authorization; `O`
-  still constructs and rechecks a fresh process-local V4 admission, and direct
+  still constructs and rechecks a fresh process-local V5 admission, and direct
   `o_run` remains an explicitly ungated compatibility surface.
 - HGraph represents ordinary results, successful completion, evaluator state,
   host-resource state, and persistent actor state as nodes. Executable

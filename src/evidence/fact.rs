@@ -1,10 +1,12 @@
 use crate::effects::ResourceKey;
 use crate::hgraph::AdmissionFactKind;
 use crate::ir::PlanNodeId;
+use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
+use std::sync::Arc;
 
-pub const EVIDENCE_SCHEMA_V4: &str = "oexec.evidence/v4";
-pub const ADMISSION_SCHEMA_V4: &str = "oexec.admission/v4";
-pub const ANALYZER_ID_V4: &str = "ostadix-oir-evidence-compiler/v4";
+pub const EVIDENCE_SCHEMA_V5: &str = "oexec.evidence/v5";
+pub const ADMISSION_SCHEMA_V5: &str = "oexec.admission/v5";
+pub const ANALYZER_ID_V5: &str = "ostadix-oir-evidence-compiler/v5";
 
 /// Strength and origin of a pre-execution fact. Declaration order is not used
 /// as an authorization lattice; callers must use the explicit predicates.
@@ -318,11 +320,21 @@ pub struct BackendArtifactV1 {
 pub struct RuntimeBindingV1 {
     pub(crate) snapshot_kind: RuntimeSnapshotKindV1,
     pub(crate) backend_artifacts: Vec<BackendArtifactV1>,
+    /// Evidence-visible direct executable entrypoints. Execution snapshots
+    /// bind an absolute invocation path plus the opened and hashed canonical
+    /// target identity; inspection snapshots remain explicitly non-probing.
+    pub(crate) executable_manifest: ExecutableManifestV1,
+    /// Opaque, process-local authority handles retained through dispatch.
+    /// They are never serialized or included directly in canonical hashes.
+    pub(crate) executable_leases: Option<Arc<ExecutableLeaseSet>>,
     /// Digest of the canonical backend specifications referenced by the
     /// exact ExecutionPlan. This is catalog identity, not runtime discovery,
     /// health, authorization, or execution-readiness evidence.
     pub(crate) backend_catalog_projection_sha256: String,
     pub(crate) backend_set_sha256: String,
+    /// Plan-independent child launch context: cwd, sorted process environment,
+    /// and explicit evaluator context only.
+    pub(crate) launch_context_sha256: String,
     pub(crate) environment_sha256: String,
     /// Descriptive digest of the ambient HostWorld process snapshot. This is
     /// not a governed World identity, lease, capability, or authority grant.
@@ -338,6 +350,14 @@ impl RuntimeBindingV1 {
         &self.backend_artifacts
     }
 
+    pub fn executable_manifest(&self) -> &ExecutableManifestV1 {
+        &self.executable_manifest
+    }
+
+    pub(crate) fn executable_leases(&self) -> Option<Arc<ExecutableLeaseSet>> {
+        self.executable_leases.clone()
+    }
+
     pub fn backend_catalog_projection_sha256(&self) -> &str {
         &self.backend_catalog_projection_sha256
     }
@@ -348,6 +368,10 @@ impl RuntimeBindingV1 {
 
     pub fn environment_sha256(&self) -> &str {
         &self.environment_sha256
+    }
+
+    pub fn launch_context_sha256(&self) -> &str {
+        &self.launch_context_sha256
     }
 
     pub fn ambient_world_sha256(&self) -> &str {
@@ -365,13 +389,15 @@ pub struct EvidenceBindingsV2 {
     pub analyzed_graph_sha256: String,
     pub backend_catalog_projection_sha256: String,
     pub backend_set_sha256: String,
+    pub executable_manifest_sha256: String,
+    pub launch_context_sha256: String,
     pub environment_sha256: String,
     pub ambient_world_sha256: String,
     pub analyzer_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidenceBundleV4 {
+pub struct EvidenceBundleV5 {
     pub(crate) schema: &'static str,
     pub(crate) analyzer: &'static str,
     pub(crate) bindings: EvidenceBindingsV2,
@@ -379,7 +405,7 @@ pub struct EvidenceBundleV4 {
     pub(crate) nodes: Vec<NodeEvidence>,
 }
 
-impl EvidenceBundleV4 {
+impl EvidenceBundleV5 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
