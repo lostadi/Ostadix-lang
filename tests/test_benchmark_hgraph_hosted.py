@@ -150,7 +150,7 @@ class HostedHGraphBenchmarkTests(unittest.TestCase):
                 admission_digest = digest
                 if mode == "mismatched-admission":
                     admission_digest = hashlib.sha256(b"different-admission").hexdigest()
-                admission_header = "; ExecutionAdmission oexec.admission/v4"
+                admission_header = "; ExecutionAdmission oexec.admission/v5"
                 if mode == "wrong-admission-schema":
                     admission_header = "; ExecutionAdmission oexec.admission/v999"
                 if mode != "missing-admission":

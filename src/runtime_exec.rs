@@ -1,0 +1,1626 @@
+//! Evidence-bound direct executable entrypoints.
+//!
+//! Admission selects one complete catalog alternative for every shim-backed
+//! backend, opens and hashes those executables once, and retains the open files
+//! until execution completes. Dispatch consumes admitted absolute invocation
+//! paths from this manifest instead of resolving command names through `PATH`
+//! again; each invocation name is bound to its opened and hashed canonical
+//! target so multicall symlinks keep their required `argv[0]` behavior.
+//!
+//! This is deliberately a *direct-launcher* guarantee.  It does not claim to
+//! bind interpreters selected by shebangs, compiler drivers' subordinate tools,
+//! dynamic libraries, or descendants launched by user code. The retained
+//! handle plus path/file-identity checks close ambient `PATH` reselection and
+//! detect drift immediately before spawn. They do not make executable bytes
+//! immutable or eliminate the final same-principal verification-to-path-exec
+//! micro-window. V5 does not use handle-based execution on any platform:
+//! macOS has no general public primitive, while Linux handle execution cannot
+//! uniformly preserve script, multicall `argv[0]`, and self-location behavior.
+//! On non-Unix targets, where the standard library exposes no equivalent
+//! stable file identity, launch remains available under a weaker guarantee:
+//! the canonical target is re-hashed immediately before each spawn.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File, Metadata};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::ir::{BackendAdapterKind, BackendRegistry, ExecutionMode, ExecutionPlan, PlanNodeKind};
+
+pub const EXECUTABLE_MANIFEST_SCHEMA_V1: &str = "oexec.direct-executable-manifest/v1";
+pub const ADMITTED_EXECUTABLE_MANIFEST_ENV: &str = "O_ADMITTED_EXECUTABLE_MANIFEST";
+pub const CURRENT_O_LOGICAL_COMMAND: &str = "__ostadix_current_executable__";
+pub const SANDBOX_EXEC_LOGICAL_COMMAND: &str = "__sandbox_exec__";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutableGuaranteeV1 {
+    /// The bytes were hashed once at capture; retained-file and canonical-path
+    /// identities are compared immediately before each direct spawn.
+    DirectLauncherPathAndOpenFileIdentity,
+    /// Portable fallback for platforms without stable Unix file identity.
+    /// The canonical target is re-hashed immediately before every launch.
+    DirectLauncherContentHashImmediatelyBeforeLaunch,
+    /// Inspection names a requirement without looking at the host filesystem.
+    InspectionNotProbed,
+}
+
+impl ExecutableGuaranteeV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DirectLauncherPathAndOpenFileIdentity => {
+                "direct-launcher-path-and-open-file-identity"
+            }
+            Self::DirectLauncherContentHashImmediatelyBeforeLaunch => {
+                "direct-launcher-content-hash-immediately-before-launch"
+            }
+            Self::InspectionNotProbed => "inspection-not-probed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutableArtifactStateV1 {
+    LocatedHashed,
+    NotProbed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutableSelectionV1 {
+    CompleteCatalogAlternative,
+    AdapterDirectLauncherRefinement,
+    NotSelected,
+}
+
+impl ExecutableSelectionV1 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CompleteCatalogAlternative => "complete-catalog-alternative",
+            Self::AdapterDirectLauncherRefinement => "adapter-direct-launcher-refinement",
+            Self::NotSelected => "not-selected",
+        }
+    }
+}
+
+impl ExecutableArtifactStateV1 {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::LocatedHashed => "located-hashed",
+            Self::NotProbed => "not-probed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableFileIdentityV1 {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_seconds: i64,
+    pub mtime_nanoseconds: i64,
+    pub ctime_seconds: i64,
+    pub ctime_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableArtifactV1 {
+    pub canonical_backend: String,
+    pub requirement_key: String,
+    pub selected_alternative: Option<usize>,
+    /// Whether the selected rows cover a complete catalog alternative or a
+    /// deliberately narrower direct-launcher projection.
+    pub selection: ExecutableSelectionV1,
+    pub logical_command: String,
+    /// `direct-launcher`, `ostadix-proxy`, or `sandbox-wrapper`.
+    pub role: String,
+    pub state: ExecutableArtifactStateV1,
+    /// Absolute path passed to `exec`. This preserves multicall symlink names
+    /// such as `rustc -> rustup` while `canonical_path` identifies the opened
+    /// and hashed target bytes.
+    pub invocation_path: Option<PathBuf>,
+    pub canonical_path: Option<PathBuf>,
+    pub invocation_identity: String,
+    pub invocation_file_identity: Option<ExecutableFileIdentityV1>,
+    pub resolved_identity: String,
+    pub sha256: Option<String>,
+    pub file_identity: Option<ExecutableFileIdentityV1>,
+    pub guarantee: ExecutableGuaranteeV1,
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactSelection<'a> {
+    requirement_key: &'a str,
+    selected_alternative: Option<usize>,
+    selection: ExecutableSelectionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableManifestV1 {
+    pub schema: String,
+    /// This manifest binds direct launch entrypoints, not their transitive
+    /// runtime closure.
+    pub scope: String,
+    pub artifacts: Vec<ExecutableArtifactV1>,
+    pub sha256: String,
+}
+
+impl ExecutableManifestV1 {
+    pub fn artifacts(&self) -> &[ExecutableArtifactV1] {
+        &self.artifacts
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn validate_execution(&self) -> Result<()> {
+        validate_decoded_manifest(self, None)
+    }
+
+    pub(crate) fn validate_inspection(&self) -> Result<()> {
+        validate_manifest_envelope(self, None)?;
+        for artifact in &self.artifacts {
+            validate_inspection_artifact_shape(artifact)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut artifacts: Vec<ExecutableArtifactV1>) -> Self {
+        artifacts.sort_by(|left, right| {
+            (
+                &left.canonical_backend,
+                &left.requirement_key,
+                left.selected_alternative,
+                left.selection.name(),
+                &left.role,
+                &left.logical_command,
+            )
+                .cmp(&(
+                    &right.canonical_backend,
+                    &right.requirement_key,
+                    right.selected_alternative,
+                    right.selection.name(),
+                    &right.role,
+                    &right.logical_command,
+                ))
+        });
+        let sha256 = manifest_sha256(&artifacts);
+        Self {
+            schema: EXECUTABLE_MANIFEST_SCHEMA_V1.to_string(),
+            scope: "direct-launcher-only".to_string(),
+            artifacts,
+            sha256,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RetainedExecutable {
+    path: PathBuf,
+    file: File,
+    identity: ExecutableFileIdentityV1,
+    sha256: String,
+}
+
+/// Process-local launch authority retained by `AdmittedExecution`.
+///
+/// Equality is intentionally based on the evidence-visible manifest.  Open
+/// file descriptors are authority handles, not canonical evidence bytes.
+#[derive(Debug)]
+pub struct ExecutableLeaseSet {
+    manifest: ExecutableManifestV1,
+    retained: BTreeMap<PathBuf, RetainedExecutable>,
+    backend_artifacts: HashMap<String, Vec<usize>>,
+    backend_digests: BTreeMap<String, String>,
+}
+
+impl PartialEq for ExecutableLeaseSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.manifest == other.manifest
+    }
+}
+
+impl Eq for ExecutableLeaseSet {}
+
+impl ExecutableLeaseSet {
+    pub fn manifest(&self) -> &ExecutableManifestV1 {
+        &self.manifest
+    }
+
+    pub fn verify_all(&self) -> Result<()> {
+        for artifact in &self.manifest.artifacts {
+            self.verify_artifact(artifact)?;
+        }
+        Ok(())
+    }
+
+    pub fn verify_backend(&self, backend: &str) -> Result<()> {
+        let indices = self.backend_artifacts.get(backend).with_context(|| {
+            format!("no admitted direct executable manifest for backend `{backend}`")
+        })?;
+        for &index in indices {
+            self.verify_artifact(&self.manifest.artifacts[index])?;
+        }
+        Ok(())
+    }
+
+    pub fn command_path(&self, backend: &str, logical_command: &str) -> Result<&Path> {
+        let artifact = self.artifact(backend, logical_command).with_context(|| {
+            format!("backend `{backend}` has no admitted direct executable `{logical_command}`")
+        })?;
+        self.verify_artifact(artifact)?;
+        artifact
+            .invocation_path
+            .as_deref()
+            .context("admitted direct executable has no invocation path")
+    }
+
+    pub fn current_o_path(&self) -> Result<&Path> {
+        self.unique_reserved_path(CURRENT_O_LOGICAL_COMMAND)
+    }
+
+    pub fn sandbox_exec_path(&self) -> Result<Option<&Path>> {
+        let artifacts = self
+            .manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.logical_command == SANDBOX_EXEC_LOGICAL_COMMAND)
+            .collect::<Vec<_>>();
+        let Some(artifact) = artifacts.first().copied() else {
+            return Ok(None);
+        };
+        for candidate in &artifacts {
+            if candidate.invocation_path != artifact.invocation_path
+                || candidate.canonical_path != artifact.canonical_path
+                || candidate.sha256 != artifact.sha256
+                || candidate.file_identity != artifact.file_identity
+            {
+                bail!("admission contains conflicting sandbox-exec identities");
+            }
+        }
+        self.verify_artifact(artifact)?;
+        artifact
+            .invocation_path
+            .as_deref()
+            .map(Some)
+            .context("admitted sandbox-exec executable has no invocation path")
+    }
+
+    pub fn backend_manifest_json(&self, backend: &str) -> Result<String> {
+        let indices = self.backend_artifacts.get(backend).with_context(|| {
+            format!("no admitted direct executable manifest for backend `{backend}`")
+        })?;
+        let artifacts = indices
+            .iter()
+            .map(|&index| self.manifest.artifacts[index].clone())
+            .collect::<Vec<_>>();
+        serde_json::to_string(&ExecutableManifestV1::finish(artifacts))
+            .context("failed to encode admitted executable manifest for backend child")
+    }
+
+    pub fn backend_executable_set_sha256(&self, backend: &str) -> Result<&str> {
+        self.backend_digests
+            .get(backend)
+            .map(String::as_str)
+            .with_context(|| format!("no admitted executable-set digest for backend `{backend}`"))
+    }
+
+    fn artifact(&self, backend: &str, logical: &str) -> Option<&ExecutableArtifactV1> {
+        self.manifest.artifacts.iter().find(|artifact| {
+            artifact.canonical_backend == backend && artifact.logical_command == logical
+        })
+    }
+
+    fn unique_reserved_path(&self, logical: &str) -> Result<&Path> {
+        let artifacts = self
+            .manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.logical_command == logical)
+            .collect::<Vec<_>>();
+        let artifact = artifacts
+            .first()
+            .copied()
+            .with_context(|| format!("admission has no `{logical}` executable"))?;
+        for candidate in &artifacts {
+            if candidate.invocation_path != artifact.invocation_path
+                || candidate.canonical_path != artifact.canonical_path
+                || candidate.sha256 != artifact.sha256
+                || candidate.file_identity != artifact.file_identity
+            {
+                bail!("admission contains conflicting `{logical}` executable identities");
+            }
+        }
+        self.verify_artifact(artifact)?;
+        artifact
+            .invocation_path
+            .as_deref()
+            .with_context(|| format!("admitted `{logical}` executable has no invocation path"))
+    }
+
+    fn verify_artifact(&self, artifact: &ExecutableArtifactV1) -> Result<()> {
+        if artifact.state != ExecutableArtifactStateV1::LocatedHashed {
+            bail!(
+                "executable `{}` for backend `{}` was not execution-bound",
+                artifact.logical_command,
+                artifact.canonical_backend
+            );
+        }
+        let path = artifact
+            .canonical_path
+            .as_ref()
+            .context("execution-bound executable lacks a canonical path")?;
+        let expected = artifact
+            .file_identity
+            .as_ref()
+            .context("execution-bound executable lacks a file identity")?;
+        let retained = self
+            .retained
+            .get(path)
+            .with_context(|| format!("no retained executable handle for {}", path.display()))?;
+        verify_invocation_path(artifact, expected)?;
+        // Check the name-to-object binding first. Replacing an executable by
+        // rename can also change ctime on the still-open inode when its old
+        // directory entry is unlinked; diagnosing the path substitution is
+        // both more precise and independent of that retained-inode detail.
+        let path_identity = file_identity(&fs::metadata(path).with_context(|| {
+            format!("failed to stat admitted executable path {}", path.display())
+        })?)?;
+        if &path_identity != expected {
+            bail!(
+                "admitted direct executable path was replaced before launch: backend `{}` command `{}` path {}",
+                artifact.canonical_backend,
+                artifact.logical_command,
+                path.display()
+            );
+        }
+        let handle_identity = file_identity(&retained.file.metadata().with_context(|| {
+            format!(
+                "failed to stat retained executable handle {}",
+                retained.path.display()
+            )
+        })?)?;
+        if &handle_identity != expected || &retained.identity != expected {
+            bail!(
+                "admitted direct executable changed through retained handle: backend `{}` command `{}`",
+                artifact.canonical_backend,
+                artifact.logical_command
+            );
+        }
+        verify_content_if_required(artifact, path)?;
+        Ok(())
+    }
+}
+
+/// Child-process projection used by `src/backend.rs`.  It independently
+/// revalidates the admitted rows immediately before every direct launch.
+#[derive(Debug)]
+pub struct BackendToolchain {
+    backend: String,
+    manifest: ExecutableManifestV1,
+}
+
+impl BackendToolchain {
+    pub fn from_env(backend: &str) -> Result<Self> {
+        let raw = std::env::var(ADMITTED_EXECUTABLE_MANIFEST_ENV).with_context(|| {
+            format!(
+                "backend `{backend}` has no admitted direct executable manifest in {ADMITTED_EXECUTABLE_MANIFEST_ENV}"
+            )
+        })?;
+        let manifest: ExecutableManifestV1 =
+            serde_json::from_str(&raw).context("invalid admitted direct executable manifest")?;
+        validate_decoded_manifest(&manifest, Some(backend))?;
+        Ok(Self {
+            backend: backend.to_string(),
+            manifest,
+        })
+    }
+
+    pub fn command_path(&self, logical_command: &str) -> Result<&Path> {
+        let artifact = self
+            .manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.logical_command == logical_command)
+            .with_context(|| {
+                format!(
+                    "backend `{}` has no admitted direct executable `{logical_command}`",
+                    self.backend
+                )
+            })?;
+        verify_decoded_artifact(artifact)?;
+        artifact
+            .invocation_path
+            .as_deref()
+            .context("admitted executable has no invocation path")
+    }
+
+    pub fn command(&self, logical_command: &str) -> Result<Command> {
+        Ok(Command::new(self.command_path(logical_command)?))
+    }
+
+    pub fn contains(&self, logical_command: &str) -> bool {
+        self.manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.logical_command == logical_command)
+    }
+
+    pub fn verify_all(&self) -> Result<()> {
+        for artifact in &self.manifest.artifacts {
+            verify_decoded_artifact(artifact)?;
+        }
+        Ok(())
+    }
+
+    pub fn executable_set_sha256(&self) -> &str {
+        &self.manifest.sha256
+    }
+}
+
+/// Capture one exact direct-launch alternative per plan-used shim backend.
+/// Missing direct entrypoints reject execution before evidence/admission and
+/// before any plan operation is dispatched.
+pub fn capture_execution_manifest(
+    plan: &ExecutionPlan,
+) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
+    let current = std::env::current_exe().context("failed to locate current O executable")?;
+    capture_execution_manifest_with_current_executable(plan, &current)
+}
+
+/// Capture a manifest with an explicit O proxy entrypoint.
+///
+/// This exists for black-box integration gates and generated-runtime hosts
+/// whose executable is already known by an outer launcher. Normal execution
+/// must use [`capture_execution_manifest`] so admission binds its own image.
+#[doc(hidden)]
+pub fn capture_execution_manifest_with_current_executable(
+    plan: &ExecutionPlan,
+    current_executable: &Path,
+) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
+    let registry = BackendRegistry::global();
+    let backends = shim_backends(plan);
+    let mut artifacts = Vec::new();
+    let mut retained = BTreeMap::new();
+
+    for backend in backends {
+        let adapter = registry.adapter_for(&backend);
+        let requirement = registry.runtime_requirements_for(&backend);
+        let (selected_alternative, selection, direct_commands) = match adapter {
+            BackendAdapterKind::LegacyPythonShim => (
+                0,
+                ExecutableSelectionV1::AdapterDirectLauncherRefinement,
+                vec![(
+                    "python3",
+                    which::which("python3")
+                        .context("python3 is required for the legacy backend bridge")?,
+                )],
+            ),
+            BackendAdapterKind::NativeRust => {
+                let (index, commands) = select_complete_alternative(requirement.alternatives)
+                    .with_context(|| {
+                        format!(
+                            "backend `{backend}` has no complete direct executable alternative for requirement `{}`",
+                            requirement.key
+                        )
+                    })?;
+                (
+                    index,
+                    ExecutableSelectionV1::CompleteCatalogAlternative,
+                    commands,
+                )
+            }
+            BackendAdapterKind::Inline => continue,
+        };
+
+        for (logical, path) in direct_commands {
+            let selection_context = ArtifactSelection {
+                requirement_key: requirement.key,
+                selected_alternative: Some(selected_alternative),
+                selection,
+            };
+            artifacts.push(capture_artifact(
+                &backend,
+                selection_context,
+                logical,
+                "direct-launcher",
+                &path,
+                &mut retained,
+            )?);
+        }
+
+        artifacts.push(capture_artifact(
+            &backend,
+            ArtifactSelection {
+                requirement_key: requirement.key,
+                selected_alternative: Some(selected_alternative),
+                selection,
+            },
+            CURRENT_O_LOGICAL_COMMAND,
+            "ostadix-proxy",
+            current_executable,
+            &mut retained,
+        )?);
+
+        #[cfg(target_os = "macos")]
+        artifacts.push(capture_artifact(
+            &backend,
+            ArtifactSelection {
+                requirement_key: requirement.key,
+                selected_alternative: Some(selected_alternative),
+                selection,
+            },
+            SANDBOX_EXEC_LOGICAL_COMMAND,
+            "sandbox-wrapper",
+            Path::new("/usr/bin/sandbox-exec"),
+            &mut retained,
+        )?);
+    }
+
+    let manifest = ExecutableManifestV1::finish(artifacts);
+    validate_decoded_manifest(&manifest, None)
+        .context("captured direct executable manifest is internally invalid")?;
+    let backend_digests = backend_digests(&manifest);
+    let leases = Arc::new(ExecutableLeaseSet {
+        manifest: manifest.clone(),
+        retained,
+        backend_artifacts: backend_artifact_indices(&manifest),
+        backend_digests,
+    });
+    Ok((manifest, leases))
+}
+
+/// Non-probing projection for `olangc --explain-schedule`.  Candidate rows
+/// remain explicitly unselected and carry no path, hash, or file identity.
+pub fn inspection_executable_manifest(plan: &ExecutionPlan) -> ExecutableManifestV1 {
+    let registry = BackendRegistry::global();
+    let mut artifacts = Vec::new();
+    for backend in shim_backends(plan) {
+        let requirement = registry.runtime_requirements_for(&backend);
+        let commands = if registry.adapter_for(&backend) == BackendAdapterKind::LegacyPythonShim {
+            vec!["python3"]
+        } else {
+            requirement
+                .alternatives
+                .iter()
+                .flat_map(|alternative| alternative.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        for command in commands {
+            artifacts.push(unprobed_artifact(
+                &backend,
+                requirement.key,
+                command,
+                "direct-launcher",
+            ));
+        }
+        artifacts.push(unprobed_artifact(
+            &backend,
+            requirement.key,
+            CURRENT_O_LOGICAL_COMMAND,
+            "ostadix-proxy",
+        ));
+        #[cfg(target_os = "macos")]
+        artifacts.push(unprobed_artifact(
+            &backend,
+            requirement.key,
+            SANDBOX_EXEC_LOGICAL_COMMAND,
+            "sandbox-wrapper",
+        ));
+    }
+    ExecutableManifestV1::finish(artifacts)
+}
+
+fn shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
+    plan.nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            PlanNodeKind::Exec { backend, .. } if backend.execution == ExecutionMode::Shim => {
+                Some(backend.canonical.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn select_complete_alternative(
+    alternatives: &'static [&'static [&'static str]],
+) -> Result<(usize, Vec<(&'static str, PathBuf)>)> {
+    alternatives
+        .iter()
+        .enumerate()
+        .find_map(|(index, alternative)| {
+            alternative
+                .iter()
+                .map(|command| which::which(command).map(|path| (*command, path)))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()
+                .map(|resolved| (index, resolved))
+        })
+        .context("no complete executable alternative is present")
+}
+
+fn absolute_invocation_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .context("failed to resolve current directory for executable invocation")
+        .map(|directory| directory.join(path))
+}
+
+fn verify_invocation_target(
+    invocation_path: &Path,
+    canonical_path: &Path,
+    expected_invocation: &ExecutableFileIdentityV1,
+    expected: &ExecutableFileIdentityV1,
+) -> Result<()> {
+    let invocation_identity =
+        file_identity(&fs::symlink_metadata(invocation_path).with_context(|| {
+            format!(
+                "failed to stat admitted executable invocation name {}",
+                invocation_path.display()
+            )
+        })?)?;
+    if &invocation_identity != expected_invocation {
+        bail!(
+            "admitted executable invocation name changed identity: {}",
+            invocation_path.display()
+        );
+    }
+    let current_target = invocation_path.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve admitted executable invocation path {}",
+            invocation_path.display()
+        )
+    })?;
+    if current_target != canonical_path {
+        bail!(
+            "admitted executable invocation path changed target: {}",
+            invocation_path.display()
+        );
+    }
+    let actual = file_identity(&fs::metadata(&current_target).with_context(|| {
+        format!(
+            "failed to stat admitted executable invocation target {}",
+            current_target.display()
+        )
+    })?)?;
+    if &actual != expected {
+        bail!(
+            "admitted executable invocation target changed identity: {}",
+            invocation_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_content_if_required(_artifact: &ExecutableArtifactV1, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_content_if_required(artifact: &ExecutableArtifactV1, path: &Path) -> Result<()> {
+    let expected = artifact
+        .sha256
+        .as_deref()
+        .context("launch-bound executable lacks a SHA-256 digest")?;
+    let file = File::open(path)
+        .with_context(|| format!("failed to reopen executable target {}", path.display()))?;
+    let actual = sha256_file(&file, path)?;
+    if actual != expected {
+        bail!(
+            "admitted direct executable content changed before launch: backend `{}` command `{}`",
+            artifact.canonical_backend,
+            artifact.logical_command
+        );
+    }
+    Ok(())
+}
+
+fn verify_invocation_path(
+    artifact: &ExecutableArtifactV1,
+    expected: &ExecutableFileIdentityV1,
+) -> Result<()> {
+    let invocation_path = artifact
+        .invocation_path
+        .as_ref()
+        .context("execution-bound executable lacks an invocation path")?;
+    let canonical_path = artifact
+        .canonical_path
+        .as_ref()
+        .context("execution-bound executable lacks a canonical target path")?;
+    let expected_invocation = artifact
+        .invocation_file_identity
+        .as_ref()
+        .context("execution-bound executable lacks an invocation-name identity")?;
+    verify_invocation_target(
+        invocation_path,
+        canonical_path,
+        expected_invocation,
+        expected,
+    )
+    .with_context(|| {
+        format!(
+            "admitted invocation path is stale for backend `{}` command `{}`",
+            artifact.canonical_backend, artifact.logical_command
+        )
+    })?;
+    Ok(())
+}
+
+fn capture_artifact(
+    backend: &str,
+    selection: ArtifactSelection<'_>,
+    logical_command: &str,
+    role: &str,
+    path: &Path,
+    retained: &mut BTreeMap<PathBuf, RetainedExecutable>,
+) -> Result<ExecutableArtifactV1> {
+    let invocation_path = absolute_invocation_path(path)?;
+    let invocation_file_identity =
+        file_identity(&fs::symlink_metadata(&invocation_path).with_context(|| {
+            format!(
+                "failed to stat executable invocation name {}",
+                invocation_path.display()
+            )
+        })?)?;
+    let canonical_path = invocation_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize executable {}", path.display()))?;
+
+    // A launcher may be shared by several plan-used backends (notably the
+    // current O proxy, sandbox-exec, and python3). The first capture owns the
+    // only content hash. Later rows reuse that evidence after proving that the
+    // canonical name and retained handle still designate the same object.
+    if let Some(existing) = retained.get(&canonical_path) {
+        let observed_path_identity =
+            file_identity(&fs::metadata(&canonical_path).with_context(|| {
+                format!(
+                    "failed to stat executable path {}",
+                    canonical_path.display()
+                )
+            })?)?;
+        let handle_identity = file_identity(&existing.file.metadata().with_context(|| {
+            format!(
+                "failed to stat retained executable handle {}",
+                canonical_path.display()
+            )
+        })?)?;
+        if observed_path_identity != existing.identity || handle_identity != existing.identity {
+            bail!(
+                "direct executable changed while reusing captured evidence: {}",
+                canonical_path.display()
+            );
+        }
+        verify_invocation_target(
+            &invocation_path,
+            &canonical_path,
+            &invocation_file_identity,
+            &existing.identity,
+        )?;
+        return Ok(ExecutableArtifactV1 {
+            canonical_backend: backend.to_string(),
+            requirement_key: selection.requirement_key.to_string(),
+            selected_alternative: selection.selected_alternative,
+            selection: selection.selection,
+            logical_command: logical_command.to_string(),
+            role: role.to_string(),
+            state: ExecutableArtifactStateV1::LocatedHashed,
+            invocation_identity: path_identity(&invocation_path),
+            invocation_path: Some(invocation_path),
+            invocation_file_identity: Some(invocation_file_identity),
+            resolved_identity: path_identity(&canonical_path),
+            canonical_path: Some(canonical_path),
+            sha256: Some(existing.sha256.clone()),
+            file_identity: Some(existing.identity.clone()),
+            guarantee: platform_execution_guarantee(),
+        });
+    }
+
+    let file = File::open(&canonical_path)
+        .with_context(|| format!("failed to open executable {}", canonical_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat executable {}", canonical_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "direct executable is not a regular file: {}",
+            canonical_path.display()
+        );
+    }
+    ensure_executable_mode(&metadata, &canonical_path)?;
+    let identity = file_identity(&metadata)?;
+    verify_invocation_target(
+        &invocation_path,
+        &canonical_path,
+        &invocation_file_identity,
+        &identity,
+    )?;
+    let path_identity_before =
+        file_identity(&fs::metadata(&canonical_path).with_context(|| {
+            format!(
+                "failed to stat executable path {}",
+                canonical_path.display()
+            )
+        })?)?;
+    if path_identity_before != identity {
+        bail!(
+            "direct executable was replaced while being opened: {}",
+            canonical_path.display()
+        );
+    }
+    let sha256 = sha256_file(&file, &canonical_path)?;
+    let handle_identity_after = file_identity(&file.metadata().with_context(|| {
+        format!(
+            "failed to re-stat executable handle {}",
+            canonical_path.display()
+        )
+    })?)?;
+    let path_identity_after =
+        file_identity(&fs::metadata(&canonical_path).with_context(|| {
+            format!(
+                "failed to re-stat executable path {}",
+                canonical_path.display()
+            )
+        })?)?;
+    if handle_identity_after != identity || path_identity_after != identity {
+        bail!(
+            "direct executable changed while being hashed: {}",
+            canonical_path.display()
+        );
+    }
+    verify_invocation_target(
+        &invocation_path,
+        &canonical_path,
+        &invocation_file_identity,
+        &identity,
+    )?;
+    retained.insert(
+        canonical_path.clone(),
+        RetainedExecutable {
+            path: canonical_path.clone(),
+            file,
+            identity: identity.clone(),
+            sha256: sha256.clone(),
+        },
+    );
+    Ok(ExecutableArtifactV1 {
+        canonical_backend: backend.to_string(),
+        requirement_key: selection.requirement_key.to_string(),
+        selected_alternative: selection.selected_alternative,
+        selection: selection.selection,
+        logical_command: logical_command.to_string(),
+        role: role.to_string(),
+        state: ExecutableArtifactStateV1::LocatedHashed,
+        invocation_identity: path_identity(&invocation_path),
+        invocation_path: Some(invocation_path),
+        invocation_file_identity: Some(invocation_file_identity),
+        resolved_identity: path_identity(&canonical_path),
+        canonical_path: Some(canonical_path),
+        sha256: Some(sha256),
+        file_identity: Some(identity),
+        guarantee: platform_execution_guarantee(),
+    })
+}
+
+fn unprobed_artifact(
+    backend: &str,
+    requirement_key: &str,
+    command: &str,
+    role: &str,
+) -> ExecutableArtifactV1 {
+    ExecutableArtifactV1 {
+        canonical_backend: backend.to_string(),
+        requirement_key: requirement_key.to_string(),
+        selected_alternative: None,
+        selection: ExecutableSelectionV1::NotSelected,
+        logical_command: command.to_string(),
+        role: role.to_string(),
+        state: ExecutableArtifactStateV1::NotProbed,
+        invocation_path: None,
+        canonical_path: None,
+        invocation_identity: format!("logical-command:{command}"),
+        invocation_file_identity: None,
+        resolved_identity: format!("logical-command:{command}"),
+        sha256: None,
+        file_identity: None,
+        guarantee: ExecutableGuaranteeV1::InspectionNotProbed,
+    }
+}
+
+fn backend_digests(manifest: &ExecutableManifestV1) -> BTreeMap<String, String> {
+    manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.canonical_backend.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|backend| {
+            let artifacts = manifest
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.canonical_backend == backend)
+                .cloned()
+                .collect();
+            let digest = ExecutableManifestV1::finish(artifacts).sha256;
+            (backend, digest)
+        })
+        .collect()
+}
+
+fn backend_artifact_indices(manifest: &ExecutableManifestV1) -> HashMap<String, Vec<usize>> {
+    let mut indices = HashMap::<String, Vec<usize>>::new();
+    for (index, artifact) in manifest.artifacts.iter().enumerate() {
+        indices
+            .entry(artifact.canonical_backend.clone())
+            .or_default()
+            .push(index);
+    }
+    indices
+}
+
+fn validate_decoded_manifest(manifest: &ExecutableManifestV1, backend: Option<&str>) -> Result<()> {
+    validate_manifest_envelope(manifest, backend)?;
+    for artifact in &manifest.artifacts {
+        validate_execution_artifact_shape(artifact)?;
+    }
+    validate_backend_selections(manifest)?;
+    Ok(())
+}
+
+fn validate_manifest_envelope(
+    manifest: &ExecutableManifestV1,
+    backend: Option<&str>,
+) -> Result<()> {
+    if manifest.schema != EXECUTABLE_MANIFEST_SCHEMA_V1 || manifest.scope != "direct-launcher-only"
+    {
+        bail!("unsupported admitted direct executable manifest schema or scope");
+    }
+    if manifest.sha256 != manifest_sha256(&manifest.artifacts) {
+        bail!("admitted direct executable manifest digest mismatch");
+    }
+    if let Some(backend) = backend {
+        if manifest.artifacts.is_empty()
+            || manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.canonical_backend != backend)
+        {
+            bail!("admitted direct executable manifest is not scoped to backend `{backend}`");
+        }
+    }
+    let mut logical_commands = BTreeSet::new();
+    let registry = BackendRegistry::global();
+    for artifact in &manifest.artifacts {
+        if !logical_commands.insert((
+            artifact.canonical_backend.as_str(),
+            artifact.logical_command.as_str(),
+        )) {
+            bail!(
+                "admitted direct executable manifest repeats backend `{}` command `{}`",
+                artifact.canonical_backend,
+                artifact.logical_command
+            );
+        }
+        if registry.canonical(&artifact.canonical_backend) != artifact.canonical_backend {
+            bail!(
+                "direct executable manifest backend `{}` is not canonical",
+                artifact.canonical_backend
+            );
+        }
+        let requirement = registry.runtime_requirements_for(&artifact.canonical_backend);
+        if artifact.requirement_key != requirement.key {
+            bail!(
+                "direct executable manifest backend `{}` names requirement `{}` instead of `{}`",
+                artifact.canonical_backend,
+                artifact.requirement_key,
+                requirement.key
+            );
+        }
+        validate_artifact_role(artifact)?;
+    }
+    Ok(())
+}
+
+fn validate_backend_selections(manifest: &ExecutableManifestV1) -> Result<()> {
+    let registry = BackendRegistry::global();
+    for backend in manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.canonical_backend.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        let rows = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.canonical_backend == backend)
+            .collect::<Vec<_>>();
+        let selected = rows[0]
+            .selected_alternative
+            .context("execution manifest backend has no selected alternative")?;
+        let selection = rows[0].selection;
+        if rows.iter().any(|artifact| {
+            artifact.selected_alternative != Some(selected) || artifact.selection != selection
+        }) {
+            bail!("direct executable manifest backend `{backend}` has inconsistent selection");
+        }
+        let direct_commands = rows
+            .iter()
+            .filter(|artifact| artifact.role == "direct-launcher")
+            .map(|artifact| artifact.logical_command.as_str())
+            .collect::<BTreeSet<_>>();
+        let requirement = registry.runtime_requirements_for(backend);
+        match selection {
+            ExecutableSelectionV1::CompleteCatalogAlternative => {
+                let expected = requirement
+                    .alternatives
+                    .get(selected)
+                    .with_context(|| {
+                        format!(
+                            "direct executable manifest backend `{backend}` selects nonexistent alternative {selected}"
+                        )
+                    })?
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if direct_commands != expected {
+                    bail!(
+                        "direct executable manifest backend `{backend}` does not bind its complete selected catalog alternative"
+                    );
+                }
+            }
+            ExecutableSelectionV1::AdapterDirectLauncherRefinement => {
+                if registry.adapter_for(backend) != BackendAdapterKind::LegacyPythonShim
+                    || direct_commands != BTreeSet::from(["python3"])
+                {
+                    bail!(
+                        "direct executable manifest backend `{backend}` has an invalid legacy-adapter launcher refinement"
+                    );
+                }
+            }
+            ExecutableSelectionV1::NotSelected => {
+                bail!("execution manifest backend `{backend}` has no selected launch alternative")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_inspection_artifact_shape(artifact: &ExecutableArtifactV1) -> Result<()> {
+    validate_artifact_identity_fields(artifact)?;
+    validate_artifact_role(artifact)?;
+    if artifact.state != ExecutableArtifactStateV1::NotProbed
+        || artifact.guarantee != ExecutableGuaranteeV1::InspectionNotProbed
+        || artifact.selected_alternative.is_some()
+        || artifact.selection != ExecutableSelectionV1::NotSelected
+        || artifact.invocation_path.is_some()
+        || artifact.invocation_file_identity.is_some()
+        || artifact.canonical_path.is_some()
+        || artifact.sha256.is_some()
+        || artifact.file_identity.is_some()
+        || artifact.invocation_identity != format!("logical-command:{}", artifact.logical_command)
+        || artifact.resolved_identity != format!("logical-command:{}", artifact.logical_command)
+    {
+        bail!(
+            "inspection executable `{}` contains probed or selected execution state",
+            artifact.logical_command
+        );
+    }
+    Ok(())
+}
+
+fn validate_execution_artifact_shape(artifact: &ExecutableArtifactV1) -> Result<()> {
+    validate_artifact_identity_fields(artifact)?;
+    validate_artifact_role(artifact)?;
+    if artifact.state != ExecutableArtifactStateV1::LocatedHashed
+        || artifact.guarantee != platform_execution_guarantee()
+        || artifact.selected_alternative.is_none()
+        || artifact.selection == ExecutableSelectionV1::NotSelected
+    {
+        bail!(
+            "direct executable `{}` is not launch-bound",
+            artifact.logical_command
+        );
+    }
+    let invocation_path = artifact
+        .invocation_path
+        .as_ref()
+        .context("launch-bound executable lacks an invocation path")?;
+    if !invocation_path.is_absolute() {
+        bail!(
+            "launch-bound executable invocation path is not absolute: {}",
+            invocation_path.display()
+        );
+    }
+    if artifact.invocation_identity != path_identity(invocation_path) {
+        bail!(
+            "launch-bound executable invocation identity disagrees with its path: {}",
+            invocation_path.display()
+        );
+    }
+    artifact
+        .invocation_file_identity
+        .as_ref()
+        .context("launch-bound executable lacks an invocation-name identity")?;
+    let path = artifact
+        .canonical_path
+        .as_ref()
+        .context("launch-bound executable lacks a canonical path")?;
+    if !path.is_absolute() {
+        bail!(
+            "launch-bound executable path is not absolute: {}",
+            path.display()
+        );
+    }
+    if artifact.resolved_identity != path_identity(path) {
+        bail!(
+            "launch-bound executable path identity disagrees with its canonical path: {}",
+            path.display()
+        );
+    }
+    let sha256 = artifact
+        .sha256
+        .as_deref()
+        .context("launch-bound executable lacks a SHA-256 digest")?;
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!(
+            "launch-bound executable `{}` has a malformed SHA-256 digest",
+            artifact.logical_command
+        );
+    }
+    artifact
+        .file_identity
+        .as_ref()
+        .context("launch-bound executable lacks a file identity")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+const fn platform_execution_guarantee() -> ExecutableGuaranteeV1 {
+    ExecutableGuaranteeV1::DirectLauncherPathAndOpenFileIdentity
+}
+
+#[cfg(not(unix))]
+const fn platform_execution_guarantee() -> ExecutableGuaranteeV1 {
+    ExecutableGuaranteeV1::DirectLauncherContentHashImmediatelyBeforeLaunch
+}
+
+fn validate_artifact_identity_fields(artifact: &ExecutableArtifactV1) -> Result<()> {
+    if artifact.canonical_backend.is_empty()
+        || artifact.requirement_key.is_empty()
+        || artifact.logical_command.is_empty()
+    {
+        bail!("direct executable manifest contains an empty identity field");
+    }
+    Ok(())
+}
+
+fn validate_artifact_role(artifact: &ExecutableArtifactV1) -> Result<()> {
+    let valid = match artifact.role.as_str() {
+        "direct-launcher" => !matches!(
+            artifact.logical_command.as_str(),
+            CURRENT_O_LOGICAL_COMMAND | SANDBOX_EXEC_LOGICAL_COMMAND
+        ),
+        "ostadix-proxy" => artifact.logical_command == CURRENT_O_LOGICAL_COMMAND,
+        "sandbox-wrapper" => artifact.logical_command == SANDBOX_EXEC_LOGICAL_COMMAND,
+        _ => false,
+    };
+    if !valid {
+        bail!(
+            "direct executable `{}` has invalid role `{}`",
+            artifact.logical_command,
+            artifact.role
+        );
+    }
+    Ok(())
+}
+
+fn verify_decoded_artifact(artifact: &ExecutableArtifactV1) -> Result<()> {
+    validate_execution_artifact_shape(artifact)?;
+    let path = artifact
+        .canonical_path
+        .as_ref()
+        .context("launch-bound executable lacks a canonical path")?;
+    let expected = artifact
+        .file_identity
+        .as_ref()
+        .context("launch-bound executable lacks a file identity")?;
+    verify_invocation_path(artifact, expected)?;
+    let actual =
+        file_identity(&fs::metadata(path).with_context(|| {
+            format!("failed to stat admitted executable path {}", path.display())
+        })?)?;
+    if &actual != expected {
+        bail!(
+            "admitted direct executable path changed before child launch: backend `{}` command `{}`",
+            artifact.canonical_backend,
+            artifact.logical_command
+        );
+    }
+    verify_content_if_required(artifact, path)?;
+    Ok(())
+}
+
+fn sha256_file(file: &File, path: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file
+        .try_clone()
+        .with_context(|| format!("failed to clone executable handle {}", path.display()))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+fn manifest_sha256(artifacts: &[ExecutableArtifactV1]) -> String {
+    let bytes = serde_json::to_vec(artifacts)
+        .expect("serializing executable manifest artifacts into memory cannot fail");
+    let mut hash = Sha256::new();
+    hash.update(EXECUTABLE_MANIFEST_SCHEMA_V1.as_bytes());
+    hash.update(b"direct-launcher-only");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    hex::encode(hash.finalize())
+}
+
+fn path_identity(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        format!("path-bytes:{}", hex::encode(path.as_os_str().as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        format!("path-lossy:{}", path.to_string_lossy())
+    }
+}
+
+#[cfg(unix)]
+fn ensure_executable_mode(metadata: &Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.mode() & 0o111 == 0 {
+        bail!(
+            "direct executable has no execute permission bits: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_executable_mode(_metadata: &Metadata, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &Metadata) -> Result<ExecutableFileIdentityV1> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(ExecutableFileIdentityV1 {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mode: metadata.mode(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &Metadata) -> Result<ExecutableFileIdentityV1> {
+    use std::time::UNIX_EPOCH;
+    let modified = metadata
+        .modified()
+        .context("executable metadata has no modification time")?
+        .duration_since(UNIX_EPOCH)
+        .context("executable modification time predates the Unix epoch")?;
+    Ok(ExecutableFileIdentityV1 {
+        device: 0,
+        inode: 0,
+        size: metadata.len(),
+        mode: 0,
+        mtime_seconds: i64::try_from(modified.as_secs())
+            .context("executable modification time exceeds i64")?,
+        mtime_nanoseconds: i64::from(modified.subsec_nanos()),
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::ir::{BackendRegistry, OIr, OIrProgram};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn shell_plan() -> ExecutionPlan {
+        OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "shell".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("shell"),
+                body: vec![OIr::Text("printf ok".into())],
+            }],
+        }
+        .plan()
+    }
+
+    #[test]
+    fn inspection_is_explicitly_non_probing() {
+        let manifest = inspection_executable_manifest(&shell_plan());
+        assert!(!manifest.artifacts.is_empty());
+        assert!(manifest.artifacts.iter().all(|artifact| {
+            artifact.state == ExecutableArtifactStateV1::NotProbed
+                && artifact.canonical_path.is_none()
+                && artifact.sha256.is_none()
+                && artifact.file_identity.is_none()
+        }));
+    }
+
+    #[test]
+    fn retained_lease_rejects_atomic_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        let replacement = temp.path().join("replacement");
+        for (path, bytes) in [
+            (&admitted, b"#!/bin/sh\nexit 0\n".as_slice()),
+            (&replacement, b"#!/bin/sh\nexit 7\n".as_slice()),
+        ] {
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut retained = BTreeMap::new();
+        let artifact = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "sh",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![artifact]);
+        let leases = ExecutableLeaseSet {
+            backend_digests: backend_digests(&manifest),
+            backend_artifacts: backend_artifact_indices(&manifest),
+            manifest,
+            retained,
+        };
+        fs::rename(&replacement, &admitted).unwrap();
+        let error = format!("{:#}", leases.verify_backend("shell").unwrap_err());
+        assert!(
+            error.contains("admitted invocation path is stale for backend `shell` command `sh`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn retained_lease_rejects_in_place_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let artifact = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "sh",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![artifact]);
+        let leases = ExecutableLeaseSet {
+            backend_digests: backend_digests(&manifest),
+            backend_artifacts: backend_artifact_indices(&manifest),
+            manifest,
+            retained,
+        };
+        let mut writer = fs::OpenOptions::new().write(true).open(&admitted).unwrap();
+        writer.write_all(b"#!/bin/sh\nexit 9\n").unwrap();
+        writer.flush().unwrap();
+        let error = format!("{:#}", leases.verify_backend("shell").unwrap_err());
+        assert!(
+            error.contains("admitted invocation path is stale for backend `shell` command `sh`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shared_launcher_reuses_one_open_and_hash_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("shared-tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let first = capture_artifact(
+            "left",
+            ArtifactSelection {
+                requirement_key: "test",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "tool",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let second = capture_artifact(
+            "right",
+            ArtifactSelection {
+                requirement_key: "test",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "tool",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(first.file_identity, second.file_identity);
+    }
+
+    #[test]
+    fn child_manifest_rejects_duplicate_logical_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let artifact = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "tool",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![artifact.clone(), artifact]);
+        let error = validate_decoded_manifest(&manifest, Some("shell"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repeats backend `shell` command `tool`"));
+    }
+
+    #[test]
+    fn child_manifest_rejects_reserved_command_under_direct_launcher_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let mut artifact = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "sh",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        artifact.logical_command = CURRENT_O_LOGICAL_COMMAND.to_string();
+        let manifest = ExecutableManifestV1::finish(vec![artifact]);
+        let error = validate_decoded_manifest(&manifest, Some("shell"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid role `direct-launcher`"));
+    }
+
+    #[test]
+    fn child_manifest_rejects_inconsistent_backend_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let direct = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "sh",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let proxy = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::AdapterDirectLauncherRefinement,
+            },
+            CURRENT_O_LOGICAL_COMMAND,
+            "ostadix-proxy",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![direct, proxy]);
+        let error = validate_decoded_manifest(&manifest, Some("shell"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("backend `shell` has inconsistent selection"));
+    }
+
+    #[test]
+    fn child_manifest_rejects_incomplete_webassembly_alternative() {
+        let temp = tempfile::tempdir().unwrap();
+        let admitted = temp.path().join("tool");
+        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut retained = BTreeMap::new();
+        let artifact = capture_artifact(
+            "webassembly",
+            ArtifactSelection {
+                requirement_key: "webassembly",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            "wasmtime",
+            "direct-launcher",
+            &admitted,
+            &mut retained,
+        )
+        .unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![artifact]);
+        let error = validate_decoded_manifest(&manifest, Some("webassembly"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(
+            "backend `webassembly` does not bind its complete selected catalog alternative"
+        ));
+    }
+}

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 #[cfg(not(unix))]
 use std::sync::OnceLock;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -491,11 +491,10 @@ fn rust_backend_command(
     lang: &str,
     shim_path: &Path,
     sandbox: &BackendSandboxPolicy,
+    executable_leases: &crate::runtime_exec::ExecutableLeaseSet,
 ) -> Result<Command> {
-    let executable = std::env::current_exe().context("failed to locate current executable")?;
-    let executable = executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf());
+    executable_leases.verify_backend(lang)?;
+    let executable = executable_leases.current_o_path()?.to_path_buf();
     let runtime_root = if shim_path.exists() {
         shim_path
             .parent()
@@ -509,14 +508,28 @@ fn rust_backend_command(
     };
 
     #[cfg(target_os = "macos")]
-    let mut command = macos_sandbox_command(&executable, sandbox, &runtime_root)?;
+    let mut command = macos_sandbox_command_with_launcher(
+        executable_leases
+            .sandbox_exec_path()?
+            .ok_or_else(|| anyhow!("admission omitted the macOS sandbox-exec artifact"))?,
+        &executable,
+        sandbox,
+        &runtime_root,
+    )?;
     #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&executable);
 
-    command.arg("--o-backend").arg(lang).env(
-        "O_BACKEND_AUTHORITIES",
-        serde_json::to_string(&sandbox.names())?,
-    );
+    command
+        .arg("--o-backend")
+        .arg(lang)
+        .env(
+            crate::runtime_exec::ADMITTED_EXECUTABLE_MANIFEST_ENV,
+            executable_leases.backend_manifest_json(lang)?,
+        )
+        .env(
+            "O_BACKEND_AUTHORITIES",
+            serde_json::to_string(&sandbox.names())?,
+        );
     if shim_path.exists() {
         command.env("O_BACKEND_LEGACY_SHIM", shim_path);
         command.env(
@@ -539,8 +552,23 @@ fn legacy_backend_command(shim_path: &Path, sandbox: &BackendSandboxPolicy) -> R
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn macos_sandbox_command(
+    executable: &Path,
+    sandbox: &BackendSandboxPolicy,
+    runtime_root: &Path,
+) -> Result<Command> {
+    macos_sandbox_command_with_launcher(
+        Path::new("/usr/bin/sandbox-exec"),
+        executable,
+        sandbox,
+        runtime_root,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_command_with_launcher(
+    sandbox_launcher: &Path,
     executable: &Path,
     sandbox: &BackendSandboxPolicy,
     runtime_root: &Path,
@@ -581,7 +609,7 @@ fn macos_sandbox_command(
         ));
     }
 
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    let mut command = Command::new(sandbox_launcher);
     command.arg("-p").arg(profile).arg(executable);
     Ok(command)
 }
@@ -594,12 +622,26 @@ fn sandbox_quote(path: &Path) -> String {
 }
 
 impl BackendProcess {
-    fn new(lang: &str, shim_path: &Path, sandbox: &BackendSandboxPolicy) -> Result<Self> {
+    fn new(
+        lang: &str,
+        shim_path: &Path,
+        sandbox: &BackendSandboxPolicy,
+        executable_leases: Option<&crate::runtime_exec::ExecutableLeaseSet>,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        let _ = executable_leases;
         #[cfg(test)]
         let mut command = legacy_backend_command(shim_path, sandbox)?;
 
         #[cfg(not(test))]
-        let mut command = rust_backend_command(lang, shim_path, sandbox)?;
+        let mut command = rust_backend_command(
+            lang,
+            shim_path,
+            sandbox,
+            executable_leases.ok_or_else(|| {
+                anyhow!("backend `{lang}` has no admitted executable lease authority")
+            })?,
+        )?;
 
         #[cfg(unix)]
         command.process_group(0);
@@ -1071,14 +1113,20 @@ pub(crate) fn run_ephemeral_with_eval_callback<F>(
     bindings: HashMap<String, OValue>,
     shim_path: &Path,
     sandbox: &BackendSandboxPolicy,
+    executable_leases: Option<&Arc<crate::runtime_exec::ExecutableLeaseSet>>,
     mut evaluate: F,
 ) -> Result<OValue>
 where
     F: FnMut(String, Option<OValue>, Duration) -> Result<OValue>,
 {
-    let mut process = BackendProcess::new(language, shim_path, sandbox)
-        .with_context(|| format!("failed to start ephemeral backend `{language}`"))
-        .map_err(infrastructure_error)?;
+    let mut process = BackendProcess::new(
+        language,
+        shim_path,
+        sandbox,
+        executable_leases.map(AsRef::as_ref),
+    )
+    .with_context(|| format!("failed to start ephemeral backend `{language}`"))
+    .map_err(infrastructure_error)?;
     let operation_timeout = backend_operation_timeout();
     let operation_deadline = Instant::now()
         .checked_add(operation_timeout)
@@ -1151,7 +1199,20 @@ where
 }
 
 pub struct ProcessRegistry {
-    registry: HashMap<(String, u32, BackendSandboxPolicy), BackendProcess>,
+    registry: HashMap<(String, u32, BackendSandboxPolicy, String), BackendProcess>,
+}
+
+/// Admission-scoped physical launch authority shared by persistent and
+/// ephemeral registry entry points. Grouping these immutable launch facts
+/// keeps the semantic execution arguments separate from process authority.
+pub(crate) struct BackendLaunchContext<'a> {
+    pub(crate) shim_path: &'a Path,
+    pub(crate) sandbox: &'a BackendSandboxPolicy,
+    pub(crate) executable_leases: Option<&'a Arc<crate::runtime_exec::ExecutableLeaseSet>>,
+    /// Canonical admission projection over this backend's exact executable
+    /// set, consumed shim artifact, and child launch context. Persistent
+    /// actors may be reused only within one such generation.
+    pub(crate) launch_generation_sha256: Option<&'a str>,
 }
 
 impl Default for ProcessRegistry {
@@ -1176,13 +1237,24 @@ impl ProcessRegistry {
         env_id: u32,
         code: &str,
         bindings: HashMap<String, OValue>,
-        shim_path: &Path,
-        sandbox: &BackendSandboxPolicy,
+        launch: BackendLaunchContext<'_>,
     ) -> Result<()> {
-        let key = (lang.to_string(), env_id, sandbox.clone());
+        let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
+        self.retire_stale_actor(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
+        let key = (
+            lang.to_string(),
+            env_id,
+            launch.sandbox.clone(),
+            launch_generation_sha256,
+        );
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(lang, shim_path, sandbox)
-                .with_context(|| format!("failed to start backend for language `{lang}`"))?;
+            let process = BackendProcess::new(
+                lang,
+                launch.shim_path,
+                launch.sandbox,
+                launch.executable_leases.map(AsRef::as_ref),
+            )
+            .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
         }
         self.registry
@@ -1207,7 +1279,7 @@ impl ProcessRegistry {
         env_id: u32,
         sandbox: &BackendSandboxPolicy,
     ) -> Result<ExecStep> {
-        let key = (lang.to_string(), env_id, sandbox.clone());
+        let key = self.process_key(lang, env_id, sandbox)?;
         let step = self
             .registry
             .get_mut(&key)
@@ -1238,7 +1310,7 @@ impl ProcessRegistry {
         sandbox: &BackendSandboxPolicy,
         timeout: Duration,
     ) -> Result<ExecStep> {
-        let key = (lang.to_string(), env_id, sandbox.clone());
+        let key = self.process_key(lang, env_id, sandbox)?;
         let step = self
             .registry
             .get_mut(&key)
@@ -1281,7 +1353,7 @@ impl ProcessRegistry {
         value: OValue,
         sandbox: &BackendSandboxPolicy,
     ) -> Result<()> {
-        let key = (lang.to_string(), env_id, sandbox.clone());
+        let key = self.process_key(lang, env_id, sandbox)?;
         self.registry
             .get_mut(&key)
             .ok_or_else(|| anyhow!("no live backend process for `{lang}[{env_id}]`"))?
@@ -1295,14 +1367,25 @@ impl ProcessRegistry {
         env_id: u32,
         code: &str,
         bindings: HashMap<String, OValue>,
-        shim_path: &Path,
-        sandbox: &BackendSandboxPolicy,
+        launch: BackendLaunchContext<'_>,
     ) -> Result<OValue> {
-        let key = (lang.to_string(), env_id, sandbox.clone());
+        let launch_generation_sha256 = actor_launch_generation(&launch, lang)?;
+        self.retire_stale_actor(lang, env_id, launch.sandbox, &launch_generation_sha256)?;
+        let key = (
+            lang.to_string(),
+            env_id,
+            launch.sandbox.clone(),
+            launch_generation_sha256,
+        );
 
         if !self.registry.contains_key(&key) {
-            let process = BackendProcess::new(lang, shim_path, sandbox)
-                .with_context(|| format!("failed to start backend for language `{lang}`"))?;
+            let process = BackendProcess::new(
+                lang,
+                launch.shim_path,
+                launch.sandbox,
+                launch.executable_leases.map(AsRef::as_ref),
+            )
+            .with_context(|| format!("failed to start backend for language `{lang}`"))?;
             self.registry.insert(key.clone(), process);
         }
 
@@ -1334,7 +1417,7 @@ impl ProcessRegistry {
         let keys = self
             .registry
             .keys()
-            .filter(|(candidate_lang, candidate_env, _)| {
+            .filter(|(candidate_lang, candidate_env, _, _)| {
                 candidate_lang == lang && *candidate_env == env_id
             })
             .cloned()
@@ -1366,6 +1449,86 @@ impl ProcessRegistry {
             ))
         }
     }
+
+    fn process_key(
+        &self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> Result<(String, u32, BackendSandboxPolicy, String)> {
+        let mut matching =
+            self.registry
+                .keys()
+                .filter(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                    candidate_lang == lang
+                        && *candidate_env == env_id
+                        && candidate_sandbox == sandbox
+                });
+        let key = matching
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow!("no live backend process for `{lang}[{env_id}]`"))?;
+        if matching.next().is_some() {
+            bail!("multiple launch generations are live for backend `{lang}[{env_id}]`");
+        }
+        Ok(key)
+    }
+
+    fn retire_stale_actor(
+        &mut self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+        launch_generation_sha256: &str,
+    ) -> Result<()> {
+        let stale_keys = self
+            .registry
+            .keys()
+            .filter(
+                |(candidate_lang, candidate_env, candidate_sandbox, candidate_digest)| {
+                    candidate_lang == lang
+                        && *candidate_env == env_id
+                        && candidate_sandbox == sandbox
+                        && candidate_digest != launch_generation_sha256
+                },
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            if let Some(mut process) = self.registry.remove(&stale_key) {
+                process.shutdown(backend_shutdown_timeout()).with_context(|| {
+                    format!(
+                        "failed to restart persistent backend `{lang}[{env_id}]` after its admitted launch generation changed"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn actor_launch_generation(launch: &BackendLaunchContext<'_>, lang: &str) -> Result<String> {
+    if let Some(executable_leases) = launch.executable_leases {
+        executable_leases.verify_backend(lang)?;
+        let generation = launch.launch_generation_sha256.with_context(|| {
+            format!("backend `{lang}` has no admitted launch-generation identity")
+        })?;
+        if generation.is_empty() {
+            bail!("backend `{lang}` has an empty admitted launch-generation identity");
+        }
+        return Ok(generation.to_string());
+    }
+    #[cfg(test)]
+    {
+        Ok(launch
+            .launch_generation_sha256
+            .unwrap_or("unit-test-legacy-shim")
+            .to_string())
+    }
+    #[cfg(not(test))]
+    {
+        bail!("backend `{lang}` has no admitted executable lease authority")
+    }
 }
 
 impl Drop for ProcessRegistry {
@@ -1386,7 +1549,12 @@ mod tests {
     }
 
     fn spawn_python_shim() -> Result<BackendProcess> {
-        BackendProcess::new("python", &python_shim_path(), &BackendSandboxPolicy::none())
+        BackendProcess::new(
+            "python",
+            &python_shim_path(),
+            &BackendSandboxPolicy::none(),
+            None,
+        )
     }
 
     fn spawn_python_shim_with(
@@ -1396,6 +1564,7 @@ mod tests {
             "python",
             &python_shim_path(),
             &BackendSandboxPolicy::new(permissions),
+            None,
         )
     }
 
@@ -1594,7 +1763,8 @@ mod tests {
         );
         std::fs::write(&shim, source.replacen(original, delayed, 1))?;
 
-        let mut process = BackendProcess::new("python", &shim, &BackendSandboxPolicy::none())?;
+        let mut process =
+            BackendProcess::new("python", &shim, &BackendSandboxPolicy::none(), None)?;
         let started = Instant::now();
         let error = process
             .shutdown(Duration::from_millis(500))
@@ -1667,8 +1837,12 @@ mod tests {
                 env_id,
                 "__oval_result__ = 'done'",
                 HashMap::new(),
-                &python_shim_path(),
-                &sandbox,
+                BackendLaunchContext {
+                    shim_path: &python_shim_path(),
+                    sandbox: &sandbox,
+                    executable_leases: None,
+                    launch_generation_sha256: None,
+                },
             )?;
             assert!(matches!(
                 registry.recv_exec_step("python", env_id, &sandbox)?,
@@ -1682,11 +1856,80 @@ mod tests {
     }
 
     #[test]
+    fn persistent_actor_restarts_when_admitted_launch_generation_changes() -> Result<()> {
+        let mut registry = ProcessRegistry::new();
+        let sandbox = BackendSandboxPolicy::none();
+        let shim = python_shim_path();
+        let first_generation = "admitted-launch-generation-v1";
+        let second_generation = "admitted-launch-generation-v2";
+
+        let first = registry.exec(
+            "python",
+            7,
+            concat!(
+                "import os\n",
+                "retained_across_commands = 'present'\n",
+                "__oval_result__ = str(os.getpid())",
+            ),
+            HashMap::new(),
+            BackendLaunchContext {
+                shim_path: &shim,
+                sandbox: &sandbox,
+                executable_leases: None,
+                launch_generation_sha256: Some(first_generation),
+            },
+        )?;
+        let first_pid = first.as_str()?.to_string();
+
+        let same_generation = registry.exec(
+            "python",
+            7,
+            "__oval_result__ = retained_across_commands",
+            HashMap::new(),
+            BackendLaunchContext {
+                shim_path: &shim,
+                sandbox: &sandbox,
+                executable_leases: None,
+                launch_generation_sha256: Some(first_generation),
+            },
+        )?;
+        assert_eq!(same_generation, OValue::str_("present"));
+
+        let restarted = registry.exec(
+            "python",
+            7,
+            concat!(
+                "import os\n",
+                "__oval_result__ = str(os.getpid()) + ':' + globals().get(\n",
+                "    'retained_across_commands', 'missing'\n",
+                ")",
+            ),
+            HashMap::new(),
+            BackendLaunchContext {
+                shim_path: &shim,
+                sandbox: &sandbox,
+                executable_leases: None,
+                launch_generation_sha256: Some(second_generation),
+            },
+        )?;
+        let restarted = restarted.as_str()?;
+        assert!(restarted.ends_with(":missing"), "{restarted}");
+        assert!(
+            !restarted.starts_with(&format!("{first_pid}:")),
+            "{restarted}"
+        );
+
+        registry.shutdown_all(Duration::from_secs(2))?;
+        Ok(())
+    }
+
+    #[test]
     fn nonresponsive_shutdown_is_bounded_and_fails_explicitly() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let shim = temp.path().join("nonresponsive.py");
         std::fs::write(&shim, "import time\ntime.sleep(60)\n")?;
-        let mut process = BackendProcess::new("python", &shim, &BackendSandboxPolicy::none())?;
+        let mut process =
+            BackendProcess::new("python", &shim, &BackendSandboxPolicy::none(), None)?;
         let started = Instant::now();
 
         let error = process

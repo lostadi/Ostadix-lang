@@ -24,6 +24,7 @@ pub mod ocore;
 pub mod parser;
 pub mod process;
 pub mod project;
+pub mod runtime_exec;
 pub mod scheduler;
 pub mod shims;
 pub mod value;

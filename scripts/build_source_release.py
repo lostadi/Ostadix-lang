@@ -280,6 +280,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/evidence/mod.rs",
         "src/evidence/profile.rs",
         "src/effects.rs",
+        "src/runtime_exec.rs",
         "src/bin/olink.rs",
         "src/bin/olangc.rs",
         "src/bin/ocorec.rs",

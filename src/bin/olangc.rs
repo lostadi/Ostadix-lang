@@ -105,6 +105,7 @@ const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
+const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
 
 // evidence — pre-execution facts and the admission compiler. These modules
 // are part of every generated runtime because eval.rs cannot construct a
@@ -1127,6 +1128,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
     fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
+    fs::write(src_dir.join("runtime_exec.rs"), RUNTIME_RUNTIME_EXEC_RS)?;
 
     // ── evidence — evidence-bound execution admission ──────────────────────
     let evidence_dir = src_dir.join("evidence");
@@ -1920,6 +1922,7 @@ pub mod eval;
 pub mod process;
 pub mod nix_ops;
 pub mod nixos_ops;
+pub mod runtime_exec;
 pub mod scheduler;
 pub mod world;
 {project_mod}pub mod wire;
@@ -2481,11 +2484,13 @@ mod tests {
         assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
+        assert!(lib_rs.contains("pub mod runtime_exec;"));
         assert!(lib_rs.contains("pub mod world;"));
 
         for path in [
             "backend_catalog.inc.rs",
             "effects.rs",
+            "runtime_exec.rs",
             "evidence/mod.rs",
             "evidence/fact.rs",
             "evidence/analyze.rs",

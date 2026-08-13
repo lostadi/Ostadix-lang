@@ -13,7 +13,7 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 | `o_doctor` | Existence checks + shim inventory + complete runtime report + a18re `search/o-run` |
 | `o_smoke` | `O examples/hello.O <absolute-backends>` — expect `2` |
 | `o_analyze_intent` | Nonexecutingly compute a stable execution intent and return a bounded, expiring, one-use opaque handle |
-| `o_execute_intent` | Consume that handle and require `O` to recompute the same source and execution-intent digests before fresh V4 admission and dispatch |
+| `o_execute_intent` | Consume that handle and require `O` to recompute the same source and execution-intent digests before fresh V5 admission and dispatch |
 | `o_run` | Direct, ungated compatibility execution of any `.O` with absolute backends; relative input resolves once against `cwd` or the repository root, while an absolute path with no `cwd` runs from its parent directory |
 | `o_olangc` | `olangc` with `--shim-dir`; relative input/output resolves against the repository root |
 | `o_search_run` | Run `~/a18re/search/<name>.O` with correct env |
