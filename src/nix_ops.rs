@@ -22,7 +22,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::value::OValue;
 
@@ -41,6 +41,25 @@ use crate::value::OValue;
 ///   - the Nix body fails to evaluate          → bubble stderr
 ///   - the body does not evaluate to a drvPath → type error message
 pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
+    validate_instantiate_source(source)?;
+    let lease = crate::runtime_exec::RuntimeCommandLease::capture("nix")?;
+    instantiate_nix_with_lease(source, &lease)
+}
+
+pub(crate) fn validate_instantiate_source(source: &OValue) -> Result<()> {
+    match source {
+        OValue::NixExpr { .. } => Ok(()),
+        other => bail!(
+            "instantiate() expected a NixExpr (nix_expr^(...)_nix_expr block), got {}",
+            other.type_name()
+        ),
+    }
+}
+
+pub(crate) fn instantiate_nix_with_lease(
+    source: &OValue,
+    lease: &crate::runtime_exec::RuntimeCommandLease,
+) -> Result<OValue> {
     let (body, deps) = match source {
         OValue::NixExpr { body, deps, .. } => (body.clone(), deps.clone()),
         other => bail!(
@@ -56,7 +75,8 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
     // `derivation { ... }`, and for any expression whose value has a drvPath.
     let wrapper = format!("(let v = ({}); in v.drvPath)", body);
 
-    let out = Command::new("nix")
+    let out = lease
+        .command()?
         .args([
             "--extra-experimental-features",
             "nix-command",
@@ -98,7 +118,8 @@ pub fn instantiate_nix(source: &OValue) -> Result<OValue> {
     //
     // The output is a JSON map keyed by drv path. We extract the `outputs`
     // dict's keys (the output names like "out", "dev", "lib").
-    let show = Command::new("nix")
+    let show = lease
+        .command()?
         .args([
             "--extra-experimental-features",
             "nix-command",
@@ -162,6 +183,25 @@ fn parse_outputs_from_show(json_bytes: &[u8], drv_path: &str) -> Result<Vec<Stri
 /// flag suppresses the `./result` symlink that nix-build would otherwise
 /// create in the working directory.
 pub fn realise_nix(source: &OValue) -> Result<OValue> {
+    validate_realise_source(source)?;
+    let lease = crate::runtime_exec::RuntimeCommandLease::capture("nix")?;
+    realise_nix_with_lease(source, &lease)
+}
+
+pub(crate) fn validate_realise_source(source: &OValue) -> Result<()> {
+    match source {
+        OValue::Derivation { .. } => Ok(()),
+        other => bail!(
+            "realise() expected a Derivation (the output of instantiate()), got {}",
+            other.type_name()
+        ),
+    }
+}
+
+pub(crate) fn realise_nix_with_lease(
+    source: &OValue,
+    lease: &crate::runtime_exec::RuntimeCommandLease,
+) -> Result<OValue> {
     let drv_path = match source {
         OValue::Derivation { drv_path, .. } => drv_path.clone(),
         other => bail!(
@@ -174,7 +214,8 @@ pub fn realise_nix(source: &OValue) -> Result<OValue> {
     // STEP3: take an output name argument so callers can pick `dev`, `lib`, etc.
     let target = format!("{}^out", drv_path);
 
-    let out = Command::new("nix")
+    let out = lease
+        .command()?
         .args([
             "--extra-experimental-features",
             "nix-command",

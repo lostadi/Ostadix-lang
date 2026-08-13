@@ -8,7 +8,9 @@ Languages can print a tagged OValue JSON envelope for exact control.
 
 import json
 import math
+import os
 import re
+import stat
 import struct
 import sys
 
@@ -20,6 +22,100 @@ INT_RE = re.compile(r"^[+-]?\d+$")
 FLOAT_RE = re.compile(
     r"^[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+[eE][+-]?\d+)|(?:\d+\.\d*[eE][+-]?\d+))$"
 )
+
+
+def _identity_from_stat(result):
+    return {
+        "device": result.st_dev,
+        "inode": result.st_ino,
+        "size": result.st_size,
+        "mode": result.st_mode,
+        "mtime_seconds": result.st_mtime_ns // 1_000_000_000,
+        "mtime_nanoseconds": result.st_mtime_ns % 1_000_000_000,
+        "ctime_seconds": result.st_ctime_ns // 1_000_000_000,
+        "ctime_nanoseconds": result.st_ctime_ns % 1_000_000_000,
+    }
+
+
+def admitted_tool_path(logical_command):
+    """Revalidate and return one adapter-owned admitted direct launcher.
+
+    Adapter-owned subprocesses must not resolve their own copies through PATH:
+    the Rust proxy validates this backend-scoped manifest at startup, and this
+    helper cheaply rechecks invocation and target identity immediately before
+    every adapter-owned subprocess. User code remains free to launch its own
+    commands; this helper is only for tools that are part of the adapter.
+    """
+    raw = os.environ.get("O_ADMITTED_EXECUTABLE_MANIFEST")
+    if not raw:
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} has no admitted executable manifest"
+        )
+    try:
+        manifest = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("admitted executable manifest is invalid JSON") from exc
+    if manifest.get("schema") != "oexec.direct-executable-manifest/v1":
+        raise RuntimeError("admitted executable manifest has an unsupported schema")
+    matches = [
+        artifact
+        for artifact in manifest.get("artifacts", [])
+        if artifact.get("role") == "direct-launcher"
+        and artifact.get("logical_command") == logical_command
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} has {len(matches)} admitted launchers; expected one"
+        )
+    artifact = matches[0]
+    invocation_path = artifact.get("invocation_path")
+    if not isinstance(invocation_path, str) or not os.path.isabs(invocation_path):
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} has no admitted absolute invocation path"
+        )
+    canonical_path = artifact.get("canonical_path")
+    if not isinstance(canonical_path, str) or not os.path.isabs(canonical_path):
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} has no admitted canonical path"
+        )
+    expected_invocation = artifact.get("invocation_file_identity")
+    expected_target = artifact.get("file_identity")
+    if not isinstance(expected_invocation, dict) or not isinstance(expected_target, dict):
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} has incomplete admitted file identity"
+        )
+    try:
+        invocation_stat = os.lstat(invocation_path)
+        target_stat = os.stat(canonical_path)
+        resolved_path = os.path.realpath(invocation_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"adapter tool {logical_command!r} cannot be revalidated: {exc}"
+        ) from exc
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise RuntimeError(f"adapter tool {logical_command!r} is no longer a regular file")
+    if os.path.normcase(resolved_path) != os.path.normcase(canonical_path):
+        raise RuntimeError(f"adapter tool {logical_command!r} resolves to a different target")
+    if os.name == "posix":
+        if _identity_from_stat(invocation_stat) != expected_invocation:
+            raise RuntimeError(f"adapter tool {logical_command!r} invocation path changed")
+        if _identity_from_stat(target_stat) != expected_target:
+            raise RuntimeError(f"adapter tool {logical_command!r} target changed")
+    else:
+        # Rust's portable identity deliberately contains only size and mtime;
+        # Windows reports different device/inode/mode/ctime values through
+        # Python. Mirror that inexpensive per-use contract. The parent already
+        # content-hashed the artifact at capture/proxy startup; re-hashing a
+        # potentially large runtime before every adapter subprocess would turn
+        # hardening into a capacity regression.
+        actual_invocation = _identity_from_stat(invocation_stat)
+        actual_target = _identity_from_stat(target_stat)
+        for field in ("size", "mtime_seconds", "mtime_nanoseconds"):
+            if actual_invocation[field] != expected_invocation.get(field):
+                raise RuntimeError(f"adapter tool {logical_command!r} invocation path changed")
+            if actual_target[field] != expected_target.get(field):
+                raise RuntimeError(f"adapter tool {logical_command!r} target changed")
+    return invocation_path
 
 
 def _encode_type_len(major, length):

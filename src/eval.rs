@@ -106,10 +106,37 @@ pub enum TraceEvent {
 // it can be safely moved into `thread::spawn` closures.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn exec_nix_kind(kind: RequestKind, src: OValue) -> Result<OValue> {
+type SharedNixLease = Arc<Result<crate::runtime_exec::RuntimeCommandLease, String>>;
+
+fn capture_shared_nix_lease() -> SharedNixLease {
+    Arc::new(
+        crate::runtime_exec::RuntimeCommandLease::capture("nix")
+            .map_err(|error| format!("{error:#}")),
+    )
+}
+
+fn require_shared_nix_lease(
+    shared: Option<&SharedNixLease>,
+) -> Result<&crate::runtime_exec::RuntimeCommandLease> {
+    match shared.map(|lease| lease.as_ref()) {
+        Some(Ok(lease)) => Ok(lease),
+        Some(Err(error)) => Err(anyhow::anyhow!(error.clone())),
+        None => bail!("Nix request has no perform-time runtime command authority"),
+    }
+}
+
+fn exec_nix_kind(
+    kind: RequestKind,
+    src: OValue,
+    nix_lease: Option<SharedNixLease>,
+) -> Result<OValue> {
     match kind {
-        RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
-        RequestKind::Realise => nix_ops::realise_nix(&src),
+        RequestKind::Instantiate => {
+            nix_ops::instantiate_nix_with_lease(&src, require_shared_nix_lease(nix_lease.as_ref())?)
+        }
+        RequestKind::Realise => {
+            nix_ops::realise_nix_with_lease(&src, require_shared_nix_lease(nix_lease.as_ref())?)
+        }
         RequestKind::Activate {
             profile,
             dry_run: true,
@@ -225,6 +252,17 @@ impl ImmediateExecutor {
 
 impl Executor for ImmediateExecutor {
     fn execute(&mut self, req: &OValue) -> Result<OValue> {
+        let mut nix_lease = None;
+        self.execute_with_nix_lease(req, &mut nix_lease)
+    }
+}
+
+impl ImmediateExecutor {
+    fn execute_with_nix_lease(
+        &mut self,
+        req: &OValue,
+        nix_lease: &mut Option<crate::runtime_exec::RuntimeCommandLease>,
+    ) -> Result<OValue> {
         let (kind, source, fingerprint) = match req {
             OValue::Request {
                 kind,
@@ -258,13 +296,36 @@ impl Executor for ImmediateExecutor {
         // executes; it sees source is a Request; it executes that first to
         // get the actual Derivation; then performs the realise.
         let resolved_source = match source {
-            OValue::Request { .. } => self.execute(&source)?,
+            OValue::Request { .. } => self.execute_with_nix_lease(&source, nix_lease)?,
             other => other,
         };
 
+        // Preserve source-first Request semantics and type diagnostics before
+        // acquiring host runtime capacity. The first Nix rung actually reached
+        // after cache/source resolution captures the lease; outer rungs reuse
+        // the same retained executable.
+        match &kind {
+            RequestKind::Instantiate => nix_ops::validate_instantiate_source(&resolved_source)?,
+            RequestKind::Realise => nix_ops::validate_realise_source(&resolved_source)?,
+            _ => {}
+        }
+        if nix_lease.is_none() && matches!(&kind, RequestKind::Instantiate | RequestKind::Realise) {
+            *nix_lease = Some(crate::runtime_exec::RuntimeCommandLease::capture("nix")?);
+        }
+
         let result = match kind {
-            RequestKind::Instantiate => nix_ops::instantiate_nix(&resolved_source)?,
-            RequestKind::Realise => nix_ops::realise_nix(&resolved_source)?,
+            RequestKind::Instantiate => nix_ops::instantiate_nix_with_lease(
+                &resolved_source,
+                nix_lease
+                    .as_ref()
+                    .context("instantiate request has no perform-time Nix authority")?,
+            )?,
+            RequestKind::Realise => nix_ops::realise_nix_with_lease(
+                &resolved_source,
+                nix_lease
+                    .as_ref()
+                    .context("realise request has no perform-time Nix authority")?,
+            )?,
             // STEP-3.5: Eval fires the shim through the ProcessRegistry. The
             // ImmediateExecutor doesn't currently have access to a registry,
             // so we bail with a clear message. The real wiring is provided
@@ -1388,17 +1449,22 @@ impl Evaluator {
         // guard here anyway to avoid zero-sized chunks in pathological configs.
         if !threadable.is_empty() {
             let cap = self.scheduler.parallelism.max(1);
+            let nix_lease = threadable
+                .iter()
+                .any(|(_, kind, _)| matches!(kind, RequestKind::Instantiate | RequestKind::Realise))
+                .then(capture_shared_nix_lease);
             for chunk in threadable.chunks(cap) {
                 let (tx, rx) = mpsc::channel::<(usize, Result<OValue>)>();
                 for (idx, kind, src) in chunk.iter().cloned() {
                     let tx = tx.clone();
+                    let nix_lease = nix_lease.clone();
                     thread::spawn(move || {
                         // `send` can only fail if the receiver was dropped
                         // (e.g. the evaluator thread panicked). Silently
                         // ignoring keeps threads from panicking on a dead
                         // channel and is the intended pattern for fire-and-
                         // collect thread fans.
-                        let _ = tx.send((idx, exec_nix_kind(kind, src)));
+                        let _ = tx.send((idx, exec_nix_kind(kind, src, nix_lease)));
                     });
                 }
                 drop(tx); // channel closes when every spawned sender drops
@@ -1489,15 +1555,20 @@ impl Evaluator {
 
         // Phase 2 — concurrent dispatch for threadable members.
         let (tx, rx) = mpsc::channel::<Result<OValue>>();
+        let nix_lease = threadable
+            .iter()
+            .any(|(kind, _)| matches!(kind, RequestKind::Instantiate | RequestKind::Realise))
+            .then(capture_shared_nix_lease);
         for (kind, src) in threadable {
             let tx = tx.clone();
+            let nix_lease = nix_lease.clone();
             thread::spawn(move || {
                 // `send` can only fail if the receiver is dropped (evaluator
                 // returned early, e.g. after the first `any` success or the
                 // first `race` settler). Silently ignoring is intentional:
                 // the thread still runs to completion, but its result is simply
                 // discarded by the already-returned caller.
-                let _ = tx.send(exec_nix_kind(kind, src));
+                let _ = tx.send(exec_nix_kind(kind, src, nix_lease));
             });
         }
         drop(tx);
@@ -4891,6 +4962,43 @@ mod tests {
         } else {
             panic!("expected Derivation results");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_executor_resolves_nested_source_before_outer_nix_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let closure = temp.path().join("system");
+        std::fs::create_dir_all(closure.join("bin")).unwrap();
+        let marker = temp.path().join("activated.marker");
+        let switch = closure.join("bin/switch-to-configuration");
+        std::fs::write(
+            &switch,
+            format!("#!/bin/sh\nprintf activated > {:?}\n", marker),
+        )
+        .unwrap();
+        std::fs::set_permissions(&switch, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let inner = OValue::request(
+            RequestKind::Activate {
+                profile: temp.path().join("profile").display().to_string(),
+                dry_run: true,
+                authority: None,
+            },
+            OValue::store_path(closure.display().to_string()),
+        );
+        let outer = OValue::request(RequestKind::Realise, inner);
+        let error = ImmediateExecutor::new().execute(&outer).unwrap_err();
+
+        assert!(
+            marker.exists(),
+            "the nested source Request must settle before outer Nix validation or capture"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("Derivation"), "{message}");
+        assert!(!message.contains("runtime command `nix`"), "{message}");
     }
 
     /// Unknown call names must error cleanly rather than silently no-op.

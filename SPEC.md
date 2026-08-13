@@ -223,8 +223,12 @@ manifest selects the plan-used shim backends' direct launch entrypoints once,
 records absolute invocation paths plus SHA-256 digests and file identity for
 their canonical targets, and retains the opened targets as process-local launch
 authority. Unix launch rechecks stable path/handle identity; non-Unix launch
-uses a portable immediate content rehash instead of disabling execution. It includes
-the current O proxy and, when consumed, the macOS sandbox wrapper. Inspection
+uses a portable immediate content rehash instead of disabling execution. On
+Linux, an ELF O backend proxy SHOULD execute through its retained open object
+when procfs exposes it; failure to obtain that compatible route MUST fall back
+to a freshly revalidated invocation path rather than disable execution. The
+manifest includes the current O proxy and, when consumed, the macOS sandbox
+wrapper. Inspection
 manifests remain explicitly non-probing and do not assert runtime readiness.
 The catalog projection binds specification identity only; it does not assert
 health, authorization, capacity, or readiness. This V5 binding does not claim
@@ -240,14 +244,18 @@ starts. The ordinary graph `Coordinator` MUST accept only an
 `AdmittedExecution`, never a raw HGraph, and MUST revalidate the runtime binding
 before dispatch. Both the coordinator and serial oracle MUST recheck immediately
 before opaque/deferred execution. Direct backend launch MUST consume the
-admitted absolute path and MUST NOT reselect an alternative through `PATH`.
-Immediately before spawn, the retained-handle and canonical-path identities
-MUST still match the admission. These checks detect drift but do not make the
-bytes immutable or eliminate a final same-principal verification-to-path-exec
-micro-window. V5 uses path execution on every platform. macOS has no general
-public handle-exec primitive; Linux handle-exec is intentionally not used
-because scripts, multicall `argv[0]`, and self-location or `$ORIGIN` behavior
-cannot be preserved uniformly.
+admitted absolute invocation path and MUST NOT reselect an alternative through
+`PATH`. Immediately before spawn, the retained-handle and canonical-path
+identities MUST still match the admission. Linux MAY instead execute the
+admitted ELF O proxy through the retained open object while preserving the
+admitted `argv[0]`; this is not applied to scripts or foreign direct launchers.
+All path-executed launchers retain a final same-principal
+verification-to-exec micro-window. macOS has no general public handle-exec
+primitive. V5 MUST NOT stage or copy arbitrary runtimes merely to close that
+window because doing so can change script, multicall, self-location,
+dynamic-loader, and toolchain behavior. The retained-object proxy route closes
+pathname substitution, not in-place mutation, interpreter, dynamic-library,
+compiler-subtool, or descendant execution.
 
 Hard pre-execution evidence MAY determine legality and graph blockers. Cost or
 historical measurements MAY rank operations only within an already-legal
@@ -450,16 +458,25 @@ backend-scoped executable set, matching legacy shim artifacts, and the
 plan-independent child launch context; it MUST be retired before work under a
 different admitted generation. An unrelated backend alone MUST NOT restart it.
 
-This is a direct-launcher guarantee, not a frozen execution closure. It excludes
-interpreters selected by shebangs, compiler-driver subtools, dynamic libraries,
-and descendants launched by hosted code. Because the current plan omits
+This is a direct-launcher guarantee, not a frozen execution closure. A consumed
+legacy Python adapter support file is bound only when the selected shim imports
+it; adapter-owned tools such as `multipass` and `nix` consume the admitted
+backend-scoped absolute paths without restricting subprocesses created by user
+Python code. It excludes interpreters selected by shebangs, compiler-driver
+subtools, dynamic libraries, and descendants launched by hosted code. Because
+the current plan omits
 WebAssembly body shape, V5 conservatively requires and binds a complete
 `wat2wasm` plus runtime catalog alternative even for an already-binary body. It
 also excludes caller initial-scope shape/values, opaque live-actor
-state/generation, frozen child environment, Request/project authority,
+state/generation, frozen child environment, Request/project admission authority,
 placement-lease freshness, and the final same-principal metadata-check-to-exec
-window. Actor identity in V5 is a serialization constraint only and MUST NOT
-close an unknown hosted footprint.
+window for path-executed launchers. When a Nix `Request` is actually performed,
+its separate Request authority captures one command lease after a cache miss and
+shares it across that operation or autonomous batch. Unforced, cached, and
+non-Nix Request members MUST NOT require Nix, and inability to capture Nix MUST
+remain the affected member's result rather than suppress independent members.
+Actor identity in V5 is a serialization constraint only and MUST NOT close an
+unknown hosted footprint.
 
 ---
 
