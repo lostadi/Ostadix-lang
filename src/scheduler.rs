@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -50,6 +50,24 @@ use crate::nix_ops;
 use crate::value::{OValue, RequestKind};
 
 type EvalRequestCallback<'a> = dyn FnMut(&OValue) -> Result<OValue> + 'a;
+type SharedNixLease = Arc<Result<crate::runtime_exec::RuntimeCommandLease, String>>;
+
+fn capture_shared_nix_lease() -> SharedNixLease {
+    Arc::new(
+        crate::runtime_exec::RuntimeCommandLease::capture("nix")
+            .map_err(|error| format!("{error:#}")),
+    )
+}
+
+fn require_shared_nix_lease(
+    shared: Option<&SharedNixLease>,
+) -> Result<&crate::runtime_exec::RuntimeCommandLease> {
+    match shared.map(|lease| lease.as_ref()) {
+        Some(Ok(lease)) => Ok(lease),
+        Some(Err(error)) => Err(anyhow!(error.clone())),
+        None => bail!("Nix request has no perform-time runtime command authority"),
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // DiskCache
@@ -358,6 +376,19 @@ impl AutonomousScheduler {
             .filter(|fp| !resolved.contains_key(*fp))
             .cloned()
             .collect();
+        let nix_lease = pending
+            .iter()
+            .any(|fp| {
+                matches!(
+                    all.get(fp),
+                    Some(OValue::Request {
+                        kind: RequestKind::Instantiate | RequestKind::Realise,
+                        ..
+                    })
+                )
+            })
+            .then(capture_shared_nix_lease);
+        let mut first_failure: Option<anyhow::Error> = None;
 
         while !pending.is_empty() {
             // Find nodes whose deps are all resolved.
@@ -373,6 +404,9 @@ impl AutonomousScheduler {
                 .collect();
 
             if ready.is_empty() {
+                if let Some(error) = first_failure {
+                    return Err(error);
+                }
                 bail!(
                     "autonomous scheduler: dependency stall ({} pending, 0 ready). \
                      Possible cycle. Pending fingerprints: {:?}",
@@ -418,11 +452,17 @@ impl AutonomousScheduler {
                     };
                     let fp_c = fp.clone();
                     let tx_c = tx.clone();
+                    let nix_lease = nix_lease.clone();
 
                     thread::spawn(move || {
                         let result = match kind {
-                            RequestKind::Instantiate => nix_ops::instantiate_nix(&src),
-                            RequestKind::Realise => nix_ops::realise_nix(&src),
+                            RequestKind::Instantiate => {
+                                require_shared_nix_lease(nix_lease.as_ref()).and_then(|lease| {
+                                    nix_ops::instantiate_nix_with_lease(&src, lease)
+                                })
+                            }
+                            RequestKind::Realise => require_shared_nix_lease(nix_lease.as_ref())
+                                .and_then(|lease| nix_ops::realise_nix_with_lease(&src, lease)),
                             RequestKind::Activate {
                                 ref profile,
                                 dry_run: true,
@@ -439,14 +479,22 @@ impl AutonomousScheduler {
                 drop(tx); // close; receiver loop below terminates when all senders drop
 
                 for (fp, result) in rx {
-                    let value = result.with_context(|| {
+                    match result.with_context(|| {
                         format!(
                             "autonomous scheduler: request {} failed",
                             &fp[..fp.len().min(8)]
                         )
-                    })?;
-                    self.cache_put(&fp, value.clone());
-                    resolved.insert(fp.clone(), value);
+                    }) {
+                        Ok(value) => {
+                            self.cache_put(&fp, value.clone());
+                            resolved.insert(fp.clone(), value);
+                        }
+                        Err(error) => {
+                            if first_failure.is_none() {
+                                first_failure = Some(error);
+                            }
+                        }
+                    }
                     pending.remove(&fp);
                 }
             }
@@ -483,7 +531,10 @@ impl AutonomousScheduler {
             }
         }
 
-        Ok(resolved)
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(resolved),
+        }
     }
 
     /// Execute a single Request using the full scheduler pipeline.

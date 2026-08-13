@@ -494,7 +494,10 @@ fn rust_backend_command(
     executable_leases: &crate::runtime_exec::ExecutableLeaseSet,
 ) -> Result<Command> {
     executable_leases.verify_backend(lang)?;
+    #[cfg(target_os = "macos")]
     let executable = executable_leases.current_o_path()?.to_path_buf();
+    #[cfg(not(target_os = "macos"))]
+    let executable = executable_leases.current_o_invocation_path()?.to_path_buf();
     let runtime_root = if shim_path.exists() {
         shim_path
             .parent()
@@ -517,7 +520,7 @@ fn rust_backend_command(
         &runtime_root,
     )?;
     #[cfg(not(target_os = "macos"))]
-    let mut command = Command::new(&executable);
+    let mut command = executable_leases.current_o_command()?;
 
     command
         .arg("--o-backend")

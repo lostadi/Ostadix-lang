@@ -229,20 +229,26 @@ in-place metadata drift; persistent actors are keyed by a backend launch
 generation over their backend-scoped executable set, matching legacy shim
 artifacts, and plan-independent child launch context. They are retired when
 that generation changes, while unrelated backend additions do not restart
-them. This closes ambient `PATH`
-alternative reselection, but it is not an immutable execution substrate. V5
-uses path execution on every platform, so a final same-principal
-verification-to-exec micro-window remains. macOS has no general public
-handle-exec primitive; Linux handle-exec is intentionally not used because it
-cannot uniformly preserve scripts, multicall `argv[0]`, and self-location or
-`$ORIGIN` behavior. The manifest covers direct
-launchers only, not shebang interpreters, compiler-driver subtools, dynamic
-libraries, or descendants launched by hosted code. Because `ExecutionPlan`
+them. This closes ambient `PATH` alternative reselection, but it is not an
+immutable execution substrate. On Linux, an ELF O backend proxy is launched
+through its retained open object when procfs supports that route, with the
+admitted invocation name preserved; an unavailable route falls back to the
+freshly revalidated path. Scripts and foreign launchers remain path-executed to
+preserve shebang, multicall, self-location, dynamic-loader, and toolchain
+behavior, so their final same-principal verification-to-exec micro-window
+remains. macOS has no general public handle-exec primitive. The manifest covers
+direct launchers only, not shebang interpreters, compiler-driver subtools,
+dynamic libraries, or descendants launched by hosted code. Consumed legacy
+Python support files and adapter-owned tools are bound without constraining
+subprocesses created by user code. Because `ExecutionPlan`
 omits WebAssembly body shape, V5 conservatively binds the complete `wat2wasm`
 plus runtime alternative rather than under-admitting a later WAT conversion. V5 also
 does not attest a frozen child environment, the opaque state or generation of
-an already-live actor, Request/project execution authority, or placement-lease
-freshness.
+an already-live actor, Request/project admission authority, or placement-lease
+freshness. The separate Request authority captures and shares a Nix command
+lease only when an uncached Nix Request is actually performed; lazy, cached,
+and independent non-Nix members retain their prior capacity and failure
+semantics.
 `ActorResourceId` remains a
 serialization identity in V5, and unknown actor work cannot use this gap to
 remove `HostWorld` or actor dependencies.
