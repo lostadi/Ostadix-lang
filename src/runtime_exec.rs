@@ -13,9 +13,13 @@
 //! handle plus path/file-identity checks close ambient `PATH` reselection and
 //! detect drift immediately before spawn. They do not make executable bytes
 //! immutable or eliminate the final same-principal verification-to-path-exec
-//! micro-window. V5 does not use handle-based execution on any platform:
-//! macOS has no general public primitive, while Linux handle execution cannot
-//! uniformly preserve script, multicall `argv[0]`, and self-location behavior.
+//! micro-window for foreign launchers. On Linux, the runtime-owned O backend
+//! proxy is executed opportunistically through its retained `/proc` file
+//! descriptor while preserving the admitted invocation name as `argv[0]`.
+//! That closes pathname substitution for the proxy without copying bytes or
+//! changing worker capacity. Foreign launchers remain path-executed because
+//! ELF magic alone does not prove that `$ORIGIN`, `AT_EXECFN`, or self-location
+//! behavior is descriptor-compatible.
 //! On non-Unix targets, where the standard library exposes no equivalent
 //! stable file identity, launch remains available under a weaker guarantee:
 //! the canonical target is re-hashed immediately before each spawn.
@@ -34,6 +38,8 @@ use crate::ir::{BackendAdapterKind, BackendRegistry, ExecutionMode, ExecutionPla
 
 pub const EXECUTABLE_MANIFEST_SCHEMA_V1: &str = "oexec.direct-executable-manifest/v1";
 pub const ADMITTED_EXECUTABLE_MANIFEST_ENV: &str = "O_ADMITTED_EXECUTABLE_MANIFEST";
+pub const ADMITTED_PROXY_EXECUTION_ENV: &str = "O_ADMITTED_PROXY_EXECUTION";
+const LINUX_PROC_FD_PROXY_EXECUTION_V1: &str = "linux-procfd-open-object/v1";
 pub const CURRENT_O_LOGICAL_COMMAND: &str = "__ostadix_current_executable__";
 pub const SANDBOX_EXEC_LOGICAL_COMMAND: &str = "__sandbox_exec__";
 
@@ -208,6 +214,8 @@ struct RetainedExecutable {
     file: File,
     identity: ExecutableFileIdentityV1,
     sha256: String,
+    #[cfg(target_os = "linux")]
+    is_elf: bool,
 }
 
 /// Process-local launch authority retained by `AdmittedExecution`.
@@ -267,6 +275,73 @@ impl ExecutableLeaseSet {
         self.unique_reserved_path(CURRENT_O_LOGICAL_COMMAND)
     }
 
+    /// Return the admitted invocation spelling for compatibility metadata.
+    ///
+    /// This is deliberately not an execution-authority check. Linux procfd
+    /// launch uses it only to preserve `argv[0]` and to derive a fallback
+    /// runtime-root hint without reopening the pathname before dispatch.
+    pub fn current_o_invocation_path(&self) -> Result<&Path> {
+        self.unique_reserved_artifact(CURRENT_O_LOGICAL_COMMAND)?
+            .invocation_path
+            .as_deref()
+            .context("admitted O proxy has no invocation path")
+    }
+
+    /// Build the admitted O backend-proxy command.
+    ///
+    /// Linux opportunistically executes the already-open runtime-owned ELF
+    /// object through procfs. This is zero-copy and preserves the admitted
+    /// invocation path as `argv[0]`. If procfs is unavailable, or the current
+    /// O image is not ELF, dispatch automatically retains the compatible
+    /// admitted-path behavior.
+    pub fn current_o_command(&self) -> Result<Command> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.current_o_command_with_proc_root(Path::new("/proc"));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let artifact = self.unique_reserved_artifact(CURRENT_O_LOGICAL_COMMAND)?;
+            self.verify_artifact_with_proxy_procfd(artifact, false)?;
+            let invocation_path = artifact
+                .invocation_path
+                .as_deref()
+                .context("admitted O proxy has no invocation path")?;
+            let mut command = Command::new(invocation_path);
+            command.env_remove(ADMITTED_PROXY_EXECUTION_ENV);
+            Ok(command)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_o_command_with_proc_root(&self, proc_root: &Path) -> Result<Command> {
+        let artifact = self.unique_reserved_artifact(CURRENT_O_LOGICAL_COMMAND)?;
+        let invocation_path = artifact
+            .invocation_path
+            .as_deref()
+            .context("admitted O proxy has no invocation path")?;
+
+        if let Some(procfd_path) = self.linux_proxy_procfd_under(artifact, proc_root)? {
+            self.verify_artifact_with_proxy_procfd(artifact, true)?;
+            use std::os::unix::process::CommandExt;
+
+            let mut command = Command::new(procfd_path);
+            command.arg0(invocation_path).env(
+                ADMITTED_PROXY_EXECUTION_ENV,
+                LINUX_PROC_FD_PROXY_EXECUTION_V1,
+            );
+            return Ok(command);
+        }
+
+        // Procfs is optional. Fall back to the compatible path launch only
+        // after revalidating the pathname as path-mode execution authority.
+        self.verify_artifact_with_proxy_procfd(artifact, false)?;
+        let mut command = Command::new(invocation_path);
+        command.env_remove(ADMITTED_PROXY_EXECUTION_ENV);
+        Ok(command)
+    }
+
     pub fn sandbox_exec_path(&self) -> Result<Option<&Path>> {
         let artifacts = self
             .manifest
@@ -319,7 +394,7 @@ impl ExecutableLeaseSet {
         })
     }
 
-    fn unique_reserved_path(&self, logical: &str) -> Result<&Path> {
+    fn unique_reserved_artifact(&self, logical: &str) -> Result<&ExecutableArtifactV1> {
         let artifacts = self
             .manifest
             .artifacts
@@ -339,6 +414,11 @@ impl ExecutableLeaseSet {
                 bail!("admission contains conflicting `{logical}` executable identities");
             }
         }
+        Ok(artifact)
+    }
+
+    fn unique_reserved_path(&self, logical: &str) -> Result<&Path> {
+        let artifact = self.unique_reserved_artifact(logical)?;
         self.verify_artifact(artifact)?;
         artifact
             .invocation_path
@@ -347,6 +427,18 @@ impl ExecutableLeaseSet {
     }
 
     fn verify_artifact(&self, artifact: &ExecutableArtifactV1) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        let retained_proxy_procfd = self.linux_proxy_procfd(artifact)?.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let retained_proxy_procfd = false;
+        self.verify_artifact_with_proxy_procfd(artifact, retained_proxy_procfd)
+    }
+
+    fn verify_artifact_with_proxy_procfd(
+        &self,
+        artifact: &ExecutableArtifactV1,
+        retained_proxy_procfd: bool,
+    ) -> Result<()> {
         if artifact.state != ExecutableArtifactStateV1::LocatedHashed {
             bail!(
                 "executable `{}` for backend `{}` was not execution-bound",
@@ -366,21 +458,25 @@ impl ExecutableLeaseSet {
             .retained
             .get(path)
             .with_context(|| format!("no retained executable handle for {}", path.display()))?;
-        verify_invocation_path(artifact, expected)?;
+        if !retained_proxy_procfd {
+            verify_invocation_path(artifact, expected)?;
+        }
         // Check the name-to-object binding first. Replacing an executable by
         // rename can also change ctime on the still-open inode when its old
         // directory entry is unlinked; diagnosing the path substitution is
         // both more precise and independent of that retained-inode detail.
-        let path_identity = file_identity(&fs::metadata(path).with_context(|| {
-            format!("failed to stat admitted executable path {}", path.display())
-        })?)?;
-        if &path_identity != expected {
-            bail!(
-                "admitted direct executable path was replaced before launch: backend `{}` command `{}` path {}",
-                artifact.canonical_backend,
-                artifact.logical_command,
-                path.display()
-            );
+        if !retained_proxy_procfd {
+            let path_identity = file_identity(&fs::metadata(path).with_context(|| {
+                format!("failed to stat admitted executable path {}", path.display())
+            })?)?;
+            if &path_identity != expected {
+                bail!(
+                    "admitted direct executable path was replaced before launch: backend `{}` command `{}` path {}",
+                    artifact.canonical_backend,
+                    artifact.logical_command,
+                    path.display()
+                );
+            }
         }
         let handle_identity = file_identity(&retained.file.metadata().with_context(|| {
             format!(
@@ -388,15 +484,65 @@ impl ExecutableLeaseSet {
                 retained.path.display()
             )
         })?)?;
-        if &handle_identity != expected || &retained.identity != expected {
+        if (retained_proxy_procfd && !same_open_object_identity(&handle_identity, expected))
+            || (!retained_proxy_procfd && &handle_identity != expected)
+            || &retained.identity != expected
+        {
             bail!(
                 "admitted direct executable changed through retained handle: backend `{}` command `{}`",
                 artifact.canonical_backend,
                 artifact.logical_command
             );
         }
-        verify_content_if_required(artifact, path)?;
+        if !retained_proxy_procfd {
+            verify_content_if_required(artifact, path)?;
+        }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_proxy_procfd(&self, artifact: &ExecutableArtifactV1) -> Result<Option<PathBuf>> {
+        self.linux_proxy_procfd_under(artifact, Path::new("/proc"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_proxy_procfd_under(
+        &self,
+        artifact: &ExecutableArtifactV1,
+        proc_root: &Path,
+    ) -> Result<Option<PathBuf>> {
+        if artifact.role != "ostadix-proxy" {
+            return Ok(None);
+        }
+        let canonical_path = artifact
+            .canonical_path
+            .as_ref()
+            .context("execution-bound O proxy lacks a canonical path")?;
+        let expected = artifact
+            .file_identity
+            .as_ref()
+            .context("execution-bound O proxy lacks a file identity")?;
+        let retained = self.retained.get(canonical_path).with_context(|| {
+            format!(
+                "no retained O proxy handle for {}",
+                canonical_path.display()
+            )
+        })?;
+        if !retained.is_elf {
+            return Ok(None);
+        }
+        use std::os::fd::AsRawFd;
+        let procfd = proc_root
+            .join(std::process::id().to_string())
+            .join("fd")
+            .join(retained.file.as_raw_fd().to_string());
+        let Ok(metadata) = fs::metadata(&procfd) else {
+            return Ok(None);
+        };
+        if !same_open_object_identity(&file_identity(&metadata)?, expected) {
+            return Ok(None);
+        }
+        Ok(Some(procfd))
     }
 }
 
@@ -406,6 +552,7 @@ impl ExecutableLeaseSet {
 pub struct BackendToolchain {
     backend: String,
     manifest: ExecutableManifestV1,
+    linux_procfd_proxy: bool,
 }
 
 impl BackendToolchain {
@@ -417,10 +564,14 @@ impl BackendToolchain {
         })?;
         let manifest: ExecutableManifestV1 =
             serde_json::from_str(&raw).context("invalid admitted direct executable manifest")?;
-        validate_decoded_manifest(&manifest, Some(backend))?;
+        let linux_procfd_proxy = cfg!(target_os = "linux")
+            && std::env::var(ADMITTED_PROXY_EXECUTION_ENV).ok().as_deref()
+                == Some(LINUX_PROC_FD_PROXY_EXECUTION_V1);
+        validate_backend_process_manifest(&manifest, backend, linux_procfd_proxy)?;
         Ok(Self {
             backend: backend.to_string(),
             manifest,
+            linux_procfd_proxy,
         })
     }
 
@@ -456,7 +607,11 @@ impl BackendToolchain {
 
     pub fn verify_all(&self) -> Result<()> {
         for artifact in &self.manifest.artifacts {
-            verify_decoded_artifact(artifact)?;
+            if self.linux_procfd_proxy && artifact.role == "ostadix-proxy" {
+                verify_running_linux_proxy(artifact)?;
+            } else {
+                verify_decoded_artifact(artifact)?;
+            }
         }
         Ok(())
     }
@@ -487,7 +642,8 @@ pub fn capture_execution_manifest_with_current_executable(
     current_executable: &Path,
 ) -> Result<(ExecutableManifestV1, Arc<ExecutableLeaseSet>)> {
     let registry = BackendRegistry::global();
-    let backends = shim_backends(plan);
+    let shim_backends = shim_backends(plan);
+    let backends = shim_backends.clone();
     let mut artifacts = Vec::new();
     let mut retained = BTreeMap::new();
 
@@ -495,16 +651,20 @@ pub fn capture_execution_manifest_with_current_executable(
         let adapter = registry.adapter_for(&backend);
         let requirement = registry.runtime_requirements_for(&backend);
         let (selected_alternative, selection, direct_commands) = match adapter {
-            BackendAdapterKind::LegacyPythonShim => (
-                0,
-                ExecutableSelectionV1::AdapterDirectLauncherRefinement,
-                vec![(
-                    "python3",
-                    which::which("python3")
-                        .context("python3 is required for the legacy backend bridge")?,
-                )],
-            ),
-            BackendAdapterKind::NativeRust => {
+            BackendAdapterKind::LegacyPythonShim
+                if backend == "nixos_test" && !nixos_test_uses_nix_on_this_host() =>
+            {
+                (
+                    0,
+                    ExecutableSelectionV1::AdapterDirectLauncherRefinement,
+                    vec![(
+                        "python3",
+                        which::which("python3")
+                            .context("python3 is required for the legacy backend bridge")?,
+                    )],
+                )
+            }
+            BackendAdapterKind::LegacyPythonShim | BackendAdapterKind::NativeRust => {
                 let (index, commands) = select_complete_alternative(requirement.alternatives)
                     .with_context(|| {
                         format!(
@@ -537,32 +697,34 @@ pub fn capture_execution_manifest_with_current_executable(
             )?);
         }
 
-        artifacts.push(capture_artifact(
-            &backend,
-            ArtifactSelection {
-                requirement_key: requirement.key,
-                selected_alternative: Some(selected_alternative),
-                selection,
-            },
-            CURRENT_O_LOGICAL_COMMAND,
-            "ostadix-proxy",
-            current_executable,
-            &mut retained,
-        )?);
+        if shim_backends.contains(&backend) {
+            artifacts.push(capture_artifact(
+                &backend,
+                ArtifactSelection {
+                    requirement_key: requirement.key,
+                    selected_alternative: Some(selected_alternative),
+                    selection,
+                },
+                CURRENT_O_LOGICAL_COMMAND,
+                "ostadix-proxy",
+                current_executable,
+                &mut retained,
+            )?);
 
-        #[cfg(target_os = "macos")]
-        artifacts.push(capture_artifact(
-            &backend,
-            ArtifactSelection {
-                requirement_key: requirement.key,
-                selected_alternative: Some(selected_alternative),
-                selection,
-            },
-            SANDBOX_EXEC_LOGICAL_COMMAND,
-            "sandbox-wrapper",
-            Path::new("/usr/bin/sandbox-exec"),
-            &mut retained,
-        )?);
+            #[cfg(target_os = "macos")]
+            artifacts.push(capture_artifact(
+                &backend,
+                ArtifactSelection {
+                    requirement_key: requirement.key,
+                    selected_alternative: Some(selected_alternative),
+                    selection,
+                },
+                SANDBOX_EXEC_LOGICAL_COMMAND,
+                "sandbox-wrapper",
+                Path::new("/usr/bin/sandbox-exec"),
+                &mut retained,
+            )?);
+        }
     }
 
     let manifest = ExecutableManifestV1::finish(artifacts);
@@ -582,10 +744,12 @@ pub fn capture_execution_manifest_with_current_executable(
 /// remain explicitly unselected and carry no path, hash, or file identity.
 pub fn inspection_executable_manifest(plan: &ExecutionPlan) -> ExecutableManifestV1 {
     let registry = BackendRegistry::global();
+    let shim_backends = shim_backends(plan);
     let mut artifacts = Vec::new();
-    for backend in shim_backends(plan) {
+    let backends = shim_backends.clone();
+    for backend in backends {
         let requirement = registry.runtime_requirements_for(&backend);
-        let commands = if registry.adapter_for(&backend) == BackendAdapterKind::LegacyPythonShim {
+        let commands = if backend == "nixos_test" && !nixos_test_uses_nix_on_this_host() {
             vec!["python3"]
         } else {
             requirement
@@ -604,19 +768,21 @@ pub fn inspection_executable_manifest(plan: &ExecutionPlan) -> ExecutableManifes
                 "direct-launcher",
             ));
         }
-        artifacts.push(unprobed_artifact(
-            &backend,
-            requirement.key,
-            CURRENT_O_LOGICAL_COMMAND,
-            "ostadix-proxy",
-        ));
-        #[cfg(target_os = "macos")]
-        artifacts.push(unprobed_artifact(
-            &backend,
-            requirement.key,
-            SANDBOX_EXEC_LOGICAL_COMMAND,
-            "sandbox-wrapper",
-        ));
+        if shim_backends.contains(&backend) {
+            artifacts.push(unprobed_artifact(
+                &backend,
+                requirement.key,
+                CURRENT_O_LOGICAL_COMMAND,
+                "ostadix-proxy",
+            ));
+            #[cfg(target_os = "macos")]
+            artifacts.push(unprobed_artifact(
+                &backend,
+                requirement.key,
+                SANDBOX_EXEC_LOGICAL_COMMAND,
+                "sandbox-wrapper",
+            ));
+        }
     }
     ExecutableManifestV1::finish(artifacts)
 }
@@ -631,6 +797,11 @@ fn shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
             _ => None,
         })
         .collect()
+}
+
+fn nixos_test_uses_nix_on_this_host() -> bool {
+    cfg!(target_os = "linux")
+        || std::env::var_os("NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM").is_some_and(|value| value == "1")
 }
 
 fn select_complete_alternative(
@@ -862,6 +1033,8 @@ fn capture_artifact(
         );
     }
     let sha256 = sha256_file(&file, &canonical_path)?;
+    #[cfg(target_os = "linux")]
+    let is_elf = file_is_elf(&file, &canonical_path)?;
     let handle_identity_after = file_identity(&file.metadata().with_context(|| {
         format!(
             "failed to re-stat executable handle {}",
@@ -894,6 +1067,8 @@ fn capture_artifact(
             file,
             identity: identity.clone(),
             sha256: sha256.clone(),
+            #[cfg(target_os = "linux")]
+            is_elf,
         },
     );
     Ok(ExecutableArtifactV1 {
@@ -978,6 +1153,48 @@ fn validate_decoded_manifest(manifest: &ExecutableManifestV1, backend: Option<&s
     }
     validate_backend_selections(manifest)?;
     Ok(())
+}
+
+fn validate_backend_process_manifest(
+    manifest: &ExecutableManifestV1,
+    backend: &str,
+    linux_procfd_proxy: bool,
+) -> Result<()> {
+    if !linux_procfd_proxy {
+        return validate_decoded_manifest(manifest, Some(backend));
+    }
+    validate_manifest_envelope(manifest, Some(backend))?;
+    for artifact in &manifest.artifacts {
+        validate_execution_artifact_shape(artifact)?;
+        if artifact.role == "ostadix-proxy" {
+            verify_running_linux_proxy(artifact)?;
+        }
+    }
+    validate_backend_selections(manifest)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_running_linux_proxy(artifact: &ExecutableArtifactV1) -> Result<()> {
+    if artifact.role != "ostadix-proxy" {
+        return verify_decoded_artifact(artifact);
+    }
+    let expected = artifact
+        .file_identity
+        .as_ref()
+        .context("launch-bound O proxy lacks a file identity")?;
+    let actual = file_identity(
+        &fs::metadata("/proc/self/exe")
+            .context("failed to stat the running Linux O backend proxy")?,
+    )?;
+    if !same_open_object_identity(&actual, expected) {
+        bail!("running Linux O backend proxy does not match its admitted open-object identity");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_running_linux_proxy(artifact: &ExecutableArtifactV1) -> Result<()> {
+    verify_decoded_artifact(artifact)
 }
 
 fn validate_manifest_envelope(
@@ -1082,7 +1299,9 @@ fn validate_backend_selections(manifest: &ExecutableManifestV1) -> Result<()> {
                 }
             }
             ExecutableSelectionV1::AdapterDirectLauncherRefinement => {
-                if registry.adapter_for(backend) != BackendAdapterKind::LegacyPythonShim
+                if backend != "nixos_test"
+                    || nixos_test_uses_nix_on_this_host()
+                    || registry.adapter_for(backend) != BackendAdapterKind::LegacyPythonShim
                     || direct_commands != BTreeSet::from(["python3"])
                 {
                     bail!(
@@ -1275,6 +1494,21 @@ fn sha256_file(file: &File, path: &Path) -> Result<String> {
     Ok(hex::encode(hash.finalize()))
 }
 
+#[cfg(target_os = "linux")]
+fn file_is_elf(file: &File, path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file
+        .try_clone()
+        .with_context(|| format!("failed to clone executable handle {}", path.display()))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut magic = [0_u8; 4];
+    match reader.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == *b"\x7fELF"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn manifest_sha256(artifacts: &[ExecutableArtifactV1]) -> String {
     let bytes = serde_json::to_vec(artifacts)
         .expect("serializing executable manifest artifacts into memory cannot fail");
@@ -1330,6 +1564,31 @@ fn file_identity(metadata: &Metadata) -> Result<ExecutableFileIdentityV1> {
     })
 }
 
+#[cfg(unix)]
+fn same_open_object_identity(
+    actual: &ExecutableFileIdentityV1,
+    expected: &ExecutableFileIdentityV1,
+) -> bool {
+    // Removing or replacing the last directory entry of a still-open inode
+    // changes ctime even though the retained object is unchanged. Device and
+    // inode establish object identity while size, mode, and mtime retain the
+    // inexpensive mutation checks that do not depend on link-count churn.
+    actual.device == expected.device
+        && actual.inode == expected.inode
+        && actual.size == expected.size
+        && actual.mode == expected.mode
+        && actual.mtime_seconds == expected.mtime_seconds
+        && actual.mtime_nanoseconds == expected.mtime_nanoseconds
+}
+
+#[cfg(not(unix))]
+fn same_open_object_identity(
+    actual: &ExecutableFileIdentityV1,
+    expected: &ExecutableFileIdentityV1,
+) -> bool {
+    actual == expected
+}
+
 #[cfg(not(unix))]
 fn file_identity(metadata: &Metadata) -> Result<ExecutableFileIdentityV1> {
     use std::time::UNIX_EPOCH;
@@ -1349,6 +1608,139 @@ fn file_identity(metadata: &Metadata) -> Result<ExecutableFileIdentityV1> {
         ctime_seconds: 0,
         ctime_nanoseconds: 0,
     })
+}
+
+/// Capacity-safe authority for a command discovered only when an operation is
+/// actually performed. Unlike the plan manifest this does not make an
+/// unforced lazy Request a host-readiness requirement. The open target, hash,
+/// invocation name, and file identity are retained and rechecked before each
+/// subprocess in that performed operation or autonomous batch.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeCommandLease {
+    inner: Arc<RuntimeCommandLeaseInner>,
+}
+
+#[derive(Debug)]
+struct RuntimeCommandLeaseInner {
+    logical_command: String,
+    invocation_path: PathBuf,
+    canonical_path: PathBuf,
+    invocation_identity: ExecutableFileIdentityV1,
+    identity: ExecutableFileIdentityV1,
+    file: File,
+    sha256: String,
+}
+
+impl RuntimeCommandLease {
+    pub(crate) fn capture(logical_command: &str) -> Result<Self> {
+        let discovered = which::which(logical_command).with_context(|| {
+            format!("required runtime command `{logical_command}` is not available on PATH")
+        })?;
+        let invocation_path = absolute_invocation_path(&discovered)?;
+        let invocation_identity =
+            file_identity(&fs::symlink_metadata(&invocation_path).with_context(|| {
+                format!(
+                    "failed to stat runtime command invocation name {}",
+                    invocation_path.display()
+                )
+            })?)?;
+        let canonical_path = invocation_path.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize runtime command {}",
+                invocation_path.display()
+            )
+        })?;
+        let file = File::open(&canonical_path).with_context(|| {
+            format!(
+                "failed to open runtime command {}",
+                canonical_path.display()
+            )
+        })?;
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "failed to stat runtime command {}",
+                canonical_path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            bail!(
+                "runtime command is not a regular file: {}",
+                canonical_path.display()
+            );
+        }
+        ensure_executable_mode(&metadata, &canonical_path)?;
+        let identity = file_identity(&metadata)?;
+        verify_invocation_target(
+            &invocation_path,
+            &canonical_path,
+            &invocation_identity,
+            &identity,
+        )?;
+        let sha256 = sha256_file(&file, &canonical_path)?;
+        let lease = Self {
+            inner: Arc::new(RuntimeCommandLeaseInner {
+                logical_command: logical_command.to_string(),
+                invocation_path,
+                canonical_path,
+                invocation_identity,
+                identity,
+                file,
+                sha256,
+            }),
+        };
+        lease.verify()?;
+        Ok(lease)
+    }
+
+    pub(crate) fn command(&self) -> Result<Command> {
+        self.verify()?;
+        Ok(Command::new(&self.inner.invocation_path))
+    }
+
+    fn verify(&self) -> Result<()> {
+        verify_invocation_target(
+            &self.inner.invocation_path,
+            &self.inner.canonical_path,
+            &self.inner.invocation_identity,
+            &self.inner.identity,
+        )
+        .with_context(|| {
+            format!(
+                "runtime command `{}` invocation path changed after perform-time capture",
+                self.inner.logical_command
+            )
+        })?;
+        let handle_identity = file_identity(&self.inner.file.metadata().with_context(|| {
+            format!(
+                "failed to stat retained runtime command `{}`",
+                self.inner.logical_command
+            )
+        })?)?;
+        if handle_identity != self.inner.identity {
+            bail!(
+                "runtime command `{}` changed after perform-time capture",
+                self.inner.logical_command
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let current = File::open(&self.inner.canonical_path).with_context(|| {
+                format!(
+                    "failed to reopen runtime command `{}`",
+                    self.inner.logical_command
+                )
+            })?;
+            if sha256_file(&current, &self.inner.canonical_path)? != self.inner.sha256 {
+                bail!(
+                    "runtime command `{}` content changed after perform-time capture",
+                    self.inner.logical_command
+                );
+            }
+        }
+        #[cfg(unix)]
+        let _ = &self.inner.sha256;
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1381,6 +1773,28 @@ mod tests {
                 && artifact.sha256.is_none()
                 && artifact.file_identity.is_none()
         }));
+    }
+
+    #[test]
+    fn legacy_adapter_projection_includes_adapter_owned_tools() {
+        let plan = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "ubuntu_vm".into(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("ubuntu_vm"),
+                body: vec![OIr::Text("adapter closure".into())],
+            }],
+        }
+        .plan();
+        let manifest = inspection_executable_manifest(&plan);
+        let launchers = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == "direct-launcher")
+            .map(|artifact| artifact.logical_command.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(launchers, BTreeSet::from(["multipass", "python3"]));
     }
 
     #[test]
@@ -1459,6 +1873,42 @@ mod tests {
             error.contains("admitted invocation path is stale for backend `shell` command `sh`"),
             "{error}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_procfs_falls_back_to_the_revalidated_invocation_path() {
+        let current = std::env::current_exe().unwrap();
+        let mut retained = BTreeMap::new();
+        let artifact = capture_artifact(
+            "shell",
+            ArtifactSelection {
+                requirement_key: "shell",
+                selected_alternative: Some(0),
+                selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+            },
+            CURRENT_O_LOGICAL_COMMAND,
+            "ostadix-proxy",
+            &current,
+            &mut retained,
+        )
+        .unwrap();
+        let expected = artifact.invocation_path.clone().unwrap();
+        let manifest = ExecutableManifestV1::finish(vec![artifact]);
+        let leases = ExecutableLeaseSet {
+            backend_digests: backend_digests(&manifest),
+            backend_artifacts: backend_artifact_indices(&manifest),
+            manifest,
+            retained,
+        };
+        let absent_procfs = tempfile::tempdir().unwrap();
+        let command = leases
+            .current_o_command_with_proc_root(absent_procfs.path())
+            .unwrap();
+        assert_eq!(command.get_program(), expected.as_os_str());
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| { key == ADMITTED_PROXY_EXECUTION_ENV && value.is_none() }));
     }
 
     #[test]
