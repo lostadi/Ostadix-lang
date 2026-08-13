@@ -42,14 +42,7 @@ pub fn runtime_binding_from_directory(
     let backends = legacy_python_shim_backends(plan);
     let artifacts = backends
         .into_iter()
-        .map(|backend| {
-            let path = BackendRegistry::global().resolve_shim_path(shim_dir, &backend);
-            BackendArtifactV1 {
-                canonical_backend: backend,
-                resolved_identity: path_identity(&path),
-                state: backend_artifact_state(&path),
-            }
-        })
+        .flat_map(|backend| legacy_python_artifacts_from_directory(shim_dir, backend))
         .collect::<Vec<_>>();
     let (executable_manifest, executable_leases) = capture_execution_manifest(plan)?;
     Ok(build_runtime_binding(
@@ -74,14 +67,7 @@ pub fn runtime_binding_from_directory_reusing_executables(
 ) -> RuntimeBindingV1 {
     let artifacts = legacy_python_shim_backends(plan)
         .into_iter()
-        .map(|backend| {
-            let path = BackendRegistry::global().resolve_shim_path(shim_dir, &backend);
-            BackendArtifactV1 {
-                canonical_backend: backend,
-                resolved_identity: path_identity(&path),
-                state: backend_artifact_state(&path),
-            }
-        })
+        .flat_map(|backend| legacy_python_artifacts_from_directory(shim_dir, backend))
         .collect::<Vec<_>>();
     build_runtime_binding(
         RuntimeSnapshotKindV1::Execution,
@@ -104,7 +90,7 @@ pub fn runtime_binding_from_adapter_bytes(
     let by_name = adapters.iter().cloned().collect::<BTreeMap<_, _>>();
     let artifacts = legacy_python_shim_backends(plan)
         .into_iter()
-        .map(|backend| {
+        .flat_map(|backend| {
             let candidates = [
                 format!("{backend}_shim.py"),
                 format!("{backend}_shim"),
@@ -116,7 +102,7 @@ pub fn runtime_binding_from_adapter_bytes(
                 .find(|candidate| by_name.contains_key(*candidate))
                 .cloned()
                 .unwrap_or_else(|| candidates[0].clone());
-            BackendArtifactV1 {
+            let mut artifacts = vec![BackendArtifactV1 {
                 canonical_backend: backend,
                 resolved_identity: format!("adapter:{selected}"),
                 state: by_name
@@ -125,7 +111,24 @@ pub fn runtime_binding_from_adapter_bytes(
                         sha256: sha256_bytes(bytes),
                     })
                     .unwrap_or(BackendArtifactStateV1::Missing),
+            }];
+            if by_name
+                .get(&selected)
+                .is_some_and(|bytes| shim_imports_common(bytes))
+            {
+                let selected = "o_shim_common.py";
+                artifacts.push(BackendArtifactV1 {
+                    canonical_backend: artifacts[0].canonical_backend.clone(),
+                    resolved_identity: format!("adapter:{selected}"),
+                    state: by_name
+                        .get(selected)
+                        .map(|bytes| BackendArtifactStateV1::Hashed {
+                            sha256: sha256_bytes(bytes),
+                        })
+                        .unwrap_or(BackendArtifactStateV1::Missing),
+                });
             }
+            artifacts
         })
         .collect::<Vec<_>>();
     build_runtime_binding(
@@ -223,6 +226,46 @@ fn legacy_python_shim_backends(plan: &ExecutionPlan) -> BTreeSet<String> {
         .collect()
 }
 
+fn shim_imports_common(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).ok().is_some_and(|source| {
+        source.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("from o_shim_common import ")
+                || line == "import o_shim_common"
+                || line.starts_with("import o_shim_common as ")
+        })
+    })
+}
+
+fn legacy_python_artifacts_from_directory(
+    shim_dir: &Path,
+    backend: String,
+) -> Vec<BackendArtifactV1> {
+    let registry = BackendRegistry::global();
+    let shim_path = registry.resolve_shim_path(shim_dir, &backend);
+    let (shim_state, shim_bytes) = backend_artifact_state_and_bytes(&shim_path);
+    let mut artifacts = vec![BackendArtifactV1 {
+        canonical_backend: backend.clone(),
+        resolved_identity: path_identity(&shim_path),
+        state: shim_state,
+    }];
+    if shim_bytes.is_some_and(|bytes| shim_imports_common(&bytes)) {
+        // Python resolves the sibling import from Path(__file__).resolve(), so
+        // bind the same directory even when the selected shim is a symlink.
+        let common_path = shim_path
+            .canonicalize()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("o_shim_common.py")))
+            .unwrap_or_else(|| shim_dir.join("o_shim_common.py"));
+        artifacts.push(BackendArtifactV1 {
+            canonical_backend: backend,
+            resolved_identity: path_identity(&common_path),
+            state: backend_artifact_state(&common_path),
+        });
+    }
+    artifacts
+}
+
 fn build_runtime_binding(
     snapshot_kind: RuntimeSnapshotKindV1,
     mut backend_artifacts: Vec<BackendArtifactV1>,
@@ -299,22 +342,35 @@ fn build_runtime_binding(
 }
 
 fn backend_artifact_state(path: &Path) -> BackendArtifactStateV1 {
+    backend_artifact_state_and_bytes(path).0
+}
+
+fn backend_artifact_state_and_bytes(path: &Path) -> (BackendArtifactStateV1, Option<Vec<u8>>) {
     match fs::metadata(path) {
-        Ok(metadata) if !metadata.is_file() => BackendArtifactStateV1::NonRegular,
+        Ok(metadata) if !metadata.is_file() => (BackendArtifactStateV1::NonRegular, None),
         Ok(_) => match fs::read(path) {
-            Ok(bytes) => BackendArtifactStateV1::Hashed {
-                sha256: sha256_bytes(&bytes),
-            },
-            Err(error) => BackendArtifactStateV1::Unreadable {
-                error_kind: format!("{:?}", error.kind()),
-            },
+            Ok(bytes) => (
+                BackendArtifactStateV1::Hashed {
+                    sha256: sha256_bytes(&bytes),
+                },
+                Some(bytes),
+            ),
+            Err(error) => (
+                BackendArtifactStateV1::Unreadable {
+                    error_kind: format!("{:?}", error.kind()),
+                },
+                None,
+            ),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            BackendArtifactStateV1::Missing
+            (BackendArtifactStateV1::Missing, None)
         }
-        Err(error) => BackendArtifactStateV1::Unreadable {
-            error_kind: format!("{:?}", error.kind()),
-        },
+        Err(error) => (
+            BackendArtifactStateV1::Unreadable {
+                error_kind: format!("{:?}", error.kind()),
+            },
+            None,
+        ),
     }
 }
 
@@ -1269,7 +1325,13 @@ mod tests {
     fn legacy_python_adapter_binds_the_consumed_shim_file() {
         let temp = tempfile::tempdir().unwrap();
         let shim_path = temp.path().join("python_shim.py");
-        fs::write(&shim_path, b"# consumed legacy shim v1\n").unwrap();
+        let common_path = temp.path().join("o_shim_common.py");
+        fs::write(
+            &shim_path,
+            b"# consumed legacy shim v1\nfrom o_shim_common import read_wire_message\n",
+        )
+        .unwrap();
+        fs::write(&common_path, b"# consumed shared support v1\n").unwrap();
         let program = program_for_backend("python", 1);
         let plan = program.plan();
         let first = runtime_binding_from_directory(
@@ -1279,12 +1341,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(first.backend_artifacts().iter().any(|artifact| {
+        assert_eq!(first.backend_artifacts().len(), 2);
+        assert!(first.backend_artifacts().iter().all(|artifact| {
             artifact.canonical_backend == "python"
                 && matches!(artifact.state, BackendArtifactStateV1::Hashed { .. })
         }));
 
-        fs::write(&shim_path, b"# consumed legacy shim v2\n").unwrap();
+        fs::write(
+            &shim_path,
+            b"# consumed legacy shim v2\nfrom o_shim_common import read_wire_message\n",
+        )
+        .unwrap();
         let second = runtime_binding_from_directory(
             &plan,
             temp.path(),
@@ -1292,6 +1359,15 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first.backend_set_sha256(), second.backend_set_sha256());
+
+        fs::write(&common_path, b"# consumed shared support v2\n").unwrap();
+        let third = runtime_binding_from_directory(
+            &plan,
+            temp.path(),
+            &[("adapter-binding-test", "legacy-python")],
+        )
+        .unwrap();
+        assert_ne!(second.backend_set_sha256(), third.backend_set_sha256());
     }
 
     #[test]

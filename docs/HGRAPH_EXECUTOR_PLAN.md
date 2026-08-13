@@ -57,16 +57,22 @@ never a later `PATH` candidate, and rechecks retained-handle plus canonical-path
 identity immediately before spawn. A persistent actor is restarted when its
 backend launch generation changes; that digest binds its backend-scoped
 executable set, matching legacy shim artifacts, and plan-independent child
-launch context without coupling actor lifetime to unrelated backends. These checks detect replacement and
-in-place drift but do not make bytes immutable. V5 uses path execution on every
-platform, so a final same-principal verification-to-exec micro-window remains.
-macOS has no general public handle-exec primitive; Linux handle-exec is
-intentionally not used because scripts, multicall `argv[0]`, and self-location
-or `$ORIGIN` behavior cannot be preserved uniformly. The direct-launcher
-manifest excludes shebang
-interpreters, compiler-driver subtools, dynamic libraries, hosted descendants,
-and the separate Request/project execution authorities. It also does not bind
-caller initial-scope shape/values, a frozen child environment, opaque
+launch context without coupling actor lifetime to unrelated backends. These
+checks detect replacement and in-place drift but do not make bytes immutable.
+On Linux, the ELF O backend proxy uses the retained open object when procfs
+makes that compatible; otherwise it falls back to a freshly revalidated path.
+The admitted `argv[0]` is preserved. Scripts and foreign launchers remain
+path-executed so shebang, multicall, self-location, dynamic-loader, and
+toolchain behavior are not narrowed, leaving their final same-principal
+verification-to-exec micro-window. macOS has no general public handle-exec
+primitive. The direct-launcher manifest excludes shebang interpreters,
+compiler-driver subtools, dynamic libraries, hosted descendants, and the
+separate Request/project admission authorities. Consumed legacy Python support
+files and adapter-owned tools are bound without restricting user-created
+subprocesses. A Nix command lease is captured only when an uncached Nix Request
+is actually performed and is shared only by Nix members; lazy, cached, and
+independent non-Nix members remain executable without Nix. V5 also does not
+bind caller initial-scope shape/values, a frozen child environment, opaque
 state/generation inside an already-live actor, or a placement lease.
 In V5, actor identity is only a serialization identity; all persistent hosted work
 remains unknown, coordinator-lane, and conservatively attached to `HostWorld`.

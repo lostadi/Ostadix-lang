@@ -24,7 +24,7 @@ import sys
 import traceback
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from o_shim_common import read_wire_message, write_wire_message
+from o_shim_common import admitted_tool_path, read_wire_message, write_wire_message
 
 # Wrapper template: turns the user's attrset fragment into a full
 # pkgs.testers.runNixOSTest call.  NIXPKGS_PATH may be overridden by env var.
@@ -34,6 +34,11 @@ let
 in
   pkgs.testers.runNixOSTest ({body})
 """
+
+
+def nix_command():
+    """Resolve Nix only on the real execution path; the non-Linux stub needs none."""
+    return admitted_tool_path("nix")
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +100,7 @@ def run_nixos_test(code):
     expr = _WRAPPER.format(nixpkgs=nixpkgs, body=code)
 
     cmd = [
-        "nix",
+        nix_command(),
         "--extra-experimental-features", "nix-command",
         "build",
         "--no-link",

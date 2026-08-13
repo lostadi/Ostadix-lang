@@ -30,6 +30,42 @@ fn copy_bash(path: &Path) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn private_o(temp: &Path) -> PathBuf {
+    let private_o = temp.join("O-under-test");
+    fs::copy(env!("CARGO_BIN_EXE_O"), &private_o).unwrap();
+    let mut permissions = fs::metadata(&private_o).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&private_o, permissions).unwrap();
+    private_o
+}
+
+fn run_bash_compatibility_case(temp: &Path, path_prefix: &[PathBuf], marker: &str) -> Output {
+    let program = temp.join("compatibility.O");
+    fs::write(&program, format!("bash^(printf '%s' {marker})_bash\n")).unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = path_prefix.to_vec();
+    paths.extend(std::env::split_paths(&inherited));
+    let path = std::env::join_paths(paths).unwrap();
+
+    Command::new(private_o(temp))
+        .arg(program)
+        .arg(backends_dir())
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+fn assert_bash_compatibility(output: &Output, marker: &str) {
+    assert!(
+        output.status.success(),
+        "admitted Bash compatibility launch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), marker);
+}
+
 fn wait_for_python_backend(child: &mut Child, trace: &Path) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -77,13 +113,7 @@ printf '%s' unsafe-backend-ran
     paths.extend(std::env::split_paths(&inherited));
     let path = std::env::join_paths(paths).unwrap();
 
-    let private_o = temp.join("O-under-test");
-    fs::copy(env!("CARGO_BIN_EXE_O"), &private_o).unwrap();
-    let mut private_o_permissions = fs::metadata(&private_o).unwrap().permissions();
-    private_o_permissions.set_mode(0o755);
-    fs::set_permissions(&private_o, private_o_permissions).unwrap();
-
-    let mut child = Command::new(&private_o)
+    let mut child = Command::new(private_o(temp))
         .arg(&program)
         .arg(backends_dir())
         .env("PATH", path)
@@ -95,6 +125,56 @@ printf '%s' unsafe-backend-ran
         .unwrap();
     wait_for_python_backend(&mut child, &trace);
     child
+}
+
+#[test]
+fn admitted_shebang_launcher_remains_executable() {
+    let real_bash = which::which("bash").expect("Bash is required for the shebang gate");
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_executable(
+        &bin.join("bash"),
+        &format!("#!/bin/sh\nexec '{}' \"$@\"\n", real_bash.display()),
+    );
+
+    let marker = "admitted-shebang-ok";
+    let output = run_bash_compatibility_case(temp.path(), &[bin], marker);
+    assert_bash_compatibility(&output, marker);
+}
+
+#[test]
+fn admitted_launcher_preserves_self_relative_argv_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("bundle");
+    fs::create_dir(&bundle).unwrap();
+    copy_bash(&bundle.join("bash-real"));
+    write_executable(
+        &bundle.join("bash"),
+        "#!/bin/sh\nself_dir=${0%/*}\nexec \"$self_dir/bash-real\" \"$@\"\n",
+    );
+
+    let marker = "admitted-self-relative-ok";
+    let output = run_bash_compatibility_case(temp.path(), &[bundle], marker);
+    assert_bash_compatibility(&output, marker);
+}
+
+#[test]
+fn admitted_launcher_retains_transitive_path_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let launchers = temp.path().join("launchers");
+    let helpers = temp.path().join("helpers");
+    fs::create_dir(&launchers).unwrap();
+    fs::create_dir(&helpers).unwrap();
+    write_executable(
+        &launchers.join("bash"),
+        "#!/bin/sh\nexec ostadix-bash-helper \"$@\"\n",
+    );
+    copy_bash(&helpers.join("ostadix-bash-helper"));
+
+    let marker = "admitted-transitive-path-ok";
+    let output = run_bash_compatibility_case(temp.path(), &[launchers, helpers], marker);
+    assert_bash_compatibility(&output, marker);
 }
 
 fn finish(child: Child) -> Output {
@@ -198,6 +278,46 @@ fn in_place_mutation_is_rejected_before_backend_effect() {
         "{stderr}"
     );
     assert!(!marker.exists(), "the mutated executable was launched");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn atomic_o_proxy_replacement_uses_the_retained_open_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let admitted_bash = bin.join("bash");
+    copy_bash(&admitted_bash);
+
+    // `start_race` waits until the first backend proxy has started, so the
+    // parent has already captured and retained the admitted O executable but
+    // the later Bash proxy has not yet launched.
+    let child = start_race(temp.path(), &admitted_bash, None);
+    let proxy_path = temp.path().join("O-under-test");
+    let replacement = temp.path().join("O.replacement");
+    let replacement_marker = temp.path().join("replacement-proxy.marker");
+    write_executable(
+        &replacement,
+        &format!(
+            "#!/bin/sh\nprintf replaced-proxy > '{}'\nexit 91\n",
+            replacement_marker.display()
+        ),
+    );
+    fs::rename(&replacement, &proxy_path).unwrap();
+
+    let output = finish(child);
+    assert!(
+        output.status.success(),
+        "retained O proxy launch failed after pathname replacement\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unsafe-backend-ran"), "{stdout}");
+    assert!(
+        !replacement_marker.exists(),
+        "the replacement O proxy was launched"
+    );
 }
 
 #[test]

@@ -10,10 +10,13 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from o_shim_common import read_wire_message, write_wire_message
+from o_shim_common import admitted_tool_path, read_wire_message, write_wire_message
 from o_shim_common import stdout_result
 
 VM_NAME = "ostadix-vm"
+
+def multipass_command():
+    return admitted_tool_path("multipass")
 
 def send_ok(value):
     write_wire_message({"status": "ok", "value": value})
@@ -25,14 +28,14 @@ def ensure_vm():
     # Only verify/launch once per process
     if hasattr(ensure_vm, "ready"):
         return
-    res = subprocess.run(["multipass", "info", VM_NAME], capture_output=True)
+    res = subprocess.run([multipass_command(), "info", VM_NAME], capture_output=True)
     if res.returncode != 0:
         # Need to launch
-        subprocess.run(["multipass", "launch", "--name", VM_NAME], capture_output=True, check=True)
+        subprocess.run([multipass_command(), "launch", "--name", VM_NAME], capture_output=True, check=True)
     else:
         # Check if running
         if b"Running" not in res.stdout:
-            subprocess.run(["multipass", "start", VM_NAME], capture_output=True, check=True)
+            subprocess.run([multipass_command(), "start", VM_NAME], capture_output=True, check=True)
     ensure_vm.ready = True
 
 def handle_exec(cmd):
@@ -60,7 +63,7 @@ def handle_exec(cmd):
     
     try:
         result = subprocess.run(
-            ["multipass", "exec", VM_NAME, "--", "bash"],
+            [multipass_command(), "exec", VM_NAME, "--", "bash"],
             input=script, capture_output=True, text=True, timeout=600
         )
         if result.returncode != 0:
