@@ -169,7 +169,7 @@ Every authoritative Rust execution entry point follows this path:
 
 ```text
 .O source -> ONode -> OIrProgram -> validated ExecutionPlan -> solved HGraph
-          -> EvidenceBundleV4 -> AdmittedExecution -> graph coordinator | serial oracle
+          -> EvidenceBundleV5 -> AdmittedExecution -> graph coordinator | serial oracle
 ```
 
 This includes the `O` interpreter, REPL entries, notebook cells,
@@ -214,15 +214,23 @@ them. These rules apply after scheduler-visible alias expansion. An explicit or
 unknown `HostWorld` access remains exclusive and therefore fail-closed.
 
 Before either the graph coordinator or the serial differential oracle executes
-the plan, the runtime MUST produce an `EvidenceBundleV4` and compile it into an
+the plan, the runtime MUST produce an `EvidenceBundleV5` and compile it into an
 `AdmittedExecution`. The bundle MUST be bound to the canonical lowered OIR,
 validated plan, solved analyzed graph, analyzer identity, backend artifacts,
-the plan-projected canonical backend specifications, environment, and
-descriptive ambient-World snapshot. The catalog projection binds specification
-identity only; it does not assert runtime discovery, health, authorization,
-capacity, or readiness. This v4 binding does not claim the original source-byte
-digest when the entry point receives an already lowered `OIrProgram`, nor does
-it bind caller initial-scope shape/values. Before issuing evidence, analysis
+the plan-projected canonical backend specifications, a direct-executable
+manifest, environment, and descriptive ambient-World snapshot. An execution
+manifest selects the plan-used shim backends' direct launch entrypoints once,
+records absolute invocation paths plus SHA-256 digests and file identity for
+their canonical targets, and retains the opened targets as process-local launch
+authority. Unix launch rechecks stable path/handle identity; non-Unix launch
+uses a portable immediate content rehash instead of disabling execution. It includes
+the current O proxy and, when consumed, the macOS sandbox wrapper. Inspection
+manifests remain explicitly non-probing and do not assert runtime readiness.
+The catalog projection binds specification identity only; it does not assert
+health, authorization, capacity, or readiness. This V5 binding does not claim
+the original source-byte digest when the entry point receives an already
+lowered `OIrProgram`, nor does it bind caller initial-scope shape/values. Before
+issuing evidence, analysis
 MUST validate that every lowered backend interface matches the registered
 language policy and that special invocation metadata has canonical
 name/mode/arity. Each executable operation MUST consume admitted type,
@@ -231,7 +239,15 @@ resource-budget facts. Stale or mismatched evidence MUST fail before execution
 starts. The ordinary graph `Coordinator` MUST accept only an
 `AdmittedExecution`, never a raw HGraph, and MUST revalidate the runtime binding
 before dispatch. Both the coordinator and serial oracle MUST recheck immediately
-before opaque/deferred execution.
+before opaque/deferred execution. Direct backend launch MUST consume the
+admitted absolute path and MUST NOT reselect an alternative through `PATH`.
+Immediately before spawn, the retained-handle and canonical-path identities
+MUST still match the admission. These checks detect drift but do not make the
+bytes immutable or eliminate a final same-principal verification-to-path-exec
+micro-window. V5 uses path execution on every platform. macOS has no general
+public handle-exec primitive; Linux handle-exec is intentionally not used
+because scripts, multicall `argv[0]`, and self-location or `$ORIGIN` behavior
+cannot be preserved uniformly.
 
 Hard pre-execution evidence MAY determine legality and graph blockers. Cost or
 historical measurements MAY rank operations only within an already-legal
@@ -255,7 +271,7 @@ sequencing region. Outside the explicit autonomous contract below, any unknown
 fact preserves sequence. Conflicting resource frontiers still constrain
 explicit group members unless that group member has the following contract.
 
-The v4 `LocalWorker` lane MAY also accept an unknown hosted operation only when
+The V5 `LocalWorker` lane MAY also accept an unknown hosted operation only when
 it is an attribute-free ephemeral shim, is a direct typed-expression member of
 a coordination group, and the nearest enclosing `lazy` or `autonomous` policy
 schedule is `autonomous`. Its complete body MUST be preparable from literal Text
@@ -270,7 +286,7 @@ semantic opt-in, not an effect-independence proof: deterministic result and
 failure selection MUST be preserved, but external effects from already-started
 members MAY race and need not be rolled back.
 
-All other v4 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
+All other V5 `LocalWorker` operations MUST be compiler-verified O-scope `Load`
 operations or attribute-free trusted inline-value renderers named `html`,
 `markdown`, `text`, or `latex` whose body is source-proven preparable: literal
 text, already-settled Store children, and recursively trusted renderers only.
@@ -320,7 +336,7 @@ unfinished semantic prefix. It MUST buffer out-of-order outcomes, settle them
 in semantic-ordinal order, select the lowest-ordinal failure, drain every
 started task, and discard every later provisional outcome. Infallible
 effect-free workers MAY be dispatched outside that prefix. Coordinator-owned
-operations MUST remain single-owner; this bounded v4 implementation does not
+operations MUST remain single-owner; this bounded V5 implementation does not
 run them while local-worker tasks are outstanding. Pool channel loss or
 submission failure MUST be treated as an infrastructure abort rather than a
 semantic program failure; the coordinator MUST stop new dispatch, drain every
@@ -351,7 +367,7 @@ describe permission, not an exact effect footprint.
 `olangc FILE --target ir --explain-schedule` MUST perform the type solve,
 analysis, and admission steps and print the digest bindings, per-operation
 evidence provenance, blockers, retained sequence reasons, and legal static
-waves without executing any operation. In v4 this inspection surface applies
+waves without executing any operation. In V5 this inspection surface applies
 only to ordinary `.O` HGraphs and MUST identify its runtime snapshot as
 `inspection-only`, not as a dispatch-compatible execution context. A reported
 wave is evidence of legal readiness,
@@ -388,7 +404,7 @@ The explanation MUST also include the nonexecuting hosted-topology prediction
 schema `oexec.schedule-prediction/v1`, headed by
 `; SchedulePrediction oexec.schedule-prediction/v1`. This record is derived
 after admission and remains outside the admission digest; its
-`admission-sha256` field MUST equal the digest on the enclosing v4 admission's
+`admission-sha256` field MUST equal the digest on the enclosing V5 admission's
 canonical digest-binding line. Its single `schedule-prediction` record has the
 following fields:
 
@@ -398,7 +414,7 @@ following fields:
 | `status` | `admitted-static`; no execution was performed. |
 | `provenance` | `evidence-bound-admission`; the topology comes from the admitted plan and blockers. |
 | `model` | `unit-cost-shim-hosted-tasks`. |
-| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v4` record. |
+| `admission-sha256` | Lowercase SHA-256 reference to the enclosing `oexec.admission/v5` record. |
 | `task-count` | Number of admitted shim-backed hosted `Exec` operations, regardless of execution lane. |
 | `predicted-width` | Maximum hosted-operation cardinality of any weighted-depth layer, or zero when `task-count=0`. |
 | `predicted-span` | Number of nonempty hosted-task layers, or zero when `task-count=0`. |
@@ -422,16 +438,28 @@ Admitted O-scope loads, source-proven-preparable trees of the four trusted
 inline renderers, and explicitly autonomous ephemeral group members execute
 through the per-run persistent pool. Enforced strict hosted footprints,
 actor-owned persistent environments, renewable-capacity allocation, and
-unification with the Request and project schedulers are not v4 behavior.
-The backend-set binding covers resolved adapter files and the current
-executable, and MUST distinguish hashed, missing, non-regular, and unreadable
-paths. Execution admission MUST reject an unhashed current executable. Runtime
-rechecks are path/environment snapshots, not an immutable execution substrate:
-v4 does not pin an opened adapter or frozen child environment and cannot prove
-the bytes/environment observed at spawn. The binding also excludes caller
-initial-scope shape/values, opaque live-actor state/generation, a complete
-external toolchain closure, and placement-lease freshness. Actor identity in v4 is a
-serialization constraint only and MUST NOT close an unknown hosted footprint.
+unification with the Request and project schedulers are not V5 behavior.
+Legacy compatibility shims remain separately content-bound. The V5
+direct-executable manifest additionally opens and hashes each unique selected
+canonical launcher target once, retains the handle through execution, and checks
+its admitted identity immediately before spawn. Backend-scoped manifests carry
+the selected absolute invocation paths into the O proxy, so a later `PATH`
+candidate is never substituted and multicall symlink names remain intact. A
+persistent actor is keyed by a backend launch-generation digest over its
+backend-scoped executable set, matching legacy shim artifacts, and the
+plan-independent child launch context; it MUST be retired before work under a
+different admitted generation. An unrelated backend alone MUST NOT restart it.
+
+This is a direct-launcher guarantee, not a frozen execution closure. It excludes
+interpreters selected by shebangs, compiler-driver subtools, dynamic libraries,
+and descendants launched by hosted code. Because the current plan omits
+WebAssembly body shape, V5 conservatively requires and binds a complete
+`wat2wasm` plus runtime catalog alternative even for an already-binary body. It
+also excludes caller initial-scope shape/values, opaque live-actor
+state/generation, frozen child environment, Request/project authority,
+placement-lease freshness, and the final same-principal metadata-check-to-exec
+window. Actor identity in V5 is a serialization constraint only and MUST NOT
+close an unknown hosted footprint.
 
 ---
 

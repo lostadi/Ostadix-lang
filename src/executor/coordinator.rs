@@ -201,8 +201,7 @@ impl<'a> Coordinator<'a> {
         evaluator: &mut Evaluator,
         scope: &mut std::collections::HashMap<String, OValue>,
     ) -> Result<OValue> {
-        let current_runtime = evaluator.admission_runtime_binding(self.plan);
-        self.admitted.verify_runtime(&current_runtime)?;
+        evaluator.verify_admitted_runtime_context(&self.admitted)?;
         evaluator.prevalidate_graph_execution(self.plan, &self.flat)?;
         self.frame.base_scope = scope.clone();
 
@@ -566,11 +565,22 @@ impl<'a> Coordinator<'a> {
         if selected.iter().any(|&index| {
             self.ops[index].dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
         }) {
-            // Opaque adapters are rebound immediately before preparation, just
-            // like coordinator-owned shim execution. A path that changed after
+            // Recheck mutable shim/environment context and the already-selected
+            // executable identities immediately before preparation. Direct
+            // commands are never re-resolved through PATH; drift after
             // admission must fail before Ready/Started is observable.
-            let current_runtime = evaluator.admission_runtime_binding(self.plan);
-            self.admitted.verify_runtime(&current_runtime)?;
+            evaluator.verify_admitted_runtime_context(&self.admitted)?;
+            for &index in selected {
+                if self.ops[index].dispatch_adapter == DispatchAdapterV1::AutonomousEphemeralShimV1
+                {
+                    let OIr::Exec { backend, .. } = self.flat[self.ops[index].plan_node.0] else {
+                        unreachable!("ephemeral shim adapter requires an Exec node")
+                    };
+                    self.admitted
+                        .executable_leases()?
+                        .verify_backend(&backend.canonical)?;
+                }
+            }
         }
         let mut prepared = Vec::with_capacity(selected.len());
         for &index in selected {
@@ -592,6 +602,7 @@ impl<'a> Coordinator<'a> {
                         Some(parallel::EphemeralShimRuntime::new(
                             evaluator.shim_path(&backend.canonical),
                             sandbox,
+                            self.admitted.executable_leases()?,
                         ))
                     }
                     _ => None,
@@ -990,12 +1001,19 @@ impl<'a> Coordinator<'a> {
             OIr::Exec { backend, .. } if backend.execution == crate::ir::ExecutionMode::Shim
         );
         if self.ops[index].effect.unknown || launches_backend {
-            // Re-resolve backend artifacts and the environment immediately
-            // before opaque/deferred work or a real shim launch. Inline
-            // renderers execute in the already-bound current process and do
-            // not consume a backend artifact at this operation boundary.
-            let current_runtime = evaluator.admission_runtime_binding(self.plan);
-            self.admitted.verify_runtime(&current_runtime)?;
+            // Recheck mutable shim/environment context plus retained executable
+            // identity immediately before opaque/deferred work or a real shim
+            // launch. The admitted direct command is not re-resolved or
+            // re-hashed here. Inline renderers execute in the already-bound
+            // current process and consume no launch artifact at this boundary.
+            evaluator.verify_admitted_runtime_context(&self.admitted)?;
+            if let OIr::Exec { backend, .. } = self.flat[id.0] {
+                if backend.execution == crate::ir::ExecutionMode::Shim {
+                    self.admitted
+                        .executable_leases()?
+                        .verify_backend(&backend.canonical)?;
+                }
+            }
         }
         self.trace.ready(id);
         self.trace.started(id);

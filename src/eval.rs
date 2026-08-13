@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
@@ -39,7 +39,7 @@ use crate::ir::{
 use crate::nix_ops;
 use crate::nixos_ops;
 use crate::parser::{ONode, Parser};
-use crate::process::{ExecStep, ProcessRegistry};
+use crate::process::{BackendLaunchContext, ExecStep, ProcessRegistry};
 use crate::scheduler::AutonomousScheduler;
 use crate::value::{
     BackendAuthority, CapabilityKind, DecimalSpecial, FloatFormat, FloatSpecial, GroupMode,
@@ -357,7 +357,7 @@ pub struct Evaluator {
 
     /// Digest-bound pre-execution decision that authorized the most recent
     /// graph run (or was compiled for the serial differential oracle).
-    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV4>,
+    last_execution_admission: Option<crate::evidence::ExecutionAdmissionV5>,
 
     /// The hypergraph schedule built from the most recent lowered OIR program.
     /// This is the compiled foothold for the graph executor: current runtime
@@ -392,6 +392,18 @@ pub struct Evaluator {
     /// recursive work uses this field; ordinary top-level evaluation retains
     /// its existing execution contract.
     callback_operation_deadline: Option<Instant>,
+
+    /// Opaque process-local authority over the exact executable artifacts
+    /// selected during the currently executing admission. Canonical evidence
+    /// contains only the immutable manifest; retained file handles never
+    /// become serializable language values.
+    active_executable_leases: Option<Arc<crate::runtime_exec::ExecutableLeaseSet>>,
+
+    /// Per-backend actor generation identities projected by the active
+    /// admission. Unlike the whole-plan binding, each digest is stable when an
+    /// unrelated backend is added to the plan, while still changing with this
+    /// backend's launcher, shim, or child launch context.
+    active_backend_launch_generations: Option<HashMap<String, String>>,
 }
 
 struct IrExecRegion<'a> {
@@ -582,6 +594,8 @@ impl Evaluator {
             default_backend_authority,
             suspended_actors: HashSet::new(),
             callback_operation_deadline: None,
+            active_executable_leases: None,
+            active_backend_launch_generations: None,
         }
     }
 
@@ -620,7 +634,7 @@ impl Evaluator {
     }
 
     /// Evidence-bound admission compiled before the most recent execution.
-    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV4> {
+    pub fn last_execution_admission(&self) -> Option<&crate::evidence::ExecutionAdmissionV5> {
         self.last_execution_admission.as_ref()
     }
 
@@ -644,6 +658,31 @@ impl Evaluator {
 
     pub(crate) fn shim_path(&self, language: &str) -> PathBuf {
         BackendRegistry::global().resolve_shim_path(&self.shim_dir, language)
+    }
+
+    pub(crate) fn verify_admitted_runtime_context(
+        &self,
+        admitted: &crate::evidence::AdmittedExecution<'_>,
+    ) -> Result<()> {
+        let mut registered = self.registered_backends.iter().cloned().collect::<Vec<_>>();
+        registered.sort();
+        let registered = registered.join(",");
+        let policy = match self.policy {
+            Policy::Eager => "eager",
+            Policy::Lazy => "lazy",
+            Policy::Autonomous => "autonomous",
+        };
+        admitted.verify_runtime_context(
+            &self.shim_dir,
+            &[
+                ("policy", policy),
+                ("registered-backends", registered.as_str()),
+                (
+                    "default-backend-authority",
+                    self.default_backend_authority.as_str(),
+                ),
+            ],
+        )
     }
 
     /// Whether the persistent backend actor `(lang, env)` is currently
@@ -671,10 +710,10 @@ impl Evaluator {
     /// Capture the process-local runtime facts bound by ordinary OIR
     /// admission. The opaque capability identity participates only through the
     /// environment digest; it is never exposed by the evidence artifact.
-    pub(crate) fn admission_runtime_binding(
+    pub(crate) fn try_admission_runtime_binding(
         &self,
         plan: &ExecutionPlan,
-    ) -> crate::evidence::RuntimeBindingV1 {
+    ) -> Result<crate::evidence::RuntimeBindingV1> {
         crate::process::lifecycle_trace(
             "evidence.runtime_binding_started",
             format!("plan_nodes={}", plan.nodes.len()),
@@ -704,6 +743,47 @@ impl Evaluator {
             format!("plan_nodes={}", plan.nodes.len()),
         );
         binding
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_runtime_binding(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> crate::evidence::RuntimeBindingV1 {
+        self.try_admission_runtime_binding(plan)
+            .expect("test runtime binding capture failed")
+    }
+
+    pub(crate) fn install_executable_leases(
+        &mut self,
+        leases: Option<Arc<crate::runtime_exec::ExecutableLeaseSet>>,
+    ) -> Option<Arc<crate::runtime_exec::ExecutableLeaseSet>> {
+        std::mem::replace(&mut self.active_executable_leases, leases)
+    }
+
+    pub(crate) fn executable_leases(
+        &self,
+    ) -> Result<&Arc<crate::runtime_exec::ExecutableLeaseSet>> {
+        self.active_executable_leases.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("hosted backend dispatch has no admitted executable lease authority")
+        })
+    }
+
+    fn install_backend_launch_generations(
+        &mut self,
+        generations: Option<HashMap<String, String>>,
+    ) -> Option<HashMap<String, String>> {
+        std::mem::replace(&mut self.active_backend_launch_generations, generations)
+    }
+
+    fn backend_launch_generation(&self, backend: &str) -> Result<String> {
+        self.active_backend_launch_generations
+            .as_ref()
+            .and_then(|generations| generations.get(backend))
+            .cloned()
+            .with_context(|| {
+                format!("backend `{backend}` has no active admitted launch generation")
+            })
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1513,11 +1593,24 @@ impl Evaluator {
                 let runtime_lang = backend.canonical.as_str();
                 let shim =
                     BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
+                let executable_leases = Arc::clone(self.executable_leases()?);
+                let launch_generation = self.backend_launch_generation(runtime_lang)?;
                 // Dependencies were rendered into the thunk body at capture
                 // time, so the forced shim receives an empty binding map.
                 let result = self
                     .registry
-                    .exec(runtime_lang, env_id, &body, HashMap::new(), &shim, &sandbox)
+                    .exec(
+                        runtime_lang,
+                        env_id,
+                        &body,
+                        HashMap::new(),
+                        BackendLaunchContext {
+                            shim_path: &shim,
+                            sandbox: &sandbox,
+                            executable_leases: Some(&executable_leases),
+                            launch_generation_sha256: Some(&launch_generation),
+                        },
+                    )
                     .with_context(|| format!("[{}{{eval}}]", runtime_lang))?;
                 if env_id == u32::MAX {
                     let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
@@ -1760,7 +1853,7 @@ impl Evaluator {
                 .context("execution rejected before admission and dispatch")?;
         }
 
-        let runtime_binding = self.admission_runtime_binding(&plan);
+        let runtime_binding = self.try_admission_runtime_binding(&plan)?;
         let evidence =
             crate::evidence::analyze_execution(program, &plan, &hgraph, runtime_binding.clone())
                 .context("failed to establish pre-execution evidence")?;
@@ -1817,12 +1910,39 @@ impl Evaluator {
             }
         };
         let use_serial = select_serial_executor(forced, configured.as_deref())?;
-        if use_serial {
-            admitted.verify_runtime(&self.admission_runtime_binding(&plan))?;
-            self.execute_plan_serial(&admitted, scope)
-        } else {
-            self.execute_plan_graph(admitted, scope)
-        }
+        let executable_leases = admitted.executable_leases()?;
+        let shim_backends = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                PlanNodeKind::Exec { backend, .. } if backend.execution == ExecutionMode::Shim => {
+                    Some(backend.canonical.clone())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let backend_launch_generations = shim_backends
+            .into_iter()
+            .map(|backend| {
+                admitted
+                    .backend_launch_generation_sha256(&backend)
+                    .map(|generation| (backend, generation))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let previous_executable_leases = self.install_executable_leases(Some(executable_leases));
+        let previous_backend_launch_generations =
+            self.install_backend_launch_generations(Some(backend_launch_generations));
+        let execution = (|| {
+            if use_serial {
+                self.verify_admitted_runtime_context(&admitted)?;
+                self.execute_plan_serial(&admitted, scope)
+            } else {
+                self.execute_plan_graph(admitted, scope)
+            }
+        })();
+        self.install_executable_leases(previous_executable_leases);
+        self.install_backend_launch_generations(previous_backend_launch_generations);
+        execution
     }
 
     /// Execute a validated plan through the readiness-driven graph coordinator.
@@ -1877,7 +1997,14 @@ impl Evaluator {
                 // The serial oracle is diagnostic, not an authority bypass:
                 // opaque/deferred work receives the same last-moment runtime
                 // freshness check as coordinator-owned work.
-                admitted.verify_runtime(&self.admission_runtime_binding(plan))?;
+                self.verify_admitted_runtime_context(admitted)?;
+                if let OIr::Exec { backend, .. } = flat[id.0] {
+                    if backend.execution == ExecutionMode::Shim {
+                        admitted
+                            .executable_leases()?
+                            .verify_backend(&backend.canonical)?;
+                    }
+                }
             }
             frame.trace.events.push(TraceEvent::NodeReady(id));
             frame.trace.events.push(TraceEvent::NodeStarted(id));
@@ -2202,14 +2329,20 @@ impl Evaluator {
             );
         }
 
+        let executable_leases = Arc::clone(self.executable_leases()?);
+        let launch_generation = self.backend_launch_generation(runtime_lang)?;
         self.registry
             .send_exec(
                 runtime_lang,
                 env_id,
                 &buf,
                 local_scope.clone(),
-                &shim,
-                &sandbox,
+                BackendLaunchContext {
+                    shim_path: &shim,
+                    sandbox: &sandbox,
+                    executable_leases: Some(&executable_leases),
+                    launch_generation_sha256: Some(&launch_generation),
+                },
             )
             .with_context(|| format!("[{}]", env_label))?;
 

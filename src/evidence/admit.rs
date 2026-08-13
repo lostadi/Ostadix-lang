@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
@@ -7,14 +9,15 @@ use crate::effects::{EffectSummary, ResourceKey};
 use crate::eval::Policy;
 use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
+use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
 
 use super::analyze::{
     analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
 };
 use super::fact::{
     BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV2,
-    EvidenceBundleV4, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
-    ADMISSION_SCHEMA_V4, ANALYZER_ID_V4, EVIDENCE_SCHEMA_V4,
+    EvidenceBundleV5, NodeEvidence, PlacementContractV1, RuntimeBindingV1, RuntimeSnapshotKindV1,
+    ADMISSION_SCHEMA_V5, ANALYZER_ID_V5, EVIDENCE_SCHEMA_V5,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,12 +130,13 @@ pub struct ScheduleWhyViewV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionAdmissionV4 {
+pub struct ExecutionAdmissionV5 {
     schema: &'static str,
     bindings: EvidenceBindingsV2,
     analyzer: &'static str,
     runtime_snapshot_kind: RuntimeSnapshotKindV1,
     backend_artifacts: Vec<BackendArtifactV1>,
+    executable_manifest: ExecutableManifestV1,
     evidence_sha256: String,
     admitted_graph_sha256: String,
     admission_sha256: String,
@@ -143,7 +147,7 @@ pub struct ExecutionAdmissionV4 {
     hosted_task_layers: Vec<Vec<PlanNodeId>>,
 }
 
-impl ExecutionAdmissionV4 {
+impl ExecutionAdmissionV5 {
     pub fn schema(&self) -> &'static str {
         self.schema
     }
@@ -162,6 +166,10 @@ impl ExecutionAdmissionV4 {
 
     pub fn backend_artifacts(&self) -> &[BackendArtifactV1] {
         &self.backend_artifacts
+    }
+
+    pub fn executable_manifest(&self) -> &ExecutableManifestV1 {
+        &self.executable_manifest
     }
 
     pub fn evidence_sha256(&self) -> &str {
@@ -275,9 +283,11 @@ impl ExecutionAdmissionV4 {
         .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "binding backend-catalog-projection-sha256={} backend-set-sha256={} environment-sha256={} ambient-world-sha256={}",
+            "binding backend-catalog-projection-sha256={} backend-set-sha256={} direct-executable-manifest-sha256={} launch-context-sha256={} environment-sha256={} ambient-world-sha256={}",
             self.bindings.backend_catalog_projection_sha256,
             self.bindings.backend_set_sha256,
+            self.bindings.executable_manifest_sha256,
+            self.bindings.launch_context_sha256,
             self.bindings.environment_sha256,
             self.bindings.ambient_world_sha256
         )
@@ -316,6 +326,45 @@ impl ExecutionAdmissionV4 {
                     }
                     _ => String::new(),
                 }
+            )
+            .expect("writing to a String cannot fail");
+        }
+        writeln!(
+            out,
+            "direct-executable-manifest schema={} scope={} sha256={} guarantee=direct-launcher-only transitive-runtime-closure=not-bound",
+            self.executable_manifest.schema,
+            self.executable_manifest.scope,
+            self.executable_manifest.sha256()
+        )
+        .expect("writing to a String cannot fail");
+        for executable in self.executable_manifest.artifacts() {
+            writeln!(
+                out,
+                "direct-executable backend={} requirement={} selected-alternative={} selection={} command={} role={} state={} invocation-path={} invocation-identity={} canonical-target={} target-identity={} sha256={} guarantee={}",
+                executable.canonical_backend,
+                executable.requirement_key,
+                executable
+                    .selected_alternative
+                    .map(|index| index.to_string())
+                    .unwrap_or_else(|| "not-selected".to_string()),
+                executable.selection.name(),
+                executable.logical_command,
+                executable.role,
+                executable.state.name(),
+                executable
+                    .invocation_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not-probed".to_string()),
+                executable.invocation_identity,
+                executable
+                    .canonical_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not-probed".to_string()),
+                executable.resolved_identity,
+                executable.sha256.as_deref().unwrap_or("not-probed"),
+                executable.guarantee.name(),
             )
             .expect("writing to a String cannot fail");
         }
@@ -433,16 +482,16 @@ impl ExecutionAdmissionV4 {
             "admission-note backend artifact states distinguish hashed, missing, non-regular, and unreadable paths\n",
         );
         out.push_str(
-            "admission-note adapter/environment rechecks are best-effort snapshots; v4 does not pin an opened artifact or frozen child environment and cannot prove bytes/environment observed at spawn\n",
+            "admission-note V5 direct-launch leases retain opened hashed canonical targets and dispatch their admitted absolute invocation paths after immediate identity checks; this preserves multicall symlink names and prevents PATH alternative reselection but does not freeze the child environment or eliminate a final same-principal stat-to-exec micro-window\n",
         );
         out.push_str(
-            "admission-note backend binding does not cover live actor state/generation or external toolchain closure\n",
+            "admission-note direct-launch binding excludes shebang interpreters, compiler-driver subtools, dynamic libraries, hosted descendants, Request/project authorities, and live actor state/generation\n",
         );
         out.push_str(
-            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in v4\n",
+            "admission-note caller initial scope shape and values are installed after admission and are not digest-bound in V5\n",
         );
         out.push_str(
-            "admission-note local placement is descriptive in v4 and does not assert a current lease\n",
+            "admission-note local placement is descriptive in V5 and does not assert a current lease\n",
         );
         out
     }
@@ -692,7 +741,7 @@ pub struct AdmittedExecution<'a> {
     plan: &'a ExecutionPlan,
     graph: HGraph,
     runtime: RuntimeBindingV1,
-    admission: ExecutionAdmissionV4,
+    admission: ExecutionAdmissionV5,
 }
 
 impl<'a> AdmittedExecution<'a> {
@@ -708,8 +757,58 @@ impl<'a> AdmittedExecution<'a> {
         &self.graph
     }
 
-    pub fn admission(&self) -> &ExecutionAdmissionV4 {
+    pub fn admission(&self) -> &ExecutionAdmissionV5 {
         &self.admission
+    }
+
+    /// Return the process-local executable launch authority retained by this
+    /// admission. Inspection admissions intentionally have no such authority.
+    pub(crate) fn executable_leases(&self) -> Result<Arc<ExecutableLeaseSet>> {
+        self.runtime.executable_leases().context(
+            "execution admission carries no executable leases (inspection-only runtime snapshot)",
+        )
+    }
+
+    /// Conservative generation identity for a backend process launch. It
+    /// binds that backend's selected direct executable set, consumed legacy
+    /// shim artifact rows, and the complete admitted environment snapshot.
+    /// Persistent actors use this digest to prevent reuse across any of those
+    /// launch-context changes.
+    pub(crate) fn backend_launch_generation_sha256(&self, backend: &str) -> Result<String> {
+        let leases = self.executable_leases()?;
+        let executable_set = leases.backend_executable_set_sha256(backend)?;
+        let mut fields = vec![executable_set, self.runtime.launch_context_sha256()];
+        for artifact in self
+            .runtime
+            .backend_artifacts()
+            .iter()
+            .filter(|artifact| artifact.canonical_backend == backend)
+        {
+            fields.push(artifact.resolved_identity.as_str());
+            fields.push(artifact.state.name());
+            fields.push(artifact.state.sha256().unwrap_or("none"));
+        }
+        Ok(digest_fields(
+            "ostadix-backend-launch-generation/v1",
+            &fields,
+        ))
+    }
+
+    /// Recheck mutable legacy-shim/environment context without re-resolving or
+    /// re-hashing direct executables. The retained lease set owns direct-launch
+    /// freshness and is verified separately at each backend spawn.
+    pub(crate) fn verify_runtime_context(
+        &self,
+        shim_dir: &Path,
+        context: &[(&str, &str)],
+    ) -> Result<()> {
+        let current = super::analyze::runtime_binding_from_directory_reusing_executables(
+            self.plan,
+            shim_dir,
+            context,
+            self.runtime.executable_manifest.clone(),
+        );
+        self.verify_runtime(&current)
     }
 
     /// Project one canonical plan operation and its immediate admitted
@@ -826,7 +925,11 @@ impl<'a> AdmittedExecution<'a> {
         let mut changed = Vec::new();
         let snapshot_kind_changed = self.runtime.snapshot_kind != current.snapshot_kind;
         let backend_artifacts_changed = self.runtime.backend_artifacts != current.backend_artifacts;
+        let executable_manifest_changed =
+            self.runtime.executable_manifest != current.executable_manifest;
         let backend_set_changed = self.runtime.backend_set_sha256 != current.backend_set_sha256;
+        let launch_context_changed =
+            self.runtime.launch_context_sha256 != current.launch_context_sha256;
         let environment_changed = self.runtime.environment_sha256 != current.environment_sha256;
 
         if snapshot_kind_changed {
@@ -834,6 +937,9 @@ impl<'a> AdmittedExecution<'a> {
         }
         if backend_artifacts_changed {
             changed.push("backend artifacts");
+        }
+        if executable_manifest_changed {
+            changed.push("direct executable manifest");
         }
         if self.runtime.backend_catalog_projection_sha256
             != current.backend_catalog_projection_sha256
@@ -847,7 +953,14 @@ impl<'a> AdmittedExecution<'a> {
         if !backend_artifacts_changed && backend_set_changed {
             changed.push("backend-set digest");
         }
-        if !snapshot_kind_changed && !backend_set_changed && environment_changed {
+        if launch_context_changed {
+            changed.push("backend launch context digest");
+        }
+        if !snapshot_kind_changed
+            && !backend_set_changed
+            && !launch_context_changed
+            && environment_changed
+        {
             changed.push("environment digest");
         }
         if !environment_changed && self.runtime.ambient_world_sha256 != current.ambient_world_sha256
@@ -872,7 +985,7 @@ pub fn admit_execution<'a>(
     mut graph: HGraph,
     base_policy: Policy,
     runtime: RuntimeBindingV1,
-    evidence: EvidenceBundleV4,
+    evidence: EvidenceBundleV5,
 ) -> Result<AdmittedExecution<'a>> {
     if plan != &program.plan() {
         bail!(
@@ -883,7 +996,7 @@ pub fn admit_execution<'a>(
         .validate_execution_source(program, plan)
         .map_err(anyhow::Error::msg)
         .context("admission rejected OIR/plan/HGraph provenance")?;
-    if evidence.schema != EVIDENCE_SCHEMA_V4 || evidence.analyzer != ANALYZER_ID_V4 {
+    if evidence.schema != EVIDENCE_SCHEMA_V5 || evidence.analyzer != ANALYZER_ID_V5 {
         bail!("unsupported or untrusted evidence bundle schema/analyzer");
     }
     if evidence.runtime != runtime {
@@ -942,7 +1055,7 @@ pub fn admit_execution<'a>(
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
     let admission_sha256 = digest_fields(
-        "ostadix-execution-admission/v4",
+        "ostadix-execution-admission/v5",
         &[
             &evidence_sha256,
             &admitted_graph_sha256,
@@ -950,12 +1063,13 @@ pub fn admit_execution<'a>(
         ],
     );
 
-    let admission = ExecutionAdmissionV4 {
-        schema: ADMISSION_SCHEMA_V4,
+    let admission = ExecutionAdmissionV5 {
+        schema: ADMISSION_SCHEMA_V5,
         bindings: expected_bindings,
-        analyzer: ANALYZER_ID_V4,
+        analyzer: ANALYZER_ID_V5,
         runtime_snapshot_kind: runtime.snapshot_kind(),
         backend_artifacts: runtime.backend_artifacts().to_vec(),
+        executable_manifest: runtime.executable_manifest().clone(),
         evidence_sha256,
         admitted_graph_sha256,
         admission_sha256,
@@ -1426,7 +1540,8 @@ mod tests {
     use super::*;
     use crate::evidence::{
         analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
-        BackendArtifactStateV1, CostEstimateV1, EvidenceProvenance,
+        runtime_binding_from_directory_reusing_executables, BackendArtifactStateV1, CostEstimateV1,
+        EvidenceProvenance,
     };
     use crate::hgraph::from_oir::build_program;
     use crate::hgraph::solve::solve_types;
@@ -1467,7 +1582,7 @@ mod tests {
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
     );
 
-    fn legal_projection(admission: &ExecutionAdmissionV4) -> LegalProjection {
+    fn legal_projection(admission: &ExecutionAdmissionV5) -> LegalProjection {
         (
             admission.waves().to_vec(),
             admission
@@ -1490,8 +1605,8 @@ mod tests {
 
         let evidence_a = analyze_execution(&program, &plan, &graph_a, runtime_a.clone()).unwrap();
         let evidence_b = analyze_execution(&program, &plan, &graph_b, runtime_b.clone()).unwrap();
-        assert_eq!(evidence_a.schema(), EVIDENCE_SCHEMA_V4);
-        assert_eq!(evidence_a.analyzer(), ANALYZER_ID_V4);
+        assert_eq!(evidence_a.schema(), EVIDENCE_SCHEMA_V5);
+        assert_eq!(evidence_a.analyzer(), ANALYZER_ID_V5);
         assert_eq!(evidence_a.bindings(), evidence_b.bindings());
         assert_eq!(
             evidence_bundle_sha256(&evidence_a),
@@ -1526,7 +1641,7 @@ mod tests {
             admitted_b.admission().to_explanation_text()
         );
         let explanation = admitted_a.admission().to_explanation_text();
-        assert!(explanation.starts_with("; ExecutionAdmission oexec.admission/v4\n"));
+        assert!(explanation.starts_with("; ExecutionAdmission oexec.admission/v5\n"));
         assert!(explanation.contains("binding lowered-oir-sha256="));
         assert!(explanation.contains("binding backend-catalog-projection-sha256="));
         assert_eq!(
@@ -1806,7 +1921,7 @@ mod tests {
         let diagnostic = error.to_string();
         assert_eq!(
             diagnostic,
-            "execution admission runtime binding is stale; changed components: environment digest"
+            "execution admission runtime binding is stale; changed components: backend launch context digest"
         );
     }
 
@@ -2110,7 +2225,7 @@ python^(__oval_result__ = sum(branches))_python
         let plan = program.plan();
         let graph = solved_graph(&program);
         let context = &[("artifact-drift-test", "v1")];
-        let runtime = runtime_binding_from_directory(&plan, shim_dir.path(), context);
+        let runtime = runtime_binding_from_directory(&plan, shim_dir.path(), context).unwrap();
         assert!(
             runtime.backend_artifacts().iter().any(|artifact| {
                 artifact.canonical_backend == "python"
@@ -2126,7 +2241,12 @@ python^(__oval_result__ = sum(branches))_python
 
         std::fs::write(&shim_path, b"# adversarially replaced shim bytes\n")
             .expect("replace the shim after admission");
-        let current = runtime_binding_from_directory(&plan, shim_dir.path(), context);
+        let current = runtime_binding_from_directory_reusing_executables(
+            &plan,
+            shim_dir.path(),
+            context,
+            admitted.runtime.executable_manifest.clone(),
+        );
         let error = admitted
             .verify_runtime(&current)
             .expect_err("artifact replacement must stale the admission before dispatch");
@@ -2134,6 +2254,50 @@ python^(__oval_result__ = sum(branches))_python
             error.to_string(),
             "execution admission runtime binding is stale; changed components: backend artifacts"
         );
+    }
+
+    #[test]
+    fn unrelated_backend_does_not_change_python_launch_generation() {
+        let shim_dir = tempfile::tempdir().expect("create isolated shim directory");
+        std::fs::write(
+            shim_dir.path().join("python_shim.py"),
+            b"# stable Python shim generation\n",
+        )
+        .unwrap();
+        let program = |include_bash: bool| {
+            let mut nodes = vec![OIr::Exec {
+                lang: "python".to_string(),
+                env_id: 0,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("python"),
+                body: vec![OIr::Text("__oval_result__ = 1".to_string())],
+            }];
+            if include_bash {
+                nodes.push(OIr::Exec {
+                    lang: "bash".to_string(),
+                    env_id: u32::MAX,
+                    attr: None,
+                    backend: BackendRegistry::global().interface_for("bash"),
+                    body: vec![OIr::Text("printf unrelated".to_string())],
+                });
+            }
+            OIrProgram { nodes }
+        };
+        let context = &[("launch-generation-test", "stable")];
+        let admit = |program: &OIrProgram| {
+            let plan = program.plan();
+            let graph = solved_graph(program);
+            let runtime = runtime_binding_from_directory(&plan, shim_dir.path(), context).unwrap();
+            let evidence = analyze_execution(program, &plan, &graph, runtime.clone()).unwrap();
+            // Keep the owned plan alive for the returned digest only; the
+            // admission itself is consumed inside this closure.
+            admit_execution(program, &plan, graph, Policy::Eager, runtime, evidence)
+                .unwrap()
+                .backend_launch_generation_sha256("python")
+                .unwrap()
+        };
+
+        assert_eq!(admit(&program(false)), admit(&program(true)));
     }
 
     #[test]
