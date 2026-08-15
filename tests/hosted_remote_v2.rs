@@ -8,12 +8,13 @@ use o_lang::hosted_remote::v2::{
     build_local_dev_placement_proof_v2, open_capability_commitment_v2, validate_hosted_response_v2,
     DenyAllPlacementAuthorizerV2, DurableSessionStoreV2, HostedCommandBindingV2,
     HostedNodeSignerV2, HostedPlacementAuthorityV2, HostedRequestV2, HostedResponseV2,
-    HostedV2Runtime, HostedV2RuntimeConfig, JournalEntryV2, JournalEventV2,
-    LocalDevPlacementConfigV2, OpenSessionRequestV2, OperationStatusV2,
-    PinnedEd25519PlacementAuthorizerV2, PlacementLeaseSignerV2, PlacementPurposeV2,
-    PreparedOperationV2, SessionCapabilityV2, SessionMutationRequestV2, SessionQueryV2,
-    SessionStateTierV2, SignedJournalEntryV2, SignedPlacementLeaseV2, SubmitOperationRequestV2,
-    HOSTED_COMMAND_BINDING_SCHEMA_V2, HOSTED_JOURNAL_ENTRY_SCHEMA_V2, HOSTED_PROTOCOL_V2,
+    HostedV2Runtime, HostedV2RuntimeClosedV2, HostedV2RuntimeConfig,
+    HostedV2RuntimeShutdownErrorV2, JournalEntryV2, JournalEventV2, LocalDevPlacementConfigV2,
+    OpenSessionRequestV2, OperationStatusV2, PinnedEd25519PlacementAuthorizerV2,
+    PlacementLeaseSignerV2, PlacementPurposeV2, PreparedOperationV2, SessionCapabilityV2,
+    SessionMutationRequestV2, SessionQueryV2, SessionStateTierV2, SignedJournalEntryV2,
+    SignedPlacementLeaseV2, SubmitOperationRequestV2, HOSTED_COMMAND_BINDING_SCHEMA_V2,
+    HOSTED_JOURNAL_ENTRY_SCHEMA_V2, HOSTED_PROTOCOL_V2,
 };
 use o_lang::hosted_remote::{canonical_hosted_sha256, unix_time_ms};
 use o_lang::ir::BackendRegistry;
@@ -26,6 +27,10 @@ use o_lang::placement::{
 };
 
 const NODE_ID: &str = "node-v2-test";
+// Capacity observations are protocol-bounded to a 5-second inclusive span;
+// fixtures start one millisecond before `now`, so 4_999 is the exact maximum.
+const TEST_EVIDENCE_VALIDITY_MS: u64 = 4_999;
+const EXPIRED_RETRY_VALIDITY_MS: u64 = 4_000;
 
 #[derive(Clone)]
 struct OpenedSession {
@@ -108,6 +113,41 @@ fn lease(
     operation_sha256: Option<String>,
     operation: &PreparedOperationV2,
 ) -> (SignedPlacementLeaseV2, TargetDescriptorV1) {
+    lease_with_validity(
+        signer,
+        principal,
+        state_session,
+        state_tier,
+        state_quotas,
+        state_reservation,
+        established_target,
+        actor_generation,
+        request_id,
+        sequence,
+        purpose,
+        operation_sha256,
+        operation,
+        TEST_EVIDENCE_VALIDITY_MS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lease_with_validity(
+    signer: &PlacementLeaseSignerV2,
+    principal: &str,
+    state_session: StateSessionIdV2,
+    state_tier: SessionStateTierV2,
+    state_quotas: StateQuotaLimitsV2,
+    state_reservation: StateReservationV2,
+    established_target: Option<&TargetDescriptorV1>,
+    actor_generation: Option<&ActorGenerationIdV1>,
+    request_id: &str,
+    sequence: u64,
+    purpose: PlacementPurposeV2,
+    operation_sha256: Option<String>,
+    operation: &PreparedOperationV2,
+    validity_ms: u64,
+) -> (SignedPlacementLeaseV2, TargetDescriptorV1) {
     let bindings = prepare_bindings(operation);
     let now = unix_time_ms().unwrap();
     let establishing_logical_environment = purpose == PlacementPurposeV2::OpenSession
@@ -162,7 +202,7 @@ fn lease(
                 0,
                 0,
                 UnixMillisV1::new(now.saturating_sub(1)),
-                UnixMillisV1::new(now + 4_000),
+                UnixMillisV1::new(now + validity_ms),
             )
             .unwrap(),
         )
@@ -216,7 +256,7 @@ fn lease(
                 digest(&format!("nonce:{request_id}")),
                 expectation,
                 UnixMillisV1::new(now.saturating_sub(1)),
-                UnixMillisV1::new(now + 20_000),
+                UnixMillisV1::new(now + validity_ms),
             )
             .unwrap(),
         )
@@ -244,7 +284,7 @@ fn lease(
                 digest(&format!("nonce:{request_id}")),
                 expectation,
                 UnixMillisV1::new(now.saturating_sub(1)),
-                UnixMillisV1::new(now + 20_000),
+                UnixMillisV1::new(now + validity_ms),
             )
             .unwrap(),
         )
@@ -338,6 +378,29 @@ fn open_session_with_reservation(
     state_quotas: StateQuotaLimitsV2,
     reservation: StateReservationV2,
 ) -> OpenedSession {
+    open_session_with_reservation_and_validity(
+        runtime,
+        placement_signer,
+        principal,
+        request_id,
+        tier,
+        state_quotas,
+        reservation,
+        TEST_EVIDENCE_VALIDITY_MS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_session_with_reservation_and_validity(
+    runtime: &HostedV2Runtime,
+    placement_signer: &PlacementLeaseSignerV2,
+    principal: &str,
+    request_id: &str,
+    tier: SessionStateTierV2,
+    state_quotas: StateQuotaLimitsV2,
+    reservation: StateReservationV2,
+    validity_ms: u64,
+) -> OpenedSession {
     let state_session = StateSessionIdV2::new(
         NODE_ID,
         GenerationV1::new(1).unwrap(),
@@ -345,7 +408,7 @@ fn open_session_with_reservation(
     )
     .unwrap();
     let proof_operation = operation("open-proof", tier);
-    let (placement_lease, target) = lease(
+    let (placement_lease, target) = lease_with_validity(
         placement_signer,
         principal,
         state_session.clone(),
@@ -359,6 +422,7 @@ fn open_session_with_reservation(
         PlacementPurposeV2::OpenSession,
         None,
         &proof_operation,
+        validity_ms,
     );
     let capability = open_capability(&state_session, request_id);
     let request = OpenSessionRequestV2 {
@@ -534,6 +598,26 @@ fn wait_for_ambiguous(
     panic!("operation did not reach durable ambiguous state")
 }
 
+fn current_session_view(
+    runtime: &HostedV2Runtime,
+    principal: &str,
+    capability: &SessionCapabilityV2,
+) -> o_lang::hosted_remote::v2::SessionViewV2 {
+    let HostedResponseV2::Status { session, .. } = runtime
+        .status(
+            principal,
+            SessionQueryV2 {
+                credentials: capability.clone().into(),
+                operation_id: None,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("wrong status response")
+    };
+    session
+}
+
 #[test]
 fn signed_session_journal_binds_principal_bearer_and_exact_duplicate_sequence() {
     let directory = tempfile::tempdir().unwrap();
@@ -666,14 +750,18 @@ fn open_retry_survives_dropped_response_restart_and_rejects_mismatch() {
         // The helper observes the returned value so the test can retain its
         // expected digest, but no acknowledgement is fed back to the runtime:
         // dropping it here models response loss after the first durable frame.
-        open_session(
+        let opened = open_session_with_reservation_and_validity(
             &runtime,
             &placement_signer,
             &principal,
             "open-dropped-response",
             SessionStateTierV2::Stateless,
             state_quotas.clone(),
-        )
+            reservation(),
+            EXPIRED_RETRY_VALIDITY_MS,
+        );
+        runtime.shutdown().unwrap();
+        opened
     };
 
     // Expire the original 4-second capacity observation. Exact duplicate Open
@@ -1338,7 +1426,7 @@ fn hard_quota_refusal_consumes_nonce_without_eviction_and_gc_is_explicit() {
     let second_lease = lease(
         &placement_signer,
         &principal,
-        second_session,
+        second_session.clone(),
         SessionStateTierV2::Stateless,
         state_quotas.clone(),
         reservation(),
@@ -1355,7 +1443,7 @@ fn hard_quota_refusal_consumes_nonce_without_eviction_and_gc_is_explicit() {
         client_request_id: "open-second".to_owned(),
         state_tier: SessionStateTierV2::Stateless,
         capability_commitment: open_capability_commitment_v2(&second_capability).unwrap(),
-        proposed_capability: second_capability,
+        proposed_capability: second_capability.clone(),
         placement_lease: second_lease,
     };
     let second = running.open_session(&principal, second_request.clone());
@@ -1363,15 +1451,41 @@ fn hard_quota_refusal_consumes_nonce_without_eviction_and_gc_is_explicit() {
         .unwrap_err()
         .to_string()
         .contains("no session was evicted"));
-    drop(running);
+    running.shutdown().unwrap();
     let runtime = runtime(
         &state_root,
         node_signer.clone(),
         &placement_signer,
         state_quotas.clone(),
     );
+    // Reissue the same deterministic nonce under a fresh capacity observation
+    // after restart. This tests durable nonce consumption without depending on
+    // a 5-second protocol freshness window surviving a loaded CI host.
+    let retry_operation = operation("open-second-retry-proof", SessionStateTierV2::Stateless);
+    let retry_request = OpenSessionRequestV2 {
+        client_request_id: "open-second".to_owned(),
+        state_tier: SessionStateTierV2::Stateless,
+        capability_commitment: open_capability_commitment_v2(&second_capability).unwrap(),
+        proposed_capability: second_capability,
+        placement_lease: lease(
+            &placement_signer,
+            &principal,
+            second_session,
+            SessionStateTierV2::Stateless,
+            state_quotas.clone(),
+            reservation(),
+            None,
+            None,
+            "open-second",
+            0,
+            PlacementPurposeV2::OpenSession,
+            None,
+            &retry_operation,
+        )
+        .0,
+    };
     assert!(runtime
-        .open_session(&principal, second_request,)
+        .open_session(&principal, retry_request)
         .unwrap_err()
         .to_string()
         .contains("already consumed"));
@@ -1387,7 +1501,7 @@ fn hard_quota_refusal_consumes_nonce_without_eviction_and_gc_is_explicit() {
         )
         .unwrap();
     let session_id = first.capability.session_id;
-    drop(runtime);
+    runtime.shutdown().unwrap();
     let store = DurableSessionStoreV2::open(&state_root, node_signer.clone()).unwrap();
     let authorization = store.authorize_closed_session_gc(&session_id).unwrap();
     assert!(matches!(
@@ -1801,4 +1915,188 @@ fn unconfigured_authority_denies_before_state_creation() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("no authenticated"));
+}
+
+#[test]
+fn explicit_shutdown_drains_terminal_and_checkpoint_workers_then_reopens_immediately() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let node_signer = HostedNodeSignerV2::generate().unwrap();
+    let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
+    let state_quotas = quotas(8);
+    let principal = principal_digest('b');
+    let running = runtime(
+        &state_root,
+        node_signer.clone(),
+        &placement_signer,
+        state_quotas.clone(),
+    );
+    let clone = running.clone();
+
+    let first = open_session(
+        &running,
+        &placement_signer,
+        &principal,
+        "shutdown-open-a",
+        SessionStateTierV2::Stateless,
+        state_quotas.clone(),
+    );
+    let checkpoint = open_session(
+        &running,
+        &placement_signer,
+        &principal,
+        "shutdown-open-checkpoint",
+        SessionStateTierV2::CheckpointRestore,
+        state_quotas.clone(),
+    );
+    let second = open_session(
+        &running,
+        &placement_signer,
+        &principal,
+        "shutdown-open-b",
+        SessionStateTierV2::Stateless,
+        state_quotas.clone(),
+    );
+
+    submit(
+        &running,
+        &placement_signer,
+        &principal,
+        &first,
+        "shutdown-execute-a",
+        1,
+        operation("shutdown-op-a", first.tier),
+        state_quotas.clone(),
+    );
+    submit(
+        &running,
+        &placement_signer,
+        &principal,
+        &checkpoint,
+        "shutdown-execute-checkpoint",
+        1,
+        operation("shutdown-op-checkpoint", checkpoint.tier),
+        state_quotas.clone(),
+    );
+    running
+        .inject_actor_close_before_execute_for_test(&second.capability.session_id)
+        .unwrap();
+    submit(
+        &running,
+        &placement_signer,
+        &principal,
+        &second,
+        "shutdown-execute-b",
+        1,
+        operation("shutdown-op-b", second.tier),
+        state_quotas.clone(),
+    );
+
+    // This is the only settlement barrier: there is no status polling, sleep,
+    // or debug acknowledgement. Close is FIFO behind every accepted Execute.
+    clone.shutdown().unwrap();
+    running.shutdown().unwrap();
+
+    let closed = running
+        .status(
+            &principal,
+            SessionQueryV2 {
+                credentials: first.capability.clone().into(),
+                operation_id: None,
+            },
+        )
+        .unwrap_err();
+    assert!(closed.downcast_ref::<HostedV2RuntimeClosedV2>().is_some());
+    assert!(running
+        .node_id()
+        .unwrap_err()
+        .downcast_ref::<HostedV2RuntimeClosedV2>()
+        .is_some());
+    assert!(running
+        .state_quotas()
+        .unwrap_err()
+        .downcast_ref::<HostedV2RuntimeClosedV2>()
+        .is_some());
+    let HostedResponseV2::Error { error } = running.handle_request(
+        &principal,
+        HostedRequestV2::Status {
+            protocol: HOSTED_PROTOCOL_V2.to_owned(),
+            query: SessionQueryV2 {
+                credentials: first.capability.clone().into(),
+                operation_id: None,
+            },
+        },
+    ) else {
+        panic!("closed runtime accepted a hosted request")
+    };
+    assert_eq!(error.code, "runtime-closed");
+    assert!(!error.retryable);
+
+    // Old runtime clones remain alive, so this immediate successful open proves
+    // explicit shutdown removed the runtime-owned store/root-lock reference.
+    let restarted = runtime(&state_root, node_signer, &placement_signer, state_quotas);
+    let first_view = current_session_view(&restarted, &principal, &first.capability);
+    let second_view = current_session_view(&restarted, &principal, &second.capability);
+    let checkpoint_view = current_session_view(&restarted, &principal, &checkpoint.capability);
+    assert!(matches!(
+        first_view.operations["shutdown-op-a"].status,
+        OperationStatusV2::Succeeded | OperationStatusV2::Failed
+    ));
+    assert_eq!(
+        second_view.operations["shutdown-op-b"].status,
+        OperationStatusV2::NotStarted
+    );
+    assert!(matches!(
+        checkpoint_view.operations["shutdown-op-checkpoint"].status,
+        OperationStatusV2::Succeeded | OperationStatusV2::Failed
+    ));
+    assert!(checkpoint_view.actor.checkpoint_sha256.is_some());
+    assert!(checkpoint_view.actor.checkpoint_bytes.is_some());
+    restarted.shutdown().unwrap();
+}
+
+#[test]
+fn worker_panic_shutdown_is_typed_idempotent_and_releases_root_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_root = directory.path().join("state");
+    let node_signer = HostedNodeSignerV2::generate().unwrap();
+    let placement_signer = PlacementLeaseSignerV2::generate().unwrap();
+    let state_quotas = quotas(8);
+    let principal = principal_digest('c');
+    let running = runtime(
+        &state_root,
+        node_signer.clone(),
+        &placement_signer,
+        state_quotas.clone(),
+    );
+    let clone = running.clone();
+    let opened = open_session(
+        &running,
+        &placement_signer,
+        &principal,
+        "shutdown-panic-open",
+        SessionStateTierV2::Stateless,
+        state_quotas.clone(),
+    );
+    running
+        .inject_worker_panic_for_test(&opened.capability.session_id)
+        .unwrap();
+
+    let first = running.shutdown().unwrap_err();
+    let first = first
+        .downcast_ref::<HostedV2RuntimeShutdownErrorV2>()
+        .expect("worker panic did not produce the typed shutdown error");
+    assert!(first.message().contains(&opened.capability.session_id));
+    let repeated = clone.shutdown().unwrap_err();
+    let repeated = repeated
+        .downcast_ref::<HostedV2RuntimeShutdownErrorV2>()
+        .expect("repeated shutdown did not preserve the typed outcome");
+    assert_eq!(repeated, first);
+
+    let closed = clone.unreadable_sessions().unwrap_err();
+    assert!(closed.downcast_ref::<HostedV2RuntimeClosedV2>().is_some());
+    let reopened = runtime(&state_root, node_signer, &placement_signer, state_quotas);
+    let view = current_session_view(&reopened, &principal, &opened.capability);
+    assert_eq!(view.operations.len(), 0);
+    reopened.shutdown().unwrap();
 }

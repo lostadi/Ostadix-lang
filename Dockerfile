@@ -1,27 +1,34 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # O-lang container image
 #
-# Multi-stage build: a Rust builder stage compiles the toolchain, and a slim
-# runtime stage ships the three binaries with Python 3 (the runtime most
-# backends shim through) and the backend shim scripts.
+# Multi-stage build: a pinned Rust builder compiles the hosted toolchain, and a
+# slim runtime stage ships the three binaries, Python 3, and the backend shim
+# adapters. The minimal image does not install every runtime those adapters can
+# delegate to (for example rustc, Node.js, Ruby, a JDK, or C/C++ compilers).
 #
 # Build:
-#   docker build -t o-lang .
+#   docker build -t o-lang:0.2.0 .
 #
 # Run a .O program from the host:
-#   docker run --rm -v "$PWD:/work" o-lang my_program.O
+#   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
+#       o-lang:0.2.0 examples/hello.O
 #
-# Literal-link a bare directory and run it immediately:
-#   docker run --rm -v "$PWD:/work" --entrypoint o-link o-lang src/ -o app.O
-# Safe, nonexecuting project lift:
-#   docker run --rm -v "$PWD:/work" --entrypoint o-link o-lang --project src/ -o project.O
+# Literal-link the checked-in Python-only fixture and run it immediately:
+#   docker run --rm \
+#       --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
+#       --entrypoint o-link o-lang:0.2.0 . -o /tmp/app.O
+# Safe, nonexecuting lift of the actual repository root:
+#   mkdir -p target/docker
+#   docker run --rm --mount type=bind,src="$PWD",dst=/work,readonly \
+#       --entrypoint o-link o-lang:0.2.0 --project . --stdout \
+#       > target/docker/project.O
 #
 # Drop into an interactive REPL:
-#   docker run --rm -it o-lang --repl
+#   docker run --rm -it o-lang:0.2.0 --repl
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1.97.1-slim-bookworm AS builder
 
 WORKDIR /src
 
@@ -30,13 +37,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 COPY backends ./backends
 
 # olangc embeds the runtime sources, Cargo.lock, and shim scripts at compile
 # time (include_str!/include_bytes!), so everything above must be present.
-RUN cargo build --release --bin O --bin olangc --bin o-link
+RUN cargo build --release --locked --bin O --bin olangc --bin o-link
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -53,16 +60,17 @@ COPY --from=builder /src/target/release/o-link /usr/local/bin/o-link
 # `o` wrapper so shebang lines (`#!/usr/bin/env o`) and docs work unchanged.
 RUN ln -s /usr/local/bin/O /usr/local/bin/o
 
-# Backend shim scripts, available at the default ./backends lookup path via
-# the /work symlink below and at a stable absolute path for explicit use.
+# Backend shim adapters. The environment variable is the image-wide authority
+# for their stable path, including when callers override ENTRYPOINT with o-link.
 COPY backends /opt/o-lang/backends
+ENV O_BACKENDS_DIR=/opt/o-lang/backends
 
 # Entrypoint wrapper: defaults the shim directory to the baked-in
 # /opt/o-lang/backends so mounted work dirs don't need their own copy.
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -e' \
-    'SHIMS=/opt/o-lang/backends' \
+    'SHIMS=${O_BACKENDS_DIR:-/opt/o-lang/backends}' \
     'if [ "$#" -eq 0 ]; then exec O --repl "$SHIMS"; fi' \
     'case "$1" in --repl|-i) exec O "$1" "${2:-$SHIMS}";; esac' \
     'if [ "$#" -eq 1 ] && [ -f "$1" ]; then exec O "$1" "$SHIMS"; fi' \
