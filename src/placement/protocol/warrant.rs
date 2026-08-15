@@ -212,7 +212,7 @@ impl WarrantAssertionV1 {
     }
 }
 
-/// One authenticated fact in a placement proof.  Signature bytes and key
+/// One authenticated fact in a placement proof. Signature bytes and key
 /// resolution remain outside this transport-neutral payload.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(deny_unknown_fields)]

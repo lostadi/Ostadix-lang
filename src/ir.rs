@@ -8,8 +8,8 @@
 //   2. Execution plan    — OIr / OIrProgram, a lowered, backend-neutral form
 //                          of the program (this module).
 //   3. Runtime values    — OValue, produced by the evaluator.
-//   4. Backend metadata  — BackendSpec / BackendRegistry: purity, splice
-//                          rendering strategy, and shim path resolution.
+//   4. Backend metadata  — re-exported compatibility facade over
+//                          registry::bundle for existing callers.
 //
 // Non-goals (deliberately out of scope for this layer):
 //   - no native codegen from OIR
@@ -21,16 +21,17 @@
 // lowering so analysis and runtime dispatch cannot silently diverge.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, OnceLock};
-
-use num_bigint::BigInt;
-use sha2::{Digest, Sha256};
-
 use crate::environment::EnvironmentRefV2;
 use crate::parser::ONode;
-use crate::value::{BackendAuthority, GroupMode};
+use crate::value::GroupMode;
+use std::collections::{BTreeSet, HashMap};
+
+pub use crate::registry::bundle::{
+    BackendAdapterKind, BackendInterface, BackendRegistry, BackendSpec, BackendValueCapabilities,
+    ExecutionMode, IntegerExactness, RichNumberPreservation, RuntimeRequirementPrecision,
+    RuntimeRequirementSpec, SpliceRenderer, BACKEND_CATALOG_CURRENT_SCHEMA,
+    BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V3, BACKEND_CATALOG_SCHEMA_V4,
+};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // OIr — the lowered instruction forms
@@ -460,106 +461,6 @@ pub struct PlanEdge {
     pub from: PlanNodeId,
     pub to: PlanNodeId,
     pub kind: PlanEdgeKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    InlineAst,
-    InlineValue,
-    Shim,
-}
-
-impl ExecutionMode {
-    fn label(self) -> &'static str {
-        match self {
-            ExecutionMode::InlineAst => "inline_ast",
-            ExecutionMode::InlineValue => "inline_value",
-            ExecutionMode::Shim => "shim",
-        }
-    }
-}
-
-/// Integer interval a backend can preserve exactly when an O number crosses
-/// into that backend. This is semantic capability metadata, not an ISA or
-/// language-name heuristic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntegerExactness {
-    /// The catalog has no sound positive statement for this implementation.
-    Unknown,
-    /// Every integer in `[-2^bits, 2^bits]` is represented exactly.
-    ExactMagnitudeBits(u16),
-    /// Every integer in `[-2^bits, 2^bits - 1]` is represented exactly.
-    ///
-    /// `bits` is the magnitude exponent, so a signed 64-bit representation is
-    /// `TwosComplementBits(63)`.
-    TwosComplementBits(u16),
-    /// An arbitrary inclusive exact interval. Catalog declarations use signed
-    /// base-10 literals which are parsed into canonical `BigInt` bounds.
-    ExactRange { min: BigInt, max: BigInt },
-    /// Integer precision is unbounded for the hosted representation.
-    Arbitrary,
-}
-
-impl IntegerExactness {
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::ExactMagnitudeBits(_) => "exact-magnitude-bits",
-            Self::TwosComplementBits(_) => "twos-complement-bits",
-            Self::ExactRange { .. } => "exact-range",
-            Self::Arbitrary => "arbitrary",
-        }
-    }
-}
-
-/// Whether a backend preserves O's distinct numeric kinds rather than
-/// collapsing them into a narrower scalar representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RichNumberPreservation {
-    Unknown,
-    Preserved,
-    Collapsed,
-}
-
-impl RichNumberPreservation {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Preserved => "preserved",
-            Self::Collapsed => "collapsed",
-        }
-    }
-}
-
-/// Value capabilities frozen into a backend interface at lowering time.
-/// Unknown facts stay explicit so fidelity and placement analysis cannot turn
-/// an absent catalog statement into `Lossless` evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendValueCapabilities {
-    pub integer_exactness: IntegerExactness,
-    pub rich_numbers: RichNumberPreservation,
-}
-
-impl BackendValueCapabilities {
-    pub const UNKNOWN: Self = Self {
-        integer_exactness: IntegerExactness::Unknown,
-        rich_numbers: RichNumberPreservation::Unknown,
-    };
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendInterface {
-    pub canonical: String,
-    /// Digest of the canonical catalog entry, including value capabilities.
-    /// `None` denotes a compatibility backend absent from the catalog.
-    pub specification_sha256: Option<String>,
-    pub pure: bool,
-    pub renderer: SpliceRenderer,
-    pub execution: ExecutionMode,
-    pub value_capabilities: BackendValueCapabilities,
-    /// Authority required by the backend adapter itself, before any
-    /// additional rights declared by a source block.
-    pub required_authorities: Vec<BackendAuthority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1092,544 +993,6 @@ fn attr_capability_binding(attr: Option<&str>) -> Option<String> {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Backend interface — BackendSpec / BackendRegistry
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// How an OValue is rendered into a backend's splice buffer. The actual
-/// renderer functions live in eval.rs (they need OValue); the registry only
-/// records which strategy a backend uses, so the dispatch decision is
-/// centralized here while the value-level code stays with the evaluator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpliceRenderer {
-    /// Python literals (`None`, `True`, `[1, 2]`, …).
-    Python,
-    /// Embeddable HTML markup (blobs become data-URI `<img>` tags).
-    Html,
-    /// LaTeX-safe text.
-    Latex,
-    /// Markdown-safe text.
-    Markdown,
-    /// Syntactically valid Nix expressions.
-    Nix,
-    /// `OValue::splice_repr()` — the conservative cross-language form.
-    Default,
-}
-
-impl SpliceRenderer {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Python => "python",
-            Self::Html => "html",
-            Self::Latex => "latex",
-            Self::Markdown => "markdown",
-            Self::Nix => "nix",
-            Self::Default => "default",
-        }
-    }
-}
-
-/// The concrete implementation boundary used after an operation has selected
-/// its high-level [`ExecutionMode`]. `Shim` means framed hosted execution; it
-/// does not by itself say whether the current Rust executable implements that
-/// backend or proxies a compatibility Python shim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendAdapterKind {
-    /// Implemented entirely inside the evaluator; no backend process is used.
-    Inline,
-    /// Implemented by `src/backend.rs` inside the current Ostadix executable.
-    NativeRust,
-    /// Implemented by a Python compatibility shim reached through the Rust
-    /// backend proxy.
-    LegacyPythonShim,
-}
-
-impl BackendAdapterKind {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Inline => "inline",
-            Self::NativeRust => "native-rust",
-            Self::LegacyPythonShim => "legacy-python-shim",
-        }
-    }
-}
-
-/// How precisely a backend-wide executable requirement describes every source
-/// body for that backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeRequirementPrecision {
-    /// Exact for ordinary OIR dispatch through the backend's declared
-    /// `ExecutionMode`. Auxiliary/direct wire endpoints are outside this
-    /// backend-wide discovery projection.
-    Exact,
-    /// A safe backend-wide over-approximation. Operation-specific analysis may
-    /// later prove that a subset of these commands is sufficient.
-    ConservativeAllSources,
-}
-
-impl RuntimeRequirementPrecision {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::ConservativeAllSources => "conservative-all-sources",
-        }
-    }
-}
-
-/// One reusable executable requirement group. Alternatives are an ordered OR
-/// of ordered AND command sets: `[["dotnet"], ["mcs", "mono"]]` means
-/// `dotnet` OR (`mcs` AND `mono`). This is descriptive availability metadata;
-/// it does not grant authority or establish runtime health.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeRequirementSpec {
-    pub key: &'static str,
-    pub builtin: bool,
-    pub precision: RuntimeRequirementPrecision,
-    pub alternatives: &'static [&'static [&'static str]],
-}
-
-const UNKNOWN_RUNTIME_REQUIREMENT: RuntimeRequirementSpec = RuntimeRequirementSpec {
-    key: "unknown-legacy-python-shim",
-    builtin: false,
-    precision: RuntimeRequirementPrecision::ConservativeAllSources,
-    alternatives: &[&["python3"]],
-};
-
-/// Static metadata for one backend: the single source of truth for aliases,
-/// purity, rendering, execution mode, authority, adapter ownership, and
-/// executable requirements.
-#[derive(Debug, Clone)]
-pub struct BackendSpec {
-    /// Canonical backend name as it appears in a language tag.
-    pub name: &'static str,
-    /// Alternate tag spellings accepted by splice rendering (`py`, `md`, …).
-    pub aliases: &'static [&'static str],
-    /// Whether `{lazy}` may cache results from this backend.
-    ///
-    /// This is a cache-safety contract for the current invocation mode, not
-    /// a claim that the source language is mathematically pure. `pure: true`
-    /// means: "safe for generic `{lazy}` memoization under the current
-    /// fingerprint (body + dep identities + env id) and runtime model" —
-    /// no hidden IO, clocks, randomness, or mutable external state can leak
-    /// into the result. Shim-backed backends that run arbitrary programs in
-    /// an unrestricted host environment must be `false` even when the
-    /// backend language is nominally pure or declarative. `{defer}` works on
-    /// any backend (it never caches), so it's the impure-backend escape
-    /// hatch.
-    pub pure: bool,
-    /// Which splice-rendering strategy `render_child` should use.
-    pub renderer: SpliceRenderer,
-    /// How the evaluator dispatches this backend.
-    pub execution: ExecutionMode,
-    /// Rights needed to implement this backend. For example,
-    /// the Bash adapter must start `bash`, while Python evaluation itself does
-    /// not require a child process.
-    pub required_authorities: &'static [BackendAuthority],
-    /// Concrete adapter ownership. This refines `execution` without changing
-    /// the OIR-level execution contract.
-    pub adapter: BackendAdapterKind,
-    /// Key into the canonical runtime-requirement catalog.
-    pub runtime_requirement_key: &'static str,
-    /// Representation facts used by fidelity and placement analysis.
-    pub value_capabilities: BackendValueCapabilities,
-}
-
-impl BackendSpec {
-    fn matches(&self, lang: &str) -> bool {
-        self.name == lang || self.aliases.contains(&lang)
-    }
-}
-
-macro_rules! runtime_requirement_catalog {
-    (
-        $(
-            {
-                key: $key:literal,
-                builtin: $builtin:literal,
-                precision: $precision:ident,
-                alternatives: [$([$($command:literal),* $(,)?]),* $(,)?],
-            }
-        ),* $(,)?
-    ) => {
-        const RUNTIME_REQUIREMENT_SPECS: &[RuntimeRequirementSpec] = &[
-            $(
-                RuntimeRequirementSpec {
-                    key: $key,
-                    builtin: $builtin,
-                    precision: RuntimeRequirementPrecision::$precision,
-                    alternatives: &[$(&[$($command),*]),*],
-                },
-            )*
-        ];
-    };
-}
-
-macro_rules! backend_catalog_metadata {
-    (schema: $schema:literal $(,)?) => {
-        /// Domain separator for deterministic canonical backend-catalog digests.
-        pub const BACKEND_CATALOG_SCHEMA_V3: &str = $schema;
-        /// Compatibility name retained for evidence code that predates the
-        /// catalog-v3 rollover. Its value always names the current schema.
-        pub const BACKEND_CATALOG_SCHEMA_V1: &str = BACKEND_CATALOG_SCHEMA_V3;
-    };
-}
-
-macro_rules! integer_exactness {
-    (Unknown) => {
-        IntegerExactness::Unknown
-    };
-    (ExactMagnitudeBits($bits:literal)) => {
-        IntegerExactness::ExactMagnitudeBits($bits)
-    };
-    (TwosComplementBits($bits:literal)) => {
-        IntegerExactness::TwosComplementBits($bits)
-    };
-    (ExactRange { min: $min:literal, max: $max:literal }) => {{
-        let min = BigInt::parse_bytes($min.as_bytes(), 10)
-            .expect("backend catalog exact-range minimum is not a signed base-10 integer");
-        let max = BigInt::parse_bytes($max.as_bytes(), 10)
-            .expect("backend catalog exact-range maximum is not a signed base-10 integer");
-        assert_eq!(
-            min.to_str_radix(10),
-            $min,
-            "backend catalog exact-range minimum must use canonical signed base-10 spelling"
-        );
-        assert_eq!(
-            max.to_str_radix(10),
-            $max,
-            "backend catalog exact-range maximum must use canonical signed base-10 spelling"
-        );
-        assert!(
-            min <= max,
-            "backend catalog exact-range minimum exceeds maximum"
-        );
-        IntegerExactness::ExactRange { min, max }
-    }};
-    (Arbitrary) => {
-        IntegerExactness::Arbitrary
-    };
-}
-
-macro_rules! backend_catalog {
-    (
-        $(
-            {
-                name: $name:literal,
-                aliases: [$($alias:literal),* $(,)?],
-                pure: $pure:literal,
-                renderer: $renderer:ident,
-                execution: $execution:ident,
-                authorities: [$($authority:ident),* $(,)?],
-                adapter: $adapter:ident,
-                runtime: $runtime:literal,
-                integer_exactness: $integer_exactness:ident
-                    $(($($integer_arguments:literal),* $(,)?))?
-                    $({ min: $integer_min:literal, max: $integer_max:literal })?,
-                rich_numbers: $rich_numbers:ident,
-            }
-        ),* $(,)?
-    ) => {
-        static BACKEND_SPECS: LazyLock<Vec<BackendSpec>> = LazyLock::new(|| vec![
-            $(
-                BackendSpec {
-                    name: $name,
-                    aliases: &[$($alias),*],
-                    pure: $pure,
-                    renderer: SpliceRenderer::$renderer,
-                    execution: ExecutionMode::$execution,
-                    required_authorities: &[$(BackendAuthority::$authority),*],
-                    adapter: BackendAdapterKind::$adapter,
-                    runtime_requirement_key: $runtime,
-                    value_capabilities: BackendValueCapabilities {
-                        integer_exactness: integer_exactness!(
-                            $integer_exactness
-                            $(($($integer_arguments),*))?
-                            $({ min: $integer_min, max: $integer_max })?
-                        ),
-                        rich_numbers: RichNumberPreservation::$rich_numbers,
-                    },
-                },
-            )*
-        ]);
-    };
-}
-
-// The included file is pure declarative data and is also embedded verbatim by
-// olangc so emitted runtime projects compile from the identical catalog.
-include!("backend_catalog.inc.rs");
-
-fn catalog_hash_field(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update((bytes.len() as u64).to_be_bytes());
-    hash.update(bytes);
-}
-
-fn catalog_hash_count(hash: &mut Sha256, count: usize) {
-    hash.update((count as u64).to_be_bytes());
-}
-
-fn hash_runtime_requirement(hash: &mut Sha256, requirement: &RuntimeRequirementSpec) {
-    catalog_hash_field(hash, requirement.key.as_bytes());
-    catalog_hash_field(
-        hash,
-        if requirement.builtin {
-            b"builtin"
-        } else {
-            b"external"
-        },
-    );
-    catalog_hash_field(hash, requirement.precision.name().as_bytes());
-    catalog_hash_count(hash, requirement.alternatives.len());
-    for alternative in requirement.alternatives {
-        catalog_hash_count(hash, alternative.len());
-        for command in *alternative {
-            catalog_hash_field(hash, command.as_bytes());
-        }
-    }
-}
-
-fn hash_backend_spec(hash: &mut Sha256, spec: &BackendSpec, requirement: &RuntimeRequirementSpec) {
-    catalog_hash_field(hash, spec.name.as_bytes());
-    catalog_hash_count(hash, spec.aliases.len());
-    for alias in spec.aliases {
-        catalog_hash_field(hash, alias.as_bytes());
-    }
-    catalog_hash_field(hash, if spec.pure { b"pure" } else { b"impure" });
-    catalog_hash_field(hash, spec.renderer.label().as_bytes());
-    catalog_hash_field(hash, spec.execution.label().as_bytes());
-    catalog_hash_count(hash, spec.required_authorities.len());
-    for authority in spec.required_authorities {
-        catalog_hash_field(hash, authority.name().as_bytes());
-    }
-    catalog_hash_field(hash, spec.adapter.name().as_bytes());
-    catalog_hash_field(hash, spec.runtime_requirement_key.as_bytes());
-    let integer_exactness = &spec.value_capabilities.integer_exactness;
-    catalog_hash_field(hash, integer_exactness.label().as_bytes());
-    match integer_exactness {
-        IntegerExactness::ExactMagnitudeBits(bits) | IntegerExactness::TwosComplementBits(bits) => {
-            catalog_hash_field(hash, &bits.to_be_bytes());
-        }
-        IntegerExactness::ExactRange { min, max } => {
-            catalog_hash_field(hash, min.to_str_radix(10).as_bytes());
-            catalog_hash_field(hash, max.to_str_radix(10).as_bytes());
-        }
-        IntegerExactness::Unknown | IntegerExactness::Arbitrary => {}
-    }
-    catalog_hash_field(
-        hash,
-        spec.value_capabilities.rich_numbers.label().as_bytes(),
-    );
-    hash_runtime_requirement(hash, requirement);
-}
-
-fn finish_catalog_hash(hash: Sha256) -> String {
-    hex::encode(hash.finalize())
-}
-
-/// Lookup table over `BackendSpec`s plus the centralized shim path
-/// resolution rule. Today the table is static; `BackendRegistry` is the
-/// place where dynamically registered backends would plug in later.
-#[derive(Debug)]
-pub struct BackendRegistry {
-    specs: &'static [BackendSpec],
-}
-
-impl BackendRegistry {
-    /// Fallback metadata for backends with no entry in the table:
-    /// impure, conservative cross-language splice representation.
-    const DEFAULT_SPEC: BackendSpec = BackendSpec {
-        name: "",
-        aliases: &[],
-        pure: false,
-        renderer: SpliceRenderer::Default,
-        execution: ExecutionMode::Shim,
-        required_authorities: &[
-            BackendAuthority::FileRead,
-            BackendAuthority::FileWrite,
-            BackendAuthority::Network,
-            BackendAuthority::Process,
-        ],
-        adapter: BackendAdapterKind::LegacyPythonShim,
-        runtime_requirement_key: "unknown-legacy-python-shim",
-        value_capabilities: BackendValueCapabilities::UNKNOWN,
-    };
-
-    /// The process-wide registry over the static spec table.
-    pub fn global() -> &'static BackendRegistry {
-        static REGISTRY: OnceLock<BackendRegistry> = OnceLock::new();
-        REGISTRY.get_or_init(|| BackendRegistry {
-            specs: BACKEND_SPECS.as_slice(),
-        })
-    }
-
-    /// Look up a backend by canonical name or alias.
-    pub fn get(&self, lang: &str) -> Option<&BackendSpec> {
-        self.specs.iter().find(|s| s.matches(lang))
-    }
-
-    /// Canonical backend specifications in their stable catalog order.
-    pub fn canonical_specs(&self) -> &'static [BackendSpec] {
-        self.specs
-    }
-
-    /// Reusable executable requirement groups in their stable discovery order.
-    pub fn runtime_requirement_specs(&self) -> &'static [RuntimeRequirementSpec] {
-        RUNTIME_REQUIREMENT_SPECS
-    }
-
-    /// Resolve descriptive executable requirements for a canonical name or
-    /// alias. Unknown tags retain the conservative legacy-Python fallback.
-    pub fn runtime_requirements_for(&self, lang: &str) -> &'static RuntimeRequirementSpec {
-        let key = self
-            .get(lang)
-            .map_or(Self::DEFAULT_SPEC.runtime_requirement_key, |spec| {
-                spec.runtime_requirement_key
-            });
-        RUNTIME_REQUIREMENT_SPECS
-            .iter()
-            .find(|requirement| requirement.key == key)
-            .unwrap_or(&UNKNOWN_RUNTIME_REQUIREMENT)
-    }
-
-    /// Concrete adapter ownership for a canonical name or alias. Unknown tags
-    /// remain conservative compatibility-shim backends.
-    pub fn adapter_for(&self, lang: &str) -> BackendAdapterKind {
-        self.get(lang)
-            .map_or(Self::DEFAULT_SPEC.adapter, |spec| spec.adapter)
-    }
-
-    /// Value-representation facts for a canonical backend or alias. Unknown
-    /// compatibility backends return an explicit all-unknown descriptor.
-    pub fn value_capabilities_for(&self, lang: &str) -> BackendValueCapabilities {
-        self.get(lang).map_or_else(
-            || BackendValueCapabilities::UNKNOWN,
-            |spec| spec.value_capabilities.clone(),
-        )
-    }
-
-    /// Deterministic SHA-256 of the complete ordered canonical catalog. This
-    /// identifies descriptive metadata only; it is not runtime readiness or
-    /// execution authority.
-    pub fn catalog_sha256(&self) -> String {
-        static DIGEST: OnceLock<String> = OnceLock::new();
-        DIGEST
-            .get_or_init(|| {
-                let mut hash = Sha256::new();
-                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
-                catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
-                for requirement in RUNTIME_REQUIREMENT_SPECS {
-                    hash_runtime_requirement(&mut hash, requirement);
-                }
-                catalog_hash_count(&mut hash, self.specs.len());
-                for spec in self.specs {
-                    let requirement = self.runtime_requirements_for(spec.name);
-                    hash_backend_spec(&mut hash, spec, requirement);
-                }
-                finish_catalog_hash(hash)
-            })
-            .clone()
-    }
-
-    /// Deterministic SHA-256 of one canonical backend specification and its
-    /// referenced runtime requirements. Aliases resolve to the same digest.
-    pub fn specification_sha256(&self, lang: &str) -> Option<String> {
-        let spec = self.get(lang)?;
-        let mut hash = Sha256::new();
-        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
-        hash_backend_spec(&mut hash, spec, self.runtime_requirements_for(spec.name));
-        Some(finish_catalog_hash(hash))
-    }
-
-    /// Whether `digest` is the specification identity of a canonical backend
-    /// under the current catalog schema and hash domain.
-    ///
-    /// This is deliberately stricter than accepting a well-formed SHA-256:
-    /// legacy catalog-domain digests and arbitrary unknown digests are not
-    /// current implementation identities, even when their old records remain
-    /// structurally inspectable.
-    pub fn contains_specification_sha256(&self, digest: &str) -> bool {
-        self.specs.iter().any(|spec| {
-            self.specification_sha256(spec.name)
-                .is_some_and(|current| current == digest)
-        })
-    }
-
-    /// Resolve a language tag (canonical name or alias) to its canonical
-    /// name. Unknown tags are returned unchanged.
-    pub fn canonical<'a>(&self, lang: &'a str) -> &'a str {
-        self.get(lang).map_or(lang, |s| s.name)
-    }
-
-    /// Whether `{lazy}` may cache results from this backend.
-    /// Unknown backends are conservatively impure.
-    pub fn is_pure(&self, lang: &str) -> bool {
-        self.get(lang).is_some_and(|s| s.pure)
-    }
-
-    /// Which splice-rendering strategy `render_child` should use for `lang`.
-    /// Unknown backends use the conservative default representation.
-    pub fn renderer_for(&self, lang: &str) -> SpliceRenderer {
-        self.get(lang)
-            .map_or(Self::DEFAULT_SPEC.renderer, |s| s.renderer)
-    }
-
-    /// Typed backend interface metadata used by planning and dispatch policy.
-    pub fn interface_for(&self, lang: &str) -> BackendInterface {
-        let canonical = self.canonical(lang).to_string();
-        let fallback = Self::DEFAULT_SPEC;
-        let spec = self.get(lang).unwrap_or(&fallback);
-        BackendInterface {
-            canonical,
-            specification_sha256: self.specification_sha256(lang),
-            pure: spec.pure,
-            renderer: spec.renderer,
-            execution: spec.execution,
-            value_capabilities: spec.value_capabilities.clone(),
-            required_authorities: spec.required_authorities.to_vec(),
-        }
-    }
-
-    /// Centralized shim path resolution.
-    ///
-    /// Probes, in order: `<dir>/<lang>_shim.py`, `<dir>/<lang>_shim`,
-    /// `<dir>/<lang>.py`, `<dir>/<lang>`. If none exists on disk, falls back
-    /// to `<dir>/<lang>_shim.py` so the eventual spawn error names the
-    /// conventional path.
-    pub fn resolve_shim_path(&self, shim_dir: &Path, lang: &str) -> PathBuf {
-        let candidates = [
-            shim_dir.join(format!("{lang}_shim.py")),
-            shim_dir.join(format!("{lang}_shim")),
-            shim_dir.join(format!("{lang}.py")),
-            shim_dir.join(lang),
-        ];
-        candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .unwrap_or_else(|| shim_dir.join(format!("{lang}_shim.py")))
-    }
-
-    /// All parser tags accepted by the registry: every canonical backend
-    /// name plus every declared alias, in the deterministic order of the
-    /// static spec table (canonical name first, then its aliases).
-    ///
-    /// This is the single source of truth for the set of accepted language
-    /// tags; binaries must not maintain their own copies.
-    pub fn registered_backend_names(&self) -> Vec<&'static str> {
-        self.specs
-            .iter()
-            .flat_map(|s| std::iter::once(s.name).chain(s.aliases.iter().copied()))
-            .collect()
-    }
-
-    /// Convenience: the accepted tag set as owned `String`s, ready for
-    /// `Parser::new` / `Evaluator::with_registered_backends`.
-    pub fn registered_backend_tags(&self) -> std::collections::HashSet<String> {
-        self.registered_backend_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1637,6 +1000,14 @@ impl BackendRegistry {
 mod tests {
     use super::*;
     use crate::parser::Parser;
+    use crate::registry::bundle::{
+        catalog_hash_field, finish_catalog_hash, hash_backend_spec_v3, hash_backend_spec_v4,
+        integer_exactness,
+    };
+    use crate::value::BackendAuthority;
+    use num_bigint::BigInt;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
 
     fn typed(lang: &str, body: Vec<ONode>) -> ONode {
         ONode::TypedExpr {
@@ -1846,7 +1217,7 @@ mod tests {
         );
 
         // Every canonical name and every alias is present.
-        for spec in BACKEND_SPECS.iter() {
+        for spec in reg.canonical_specs() {
             assert!(
                 unique.contains(spec.name),
                 "missing canonical name {}",
@@ -1989,7 +1360,9 @@ mod tests {
     fn catalog_digests_are_stable_canonical_projections() {
         let registry = BackendRegistry::global();
         assert_eq!(BACKEND_CATALOG_SCHEMA_V3, "ostadix.backend-catalog/v3");
-        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V3);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V4, "ostadix.backend-catalog/v4");
+        assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4);
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V4);
         let catalog = registry.catalog_sha256();
         assert_eq!(catalog.len(), 64);
         assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -2007,17 +1380,236 @@ mod tests {
         );
         assert!(!registry.contains_specification_sha256(&"0".repeat(64)));
 
-        let python_spec = registry.get("python").unwrap();
-        let mut legacy_hash = Sha256::new();
-        catalog_hash_field(&mut legacy_hash, "ostadix.backend-catalog/v2".as_bytes());
-        hash_backend_spec(
-            &mut legacy_hash,
-            python_spec,
-            registry.runtime_requirements_for("python"),
+        let legacy_v3 = registry.specification_sha256_v3("python").unwrap();
+        assert_ne!(legacy_v3, python);
+        assert_eq!(legacy_v3, registry.specification_sha256_v3("py").unwrap());
+        assert!(!registry.contains_specification_sha256(&legacy_v3));
+    }
+
+    #[test]
+    fn catalog_v3_digest_goldens_are_pinned_before_the_v4_rollover() {
+        let registry = BackendRegistry::global();
+        assert_eq!(
+            registry.catalog_sha256_v3(),
+            "c2453ff4cb2480e03a4a0b2356439cbc2a0ddcc914ed948fa9fe91eab1ac79ea"
         );
-        let legacy_v2 = finish_catalog_hash(legacy_hash);
-        assert_ne!(legacy_v2, python);
-        assert!(!registry.contains_specification_sha256(&legacy_v2));
+        let expected = [
+            (
+                "O",
+                "d950d5857e1dc57ea4f2a2ae4603c22809aa3fbb0ae72fb983c78c5a9e632594",
+            ),
+            (
+                "quote",
+                "a354062b89cdc800361a22973e7b22029ef3a8ba6c89ae517dd060323fe9584d",
+            ),
+            (
+                "nix",
+                "af2e5cb7ca31a435f11e4d963fd72f1602bdc34af22f952e0fa2ab79d5073d4e",
+            ),
+            (
+                "nix_expr",
+                "6df666a6848122bf99bd6a6fb0a69ca807dec1324decf3e056a94af43ac6fe5c",
+            ),
+            (
+                "nix_store",
+                "de30341e99237888ae48d1acaad65d008281dd6d596b27a9b7bac8472888dd66",
+            ),
+            (
+                "nixos_test",
+                "3aab03df2cd680d7525038bb7d8f996abceabf88f0fc1b538f0555469863956f",
+            ),
+            (
+                "html",
+                "09c84ed2860b7e489ac7b85019bea022776201f777fa46342ffab3f906eff9ab",
+            ),
+            (
+                "markdown",
+                "aee4c1a29734ebfbf378b20e4fc19d7fbfb8365fbcbdd5538d337e3239a0c427",
+            ),
+            (
+                "latex",
+                "06ed79952fca6fb4e5221a9f4f9f36a15f17aaef747fdf7bae2fa290d497a6ab",
+            ),
+            (
+                "text",
+                "636b9d9237b58af152c2fe92896306e491f8cde407d01a1c0857b3a465f8b551",
+            ),
+            (
+                "sql",
+                "db4b71ab62c1c528f63b4b3706e7bab8a0e8583800d8a9cce27763f52ae618ec",
+            ),
+            (
+                "haskell",
+                "22f9325f9ca3200747b05cdee3656ffd65159fd06bfb55093956247451852f16",
+            ),
+            (
+                "ocaml",
+                "37cd484f614d3f8c1d1c3d06d8f52f9ecfe7d1d07b7728f7362536f3b07cf9bb",
+            ),
+            (
+                "webassembly",
+                "51cdefb6d3d187f6bd3a3c2ee343c18c462048e9e025d0d8052a9cad2bf4d4aa",
+            ),
+            (
+                "python",
+                "dd078f6b0eb48e099cce81b39711fa62313d39c7f8915abd97d9e72bc7678ecc",
+            ),
+            (
+                "ubuntu_vm",
+                "e863e96d5b3ce3e2b57a0ec8ee0ceb06038aa19b7929f5852ff2f92e117f44d3",
+            ),
+            (
+                "bash",
+                "e89ea6eb57eea53b50ba1c3b7a83a64c79d36160af7bffb0b15f8d03560c10cd",
+            ),
+            (
+                "shell",
+                "31652f34b475bdc7956505e39d135af74f80659f0795ca54a0e8f8a76c116cf9",
+            ),
+            (
+                "rust",
+                "8744827a7d497396ab645f4abd6f2f3a660da2fb769449d1cfa76ba98b68c2e5",
+            ),
+            (
+                "racket",
+                "c4e53bf39f937d0c25282b6f4e6a1ecf7073a68e110910fe0193cb446f2393e5",
+            ),
+            (
+                "csharp",
+                "4a34c14b79e3631831c220f61d8a30151b77fd4ccd475f35147aa94ba6d00e5e",
+            ),
+            (
+                "c",
+                "d8842139f0f671a062f414069d5653dc880e23e3439e73323868829fbaf7210d",
+            ),
+            (
+                "cpp",
+                "9c33364ebeb787d05f0ec4f01cf2f429cdcb6adbed2c01c67595557660dc6b73",
+            ),
+            (
+                "lisp",
+                "48df5c9240a148db43ad011dbf92a669138111540338273557e7d86faa8132fd",
+            ),
+            (
+                "common_lisp",
+                "7da0053792edf03b618f61408429bdc93fa2d50387f731c4d365d61d1f3b03c7",
+            ),
+            (
+                "ruby",
+                "14891c157518c0c8f34622adc00a8c755447ab7a894386341548dbec21fd6513",
+            ),
+            (
+                "matlab",
+                "d3917e3c2cd83292ef23795ba0098ccc62112c827a62499f404200c58c4bb8cf",
+            ),
+            (
+                "mathematica",
+                "c67b1715316b2b22349046e9541792d9d62c81bf48a9dd08b0d9fd2559557760",
+            ),
+            (
+                "java",
+                "b97392e28423d3aa4fd47919f18ca97d056b18344df9cba952f2c8a6c83b5962",
+            ),
+            (
+                "javascript",
+                "f98d171a8e35e67baa2d2a0b7d586140a1e37ea2d580844d596bf80ce8dd9bac",
+            ),
+        ];
+        assert_eq!(registry.canonical_specs().len(), expected.len());
+        for (name, digest) in expected {
+            assert_eq!(
+                registry.specification_sha256_v3(name).as_deref(),
+                Some(digest)
+            );
+            assert!(!registry.contains_specification_sha256(digest));
+        }
+    }
+
+    #[test]
+    fn catalog_v4_declares_the_exact_state_support_partition() {
+        use crate::placement::{BackendStateSupportV2, SnapshotCompatibilityV2};
+
+        let registry = BackendRegistry::global();
+        let mut stateless = Vec::new();
+        let mut semantic = Vec::new();
+        let mut external = Vec::new();
+        for spec in registry.canonical_specs() {
+            match &spec.state_support {
+                BackendStateSupportV2::Stateless => stateless.push(spec.name),
+                BackendStateSupportV2::SemanticSnapshot { .. } => semantic.push(spec.name),
+                BackendStateSupportV2::ExternalPinned { .. } => external.push(spec.name),
+            }
+        }
+
+        assert_eq!(stateless.len(), 27);
+        assert_eq!(semantic, ["sql", "python"]);
+        assert_eq!(external, ["ubuntu_vm"]);
+
+        let expected_python_codec = crate::placement::SemanticDigestV1::hash_bytes(
+            "ostadix/backend-state-codec-name/v2",
+            b"ostadix.python-graph/v1",
+        );
+        assert_eq!(
+            registry.state_support_for("py"),
+            Some(&BackendStateSupportV2::SemanticSnapshot {
+                codec: expected_python_codec,
+                compatibility: SnapshotCompatibilityV2::ExactImplementation,
+            })
+        );
+        let expected_sql_codec = crate::placement::SemanticDigestV1::hash_bytes(
+            "ostadix/backend-state-codec-name/v2",
+            crate::backend::state::SQL_CLI_CODEC_V1.as_bytes(),
+        );
+        assert_eq!(
+            registry.state_support_for("sql"),
+            Some(&BackendStateSupportV2::SemanticSnapshot {
+                codec: expected_sql_codec,
+                compatibility: SnapshotCompatibilityV2::ExactImplementation,
+            })
+        );
+        let expected_ubuntu_manifest = crate::placement::SemanticDigestV1::hash_bytes(
+            "ostadix/external-state-manifest-schema-name/v2",
+            b"ostadix.multipass-resource/v1",
+        );
+        assert_eq!(
+            registry.state_support_for("ubuntu"),
+            Some(&BackendStateSupportV2::ExternalPinned {
+                manifest_schema: expected_ubuntu_manifest,
+            })
+        );
+        assert_eq!(registry.state_support_for("unknown"), None);
+        assert_eq!(registry.interface_for("unknown").state_support, None);
+    }
+
+    #[test]
+    fn catalog_v4_hashes_state_support_while_v3_stays_archival() {
+        use crate::placement::BackendStateSupportV2;
+
+        let registry = BackendRegistry::global();
+        let python = registry.get("python").unwrap();
+        let requirement = registry.runtime_requirements_for("python");
+        let digest_for =
+            |schema: &str,
+             spec: &BackendSpec,
+             hash_spec: fn(&mut Sha256, &BackendSpec, &RuntimeRequirementSpec)| {
+                let mut hash = Sha256::new();
+                catalog_hash_field(&mut hash, schema.as_bytes());
+                hash_spec(&mut hash, spec, requirement);
+                finish_catalog_hash(hash)
+            };
+
+        let mut weakened = python.clone();
+        weakened.state_support = BackendStateSupportV2::Stateless;
+        assert_eq!(
+            digest_for(BACKEND_CATALOG_SCHEMA_V3, python, hash_backend_spec_v3),
+            digest_for(BACKEND_CATALOG_SCHEMA_V3, &weakened, hash_backend_spec_v3),
+            "archival V3 identity predates state support"
+        );
+        assert_ne!(
+            digest_for(BACKEND_CATALOG_SCHEMA_V4, python, hash_backend_spec_v4),
+            digest_for(BACKEND_CATALOG_SCHEMA_V4, &weakened, hash_backend_spec_v4),
+            "current V4 identity must bind state support"
+        );
     }
 
     #[test]
@@ -2040,7 +1632,7 @@ mod tests {
             spec.value_capabilities.integer_exactness = integer_exactness;
             let mut hash = Sha256::new();
             catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
-            hash_backend_spec(
+            hash_backend_spec_v3(
                 &mut hash,
                 &spec,
                 registry.runtime_requirements_for(spec.name),
