@@ -257,11 +257,16 @@ fn bounded_deadline(timeout: Duration, subject: &str) -> Result<Instant> {
 /// boundary; complete containment requires a stronger OS facility such as a
 /// Linux cgroup or a Windows job object.
 #[cfg(target_os = "linux")]
+fn linux_proc_entry_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
 fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if linux_proc_entry_vanished(&error) => continue,
             Err(error) => return Err(error),
         };
         let Some(pid) = entry
@@ -276,7 +281,7 @@ fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
         }
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if linux_proc_entry_vanished(&error) => continue,
             Err(error) => return Err(error),
         };
         let close = stat.rfind(')').ok_or_else(|| {
@@ -1546,6 +1551,20 @@ impl Drop for ProcessRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_procfs_vanished_entry_errors_are_narrowly_classified() {
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "vanished proc entry");
+        let esrch = io::Error::from_raw_os_error(libc::ESRCH);
+        let permission_denied = io::Error::from_raw_os_error(libc::EACCES);
+        let malformed = io::Error::new(io::ErrorKind::InvalidData, "malformed stat");
+
+        assert!(linux_proc_entry_vanished(&not_found));
+        assert!(linux_proc_entry_vanished(&esrch));
+        assert!(!linux_proc_entry_vanished(&permission_denied));
+        assert!(!linux_proc_entry_vanished(&malformed));
+    }
 
     fn python_shim_path() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/python_shim.py")

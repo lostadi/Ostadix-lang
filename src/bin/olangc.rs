@@ -94,6 +94,7 @@ use o_lang::world::{GroundingReport, WorldEpoch, WorldId, WorldIdentity};
 
 const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");
 const RUNTIME_CAPABILITY_RS: &str = include_str!("../capability.rs");
+const RUNTIME_ENVIRONMENT_RS: &str = include_str!("../environment.rs");
 const RUNTIME_PARSER_RS: &str = include_str!("../parser.rs");
 const RUNTIME_IR_RS: &str = include_str!("../ir.rs");
 const RUNTIME_BACKEND_CATALOG_RS: &str = include_str!("../backend_catalog.inc.rs");
@@ -1114,6 +1115,7 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::create_dir_all(src_dir)?;
     fs::write(src_dir.join("value.rs"), RUNTIME_VALUE_RS)?;
     fs::write(src_dir.join("capability.rs"), RUNTIME_CAPABILITY_RS)?;
+    fs::write(src_dir.join("environment.rs"), RUNTIME_ENVIRONMENT_RS)?;
     fs::write(src_dir.join("parser.rs"), RUNTIME_PARSER_RS)?;
     fs::write(src_dir.join("ir.rs"), RUNTIME_IR_RS)?;
     fs::write(
@@ -1386,6 +1388,17 @@ fn dump_schedule_why(
 
     print!("{}", why.to_text());
     print_schedule_why_origins(input, source, &why, &origins)?;
+    let footprint = o_lang::placement::requirement_footprint_for_program_node(
+        &program,
+        &plan,
+        target,
+    )
+    .context("failed to derive Hosted Placement V6 requirement footprint")?;
+    println!(
+        "\n; Hosted Placement V6 requirement footprint (descriptive; not authority)\n{}",
+        serde_json::to_string_pretty(&footprint)
+            .context("failed to serialize placement requirement footprint")?
+    );
     Ok(())
 }
 
@@ -1811,10 +1824,11 @@ fn executable_op_label(
         (ExecutableOp::Invoke { fn_name, mode }, _) => {
             format!("invoke:{fn_name} ({mode:?})")
         }
-        (ExecutableOp::EvalBackend { lang, env }, _) if *env == u32::MAX => {
-            format!("eval:{lang}")
-        }
-        (ExecutableOp::EvalBackend { lang, env }, _) => format!("eval:{lang}[{env}]"),
+        (ExecutableOp::EvalBackend { lang, env }, _) => match o_lang::environment::EnvironmentRefV2::from_encoded(*env) {
+            o_lang::environment::EnvironmentRefV2::Ephemeral => format!("eval:{lang}"),
+            o_lang::environment::EnvironmentRefV2::LinkerIsolated => format!("eval:{lang}[*]"),
+            o_lang::environment::EnvironmentRefV2::Persistent(id) => format!("eval:{lang}[{id}]"),
+        },
         (ExecutableOp::InlineBackend { lang }, _) => format!("inline:{lang}"),
         (ExecutableOp::ForceRequest { kind }, _) => format!("force-request:{kind}"),
         (ExecutableOp::Request { kind }, _) => format!("request:{kind}"),
@@ -1911,6 +1925,7 @@ fn generate_lib_rs(include_project: bool) -> String {
 
 pub mod value;
 mod capability;
+pub mod environment;
 pub mod backend;
 pub mod parser;
 pub mod ir;
@@ -2481,6 +2496,7 @@ mod tests {
 
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
+        assert!(lib_rs.contains("pub mod environment;"));
         assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
@@ -2489,6 +2505,7 @@ mod tests {
 
         for path in [
             "backend_catalog.inc.rs",
+            "environment.rs",
             "effects.rs",
             "runtime_exec.rs",
             "evidence/mod.rs",

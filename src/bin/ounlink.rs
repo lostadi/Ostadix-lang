@@ -9,9 +9,9 @@
 // `o-link` embeds a path comment before each wrapped file:
 //
 //   # ── path/to/file.py ──
-//   python[N]^(
+//   python[*]^(
 //   ...escaped file contents...
-//   )_python[N]
+//   )_python[*]
 //
 // `o-unlink` reads these markers, un-escapes the body (the Ostadix-lang parser
 // consumes escape sequences like `\$HOME` → `$HOME` and `\python^(` →
@@ -320,7 +320,7 @@ fn next_marker_line_start(source: &str, content_start: usize) -> usize {
 ///
 /// Returns `None` if no typed-expression block is present (`.O` inline case).
 fn extract_block_content(section: &str, backends: &HashSet<String>) -> Result<Option<String>> {
-    // Find the `LANG[N]^(` opener.
+    // Find the `LANG[N]^(` or linker-isolated `LANG[*]^(` opener.
     let opener_pos = find_typed_opener(section, backends);
     let opener_pos = match opener_pos {
         Some(p) => p,
@@ -340,7 +340,7 @@ fn extract_block_content(section: &str, backends: &HashSet<String>) -> Result<Op
     for node in &nodes {
         if let ONode::TypedExpr { body, .. } = node {
             let content = reconstruct_source(body);
-            // o-link writes `LANG[N]^(\n<content>`, so the parser body starts
+            // o-link writes `LANG[*]^(\n<content>`, so the parser body starts
             // with a newline. Strip exactly that one leading newline.
             let content = content.strip_prefix('\n').unwrap_or(&content);
             return Ok(Some(content.to_string()));
@@ -350,7 +350,7 @@ fn extract_block_content(section: &str, backends: &HashSet<String>) -> Result<Op
     Ok(None)
 }
 
-/// Return the byte offset of the first `IDENT[N]^(` pattern in `text` that
+/// Return the byte offset of the first `IDENT[N|*]^(` pattern in `text` that
 /// uses a registered backend name, or `None`.
 fn find_typed_opener(text: &str, backends: &HashSet<String>) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -364,19 +364,26 @@ fn find_typed_opener(text: &str, backends: &HashSet<String>) -> Option<usize> {
             }
             let name = &text[start..i];
             if backends.contains(name) {
-                // Accept optional `[N]` (N must be at least one digit) then `^(`
+                // Accept optional numeric persistent `[N]` or fresh `[*]`.
                 let mut j = i;
                 if j < bytes.len() && bytes[j] == b'[' {
                     let j_bracket = j;
                     j += 1;
-                    let digits_start = j;
-                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    if j < bytes.len() && bytes[j] == b'*' {
                         j += 1;
-                    }
-                    if j > digits_start && j < bytes.len() && bytes[j] == b']' {
-                        j += 1; // consumed valid `[N]`
                     } else {
-                        j = j_bracket; // not a valid `[N]`, don't consume
+                        let digits_start = j;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if j == digits_start {
+                            j = j_bracket;
+                        }
+                    }
+                    if j != j_bracket && j < bytes.len() && bytes[j] == b']' {
+                        j += 1;
+                    } else {
+                        j = j_bracket;
                     }
                 }
                 if j < bytes.len() && bytes[j] == b'{' {
@@ -585,6 +592,21 @@ mod tests {
             !content.contains("\\$"),
             "no backslash should remain; got: {:?}",
             content
+        );
+    }
+
+    #[test]
+    fn roundtrip_linker_isolated_section_inside_parallel_group() {
+        let section = "python[*]^(\nprint('fresh')\n)_python[*]\n";
+        let combined = format!(
+            "# Linked by o-link: single-file .O program\n\nautonomous(batch(\n# ── fresh.py ──\n{SECTION_LENGTH_PREFIX}{}\n{},\n))\n",
+            section.len(),
+            section
+        );
+        let entries = unlink_source(&combined).unwrap();
+        assert_eq!(
+            entries,
+            vec![(PathBuf::from("fresh.py"), "print('fresh')\n".to_string())]
         );
     }
 

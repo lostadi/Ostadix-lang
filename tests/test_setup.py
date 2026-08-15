@@ -341,6 +341,75 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("mtools", packages)
         self.assertIn("ovmf", packages)
 
+    def test_normal_build_plans_every_public_rust_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            result = self.run_setup(
+                "--minimal",
+                "--dry-run",
+                "--no-env",
+                home=home,
+            )
+
+            output = self.combined_output(result)
+            self.assertEqual(result.returncode, 0, output)
+            for binary in (
+                "O",
+                "olangc",
+                "ocorec",
+                "o-link",
+                "o-unlink",
+                "ogit",
+                "o-live-host",
+                "o-node",
+                "octl",
+                "o-registry",
+            ):
+                with self.subTest(binary=binary):
+                    self.assertIn(f"--bin {binary}", output)
+                    installed = home / "cargo" / "bin" / binary
+                    self.assertIn(f"replace {installed}", output)
+
+    def test_python_setup_is_repository_local_and_never_runs_pip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_setup(
+                "--minimal",
+                "--dry-run",
+                "--no-env",
+                home=Path(temp_dir),
+            )
+
+        output = self.combined_output(result)
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("repository-local o_lang package", output)
+        self.assertNotIn("pip install", output)
+
+    def test_python_reference_version_matches_rust_package(self) -> None:
+        cargo_toml = (PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        package_version = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in cargo_toml.splitlines()
+            if line.startswith("version")
+        )
+        python_version = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in (PROJECT_ROOT / "o_lang" / "__init__.py")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.startswith("__version__")
+        )
+        self.assertEqual(python_version, package_version)
+
+    def test_platform_entrypoints_are_thin_canonical_delegates(self) -> None:
+        scripts = sorted((PROJECT_ROOT / "setup" / "os").glob("setup-*.sh"))
+        self.assertEqual(len(scripts), 12)
+        for script in scripts:
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding="utf-8")
+                self.assertIn('exec "$SCRIPT_DIR/../../setup.sh" "$@"', text)
+                self.assertNotIn("cargo build", text)
+                self.assertNotIn("pip install", text)
+
 
 if __name__ == "__main__":
     unittest.main()
