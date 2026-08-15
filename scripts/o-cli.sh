@@ -21,7 +21,8 @@ Repository commands:
   run FILE.O [backends]          Run one local O document
   plan <project-or-.O> [options]  Print the OIR and execution plan
   why FILE.O P<N> [options]       Explain one admitted plan operation
-  node <profile|doctor|run> ...   Inspect or invoke one explicit hosted node
+  node <profile|doctor|run|session> ...
+                                  Inspect or invoke one explicit hosted node
   node-host <command> ...         Provision or serve a hosted node
   registry <command> ...          Manage the local signed node registry
   live <command> ...              Run the hosted live-system control plane

@@ -65,6 +65,18 @@ class LowercaseCliDispatchTests(unittest.TestCase):
             "--bind",
             "127.0.0.1:7337",
         ])
+        self.assert_dispatch(("node", "session", "status", "--capability", "session.json"), [
+            "node",
+            "session",
+            "status",
+            "--capability",
+            "session.json",
+        ])
+
+    def test_help_advertises_hosted_v2_sessions(self) -> None:
+        result = self.run_cli("help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("node <profile|doctor|run|session>", result.stdout)
 
     def test_registry_and_live_commands_forward_exact_arguments(self) -> None:
         self.assert_dispatch(("registry", "verify", "--state", "store.cbor"), [
