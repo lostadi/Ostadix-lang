@@ -28,7 +28,10 @@ mod tests {
 
     use crate::{
         effects::ResourceKey,
-        ir::{BackendRegistry, InvokeMode, OIr, OIrProgram},
+        ir::{
+            BackendRegistry, BackendValueCapabilities, IntegerExactness, InvokeMode, OIr,
+            OIrProgram, RichNumberPreservation,
+        },
         value::{AnnotationKind, Fidelity, GroupMode, ONumber, OValue},
     };
 
@@ -863,17 +866,82 @@ mod tests {
     #[test]
     fn javascript_integer_fidelity_respects_the_exact_2_pow_53_boundary() {
         let boundary = BigInt::from(1_u8) << 53_usize;
-        let at_boundary =
-            solve::fidelity_for_value(&OValue::big_int(boundary.clone()), "javascript");
-        let above_boundary =
-            solve::fidelity_for_value(&OValue::big_int(boundary + 1_u8), "javascript");
+        for exact in [boundary.clone(), -&boundary] {
+            let fidelity = solve::fidelity_for_value(&OValue::big_int(exact), "javascript");
+            let losses = fidelity.losses().expect("numeric kind collapse");
+            assert!(!losses.contains(&AnnotationKind::NumericPrecision));
+            assert!(losses.contains(&AnnotationKind::NumericExactness));
+        }
+        for inexact in [&boundary + 1_u8, -&boundary - 1_u8] {
+            let fidelity = solve::fidelity_for_value(&OValue::big_int(inexact), "javascript");
+            let losses = fidelity.losses().expect("numeric fidelity loss");
+            assert!(losses.contains(&AnnotationKind::NumericPrecision));
+            assert!(losses.contains(&AnnotationKind::NumericExactness));
+        }
+    }
 
-        let at_losses = at_boundary.losses().expect("numeric kind collapse");
-        assert!(!at_losses.contains(&AnnotationKind::NumericPrecision));
-        assert!(at_losses.contains(&AnnotationKind::NumericExactness));
-        let above_losses = above_boundary.losses().expect("numeric fidelity loss");
-        assert!(above_losses.contains(&AnnotationKind::NumericPrecision));
-        assert!(above_losses.contains(&AnnotationKind::NumericExactness));
+    #[test]
+    fn signed_i64_backend_fidelity_respects_asymmetric_twos_complement_bounds() {
+        let magnitude = BigInt::from(1_u8) << 63_usize;
+        let minimum = -&magnitude;
+        let maximum = &magnitude - 1_u8;
+        for exact in [minimum.clone(), maximum.clone()] {
+            let fidelity = solve::fidelity_for_value(&OValue::big_int(exact), "java");
+            let losses = fidelity.losses().expect("numeric kind collapse");
+            assert!(!losses.contains(&AnnotationKind::NumericPrecision));
+        }
+        for inexact in [minimum - 1_u8, magnitude] {
+            let fidelity = solve::fidelity_for_value(&OValue::big_int(inexact), "java");
+            assert!(fidelity
+                .losses()
+                .is_some_and(|losses| losses.contains(&AnnotationKind::NumericPrecision)));
+        }
+    }
+
+    #[test]
+    fn exact_range_fidelity_covers_concrete_and_abstract_inclusive_boundaries() {
+        let exact_range = BackendValueCapabilities {
+            integer_exactness: IntegerExactness::ExactRange {
+                min: BigInt::from(i16::MIN),
+                max: BigInt::from(i16::MAX),
+            },
+            rich_numbers: RichNumberPreservation::Preserved,
+        };
+
+        for exact in [BigInt::from(i16::MIN), BigInt::from(i16::MAX)] {
+            assert_eq!(
+                solve::fidelity_for_value_with_capabilities(&OValue::big_int(exact), &exact_range),
+                Fidelity::Lossless
+            );
+        }
+        for inexact in [BigInt::from(i16::MIN) - 1_u8, BigInt::from(i16::MAX) + 1_u8] {
+            assert_eq!(
+                solve::fidelity_for_value_with_capabilities(
+                    &OValue::big_int(inexact),
+                    &exact_range
+                ),
+                Fidelity::structural([AnnotationKind::NumericPrecision])
+            );
+        }
+
+        let i16_node = HNode {
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I16,
+            ..HNode::fresh()
+        };
+        assert_eq!(
+            solve::fidelity_for_abstract(&i16_node, &exact_range),
+            Fidelity::Lossless
+        );
+        let i32_node = HNode {
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I32,
+            ..HNode::fresh()
+        };
+        assert_eq!(
+            solve::fidelity_for_abstract(&i32_node, &exact_range),
+            Fidelity::structural([AnnotationKind::NumericPrecision])
+        );
     }
 
     #[test]
@@ -891,6 +959,11 @@ mod tests {
                 .is_some_and(|lost| lost.contains(&AnnotationKind::NumericPrecision)),
             "abstract I64 includes values outside JavaScript's exact integer range"
         );
+        let java = solve::fidelity_for(&node, "O", "java");
+        assert!(!java
+            .losses()
+            .expect("Java collapses O numeric kinds")
+            .contains(&AnnotationKind::NumericPrecision));
         assert_eq!(
             solve::fidelity_for(&node, "O", "python"),
             Fidelity::Lossless

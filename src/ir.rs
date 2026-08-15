@@ -23,8 +23,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
+use num_bigint::BigInt;
 use sha2::{Digest, Sha256};
 
 use crate::environment::EnvironmentRefV2;
@@ -478,24 +479,34 @@ impl ExecutionMode {
     }
 }
 
-/// Largest integer magnitude a backend can preserve exactly when an O number
-/// crosses into that backend. This is semantic capability metadata, not an ISA
-/// or language-name heuristic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Integer interval a backend can preserve exactly when an O number crosses
+/// into that backend. This is semantic capability metadata, not an ISA or
+/// language-name heuristic.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegerExactness {
     /// The catalog has no sound positive statement for this implementation.
     Unknown,
     /// Every integer in `[-2^bits, 2^bits]` is represented exactly.
     ExactMagnitudeBits(u16),
+    /// Every integer in `[-2^bits, 2^bits - 1]` is represented exactly.
+    ///
+    /// `bits` is the magnitude exponent, so a signed 64-bit representation is
+    /// `TwosComplementBits(63)`.
+    TwosComplementBits(u16),
+    /// An arbitrary inclusive exact interval. Catalog declarations use signed
+    /// base-10 literals which are parsed into canonical `BigInt` bounds.
+    ExactRange { min: BigInt, max: BigInt },
     /// Integer precision is unbounded for the hosted representation.
     Arbitrary,
 }
 
 impl IntegerExactness {
-    const fn label(self) -> &'static str {
+    const fn label(&self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
             Self::ExactMagnitudeBits(_) => "exact-magnitude-bits",
+            Self::TwosComplementBits(_) => "twos-complement-bits",
+            Self::ExactRange { .. } => "exact-range",
             Self::Arbitrary => "arbitrary",
         }
     }
@@ -523,7 +534,7 @@ impl RichNumberPreservation {
 /// Value capabilities frozen into a backend interface at lowering time.
 /// Unknown facts stay explicit so fidelity and placement analysis cannot turn
 /// an absent catalog statement into `Lossless` evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendValueCapabilities {
     pub integer_exactness: IntegerExactness,
     pub rich_numbers: RichNumberPreservation,
@@ -1186,7 +1197,7 @@ const UNKNOWN_RUNTIME_REQUIREMENT: RuntimeRequirementSpec = RuntimeRequirementSp
 /// Static metadata for one backend: the single source of truth for aliases,
 /// purity, rendering, execution mode, authority, adapter ownership, and
 /// executable requirements.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BackendSpec {
     /// Canonical backend name as it appears in a language tag.
     pub name: &'static str,
@@ -1255,7 +1266,10 @@ macro_rules! runtime_requirement_catalog {
 macro_rules! backend_catalog_metadata {
     (schema: $schema:literal $(,)?) => {
         /// Domain separator for deterministic canonical backend-catalog digests.
-        pub const BACKEND_CATALOG_SCHEMA_V1: &str = $schema;
+        pub const BACKEND_CATALOG_SCHEMA_V3: &str = $schema;
+        /// Compatibility name retained for evidence code that predates the
+        /// catalog-v3 rollover. Its value always names the current schema.
+        pub const BACKEND_CATALOG_SCHEMA_V1: &str = BACKEND_CATALOG_SCHEMA_V3;
     };
 }
 
@@ -1266,6 +1280,30 @@ macro_rules! integer_exactness {
     (ExactMagnitudeBits($bits:literal)) => {
         IntegerExactness::ExactMagnitudeBits($bits)
     };
+    (TwosComplementBits($bits:literal)) => {
+        IntegerExactness::TwosComplementBits($bits)
+    };
+    (ExactRange { min: $min:literal, max: $max:literal }) => {{
+        let min = BigInt::parse_bytes($min.as_bytes(), 10)
+            .expect("backend catalog exact-range minimum is not a signed base-10 integer");
+        let max = BigInt::parse_bytes($max.as_bytes(), 10)
+            .expect("backend catalog exact-range maximum is not a signed base-10 integer");
+        assert_eq!(
+            min.to_str_radix(10),
+            $min,
+            "backend catalog exact-range minimum must use canonical signed base-10 spelling"
+        );
+        assert_eq!(
+            max.to_str_radix(10),
+            $max,
+            "backend catalog exact-range maximum must use canonical signed base-10 spelling"
+        );
+        assert!(
+            min <= max,
+            "backend catalog exact-range minimum exceeds maximum"
+        );
+        IntegerExactness::ExactRange { min, max }
+    }};
     (Arbitrary) => {
         IntegerExactness::Arbitrary
     };
@@ -1283,12 +1321,14 @@ macro_rules! backend_catalog {
                 authorities: [$($authority:ident),* $(,)?],
                 adapter: $adapter:ident,
                 runtime: $runtime:literal,
-                integer_exactness: $integer_exactness:ident $(($integer_bits:literal))?,
+                integer_exactness: $integer_exactness:ident
+                    $(($($integer_arguments:literal),* $(,)?))?
+                    $({ min: $integer_min:literal, max: $integer_max:literal })?,
                 rich_numbers: $rich_numbers:ident,
             }
         ),* $(,)?
     ) => {
-        const BACKEND_SPECS: &[BackendSpec] = &[
+        static BACKEND_SPECS: LazyLock<Vec<BackendSpec>> = LazyLock::new(|| vec![
             $(
                 BackendSpec {
                     name: $name,
@@ -1301,13 +1341,15 @@ macro_rules! backend_catalog {
                     runtime_requirement_key: $runtime,
                     value_capabilities: BackendValueCapabilities {
                         integer_exactness: integer_exactness!(
-                            $integer_exactness $(($integer_bits))?
+                            $integer_exactness
+                            $(($($integer_arguments),*))?
+                            $({ min: $integer_min, max: $integer_max })?
                         ),
                         rich_numbers: RichNumberPreservation::$rich_numbers,
                     },
                 },
             )*
-        ];
+        ]);
     };
 }
 
@@ -1359,12 +1401,17 @@ fn hash_backend_spec(hash: &mut Sha256, spec: &BackendSpec, requirement: &Runtim
     }
     catalog_hash_field(hash, spec.adapter.name().as_bytes());
     catalog_hash_field(hash, spec.runtime_requirement_key.as_bytes());
-    catalog_hash_field(
-        hash,
-        spec.value_capabilities.integer_exactness.label().as_bytes(),
-    );
-    if let IntegerExactness::ExactMagnitudeBits(bits) = spec.value_capabilities.integer_exactness {
-        catalog_hash_field(hash, &bits.to_be_bytes());
+    let integer_exactness = &spec.value_capabilities.integer_exactness;
+    catalog_hash_field(hash, integer_exactness.label().as_bytes());
+    match integer_exactness {
+        IntegerExactness::ExactMagnitudeBits(bits) | IntegerExactness::TwosComplementBits(bits) => {
+            catalog_hash_field(hash, &bits.to_be_bytes());
+        }
+        IntegerExactness::ExactRange { min, max } => {
+            catalog_hash_field(hash, min.to_str_radix(10).as_bytes());
+            catalog_hash_field(hash, max.to_str_radix(10).as_bytes());
+        }
+        IntegerExactness::Unknown | IntegerExactness::Arbitrary => {}
     }
     catalog_hash_field(
         hash,
@@ -1409,7 +1456,7 @@ impl BackendRegistry {
     pub fn global() -> &'static BackendRegistry {
         static REGISTRY: OnceLock<BackendRegistry> = OnceLock::new();
         REGISTRY.get_or_init(|| BackendRegistry {
-            specs: BACKEND_SPECS,
+            specs: BACKEND_SPECS.as_slice(),
         })
     }
 
@@ -1452,10 +1499,10 @@ impl BackendRegistry {
     /// Value-representation facts for a canonical backend or alias. Unknown
     /// compatibility backends return an explicit all-unknown descriptor.
     pub fn value_capabilities_for(&self, lang: &str) -> BackendValueCapabilities {
-        self.get(lang)
-            .map_or(BackendValueCapabilities::UNKNOWN, |spec| {
-                spec.value_capabilities
-            })
+        self.get(lang).map_or_else(
+            || BackendValueCapabilities::UNKNOWN,
+            |spec| spec.value_capabilities.clone(),
+        )
     }
 
     /// Deterministic SHA-256 of the complete ordered canonical catalog. This
@@ -1466,7 +1513,7 @@ impl BackendRegistry {
         DIGEST
             .get_or_init(|| {
                 let mut hash = Sha256::new();
-                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+                catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
                 catalog_hash_count(&mut hash, RUNTIME_REQUIREMENT_SPECS.len());
                 for requirement in RUNTIME_REQUIREMENT_SPECS {
                     hash_runtime_requirement(&mut hash, requirement);
@@ -1486,9 +1533,23 @@ impl BackendRegistry {
     pub fn specification_sha256(&self, lang: &str) -> Option<String> {
         let spec = self.get(lang)?;
         let mut hash = Sha256::new();
-        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V1.as_bytes());
+        catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
         hash_backend_spec(&mut hash, spec, self.runtime_requirements_for(spec.name));
         Some(finish_catalog_hash(hash))
+    }
+
+    /// Whether `digest` is the specification identity of a canonical backend
+    /// under the current catalog schema and hash domain.
+    ///
+    /// This is deliberately stricter than accepting a well-formed SHA-256:
+    /// legacy catalog-domain digests and arbitrary unknown digests are not
+    /// current implementation identities, even when their old records remain
+    /// structurally inspectable.
+    pub fn contains_specification_sha256(&self, digest: &str) -> bool {
+        self.specs.iter().any(|spec| {
+            self.specification_sha256(spec.name)
+                .is_some_and(|current| current == digest)
+        })
     }
 
     /// Resolve a language tag (canonical name or alias) to its canonical
@@ -1513,14 +1574,15 @@ impl BackendRegistry {
     /// Typed backend interface metadata used by planning and dispatch policy.
     pub fn interface_for(&self, lang: &str) -> BackendInterface {
         let canonical = self.canonical(lang).to_string();
-        let spec = self.get(lang).copied().unwrap_or(Self::DEFAULT_SPEC);
+        let fallback = Self::DEFAULT_SPEC;
+        let spec = self.get(lang).unwrap_or(&fallback);
         BackendInterface {
             canonical,
             specification_sha256: self.specification_sha256(lang),
             pure: spec.pure,
             renderer: spec.renderer,
             execution: spec.execution,
-            value_capabilities: spec.value_capabilities,
+            value_capabilities: spec.value_capabilities.clone(),
             required_authorities: spec.required_authorities.to_vec(),
         }
     }
@@ -1784,7 +1846,7 @@ mod tests {
         );
 
         // Every canonical name and every alias is present.
-        for spec in BACKEND_SPECS {
+        for spec in BACKEND_SPECS.iter() {
             assert!(
                 unique.contains(spec.name),
                 "missing canonical name {}",
@@ -1926,6 +1988,8 @@ mod tests {
     #[test]
     fn catalog_digests_are_stable_canonical_projections() {
         let registry = BackendRegistry::global();
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V3, "ostadix.backend-catalog/v3");
+        assert_eq!(BACKEND_CATALOG_SCHEMA_V1, BACKEND_CATALOG_SCHEMA_V3);
         let catalog = registry.catalog_sha256();
         assert_eq!(catalog.len(), 64);
         assert!(catalog.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -1936,6 +2000,82 @@ mod tests {
         assert_ne!(python, registry.specification_sha256("bash").unwrap());
         assert_eq!(python.len(), 64);
         assert!(registry.specification_sha256("unknown").is_none());
+
+        assert!(registry.contains_specification_sha256(&python));
+        assert!(
+            registry.contains_specification_sha256(&registry.specification_sha256("py").unwrap())
+        );
+        assert!(!registry.contains_specification_sha256(&"0".repeat(64)));
+
+        let python_spec = registry.get("python").unwrap();
+        let mut legacy_hash = Sha256::new();
+        catalog_hash_field(&mut legacy_hash, "ostadix.backend-catalog/v2".as_bytes());
+        hash_backend_spec(
+            &mut legacy_hash,
+            python_spec,
+            registry.runtime_requirements_for("python"),
+        );
+        let legacy_v2 = finish_catalog_hash(legacy_hash);
+        assert_ne!(legacy_v2, python);
+        assert!(!registry.contains_specification_sha256(&legacy_v2));
+    }
+
+    #[test]
+    fn exact_range_catalog_syntax_hashes_canonical_bigint_bounds() {
+        let parsed = integer_exactness!(ExactRange {
+            min: "-10",
+            max: "20"
+        });
+        assert_eq!(
+            parsed,
+            IntegerExactness::ExactRange {
+                min: BigInt::from(-10),
+                max: BigInt::from(20),
+            }
+        );
+
+        let registry = BackendRegistry::global();
+        let digest_for = |integer_exactness: IntegerExactness| {
+            let mut spec = registry.get("javascript").unwrap().clone();
+            spec.value_capabilities.integer_exactness = integer_exactness;
+            let mut hash = Sha256::new();
+            catalog_hash_field(&mut hash, BACKEND_CATALOG_SCHEMA_V3.as_bytes());
+            hash_backend_spec(
+                &mut hash,
+                &spec,
+                registry.runtime_requirements_for(spec.name),
+            );
+            finish_catalog_hash(hash)
+        };
+
+        let canonical = IntegerExactness::ExactRange {
+            min: BigInt::from(-10),
+            max: BigInt::from(20),
+        };
+        assert_eq!(digest_for(parsed), digest_for(canonical));
+        assert_ne!(
+            digest_for(IntegerExactness::ExactRange {
+                min: BigInt::from(-10),
+                max: BigInt::from(20),
+            }),
+            digest_for(IntegerExactness::ExactRange {
+                min: BigInt::from(-10),
+                max: BigInt::from(21),
+            })
+        );
+        assert_ne!(
+            digest_for(IntegerExactness::ExactMagnitudeBits(63)),
+            digest_for(IntegerExactness::TwosComplementBits(63))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must use canonical signed base-10 spelling")]
+    fn exact_range_catalog_syntax_rejects_noncanonical_bounds() {
+        let _ = integer_exactness!(ExactRange {
+            min: "-00010",
+            max: "20"
+        });
     }
 
     #[test]
@@ -1956,6 +2096,13 @@ mod tests {
             registry.value_capabilities_for("javascript"),
             BackendValueCapabilities {
                 integer_exactness: IntegerExactness::ExactMagnitudeBits(53),
+                rich_numbers: RichNumberPreservation::Collapsed,
+            }
+        );
+        assert_eq!(
+            registry.value_capabilities_for("java"),
+            BackendValueCapabilities {
+                integer_exactness: IntegerExactness::TwosComplementBits(63),
                 rich_numbers: RichNumberPreservation::Collapsed,
             }
         );
