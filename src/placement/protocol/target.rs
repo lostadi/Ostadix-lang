@@ -318,14 +318,16 @@ impl TargetDescriptorV1 {
         &self.backend_implementations
     }
 
-    /// Reject backend identities minted under an older catalog hash domain.
+    /// Reject backend identities minted under an older catalog or realization
+    /// hash domain.
     ///
     /// The records themselves remain decodable and their detached signatures
     /// remain independently inspectable.  They cannot, however, authorize a
     /// placement against this process unless every advertised backend
-    /// specification belongs to the current compiled catalog.  Because the
-    /// catalog schema is part of every specification digest, catalog rollovers
-    /// fail closed without rewriting the signed record schema.
+    /// specification and complete realization belong to the current compiled
+    /// catalog. Because the catalog schema and realization formula are both
+    /// checked, either rollover fails closed without rewriting the signed
+    /// target-record schema.
     pub fn validate_current_backend_catalog_with(
         &self,
         catalog: &impl CurrentBackendCatalogV1,
@@ -335,6 +337,15 @@ impl TargetDescriptorV1 {
             if !catalog.contains_current_specification(specification) {
                 return Err(PlacementValidationError::NonCurrentBackendCatalog {
                     specification: specification.as_sha256().to_owned(),
+                    current_schema: catalog.current_schema().to_owned(),
+                });
+            }
+            if !catalog.contains_current_implementation(implementation) {
+                return Err(PlacementValidationError::NonCurrentBackendImplementation {
+                    realization_pipeline: implementation
+                        .realization_pipeline()
+                        .as_sha256()
+                        .to_owned(),
                     current_schema: catalog.current_schema().to_owned(),
                 });
             }

@@ -10,19 +10,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use o_lang::ir::{BackendAdapterKind, BackendRegistry};
+use o_lang::ir::{BackendAdapterKind, BackendRegistry, ExecutionMode};
 use o_lang::placement::{
     BackendImplementationIdV1, CapabilityAtomV1, CapabilityKeyV1, EndiannessV1, GenerationV1,
     NodeProfileV1 as PlacementNodeProfileV1, PlatformDescriptorV1, SemanticDigestV1,
     TargetCapabilityModelV1, TargetDescriptorV1, UnixMillisV1,
 };
-use o_lang::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1;
+use o_lang::registry::bundle::{
+    backend_executable_set_v2, BackendExecutableSetRowV2, LOCAL_BACKEND_PROTOCOL_ABI_V1,
+};
 use o_lang::registry::{
     append_profile_to_registry_state, atomic_write_node_profile_json, export_registry_store,
     import_registry_store, read_node_profile_json, read_registry_store, read_registry_trust,
     read_signing_key, registry_public_key_id, verify_registry_store, write_new_registry_state,
     ProfilePublicationV1, ProfileStalenessPolicyV1, RegistrySignerV1, RegistryStatePathsV1,
 };
+#[cfg(target_os = "macos")]
+use o_lang::runtime_exec::SANDBOX_EXEC_LOGICAL_COMMAND;
+use o_lang::runtime_exec::{resolve_backend_launch_selection, CURRENT_O_LOGICAL_COMMAND};
 use o_lang::world::ArtifactId;
 use sha2::{Digest, Sha256};
 
@@ -80,7 +85,8 @@ enum Command {
         /// Canonical backend to fingerprint. Repeat for multiple backends.
         #[arg(long = "backend")]
         backends: Vec<String>,
-        /// Exact O executable containing inline/native Rust adapters.
+        /// Exact O executable containing inline/native Rust adapters and the
+        /// backend proxy used by shim implementations.
         #[arg(long)]
         runtime_binary: Option<PathBuf>,
         /// Directory containing compatibility shims selected by --backend.
@@ -452,7 +458,19 @@ fn discover_backend_implementations(
         let adapter_sha256 = sha256_file(&adapter_path)?;
         let adapter_artifact =
             ArtifactId::from_sha256(&adapter_sha256).context("invalid adapter artifact digest")?;
-        let executable_set = discover_executable_set(registry, spec.name, &adapter_path)?;
+        let runtime_proxy = match spec.execution {
+            ExecutionMode::Shim => Some(match spec.adapter {
+                BackendAdapterKind::NativeRust => adapter_path.clone(),
+                BackendAdapterKind::LegacyPythonShim => resolve_runtime_binary(runtime_binary)?
+                    .canonicalize()
+                    .with_context(|| "could not canonicalize the O backend proxy executable")?,
+                BackendAdapterKind::Inline => {
+                    bail!("shim backend `{}` has no process adapter", spec.name)
+                }
+            }),
+            ExecutionMode::InlineAst | ExecutionMode::InlineValue => None,
+        };
+        let executable_set = discover_executable_set(spec.name, runtime_proxy.as_deref())?;
         output.push(
             registry
                 .backend_implementation_id_v1(
@@ -510,46 +528,62 @@ fn validate_native_runtime_binary(path: &Path) -> Result<PathBuf> {
 }
 
 fn discover_executable_set(
-    registry: &BackendRegistry,
     backend: &str,
-    adapter_path: &Path,
+    runtime_proxy: Option<&Path>,
 ) -> Result<SemanticDigestV1> {
-    let requirement = registry.runtime_requirements_for(backend);
-    let mut artifacts = vec![(
-        "adapter".to_owned(),
-        adapter_path.display().to_string(),
-        sha256_file(adapter_path)?,
-    )];
-    if !requirement.builtin {
-        let selected = requirement
-            .alternatives
-            .iter()
-            .find_map(|commands| {
-                let paths = commands
-                    .iter()
-                    .map(|command| which::which(command).ok())
-                    .collect::<Option<Vec<_>>>()?;
-                Some(commands.iter().copied().zip(paths).collect::<Vec<_>>())
-            })
-            .with_context(|| {
-                format!("backend `{backend}` has no complete installed executable alternative")
-            })?;
-        for (command, path) in selected {
-            let path = path
-                .canonicalize()
-                .with_context(|| format!("could not canonicalize executable `{command}`"))?;
-            artifacts.push((
-                command.to_owned(),
-                path.display().to_string(),
-                sha256_file(&path)?,
-            ));
-        }
+    let Some(runtime_proxy) = runtime_proxy else {
+        return backend_executable_set_v2(Vec::new()).map_err(Into::into);
+    };
+    let launch = resolve_backend_launch_selection(backend)?;
+    let selected_alternative = u32::try_from(launch.selected_alternative())
+        .context("selected executable alternative exceeds the V2 coordinate range")?;
+    let selection = launch
+        .selection()
+        .implementation_selection_v2()
+        .context("unprobed executable selection cannot enter implementation identity")?;
+    let mut rows = Vec::with_capacity(launch.direct_commands().len() + 2);
+    for (logical, path) in launch.direct_commands() {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("could not canonicalize executable `{logical}`"))?;
+        rows.push(BackendExecutableSetRowV2::new(
+            launch.requirement_key(),
+            selected_alternative,
+            selection,
+            logical,
+            "direct-launcher",
+            ArtifactId::from_sha256(sha256_file(&path)?)?,
+        )?);
     }
-    artifacts.sort();
-    Ok(SemanticDigestV1::hash_bytes(
-        "ostadix/registry/executable-set/v1",
-        &serde_json::to_vec(&artifacts)?,
-    ))
+
+    let runtime_proxy = runtime_proxy
+        .canonicalize()
+        .context("could not canonicalize the O backend proxy executable")?;
+    rows.push(BackendExecutableSetRowV2::new(
+        launch.requirement_key(),
+        selected_alternative,
+        selection,
+        CURRENT_O_LOGICAL_COMMAND,
+        "ostadix-proxy",
+        ArtifactId::from_sha256(sha256_file(&runtime_proxy)?)?,
+    )?);
+
+    #[cfg(target_os = "macos")]
+    {
+        let sandbox = Path::new("/usr/bin/sandbox-exec")
+            .canonicalize()
+            .context("could not canonicalize macOS sandbox-exec")?;
+        rows.push(BackendExecutableSetRowV2::new(
+            launch.requirement_key(),
+            selected_alternative,
+            selection,
+            SANDBOX_EXEC_LOGICAL_COMMAND,
+            "sandbox-wrapper",
+            ArtifactId::from_sha256(sha256_file(&sandbox)?)?,
+        )?);
+    }
+
+    backend_executable_set_v2(rows).map_err(Into::into)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -615,9 +649,7 @@ mod tests {
         let canonical_evaluator = evaluator.canonicalize().unwrap();
         let adapter_artifact =
             ArtifactId::from_sha256(sha256_file(&canonical_evaluator).unwrap()).unwrap();
-        let executable_set =
-            discover_executable_set(BackendRegistry::global(), "html", &canonical_evaluator)
-                .unwrap();
+        let executable_set = discover_executable_set("html", None).unwrap();
         let expected_specification = SemanticDigestV1::from_sha256(
             BackendRegistry::global()
                 .specification_sha256("html")
@@ -646,7 +678,59 @@ mod tests {
         write_executable(&evaluator, &native_test_image(b"second-runtime"));
         let second = discover_backend_implementations(&backend, Some(&evaluator), None).unwrap();
         assert_ne!(first[0].adapter_artifact(), second[0].adapter_artifact());
-        assert_ne!(first[0].executable_set(), second[0].executable_set());
+        assert_eq!(first[0].executable_set(), second[0].executable_set());
+        assert_ne!(first[0], second[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_discovery_and_admission_project_the_same_implementation_identity() {
+        use o_lang::ir::{OIr, OIrProgram};
+        use o_lang::placement::CanonicalPlacementRecordV1;
+
+        let directory = tempfile::tempdir().unwrap();
+        let evaluator = directory.path().join(INSTALLED_EVALUATOR_ALIAS);
+        write_executable(&evaluator, &native_test_image(b"shared-runtime"));
+
+        let discovered =
+            discover_backend_implementations(&["bash".to_owned()], Some(&evaluator), None).unwrap();
+        let plan = OIrProgram {
+            nodes: vec![OIr::Exec {
+                lang: "bash".to_owned(),
+                env_id: u32::MAX,
+                attr: None,
+                backend: BackendRegistry::global().interface_for("bash"),
+                body: vec![OIr::Text("printf ok".to_owned())],
+            }],
+        }
+        .plan();
+        let (_, leases) = o_lang::runtime_exec::capture_execution_manifest_with_current_executable(
+            &plan, &evaluator,
+        )
+        .unwrap();
+        let executable_set = leases.backend_executable_set_v2("bash").unwrap();
+        let adapter_artifact = ArtifactId::from_sha256(sha256_file(&evaluator).unwrap()).unwrap();
+        let specification = SemanticDigestV1::from_sha256(
+            BackendRegistry::global()
+                .specification_sha256("bash")
+                .unwrap(),
+        )
+        .unwrap();
+        let admitted = BackendRegistry::global()
+            .backend_implementation_id_v1(
+                "bash",
+                Some(&specification),
+                adapter_artifact,
+                executable_set,
+                LOCAL_BACKEND_PROTOCOL_ABI_V1,
+            )
+            .unwrap();
+
+        assert_eq!(discovered[0], admitted);
+        assert_eq!(
+            discovered[0].semantic_digest().unwrap(),
+            admitted.semantic_digest().unwrap()
+        );
     }
 
     #[test]
