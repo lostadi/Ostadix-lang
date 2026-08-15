@@ -1,8 +1,11 @@
 # Per-OS Setup Scripts for O-lang
 
-These are dedicated, simple `.sh` scripts for specific operating systems/distributions. They perform the equivalent of the main `setup.sh` but without runtime detection — just the commands tailored for that OS.
+These compatibility entrypoints delegate to the repository-root `setup.sh`.
+Keeping one implementation prevents platform scripts from silently omitting new
+binaries, verification gates, or safety fixes.
 
-Use the appropriate one directly when you know your target (great for Docker, CI, or clean installs).
+Existing commands may continue using the platform-named entrypoint; every option
+is forwarded unchanged to the canonical setup.
 
 ## Available scripts
 
@@ -22,23 +25,15 @@ Use the appropriate one directly when you know your target (great for Docker, CI
 ## Usage
 
 ```bash
-# Example for a Debian-based system (or in docker)
-curl -O https://.../setup-debian.sh   # or copy from repo
-chmod +x setup-debian.sh
-./setup-debian.sh
+# From a repository checkout on a Debian-based system (or in Docker)
+./setup/os/setup-debian.sh --minimal --verify
 ```
 
 After running, follow the printed "Runnable forms" at the end.
 
-Each script:
-- Installs compilers, make, Python, SQLite, curl, git, etc.
-- Installs Rust via rustup (if missing)
-- Builds the Rust edition (`cargo build --release`)
-- Builds the C/C++ edition (`cd c_cpp && make`)
-- Sets up the Python compatibility bridge (including optional matplotlib)
-- Prints exact commands to run examples with Rust, C, AOT, and Python editions.
-
-For the universal detector (tries to pick the right one), use the top-level `setup.sh` in the repo root.
+The root setup detects the platform, installs the selected dependency profile,
+builds every public binary, and prints the runnable forms. Optional Python
+packages such as matplotlib are reported but never installed implicitly.
 
 For Docker testing (as originally suggested):
 ```bash
@@ -46,4 +41,5 @@ docker run -it -v "$PWD:/workspace" -w /workspace debian bash -c \
   'apt-get update && apt-get install -y sudo curl && ./setup/os/setup-debian.sh'
 ```
 
-These scripts are standalone and can be used independently of the main `setup.sh`.
+The platform entrypoints require the surrounding repository because they invoke
+`../../setup.sh`; use a source checkout or source release, not a copied script.

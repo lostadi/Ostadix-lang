@@ -564,6 +564,7 @@ static OValue *eval_call(OEvaluator *ev, const char *fn, ONode **args, size_t na
 
 static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id,
                                const char *attr, ONode **body, size_t body_len, bool *err) {
+    uint32_t runtime_env_id = olang_env_is_fresh(env_id) ? OLANG_ENV_EPHEMERAL : env_id;
     if (strcmp(lang, "quote") == 0) {
         char *src = reconstruct_source(body, body_len);
         OValue *v = oval_expr(src ? src : "");
@@ -689,10 +690,10 @@ static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id
     OValue *bmapv = oval_map();
     OValueMap *bindings = bmapv ? bmapv->data.map : NULL;
     char *shim = olang_find_shim(ev, lang);
-    olang_process_registry_send_exec(ev->registry, lang, env_id, bodystr, bindings, shim ? shim : "backends/python_shim.py");
+    olang_process_registry_send_exec(ev->registry, lang, runtime_env_id, bodystr, bindings, shim ? shim : "backends/python_shim.py");
     OValue *result = NULL;
     while (1) {
-        OExecStep step = olang_process_registry_recv_exec_step(ev->registry, lang, env_id);
+        OExecStep step = olang_process_registry_recv_exec_step(ev->registry, lang, runtime_env_id);
         if (step.kind == EXEC_STEP_DONE) {
             result = step.value;
             step.value = NULL;
@@ -708,18 +709,15 @@ static OValue *eval_typed_expr(OEvaluator *ev, const char *lang, uint32_t env_id
             oexec_step_free(&step);
             break;
         }
-        olang_process_registry_send_eval_result(ev->registry, lang, env_id, inner);
+        olang_process_registry_send_eval_result(ev->registry, lang, runtime_env_id, inner);
         oval_release(inner);
         oexec_step_free(&step);
-    }
-    if (env_id == UINT32_MAX) {
-        olang_process_registry_cleanup_env(ev->registry, lang, UINT32_MAX);
     }
     free(bodystr);
     free(shim);
     oval_release(bmapv);
-    if (env_id == UINT32_MAX) {
-        olang_process_registry_cleanup_env(ev->registry, lang, UINT32_MAX);
+    if (olang_env_is_fresh(env_id)) {
+        olang_process_registry_cleanup_env(ev->registry, lang, runtime_env_id);
     }
     return result ? result : oval_null();
 }

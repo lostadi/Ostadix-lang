@@ -8,10 +8,9 @@ A node's children are evaluated first; their OValues are then rendered
 into the parent's language via the parent backend's render_child(); the
 parent backend then runs its evaluate() on the fully-spliced body string.
 
-Persistent environments: every unique (canonical_language, env_id) pair
-gets its own env object created exactly once via backend.make_env() and
-reused for every expression that references it. This gives you a REPL-
-like shell per bracket-labeled env, surviving across evaluations.
+Persistent environments: every numeric (canonical_language, env_id) pair gets
+its own env object created exactly once. Bare and [*] blocks bypass that map
+and receive a fresh backend environment on every evaluation attempt.
 """
 
 from __future__ import annotations
@@ -22,7 +21,15 @@ from typing import Dict, List, Tuple, Union
 from .backends import default_registry
 from .backends.base import Backend
 from .ovalue import OStr, OValue
-from .parser import Document, ExpressionNode, LetBinding, TextPart, VarRef
+from .parser import (
+    EPHEMERAL_ENV_ID,
+    LINKER_ISOLATED_ENV_ID,
+    Document,
+    ExpressionNode,
+    LetBinding,
+    TextPart,
+    VarRef,
+)
 
 
 # (canonical_language, env_id) -> persistent env object
@@ -43,6 +50,8 @@ class EvalContext:
         return self.backends[canonical_language]
 
     def env_for(self, canonical_language: str, env_id: int) -> object:
+        if env_id in (EPHEMERAL_ENV_ID, LINKER_ISOLATED_ENV_ID):
+            return self.backend_for(canonical_language).make_env()
         key = (canonical_language, env_id)
         if key not in self.envs:
             self.envs[key] = self.backend_for(canonical_language).make_env()
@@ -100,7 +109,7 @@ def evaluate_document(doc: Document, ctx: EvalContext = None) -> OValue:
     # OValue. The text backend renders children using render_plain.
     synthetic_root = ExpressionNode(
         language="text",
-        env_id=0,
+        env_id=EPHEMERAL_ENV_ID,
         env_explicit=False,
         body=non_let,
     )

@@ -10,7 +10,7 @@
 // `[["dotnet"], ["mcs", "mono"]]` means dotnet OR (mcs AND mono).
 
 backend_catalog_metadata! {
-    schema: "ostadix.backend-catalog/v1",
+    schema: "ostadix.backend-catalog/v2",
 }
 
 runtime_requirement_catalog! {
@@ -164,6 +164,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Arbitrary,
+        rich_numbers: Preserved,
     },
     {
         name: "quote",
@@ -174,6 +176,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "nix",
@@ -184,6 +188,8 @@ backend_catalog! {
         authorities: [FileRead, FileWrite, Network, Process],
         adapter: NativeRust,
         runtime: "nix",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "nix_expr",
@@ -196,6 +202,8 @@ backend_catalog! {
         // retains the native Rust `run_nix` implementation for direct calls.
         adapter: NativeRust,
         runtime: "builtin",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "nix_store",
@@ -206,6 +214,8 @@ backend_catalog! {
         authorities: [FileRead, FileWrite, Network, Process],
         adapter: NativeRust,
         runtime: "nix",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "nixos_test",
@@ -216,6 +226,8 @@ backend_catalog! {
         authorities: [FileRead, FileWrite, Network, Process],
         adapter: LegacyPythonShim,
         runtime: "nixos_test",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "html",
@@ -226,6 +238,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "markdown",
@@ -236,6 +250,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "latex",
@@ -246,6 +262,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "text",
@@ -256,6 +274,8 @@ backend_catalog! {
         authorities: [],
         adapter: Inline,
         runtime: "builtin",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "sql",
@@ -266,6 +286,8 @@ backend_catalog! {
         authorities: [],
         adapter: NativeRust,
         runtime: "sql",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "haskell",
@@ -276,6 +298,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "haskell",
+        integer_exactness: Arbitrary,
+        rich_numbers: Preserved,
     },
     {
         name: "ocaml",
@@ -286,6 +310,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "ocaml",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "webassembly",
@@ -296,6 +322,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "webassembly",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "python",
@@ -306,6 +334,8 @@ backend_catalog! {
         authorities: [],
         adapter: LegacyPythonShim,
         runtime: "python",
+        integer_exactness: Arbitrary,
+        rich_numbers: Preserved,
     },
     {
         name: "ubuntu_vm",
@@ -316,6 +346,8 @@ backend_catalog! {
         authorities: [Process],
         adapter: LegacyPythonShim,
         runtime: "ubuntu_vm",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "bash",
@@ -326,6 +358,8 @@ backend_catalog! {
         authorities: [Process],
         adapter: NativeRust,
         runtime: "bash",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "shell",
@@ -336,6 +370,8 @@ backend_catalog! {
         authorities: [Process],
         adapter: NativeRust,
         runtime: "shell",
+        integer_exactness: Unknown,
+        rich_numbers: Unknown,
     },
     {
         name: "rust",
@@ -346,6 +382,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "rust",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "racket",
@@ -356,6 +394,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "racket",
+        integer_exactness: Arbitrary,
+        rich_numbers: Preserved,
     },
     {
         name: "csharp",
@@ -366,6 +406,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "csharp",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "c",
@@ -376,6 +418,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "c",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "cpp",
@@ -386,6 +430,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "cpp",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "lisp",
@@ -396,6 +442,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "common_lisp",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "common_lisp",
@@ -406,6 +454,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "common_lisp",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "ruby",
@@ -416,6 +466,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "ruby",
+        integer_exactness: Arbitrary,
+        rich_numbers: Collapsed,
     },
     {
         name: "matlab",
@@ -426,6 +478,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "matlab",
+        integer_exactness: ExactMagnitudeBits(53),
+        rich_numbers: Collapsed,
     },
     {
         name: "mathematica",
@@ -436,6 +490,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "mathematica",
+        integer_exactness: Arbitrary,
+        rich_numbers: Preserved,
     },
     {
         name: "java",
@@ -446,6 +502,8 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "java",
+        integer_exactness: ExactMagnitudeBits(63),
+        rich_numbers: Collapsed,
     },
     {
         name: "javascript",
@@ -456,5 +514,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "javascript",
+        integer_exactness: ExactMagnitudeBits(53),
+        rich_numbers: Collapsed,
     },
 }

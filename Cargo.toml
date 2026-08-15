@@ -44,6 +44,18 @@ name = "o-live-host"
 path = "src/bin/o-live-host.rs"
 
 [[bin]]
+name = "o-node"
+path = "src/bin/o-node.rs"
+
+[[bin]]
+name = "octl"
+path = "src/bin/octl.rs"
+
+[[bin]]
+name = "o-registry"
+path = "src/bin/o-registry.rs"
+
+[[bin]]
 name = "ocore-kernel-world-record"
 path = "src/bin/ocore-kernel-world-record.rs"
 
@@ -78,6 +90,12 @@ hex         = "0.4"
 # Established, versioned signature provider for canonical World receipts. Native
 # O-core consumes the same envelope bytes but does not yet implement Ed25519.
 ed25519-dalek = "2"
+
+# Hosted-placement preview transport. The protocol deliberately enables only
+# TLS 1.3 and requires certificates in both directions; it does not share the
+# World/OWPROTO transport or admit plaintext fallback.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 
 # Lossless numeric value vocabulary for ONumber.
 num-bigint  = { version = "0.4", features = ["serde"] }

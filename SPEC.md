@@ -52,10 +52,18 @@ expression that references that env in the document.
 
 `python^(...)_python` without brackets is ephemeral. It receives a fresh
 backend process for that expression and is cleaned up afterward. Persistent
-state is always explicit through `[n]`. The parser also requires the opener
-and closer to match textually. If you opened with `python^(` you must close
-with `)_python`; if you opened with `python[0]^(` you must close with
-`)_python[0]`.
+state is always explicit through `[n]`.
+
+`python[*]^(...)_python[*]` is the explicit linker-isolated fresh form. It has
+the same single-attempt process lifetime as a bare block, but preserves the
+linker's placement intent in source, OIR, fingerprints, and diagnostics. `*`
+is not an environment identity and two `[*]` blocks do not denote the same
+actor. The two high `u32` wire values used for bare and `[*]` environments are
+reserved and MUST be rejected when spelled as numeric persistent IDs.
+
+The parser requires the opener and closer to match textually. If you opened
+with `python^(` you must close with `)_python`; `python[0]^(` closes with
+`)_python[0]`, and `python[*]^(` closes with `)_python[*]`.
 
 ---
 
@@ -67,8 +75,9 @@ the parsed forest to executable OIR and builds a validated `ExecutionPlan`.
 
 ### 2.1 Default flow (splice + evaluate)
 
-For each OIR `Exec` instruction `E` with language `L[n]`, embedded
-`BackendInterface`, and body `B = [c₁, c₂, …]`:
+For each OIR `Exec` instruction `E` with language `L`, an environment reference
+that is bare, `[*]`, or persistent `[n]`, embedded `BackendInterface`, and body
+`B = [c₁, c₂, …]`:
 
 1. For each child `cᵢ`:
     * if `cᵢ` is text, emit `cᵢ` verbatim into a splice buffer.
@@ -78,9 +87,9 @@ For each OIR `Exec` instruction `E` with language `L[n]`, embedded
 3. Return `backend(L).evaluate(B*, env(L, n))`.
 
 Persistent environments: `env(L, n)` is created exactly once for an explicit
-environment marker and memoized in the process registry. Subsequent references
-to the same `(L, n)` pair reuse the same process. A bare expression uses the
-ephemeral environment identifier and is destroyed after dispatch.
+numeric environment marker and memoized in the process registry. Subsequent
+references to the same `(L, n)` pair reuse the same process. A bare or `[*]`
+expression uses fresh physical execution and is destroyed after dispatch.
 
 ### 2.2 Structural backends (`eval_ast` hook)
 
@@ -151,7 +160,8 @@ Environment lifetime and request forcing are part of the stable language core:
 - A persistent environment is keyed by `(language, env_id)` and lives until the
   evaluator drops it or explicitly cleans it up.
 - Bare `lang^(...)_lang` blocks are ephemeral. Explicit `lang[n]` blocks are
-  persistent.
+  persistent. Explicit `lang[*]` blocks are linker-isolated fresh attempts, not
+  persistent identities.
 - `now(request)` forces exactly the named deferred computation.
 - `now(group)` resolves the group according to its `GroupMode`.
 - Under `Policy::Autonomous`, schedulable Nix requests and dry activation are
@@ -267,7 +277,9 @@ later execution.
 Hosted operations whose complete effect footprint is not verified MUST report
 reads and writes of `HostWorld` in their effect evidence. Persistent `LANG[n]`
 shim operations MUST additionally read and write
-`ActorState(canonical-LANG[n])`. Those effects MUST produce conservative
+`ActorState(canonical-LANG[n])`. Inline renderers and fresh `LANG[*]` shim
+attempts MUST NOT acquire a persistent actor-state identity merely because an
+environment marker is present. Those effects MUST produce conservative
 resource-state topology except for the explicit non-strict exception below.
 Ordinary sequence MUST consume the predecessor's completion token unless the
 operations are direct members of an explicit concurrent group; are two
