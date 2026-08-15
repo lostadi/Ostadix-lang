@@ -13,8 +13,10 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
+use sha2::{Digest, Sha256};
 
 pub const HOSTED_TLS_ALPN_V1: &[u8] = b"ostadix-hosted/1";
+pub const HOSTED_TLS_ALPN_V2: &[u8] = b"ostadix-hosted/2";
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -36,7 +38,24 @@ pub struct ServerTlsIdentity {
 pub type HostedClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub type HostedServerStream = StreamOwned<ServerConnection, TcpStream>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedTlsProtocol {
+    V1,
+    V2,
+}
+
 pub fn build_client_config(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
+    build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_V1)
+}
+
+pub fn build_client_config_v2(identity: &ClientTlsIdentity) -> Result<Arc<ClientConfig>> {
+    build_client_config_for_alpn(identity, HOSTED_TLS_ALPN_V2)
+}
+
+fn build_client_config_for_alpn(
+    identity: &ClientTlsIdentity,
+    alpn: &[u8],
+) -> Result<Arc<ClientConfig>> {
     let roots = load_roots(&identity.ca_path)
         .with_context(|| format!("failed to load server CA {}", identity.ca_path.display()))?;
     let certs = load_certificates(&identity.cert_path).with_context(|| {
@@ -60,11 +79,25 @@ pub fn build_client_config(identity: &ClientTlsIdentity) -> Result<Arc<ClientCon
         .with_client_auth_cert(certs, key)
         .context("client certificate and key do not form a usable TLS identity")?;
     config.enable_early_data = false;
-    config.alpn_protocols = vec![HOSTED_TLS_ALPN_V1.to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(Arc::new(config))
 }
 
 pub fn build_server_config(identity: &ServerTlsIdentity) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(identity, vec![HOSTED_TLS_ALPN_V1.to_vec()])
+}
+
+pub fn build_dual_server_config(identity: &ServerTlsIdentity) -> Result<Arc<ServerConfig>> {
+    build_server_config_for_alpns(
+        identity,
+        vec![HOSTED_TLS_ALPN_V2.to_vec(), HOSTED_TLS_ALPN_V1.to_vec()],
+    )
+}
+
+fn build_server_config_for_alpns(
+    identity: &ServerTlsIdentity,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Arc<ServerConfig>> {
     let client_roots = load_roots(&identity.client_ca_path).with_context(|| {
         format!(
             "failed to load client CA {}",
@@ -98,7 +131,7 @@ pub fn build_server_config(identity: &ServerTlsIdentity) -> Result<Arc<ServerCon
         .with_single_cert(certs, key)
         .context("server certificate and key do not form a usable TLS identity")?;
     config.max_early_data_size = 0;
-    config.alpn_protocols = vec![HOSTED_TLS_ALPN_V1.to_vec()];
+    config.alpn_protocols = alpns;
     Ok(Arc::new(config))
 }
 
@@ -108,7 +141,41 @@ pub fn connect_mutual_tls(
     connect_timeout: Duration,
     io_timeout: Duration,
 ) -> Result<HostedClientStream> {
-    let config = build_client_config(identity)?;
+    connect_mutual_tls_for_protocol(
+        address,
+        identity,
+        connect_timeout,
+        io_timeout,
+        HostedTlsProtocol::V1,
+    )
+}
+
+pub fn connect_mutual_tls_v2(
+    address: &str,
+    identity: &ClientTlsIdentity,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<HostedClientStream> {
+    connect_mutual_tls_for_protocol(
+        address,
+        identity,
+        connect_timeout,
+        io_timeout,
+        HostedTlsProtocol::V2,
+    )
+}
+
+fn connect_mutual_tls_for_protocol(
+    address: &str,
+    identity: &ClientTlsIdentity,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    protocol: HostedTlsProtocol,
+) -> Result<HostedClientStream> {
+    let config = match protocol {
+        HostedTlsProtocol::V1 => build_client_config(identity)?,
+        HostedTlsProtocol::V2 => build_client_config_v2(identity)?,
+    };
     let server_name = ServerName::try_from(identity.server_name.clone()).with_context(|| {
         format!(
             "invalid TLS server name `{}` (use a DNS name or IP SAN from the node certificate)",
@@ -137,7 +204,7 @@ pub fn connect_mutual_tls(
         set_timeouts(&tcp, connect_timeout)?;
         let mut connection = ClientConnection::new(config.clone(), server_name.clone())
             .context("failed to initialize hosted TLS client")?;
-        if let Err(error) = complete_client_handshake(&mut connection, &mut tcp) {
+        if let Err(error) = complete_client_handshake(&mut connection, &mut tcp, protocol) {
             failures.push(format!("{resolved}: {error:#}"));
             continue;
         }
@@ -151,11 +218,25 @@ pub fn connect_mutual_tls(
 }
 
 pub fn accept_mutual_tls(
-    mut tcp: TcpStream,
+    tcp: TcpStream,
     config: Arc<ServerConfig>,
     handshake_timeout: Duration,
     io_timeout: Duration,
 ) -> Result<HostedServerStream> {
+    let (stream, protocol) =
+        accept_mutual_tls_versioned(tcp, config, handshake_timeout, io_timeout)?;
+    if protocol != HostedTlsProtocol::V1 {
+        bail!("client did not negotiate the hosted-transport V1 ALPN");
+    }
+    Ok(stream)
+}
+
+pub fn accept_mutual_tls_versioned(
+    mut tcp: TcpStream,
+    config: Arc<ServerConfig>,
+    handshake_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<(HostedServerStream, HostedTlsProtocol)> {
     tcp.set_nodelay(true)
         .context("failed to enable TCP_NODELAY for hosted node")?;
     set_timeouts(&tcp, handshake_timeout)?;
@@ -166,20 +247,49 @@ pub fn accept_mutual_tls(
             .complete_io(&mut tcp)
             .context("mutual TLS handshake failed")?;
     }
-    if connection.alpn_protocol() != Some(HOSTED_TLS_ALPN_V1) {
-        bail!("client did not negotiate the hosted-transport ALPN");
-    }
+    let protocol = match connection.alpn_protocol() {
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_V1 => HostedTlsProtocol::V1,
+        Some(protocol) if protocol == HOSTED_TLS_ALPN_V2 => HostedTlsProtocol::V2,
+        _ => bail!("client did not negotiate a supported hosted-transport ALPN"),
+    };
     set_timeouts(&tcp, io_timeout)?;
-    Ok(StreamOwned::new(connection, tcp))
+    Ok((StreamOwned::new(connection, tcp), protocol))
 }
 
-fn complete_client_handshake(connection: &mut ClientConnection, tcp: &mut TcpStream) -> Result<()> {
+pub fn peer_principal_sha256(stream: &HostedServerStream) -> Result<String> {
+    let certificate = stream
+        .conn
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .context("mutually authenticated TLS stream has no peer leaf certificate")?;
+    Ok(hex::encode(Sha256::digest(certificate.as_ref())))
+}
+
+pub fn certificate_leaf_sha256(path: impl AsRef<Path>) -> Result<String> {
+    let certificates = load_certificates(path.as_ref()).with_context(|| {
+        format!(
+            "failed to load certificate fingerprint source {}",
+            path.as_ref().display()
+        )
+    })?;
+    Ok(hex::encode(Sha256::digest(certificates[0].as_ref())))
+}
+
+fn complete_client_handshake(
+    connection: &mut ClientConnection,
+    tcp: &mut TcpStream,
+    protocol: HostedTlsProtocol,
+) -> Result<()> {
     while connection.is_handshaking() {
         connection
             .complete_io(tcp)
             .context("mutual TLS handshake failed")?;
     }
-    if connection.alpn_protocol() != Some(HOSTED_TLS_ALPN_V1) {
+    let expected = match protocol {
+        HostedTlsProtocol::V1 => HOSTED_TLS_ALPN_V1,
+        HostedTlsProtocol::V2 => HOSTED_TLS_ALPN_V2,
+    };
+    if connection.alpn_protocol() != Some(expected) {
         bail!("node did not negotiate the hosted-transport ALPN");
     }
     Ok(())

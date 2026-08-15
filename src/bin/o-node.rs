@@ -56,7 +56,7 @@ enum Command {
     Profile(ProfileArgs),
     /// Validate the local shim and TLS configuration without listening.
     Doctor(DoctorArgs),
-    /// Listen for one-operation canonical-CBOR requests over mTLS.
+    /// Serve frozen V1 and optional durable Hosted V2 requests over mTLS.
     Serve(ServeArgs),
 }
 
@@ -816,6 +816,21 @@ impl Drop for TemporaryPkiDirectory {
     }
 }
 
+fn resolve_shim_dir(explicit: Option<PathBuf>) -> Result<(PathBuf, Option<ExtractedShims>)> {
+    if let Some(path) = explicit {
+        return Ok((path, None));
+    }
+    if let Some(path) = env::var_os("O_BACKENDS_DIR")
+        .or_else(|| env::var_os("BACKENDS_DIR"))
+        .filter(|path| !path.is_empty())
+    {
+        return Ok((PathBuf::from(path), None));
+    }
+    let extracted = o_lang::shims::extract_bundled_shims("o_node_shims")
+        .context("failed to extract bundled backend shims")?;
+    Ok((extracted.path().to_path_buf(), Some(extracted)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,19 +919,4 @@ mod tests {
         let error = validate_native_runtime_binary(&wrapper).unwrap_err();
         assert!(error.to_string().contains("script or unsupported"));
     }
-}
-
-fn resolve_shim_dir(explicit: Option<PathBuf>) -> Result<(PathBuf, Option<ExtractedShims>)> {
-    if let Some(path) = explicit {
-        return Ok((path, None));
-    }
-    if let Some(path) = env::var_os("O_BACKENDS_DIR")
-        .or_else(|| env::var_os("BACKENDS_DIR"))
-        .filter(|path| !path.is_empty())
-    {
-        return Ok((PathBuf::from(path), None));
-    }
-    let extracted = o_lang::shims::extract_bundled_shims("o_node_shims")
-        .context("failed to extract bundled backend shims")?;
-    Ok((extracted.path().to_path_buf(), Some(extracted)))
 }

@@ -25,7 +25,8 @@ pub use error::PlacementValidationError;
 pub use records::{
     CapacityObservationV1, LeaseExpectationV1, LeaseExpectationV2, LeaseStateBindingV2,
     NodeProfileV1, PlacementLeaseV1, PlacementLeaseV2, PlacementReservationV1,
-    RecordAuthenticationV1, RecordAuthenticatorV1, TaskAttemptIdV1,
+    RecordAuthenticationV1, RecordAuthenticatorV1, StateControlExpectationV2, StateControlLeaseV2,
+    TaskAttemptIdV1,
 };
 pub use requirement::{
     CapabilityAtomV1, CapabilityKeyV1, EffectRequirementV1, EndiannessV1, EnvironmentRequirementV1,
