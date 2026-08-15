@@ -35,6 +35,16 @@ ROOT_LICENSE_SPDX = "LGPL-2.1-only"
 ROOT_REPOSITORY = "https://github.com/lostadi/Ostadix-lang"
 EXISTING_PREPRINT_DOI = "10.5281/zenodo.21544345"
 
+# `olangc` embeds its generated-runtime source closure with compile-time
+# include_str!/include_bytes! calls relative to src/bin.  Derive that closure
+# from the compiler source instead of copying another long source manifest
+# into this release script.  Restrict matches to parent-relative literals so
+# generated-code templates such as include_bytes!("project_bundle.json") are
+# not mistaken for compiler-time inputs.
+GENERATED_RUNTIME_INCLUDE = re.compile(
+    r'include_(?:str|bytes)!\(\s*"(?P<path>(?:\.\./)+[^"\r\n]+)"\s*\)'
+)
+
 # Keep this list intentionally narrow.  Adding a new top-level project surface
 # requires an explicit release-engineering decision here.
 ALLOWED_TOP_LEVEL_FILES = frozenset(
@@ -56,6 +66,7 @@ ALLOWED_TOP_LEVEL_FILES = frozenset(
         "SPEC.md",
         "big_iron_to_my_texas_red.sh",
         "boot-and-test.sh",
+        "rust-toolchain.toml",
         "setup.sh",
         "test_o_lang_examples.sh",
     }
@@ -98,6 +109,7 @@ ALLOWED_TOP_LEVEL_DIRECTORIES = frozenset(
         "assets",
         "backends",
         "c_cpp",
+        "ci",
         "docs",
         "evidence",
         "examples",
@@ -171,8 +183,10 @@ EXCLUDED_SUFFIXES = (
 REQUIRED_RELEASE_PATHS = frozenset(
     {
         ".github/workflows/ci.yml",
+        ".github/dependabot.yml",
         ".mcp.json",
         "CITATION.cff",
+        "Cargo.lock",
         "Cargo.toml",
         "LICENSE",
         "llms.txt",
@@ -182,6 +196,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "mcp/ostadix_lang_mcp_server/src/main.rs",
         "README.md",
         "boot-and-test.sh",
+        "ci/required-jobs.toml",
+        "ci/test-suites.toml",
+        "rust-toolchain.toml",
         "setup.sh",
         "docs/HOSTED_PLACEMENT_V6.md",
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
@@ -262,6 +279,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "ocore/world/value.oc",
         "ocore/world/value_codec.oc",
         "scripts/smoke_ostadix_mcp.py",
+        "scripts/contract_surfaces.py",
         "scripts/install-o-cli-wrapper.sh",
         "scripts/o-cli.sh",
         "scripts/o-kernel.sh",
@@ -275,7 +293,9 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "scripts/release_evidence.py",
         "scripts/world_alpha_evidence.py",
         "backends/o_shim_common.py",
+        "src/backend.rs",
         "src/backend_catalog.inc.rs",
+        "src/backend_state.rs",
         "src/evidence/admit.rs",
         "src/evidence/analyze.rs",
         "src/evidence/fact.rs",
@@ -283,11 +303,39 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "src/evidence/mod.rs",
         "src/evidence/profile.rs",
         "src/effects.rs",
+        "src/eval.rs",
+        "src/hosted_remote/client.rs",
+        "src/hosted_remote/mod.rs",
         "src/hosted_remote/node.rs",
+        "src/hosted_remote/paths.rs",
+        "src/hosted_remote/protocol.rs",
+        "src/hosted_remote/tls.rs",
+        "src/hosted_remote/v2/auth.rs",
+        "src/hosted_remote/v2/client.rs",
+        "src/hosted_remote/v2/crypto.rs",
+        "src/hosted_remote/v2/dev.rs",
+        "src/hosted_remote/v2/mod.rs",
+        "src/hosted_remote/v2/protocol.rs",
+        "src/hosted_remote/v2/runtime.rs",
+        "src/hosted_remote/v2/server.rs",
+        "src/hosted_remote/v2/store.rs",
         "src/ir.rs",
-        "src/placement/error.rs",
-        "src/placement/records.rs",
-        "src/placement/target.rs",
+        "src/lib.rs",
+        "src/placement/catalog_compat.rs",
+        "src/placement/mod.rs",
+        "src/placement/projection.rs",
+        "src/placement/protocol/candidate.rs",
+        "src/placement/protocol/catalog.rs",
+        "src/placement/protocol/digest.rs",
+        "src/placement/protocol/error.rs",
+        "src/placement/protocol/mod.rs",
+        "src/placement/protocol/records.rs",
+        "src/placement/protocol/requirement.rs",
+        "src/placement/protocol/state.rs",
+        "src/placement/protocol/target.rs",
+        "src/placement/protocol/warrant.rs",
+        "src/process.rs",
+        "src/registry/bundle/mod.rs",
         "src/registry/store.rs",
         "src/runtime_exec.rs",
         "src/bin/o-node.rs",
@@ -345,10 +393,14 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "tests/test_ostadix_boot_media.py",
         "tests/test_ostadix_media_writer.py",
         "tests/test_ostadix_physical_evidence.py",
+        "tests/test_o_cli_dispatch.py",
         "tests/test_setup.py",
+        "tests/test_contract_surfaces.py",
+        "tests/test_backend_state_protocol.py",
         "tests/test_bundled_shim_protocol.py",
         "tests/test_world_alpha_evidence.py",
         "tests/hosted_remote_cli.rs",
+        "tests/hosted_remote_v2.rs",
         "tests/placement_v6.rs",
         "tests/registry_v1.rs",
         "tests/project_hgraph.rs",
@@ -684,6 +736,53 @@ def _decode_git_path(raw_path: bytes) -> str:
         ) from error
 
 
+def _resolve_generated_runtime_include(relative: str) -> str:
+    """Resolve one src/bin/olangc.rs parent-relative include inside the tree."""
+
+    parts = ["src", "bin"]
+    for part in PurePosixPath(relative).parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ReleaseError(
+                    f"olangc generated-runtime include escapes the release root: {relative!r}"
+                )
+            parts.pop()
+        else:
+            parts.append(part)
+    if not parts:
+        raise ReleaseError(
+            f"olangc generated-runtime include resolves to the release root: {relative!r}"
+        )
+    return PurePosixPath(*parts).as_posix()
+
+
+def validate_generated_runtime_source_closure(entries: Sequence[SourceEntry]) -> None:
+    """Require every compile-time source embedded by olangc in the release."""
+
+    files = {entry.path: entry.data for entry in entries}
+    compiler_path = "src/bin/olangc.rs"
+    compiler_bytes = files.get(compiler_path)
+    if compiler_bytes is None:
+        raise ReleaseError(f"release is missing generated-runtime compiler {compiler_path}")
+    try:
+        compiler = compiler_bytes.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"{compiler_path} is not valid UTF-8") from error
+
+    embedded = {
+        _resolve_generated_runtime_include(match.group("path"))
+        for match in GENERATED_RUNTIME_INCLUDE.finditer(compiler)
+    }
+    missing = sorted(embedded - files.keys())
+    if missing:
+        raise ReleaseError(
+            "release omits olangc generated-runtime source closure path(s): "
+            + ", ".join(missing)
+        )
+
+
 def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
     tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", commit)
     selected: list[tuple[str, str, str]] = []
@@ -727,6 +826,7 @@ def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
         SourceEntry(path=path, mode=mode, data=_git(repo, "cat-file", "blob", oid))
         for path, mode, oid in selected
     ]
+    validate_generated_runtime_source_closure(entries)
     validate_document_links(entries)
     validate_release_metadata(entries)
     return entries
@@ -3261,6 +3361,7 @@ def verify_archive(path: Path | str) -> dict[str, object]:
                     "release ZIP is missing required path(s): "
                     + ", ".join(missing_required)
                 )
+            validate_generated_runtime_source_closure(archive_entries)
             validate_document_links(archive_entries)
             validate_release_metadata(archive_entries)
 

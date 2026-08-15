@@ -30,9 +30,10 @@
 //        - Compatibility adapter scripts (copied into src/shims/).
 //        - A generated main.rs that references them via include_str!/include_bytes!.
 //        - A Cargo.toml mirroring the runtime's dependencies.
-//        - The workspace Cargo.lock so dependency resolution is instant and
-//          reproducible (embedded in olangc at its own compile time).
-//   4. Runs `cargo build --release` in the temp project.
+//        - A Cargo.lock projected deterministically from the workspace lock to
+//          the generated package's exact direct dependency set.
+//        - The authoritative rust-toolchain.toml used to build this olangc.
+//   4. Runs `cargo build --release --locked` in the temp project.
 //   5. Copies the resulting binary to the requested output path.
 //
 //   The output binary is fully self-contained at the Rust level: it has no
@@ -101,12 +102,66 @@ const RUNTIME_BACKEND_CATALOG_RS: &str = include_str!("../backend_catalog.inc.rs
 const RUNTIME_EVAL_RS: &str = include_str!("../eval.rs");
 const RUNTIME_PROCESS_RS: &str = include_str!("../process.rs");
 const RUNTIME_BACKEND_RS: &str = include_str!("../backend.rs");
+const RUNTIME_BACKEND_STATE_RS: &str = include_str!("../backend_state.rs");
 const RUNTIME_NIX_OPS_RS: &str = include_str!("../nix_ops.rs");
 const RUNTIME_NIXOS_OPS_RS: &str = include_str!("../nixos_ops.rs");
 const RUNTIME_SCHEDULER_RS: &str = include_str!("../scheduler.rs");
 const RUNTIME_WIRE_RS: &str = include_str!("../wire.rs");
 const RUNTIME_EFFECTS_RS: &str = include_str!("../effects.rs");
 const RUNTIME_RUNTIME_EXEC_RS: &str = include_str!("../runtime_exec.rs");
+
+// placement protocol + compiled catalog — the canonical identity, state,
+// quota, and backend-capability vocabulary consumed by ir.rs. Generated
+// runtimes receive the same source rather than a reduced compatibility stub.
+const RUNTIME_PLACEMENT_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../placement/mod.rs")),
+    (
+        "catalog_compat.rs",
+        include_str!("../placement/catalog_compat.rs"),
+    ),
+    ("projection.rs", include_str!("../placement/projection.rs")),
+    (
+        "protocol/mod.rs",
+        include_str!("../placement/protocol/mod.rs"),
+    ),
+    (
+        "protocol/candidate.rs",
+        include_str!("../placement/protocol/candidate.rs"),
+    ),
+    (
+        "protocol/catalog.rs",
+        include_str!("../placement/protocol/catalog.rs"),
+    ),
+    (
+        "protocol/digest.rs",
+        include_str!("../placement/protocol/digest.rs"),
+    ),
+    (
+        "protocol/error.rs",
+        include_str!("../placement/protocol/error.rs"),
+    ),
+    (
+        "protocol/records.rs",
+        include_str!("../placement/protocol/records.rs"),
+    ),
+    (
+        "protocol/requirement.rs",
+        include_str!("../placement/protocol/requirement.rs"),
+    ),
+    (
+        "protocol/state.rs",
+        include_str!("../placement/protocol/state.rs"),
+    ),
+    (
+        "protocol/target.rs",
+        include_str!("../placement/protocol/target.rs"),
+    ),
+    (
+        "protocol/warrant.rs",
+        include_str!("../placement/protocol/warrant.rs"),
+    ),
+];
+const RUNTIME_REGISTRY_BUNDLE_RS: &str = include_str!("../registry/bundle/mod.rs");
 
 // evidence — pre-execution facts and the admission compiler. These modules
 // are part of every generated runtime because eval.rs cannot construct a
@@ -222,8 +277,33 @@ const RUNTIME_PROJECT_SOURCES: &[(&str, &str)] = &[
 ];
 
 // Cargo.lock from the workspace — embedded so the temp project gets identical
-// dependency versions on first build without a network round-trip.
+// resolved dependency versions (Cargo may still download an absent crate).
+// The generated root package entry is projected to a fixed non-colliding
+// package name and the generated runtime's smaller dependency set before the
+// lock is written.
 const WORKSPACE_CARGO_LOCK: &[u8] = include_bytes!("../../Cargo.lock");
+const WORKSPACE_RUST_TOOLCHAIN_TOML: &[u8] = include_bytes!("../../rust-toolchain.toml");
+const GENERATED_PACKAGE_NAME: &str = "ostadix-generated-runtime";
+const GENERATED_PACKAGE_VERSION: &str = "0.1.0";
+const GENERATED_RUNTIME_DEPENDENCY_NAMES: &[&str] = &[
+    "anyhow",
+    "base64",
+    "bitflags",
+    "clap",
+    "ed25519-dalek",
+    "getrandom",
+    "hex",
+    "libc",
+    "num-bigint",
+    "num-traits",
+    "semver",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror",
+    "toml",
+    "which",
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -765,13 +845,13 @@ fn compile_project_to_binary(
     let bin_name = derive_bin_name(output);
     write_project_cargo_project(bundle, shims, build_dir, &bin_name)?;
 
-    let mut cargo_args = vec!["build", "--release"];
+    let mut cargo_args = vec!["build", "--release", "--locked"];
     if is_wasm {
         cargo_args.push("--target");
         cargo_args.push("wasm32-wasip1");
-        eprintln!("olangc: running cargo build --release --target wasm32-wasip1 ...");
+        eprintln!("olangc: running cargo build --release --locked --target wasm32-wasip1 ...");
     } else {
-        eprintln!("olangc: running cargo build --release ...");
+        eprintln!("olangc: running cargo build --release --locked ...");
     }
 
     let status = Command::new("cargo")
@@ -835,11 +915,7 @@ fn write_project_cargo_project(
     let main_rs = generate_project_main_rs(bin_name, &shim_include_lines);
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
-    fs::write(
-        build_dir.join("Cargo.toml"),
-        generate_cargo_toml(bin_name, true),
-    )?;
-    fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
+    write_generated_cargo_contract(build_dir, bin_name, true)?;
     Ok(())
 }
 
@@ -870,8 +946,17 @@ fn write_project_sources(src_dir: &Path) -> Result<()> {
 /// Generate the `main.rs` for a compiled project binary. It embeds the bundle
 /// and supports `--list-routes`, `--route <ID>`, `--routes-policy <POLICY>`,
 /// `--project-trace-out <PATH>`, and default-route execution.
+fn generated_lib_name(bin_name: &str) -> String {
+    // Cargo exposes both the package library and every direct dependency to
+    // the generated binary. A user output such as `serde` would otherwise
+    // create two crates with the same extern name. Keep the target dynamic,
+    // but reserve an Ostadix namespace distinct from this runtime's direct
+    // dependency names.
+    format!("ostadix_generated_{}", bin_name.replace('-', "_"))
+}
+
 fn generate_project_main_rs(bin_name: &str, shim_include_lines: &[String]) -> String {
-    let lib_name = bin_name.replace('-', "_");
+    let lib_name = generated_lib_name(bin_name);
     let shim_entries = if shim_include_lines.is_empty() {
         "    // no shims bundled".to_string()
     } else {
@@ -1064,23 +1149,17 @@ fn compile_to_binary(
     );
     fs::write(src_dir.join("main.rs"), &main_rs)?;
 
-    // ── Cargo.toml ───────────────────────────────────────────────────────────
-    fs::write(
-        build_dir.join("Cargo.toml"),
-        generate_cargo_toml(&bin_name, false),
-    )?;
-
-    // ── Cargo.lock — embed workspace lock for reproducible/fast first build ──
-    fs::write(build_dir.join("Cargo.lock"), WORKSPACE_CARGO_LOCK)?;
+    // ── Cargo build contract — manifest, exact lock, pinned toolchain ─────────
+    write_generated_cargo_contract(build_dir, &bin_name, false)?;
 
     // ── Build ────────────────────────────────────────────────────────────────
-    let mut cargo_args = vec!["build", "--release"];
+    let mut cargo_args = vec!["build", "--release", "--locked"];
     if is_wasm {
         cargo_args.push("--target");
         cargo_args.push("wasm32-wasip1");
-        eprintln!("olangc: running cargo build --release --target wasm32-wasip1 ...");
+        eprintln!("olangc: running cargo build --release --locked --target wasm32-wasip1 ...");
     } else {
-        eprintln!("olangc: running cargo build --release ...");
+        eprintln!("olangc: running cargo build --release --locked ...");
     }
 
     let status = Command::new("cargo")
@@ -1125,12 +1204,30 @@ fn write_runtime_sources(src_dir: &Path) -> Result<()> {
     fs::write(src_dir.join("eval.rs"), RUNTIME_EVAL_RS)?;
     fs::write(src_dir.join("process.rs"), RUNTIME_PROCESS_RS)?;
     fs::write(src_dir.join("backend.rs"), RUNTIME_BACKEND_RS)?;
+    fs::write(src_dir.join("backend_state.rs"), RUNTIME_BACKEND_STATE_RS)?;
     fs::write(src_dir.join("nix_ops.rs"), RUNTIME_NIX_OPS_RS)?;
     fs::write(src_dir.join("nixos_ops.rs"), RUNTIME_NIXOS_OPS_RS)?;
     fs::write(src_dir.join("scheduler.rs"), RUNTIME_SCHEDULER_RS)?;
     fs::write(src_dir.join("wire.rs"), RUNTIME_WIRE_RS)?;
     fs::write(src_dir.join("effects.rs"), RUNTIME_EFFECTS_RS)?;
     fs::write(src_dir.join("runtime_exec.rs"), RUNTIME_RUNTIME_EXEC_RS)?;
+
+    // ── placement/catalog — shared semantic identity and capabilities ──────
+    let placement_dir = src_dir.join("placement");
+    for &(relative_path, source) in RUNTIME_PLACEMENT_SOURCES {
+        let destination = placement_dir.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(destination, source)?;
+    }
+    let registry_bundle_dir = src_dir.join("registry").join("bundle");
+    fs::create_dir_all(&registry_bundle_dir)?;
+    fs::write(src_dir.join("registry/mod.rs"), "pub mod bundle;\n")?;
+    fs::write(
+        registry_bundle_dir.join("mod.rs"),
+        RUNTIME_REGISTRY_BUNDLE_RS,
+    )?;
 
     // ── evidence — evidence-bound execution admission ──────────────────────
     let evidence_dir = src_dir.join("evidence");
@@ -1929,6 +2026,8 @@ mod capability;
 pub mod environment;
 pub mod backend;
 pub mod parser;
+pub mod placement;
+pub mod registry;
 pub mod ir;
 pub mod effects;
 pub mod evidence;
@@ -1952,7 +2051,7 @@ fn generate_main_rs(
     shim_include_lines: &[String],
     backend_grants: &[String],
 ) -> String {
-    let lib_name = bin_name.replace('-', "_");
+    let lib_name = generated_lib_name(bin_name);
     let shim_entries = if shim_include_lines.is_empty() {
         "    // no shims bundled".to_string()
     } else {
@@ -2073,6 +2172,207 @@ fn main() -> anyhow::Result<()> {{
     )
 }
 
+fn write_generated_cargo_contract(
+    build_dir: &Path,
+    bin_name: &str,
+    include_project: bool,
+) -> Result<()> {
+    fs::write(
+        build_dir.join("Cargo.toml"),
+        generate_cargo_toml(bin_name, include_project),
+    )?;
+    fs::write(
+        build_dir.join("Cargo.lock"),
+        generate_cargo_lock(include_project)?,
+    )?;
+    fs::write(
+        build_dir.join("rust-toolchain.toml"),
+        WORKSPACE_RUST_TOOLCHAIN_TOML,
+    )?;
+    Ok(())
+}
+
+fn generate_cargo_lock(include_project: bool) -> Result<String> {
+    let workspace_lock = std::str::from_utf8(WORKSPACE_CARGO_LOCK)
+        .context("workspace Cargo.lock embedded in olangc is not UTF-8")?;
+    let mut lock: toml::Value =
+        toml::from_str(workspace_lock).context("workspace Cargo.lock is not valid TOML")?;
+
+    let package_index = {
+        let packages = lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .context("workspace Cargo.lock has no package array")?;
+        let matches = packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, package)| {
+                let table = package.as_table()?;
+                (table.get("name")?.as_str()? == env!("CARGO_PKG_NAME")
+                    && table.get("version")?.as_str()? == env!("CARGO_PKG_VERSION")
+                    && !table.contains_key("source"))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [index] => *index,
+            _ => bail!(
+                "workspace Cargo.lock must contain exactly one local {} {} package entry",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            ),
+        }
+    };
+
+    {
+        let packages = lock
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .context("workspace Cargo.lock has no mutable package array")?;
+        let package = packages[package_index]
+            .as_table_mut()
+            .context("workspace Cargo.lock local package entry is not a table")?;
+        let workspace_dependencies = package
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .context("workspace Cargo.lock local package has no dependency list")?
+            .iter()
+            .map(|dependency| {
+                dependency
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("workspace Cargo.lock contains a non-string dependency coordinate")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut dependency_names = GENERATED_RUNTIME_DEPENDENCY_NAMES.to_vec();
+        if include_project {
+            dependency_names.push("ignore");
+        }
+        dependency_names.sort_unstable();
+        dependency_names.dedup();
+
+        let mut generated_dependencies = Vec::with_capacity(dependency_names.len());
+        for name in dependency_names {
+            let matches = workspace_dependencies
+                .iter()
+                .filter(|coordinate| coordinate.split(' ').next() == Some(name))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [coordinate] => generated_dependencies.push((*coordinate).clone()),
+                _ => bail!(
+                    "workspace Cargo.lock must contain exactly one direct `{name}` coordinate for generated runtimes"
+                ),
+            }
+        }
+        generated_dependencies.sort();
+
+        package.insert(
+            "name".to_owned(),
+            toml::Value::String(GENERATED_PACKAGE_NAME.to_owned()),
+        );
+        package.insert(
+            "version".to_owned(),
+            toml::Value::String(GENERATED_PACKAGE_VERSION.to_owned()),
+        );
+        package.insert(
+            "dependencies".to_owned(),
+            toml::Value::Array(
+                generated_dependencies
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+        let _ = package.remove("source");
+        let _ = package.remove("checksum");
+    }
+
+    prune_generated_cargo_lock(&mut lock, package_index)?;
+
+    let serialized = toml::to_string(&lock).context("failed to serialize generated Cargo.lock")?;
+    Ok(format!(
+        "# This file is @generated by olangc from the Ostadix workspace lock.\n# It is not intended for manual editing.\n{serialized}"
+    ))
+}
+
+/// Retain the exact transitive package graph reachable from the projected
+/// generated root. Cargo treats a copied workspace lock with now-unreachable
+/// packages as stale, so root-entry replacement alone is insufficient for a
+/// real `--locked` build.
+fn prune_generated_cargo_lock(lock: &mut toml::Value, root_index: usize) -> Result<()> {
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("generated Cargo.lock has no package array")?;
+    let mut reachable = HashSet::new();
+    let mut pending = vec![root_index];
+
+    while let Some(index) = pending.pop() {
+        if !reachable.insert(index) {
+            continue;
+        }
+        let package = packages
+            .get(index)
+            .and_then(toml::Value::as_table)
+            .context("generated Cargo.lock contains a non-table package")?;
+        let dependencies = match package.get("dependencies") {
+            Some(value) => value
+                .as_array()
+                .context("generated Cargo.lock package dependencies are not an array")?,
+            None => continue,
+        };
+
+        for dependency in dependencies {
+            let coordinate = dependency
+                .as_str()
+                .context("generated Cargo.lock contains a non-string dependency coordinate")?;
+            let mut parts = coordinate.split_whitespace();
+            let name = parts
+                .next()
+                .context("generated Cargo.lock contains an empty dependency coordinate")?;
+            let version = parts.next();
+            if parts.next().is_some() {
+                bail!(
+                    "generated Cargo.lock dependency coordinate `{coordinate}` has an unsupported source qualifier"
+                );
+            }
+
+            let matches = packages
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, candidate)| {
+                    let candidate = candidate.as_table()?;
+                    (candidate.get("name")?.as_str()? == name
+                        && version.is_none_or(|expected| {
+                            candidate.get("version").and_then(toml::Value::as_str) == Some(expected)
+                        }))
+                    .then_some(candidate_index)
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [dependency_index] => pending.push(*dependency_index),
+                _ => bail!(
+                    "generated Cargo.lock dependency `{coordinate}` resolves to {} package entries",
+                    matches.len()
+                ),
+            }
+        }
+    }
+
+    let packages = lock
+        .get_mut("package")
+        .and_then(toml::Value::as_array_mut)
+        .context("generated Cargo.lock has no mutable package array")?;
+    let mut index = 0usize;
+    packages.retain(|_| {
+        let keep = reachable.contains(&index);
+        index += 1;
+        keep
+    });
+    Ok(())
+}
+
 fn generate_cargo_toml(bin_name: &str, include_project: bool) -> String {
     // Keep dependency versions in sync with the workspace Cargo.toml.
     // The Cargo.lock (embedded above) pins exact versions, so this just
@@ -2084,9 +2384,10 @@ fn generate_cargo_toml(bin_name: &str, include_project: bool) -> String {
     };
     format!(
         r#"[package]
-name    = "{bin_name}"
-version = "0.1.0"
+name    = "{generated_package_name}"
+version = "{generated_version}"
 edition = "2021"
+rust-version = "{package_rust_version}"
 publish = false
 
 [package.metadata.ostadix]
@@ -2133,7 +2434,10 @@ strip         = "symbols"
 opt-level = 3
 "#,
         bin_name = bin_name,
-        lib_name = bin_name.replace('-', "_"),
+        lib_name = generated_lib_name(bin_name),
+        generated_package_name = GENERATED_PACKAGE_NAME,
+        generated_version = GENERATED_PACKAGE_VERSION,
+        package_rust_version = env!("CARGO_PKG_RUST_VERSION"),
         package_license = env!("CARGO_PKG_LICENSE"),
         ignore_dep = ignore_dep,
     )
@@ -2498,6 +2802,8 @@ mod tests {
         let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
         assert!(lib_rs.contains("pub mod effects;"));
         assert!(lib_rs.contains("pub mod environment;"));
+        assert!(lib_rs.contains("pub mod placement;"));
+        assert!(lib_rs.contains("pub mod registry;"));
         assert!(lib_rs.contains("pub mod evidence;"));
         assert!(lib_rs.contains("pub mod hgraph;"));
         assert!(lib_rs.contains("pub mod executor;"));
@@ -2506,9 +2812,25 @@ mod tests {
 
         for path in [
             "backend_catalog.inc.rs",
+            "backend_state.rs",
             "environment.rs",
             "effects.rs",
             "runtime_exec.rs",
+            "placement/mod.rs",
+            "placement/catalog_compat.rs",
+            "placement/projection.rs",
+            "placement/protocol/mod.rs",
+            "placement/protocol/candidate.rs",
+            "placement/protocol/catalog.rs",
+            "placement/protocol/digest.rs",
+            "placement/protocol/error.rs",
+            "placement/protocol/records.rs",
+            "placement/protocol/requirement.rs",
+            "placement/protocol/state.rs",
+            "placement/protocol/target.rs",
+            "placement/protocol/warrant.rs",
+            "registry/mod.rs",
+            "registry/bundle/mod.rs",
             "evidence/mod.rs",
             "evidence/fact.rs",
             "evidence/analyze.rs",
@@ -2552,6 +2874,23 @@ mod tests {
             RUNTIME_BACKEND_CATALOG_RS,
             "generated runtimes must receive the canonical backend catalog verbatim"
         );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("backend_state.rs")).unwrap(),
+            RUNTIME_BACKEND_STATE_RS,
+            "generated runtimes must receive the state wire protocol verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("registry/bundle/mod.rs")).unwrap(),
+            RUNTIME_REGISTRY_BUNDLE_RS,
+            "generated runtimes must receive the canonical backend bundle verbatim"
+        );
+        for &(relative_path, embedded) in RUNTIME_PLACEMENT_SOURCES {
+            assert_eq!(
+                fs::read_to_string(src_dir.join("placement").join(relative_path)).unwrap(),
+                embedded,
+                "generated placement source {relative_path} must match its embedded source"
+            );
+        }
         assert_eq!(
             fs::read_to_string(src_dir.join("effects.rs")).unwrap(),
             RUNTIME_EFFECTS_RS,
@@ -2603,6 +2942,11 @@ mod tests {
                 Some(false),
                 "generated runtimes are build artifacts, not publishable crates"
             );
+            assert_eq!(
+                package.get("rust-version").and_then(toml::Value::as_str),
+                Some(env!("CARGO_PKG_RUST_VERSION")),
+                "generated runtimes must retain the package MSRV"
+            );
             assert!(
                 package.get("license").is_none(),
                 "a mixed generated package must not relicense embedded input source"
@@ -2631,6 +2975,82 @@ mod tests {
     }
 
     #[test]
+    fn generated_runtime_build_contract_projects_lock_and_toolchain() {
+        for include_project in [false, true] {
+            for bin_name in ["generated-runtime", "serde"] {
+                let build_dir = tempfile::tempdir().unwrap();
+                write_generated_cargo_contract(build_dir.path(), bin_name, include_project)
+                    .unwrap();
+
+                assert_eq!(
+                    fs::read(build_dir.path().join("rust-toolchain.toml")).unwrap(),
+                    WORKSPACE_RUST_TOOLCHAIN_TOML,
+                    "generated builds must inherit the authoritative compiler pin"
+                );
+
+                let manifest = fs::read_to_string(build_dir.path().join("Cargo.toml")).unwrap();
+                let manifest = toml::from_str::<toml::Value>(&manifest).unwrap();
+                let package = manifest
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .unwrap();
+                let expected_lib_name = generated_lib_name(bin_name);
+                assert_eq!(
+                    package.get("name").and_then(toml::Value::as_str),
+                    Some(GENERATED_PACKAGE_NAME)
+                );
+                assert_eq!(
+                    manifest
+                        .get("lib")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|lib| lib.get("name"))
+                        .and_then(toml::Value::as_str),
+                    Some(expected_lib_name.as_str())
+                );
+
+                let lock_text = fs::read_to_string(build_dir.path().join("Cargo.lock")).unwrap();
+                assert_eq!(
+                    lock_text,
+                    generate_cargo_lock(include_project).unwrap(),
+                    "generated lock projection must be deterministic and output-name independent"
+                );
+                let lock = toml::from_str::<toml::Value>(&lock_text).unwrap();
+                let packages = lock.get("package").and_then(toml::Value::as_array).unwrap();
+                let generated = packages
+                    .iter()
+                    .filter_map(toml::Value::as_table)
+                    .filter(|package| {
+                        package.get("name").and_then(toml::Value::as_str)
+                            == Some(GENERATED_PACKAGE_NAME)
+                            && package.get("source").is_none()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(generated.len(), 1);
+                assert_eq!(
+                    generated[0].get("version").and_then(toml::Value::as_str),
+                    Some(GENERATED_PACKAGE_VERSION)
+                );
+
+                let actual_dependencies = generated[0]
+                    .get("dependencies")
+                    .and_then(toml::Value::as_array)
+                    .unwrap()
+                    .iter()
+                    .map(|dependency| dependency.as_str().unwrap().split(' ').next().unwrap())
+                    .collect::<HashSet<_>>();
+                let mut expected_dependencies = GENERATED_RUNTIME_DEPENDENCY_NAMES
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                if include_project {
+                    expected_dependencies.insert("ignore");
+                }
+                assert_eq!(actual_dependencies, expected_dependencies);
+            }
+        }
+    }
+
+    #[test]
     fn generated_project_runtime_emits_every_embedded_source() {
         let build_dir = tempfile::tempdir().unwrap();
         let src_dir = build_dir.path().join("src");
@@ -2651,12 +3071,46 @@ mod tests {
         let bundle = o_lang::project::assemble(&fixture, "generated-project-closure", &[])
             .expect("real project fixture must assemble");
         let build_dir = tempfile::tempdir().unwrap();
-        write_project_cargo_project(&bundle, &[], build_dir.path(), "generated-project-closure")
+        write_project_cargo_project(&bundle, &[], build_dir.path(), "serde")
             .expect("real project fixture must generate a Cargo project");
+
+        let probe_dir = build_dir.path().join("tests");
+        fs::create_dir_all(&probe_dir).unwrap();
+        fs::write(
+            probe_dir.join("generated_runtime_closure.rs"),
+            r#"use ostadix_generated_serde::backend::state::{
+    empty_checkpoint, validate_empty_restore,
+};
+use ostadix_generated_serde::placement::SemanticDigestV1;
+use ostadix_generated_serde::registry::bundle::{
+    BackendRegistry, IntegerExactness, BACKEND_CATALOG_CURRENT_SCHEMA,
+    BACKEND_CATALOG_SCHEMA_V4,
+};
+
+#[test]
+fn catalog_placement_and_checkpoint_sources_are_live() {
+    assert_eq!(BACKEND_CATALOG_CURRENT_SCHEMA, BACKEND_CATALOG_SCHEMA_V4);
+    let rust = BackendRegistry::global().interface_for("rust");
+    assert!(matches!(
+        rust.value_capabilities.integer_exactness,
+        IntegerExactness::TwosComplementBits(63)
+    ));
+
+    let runtime = SemanticDigestV1::hash_bytes(
+        "ostadix/generated-runtime-closure-test/v1",
+        b"rust-runtime",
+    );
+    let checkpoint = empty_checkpoint("rust", runtime.as_sha256()).unwrap();
+    checkpoint.validate().unwrap();
+    validate_empty_restore("rust", runtime.as_sha256(), &checkpoint).unwrap();
+}
+"#,
+        )
+        .unwrap();
 
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
-            .args(["check", "--offline", "--color", "never"])
+            .args(["check", "--offline", "--locked", "--color", "never"])
             .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
             .current_dir(build_dir.path())
             .output()
@@ -2667,13 +3121,35 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .args([
+                "test",
+                "--offline",
+                "--locked",
+                "--color",
+                "never",
+                "--test",
+                "generated_runtime_closure",
+            ])
+            .env("CARGO_TARGET_DIR", build_dir.path().join("target"))
+            .current_dir(build_dir.path())
+            .output()
+            .expect("Cargo must be available to exercise the generated project closure");
+        assert!(
+            output.status.success(),
+            "generated project closure probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
     fn generated_project_main_handles_project_crate_name() {
         let main = generate_project_main_rs("project", &[]);
-        assert!(main.contains("use ::project::project::RoutePolicy;"));
-        assert!(main.contains("::project::project::bundle::deserialize"));
+        assert!(main.contains("use ::ostadix_generated_project::project::RoutePolicy;"));
+        assert!(main.contains("::ostadix_generated_project::project::bundle::deserialize"));
         assert!(!main.contains("use project::project::{self"));
         assert!(main.contains("--route requires a value"));
         assert!(main.contains("RoutePolicy::parse_checked"));
