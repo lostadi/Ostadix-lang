@@ -26,7 +26,7 @@ class ContractSurfacesTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "contract-surfaces: ok")
 
     def test_rust_suite_projects_openssl_from_one_manifest(self) -> None:
-        result = self.run_contracts("required-executables", "--suite", "rust")
+        result = self.run_contracts("required-executables", "--suite", "rust-hosted")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
