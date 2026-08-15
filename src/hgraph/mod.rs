@@ -23,8 +23,6 @@ pub use schedule::{schedule, try_schedule, ExecutionCluster, ReadyOp, ReadySched
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use num_bigint::BigInt;
     use proptest::prelude::*;
 
@@ -37,6 +35,26 @@ mod tests {
     use super::*;
 
     type SolverProjection = (DomainFlags, RepFlags, Option<Fidelity>, Option<OValue>);
+
+    fn fidelity_strategy() -> impl Strategy<Value = Fidelity> {
+        prop_oneof![
+            Just(Fidelity::Lossless),
+            Just(Fidelity::NativeCapsule),
+            Just(Fidelity::Unsupported),
+            proptest::collection::btree_set(0_u8..8, 1..=8).prop_map(|kinds| {
+                Fidelity::structural(kinds.into_iter().map(|kind| match kind {
+                    0 => AnnotationKind::TypeTag,
+                    1 => AnnotationKind::NumericPrecision,
+                    2 => AnnotationKind::NumericExactness,
+                    3 => AnnotationKind::Encoding,
+                    4 => AnnotationKind::Ordering,
+                    5 => AnnotationKind::Identity,
+                    6 => AnnotationKind::Constraint,
+                    _ => AnnotationKind::Capability,
+                }))
+            }),
+        ]
+    }
 
     fn solve_dataflow_order(order: &[usize]) -> SolverProjection {
         let mut graph = HGraph::default();
@@ -365,9 +383,10 @@ mod tests {
 
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
-            Some(Fidelity::Structural {
-                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
-            })
+            Some(Fidelity::structural([
+                AnnotationKind::NumericExactness,
+                AnnotationKind::TypeTag,
+            ]))
         );
     }
 
@@ -382,12 +401,10 @@ mod tests {
             (
                 DomainFlags::BOOL,
                 RepFlags::BOOL,
-                Some(Fidelity::Structural {
-                    lost: BTreeSet::from([
-                        AnnotationKind::NumericExactness,
-                        AnnotationKind::TypeTag,
-                    ]),
-                }),
+                Some(Fidelity::structural([
+                    AnnotationKind::NumericExactness,
+                    AnnotationKind::TypeTag,
+                ])),
                 None,
             )
         );
@@ -426,6 +443,25 @@ mod tests {
                 solve_dataflow_order(&order),
                 solve_dataflow_order(&[0, 1, 2]),
             );
+        }
+
+        #[test]
+        fn fidelity_join_is_associative_commutative_idempotent_with_identity(
+            a in fidelity_strategy(),
+            b in fidelity_strategy(),
+            c in fidelity_strategy(),
+        ) {
+            prop_assert_eq!(
+                a.clone().compose(b.clone()),
+                b.clone().compose(a.clone()),
+            );
+            prop_assert_eq!(
+                a.clone().compose(b.clone()).compose(c.clone()),
+                a.clone().compose(b.clone().compose(c.clone())),
+            );
+            prop_assert_eq!(a.clone().compose(a.clone()), a.clone());
+            prop_assert_eq!(a.clone().compose(Fidelity::Lossless), a.clone());
+            prop_assert_eq!(Fidelity::Lossless.compose(a.clone()), a);
         }
     }
 
@@ -586,9 +622,7 @@ mod tests {
 
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
-            Some(Fidelity::Structural {
-                lost: BTreeSet::from([first_kind, second_kind]),
-            })
+            Some(Fidelity::structural([first_kind, second_kind]))
         );
     }
 
@@ -818,9 +852,113 @@ mod tests {
         solve::solve_types(&mut graph).unwrap();
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
-            Some(Fidelity::Structural {
-                lost: BTreeSet::from([AnnotationKind::NumericPrecision]),
-            })
+            Some(Fidelity::structural([AnnotationKind::NumericPrecision]))
+        );
+    }
+
+    #[test]
+    fn javascript_integer_fidelity_respects_the_exact_2_pow_53_boundary() {
+        let boundary = BigInt::from(1_u8) << 53_usize;
+        let at_boundary =
+            solve::fidelity_for_value(&OValue::big_int(boundary.clone()), "javascript");
+        let above_boundary =
+            solve::fidelity_for_value(&OValue::big_int(boundary + 1_u8), "javascript");
+
+        let at_losses = at_boundary.losses().expect("numeric kind collapse");
+        assert!(!at_losses.contains(&AnnotationKind::NumericPrecision));
+        assert!(at_losses.contains(&AnnotationKind::NumericExactness));
+        let above_losses = above_boundary.losses().expect("numeric fidelity loss");
+        assert!(above_losses.contains(&AnnotationKind::NumericPrecision));
+        assert!(above_losses.contains(&AnnotationKind::NumericExactness));
+    }
+
+    #[test]
+    fn abstract_i64_crossing_uses_backend_capabilities_not_language_names() {
+        let node = HNode {
+            domain: DomainFlags::INTEGER,
+            rep: RepFlags::I64,
+            ..HNode::fresh()
+        };
+
+        let javascript = solve::fidelity_for(&node, "O", "javascript");
+        assert!(
+            javascript
+                .losses()
+                .is_some_and(|lost| lost.contains(&AnnotationKind::NumericPrecision)),
+            "abstract I64 includes values outside JavaScript's exact integer range"
+        );
+        assert_eq!(
+            solve::fidelity_for(&node, "O", "python"),
+            Fidelity::Lossless
+        );
+        assert_eq!(
+            solve::fidelity_for(&node, "O", "py"),
+            Fidelity::Lossless,
+            "aliases must resolve through the same canonical capability descriptor"
+        );
+        assert_eq!(
+            solve::fidelity_for(&node, "O", "unregistered-backend"),
+            Fidelity::Unsupported
+        );
+    }
+
+    #[test]
+    fn fidelity_phase_waits_for_type_and_value_fixpoint() {
+        let mut graph = HGraph::default();
+        let input = graph.add_node(HNode::fresh());
+        let output = graph.add_node(HNode::fresh());
+
+        // Deliberately insert the crossing before the fact that materializes
+        // its input. A single mixed phase would seed Unsupported here and the
+        // ascending join could never recover the precise structural result.
+        graph.add_edge(HEdge::constraint(
+            OpKind::BackendCrossing {
+                from_lang: "O".into(),
+                to_lang: "javascript".into(),
+            },
+            vec![
+                Port {
+                    node: input,
+                    role: PortRole::Input,
+                },
+                Port {
+                    node: output,
+                    role: PortRole::Output,
+                },
+            ],
+        ));
+        graph.add_edge(HEdge::constraint(
+            OpKind::Bounded {
+                value: (BigInt::from(1_u8) << 53_usize) + 1_u8,
+            },
+            vec![Port {
+                node: input,
+                role: PortRole::Output,
+            }],
+        ));
+
+        solve::solve_types(&mut graph).unwrap();
+        let fidelity = graph
+            .node(output)
+            .and_then(|node| node.fidelity.as_ref())
+            .expect("crossing fidelity");
+        assert_ne!(fidelity, &Fidelity::Unsupported);
+        assert!(fidelity
+            .losses()
+            .is_some_and(|lost| lost.contains(&AnnotationKind::NumericPrecision)));
+    }
+
+    #[test]
+    fn same_backend_aliases_are_lossless_but_unknown_backends_are_not() {
+        let node = HNode::fresh();
+        assert_eq!(
+            solve::fidelity_for(&node, "py", "python"),
+            Fidelity::Lossless
+        );
+        assert_eq!(
+            solve::fidelity_for(&node, "mystery", "mystery"),
+            Fidelity::Unsupported,
+            "syntactic equality is not capability evidence"
         );
     }
 
@@ -867,9 +1005,10 @@ mod tests {
         solve::solve_types(&mut graph).unwrap();
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
-            Some(Fidelity::Structural {
-                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
-            })
+            Some(Fidelity::structural([
+                AnnotationKind::NumericExactness,
+                AnnotationKind::TypeTag,
+            ]))
         );
     }
 

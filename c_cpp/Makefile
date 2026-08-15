@@ -54,7 +54,7 @@ src/olangc.o: src/olangc.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f O olangc src/*.o src/main.o src/olangc.o
+	rm -f O olangc tests/test_fresh_env src/*.o src/main.o src/olangc.o
 	@echo "Cleaned."
 
 # Smoke test core (no-nix) examples. Adjust path to backends if needed.
@@ -63,6 +63,12 @@ test: all
 	@echo "=== Testing manifest-selected C17 interpreter examples ==="
 	@python3 ../tests/example_manifest.py run \
 		--edition c17 --runner ./O --backends ../backends
+
+tests/test_fresh_env: $(CORE_OBJS) tests/test_fresh_env.c
+	$(CC) $(CFLAGS) -o $@ tests/test_fresh_env.c $(CORE_OBJS) $(LDFLAGS)
+
+fresh-env-test: tests/test_fresh_env
+	@./tests/test_fresh_env ../backends
 
 # Test AOT path for the manifest entries that declare C17 AOT support.
 olangc-test: all
@@ -87,4 +93,4 @@ run:
 	@if [ -z "$(EX)" ]; then echo "Usage: make run EX=hello  (or bindings, html_basic, ...)"; exit 1; fi
 	@./O ../examples/$(EX).O ../backends
 
-.PHONY: all clean test olangc-test path-test warnings-as-errors run
+.PHONY: all clean test fresh-env-test olangc-test path-test warnings-as-errors run

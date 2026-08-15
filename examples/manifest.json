@@ -127,7 +127,7 @@
     },
     {
       "path": "ephemeral.O",
-      "editions": ["rust"],
+      "editions": ["rust", "c17", "python"],
       "classification": "unit",
       "requirements": {
         "backends": ["python"],
@@ -135,7 +135,12 @@
         "authorities": ["process"]
       },
       "expected": {
-        "rust": {"patterns": ["EPHEMERAL: x from first bare block is NOT visible here"]}
+        "rust": {"patterns": ["EPHEMERAL: x from first bare block is NOT visible here"]},
+        "c17": {
+          "patterns": ["EPHEMERAL: x from first bare block is NOT visible here"],
+          "modes": ["interpreter", "aot"]
+        },
+        "python": {"patterns": ["EPHEMERAL: x from first bare block is NOT visible here"]}
       }
     },
     {

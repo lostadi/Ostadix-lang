@@ -9,6 +9,17 @@
 extern "C" {
 #endif
 
+/* Environment encodings shared with the Rust and Python editions.  Numeric
+   source IDs stop below these sentinels, so authored persistent identities
+   can never alias either fresh-environment spelling. */
+#define OLANG_ENV_EPHEMERAL UINT32_MAX
+#define OLANG_ENV_LINKER_ISOLATED (UINT32_MAX - UINT32_C(1))
+#define OLANG_ENV_MAX_PERSISTENT (UINT32_MAX - UINT32_C(2))
+
+static inline bool olang_env_is_fresh(uint32_t env_id) {
+    return env_id == OLANG_ENV_EPHEMERAL || env_id == OLANG_ENV_LINKER_ISOLATED;
+}
+
 /* ── AST node types ───────────────────────────────────────────────────── */
 typedef enum {
     ONODE_RAW_TEXT = 0,
