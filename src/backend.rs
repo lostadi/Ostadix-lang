@@ -9,12 +9,22 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use num_bigint::BigInt;
 use serde_json::Value;
 
+#[path = "backend_state.rs"]
+pub mod state;
+
+use self::state::{
+    BackendCheckpointV1, BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendStateErrorV1,
+    BackendStateReasonV1, BackendStateTierV1, BackendWireCommandV2, BackendWireResponseV2,
+    SQL_CLI_CODEC_V1,
+};
 use crate::ir::{BackendAdapterKind, BackendRegistry};
 use crate::runtime_exec::BackendToolchain;
-use crate::value::{FloatFormat, ONumber, OValue, OWireCommand, OWireResponse};
+use crate::value::{FloatFormat, ONumber, OValue};
 use crate::wire;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -78,11 +88,11 @@ pub fn run_backend(lang: &str) -> Result<()> {
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
 
-    while let Some(command) = wire::read_frame::<_, OWireCommand>(&mut reader)? {
-        if matches!(&command, OWireCommand::Shutdown) {
+    while let Some(command) = wire::read_frame::<_, BackendWireCommandV2>(&mut reader)? {
+        if matches!(&command, BackendWireCommandV2::Shutdown) {
             match backend.shutdown() {
                 Ok(()) => {
-                    wire::write_frame(&mut writer, &OWireResponse::ok(OValue::Null))?;
+                    wire::write_frame(&mut writer, &BackendWireResponseV2::ok(OValue::Null))?;
                     crate::process::lifecycle_trace(
                         "backend.shutdown_acknowledged",
                         format!("language={lang}"),
@@ -92,22 +102,38 @@ pub fn run_backend(lang: &str) -> Result<()> {
                 Err(error) => {
                     wire::write_frame(
                         &mut writer,
-                        &OWireResponse::err(format!("backend shutdown failed: {error:#}")),
+                        &BackendWireResponseV2::err(format!("backend shutdown failed: {error:#}")),
                     )?;
                     return Err(error).context("backend shutdown failed");
                 }
             }
         }
         let response = match command {
-            OWireCommand::Exec { code, bindings } => match backend.exec(lang, &code, bindings) {
-                Ok(value) => OWireResponse::ok(value),
-                Err(error) => OWireResponse::err(format!("{error:#}")),
+            BackendWireCommandV2::Exec { code, bindings } => {
+                match backend.exec(lang, &code, bindings) {
+                    Ok(value) => BackendWireResponseV2::ok(value),
+                    Err(error) => BackendWireResponseV2::err(format!("{error:#}")),
+                }
+            }
+            BackendWireCommandV2::Cleanup => match backend.cleanup() {
+                Ok(()) => BackendWireResponseV2::ok(OValue::Null),
+                Err(error) => BackendWireResponseV2::err(format!("{error:#}")),
             },
-            OWireCommand::Cleanup => OWireResponse::ok(OValue::Null),
-            OWireCommand::Shutdown => unreachable!("shutdown handled before dispatch"),
-            OWireCommand::Ping => OWireResponse::ok(OValue::Null),
-            OWireCommand::EvalResult { .. } => {
-                OWireResponse::err("backend received eval_result without a pending eval request")
+            BackendWireCommandV2::Shutdown => unreachable!("shutdown handled before dispatch"),
+            BackendWireCommandV2::Ping => BackendWireResponseV2::ok(OValue::Null),
+            BackendWireCommandV2::EvalResult { .. } => BackendWireResponseV2::err(
+                "backend received eval_result without a pending eval request",
+            ),
+            BackendWireCommandV2::StateCapabilitiesV1 => {
+                BackendWireResponseV2::StateCapabilitiesV1 {
+                    capabilities: backend.state_capabilities(lang),
+                }
+            }
+            BackendWireCommandV2::CheckpointV1 { max_bytes } => {
+                backend.checkpoint_response(lang, max_bytes)
+            }
+            BackendWireCommandV2::RestoreV1 { checkpoint } => {
+                backend.restore_response(lang, checkpoint)
             }
         };
         wire::write_frame(&mut writer, &response)?;
@@ -130,10 +156,12 @@ struct RustBackend {
 /// multi-block `sql[0]^(…)_sql[0]` programs match the Python shim semantics.
 struct SqlState {
     _dir: TempDir,
+    db_path: PathBuf,
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
     stderr_rx: Receiver<String>,
+    checkpoint_safe: bool,
 }
 
 impl RustBackend {
@@ -207,21 +235,190 @@ impl RustBackend {
         Ok(self.sql.as_mut().expect("sql state was just initialized"))
     }
 
-    fn shutdown(&mut self) -> Result<()> {
+    fn cleanup(&mut self) -> Result<()> {
         if let Some(mut sql) = self.sql.take() {
             sql.shutdown(crate::process::backend_shutdown_timeout())?;
         }
         Ok(())
     }
+
+    fn state_capabilities(&self, lang: &str) -> BackendStateCapabilitiesV1 {
+        if lang == "sql" {
+            BackendStateCapabilitiesV1::new(
+                lang,
+                BackendStateTierV1::SemanticSnapshot,
+                SQL_CLI_CODEC_V1,
+                true,
+            )
+        } else {
+            state::empty_state_capabilities(lang)
+        }
+    }
+
+    fn checkpoint_response(&mut self, lang: &str, max_bytes: u64) -> BackendWireResponseV2 {
+        let checkpoint = if lang == "sql" {
+            self.sql_checkpoint()
+        } else {
+            state::empty_checkpoint(lang, self.tools.executable_set_sha256())
+        };
+        match checkpoint {
+            Ok(checkpoint) => match state::ensure_checkpoint_bound(&checkpoint, max_bytes) {
+                Ok(()) => BackendWireResponseV2::CheckpointV1 { checkpoint },
+                Err(error) => BackendWireResponseV2::StateErrorV1 {
+                    error: BackendStateErrorV1::new(
+                        lang,
+                        "state.checkpoint-too-large",
+                        format!("{error:#}"),
+                    ),
+                },
+            },
+            Err(error) => {
+                if let Some(pin) = error.downcast_ref::<BackendStatePinRequired>() {
+                    BackendWireResponseV2::StatePinRequiredV1 {
+                        reason: BackendStateReasonV1::pin_required(
+                            lang,
+                            pin.path.clone(),
+                            pin.message.clone(),
+                        ),
+                    }
+                } else {
+                    BackendWireResponseV2::StateErrorV1 {
+                        error: BackendStateErrorV1::new(
+                            lang,
+                            "state.checkpoint-failed",
+                            format!("{error:#}"),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_response(
+        &mut self,
+        lang: &str,
+        checkpoint: BackendCheckpointV1,
+    ) -> BackendWireResponseV2 {
+        let result = if lang == "sql" {
+            self.restore_sql(&checkpoint)
+        } else {
+            state::validate_empty_restore(lang, self.tools.executable_set_sha256(), &checkpoint)
+        };
+        match result.and_then(|()| BackendRestoreReceiptV1::restored(lang, &checkpoint)) {
+            Ok(receipt) => BackendWireResponseV2::RestoreV1 { receipt },
+            Err(error) => BackendWireResponseV2::StateErrorV1 {
+                error: BackendStateErrorV1::new(
+                    lang,
+                    "state.restore-incompatible",
+                    format!("{error:#}"),
+                ),
+            },
+        }
+    }
+
+    fn sql_checkpoint(&mut self) -> Result<BackendCheckpointV1> {
+        let runtime_binding = self.tools.executable_set_sha256().to_string();
+        let sql = self.sql_state()?;
+        if !sql.checkpoint_safe {
+            return Err(anyhow::Error::new(BackendStatePinRequired {
+                path: "$sql.connection".to_string(),
+                message: "SQL history used transaction-, attachment-, TEMP-, PRAGMA-, extension-, or connection-local state outside the constrained main-database codec"
+                    .to_string(),
+            }));
+        }
+        let database = fs::read(&sql.db_path).with_context(|| {
+            format!(
+                "failed to read SQL state database {}",
+                sql.db_path.display()
+            )
+        })?;
+        BackendCheckpointV1::new(
+            "sql",
+            BackendStateTierV1::SemanticSnapshot,
+            SQL_CLI_CODEC_V1,
+            runtime_binding,
+            serde_json::json!({
+                "profile": "autocommit-main-only",
+                "database_b64": BASE64_STANDARD.encode(database),
+            }),
+            Vec::new(),
+        )
+    }
+
+    fn restore_sql(&mut self, checkpoint: &BackendCheckpointV1) -> Result<()> {
+        checkpoint.validate()?;
+        if self.sql.is_some() {
+            bail!("state.restore-conflict: SQL actor already owns an open session");
+        }
+        if checkpoint.backend != "sql"
+            || checkpoint.tier != BackendStateTierV1::SemanticSnapshot
+            || checkpoint.codec != SQL_CLI_CODEC_V1
+            || checkpoint.runtime_binding_sha256 != self.tools.executable_set_sha256()
+            || !checkpoint.external_resources.is_empty()
+        {
+            bail!("SQL checkpoint is incompatible with this backend implementation");
+        }
+        let object = checkpoint
+            .payload
+            .as_object()
+            .context("SQL checkpoint payload is not an object")?;
+        if object.get("profile").and_then(Value::as_str) != Some("autocommit-main-only") {
+            bail!("SQL checkpoint has an unsupported connection profile");
+        }
+        let encoded = object
+            .get("database_b64")
+            .and_then(Value::as_str)
+            .context("SQL checkpoint omitted database_b64")?;
+        let database = BASE64_STANDARD
+            .decode(encoded)
+            .context("SQL checkpoint database is not valid base64")?;
+        let mut replacement = SqlState::spawn_with_database(&self.tools, Some(&database))?;
+        let integrity = replacement.exec_untracked("PRAGMA integrity_check;")?;
+        match integrity {
+            OValue::Text { v } if v.utf8 == "ok" => {}
+            other => bail!("SQL checkpoint failed integrity_check: {other}"),
+        }
+        self.sql = Some(replacement);
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.cleanup()
+    }
 }
+
+#[derive(Debug)]
+struct BackendStatePinRequired {
+    path: String,
+    message: String,
+}
+
+impl std::fmt::Display for BackendStatePinRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for BackendStatePinRequired {}
 
 impl SqlState {
     fn spawn(tools: &BackendToolchain) -> Result<Self> {
+        Self::spawn_with_database(tools, None)
+    }
+
+    fn spawn_with_database(tools: &BackendToolchain, database: Option<&[u8]>) -> Result<Self> {
         let dir = TempDir::new("o-backend-sql")?;
         let db_path = dir.path().join("state.sqlite3");
-        // Ensure the file exists so sqlite3 opens a durable on-disk DB.
-        fs::File::create(&db_path)
-            .with_context(|| format!("failed to create sql state db {}", db_path.display()))?;
+        match database {
+            Some(database) => fs::write(&db_path, database)
+                .with_context(|| format!("failed to restore sql state db {}", db_path.display()))?,
+            None => {
+                // Ensure the file exists so sqlite3 opens a durable on-disk DB.
+                fs::File::create(&db_path).with_context(|| {
+                    format!("failed to create sql state db {}", db_path.display())
+                })?;
+            }
+        }
 
         let mut command = tools.command("sqlite3")?;
         let mut child = command
@@ -263,10 +460,12 @@ impl SqlState {
 
         let mut state = Self {
             _dir: dir,
+            db_path,
             child,
             stdin: Some(stdin),
             stdout,
             stderr_rx,
+            checkpoint_safe: true,
         };
         // JSON row output for SELECT/WITH/PRAGMA, matching the old -json flag.
         state.write_raw(".mode json\n")?;
@@ -308,6 +507,16 @@ impl SqlState {
     }
 
     fn exec(&mut self, code: &str) -> Result<OValue> {
+        if !sql_checkpoint_profile_accepts(code) {
+            // This is a monotone downgrade for the current actor generation.
+            // Later SQL cannot prove that an attachment, open transaction, or
+            // connection-local mutation was completely undone.
+            self.checkpoint_safe = false;
+        }
+        self.exec_untracked(code)
+    }
+
+    fn exec_untracked(&mut self, code: &str) -> Result<OValue> {
         // Clear stale stderr from prior statements.
         let _ = self.drain_stderr();
 
@@ -363,6 +572,40 @@ impl SqlState {
         let json: Value = serde_json::from_str(trimmed).context("sqlite3 returned non-JSON")?;
         sqlite_json_to_ovalue(json)
     }
+}
+
+/// Conservative profile accepted by the first SQL semantic codec.
+///
+/// False positives only pin a session. Missing a stateful construct would lose
+/// state, so unfamiliar connection control is rejected by broad token checks.
+fn sql_checkpoint_profile_accepts(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    const PINNING_TOKENS: &[&str] = &[
+        "attach",
+        "detach",
+        "begin",
+        "commit",
+        "rollback",
+        "savepoint",
+        "release",
+        "pragma",
+        " temp ",
+        "temporary",
+        "load_extension",
+        ".load",
+        ".open",
+        ".restore",
+        ".backup",
+        "create virtual table",
+        "last_insert_rowid",
+        "changes(",
+        "total_changes(",
+        "random(",
+        "randomblob(",
+    ];
+    !PINNING_TOKENS.iter().any(|token| lower.contains(token))
+        && !lower.trim_start().starts_with('.')
+        && !lower.contains("\n.")
 }
 
 impl Drop for SqlState {
@@ -445,8 +688,8 @@ fn proxy_legacy_backend(lang: &str, tools: &BackendToolchain) -> Result<()> {
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
 
-    while let Some(command) = wire::read_frame::<_, OWireCommand>(&mut reader)? {
-        if matches!(&command, OWireCommand::Shutdown) {
+    while let Some(command) = wire::read_frame::<_, BackendWireCommandV2>(&mut reader)? {
+        if matches!(&command, BackendWireCommandV2::Shutdown) {
             crate::process::lifecycle_trace(
                 "proxy.shutdown_received",
                 format!("language={lang} shim_pid={}", child.id()),
@@ -459,7 +702,7 @@ fn proxy_legacy_backend(lang: &str, tools: &BackendToolchain) -> Result<()> {
             if !status.success() {
                 wire::write_frame(
                     &mut writer,
-                    &OWireResponse::err(format!(
+                    &BackendWireResponseV2::err(format!(
                         "legacy backend shim exited with status {status} during shutdown"
                     )),
                 )?;
@@ -469,7 +712,7 @@ fn proxy_legacy_backend(lang: &str, tools: &BackendToolchain) -> Result<()> {
                 "proxy.shim_reaped",
                 format!("language={lang} shim_pid={}", child.id()),
             );
-            wire::write_frame(&mut writer, &OWireResponse::ok(OValue::Null))?;
+            wire::write_frame(&mut writer, &BackendWireResponseV2::ok(OValue::Null))?;
             crate::process::lifecycle_trace(
                 "proxy.shutdown_acknowledged",
                 format!("language={lang}"),
@@ -483,7 +726,7 @@ fn proxy_legacy_backend(lang: &str, tools: &BackendToolchain) -> Result<()> {
                 .context("legacy backend command pipe is closed")?,
             &command,
         )?;
-        let response = wire::read_frame::<_, OWireResponse>(&mut child_stdout)?
+        let response = wire::read_frame::<_, BackendWireResponseV2>(&mut child_stdout)?
             .ok_or_else(|| anyhow!("legacy backend shim closed stdout unexpectedly"))?;
         wire::write_frame(&mut writer, &response)?;
     }
@@ -1312,7 +1555,27 @@ impl Drop for TempDir {
 
 #[cfg(test)]
 mod tests {
-    use super::has_native_backend;
+    use super::{has_native_backend, sql_checkpoint_profile_accepts};
+
+    #[test]
+    fn sql_checkpoint_profile_is_portable_only_for_main_autocommit_state() {
+        assert!(sql_checkpoint_profile_accepts(
+            "CREATE TABLE items(value INTEGER); INSERT INTO items VALUES (42);"
+        ));
+        assert!(sql_checkpoint_profile_accepts(
+            "SELECT value FROM items ORDER BY value;"
+        ));
+        for source in [
+            "ATTACH DATABASE 'other.db' AS other;",
+            "BEGIN; INSERT INTO items VALUES (1);",
+            "CREATE TEMP TABLE transient(value INTEGER);",
+            "PRAGMA foreign_keys = ON;",
+            "SELECT last_insert_rowid();",
+            ".load './extension'",
+        ] {
+            assert!(!sql_checkpoint_profile_accepts(source), "{source}");
+        }
+    }
 
     #[test]
     fn production_native_launches_cannot_reselect_from_ambient_path() {
