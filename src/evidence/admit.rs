@@ -10,6 +10,7 @@ use crate::effects::{EffectSummary, ResourceKey};
 use crate::eval::Policy;
 use crate::hgraph::{AdmissionFactKind, EdgeId, HGraph, HNodeKind, NodeId, ReadySchedule};
 use crate::ir::{ExecutionPlan, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind};
+use crate::placement::SemanticDigestV1;
 use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
 
 use super::analyze::{
@@ -89,6 +90,7 @@ pub struct AdmittedOperationV1 {
 }
 
 pub const SCHEDULE_WHY_SCHEMA_V1: &str = "oexec.admission-why/v1";
+pub const PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1: &str = "ostadix/placement-admission/v1";
 
 /// One exact HGraph input/producer correspondence behind a blocker.
 ///
@@ -141,6 +143,7 @@ pub struct ExecutionAdmissionV5 {
     executable_manifest: ExecutableManifestV1,
     evidence_sha256: String,
     admitted_graph_sha256: String,
+    placement_admission: SemanticDigestV1,
     admission_sha256: String,
     base_policy: Policy,
     operations: Vec<AdmittedOperationV1>,
@@ -182,6 +185,18 @@ impl ExecutionAdmissionV5 {
         &self.admitted_graph_sha256
     }
 
+    /// Process-portable semantic admission used by placement authority.
+    ///
+    /// This digest deliberately excludes the process-local runtime snapshot,
+    /// executable manifest, environment, ambient world, and launch context
+    /// retained by [`Self::admission_sha256`]. Source bytes, task identity,
+    /// backend realization, environment, sandbox, and physical generation
+    /// remain separately bound placement coordinates.
+    pub fn placement_admission(&self) -> &SemanticDigestV1 {
+        &self.placement_admission
+    }
+
+    /// Full process-local admission digest used for runtime freshness.
     pub fn admission_sha256(&self) -> &str {
         &self.admission_sha256
     }
@@ -296,10 +311,11 @@ impl ExecutionAdmissionV5 {
         .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} admission-sha256={}",
+            "binding analyzer-sha256={} evidence-sha256={} admitted-graph-sha256={} placement-admission-sha256={} admission-sha256={}",
             self.bindings.analyzer_sha256,
             self.evidence_sha256,
             self.admitted_graph_sha256,
+            self.placement_admission,
             self.admission_sha256
         )
         .expect("writing to a String cannot fail");
@@ -1128,6 +1144,8 @@ pub fn admit_execution<'a>(
     let hosted_task_layers = explain_hosted_task_layers(plan, &schedule, &waves)?;
     let operations = explain_operations(&graph, &schedule, &by_plan)?;
     let retained_sequences = explain_sequences(plan, &graph);
+    let placement_admission =
+        placement_admission_digest(&expected_bindings, &admitted_graph_sha256, base_policy);
     let admission_sha256 = digest_fields(
         "ostadix-execution-admission/v5",
         &[
@@ -1146,6 +1164,7 @@ pub fn admit_execution<'a>(
         executable_manifest: runtime.executable_manifest().clone(),
         evidence_sha256,
         admitted_graph_sha256,
+        placement_admission,
         admission_sha256,
         base_policy,
         operations,
@@ -1160,6 +1179,28 @@ pub fn admit_execution<'a>(
         runtime,
         admission,
     })
+}
+
+fn placement_admission_digest(
+    bindings: &EvidenceBindingsV2,
+    admitted_graph_sha256: &str,
+    base_policy: Policy,
+) -> SemanticDigestV1 {
+    let digest = digest_fields(
+        PLACEMENT_ADMISSION_DIGEST_DOMAIN_V1,
+        &[
+            ADMISSION_SCHEMA_V5,
+            ANALYZER_ID_V5,
+            &bindings.oir_sha256,
+            &bindings.plan_sha256,
+            &bindings.analyzed_graph_sha256,
+            admitted_graph_sha256,
+            &bindings.backend_catalog_projection_sha256,
+            policy_name(base_policy),
+        ],
+    );
+    SemanticDigestV1::from_sha256(digest)
+        .expect("canonical placement admission hashing always yields lowercase SHA-256")
 }
 
 fn validate_node_evidence(
@@ -1651,6 +1692,21 @@ mod tests {
         runtime_binding_from_adapter_bytes(plan, &[], &[("evidence-test", label)])
     }
 
+    fn compile_admission(
+        program: &OIrProgram,
+        graph: HGraph,
+        policy: Policy,
+        runtime: RuntimeBindingV1,
+    ) -> ExecutionAdmissionV5 {
+        let plan = program.plan();
+        let evidence = analyze_execution(program, &plan, &graph, runtime.clone())
+            .expect("fixture evidence must analyze");
+        admit_execution(program, &plan, graph, policy, runtime, evidence)
+            .expect("fixture evidence must admit")
+            .admission()
+            .clone()
+    }
+
     type LegalProjection = (
         Vec<Vec<PlanNodeId>>,
         Vec<(PlanNodeId, Vec<OperationBlockerV1>)>,
@@ -1746,6 +1802,86 @@ mod tests {
         assert!(explanation.contains(
             "runtime-readiness=unknown placement-lease=none observed-overlap=not-run source=machine-default"
         ));
+    }
+
+    #[test]
+    fn placement_admission_excludes_process_context_but_binds_semantic_coordinates() {
+        let program = reader_writer_program("portable-admission");
+        let plan = program.plan();
+
+        let runtime_a = inspection_runtime(&plan, "process-context-a");
+        let runtime_b = inspection_runtime(&plan, "process-context-b");
+        assert_ne!(
+            runtime_a.launch_context_sha256(),
+            runtime_b.launch_context_sha256(),
+            "fixture must perturb process-local launch context"
+        );
+        assert_eq!(
+            runtime_a.backend_catalog_projection_sha256(),
+            runtime_b.backend_catalog_projection_sha256(),
+            "process perturbation must retain the semantic catalog projection"
+        );
+
+        let admission_a =
+            compile_admission(&program, solved_graph(&program), Policy::Eager, runtime_a);
+        let admission_b =
+            compile_admission(&program, solved_graph(&program), Policy::Eager, runtime_b);
+        assert_ne!(
+            admission_a.admission_sha256(),
+            admission_b.admission_sha256(),
+            "full admission must retain process-local freshness"
+        );
+        assert_eq!(
+            admission_a.placement_admission(),
+            admission_b.placement_admission(),
+            "placement admission must be portable across process context"
+        );
+
+        let lazy = compile_admission(
+            &program,
+            solved_graph(&program),
+            Policy::Lazy,
+            inspection_runtime(&plan, "process-context-a"),
+        );
+        assert_ne!(
+            admission_a.placement_admission(),
+            lazy.placement_admission(),
+            "base policy is a semantic placement coordinate"
+        );
+
+        let mut changed_catalog_bindings = admission_a.bindings().clone();
+        changed_catalog_bindings.backend_catalog_projection_sha256 = "ab".repeat(32);
+        let changed_catalog = placement_admission_digest(
+            &changed_catalog_bindings,
+            admission_a.admitted_graph_sha256(),
+            Policy::Eager,
+        );
+        assert_ne!(
+            admission_a.placement_admission(),
+            &changed_catalog,
+            "current backend-catalog projection is a semantic placement coordinate"
+        );
+
+        let mut changed_graph_bindings = admission_a.bindings().clone();
+        changed_graph_bindings.analyzed_graph_sha256 = "cd".repeat(32);
+        let changed_analyzed_graph = placement_admission_digest(
+            &changed_graph_bindings,
+            admission_a.admitted_graph_sha256(),
+            Policy::Eager,
+        );
+        assert_ne!(
+            admission_a.placement_admission(),
+            &changed_analyzed_graph,
+            "analyzed HGraph semantics are a placement coordinate"
+        );
+
+        let changed_admitted_graph =
+            placement_admission_digest(admission_a.bindings(), &"ef".repeat(32), Policy::Eager);
+        assert_ne!(
+            admission_a.placement_admission(),
+            &changed_admitted_graph,
+            "admitted HGraph semantics are a placement coordinate"
+        );
     }
 
     #[test]
