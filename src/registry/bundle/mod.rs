@@ -5,6 +5,7 @@
 //! The placement protocol depends only on an injected catalog interface; this
 //! bundle supplies the process-wide current implementation.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 
@@ -20,10 +21,192 @@ use crate::world::ArtifactId;
 
 /// Wire ABI spoken by the current local evaluator/backend process boundary.
 pub const LOCAL_BACKEND_PROTOCOL_ABI_V1: &str = "o-backend-cbor-v1";
-/// Canonical JSON material schema retained for local realization identities.
+/// Archival local-realization material schema. V1 identities remain decodable
+/// but are not current placement authority.
 pub const LOCAL_REALIZATION_SCHEMA_V1: &str = "ostadix.local-realization/v1";
-/// Domain separating a realization-pipeline digest from every other digest.
+/// Archival V1 realization digest domain.
 pub const LOCAL_REALIZATION_DIGEST_DOMAIN_V1: &str = "ostadix/registry/local-realization/v1";
+/// Current local-realization material schema.
+pub const LOCAL_REALIZATION_SCHEMA_V2: &str = "ostadix.local-realization/v2";
+/// Current domain separating realization-pipeline digests from legacy V1.
+pub const LOCAL_REALIZATION_DIGEST_DOMAIN_V2: &str = "ostadix/registry/local-realization/v2";
+/// Current semantic executable-set domain. Path-bearing V1 discovery digests
+/// are archival coordinates and never authorize a current placement.
+pub const BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2: &str = "ostadix/backend-executable-set/v2";
+
+/// How one exact direct-launch alternative was selected for a backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendExecutableSelectionV2 {
+    CompleteCatalogAlternative,
+    AdapterDirectLauncherRefinement,
+}
+
+impl BackendExecutableSelectionV2 {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CompleteCatalogAlternative => "complete-catalog-alternative",
+            Self::AdapterDirectLauncherRefinement => "adapter-direct-launcher-refinement",
+        }
+    }
+}
+
+/// Path-independent semantic coordinate for one executable consumed by a
+/// backend launch. Physical path and file identities stay in admission
+/// evidence; this row binds the selected catalog alternative, invocation
+/// meaning, role, and immutable content.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct BackendExecutableSetRowV2 {
+    requirement_key: String,
+    selected_alternative: u32,
+    selection: BackendExecutableSelectionV2,
+    logical_command: String,
+    role: String,
+    artifact: ArtifactId,
+}
+
+impl BackendExecutableSetRowV2 {
+    pub fn new(
+        requirement_key: impl Into<String>,
+        selected_alternative: u32,
+        selection: BackendExecutableSelectionV2,
+        logical_command: impl Into<String>,
+        role: impl Into<String>,
+        artifact: ArtifactId,
+    ) -> Result<Self, PlacementValidationError> {
+        let requirement_key = requirement_key.into();
+        let logical_command = logical_command.into();
+        let role = role.into();
+        validate_executable_set_token("backend executable requirement key", &requirement_key)?;
+        validate_executable_set_token("backend executable logical command", &logical_command)?;
+        validate_executable_set_token("backend executable role", &role)?;
+        if !matches!(
+            role.as_str(),
+            "direct-launcher" | "ostadix-proxy" | "sandbox-wrapper"
+        ) {
+            return Err(PlacementValidationError::InvalidToken {
+                field: "backend executable role",
+                value: role,
+            });
+        }
+        Ok(Self {
+            requirement_key,
+            selected_alternative,
+            selection,
+            logical_command,
+            role,
+            artifact,
+        })
+    }
+
+    pub fn requirement_key(&self) -> &str {
+        &self.requirement_key
+    }
+
+    pub const fn selected_alternative(&self) -> u32 {
+        self.selected_alternative
+    }
+
+    pub const fn selection(&self) -> BackendExecutableSelectionV2 {
+        self.selection
+    }
+
+    pub fn logical_command(&self) -> &str {
+        &self.logical_command
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn artifact(&self) -> &ArtifactId {
+        &self.artifact
+    }
+
+    fn coordinate_label(&self) -> String {
+        format!(
+            "{}@{}/{}/{}/{}",
+            self.requirement_key,
+            self.selected_alternative,
+            self.selection.name(),
+            self.logical_command,
+            self.role
+        )
+    }
+}
+
+/// Project exact launch rows into the current path-independent executable-set
+/// identity. Inputs are sorted canonically, so filesystem traversal and
+/// manifest row order cannot affect the result.
+pub fn backend_executable_set_v2(
+    rows: impl IntoIterator<Item = BackendExecutableSetRowV2>,
+) -> Result<SemanticDigestV1, PlacementValidationError> {
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    rows.sort();
+
+    let mut coordinates = BTreeSet::new();
+    for row in &rows {
+        let coordinate = (
+            row.requirement_key.as_str(),
+            row.selected_alternative,
+            row.selection,
+            row.logical_command.as_str(),
+            row.role.as_str(),
+        );
+        if !coordinates.insert(coordinate) {
+            return Err(PlacementValidationError::Duplicate {
+                kind: "backend executable-set coordinate",
+                value: row.coordinate_label(),
+            });
+        }
+    }
+    if let Some(first) = rows.first() {
+        if rows.iter().skip(1).any(|row| {
+            row.requirement_key != first.requirement_key
+                || row.selected_alternative != first.selected_alternative
+                || row.selection != first.selection
+        }) {
+            return Err(PlacementValidationError::InvalidToken {
+                field: "backend executable-set selection",
+                value: "mixed requirement or alternative coordinates".to_owned(),
+            });
+        }
+    }
+
+    let bytes = serde_json::to_vec(&rows)
+        .map_err(|error| PlacementValidationError::CanonicalSerialization(error.to_string()))?;
+    Ok(SemanticDigestV1::hash_bytes(
+        BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2,
+        &bytes,
+    ))
+}
+
+fn validate_executable_set_token(
+    field: &'static str,
+    value: &str,
+) -> Result<(), PlacementValidationError> {
+    const MAX_TOKEN_BYTES: usize = 128;
+    if value.is_empty() {
+        return Err(PlacementValidationError::Empty { field });
+    }
+    if value.len() > MAX_TOKEN_BYTES {
+        return Err(PlacementValidationError::TooLong {
+            field,
+            limit: MAX_TOKEN_BYTES,
+        });
+    }
+    if matches!(value, "." | "..")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b':' | b'/')
+        })
+    {
+        return Err(PlacementValidationError::InvalidToken {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -767,18 +950,26 @@ impl BackendRegistry {
         }
 
         let protocol_abi = protocol_abi.into();
+        if protocol_abi != LOCAL_BACKEND_PROTOCOL_ABI_V1 {
+            return Err(PlacementValidationError::ScopeMismatch {
+                field: "backend implementation protocol ABI",
+                expected: LOCAL_BACKEND_PROTOCOL_ABI_V1.to_owned(),
+                got: protocol_abi,
+            });
+        }
         let realization_material = serde_json::json!({
-            "schema": LOCAL_REALIZATION_SCHEMA_V1,
+            "schema": LOCAL_REALIZATION_SCHEMA_V2,
             "backend_specification": backend_specification.as_sha256(),
             "adapter_kind": spec.adapter.name(),
             "adapter_artifact": adapter_artifact.as_sha256(),
+            "executable_set_schema": BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2,
             "executable_set": executable_set.as_sha256(),
             "protocol": protocol_abi.as_str(),
         });
         let realization_bytes = serde_json::to_vec(&realization_material)
             .map_err(|error| PlacementValidationError::CanonicalSerialization(error.to_string()))?;
         let realization_pipeline =
-            SemanticDigestV1::hash_bytes(LOCAL_REALIZATION_DIGEST_DOMAIN_V1, &realization_bytes);
+            SemanticDigestV1::hash_bytes(LOCAL_REALIZATION_DIGEST_DOMAIN_V2, &realization_bytes);
         BackendImplementationIdV1::new(
             backend_specification,
             adapter_artifact,
@@ -889,6 +1080,23 @@ impl CurrentBackendCatalogV1 for BackendRegistry {
         self.contains_specification_sha256(digest.as_sha256())
     }
 
+    fn contains_current_implementation(&self, implementation: &BackendImplementationIdV1) -> bool {
+        let Some(spec) = self.specs.iter().find(|spec| {
+            self.specification_sha256(spec.name).as_deref()
+                == Some(implementation.backend_specification().as_sha256())
+        }) else {
+            return false;
+        };
+        self.backend_implementation_id_v1(
+            spec.name,
+            Some(implementation.backend_specification()),
+            implementation.adapter_artifact().clone(),
+            implementation.executable_set().clone(),
+            implementation.protocol_abi(),
+        )
+        .is_ok_and(|current| current == *implementation)
+    }
+
     fn state_support_for_current_specification(
         &self,
         digest: &SemanticDigestV1,
@@ -911,6 +1119,54 @@ mod tests {
 
     fn digest(byte: u8) -> SemanticDigestV1 {
         SemanticDigestV1::from_sha256(format!("{byte:02x}").repeat(32)).unwrap()
+    }
+
+    fn executable_row(logical_command: &str, role: &str, byte: u8) -> BackendExecutableSetRowV2 {
+        BackendExecutableSetRowV2::new(
+            "bash",
+            0,
+            BackendExecutableSelectionV2::CompleteCatalogAlternative,
+            logical_command,
+            role,
+            artifact(byte),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn executable_set_v2_is_order_invariant_and_content_sensitive() {
+        let direct = executable_row("bash", "direct-launcher", 0x44);
+        let proxy = executable_row("__ostadix_current_executable__", "ostadix-proxy", 0x55);
+        let forward = backend_executable_set_v2([direct.clone(), proxy.clone()]).unwrap();
+        let reverse = backend_executable_set_v2([proxy, direct]).unwrap();
+        let changed = backend_executable_set_v2([
+            executable_row("bash", "direct-launcher", 0x45),
+            executable_row("__ostadix_current_executable__", "ostadix-proxy", 0x55),
+        ])
+        .unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_ne!(forward, changed);
+        assert_eq!(
+            forward.as_sha256(),
+            "f72db198d56a1b89e6daf7b9e43c345ed4790be49dbf28740bbcc66aaf2911a1"
+        );
+    }
+
+    #[test]
+    fn executable_set_v2_rejects_duplicate_launch_coordinates() {
+        let error = backend_executable_set_v2([
+            executable_row("bash", "direct-launcher", 0x44),
+            executable_row("bash", "direct-launcher", 0x45),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PlacementValidationError::Duplicate {
+                kind: "backend executable-set coordinate",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -942,7 +1198,7 @@ mod tests {
         );
         assert_eq!(
             canonical.realization_pipeline().as_sha256(),
-            "c98daed592288c5e4e80bd10be1c8f26786303d07d001d4250171616e4e41c90"
+            "862eb13d45352d2ce3728700252c2b47ad237ced2521d38c4e315c5ad8af5a0b"
         );
 
         // Compatibility oracle for the formula formerly owned by
@@ -956,10 +1212,24 @@ mod tests {
             "protocol": "o-backend-cbor-v1",
         });
         let legacy_pipeline = SemanticDigestV1::hash_bytes(
-            "ostadix/registry/local-realization/v1",
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
             &serde_json::to_vec(&legacy_material).unwrap(),
         );
-        assert_eq!(canonical.realization_pipeline(), &legacy_pipeline);
+        assert_eq!(
+            legacy_pipeline.as_sha256(),
+            "c98daed592288c5e4e80bd10be1c8f26786303d07d001d4250171616e4e41c90"
+        );
+        assert_ne!(canonical.realization_pipeline(), &legacy_pipeline);
+        let legacy = BackendImplementationIdV1::new(
+            canonical.backend_specification().clone(),
+            canonical.adapter_artifact().clone(),
+            canonical.executable_set().clone(),
+            canonical.protocol_abi(),
+            legacy_pipeline,
+        )
+        .unwrap();
+        assert!(registry.contains_current_implementation(&canonical));
+        assert!(!registry.contains_current_implementation(&legacy));
     }
 
     #[test]
@@ -1037,5 +1307,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(implementation.backend_specification(), &expected);
+    }
+
+    #[test]
+    fn implementation_identity_rejects_a_foreign_protocol_abi() {
+        let registry = BackendRegistry::global();
+        let adapter_artifact = artifact(0x11);
+        let executable_set = digest(0x22);
+        let error = registry
+            .backend_implementation_id_v1(
+                "markdown",
+                None,
+                adapter_artifact.clone(),
+                executable_set.clone(),
+                "foreign-backend-abi-v1",
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            PlacementValidationError::ScopeMismatch {
+                field: "backend implementation protocol ABI",
+                expected: LOCAL_BACKEND_PROTOCOL_ABI_V1.to_owned(),
+                got: "foreign-backend-abi-v1".to_owned(),
+            }
+        );
+
+        let backend_specification =
+            SemanticDigestV1::from_sha256(registry.specification_sha256("markdown").unwrap())
+                .unwrap();
+        let foreign_material = serde_json::json!({
+            "schema": LOCAL_REALIZATION_SCHEMA_V2,
+            "backend_specification": backend_specification.as_sha256(),
+            "adapter_kind": "inline",
+            "adapter_artifact": adapter_artifact.as_sha256(),
+            "executable_set_schema": BACKEND_EXECUTABLE_SET_DIGEST_DOMAIN_V2,
+            "executable_set": executable_set.as_sha256(),
+            "protocol": "foreign-backend-abi-v1",
+        });
+        let foreign_pipeline = SemanticDigestV1::hash_bytes(
+            LOCAL_REALIZATION_DIGEST_DOMAIN_V2,
+            &serde_json::to_vec(&foreign_material).unwrap(),
+        );
+        let foreign = BackendImplementationIdV1::new(
+            backend_specification,
+            adapter_artifact,
+            executable_set,
+            "foreign-backend-abi-v1",
+            foreign_pipeline,
+        )
+        .unwrap();
+        assert!(!registry.contains_current_implementation(&foreign));
     }
 }
