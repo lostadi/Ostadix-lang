@@ -61,7 +61,8 @@ numeric indices remain numeric and `o-unlink` preserves them.
 `[*]` never means “choose an existing shared environment.” Each occurrence is
 fresh. Programs that intentionally share evaluator state must continue to use
 an explicit numeric environment and accept its locality/serialization
-constraint.
+constraint. Sequential `LANG[*]` syntax and fresh-per-occurrence semantics are
+supported by the Rust runtime, the Python reference, and the C17 edition.
 
 The current V5 scheduler's `ActorResourceId` remains the canonical backend name
 plus persistent numeric environment. Its process registry separately adds the
@@ -78,6 +79,17 @@ Inlined `.O` roots and structural coordinator boundaries remain sequential and
 split those runs. Hidden effects from already started operations can race and
 are not rolled back. This syntax does not prove remote eligibility and does not
 implicitly contact `o-node`.
+
+The linker's existing import/include scan is a scheduling constraint, not just
+an output sort: detected dependencies form topological barrier waves, and only
+an antichain within one wave may share a batch. Dependency cycles retain stable
+source order and are serialized conservatively.
+
+The emitted `autonomous(batch(...))` call expression is currently executable
+only by the authoritative Rust edition. C17 supports `LANG[*]` but schedules
+operations serially; the Python reference supports sequential `LANG[*]` but
+lacks the call-expression grammar used by that wrapper. Cross-edition users of
+generated literal wrappers must therefore keep the ordered linker default.
 
 Use `--parallel=verified` to admit only catalog-verified pure inline renderers,
 `--parallel-required` to fail if any selected section cannot enter the chosen
@@ -172,8 +184,10 @@ lease and does not automatically authorize dispatch.
 Specifically, `o-node profile` and `octl node profile` expose the descriptive
 `hosted_remote::NodeProfileV1` catalog/limit record. It is distinct from the
 authenticated, short-lived `placement::NodeProfileV1` used by the proof core.
-`doctor` reports point-in-time transport/runtime readiness; it is not a
-`PlacementWarrantV1` or capacity reservation.
+`doctor` reports point-in-time transport and native-image preflight readiness;
+it is not a backend-protocol probe, `PlacementWarrantV1`, or capacity
+reservation. The first admitted hosted-backend launch exercises the selected
+image's O protocol.
 
 The placement core separately caps a node profile at 60 seconds, a capacity
 observation at 5 seconds, and a placement lease at 30 seconds. These are maximum
@@ -186,10 +200,11 @@ Registry v1 carries `placement::NodeProfileV1` records in canonical-CBOR,
 Ed25519-signed, append-only snapshots. A pinned `NamespaceRootV1` can delegate
 only to a strict descendant namespace through `NamespaceDelegationV1`.
 Verification checks signatures, scope, validity, sequence and previous-event
-chains, monotonic profile generations, and snapshot continuity. Imports merge
-only snapshots anchored by a local trust pin or a current delegation and reject
-rollback, forks, equivocation, and conflicting profiles before atomically
-replacing local state.
+chains, monotonic profile generations, and snapshot continuity. Future-dated
+events are rejected, and every profile validity interval must fit completely
+inside one signer-authority interval. Imports merge only snapshots anchored by
+a local trust pin or a current delegation and reject rollback, forks,
+equivocation, and conflicting profiles before atomically replacing local state.
 
 `o-registry` is the durable local-file CLI for this core. All state, key, and
 trust paths are explicit. A minimal local flow after normal setup is:
@@ -227,11 +242,15 @@ o-registry list \
 ```
 
 `profile-local` defaults to a 45-second profile lifetime, up to the placement
-core's 60-second maximum. It binds the registry signing-key identity and
+core's 60-second maximum; the CLI rejects values outside `1..=60` before it
+touches registry state. It binds the registry signing-key identity and
 fingerprints the exact adapter and installed runtime artifacts for each
 selected `--backend`. Repeat `--backend`, `--capability`, or `--cpu-feature` as
 needed; shim backends also require `--shim-dir`. Generate and publish the
-short-lived profile together.
+short-lived profile together. Normal setup installs `ostadix-evaluator` as a
+native, byte-identical evaluator alias so `profile-local` never mistakes the
+case-insensitive `O`/`o` shell dispatcher for evaluator bytes. A script passed
+through `--runtime-binary` is rejected rather than executed or fingerprinted.
 
 The generated placement profile is intentionally different from the
 self-reported descriptive profile returned by `o-node profile`. It is not a
@@ -242,6 +261,11 @@ authorization. The registry signer key must retain mode `0600` on Unix.
 `o-registry import` verifies and atomically merges one. The core library
 supports namespace-delegation records; the current CLI does not mint
 delegations or edit trust roots, and it never serves snapshots over a network.
+Publish and import transactions hold a persistent sibling advisory lock across
+read, verification, append/merge, atomic replacement, and directory sync, so
+cooperating CLI processes cannot silently lose one another's appends. Do not
+delete that `.lock` file while writers are running; advisory locking does not
+constrain programs that bypass the registry transaction API.
 The lowercase wrapper exposes the same operations as `o registry ...`.
 Verification rejects expired profiles by default. `--allow-stale-profiles` is
 an explicit inspection/import policy that preserves the stale marker; it does
@@ -258,6 +282,16 @@ The node binds `127.0.0.1:7337` by default, the client connects to that address
 and validates the certificate name `localhost`, and the node permits at most 32
 simultaneous connections. Use `o-node serve --bind`, `octl node ... --address`,
 and `--server-name` for an explicitly configured non-loopback endpoint.
+
+`o-node doctor` and `serve` also require a supported native evaluator image.
+Normal setup installs the byte-identical `ostadix-evaluator` alias beside
+`o-node`; development builds may resolve a sibling native `O`. Those paths are
+covered by the hosted execution gate. Use `--runtime-binary` to select another
+native image. Preflight checks its file type, executable permission, and native
+image magic, but does not claim ABI or `--o-backend` compatibility until an
+admitted hosted block launches. Script dispatchers are rejected, and each operation's
+V5 admission opens, hashes, and retains the selected evaluator rather than
+binding the embedding `o-node` executable.
 
 Control messages are canonical CBOR with a 2 MiB frame maximum. Operation
 source is capped at 1 MiB and returned result data at 768 KiB. Connect and TLS

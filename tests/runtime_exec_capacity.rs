@@ -15,6 +15,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn backends_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("backends")
 }
@@ -89,7 +91,10 @@ __oval_result__ = o_capacity_counter
         .process_group(0);
 
     let started = Instant::now();
-    let output = wait_bounded(command.spawn().unwrap(), Duration::from_secs(15));
+    let output = wait_bounded(
+        support::spawn_private_executable(&mut command).unwrap(),
+        Duration::from_secs(15),
+    );
     let elapsed = started.elapsed();
     assert!(
         output.status.success(),
@@ -244,7 +249,10 @@ autonomous(batch(instantiate($e1), instantiate($e2)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let output = wait_bounded(command.spawn().unwrap(), Duration::from_secs(15));
+    let output = wait_bounded(
+        support::spawn_private_executable(&mut command).unwrap(),
+        Duration::from_secs(15),
+    );
     assert!(
         output.status.success(),
         "parallel Request execution failed\nstdout:\n{}\nstderr:\n{}",

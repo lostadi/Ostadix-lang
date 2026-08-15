@@ -505,8 +505,10 @@ fn olink_execute_all_alias_enters_explicit_legacy_mode() {
     assert!(stderr.contains("--literal/--execute-all directory mode"));
     let source = fs::read_to_string(output).unwrap();
     assert!(source.starts_with("# Linked by o-link"));
-    assert!(source.contains("bash[0]^("));
-    assert!(source.contains("python[0]^("));
+    assert!(source.contains("bash[*]^("));
+    assert!(source.contains("python[*]^("));
+    assert!(!source.contains("bash[0]^("));
+    assert!(!source.contains("python[0]^("));
     assert!(!source.contains("O-PROJECT-BUNDLE-V1"));
     assert!(
         !marker.exists(),

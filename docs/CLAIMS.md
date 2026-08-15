@@ -205,9 +205,12 @@
 - Registry v1 is a transport-independent, canonical-CBOR, Ed25519-signed
   append-only store for namespace-scoped `placement::NodeProfileV1` records.
   It verifies pinned roots, strict-descendant namespace delegation, sequence
-  and previous-event chains, profile freshness and monotonic generation, and
-  rejects rollback, forks, equivocation, or untrusted imports before atomic
-  replacement. `o-registry` provides local `init`, `profile-local`,
+  and previous-event chains, rejects future-dated events, contains each profile
+  validity interval within one signer authority, checks profile freshness and
+  monotonic generation, and rejects rollback, forks, equivocation, or untrusted
+  imports before atomic replacement. Cooperating publish/import writers hold a
+  persistent sibling advisory lock for the complete transaction. `o-registry`
+  provides local `init`, `profile-local`,
   `publish-profile`, `verify`, `list`, `export`, and `import` operations; it is
   not a network daemon, discovery service, health oracle, lease issuer, or
   execution authority, and the direct node path does not consume it.
@@ -241,16 +244,33 @@
   remain serial.
 - Literal `o-link` wrappers use linker-isolated `[*]` environments rather than
   synthesized persistent numeric indices. Authored numeric environments remain
-  persistent logical affinity. Ordered linking remains the default;
+  persistent logical affinity. Sequential `LANG[*]` syntax and fresh semantics
+  are implemented by Rust, the Python reference, and C17. Ordered `LANG[*]`
+  wrapping remains the cross-edition form;
   `o-link --parallel` is explicit autonomous consent, each admitted parallel
   run returns input-ordered results, and sequential structural/inlined `.O`
-  boundaries split those runs. It does not by itself establish remote
-  eligibility or rollback already-started hidden effects.
+  boundaries split those runs. Its emitted `autonomous(batch(...))` call
+  expression currently requires the Rust edition: C17 schedules serially and
+  the Python reference lacks call-expression grammar. Parallel linking does not
+  by itself establish remote eligibility or rollback already-started hidden
+  effects. Detected import/include dependencies form topological barrier waves;
+  only same-wave antichains overlap, and dependency cycles are serialized in
+  stable source order.
 - The bounded direct-node transport uses synchronous TCP with TLS 1.3-only
   mutual X.509 authentication, a pinned CA and server name, required client
   certificate/key, and ALPN. It has no plaintext or 0-RTT path. Canonical-CBOR
   frames are limited to 2 MiB; operation source to 1 MiB; result payload to
   768 KiB; connect/handshake to 10 seconds; and I/O to 60 seconds by default.
+  The embedding `o-node` process is not treated as the O backend proxy: doctor
+  and serve resolve a native `ostadix-evaluator`/sibling O or an explicit
+  `--runtime-binary`, reject script dispatchers, and bind that exact executable
+  into each operation's retained V5 executable manifest. Doctor's native-image
+  check is a format preflight, not an ABI or backend-protocol probe; the
+  default/sibling O path is exercised end-to-end, while an arbitrary explicit
+  image proves protocol compatibility only on an admitted hosted-backend
+  launch. Registry
+  `profile-local` records default to 45 seconds and accept integer lifetimes
+  from 1 through 60 seconds.
 - `octl node run` sends one operator-selected node a
   `RemotePreparedOperationV1` binding exact source SHA-256, task/attempt
   identities, the full descriptive backend-catalog digest, deadline, and output

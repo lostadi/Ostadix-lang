@@ -1,14 +1,15 @@
 """
-Python backend: real execution, persistent globals per env_id.
+Python backend: real execution with explicit persistent and fresh globals.
 
 Semantics of evaluate(body, env):
   * The body string is treated as a Python module top-level.
   * If the body's final statement is an expression, its value becomes
     the expression's OValue. Otherwise, captured stdout becomes an OStr;
     if there's no stdout either, the result is ONull.
-  * `env` is the persistent globals dict for this (python, env_id) pair.
-    State (imports, variables, function defs) survives across invocations
-    of the same env_id, which is how you get a REPL-like shell per [N].
+  * For a numeric ``[N]`` block, `env` is the persistent globals dict for its
+    (python, env_id) pair. State survives across invocations, which gives a
+    REPL-like shell per ``[N]``. Bare and ``[*]`` blocks receive a newly made
+    globals dict for each attempt instead.
 
 Opportunistic native -> OValue lifting:
   * matplotlib.figure.Figure  ->  OBlob(png_bytes, 'image/png')
