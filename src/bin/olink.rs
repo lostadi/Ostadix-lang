@@ -10,20 +10,20 @@
 // In literal mode, each input file is wrapped in the typed-expression block of
 // the backend that matches its extension:
 //
-//   hello.py    →  python[N]^( ...file contents... )_python[N]
-//   build.sh    →  bash[N]^( ...file contents... )_bash[N]
-//   index.html  →  html[N]^( ...file contents... )_html[N]
-//   notes.md    →  markdown[N]^( ... )_markdown[N]
+//   hello.py    →  python[*]^( ...file contents... )_python[*]
+//   build.sh    →  bash[*]^( ...file contents... )_bash[*]
+//   index.html  →  html[*]^( ...file contents... )_html[*]
+//   notes.md    →  markdown[*]^( ... )_markdown[*]
 //   prog.O      →  inlined verbatim (it is already Ostadix-lang source)
 //
-// Every wrapped file receives a unique `[N]` environment index within its
-// language group (python[0], python[1], …), so each file runs in its own
-// isolated backend environment and their state cannot leak into one another.
+// Every wrapped file receives the explicit `[*]` fresh-environment marker.
+// Unlike an authored numeric `[N]`, this is placement-eligible and cannot
+// collide across aliases or with an environment already present in an inlined
+// `.O` source.
 //
 // Files of the same language are ordered by their import-dependency graph
-// before being assigned environment indices: if `b.py` imports from `a.py`,
-// `a.py` will appear as python[0] and `b.py` as python[1], regardless of
-// their alphabetical order.  For languages without import scanning support,
+// before wrapping: if `b.py` imports from `a.py`, `a.py` will appear first,
+// regardless of alphabetical order. For languages without import scanning support,
 // files keep the sorted order from the directory walk.
 //
 // Literal directories are walked recursively; every UTF-8 text file is
@@ -63,7 +63,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
-use clap::Parser as ClapParser;
+use clap::{Parser as ClapParser, ValueEnum};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -76,6 +76,25 @@ use o_lang::value::OValue;
 
 const SECTION_LENGTH_PREFIX: &str = "# o-link-section-bytes: ";
 const O_LINK_GENERATED_HEADER: &str = "# Linked by o-link";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ParallelLinkMode {
+    /// Explicitly authorize fresh hosted blocks to overlap despite unknown
+    /// hidden host effects. Explicit O-value dependencies remain ordered.
+    Autonomous,
+    /// Overlap only catalog-verified pure inline renderers; hosted shims remain
+    /// sequential in their original positions.
+    Verified,
+}
+
+impl ParallelLinkMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Autonomous => "autonomous",
+            Self::Verified => "verified",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkippedPath {
@@ -233,6 +252,25 @@ struct Cli {
     /// `id=NAME;cmd=PROGRAM ARGS;cwd=.;provides=a,b;codec=json;depends=r1,r2`.
     #[arg(long = "route-decl", value_name = "DECL")]
     route_decls: Vec<String>,
+
+    /// Emit placement-eligible execution groups. With no value this selects
+    /// `autonomous`; use `--parallel=verified` to overlap only verified pure
+    /// inline renderers.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "autonomous"
+    )]
+    parallel: Option<ParallelLinkMode>,
+
+    /// Fail if any selected section cannot enter the requested parallel lane.
+    #[arg(long = "parallel-required", requires = "parallel")]
+    parallel_required: bool,
+
+    /// Explain each section's parallel-placement decision on stderr.
+    #[arg(long = "explain-parallel")]
+    explain_parallel: bool,
 }
 
 fn main() -> Result<()> {
@@ -305,9 +343,16 @@ fn main() -> Result<()> {
         eprintln!(
             "warning: --literal/--execute-all directory mode wraps every selected UTF-8 file as executable backend code"
         );
-        eprintln!(
-            "warning: running the linked document executes all wrapped backend blocks in dependency order"
-        );
+        if let Some(mode) = cli.parallel {
+            eprintln!(
+                "warning: {} parallel groups preserve result order, but admitted members have unordered hidden effects",
+                mode.label()
+            );
+        } else {
+            eprintln!(
+                "warning: running the linked document executes all wrapped backend blocks in dependency order"
+            );
+        }
     }
 
     let mut ext_map = default_extension_map();
@@ -334,11 +379,14 @@ fn main() -> Result<()> {
         bail!("no linkable files found in the given inputs");
     }
 
-    let mut combined = link_files(
+    let mut combined = link_files_with_options(
         &collected.files,
         &collected.marker_root,
         &ext_map,
         &backends,
+        cli.parallel,
+        cli.parallel_required,
+        cli.explain_parallel,
     )?;
 
     if !cli.no_validate {
@@ -467,6 +515,15 @@ fn ensure_project_compatible_flags(cli: &Cli) -> Result<()> {
     }
     if !cli.backend_grants.is_empty() {
         incompatible.push("--backend-grant");
+    }
+    if cli.parallel.is_some() {
+        incompatible.push("--parallel");
+    }
+    if cli.parallel_required {
+        incompatible.push("--parallel-required");
+    }
+    if cli.explain_parallel {
+        incompatible.push("--explain-parallel");
     }
 
     if !incompatible.is_empty() {
@@ -1050,35 +1107,53 @@ fn file_backend(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
 // Linking
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
+struct LinkedSection {
+    marker: PathBuf,
+    body: String,
+    parallel_eligible: bool,
+    /// Monotone execution wave derived from detected source dependencies.
+    /// Sections in one wave may overlap; a later wave is emitted as a new
+    /// top-level coordination call, so the evaluator settles the predecessor
+    /// wave before starting it.
+    dependency_wave: usize,
+    decision: String,
+}
+
+#[cfg(test)]
 fn link_files(
     files: &[PathBuf],
     marker_root: &Path,
     ext_map: &BTreeMap<String, String>,
     backends: &HashSet<String>,
 ) -> Result<String> {
+    link_files_with_options(files, marker_root, ext_map, backends, None, false, false)
+}
+
+fn link_files_with_options(
+    files: &[PathBuf],
+    marker_root: &Path,
+    ext_map: &BTreeMap<String, String>,
+    backends: &HashSet<String>,
+    parallel: Option<ParallelLinkMode>,
+    parallel_required: bool,
+    explain_parallel: bool,
+) -> Result<String> {
     // Reorder same-language files according to their import-graph so that
     // files depended on by others always appear first.  Files of different
     // languages keep their relative order from the input list.
-    let ordered = order_by_deps(files, ext_map);
+    let ordered = dependency_order_plan(files, ext_map);
+    let registry = o_lang::ir::BackendRegistry::global();
+    let mut sections = Vec::with_capacity(ordered.len());
 
-    let mut out = String::new();
-    out.push_str("# Linked by o-link: single-file .O program\n");
-
-    // Track how many files of each language we have seen so far so we can
-    // give every wrapped file its own isolated `[N]` environment slot.
-    // `.O` files are inlined verbatim and do not get an env slot.
-    let mut lang_counters: HashMap<String, u32> = HashMap::new();
-
-    for path in &ordered {
+    for ordered_file in &ordered {
+        let path = &ordered_file.path;
         let backend = file_backend(path, ext_map);
         let mut content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let marker = marker_path(path, marker_root)?;
 
-        out.push('\n');
-        out.push_str(&format!("# ── {} ──\n", marker.display()));
-
-        let mut section = String::new();
+        let mut body = String::new();
 
         if backend.is_empty() {
             // .O source: strip a shebang line and inline verbatim.
@@ -1088,35 +1163,135 @@ fn link_files(
                     .map(|nl| content[nl + 1..].to_string())
                     .unwrap_or_default();
             }
-            section.push_str(&content);
+            body.push_str(&content);
         } else {
-            // Assign a unique per-language environment index so that every
-            // wrapped file runs in its own isolated backend environment.
-            // `python[0]^(...)_python[0]`, `python[1]^(...)_python[1]`, …
-            let env_id = lang_counters.entry(backend.clone()).or_insert(0);
-            let n = *env_id;
-            *env_id += 1;
-
-            let tag = format!("{backend}[{n}]");
+            // `[*]` is an explicit fresh-environment request, not a logical
+            // actor identity. It cannot collide across aliases or with an
+            // authored `.O` environment and remains placement-eligible.
+            let tag = format!("{backend}[*]");
             let closer = format!(")_{tag}");
             let escaped = escape_body(&content, &closer, backends);
-            section.push_str(&tag);
-            section.push_str("^(\n");
-            section.push_str(&escaped);
-            section.push_str(&closer);
-            section.push('\n');
+            body.push_str(&tag);
+            body.push_str("^(\n");
+            body.push_str(&escaped);
+            body.push_str(&closer);
+            body.push('\n');
         }
 
-        out.push_str(SECTION_LENGTH_PREFIX);
-        out.push_str(&section.len().to_string());
-        out.push('\n');
-        out.push_str(&section);
-        if !section.ends_with('\n') {
-            out.push('\n');
+        let (parallel_eligible, decision) = match (parallel, backend.is_empty()) {
+            (None, _) => (
+                false,
+                "sequential: --parallel was not requested".to_string(),
+            ),
+            (Some(_), true) => (
+                false,
+                "sequential: an inlined .O document may contain multiple ordered roots".to_string(),
+            ),
+            (Some(mode), false) => {
+                let spec = registry
+                    .get(&backend)
+                    .expect("file backend came from the registered backend set");
+                match mode {
+                    ParallelLinkMode::Autonomous
+                        if spec.execution != o_lang::ir::ExecutionMode::InlineAst =>
+                    {
+                        (
+                            true,
+                            "parallel: explicit autonomous fresh-environment opt-in".to_string(),
+                        )
+                    }
+                    ParallelLinkMode::Autonomous => (
+                        false,
+                        "sequential: structural InlineAst backends stay coordinator-owned"
+                            .to_string(),
+                    ),
+                    ParallelLinkMode::Verified
+                        if spec.pure
+                            && spec.execution == o_lang::ir::ExecutionMode::InlineValue =>
+                    {
+                        (
+                            true,
+                            "parallel: catalog-verified pure inline renderer".to_string(),
+                        )
+                    }
+                    ParallelLinkMode::Verified => (
+                        false,
+                        "sequential: backend lacks a verified pure inline contract".to_string(),
+                    ),
+                }
+            }
+        };
+
+        if explain_parallel {
+            eprintln!("o-link placement: {}: {}", marker.display(), decision);
+        }
+        sections.push(LinkedSection {
+            marker,
+            body,
+            parallel_eligible,
+            dependency_wave: ordered_file.wave,
+            decision,
+        });
+    }
+
+    if parallel_required {
+        let rejected = sections
+            .iter()
+            .filter(|section| !section.parallel_eligible)
+            .map(|section| format!("{} ({})", section.marker.display(), section.decision))
+            .collect::<Vec<_>>();
+        if !rejected.is_empty() {
+            bail!(
+                "--parallel-required could not place {} section(s) in the {} lane:\n  {}",
+                rejected.len(),
+                parallel.expect("clap requires --parallel").label(),
+                rejected.join("\n  ")
+            );
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("# Linked by o-link: single-file .O program\n");
+    let mut index = 0;
+    while index < sections.len() {
+        if parallel.is_some() && sections[index].parallel_eligible {
+            let run_start = index;
+            let dependency_wave = sections[index].dependency_wave;
+            while index < sections.len()
+                && sections[index].parallel_eligible
+                && sections[index].dependency_wave == dependency_wave
+            {
+                index += 1;
+            }
+            out.push_str("\nautonomous(batch(\n");
+            for (offset, section) in sections[run_start..index].iter().enumerate() {
+                emit_linked_section(&mut out, section);
+                if offset + 1 < index - run_start {
+                    out.push_str(",\n");
+                } else {
+                    out.push('\n');
+                }
+            }
+            out.push_str("))\n");
+        } else {
+            emit_linked_section(&mut out, &sections[index]);
+            index += 1;
         }
     }
 
     Ok(out)
+}
+
+fn emit_linked_section(out: &mut String, section: &LinkedSection) {
+    out.push('\n');
+    out.push_str(&format!("# ── {} ──\n", section.marker.display()));
+    out.push_str(SECTION_LENGTH_PREFIX);
+    out.push_str(&section.body.len().to_string());
+    out.push('\n');
+    out.push_str(&section.body);
+    if !section.body.ends_with('\n') {
+        out.push('\n');
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1132,6 +1307,35 @@ fn link_files(
 /// Cycles are broken conservatively: any file that participates in a cycle
 /// keeps its original position relative to the other cycle members.
 pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    dependency_order_plan(files, ext_map)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct DependencyOrderedFile {
+    path: PathBuf,
+    wave: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GroupDependencyEntry {
+    path: PathBuf,
+    dependencies: Vec<PathBuf>,
+    /// Cycles have no valid topological wave. Preserve the legacy fallback by
+    /// serializing their remaining members in original order.
+    force_barrier_before: bool,
+}
+
+/// Produce the stable file order together with the execution wave required by
+/// every detected dependency. The wave numbers are monotone in emitted order,
+/// preserving the existing cross-language interleave while allowing unrelated
+/// files adjacent to a dependent to share its wave.
+fn dependency_order_plan(
+    files: &[PathBuf],
+    ext_map: &BTreeMap<String, String>,
+) -> Vec<DependencyOrderedFile> {
     // Group files by dependency language, preserving original indices so we
     // can interleave the sorted groups back correctly. This differs from the
     // output backend for C/C++ headers: .h/.hpp still render as inert text,
@@ -1146,21 +1350,50 @@ pub fn order_by_deps(files: &[PathBuf], ext_map: &BTreeMap<String, String>) -> V
 
     // Sort each group by import-graph dependencies, then reassemble the full
     // list in original index order (preserving cross-language ordering).
-    let mut sorted_entries: Vec<(usize, PathBuf)> = Vec::with_capacity(files.len());
+    let mut sorted_entries: Vec<(usize, GroupDependencyEntry)> = Vec::with_capacity(files.len());
 
     for group in groups.values() {
         let orig_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
         let paths: Vec<&PathBuf> = group.iter().map(|(_, p)| *p).collect();
-        let sorted_paths = topo_sort_group(&paths, ext_map);
+        let sorted_paths = dependency_plan_group(&paths, ext_map);
         // Zip the topo-sorted paths back with the original indices so the
         // interleave step uses the slot each file occupied in the input list.
-        for (orig_i, path) in orig_indices.iter().zip(sorted_paths) {
-            sorted_entries.push((*orig_i, path.clone()));
+        for (orig_i, entry) in orig_indices.iter().zip(sorted_paths) {
+            sorted_entries.push((*orig_i, entry));
         }
     }
 
     sorted_entries.sort_by_key(|(i, _)| *i);
-    sorted_entries.into_iter().map(|(_, p)| p).collect()
+
+    let mut current_wave = 0usize;
+    let mut emitted_any = false;
+    let mut wave_by_path = HashMap::<PathBuf, usize>::with_capacity(files.len());
+    let mut ordered = Vec::with_capacity(files.len());
+
+    for (_, entry) in sorted_entries {
+        let dependency_wave = entry
+            .dependencies
+            .iter()
+            .filter_map(|dependency| wave_by_path.get(dependency).copied())
+            .max()
+            .map(|wave| wave.saturating_add(1))
+            .unwrap_or(0);
+
+        let mut wave = current_wave.max(dependency_wave);
+        if emitted_any && entry.force_barrier_before {
+            wave = wave.max(current_wave.saturating_add(1));
+        }
+
+        current_wave = wave;
+        emitted_any = true;
+        wave_by_path.insert(entry.path.clone(), wave);
+        ordered.push(DependencyOrderedFile {
+            path: entry.path,
+            wave,
+        });
+    }
+
+    ordered
 }
 
 fn dependency_group(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
@@ -1186,9 +1419,19 @@ fn dependency_group(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
 /// no dependency relationship keep their original relative order.  Cycles
 /// are detected and broken by removing one back-edge (the cycle members keep
 /// their original order).
-fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Vec<PathBuf> {
+fn dependency_plan_group(
+    paths: &[&PathBuf],
+    ext_map: &BTreeMap<String, String>,
+) -> Vec<GroupDependencyEntry> {
     if paths.len() <= 1 {
-        return paths.iter().map(|p| (*p).clone()).collect();
+        return paths
+            .iter()
+            .map(|path| GroupDependencyEntry {
+                path: (*path).clone(),
+                dependencies: Vec::new(),
+                force_barrier_before: false,
+            })
+            .collect();
     }
 
     // Build a stem→index map so we can resolve import names to file indices.
@@ -1230,7 +1473,8 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
 
     // Use a stable queue (preserve original order among equal-priority nodes).
     let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
-    let mut result: Vec<PathBuf> = Vec::with_capacity(n);
+    let mut result = Vec::with_capacity(n);
+    let mut emitted = vec![false; n];
 
     while !queue.is_empty() {
         // Pick the smallest original index among ready nodes to preserve order.
@@ -1241,7 +1485,17 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
             .map(|(p, _)| p)
             .unwrap();
         let node = queue.remove(pos);
-        result.push(paths[node].clone());
+        emitted[node] = true;
+        let mut dependencies = deps[node].iter().copied().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        result.push(GroupDependencyEntry {
+            path: paths[node].clone(),
+            dependencies: dependencies
+                .into_iter()
+                .map(|dependency| paths[dependency].clone())
+                .collect(),
+            force_barrier_before: false,
+        });
         for &dependent in &rev_adj[node] {
             in_degree[dependent] -= 1;
             if in_degree[dependent] == 0 {
@@ -1253,12 +1507,18 @@ fn topo_sort_group(paths: &[&PathBuf], ext_map: &BTreeMap<String, String>) -> Ve
     // If there are cycles, some nodes were never enqueued.  Append them in
     // original order (conservative: keep what the user gave us).
     if result.len() < n {
-        let emitted: HashSet<usize> = (0..result.len())
-            .filter_map(|k| paths.iter().position(|p| *p == &result[k]))
-            .collect();
         for (i, path) in paths.iter().enumerate() {
-            if !emitted.contains(&i) {
-                result.push((*path).clone());
+            if !emitted[i] {
+                let mut dependencies = deps[i].iter().copied().collect::<Vec<_>>();
+                dependencies.sort_unstable();
+                result.push(GroupDependencyEntry {
+                    path: (*path).clone(),
+                    dependencies: dependencies
+                        .into_iter()
+                        .map(|dependency| paths[dependency].clone())
+                        .collect(),
+                    force_barrier_before: true,
+                });
             }
         }
     }
@@ -1553,7 +1813,7 @@ fn escape_body(body: &str, closer: &str, backends: &HashSet<String>) -> String {
     out
 }
 
-/// If `s` begins with a registered opener (`IDENT [N]? {attr}? ^(`), return
+/// If `s` begins with a registered opener (`IDENT [N|*]? {attr}? ^(`), return
 /// the byte length of the opener text including the trailing `^(`.
 fn opener_len(s: &str, backends: &HashSet<String>) -> Option<usize> {
     let bytes = s.as_bytes();
@@ -1567,14 +1827,21 @@ fn opener_len(s: &str, backends: &HashSet<String>) -> Option<usize> {
     if !backends.contains(&s[..i]) {
         return None;
     }
-    // Optional `[digits]` env marker.
+    // Optional numeric persistent or `[*]` linker-isolated env marker.
     if i < bytes.len() && bytes[i] == b'[' {
         let mut j = i + 1;
-        let digits_start = j;
-        while j < bytes.len() && bytes[j].is_ascii_digit() {
+        if j < bytes.len() && bytes[j] == b'*' {
             j += 1;
+        } else {
+            let digits_start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j == digits_start {
+                return None;
+            }
         }
-        if j > digits_start && j < bytes.len() && bytes[j] == b']' {
+        if j < bytes.len() && bytes[j] == b']' {
             i = j + 1;
         }
     }
@@ -2104,10 +2371,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── env_id isolation tests ───────────────────────────────────────────────
+    // ── environment isolation and placement tests ───────────────────────────
 
     #[test]
-    fn link_files_assigns_unique_env_ids_per_language() {
+    fn link_files_synthesizes_fresh_intent_without_numeric_identities() {
         let dir = scratch("env_ids");
         fs::write(dir.join("a.py"), "x = 1\n").unwrap();
         fs::write(dir.join("b.py"), "y = 2\n").unwrap();
@@ -2119,39 +2386,16 @@ mod tests {
         let combined =
             link_files(&collection.files, &collection.marker_root, &map, &backends).unwrap();
 
-        // Both Python files must appear with distinct [N] tags.
-        assert!(
-            combined.contains("python[0]^("),
-            "expected python[0]^(, got:\n{}",
-            combined
-        );
-        assert!(
-            combined.contains("python[1]^("),
-            "expected python[1]^(, got:\n{}",
-            combined
-        );
-        assert!(
-            combined.contains(")_python[0]"),
-            "expected )_python[0], got:\n{}",
-            combined
-        );
-        assert!(
-            combined.contains(")_python[1]"),
-            "expected )_python[1], got:\n{}",
-            combined
-        );
-        // The shell file is the only file of its language so it gets [0].
-        assert!(
-            combined.contains("bash[0]^("),
-            "expected plain bash block, got:\n{}",
-            combined
-        );
+        assert_eq!(combined.matches("python[*]^(").count(), 2, "{combined}");
+        assert_eq!(combined.matches(")_python[*]").count(), 2, "{combined}");
+        assert!(combined.contains("bash[*]^("), "{combined}");
+        assert!(!combined.contains("python[0]^(") && !combined.contains("python[1]^("));
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn link_files_env_ids_parse_cleanly() {
+    fn linker_isolated_environment_markers_parse_cleanly() {
         let dir = scratch("env_parse");
         fs::write(dir.join("a.py"), "x = 1\n").unwrap();
         fs::write(dir.join("b.py"), "y = 2\n").unwrap();
@@ -2166,7 +2410,7 @@ mod tests {
         let mut parser = o_lang::parser::Parser::new(&combined, &backends);
         parser
             .parse()
-            .expect("combined output with env_ids should parse");
+            .expect("combined output with linker-isolated environments should parse");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2186,24 +2430,217 @@ mod tests {
         let combined =
             link_files(&collection.files, &collection.marker_root, &map, &backends).unwrap();
 
-        // a.py (the dependency) must appear before b.py in the output.
-        let pos_a = combined.find("python[0]^(").expect("python[0] not found");
-        let pos_b = combined.find("python[1]^(").expect("python[1] not found");
+        // a.py (the dependency) must appear before b.py in the output even
+        // though both use the same non-identifying fresh marker.
+        let pos_a = combined
+            .find("# ── a.py ──")
+            .expect("a.py marker not found");
+        let pos_b = combined
+            .find("# ── b.py ──")
+            .expect("b.py marker not found");
         assert!(
             pos_a < pos_b,
-            "a.py (dependency) should be python[0] but positions are a={} b={}",
+            "a.py dependency should precede b.py; positions are a={} b={}",
             pos_a,
             pos_b
         );
-        // Verify a.py body is in python[0] slot.
-        let slot0_start = combined.find("python[0]^(").unwrap();
-        let slot0_end = combined.find(")_python[0]").unwrap();
+        let slot0_start = combined[pos_a..].find("python[*]^(").unwrap() + pos_a;
+        let slot0_end = combined[slot0_start..].find(")_python[*]").unwrap() + slot0_start;
         let slot0_body = &combined[slot0_start..slot0_end];
         assert!(
             slot0_body.contains("def helper"),
-            "python[0] should contain a.py"
+            "first fresh Python section should contain a.py"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_wraps_fresh_sections_and_preserves_member_order() {
+        let dir = scratch("parallel_autonomous");
+        fs::write(dir.join("a.py"), "print('a')\n").unwrap();
+        fs::write(dir.join("b.sh"), "printf b\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(combined.contains("autonomous(batch("), "{combined}");
+        assert_eq!(
+            combined.matches("autonomous(batch(").count(),
+            1,
+            "independent sections should share one wave:\n{combined}"
+        );
+        assert!(combined.find("# ── a.py ──").unwrap() < combined.find("# ── b.sh ──").unwrap());
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("parallel linked output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_emits_dependency_chain_as_barrier_waves() {
+        let dir = scratch("parallel_dependency_chain");
+        fs::write(dir.join("a.py"), "VALUE = 40\n").unwrap();
+        fs::write(dir.join("b.py"), "from a import VALUE\nNEXT = VALUE + 1\n").unwrap();
+        fs::write(dir.join("c.py"), "from b import NEXT\nprint(NEXT + 1)\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let waves = combined
+            .split("autonomous(batch(")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            waves.len(),
+            3,
+            "dependency chain must have three waves:\n{combined}"
+        );
+        assert!(waves[0].contains("# ── a.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── b.py ──"), "{combined}");
+        assert!(waves[2].contains("# ── c.py ──"), "{combined}");
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("dependency-wave output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_keeps_independent_dependents_in_one_wave() {
+        let dir = scratch("parallel_dependency_fanout");
+        fs::write(dir.join("a.py"), "VALUE = 40\n").unwrap();
+        fs::write(dir.join("b.py"), "from a import VALUE\nprint(VALUE + 1)\n").unwrap();
+        fs::write(dir.join("c.py"), "from a import VALUE\nprint(VALUE + 2)\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let waves = combined
+            .split("autonomous(batch(")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(waves.len(), 2, "fanout should use two waves:\n{combined}");
+        assert!(waves[0].contains("# ── a.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── b.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── c.py ──"), "{combined}");
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("fanout-wave output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_serializes_dependency_cycles_in_input_order() {
+        let dir = scratch("parallel_dependency_cycle");
+        fs::write(dir.join("a.py"), "import b\nprint('a')\n").unwrap();
+        fs::write(dir.join("b.py"), "import a\nprint('b')\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let waves = combined
+            .split("autonomous(batch(")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            waves.len(),
+            2,
+            "cycle fallback must remain serial:\n{combined}"
+        );
+        assert!(waves[0].contains("# ── a.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── b.py ──"), "{combined}");
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("cycle fallback output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_parallel_keeps_hosted_shims_sequential() {
+        let dir = scratch("parallel_verified");
+        fs::write(dir.join("a.html"), "<p>a</p>\n").unwrap();
+        fs::write(dir.join("b.py"), "print('b')\n").unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Verified),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            combined.matches("autonomous(batch(").count(),
+            1,
+            "{combined}"
+        );
+        assert!(combined.contains("html[*]^("));
+        assert!(combined.contains("python[*]^("));
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("mixed verified output should parse");
+
+        let required = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Verified),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(required.to_string().contains("b.py"), "{required:#}");
         let _ = fs::remove_dir_all(&dir);
     }
 

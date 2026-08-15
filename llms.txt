@@ -10,7 +10,8 @@
 Key facts for agents:
 
 - File extension: `.O` (hosted orchestration) and `.oc` (O-core native systems language).
-- Run a program: `O program.O` (Rust edition; build with `cargo build --release`).
+- Run a program: `O program.O` or `o run program.O` (Rust edition; build with
+  `./setup.sh --minimal`).
 - Machine-readable output: `O --json program.O` prints one JSON object on
   stdout: `{"ok":true,"value":...,"type":...,"elapsed_ms":...}` on success, or
   `{"ok":false,"stage":"parse"|"eval","error":"..."}` on failure (exit code 1).
@@ -19,7 +20,9 @@ Key facts for agents:
 - Blocks: `python^( ... )_python`, `bash^( ... )_bash`, `sql^( ... )_sql`, etc.
   Opener and closer tags must match exactly.
 - Persistent state: `python[0]^( ... )_python[0]` reuses one Python process for
-  every block marked `[0]`; unmarked blocks are ephemeral.
+  every block marked `[0]`; unmarked blocks are ephemeral. Generated
+  `python[*]^( ... )_python[*]` blocks request fresh linker-isolated execution
+  without minting a persistent actor identity.
 - Values: a Python block returns whatever it assigns to `__oval_result__`;
   inline backends (`html`, `markdown`, `text`) return their spliced body.
 - Bindings: `let name = LANG^( ... )_LANG` then reference `$name` inside any
@@ -38,6 +41,8 @@ Key facts for agents:
   G0-G13 dependency ladder, evidence boundaries, and implementation program
 - [Hosted World reference profile](docs/HOSTED_WORLD_REFERENCE_PROFILE.md):
   non-qualifying simulator/oracle boundary retained for development
+- [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md): target descriptors,
+  warrants, the local signed registry, and the bounded direct-node preview
 
 ## Examples
 

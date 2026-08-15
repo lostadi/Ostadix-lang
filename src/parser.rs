@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 
+use crate::environment::{EnvironmentRefV2, EPHEMERAL_ENV_ID};
 use crate::ir::{BackendRegistry, ExecutionMode, PlanNodeId};
 
 /// Languages whose bodies are SEQUENCED (children are O-level statements)
@@ -478,7 +479,7 @@ impl<'a> Parser<'a> {
         // Commit: from here on, errors are real errors.
         let origin = self.begin_origin(original_pos);
         self.advance_one_byte(); // consume '('
-        self.skip_whitespace();
+        self.skip_call_trivia();
 
         let mut args = Vec::new();
         loop {
@@ -508,11 +509,11 @@ impl<'a> Parser<'a> {
             };
             args.push(arg);
 
-            self.skip_whitespace();
+            self.skip_call_trivia();
             match self.current_byte() {
                 Some(b',') => {
                     self.advance_one_byte();
-                    self.skip_whitespace();
+                    self.skip_call_trivia();
                 }
                 Some(b')') => {
                     self.advance_one_byte();
@@ -579,29 +580,41 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let mut env_id = u32::MAX;
+        let mut env_id = EPHEMERAL_ENV_ID;
         let mut raw = lang.clone();
 
         if i < bytes.len() && bytes[i] == b'[' {
             let env_start = i;
             i += 1;
 
-            let digits_start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
+            if i < bytes.len() && bytes[i] == b'*' {
+                i += 1;
+                if i >= bytes.len() || bytes[i] != b']' {
+                    return Ok(None);
+                }
+                env_id = EnvironmentRefV2::LinkerIsolated.encoded();
+                i += 1;
+            } else {
+                let digits_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+
+                if digits_start == i {
+                    return Ok(None);
+                }
+
+                if i >= bytes.len() || bytes[i] != b']' {
+                    return Ok(None);
+                }
+
+                let digits = &self.source[digits_start..i];
+                let numeric = digits.parse::<u32>()?;
+                env_id = EnvironmentRefV2::persistent(numeric)
+                    .map_err(anyhow::Error::from)?
+                    .encoded();
                 i += 1;
             }
-
-            if digits_start == i {
-                return Ok(None);
-            }
-
-            if i >= bytes.len() || bytes[i] != b']' {
-                return Ok(None);
-            }
-
-            let digits = &self.source[digits_start..i];
-            env_id = digits.parse::<u32>()?;
-            i += 1;
 
             raw.push_str(&self.source[env_start..i]);
         }
@@ -753,6 +766,18 @@ impl<'a> Parser<'a> {
     fn skip_whitespace(&mut self) {
         while matches!(self.current_byte(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.advance_one_byte();
+        }
+    }
+
+    /// O-level calls are sequencing syntax, so line comments are trivia
+    /// between arguments just as they are between top-level statements.
+    fn skip_call_trivia(&mut self) {
+        loop {
+            self.skip_whitespace();
+            if self.current_byte() != Some(b'#') {
+                break;
+            }
+            self.skip_to_end_of_line();
         }
     }
 
@@ -1005,12 +1030,10 @@ fn reconstruct_node(node: &ONode, buf: &mut String) {
             attr,
             body,
         } => {
-            // opener: lang[N]?{attr}?^(
+            // opener: lang[N]? / lang[*]? followed by attributes and ^(
             buf.push_str(lang);
-            if *env_id != u32::MAX {
-                buf.push('[');
-                buf.push_str(&env_id.to_string());
-                buf.push(']');
+            if let Some(marker) = EnvironmentRefV2::from_encoded(*env_id).source_marker() {
+                buf.push_str(&marker);
             }
             if let Some(a) = attr {
                 buf.push('{');
@@ -1026,10 +1049,8 @@ fn reconstruct_node(node: &ONode, buf: &mut String) {
             buf.push(')');
             buf.push('_');
             buf.push_str(lang);
-            if *env_id != u32::MAX {
-                buf.push('[');
-                buf.push_str(&env_id.to_string());
-                buf.push(']');
+            if let Some(marker) = EnvironmentRefV2::from_encoded(*env_id).source_marker() {
+                buf.push_str(&marker);
             }
             if let Some(a) = attr {
                 buf.push('{');
@@ -1205,6 +1226,37 @@ mod tests {
     }
 
     #[test]
+    fn linker_isolated_environment_roundtrips_without_becoming_persistent() {
+        let src = "python[*]^(6 * 7)_python[*]";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        let ONode::TypedExpr { env_id, .. } = &nodes[0] else {
+            panic!("expected typed expression")
+        };
+        assert_eq!(
+            EnvironmentRefV2::from_encoded(*env_id),
+            EnvironmentRefV2::LinkerIsolated
+        );
+        assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn numeric_environment_cannot_alias_reserved_fresh_sentinels() {
+        let backends = make_backends(&["python"]);
+        for reserved in [
+            crate::environment::LINKER_ISOLATED_ENV_ID,
+            crate::environment::EPHEMERAL_ENV_ID,
+        ] {
+            let src = format!("python[{reserved}]^(1)_python[{reserved}]");
+            let error = Parser::new(&src, &backends).parse().unwrap_err();
+            assert!(
+                error.to_string().contains("is reserved"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn call_arguments_accept_and_roundtrip_typed_expressions() {
         let src = "autonomous(batch(python^(6 * 7)_python, python^(7 * 8)_python))";
         let backends = make_backends(&["python"]);
@@ -1224,6 +1276,20 @@ mod tests {
             .iter()
             .all(|member| matches!(member, ONode::TypedExpr { lang, .. } if lang == "python")));
         assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn coordination_calls_accept_generated_section_comments() {
+        let src = "autonomous(batch(\n# section one\npython[*]^(1)_python[*],\n# section two\npython[*]^(2)_python[*]\n))";
+        let backends = make_backends(&["python"]);
+        let nodes = Parser::new(src, &backends).parse().unwrap();
+        let ONode::Call { args, .. } = &nodes[0] else {
+            panic!("expected autonomous call")
+        };
+        let ONode::Call { args: members, .. } = &args[0] else {
+            panic!("expected batch call")
+        };
+        assert_eq!(members.len(), 2);
     }
 
     #[test]

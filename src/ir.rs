@@ -27,6 +27,7 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
+use crate::environment::EnvironmentRefV2;
 use crate::parser::ONode;
 use crate::value::{BackendAuthority, GroupMode};
 
@@ -286,10 +287,9 @@ fn reconstruct_node(node: &OIr, out: &mut String) {
             ..
         } => {
             out.push_str(lang);
-            if *env_id != u32::MAX {
-                out.push('[');
-                out.push_str(&env_id.to_string());
-                out.push(']');
+            let environment = EnvironmentRefV2::from_encoded(*env_id);
+            if let Some(marker) = environment.source_marker() {
+                out.push_str(&marker);
             }
             if let Some(attr) = attr {
                 out.push('{');
@@ -302,10 +302,8 @@ fn reconstruct_node(node: &OIr, out: &mut String) {
             }
             out.push_str(")_");
             out.push_str(lang);
-            if *env_id != u32::MAX {
-                out.push('[');
-                out.push_str(&env_id.to_string());
-                out.push(']');
+            if let Some(marker) = environment.source_marker() {
+                out.push_str(&marker);
             }
             if let Some(attr) = attr {
                 out.push('{');
@@ -354,10 +352,10 @@ fn dump_node(node: &OIr, depth: usize, out: &mut String) {
                 .as_deref()
                 .map(|a| format!(" {{{a}}}"))
                 .unwrap_or_default();
-            let env_s = if *env_id == u32::MAX {
-                String::new()
-            } else {
-                format!(" [env {env_id}]")
+            let env_s = match EnvironmentRefV2::from_encoded(*env_id) {
+                EnvironmentRefV2::Ephemeral => String::new(),
+                EnvironmentRefV2::LinkerIsolated => " [env *]".to_string(),
+                EnvironmentRefV2::Persistent(id) => format!(" [env {id}]"),
             };
             out.push_str(&format!("{indent}exec {lang}{env_s}{attr_s}\n"));
             for child in body {
@@ -480,12 +478,74 @@ impl ExecutionMode {
     }
 }
 
+/// Largest integer magnitude a backend can preserve exactly when an O number
+/// crosses into that backend. This is semantic capability metadata, not an ISA
+/// or language-name heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerExactness {
+    /// The catalog has no sound positive statement for this implementation.
+    Unknown,
+    /// Every integer in `[-2^bits, 2^bits]` is represented exactly.
+    ExactMagnitudeBits(u16),
+    /// Integer precision is unbounded for the hosted representation.
+    Arbitrary,
+}
+
+impl IntegerExactness {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::ExactMagnitudeBits(_) => "exact-magnitude-bits",
+            Self::Arbitrary => "arbitrary",
+        }
+    }
+}
+
+/// Whether a backend preserves O's distinct numeric kinds rather than
+/// collapsing them into a narrower scalar representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RichNumberPreservation {
+    Unknown,
+    Preserved,
+    Collapsed,
+}
+
+impl RichNumberPreservation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Preserved => "preserved",
+            Self::Collapsed => "collapsed",
+        }
+    }
+}
+
+/// Value capabilities frozen into a backend interface at lowering time.
+/// Unknown facts stay explicit so fidelity and placement analysis cannot turn
+/// an absent catalog statement into `Lossless` evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendValueCapabilities {
+    pub integer_exactness: IntegerExactness,
+    pub rich_numbers: RichNumberPreservation,
+}
+
+impl BackendValueCapabilities {
+    pub const UNKNOWN: Self = Self {
+        integer_exactness: IntegerExactness::Unknown,
+        rich_numbers: RichNumberPreservation::Unknown,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendInterface {
     pub canonical: String,
+    /// Digest of the canonical catalog entry, including value capabilities.
+    /// `None` denotes a compatibility backend absent from the catalog.
+    pub specification_sha256: Option<String>,
     pub pure: bool,
     pub renderer: SpliceRenderer,
     pub execution: ExecutionMode,
+    pub value_capabilities: BackendValueCapabilities,
     /// Authority required by the backend adapter itself, before any
     /// additional rights declared by a source block.
     pub required_authorities: Vec<BackendAuthority>,
@@ -747,10 +807,10 @@ impl PlanNodeKind {
                     .as_deref()
                     .map(|a| format!(" {{{a}}}"))
                     .unwrap_or_default();
-                let env = if *env_id == u32::MAX {
-                    "ephemeral".to_string()
-                } else {
-                    env_id.to_string()
+                let env = match EnvironmentRefV2::from_encoded(*env_id) {
+                    EnvironmentRefV2::Ephemeral => "ephemeral".to_string(),
+                    EnvironmentRefV2::LinkerIsolated => "*".to_string(),
+                    EnvironmentRefV2::Persistent(id) => id.to_string(),
                 };
                 let required = backend
                     .required_authorities
@@ -759,11 +819,12 @@ impl PlanNodeKind {
                     .collect::<Vec<_>>()
                     .join(",");
                 format!(
-                    "exec {} [env {}]{} backend={} pure={} renderer={:?} execution={} required=[{}]",
+                    "exec {} [env {}]{} backend={} spec={} pure={} renderer={:?} execution={} required=[{}]",
                     lang,
                     env,
                     attr_s,
                     backend.canonical,
+                    backend.specification_sha256.as_deref().unwrap_or("unknown"),
                     backend.pure,
                     backend.renderer,
                     backend.execution.label(),
@@ -1157,6 +1218,8 @@ pub struct BackendSpec {
     pub adapter: BackendAdapterKind,
     /// Key into the canonical runtime-requirement catalog.
     pub runtime_requirement_key: &'static str,
+    /// Representation facts used by fidelity and placement analysis.
+    pub value_capabilities: BackendValueCapabilities,
 }
 
 impl BackendSpec {
@@ -1196,6 +1259,18 @@ macro_rules! backend_catalog_metadata {
     };
 }
 
+macro_rules! integer_exactness {
+    (Unknown) => {
+        IntegerExactness::Unknown
+    };
+    (ExactMagnitudeBits($bits:literal)) => {
+        IntegerExactness::ExactMagnitudeBits($bits)
+    };
+    (Arbitrary) => {
+        IntegerExactness::Arbitrary
+    };
+}
+
 macro_rules! backend_catalog {
     (
         $(
@@ -1208,6 +1283,8 @@ macro_rules! backend_catalog {
                 authorities: [$($authority:ident),* $(,)?],
                 adapter: $adapter:ident,
                 runtime: $runtime:literal,
+                integer_exactness: $integer_exactness:ident $(($integer_bits:literal))?,
+                rich_numbers: $rich_numbers:ident,
             }
         ),* $(,)?
     ) => {
@@ -1222,6 +1299,12 @@ macro_rules! backend_catalog {
                     required_authorities: &[$(BackendAuthority::$authority),*],
                     adapter: BackendAdapterKind::$adapter,
                     runtime_requirement_key: $runtime,
+                    value_capabilities: BackendValueCapabilities {
+                        integer_exactness: integer_exactness!(
+                            $integer_exactness $(($integer_bits))?
+                        ),
+                        rich_numbers: RichNumberPreservation::$rich_numbers,
+                    },
                 },
             )*
         ];
@@ -1276,6 +1359,17 @@ fn hash_backend_spec(hash: &mut Sha256, spec: &BackendSpec, requirement: &Runtim
     }
     catalog_hash_field(hash, spec.adapter.name().as_bytes());
     catalog_hash_field(hash, spec.runtime_requirement_key.as_bytes());
+    catalog_hash_field(
+        hash,
+        spec.value_capabilities.integer_exactness.label().as_bytes(),
+    );
+    if let IntegerExactness::ExactMagnitudeBits(bits) = spec.value_capabilities.integer_exactness {
+        catalog_hash_field(hash, &bits.to_be_bytes());
+    }
+    catalog_hash_field(
+        hash,
+        spec.value_capabilities.rich_numbers.label().as_bytes(),
+    );
     hash_runtime_requirement(hash, requirement);
 }
 
@@ -1308,6 +1402,7 @@ impl BackendRegistry {
         ],
         adapter: BackendAdapterKind::LegacyPythonShim,
         runtime_requirement_key: "unknown-legacy-python-shim",
+        value_capabilities: BackendValueCapabilities::UNKNOWN,
     };
 
     /// The process-wide registry over the static spec table.
@@ -1352,6 +1447,15 @@ impl BackendRegistry {
     pub fn adapter_for(&self, lang: &str) -> BackendAdapterKind {
         self.get(lang)
             .map_or(Self::DEFAULT_SPEC.adapter, |spec| spec.adapter)
+    }
+
+    /// Value-representation facts for a canonical backend or alias. Unknown
+    /// compatibility backends return an explicit all-unknown descriptor.
+    pub fn value_capabilities_for(&self, lang: &str) -> BackendValueCapabilities {
+        self.get(lang)
+            .map_or(BackendValueCapabilities::UNKNOWN, |spec| {
+                spec.value_capabilities
+            })
     }
 
     /// Deterministic SHA-256 of the complete ordered canonical catalog. This
@@ -1412,9 +1516,11 @@ impl BackendRegistry {
         let spec = self.get(lang).copied().unwrap_or(Self::DEFAULT_SPEC);
         BackendInterface {
             canonical,
+            specification_sha256: self.specification_sha256(lang),
             pure: spec.pure,
             renderer: spec.renderer,
             execution: spec.execution,
+            value_capabilities: spec.value_capabilities,
             required_authorities: spec.required_authorities.to_vec(),
         }
     }
@@ -1602,18 +1708,24 @@ mod tests {
     fn ir_dump_is_stable() {
         let nodes = vec![typed("python", vec![ONode::RawText("1 + 1".into())])];
         let prog = OIrProgram::lower(&nodes);
+        let python_spec = BackendRegistry::global()
+            .specification_sha256("python")
+            .expect("python specification digest");
         assert_eq!(
             prog.to_text(),
-            concat!(
+            format!(
+                concat!(
                 "; OIrProgram\n",
                 "exec python [env 0]\n",
                 "  text \"1 + 1\"\n",
                 "\n",
                 "; ExecutionPlan\n",
                 "roots [0]\n",
-                "node 0 exec python [env 0] backend=python pure=false renderer=Python execution=shim required=[]\n",
+                "node 0 exec python [env 0] backend=python spec={} pure=false renderer=Python execution=shim required=[]\n",
                 "node 1 text\n",
                 "edge 1 -> 0 structural\n",
+                ),
+                python_spec
             )
         );
     }
@@ -1824,6 +1936,44 @@ mod tests {
         assert_ne!(python, registry.specification_sha256("bash").unwrap());
         assert_eq!(python.len(), 64);
         assert!(registry.specification_sha256("unknown").is_none());
+    }
+
+    #[test]
+    fn catalog_value_capabilities_follow_canonical_backend_identity() {
+        let registry = BackendRegistry::global();
+        assert_eq!(
+            registry.value_capabilities_for("python"),
+            registry.value_capabilities_for("py")
+        );
+        assert_eq!(
+            registry.value_capabilities_for("python"),
+            BackendValueCapabilities {
+                integer_exactness: IntegerExactness::Arbitrary,
+                rich_numbers: RichNumberPreservation::Preserved,
+            }
+        );
+        assert_eq!(
+            registry.value_capabilities_for("javascript"),
+            BackendValueCapabilities {
+                integer_exactness: IntegerExactness::ExactMagnitudeBits(53),
+                rich_numbers: RichNumberPreservation::Collapsed,
+            }
+        );
+        assert_eq!(
+            registry.value_capabilities_for("unregistered"),
+            BackendValueCapabilities::UNKNOWN
+        );
+
+        let python = registry.interface_for("py");
+        assert_eq!(python.canonical, "python");
+        assert_eq!(
+            python.specification_sha256,
+            registry.specification_sha256("python")
+        );
+        assert_eq!(
+            python.value_capabilities,
+            registry.value_capabilities_for("python")
+        );
     }
 
     #[test]
@@ -2157,6 +2307,23 @@ mod tests {
             reconstruct_source(&program.nodes),
             "html[0]^(<p>$answer</p>)_html[0]"
         );
+    }
+
+    #[test]
+    fn executable_oir_preserves_linker_isolated_source_marker() {
+        let mut node = typed("python", vec![ONode::RawText("1".into())]);
+        let ONode::TypedExpr { env_id, .. } = &mut node else {
+            unreachable!("typed helper always constructs a typed expression")
+        };
+        *env_id = crate::environment::LINKER_ISOLATED_ENV_ID;
+        let program = OIrProgram::lower(&[node]);
+
+        assert_eq!(
+            reconstruct_source(&program.nodes),
+            "python[*]^(1)_python[*]"
+        );
+        let dump = program.to_text();
+        assert!(dump.contains("exec python [env *]"), "{dump}");
     }
 
     #[test]

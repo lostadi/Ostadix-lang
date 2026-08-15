@@ -628,11 +628,38 @@ struct CatalogRuntimeRequirement {
 struct CatalogBackendRuntime {
     name: &'static str,
     requirement_key: &'static str,
+    integer_exactness: &'static str,
+    integer_exactness_bits: Option<u16>,
+    rich_numbers: &'static str,
 }
 
 macro_rules! backend_catalog_metadata {
     (schema: $schema:literal $(,)?) => {
         const CATALOG_SCHEMA: &str = $schema;
+    };
+}
+
+macro_rules! catalog_integer_exactness {
+    (Unknown) => {
+        ("unknown", None::<u16>)
+    };
+    (ExactMagnitudeBits($bits:literal)) => {
+        ("exact-magnitude-bits", Some($bits))
+    };
+    (Arbitrary) => {
+        ("arbitrary", None::<u16>)
+    };
+}
+
+macro_rules! catalog_rich_numbers {
+    (Unknown) => {
+        "unknown"
+    };
+    (Preserved) => {
+        "preserved"
+    };
+    (Collapsed) => {
+        "collapsed"
     };
 }
 
@@ -681,6 +708,8 @@ macro_rules! backend_catalog {
                 authorities: [$($authority:ident),* $(,)?],
                 adapter: $adapter:ident,
                 runtime: $runtime:literal,
+                integer_exactness: $integer_exactness:ident $(($integer_bits:literal))?,
+                rich_numbers: $rich_numbers:ident,
             }
         ),* $(,)?
     ) => {
@@ -689,6 +718,13 @@ macro_rules! backend_catalog {
                 CatalogBackendRuntime {
                     name: $name,
                     requirement_key: $runtime,
+                    integer_exactness: catalog_integer_exactness!(
+                        $integer_exactness $(($integer_bits))?
+                    ).0,
+                    integer_exactness_bits: catalog_integer_exactness!(
+                        $integer_exactness $(($integer_bits))?
+                    ).1,
+                    rich_numbers: catalog_rich_numbers!($rich_numbers),
                 },
             )*
         ];
@@ -833,6 +869,17 @@ fn discover_runtimes(search: &RuntimeSearchPath, root: &Path) -> RuntimeDiscover
                 ));
             }
         }
+    }
+
+    for backend in CATALOG_BACKEND_RUNTIMES {
+        let integer_exactness = match backend.integer_exactness_bits {
+            Some(bits) => format!("{}:{bits}", backend.integer_exactness),
+            None => backend.integer_exactness.to_string(),
+        };
+        lines.push(format!(
+            "runtime-capability backend={} integer-exactness={} rich-numbers={} provenance=catalog",
+            backend.name, integer_exactness, backend.rich_numbers
+        ));
     }
 
     RuntimeDiscovery {
@@ -1745,7 +1792,7 @@ mod tests {
 
     #[test]
     fn runtime_inventory_is_a_complete_catalog_projection() {
-        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v1");
+        assert_eq!(CATALOG_SCHEMA, "ostadix.backend-catalog/v2");
         let requirement_keys = CATALOG_RUNTIME_REQUIREMENTS
             .iter()
             .map(|requirement| requirement.key)
@@ -1781,6 +1828,25 @@ mod tests {
                 requirement.key
             );
         }
+    }
+
+    #[test]
+    fn runtime_inventory_projects_value_capabilities() {
+        let python = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .find(|backend| backend.name == "python")
+            .expect("python catalog entry");
+        assert_eq!(python.integer_exactness, "arbitrary");
+        assert_eq!(python.integer_exactness_bits, None);
+        assert_eq!(python.rich_numbers, "preserved");
+
+        let javascript = CATALOG_BACKEND_RUNTIMES
+            .iter()
+            .find(|backend| backend.name == "javascript")
+            .expect("javascript catalog entry");
+        assert_eq!(javascript.integer_exactness, "exact-magnitude-bits");
+        assert_eq!(javascript.integer_exactness_bits, Some(53));
+        assert_eq!(javascript.rich_numbers, "collapsed");
     }
 
     #[test]

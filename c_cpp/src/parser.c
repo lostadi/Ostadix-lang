@@ -1,6 +1,7 @@
 #include "parser.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -52,6 +53,8 @@ static unsigned char current_byte(const OParser *p);
 static bool has_current_byte(const OParser *p);
 static bool starts_with_at(const OParser *p, size_t pos, const char *pat);
 static bool starts_with(const OParser *p, const char *pat);
+static bool starts_with_exact_closer(const OParser *p, size_t pos,
+                                     const char *closer, size_t closer_len);
 static void skip_horizontal_whitespace(OParser *p);
 static void skip_whitespace(OParser *p);
 static void skip_to_end_of_line(OParser *p);
@@ -564,6 +567,23 @@ static bool starts_with(const OParser *p, const char *pat) {
     return starts_with_at(p, p->pos, pat);
 }
 
+/* A bare closer must not consume the prefix of a bracketed/attributed closer.
+   This makes the opener spelling part of the delimiter identity: `)_python`
+   cannot close `python[*]^(` and vice versa. */
+static bool starts_with_exact_closer(const OParser *p, size_t pos,
+                                     const char *closer, size_t closer_len) {
+    size_t after;
+
+    if (!starts_with_at(p, pos, closer)) {
+        return false;
+    }
+    after = pos + closer_len;
+    if (after >= p->source_len) {
+        return true;
+    }
+    return p->source[after] != '[' && p->source[after] != '{';
+}
+
 static void skip_horizontal_whitespace(OParser *p) {
     while (has_current_byte(p) && (current_byte(p) == ' ' || current_byte(p) == '\t')) {
         advance_one_byte(p);
@@ -716,7 +736,7 @@ static Tag *try_parse_opener(OParser *p) {
     size_t digits_start;
     unsigned long parsed_env;
     char *lang;
-    uint32_t env_id = UINT32_MAX;
+    uint32_t env_id = OLANG_ENV_EPHEMERAL;
     char *attr = NULL;
     char *raw = NULL;
     Tag *tag;
@@ -756,37 +776,54 @@ static Tag *try_parse_opener(OParser *p) {
         env_start = i;
         i += 1;
         digits_start = i;
-        while (i < p->source_len && isdigit((unsigned char)p->source[i]) != 0) {
+        if (i < p->source_len && p->source[i] == '*') {
             i += 1;
-        }
-        if (digits_start == i) {
-            free(lang);
-            free(raw);
-            return NULL;
-        }
-        if (i >= p->source_len || p->source[i] != ']') {
-            free(lang);
-            free(raw);
-            return NULL;
-        }
-        {
-            char *digits = dup_range(p->source + digits_start, i - digits_start);
+            if (i >= p->source_len || p->source[i] != ']') {
+                free(lang);
+                free(raw);
+                return NULL;
+            }
+            env_id = OLANG_ENV_LINKER_ISOLATED;
+        } else {
+            char *digits;
+            char *end = NULL;
+
+            while (i < p->source_len && isdigit((unsigned char)p->source[i]) != 0) {
+                i += 1;
+            }
+            if (digits_start == i) {
+                free(lang);
+                free(raw);
+                return NULL;
+            }
+            if (i >= p->source_len || p->source[i] != ']') {
+                free(lang);
+                free(raw);
+                return NULL;
+            }
+            digits = dup_range(p->source + digits_start, i - digits_start);
             if (digits == NULL) {
                 free(lang);
                 free(raw);
                 parser_set_error(p, "Out of memory");
                 return NULL;
             }
-            parsed_env = strtoul(digits, NULL, 10);
+            errno = 0;
+            parsed_env = strtoul(digits, &end, 10);
+            if (errno == ERANGE || end == NULL || *end != '\0' ||
+                parsed_env > OLANG_ENV_MAX_PERSISTENT) {
+                free(digits);
+                free(lang);
+                free(raw);
+                parser_set_error(
+                    p,
+                    "Line %zu: persistent env id is reserved or out of range (maximum %u)",
+                    p->line, (unsigned)OLANG_ENV_MAX_PERSISTENT);
+                return NULL;
+            }
             free(digits);
+            env_id = (uint32_t)parsed_env;
         }
-        if (parsed_env > UINT32_MAX) {
-            free(lang);
-            free(raw);
-            parser_set_error(p, "Line %zu: invalid env id", p->line);
-            return NULL;
-        }
-        env_id = (uint32_t)parsed_env;
         i += 1;
         {
             char *env_piece = dup_range(p->source + env_start, i - env_start);
@@ -1104,7 +1141,8 @@ static ONodeList *parse_until(OParser *p, const Tag *expected_closer) {
     }
 
     while (p->pos < p->source_len) {
-        if (expected_closer != NULL && starts_with(p, closer)) {
+        if (expected_closer != NULL &&
+            starts_with_exact_closer(p, p->pos, closer, closer_len)) {
             if (!flush_text(nodes, p, text_start, p->pos)) {
                 onode_list_free(nodes);
                 free(closer);
@@ -1195,7 +1233,8 @@ static ONodeList *parse_until(OParser *p, const Tag *expected_closer) {
                     }
                 }
                 p->pos = temp_pos;
-                if (expected_closer != NULL && starts_with_at(p, after_bs, closer)) {
+                if (expected_closer != NULL &&
+                    starts_with_exact_closer(p, after_bs, closer, closer_len)) {
                     p->pos = temp_pos;
                     if (!flush_text(nodes, p, text_start, p->pos) ||
                         !append_raw_text_literal(nodes, closer)) {
@@ -1360,7 +1399,9 @@ static void reconstruct_node(const ONode *node, StringBuilder *sb) {
                                         node->data.typed_expr.lang != NULL
                                             ? node->data.typed_expr.lang
                                             : "");
-            if (node->data.typed_expr.env_id != UINT32_MAX) {
+            if (node->data.typed_expr.env_id == OLANG_ENV_LINKER_ISOLATED) {
+                (void)string_builder_append(sb, "[*]");
+            } else if (node->data.typed_expr.env_id != OLANG_ENV_EPHEMERAL) {
                 snprintf(num_buf, sizeof(num_buf), "%u", node->data.typed_expr.env_id);
                 (void)string_builder_append_char(sb, '[');
                 (void)string_builder_append(sb, num_buf);
@@ -1381,7 +1422,9 @@ static void reconstruct_node(const ONode *node, StringBuilder *sb) {
                                         node->data.typed_expr.lang != NULL
                                             ? node->data.typed_expr.lang
                                             : "");
-            if (node->data.typed_expr.env_id != UINT32_MAX) {
+            if (node->data.typed_expr.env_id == OLANG_ENV_LINKER_ISOLATED) {
+                (void)string_builder_append(sb, "[*]");
+            } else if (node->data.typed_expr.env_id != OLANG_ENV_EPHEMERAL) {
                 snprintf(num_buf, sizeof(num_buf), "%u", node->data.typed_expr.env_id);
                 (void)string_builder_append_char(sb, '[');
                 (void)string_builder_append(sb, num_buf);
