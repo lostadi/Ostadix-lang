@@ -758,21 +758,21 @@ pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {
         return Fidelity::Lossless;
     }
     if let Some(value) = &node.value {
-        return fidelity_for_value_with_capabilities(value, to_spec.value_capabilities);
+        return fidelity_for_value_with_capabilities(value, &to_spec.value_capabilities);
     }
-    fidelity_for_abstract(node, to_spec.value_capabilities)
+    fidelity_for_abstract(node, &to_spec.value_capabilities)
 }
 
 pub fn fidelity_for_value(value: &OValue, to_lang: &str) -> Fidelity {
     let Some(spec) = BackendRegistry::global().get(to_lang) else {
         return Fidelity::Unsupported;
     };
-    fidelity_for_value_with_capabilities(value, spec.value_capabilities)
+    fidelity_for_value_with_capabilities(value, &spec.value_capabilities)
 }
 
-fn fidelity_for_value_with_capabilities(
+pub(super) fn fidelity_for_value_with_capabilities(
     value: &OValue,
-    capabilities: BackendValueCapabilities,
+    capabilities: &BackendValueCapabilities,
 ) -> Fidelity {
     match value {
         OValue::Native { .. } => Fidelity::NativeCapsule,
@@ -783,11 +783,11 @@ fn fidelity_for_value_with_capabilities(
     }
 }
 
-fn fidelity_for_number(number: &ONumber, capabilities: BackendValueCapabilities) -> Fidelity {
+fn fidelity_for_number(number: &ONumber, capabilities: &BackendValueCapabilities) -> Fidelity {
     let mut lost = BTreeSet::new();
 
     if let ONumber::Int { v } = number {
-        match integer_exceeds_capability(v, capabilities.integer_exactness) {
+        match integer_exceeds_capability(v, &capabilities.integer_exactness) {
             Some(true) => {
                 lost.insert(AnnotationKind::NumericPrecision);
             }
@@ -808,19 +808,43 @@ fn fidelity_for_number(number: &ONumber, capabilities: BackendValueCapabilities)
     Fidelity::structural(lost)
 }
 
-fn integer_exceeds_capability(value: &BigInt, exactness: IntegerExactness) -> Option<bool> {
+fn integer_exceeds_capability(value: &BigInt, exactness: &IntegerExactness) -> Option<bool> {
+    integer_range_exceeds_capability(value, value, exactness)
+}
+
+fn integer_range_exceeds_capability(
+    minimum: &BigInt,
+    maximum: &BigInt,
+    exactness: &IntegerExactness,
+) -> Option<bool> {
     match exactness {
         IntegerExactness::Unknown => None,
         IntegerExactness::Arbitrary => Some(false),
         IntegerExactness::ExactMagnitudeBits(bits) => {
-            let limit = BigInt::from(1_u8) << usize::from(bits);
-            let minimum = -&limit;
-            Some(value < &minimum || value > &limit)
+            let upper = BigInt::from(1_u8) << usize::from(*bits);
+            let lower = -&upper;
+            Some(minimum < &lower || maximum > &upper)
+        }
+        IntegerExactness::TwosComplementBits(bits) => {
+            let magnitude = BigInt::from(1_u8) << usize::from(*bits);
+            let lower = -&magnitude;
+            let upper = &magnitude - 1_u8;
+            Some(minimum < &lower || maximum > &upper)
+        }
+        IntegerExactness::ExactRange { min, max } => {
+            if min > max {
+                None
+            } else {
+                Some(minimum < min || maximum > max)
+            }
         }
     }
 }
 
-fn fidelity_for_abstract(node: &HNode, capabilities: BackendValueCapabilities) -> Fidelity {
+pub(super) fn fidelity_for_abstract(
+    node: &HNode,
+    capabilities: &BackendValueCapabilities,
+) -> Fidelity {
     if node.domain.is_empty() || node.rep.is_empty() {
         return Fidelity::Unsupported;
     }
@@ -845,7 +869,7 @@ fn fidelity_for_abstract(node: &HNode, capabilities: BackendValueCapabilities) -
         }
 
         let mut lost = BTreeSet::new();
-        match abstract_integer_exceeds_capability(numeric_rep, capabilities.integer_exactness) {
+        match abstract_integer_exceeds_capability(numeric_rep, &capabilities.integer_exactness) {
             Some(true) => {
                 lost.insert(AnnotationKind::NumericPrecision);
             }
@@ -876,7 +900,7 @@ fn fidelity_for_abstract(node: &HNode, capabilities: BackendValueCapabilities) -
 
 fn abstract_integer_exceeds_capability(
     reps: RepFlags,
-    exactness: IntegerExactness,
+    exactness: &IntegerExactness,
 ) -> Option<bool> {
     let integer_reps = reps
         & (RepFlags::I8
@@ -888,17 +912,31 @@ fn abstract_integer_exceeds_capability(
     if integer_reps.is_empty() {
         return Some(false);
     }
-    match exactness {
-        IntegerExactness::Unknown => None,
-        IntegerExactness::Arbitrary => Some(false),
-        IntegerExactness::ExactMagnitudeBits(bits) => Some(
-            integer_reps.intersects(RepFlags::BIG | RepFlags::I128)
-                || (integer_reps.contains(RepFlags::I64) && bits < 63)
-                || (integer_reps.contains(RepFlags::I32) && bits < 31)
-                || (integer_reps.contains(RepFlags::I16) && bits < 15)
-                || (integer_reps.contains(RepFlags::I8) && bits < 7),
-        ),
+    if integer_reps.contains(RepFlags::BIG) {
+        return match exactness {
+            IntegerExactness::Unknown => None,
+            IntegerExactness::Arbitrary => Some(false),
+            IntegerExactness::ExactMagnitudeBits(_)
+            | IntegerExactness::TwosComplementBits(_)
+            | IntegerExactness::ExactRange { .. } => Some(true),
+        };
     }
+
+    let magnitude_bits = if integer_reps.contains(RepFlags::I128) {
+        127_u16
+    } else if integer_reps.contains(RepFlags::I64) {
+        63
+    } else if integer_reps.contains(RepFlags::I32) {
+        31
+    } else if integer_reps.contains(RepFlags::I16) {
+        15
+    } else {
+        7
+    };
+    let magnitude = BigInt::from(1_u8) << usize::from(magnitude_bits);
+    let minimum = -&magnitude;
+    let maximum = &magnitude - 1_u8;
+    integer_range_exceeds_capability(&minimum, &maximum, exactness)
 }
 
 fn apply_domain_to_all(
