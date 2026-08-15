@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::ir::{BackendRegistry, BACKEND_CATALOG_SCHEMA_V3};
 use crate::world::ArtifactId;
 
 use super::digest::{validate_label, validate_token};
@@ -315,6 +316,28 @@ impl TargetDescriptorV1 {
 
     pub fn backend_implementations(&self) -> &BTreeSet<BackendImplementationIdV1> {
         &self.backend_implementations
+    }
+
+    /// Reject backend identities minted under an older catalog hash domain.
+    ///
+    /// The records themselves remain decodable and their detached signatures
+    /// remain independently inspectable.  They cannot, however, authorize a
+    /// placement against this process unless every advertised backend
+    /// specification belongs to the current compiled catalog.  Because the
+    /// catalog schema is part of every specification digest, the V2 -> V3
+    /// rollover fails closed without rewriting the signed record schema.
+    pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {
+        let registry = BackendRegistry::global();
+        for implementation in &self.backend_implementations {
+            let specification = implementation.backend_specification().as_sha256();
+            if !registry.contains_specification_sha256(specification) {
+                return Err(PlacementValidationError::NonCurrentBackendCatalog {
+                    specification: specification.to_owned(),
+                    current_schema: BACKEND_CATALOG_SCHEMA_V3.to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn supports_capability(&self, atom: &CapabilityAtomV1) -> bool {

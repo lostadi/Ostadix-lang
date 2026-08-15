@@ -24,7 +24,7 @@ import sys
 import traceback
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from o_shim_common import admitted_tool_path, read_wire_message, write_wire_message
+from o_shim_common import admitted_tool_path, command_loop, write_wire_message
 
 # Wrapper template: turns the user's attrset fragment into a full
 # pkgs.testers.runNixOSTest call.  NIXPKGS_PATH may be overridden by env var.
@@ -174,21 +174,4 @@ def handle_ping():
 def handle_cleanup():
     send_ok({"t": "null"})
 
-while True:
-    try:
-        cmd = read_wire_message()
-        if cmd is None:
-            break
-        tag = cmd.get("cmd")
-
-        if tag == "exec":
-            handle_exec(cmd)
-        elif tag == "ping":
-            handle_ping()
-        elif tag == "cleanup":
-            handle_cleanup()
-        else:
-            send_err(f"unknown command: {tag!r}")
-
-    except Exception:
-        send_err(traceback.format_exc())
+command_loop(handle_exec, handle_cleanup=handle_cleanup, handle_ping=handle_ping)
