@@ -12,5 +12,7 @@ pub mod protocol;
 pub use projection::{
     requirement_footprint_for_island, requirement_footprint_for_plan_node,
     requirement_footprint_for_program_node, PlacementIntentV1,
+    SESSION_SERIALIZED_OPAQUE_EFFECTS_CAPABILITY_V1,
+    SESSION_SERIALIZED_OPAQUE_EFFECTS_NAMESPACE_V1, SESSION_SERIALIZED_OPAQUE_EFFECTS_NAME_V1,
 };
 pub use protocol::*;

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::effects::{EffectSummary, ResourceKey};
 use crate::eval::Policy;
@@ -13,6 +14,7 @@ use crate::runtime_exec::{ExecutableLeaseSet, ExecutableManifestV1};
 
 use super::analyze::{
     analyze_execution, digest_fields, evidence_bindings, evidence_bundle_sha256, graph_sha256,
+    oir_sha256,
 };
 use super::fact::{
     BackendArtifactV1, DispatchAdapterV1, DispatchLaneV1, DispatchSemanticsV1, EvidenceBindingsV2,
@@ -744,6 +746,18 @@ pub struct AdmittedExecution<'a> {
     admission: ExecutionAdmissionV5,
 }
 
+/// Owned half of an admitted execution used when a caller must retain exact
+/// admission authority across an external authorization round trip.  The
+/// lowered program and plan deliberately live with the caller: storing their
+/// references here would make the resulting object self-referential.  The
+/// only reconstruction path revalidates those owned sources before yielding
+/// the short-lived borrowed [`AdmittedExecution`] consumed by the runtime.
+pub(crate) struct PreparedAdmissionPartsV1 {
+    graph: HGraph,
+    runtime: RuntimeBindingV1,
+    admission: ExecutionAdmissionV5,
+}
+
 impl<'a> AdmittedExecution<'a> {
     pub fn program(&self) -> &'a OIrProgram {
         self.program
@@ -759,6 +773,14 @@ impl<'a> AdmittedExecution<'a> {
 
     pub fn admission(&self) -> &ExecutionAdmissionV5 {
         &self.admission
+    }
+
+    pub(crate) fn into_prepared_parts(self) -> PreparedAdmissionPartsV1 {
+        PreparedAdmissionPartsV1 {
+            graph: self.graph,
+            runtime: self.runtime,
+            admission: self.admission,
+        }
     }
 
     /// Return the process-local executable launch authority retained by this
@@ -974,6 +996,58 @@ impl<'a> AdmittedExecution<'a> {
             );
         }
         Ok(())
+    }
+}
+
+impl PreparedAdmissionPartsV1 {
+    /// Reconstruct the runtime authority view without re-analysis or
+    /// re-admission.  The inputs are borrowed only for the lifetime of the
+    /// returned value and must reproduce the exact canonical bindings sealed
+    /// at preparation time.
+    pub(crate) fn bind<'a>(
+        self,
+        program: &'a OIrProgram,
+        plan: &'a ExecutionPlan,
+    ) -> Result<AdmittedExecution<'a>> {
+        if plan != &program.plan() {
+            bail!(
+                "prepared execution requires the canonical ExecutionPlan derived from its exact lowered OIR"
+            );
+        }
+        self.graph
+            .validate_execution_source(program, plan)
+            .map_err(anyhow::Error::msg)
+            .context("prepared execution rejected OIR/plan/HGraph provenance")?;
+        let plan_sha256 = hex::encode(Sha256::digest(plan.to_text().as_bytes()));
+        if self.admission.bindings.oir_sha256 != oir_sha256(program)
+            || self.admission.bindings.plan_sha256 != plan_sha256
+            || self.admission.admitted_graph_sha256 != graph_sha256(&self.graph)
+            || self.admission.bindings.backend_catalog_projection_sha256
+                != self.runtime.backend_catalog_projection_sha256()
+            || self.admission.bindings.backend_set_sha256 != self.runtime.backend_set_sha256()
+            || self.admission.bindings.executable_manifest_sha256
+                != self.runtime.executable_manifest().sha256()
+            || self.admission.bindings.launch_context_sha256 != self.runtime.launch_context_sha256()
+            || self.admission.bindings.environment_sha256 != self.runtime.environment_sha256()
+            || self.admission.bindings.ambient_world_sha256 != self.runtime.ambient_world_sha256()
+        {
+            bail!(
+                "prepared execution binding mismatch: lowered OIR, plan, graph, catalog, runtime, or environment changed"
+            );
+        }
+        if self.admission.runtime_snapshot_kind != self.runtime.snapshot_kind()
+            || self.admission.backend_artifacts != self.runtime.backend_artifacts()
+            || self.admission.executable_manifest != *self.runtime.executable_manifest()
+        {
+            bail!("prepared execution runtime authority no longer matches its admission");
+        }
+        Ok(AdmittedExecution {
+            program,
+            plan,
+            graph: self.graph,
+            runtime: self.runtime,
+            admission: self.admission,
+        })
     }
 }
 
