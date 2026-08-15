@@ -10,7 +10,17 @@ See SPEC.md for the language definition.
 """
 
 from .evaluator import EvalContext, evaluate_document, run
-from .parser import Document, ExpressionNode, TextPart, parse, pretty
+from .parser import (
+    EPHEMERAL_ENV_ID,
+    LINKER_ISOLATED_ENV_ID,
+    MAX_PERSISTENT_ENV_ID,
+    Document,
+    ExpressionNode,
+    TextPart,
+    parse,
+    pretty,
+    reconstruct_source,
+)
 from .ovalue import (
     OBlob, OBool, OExpr, OFloat, OHtml, OInt, OList, OMap, ONull, OScope,
     OStorePath, OStr,
@@ -19,11 +29,12 @@ from .ovalue import (
 )
 
 __all__ = [
-    "run", "parse", "evaluate_document", "EvalContext", "pretty",
+    "run", "parse", "evaluate_document", "EvalContext", "pretty", "reconstruct_source",
+    "EPHEMERAL_ENV_ID", "LINKER_ISOLATED_ENV_ID", "MAX_PERSISTENT_ENV_ID",
     "Document", "ExpressionNode", "TextPart",
     "OValue", "ONull", "OBool", "OInt", "OFloat", "OStr", "OHtml", "OStorePath",
     "OList", "OMap", "OScope", "OBlob", "OExpr",
     "from_python", "to_python", "render_plain", "to_json_str",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -140,14 +140,14 @@ class _OHelpers:
         more than one top-level element, we wrap them in a synthetic
         O-node (same convention as quote^).
         """
-        from ..parser import ExpressionNode, parse
+        from ..parser import EPHEMERAL_ENV_ID, ExpressionNode, parse
 
         doc = parse(src)
         if len(doc.body) == 1 and isinstance(doc.body[0], ExpressionNode):
             return OExpr(doc.body[0])
         synthetic = ExpressionNode(
             language="O",
-            env_id=0,
+            env_id=EPHEMERAL_ENV_ID,
             env_explicit=False,
             body=list(doc.body),
         )

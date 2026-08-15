@@ -48,8 +48,8 @@ WINDOWS_RERUN_REQUIRED=false
 ENV_FILE="${OSTADIX_ENV_FILE:-$HOME/.config/ostadix/env.sh}"
 GUESTS_DIR="${OSTADIX_GUESTS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests}"
 
-RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink)
-RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink o-notebook)
+RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink ogit o-live-host o-node octl o-registry)
+RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink ogit o-live-host o-node octl o-registry o-notebook)
 WRAPPER_TARGETS=(O o olangc o-c olangc-c o-notebook)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
@@ -907,19 +907,21 @@ build_mcp_server() {
 }
 
 setup_python() {
-  echo ">>> Setting up Python compatibility bridge / edition..."
+  echo ">>> Checking the repository-local Python reference edition..."
   if $DRY_RUN; then
-    echo "[DRY] Would install Python compatibility dependencies and editable Python package"
+    echo "[DRY] verify python3 can import the repository-local o_lang package"
+    if ! $MINIMAL; then
+      echo "[DRY] optional matplotlib availability check (no automatic install)"
+    fi
     return
   fi
   if has_cmd python3; then
-    python3 -m pip install --user --upgrade pip setuptools wheel 2>/dev/null || true
-    if ! $MINIMAL; then
-      python3 -m pip install --user matplotlib 2>/dev/null || echo "  (matplotlib optional for computed_plot.O)"
-    fi
-    # Install Python edition in editable mode for convenience
     if [[ -f o_lang/__init__.py ]]; then
-      python3 -m pip install --user -e . 2>/dev/null || true
+      PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -c 'import o_lang; print("  Python reference edition", o_lang.__version__)'
+    fi
+    if ! $MINIMAL && ! python3 -c 'import matplotlib' >/dev/null 2>&1; then
+      echo "  matplotlib is optional for computed_plot.O; install it explicitly if needed"
     fi
   fi
 }
@@ -1587,7 +1589,7 @@ echo '  docker run -it -v "$PWD:/ws" -w /ws debian bash -c "apt-get update && ap
 echo
 
 echo
-echo "Dedicated per-OS scripts (no detection, simpler for CI/Docker/specific machines) live in ./setup/os/:"
+echo "Compatibility per-OS entrypoints delegate to this canonical setup in ./setup/os/:"
 echo "  setup-macos.sh, setup-debian.sh, setup-arch.sh (incl. CachyOS), setup-fedora.sh,"
 echo "  setup-gentoo.sh, setup-nixos.sh, setup-tinycore.sh, setup-alpine.sh, setup-opensuse.sh,"
 echo "  setup-void.sh, setup-freebsd.sh, setup-windows.sh"

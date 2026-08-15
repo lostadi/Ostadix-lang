@@ -9,7 +9,7 @@ resolve an **absolute** `O_BACKENDS_DIR`, so relative `backends` and bare
 | Tool | Purpose |
 |------|---------|
 | `o_env` | Print roots, `O` / `olangc` paths, shim presence, and the 30-backend runtime summary |
-| `o_runtimes` | Report executable discovery for every canonical backend and each supported alternative runtime set |
+| `o_runtimes` | Report executable discovery and catalog value capabilities for every canonical backend and supported alternative runtime set |
 | `o_doctor` | Existence checks + shim inventory + complete runtime report + a18re `search/o-run` |
 | `o_smoke` | `O examples/hello.O <absolute-backends>` — expect `2` |
 | `o_analyze_intent` | Nonexecutingly compute a stable execution intent and return a bounded, expiring, one-use opaque handle |
@@ -59,13 +59,23 @@ after 120 seconds by default, may request 1 through 900 seconds, and is consumed
 execution. Reuse, expiration, a different canonical program/cwd/root/backends,
 or a changed source fails closed. `o_execute_intent` supplies the analyzed
 source and stable-intent digests to `O`; `O` recomputes them and then constructs
-a fresh V4 `AdmittedExecution`, which remains the sole dispatch authority.
+a fresh V5 `AdmittedExecution`, which remains the sole dispatch authority.
 
 This protocol is a local **same-intent gate**, not authorization, a capability,
 a retained admission object, proof of runtime health, or a capacity lease.
 `o_run` remains available as an explicitly ungated compatibility path. The MCP
 crate does not link the root runtime and does not add a worker, scheduler lane,
 or persistent `O` process.
+
+Admission V5 and Hosted Placement V6 are dual current contracts. This MCP
+surface remains deliberately local and V5 by default: it does not discover a
+federated registry, enroll a node, request a placement lease, or turn a stable
+intent handle into V6 authority. The current direct-node surface is the
+separately authenticated `octl node ...` client and `o-node` service documented
+in [`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md). No MCP
+tool wraps that channel or the separate local `o-registry` snapshot store. A
+future placement-aware MCP adapter must select V6 explicitly rather than
+silently upgrading a V5 handle.
 
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its
@@ -112,6 +122,12 @@ later refine. The output makes the evidence ladder explicit: this tool
 establishes only `declared` and `located`; `invocable`, `compatible`,
 `authorized`, `healthy`, and per-operation `admitted` remain not-probed or
 deferred to their actual operation-scoped mechanisms.
+
+The same catalog projection emits one `runtime-capability` record per backend
+with `integer-exactness` and `rich-numbers` fields. These are typed catalog
+declarations used by conservative fidelity analysis, not runtime probes or
+placement warrants. Unknown capability remains explicit and cannot be promoted
+to a lossless crossing merely because two aliases share a language name.
 
 ## Grok config (`~/.grok/config.toml`)
 
