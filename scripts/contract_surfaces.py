@@ -60,6 +60,23 @@ def workflow_jobs(text: str) -> set[str]:
     return set(re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\s*$", text[match.end() :]))
 
 
+def workflow_job_needs(text: str, job_name: str) -> list[str]:
+    """Return one top-level job's block-list `needs` without a YAML dependency."""
+    job = re.search(
+        rf"(?ms)^  {re.escape(job_name)}:\s*\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
+        text,
+    )
+    if job is None:
+        raise ContractError(f"CI workflow has no {job_name!r} job")
+    needs = re.search(
+        r"(?ms)^    needs:\s*\n(?P<items>(?:^      - [A-Za-z0-9_-]+\s*$\n?)+)",
+        job.group("body"),
+    )
+    if needs is None:
+        raise ContractError(f"CI job {job_name!r} has no block-list needs")
+    return re.findall(r"(?m)^      - ([A-Za-z0-9_-]+)\s*$", needs.group("items"))
+
+
 def catalog_schema() -> str:
     match = re.search(
         r'backend_catalog_metadata!\s*\{\s*current_schema:\s*"([^"]+)"',
@@ -102,7 +119,8 @@ def validate() -> None:
     required_jobs = required.get("required_jobs")
     if not isinstance(required_jobs, list) or required_jobs != sorted(set(required_jobs)):
         raise ContractError("required_jobs must be a sorted unique list")
-    jobs = workflow_jobs(CI_WORKFLOW.read_text(encoding="utf-8"))
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    jobs = workflow_jobs(workflow)
     missing_jobs = sorted(set(required_jobs) - jobs)
     if missing_jobs:
         raise ContractError(f"CI workflow is missing required job(s): {', '.join(missing_jobs)}")
@@ -110,6 +128,20 @@ def validate() -> None:
     if missing_suites:
         raise ContractError(
             f"test-suite manifest is missing required job(s): {', '.join(missing_suites)}"
+        )
+    aggregate_needs = workflow_job_needs(workflow, "required-ci")
+    if aggregate_needs != sorted(set(aggregate_needs)):
+        raise ContractError("required-ci needs must be sorted and unique")
+    if set(aggregate_needs) != set(required_jobs):
+        missing = sorted(set(required_jobs) - set(aggregate_needs))
+        extra = sorted(set(aggregate_needs) - set(required_jobs))
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if extra:
+            details.append(f"extra: {', '.join(extra)}")
+        raise ContractError(
+            "required-ci needs do not match required_jobs (" + "; ".join(details) + ")"
         )
     validate_manifest_versions()
     validate_action_pins()
