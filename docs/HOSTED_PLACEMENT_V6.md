@@ -1,23 +1,31 @@
 # Hosted Placement V6 profile
 
-Hosted Placement V6 contains two deliberately separate pieces: a transport-
-independent placement proof core and a bounded, direct-node execution channel.
-The proof records are independently testable even when no node is running. The
-current channel lets an operator explicitly select and authenticate one node;
-it does not yet turn a placement proof into dispatch authority. Neither piece
-is an implementation of an OSTADIX World.
+Hosted Placement V6 contains a transport-independent placement proof core and
+two explicitly versioned direct-node transports. The proof records are
+independently testable when no node is running. Frozen transport V1 executes one
+fresh source document without consuming the placement proof. Durable transport
+V2 carries the complete proof under a one-use signed authority envelope,
+reconstructs the exact source locally as a sealed single-shim fragment, and
+records session mutations in a node-signed hash-chain journal. Both transports
+require an operator-selected node. None of these pieces implements an OSTADIX
+World.
 
 The profile has deliberately narrow authority:
 
 - the placement core models requirements, targets, warrants, capacity, and
   one-use leases without depending on a transport;
-- pinned mutual TLS authenticates one explicitly configured live node;
-- a bounded prepared-operation message binds the exact source and attempt; and
-- a self-digested hosted-operation receipt makes a captured outcome tamper-
-  evident.
+- pinned mutual TLS authenticates one explicitly configured live node and its
+  client certificate;
+- V1 binds one fresh source/attempt and returns a self-digested outcome;
+- V2 separates the TLS principal, high-entropy session bearer, logical state
+  session, and physical actor generation;
+- V2 recomputes placement eligibility against the current catalog and the
+  exact locally prepared fragment before dispatch; and
+- hard state quotas refuse pressure without silently evicting live actors.
 
 It does not grant Governor authority, World membership, WorldFS access, native
-O-core authority, or an exactly-once external-effect guarantee.
+O-core authority, scheduler-selected placement, global effect isolation,
+cancelled-effect rollback, or an exactly-once external-effect guarantee.
 
 ## Admission versions
 
@@ -25,23 +33,24 @@ Admission V5 and Hosted Placement V6 are dual current contracts:
 
 - **V5** remains the supported legacy-local execution contract and the default
   for the uppercase `O` compatibility CLI and existing MCP execution tools.
-- **V6** adds descriptor-based placement records and the bounded prepared-
-  operation protocol. The current direct transport is exposed by `o-node` and
-  `octl`; it is not an implicit mode of uppercase `O` or the MCP tools.
+- **V6** adds descriptor-based placement records plus frozen direct transport
+  V1 and opt-in durable transport V2. They are exposed by `o-node` and `octl`;
+  neither is an implicit mode of uppercase `O`, `o-link`, or the MCP tools.
 
 A V5 record is never silently upgraded to V6, and a V6 record is never treated
 as World admission. A generated executable embeds the admission version it was
 built against.
 
-## Backend catalog V3 hard rollover
+## Backend catalog V4 hard rollover
 
-Admission V5/V6 and backend-catalog V2/V3 describe different things. The
+Admission V5/V6 and backend-catalog V3/V4 describe different things. The
 admission version selects an execution/placement contract. The catalog schema
 selects the hash domain for backend metadata. The current authorizing catalog
-schema is `ostadix.backend-catalog/v3`.
+schema is `ostadix.backend-catalog/v4`. V4 adds the backend-state support tier
+and snapshot-compatibility identity to the catalog claim.
 
 The schema string participates in the digest of the complete ordered catalog
-and in every canonical backend-specification digest. Moving from V2 to V3 thus
+and in every canonical backend-specification digest. Moving from V3 to V4 thus
 changes those identities even when a backend keeps the same display name. A
 name or alias is never substituted for that digest.
 
@@ -54,34 +63,60 @@ schemas:
 2. `NodeProfileV1::validate_at()` performs that check before freshness and
    detached-authentication checks. Candidate evaluation validates the profile
    before it attempts requirement or warrant discharge.
-3. A V2 or otherwise unknown specification fails with
+3. A V3 or otherwise unknown specification fails with
    `PlacementValidationError::NonCurrentBackendCatalog`.
 
 The exact diagnostic is:
 
 ```text
-backend specification `<digest>` is not authorized by current catalog `ostadix.backend-catalog/v3`
+backend specification `<digest>` is not authorized by current catalog `ostadix.backend-catalog/v4`
 ```
 
 Consequently, a self-consistent set of old profile, footprint, implementation,
-warrant, and signature records cannot authorize V3 placement. Old warrants
-also cannot discharge requirements freshly derived from V3 identities. The
-runtime never edits, relabels, or silently uplifts a V2 digest. A descriptor
+warrant, and signature records cannot authorize V4 placement. Old warrants
+also cannot discharge requirements freshly derived from V4 identities. The
+runtime never edits, relabels, or silently uplifts a V3 digest. A descriptor
 with no backend implementations may remain structurally valid, but it cannot
 satisfy a `BackendSpecification` or `BackendImplementation` requirement.
 
-V2 records remain archive material. Their original bytes can be decoded and
+V3 records remain archive material. Their original bytes can be decoded and
 their detached signatures can be checked against their original digests and
 keys. Registry signature, namespace, and history verification establishes the
 integrity of that archive; it is not current profile validation and is not
 placement authorization. Keep the original records if they are needed for an
 audit instead of modifying their signed contents.
 
-The bounded direct-node protocol separately binds the exact whole-catalog
-digest in `RemotePreparedOperationV1`, so peers built from different catalog
-generations reject one another. That is a direct-protocol compatibility check,
-not V6 placement authorization; the direct channel still does not consume a
-placement profile or warrant discharge.
+Frozen direct-node V1 separately binds the exact whole-catalog digest in
+`RemotePreparedOperationV1`, so peers built from different catalog generations
+reject one another. That remains a protocol-compatibility check, not placement
+authorization. Durable V2 carries the whole placement evidence bundle and
+requires the operation's catalog digest to equal the current catalog before
+local preparation and authorization.
+
+### Executable-set and local-realization V2 rollover
+
+Catalog V4 identity is necessary but not sufficient for a current backend
+implementation. The implementation also uses:
+
+- `ostadix/backend-executable-set/v2`, a path-independent digest over the
+  selected catalog alternative, selection kind, logical command, executable
+  role, and immutable artifact bytes; and
+- `ostadix.local-realization/v2`, whose digest material binds the current
+  backend specification, adapter kind and artifact, executable-set V2 identity,
+  and `o-backend-cbor-v1` protocol ABI.
+
+Physical invocation paths, file identities, and retained file handles stay in
+process-local `AdmittedExecution` authority and are rechecked immediately
+before launch. Moving the same immutable executable set to different paths does
+not change the semantic V2 identity; changing bytes or launch coordinates does.
+The runtime and `o-registry profile-local` use the same builder, so publication
+and evaluator preflight cannot silently apply different realization formulas.
+
+Local-realization V1 remains an archival digest domain. Even when paired with a
+current V4 backend specification, it fails current target validation with
+`NonCurrentBackendImplementation`. The runtime never relabels V1 material as
+V2. Regenerate backend implementations, profiles, warrants, discharges, and
+leases whenever either the catalog or realization formula changes.
 
 ### Regenerating current identities
 
@@ -93,7 +128,7 @@ After a catalog rollover, rebuild components that compile or embed the catalog:
 
 Then restart long-running `O`, `o-node`, and MCP processes so they do not retain
 an older compiled snapshot. Confirm that a rebuilt MCP `o_runtimes` report says
-`runtime-catalog-schema=ostadix.backend-catalog/v3`.
+`runtime-catalog-schema=ostadix.backend-catalog/v4`.
 
 For placement, generate and publish a new short-lived profile with
 `o-registry profile-local` and `o-registry publish-profile`. Recompute the
@@ -107,19 +142,22 @@ example:
 olangc program.O -o program --shim-dir backends
 ```
 
-An installed V2 MCP snapshot reports its own compiled catalog, and a generated
+An installed V3 MCP snapshot reports its own compiled catalog, and a generated
 executable retains its embedded build generation. Neither is a way to authorize
-V3 placement.
+V4 placement.
 
 The behavioral rollover seam is
 `tests/placement_v6.rs::noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize`:
 it round-trips an obsolete descriptor, then proves that current profile
 validation returns `NonCurrentBackendCatalog`. The catalog hash-domain check is
 covered by `src/ir.rs::catalog_digests_are_stable_canonical_projections`, and
-the MCP projection pins V3 in
+the MCP projection pins current V4 plus archival V3 in
 `mcp/ostadix_lang_mcp_server/src/main.rs::runtime_inventory_is_a_complete_catalog_projection`.
-These tests establish the bounded catalog/placement contract only; they do not
-turn the direct transport into a placement-authorized dispatcher.
+The companion regression
+`tests/placement_v6.rs::current_catalog_rejects_legacy_realization_with_a_current_specification`
+proves the independent realization rollover. These tests establish the bounded
+identity rules; frozen V1 still does not consume proof, while durable V2 does so
+only through the pinned-authority adapter described below.
 
 The ordinary HGraph coordinator is the default hosted executor. The ordered
 OIR executor remains available through `O_EXECUTOR=serial` as a differential
@@ -154,11 +192,13 @@ supported by the Rust runtime, the Python reference, and the C17 edition.
 
 The current V5 scheduler's `ActorResourceId` remains the canonical backend name
 plus persistent numeric environment. Its process registry separately adds the
-sandbox policy and admitted launch generation. V6's stronger
-`ActorGenerationIdV1` can bind the backend implementation, target, logical
-environment, sandbox/launch context, and process generation, but it is not yet
-substituted for the V5 scheduler resource key. Linker-isolated `[*]` operations
-are fresh and carry no `ActorState` dependency.
+sandbox policy and admitted launch generation. Durable hosted V2 does not
+reinterpret that smaller key as remote identity: it uses
+`ActorGenerationIdV1`, which binds the logical environment, exact backend
+implementation, target descriptor, sandbox policy, launch context, and
+physical generation. `StateSessionIdV2` separately names the logical durable
+session. Linker-isolated `[*]` operations remain fresh and carry no persistent
+`ActorState` dependency.
 
 The default linker remains ordered. `o-link --parallel` is explicit autonomous
 consent: eligible independent files are emitted as an autonomous batch, may
@@ -209,8 +249,9 @@ into an illegal one.
 
 A backend specification digest is semantic catalog identity, not process
 identity. `BackendImplementationIdV1` additionally binds adapter bytes,
-executable-set manifest, and protocol ABI. `ActorGenerationIdV1` then binds the
-target, logical environment, launch/sandbox context, and process generation.
+the path-independent executable-set V2 projection, protocol ABI, and local-
+realization V2 pipeline. `ActorGenerationIdV1` then binds the target, logical
+environment, launch/sandbox context, and process generation.
 Logical persistent-environment serialization therefore remains stable while
 physical actors can be retired and replaced without aliasing one another.
 Artifact-cache identity binds OIR, analyzer/compiler, backend implementation,
@@ -229,14 +270,20 @@ Every required atom has an exact discharge through `PlacementWarrantV1`:
 The placement-core trust policy can opt into provider-declared, historical, or
 both positive warrant tiers. Neither tier may override a fresh discovered
 negative, unknown requirements, insufficient capacity, or a World authority
-boundary. The direct `octl node run` path does not yet consume this policy or
-its discharge record.
+boundary. Frozen `octl node run` V1 does not consume this policy or its
+discharge record. V2 places the full policy, warrants, and discharge inside the
+signed envelope and re-evaluates them at the node; it does not accept a lease
+digest as a substitute for the underlying proof records.
 
 `PlacementWarrantV1` carries an issuer-key digest, while signature bytes and
 key resolution remain outside the transport-independent payload behind the
 `RecordAuthenticatorV1` boundary. The core therefore verifies that an
 authenticator accepted each record; it does not itself define a production key
-enrollment system.
+enrollment system. The current V2 adapter pins exactly one Ed25519 placement-
+authority public key and requires the envelope authority, profile, capacity
+observation, warrants, and open-session state-capacity observation to name that
+issuer. This is a bounded single-issuer policy, not a multi-key trust chain,
+rotation, revocation, or production enrollment service.
 
 Runtime-discovered warrants have a 60-second maximum lifetime, provider-
 declared warrants 5 minutes, and historical warrants 24 hours. Historical
@@ -279,8 +326,10 @@ image's O protocol.
 
 The placement core separately caps a node profile at 60 seconds, a capacity
 observation at 5 seconds, and a placement lease at 30 seconds. These are maximum
-record validity intervals, not promises that the direct transport consumes the
-records or that a node remains healthy for their duration.
+record validity intervals, not promises that a node remains healthy for their
+duration. V1 does not consume these records. V2 authenticates and revalidates
+the records it carries at the exact command time; an operator-provided endpoint
+still determines which node receives the request.
 
 ## Signed namespace registry: local and offline
 
@@ -359,72 +408,300 @@ Verification rejects expired profiles by default. `--allow-stale-profiles` is
 an explicit inspection/import policy that preserves the stale marker; it does
 not turn an expired profile into current health or placement authority.
 
-## Direct transport and prepared-operation boundary
+## Direct transports and prepared-operation boundaries
 
 `o-node` uses synchronous TCP with TLS 1.3-only mutual X.509 authentication. It
 requires a pinned trust root, expected server name, client certificate and key,
-and an Ostadix ALPN value. There is no plaintext fallback, opportunistic trust,
-or 0-RTT path.
+and a version-specific Ostadix ALPN value. There is no plaintext fallback,
+opportunistic trust, 0-RTT path, or downgrade after ALPN selection. A dual node
+offers frozen `ostadix-hosted/1` and durable `ostadix-hosted/2` on the same port,
+but selects the decoder before reading application bytes.
 
 The node binds `127.0.0.1:7337` by default, the client connects to that address
 and validates the certificate name `localhost`, and the node permits at most 32
 simultaneous connections. Use `o-node serve --bind`, `octl node ... --address`,
-and `--server-name` for an explicitly configured non-loopback endpoint.
+and `--server-name` for an explicitly configured non-loopback endpoint. Endpoint
+selection remains an operator action; neither protocol performs discovery.
 
 `o-node doctor` and `serve` also require a supported native evaluator image.
 Normal setup installs the byte-identical `ostadix-evaluator` alias beside
-`o-node`; development builds may resolve a sibling native `O`. Those paths are
-covered by the hosted execution gate. Use `--runtime-binary` to select another
-native image. Preflight checks its file type, executable permission, and native
-image magic, but does not claim ABI or `--o-backend` compatibility until an
-admitted hosted block launches. Script dispatchers are rejected, and each operation's
-V5 admission opens, hashes, and retains the selected evaluator rather than
-binding the embedding `o-node` executable.
+`o-node`; development builds may resolve a sibling native `O`. Use
+`--runtime-binary` to select another native image. Preflight checks its file
+type, executable permission, and native image magic, but does not claim ABI or
+`--o-backend` compatibility until an admitted hosted block launches. Script
+dispatchers are rejected. Each operation's admission opens, hashes, and retains
+the selected evaluator and its exact backend executable set rather than binding
+the embedding `o-node` executable.
 
 Control messages are canonical CBOR with a 2 MiB frame maximum. Operation
 source is capped at 1 MiB and returned result data at 768 KiB. Connect and TLS
 handshake timeout after 10 seconds by default; ordinary I/O after 60 seconds.
+The placement core's immutable records use their domain-separated deterministic
+JSON digest projection. A decodable CBOR or JSON record is not authority.
 
-`RemotePreparedOperationV1` binds exact source bytes through SHA-256, task and
-attempt identities, the complete descriptive backend-catalog digest, a
-deadline, and an output ceiling. The node checks those bounds and creates a
-fresh evaluator for every request. This is not a generic shell-command RPC,
-does not preserve a remote evaluator between operations, and does not accept a
-project bundle.
+### Frozen direct transport V1
 
-The deadline is checked before evaluation and again before result publication.
-A late success is suppressed and returned as a deadline failure, but the
-current evaluator cannot safely cancel effects that were already running.
+`octl node run` sends `RemotePreparedOperationV1`, which binds exact source
+bytes through SHA-256, textual task and attempt identities, the complete
+descriptive backend-catalog digest, an absolute deadline, and an output ceiling.
+The node creates a fresh evaluator for every request. This is not a generic
+shell-command RPC, does not retain an evaluator, and does not accept a project
+bundle.
 
-The placement core's immutable semantic records use their own domain-separated,
-deterministic JSON digest projection. The direct protocol uses canonical CBOR;
-neither deserialization alone grants authority.
+V1 checks the deadline before evaluation and before result publication. A late
+success is suppressed, but effects already performed by a backend cannot be
+cancelled or rolled back. `HostedOperationReceiptV1` binds request and outcome
+with a canonical-CBOR SHA-256 self-digest. TLS authenticates the node only while
+the response is received; because the receipt has no detached node signature,
+a captured V1 receipt is tamper-evident but not independently attributable or
+offline-verifiable.
 
-`HostedOperationReceiptV1` binds the request and outcome with a canonical-CBOR
-SHA-256 self-digest. The live TLS session authenticates the node while the
-result is received. The receipt has no detached node signature, so after
-capture it is tamper-evident but not independently attributable or offline-
-verifiable.
+V1 does not validate `RequirementFootprintV1`, `TargetDescriptorV1`, warrant
+discharge, capacity admission, `PlacementLeaseV1`, `PlacementLeaseV2`, or a
+verified registry profile. The catalog digest is compatibility, not placement
+authority.
 
-The direct run path does not validate `RequirementFootprintV1`,
-`TargetDescriptorV1`, warrant discharge, capacity admission, or
-`PlacementLeaseV1`. Those remain a tested placement-proof core awaiting an
-authority-preserving adapter into transport dispatch.
+### Durable direct transport V2
+
+V2 is an explicit session protocol, not an automatic upgrade of V1. The node
+must be started with a durable state root, its Ed25519 receipt-signing key, an
+exact node generation, the generation and values of all five state quotas, and
+one pinned Ed25519 placement-authority public key. Without an authorizer the
+safe library default denies every open, execute, and recovery command.
+
+Every authority envelope contains the canonical authority record, exact hosted
+command binding, complete `HostedPlacementEvidenceV2`, and, for open, the
+`StateCapacityObservationV2`. Open and recover use
+`StateControlLeaseV2`; execute uses one-use `PlacementLeaseV2`. The signature
+covers all of those records. The node verifies the pinned signer and same-issuer
+proof records, freshness, target/node generations, current catalog and
+realization, capacity, warrant discharge, trust policy, reservations, command
+purpose, session, client sequence, operation or recovery digest, state quota
+generation, and actor generation. It recomputes `CandidateDecisionV1`; an
+echoed lease digest is not sufficient.
+
+The placement lease binds:
+
+- node, target/profile/capacity generations and candidate eligibility;
+- operation OIR, complete footprint, warrant discharge, portable placement
+  admission, and typed task attempt;
+- backend implementation, realization pipeline, trust policy, and compute
+  reservation; and
+- exact hosted command plus open/existing state and actor-generation binding.
+
+Before execute authorization, the node parses, lowers, solves, and admits the
+submitted bytes into a non-cloneable `PreparedPlacementFragmentV1`. It accepts
+one non-whitespace semantic root whose only executable node is exactly one shim
+`Exec`; structural text may be a child. A second `Exec`, non-shim execution, `Load`, `Store`, `Call`,
+`Request`, `Group`, `Schedule`, text-only source, or a nonempty coordinator
+scope is rejected. Obvious `O.eval` is rejected during preparation, and a
+dynamically hidden callback is settled as a typed semantic refusal without
+granting recursive evaluator authority. Persistent actor state is retained when
+that refusal settles cleanly; ambiguous infrastructure failure is not relabeled
+as a semantic refusal.
+
+The fragment handle is process-local, non-serializable, non-cloneable, and
+fenced to the `Evaluator` instance that prepared it. After authorization, the
+runtime consumes that same handle and rechecks retained executable authority
+immediately before dispatch; it does not parse, solve, discover, or admit a
+second program. Its portable placement-admission digest excludes ambient world,
+PID, paths, and other process-local runtime facts so the authority and node can
+derive the same semantic coordinate. The complete V5 admission retains those
+local freshness facts and is still checked at dispatch. The session's target, exact requirement footprint, backend,
+realization, logical environment, trust policy, and compute reservation are
+fixed at open and cannot drift on a later execute. Open has no physical actor
+generation. A stateful first execute carries `None` for the not-yet-established
+physical actor. After exact local preparation, the node derives and signs
+`ActorGenerationIdV1`, including the exact sandbox and launch context; later
+execute commands must carry that exact identity. Source, task attempt, OIR,
+portable placement admission, and operation deadline are bound again by each
+execute lease, so multiple separately authorized commands may use one persistent
+environment only while those fixed coordinates continue to match.
+
+Persistent opaque shim effects require the complete footprint to include
+`execution/session-serialized-opaque-effects@1` and the selected target to
+advertise it. This means the exact session serializes its command. It does not
+mean the source is pure, replayable, deterministic, compensatable, or isolated
+from effects in other sessions.
+
+### V2 session authority and durable journal
+
+At open, V2 binds the SHA-256 fingerprint of the authenticated TLS client leaf
+certificate and a separate random 256-bit bearer. `octl` generates the bearer,
+creates and fsyncs its mode-0600 capability file, and binds its domain-separated
+commitment into the signed Open command before the first network write. Later
+requests must present the same TLS principal and bearer. The node omits the
+bearer from durable state and stores only its commitment, a random salt, and a
+salted bearer hash.
+
+The first signed `SessionOpened` record also binds the canonical digest of the
+complete Open request, including its authority signature. If the connection or
+receipt validation fails after durable commit, the caller retains the capability
+and may resend the byte-identical request. The node returns the original signed
+receipt even after restart or proof expiry; a changed principal, request,
+signature, lease, tier, or bearer produces `open-retry-conflict`. A pre-send
+failure never deletes a caller-owned capability because it may be retry material
+for an earlier ambiguous attempt.
+
+Every accepted session mutation is appended to a canonical-CBOR, Ed25519-
+signed, previous-hash-chained journal before it is acknowledged. The client
+pins the node receipt public key and verifies every returned journal receipt.
+The separate signed placement-authority journal records refused lease nonces
+and explicit closed-session GC. On restart, the node verifies both journals,
+reconstructs consumed accepted/refused nonces and exact client commits, and
+rejects nonce replay. An exact duplicate client sequence/request-id/request-
+digest triple returns the prior commit receipt; a conflicting reuse fails.
+GC first signs an authorization binding the closed journal's terminal head,
+raw digest, and byte length, then atomically relocates that already-durable
+journal into a permanent tombstone archive before deleting operation and
+checkpoint payloads. The archive therefore preserves the retired session
+identity and every consumed nonce without a quota-expanding copy. Retained
+journal bytes are never reported as reclaimed, and a fixed 16 KiB authority-
+control reserve keeps authorization and completion reachable at the hard total
+state boundary. Missing, replaced, or corrupt archives fail startup closed.
+
+Cooperating server and offline-admin processes retain an exclusive advisory
+lock on the persistent state-root marker for their complete lifetime. This is
+process coordination under the host account, not protection from a hostile
+same-UID process that can mutate the state directory. On Unix, state directories
+are mode 0700 and files mode 0600; trusted inputs reject symlinks and non-regular
+files, and file plus parent-directory updates are synchronized. A new session
+and its first journal frame are published by one staged-directory rename.
+Immutable operation and checkpoint blobs are written and fsynced in a private
+same-filesystem staging directory, then installed through atomic no-clobber
+publication; an exact existing canonical blob is idempotent and conflicting or
+partial content fails closed. Durable operation source, outcomes, journals, and
+checkpoints are protected by filesystem ownership but are deliberately **not
+encrypted at rest**.
+
+Each journal is fully verified once when the exclusive store opens. Appends then
+advance a cached sequence/head/byte coordinate in constant work and reject any
+out-of-band length change. Startup repairs only an incomplete final frame;
+complete invalid CBOR, signatures, or hash links remain corruption. The repair
+is followed by a signed `JournalTailRepaired` authority event. A second crash in
+the narrow interval after truncation is fsynced but before that event is appended
+can leave the valid retained prefix without the audit event; V2 does not claim a
+transactional repair-intent log for that interval.
+
+`session status` and `session actors` verify and correlate a node-signed receipt
+for the exact current journal head. The projected view fields are authenticated
+by the live mTLS channel but are not individually signed by that receipt; offline
+consumers should verify the underlying journal events rather than treating the
+convenience projection as a detached attestation.
+
+Submission is asynchronous: acceptance and terminal outcome are separate
+journal events, and `session status` collects the current durable view. On
+restart, accepted-but-not-started work becomes `NotStarted`; work that started
+without a terminal event becomes `Ambiguous` and puts the session into
+`RecoveryRequired`. This is durable evidence and reconnect status, not exactly-
+once execution or exactly-once external-effect publication.
+
+### V2 state tiers and hard quotas
+
+`SessionStateTierV2` has four wire labels, but the current release authorizes
+only these exact catalog mappings:
+
+| Session tier | Required source environment | Required catalog support | Restart behavior |
+|---|---|---|---|
+| `Stateless` | fresh ephemeral or `[*]` | `BackendStateSupportV2::Stateless` | new evaluator; no retained state |
+| `CheckpointRestore` | explicit persistent environment | `SemanticSnapshot` with exact codec and compatibility | validate the last durable snapshot, fence the lost generation, then require signed acknowledged recovery before more user execution |
+| `LiveActorOnly` | explicit persistent environment | `ExternalPinned` | state is node/process-bound; loss requires explicit handling |
+| `ReplayReconstructible` | n/a | none currently | rejected before open |
+
+The catalog currently declares semantic snapshots for Python and SQL and an
+external-pinned manifest for `ubuntu_vm`; other current entries are stateless.
+A checkpoint refusal or checkpoint/restore incompatibility does not become a
+false durability claim. Startup validates compatible snapshot bytes, durably
+records the old physical generation as lost, and exposes `RecoveryRequired`;
+ordinary submission never performs a hidden restore or executes user code on a
+replacement first. Recovery may be triggered either by an ambiguous operation
+or by actor loss at an exact signed checkpoint head, and requires an exact
+`RecoveryWarrantV2` plus a recover-purpose state-control lease. Before spawning
+the replacement, V2 appends `RecoveryAttemptStarted`, consuming the lease nonce,
+client sequence reservation, and unique next actor generation. For the current
+Python and SQL semantic-snapshot codecs, it then stages the exact snapshot in a
+fresh evaluator and executes a reviewed state-neutral probe to force the
+RestoreV1 receipt. Only that acknowledgement permits `RecoveryCommitted` and a
+return to `Ready`. A failed, expired, unsupported, or crash-interrupted
+handshake closes or forgets the replacement, durably refuses the attempt, and
+keeps the session in `RecoveryRequired`; its attempted generation is never
+reused. Replay, live-only recovery, and future unreviewed snapshot codecs remain
+fail-closed; there is no automatic replay or external-effect publication
+adapter.
+
+`StateQuotaLimitsV2` contains exactly five hard limits:
+
+1. maximum open sessions;
+2. maximum actors per session;
+3. maximum snapshot bytes per actor;
+4. maximum durable state bytes per session; and
+5. maximum durable state bytes in the complete root.
+
+Open carries a fresh signed capacity observation and exact reservation. The
+initial V2 runtime realizes exactly one actor per session. When a reservation,
+journal, checkpoint, output, session, or total-state bound would be exceeded,
+the operation is refused; no existing actor is evicted to make room. Closing a
+session stops its actor and releases the reservation but retains its signed
+journal. Only the explicit offline `o-node admin gc-closed` command can remove
+a durably closed session. It acquires the cooperating state-root lock and writes
+signed `ClosedSessionGcAuthorized` and `ClosedSessionGcCompleted` anchors to the
+authority journal around deletion. There is no automatic TTL or pressure GC.
+Per-session terminal, generation-fence, and close headroom makes the mandatory
+failure records reachable after ordinary work reaches its limit. A separate
+16-KiB authority-control debit covers tail repair and the two GC anchors;
+verified bytes reclaimed by a completed GC recycle that debit, while a
+zero-reclaim history can eventually exhaust it and is refused rather than
+evicted. If a filesystem barrier cannot be reconciled to exact durable bytes,
+the store enters `store-reopen-required`: mutation and current-head views stop
+until a fresh open revalidates the journals.
+
+### Deadlines and cancellation boundary
+
+V2 checks the absolute operation deadline before admission, before evaluator
+entry, and while waiting on the prepared backend. A
+deadline already expired at prepared-fragment entry produces the typed
+`PreparedPlacementDeadlineExpiredV1` result and proves that no backend command
+was sent. After dispatch, a timeout bounds the evaluator wait and suppresses a
+late value, but it cannot safely cancel, compensate, or roll back external
+effects. Output encoding, checkpoint creation, journal and directory fsync, and
+terminal response publication may finish after the deadline; V2 makes no
+end-to-end publication-deadline claim. A lost in-flight attempt may remain
+`Ambiguous`; neither V1 nor V2 claims cancellation or exactly-once effects.
 
 ## Failure behavior
 
-A direct run is one synchronous request to one operator-selected node. A
+Frozen V1 is one synchronous request to one operator-selected node. A
 connection, authentication, timeout, protocol, or execution failure is returned
-to the caller. There is no durable attempt ledger, reconnect status query,
-automatic retry, alternate-node selection, or local fallback. Task and attempt
-identities bind the request; they do not make it idempotent or exactly once.
+to the caller. V1 has no durable attempt ledger or reconnect-status query.
+
+V2 first durably accepts an operation and returns a signed commit receipt; the
+client then uses `session status` to collect the terminal record. Exact duplicate
+sequence, request-id, and request-digest input returns the prior commit rather
+than starting a second operation. This is control-plane idempotence, not a claim
+that arbitrary backend effects occur exactly once. The signed terminal record
+also binds whether actor state was touched and whether it remains durable, so
+restart does not infer those facts from the session tier. After restart, an
+accepted operation with no start record is classified `NotStarted` and its
+physical generation is retired or fenced according to prior state; a start
+record with no terminal record is `Ambiguous` and blocks ordinary session
+mutation until an authorized recovery path resolves the state. Current recover
+support is limited to compatible checkpoint/restore sessions; reset does not
+erase an ambiguous attempt.
+
+Neither version automatically retries, selects an alternate node, or falls back
+to local execution. Retryability and durable classifications are evidence for a
+caller; they are not an automatic retry policy. Task, attempt, operation, request,
+and sequence identities bind exact work and reject conflicts, but do not make
+external effects idempotent or exactly once.
 
 ## User-facing commands
 
-The implemented direct-node surface is intentionally small:
+The implemented direct-node surface is explicit:
 
 ```text
 o-node pki init ...
+o-node identity init ...
+o-node admin gc-closed ...
 o-node profile ...
 o-node doctor ...
 o-node serve ...
@@ -432,7 +709,29 @@ o-node serve ...
 octl node profile ...
 octl node doctor ...
 octl node run ...
+octl node session principal|open|exec|status|actors|reset|recover|close ...
+octl node authority init|issue ...
+octl node authority dev-mint open|execute|recover ...
 ```
+
+`profile`, `doctor`, and `session principal` inspect. `node run` executes the
+frozen one-operation V1 path. V2 requires an explicitly enabled server, a signed
+lease, and an explicit `session` command; it is never selected by a V1 request.
+`authority issue` envelopes caller-supplied exact expectation, command, evidence,
+and optional open-capacity records. The `authority dev-mint` commands are a
+co-located development bridge that prepares one exact source fragment against
+the same local shim directory and native evaluator image as the selected node;
+they are not network discovery, enrollment, or a production scheduler. The
+development helper can derive open, execute, and current checkpoint-recovery
+authority and accepts `--submit` to send the freshly minted envelope immediately.
+That integrated path avoids spending most of the four-second development
+capacity-observation lifetime between separate human commands. It remains a
+co-located self-attested authority, not an independent observation, discovery,
+enrollment, scheduler, production key policy, or automatic recovery service.
+The deterministic source-release closure includes
+`src/hosted_remote/v2/dev.rs` together with the V2 protocol, cryptography,
+authorizer, client, server, runtime, and store modules; the release validator
+rejects an archive that omits the development bridge.
 
 ### Development PKI quickstart
 
@@ -456,7 +755,7 @@ initial set can be inspected. Move that CA private key to protected offline
 storage after issuance; the node and client need only `ca.pem` and their own
 certificate/private-key pair at runtime.
 
-With the default file locations and loopback endpoint:
+With the default file locations and loopback endpoint, this exercises frozen V1:
 
 ```bash
 o-node doctor --shim-dir backends
@@ -473,9 +772,8 @@ The lowercase wrapper exposes the same paths as `o node-host ...` and
 without a new command.
 
 Use each command's `--help` for certificate, endpoint, timeout, limit, and
-output options. `profile` and `doctor` inspect; only `octl node run` executes an
-operation. The uppercase `O`, existing MCP tools, and `o-link` do not contact a
-node implicitly.
+output options. The uppercase `O`, existing MCP tools, and `o-link` do not
+contact a node implicitly.
 
 ## Explicit non-claims
 
@@ -483,20 +781,29 @@ Hosted Placement V6 does **not** establish:
 
 - OSTADIX World membership, a replicated Governor, Governor admission or
   commit, WorldFS, or passage of G1 or any G0--G13 gate;
-- automatic network discovery, a network registry service, scheduler-selected
-  placement, transport enforcement of the proof core, capacity reservation,
-  durable attempts, retry, alternate-node or local fallback;
-- a detached node signature or independently verifiable attribution for a
-  captured hosted-operation receipt;
+- automatic network discovery, a live network registry service, scheduler-
+  selected placement, or production placement-authority enrollment, multi-key
+  policy, rotation, revocation, or provider admission;
+- proof enforcement, state-capacity reservation, a durable attempt ledger, or
+  detached node attribution on frozen V1; these are bounded V2 properties and
+  must not be read back into V1;
+- automatic retry, alternate-node selection, local fallback, timeout
+  cancellation, effect compensation or rollback, automatic actor eviction, or
+  automatic TTL/pressure garbage collection;
+- a global exactly-once execution/effect guarantee, distributed transaction,
+  global effects-isolation protocol, or transparent recovery from every
+  accepted or ambiguous attempt;
+- encrypted-at-rest session state, hardware-protected node or authority keys,
+  production secret distribution, or confidential-computing attestation;
 - physical-machine, Secure Boot, measured-boot, device-assignment, DMA/IOMMU,
   or O-core hardware-isolation evidence;
 - coherent cross-node memory, transparent pointers, persistent-actor
   migration, mid-operation migration, safepoints, rematerialization, or
   holonomy-flat target-neutral semantics;
-- arbitrary HGraph-island, project, accelerator, foreign-kernel, or operating-
-  system placement; or
-- exactly-once external effects, distributed transactions, or transparent
-  recovery from every accepted attempt.
+- arbitrary HGraph-island, multi-backend project, accelerator, foreign-kernel,
+  or operating-system placement; or
+- a general replay/publication adapter for `ReplayReconstructible`, cross-node
+  migration for `CheckpointRestore`, or recovery of lost `LiveActorOnly` state.
 
 The current 26-gate portable QEMU component manifest remains separate evidence
 for its exact O-core and bounded World-codec scenarios. An older sealed Alpha
