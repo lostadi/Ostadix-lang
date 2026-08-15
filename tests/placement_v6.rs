@@ -15,6 +15,9 @@ use o_lang::placement::{
     TaskAttemptIdV1, UnixMillisV1, WarrantAssertionV1, WarrantDischargeV1, WarrantScopeV1,
     WarrantTierV1,
 };
+use o_lang::registry::bundle::{
+    LOCAL_BACKEND_PROTOCOL_ABI_V1, LOCAL_REALIZATION_DIGEST_DOMAIN_V1, LOCAL_REALIZATION_SCHEMA_V1,
+};
 use o_lang::world::ArtifactId;
 
 struct AcceptAll;
@@ -82,13 +85,22 @@ fn capability(namespace: &str, name: &str, level: u32) -> CapabilityAtomV1 {
 }
 
 fn backend(seed: u8) -> BackendImplementationIdV1 {
+    let registry = BackendRegistry::global();
     let specification = SemanticDigestV1::from_sha256(
-        BackendRegistry::global()
+        registry
             .specification_sha256("python")
             .expect("the canonical Python backend has a specification digest"),
     )
     .unwrap();
-    backend_with_specification(seed, specification)
+    registry
+        .backend_implementation_id_v1(
+            "python",
+            Some(&specification),
+            artifact(seed.wrapping_add(1)),
+            digest(seed.wrapping_add(2)),
+            LOCAL_BACKEND_PROTOCOL_ABI_V1,
+        )
+        .unwrap()
 }
 
 fn backend_with_specification(
@@ -225,6 +237,58 @@ fn current_catalog_state_support_is_exact_and_alias_stable() {
         registry.state_support_for_current_specification(&legacy_python),
         None
     );
+}
+
+#[test]
+fn current_catalog_rejects_legacy_realization_with_a_current_specification() {
+    let registry = BackendRegistry::global();
+    let current = backend(50);
+    let current_target = target(
+        "current-realization",
+        "current realization",
+        "aarch64",
+        Vec::new(),
+        current.clone(),
+    );
+    current_target
+        .validate_current_backend_catalog_with(registry)
+        .unwrap();
+
+    let legacy_material = serde_json::json!({
+        "schema": LOCAL_REALIZATION_SCHEMA_V1,
+        "backend_specification": current.backend_specification().as_sha256(),
+        "adapter_kind": "legacy-python-shim",
+        "adapter_artifact": current.adapter_artifact().as_sha256(),
+        "executable_set": current.executable_set().as_sha256(),
+        "protocol": current.protocol_abi(),
+    });
+    let legacy_pipeline = SemanticDigestV1::hash_bytes(
+        LOCAL_REALIZATION_DIGEST_DOMAIN_V1,
+        &serde_json::to_vec(&legacy_material).unwrap(),
+    );
+    let legacy = BackendImplementationIdV1::new(
+        current.backend_specification().clone(),
+        current.adapter_artifact().clone(),
+        current.executable_set().clone(),
+        current.protocol_abi(),
+        legacy_pipeline.clone(),
+    )
+    .unwrap();
+    let legacy_target = target(
+        "legacy-realization",
+        "legacy realization",
+        "aarch64",
+        Vec::new(),
+        legacy,
+    );
+    assert!(matches!(
+        legacy_target.validate_current_backend_catalog_with(registry),
+        Err(PlacementValidationError::NonCurrentBackendImplementation {
+            realization_pipeline,
+            current_schema,
+        }) if realization_pipeline == legacy_pipeline.as_sha256()
+            && current_schema == "ostadix.backend-catalog/v4"
+    ));
 }
 
 #[test]
