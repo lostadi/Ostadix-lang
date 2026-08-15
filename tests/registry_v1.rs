@@ -3,11 +3,11 @@ use o_lang::placement::{
     TargetCapabilityModelV1, TargetDescriptorV1,
 };
 use o_lang::registry::{
-    append_namespace_delegation, append_profile_publication, canonical_registry_bytes,
-    create_registry_root, merge_registry_store, registry_public_key_id, verify_registry_store,
-    write_new_registry_state, NamespaceDelegationV1, ProfilePublicationV1,
-    ProfileStalenessPolicyV1, RegistryError, RegistryRootPinV1, RegistrySignerV1,
-    RegistryStatePathsV1, RegistryStoreV1, RegistryTrustV1,
+    append_namespace_delegation, append_profile_publication, append_profile_to_registry_state,
+    canonical_registry_bytes, create_registry_root, merge_registry_store, read_registry_store,
+    registry_public_key_id, verify_registry_store, write_new_registry_state, NamespaceDelegationV1,
+    ProfilePublicationV1, ProfileStalenessPolicyV1, RegistryError, RegistryRootPinV1,
+    RegistrySignerV1, RegistryStatePathsV1, RegistryStoreV1, RegistryTrustV1,
 };
 
 fn signer(seed: u8) -> RegistrySignerV1 {
@@ -175,6 +175,139 @@ fn federated_snapshot_requires_live_parent_delegation() {
     let verified =
         verify_registry_store(&merged, &trusted, 2_000, ProfileStalenessPolicyV1::Reject).unwrap();
     assert_eq!(verified.verified_snapshots(), 2);
+}
+
+#[test]
+fn future_event_cannot_activate_a_not_yet_valid_delegation() {
+    let root_signer = signer(20);
+    let child_signer = signer(21);
+    let mut snapshot = create_registry_root("org.ostadix", 1_000, 10_000, &root_signer).unwrap();
+    append_namespace_delegation(
+        &mut snapshot,
+        NamespaceDelegationV1::new(
+            "org.ostadix",
+            "org.ostadix/future",
+            child_signer.public_key(),
+            3_000,
+            5_000,
+        )
+        .unwrap(),
+        1_200,
+        &root_signer,
+    )
+    .unwrap();
+    append_profile_publication(
+        &mut snapshot,
+        ProfilePublicationV1::new(
+            "org.ostadix/future",
+            "node-future",
+            profile(&child_signer, "node-future", 1, 1_500, 4_500),
+        )
+        .unwrap(),
+        3_500,
+        &child_signer,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        verify_registry_store(
+            &RegistryStoreV1::new(snapshot),
+            &trust("org.ostadix", &root_signer),
+            2_000,
+            ProfileStalenessPolicyV1::Reject,
+        ),
+        Err(RegistryError::FutureEvent {
+            sequence: 3,
+            issued_at_ms: 3_500,
+            now_ms: 2_000,
+        })
+    ));
+}
+
+#[test]
+fn profile_validity_must_fit_one_complete_signer_authority() {
+    let root_signer = signer(22);
+    let child_signer = signer(23);
+    let trusted = trust("org.ostadix", &root_signer);
+
+    let mut outlives = create_registry_root("org.ostadix", 1_000, 10_000, &root_signer).unwrap();
+    append_namespace_delegation(
+        &mut outlives,
+        NamespaceDelegationV1::new(
+            "org.ostadix",
+            "org.ostadix/team",
+            child_signer.public_key(),
+            1_500,
+            2_000,
+        )
+        .unwrap(),
+        1_400,
+        &root_signer,
+    )
+    .unwrap();
+    append_profile_publication(
+        &mut outlives,
+        ProfilePublicationV1::new(
+            "org.ostadix/team",
+            "node-team",
+            profile(&child_signer, "node-team", 1, 1_500, 2_500),
+        )
+        .unwrap(),
+        1_600,
+        &child_signer,
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_registry_store(
+            &RegistryStoreV1::new(outlives),
+            &trusted,
+            1_700,
+            ProfileStalenessPolicyV1::Reject,
+        ),
+        Err(RegistryError::InvalidValidity {
+            record: "authority-bounded profile publication"
+        })
+    ));
+
+    // The first matching grant is deliberately too narrow. Verification must
+    // consider the second, wider grant instead of depending on event order.
+    let mut overlapping = create_registry_root("org.ostadix", 1_000, 10_000, &root_signer).unwrap();
+    for expires_at_ms in [1_800, 3_000] {
+        append_namespace_delegation(
+            &mut overlapping,
+            NamespaceDelegationV1::new(
+                "org.ostadix",
+                "org.ostadix/team",
+                child_signer.public_key(),
+                1_500,
+                expires_at_ms,
+            )
+            .unwrap(),
+            1_400,
+            &root_signer,
+        )
+        .unwrap();
+    }
+    append_profile_publication(
+        &mut overlapping,
+        ProfilePublicationV1::new(
+            "org.ostadix/team",
+            "node-team",
+            profile(&child_signer, "node-team", 1, 1_500, 2_500),
+        )
+        .unwrap(),
+        1_600,
+        &child_signer,
+    )
+    .unwrap();
+    let verified = verify_registry_store(
+        &RegistryStoreV1::new(overlapping),
+        &trusted,
+        1_700,
+        ProfileStalenessPolicyV1::Reject,
+    )
+    .unwrap();
+    assert_eq!(verified.profiles().len(), 1);
 }
 
 #[test]
@@ -366,6 +499,60 @@ fn initialized_secret_key_is_mode_0600() {
         std::fs::metadata(paths.signing_key()).unwrap().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn concurrent_profile_transactions_preserve_every_append() {
+    use std::sync::{Arc, Barrier};
+
+    const PUBLISHERS: usize = 12;
+
+    let directory = tempfile::tempdir().unwrap();
+    let paths = RegistryStatePathsV1::new(
+        directory.path().join("registry.cbor"),
+        directory.path().join("registry.key"),
+        directory.path().join("trust.cbor"),
+    );
+    let root_signer = signer(24);
+    let trusted = trust("org.ostadix", &root_signer);
+    write_new_registry_state(&paths, "org.ostadix", 1_000, 10_000, &root_signer).unwrap();
+
+    let barrier = Arc::new(Barrier::new(PUBLISHERS + 1));
+    let mut publishers = Vec::with_capacity(PUBLISHERS);
+    for index in 0..PUBLISHERS {
+        let barrier = Arc::clone(&barrier);
+        let state = paths.state().to_owned();
+        let signer = root_signer.clone();
+        let trust = trusted.clone();
+        publishers.push(std::thread::spawn(move || {
+            let node_id = format!("node-{index}");
+            let publication = ProfilePublicationV1::new(
+                "org.ostadix",
+                node_id.clone(),
+                profile(&signer, &node_id, 1, 1_400, 2_000),
+            )
+            .unwrap();
+            barrier.wait();
+            append_profile_to_registry_state(
+                state,
+                publication,
+                1_500,
+                &signer,
+                &trust,
+                ProfileStalenessPolicyV1::Reject,
+            )
+        }));
+    }
+    barrier.wait();
+    for publisher in publishers {
+        publisher.join().unwrap().unwrap();
+    }
+
+    let store = read_registry_store(paths.state()).unwrap();
+    let verified =
+        verify_registry_store(&store, &trusted, 1_500, ProfileStalenessPolicyV1::Reject).unwrap();
+    assert_eq!(verified.profiles().len(), PUBLISHERS);
+    assert_eq!(verified.last_sequences().get("org.ostadix"), Some(&13));
 }
 
 #[test]

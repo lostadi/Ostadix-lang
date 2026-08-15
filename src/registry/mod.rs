@@ -26,10 +26,10 @@ pub use model::{
     MAX_REGISTRY_EVENTS, MAX_REGISTRY_SNAPSHOTS, REGISTRY_SCHEMA_V1,
 };
 pub use store::{
-    atomic_write_node_profile_json, atomic_write_registry_store, atomic_write_registry_trust,
-    export_registry_store, import_registry_store, read_node_profile_json, read_registry_store,
-    read_registry_trust, read_signing_key, write_new_registry_state, RegistryStatePathsV1,
-    MAX_REGISTRY_INPUT_BYTES,
+    append_profile_to_registry_state, atomic_write_node_profile_json, atomic_write_registry_store,
+    atomic_write_registry_trust, export_registry_store, import_registry_store,
+    read_node_profile_json, read_registry_store, read_registry_trust, read_signing_key,
+    write_new_registry_state, RegistryStatePathsV1, MAX_REGISTRY_INPUT_BYTES,
 };
 pub use verify::{merge_registry_store, verify_registry_store};
 

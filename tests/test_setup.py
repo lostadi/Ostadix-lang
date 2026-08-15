@@ -369,6 +369,16 @@ class SetupScriptTests(unittest.TestCase):
                     self.assertIn(f"--bin {binary}", output)
                     installed = home / "cargo" / "bin" / binary
                     self.assertIn(f"replace {installed}", output)
+            evaluator_alias = home / "cargo" / "bin" / "ostadix-evaluator"
+            self.assertIn(
+                f"replace {evaluator_alias} from {PROJECT_ROOT / 'target' / 'release' / 'O'}",
+                output,
+            )
+            local_alias = home / ".local" / "bin" / "ostadix-evaluator"
+            self.assertIn(
+                f"replace {local_alias} from {PROJECT_ROOT / 'target' / 'release' / 'O'}",
+                output,
+            )
 
     def test_python_setup_is_repository_local_and_never_runs_pip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -57,8 +57,8 @@ def test_explicit_fresh_environment_round_trips_exactly():
 
 def test_all_environment_spellings_round_trip_together():
     source = (
-        "python^(1)_python"
-        "python[*]^(2)_python[*]"
+        "python^(1)_python\n"
+        "python[*]^(2)_python[*]\n"
         f"python[{MAX_PERSISTENT_ENV_ID}]^(3)_python[{MAX_PERSISTENT_ENV_ID}]"
     )
     assert reconstruct_source(parse(source)) == source
@@ -86,6 +86,27 @@ def test_bare_and_star_closers_do_not_cross_match():
             assert "unterminated" in str(exc) or "closing" in str(exc)
             continue
         raise AssertionError(f"expected exact closer failure for {source!r}")
+
+
+def test_closer_prefixes_that_can_extend_a_tag_are_not_consumed():
+    sources = (
+        "python^(1)_python_suffix",
+        "python^(1)_python2",
+        "python^(1)_python{defer}",
+        "python[*]^(1)_python[*]{defer}",
+    )
+    for source in sources:
+        try:
+            parse(source)
+        except ParseError as exc:
+            assert "unterminated" in str(exc) or "closing" in str(exc)
+            continue
+        raise AssertionError(f"expected extended closer prefix to remain literal: {source!r}")
+
+
+def test_environment_closer_followed_by_identifier_is_complete():
+    source = "python[*]^(1)_python[*]tail"
+    assert reconstruct_source(parse(source)) == source
 
 
 def test_mismatched_env_bracket_is_unterminated():

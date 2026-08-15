@@ -81,6 +81,10 @@ toml        = "0.8"
 # PATH resolution for backend binary checking
 which       = "6"
 
+# Cross-process serialization for durable local registry transactions. The
+# lock is advisory and intentionally lives beside the explicitly chosen state.
+fs2         = "0.4"
+
 # semver version checking for backend dependency resolution
 semver      = { version = "1", features = ["serde"] }
 

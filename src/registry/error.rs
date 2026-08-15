@@ -33,6 +33,12 @@ pub enum RegistryError {
     PreviousEventMismatch { sequence: u64 },
     #[error("registry event timestamps moved backwards at sequence {sequence}")]
     TimestampRollback { sequence: u64 },
+    #[error("registry event {sequence} is dated {issued_at_ms}ms, after verifier time {now_ms}ms")]
+    FutureEvent {
+        sequence: u64,
+        issued_at_ms: u64,
+        now_ms: u64,
+    },
     #[error("registry event {sequence} has an invalid Ed25519 signature")]
     InvalidSignature { sequence: u64 },
     #[error("registry event {sequence} is outside signer authority for namespace `{namespace}`")]

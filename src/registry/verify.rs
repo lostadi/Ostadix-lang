@@ -39,6 +39,10 @@ impl Authority {
             && self.valid_from_ms <= now_ms
             && now_ms < self.expires_at_ms
     }
+
+    fn contains_interval(&self, valid_from_ms: u64, expires_at_ms: u64) -> bool {
+        self.valid_from_ms <= valid_from_ms && expires_at_ms <= self.expires_at_ms
+    }
 }
 
 struct SnapshotVerification {
@@ -212,20 +216,30 @@ fn verify_snapshot(
                 sequence: event.sequence(),
             });
         }
+        if event.issued_at_ms() > now_ms {
+            return Err(RegistryError::FutureEvent {
+                sequence: event.sequence(),
+                issued_at_ms: event.issued_at_ms(),
+                now_ms,
+            });
+        }
         verify_event_signature(signed)?;
-        let authorizing = authorities.iter().find(|authority| {
-            authority.authorizes(
-                event.namespace(),
-                event.signer_public_key(),
-                event.issued_at_ms(),
-            )
-        });
-        let Some(authorizing) = authorizing.cloned() else {
+        let authorizing: Vec<_> = authorities
+            .iter()
+            .filter(|authority| {
+                authority.authorizes(
+                    event.namespace(),
+                    event.signer_public_key(),
+                    event.issued_at_ms(),
+                )
+            })
+            .collect();
+        if authorizing.is_empty() {
             return Err(RegistryError::UnauthorizedSigner {
                 sequence: event.sequence(),
                 namespace: event.namespace().to_owned(),
             });
-        };
+        }
 
         match event.body() {
             RegistryEventBodyV1::NamespaceRoot(_) => return Err(RegistryError::InvalidRootEvent),
@@ -237,8 +251,12 @@ fn verify_snapshot(
                     });
                 }
                 if delegation.valid_from_ms() < event.issued_at_ms()
-                    || delegation.valid_from_ms() < authorizing.valid_from_ms
-                    || delegation.expires_at_ms() > authorizing.expires_at_ms
+                    || !authorizing.iter().any(|authority| {
+                        authority.contains_interval(
+                            delegation.valid_from_ms(),
+                            delegation.expires_at_ms(),
+                        )
+                    })
                 {
                     return Err(RegistryError::InvalidValidity {
                         record: "bounded namespace delegation",
@@ -264,9 +282,14 @@ fn verify_snapshot(
                 }
                 validate_profile_issuer(publication, event.signer_public_key())?;
                 let (issued_at_ms, expires_at_ms) = profile_validity(publication)?;
-                if event.issued_at_ms() < issued_at_ms || event.issued_at_ms() >= expires_at_ms {
+                if event.issued_at_ms() < issued_at_ms
+                    || event.issued_at_ms() >= expires_at_ms
+                    || !authorizing
+                        .iter()
+                        .any(|authority| authority.contains_interval(issued_at_ms, expires_at_ms))
+                {
                     return Err(RegistryError::InvalidValidity {
-                        record: "profile publication event",
+                        record: "authority-bounded profile publication",
                     });
                 }
                 let key = RegistryProfileKeyV1::new(

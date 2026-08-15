@@ -56,6 +56,8 @@ fn content_strategy() -> impl Strategy<Value = String> {
             Just("python^(".to_string()),
             Just(")_python".to_string()),
             Just(")_python[0]".to_string()),
+            Just(")_python[*]{defer}".to_string()),
+            Just(")_python_suffix".to_string()),
             Just("bash[3]^(".to_string()),
             Just(")_bash[3]".to_string()),
             Just("\\python^(".to_string()),
