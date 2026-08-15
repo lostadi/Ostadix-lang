@@ -123,6 +123,19 @@ establishes only `declared` and `located`; `invocable`, `compatible`,
 `authorized`, `healthy`, and per-operation `admitted` remain not-probed or
 deferred to their actual operation-scoped mechanisms.
 
+The current compiled catalog schema is `ostadix.backend-catalog/v3`.
+`o_runtimes` exposes it as
+`runtime-catalog-schema=ostadix.backend-catalog/v3`. The schema participates in
+both the complete catalog digest and every backend-specification digest, so a
+V2 MCP binary is an older descriptive snapshot rather than a source of V3
+placement identity. Rebuild the root runtime and this dependency-isolated MCP
+crate together after a catalog change (the root `./setup.sh --minimal --yes`
+flow does so), then restart MCP clients. Never relabel a digest reported by an
+old binary. Archived V2 records may still be decoded and their original
+signatures inspected, but that is not placement authorization; current
+`NodeProfileV1` validation accepts only backend specifications present in the
+V3 registry.
+
 The same catalog projection emits one `runtime-capability` record per backend
 with `integer-exactness` and `rich-numbers` fields. These are typed catalog
 declarations used by conservative fidelity analysis, not runtime probes or

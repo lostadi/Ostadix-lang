@@ -202,6 +202,19 @@
   explicit trust policy, cannot override a fresh discovered negative, and are
   bound into the transport-independent discharge record. The direct node
   transport described below does not yet consume that placement proof.
+- Admission V5/V6 and backend-catalog generation are independent version axes.
+  The current authorizing catalog is `ostadix.backend-catalog/v3`, and its
+  schema string participates in the whole-catalog and per-specification hash
+  domains. `NodeProfileV1::validate_at` invokes
+  `TargetDescriptorV1::validate_current_backend_catalog` before candidate
+  authorization. A profile containing a V2 or otherwise unknown backend
+  specification therefore fails with `NonCurrentBackendCatalog`, even if its
+  old digest, detached signature, requirements, and warrants agree with one
+  another. Decoding or independently verifying an archived signed record is
+  not current placement authorization, and no V2 digest is relabeled as V3.
+  A descriptor with no backend implementations may remain structurally valid,
+  but cannot discharge a backend-specification or backend-implementation
+  requirement.
 - Registry v1 is a transport-independent, canonical-CBOR, Ed25519-signed
   append-only store for namespace-scoped `placement::NodeProfileV1` records.
   It verifies pinned roots, strict-descendant namespace delegation, sequence
@@ -279,6 +292,10 @@
   actor. It returns a canonical-CBOR, SHA-256 self-digested
   `HostedOperationReceiptV1`. The deadline suppresses a late result but cannot
   cancel evaluator effects that were already running.
+- The direct node channel compares the exact whole-catalog digest and therefore
+  rejects peers built from different catalog generations. That is a protocol-
+  compatibility binding only: this channel still does not consume a placement
+  profile, warrant discharge, or lease.
 - The current direct transport does not consume `RequirementFootprintV1`,
   `TargetDescriptorV1`, warrant discharge, capacity admission, or a
   `PlacementLeaseV1` or a verified registry profile. It has no automatic
