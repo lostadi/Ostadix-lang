@@ -74,6 +74,62 @@ conservative `aarch64-unknown-none` scalar backend and single-vCPU QEMU/TCG
 execution. Those native target boundaries do not apply to hosted `.O`
 execution.
 
+## Hosted Placement V6
+
+Ostadix-lang has two current admission contracts. V5 remains the supported
+legacy-local contract used by the uppercase `O` compatibility CLI and the
+existing MCP execution tools. Hosted Placement V6 adds a transport-independent
+descriptor, requirement, warrant, capacity, and lease core plus a bounded
+direct-node transport for one prepared operation. Neither version is silently
+translated into the other.
+
+The direct transport has a deliberately small command surface:
+
+```text
+o-node pki init ...
+o-node profile ...
+o-node doctor ...
+o-node serve ...
+octl node profile ...
+octl node doctor ...
+octl node run ...
+```
+
+After normal setup, the lowercase wrapper delegates `o node ...` to `octl` and
+`o node-host ...` to `o-node`; `o run ...` remains the explicit local
+execution path.
+
+Eligibility is keyed by `TargetDescriptorV1`, not an ISA or language display
+name. `RequirementFootprintV1` collects the operation's capability, value,
+effect, environment, and resource constraints; `PlacementWarrantV1` records
+the exact evidence discharging each atom. Strict placement trusts compiler-
+static requirements and fresh discovered/enforced target facts. Provider-
+declared or historical positive evidence requires an explicit non-default
+`PlacementTrustPolicyV1`. The eligibility proof and any resulting lease bind
+the selected trust policy and warrant discharge by digest.
+
+The transport is deliberately limited to `RemotePreparedOperationV1`: exact
+source, task and attempt identities, backend-catalog digest, deadline, and
+output limit sent to one explicitly configured node. It uses TLS 1.3 mutual
+authentication with pinned trust inputs and returns a digest-bound
+`HostedOperationReceiptV1`. Each request gets a fresh evaluator. There is no
+automatic registry discovery, scheduler-driven target selection, retry, local
+fallback, persistent remote actor, or project-bundle dispatch in this slice.
+For a development-only loopback setup, `o-node pki init` provisions and verifies
+the required mutual-TLS identities without overwriting existing files.
+
+The separate `o-registry` CLI manages a local, durable, signed namespace
+registry: `init`, `profile-local`, `publish-profile`, `verify`, `list`,
+`export`, and `import`. Its canonical snapshots support pinned roots and
+prefix-scoped delegation for offline federation, but there is no registry
+network daemon and neither `octl` nor the scheduler discovers or dispatches
+through this store. Normal setup also exposes it as `o registry ...`.
+
+This hosted profile is not a World, Governor, G1/G10, physical-machine,
+exactly-once, project-migration, or mid-operation-migration claim. Its complete
+contract, trust rules, user commands, and exclusions are in
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md).
+
 ---
 
 ## Using Ostadix-lang with AI agents
@@ -107,7 +163,7 @@ reconstructing executable and backend paths by hand.
 | MCP tool | Current behavior |
 |----------|------------------|
 | `o_env` | Reports the resolved Ostadix root, backend directory, `O` and `olangc` paths, Python shim status, and a 30-backend runtime summary. |
-| `o_runtimes` | Discovers executable requirements from the canonical backend catalog compiled into that MCP binary, including alternative runtime sets, without failing because an optional runtime is absent. Rebuild MCP with O after catalog changes. |
+| `o_runtimes` | Discovers executable requirements and projects typed value capabilities from the canonical backend catalog compiled into that MCP binary, including alternative runtime sets, without failing because an optional runtime is absent. Rebuild MCP with O after catalog changes. |
 | `o_doctor` | Checks the local toolchain and inventories compatibility shims plus the complete backend runtime report. |
 | `o_smoke` | Runs `examples/hello.O` with an absolute backend path and expects `2`. |
 | `o_analyze_intent` | Nonexecutingly creates a bounded one-use handle for an exact source and stable analyzed graph intent. |
@@ -793,6 +849,10 @@ ladder, and explicit non-claims are pinned in
 [`docs/OSTADIX_WORLD.md`](docs/OSTADIX_WORLD.md). The machine-readable
 qualification registry is
 [`evidence/world_alpha_gates.toml`](evidence/world_alpha_gates.toml).
+Its byte-sealed historical text still contains a 24-gate component comment.
+The current unsealed component manifest and generated status table define 26
+required portable gates; the seal is preserved as historical evidence rather
+than silently rewritten.
 
 Hosted World work is retained only as a simulator, differential oracle,
 protocol-fuzz target, and development console under
@@ -1147,12 +1207,15 @@ needs QEMU and the local Rust linker toolchain.
 | Binary | Location | What it does |
 |--------|----------|--------------|
 | `O` | `target/release/O` | Runs `.O` documents and provides the interactive REPL. |
-| `o` | `scripts/o-cli.sh` through an installed wrapper | Runs repository commands such as `o plan` and `o kernel`; unknown command forms retain lowercase evaluator compatibility. |
+| `o` | `scripts/o-cli.sh` through an installed wrapper | Unifies `run`, `plan`, `why`, `node`, `node-host`, `registry`, `live`, `receipt`, and `kernel`; unknown command forms retain lowercase evaluator compatibility. |
 | `olangc` | `target/release/olangc` | Produces native hosted binaries, WASI modules, script execution, OIR dumps, or Graphviz DOT hypergraph export. |
 | `ocorec` | `target/release/ocorec` | Compiles `.oc` modules through AST, typed HIR, and SSA MIR to freestanding ELF64 objects for the primary x86_64 and bounded AArch64 targets. |
 | `o-link` | `target/release/o-link` | Recursively literal-links and runs a bare single directory; `--project` creates an inert route-preserving bundle. |
 | `o-unlink` | `target/release/o-unlink` | Restores safe project bundles and legacy literal link sections. |
 | `o-live-host` | `target/release/o-live-host` | Runs the hosted package-store, activation, service-supervision, and cross-world semantic oracle. |
+| `o-node` | `target/release/o-node` | Provisions development mTLS identities, reports a descriptive profile, checks readiness, and serves bounded prepared operations. |
+| `octl` | `target/release/octl` | Inspects or directly invokes one explicitly selected mutually authenticated hosted node. |
+| `o-registry` | `target/release/o-registry` | Generates local placement profiles and creates, signs, verifies, lists, exports, and imports local registry snapshots. |
 | `o-notebook` | feature-gated Cargo binary | Runs the local notebook server when built with `--features notebook`. |
 | `ostadix-mcp` | `mcp/ostadix_lang_mcp_server/target/release/ostadix-mcp` | Exposes the local agent tools above through MCP stdio; normal setup also installs `~/.local/bin/ostadix-mcp`. |
 | `O` | `c_cpp/O` | Runs `.O` through the standalone C17 edition. |
@@ -1506,7 +1569,7 @@ actor-state tokens, and strict-equivalent worker dispatch is restricted to
 compiler-verified O-scope loads plus source-proven-preparable trees of four
 trusted pure inline renderers (`html`, `markdown`, `text`, and `latex`). Direct
 ephemeral members of an explicitly autonomous group may separately opt into
-non-strict, unordered host effects. Evidence schema v4 binds those choices,
+non-strict, unordered host effects. Evidence schema V5 binds those choices,
 their dispatch semantics, and the plan-referenced canonical backend-catalog
 specifications before execution. That catalog identity is not runtime
 discovery, health, authorization, capacity, or readiness evidence. A
@@ -1515,7 +1578,8 @@ fixed-size local pool is created only when a graph run contains admitted
 reports completions individually; a coordinator-only graph creates no worker
 pool. This does not admit arbitrary hosted code or make pool capacity an
 evidence-backed CPU or memory reservation.
-The serial OIR executor remains the differential oracle. Wherever a
+The HGraph coordinator is the default executor. The serial OIR executor remains
+the differential oracle. Wherever a
 prior system satisfies part of this
 conjunction, the paragraphs above and below say so; corrections and closer
 prior art are welcome as issues.
@@ -1699,9 +1763,12 @@ cargo run --bin ocorec -- kernel.oc --emit obj --keep-asm -o target/kernel.o
 ### Link source into one O document
 
 ```bash
-# Explicit files retain the sequential typed-block linker.
+# Explicit files remain ordered and receive fresh linker-isolated [*] envs.
 cargo run --bin o-link -- calc.py page.html app.O -o target/program.O
 cargo run -- target/program.O
+
+# Explicit autonomous consent permits eligible independent files to overlap.
+cargo run --bin o-link -- --parallel calc.py page.html -o target/parallel.O
 
 # Safe project lifting is explicit; the resulting bundle is inert.
 cargo run --bin o-link -- --project src/ -o target/project.O
@@ -1718,6 +1785,7 @@ cargo run --bin o-unlink -- target/project.O -o target/restored/
 
 ```text
 LANG^( body )_LANG
+LANG[*]^( body )_LANG[*]
 LANG[n]^( body )_LANG[n]
 LANG{lazy}^( body )_LANG{lazy}
 LANG[n]{defer}^( body )_LANG[n]{defer}
@@ -1810,6 +1878,8 @@ inline AST backend rather than as a subprocess shim.
 python^( x = 40 )_python
 python^( x + 2 )_python        # fresh environment, x is absent
 
+python[*]^( x = 40 )_python[*] # fresh linker-isolated environment
+
 python[0]^( x = 40 )_python[0]
 python[0]^( x + 2 )_python[0] # 42
 python[1]^( x )_python[1]     # isolated environment
@@ -1817,7 +1887,15 @@ python[1]^( x )_python[1]     # isolated environment
 
 The Rust runtime uses an internal ephemeral environment identifier for bare
 blocks and destroys that backend process after the expression. An explicit
-numeric identifier names a persistent `(language, environment)` process.
+`[*]` identifies a fresh isolated evaluator without prematurely naming its
+physical process or placement. An explicit numeric identifier names persistent
+logical `(canonical backend, environment)` affinity in the current V5
+scheduler; it is not a node, backend-specification, or process-generation
+identifier. The V6 placement projection can bind the backend specification and
+stronger actor-generation coordinates separately, but does not silently change
+that V5 key. Two `[*]` blocks never communicate through evaluator state; use an
+explicit numeric environment when state sharing is the program's intended
+semantics.
 
 ### Lazy and deferred blocks
 
@@ -2244,7 +2322,7 @@ native hosted binaries as a compatibility hook. Compiled binaries mint fresh
 process-local default backend authority at startup instead of embedding
 serialized authority.
 
-### `o-link`: default literal execution and explicit safe projects
+### `o-link`: isolated literal execution, explicit parallelism, and safe projects
 
 `o-link` treats a bare single directory as a **sequence of scripts**: it
 recursively literal-links every selected UTF-8 file, writes `combined.O`, and
@@ -2259,6 +2337,29 @@ o-link src/ -o sequential.O        # writes sequential.O and runs it now
 # Explicit --literal retains the same linker but suppresses the inferred run:
 o-link src/ --literal -o sequential.O
 ```
+
+Each literal wrapper uses `LANG[*]^(...)_LANG[*]`, so files remain evaluator-
+isolated without synthesizing a persistent numeric identity. Existing numeric
+indices inside authored `.O` input remain persistent and are never renumbered.
+
+The default sequence remains ordered. `--parallel` emits each consecutive run
+of eligible independent wrappers under `autonomous(batch(...))`; that run
+returns an `OList` in input order. Inlined `.O` roots and structural coordinator
+boundaries remain sequential and split parallel runs:
+
+```bash
+o-link --parallel calc.py report.py page.html -o parallel.O
+o-link --parallel=verified report.html notes.md -o verified-parallel.O
+o-link --parallel --parallel-required calc.py report.py
+o-link --parallel --explain-parallel calc.py report.py
+```
+
+Plain `--parallel` is explicit consent to unordered hidden effects in eligible
+one-shot hosted operations; work already started is not rolled back. The
+`verified` mode admits only catalog-verified pure inline renderers,
+`--parallel-required` fails if a selected section cannot enter the requested
+lane, and `--explain-parallel` reports every decision on stderr. Parallel
+linking does not itself authorize remote placement.
 
 Use explicit `--project` whenever the directory must be captured without
 executing arbitrary files:
@@ -2368,9 +2469,9 @@ Literal mode retains these correctness properties:
 - Static imports are dependency ordered for Python, JavaScript, Rust, C and
   C++, Java, Haskell, Ruby, OCaml, Racket and Lisp, shell, Nix, C#, MATLAB,
   and Wolfram Language. Unrecognized dependencies retain stable walk order.
-- Every wrapped file receives an isolated explicit environment number, and the
-  combined source is parsed again before writing unless `--no-validate` is
-  requested.
+- Every wrapped file receives an isolated `[*]` fresh-environment marker rather
+  than a synthesized persistent number, and the combined source is parsed again
+  before writing unless `--no-validate` is requested.
 
 The built-in extension map includes Python, shell, HTML, LaTeX, Markdown,
 Rust, Racket, Nix, text, C and C++, C#, Haskell, Scheme, Common Lisp, SQL,
@@ -2541,8 +2642,9 @@ The ExecutionPlan adds three kinds of graph edge:
 - Data edges connect `$name` loads to the latest visible `let name` store.
 
 BackendRegistry records aliases and shim resolution. BackendInterface freezes
-the canonical name, purity, splice renderer, and execution mode into each OIR
-`Exec` instruction. Before execution, the plan validates node identities, root
+the canonical specification identity, typed value capabilities, purity, splice
+renderer, and execution mode into each OIR `Exec` instruction. Before execution,
+the plan validates node identities, root
 coverage, edge bounds, and acyclicity, then produces the stable
 topological root schedule and direct-child schedules used by every `Store`,
 `Invoke`, and `Exec`. The most recent runtime plan is available through
@@ -2569,7 +2671,7 @@ The validated plan is projected into a directed HGraph before execution.
 Ordinary results, successful completion, evaluator/host resource versions, and
 persistent actor state are nodes. Operations are directed hyperedges whose
 outputs include one ordinary value, one completion token, and successor state
-versions. Evidence schema v4 admits each executable operation and binds its
+versions. Evidence schema V5 admits each executable operation and binds its
 dispatch adapter before the coordinator accepts the graph. The coordinator
 marks an operation graph-ready exactly when every input node is materialized;
 dispatch additionally respects its admitted adapter, local-pool capacity, and
@@ -2668,8 +2770,12 @@ it does not parse or independently derive scheduler evidence. `--why` and
 `--explain-schedule` are mutually exclusive. The focused report projects the
 selected operation, its exact admitted HGraph blocker/producer witnesses,
 immediate dependents, retained source-sequence constraints, and its static
-wave/layer context. It is inspection-only: it dispatches nothing and reports no
-observed runtime readiness, timing, worker identity, or overlap.
+wave/layer context. It also appends the compiler-derived Hosted Placement V6
+`RequirementFootprintV1` for that exact plan node. Non-closed shim effects,
+coordinator-local control, and unpackaged scope state remain explicit
+`ConservativeUnknown` results. This is inspection-only: it dispatches nothing
+and reports no observed runtime readiness, timing, worker identity, overlap,
+placement authority, or lease.
 
 Any source origin printed beside the result is a descriptive sidecar for the
 exact `.O` input parsed by that inspection. Source locations do not enter OIR,
@@ -3321,9 +3427,16 @@ python3 scripts/release_evidence.py validate
 - Applicative-order nested evaluation with inline structural backends and
   receiving-language rendering.
 - Ephemeral bare blocks and explicit persistent backend environments.
+- Linker-isolated `[*]` environments that preserve per-file isolation without
+  creating a persistent numeric actor identity.
+- Explicit `o-link --parallel` autonomous batching with input-ordered results,
+  verified-only admission, required-mode failure, and per-section explanation.
 - O-level `let` bindings and `$var` splicing.
 - The complete current OValue sum type, canonical CBOR backend wire protocol,
   content identity, runtime-boundary classification, and persistence checks.
+- Typed backend value-capability descriptors and conservative abstract-value
+  fidelity: unknown preservation is `Unsupported`, and fidelity is never
+  inferred from a canonical language display name.
 - `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
 - Lexical scope snapshots for `O.eval`, including caller binding visibility
   without callback writes leaking into the caller.
@@ -3623,6 +3736,9 @@ native World constitution and G0--G13 convergence program are in
 [docs/OSTADIX_WORLD.md](docs/OSTADIX_WORLD.md); the superseded hosted-first
 design survives only as the explicitly non-qualifying
 [hosted reference profile](docs/HOSTED_WORLD_REFERENCE_PROFILE.md). The
+independent authenticated hosted-node boundary is documented in
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md); it is neither World
+admission nor OSTADIX Alpha gate evidence. The
 dependency-ordered path from `native[0]` to foreign personalities is tracked in
 [docs/ODOMAIN_PLAN.md](docs/ODOMAIN_PLAN.md), with the native package/REPL
 contract in [docs/LIVE_SYSTEM.md](docs/LIVE_SYSTEM.md) and the bounded foreign

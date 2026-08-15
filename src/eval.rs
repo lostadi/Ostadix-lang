@@ -11,7 +11,8 @@
 //          Load  → look up scope, render through the OIR backend interface
 //          Exec  → read already-computed child values from the execution frame
 //     2. Call ProcessRegistry::exec(lang, env_id, buffer, scope, shim)
-//     3. For ephemeral envs (env_id == u32::MAX, used internally for re-entrancy etc): call cleanup_env (always, even on err)
+//     3. For fresh envs (bare ephemeral or linker-isolated `[*]`): normalize
+//        to the process-registry ephemeral key and clean up after the attempt.
 //
 //   Root document (eval_document):
 //     Lower ONode syntax to OIR, build and validate ExecutionPlan, execute its
@@ -29,6 +30,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::effects::EffectDeclaration;
+use crate::environment::EnvironmentRefV2;
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
@@ -621,6 +623,29 @@ fn select_serial_executor(forced: Option<bool>, configured: Option<&str>) -> Res
             }
             None => Ok(false),
         },
+    }
+}
+
+/// A fresh environment is not complete until its physical evaluator has been
+/// retired. Preserve an execution error when cleanup succeeds, but classify a
+/// cleanup failure as infrastructure failure so it cannot be reported as a
+/// successful fresh attempt (or merely as a backend semantic failure).
+fn settle_fresh_backend_result<T>(
+    label: &str,
+    execution: Result<T>,
+    cleanup: Result<()>,
+) -> Result<T> {
+    match (execution, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(crate::process::infrastructure_error(
+            cleanup.context(format!("{label} completed but cleanup failed")),
+        )),
+        (Err(execution), Err(cleanup)) => {
+            Err(crate::process::infrastructure_error(anyhow::anyhow!(
+                "{label} failed: {execution:#}; fresh backend cleanup also failed: {cleanup:#}"
+            )))
+        }
     }
 }
 
@@ -1662,6 +1687,8 @@ impl Evaluator {
             },
             ExecutionMode::Shim => {
                 let runtime_lang = backend.canonical.as_str();
+                let environment = EnvironmentRefV2::from_encoded(env_id);
+                let runtime_env_id = environment.runtime_env_id();
                 let shim =
                     BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
                 let executable_leases = Arc::clone(self.executable_leases()?);
@@ -1672,7 +1699,7 @@ impl Evaluator {
                     .registry
                     .exec(
                         runtime_lang,
-                        env_id,
+                        runtime_env_id,
                         &body,
                         HashMap::new(),
                         BackendLaunchContext {
@@ -1682,11 +1709,16 @@ impl Evaluator {
                             launch_generation_sha256: Some(&launch_generation),
                         },
                     )
-                    .with_context(|| format!("[{}{{eval}}]", runtime_lang))?;
-                if env_id == u32::MAX {
-                    let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
+                    .with_context(|| format!("[{}{{eval}}]", runtime_lang));
+                if environment.is_fresh() {
+                    settle_fresh_backend_result(
+                        &format!("[{runtime_lang}{{eval}}]"),
+                        result,
+                        self.registry.cleanup_env(runtime_lang, runtime_env_id),
+                    )?
+                } else {
+                    result?
                 }
-                result
             }
             ExecutionMode::InlineAst => bail!(
                 "structural OIR backend `{}` cannot be captured as an Eval request",
@@ -2382,16 +2414,18 @@ impl Evaluator {
         debug_assert_eq!(backend.execution, ExecutionMode::Shim);
         let runtime_lang = backend.canonical.as_str();
         let shim = BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
-        let env_label = if env_id == u32::MAX {
-            format!("{runtime_lang}[*ephemeral*]")
-        } else {
-            format!("{runtime_lang}[{env_id}]")
+        let environment = EnvironmentRefV2::from_encoded(env_id);
+        let runtime_env_id = environment.runtime_env_id();
+        let env_label = match environment {
+            EnvironmentRefV2::Ephemeral => format!("{runtime_lang}[*ephemeral*]"),
+            EnvironmentRefV2::LinkerIsolated => format!("{runtime_lang}[*linked*]"),
+            EnvironmentRefV2::Persistent(id) => format!("{runtime_lang}[{id}]"),
         };
 
         // Reentrancy guard: a nested O.eval evaluation must never dispatch a new
         // command onto a persistent actor that is currently suspended awaiting
         // its own eval result — that would deadlock the shim protocol.
-        if env_id != u32::MAX && self.is_actor_suspended(runtime_lang, env_id) {
+        if environment.is_persistent() && self.is_actor_suspended(runtime_lang, runtime_env_id) {
             bail!(
                 "[{}] reentrant deadlock: this operation targets backend actor {} \
                  which is suspended awaiting the result of its own O.eval callback",
@@ -2402,94 +2436,109 @@ impl Evaluator {
 
         let executable_leases = Arc::clone(self.executable_leases()?);
         let launch_generation = self.backend_launch_generation(runtime_lang)?;
-        self.registry
-            .send_exec(
-                runtime_lang,
-                env_id,
-                &buf,
-                local_scope.clone(),
-                BackendLaunchContext {
-                    shim_path: &shim,
-                    sandbox: &sandbox,
-                    executable_leases: Some(&executable_leases),
-                    launch_generation_sha256: Some(&launch_generation),
-                },
-            )
-            .with_context(|| format!("[{}]", env_label))?;
+        let execution: Result<OValue> = (|| {
+            self.registry
+                .send_exec(
+                    runtime_lang,
+                    runtime_env_id,
+                    &buf,
+                    local_scope.clone(),
+                    BackendLaunchContext {
+                        shim_path: &shim,
+                        sandbox: &sandbox,
+                        executable_leases: Some(&executable_leases),
+                        launch_generation_sha256: Some(&launch_generation),
+                    },
+                )
+                .with_context(|| format!("[{}]", env_label))?;
 
-        let result: Result<OValue> = loop {
-            let step = if let Some(deadline) = self.callback_operation_deadline {
-                let remaining =
-                    deadline
-                        .checked_duration_since(Instant::now())
-                        .ok_or_else(|| {
-                            crate::process::infrastructure_error(anyhow::anyhow!(
-                                "[{}] inherited O.eval callback deadline expired",
-                                env_label
-                            ))
-                        })?;
-                self.registry
-                    .recv_exec_step_timeout(runtime_lang, env_id, &sandbox, remaining)
-            } else {
-                self.registry.recv_exec_step(runtime_lang, env_id, &sandbox)
-            }
-            .with_context(|| format!("[{}]", env_label))?;
-
-            match step {
-                ExecStep::Done(v) => break Ok(v),
-                ExecStep::EvalRequest {
-                    src,
-                    scope: explicit_scope,
-                } => {
-                    let callback_scope = match explicit_scope {
-                        None => local_scope.clone(),
-                        Some(OValue::Scope { bindings }) => bindings,
-                        Some(other) => {
-                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
-                            bail!(
-                                "[{}] O.eval explicit scope must be an OScope, got {}",
-                                env_label,
-                                other.type_name()
-                            );
-                        }
-                    };
-                    // Mark this persistent actor suspended for the duration of
-                    // the nested evaluation so a reentrant command targeting it
-                    // fails fast instead of deadlocking.
-                    let suspended_key =
-                        (env_id != u32::MAX).then(|| (runtime_lang.to_string(), env_id));
-                    if let Some(key) = &suspended_key {
-                        self.suspended_actors.insert(key.clone());
-                    }
-                    let eval_outcome = self.eval_source_with_scope(&src, &callback_scope);
-                    if let Some(key) = &suspended_key {
-                        self.suspended_actors.remove(key);
-                    }
-                    match eval_outcome {
-                        Ok(result) => {
-                            self.registry
-                                .send_eval_result(runtime_lang, env_id, result, &sandbox)
-                                .with_context(|| format!("[{}] send_eval_result", env_label))?;
-                        }
-                        Err(e) => {
-                            let _ = self.registry.cleanup_env(runtime_lang, env_id);
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "[{}] O.eval() failed while evaluating quoted source",
+            loop {
+                let step = if let Some(deadline) = self.callback_operation_deadline {
+                    let remaining =
+                        deadline
+                            .checked_duration_since(Instant::now())
+                            .ok_or_else(|| {
+                                crate::process::infrastructure_error(anyhow::anyhow!(
+                                    "[{}] inherited O.eval callback deadline expired",
                                     env_label
-                                )
-                            });
+                                ))
+                            })?;
+                    self.registry.recv_exec_step_timeout(
+                        runtime_lang,
+                        runtime_env_id,
+                        &sandbox,
+                        remaining,
+                    )
+                } else {
+                    self.registry
+                        .recv_exec_step(runtime_lang, runtime_env_id, &sandbox)
+                }
+                .with_context(|| format!("[{}]", env_label))?;
+
+                match step {
+                    ExecStep::Done(v) => break Ok(v),
+                    ExecStep::EvalRequest {
+                        src,
+                        scope: explicit_scope,
+                    } => {
+                        let callback_scope = match explicit_scope {
+                            None => local_scope.clone(),
+                            Some(OValue::Scope { bindings }) => bindings,
+                            Some(other) => {
+                                bail!(
+                                    "[{}] O.eval explicit scope must be an OScope, got {}",
+                                    env_label,
+                                    other.type_name()
+                                );
+                            }
+                        };
+                        // Mark this persistent actor suspended for the duration of
+                        // the nested evaluation so a reentrant command targeting it
+                        // fails fast instead of deadlocking.
+                        let suspended_key = environment
+                            .is_persistent()
+                            .then(|| (runtime_lang.to_string(), runtime_env_id));
+                        if let Some(key) = &suspended_key {
+                            self.suspended_actors.insert(key.clone());
+                        }
+                        let eval_outcome = self.eval_source_with_scope(&src, &callback_scope);
+                        if let Some(key) = &suspended_key {
+                            self.suspended_actors.remove(key);
+                        }
+                        match eval_outcome {
+                            Ok(result) => {
+                                self.registry
+                                    .send_eval_result(
+                                        runtime_lang,
+                                        runtime_env_id,
+                                        result,
+                                        &sandbox,
+                                    )
+                                    .with_context(|| format!("[{}] send_eval_result", env_label))?;
+                            }
+                            Err(e) => {
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "[{}] O.eval() failed while evaluating quoted source",
+                                        env_label
+                                    )
+                                });
+                            }
                         }
                     }
                 }
             }
-        };
+        })();
 
-        if env_id == u32::MAX {
-            let _ = self.registry.cleanup_env(runtime_lang, u32::MAX);
+        if environment.is_fresh() {
+            settle_fresh_backend_result(
+                &format!("[{env_label}]"),
+                execution,
+                self.registry.cleanup_env(runtime_lang, runtime_env_id),
+            )
+        } else {
+            execution.with_context(|| format!("[{}]", env_label))
         }
-
-        result.with_context(|| format!("[{}]", env_label))
     }
 
     /// Test-only helper: evaluate a lowered program forcing a specific executor

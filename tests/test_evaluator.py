@@ -108,6 +108,30 @@ def test_env_0_and_env_1_are_isolated():
     assert "one" not in v.value
 
 
+def test_bare_python_environment_is_fresh_per_attempt():
+    ctx = EvalContext()
+    run("python^(x = 7)_python", ctx)
+    v = run("python^(globals().get('x', 'missing'))_python", ctx)
+    assert isinstance(v, OStr)
+    assert v.value == "missing"
+
+
+def test_star_python_environment_is_fresh_per_attempt():
+    ctx = EvalContext()
+    run("python[*]^(x = 7)_python[*]", ctx)
+    v = run("python[*]^(globals().get('x', 'missing'))_python[*]", ctx)
+    assert isinstance(v, OStr)
+    assert v.value == "missing"
+
+
+def test_numeric_environment_persists_across_attempts_and_aliases():
+    ctx = EvalContext()
+    run("py[17]^(x = 40)_py[17]", ctx)
+    v = run("python[17]^(x + 2)_python[17]", ctx)
+    assert isinstance(v, OInt)
+    assert v.value == 42
+
+
 def test_python_matplotlib_lifts_to_oblob():
     # Skip gracefully if matplotlib isn't installed.
     try:
@@ -166,11 +190,10 @@ def test_example_manifest_covers_tree_and_classifies_privileged_demo():
     assert "elevated" in plan9["requirements"]["authorities"]
 
     # These examples assert semantics the Python reference does not currently
-    # implement: fresh bare environments, trusted-HTML round trips, and a
-    # scalar document result despite leading prose.  Do not bless their
-    # non-null literal/text output as Python support.
+    # implement: trusted-HTML round trips and a scalar document result despite
+    # leading prose. Do not bless their non-null literal/text output as Python
+    # support.
     for path in (
-        "ephemeral.O",
         "html_python_html.O",
         "html_raw_roundtrip.O",
         "literate_report.O",

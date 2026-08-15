@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use crate::effects::{
     effect_summary_for_plan_node, ActorResourceId, EffectSummary, Fallibility, ResourceKey,
 };
+use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
 use crate::value::{Fidelity, OValue};
 
@@ -1300,7 +1301,7 @@ impl HGraph {
                         self.validate_operation_resource_write(info, &resource)?;
                     }
                 }
-                if *env != u32::MAX {
+                if EnvironmentRefV2::from_encoded(*env).is_persistent() {
                     let actor = ActorResourceId::new(lang.clone(), *env);
                     if summary.actor_state.as_ref() != Some(&actor) {
                         return Err(format!(
