@@ -126,6 +126,176 @@ After normal setup, the lowercase wrapper delegates `o node ...` to `octl` and
 `o node-host ...` to `o-node`; `o run ...` remains the explicit local
 execution path.
 
+### Hosted V2 development quickstart
+
+This loopback walkthrough exercises the opt-in durable V2 path with the
+co-located, self-attested development authority. It is not production
+discovery, enrollment, scheduling, or key management. Paste each code block
+separately. If zsh displays `heredoc>`, press `Ctrl-C` before continuing; the
+commands below intentionally avoid heredocs.
+
+First refresh the installed tools and prove ordinary local execution:
+
+```bash
+cd "${O_LANG_ROOT:-$HOME/Ostadix-lang}"
+git switch master
+git pull --ff-only origin master
+./setup.sh -y --minimal
+export O_LANG_ROOT="$PWD"
+export PATH="$HOME/.local/bin:$O_LANG_ROOT/target/release:$PATH"
+O examples/hello.O "$O_LANG_ROOT/backends"
+# expected: [number] 2
+```
+
+In Terminal 1, create a fresh private demo root, one persistent Python
+fragment, the development PKI, the node receipt identity, and the placement
+authority. `o-node pki init` and both identity initializers refuse to overwrite
+existing keys, so use a new demo root for each walkthrough:
+
+```bash
+export DEMO="$(mktemp -d "${TMPDIR:-/tmp}/ostadix-v2-demo.XXXXXX")"
+export PKI="$DEMO/pki"
+export STATE="$DEMO/state"
+export AUTH="$DEMO/authority"
+printf '%s\n' 'python[7]^(' '__oval_result__ = 1 + 1' ')_python[7]' >"$DEMO/demo.O"
+o-node pki init --directory "$PKI" --server-name localhost
+o-node identity init --state-dir "$STATE"
+octl node authority init --directory "$AUTH"
+printf 'export DEMO=%q\n' "$DEMO"
+```
+
+Keep Terminal 1 open and start the node. V2 is enabled only because the state
+root and pinned placement-authority key are explicit:
+
+```bash
+o-node serve \
+  --node-id demo-node \
+  --shim-dir "$O_LANG_ROOT/backends" \
+  --runtime-binary "$O_LANG_ROOT/target/release/O" \
+  --bind 127.0.0.1:7337 \
+  --cert "$PKI/node-cert.pem" \
+  --key "$PKI/node-key.pem" \
+  --client-ca "$PKI/ca.pem" \
+  --v2-state-dir "$STATE" \
+  --v2-authority-public-key "$AUTH/placement-public-key.v2"
+```
+
+In Terminal 2, paste the exact `export DEMO=...` line printed by Terminal 1,
+then paste this block to reconstruct the remaining paths and check the TLS
+endpoint:
+
+```bash
+cd "${O_LANG_ROOT:-$HOME/Ostadix-lang}"
+export O_LANG_ROOT="$PWD"
+export PATH="$HOME/.local/bin:$O_LANG_ROOT/target/release:$PATH"
+export PKI="$DEMO/pki"
+export STATE="$DEMO/state"
+export AUTH="$DEMO/authority"
+octl node profile \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --cert "$PKI/client-cert.pem" \
+  --key "$PKI/client-key.pem"
+```
+
+Mint and immediately submit Open. The integrated `--submit` path matters:
+development capacity observations expire after four seconds and are not meant
+to survive a delayed handoff between separate manual commands.
+
+```bash
+octl node authority dev-mint open \
+  --signing-key "$AUTH/placement-signing-key.v2" \
+  --shim-dir "$O_LANG_ROOT/backends" \
+  --runtime-binary "$O_LANG_ROOT/target/release/O" \
+  --source "$DEMO/demo.O" \
+  --node-id demo-node \
+  --state-tier checkpoint-restore \
+  --client-cert "$PKI/client-cert.pem" \
+  --capability-out "$DEMO/capability.json" \
+  --out "$DEMO/open-lease.json" \
+  --submit \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --key "$PKI/client-key.pem" \
+  --node-receipt-public-key "$STATE/node-signing-public.v2"
+```
+
+The response contains a signed `session_opened` event. Mint and submit the
+first operation; the node, rather than the client, establishes its physical
+actor generation:
+
+```bash
+octl node authority dev-mint execute \
+  --signing-key "$AUTH/placement-signing-key.v2" \
+  --shim-dir "$O_LANG_ROOT/backends" \
+  --runtime-binary "$O_LANG_ROOT/target/release/O" \
+  --open-lease "$DEMO/open-lease.json" \
+  --source "$DEMO/demo.O" \
+  --operation-id demo-operation \
+  --task-sha256 1111111111111111111111111111111111111111111111111111111111111111 \
+  --capability "$DEMO/capability.json" \
+  --operation-out "$DEMO/operation.json" \
+  --out "$DEMO/execute-lease.json" \
+  --submit \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --cert "$PKI/client-cert.pem" \
+  --key "$PKI/client-key.pem" \
+  --node-receipt-public-key "$STATE/node-signing-public.v2"
+```
+
+Execute admission returns a signed `operation_accepted` event. Status is
+asynchronous, so repeat the first command until `demo-operation` reaches
+`succeeded`; the actor view then contains the established generation and
+checkpoint:
+
+```bash
+octl node session status \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --cert "$PKI/client-cert.pem" \
+  --key "$PKI/client-key.pem" \
+  --node-receipt-public-key "$STATE/node-signing-public.v2" \
+  --capability "$DEMO/capability.json" \
+  --operation-id demo-operation
+
+octl node session actors \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --cert "$PKI/client-cert.pem" \
+  --key "$PKI/client-key.pem" \
+  --node-receipt-public-key "$STATE/node-signing-public.v2" \
+  --capability "$DEMO/capability.json"
+```
+
+Close explicitly when finished. Closing preserves the signed journal; offline
+`o-node admin gc-closed` removes active payloads while retaining the permanent
+replay tombstone.
+
+```bash
+octl node session close \
+  --address 127.0.0.1:7337 \
+  --server-name localhost \
+  --ca "$PKI/ca.pem" \
+  --cert "$PKI/client-cert.pem" \
+  --key "$PKI/client-key.pem" \
+  --node-receipt-public-key "$STATE/node-signing-public.v2" \
+  --capability "$DEMO/capability.json"
+```
+
+Return to Terminal 1 and press `Ctrl-C` to stop the node.
+
+The automated recovery gate below additionally kills and restarts the node,
+proves that the old physical actor generation is fenced, and submits an exact
+checkpoint recovery before any replacement evaluator runs user work. See the
+full authority, quota, failure, and non-claim boundaries in
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md).
+
 Eligibility is keyed by `TargetDescriptorV1`, not an ISA or language display
 name. `RequirementFootprintV1` collects the operation's capability, value,
 effect, environment, and resource constraints; `PlacementWarrantV1` records
@@ -1370,12 +1540,16 @@ git check-ignore -v target/release/O c_cpp/O fuzz/artifacts/parser/crash
 
 ### Verifying the installation
 
+After `setup.sh` has refreshed the installed tools, run these host-side checks
+in the canonical checkout. They do not invoke Cargo against the root Rust
+package; the release CLI contract may compile generated projects in temporary
+directories:
+
 ```bash
-# Rust unit and binary-target tests
-cargo test --all-targets --all-features
+# Interpreter smoke; expect [number] 2
+O examples/hello.O "$PWD/backends"
 
 # Release CLI contract, including olangc and ocorec object emission
-cargo build --release
 bash tests/test_cli.sh
 
 # Hosted example suite
@@ -1387,10 +1561,22 @@ make -C c_cpp test
 # Python reference
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
-
-# Native boot proof
-./ocore/kernel/smoke-qemu.sh
 ```
+
+On the canonical macOS development host, run Rust builds and tests in the
+isolated `moral-gaur` Multipass guest rather than writing Cargo artifacts from
+the live checkout. Check that the guest is available, then run the complete
+locked gate as one shell command:
+
+```bash
+multipass list
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; git switch master; git pull --ff-only origin master; git rev-parse HEAD'
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export CARGO_TARGET_DIR=/home/ubuntu/ostadix-target-hosted-v2; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo check --locked --all-targets --all-features; rustup run 1.97.1 cargo test --locked --all-targets --all-features --no-fail-fast; rustup run 1.97.1 cargo clippy --locked --all-targets --all-features -- -D warnings'
+```
+
+The inner Cargo commands are also suitable for CI or another isolated clone.
+See [Running the tests](#running-the-tests) for focused Hosted V2 and recovery
+gates.
 
 ---
 
@@ -1816,6 +2002,11 @@ the resulting target code.
 ---
 
 ## Quickstart
+
+The bare Cargo examples in this general section assume CI or another isolated
+clone. On the canonical macOS development checkout, use `setup.sh` for the
+installed tools and the [Multipass test workflow](#running-the-tests) for Rust
+builds and tests.
 
 ### Run a hosted O program
 
@@ -3396,19 +3587,44 @@ edition supports every file.
 
 ## Running the tests
 
-The primary verification command is:
+On the canonical macOS development host, do not run Cargo in the live
+`~/Ostadix-lang` checkout. Confirm that the `moral-gaur` Multipass guest is
+available, then run the primary locked gate as one command. If the guest is
+stopped or unavailable, repair that runtime state before testing; do not treat
+a VM connection failure as a source failure.
 
 ```bash
-cargo test --all-targets --all-features
+multipass list
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; git switch master; git pull --ff-only origin master; git rev-parse HEAD'
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export CARGO_TARGET_DIR=/home/ubuntu/ostadix-target-hosted-v2; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo check --locked --all-targets --all-features; rustup run 1.97.1 cargo test --locked --all-targets --all-features --no-fail-fast; rustup run 1.97.1 cargo clippy --locked --all-targets --all-features -- -D warnings'
+```
+
+The focused Hosted V2 suites cover signed admission and session semantics,
+durable restart/recovery and storage boundaries, and the public CLI lifecycle:
+
+```bash
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export CARGO_TARGET_DIR=/home/ubuntu/ostadix-target-hosted-v2; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo test --locked --test hosted_remote_v2; rustup run 1.97.1 cargo test --locked --test hosted_remote_v2_recovery; rustup run 1.97.1 cargo test --locked --test hosted_remote_cli'
+```
+
+The end-to-end checkpoint-recovery gate provisions loopback PKI and authority
+keys, opens and executes a stateful Python fragment, kills and restarts the
+node, proves that the old actor generation is fenced, acknowledges restoration,
+and closes the recovered session:
+
+```bash
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export CARGO_TARGET_DIR=/home/ubuntu/ostadix-target-hosted-v2; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo test --locked --test hosted_remote_cli durable_v2_integrated_dev_submit_and_checkpoint_recovery_are_usable_end_to_end -- --exact --nocapture'
 ```
 
 The release CLI suite checks interpreter errors, successful execution,
 `olangc` native output, `ocorec` ELF object output, and linker help contracts:
 
 ```bash
-cargo build --release
-bash tests/test_cli.sh
+multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo build --locked --release --target-dir "$PWD/target"; bash tests/test_cli.sh'
 ```
+
+In CI or another throwaway clone, run the quoted inner commands directly. All
+bare Cargo commands below likewise assume an isolated checkout; they are not
+instructions to write build artifacts into the canonical live macOS tree.
 
 The example suite executes every `.O` example with an explicit expected
 output. Nix examples are skipped when Nix is not part of the local test
