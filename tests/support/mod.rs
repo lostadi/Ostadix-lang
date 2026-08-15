@@ -9,14 +9,46 @@
 // different subset of its shared helpers.
 #![allow(dead_code)]
 
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::io;
 use std::process::{Child, Command, Output};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 const POLICY_ENV: &str = "OSTADIX_TEST_RUNTIME_POLICY";
+const RUNTIME_PROBE_CONTRACT: &str = include_str!("../../ci/test-suites.toml");
 
 const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
+
+#[derive(Debug, Deserialize)]
+struct RuntimeProbeManifest {
+    schema: String,
+    runtime_probes: HashMap<String, RuntimeProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeProbe {
+    executable: String,
+    probe_args: Vec<String>,
+}
+
+fn runtime_probe(name: &str) -> &'static RuntimeProbe {
+    static PROBES: OnceLock<HashMap<String, RuntimeProbe>> = OnceLock::new();
+    let probes = PROBES.get_or_init(|| {
+        let manifest: RuntimeProbeManifest = toml::from_str(RUNTIME_PROBE_CONTRACT)
+            .expect("ci/test-suites.toml must contain valid runtime probe contracts");
+        assert_eq!(
+            manifest.schema, "ostadix.ci-test-suites/v2",
+            "ci/test-suites.toml has an unsupported runtime probe schema"
+        );
+        manifest.runtime_probes
+    });
+    probes.get(name).unwrap_or_else(|| {
+        panic!("runtime {name:?} has no authoritative probe in ci/test-suites.toml")
+    })
+}
 
 fn retry_executable_busy<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     for attempt in 0..=MAX_EXECUTABLE_BUSY_RETRIES {
@@ -65,8 +97,9 @@ fn runtime_policy() -> RuntimePolicy {
 }
 
 fn runtime_available(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
+    let probe = runtime_probe(name);
+    Command::new(&probe.executable)
+        .args(&probe.probe_args)
         .output()
         .is_ok_and(|output| output.status.success())
 }

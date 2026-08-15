@@ -1,7 +1,75 @@
-schema = "ostadix.ci-test-suites/v1"
+schema = "ostadix.ci-test-suites/v2"
+
+# Every executable used by a CI suite is named once here together with the
+# invocation that proves it is the expected, usable tool. Suites below refer to
+# these stable IDs; CI and the Rust integration-test helper consume the same
+# probe contract. In particular, OpenSSL exposes `version` as a subcommand, not
+# the generic `--version` accepted by most other tools.
+[runtime_probes.bash]
+executable = "bash"
+probe_args = ["--version"]
+
+[runtime_probes.cargo]
+executable = "cargo"
+probe_args = ["--version"]
+
+[runtime_probes.cc]
+executable = "cc"
+probe_args = ["--version"]
+
+[runtime_probes.clang]
+executable = "clang"
+probe_args = ["--version"]
+
+[runtime_probes.cmake]
+executable = "cmake"
+probe_args = ["--version"]
+
+[runtime_probes.docker]
+executable = "docker"
+probe_args = ["--version"]
+
+[runtime_probes.grub-mkstandalone]
+executable = "grub-mkstandalone"
+probe_args = ["--version"]
+
+[runtime_probes.make]
+executable = "make"
+probe_args = ["--version"]
+
+[runtime_probes.mcopy]
+executable = "mcopy"
+probe_args = ["-V"]
+
+[runtime_probes.openssl]
+executable = "openssl"
+probe_args = ["version"]
+
+[runtime_probes.python3]
+executable = "python3"
+probe_args = ["--version"]
+
+[runtime_probes.qemu-system-aarch64]
+executable = "qemu-system-aarch64"
+probe_args = ["--version"]
+
+[runtime_probes.qemu-system-x86_64]
+executable = "qemu-system-x86_64"
+probe_args = ["--version"]
+
+[runtime_probes.rustc]
+executable = "rustc"
+probe_args = ["--version"]
+
+[runtime_probes.sqlite3]
+executable = "sqlite3"
+probe_args = ["--version"]
 
 [suites.contracts]
 required_executables = ["python3"]
+
+[suites.docker]
+required_executables = ["docker"]
 
 [suites.rust-msrv]
 required_executables = ["cargo", "rustc"]

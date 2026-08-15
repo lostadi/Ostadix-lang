@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -22,6 +24,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 FUZZ_WORKFLOW = ROOT / ".github" / "workflows" / "fuzz.yml"
 CATALOG = ROOT / "src" / "backend_catalog.inc.rs"
 MCP_SMOKE = ROOT / "scripts" / "smoke_ostadix_mcp.py"
+RUST_TEST_SUPPORT = ROOT / "tests" / "support" / "mod.rs"
 
 
 class ContractError(RuntimeError):
@@ -33,10 +36,42 @@ def load_toml(path: Path) -> dict:
         return tomllib.load(handle)
 
 
-def test_suites() -> dict[str, dict]:
+def test_suite_contract() -> tuple[dict[str, dict], dict[str, dict]]:
     document = load_toml(TEST_SUITES)
-    if document.get("schema") != "ostadix.ci-test-suites/v1":
+    if document.get("schema") != "ostadix.ci-test-suites/v2":
         raise ContractError("unsupported CI test-suite schema")
+    probes = document.get("runtime_probes")
+    if not isinstance(probes, dict) or not probes:
+        raise ContractError("CI test-suite manifest has no runtime probes")
+    if list(probes) != sorted(probes):
+        raise ContractError("runtime probe IDs must be sorted")
+    commands: list[str] = []
+    for probe_id, probe in probes.items():
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", probe_id):
+            raise ContractError(f"runtime probe {probe_id!r} has an invalid ID")
+        if not isinstance(probe, dict) or set(probe) != {"executable", "probe_args"}:
+            raise ContractError(
+                f"runtime probe {probe_id!r} must contain only executable and probe_args"
+            )
+        executable = probe["executable"]
+        if not isinstance(executable, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.+-]+", executable
+        ):
+            raise ContractError(f"runtime probe {probe_id!r} has an invalid executable")
+        probe_args = probe["probe_args"]
+        if (
+            not isinstance(probe_args, list)
+            or not probe_args
+            or any(
+                not isinstance(argument, str) or not argument or "\0" in argument
+                for argument in probe_args
+            )
+        ):
+            raise ContractError(f"runtime probe {probe_id!r} has invalid probe arguments")
+        commands.append(executable)
+    if len(commands) != len(set(commands)):
+        raise ContractError("runtime probe executables must be unique")
+
     suites = document.get("suites")
     if not isinstance(suites, dict) or not suites:
         raise ContractError("CI test-suite manifest has no suites")
@@ -48,9 +83,68 @@ def test_suites() -> dict[str, dict]:
             raise ContractError(
                 f"suite {name!r} required executables must be sorted and unique"
             )
-        if any(not re.fullmatch(r"[A-Za-z0-9_.+-]+", item) for item in requirements):
-            raise ContractError(f"suite {name!r} contains an invalid executable name")
-    return suites
+        unknown = sorted(set(requirements) - set(probes))
+        if unknown:
+            raise ContractError(
+                f"suite {name!r} references unknown runtime probe(s): {', '.join(unknown)}"
+            )
+    return probes, suites
+
+
+def runtime_probes() -> dict[str, dict]:
+    return test_suite_contract()[0]
+
+
+def test_suites() -> dict[str, dict]:
+    return test_suite_contract()[1]
+
+
+def suite_runtime_ids(suite_name: str) -> list[str]:
+    _, suites = test_suite_contract()
+    if suite_name not in suites:
+        raise ContractError(f"unknown CI suite {suite_name!r}")
+    return suites[suite_name]["required_executables"]
+
+
+def required_executables(suite_name: str) -> list[str]:
+    probes, _ = test_suite_contract()
+    return [probes[probe_id]["executable"] for probe_id in suite_runtime_ids(suite_name)]
+
+
+def probe_runtime(probe_id: str, probe: dict) -> str:
+    executable = probe["executable"]
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise ContractError(
+            "runtime-evidence status=missing-required "
+            f"policy=required runtime={probe_id} executable={executable}"
+        )
+    completed = subprocess.run(
+        [resolved, *probe["probe_args"]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise ContractError(
+            "runtime-evidence status=not-invocable "
+            f"policy=required runtime={probe_id} path={resolved} "
+            f"exit_code={completed.returncode}"
+        )
+    output_lines = completed.stdout.splitlines()
+    version = output_lines[0] if output_lines else "<no-output>"
+    return (
+        "runtime-evidence status=invocable "
+        f"policy=required runtime={probe_id} path={resolved} version={version}"
+    )
+
+
+def probe_suite(suite_name: str) -> list[str]:
+    probes, _ = test_suite_contract()
+    return [probe_runtime(probe_id, probes[probe_id]) for probe_id in suite_runtime_ids(suite_name)]
 
 
 def workflow_jobs(text: str) -> set[str]:
@@ -60,17 +154,21 @@ def workflow_jobs(text: str) -> set[str]:
     return set(re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\s*$", text[match.end() :]))
 
 
-def workflow_job_needs(text: str, job_name: str) -> list[str]:
-    """Return one top-level job's block-list `needs` without a YAML dependency."""
+def workflow_job_body(text: str, job_name: str) -> str:
     job = re.search(
         rf"(?ms)^  {re.escape(job_name)}:\s*\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
         text,
     )
     if job is None:
         raise ContractError(f"CI workflow has no {job_name!r} job")
+    return job.group("body")
+
+
+def workflow_job_needs(text: str, job_name: str) -> list[str]:
+    """Return one top-level job's block-list `needs` without a YAML dependency."""
     needs = re.search(
         r"(?ms)^    needs:\s*\n(?P<items>(?:^      - [A-Za-z0-9_-]+\s*$\n?)+)",
-        job.group("body"),
+        workflow_job_body(text, job_name),
     )
     if needs is None:
         raise ContractError(f"CI job {job_name!r} has no block-list needs")
@@ -111,6 +209,28 @@ def validate_action_pins() -> None:
                 )
 
 
+def validate_runtime_probe_consumers(workflow: str) -> None:
+    for suite in ("docker", "rust-hosted", "rust-tests"):
+        command = f"python3 scripts/contract_surfaces.py probe-runtimes --suite {suite}"
+        if workflow.count(command) != 1:
+            raise ContractError(
+                f"CI must consume the authoritative runtime probes once for suite {suite!r}"
+            )
+    support = RUST_TEST_SUPPORT.read_text(encoding="utf-8")
+    if 'include_str!("../../ci/test-suites.toml")' not in support:
+        raise ContractError(
+            "Rust integration-test support does not consume ci/test-suites.toml"
+        )
+
+    mcp_job = workflow_job_body(workflow, "mcp")
+    component = "components: clippy"
+    invocation = "cargo +1.97.1 clippy"
+    if component not in mcp_job or invocation not in mcp_job:
+        raise ContractError("MCP CI must install and invoke the Clippy component")
+    if mcp_job.index(component) > mcp_job.index(invocation):
+        raise ContractError("MCP CI must install Clippy before invoking it")
+
+
 def validate() -> None:
     suites = test_suites()
     required = load_toml(REQUIRED_JOBS)
@@ -145,6 +265,7 @@ def validate() -> None:
         )
     validate_manifest_versions()
     validate_action_pins()
+    validate_runtime_probe_consumers(workflow)
     catalog_schema()
     smoke = MCP_SMOKE.read_text(encoding="utf-8")
     if (
@@ -162,16 +283,17 @@ def main() -> int:
     subparsers.add_parser("validate")
     required = subparsers.add_parser("required-executables")
     required.add_argument("--suite", required=True)
+    probe = subparsers.add_parser("probe-runtimes")
+    probe.add_argument("--suite", required=True)
     args = parser.parse_args()
     try:
         if args.command == "validate":
             validate()
             print("contract-surfaces: ok")
+        elif args.command == "required-executables":
+            print("\n".join(required_executables(args.suite)))
         else:
-            suites = test_suites()
-            if args.suite not in suites:
-                raise ContractError(f"unknown CI suite {args.suite!r}")
-            print("\n".join(suites[args.suite]["required_executables"]))
+            print("\n".join(probe_suite(args.suite)))
     except (ContractError, OSError, tomllib.TOMLDecodeError) as error:
         print(f"contract-surfaces: {error}", file=sys.stderr)
         return 1

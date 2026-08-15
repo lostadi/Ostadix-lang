@@ -1,0 +1,9 @@
+# Bounded custody demonstration: one hosted value crosses from Python into
+# O's text renderer. The accompanying script records the analyzed identities
+# and then performs a fresh, same-intent-gated execution.
+
+let answer = python^(
+__oval_result__ = 20 + 22
+)_python
+
+text^(semantic-custody answer=$answer)_text
