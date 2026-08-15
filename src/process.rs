@@ -53,6 +53,22 @@ impl fmt::Display for BackendSemanticError {
 
 impl StdError for BackendSemanticError {}
 
+/// A one-shot compatibility backend completed its semantic operation but
+/// could not participate in the explicit shutdown handshake.  This marker is
+/// intentionally narrower than "the process is now terminal": protocol-shape
+/// errors and acknowledged shutdowns with lingering descendants must remain
+/// failures even when forced cleanup eventually succeeds.
+#[derive(Debug)]
+struct BackendShutdownUnacknowledged(String);
+
+impl fmt::Display for BackendShutdownUnacknowledged {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl StdError for BackendShutdownUnacknowledged {}
+
 pub(crate) fn infrastructure_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<BackendInfrastructureError>() {
         error
@@ -814,7 +830,9 @@ impl BackendProcess {
         if let Err(error) = self.send_command(&OWireCommand::Shutdown) {
             let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
             return match termination {
-                Ok(()) => Err(error.context("failed to send backend shutdown")),
+                Ok(()) => Err(anyhow::Error::new(BackendShutdownUnacknowledged(
+                    format!("failed to send backend shutdown: {error:#}"),
+                ))),
                 Err(termination) => Err(anyhow!(
                     "failed to send backend shutdown: {error:#}; forced termination also failed: {termination:#}"
                 )),
@@ -859,7 +877,9 @@ impl BackendProcess {
             Err(error) => {
                 let termination = self.force_terminate(BACKEND_FALLBACK_REAP_TIMEOUT);
                 return match termination {
-                    Ok(()) => Err(error.context("backend shutdown was not acknowledged")),
+                    Ok(()) => Err(anyhow::Error::new(BackendShutdownUnacknowledged(
+                        format!("backend shutdown was not acknowledged: {error:#}"),
+                    ))),
                     Err(termination) => Err(anyhow!(
                         "backend shutdown was not acknowledged: {error:#}; forced termination also failed: {termination:#}"
                     )),
@@ -885,6 +905,35 @@ impl BackendProcess {
             };
         }
         Ok(())
+    }
+
+    /// Retire a one-shot backend after a fresh environment completes.
+    ///
+    /// `shutdown` deliberately reports a missing protocol acknowledgement,
+    /// even when its bounded fallback has already killed and reaped the owned
+    /// process group. That strict diagnostic is useful for explicit lifecycle
+    /// checks, but older compatibility shims do not implement the shutdown
+    /// verb. Fresh-environment isolation requires physical retirement, not a
+    /// particular acknowledgement. Accept the fallback only when `shutdown`
+    /// proved the process, response reader, and owned group fully terminal.
+    fn retire_fresh_attempt(&mut self, timeout: Duration) -> Result<()> {
+        match self.shutdown(timeout) {
+            Ok(()) => Ok(()),
+            Err(graceful_error)
+                if self.terminal && graceful_error.is::<BackendShutdownUnacknowledged>() =>
+            {
+                lifecycle_trace(
+                    "worker.shutdown_forced_compatible",
+                    format!(
+                        "language={} backend_pid={} reason={graceful_error:#}",
+                        self.language,
+                        self.child.id()
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn recv_shutdown_step_before(
@@ -1188,10 +1237,10 @@ where
     match execution {
         Ok(value) => {
             process
-                .shutdown(backend_shutdown_timeout())
+                .retire_fresh_attempt(backend_shutdown_timeout())
                 .with_context(|| {
                     format!(
-                        "ephemeral backend `{language}` returned a value but did not shut down cleanly"
+                        "ephemeral backend `{language}` returned a value but could not be retired"
                     )
                 })
                 .map_err(infrastructure_error)?;
@@ -1432,7 +1481,7 @@ impl ProcessRegistry {
             .collect::<Vec<_>>();
         for key in keys {
             if let Some(mut process) = self.registry.remove(&key) {
-                process.shutdown(backend_shutdown_timeout())?;
+                process.retire_fresh_attempt(backend_shutdown_timeout())?;
             }
         }
         Ok(())

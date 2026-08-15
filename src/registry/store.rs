@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,9 +10,9 @@ use serde::Serialize;
 use crate::placement::NodeProfileV1;
 
 use super::{
-    canonical_registry_bytes, create_registry_root, merge_registry_store, verify_registry_store,
-    ProfileStalenessPolicyV1, RegistryError, RegistryRootPinV1, RegistrySignerV1, RegistryStoreV1,
-    RegistryTrustV1, VerifiedRegistryV1,
+    append_profile_to_store, canonical_registry_bytes, create_registry_root, merge_registry_store,
+    verify_registry_store, ProfilePublicationV1, ProfileStalenessPolicyV1, RegistryError,
+    RegistryRootPinV1, RegistrySignerV1, RegistryStoreV1, RegistryTrustV1, VerifiedRegistryV1,
 };
 
 pub const MAX_REGISTRY_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -143,6 +144,34 @@ pub fn atomic_write_registry_trust(
     atomic_write(path.as_ref(), &canonical_registry_bytes(trust)?)
 }
 
+/// Append and persist one publication as a single cooperating-process
+/// transaction. The sibling advisory lock remains on disk so every process
+/// always locks the same inode; deleting lock files can split the lock domain.
+pub fn append_profile_to_registry_state(
+    state_path: impl AsRef<Path>,
+    publication: ProfilePublicationV1,
+    issued_at_ms: u64,
+    signer: &RegistrySignerV1,
+    trust: &RegistryTrustV1,
+    staleness: ProfileStalenessPolicyV1,
+) -> Result<VerifiedRegistryV1, RegistryError> {
+    let state_path = state_path.as_ref();
+    with_exclusive_registry_lock(state_path, || {
+        let mut store = read_registry_store(state_path)?;
+        append_profile_to_store(
+            &mut store,
+            publication,
+            issued_at_ms,
+            signer,
+            trust,
+            staleness,
+        )?;
+        let verified = verify_registry_store(&store, trust, issued_at_ms, staleness)?;
+        atomic_write_registry_store(state_path, &store)?;
+        Ok(verified)
+    })
+}
+
 pub fn export_registry_store(
     store: &RegistryStoreV1,
     output: impl AsRef<Path>,
@@ -159,14 +188,16 @@ pub fn import_registry_store(
     staleness: ProfileStalenessPolicyV1,
 ) -> Result<VerifiedRegistryV1, RegistryError> {
     let state_path = state_path.as_ref();
-    let current = read_registry_store(state_path)?;
-    let incoming = read_registry_store(incoming_path)?;
-    let trust = read_registry_trust(trust_path)?;
-    verify_registry_store(&current, &trust, now_ms, staleness)?;
-    let merged = merge_registry_store(&current, &incoming)?;
-    let verified = verify_registry_store(&merged, &trust, now_ms, staleness)?;
-    atomic_write_registry_store(state_path, &merged)?;
-    Ok(verified)
+    with_exclusive_registry_lock(state_path, || {
+        let current = read_registry_store(state_path)?;
+        let incoming = read_registry_store(incoming_path)?;
+        let trust = read_registry_trust(trust_path)?;
+        verify_registry_store(&current, &trust, now_ms, staleness)?;
+        let merged = merge_registry_store(&current, &incoming)?;
+        let verified = verify_registry_store(&merged, &trust, now_ms, staleness)?;
+        atomic_write_registry_store(state_path, &merged)?;
+        Ok(verified)
+    })
 }
 
 fn encode_key(signer: &RegistrySignerV1) -> Vec<u8> {
@@ -240,7 +271,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = containing_directory(path);
     let file_name = path.file_name().ok_or_else(|| {
         RegistryError::Canonical(format!(
             "registry output path `{}` has no file name",
@@ -261,6 +292,50 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
     }
     sync_parent(parent)?;
     Ok(())
+}
+
+fn with_exclusive_registry_lock<T>(
+    state_path: &Path,
+    operation: impl FnOnce() -> Result<T, RegistryError>,
+) -> Result<T, RegistryError> {
+    let lock_path = registry_lock_path(state_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| RegistryError::io(&lock_path, error))?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|error| RegistryError::io(&lock_path, error))?;
+
+    // File close is the lock release. An explicit unlock error after a
+    // successful atomic replacement would falsely tell callers to retry a
+    // transaction that already committed.
+    let result = operation();
+    drop(lock);
+    result
+}
+
+fn registry_lock_path(state_path: &Path) -> Result<PathBuf, RegistryError> {
+    let file_name = state_path.file_name().ok_or_else(|| {
+        RegistryError::Canonical(format!(
+            "registry state path `{}` has no file name",
+            state_path.display()
+        ))
+    })?;
+    let mut lock_name = OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    Ok(containing_directory(state_path).join(lock_name))
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(unix)]

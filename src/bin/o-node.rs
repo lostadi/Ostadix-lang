@@ -18,6 +18,7 @@ use o_lang::hosted_remote::{
     ClientTlsIdentity, HostedNodeRuntime, HostedNodeServerConfig, NodeDoctorCheckV1,
     ServerTlsIdentity, DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND, DEFAULT_NODE_ID,
 };
+use o_lang::runtime_exec::validate_native_runtime_binary;
 use o_lang::shims::ExtractedShims;
 
 #[derive(Debug, Parser)]
@@ -75,6 +76,11 @@ struct RuntimeArgs {
     /// Backend shim directory. Defaults to O_BACKENDS_DIR, then bundled shims.
     #[arg(long)]
     shim_dir: Option<PathBuf>,
+    /// Native evaluator image used for admitted backend-proxy launches.
+    /// Defaults to a sibling `ostadix-evaluator`, then a sibling O development
+    /// binary, then PATH `ostadix-evaluator`; shell dispatchers are rejected.
+    #[arg(long)]
+    runtime_binary: Option<PathBuf>,
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
 }
@@ -329,7 +335,7 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
 
 fn doctor(args: DoctorArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
-    let runtime = runtime_from_args(args.runtime, shim_dir);
+    let runtime = runtime_from_args(args.runtime, shim_dir)?;
     let mut doctor = runtime.doctor()?;
     let identity = tls_identity(args.tls);
     let tls_check = match build_server_config(&identity) {
@@ -361,7 +367,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let config = HostedNodeServerConfig {
         bind_address: args.bind,
-        runtime: runtime_from_args(args.runtime, shim_dir),
+        runtime: runtime_from_args(args.runtime, shim_dir)?,
         tls_identity: tls_identity(args.tls),
     };
     eprintln!(
@@ -371,12 +377,52 @@ fn serve(args: ServeArgs) -> Result<()> {
     serve_node(config)
 }
 
-fn runtime_from_args(args: RuntimeArgs, shim_dir: PathBuf) -> HostedNodeRuntime {
-    HostedNodeRuntime {
+fn runtime_from_args(args: RuntimeArgs, shim_dir: PathBuf) -> Result<HostedNodeRuntime> {
+    let runtime_executable = resolve_runtime_binary(args.runtime_binary)?;
+    Ok(HostedNodeRuntime {
         node_id: args.node_id,
         shim_dir,
+        runtime_executable,
         max_concurrent_connections: args.max_connections,
+    })
+}
+
+fn resolve_runtime_binary(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return validate_native_runtime_binary(&path).with_context(|| {
+            format!(
+                "--runtime-binary `{}` is not a supported native evaluator image",
+                path.display()
+            )
+        });
     }
+
+    let current = env::current_exe().context("failed to locate o-node executable")?;
+    let mut candidates = current
+        .parent()
+        .into_iter()
+        .flat_map(|directory| [directory.join("ostadix-evaluator"), directory.join("O")])
+        .collect::<Vec<_>>();
+    if let Ok(installed) = which::which("ostadix-evaluator") {
+        if !candidates.contains(&installed) {
+            candidates.push(installed);
+        }
+    }
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match validate_native_runtime_binary(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(error) => rejected.push(format!("{} ({error})", candidate.display())),
+        }
+    }
+    bail!(
+        "could not find a native evaluator image; run setup.sh, install `ostadix-evaluator` beside o-node, or pass --runtime-binary{}",
+        if rejected.is_empty() {
+            String::new()
+        } else {
+            format!("; rejected candidates: {}", rejected.join(", "))
+        }
+    )
 }
 
 fn tls_identity(args: ServerTlsArgs) -> ServerTlsIdentity {
@@ -613,6 +659,23 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn runtime_binary_must_be_a_native_executable() {
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(
+            validate_native_runtime_binary(&current).unwrap(),
+            current.canonicalize().unwrap()
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let wrapper = root.path().join("O-wrapper");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = validate_native_runtime_binary(&wrapper).unwrap_err();
+        assert!(error.to_string().contains("script or unsupported"));
     }
 }
 
