@@ -182,6 +182,7 @@ REQUIRED_RELEASE_PATHS = frozenset(
         "mcp/ostadix_lang_mcp_server/src/main.rs",
         "README.md",
         "boot-and-test.sh",
+        "docs/HOSTED_PLACEMENT_V6.md",
         "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
         "docs/O_MACHINE_CONTRACT.md",
         "docs/OSTADIX_BOOT.md",
@@ -680,11 +681,15 @@ def collect_source_entries(repo: Path, commit: str) -> list[SourceEntry]:
         except ValueError as error:
             raise ReleaseError("Git produced a malformed tree record") from error
         path = _decode_git_path(raw_path)
-        if not is_allowed_release_path(path):
-            continue
         kind = raw_kind.decode("ascii", "strict")
         mode = raw_mode.decode("ascii", "strict")
         oid = raw_oid.decode("ascii", "strict")
+        if kind == "commit" or mode == "160000":
+            raise ReleaseError(
+                f"self-contained source releases forbid Git gitlinks: {path}"
+            )
+        if not is_allowed_release_path(path):
+            continue
         if kind != "blob":
             raise ReleaseError(f"allowlisted path is not a Git blob: {path}")
         if mode not in VALID_GIT_MODES:

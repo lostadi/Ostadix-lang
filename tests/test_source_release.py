@@ -391,6 +391,7 @@ class SourceReleaseTests(unittest.TestCase):
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
+            "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
             "docs/KERNEL_WORLD_CONTRACT.md": "fixture kernel World contract\n",
             "docs/HOSTED_WORLD_REFERENCE_PROFILE.md": WORLD_NORMATIVE_BYTES[
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md"
@@ -734,6 +735,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "boot-and-test.sh",
                 "docs/CLAIMS.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
+                "docs/HOSTED_PLACEMENT_V6.md",
                 "docs/HOSTED_WORLD_REFERENCE_PROFILE.md",
                 "docs/KERNEL_WORLD_CONTRACT.md",
                 "docs/O_MACHINE_CONTRACT.md",
@@ -1090,6 +1092,25 @@ class SourceReleaseTests(unittest.TestCase):
             r"unsupported Git mode 120000 for docs/escape-link",
         ):
             self._build("symlink.zip")
+
+    def test_unconfigured_gitlink_is_rejected_even_outside_allowlist(self) -> None:
+        parent = self._commit()
+        self._git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            parent,
+            "Avesta",
+        )
+        self._git("commit", "-q", "-m", "add malformed gitlink")
+        (self.repo / "Avesta").mkdir()
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"self-contained source releases forbid Git gitlinks: Avesta",
+        ):
+            self._build("gitlink.zip")
 
     def test_archive_manifest_cannot_reintroduce_symlink_mode(self) -> None:
         result = self._build("valid-before-mode-tamper.zip", ref=self._commit())

@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use crate::capability::BackendSandboxPolicy;
 use crate::effects::{EffectConfidence, EffectSummary, Fallibility, ResourceKey};
+use crate::environment::EnvironmentRefV2;
 use crate::eval::{render_with, GraphEvalFrame};
 use crate::evidence::DispatchAdapterV1;
 use crate::ir::{ExecutionMode, ExecutionPlan, OIr, PlanNodeId, PlanNodeKind, SpliceRenderer};
@@ -479,7 +480,9 @@ pub(crate) fn effect_contract_worker_safe(summary: &EffectSummary, oir: &OIr) ->
     match oir {
         OIr::Exec {
             env_id, backend, ..
-        } if *env_id == u32::MAX && backend.execution == ExecutionMode::Shim => {
+        } if EnvironmentRefV2::from_encoded(*env_id).is_fresh()
+            && backend.execution == ExecutionMode::Shim =>
+        {
             summary.unknown
                 && summary.fallibility == Fallibility::MayFail
                 && summary.actor_state.is_none()

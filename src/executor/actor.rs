@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::environment::{EnvironmentRefV2, LINKER_ISOLATED_ENV_ID};
 use crate::ir::{ExecutionPlan, PlanNodeId, PlanNodeKind};
 
 /// A concrete actor label used by compatibility analysis.
@@ -41,6 +42,9 @@ impl ActorKey {
 
     pub fn describe(&self) -> String {
         match self.ephemeral_instance {
+            Some(instance) if self.environment == LINKER_ISOLATED_ENV_ID => {
+                format!("{}[*linked#{instance}*]", self.language)
+            }
             Some(instance) => format!("{}[*ephemeral#{instance}*]", self.language),
             None => format!("{}[{}]", self.language, self.environment),
         }
@@ -62,7 +66,7 @@ impl ActorTable {
         let mut next_ephemeral: u64 = 0;
         for node in &plan.nodes {
             if let PlanNodeKind::Exec { lang, env_id, .. } = &node.kind {
-                let key = if *env_id == u32::MAX {
+                let key = if EnvironmentRefV2::from_encoded(*env_id).is_fresh() {
                     let instance = next_ephemeral;
                     next_ephemeral += 1;
                     ActorKey {

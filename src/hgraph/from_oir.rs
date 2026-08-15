@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     effects::{effect_summary_for_plan_node, EffectSummary, ResourceKey},
+    environment::EnvironmentRefV2,
     ir::{
         BackendInterface, ExecutionMode, ExecutionPlan, OIr, OIrProgram, PlanEdgeKind, PlanNodeId,
         PlanNodeKind, PlanScheduleKind,
@@ -391,7 +392,7 @@ pub(crate) fn autonomous_ephemeral_group(
     else {
         return None;
     };
-    if *env_id != u32::MAX
+    if !EnvironmentRefV2::from_encoded(*env_id).is_fresh()
         || attr.is_some()
         || backend.execution != ExecutionMode::Shim
         || !body
@@ -599,7 +600,7 @@ fn add_plan_semantics(
         let inputs = structural_inputs(plan, node_map, plan_node.id);
 
         match &plan_node.kind {
-            PlanNodeKind::Exec { lang, backend, .. } => {
+            PlanNodeKind::Exec { backend, .. } => {
                 if let Some((dom, rep)) = backend_output_constraints(backend) {
                     graph.add_edge(HEdge::constraint(
                         OpKind::AbiFixed { dom, rep },
@@ -614,7 +615,10 @@ fn add_plan_semantics(
                     graph.add_edge(HEdge::constraint(
                         OpKind::BackendCrossing {
                             from_lang: "O".to_string(),
-                            to_lang: lang.clone(),
+                            // The solver keys value capabilities through the
+                            // canonical catalog identity frozen in the plan.
+                            // Source aliases are presentation syntax only.
+                            to_lang: backend.canonical.clone(),
                         },
                         vec![
                             Port {
