@@ -69,6 +69,46 @@ pub const BUNDLED_SHIMS: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// Truthful restart boundary for every executable bundled compatibility shim.
+/// This catalog describes backend-owned process state only; it does not turn
+/// files, services, or VM instances into portable values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundledShimStateClass {
+    Stateless,
+    SemanticSnapshot,
+    ExternalPinned,
+}
+
+pub fn bundled_shim_state_class(name: &str) -> Option<BundledShimStateClass> {
+    match name {
+        "python_shim.py" | "sql_shim.py" => Some(BundledShimStateClass::SemanticSnapshot),
+        "ubuntu_vm_shim.py" => Some(BundledShimStateClass::ExternalPinned),
+        "bash_shim.py"
+        | "common_lisp_shim.py"
+        | "cpp_shim.py"
+        | "csharp_shim.py"
+        | "haskell_shim.py"
+        | "java_shim.py"
+        | "javascript_shim.py"
+        | "lisp_shim.py"
+        | "mathematica_shim.py"
+        | "matlab_shim.py"
+        | "nix_shim.py"
+        | "nix_store_shim.py"
+        | "nixos_test_shim.py"
+        | "ocaml_shim.py"
+        | "racket_shim.py"
+        | "ruby_shim.py"
+        | "rust_shim.py"
+        | "shell_shim.py"
+        | "webassembly_shim.py" => Some(BundledShimStateClass::Stateless),
+        // The common module is shipped beside executable shims but is not a
+        // backend actor and therefore has no independent state tier.
+        "o_shim_common.py" => None,
+        _ => None,
+    }
+}
+
 pub struct ExtractedShims {
     path: PathBuf,
 }
@@ -153,6 +193,31 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(names.contains("python_shim.py"));
         assert!(names.contains("o_shim_common.py"));
+    }
+
+    #[test]
+    fn every_executable_bundled_shim_has_one_state_class() {
+        let classified = BUNDLED_SHIMS
+            .iter()
+            .filter(|(name, _)| *name != "o_shim_common.py")
+            .map(|(name, _)| (*name, bundled_shim_state_class(name)))
+            .collect::<Vec<_>>();
+        assert_eq!(classified.len(), 22);
+        assert!(classified.iter().all(|(_, class)| class.is_some()));
+        assert_eq!(
+            classified
+                .iter()
+                .filter(|(_, class)| { *class == Some(BundledShimStateClass::SemanticSnapshot) })
+                .count(),
+            2
+        );
+        assert_eq!(
+            classified
+                .iter()
+                .filter(|(_, class)| *class == Some(BundledShimStateClass::ExternalPinned))
+                .count(),
+            1
+        );
     }
 
     #[test]

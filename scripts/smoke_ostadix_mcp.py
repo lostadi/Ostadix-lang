@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,19 @@ class SmokeError(RuntimeError):
 
 
 _EOF = object()
+
+
+def _current_catalog_schema(root: Path) -> str:
+    """Read the one authoritative catalog-generation identifier."""
+    catalog = root / "src" / "backend_catalog.inc.rs"
+    match = re.search(
+        r'backend_catalog_metadata!\s*\{\s*current_schema:\s*"([^"]+)"',
+        catalog.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    if match is None:
+        raise SmokeError(f"backend catalog does not declare current_schema: {catalog}")
+    return match.group(1)
 
 
 class ResponseReader:
@@ -146,6 +160,7 @@ def _record_field(text: str, key: str) -> str:
 
 
 def run_smoke(root: Path, binary: Path, timeout: float) -> None:
+    catalog_schema = _current_catalog_schema(root)
     config = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
     registered = config.get("mcpServers", {}).get("ostadix", {})
     if registered.get("command") != "ostadix-mcp":
@@ -297,7 +312,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         if runtimes_result.get("isError") is True:
             raise SmokeError(f"o_runtimes returned an MCP tool error:\n{runtimes_text}")
         required_runtime_markers = {
-            "runtime-catalog-schema=ostadix.backend-catalog/v3",
+            f"runtime-catalog-schema={catalog_schema}",
             "runtime-catalog-projection=compiled-mcp-snapshot",
             "runtime-search-mode=discover-local",
             "runtime-search-entry index=0 source=inherited:0 path=/usr/bin",

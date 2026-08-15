@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ActorGenerationIdV1, CanonicalPlacementRecordV1, CapacityObservationV1, NodeProfileV1,
-    PlacementReservationV1, PlacementTrustPolicyV1, PlacementValidationError, PlacementWarrantV1,
-    RecordAuthenticatorV1, RequirementAtomV1, RequirementFootprintV1, ResourceKindV1,
-    SemanticDigestV1, UnixMillisV1, WarrantDischargeV1,
+    ActorGenerationIdV1, CanonicalPlacementRecordV1, CapacityObservationV1,
+    CurrentBackendCatalogV1, NodeProfileV1, PlacementReservationV1, PlacementTrustPolicyV1,
+    PlacementValidationError, PlacementWarrantV1, RecordAuthenticatorV1, RequirementAtomV1,
+    RequirementFootprintV1, ResourceKindV1, SemanticDigestV1, UnixMillisV1, WarrantDischargeV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -82,16 +82,25 @@ pub struct PlacementCandidateInputV1<'a> {
     pub trust_policy: &'a PlacementTrustPolicyV1,
     pub reservation: &'a PlacementReservationV1,
     pub actor_generation: Option<&'a ActorGenerationIdV1>,
+    /// Logical identity to be created by state-control Open or established by
+    /// the first stateful Execute. This proves only prospective
+    /// same-environment continuity; later execution requires the full
+    /// node-established `ActorGenerationIdV1` bound to local runtime facts.
+    pub prospective_logical_environment: Option<&'a SemanticDigestV1>,
 }
 
 impl<'a> PlacementCandidateInputV1<'a> {
-    pub fn evaluate(
+    pub fn evaluate_with_catalog(
         &self,
         now: UnixMillisV1,
         authenticator: &impl RecordAuthenticatorV1,
+        catalog: &impl CurrentBackendCatalogV1,
     ) -> CandidateDecisionV1 {
         let mut rejections = BTreeSet::new();
-        if let Err(error) = self.profile.validate_at(now, authenticator) {
+        if let Err(error) = self
+            .profile
+            .validate_at_with_catalog(now, authenticator, catalog)
+        {
             rejections.insert(CandidateRejectionV1::InvalidProfile(error.to_string()));
         }
         if let Err(error) = self
@@ -133,18 +142,11 @@ impl<'a> PlacementCandidateInputV1<'a> {
                         }
                     }
                     RequirementAtomV1::Environment(environment) => {
-                        use super::EnvironmentRequirementV1;
-                        let matched = match environment {
-                            EnvironmentRequirementV1::Stateless
-                            | EnvironmentRequirementV1::Ephemeral => true,
-                            EnvironmentRequirementV1::SameLogicalEnvironment { identity } => self
-                                .actor_generation
-                                .is_some_and(|actor| actor.logical_environment() == identity),
-                            EnvironmentRequirementV1::SameActorGeneration { identity } => self
-                                .actor_generation
-                                .and_then(|actor| actor.semantic_digest().ok())
-                                .is_some_and(|actual| &actual == identity),
-                        };
+                        let matched = environment_requirement_matches(
+                            environment,
+                            self.actor_generation,
+                            self.prospective_logical_environment,
+                        );
                         if !matched {
                             rejections.insert(CandidateRejectionV1::ActorGenerationMismatch(
                                 requirement.label(),
@@ -220,7 +222,63 @@ impl<'a> PlacementCandidateInputV1<'a> {
     }
 }
 
-/// Canonically ordered decisions for one requirement/policy pair.
+fn environment_requirement_matches(
+    requirement: &super::EnvironmentRequirementV1,
+    actor_generation: Option<&ActorGenerationIdV1>,
+    prospective_logical_environment: Option<&SemanticDigestV1>,
+) -> bool {
+    use super::EnvironmentRequirementV1;
+
+    match requirement {
+        EnvironmentRequirementV1::Stateless | EnvironmentRequirementV1::Ephemeral => true,
+        EnvironmentRequirementV1::SameLogicalEnvironment { identity } => match actor_generation {
+            Some(actor) => actor.logical_environment() == identity,
+            None => prospective_logical_environment == Some(identity),
+        },
+        EnvironmentRequirementV1::SameActorGeneration { identity } => actor_generation
+            .and_then(|actor| actor.semantic_digest().ok())
+            .is_some_and(|actual| &actual == identity),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placement::{EnvironmentRequirementV1, GenerationV1};
+
+    fn digest(label: &[u8]) -> SemanticDigestV1 {
+        SemanticDigestV1::hash_bytes("ostadix/placement/candidate-test/v1", label)
+    }
+
+    #[test]
+    fn established_actor_is_authoritative_over_prospective_environment() {
+        let required = digest(b"required-environment");
+        let mismatched = ActorGenerationIdV1::new(
+            digest(b"different-environment"),
+            digest(b"backend"),
+            digest(b"target"),
+            digest(b"sandbox"),
+            digest(b"launch"),
+            GenerationV1::new(1).unwrap(),
+        );
+        let requirement = EnvironmentRequirementV1::SameLogicalEnvironment {
+            identity: required.clone(),
+        };
+
+        assert!(environment_requirement_matches(
+            &requirement,
+            None,
+            Some(&required),
+        ));
+        assert!(!environment_requirement_matches(
+            &requirement,
+            Some(&mismatched),
+            Some(&required),
+        ));
+    }
+}
+
+/// Canonically ordered protocol decisions for one requirement/policy pair.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateSetV1 {

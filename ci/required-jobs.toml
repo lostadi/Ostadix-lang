@@ -1,0 +1,2 @@
+schema = "ostadix.ci-required-jobs/v1"
+required_jobs = ["c17", "contracts", "mcp", "ocore-qemu", "python", "release-claims", "rust-hosted", "rust-msrv", "rust-quality", "rust-tests"]

@@ -4,6 +4,7 @@
 //! intentionally usable through local files without claiming a discovery or
 //! network service. Any future transport carries the same canonical snapshots.
 
+pub mod bundle;
 mod crypto;
 mod error;
 mod model;

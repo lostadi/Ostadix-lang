@@ -28,15 +28,19 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
+use crate::backend::state::{
+    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
+    EvaluatorStateSnapshotV1,
+};
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::effects::EffectDeclaration;
 use crate::environment::EnvironmentRefV2;
 #[cfg(test)]
 use crate::ir::lower_node;
 use crate::ir::{
-    reconstruct_source as reconstruct_ir_source, BackendInterface, BackendRegistry, ExecutionMode,
-    ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanEdgeKind, PlanNodeId, PlanNodeKind,
-    SpliceRenderer,
+    reconstruct_source as reconstruct_ir_source, BackendAdapterKind, BackendInterface,
+    BackendRegistry, ExecutionMode, ExecutionPlan, InvokeMode, OIr, OIrProgram, PlanEdgeKind,
+    PlanNodeId, PlanNodeKind, SpliceRenderer,
 };
 use crate::nix_ops;
 use crate::nixos_ops;
@@ -47,6 +51,12 @@ use crate::value::{
     BackendAuthority, CapabilityKind, DecimalSpecial, FloatFormat, FloatSpecial, GroupMode,
     ONumber, OValue, RequestKind, SeqKind,
 };
+
+/// Stable evidence projection of the built-in authority policy. The random
+/// bearer that realizes this policy remains process-local and is checked at
+/// every dispatch; hashing that secret into launch identity would make an
+/// otherwise compatible actor checkpoint unrestorable after evaluator restart.
+const DEFAULT_BACKEND_AUTHORITY_POLICY_V1: &str = "wildcard:fs_read,fs_write,network,process";
 
 /// How to resolve group members that might be cached Request values.
 ///
@@ -472,7 +482,163 @@ pub struct Evaluator {
     /// unrelated backend is added to the plan, while still changing with this
     /// backend's launcher, shim, or child launch context.
     active_backend_launch_generations: Option<HashMap<String, String>>,
+
+    /// Authority-free actor checkpoints waiting for the first exact admitted
+    /// dispatch after restart. The sandbox digest participates in identity so
+    /// two deliberately isolated actors cannot overwrite one another.
+    pending_backend_restores: HashMap<(String, u32, String), EvaluatorActorCheckpointV1>,
+
+    /// A placement-prepared fragment is a closed, single-backend authority
+    /// unit.  Recursive `O.eval` would introduce an unadmitted second program,
+    /// so callbacks are rejected while that unit is being consumed even when
+    /// a foreign backend obscures the request from static source scanning.
+    prepared_fragment_callbacks_forbidden: bool,
 }
+
+/// Authority-free coordinates derived from the exact locally admitted
+/// fragment.  These values may be compared with a placement lease; they are
+/// not themselves permission to execute it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementFragmentBindingsV1 {
+    source_sha256: String,
+    canonical_backend: String,
+    plan_node: PlanNodeId,
+    operation_oir: crate::world::ArtifactId,
+    requirement_footprint: crate::placement::RequirementFootprintV1,
+    requirement_footprint_sha256: crate::placement::SemanticDigestV1,
+    placement_admission: crate::placement::SemanticDigestV1,
+    task_attempt: crate::placement::TaskAttemptIdV1,
+    backend_implementation: crate::placement::BackendImplementationIdV1,
+    backend_implementation_sha256: crate::placement::SemanticDigestV1,
+    backend_launch_generation: crate::placement::SemanticDigestV1,
+    environment: EnvironmentRefV2,
+    sandbox_permissions: Vec<BackendAuthority>,
+    sandbox_policy_sha256: crate::placement::SemanticDigestV1,
+}
+
+impl PlacementFragmentBindingsV1 {
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
+    pub fn canonical_backend(&self) -> &str {
+        &self.canonical_backend
+    }
+
+    pub fn plan_node(&self) -> PlanNodeId {
+        self.plan_node
+    }
+
+    pub fn operation_oir(&self) -> &crate::world::ArtifactId {
+        &self.operation_oir
+    }
+
+    pub fn requirement_footprint(&self) -> &crate::placement::RequirementFootprintV1 {
+        &self.requirement_footprint
+    }
+
+    pub fn requirement_footprint_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.requirement_footprint_sha256
+    }
+
+    /// Process-portable admission over the exact semantic OIR/plan/HGraph,
+    /// current catalog projection, analyzer, schema, and base policy.
+    pub fn placement_admission(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.placement_admission
+    }
+
+    /// Compatibility spelling for the placement-lease admission coordinate.
+    /// This is intentionally not the full process-local `admission_sha256`.
+    pub fn admission(&self) -> &crate::placement::SemanticDigestV1 {
+        self.placement_admission()
+    }
+
+    pub fn task_attempt(&self) -> &crate::placement::TaskAttemptIdV1 {
+        &self.task_attempt
+    }
+
+    pub fn backend_implementation(&self) -> &crate::placement::BackendImplementationIdV1 {
+        &self.backend_implementation
+    }
+
+    pub fn backend_implementation_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.backend_implementation_sha256
+    }
+
+    pub fn realization_pipeline(&self) -> &crate::placement::SemanticDigestV1 {
+        self.backend_implementation.realization_pipeline()
+    }
+
+    /// Exact admitted local process-generation coordinate: selected direct
+    /// executable set, consumed compatibility-adapter rows, and launch
+    /// context. This is descriptive input to `ActorGenerationIdV1`, not
+    /// mutable launch authority.
+    pub fn backend_launch_generation(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.backend_launch_generation
+    }
+
+    pub fn environment(&self) -> EnvironmentRefV2 {
+        self.environment
+    }
+
+    pub fn sandbox_permissions(&self) -> &[BackendAuthority] {
+        &self.sandbox_permissions
+    }
+
+    pub fn sandbox_policy_sha256(&self) -> &crate::placement::SemanticDigestV1 {
+        &self.sandbox_policy_sha256
+    }
+}
+
+/// Non-cloneable, process-local execution authority prepared from one exact
+/// source fragment.  There is intentionally no public constructor and no
+/// mutable access to its lowered/admitted components.
+pub struct PreparedPlacementFragmentV1 {
+    program: OIrProgram,
+    plan: ExecutionPlan,
+    admission: crate::evidence::PreparedAdmissionPartsV1,
+    hgraph_schedule: crate::hgraph::Schedule,
+    bindings: PlacementFragmentBindingsV1,
+    /// Process-local evaluator instance fence. This private bearer never
+    /// enters canonical placement records or leaves the non-serializable
+    /// handle.
+    evaluator_instance_binding: String,
+}
+
+impl PreparedPlacementFragmentV1 {
+    pub fn bindings(&self) -> &PlacementFragmentBindingsV1 {
+        &self.bindings
+    }
+}
+
+/// Semantic refusal raised when a sealed placement fragment attempts to gain
+/// evaluator authority that was not present in its admitted OIR. This is
+/// distinct from an infrastructure failure: the split shim protocol settled
+/// cleanly and, for a persistent environment, its actor remains live.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct PreparedPlacementRefusalV1 {
+    message: String,
+}
+
+impl PreparedPlacementRefusalV1 {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// The caller-supplied prepared-fragment deadline elapsed before backend
+/// dispatch began. Unlike an in-flight timeout, this proves no backend command
+/// was sent and therefore carries no ambiguous side-effect claim.
+#[derive(Debug, thiserror::Error)]
+#[error("prepared placement fragment deadline expired before evaluator entry")]
+pub struct PreparedPlacementDeadlineExpiredV1;
 
 struct IrExecRegion<'a> {
     lang: &'a str,
@@ -688,6 +854,8 @@ impl Evaluator {
             callback_operation_deadline: None,
             active_executable_leases: None,
             active_backend_launch_generations: None,
+            pending_backend_restores: HashMap::new(),
+            prepared_fragment_callbacks_forbidden: false,
         }
     }
 
@@ -713,6 +881,76 @@ impl Evaluator {
     pub fn with_runtime_executable(mut self, executable: PathBuf) -> Self {
         self.runtime_executable_override = Some(executable);
         self
+    }
+
+    /// Capture all settled persistent backend actors as canonical portable
+    /// state. No actor is cleaned up or evicted; any pin or protocol failure
+    /// aborts the complete snapshot and leaves the registry intact.
+    pub fn checkpoint_persistent_actors(
+        &mut self,
+        max_total_bytes: u64,
+    ) -> Result<EvaluatorStateSnapshotV1> {
+        self.registry
+            .checkpoint_persistent_actors(max_total_bytes)
+            .context("failed to checkpoint persistent evaluator actors")
+    }
+
+    /// Stage portable actor state for lazy restoration under a future exact
+    /// admission. Staging launches no process and is atomic: malformed,
+    /// duplicate, already-live, or already-pending targets insert nothing.
+    pub fn stage_persistent_actor_restore(
+        &mut self,
+        snapshot: EvaluatorStateSnapshotV1,
+        max_total_bytes: u64,
+    ) -> Result<()> {
+        ensure_evaluator_snapshot_bound(&snapshot, max_total_bytes)?;
+        for actor in &snapshot.actors {
+            let spec = BackendRegistry::global()
+                .get(&actor.canonical_backend)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "state.restore-incompatible: backend `{}` is not registered",
+                        actor.canonical_backend
+                    )
+                })?;
+            if spec.name != actor.canonical_backend {
+                bail!(
+                    "state.restore-incompatible: actor backend `{}` is an alias for canonical backend `{}`",
+                    actor.canonical_backend,
+                    spec.name
+                );
+            }
+            let key = (
+                actor.canonical_backend.clone(),
+                actor.environment_id,
+                actor.sandbox_policy_sha256.clone(),
+            );
+            if self.pending_backend_restores.contains_key(&key) {
+                bail!(
+                    "state.restore-conflict: backend `{}[{}]` already has a pending restore for sandbox {}",
+                    actor.canonical_backend,
+                    actor.environment_id,
+                    actor.sandbox_policy_sha256
+                );
+            }
+        }
+        self.registry
+            .ensure_restore_targets_vacant(&snapshot.actors)?;
+
+        for actor in snapshot.actors {
+            let key = (
+                actor.canonical_backend.clone(),
+                actor.environment_id,
+                actor.sandbox_policy_sha256.clone(),
+            );
+            let previous = self.pending_backend_restores.insert(key, actor);
+            debug_assert!(previous.is_none(), "restore staging was prevalidated");
+        }
+        Ok(())
+    }
+
+    pub fn pending_persistent_actor_restores(&self) -> usize {
+        self.pending_backend_restores.len()
     }
 
     /// Replace the executor. Used by tests; the autonomous scheduler is a
@@ -778,8 +1016,8 @@ impl Evaluator {
                 ("policy", policy),
                 ("registered-backends", registered.as_str()),
                 (
-                    "default-backend-authority",
-                    self.default_backend_authority.as_str(),
+                    "default-backend-authority-policy",
+                    DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
                 ),
             ],
         )
@@ -808,8 +1046,9 @@ impl Evaluator {
     }
 
     /// Capture the process-local runtime facts bound by ordinary OIR
-    /// admission. The opaque capability identity participates only through the
-    /// environment digest; it is never exposed by the evidence artifact.
+    /// admission. Canonical evidence records the authority policy, never the
+    /// random live bearer that realizes it; dispatch still resolves that
+    /// bearer through the private broker before launching a backend.
     pub(crate) fn try_admission_runtime_binding(
         &self,
         plan: &ExecutionPlan,
@@ -830,8 +1069,8 @@ impl Evaluator {
             ("policy", policy),
             ("registered-backends", registered.as_str()),
             (
-                "default-backend-authority",
-                self.default_backend_authority.as_str(),
+                "default-backend-authority-policy",
+                DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
             ),
         ];
         let binding = match &self.runtime_executable_override {
@@ -891,6 +1130,90 @@ impl Evaluator {
             .with_context(|| {
                 format!("backend `{backend}` has no active admitted launch generation")
             })
+    }
+
+    fn apply_pending_actor_restore(
+        &mut self,
+        backend: &str,
+        environment_id: u32,
+        sandbox: &BackendSandboxPolicy,
+        shim_path: &std::path::Path,
+        executable_leases: &Arc<crate::runtime_exec::ExecutableLeaseSet>,
+        launch_generation_sha256: &str,
+    ) -> Result<()> {
+        if environment_id > crate::environment::MAX_PERSISTENT_ENV_ID {
+            return Ok(());
+        }
+        let sandbox_policy_sha256 = sandbox_policy_sha256(sandbox.permissions())?;
+        let key = (
+            backend.to_string(),
+            environment_id,
+            sandbox_policy_sha256.clone(),
+        );
+        let Some(actor) = self.pending_backend_restores.get(&key).cloned() else {
+            if self.pending_backend_restores.keys().any(
+                |(candidate_backend, candidate_environment, _)| {
+                    candidate_backend == backend && *candidate_environment == environment_id
+                },
+            ) {
+                bail!(
+                    "state.restore-incompatible: pending backend `{backend}[{environment_id}]` does not match admitted sandbox {sandbox_policy_sha256}"
+                );
+            }
+            return Ok(());
+        };
+
+        actor.validate()?;
+        if actor.sandbox_permissions != sandbox.permissions() {
+            bail!(
+                "state.restore-incompatible: pending backend `{backend}[{environment_id}]` permissions disagree with admitted sandbox"
+            );
+        }
+        if actor.launch_generation_sha256 != launch_generation_sha256 {
+            bail!(
+                "state.restore-generation-mismatch: pending backend `{backend}[{environment_id}]` launch generation `{}` does not match admitted generation `{launch_generation_sha256}`",
+                actor.launch_generation_sha256
+            );
+        }
+        let backend_manifest = executable_leases
+            .backend_manifest_json(backend)
+            .with_context(|| {
+                format!(
+                    "state.restore-incompatible: backend `{backend}[{environment_id}]` has no admitted runtime manifest"
+                )
+            })?;
+        let backend_manifest: serde_json::Value = serde_json::from_str(&backend_manifest)
+            .context("admitted backend runtime manifest is not valid JSON")?;
+        let admitted_runtime_binding = backend_manifest
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .context("admitted backend runtime manifest omitted sha256")?;
+        if actor.runtime_binding_sha256 != admitted_runtime_binding {
+            bail!(
+                "state.restore-generation-mismatch: pending backend `{backend}[{environment_id}]` runtime binding `{}` does not match admitted binding `{admitted_runtime_binding}`",
+                actor.runtime_binding_sha256
+            );
+        }
+
+        self.registry
+            .restore_env(
+                backend,
+                environment_id,
+                actor.checkpoint,
+                BackendLaunchContext {
+                    shim_path,
+                    sandbox,
+                    executable_leases: Some(executable_leases),
+                    launch_generation_sha256: Some(launch_generation_sha256),
+                },
+            )
+            .with_context(|| {
+                format!("failed to restore pending backend `{backend}[{environment_id}]`")
+            })?;
+        self.pending_backend_restores
+            .remove(&key)
+            .expect("successfully restored pending actor disappeared");
+        Ok(())
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1714,6 +2037,14 @@ impl Evaluator {
                     BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
                 let executable_leases = Arc::clone(self.executable_leases()?);
                 let launch_generation = self.backend_launch_generation(runtime_lang)?;
+                self.apply_pending_actor_restore(
+                    runtime_lang,
+                    runtime_env_id,
+                    &sandbox,
+                    &shim,
+                    &executable_leases,
+                    &launch_generation,
+                )?;
                 // Dependencies were rendered into the thunk body at capture
                 // time, so the forced shim receives an empty binding map.
                 let result = self
@@ -1808,6 +2139,12 @@ impl Evaluator {
         src: &str,
         caller_scope: &HashMap<String, OValue>,
     ) -> Result<OValue> {
+        if self.prepared_fragment_callbacks_forbidden {
+            return Err(PreparedPlacementRefusalV1::new(
+                "prepared placement fragment requested recursive O.eval authority outside its admitted OIR",
+            )
+            .into());
+        }
         let nodes = Parser::new(src, &self.registered_backends)
             .parse()
             .with_context(|| {
@@ -1850,6 +2187,250 @@ impl Evaluator {
     // ─────────────────────────────────────────────────────────────────────────
     // Public API
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// Parse, lower, solve, and admit exactly one shim-backed placement
+    /// fragment without dispatching it. A leading shebang is excluded from
+    /// executable syntax by the same rule as the CLI, while `source_sha256`
+    /// still binds the exact unmodified bytes supplied here. The returned
+    /// non-cloneable handle retains the executable leases and all other
+    /// process-local admission authority needed by
+    /// [`Self::execute_prepared_placement_fragment`].
+    pub fn prepare_placement_fragment(
+        &mut self,
+        source_utf8: &str,
+        task_attempt: crate::placement::TaskAttemptIdV1,
+    ) -> Result<PreparedPlacementFragmentV1> {
+        use crate::placement::CanonicalPlacementRecordV1;
+
+        let executable_source = strip_prepared_source_shebang(source_utf8);
+        let nodes = Parser::new(executable_source, &self.registered_backends)
+            .parse()
+            .context("failed to parse placement fragment")?;
+        let program = OIrProgram::lower(&nodes);
+        let plan = program.plan();
+        plan.validate(program.nodes.len())
+            .map_err(anyhow::Error::msg)
+            .context("invalid placement-fragment execution plan")?;
+
+        let exec_node = validate_placement_fragment_shape(&program, &plan)?;
+        let (backend, environment, attr) = match &plan.nodes[exec_node.0].kind {
+            PlanNodeKind::Exec {
+                env_id,
+                attr,
+                backend,
+                ..
+            } => (
+                backend.clone(),
+                EnvironmentRefV2::from_encoded(*env_id),
+                attr.as_deref(),
+            ),
+            _ => unreachable!("validated placement fragment root must be Exec"),
+        };
+
+        let flat = program.flatten_for_plan();
+        self.prevalidate_graph_execution(&plan, &flat)?;
+        let mut hgraph = program
+            .hgraph_for_plan(&plan)
+            .map_err(anyhow::Error::msg)
+            .context("failed to project placement fragment into hypergraph")?;
+        crate::hgraph::solve::solve_types(&mut hgraph)
+            .context("failed to solve placement-fragment type and fidelity constraints")?;
+        let runtime_binding = self.try_admission_runtime_binding(&plan)?;
+        let evidence =
+            crate::evidence::analyze_execution(&program, &plan, &hgraph, runtime_binding.clone())
+                .context("failed to establish placement-fragment evidence")?;
+        let admitted = crate::evidence::admit_execution(
+            &program,
+            &plan,
+            hgraph,
+            self.policy,
+            runtime_binding,
+            evidence,
+        )
+        .context("failed to admit placement fragment")?;
+
+        let admitted_execs = admitted
+            .admission()
+            .operations()
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    plan.nodes.get(operation.plan_node.0).map(|node| &node.kind),
+                    Some(PlanNodeKind::Exec { .. })
+                )
+            })
+            .map(|operation| operation.plan_node)
+            .collect::<Vec<_>>();
+        if admitted_execs != [exec_node] {
+            bail!(
+                "placement fragment must contain exactly one admitted shim Exec at P{}; admission contains {:?}",
+                exec_node.0,
+                admitted_execs
+            );
+        }
+
+        // A sealed fragment is never coarsened with another operation and its
+        // dispatch path rejects recursive O.eval callbacks. Fresh shim work
+        // uses the existing autonomous unknown-effects contract. Persistent
+        // work instead requires the target's explicit session-serialization
+        // capability alongside SameLogicalEnvironment; it is never relabeled
+        // pure, replayable, or globally isolated.
+        let placement_intent = if environment.is_persistent() {
+            crate::placement::PlacementIntentV1::SessionSerializedOpaqueEffects
+        } else {
+            crate::placement::PlacementIntentV1::AutonomousUnknownEffects
+        };
+        let footprint = crate::placement::requirement_footprint_for_plan_node(
+            &plan.nodes[exec_node.0].kind,
+            placement_intent,
+        )?;
+        footprint.require_complete().with_context(|| {
+            format!(
+                "placement fragment P{} has an incomplete requirement footprint",
+                exec_node.0
+            )
+        })?;
+        let requirement_footprint_sha256 = footprint.semantic_digest()?;
+
+        let options = BlockOptions::parse(attr, &backend.canonical)?;
+        let sandbox = self.backend_sandbox_policy(&backend, &options);
+        let sandbox_permissions = sandbox.permissions().to_vec();
+        let sandbox_policy_sha256 = crate::placement::SemanticDigestV1::from_sha256(
+            sandbox_policy_sha256(&sandbox_permissions)?,
+        )?;
+
+        let backend_implementation = prepared_backend_implementation(&admitted, &backend)?;
+        let backend_implementation_sha256 = backend_implementation.semantic_digest()?;
+        let backend_launch_generation = crate::placement::SemanticDigestV1::from_sha256(
+            admitted.backend_launch_generation_sha256(&backend.canonical)?,
+        )?;
+        let operation_oir = crate::world::ArtifactId::from_sha256(
+            admitted.admission().bindings().oir_sha256.clone(),
+        )?;
+        let placement_admission = admitted.admission().placement_admission().clone();
+        let hgraph_schedule = crate::hgraph::schedule::try_schedule(admitted.graph())
+            .map_err(anyhow::Error::msg)
+            .context("failed to schedule admitted placement fragment")?;
+        crate::hgraph::schedule::ReadySchedule::derive(admitted.graph())
+            .and_then(|schedule| schedule.launch_order().map(|_| ()))
+            .map_err(anyhow::Error::msg)
+            .context("placement-fragment ready schedule is not executable")?;
+
+        let bindings = PlacementFragmentBindingsV1 {
+            source_sha256: crate::evidence::source_sha256(source_utf8.as_bytes()),
+            canonical_backend: backend.canonical,
+            plan_node: exec_node,
+            operation_oir,
+            requirement_footprint: footprint,
+            requirement_footprint_sha256,
+            placement_admission,
+            task_attempt,
+            backend_implementation,
+            backend_implementation_sha256,
+            backend_launch_generation,
+            environment,
+            sandbox_permissions,
+            sandbox_policy_sha256,
+        };
+        let admission = admitted.into_prepared_parts();
+        Ok(PreparedPlacementFragmentV1 {
+            program,
+            plan,
+            admission,
+            hgraph_schedule,
+            bindings,
+            evaluator_instance_binding: self.default_backend_authority.clone(),
+        })
+    }
+
+    /// Consume one exact prepared placement fragment without imposing an
+    /// additional caller deadline. No parsing, lowering, solving, runtime
+    /// discovery, or admission is repeated after lease authorization; only
+    /// the retained runtime context and executable file handles are rechecked
+    /// immediately before dispatch.
+    pub fn execute_prepared_placement_fragment(
+        &mut self,
+        prepared: PreparedPlacementFragmentV1,
+        scope: &mut HashMap<String, OValue>,
+    ) -> Result<OValue> {
+        // GraphEvalFrame normally copies the entire caller scope into every
+        // shim invocation, even when the source contains no explicit Load.
+        // This initial portable-fragment slice has no canonical scope package
+        // or digest, so accepting any such binding would introduce authority
+        // after placement authorization. Persistent state belongs to the
+        // exact backend actor selected by `environment`, not this coordinator
+        // map; Load and Store are rejected during preparation as well.
+        if !scope.is_empty() {
+            bail!(
+                "prepared placement fragment cannot consume a nonempty coordinator scope until that scope is canonically packaged and digest-bound"
+            );
+        }
+        let PreparedPlacementFragmentV1 {
+            program,
+            plan,
+            admission,
+            hgraph_schedule,
+            bindings,
+            evaluator_instance_binding,
+        } = prepared;
+        if evaluator_instance_binding != self.default_backend_authority {
+            bail!("prepared placement fragment belongs to a different Evaluator instance");
+        }
+        let admitted = admission.bind(&program, &plan)?;
+        self.verify_admitted_runtime_context(&admitted)?;
+        let executable_leases = admitted.executable_leases()?;
+        executable_leases.verify_backend(bindings.canonical_backend())?;
+        let launch_generation =
+            admitted.backend_launch_generation_sha256(bindings.canonical_backend())?;
+        if launch_generation.as_str() != bindings.backend_launch_generation().as_sha256() {
+            bail!("prepared placement fragment backend launch generation changed internally");
+        }
+        let backend_launch_generations =
+            HashMap::from([(bindings.canonical_backend().to_string(), launch_generation)]);
+
+        self.last_execution_plan = Some(plan.clone());
+        self.last_execution_trace = Some(ExecutionTrace::new());
+        self.last_execution_admission = Some(admitted.admission().clone());
+        self.last_hgraph_schedule = Some(hgraph_schedule);
+
+        let previous_executable_leases = self.install_executable_leases(Some(executable_leases));
+        let previous_backend_launch_generations =
+            self.install_backend_launch_generations(Some(backend_launch_generations));
+        let previous_callback_policy =
+            std::mem::replace(&mut self.prepared_fragment_callbacks_forbidden, true);
+        let execution = self.execute_plan_graph(admitted, scope);
+        self.prepared_fragment_callbacks_forbidden = previous_callback_policy;
+        self.install_executable_leases(previous_executable_leases);
+        self.install_backend_launch_generations(previous_backend_launch_generations);
+        execution
+    }
+
+    /// Consume a prepared fragment under an absolute process-local deadline.
+    /// A pre-existing evaluator deadline remains authoritative when it is
+    /// earlier. Timeout bounds the evaluator's wait and makes an unresponsive
+    /// process unusable; it does not claim to roll back external effects the
+    /// backend may already have performed.
+    pub fn execute_prepared_placement_fragment_until(
+        &mut self,
+        prepared: PreparedPlacementFragmentV1,
+        scope: &mut HashMap<String, OValue>,
+        deadline: Instant,
+    ) -> Result<OValue> {
+        let previous_deadline = self.callback_operation_deadline;
+        let effective_deadline = previous_deadline
+            .map(|existing| existing.min(deadline))
+            .unwrap_or(deadline);
+        if effective_deadline
+            .checked_duration_since(Instant::now())
+            .is_none_or(|remaining| remaining.is_zero())
+        {
+            return Err(PreparedPlacementDeadlineExpiredV1.into());
+        }
+        self.callback_operation_deadline = Some(effective_deadline);
+        let execution = self.execute_prepared_placement_fragment(prepared, scope);
+        self.callback_operation_deadline = previous_deadline;
+        execution
+    }
 
     /// Lower a parsed document to executable OIR, validate its dependency
     /// plan, and execute the plan with a fresh root scope.
@@ -2457,6 +3038,14 @@ impl Evaluator {
 
         let executable_leases = Arc::clone(self.executable_leases()?);
         let launch_generation = self.backend_launch_generation(runtime_lang)?;
+        self.apply_pending_actor_restore(
+            runtime_lang,
+            runtime_env_id,
+            &sandbox,
+            &shim,
+            &executable_leases,
+            &launch_generation,
+        )?;
         let execution: Result<OValue> = (|| {
             self.registry
                 .send_exec(
@@ -2473,8 +3062,9 @@ impl Evaluator {
                 )
                 .with_context(|| format!("[{}]", env_label))?;
 
+            let mut forbidden_callback_refusal = None::<String>;
             loop {
-                let step = if let Some(deadline) = self.callback_operation_deadline {
+                let step_result = if let Some(deadline) = self.callback_operation_deadline {
                     let remaining =
                         deadline
                             .checked_duration_since(Instant::now())
@@ -2493,15 +3083,57 @@ impl Evaluator {
                 } else {
                     self.registry
                         .recv_exec_step(runtime_lang, runtime_env_id, &sandbox)
-                }
-                .with_context(|| format!("[{}]", env_label))?;
+                };
+                let step = match step_result {
+                    Ok(step) => step,
+                    Err(error) => {
+                        let Some(refusal) = forbidden_callback_refusal.as_deref() else {
+                            return Err(error).with_context(|| format!("[{}]", env_label));
+                        };
+                        if self
+                            .registry
+                            .has_live_env(runtime_lang, runtime_env_id, &sandbox)
+                        {
+                            return Err(PreparedPlacementRefusalV1::new(format!(
+                                "{refusal}; backend settled the refused callback with an execution error: {error:#}"
+                            ))
+                            .into());
+                        }
+                        return Err(crate::process::infrastructure_error(anyhow::anyhow!(
+                            "{refusal}; backend did not settle after the refusal and actor state is ambiguous: {error:#}"
+                        )));
+                    }
+                };
 
                 match step {
-                    ExecStep::Done(v) => break Ok(v),
+                    ExecStep::Done(v) => match forbidden_callback_refusal.take() {
+                        Some(refusal) => break Err(PreparedPlacementRefusalV1::new(refusal).into()),
+                        None => break Ok(v),
+                    },
                     ExecStep::EvalRequest {
                         src,
                         scope: explicit_scope,
                     } => {
+                        if self.prepared_fragment_callbacks_forbidden {
+                            let refusal = format!(
+                                "[{}] prepared placement fragment requested recursive O.eval authority outside its admitted OIR",
+                                env_label
+                            );
+                            self.registry
+                                .send_eval_result(
+                                    runtime_lang,
+                                    runtime_env_id,
+                                    OValue::error(refusal.clone()),
+                                    &sandbox,
+                                )
+                                .map_err(|error| {
+                                    crate::process::infrastructure_error(anyhow::anyhow!(
+                                        "{refusal}; failed to settle the refused callback and actor state is ambiguous: {error:#}"
+                                    ))
+                                })?;
+                            forbidden_callback_refusal.get_or_insert(refusal);
+                            continue;
+                        }
                         let callback_scope = match explicit_scope {
                             None => local_scope.clone(),
                             Some(OValue::Scope { bindings }) => bindings,
@@ -2819,6 +3451,205 @@ impl Evaluator {
     #[cfg(test)]
     fn render_child(&self, lang: &str, val: &OValue) -> String {
         render_with(BackendRegistry::global().renderer_for(lang), val)
+    }
+}
+
+fn validate_placement_fragment_shape(
+    program: &OIrProgram,
+    plan: &ExecutionPlan,
+) -> Result<PlanNodeId> {
+    let flat = program.flatten_for_plan();
+    let mut semantic_roots = Vec::new();
+    for root in &plan.roots {
+        match flat.get(root.0) {
+            Some(OIr::Text(text)) if text.trim().is_empty() => {}
+            Some(OIr::Text(_)) => {
+                bail!(
+                    "placement fragment contains a non-whitespace top-level text root (text-only or mixed-document input is not executable placement authority)"
+                )
+            }
+            Some(_) => semantic_roots.push(*root),
+            None => bail!("placement fragment root P{} has no OIR node", root.0),
+        }
+    }
+    if semantic_roots.len() != 1 {
+        bail!(
+            "placement fragment requires exactly one non-whitespace semantic root, found {}",
+            semantic_roots.len()
+        );
+    }
+    let root = semantic_roots[0];
+    let mut exec = None;
+    for node in &plan.nodes {
+        match &node.kind {
+            PlanNodeKind::Text => {}
+            PlanNodeKind::Load { .. } => {
+                bail!(
+                    "placement fragment cannot contain Load P{} until the input scope is digest-bound and packaged",
+                    node.id.0
+                )
+            }
+            PlanNodeKind::Exec { backend, .. } => {
+                if exec.replace(node.id).is_some() {
+                    bail!(
+                        "placement fragment contains a second Exec at P{}",
+                        node.id.0
+                    );
+                }
+                if backend.execution != ExecutionMode::Shim {
+                    bail!(
+                        "placement fragment Exec P{} uses {}, expected a shim backend",
+                        node.id.0,
+                        backend.execution.label()
+                    );
+                }
+            }
+            PlanNodeKind::Store { .. } => {
+                bail!("placement fragment cannot contain Store P{}", node.id.0)
+            }
+            PlanNodeKind::Call { .. } => {
+                bail!("placement fragment cannot contain Call P{}", node.id.0)
+            }
+            PlanNodeKind::Request { .. } => {
+                bail!("placement fragment cannot contain Request P{}", node.id.0)
+            }
+            PlanNodeKind::Group { .. } => {
+                bail!("placement fragment cannot contain Group P{}", node.id.0)
+            }
+            PlanNodeKind::Schedule { .. } => {
+                bail!("placement fragment cannot contain Schedule P{}", node.id.0)
+            }
+        }
+    }
+    let exec = exec.context("placement fragment contains no shim Exec (text-only input is not executable placement authority)")?;
+    if exec != root {
+        bail!(
+            "placement fragment's only Exec is P{}, but its sole root is P{}",
+            exec.0,
+            root.0
+        );
+    }
+    if program_contains_obvious_o_eval(program) {
+        bail!(
+            "placement fragment contains O.eval; recursive evaluator authority is outside a single admitted backend fragment"
+        );
+    }
+    Ok(exec)
+}
+
+fn strip_prepared_source_shebang(source: &str) -> &str {
+    if !source.starts_with("#!") {
+        return source;
+    }
+    source
+        .find('\n')
+        .map_or("", |newline| &source[newline + 1..])
+}
+
+fn program_contains_obvious_o_eval(program: &OIrProgram) -> bool {
+    fn visit(node: &OIr) -> bool {
+        match node {
+            OIr::Text(text) => {
+                let compact = text
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>();
+                compact.contains("O.eval")
+                    || compact.contains("O['eval']")
+                    || compact.contains("O[\"eval\"]")
+                    || compact.contains("getattr(O,'eval')")
+                    || compact.contains("getattr(O,\"eval\")")
+            }
+            OIr::Load(_) => false,
+            OIr::Store { expr, .. } => visit(expr),
+            OIr::Invoke { args, .. } => args.iter().any(visit),
+            OIr::Exec { body, .. } => body.iter().any(visit),
+        }
+    }
+    program.nodes.iter().any(visit)
+}
+
+fn prepared_backend_implementation(
+    admitted: &crate::evidence::AdmittedExecution<'_>,
+    backend: &BackendInterface,
+) -> Result<crate::placement::BackendImplementationIdV1> {
+    let registry = BackendRegistry::global();
+    let expected_specification = backend
+        .specification_sha256
+        .as_deref()
+        .context("placement fragment backend has no admitted catalog specification digest")?;
+    let expected_specification =
+        crate::placement::SemanticDigestV1::from_sha256(expected_specification.to_string())?;
+
+    let adapter_sha256 = match registry.adapter_for(&backend.canonical) {
+        BackendAdapterKind::NativeRust => unique_admitted_sha256(
+            admitted
+                .admission()
+                .executable_manifest()
+                .artifacts()
+                .iter()
+                .filter(|artifact| {
+                    artifact.canonical_backend == backend.canonical
+                        && artifact.role == "ostadix-proxy"
+                })
+                .filter_map(|artifact| artifact.sha256.as_deref()),
+            "admitted Ostadix proxy adapter",
+            &backend.canonical,
+        )?,
+        BackendAdapterKind::LegacyPythonShim => {
+            let common_name = "o_shim_common.py";
+            let common_hex = hex::encode(common_name.as_bytes());
+            unique_admitted_sha256(
+                admitted
+                    .admission()
+                    .backend_artifacts()
+                    .iter()
+                    .filter(|artifact| artifact.canonical_backend == backend.canonical)
+                    .filter(|artifact| {
+                        !artifact.resolved_identity.ends_with(common_name)
+                            && !artifact.resolved_identity.ends_with(&common_hex)
+                    })
+                    .filter_map(|artifact| artifact.state.sha256()),
+                "admitted legacy shim adapter",
+                &backend.canonical,
+            )?
+        }
+        BackendAdapterKind::Inline => {
+            bail!(
+                "placement fragment backend `{}` has no hosted adapter",
+                backend.canonical
+            )
+        }
+    };
+    let adapter_artifact = crate::world::ArtifactId::from_sha256(adapter_sha256)?;
+    let executable_set = admitted
+        .executable_leases()?
+        .backend_executable_set_v2(&backend.canonical)?;
+    registry
+        .backend_implementation_id_v1(
+            &backend.canonical,
+            Some(&expected_specification),
+            adapter_artifact,
+            executable_set,
+            crate::registry::bundle::LOCAL_BACKEND_PROTOCOL_ABI_V1,
+        )
+        .map_err(Into::into)
+}
+
+fn unique_admitted_sha256<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    label: &str,
+    backend: &str,
+) -> Result<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    match values.as_slice() {
+        [sha256] => Ok((*sha256).to_string()),
+        [] => bail!("backend `{backend}` has no {label} digest in its retained admission"),
+        _ => bail!(
+            "backend `{backend}` has multiple conflicting {label} digests in its retained admission"
+        ),
     }
 }
 
@@ -4149,6 +4980,30 @@ fn render_markdown(val: &OValue) -> String {
 mod tests {
     use super::*;
 
+    fn placement_attempt() -> crate::placement::TaskAttemptIdV1 {
+        crate::placement::TaskAttemptIdV1::new(
+            crate::placement::SemanticDigestV1::hash_bytes(
+                "ostadix/test/prepared-placement-task/v1",
+                b"prepared-placement-fragment",
+            ),
+            crate::placement::GenerationV1::new(1).unwrap(),
+        )
+    }
+
+    fn placement_evaluator(shim_dir: PathBuf) -> Evaluator {
+        Evaluator::new(shim_dir)
+            .with_registered_backends(BackendRegistry::global().registered_backend_tags())
+    }
+
+    fn eval_test_source(
+        evaluator: &mut Evaluator,
+        backends: &HashSet<String>,
+        source: &str,
+    ) -> Result<OValue> {
+        let nodes = Parser::new(source, backends).parse()?;
+        evaluator.eval_document(nodes)
+    }
+
     #[test]
     fn fresh_backend_success_cannot_hide_cleanup_failure() {
         let error = settle_fresh_backend_result(
@@ -4396,6 +5251,490 @@ mod tests {
             }
             other => panic!("expected spliced big integer number, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn evaluator_checkpoint_restore_round_trips_python_actor_state() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut source =
+            Evaluator::new(shim_dir.clone()).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut source,
+            &backends,
+            "python[17]^(x = []\nx.append(x)\ny = x\n__oval_result__ = 'ready')_python[17]",
+        )?;
+
+        let snapshot = source.checkpoint_persistent_actors(4 * 1024 * 1024)?;
+        assert_eq!(snapshot.actors.len(), 1);
+        assert_eq!(snapshot.actors[0].canonical_backend, "python");
+        assert_eq!(snapshot.actors[0].environment_id, 17);
+        assert_eq!(
+            eval_test_source(
+                &mut source,
+                &backends,
+                "python[17]^(__oval_result__ = x is y and x[0] is x)_python[17]",
+            )?,
+            OValue::bool_(true),
+            "checkpointing must not evict the live source actor"
+        );
+
+        let mut restored = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        restored.stage_persistent_actor_restore(snapshot, 4 * 1024 * 1024)?;
+        assert_eq!(restored.pending_persistent_actor_restores(), 1);
+        assert_eq!(
+            eval_test_source(
+                &mut restored,
+                &backends,
+                "python[17]^(__oval_result__ = x is y and x[0] is x)_python[17]",
+            )?,
+            OValue::bool_(true)
+        );
+        assert_eq!(restored.pending_persistent_actor_restores(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_checkpoint_pin_keeps_python_actor_live() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut evaluator,
+            &backends,
+            "python[19]^(f = lambda: 42\n__oval_result__ = 'ready')_python[19]",
+        )?;
+
+        let error = evaluator
+            .checkpoint_persistent_actors(4 * 1024 * 1024)
+            .expect_err("a Python function must pin the actor");
+        assert!(format!("{error:#}").contains("state.pin-required"));
+        assert_eq!(
+            eval_test_source(
+                &mut evaluator,
+                &backends,
+                "python[19]^(__oval_result__ = f())_python[19]",
+            )?,
+            OValue::int(42),
+            "checkpoint refusal must retain the live actor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_evaluator_restore_fails_closed_on_launch_generation_mismatch() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut source =
+            Evaluator::new(shim_dir.clone()).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut source,
+            &backends,
+            "python[23]^(x = 42\n__oval_result__ = x)_python[23]",
+        )?;
+        let mut snapshot = source.checkpoint_persistent_actors(4 * 1024 * 1024)?;
+        snapshot.actors[0].launch_generation_sha256 = "00".repeat(32);
+
+        let mut restored = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        restored.stage_persistent_actor_restore(snapshot, 4 * 1024 * 1024)?;
+        let error = eval_test_source(
+            &mut restored,
+            &backends,
+            "python[23]^(__oval_result__ = x)_python[23]",
+        )
+        .expect_err("mismatched generation must fail before actor dispatch");
+        assert!(
+            format!("{error:#}").contains("state.restore-generation-mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(
+            restored.pending_persistent_actor_restores(),
+            1,
+            "failed restore must remain staged and must not publish an actor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_snapshot_is_empty_without_persistent_actors() -> Result<()> {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let snapshot = evaluator.checkpoint_persistent_actors(1024)?;
+        assert!(snapshot.actors.is_empty());
+        snapshot.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_snapshots_stateless_actor_as_explicit_empty_checkpoint() -> Result<()> {
+        if which::which("bash").is_err() {
+            return Ok(());
+        }
+        let backends: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        assert_eq!(
+            eval_test_source(&mut evaluator, &backends, "bash[29]^(printf 42)_bash[29]")?,
+            OValue::int(42)
+        );
+        let snapshot = evaluator.checkpoint_persistent_actors(1024 * 1024)?;
+        assert_eq!(snapshot.actors.len(), 1);
+        assert_eq!(
+            snapshot.actors[0].checkpoint.tier,
+            crate::backend::state::BackendStateTierV1::Stateless
+        );
+        assert_eq!(
+            snapshot.actors[0].checkpoint.payload,
+            serde_json::json!({ "kind": "empty" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_executes_exact_admitted_python() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let source = "#!/usr/bin/env O\npython^(__oval_result__ = 6 * 7)_python";
+        let prepared = evaluator.prepare_placement_fragment(source, placement_attempt())?;
+        let bindings = prepared.bindings().clone();
+        assert_eq!(
+            bindings.source_sha256(),
+            crate::evidence::source_sha256(source.as_bytes())
+        );
+        assert_eq!(bindings.canonical_backend(), "python");
+        assert_eq!(bindings.environment(), EnvironmentRefV2::Ephemeral);
+        assert!(bindings.requirement_footprint().is_complete());
+        assert_eq!(
+            bindings.backend_launch_generation().as_sha256().len(),
+            64,
+            "prepared authority must expose the exact admitted launch-generation digest"
+        );
+        assert_eq!(
+            bindings.backend_implementation().realization_pipeline(),
+            bindings.realization_pipeline()
+        );
+
+        let mut scope = HashMap::new();
+        assert_eq!(
+            evaluator.execute_prepared_placement_fragment(prepared, &mut scope)?,
+            OValue::int(42)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_exposes_portable_admission_separately() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let source = "python^(__oval_result__ = 6 * 7)_python";
+        let source_with_shebang = format!("#!/usr/bin/env O\n{source}");
+        let mut evaluator = placement_evaluator(shim_dir);
+
+        let plain = evaluator.prepare_placement_fragment(source, placement_attempt())?;
+        let alternate_attempt = crate::placement::TaskAttemptIdV1::new(
+            crate::placement::SemanticDigestV1::from_sha256("ba".repeat(32))?,
+            crate::placement::GenerationV1::new(2)?,
+        );
+        let shebang =
+            evaluator.prepare_placement_fragment(&source_with_shebang, alternate_attempt)?;
+
+        assert_ne!(
+            plain.bindings().source_sha256(),
+            shebang.bindings().source_sha256(),
+            "original source bytes remain a separate binding"
+        );
+        assert_ne!(
+            plain.bindings().task_attempt(),
+            shebang.bindings().task_attempt(),
+            "task identity remains a separate binding"
+        );
+        assert_eq!(
+            plain.bindings().operation_oir(),
+            shebang.bindings().operation_oir(),
+            "the prepared executable syntax is identical after shebang stripping"
+        );
+        assert_eq!(
+            plain.bindings().placement_admission(),
+            shebang.bindings().placement_admission(),
+            "source bytes and task identity must not contaminate portable admission"
+        );
+        assert_eq!(
+            plain.bindings().admission(),
+            plain.bindings().placement_admission(),
+            "the placement-lease compatibility getter uses the portable coordinate"
+        );
+        assert_eq!(plain.bindings().placement_admission().as_sha256().len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_permits_only_trailing_whitespace_roots() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        for suffix in ["\n", "\r\n \t"] {
+            let source = format!("python^(__oval_result__ = 6 * 7)_python{suffix}");
+            let mut evaluator = placement_evaluator(shim_dir.clone());
+            let prepared = evaluator.prepare_placement_fragment(&source, placement_attempt())?;
+            assert_eq!(
+                prepared.bindings().source_sha256(),
+                crate::evidence::source_sha256(source.as_bytes())
+            );
+            assert_eq!(
+                evaluator.execute_prepared_placement_fragment(prepared, &mut HashMap::new())?,
+                OValue::int(42)
+            );
+        }
+
+        let mut evaluator = placement_evaluator(shim_dir);
+        let error = match evaluator.prepare_placement_fragment(
+            "python^(__oval_result__ = 42)_python\nnot whitespace",
+            placement_attempt(),
+        ) {
+            Ok(_) => panic!("non-whitespace sibling text must remain outside placement authority"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("non-whitespace top-level text root"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_binds_persistent_session_requirement() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let prepared = evaluator.prepare_placement_fragment(
+            "python[17]^(__oval_result__ = 42)_python[17]",
+            placement_attempt(),
+        )?;
+        assert_eq!(
+            prepared.bindings().environment(),
+            EnvironmentRefV2::Persistent(17)
+        );
+        let capability = crate::placement::CapabilityAtomV1::new(
+            crate::placement::CapabilityKeyV1::new(
+                crate::placement::SESSION_SERIALIZED_OPAQUE_EFFECTS_NAMESPACE_V1,
+                crate::placement::SESSION_SERIALIZED_OPAQUE_EFFECTS_NAME_V1,
+            )?,
+            1,
+        )?;
+        assert!(prepared
+            .bindings()
+            .requirement_footprint()
+            .known_atoms()
+            .contains(&crate::placement::RequirementAtomV1::Capability(capability)));
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_rejects_non_fragment_shapes() {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let cases = [
+            (
+                "python^(1)_python\npython^(2)_python",
+                "exactly one non-whitespace semantic root",
+            ),
+            ("now(python^(1)_python)", "cannot contain"),
+            ("ordinary text only", "text-only"),
+            ("python^($later)_python", "cannot contain Load"),
+            ("python^(O.eval('2'))_python", "contains O.eval"),
+        ];
+        for (source, expected) in cases {
+            let mut evaluator = placement_evaluator(shim_dir.clone());
+            let error = match evaluator.prepare_placement_fragment(source, placement_attempt()) {
+                Ok(_) => panic!("non-fragment input must fail before authorization: {source:?}"),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{source:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn prepared_placement_fragment_rejects_runtime_hidden_o_eval() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let prepared = evaluator.prepare_placement_fragment(
+            "python^(__oval_result__ = getattr(O, ''.join(['e', 'val']))('2'))_python",
+            placement_attempt(),
+        )?;
+        let error = evaluator
+            .execute_prepared_placement_fragment(prepared, &mut HashMap::new())
+            .expect_err("a dynamically hidden O.eval callback must fail closed");
+        assert!(
+            error.downcast_ref::<PreparedPlacementRefusalV1>().is_some(),
+            "settled callback refusal must retain its semantic error type: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("recursive O.eval authority outside its admitted OIR"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_persistent_callback_refusal_preserves_actor_state() -> Result<()> {
+        let backends = BackendRegistry::global().registered_backend_tags();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        let prepared = evaluator.prepare_placement_fragment(
+            "python[37]^(x = 41\ngetattr(O, ''.join(['e', 'val']))('2')\n__oval_result__ = x)_python[37]",
+            placement_attempt(),
+        )?;
+        let error = evaluator
+            .execute_prepared_placement_fragment(prepared, &mut HashMap::new())
+            .expect_err("a hidden callback must be refused without evicting session state");
+        assert!(
+            error.downcast_ref::<PreparedPlacementRefusalV1>().is_some(),
+            "persistent callback refusal must remain a typed semantic refusal: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("recursive O.eval authority outside its admitted OIR"),
+            "{error:#}"
+        );
+        assert_eq!(
+            eval_test_source(
+                &mut evaluator,
+                &backends,
+                "python[37]^(__oval_result__ = x + 1)_python[37]",
+            )?,
+            OValue::int(42),
+            "semantic callback refusal must leave the persistent actor live"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_rejects_stale_runtime_before_dispatch() -> Result<()> {
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let temp = tempfile::tempdir()?;
+        for file in ["python_shim.py", "o_shim_common.py"] {
+            std::fs::copy(source_dir.join(file), temp.path().join(file))?;
+        }
+        let mut evaluator = placement_evaluator(temp.path().to_path_buf());
+        let prepared = evaluator.prepare_placement_fragment(
+            "python^(__oval_result__ = 42)_python",
+            placement_attempt(),
+        )?;
+        let shim = temp.path().join("python_shim.py");
+        let mut bytes = std::fs::read(&shim)?;
+        bytes.extend_from_slice(b"\n# stale after placement preparation\n");
+        std::fs::write(&shim, bytes)?;
+
+        let error = evaluator
+            .execute_prepared_placement_fragment(prepared, &mut HashMap::new())
+            .expect_err("runtime drift must invalidate the prepared handle");
+        assert!(
+            format!("{error:#}").contains("runtime binding is stale"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_is_fenced_to_its_evaluator() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut source = placement_evaluator(shim_dir.clone());
+        let prepared = source.prepare_placement_fragment(
+            "python^(__oval_result__ = 42)_python",
+            placement_attempt(),
+        )?;
+        let mut other = placement_evaluator(shim_dir);
+        let error = other
+            .execute_prepared_placement_fragment(prepared, &mut HashMap::new())
+            .expect_err("a different evaluator must not consume retained authority");
+        assert!(
+            format!("{error:#}").contains("different Evaluator instance"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_rejects_unbound_coordinator_scope() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let prepared = evaluator.prepare_placement_fragment(
+            "python[43]^(__oval_result__ = injected)_python[43]",
+            placement_attempt(),
+        )?;
+        let mut scope = HashMap::from([("injected".to_owned(), OValue::int(42))]);
+        let error = evaluator
+            .execute_prepared_placement_fragment(prepared, &mut scope)
+            .expect_err("later coordinator scope must not enter sealed placement authority");
+        assert!(
+            format!("{error:#}").contains("nonempty coordinator scope"),
+            "{error:#}"
+        );
+        assert_eq!(scope.get("injected"), Some(&OValue::int(42)));
+        assert!(
+            evaluator
+                .checkpoint_persistent_actors(1024 * 1024)?
+                .actors
+                .is_empty(),
+            "scope rejection must happen before a persistent actor is launched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_deadline_bounds_unresponsive_shim() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let prepared = evaluator.prepare_placement_fragment(
+            "python^(import time\ntime.sleep(30)\n__oval_result__ = 42)_python",
+            placement_attempt(),
+        )?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(std::time::Duration::from_millis(150))
+            .context("test deadline overflowed")?;
+        let error = evaluator
+            .execute_prepared_placement_fragment_until(prepared, &mut HashMap::new(), deadline)
+            .expect_err("a prepared shim must not outlive its evaluator deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "deadline enforcement waited too long: {error:#}"
+        );
+        assert!(
+            crate::process::is_infrastructure_error(&error),
+            "an unresponsive backend leaves execution state ambiguous: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("deadline"),
+            "timeout diagnostic must identify the deadline: {error:#}"
+        );
+        assert_eq!(
+            evaluator.callback_operation_deadline, None,
+            "prepared deadline wrapper must restore the evaluator's prior deadline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_placement_fragment_expired_deadline_is_typed_and_pre_dispatch() -> Result<()> {
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = placement_evaluator(shim_dir);
+        let prepared = evaluator.prepare_placement_fragment(
+            "python[44]^(__oval_result__ = 42)_python[44]",
+            placement_attempt(),
+        )?;
+        let expired = Instant::now();
+        let error = evaluator
+            .execute_prepared_placement_fragment_until(prepared, &mut HashMap::new(), expired)
+            .expect_err("an elapsed prepared deadline must fail before backend dispatch");
+        assert!(
+            error
+                .downcast_ref::<PreparedPlacementDeadlineExpiredV1>()
+                .is_some(),
+            "pre-dispatch deadline refusal must retain its public error type: {error:#}"
+        );
+        assert!(
+            evaluator
+                .checkpoint_persistent_actors(1024 * 1024)?
+                .actors
+                .is_empty(),
+            "expired deadline must not launch a persistent actor"
+        );
+        Ok(())
     }
 
     #[test]
