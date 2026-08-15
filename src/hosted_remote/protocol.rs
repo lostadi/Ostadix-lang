@@ -303,6 +303,9 @@ impl RemotePreparedOperationV1 {
     }
 }
 
+// Preserve the V1 public outcome API. Boxing the successful value would only
+// move this versioned schema's size trade-off into every producer and consumer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum HostedOperationOutcomeV1 {
@@ -500,6 +503,9 @@ impl HostedRequestV1 {
     }
 }
 
+// Preserve direct construction of the frozen V1 response variants; the wire
+// boundary is intentionally kept distinct from an internal boxed transport.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum HostedResponseV1 {
