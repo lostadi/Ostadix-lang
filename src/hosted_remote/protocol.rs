@@ -31,6 +31,18 @@ pub const MAX_HOSTED_OUTPUT_BYTES: usize = 768 * 1024;
 pub const MAX_HOSTED_ID_BYTES: usize = 128;
 pub const MAX_HOSTED_ERROR_BYTES: usize = 8 * 1024;
 
+pub(crate) fn truncate_hosted_error_message(mut message: String) -> String {
+    if message.len() > MAX_HOSTED_ERROR_BYTES {
+        let mut boundary = MAX_HOSTED_ERROR_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push_str(" [truncated]");
+    }
+    message
+}
+
 /// Encode a message with Ostadix's deterministic CBOR encoder and the hosted
 /// transport's smaller frame bound.
 pub fn write_hosted_frame<W, T>(writer: &mut W, message: &T) -> Result<()>
@@ -325,11 +337,7 @@ impl HostedOperationOutcomeV1 {
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
-        let mut message = message.into();
-        if message.len() > MAX_HOSTED_ERROR_BYTES {
-            message.truncate(MAX_HOSTED_ERROR_BYTES);
-            message.push_str(" [truncated]");
-        }
+        let message = truncate_hosted_error_message(message.into());
         Self::Failed {
             stage,
             code: code.into(),
@@ -523,11 +531,7 @@ pub struct HostedProtocolErrorV1 {
 
 impl HostedProtocolErrorV1 {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        let mut message = message.into();
-        if message.len() > MAX_HOSTED_ERROR_BYTES {
-            message.truncate(MAX_HOSTED_ERROR_BYTES);
-            message.push_str(" [truncated]");
-        }
+        let message = truncate_hosted_error_message(message.into());
         Self {
             code: code.into(),
             message,
@@ -646,5 +650,20 @@ mod tests {
             value: OValue::int(3),
         };
         assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn error_truncation_preserves_utf8_boundaries() {
+        let message = format!(
+            "{}{}",
+            "a".repeat(MAX_HOSTED_ERROR_BYTES - 1),
+            "é".repeat(8)
+        );
+        let error = HostedProtocolErrorV1::new("invalid-frame", message);
+        assert!(error.message.ends_with(" [truncated]"));
+        assert_eq!(
+            error.message.trim_end_matches(" [truncated]").len(),
+            MAX_HOSTED_ERROR_BYTES - 1
+        );
     }
 }

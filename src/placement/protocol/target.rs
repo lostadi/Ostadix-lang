@@ -43,7 +43,7 @@ impl PlatformDescriptorV1 {
         validate_token("target operating system", &operating_system)?;
         validate_token("target architecture", &architecture)?;
         validate_token("target ABI", &abi)?;
-        if pointer_width == 0 || pointer_width > 128 || pointer_width % 8 != 0 {
+        if pointer_width == 0 || pointer_width > 128 || !pointer_width.is_multiple_of(8) {
             return Err(PlacementValidationError::InvalidToken {
                 field: "target pointer width",
                 value: pointer_width.to_string(),
@@ -222,6 +222,22 @@ impl ActorGenerationIdV1 {
 
     pub fn logical_environment(&self) -> &SemanticDigestV1 {
         &self.logical_environment
+    }
+
+    pub fn backend_implementation(&self) -> &SemanticDigestV1 {
+        &self.backend_implementation
+    }
+
+    pub fn target_descriptor(&self) -> &SemanticDigestV1 {
+        &self.target_descriptor
+    }
+
+    pub fn sandbox_policy(&self) -> &SemanticDigestV1 {
+        &self.sandbox_policy
+    }
+
+    pub fn launch_context(&self) -> &SemanticDigestV1 {
+        &self.launch_context
     }
 
     pub fn generation(&self) -> super::GenerationV1 {
