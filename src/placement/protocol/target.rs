@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ir::{BackendRegistry, BACKEND_CATALOG_SCHEMA_V3};
 use crate::world::ArtifactId;
 
 use super::digest::{validate_label, validate_token};
 use super::{
-    CanonicalPlacementRecordV1, CapabilityAtomV1, CapabilityKeyV1, EndiannessV1,
-    PlacementValidationError, RequirementAtomV1, RequirementFootprintV1, SemanticDigestV1,
+    CanonicalPlacementRecordV1, CapabilityAtomV1, CapabilityKeyV1, CurrentBackendCatalogV1,
+    EndiannessV1, PlacementValidationError, RequirementAtomV1, RequirementFootprintV1,
+    SemanticDigestV1,
 };
 
-/// V1 deliberately accepts only capability ideals.  Non-downward-closed
+/// Placement V1 deliberately accepts only capability ideals. Non-downward-closed
 /// accelerator capability relations require a different solver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -324,16 +324,18 @@ impl TargetDescriptorV1 {
     /// remain independently inspectable.  They cannot, however, authorize a
     /// placement against this process unless every advertised backend
     /// specification belongs to the current compiled catalog.  Because the
-    /// catalog schema is part of every specification digest, the V2 -> V3
-    /// rollover fails closed without rewriting the signed record schema.
-    pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {
-        let registry = BackendRegistry::global();
+    /// catalog schema is part of every specification digest, catalog rollovers
+    /// fail closed without rewriting the signed record schema.
+    pub fn validate_current_backend_catalog_with(
+        &self,
+        catalog: &impl CurrentBackendCatalogV1,
+    ) -> Result<(), PlacementValidationError> {
         for implementation in &self.backend_implementations {
-            let specification = implementation.backend_specification().as_sha256();
-            if !registry.contains_specification_sha256(specification) {
+            let specification = implementation.backend_specification();
+            if !catalog.contains_current_specification(specification) {
                 return Err(PlacementValidationError::NonCurrentBackendCatalog {
-                    specification: specification.to_owned(),
-                    current_schema: BACKEND_CATALOG_SCHEMA_V3.to_owned(),
+                    specification: specification.as_sha256().to_owned(),
+                    current_schema: catalog.current_schema().to_owned(),
                 });
             }
         }

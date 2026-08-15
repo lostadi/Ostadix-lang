@@ -3,16 +3,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::world::ArtifactId;
 
 use super::digest::{validate_fresh, validate_token, validate_window};
+use super::state::{StateReservationV2, StateSessionIdV2};
 use super::{
-    CanonicalPlacementRecordV1, GenerationV1, PlacementValidationError, SemanticDigestV1,
-    TargetDescriptorV1, UnixMillisV1,
+    CanonicalPlacementRecordV1, CurrentBackendCatalogV1, GenerationV1, PlacementValidationError,
+    SemanticDigestV1, TargetDescriptorV1, UnixMillisV1,
 };
 
 pub const MAX_NODE_PROFILE_LIFETIME_MS: u64 = 60_000;
 pub const MAX_CAPACITY_OBSERVATION_LIFETIME_MS: u64 = 5_000;
 pub const MAX_PLACEMENT_LEASE_LIFETIME_MS: u64 = 30_000;
 
-/// Authentication query handed to a transport- or registry-owned verifier.
+/// Authentication query handed to a transport- or registry-owned protocol verifier.
 /// The core deliberately never treats a signer name or key digest as proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordAuthenticationV1 {
@@ -54,7 +55,7 @@ pub trait RecordAuthenticatorV1 {
     fn authenticate(&self, record: &RecordAuthenticationV1) -> bool;
 }
 
-fn require_authenticated(
+pub(super) fn require_authenticated(
     record_kind: &'static str,
     issuer_key: &SemanticDigestV1,
     record_digest: SemanticDigestV1,
@@ -129,12 +130,14 @@ impl NodeProfileV1 {
         self.expires_at
     }
 
-    pub fn validate_at(
+    pub fn validate_at_with_catalog(
         &self,
         now: UnixMillisV1,
         authenticator: &impl RecordAuthenticatorV1,
+        catalog: &impl CurrentBackendCatalogV1,
     ) -> Result<(), PlacementValidationError> {
-        self.descriptor.validate_current_backend_catalog()?;
+        self.descriptor
+            .validate_current_backend_catalog_with(catalog)?;
         validate_fresh("node profile", self.issued_at, self.expires_at, now)?;
         require_authenticated(
             "node profile",
@@ -686,6 +689,622 @@ impl<'de> Deserialize<'de> for PlacementLeaseV1 {
     }
 }
 
+/// Exact state authority carried by a placement lease.
+///
+/// `None` means the command neither opens nor resumes backend state. `Open`
+/// binds the separately authenticated state-capacity observation and the hard
+/// reservation admitted against it. `Existing` binds one accepted session;
+/// stateful actors carry their exact actor-generation digest, while a
+/// stateless session may omit it because no actor state is being resumed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind", deny_unknown_fields)]
+pub enum LeaseStateBindingV2 {
+    None,
+    Open {
+        state_capacity_observation: SemanticDigestV1,
+        reservation: StateReservationV2,
+    },
+    Existing {
+        session: StateSessionIdV2,
+        actor_generation: Option<SemanticDigestV1>,
+    },
+}
+
+impl LeaseStateBindingV2 {
+    pub fn open(
+        state_capacity_observation: SemanticDigestV1,
+        reservation: StateReservationV2,
+    ) -> Self {
+        Self::Open {
+            state_capacity_observation,
+            reservation,
+        }
+    }
+
+    pub fn existing(session: StateSessionIdV2, actor_generation: Option<SemanticDigestV1>) -> Self {
+        Self::Existing {
+            session,
+            actor_generation,
+        }
+    }
+
+    pub fn state_capacity_observation(&self) -> Option<&SemanticDigestV1> {
+        match self {
+            Self::Open {
+                state_capacity_observation,
+                ..
+            } => Some(state_capacity_observation),
+            Self::None | Self::Existing { .. } => None,
+        }
+    }
+
+    pub fn reservation(&self) -> Option<&StateReservationV2> {
+        match self {
+            Self::Open { reservation, .. } => Some(reservation),
+            Self::None | Self::Existing { .. } => None,
+        }
+    }
+
+    pub fn session(&self) -> Option<&StateSessionIdV2> {
+        match self {
+            Self::Existing { session, .. } => Some(session),
+            Self::None | Self::Open { .. } => None,
+        }
+    }
+
+    pub fn actor_generation(&self) -> Option<&SemanticDigestV1> {
+        match self {
+            Self::Existing {
+                actor_generation, ..
+            } => actor_generation.as_ref(),
+            Self::None | Self::Open { .. } => None,
+        }
+    }
+
+    fn validate_for_node(&self, node_id: &str) -> Result<(), PlacementValidationError> {
+        if let Self::Existing { session, .. } = self {
+            require_equal("lease state session node", node_id, session.node_id())?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete execution scope expected by a placement-lease V2 consumer.
+///
+/// This is a canonical record in its own right so scheduler/transport adapters
+/// can compare or log the exact expectation without inventing a second field
+/// projection. Envelope authority (issuer, nonce, and validity) remains on the
+/// lease and is checked by `PlacementLeaseV2::validate_for`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseExpectationV2 {
+    node_id: String,
+    target_descriptor: SemanticDigestV1,
+    profile_generation: GenerationV1,
+    capacity_generation: GenerationV1,
+    capacity_observation: SemanticDigestV1,
+    candidate_eligibility: SemanticDigestV1,
+    operation_oir: ArtifactId,
+    requirement_footprint: SemanticDigestV1,
+    warrant_discharge: SemanticDigestV1,
+    admission: SemanticDigestV1,
+    task_attempt: TaskAttemptIdV1,
+    backend_implementation: SemanticDigestV1,
+    realization_pipeline: SemanticDigestV1,
+    trust_policy: SemanticDigestV1,
+    reservation: PlacementReservationV1,
+    hosted_command_binding: SemanticDigestV1,
+    state_binding: LeaseStateBindingV2,
+}
+
+impl LeaseExpectationV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node_id: impl Into<String>,
+        target_descriptor: SemanticDigestV1,
+        profile_generation: GenerationV1,
+        capacity_generation: GenerationV1,
+        capacity_observation: SemanticDigestV1,
+        candidate_eligibility: SemanticDigestV1,
+        operation_oir: ArtifactId,
+        requirement_footprint: SemanticDigestV1,
+        warrant_discharge: SemanticDigestV1,
+        admission: SemanticDigestV1,
+        task_attempt: TaskAttemptIdV1,
+        backend_implementation: SemanticDigestV1,
+        realization_pipeline: SemanticDigestV1,
+        trust_policy: SemanticDigestV1,
+        reservation: PlacementReservationV1,
+        hosted_command_binding: SemanticDigestV1,
+        state_binding: LeaseStateBindingV2,
+    ) -> Result<Self, PlacementValidationError> {
+        let node_id = node_id.into();
+        validate_token("lease v2 expectation node", &node_id)?;
+        state_binding.validate_for_node(&node_id)?;
+        Ok(Self {
+            node_id,
+            target_descriptor,
+            profile_generation,
+            capacity_generation,
+            capacity_observation,
+            candidate_eligibility,
+            operation_oir,
+            requirement_footprint,
+            warrant_discharge,
+            admission,
+            task_attempt,
+            backend_implementation,
+            realization_pipeline,
+            trust_policy,
+            reservation,
+            hosted_command_binding,
+            state_binding,
+        })
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn target_descriptor(&self) -> &SemanticDigestV1 {
+        &self.target_descriptor
+    }
+
+    pub fn profile_generation(&self) -> GenerationV1 {
+        self.profile_generation
+    }
+
+    pub fn capacity_generation(&self) -> GenerationV1 {
+        self.capacity_generation
+    }
+
+    pub fn capacity_observation(&self) -> &SemanticDigestV1 {
+        &self.capacity_observation
+    }
+
+    pub fn candidate_eligibility(&self) -> &SemanticDigestV1 {
+        &self.candidate_eligibility
+    }
+
+    pub fn operation_oir(&self) -> &ArtifactId {
+        &self.operation_oir
+    }
+
+    pub fn requirement_footprint(&self) -> &SemanticDigestV1 {
+        &self.requirement_footprint
+    }
+
+    pub fn warrant_discharge(&self) -> &SemanticDigestV1 {
+        &self.warrant_discharge
+    }
+
+    pub fn admission(&self) -> &SemanticDigestV1 {
+        &self.admission
+    }
+
+    pub fn task_attempt(&self) -> &TaskAttemptIdV1 {
+        &self.task_attempt
+    }
+
+    pub fn backend_implementation(&self) -> &SemanticDigestV1 {
+        &self.backend_implementation
+    }
+
+    pub fn realization_pipeline(&self) -> &SemanticDigestV1 {
+        &self.realization_pipeline
+    }
+
+    pub fn trust_policy(&self) -> &SemanticDigestV1 {
+        &self.trust_policy
+    }
+
+    pub fn reservation(&self) -> &PlacementReservationV1 {
+        &self.reservation
+    }
+
+    pub fn hosted_command_binding(&self) -> &SemanticDigestV1 {
+        &self.hosted_command_binding
+    }
+
+    pub fn state_binding(&self) -> &LeaseStateBindingV2 {
+        &self.state_binding
+    }
+}
+
+impl CanonicalPlacementRecordV1 for LeaseExpectationV2 {
+    const DIGEST_DOMAIN: &'static str = "ostadix/placement/lease-expectation/v2";
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseExpectationWireV2 {
+    node_id: String,
+    target_descriptor: SemanticDigestV1,
+    profile_generation: GenerationV1,
+    capacity_generation: GenerationV1,
+    capacity_observation: SemanticDigestV1,
+    candidate_eligibility: SemanticDigestV1,
+    operation_oir: ArtifactId,
+    requirement_footprint: SemanticDigestV1,
+    warrant_discharge: SemanticDigestV1,
+    admission: SemanticDigestV1,
+    task_attempt: TaskAttemptIdV1,
+    backend_implementation: SemanticDigestV1,
+    realization_pipeline: SemanticDigestV1,
+    trust_policy: SemanticDigestV1,
+    reservation: PlacementReservationV1,
+    hosted_command_binding: SemanticDigestV1,
+    state_binding: LeaseStateBindingV2,
+}
+
+impl<'de> Deserialize<'de> for LeaseExpectationV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LeaseExpectationWireV2::deserialize(deserializer)?;
+        Self::new(
+            wire.node_id,
+            wire.target_descriptor,
+            wire.profile_generation,
+            wire.capacity_generation,
+            wire.capacity_observation,
+            wire.candidate_eligibility,
+            wire.operation_oir,
+            wire.requirement_footprint,
+            wire.warrant_discharge,
+            wire.admission,
+            wire.task_attempt,
+            wire.backend_implementation,
+            wire.realization_pipeline,
+            wire.trust_policy,
+            wire.reservation,
+            wire.hosted_command_binding,
+            wire.state_binding,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// One-use, short-lived execution authority binding eligibility, warrants,
+/// capacity, exact realization, hosted command context, and state.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementLeaseV2 {
+    issuer_key: SemanticDigestV1,
+    lease_nonce: SemanticDigestV1,
+    node_id: String,
+    target_descriptor: SemanticDigestV1,
+    profile_generation: GenerationV1,
+    capacity_generation: GenerationV1,
+    capacity_observation: SemanticDigestV1,
+    candidate_eligibility: SemanticDigestV1,
+    operation_oir: ArtifactId,
+    requirement_footprint: SemanticDigestV1,
+    warrant_discharge: SemanticDigestV1,
+    admission: SemanticDigestV1,
+    task_attempt: TaskAttemptIdV1,
+    backend_implementation: SemanticDigestV1,
+    realization_pipeline: SemanticDigestV1,
+    trust_policy: SemanticDigestV1,
+    reservation: PlacementReservationV1,
+    hosted_command_binding: SemanticDigestV1,
+    state_binding: LeaseStateBindingV2,
+    one_use: bool,
+    issued_at: UnixMillisV1,
+    expires_at: UnixMillisV1,
+}
+
+impl PlacementLeaseV2 {
+    pub fn new(
+        issuer_key: SemanticDigestV1,
+        lease_nonce: SemanticDigestV1,
+        expectation: LeaseExpectationV2,
+        issued_at: UnixMillisV1,
+        expires_at: UnixMillisV1,
+    ) -> Result<Self, PlacementValidationError> {
+        validate_window(
+            "placement lease v2",
+            issued_at,
+            expires_at,
+            MAX_PLACEMENT_LEASE_LIFETIME_MS,
+        )?;
+        expectation
+            .state_binding
+            .validate_for_node(&expectation.node_id)?;
+        Ok(Self {
+            issuer_key,
+            lease_nonce,
+            node_id: expectation.node_id,
+            target_descriptor: expectation.target_descriptor,
+            profile_generation: expectation.profile_generation,
+            capacity_generation: expectation.capacity_generation,
+            capacity_observation: expectation.capacity_observation,
+            candidate_eligibility: expectation.candidate_eligibility,
+            operation_oir: expectation.operation_oir,
+            requirement_footprint: expectation.requirement_footprint,
+            warrant_discharge: expectation.warrant_discharge,
+            admission: expectation.admission,
+            task_attempt: expectation.task_attempt,
+            backend_implementation: expectation.backend_implementation,
+            realization_pipeline: expectation.realization_pipeline,
+            trust_policy: expectation.trust_policy,
+            reservation: expectation.reservation,
+            hosted_command_binding: expectation.hosted_command_binding,
+            state_binding: expectation.state_binding,
+            one_use: true,
+            issued_at,
+            expires_at,
+        })
+    }
+
+    pub fn issuer_key(&self) -> &SemanticDigestV1 {
+        &self.issuer_key
+    }
+
+    pub fn lease_nonce(&self) -> &SemanticDigestV1 {
+        &self.lease_nonce
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn target_descriptor(&self) -> &SemanticDigestV1 {
+        &self.target_descriptor
+    }
+
+    pub fn profile_generation(&self) -> GenerationV1 {
+        self.profile_generation
+    }
+
+    pub fn capacity_generation(&self) -> GenerationV1 {
+        self.capacity_generation
+    }
+
+    pub fn capacity_observation(&self) -> &SemanticDigestV1 {
+        &self.capacity_observation
+    }
+
+    pub fn candidate_eligibility(&self) -> &SemanticDigestV1 {
+        &self.candidate_eligibility
+    }
+
+    pub fn operation_oir(&self) -> &ArtifactId {
+        &self.operation_oir
+    }
+
+    pub fn requirement_footprint(&self) -> &SemanticDigestV1 {
+        &self.requirement_footprint
+    }
+
+    pub fn warrant_discharge(&self) -> &SemanticDigestV1 {
+        &self.warrant_discharge
+    }
+
+    pub fn admission(&self) -> &SemanticDigestV1 {
+        &self.admission
+    }
+
+    pub fn task_attempt(&self) -> &TaskAttemptIdV1 {
+        &self.task_attempt
+    }
+
+    pub fn backend_implementation(&self) -> &SemanticDigestV1 {
+        &self.backend_implementation
+    }
+
+    pub fn realization_pipeline(&self) -> &SemanticDigestV1 {
+        &self.realization_pipeline
+    }
+
+    pub fn trust_policy(&self) -> &SemanticDigestV1 {
+        &self.trust_policy
+    }
+
+    pub fn reservation(&self) -> &PlacementReservationV1 {
+        &self.reservation
+    }
+
+    pub fn hosted_command_binding(&self) -> &SemanticDigestV1 {
+        &self.hosted_command_binding
+    }
+
+    pub fn state_binding(&self) -> &LeaseStateBindingV2 {
+        &self.state_binding
+    }
+
+    pub fn one_use(&self) -> bool {
+        self.one_use
+    }
+
+    pub fn issued_at(&self) -> UnixMillisV1 {
+        self.issued_at
+    }
+
+    pub fn expires_at(&self) -> UnixMillisV1 {
+        self.expires_at
+    }
+
+    pub fn validate_for(
+        &self,
+        expected: &LeaseExpectationV2,
+        now: UnixMillisV1,
+        authenticator: &impl RecordAuthenticatorV1,
+    ) -> Result<(), PlacementValidationError> {
+        validate_fresh("placement lease v2", self.issued_at, self.expires_at, now)?;
+        if !self.one_use {
+            return Err(PlacementValidationError::InvalidToken {
+                field: "placement lease v2 use policy",
+                value: "reusable".to_owned(),
+            });
+        }
+        self.state_binding.validate_for_node(&self.node_id)?;
+
+        macro_rules! exact {
+            ($field:literal, $actual:expr, $expected:expr) => {
+                require_equal($field, &$expected.to_string(), &$actual.to_string())?
+            };
+        }
+        require_equal("lease v2 node", &expected.node_id, &self.node_id)?;
+        exact!(
+            "lease v2 target descriptor",
+            self.target_descriptor,
+            expected.target_descriptor
+        );
+        exact!(
+            "lease v2 profile generation",
+            self.profile_generation.get(),
+            expected.profile_generation.get()
+        );
+        exact!(
+            "lease v2 capacity generation",
+            self.capacity_generation.get(),
+            expected.capacity_generation.get()
+        );
+        exact!(
+            "lease v2 capacity observation",
+            self.capacity_observation,
+            expected.capacity_observation
+        );
+        exact!(
+            "lease v2 candidate eligibility",
+            self.candidate_eligibility,
+            expected.candidate_eligibility
+        );
+        require_equal(
+            "lease v2 operation",
+            expected.operation_oir.as_sha256(),
+            self.operation_oir.as_sha256(),
+        )?;
+        exact!(
+            "lease v2 requirement footprint",
+            self.requirement_footprint,
+            expected.requirement_footprint
+        );
+        exact!(
+            "lease v2 warrant discharge",
+            self.warrant_discharge,
+            expected.warrant_discharge
+        );
+        exact!("lease v2 admission", self.admission, expected.admission);
+        require_exact_debug(
+            "lease v2 task attempt",
+            &expected.task_attempt,
+            &self.task_attempt,
+        )?;
+        exact!(
+            "lease v2 backend implementation",
+            self.backend_implementation,
+            expected.backend_implementation
+        );
+        exact!(
+            "lease v2 realization pipeline",
+            self.realization_pipeline,
+            expected.realization_pipeline
+        );
+        exact!(
+            "lease v2 trust policy",
+            self.trust_policy,
+            expected.trust_policy
+        );
+        require_exact_debug(
+            "lease v2 compute reservation",
+            &expected.reservation,
+            &self.reservation,
+        )?;
+        exact!(
+            "lease v2 hosted command binding",
+            self.hosted_command_binding,
+            expected.hosted_command_binding
+        );
+        require_exact_debug(
+            "lease v2 state binding",
+            &expected.state_binding,
+            &self.state_binding,
+        )?;
+        require_authenticated(
+            "placement lease v2",
+            &self.issuer_key,
+            self.semantic_digest()?,
+            authenticator,
+        )
+    }
+}
+
+impl CanonicalPlacementRecordV1 for PlacementLeaseV2 {
+    const DIGEST_DOMAIN: &'static str = "ostadix/placement/lease/v2";
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlacementLeaseWireV2 {
+    issuer_key: SemanticDigestV1,
+    lease_nonce: SemanticDigestV1,
+    node_id: String,
+    target_descriptor: SemanticDigestV1,
+    profile_generation: GenerationV1,
+    capacity_generation: GenerationV1,
+    capacity_observation: SemanticDigestV1,
+    candidate_eligibility: SemanticDigestV1,
+    operation_oir: ArtifactId,
+    requirement_footprint: SemanticDigestV1,
+    warrant_discharge: SemanticDigestV1,
+    admission: SemanticDigestV1,
+    task_attempt: TaskAttemptIdV1,
+    backend_implementation: SemanticDigestV1,
+    realization_pipeline: SemanticDigestV1,
+    trust_policy: SemanticDigestV1,
+    reservation: PlacementReservationV1,
+    hosted_command_binding: SemanticDigestV1,
+    state_binding: LeaseStateBindingV2,
+    one_use: bool,
+    issued_at: UnixMillisV1,
+    expires_at: UnixMillisV1,
+}
+
+impl<'de> Deserialize<'de> for PlacementLeaseV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PlacementLeaseWireV2::deserialize(deserializer)?;
+        if !wire.one_use {
+            return Err(serde::de::Error::custom(
+                "placement lease v2 must be one-use",
+            ));
+        }
+        let expectation = LeaseExpectationV2::new(
+            wire.node_id,
+            wire.target_descriptor,
+            wire.profile_generation,
+            wire.capacity_generation,
+            wire.capacity_observation,
+            wire.candidate_eligibility,
+            wire.operation_oir,
+            wire.requirement_footprint,
+            wire.warrant_discharge,
+            wire.admission,
+            wire.task_attempt,
+            wire.backend_implementation,
+            wire.realization_pipeline,
+            wire.trust_policy,
+            wire.reservation,
+            wire.hosted_command_binding,
+            wire.state_binding,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Self::new(
+            wire.issuer_key,
+            wire.lease_nonce,
+            expectation,
+            wire.issued_at,
+            wire.expires_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 pub(crate) fn scope_mismatch(
     field: &'static str,
     expected: impl Into<String>,
@@ -707,5 +1326,21 @@ pub(crate) fn require_equal(
         Ok(())
     } else {
         Err(scope_mismatch(field, expected, got))
+    }
+}
+
+fn require_exact_debug<T: PartialEq + std::fmt::Debug>(
+    field: &'static str,
+    expected: &T,
+    got: &T,
+) -> Result<(), PlacementValidationError> {
+    if expected == got {
+        Ok(())
+    } else {
+        Err(scope_mismatch(
+            field,
+            format!("{expected:?}"),
+            format!("{got:?}"),
+        ))
     }
 }

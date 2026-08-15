@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::digest::{validate_label, validate_token};
 use super::{CanonicalPlacementRecordV1, PlacementValidationError, SemanticDigestV1};
 
-/// Semantic capability coordinate.  The ISA name is intentionally not part of
+/// Semantic placement-capability coordinate. The ISA name is intentionally not part of
 /// the key; for example, `vector/reduce-width-agnostic` can be implemented by
 /// both SVE and AVX-512 realizations.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

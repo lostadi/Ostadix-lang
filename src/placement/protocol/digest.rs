@@ -11,7 +11,7 @@ const SHA256_HEX_BYTES: usize = 64;
 pub(crate) const MAX_TOKEN_BYTES: usize = 128;
 pub(crate) const MAX_LABEL_BYTES: usize = 256;
 
-/// Domain-separated SHA-256 identity for an immutable placement record.
+/// Domain-separated SHA-256 identity for an immutable placement-protocol record.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SemanticDigestV1(String);
