@@ -25,6 +25,11 @@ use crate::placement::{
 
 use super::{HostedPlacementEvidenceV2, SessionStateTierV2, HOSTED_PLACEMENT_EVIDENCE_SCHEMA_V2};
 
+/// Freshness window for the co-located self-attested development evidence.
+/// Production authorities derive freshness from independently observed
+/// capacity records rather than this development-only constant.
+pub const DEVELOPMENT_EVIDENCE_LIFETIME_MILLIS_V2: u64 = 4_000;
+
 #[derive(Debug, Clone)]
 pub struct LocalDevPlacementConfigV2 {
     pub node_id: String,
@@ -89,16 +94,21 @@ pub fn local_dev_actor_generation_v2(
 ///
 /// `established_target` is used by later session commands to preserve the
 /// target descriptor fixed by Open while refreshing profile/capacity records.
-/// An actor is supplied only for an existing stateful session. Open instead
-/// uses the prospective logical environment already present in the footprint.
+/// An actor is supplied only when the node reports an established stateful
+/// actor. Open and the first stateful Execute instead use the prospective
+/// logical environment already present in the footprint; they never claim a
+/// physical actor identity that only the execution node can establish.
 pub fn build_local_dev_placement_proof_v2(
     bindings: &PlacementFragmentBindingsV1,
     issuer_key: SemanticDigestV1,
     config: LocalDevPlacementConfigV2,
     established_target: Option<&TargetDescriptorV1>,
     actor_generation: Option<&ActorGenerationIdV1>,
-    opening_session: bool,
+    establishing_logical_environment: bool,
 ) -> Result<LocalDevPlacementProofV2> {
+    if establishing_logical_environment && actor_generation.is_some() {
+        bail!("prospective logical environment cannot claim an existing actor generation");
+    }
     let requirements = bindings
         .requirement_footprint()
         .require_complete()
@@ -142,7 +152,7 @@ pub fn build_local_dev_placement_proof_v2(
     let short_expires = UnixMillisV1::new(
         config
             .now_unix_ms
-            .checked_add(4_000)
+            .checked_add(DEVELOPMENT_EVIDENCE_LIFETIME_MILLIS_V2)
             .context("development capacity expiry overflow")?,
     );
     let target_descriptor = descriptor.semantic_digest()?;
@@ -222,7 +232,7 @@ pub fn build_local_dev_placement_proof_v2(
     });
     let discharge = WarrantDischargeV1::new(exact_scope, entries)?;
     let trust_policy = PlacementTrustPolicyV1::declared();
-    let prospective_logical_environment = opening_session
+    let prospective_logical_environment = establishing_logical_environment
         .then(|| logical_environment(requirements))
         .flatten();
     let evidence = HostedPlacementEvidenceV2 {
