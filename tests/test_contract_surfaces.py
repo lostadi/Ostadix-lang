@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "contract_surfaces.py"
+SPEC = importlib.util.spec_from_file_location("ostadix_contract_surfaces", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+contracts = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(contracts)
 
 
 class ContractSurfacesTests(unittest.TestCase):
@@ -37,6 +42,24 @@ class ContractSurfacesTests(unittest.TestCase):
         result = self.run_contracts("required-executables", "--suite", "absent")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown CI suite", result.stderr)
+
+    def test_required_aggregate_needs_are_parsed_as_an_exact_block_list(self) -> None:
+        workflow = """\
+jobs:
+  alpha:
+    runs-on: ubuntu-latest
+  required-ci:
+    needs:
+      - alpha
+      - beta
+    runs-on: ubuntu-latest
+  beta:
+    runs-on: ubuntu-latest
+"""
+        self.assertEqual(
+            contracts.workflow_job_needs(workflow, "required-ci"),
+            ["alpha", "beta"],
+        )
 
 
 if __name__ == "__main__":
