@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Structural, temporal, and scope failures in the hosted placement core.
+/// Structural, temporal, and scope failures in the hosted placement protocol.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PlacementValidationError {
     #[error("{field} must not be empty")]
@@ -47,8 +47,25 @@ pub enum PlacementValidationError {
         specification: String,
         current_schema: String,
     },
+    #[error(
+        "backend realization `{realization_pipeline}` is not authorized by current catalog `{current_schema}`"
+    )]
+    NonCurrentBackendImplementation {
+        realization_pipeline: String,
+        current_schema: String,
+    },
     #[error("node capacity cannot satisfy the requested reservation")]
     InsufficientCapacity,
+    #[error("invalid state quota relationship: {0}")]
+    InvalidStateQuota(String),
+    #[error("state quota `{dimension}` cannot admit {requested} units against limit {limit}")]
+    StateQuotaExceeded {
+        dimension: String,
+        requested: u64,
+        limit: u64,
+    },
+    #[error("external-pinned state requires at least one governed resource identity")]
+    EmptyPinnedStateResources,
     #[error("warrant `{0}` was not supplied")]
     MissingWarrant(String),
     #[error("requirement `{0}` has no exact discharge")]

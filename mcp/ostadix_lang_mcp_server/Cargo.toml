@@ -2,6 +2,7 @@
 name = "ostadix-mcp-server"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.93.1"
 description = "Rust-only Ostadix-lang / O-lang MCP — endow agents to build with O"
 license = "LGPL-2.1-only"
 publish = false
