@@ -12,6 +12,7 @@ mod fact;
 mod intent;
 pub mod profile;
 
+pub(crate) use admit::PreparedAdmissionPartsV1;
 pub use admit::{
     admit_execution, AdmittedExecution, AdmittedOperationV1, BlockerReasonV1, ExecutionAdmissionV5,
     OperationBlockerV1, RetainedSequenceV1, ScheduleWhyDependentV1, ScheduleWhyViewV1,

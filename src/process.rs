@@ -1656,6 +1656,23 @@ impl ProcessRegistry {
             .with_context(|| format!("failed to send eval_result to backend `{lang}`"))
     }
 
+    /// Whether an exact logical actor/sandbox still has a published physical
+    /// process, independent of its launch generation. Used only to classify a
+    /// failed split-protocol settlement as a semantic refusal (actor retained)
+    /// or ambiguous infrastructure loss (actor no longer usable).
+    pub(crate) fn has_live_env(
+        &self,
+        lang: &str,
+        env_id: u32,
+        sandbox: &BackendSandboxPolicy,
+    ) -> bool {
+        self.registry
+            .keys()
+            .any(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                candidate_lang == lang && *candidate_env == env_id && candidate_sandbox == sandbox
+            })
+    }
+
     pub(crate) fn exec(
         &mut self,
         lang: &str,
