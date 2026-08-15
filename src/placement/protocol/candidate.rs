@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ActorGenerationIdV1, CanonicalPlacementRecordV1, CapacityObservationV1, NodeProfileV1,
-    PlacementReservationV1, PlacementTrustPolicyV1, PlacementValidationError, PlacementWarrantV1,
-    RecordAuthenticatorV1, RequirementAtomV1, RequirementFootprintV1, ResourceKindV1,
-    SemanticDigestV1, UnixMillisV1, WarrantDischargeV1,
+    ActorGenerationIdV1, CanonicalPlacementRecordV1, CapacityObservationV1,
+    CurrentBackendCatalogV1, NodeProfileV1, PlacementReservationV1, PlacementTrustPolicyV1,
+    PlacementValidationError, PlacementWarrantV1, RecordAuthenticatorV1, RequirementAtomV1,
+    RequirementFootprintV1, ResourceKindV1, SemanticDigestV1, UnixMillisV1, WarrantDischargeV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -85,13 +85,17 @@ pub struct PlacementCandidateInputV1<'a> {
 }
 
 impl<'a> PlacementCandidateInputV1<'a> {
-    pub fn evaluate(
+    pub fn evaluate_with_catalog(
         &self,
         now: UnixMillisV1,
         authenticator: &impl RecordAuthenticatorV1,
+        catalog: &impl CurrentBackendCatalogV1,
     ) -> CandidateDecisionV1 {
         let mut rejections = BTreeSet::new();
-        if let Err(error) = self.profile.validate_at(now, authenticator) {
+        if let Err(error) = self
+            .profile
+            .validate_at_with_catalog(now, authenticator, catalog)
+        {
             rejections.insert(CandidateRejectionV1::InvalidProfile(error.to_string()));
         }
         if let Err(error) = self
@@ -220,7 +224,7 @@ impl<'a> PlacementCandidateInputV1<'a> {
     }
 }
 
-/// Canonically ordered decisions for one requirement/policy pair.
+/// Canonically ordered protocol decisions for one requirement/policy pair.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateSetV1 {
