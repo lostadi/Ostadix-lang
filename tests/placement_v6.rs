@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use o_lang::ir::BackendRegistry;
 use o_lang::placement::{
     BackendImplementationIdV1, CanonicalPlacementRecordV1, CapabilityAtomV1, CapabilityKeyV1,
     CapacityObservationV1, DischargedRequirementV1, EndiannessV1, GenerationV1, LeaseExpectationV1,
@@ -32,14 +33,64 @@ fn capability(namespace: &str, name: &str, level: u32) -> CapabilityAtomV1 {
 }
 
 fn backend(seed: u8) -> BackendImplementationIdV1 {
+    let specification = SemanticDigestV1::from_sha256(
+        BackendRegistry::global()
+            .specification_sha256("python")
+            .expect("the canonical Python backend has a specification digest"),
+    )
+    .unwrap();
+    backend_with_specification(seed, specification)
+}
+
+fn backend_with_specification(
+    seed: u8,
+    specification: SemanticDigestV1,
+) -> BackendImplementationIdV1 {
     BackendImplementationIdV1::new(
-        digest(seed),
+        specification,
         artifact(seed.wrapping_add(1)),
         digest(seed.wrapping_add(2)),
         "o-shim-v1",
         digest(seed.wrapping_add(3)),
     )
     .unwrap()
+}
+
+#[test]
+fn noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize() {
+    let obsolete_specification = digest(250);
+    assert!(!BackendRegistry::global()
+        .contains_specification_sha256(obsolete_specification.as_sha256()));
+    let descriptor = target(
+        "legacy-node",
+        "legacy catalog node",
+        "x86_64",
+        vec![],
+        backend_with_specification(240, obsolete_specification.clone()),
+    );
+    let encoded = serde_json::to_vec(&descriptor).unwrap();
+    let decoded: TargetDescriptorV1 = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        decoded, descriptor,
+        "archival decoding must remain lossless"
+    );
+
+    let profile = NodeProfileV1::new(
+        digest(241),
+        decoded,
+        GenerationV1::new(1).unwrap(),
+        UnixMillisV1::new(1_000),
+        UnixMillisV1::new(2_000),
+    )
+    .unwrap();
+    assert!(matches!(
+        profile.validate_at(UnixMillisV1::new(1_500), &AcceptAll),
+        Err(PlacementValidationError::NonCurrentBackendCatalog {
+            specification,
+            current_schema,
+        }) if specification == obsolete_specification.as_sha256()
+            && current_schema == "ostadix.backend-catalog/v3"
+    ));
 }
 
 fn target(

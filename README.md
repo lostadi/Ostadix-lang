@@ -83,6 +83,17 @@ descriptor, requirement, warrant, capacity, and lease core plus a bounded
 direct-node transport for one prepared operation. Neither version is silently
 translated into the other.
 
+Admission version and backend-catalog generation are separate version axes.
+The current authorizing catalog is `ostadix.backend-catalog/v3`; its schema is
+part of both the whole-catalog digest and every backend-specification digest.
+A placement profile that advertises any V2 backend identity remains decodable
+and independently auditable, but fails current profile validation before it can
+authorize candidate selection or warrant discharge. There is no digest
+relabeling or silent V2-to-V3 uplift. Rebuild the runtime and MCP server, then
+regenerate short-lived profiles and all derived placement evidence after this
+rollover. The exact boundary and regeneration sequence are in
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v3-hard-rollover).
+
 The direct transport has a deliberately small command surface:
 
 ```text

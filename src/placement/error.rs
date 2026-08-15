@@ -40,6 +40,13 @@ pub enum PlacementValidationError {
     Unsatisfiable(Vec<String>),
     #[error("target does not support requirement `{0}`")]
     UnsupportedRequirement(String),
+    #[error(
+        "backend specification `{specification}` is not authorized by current catalog `{current_schema}`"
+    )]
+    NonCurrentBackendCatalog {
+        specification: String,
+        current_schema: String,
+    },
     #[error("node capacity cannot satisfy the requested reservation")]
     InsufficientCapacity,
     #[error("warrant `{0}` was not supplied")]

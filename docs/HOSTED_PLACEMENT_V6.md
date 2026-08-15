@@ -33,6 +33,94 @@ A V5 record is never silently upgraded to V6, and a V6 record is never treated
 as World admission. A generated executable embeds the admission version it was
 built against.
 
+## Backend catalog V3 hard rollover
+
+Admission V5/V6 and backend-catalog V2/V3 describe different things. The
+admission version selects an execution/placement contract. The catalog schema
+selects the hash domain for backend metadata. The current authorizing catalog
+schema is `ostadix.backend-catalog/v3`.
+
+The schema string participates in the digest of the complete ordered catalog
+and in every canonical backend-specification digest. Moving from V2 to V3 thus
+changes those identities even when a backend keeps the same display name. A
+name or alias is never substituted for that digest.
+
+The rollover is enforced without rewriting the signed placement-record
+schemas:
+
+1. `TargetDescriptorV1::validate_current_backend_catalog()` checks every
+   `BackendImplementationIdV1.backend_specification` against the specification
+   identities minted by the process's current `BackendRegistry`.
+2. `NodeProfileV1::validate_at()` performs that check before freshness and
+   detached-authentication checks. Candidate evaluation validates the profile
+   before it attempts requirement or warrant discharge.
+3. A V2 or otherwise unknown specification fails with
+   `PlacementValidationError::NonCurrentBackendCatalog`.
+
+The exact diagnostic is:
+
+```text
+backend specification `<digest>` is not authorized by current catalog `ostadix.backend-catalog/v3`
+```
+
+Consequently, a self-consistent set of old profile, footprint, implementation,
+warrant, and signature records cannot authorize V3 placement. Old warrants
+also cannot discharge requirements freshly derived from V3 identities. The
+runtime never edits, relabels, or silently uplifts a V2 digest. A descriptor
+with no backend implementations may remain structurally valid, but it cannot
+satisfy a `BackendSpecification` or `BackendImplementation` requirement.
+
+V2 records remain archive material. Their original bytes can be decoded and
+their detached signatures can be checked against their original digests and
+keys. Registry signature, namespace, and history verification establishes the
+integrity of that archive; it is not current profile validation and is not
+placement authorization. Keep the original records if they are needed for an
+audit instead of modifying their signed contents.
+
+The bounded direct-node protocol separately binds the exact whole-catalog
+digest in `RemotePreparedOperationV1`, so peers built from different catalog
+generations reject one another. That is a direct-protocol compatibility check,
+not V6 placement authorization; the direct channel still does not consume a
+placement profile or warrant discharge.
+
+### Regenerating current identities
+
+After a catalog rollover, rebuild components that compile or embed the catalog:
+
+```bash
+./setup.sh --minimal --yes
+```
+
+Then restart long-running `O`, `o-node`, and MCP processes so they do not retain
+an older compiled snapshot. Confirm that a rebuilt MCP `o_runtimes` report says
+`runtime-catalog-schema=ostadix.backend-catalog/v3`.
+
+For placement, generate and publish a new short-lived profile with
+`o-registry profile-local` and `o-registry publish-profile`. Recompute the
+operation footprint and every backend implementation, warrant/discharge,
+capacity observation, reservation, and lease derived from catalog identity.
+Do not copy old digest fields into new records. Re-run `olangc` for generated
+or AOT executables intended to carry the current embedded runtime/catalog, for
+example:
+
+```bash
+olangc program.O -o program --shim-dir backends
+```
+
+An installed V2 MCP snapshot reports its own compiled catalog, and a generated
+executable retains its embedded build generation. Neither is a way to authorize
+V3 placement.
+
+The behavioral rollover seam is
+`tests/placement_v6.rs::noncurrent_catalog_profiles_remain_inspectable_but_cannot_authorize`:
+it round-trips an obsolete descriptor, then proves that current profile
+validation returns `NonCurrentBackendCatalog`. The catalog hash-domain check is
+covered by `src/ir.rs::catalog_digests_are_stable_canonical_projections`, and
+the MCP projection pins V3 in
+`mcp/ostadix_lang_mcp_server/src/main.rs::runtime_inventory_is_a_complete_catalog_projection`.
+These tests establish the bounded catalog/placement contract only; they do not
+turn the direct transport into a placement-authorized dispatcher.
+
 The ordinary HGraph coordinator is the default hosted executor. The ordered
 OIR executor remains available through `O_EXECUTOR=serial` as a differential
 oracle; it is not the default execution path.

@@ -134,6 +134,7 @@ impl NodeProfileV1 {
         now: UnixMillisV1,
         authenticator: &impl RecordAuthenticatorV1,
     ) -> Result<(), PlacementValidationError> {
+        self.descriptor.validate_current_backend_catalog()?;
         validate_fresh("node profile", self.issued_at, self.expires_at, now)?;
         require_authenticated(
             "node profile",
