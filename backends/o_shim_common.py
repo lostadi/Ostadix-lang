@@ -7,8 +7,10 @@ Languages can print a tagged OValue JSON envelope for exact control.
 """
 
 import json
+import hashlib
 import math
 import os
+from pathlib import Path
 import re
 import stat
 import struct
@@ -18,6 +20,13 @@ import sys
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
 MAX_FRAME_LEN = 128 * 1024 * 1024
+BACKEND_STATE_PROTOCOL_V1 = "ostadix.backend-state/v1"
+BACKEND_STATE_CAPABILITIES_SCHEMA_V1 = "ostadix.backend-state-capabilities/v1"
+BACKEND_CHECKPOINT_SCHEMA_V1 = "ostadix.backend-checkpoint/v1"
+BACKEND_RESTORE_RECEIPT_SCHEMA_V1 = "ostadix.backend-restore-receipt/v1"
+BACKEND_STATE_REASON_SCHEMA_V1 = "ostadix.backend-state-reason/v1"
+BACKEND_STATE_ERROR_SCHEMA_V1 = "ostadix.backend-state-error/v1"
+STATELESS_EMPTY_CODEC_V1 = "ostadix.backend-empty/v1"
 INT_RE = re.compile(r"^[+-]?\d+$")
 FLOAT_RE = re.compile(
     r"^[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+[eE][+-]?\d+)|(?:\d+\.\d*[eE][+-]?\d+))$"
@@ -295,7 +304,209 @@ def send_err(message):
     write_wire_message({"status": "err", "message": message})
 
 
-def command_loop(handle_exec, handle_cleanup=None, handle_ping=None):
+class StatePinRequired(Exception):
+    def __init__(self, path, message):
+        super().__init__(message)
+        self.path = path
+        self.message = message
+
+
+def backend_name_from_argv():
+    name = Path(sys.argv[0]).name
+    if name.endswith("_shim.py"):
+        return name[: -len("_shim.py")]
+    return name.removesuffix(".py")
+
+
+def backend_runtime_binding_sha256():
+    """Return the admitted executable-set identity, with a test-only fallback."""
+    raw = os.environ.get("O_ADMITTED_EXECUTABLE_MANIFEST")
+    if raw:
+        try:
+            digest = json.loads(raw).get("sha256")
+        except (TypeError, ValueError):
+            digest = None
+        if isinstance(digest, str) and _is_sha256(digest):
+            return digest.lower()
+    identity = "\0".join(
+        (
+            "ostadix-python-shim-runtime/v1",
+            sys.implementation.name,
+            ".".join(str(part) for part in sys.version_info[:3]),
+            os.path.realpath(sys.executable),
+            os.path.realpath(sys.argv[0]),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def payload_sha256(payload):
+    return hashlib.sha256(cbor_encode(payload)).hexdigest()
+
+
+def checkpoint_sha256(checkpoint):
+    return hashlib.sha256(cbor_encode(checkpoint)).hexdigest()
+
+
+def state_capabilities(backend, tier="stateless", codec=STATELESS_EMPTY_CODEC_V1,
+                       restore_supported=True):
+    return {
+        "schema": BACKEND_STATE_CAPABILITIES_SCHEMA_V1,
+        "protocol": BACKEND_STATE_PROTOCOL_V1,
+        "backend": backend,
+        "tier": tier,
+        "codec": codec,
+        "scope": "backend-owned-state-at-settled-command-boundary",
+        "restore_supported": bool(restore_supported),
+    }
+
+
+def make_checkpoint(backend, tier, codec, payload, external_resources=None,
+                    runtime_binding_sha256=None):
+    checkpoint = {
+        "schema": BACKEND_CHECKPOINT_SCHEMA_V1,
+        "protocol": BACKEND_STATE_PROTOCOL_V1,
+        "backend": backend,
+        "tier": tier,
+        "codec": codec,
+        "runtime_binding_sha256": (
+            runtime_binding_sha256 or backend_runtime_binding_sha256()
+        ),
+        "payload": payload,
+        "payload_sha256": payload_sha256(payload),
+    }
+    if external_resources:
+        checkpoint["external_resources"] = list(external_resources)
+    validate_checkpoint(checkpoint)
+    return checkpoint
+
+
+def validate_checkpoint(checkpoint):
+    if not isinstance(checkpoint, dict):
+        raise ValueError("backend checkpoint is not an object")
+    allowed = {
+        "schema", "protocol", "backend", "tier", "codec",
+        "runtime_binding_sha256", "payload", "payload_sha256",
+        "external_resources",
+    }
+    unknown = set(checkpoint) - allowed
+    required = allowed - {"external_resources"}
+    missing = required - set(checkpoint)
+    if unknown or missing:
+        raise ValueError(
+            f"backend checkpoint has unknown={sorted(unknown)!r} missing={sorted(missing)!r}"
+        )
+    if checkpoint["schema"] != BACKEND_CHECKPOINT_SCHEMA_V1:
+        raise ValueError("unsupported backend checkpoint schema")
+    if checkpoint["protocol"] != BACKEND_STATE_PROTOCOL_V1:
+        raise ValueError("unsupported backend state protocol")
+    if checkpoint["tier"] not in {"stateless", "semantic_snapshot", "external_pinned"}:
+        raise ValueError("unsupported backend state tier")
+    for key in ("backend", "codec"):
+        if not isinstance(checkpoint[key], str) or not checkpoint[key]:
+            raise ValueError(f"backend checkpoint has invalid {key}")
+    if not _is_sha256(checkpoint["runtime_binding_sha256"]):
+        raise ValueError("backend checkpoint has invalid runtime binding")
+    if not _is_sha256(checkpoint["payload_sha256"]):
+        raise ValueError("backend checkpoint has invalid payload digest")
+    if payload_sha256(checkpoint["payload"]) != checkpoint["payload_sha256"].lower():
+        raise ValueError("backend checkpoint payload digest mismatch")
+    resources = checkpoint.get("external_resources", [])
+    if not isinstance(resources, list):
+        raise ValueError("backend checkpoint external resources are not a list")
+    for resource in resources:
+        if not isinstance(resource, dict) or not all(
+            isinstance(resource.get(field), str) and resource[field]
+            for field in ("kind", "identity", "recovery")
+        ):
+            raise ValueError("backend checkpoint contains an incomplete external resource")
+    if checkpoint["tier"] == "external_pinned" and not resources:
+        raise ValueError("external-pinned checkpoint omitted its resource binding")
+    if checkpoint["tier"] != "external_pinned" and resources:
+        raise ValueError("portable backend checkpoint contains external resource bindings")
+    return checkpoint
+
+
+def _is_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def ensure_checkpoint_bound(checkpoint, max_bytes):
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("checkpoint byte limit must be a positive integer")
+    encoded = len(cbor_encode(checkpoint))
+    if encoded > max_bytes:
+        raise ValueError(
+            f"checkpoint length {encoded} exceeds requested maximum {max_bytes}"
+        )
+
+
+def empty_checkpoint(backend):
+    return make_checkpoint(
+        backend,
+        "stateless",
+        STATELESS_EMPTY_CODEC_V1,
+        {"kind": "empty"},
+    )
+
+
+def restore_empty_checkpoint(backend, checkpoint):
+    validate_checkpoint(checkpoint)
+    if (
+        checkpoint["backend"] != backend
+        or checkpoint["tier"] != "stateless"
+        or checkpoint["codec"] != STATELESS_EMPTY_CODEC_V1
+        or checkpoint["runtime_binding_sha256"] != backend_runtime_binding_sha256()
+        or checkpoint["payload"] != {"kind": "empty"}
+        or checkpoint.get("external_resources", [])
+    ):
+        raise ValueError(f"stateless checkpoint is incompatible with backend {backend!r}")
+
+
+def restore_receipt(backend, checkpoint):
+    return {
+        "schema": BACKEND_RESTORE_RECEIPT_SCHEMA_V1,
+        "protocol": BACKEND_STATE_PROTOCOL_V1,
+        "backend": backend,
+        "checkpoint_sha256": checkpoint_sha256(checkpoint),
+        "restored": True,
+    }
+
+
+def _state_pin_response(backend, error):
+    return {
+        "status": "state_pin_required_v1",
+        "reason": {
+            "schema": BACKEND_STATE_REASON_SCHEMA_V1,
+            "backend": backend,
+            "code": "state.pin-required",
+            "path": error.path,
+            "message": error.message,
+            "recovery": "continue-pinned",
+        },
+    }
+
+
+def _state_error_response(backend, code, error):
+    return {
+        "status": "state_error_v1",
+        "error": {
+            "schema": BACKEND_STATE_ERROR_SCHEMA_V1,
+            "backend": backend,
+            "code": code,
+            "message": str(error),
+        },
+    }
+
+
+def command_loop(handle_exec, handle_cleanup=None, handle_ping=None,
+                 handle_state_capabilities=None, handle_checkpoint=None,
+                 handle_restore=None, state_backend=None):
+    state_backend = state_backend or backend_name_from_argv()
     while True:
         try:
             cmd = read_wire_message()
@@ -317,6 +528,51 @@ def command_loop(handle_exec, handle_cleanup=None, handle_ping=None):
                     handle_ping()
                 else:
                     send_ok({"t": "null"})
+            elif tag == "state_capabilities_v1":
+                capabilities = (
+                    handle_state_capabilities()
+                    if handle_state_capabilities is not None
+                    else state_capabilities(state_backend)
+                )
+                write_wire_message({
+                    "status": "state_capabilities_v1",
+                    "capabilities": capabilities,
+                })
+            elif tag == "checkpoint_v1":
+                try:
+                    checkpoint = (
+                        handle_checkpoint(cmd.get("max_bytes"))
+                        if handle_checkpoint is not None
+                        else empty_checkpoint(state_backend)
+                    )
+                    ensure_checkpoint_bound(checkpoint, cmd.get("max_bytes"))
+                    write_wire_message({
+                        "status": "checkpoint_v1",
+                        "checkpoint": checkpoint,
+                    })
+                except StatePinRequired as exc:
+                    write_wire_message(_state_pin_response(state_backend, exc))
+                except Exception as exc:
+                    write_wire_message(_state_error_response(
+                        state_backend, "state.checkpoint-failed", exc
+                    ))
+            elif tag == "restore_v1":
+                try:
+                    checkpoint = cmd.get("checkpoint")
+                    if handle_restore is not None:
+                        handle_restore(checkpoint)
+                    else:
+                        restore_empty_checkpoint(state_backend, checkpoint)
+                    write_wire_message({
+                        "status": "restore_v1",
+                        "receipt": restore_receipt(state_backend, checkpoint),
+                    })
+                except StatePinRequired as exc:
+                    write_wire_message(_state_pin_response(state_backend, exc))
+                except Exception as exc:
+                    write_wire_message(_state_error_response(
+                        state_backend, "state.restore-incompatible", exc
+                    ))
             else:
                 send_err(f"unknown command: {tag!r}")
         except Exception:
