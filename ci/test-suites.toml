@@ -1,6 +1,18 @@
 schema = "ostadix.ci-test-suites/v1"
 
-[suites.rust]
+[suites.contracts]
+required_executables = ["python3"]
+
+[suites.rust-msrv]
+required_executables = ["cargo", "rustc"]
+
+[suites.rust-quality]
+required_executables = ["cargo", "rustc"]
+
+[suites.rust-tests]
+required_executables = ["bash", "clang", "python3", "sqlite3"]
+
+[suites.rust-hosted]
 required_executables = ["bash", "clang", "openssl", "python3", "sqlite3"]
 
 [suites.python]
