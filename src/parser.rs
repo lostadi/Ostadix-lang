@@ -192,10 +192,9 @@ impl<'a> Parser<'a> {
 
         while self.pos < self.source.len() {
             if let Some(tag) = expected_closer {
-                let closer = format!(")_{}", tag.raw);
-                if self.starts_with(&closer) {
+                if let Some(closer_len) = self.exact_closer_len_at(self.pos, tag) {
                     self.flush_text(&mut nodes, text_start, self.pos);
-                    self.advance_bytes(closer.len());
+                    self.advance_bytes(closer_len);
                     return Ok(nodes);
                 }
             }
@@ -267,10 +266,10 @@ impl<'a> Parser<'a> {
 
                     // Check if the matching closer follows the backslash.
                     if let Some(tag) = expected_closer {
-                        let closer = format!(")_{}", tag.raw);
-                        if self.source[after_bs..].starts_with(&closer) {
+                        if let Some(closer_len) = self.exact_closer_len_at(after_bs, tag) {
+                            let closer = self.source[after_bs..after_bs + closer_len].to_string();
                             self.flush_text(&mut nodes, text_start, self.pos);
-                            self.pos = after_bs + closer.len();
+                            self.pos = after_bs + closer_len;
                             if let Some(ONode::RawText(s)) = nodes.last_mut() {
                                 s.push_str(&closer);
                                 self.extend_last_origin(self.pos);
@@ -913,8 +912,28 @@ impl<'a> Parser<'a> {
         (byte, line_index + 1, column)
     }
 
-    fn starts_with(&self, pat: &str) -> bool {
-        self.source[self.pos..].starts_with(pat)
+    /// Return the byte length of the matching closer only when the expected
+    /// raw tag is the complete lexical tag at `position`. A prefix comparison
+    /// would let a bare `)_python` consume `)_python[*]`, or let
+    /// `)_python[1]` consume the prefix of `)_python[1]{lazy}`.
+    fn exact_closer_len_at(&self, position: usize, tag: &Tag) -> Option<usize> {
+        let closer = format!(")_{}", tag.raw);
+        let remaining = self.source.get(position..)?;
+        if !remaining.starts_with(&closer) {
+            return None;
+        }
+
+        let next = remaining.as_bytes().get(closer.len()).copied();
+        let has_environment = tag.raw.as_bytes().contains(&b'[');
+        let has_attributes = tag.attr.is_some();
+        let extends_tag = if has_attributes {
+            false
+        } else if has_environment {
+            next == Some(b'{')
+        } else {
+            next.is_some_and(is_ident_continue) || matches!(next, Some(b'[' | b'{'))
+        };
+        (!extends_tag).then_some(closer.len())
     }
 
     fn current_byte(&self) -> Option<u8> {
@@ -1223,6 +1242,26 @@ mod tests {
         let backends = make_backends(&["python"]);
         let nodes = Parser::new(src, &backends).parse().unwrap();
         assert_eq!(reconstruct_source(&nodes), src);
+    }
+
+    #[test]
+    fn bare_closer_cannot_consume_linker_isolated_closer_prefix() {
+        let src = "python^(6 * 7)_python[*]";
+        let backends = make_backends(&["python"]);
+        let error = Parser::new(src, &backends).parse().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Unclosed expression"), "{message}");
+        assert!(message.contains(")_python"), "{message}");
+    }
+
+    #[test]
+    fn environment_closer_cannot_consume_attributed_closer_prefix() {
+        let src = "python[7]^(6 * 7)_python[7]{defer}";
+        let backends = make_backends(&["python"]);
+        let error = Parser::new(src, &backends).parse().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Unclosed expression"), "{message}");
+        assert!(message.contains(")_python[7]"), "{message}");
     }
 
     #[test]

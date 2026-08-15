@@ -3,7 +3,7 @@ Backend protocol.
 
 A Backend is the language-specific plug-in that tells the O runtime:
 
-  1. How to start a fresh persistent environment for [env_id]
+  1. How to create an environment for one evaluation attempt or persistent [N]
   2. How to render a child expression's OValue as a string in MY language
   3. How to evaluate MY language's source code (with children already spliced
      in) into an OValue
@@ -40,12 +40,13 @@ class Backend(Protocol):
     name: str
 
     def make_env(self) -> Any:
-        """Create a fresh persistent environment for this language.
+        """Create a fresh environment for this language.
 
-        Called once per unique (language, env_id) pair that the program
-        references. Subsequent expressions in the same env share this state.
-        For Python this is a globals dict; for Markdown/HTML it can be
-        anything (or None) since those backends are stateless.
+        Numeric ``[N]`` blocks call this once per canonical-language/environment
+        pair and reuse the result. Bare and explicit ``[*]`` blocks call it for
+        every evaluation attempt and never enter the persistent registry. For
+        Python this is a globals dict; for Markdown/HTML it can be anything (or
+        None) since those backends are stateless.
         """
         ...
 

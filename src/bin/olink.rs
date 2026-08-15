@@ -1411,14 +1411,15 @@ fn dependency_group(path: &Path, ext_map: &BTreeMap<String, String>) -> String {
     }
 }
 
-/// Topological sort of a single-language file group.
+/// Topological plan for a single-language file group.
 ///
 /// Builds a directed dependency graph among the files in `paths` using
-/// language-specific import scanning, then emits files in an order where
-/// every dependency precedes the files that depend on it.  Files that have
-/// no dependency relationship keep their original relative order.  Cycles
-/// are detected and broken by removing one back-edge (the cycle members keep
-/// their original order).
+/// language-specific import scanning, condenses strongly connected components,
+/// then emits those components in stable topological order. Every dependency
+/// outside a cycle therefore precedes the files that depend on it. Files that
+/// have no dependency relationship keep their original relative order. Cycle
+/// members have no valid topological order, so they keep their original order
+/// and each receives a conservative execution barrier.
 fn dependency_plan_group(
     paths: &[&PathBuf],
     ext_map: &BTreeMap<String, String>,
@@ -1459,71 +1460,174 @@ fn dependency_plan_group(
         }
     }
 
-    // Kahn's algorithm for topological sort.
     let n = paths.len();
-    let mut in_degree = vec![0u32; n];
-    // adjacency: rev_adj[j] = files that depend on j (j must come before them)
+    let mut adjacency = Vec::with_capacity(n);
+    for dependencies in &deps {
+        let mut dependencies = dependencies.iter().copied().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        adjacency.push(dependencies);
+    }
+
+    // reverse_adjacency[j] = files that depend on j (j must come before them).
     let mut rev_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, dep_set) in deps.iter().enumerate() {
-        for &j in dep_set {
-            in_degree[i] += 1;
+    for (i, dependencies) in adjacency.iter().enumerate() {
+        for &j in dependencies {
             rev_adj[j].push(i);
         }
     }
+    for dependents in &mut rev_adj {
+        dependents.sort_unstable();
+    }
 
-    // Use a stable queue (preserve original order among equal-priority nodes).
-    let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    // A cycle has no member-level topological order, but its SCC is one node
+    // in the condensation DAG. Sorting that DAG preserves every satisfiable
+    // dependency into and out of the cycle instead of treating downstream
+    // consumers as arbitrary cycle leftovers.
+    let mut components = strongly_connected_components(&adjacency, &rev_adj);
+    for component in &mut components {
+        component.sort_unstable();
+    }
+    let mut component_of = vec![usize::MAX; n];
+    for (component_id, component) in components.iter().enumerate() {
+        for &node in component {
+            component_of[node] = component_id;
+        }
+    }
+
+    let mut component_dependencies = vec![HashSet::<usize>::new(); components.len()];
+    let mut component_dependents = vec![HashSet::<usize>::new(); components.len()];
+    for (node, dependencies) in adjacency.iter().enumerate() {
+        let dependent_component = component_of[node];
+        for &dependency in dependencies {
+            let dependency_component = component_of[dependency];
+            if dependency_component != dependent_component {
+                component_dependencies[dependent_component].insert(dependency_component);
+                component_dependents[dependency_component].insert(dependent_component);
+            }
+        }
+    }
+
+    let component_min_index = components
+        .iter()
+        .map(|component| component[0])
+        .collect::<Vec<_>>();
+    let mut in_degree = component_dependencies
+        .iter()
+        .map(HashSet::len)
+        .collect::<Vec<_>>();
+    let mut ready = (0..components.len())
+        .filter(|&component| in_degree[component] == 0)
+        .collect::<Vec<_>>();
     let mut result = Vec::with_capacity(n);
-    let mut emitted = vec![false; n];
 
-    while !queue.is_empty() {
-        // Pick the smallest original index among ready nodes to preserve order.
-        let pos = queue
+    while !ready.is_empty() {
+        // Pick the component whose first member appeared earliest. This is the
+        // stable analogue of Kahn's algorithm on the condensation DAG.
+        let pos = ready
             .iter()
             .enumerate()
-            .min_by_key(|(_, &i)| i)
+            .min_by_key(|(_, &component)| component_min_index[component])
             .map(|(p, _)| p)
             .unwrap();
-        let node = queue.remove(pos);
-        emitted[node] = true;
-        let mut dependencies = deps[node].iter().copied().collect::<Vec<_>>();
-        dependencies.sort_unstable();
-        result.push(GroupDependencyEntry {
-            path: paths[node].clone(),
-            dependencies: dependencies
-                .into_iter()
-                .map(|dependency| paths[dependency].clone())
-                .collect(),
-            force_barrier_before: false,
-        });
-        for &dependent in &rev_adj[node] {
+        let component = ready.remove(pos);
+        let cyclic = components[component].len() > 1;
+        for &node in &components[component] {
+            let mut effective_dependencies = adjacency[node].clone();
+            // An edge to any member of an SCC is transitively an edge from the
+            // whole component. Its last emitted member is the conservative
+            // completion frontier used by the global wave planner.
+            effective_dependencies.extend(component_dependencies[component].iter().map(
+                |&dependency_component| {
+                    *components[dependency_component]
+                        .last()
+                        .expect("dependency components are non-empty")
+                },
+            ));
+            effective_dependencies.sort_unstable();
+            effective_dependencies.dedup();
+            result.push(GroupDependencyEntry {
+                path: paths[node].clone(),
+                dependencies: effective_dependencies
+                    .iter()
+                    .map(|&dependency| paths[dependency].clone())
+                    .collect(),
+                force_barrier_before: cyclic,
+            });
+        }
+
+        let mut dependents = component_dependents[component]
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        dependents.sort_by_key(|&dependent| component_min_index[dependent]);
+        for dependent in dependents {
             in_degree[dependent] -= 1;
             if in_degree[dependent] == 0 {
-                queue.push(dependent);
+                ready.push(dependent);
             }
         }
     }
 
-    // If there are cycles, some nodes were never enqueued.  Append them in
-    // original order (conservative: keep what the user gave us).
-    if result.len() < n {
-        for (i, path) in paths.iter().enumerate() {
-            if !emitted[i] {
-                let mut dependencies = deps[i].iter().copied().collect::<Vec<_>>();
-                dependencies.sort_unstable();
-                result.push(GroupDependencyEntry {
-                    path: (*path).clone(),
-                    dependencies: dependencies
-                        .into_iter()
-                        .map(|dependency| paths[dependency].clone())
-                        .collect(),
-                    force_barrier_before: true,
-                });
-            }
-        }
-    }
-
+    debug_assert_eq!(
+        result.len(),
+        n,
+        "the SCC condensation graph must be acyclic"
+    );
     result
+}
+
+/// Compute SCCs without recursive DFS so linking a very large source tree
+/// cannot exhaust the process stack. Traversal order is deterministic because
+/// both adjacency lists are sorted before this helper is called.
+fn strongly_connected_components(
+    adjacency: &[Vec<usize>],
+    reverse_adjacency: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
+    let mut visited = vec![false; adjacency.len()];
+    let mut finish_order = Vec::with_capacity(adjacency.len());
+
+    for start in 0..adjacency.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, next_edge)) = stack.last_mut() {
+            if *next_edge < adjacency[*node].len() {
+                let successor = adjacency[*node][*next_edge];
+                *next_edge += 1;
+                if !visited[successor] {
+                    visited[successor] = true;
+                    stack.push((successor, 0));
+                }
+            } else {
+                let (finished, _) = stack.pop().expect("DFS stack is non-empty");
+                finish_order.push(finished);
+            }
+        }
+    }
+
+    visited.fill(false);
+    let mut components = Vec::new();
+    for &start in finish_order.iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut component = Vec::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            component.push(node);
+            for &successor in reverse_adjacency[node].iter().rev() {
+                if !visited[successor] {
+                    visited[successor] = true;
+                    stack.push(successor);
+                }
+            }
+        }
+        components.push(component);
+    }
+    components
 }
 
 /// Return the set of module-name stems that `path` could be imported as.
@@ -1766,7 +1870,7 @@ fn push_import_candidates(modules: &mut Vec<String>, specifier: &str) {
 /// treat as syntax inside a `wrapper^( ... )_wrapper` block:
 ///
 ///   * any registered opener `IDENT[N]?{attr}?^(`  →  `\IDENT...^(`
-///   * the wrapping block's own closer `)_wrapper`  →  `\)_wrapper`
+///   * the wrapping block's exact closer `)_wrapper`  →  `\)_wrapper`
 ///   * any splice `$IDENT`                          →  `\$IDENT`
 ///
 /// The parser consumes the backslash and emits the literal text, so the
@@ -1777,7 +1881,7 @@ fn escape_body(body: &str, closer: &str, backends: &HashSet<String>) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        if body[i..].starts_with(closer) {
+        if exact_closer_len_at(body, i, closer).is_some() {
             out.push('\\');
             out.push_str(closer);
             i += closer.len();
@@ -1811,6 +1915,38 @@ fn escape_body(body: &str, closer: &str, backends: &HashSet<String>) -> String {
     }
 
     out
+}
+
+/// Return the closer length only when `closer` is a complete lexical tag at
+/// `position`. This intentionally mirrors `Parser::exact_closer_len_at`:
+///
+/// * a bare tag can still grow an identifier, environment, or attribute;
+/// * an environment tag can still grow an attribute;
+/// * an attributed tag is already complete.
+///
+/// Prefix-only escaping is not lossless. For example, escaping the prefix in
+/// `)_python[*]{defer}` would leave the backslash intact because the parser
+/// correctly sees that prefix as a non-closer.
+fn exact_closer_len_at(source: &str, position: usize, closer: &str) -> Option<usize> {
+    let raw_tag = closer.strip_prefix(")_")?;
+    let remaining = source.get(position..)?;
+    if !remaining.starts_with(closer) {
+        return None;
+    }
+
+    let next = remaining.as_bytes().get(closer.len()).copied();
+    let has_attributes = raw_tag.as_bytes().contains(&b'{');
+    let tag_before_attributes = raw_tag.split('{').next().unwrap_or(raw_tag);
+    let has_environment = tag_before_attributes.as_bytes().contains(&b'[');
+    let extends_tag = if has_attributes {
+        false
+    } else if has_environment {
+        next == Some(b'{')
+    } else {
+        next.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || matches!(next, Some(b'[' | b'{'))
+    };
+    (!extends_tag).then_some(closer.len())
 }
 
 /// If `s` begins with a registered opener (`IDENT [N|*]? {attr}? ^(`), return
@@ -1995,6 +2131,45 @@ mod tests {
         assert!(escaped.starts_with(")_python stays literal"));
         assert!(escaped.contains("\\)_python[0]"));
         let combined = format!("python[0]^(\n{escaped})_python[0]\n");
+        let nodes = parse(&combined);
+        let body = first_block_text(&nodes);
+        assert_eq!(body.trim_start_matches('\n'), inner);
+    }
+
+    #[test]
+    fn environment_closer_attribute_prefix_is_not_escaped_and_round_trips() {
+        let backends = registered_backends();
+        let inner = "value = ')_python[*]{defer}'\n";
+        let escaped = escape_body(inner, ")_python[*]", &backends);
+        assert_eq!(escaped, inner, "a longer tag prefix is literal text");
+
+        let combined = format!("python[*]^(\n{escaped})_python[*]\n");
+        let nodes = parse(&combined);
+        let body = first_block_text(&nodes);
+        assert_eq!(body.trim_start_matches('\n'), inner);
+    }
+
+    #[test]
+    fn bare_closer_identifier_continuations_are_not_escaped_and_round_trip() {
+        let backends = registered_backends();
+        let inner = ")_pythonista )_python2 )_python_suffix\n";
+        let escaped = escape_body(inner, ")_python", &backends);
+        assert_eq!(escaped, inner, "identifier continuations extend a bare tag");
+
+        let combined = format!("python^(\n{escaped})_python\n");
+        let nodes = parse(&combined);
+        let body = first_block_text(&nodes);
+        assert_eq!(body.trim_start_matches('\n'), inner);
+    }
+
+    #[test]
+    fn environment_closer_followed_by_identifier_is_exact_and_round_trips() {
+        let backends = registered_backends();
+        let inner = ")_python[*]tail\n";
+        let escaped = escape_body(inner, ")_python[*]", &backends);
+        assert_eq!(escaped, "\\)_python[*]tail\n");
+
+        let combined = format!("python[*]^(\n{escaped})_python[*]\n");
         let nodes = parse(&combined);
         let body = first_block_text(&nodes);
         assert_eq!(body.trim_start_matches('\n'), inner);
@@ -2596,6 +2771,111 @@ mod tests {
         Parser::new(&combined, &backends)
             .parse()
             .expect("cycle fallback output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_keeps_cycle_dependents_after_the_cycle() {
+        let dir = scratch("parallel_dependency_cycle_consumer");
+        // Lexical order puts the consumer first. A plain Kahn-leftover
+        // fallback would therefore emit it before the unresolved cycle.
+        fs::write(
+            dir.join("a_consumer.py"),
+            // Depending on the first emitted member still means depending on
+            // the whole SCC through the other member's back-edge.
+            "from y_cycle import RIGHT\nprint(RIGHT)\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("y_cycle.py"),
+            "from z_cycle import VALUE\nRIGHT = VALUE\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("z_cycle.py"),
+            "from y_cycle import RIGHT\nVALUE = RIGHT\n",
+        )
+        .unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let pos_consumer = combined.find("# ── a_consumer.py ──").unwrap();
+        let pos_y = combined.find("# ── y_cycle.py ──").unwrap();
+        let pos_z = combined.find("# ── z_cycle.py ──").unwrap();
+        assert!(pos_y < pos_z, "cycle fallback must preserve input order");
+        assert!(
+            pos_z < pos_consumer,
+            "a dependent outside the SCC must follow the entire cycle:\n{combined}"
+        );
+        assert_eq!(
+            combined.matches("autonomous(batch(").count(),
+            3,
+            "cycle members and their consumer each require a barrier wave:\n{combined}"
+        );
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("cycle-consumer output should parse");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_parallel_emits_diamond_as_antichain_waves() {
+        let dir = scratch("parallel_dependency_diamond");
+        fs::write(dir.join("a.py"), "VALUE = 40\n").unwrap();
+        fs::write(dir.join("b.py"), "from a import VALUE\nLEFT = VALUE + 1\n").unwrap();
+        fs::write(dir.join("c.py"), "from a import VALUE\nRIGHT = VALUE + 2\n").unwrap();
+        fs::write(
+            dir.join("d.py"),
+            "from b import LEFT\nfrom c import RIGHT\nprint(LEFT + RIGHT)\n",
+        )
+        .unwrap();
+
+        let map = default_extension_map();
+        let backends = registered_backends();
+        let collection = collect_files(std::slice::from_ref(&dir), &map, None).unwrap();
+        let combined = link_files_with_options(
+            &collection.files,
+            &collection.marker_root,
+            &map,
+            &backends,
+            Some(ParallelLinkMode::Autonomous),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let waves = combined
+            .split("autonomous(batch(")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            waves.len(),
+            3,
+            "diamond should use three waves:\n{combined}"
+        );
+        assert!(waves[0].contains("# ── a.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── b.py ──"), "{combined}");
+        assert!(waves[1].contains("# ── c.py ──"), "{combined}");
+        assert!(waves[2].contains("# ── d.py ──"), "{combined}");
+        assert!(
+            waves[1].find("# ── b.py ──").unwrap() < waves[1].find("# ── c.py ──").unwrap(),
+            "antichain result members must retain deterministic input order"
+        );
+        Parser::new(&combined, &backends)
+            .parse()
+            .expect("diamond-wave output should parse");
         let _ = fs::remove_dir_all(&dir);
     }
 
