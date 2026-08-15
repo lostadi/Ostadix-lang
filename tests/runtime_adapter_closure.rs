@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use o_lang::value::{OValue, OWireResponse};
 use o_lang::wire;
 
+mod support;
+
 fn write_executable(path: &Path, source: &str) {
     fs::write(path, source).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -64,7 +66,7 @@ fn start_program(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = support::spawn_private_executable(&mut command).unwrap();
     wait_for_backend(&mut child, &trace, "bash");
     (child, trace)
 }
@@ -170,11 +172,9 @@ while True:
         "python^(__oval_result__ = 'ignored by fixture')_python\n",
     )
     .unwrap();
-    let output = Command::new(private_o(temp.path()))
-        .arg(program)
-        .arg(&backends)
-        .output()
-        .unwrap();
+    let mut command = Command::new(private_o(temp.path()));
+    command.arg(program).arg(&backends);
+    let output = support::output_private_executable(&mut command).unwrap();
     assert!(
         output.status.success(),
         "standalone custom legacy shim was coupled to bundled support\nstdout:\n{}\nstderr:\n{}",
@@ -284,14 +284,14 @@ fn persistent_adapter_revalidates_owned_tool_before_each_subprocess() {
     let path =
         std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&inherited)))
             .unwrap();
-    let mut child = Command::new(private_o(temp.path()))
+    let mut command = Command::new(private_o(temp.path()));
+    command
         .arg(program)
         .arg(&backends)
         .env("PATH", path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = support::spawn_private_executable(&mut command).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     while !first_spawned.exists() {
         if let Some(status) = child.try_wait().unwrap() {
@@ -358,12 +358,9 @@ text^(deferred)_text
 "#,
     )
     .unwrap();
-    let output = Command::new(private_o(temp.path()))
-        .arg(program)
-        .arg(backends)
-        .env("PATH", &empty_path)
-        .output()
-        .unwrap();
+    let mut command = Command::new(private_o(temp.path()));
+    command.arg(program).arg(backends).env("PATH", &empty_path);
+    let output = support::output_private_executable(&mut command).unwrap();
     assert!(
         output.status.success(),
         "an unforced lazy Nix request was incorrectly made host-realizable\nstdout:\n{}\nstderr:\n{}",
@@ -410,14 +407,14 @@ derivation { name = "race"; builder = "/bin/sh"; system = builtins.currentSystem
     let path =
         std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&inherited)))
             .unwrap();
-    let mut child = Command::new(private_o(temp.path()))
+    let mut command = Command::new(private_o(temp.path()));
+    command
         .arg(program)
         .arg(backends)
         .env("PATH", path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = support::spawn_private_executable(&mut command).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     while !signal.exists() {
         if let Some(status) = child.try_wait().unwrap() {
@@ -469,12 +466,9 @@ dry_activate($system)
         ),
     )
     .unwrap();
-    let output = Command::new(private_o(temp.path()))
-        .arg(program)
-        .arg(backends)
-        .env("PATH", &bin)
-        .output()
-        .unwrap();
+    let mut command = Command::new(private_o(temp.path()));
+    command.arg(program).arg(backends).env("PATH", &bin);
+    let output = support::output_private_executable(&mut command).unwrap();
     let activated = marker.exists();
     (output, activated)
 }

@@ -80,7 +80,7 @@ fn run_graph_bounded_with_operation_timeout(
     }
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn().expect("start O CLI");
+    let mut child = support::spawn_private_executable(&mut command).expect("start O CLI");
     let pid = child.id();
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -711,7 +711,7 @@ __oval_result__ = "parent-complete"
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(
         stderr.contains("still contains an active descendant")
-            && stderr.contains("did not shut down cleanly"),
+            && stderr.contains("did not terminate cleanly"),
         "process-group shutdown failure was not reported\nstderr:\n{stderr}"
     );
     let trace = fs::read_to_string(&run.trace_path).expect("read descendant lifecycle trace");
@@ -773,7 +773,8 @@ fn production_python_backend_proxy_shutdown_reaps_shim() {
         .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
-    let mut proxy = command.spawn().expect("spawn production Python proxy");
+    let mut proxy =
+        support::spawn_private_executable(&mut command).expect("spawn production Python proxy");
     let proxy_pid = proxy.id();
     let stdin = proxy.stdin.take().expect("proxy stdin");
     let stdout = proxy.stdout.take().expect("proxy stdout");
