@@ -1,0 +1,35 @@
+//! Compatibility entrypoints that bind protocol validation to the process's
+//! compiled backend catalog. The protocol core itself remains registry-free.
+
+use crate::registry::bundle::BackendRegistry;
+
+use super::protocol::{
+    CandidateDecisionV1, NodeProfileV1, PlacementCandidateInputV1, PlacementValidationError,
+    RecordAuthenticatorV1, TargetDescriptorV1, UnixMillisV1,
+};
+
+impl TargetDescriptorV1 {
+    pub fn validate_current_backend_catalog(&self) -> Result<(), PlacementValidationError> {
+        self.validate_current_backend_catalog_with(BackendRegistry::global())
+    }
+}
+
+impl NodeProfileV1 {
+    pub fn validate_at(
+        &self,
+        now: UnixMillisV1,
+        authenticator: &impl RecordAuthenticatorV1,
+    ) -> Result<(), PlacementValidationError> {
+        self.validate_at_with_catalog(now, authenticator, BackendRegistry::global())
+    }
+}
+
+impl PlacementCandidateInputV1<'_> {
+    pub fn evaluate(
+        &self,
+        now: UnixMillisV1,
+        authenticator: &impl RecordAuthenticatorV1,
+    ) -> CandidateDecisionV1 {
+        self.evaluate_with_catalog(now, authenticator, BackendRegistry::global())
+    }
+}

@@ -92,6 +92,23 @@ class BackendStateProtocolTests(unittest.TestCase):
                 finally:
                     shim.close()
 
+    def test_catalog_state_identities_match_production_proxy_protocols(self):
+        catalog = (ROOT / "src" / "backend_catalog.inc.rs").read_text(
+            encoding="utf-8"
+        )
+        for shim_name, catalog_field in (
+            ("python_shim.py", "codec"),
+            ("ubuntu_vm_shim.py", "manifest_schema"),
+        ):
+            with self.subTest(shim=shim_name):
+                shim = ShimProcess(shim_name)
+                try:
+                    response = shim.request({"cmd": "state_capabilities_v1"})
+                    identity = response["capabilities"]["codec"]
+                finally:
+                    shim.close()
+                self.assertIn(f'{catalog_field}: "{identity}"', catalog)
+
     def test_all_19_stateless_shims_round_trip_canonical_empty_state(self):
         self.assertEqual(19, len(STATELESS))
         for shim_name in sorted(STATELESS):
