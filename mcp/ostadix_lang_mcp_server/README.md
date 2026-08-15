@@ -73,9 +73,12 @@ federated registry, enroll a node, request a placement lease, or turn a stable
 intent handle into V6 authority. The current direct-node surface is the
 separately authenticated `octl node ...` client and `o-node` service documented
 in [`docs/HOSTED_PLACEMENT_V6.md`](../../docs/HOSTED_PLACEMENT_V6.md). No MCP
-tool wraps that channel or the separate local `o-registry` snapshot store. A
-future placement-aware MCP adapter must select V6 explicitly rather than
-silently upgrading a V5 handle.
+tool wraps frozen one-operation V1, durable session V2, placement-authority
+issuance or the co-located development mint, explicit closed-session GC, or the
+separate local `o-registry` snapshot store. In particular, no MCP tool holds a
+session bearer, submits `PlacementLeaseV2`, or consumes a V2 signed journal
+receipt. A future placement-aware MCP adapter must select V6 explicitly rather
+than silently upgrading a V5 handle.
 
 The checked-in `.mcp.json` contains no shell expressions. When explicit
 environment paths are absent, the server recognizes the repository from its
@@ -123,24 +126,27 @@ establishes only `declared` and `located`; `invocable`, `compatible`,
 `authorized`, `healthy`, and per-operation `admitted` remain not-probed or
 deferred to their actual operation-scoped mechanisms.
 
-The current compiled catalog schema is `ostadix.backend-catalog/v3`.
+The current compiled catalog schema is `ostadix.backend-catalog/v4`.
 `o_runtimes` exposes it as
-`runtime-catalog-schema=ostadix.backend-catalog/v3`. The schema participates in
+`runtime-catalog-schema=ostadix.backend-catalog/v4`. The schema participates in
 both the complete catalog digest and every backend-specification digest, so a
-V2 MCP binary is an older descriptive snapshot rather than a source of V3
+V3 MCP binary is an older descriptive snapshot rather than a source of V4
 placement identity. Rebuild the root runtime and this dependency-isolated MCP
 crate together after a catalog change (the root `./setup.sh --minimal --yes`
 flow does so), then restart MCP clients. Never relabel a digest reported by an
-old binary. Archived V2 records may still be decoded and their original
+old binary. Archived V3 records may still be decoded and their original
 signatures inspected, but that is not placement authorization; current
 `NodeProfileV1` validation accepts only backend specifications present in the
-V3 registry.
+V4 registry. V4 also binds each backend's state-support tier and snapshot-
+compatibility identity.
 
 The same catalog projection emits one `runtime-capability` record per backend
-with `integer-exactness` and `rich-numbers` fields. These are typed catalog
-declarations used by conservative fidelity analysis, not runtime probes or
-placement warrants. Unknown capability remains explicit and cannot be promoted
-to a lossless crossing merely because two aliases share a language name.
+with `integer-exactness`, `rich-numbers`, `state-support`, and the applicable
+state-codec/compatibility or external-manifest fields. These are typed catalog
+declarations used by conservative fidelity and placement analysis, not runtime
+probes, proof that a checkpoint currently succeeds, or placement warrants.
+Unknown capability remains explicit and cannot be promoted to a lossless
+crossing merely because two aliases share a language name.
 
 ## Grok config (`~/.grok/config.toml`)
 

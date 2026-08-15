@@ -79,31 +79,47 @@ execution.
 Ostadix-lang has two current admission contracts. V5 remains the supported
 legacy-local contract used by the uppercase `O` compatibility CLI and the
 existing MCP execution tools. Hosted Placement V6 adds a transport-independent
-descriptor, requirement, warrant, capacity, and lease core plus a bounded
-direct-node transport for one prepared operation. Neither version is silently
-translated into the other.
+descriptor, requirement, warrant, capacity, and lease core. Its direct-node V1
+compatibility path executes one fresh source document; its opt-in V2 path
+combines a locally prepared single-shim fragment with the complete signed
+placement proof and a durable, explicitly closed session. Neither an admission
+nor a transport version is silently translated into another.
 
 Admission version and backend-catalog generation are separate version axes.
-The current authorizing catalog is `ostadix.backend-catalog/v3`; its schema is
+The current authorizing catalog is `ostadix.backend-catalog/v4`; its schema is
 part of both the whole-catalog digest and every backend-specification digest.
-A placement profile that advertises any V2 backend identity remains decodable
+A placement profile that advertises any V3 backend identity remains decodable
 and independently auditable, but fails current profile validation before it can
 authorize candidate selection or warrant discharge. There is no digest
-relabeling or silent V2-to-V3 uplift. Rebuild the runtime and MCP server, then
-regenerate short-lived profiles and all derived placement evidence after this
-rollover. The exact boundary and regeneration sequence are in
-[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v3-hard-rollover).
+relabeling or silent V3-to-V4 uplift. V4 additionally binds each backend's
+state-support tier and snapshot-compatibility identity. Rebuild the runtime and
+MCP server, then regenerate short-lived profiles and all derived placement
+evidence after this rollover. The exact boundary and regeneration sequence are in
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md#backend-catalog-v4-hard-rollover).
 
-The direct transport has a deliberately small command surface:
+Current implementation identity also uses the path-independent
+`ostadix/backend-executable-set/v2` projection and
+`ostadix.local-realization/v2` hash material. Physical paths and retained file
+handles remain process-local launch authority, while selected executable roles,
+catalog-alternative coordinates, and immutable content identify the realization.
+A legacy local-realization V1 record remains inspectable but cannot authorize a
+current profile; it is never relabeled as V2.
+
+The direct transport has an explicit command surface:
 
 ```text
 o-node pki init ...
+o-node identity init ...
 o-node profile ...
 o-node doctor ...
 o-node serve ...
+o-node admin gc-closed ...
 octl node profile ...
 octl node doctor ...
 octl node run ...
+octl node authority init|issue ...
+octl node authority dev-mint open|execute|recover ...
+octl node session principal|open|exec|status|actors|reset|recover|close ...
 ```
 
 After normal setup, the lowercase wrapper delegates `o node ...` to `octl` and
@@ -119,15 +135,79 @@ declared or historical positive evidence requires an explicit non-default
 `PlacementTrustPolicyV1`. The eligibility proof and any resulting lease bind
 the selected trust policy and warrant discharge by digest.
 
-The transport is deliberately limited to `RemotePreparedOperationV1`: exact
-source, task and attempt identities, backend-catalog digest, deadline, and
-output limit sent to one explicitly configured node. It uses TLS 1.3 mutual
-authentication with pinned trust inputs and returns a digest-bound
-`HostedOperationReceiptV1`. Each request gets a fresh evaluator. There is no
-automatic registry discovery, scheduler-driven target selection, retry, local
-fallback, persistent remote actor, or project-bundle dispatch in this slice.
-For a development-only loopback setup, `o-node pki init` provisions and verifies
-the required mutual-TLS identities without overwriting existing files.
+Both paths use TLS 1.3 mutual authentication with pinned trust inputs. V1 binds
+exact source, task and attempt identities, the backend-catalog digest, deadline,
+and output limit and returns a self-digested `HostedOperationReceiptV1`; each
+request gets a fresh evaluator. V2 additionally binds the exact locally derived
+OIR, requirement footprint, portable placement admission, backend
+implementation, realization pipeline, trust policy, capacity observations and
+reservations, hosted command, state session, and the applicable actor-generation
+state under one Ed25519-signed authority envelope. A first stateful execute
+carries no invented physical actor identity: the node derives and signs that
+generation after exact local preparation, and every later execute must pin it.
+The node locally prepares the submitted bytes and re-evaluates the full proof
+against the current catalog before consuming the non-cloneable fragment.
+Preparation accepts one non-whitespace semantic root containing exactly one
+shim `Exec`, no coordinator scope, and no nested evaluator authority. The
+complete process-local V5 admission remains a separate dispatch-freshness
+check; ambient process identity is deliberately excluded from the signed
+portable coordinate.
+
+Open fixes the target, exact requirement footprint, backend implementation and
+pipeline, logical environment, trust policy, and compute reservation—not one
+source document for the session lifetime. For a stateful session, the first
+execute additionally fixes the physical `ActorGenerationIdV1`, including exact
+sandbox and launch context; later executes must match it. Each execute lease
+separately binds its exact source-derived OIR, task attempt, portable placement
+admission, deadline, and operation. A persistent environment can therefore
+receive multiple separately authorized commands only while those fixed
+coordinates remain equal.
+
+V2 binds the TLS client-certificate fingerprint and a separate random 256-bit
+session bearer. `octl` creates and fsyncs the mode-0600 capability file before
+the first network write; the signed Open request commits to those exact bytes,
+while the node persists only a salt, salted hash, and commitment. A response
+loss can therefore be retried with the byte-identical signed request and bearer,
+even after restart or proof expiry, without allocating a second session. The
+node-signed session hash chain and separate signed authority journal reconstruct
+accepted/refused lease nonces and distinguish an exact full-request retry from
+conflicting reuse. Offline GC atomically relocates the already-signed closed
+session journal into a permanent tombstone archive before deleting operation
+and checkpoint payloads; the archive preserves the retired session identity and
+every spent lease nonce without duplicating the journal under quota pressure.
+The five hard state quotas cover open sessions, actors per session, snapshot bytes
+per actor, state bytes per session, and total state bytes; pressure refuses work
+without evicting an actor. On Unix, state uses owner-only directories/files and
+durable writes, but source, results, journals, and checkpoints are not encrypted
+at rest. Only an explicit close followed by the offline audited GC command
+removes active session payloads; the signed journal tombstone remains
+permanent. Absolute deadlines bound backend dispatch/wait and value acceptance;
+result encoding, checkpointing, journal fsync, and terminal response publication
+may finish later. They do not cancel or roll back effects already performed by
+a backend.
+
+The current state tiers are deliberately narrow: `Stateless` requires a fresh
+fragment and a catalogued stateless backend; `CheckpointRestore` requires a
+persistent environment and the exact catalogued semantic-snapshot codec;
+`LiveActorOnly` requires catalogued external-pinned state and does not survive
+actor loss. `ReplayReconstructible` is represented on the wire but rejected in
+this release. There is still no automatic registry discovery, scheduler-driven
+target selection, retry, local fallback, cross-node actor migration, or project-
+bundle dispatch. For a development-only loopback setup, `o-node pki init`,
+`o-node identity init`, and the clearly labeled co-located authority helper
+provision the necessary identities and full proof bundle without being a
+production enrollment, discovery, or scheduling service. The helper mints open
+and execute authority and can derive the bounded checkpoint-recovery authority;
+each command can optionally submit immediately so its short-lived capacity
+evidence is not exposed to a manual multi-process delay. Recovery succeeds only
+after the current Python or SQL adapter acknowledges restoration of the exact
+durable snapshot. Restart or loss of a stateful worker first durably fences the
+old physical generation and enters `RecoveryRequired`; no user command runs on
+a replacement evaluator before that acknowledgement. A signed
+`RecoveryAttemptStarted` consumes the one-use nonce and the replacement
+generation before launch, and restart deterministically refuses an unfinished
+attempt so that generation cannot be reused. Unsupported future codecs and
+live-only state remain fail-closed.
 
 The separate `o-registry` CLI manages a local, durable, signed namespace
 registry: `init`, `profile-local`, `publish-profile`, `verify`, `list`,
@@ -147,8 +227,9 @@ records default to 45 seconds and accept `--valid-for-seconds` from 1 through
 the placement-core maximum of 60.
 
 This hosted profile is not a World, Governor, G1/G10, physical-machine,
-exactly-once, project-migration, or mid-operation-migration claim. Its complete
-contract, trust rules, user commands, and exclusions are in
+exactly-once, global-effect-isolation, project-migration, cancellation, or mid-
+operation-migration claim. Its complete contract, trust rules, user commands,
+and exclusions are in
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md).
 
 ---
@@ -223,7 +304,10 @@ broken runtime-path recovery or execution tool. Use `./setup.sh --no-mcp` when
 the MCP server is not wanted. The deterministic source release includes `mcp/`,
 `.mcp.json`, and the smoke client, and its link/schema/metadata verifier rejects
 an incomplete MCP release surface without executing archive payloads. The
-separate crate uses the repository's LGPL-2.1-only license.
+separate crate uses the repository's LGPL-2.1-only license. The required hosted-
+placement closure also includes every V2 module, including the co-located
+development authority implementation in `src/hosted_remote/v2/dev.rs`; release
+validation rejects an archive that omits it.
 
 The checked-in `.mcp.json` registers the server as `ostadix` using the
 `ostadix-mcp` wrapper. MCP clients that support repository-local stdio server
@@ -3472,9 +3556,12 @@ python3 scripts/release_evidence.py validate
 - O-level `let` bindings and `$var` splicing.
 - The complete current OValue sum type, canonical CBOR backend wire protocol,
   content identity, runtime-boundary classification, and persistence checks.
-- Typed backend value-capability descriptors and conservative abstract-value
-  fidelity: unknown preservation is `Unsupported`, and fidelity is never
-  inferred from a canonical language display name.
+- Typed backend value-capability descriptors and bounded abstract-value
+  fidelity: `FidelityAssessmentV2` keeps definite and possible losses distinct,
+  unknown preservation is `Unsupported`, and fidelity is never inferred from a
+  canonical language display name. Integer guarantees distinguish symmetric
+  exact-magnitude, signed two's-complement, arbitrary inclusive ranges, and
+  arbitrary precision.
 - `quote^`, OExpr, `O.quote`, and callback-based `O.eval`.
 - Lexical scope snapshots for `O.eval`, including caller binding visibility
   without callback writes leaking into the caller.
