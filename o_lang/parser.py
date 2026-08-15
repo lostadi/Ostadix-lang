@@ -345,9 +345,24 @@ class _ParserState:
         if not self.src.startswith(end_tag, pos):
             return False
         after = pos + len(end_tag)
-        # Do not let a bare closer consume the prefix of `)_lang[N]` or
-        # `)_lang[*]`; the source marker is part of the delimiter identity.
-        return after >= len(self.src) or self.src[after] != "["
+        if after >= len(self.src):
+            return True
+
+        # Keep this boundary rule aligned with the Rust parser. A bare tag can
+        # still grow an identifier, environment, or attribute; an environment
+        # tag can still grow an attribute. Python edition does not yet parse
+        # attributes, but it must not consume their closer prefixes.
+        next_char = self.src[after]
+        has_environment = end_tag.endswith("]")
+        if has_environment:
+            return next_char != "{"
+        is_ascii_ident_continue = (
+            "A" <= next_char <= "Z"
+            or "a" <= next_char <= "z"
+            or "0" <= next_char <= "9"
+            or next_char == "_"
+        )
+        return not is_ascii_ident_continue and next_char not in "[{"
 
 
 # ---------------------------------------------------------------------------

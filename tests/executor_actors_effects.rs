@@ -325,7 +325,7 @@ fn persistent_shim_uses_canonical_actor_resource() {
 }
 
 #[test]
-fn explicit_inline_environment_is_conservatively_actor_stateful() {
+fn explicit_inline_environment_does_not_invent_actor_state() {
     let inline = PlanNodeKind::Exec {
         lang: "html".into(),
         env_id: 7,
@@ -333,12 +333,13 @@ fn explicit_inline_environment_is_conservatively_actor_stateful() {
         backend: shim("html"),
     };
     let summary = effect_summary_for_plan_node(PlanNodeId(5), &inline).unwrap();
-    let actor = ActorResourceId::new("html", 7);
-    let resource = ResourceKey::ActorState(actor.clone());
-    assert_eq!(summary.actor_state, Some(actor));
-    assert!(summary.reads.contains(&resource));
-    assert!(summary.writes.contains(&resource));
-    assert!(!summary.is_verified_pure_infallible());
+    assert_eq!(summary.actor_state, None);
+    assert!(summary.is_verified_pure_infallible());
+    assert!(summary
+        .reads
+        .iter()
+        .chain(&summary.writes)
+        .all(|resource| !matches!(resource, ResourceKey::ActorState(_))));
 }
 
 #[test]

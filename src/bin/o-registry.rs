@@ -17,16 +17,16 @@ use o_lang::placement::{
     TargetCapabilityModelV1, TargetDescriptorV1, UnixMillisV1,
 };
 use o_lang::registry::{
-    append_profile_to_store, atomic_write_node_profile_json, atomic_write_registry_store,
-    export_registry_store, import_registry_store, read_node_profile_json, read_registry_store,
-    read_registry_trust, read_signing_key, registry_public_key_id, verify_registry_store,
-    write_new_registry_state, ProfilePublicationV1, ProfileStalenessPolicyV1, RegistrySignerV1,
-    RegistryStatePathsV1,
+    append_profile_to_registry_state, atomic_write_node_profile_json, export_registry_store,
+    import_registry_store, read_node_profile_json, read_registry_store, read_registry_trust,
+    read_signing_key, registry_public_key_id, verify_registry_store, write_new_registry_state,
+    ProfilePublicationV1, ProfileStalenessPolicyV1, RegistrySignerV1, RegistryStatePathsV1,
 };
 use o_lang::world::ArtifactId;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_ROOT_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const INSTALLED_EVALUATOR_ALIAS: &str = "ostadix-evaluator";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -91,7 +91,12 @@ enum Command {
         /// Descriptive raw CPU feature. Repeat to add multiple features.
         #[arg(long = "cpu-feature")]
         cpu_features: Vec<String>,
-        #[arg(long, default_value_t = 45)]
+        /// Profile lifetime in seconds (the v1 schema permits 1 through 60).
+        #[arg(
+            long,
+            default_value_t = 45,
+            value_parser = clap::value_parser!(u64).range(1..=60)
+        )]
         valid_for_seconds: u64,
     },
     /// Append one signed NodeProfileV1 JSON document.
@@ -265,18 +270,20 @@ fn main() -> Result<()> {
             let policy = staleness_policy(allow_stale_profiles);
             let signer = read_signing_key(&key).context("could not read registry signing key")?;
             let trust_record = read_registry_trust(&trust).context("could not read trust file")?;
-            let mut store = read_registry_store(&state).context("could not read registry state")?;
             let profile_record =
                 read_node_profile_json(&profile).context("could not read NodeProfileV1 JSON")?;
             let node_id = profile_record.descriptor().node_id().to_owned();
             let publication = ProfilePublicationV1::new(&namespace, node_id, profile_record)
                 .context("profile publication is invalid")?;
-            append_profile_to_store(&mut store, publication, now, &signer, &trust_record, policy)
-                .context("registry key is not authorized to publish this profile")?;
-            verify_registry_store(&store, &trust_record, now, policy)
-                .context("updated registry did not verify")?;
-            atomic_write_registry_store(&state, &store)
-                .context("could not atomically update registry state")?;
+            append_profile_to_registry_state(
+                &state,
+                publication,
+                now,
+                &signer,
+                &trust_record,
+                policy,
+            )
+            .context("registry key is not authorized to publish this profile")?;
             println!(
                 "published profile namespace={namespace} state={}",
                 state.display()
@@ -479,14 +486,43 @@ fn discover_backend_implementations(
 
 fn resolve_runtime_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        if path.is_file() {
-            return Ok(path.to_owned());
-        }
-        bail!("runtime binary `{}` is not a file", path.display());
+        return validate_native_runtime_binary(path).with_context(|| {
+            format!(
+                "--runtime-binary `{}` is not a supported native runtime image",
+                path.display()
+            )
+        });
     }
-    which::which("O").context(
-        "could not find O on PATH; pass --runtime-binary for inline/native backend profiling",
+    let candidates = [INSTALLED_EVALUATOR_ALIAS, "O"]
+        .into_iter()
+        .filter_map(|command| which::which(command).ok())
+        .collect::<Vec<_>>();
+    select_native_runtime_binary(candidates).with_context(|| {
+        format!(
+            "could not find a native evaluator image on PATH; install `{INSTALLED_EVALUATOR_ALIAS}` or pass --runtime-binary"
+        )
+    })
+}
+
+fn select_native_runtime_binary(candidates: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match validate_native_runtime_binary(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(error) => rejected.push(format!("{} ({error})", candidate.display())),
+        }
+    }
+    if rejected.is_empty() {
+        bail!("no evaluator candidate was found")
+    }
+    bail!(
+        "evaluator candidates were launchers or invalid native binaries: {}",
+        rejected.join(", ")
     )
+}
+
+fn validate_native_runtime_binary(path: &Path) -> Result<PathBuf> {
+    o_lang::runtime_exec::validate_native_runtime_binary(path)
 }
 
 fn discover_executable_set(
@@ -547,4 +583,72 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_executable(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn native_test_image(marker: &[u8]) -> Vec<u8> {
+        #[cfg(target_os = "macos")]
+        let prefix = b"\xcf\xfa\xed\xfe".as_slice();
+        #[cfg(windows)]
+        let prefix = b"MZ\0\0".as_slice();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let prefix = b"\x7fELF".as_slice();
+        #[cfg(not(any(unix, windows)))]
+        let prefix = b"unsupported".as_slice();
+
+        [prefix, marker].concat()
+    }
+
+    #[test]
+    fn runtime_selection_rejects_wrapper_and_hashes_native_evaluator_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("O");
+        let evaluator = directory.path().join(INSTALLED_EVALUATOR_ALIAS);
+        write_executable(&wrapper, b"#!/bin/sh\nexec /some/other/O \"$@\"\n");
+        write_executable(&evaluator, &native_test_image(b"first-runtime"));
+
+        assert!(select_native_runtime_binary([wrapper.clone()]).is_err());
+        assert_eq!(
+            select_native_runtime_binary([wrapper, evaluator.clone()]).unwrap(),
+            evaluator.canonicalize().unwrap()
+        );
+
+        let backend = vec!["html".to_owned()];
+        let first = discover_backend_implementations(&backend, Some(&evaluator), None).unwrap();
+        write_executable(&evaluator, &native_test_image(b"second-runtime"));
+        let second = discover_backend_implementations(&backend, Some(&evaluator), None).unwrap();
+        assert_ne!(first[0].adapter_artifact(), second[0].adapter_artifact());
+        assert_ne!(first[0].executable_set(), second[0].executable_set());
+    }
+
+    #[test]
+    fn profile_lifetime_is_rejected_at_the_cli_boundary() {
+        let error = Cli::try_parse_from([
+            "o-registry",
+            "profile-local",
+            "--key",
+            "root.key",
+            "--output",
+            "node.json",
+            "--node-id",
+            "node-a",
+            "--valid-for-seconds",
+            "61",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("1..=60"));
+    }
 }

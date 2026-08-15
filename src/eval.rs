@@ -407,6 +407,11 @@ pub struct Evaluator {
     /// the legacy buffered Request scheduler as a side effect.
     local_worker_parallelism_override: Option<usize>,
 
+    /// Optional native `O --o-backend` entrypoint for embedding processes that
+    /// are not themselves the O evaluator (for example `o-node`). Ordinary O
+    /// execution leaves this unset and binds `current_exe()` as before.
+    runtime_executable_override: Option<PathBuf>,
+
     /// STEP-4: buffer of non-Eval Requests constructed under
     /// Policy::Autonomous. Flushed by flush_autonomous_buffer() at force
     /// points: end of autonomous(expr) block, explicit now(), document end.
@@ -670,6 +675,7 @@ impl Evaluator {
             eval_cache: HashMap::new(),
             scheduler: AutonomousScheduler::new(),
             local_worker_parallelism_override: None,
+            runtime_executable_override: None,
             autonomous_buffer: Vec::new(),
             last_execution_plan: None,
             last_execution_trace: None,
@@ -698,6 +704,14 @@ impl Evaluator {
     /// are legal to overlap; this only caps the feasible local subset.
     pub fn with_local_worker_parallelism(mut self, workers: usize) -> Self {
         self.local_worker_parallelism_override = Some(workers.max(1));
+        self
+    }
+
+    /// Bind hosted backend proxy launches to an explicit native O evaluator.
+    /// The admission layer opens, hashes, and retains this exact executable;
+    /// this is not an ambient PATH override.
+    pub fn with_runtime_executable(mut self, executable: PathBuf) -> Self {
+        self.runtime_executable_override = Some(executable);
         self
     }
 
@@ -812,18 +826,25 @@ impl Evaluator {
             Policy::Lazy => "lazy",
             Policy::Autonomous => "autonomous",
         };
-        let binding = crate::evidence::runtime_binding_from_directory(
-            plan,
-            &self.shim_dir,
-            &[
-                ("policy", policy),
-                ("registered-backends", registered.as_str()),
-                (
-                    "default-backend-authority",
-                    self.default_backend_authority.as_str(),
-                ),
-            ],
-        );
+        let context = [
+            ("policy", policy),
+            ("registered-backends", registered.as_str()),
+            (
+                "default-backend-authority",
+                self.default_backend_authority.as_str(),
+            ),
+        ];
+        let binding = match &self.runtime_executable_override {
+            Some(executable) => {
+                crate::evidence::runtime_binding_from_directory_with_current_executable(
+                    plan,
+                    &self.shim_dir,
+                    &context,
+                    executable,
+                )
+            }
+            None => crate::evidence::runtime_binding_from_directory(plan, &self.shim_dir, &context),
+        };
         crate::process::lifecycle_trace(
             "evidence.runtime_binding_finished",
             format!("plan_nodes={}", plan.nodes.len()),
@@ -4127,6 +4148,39 @@ fn render_markdown(val: &OValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_backend_success_cannot_hide_cleanup_failure() {
+        let error = settle_fresh_backend_result(
+            "[python[*]]",
+            Ok(OValue::str_("completed")),
+            Err(anyhow::anyhow!("shutdown timed out")),
+        )
+        .unwrap_err();
+
+        assert!(crate::process::is_infrastructure_error(&error));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("completed but cleanup failed"),
+            "{message}"
+        );
+        assert!(message.contains("shutdown timed out"), "{message}");
+    }
+
+    #[test]
+    fn fresh_backend_dual_failure_preserves_both_diagnostics() {
+        let error = settle_fresh_backend_result::<OValue>(
+            "[python[*]]",
+            Err(anyhow::anyhow!("semantic execution failed")),
+            Err(anyhow::anyhow!("termination failed")),
+        )
+        .unwrap_err();
+
+        assert!(crate::process::is_infrastructure_error(&error));
+        let message = format!("{error:#}");
+        assert!(message.contains("semantic execution failed"), "{message}");
+        assert!(message.contains("termination failed"), "{message}");
+    }
 
     #[test]
     fn graph_executor_is_the_unconfigured_default() {

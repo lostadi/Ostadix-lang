@@ -39,8 +39,8 @@ static OValue *eval_source(OEvaluator *evaluator, const StringSet *backends,
 
 static void test_parser(const StringSet *backends) {
     const char *source =
-        "python^(1)_python"
-        "py[*]^(2)_py[*]"
+        "python^(1)_python\n"
+        "py[*]^(2)_py[*]\n"
         "python[4294967293]^(3)_python[4294967293]";
     OParser parser;
     ONodeList *nodes = parse_with(&parser, backends, source);
@@ -48,13 +48,14 @@ static void test_parser(const StringSet *backends) {
     check(nodes != NULL, "all environment spellings parse");
     if (nodes != NULL) {
         char *round_trip;
-        check(nodes->len == 3, "three typed expressions were parsed");
-        if (nodes->len == 3) {
+        check(nodes->len == 5,
+              "three typed expressions and two separator nodes were parsed");
+        if (nodes->len == 5) {
             check(nodes->items[0]->data.typed_expr.env_id == OLANG_ENV_EPHEMERAL,
                   "bare environment uses the ephemeral sentinel");
-            check(nodes->items[1]->data.typed_expr.env_id == OLANG_ENV_LINKER_ISOLATED,
+            check(nodes->items[2]->data.typed_expr.env_id == OLANG_ENV_LINKER_ISOLATED,
                   "[*] environment uses the linker-isolated sentinel");
-            check(nodes->items[2]->data.typed_expr.env_id == OLANG_ENV_MAX_PERSISTENT,
+            check(nodes->items[4]->data.typed_expr.env_id == OLANG_ENV_MAX_PERSISTENT,
                   "largest legal numeric environment remains persistent");
         }
         round_trip = reconstruct_source(nodes->items, nodes->len);
@@ -84,13 +85,38 @@ static void test_parser(const StringSet *backends) {
         const char *mismatched[] = {
             "python[*]^(1)_python",
             "python^(1)_python[*]",
+            "python^(1)_python_suffix",
+            "python^(1)_python2",
+            "python^(1)_python{defer}",
+            "python[*]^(1)_python[*]{defer}",
             NULL,
         };
         size_t i;
         for (i = 0; mismatched[i] != NULL; i++) {
             nodes = parse_with(&parser, backends, mismatched[i]);
-            check(nodes == NULL, "bare and [*] closers cannot cross-match");
+            check(nodes == NULL, "an extended closer prefix remains literal");
             if (nodes != NULL) {
+                onode_list_free(nodes);
+            }
+        }
+    }
+
+    {
+        const char *complete[] = {
+            "python[*]^(1)_python[*]tail",
+            "python{defer}^(1)_python{defer}tail",
+            NULL,
+        };
+        size_t i;
+        for (i = 0; complete[i] != NULL; i++) {
+            char *round_trip = NULL;
+            nodes = parse_with(&parser, backends, complete[i]);
+            check(nodes != NULL, "a complete closer may be followed by text");
+            if (nodes != NULL) {
+                round_trip = reconstruct_source(nodes->items, nodes->len);
+                check(round_trip != NULL && strcmp(round_trip, complete[i]) == 0,
+                      "complete closer boundaries round-trip exactly");
+                free(round_trip);
                 onode_list_free(nodes);
             }
         }
@@ -109,6 +135,10 @@ static void test_evaluator(const StringSet *backends, const char *shim_dir) {
           "test backends are registered");
 
     value = eval_source(evaluator, backends, "python^(x = 7)_python");
+    check(value != NULL && value->tag == OVAL_NULL,
+          "bare state write completes before freshness is tested");
+    check(!olang_evaluator_had_error(evaluator),
+          "bare state write has no hidden evaluator error");
     oval_release(value);
     value = eval_source(
         evaluator, backends,
@@ -116,9 +146,15 @@ static void test_evaluator(const StringSet *backends, const char *shim_dir) {
     check(value != NULL && value->tag == OVAL_STR &&
               strcmp(value->data.str_val, "bare-fresh") == 0,
           "bare environment is fresh on the next attempt");
+    check(!olang_evaluator_had_error(evaluator),
+          "bare freshness read has no hidden evaluator error");
     oval_release(value);
 
     value = eval_source(evaluator, backends, "python[*]^(y = 8)_python[*]");
+    check(value != NULL && value->tag == OVAL_NULL,
+          "[*] state write completes before freshness is tested");
+    check(!olang_evaluator_had_error(evaluator),
+          "[*] state write has no hidden evaluator error");
     oval_release(value);
     value = eval_source(
         evaluator, backends,
@@ -126,13 +162,21 @@ static void test_evaluator(const StringSet *backends, const char *shim_dir) {
     check(value != NULL && value->tag == OVAL_STR &&
               strcmp(value->data.str_val, "star-fresh") == 0,
           "[*] environment is fresh on the next attempt");
+    check(!olang_evaluator_had_error(evaluator),
+          "[*] freshness read has no hidden evaluator error");
     oval_release(value);
 
     value = eval_source(evaluator, backends, "python[17]^(z = 40)_python[17]");
+    check(value != NULL && value->tag == OVAL_NULL,
+          "numeric state write completes before persistence is tested");
+    check(!olang_evaluator_had_error(evaluator),
+          "numeric state write has no hidden evaluator error");
     oval_release(value);
     value = eval_source(evaluator, backends, "python[17]^(z + 2)_python[17]");
     check(value != NULL && value->tag == OVAL_INT && value->data.int_val == 42,
           "numeric environment persists across attempts");
+    check(!olang_evaluator_had_error(evaluator),
+          "numeric persistence read has no hidden evaluator error");
     oval_release(value);
 
     check(!olang_evaluator_had_error(evaluator), "focused evaluations completed cleanly");

@@ -852,7 +852,11 @@ mod tests {
         solve::solve_types(&mut graph).unwrap();
         assert_eq!(
             graph.node(output).and_then(|node| node.fidelity.clone()),
-            Some(Fidelity::structural([AnnotationKind::NumericPrecision]))
+            Some(Fidelity::structural([
+                AnnotationKind::NumericPrecision,
+                AnnotationKind::NumericExactness,
+                AnnotationKind::TypeTag,
+            ]))
         );
     }
 
