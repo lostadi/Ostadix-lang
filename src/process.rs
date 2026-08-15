@@ -1781,8 +1781,9 @@ impl ProcessRegistry {
             .registry
             .keys()
             .filter(|(_, env_id, _, _)| *env_id <= crate::environment::MAX_PERSISTENT_ENV_ID)
-            .cloned()
-            .map(|key| sandbox_policy_sha256(key.2.permissions()).map(|digest| (key, digest)))
+            .map(|key| {
+                sandbox_policy_sha256(key.2.permissions()).map(|digest| (key.clone(), digest))
+            })
             .collect::<Result<Vec<_>>>()?;
         ordered.sort_by(|(left, left_sandbox), (right, right_sandbox)| {
             (&left.0, left.1, left_sandbox, &left.3).cmp(&(
@@ -2387,26 +2388,29 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let shim = temp.path().join("delayed_shutdown.py");
         let common = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/o_shim_common.py");
-        std::fs::copy(&common, temp.path().join("o_shim_common.py"))?;
+        std::fs::copy(python_shim_path(), &shim)?;
 
-        let source = std::fs::read_to_string(python_shim_path())?;
+        let source = std::fs::read_to_string(&common)?;
         let original = concat!(
-            "        elif tag == \"shutdown\":\n",
-            "            send_ok(None)\n",
-            "            break\n",
+            "            elif tag == \"shutdown\":\n",
+            "                send_ok({\"t\": \"null\"})\n",
+            "                break\n",
         );
         let delayed = concat!(
-            "        elif tag == \"shutdown\":\n",
-            "            __import__(\"time\").sleep(0.2)\n",
-            "            send_ok(None)\n",
-            "            __import__(\"time\").sleep(0.4)\n",
-            "            break\n",
+            "            elif tag == \"shutdown\":\n",
+            "                __import__(\"time\").sleep(0.2)\n",
+            "                send_ok({\"t\": \"null\"})\n",
+            "                __import__(\"time\").sleep(0.4)\n",
+            "                break\n",
         );
         assert!(
             source.contains(original),
-            "Python shim shutdown branch changed; update the deadline fixture"
+            "shared shim shutdown branch changed; update the deadline fixture"
         );
-        std::fs::write(&shim, source.replacen(original, delayed, 1))?;
+        std::fs::write(
+            temp.path().join("o_shim_common.py"),
+            source.replacen(original, delayed, 1),
+        )?;
 
         let mut process =
             BackendProcess::new("python", &shim, &BackendSandboxPolicy::none(), None)?;
