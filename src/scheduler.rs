@@ -248,6 +248,8 @@ pub struct AutonomousScheduler {
     disk_cache: Option<DiskCache>,
     /// Maximum number of concurrent threads per dispatch wave.
     pub(crate) parallelism: usize,
+    #[cfg(test)]
+    nix_lease_capture: fn() -> SharedNixLease,
 }
 
 impl AutonomousScheduler {
@@ -270,6 +272,8 @@ impl AutonomousScheduler {
             mem_cache: HashMap::new(),
             disk_cache,
             parallelism,
+            #[cfg(test)]
+            nix_lease_capture: capture_shared_nix_lease,
         }
     }
 
@@ -283,6 +287,8 @@ impl AutonomousScheduler {
             mem_cache: HashMap::new(),
             disk_cache: Some(DiskCache::new(dir)?),
             parallelism,
+            #[cfg(test)]
+            nix_lease_capture: capture_shared_nix_lease,
         })
     }
 
@@ -300,6 +306,7 @@ impl AutonomousScheduler {
             mem_cache: HashMap::new(),
             disk_cache: None,
             parallelism: 2,
+            nix_lease_capture: capture_shared_nix_lease,
         }
     }
 
@@ -376,18 +383,7 @@ impl AutonomousScheduler {
             .filter(|fp| !resolved.contains_key(*fp))
             .cloned()
             .collect();
-        let nix_lease = pending
-            .iter()
-            .any(|fp| {
-                matches!(
-                    all.get(fp),
-                    Some(OValue::Request {
-                        kind: RequestKind::Instantiate | RequestKind::Realise,
-                        ..
-                    })
-                )
-            })
-            .then(capture_shared_nix_lease);
+        let mut nix_lease: Option<SharedNixLease> = None;
         let mut first_failure: Option<anyhow::Error> = None;
 
         while !pending.is_empty() {
@@ -443,6 +439,11 @@ impl AutonomousScheduler {
             if !wave.is_empty() {
                 let (tx, rx) = mpsc::channel::<(String, Result<OValue>)>();
 
+                // Resolve and validate every source before acquiring runtime
+                // authority. This matches ImmediateExecutor's source-first
+                // semantics: a malformed request must not be masked by a
+                // missing `nix` executable.
+                let mut prepared = Vec::with_capacity(wave.len());
                 for fp in &wave {
                     let req = all[fp].clone();
                     let src = resolve_source(&req, &resolved)?;
@@ -450,7 +451,27 @@ impl AutonomousScheduler {
                         OValue::Request { kind, .. } => kind.clone(),
                         _ => unreachable!(),
                     };
-                    let fp_c = fp.clone();
+                    match &kind {
+                        RequestKind::Instantiate => nix_ops::validate_instantiate_source(&src)?,
+                        RequestKind::Realise => nix_ops::validate_realise_source(&src)?,
+                        _ => {}
+                    }
+                    prepared.push((fp.clone(), src, kind));
+                }
+
+                if nix_lease.is_none()
+                    && prepared.iter().any(|(_, _, kind)| {
+                        matches!(kind, RequestKind::Instantiate | RequestKind::Realise)
+                    })
+                {
+                    #[cfg(test)]
+                    let capture_nix_lease = self.nix_lease_capture;
+                    #[cfg(not(test))]
+                    let capture_nix_lease = capture_shared_nix_lease;
+                    nix_lease = Some(capture_nix_lease());
+                }
+
+                for (fp_c, src, kind) in prepared {
                     let tx_c = tx.clone();
                     let nix_lease = nix_lease.clone();
 
@@ -580,6 +601,10 @@ mod tests {
     use super::*;
     use std::env;
     use std::sync::{Arc, Mutex};
+
+    fn panic_if_nix_lease_is_captured() -> SharedNixLease {
+        panic!("Nix authority was captured before request validation")
+    }
 
     // ── DiskCache ──────────────────────────────────────────────────────────────
 
@@ -838,6 +863,22 @@ mod tests {
         let mut sched = AutonomousScheduler::no_disk();
         let result = sched.execute_batch(&[], None).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn execute_batch_validates_nix_source_before_capturing_lease() {
+        let mut sched = AutonomousScheduler::no_disk();
+        sched.nix_lease_capture = panic_if_nix_lease_is_captured;
+        let malformed = OValue::request(RequestKind::Instantiate, OValue::int(42));
+
+        let error = sched.execute_batch(&[malformed], None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("instantiate() expected a NixExpr"),
+            "{error:#}"
+        );
     }
 
     // ── execute_batch: pre-cached chain ───────────────────────────────────────

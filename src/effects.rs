@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionMode, PlanNodeId, PlanNodeKind};
 use crate::world::identity::{
     ArtifactPublicationIdentity, CapabilityIdentity, DomainIdentity, GovernorIdentity,
@@ -765,7 +766,7 @@ fn parse_actor_resource(value: &str) -> Result<ActorResourceId, String> {
     let environment = environment
         .parse::<u32>()
         .map_err(|_| format!("invalid actor environment `{environment}`"))?;
-    if environment == u32::MAX {
+    if !EnvironmentRefV2::from_encoded(environment).is_persistent() {
         return Err("actor resources require an explicit persistent environment".to_string());
     }
     Ok(ActorResourceId::new(language, environment))
@@ -821,11 +822,12 @@ pub fn effect_summary_for_plan_node(
                 EffectSummary::conservative_evaluator()
             };
 
-            // An explicit environment denotes persistent evaluator identity.
-            // Even today's state-free inline implementations receive the
-            // token conservatively so future backend changes cannot make an
-            // indexed block silently share mutable state off-graph.
-            if *env_id != u32::MAX {
+            // Actor serialization belongs only to stateful hosted evaluators.
+            // Pure inline renderers have no process state, while `[*]` is a
+            // fresh-per-attempt linker intent rather than a persistent actor.
+            if backend.execution == ExecutionMode::Shim
+                && EnvironmentRefV2::from_encoded(*env_id).is_persistent()
+            {
                 summary = summary
                     .with_actor_state(ActorResourceId::new(backend.canonical.clone(), *env_id));
             }
@@ -863,6 +865,41 @@ mod tests {
         assert!(EffectDeclaration::parse(Some("reads=env:bad-name")).is_err());
         assert!(EffectDeclaration::parse(Some("reads=actor:python[*]")).is_err());
         assert!(EffectDeclaration::parse(Some("effects=trusted")).is_err());
+    }
+
+    #[test]
+    fn environment_identity_tracks_hosted_actor_state_not_source_syntax() {
+        let inline = PlanNodeKind::Exec {
+            lang: "html".to_string(),
+            env_id: 7,
+            attr: None,
+            backend: crate::ir::BackendRegistry::global().interface_for("html"),
+        };
+        let inline_summary = effect_summary_for_plan_node(PlanNodeId(0), &inline).unwrap();
+        assert_eq!(inline_summary.actor_state, None);
+
+        let persistent_shim = PlanNodeKind::Exec {
+            lang: "python".to_string(),
+            env_id: 7,
+            attr: None,
+            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+        };
+        let persistent_summary =
+            effect_summary_for_plan_node(PlanNodeId(1), &persistent_shim).unwrap();
+        assert_eq!(
+            persistent_summary.actor_state,
+            Some(ActorResourceId::new("python", 7))
+        );
+
+        let linker_isolated_shim = PlanNodeKind::Exec {
+            lang: "python".to_string(),
+            env_id: crate::environment::LINKER_ISOLATED_ENV_ID,
+            attr: None,
+            backend: crate::ir::BackendRegistry::global().interface_for("python"),
+        };
+        let fresh_summary =
+            effect_summary_for_plan_node(PlanNodeId(2), &linker_isolated_shim).unwrap();
+        assert_eq!(fresh_summary.actor_state, None);
     }
 
     #[test]

@@ -48,6 +48,12 @@ add_executable(olangc
 )
 olang_configure_target(olangc)
 
+add_executable(fresh_env_test
+    ${OLANG_CORE_SRCS}
+    tests/test_fresh_env.c
+)
+olang_configure_target(fresh_env_test)
+
 # olangc locates runtime sources relative to its executable; provide them in
 # out-of-source CMake build directories without making the legacy C++ path active.
 add_custom_command(TARGET olangc POST_BUILD
@@ -84,6 +90,10 @@ add_test(NAME aot_path_safety
             $<TARGET_FILE:olangc>
             ${CMAKE_C_COMPILER}
             $<TARGET_FILE:O>
+)
+
+add_test(NAME fresh_environment_semantics
+    COMMAND $<TARGET_FILE:fresh_env_test> ${OLANG_BACKENDS_DIR}
 )
 
 if(OLANG_WARNINGS_AS_ERRORS)

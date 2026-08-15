@@ -462,9 +462,12 @@ class OvmfResolverTests(unittest.TestCase):
             firmware.write_bytes(b"fixture")
             result = self._resolve(qemu)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(Path(result.stdout.strip()).is_file(), result.stdout)
-        self.assertNotIn("unbound variable", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Assert while the synthetic candidate still exists. On hosts
+            # with a higher-priority system/Homebrew OVMF, the resolver may
+            # validly select that file while still exercising this prefix.
+            self.assertTrue(Path(result.stdout.strip()).is_file(), result.stdout)
+            self.assertNotIn("unbound variable", result.stderr)
 
 
 if __name__ == "__main__":

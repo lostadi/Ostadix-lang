@@ -7,8 +7,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from o_lang.parser import (
+    EPHEMERAL_ENV_ID, LINKER_ISOLATED_ENV_ID, MAX_PERSISTENT_ENV_ID,
     Document, ExpressionNode, TextPart,
-    parse, ParseError, REGISTERED_LANGUAGES,
+    parse, ParseError, REGISTERED_LANGUAGES, reconstruct_source,
 )
 
 
@@ -26,7 +27,7 @@ def test_single_expression():
     node = doc.body[0]
     assert isinstance(node, ExpressionNode)
     assert node.language == "python"
-    assert node.env_id == 0
+    assert node.env_id == EPHEMERAL_ENV_ID
     assert not node.env_explicit
     assert len(node.body) == 1
     assert node.body[0].text == "1 + 1"
@@ -38,6 +39,53 @@ def test_explicit_env_expression():
     assert node.env_id == 3
     assert node.env_explicit
     assert node.closing_tag == ")_python[3]"
+
+
+def test_explicit_fresh_environment_round_trips_exactly():
+    source = "py[*]^(python^(1)_python)_py[*]"
+    doc = parse(source)
+    node = doc.body[0]
+    assert node.language == "py"
+    assert node.canonical_language == "python"
+    assert node.env_id == LINKER_ISOLATED_ENV_ID
+    assert node.env_explicit
+    assert node.is_fresh_environment
+    assert node.opening_tag == "py[*]^("
+    assert node.closing_tag == ")_py[*]"
+    assert reconstruct_source(doc) == source
+
+
+def test_all_environment_spellings_round_trip_together():
+    source = (
+        "python^(1)_python"
+        "python[*]^(2)_python[*]"
+        f"python[{MAX_PERSISTENT_ENV_ID}]^(3)_python[{MAX_PERSISTENT_ENV_ID}]"
+    )
+    assert reconstruct_source(parse(source)) == source
+
+
+def test_reserved_numeric_environment_ids_are_rejected():
+    for env_id in (LINKER_ISOLATED_ENV_ID, EPHEMERAL_ENV_ID):
+        source = f"python[{env_id}]^(1)_python[{env_id}]"
+        try:
+            parse(source)
+        except ParseError as exc:
+            assert "reserved or out of range" in str(exc)
+            continue
+        raise AssertionError(f"expected ParseError for reserved env id {env_id}")
+
+
+def test_bare_and_star_closers_do_not_cross_match():
+    for source in (
+        "python[*]^(1)_python",
+        "python^(1)_python[*]",
+    ):
+        try:
+            parse(source)
+        except ParseError as exc:
+            assert "unterminated" in str(exc) or "closing" in str(exc)
+            continue
+        raise AssertionError(f"expected exact closer failure for {source!r}")
 
 
 def test_mismatched_env_bracket_is_unterminated():
