@@ -28,6 +28,10 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
+use crate::backend::state::{
+    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, EvaluatorActorCheckpointV1,
+    EvaluatorStateSnapshotV1,
+};
 use crate::capability::{fresh_bearer_identity, BackendAuthorityBroker, BackendSandboxPolicy};
 use crate::effects::EffectDeclaration;
 use crate::environment::EnvironmentRefV2;
@@ -47,6 +51,12 @@ use crate::value::{
     BackendAuthority, CapabilityKind, DecimalSpecial, FloatFormat, FloatSpecial, GroupMode,
     ONumber, OValue, RequestKind, SeqKind,
 };
+
+/// Stable evidence projection of the built-in authority policy. The random
+/// bearer that realizes this policy remains process-local and is checked at
+/// every dispatch; hashing that secret into launch identity would make an
+/// otherwise compatible actor checkpoint unrestorable after evaluator restart.
+const DEFAULT_BACKEND_AUTHORITY_POLICY_V1: &str = "wildcard:fs_read,fs_write,network,process";
 
 /// How to resolve group members that might be cached Request values.
 ///
@@ -472,6 +482,11 @@ pub struct Evaluator {
     /// unrelated backend is added to the plan, while still changing with this
     /// backend's launcher, shim, or child launch context.
     active_backend_launch_generations: Option<HashMap<String, String>>,
+
+    /// Authority-free actor checkpoints waiting for the first exact admitted
+    /// dispatch after restart. The sandbox digest participates in identity so
+    /// two deliberately isolated actors cannot overwrite one another.
+    pending_backend_restores: HashMap<(String, u32, String), EvaluatorActorCheckpointV1>,
 }
 
 struct IrExecRegion<'a> {
@@ -688,6 +703,7 @@ impl Evaluator {
             callback_operation_deadline: None,
             active_executable_leases: None,
             active_backend_launch_generations: None,
+            pending_backend_restores: HashMap::new(),
         }
     }
 
@@ -713,6 +729,76 @@ impl Evaluator {
     pub fn with_runtime_executable(mut self, executable: PathBuf) -> Self {
         self.runtime_executable_override = Some(executable);
         self
+    }
+
+    /// Capture all settled persistent backend actors as canonical portable
+    /// state. No actor is cleaned up or evicted; any pin or protocol failure
+    /// aborts the complete snapshot and leaves the registry intact.
+    pub fn checkpoint_persistent_actors(
+        &mut self,
+        max_total_bytes: u64,
+    ) -> Result<EvaluatorStateSnapshotV1> {
+        self.registry
+            .checkpoint_persistent_actors(max_total_bytes)
+            .context("failed to checkpoint persistent evaluator actors")
+    }
+
+    /// Stage portable actor state for lazy restoration under a future exact
+    /// admission. Staging launches no process and is atomic: malformed,
+    /// duplicate, already-live, or already-pending targets insert nothing.
+    pub fn stage_persistent_actor_restore(
+        &mut self,
+        snapshot: EvaluatorStateSnapshotV1,
+        max_total_bytes: u64,
+    ) -> Result<()> {
+        ensure_evaluator_snapshot_bound(&snapshot, max_total_bytes)?;
+        for actor in &snapshot.actors {
+            let spec = BackendRegistry::global()
+                .get(&actor.canonical_backend)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "state.restore-incompatible: backend `{}` is not registered",
+                        actor.canonical_backend
+                    )
+                })?;
+            if spec.name != actor.canonical_backend {
+                bail!(
+                    "state.restore-incompatible: actor backend `{}` is an alias for canonical backend `{}`",
+                    actor.canonical_backend,
+                    spec.name
+                );
+            }
+            let key = (
+                actor.canonical_backend.clone(),
+                actor.environment_id,
+                actor.sandbox_policy_sha256.clone(),
+            );
+            if self.pending_backend_restores.contains_key(&key) {
+                bail!(
+                    "state.restore-conflict: backend `{}[{}]` already has a pending restore for sandbox {}",
+                    actor.canonical_backend,
+                    actor.environment_id,
+                    actor.sandbox_policy_sha256
+                );
+            }
+        }
+        self.registry
+            .ensure_restore_targets_vacant(&snapshot.actors)?;
+
+        for actor in snapshot.actors {
+            let key = (
+                actor.canonical_backend.clone(),
+                actor.environment_id,
+                actor.sandbox_policy_sha256.clone(),
+            );
+            let previous = self.pending_backend_restores.insert(key, actor);
+            debug_assert!(previous.is_none(), "restore staging was prevalidated");
+        }
+        Ok(())
+    }
+
+    pub fn pending_persistent_actor_restores(&self) -> usize {
+        self.pending_backend_restores.len()
     }
 
     /// Replace the executor. Used by tests; the autonomous scheduler is a
@@ -778,8 +864,8 @@ impl Evaluator {
                 ("policy", policy),
                 ("registered-backends", registered.as_str()),
                 (
-                    "default-backend-authority",
-                    self.default_backend_authority.as_str(),
+                    "default-backend-authority-policy",
+                    DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
                 ),
             ],
         )
@@ -808,8 +894,9 @@ impl Evaluator {
     }
 
     /// Capture the process-local runtime facts bound by ordinary OIR
-    /// admission. The opaque capability identity participates only through the
-    /// environment digest; it is never exposed by the evidence artifact.
+    /// admission. Canonical evidence records the authority policy, never the
+    /// random live bearer that realizes it; dispatch still resolves that
+    /// bearer through the private broker before launching a backend.
     pub(crate) fn try_admission_runtime_binding(
         &self,
         plan: &ExecutionPlan,
@@ -830,8 +917,8 @@ impl Evaluator {
             ("policy", policy),
             ("registered-backends", registered.as_str()),
             (
-                "default-backend-authority",
-                self.default_backend_authority.as_str(),
+                "default-backend-authority-policy",
+                DEFAULT_BACKEND_AUTHORITY_POLICY_V1,
             ),
         ];
         let binding = match &self.runtime_executable_override {
@@ -891,6 +978,90 @@ impl Evaluator {
             .with_context(|| {
                 format!("backend `{backend}` has no active admitted launch generation")
             })
+    }
+
+    fn apply_pending_actor_restore(
+        &mut self,
+        backend: &str,
+        environment_id: u32,
+        sandbox: &BackendSandboxPolicy,
+        shim_path: &std::path::Path,
+        executable_leases: &Arc<crate::runtime_exec::ExecutableLeaseSet>,
+        launch_generation_sha256: &str,
+    ) -> Result<()> {
+        if environment_id > crate::environment::MAX_PERSISTENT_ENV_ID {
+            return Ok(());
+        }
+        let sandbox_policy_sha256 = sandbox_policy_sha256(sandbox.permissions())?;
+        let key = (
+            backend.to_string(),
+            environment_id,
+            sandbox_policy_sha256.clone(),
+        );
+        let Some(actor) = self.pending_backend_restores.get(&key).cloned() else {
+            if self.pending_backend_restores.keys().any(
+                |(candidate_backend, candidate_environment, _)| {
+                    candidate_backend == backend && *candidate_environment == environment_id
+                },
+            ) {
+                bail!(
+                    "state.restore-incompatible: pending backend `{backend}[{environment_id}]` does not match admitted sandbox {sandbox_policy_sha256}"
+                );
+            }
+            return Ok(());
+        };
+
+        actor.validate()?;
+        if actor.sandbox_permissions != sandbox.permissions() {
+            bail!(
+                "state.restore-incompatible: pending backend `{backend}[{environment_id}]` permissions disagree with admitted sandbox"
+            );
+        }
+        if actor.launch_generation_sha256 != launch_generation_sha256 {
+            bail!(
+                "state.restore-generation-mismatch: pending backend `{backend}[{environment_id}]` launch generation `{}` does not match admitted generation `{launch_generation_sha256}`",
+                actor.launch_generation_sha256
+            );
+        }
+        let backend_manifest = executable_leases
+            .backend_manifest_json(backend)
+            .with_context(|| {
+                format!(
+                    "state.restore-incompatible: backend `{backend}[{environment_id}]` has no admitted runtime manifest"
+                )
+            })?;
+        let backend_manifest: serde_json::Value = serde_json::from_str(&backend_manifest)
+            .context("admitted backend runtime manifest is not valid JSON")?;
+        let admitted_runtime_binding = backend_manifest
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .context("admitted backend runtime manifest omitted sha256")?;
+        if actor.runtime_binding_sha256 != admitted_runtime_binding {
+            bail!(
+                "state.restore-generation-mismatch: pending backend `{backend}[{environment_id}]` runtime binding `{}` does not match admitted binding `{admitted_runtime_binding}`",
+                actor.runtime_binding_sha256
+            );
+        }
+
+        self.registry
+            .restore_env(
+                backend,
+                environment_id,
+                actor.checkpoint,
+                BackendLaunchContext {
+                    shim_path,
+                    sandbox,
+                    executable_leases: Some(executable_leases),
+                    launch_generation_sha256: Some(launch_generation_sha256),
+                },
+            )
+            .with_context(|| {
+                format!("failed to restore pending backend `{backend}[{environment_id}]`")
+            })?;
+        self.pending_backend_restores
+            .remove(&key)
+            .expect("successfully restored pending actor disappeared");
+        Ok(())
     }
 
     /// Mint a live capability for embedding-specific activation guards.
@@ -1714,6 +1885,14 @@ impl Evaluator {
                     BackendRegistry::global().resolve_shim_path(&self.shim_dir, runtime_lang);
                 let executable_leases = Arc::clone(self.executable_leases()?);
                 let launch_generation = self.backend_launch_generation(runtime_lang)?;
+                self.apply_pending_actor_restore(
+                    runtime_lang,
+                    runtime_env_id,
+                    &sandbox,
+                    &shim,
+                    &executable_leases,
+                    &launch_generation,
+                )?;
                 // Dependencies were rendered into the thunk body at capture
                 // time, so the forced shim receives an empty binding map.
                 let result = self
@@ -2457,6 +2636,14 @@ impl Evaluator {
 
         let executable_leases = Arc::clone(self.executable_leases()?);
         let launch_generation = self.backend_launch_generation(runtime_lang)?;
+        self.apply_pending_actor_restore(
+            runtime_lang,
+            runtime_env_id,
+            &sandbox,
+            &shim,
+            &executable_leases,
+            &launch_generation,
+        )?;
         let execution: Result<OValue> = (|| {
             self.registry
                 .send_exec(
@@ -4149,6 +4336,15 @@ fn render_markdown(val: &OValue) -> String {
 mod tests {
     use super::*;
 
+    fn eval_test_source(
+        evaluator: &mut Evaluator,
+        backends: &HashSet<String>,
+        source: &str,
+    ) -> Result<OValue> {
+        let nodes = Parser::new(source, backends).parse()?;
+        evaluator.eval_document(nodes)
+    }
+
     #[test]
     fn fresh_backend_success_cannot_hide_cleanup_failure() {
         let error = settle_fresh_backend_result(
@@ -4396,6 +4592,142 @@ mod tests {
             }
             other => panic!("expected spliced big integer number, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn evaluator_checkpoint_restore_round_trips_python_actor_state() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut source =
+            Evaluator::new(shim_dir.clone()).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut source,
+            &backends,
+            "python[17]^(x = []\nx.append(x)\ny = x\n__oval_result__ = 'ready')_python[17]",
+        )?;
+
+        let snapshot = source.checkpoint_persistent_actors(4 * 1024 * 1024)?;
+        assert_eq!(snapshot.actors.len(), 1);
+        assert_eq!(snapshot.actors[0].canonical_backend, "python");
+        assert_eq!(snapshot.actors[0].environment_id, 17);
+        assert_eq!(
+            eval_test_source(
+                &mut source,
+                &backends,
+                "python[17]^(__oval_result__ = x is y and x[0] is x)_python[17]",
+            )?,
+            OValue::bool_(true),
+            "checkpointing must not evict the live source actor"
+        );
+
+        let mut restored = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        restored.stage_persistent_actor_restore(snapshot, 4 * 1024 * 1024)?;
+        assert_eq!(restored.pending_persistent_actor_restores(), 1);
+        assert_eq!(
+            eval_test_source(
+                &mut restored,
+                &backends,
+                "python[17]^(__oval_result__ = x is y and x[0] is x)_python[17]",
+            )?,
+            OValue::bool_(true)
+        );
+        assert_eq!(restored.pending_persistent_actor_restores(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_checkpoint_pin_keeps_python_actor_live() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut evaluator,
+            &backends,
+            "python[19]^(f = lambda: 42\n__oval_result__ = 'ready')_python[19]",
+        )?;
+
+        let error = evaluator
+            .checkpoint_persistent_actors(4 * 1024 * 1024)
+            .expect_err("a Python function must pin the actor");
+        assert!(format!("{error:#}").contains("state.pin-required"));
+        assert_eq!(
+            eval_test_source(
+                &mut evaluator,
+                &backends,
+                "python[19]^(__oval_result__ = f())_python[19]",
+            )?,
+            OValue::int(42),
+            "checkpoint refusal must retain the live actor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_evaluator_restore_fails_closed_on_launch_generation_mismatch() -> Result<()> {
+        let backends: HashSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut source =
+            Evaluator::new(shim_dir.clone()).with_registered_backends(backends.clone());
+        eval_test_source(
+            &mut source,
+            &backends,
+            "python[23]^(x = 42\n__oval_result__ = x)_python[23]",
+        )?;
+        let mut snapshot = source.checkpoint_persistent_actors(4 * 1024 * 1024)?;
+        snapshot.actors[0].launch_generation_sha256 = "00".repeat(32);
+
+        let mut restored = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        restored.stage_persistent_actor_restore(snapshot, 4 * 1024 * 1024)?;
+        let error = eval_test_source(
+            &mut restored,
+            &backends,
+            "python[23]^(__oval_result__ = x)_python[23]",
+        )
+        .expect_err("mismatched generation must fail before actor dispatch");
+        assert!(
+            format!("{error:#}").contains("state.restore-generation-mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(
+            restored.pending_persistent_actor_restores(),
+            1,
+            "failed restore must remain staged and must not publish an actor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_snapshot_is_empty_without_persistent_actors() -> Result<()> {
+        let mut evaluator = Evaluator::new("/tmp".into());
+        let snapshot = evaluator.checkpoint_persistent_actors(1024)?;
+        assert!(snapshot.actors.is_empty());
+        snapshot.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_snapshots_stateless_actor_as_explicit_empty_checkpoint() -> Result<()> {
+        if which::which("bash").is_err() {
+            return Ok(());
+        }
+        let backends: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
+        let shim_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backends");
+        let mut evaluator = Evaluator::new(shim_dir).with_registered_backends(backends.clone());
+        assert_eq!(
+            eval_test_source(&mut evaluator, &backends, "bash[29]^(printf 42)_bash[29]")?,
+            OValue::int(42)
+        );
+        let snapshot = evaluator.checkpoint_persistent_actors(1024 * 1024)?;
+        assert_eq!(snapshot.actors.len(), 1);
+        assert_eq!(
+            snapshot.actors[0].checkpoint.tier,
+            crate::backend::state::BackendStateTierV1::Stateless
+        );
+        assert_eq!(
+            snapshot.actors[0].checkpoint.payload,
+            serde_json::json!({ "kind": "empty" })
+        );
+        Ok(())
     }
 
     #[test]
