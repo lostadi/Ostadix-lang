@@ -421,7 +421,7 @@ impl ExecutableLeaseSet {
     pub fn current_o_command(&self) -> Result<Command> {
         #[cfg(target_os = "linux")]
         {
-            return self.current_o_command_with_proc_root(Path::new("/proc"));
+            self.current_o_command_with_proc_root(Path::new("/proc"))
         }
 
         #[cfg(not(target_os = "linux"))]
