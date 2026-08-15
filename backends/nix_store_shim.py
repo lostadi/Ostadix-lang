@@ -5,7 +5,7 @@ import subprocess
 import traceback
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from o_shim_common import read_wire_message, write_wire_message
+from o_shim_common import command_loop, write_wire_message
 
 def send_ok_store_path(path):
     write_wire_message({
@@ -65,21 +65,4 @@ def handle_exec(cmd):
     except Exception:
         send_err(traceback.format_exc())
 
-while True:
-    try:
-        cmd = read_wire_message()
-        if cmd is None:
-            break
-        tag = cmd.get("cmd")
-
-        if tag == "exec":
-            handle_exec(cmd)
-        elif tag == "ping":
-            send_ok_null()
-        elif tag == "cleanup":
-            send_ok_null()
-        else:
-            send_err(f"unknown command: {tag!r}")
-
-    except Exception:
-        send_err(traceback.format_exc())
+command_loop(handle_exec, handle_cleanup=send_ok_null, handle_ping=send_ok_null)

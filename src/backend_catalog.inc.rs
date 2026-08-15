@@ -10,7 +10,7 @@
 // `[["dotnet"], ["mcs", "mono"]]` means dotnet OR (mcs AND mono).
 
 backend_catalog_metadata! {
-    schema: "ostadix.backend-catalog/v2",
+    schema: "ostadix.backend-catalog/v3",
 }
 
 runtime_requirement_catalog! {
@@ -188,7 +188,7 @@ backend_catalog! {
         authorities: [FileRead, FileWrite, Network, Process],
         adapter: NativeRust,
         runtime: "nix",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -202,7 +202,7 @@ backend_catalog! {
         // retains the native Rust `run_nix` implementation for direct calls.
         adapter: NativeRust,
         runtime: "builtin",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -214,7 +214,7 @@ backend_catalog! {
         authorities: [FileRead, FileWrite, Network, Process],
         adapter: NativeRust,
         runtime: "nix",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -286,7 +286,7 @@ backend_catalog! {
         authorities: [],
         adapter: NativeRust,
         runtime: "sql",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -322,7 +322,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "webassembly",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -382,7 +382,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "rust",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -406,7 +406,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "csharp",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -418,7 +418,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "c",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -430,7 +430,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "cpp",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {
@@ -502,7 +502,7 @@ backend_catalog! {
         authorities: [FileWrite, Process],
         adapter: NativeRust,
         runtime: "java",
-        integer_exactness: ExactMagnitudeBits(63),
+        integer_exactness: TwosComplementBits(63),
         rich_numbers: Collapsed,
     },
     {

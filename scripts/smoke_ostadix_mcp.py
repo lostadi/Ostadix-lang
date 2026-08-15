@@ -297,7 +297,7 @@ def run_smoke(root: Path, binary: Path, timeout: float) -> None:
         if runtimes_result.get("isError") is True:
             raise SmokeError(f"o_runtimes returned an MCP tool error:\n{runtimes_text}")
         required_runtime_markers = {
-            "runtime-catalog-schema=ostadix.backend-catalog/v1",
+            "runtime-catalog-schema=ostadix.backend-catalog/v3",
             "runtime-catalog-projection=compiled-mcp-snapshot",
             "runtime-search-mode=discover-local",
             "runtime-search-entry index=0 source=inherited:0 path=/usr/bin",
