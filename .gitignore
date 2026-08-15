@@ -60,6 +60,9 @@
 /.ogit/
 /examples/group_pipeline/generated/
 /examples/group_pipeline/output.txt
+# Local archive/reference checkout. The project bundler consumes this ignore
+# file too, so `o-link --project .` does not recursively capture the repository.
+/Ostadix-lang/
 
 # OS metadata
 .DS_Store

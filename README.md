@@ -48,6 +48,11 @@ the syntax that says "evaluate this in Python." The result is an OValue that
 HTML can embed directly, without either side knowing about the other's type
 system.
 
+**Start here:** [Quickstart](#quickstart) · [Architecture](#architecture) ·
+[Semantic custody](docs/SEMANTIC_CUSTODY.md) ·
+[Versioning](docs/VERSIONING.md) · [Evidence claims](docs/CLAIMS.md) ·
+[Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
+
 Ostadix-lang now has two computation layers that share one project but do different
 jobs:
 
@@ -86,6 +91,9 @@ placement proof and a durable, explicitly closed session. Neither an admission
 nor a transport version is silently translated into another.
 
 Admission version and backend-catalog generation are separate version axes.
+`O version --json` reports the independent coordinates compiled into the
+interpreter; [VERSIONING.md](docs/VERSIONING.md) defines their compatibility
+rules.
 The current authorizing catalog is `ostadix.backend-catalog/v4`; its schema is
 part of both the whole-catalog digest and every backend-specification digest.
 A placement profile that advertises any V3 backend identity remains decodable
@@ -1457,21 +1465,58 @@ exactly-once guarantee.
 
 ### Docker
 
-The Dockerfile builds the hosted `O`, `olangc`, and `o-link` binaries and
-packages Python 3 with the core shims. The native O-core compiler and
-`o-unlink` remain part of the direct Cargo build:
+The default image is an intentionally minimal hosted profile. It contains `O`,
+`olangc`, `o-link`, Python 3, and the core shim adapters. Python blocks and
+Ostadix's built-in renderers are available, but copying an adapter does not
+install the runtime it delegates to: this image does not include `rustc`,
+Cargo, Node.js, Ruby, a JDK, C/C++ compilers, Nix, or the other optional
+language tools. The native O-core compiler and `o-unlink` remain part of the
+direct Cargo build.
+
+Build the versioned image and run `hello.O` from a read-only source mount:
 
 ```bash
-docker build -t o-lang .
+docker build -t o-lang:0.2.0 .
 
-docker run --rm -v "$PWD:/work" o-lang examples/hello.O
-docker run --rm -it o-lang --repl
-# Bare directory mode literal-links and runs immediately.
-docker run --rm -v "$PWD:/work" --entrypoint o-link \
-    o-lang src/ -o app.O
-# Use --project when only an inert route-preserving bundle is wanted.
-docker run --rm -v "$PWD:/work" --entrypoint o-link \
-    o-lang --project src/ -o project.O
+docker run --rm \
+    --mount type=bind,src="$PWD",dst=/work,readonly \
+    o-lang:0.2.0 examples/hello.O
+
+docker run --rm -it o-lang:0.2.0 --repl
+```
+
+Bare single-directory mode deliberately literal-links and immediately runs all
+selected executable blocks. This example mounts only the checked-in
+Python-only fixture; `/tmp/app.O` is discarded with the container. Overriding
+the entrypoint still finds the image's shims through `O_BACKENDS_DIR`:
+
+```bash
+docker run --rm \
+    --mount type=bind,src="$PWD/examples/docker_literal",dst=/work,readonly \
+    --entrypoint o-link \
+    o-lang:0.2.0 . -o /tmp/app.O
+# 42
+```
+
+Project mode is inert unless `--run` is explicit. Use the repository root, not
+`src/`, so `Cargo.toml` and its routes are captured. The source mount remains
+read-only; shell redirection writes the generated document under the ignored
+host `target/` directory:
+
+```bash
+mkdir -p target/docker
+docker run --rm \
+    --mount type=bind,src="$PWD",dst=/work,readonly \
+    --entrypoint o-link \
+    o-lang:0.2.0 --project . --stdout > target/docker/project.O
+```
+
+The repository-owned Docker smoke gate exercises the build, read-only hello
+run, inert project lift, and Python literal execution through an overridden
+entrypoint:
+
+```bash
+bash scripts/smoke-docker.sh
 ```
 
 The O-core QEMU proof is intended to run directly on the host because it
@@ -2013,6 +2058,7 @@ builds and tests.
 ```bash
 cargo build
 cargo run -- examples/hello.O
+./target/debug/O version --json
 ```
 
 ### Use the REPL
@@ -2819,7 +2865,9 @@ cargo run --features notebook --bin o-notebook -- backends
 ## Architecture
 
 Ostadix-lang has two compiler and execution pipelines with a deliberate boundary
-between them.
+between them. [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) identifies
+which transformations are digest-linked today and the authority each artifact
+does—or deliberately does not—carry.
 
 ```text
 Hosted orchestration

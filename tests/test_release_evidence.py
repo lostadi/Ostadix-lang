@@ -133,10 +133,15 @@ class G2Aarch64EvidenceTests(unittest.TestCase):
         ):
             release_evidence.verify_transcript([gate], gate["script"], duplicated)
 
-    def test_ci_installs_the_aarch64_qemu_system_package(self):
+    def test_ci_installs_and_runs_the_manifest_bound_aarch64_gate(self):
+        manifest = self.manifest()
+        gates = release_evidence.validated_gates(manifest)
+        gate = self.g2(manifest)
+        self.assertIn(gate, gates)
+        release_evidence.validate(gates)
+
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("qemu-system-arm", workflow)
-        self.assertIn("command -v qemu-system-aarch64", workflow)
 
 
 if __name__ == "__main__":

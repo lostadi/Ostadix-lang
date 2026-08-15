@@ -18,6 +18,9 @@ fn main() -> Result<()> {
     }
 
     let mut args = env::args().skip(1).collect::<VecDeque<_>>();
+    if print_version_if_requested(&args)? {
+        return Ok(());
+    }
     let backends = registered_backends();
     let mut backend_grants = Vec::new();
     let mut json_output = false;
@@ -301,6 +304,8 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
         "  O --require-source-sha256 HEX --require-execution-intent-sha256 HEX <input.O> [backends_dir]"
     )?;
     writeln!(out, "  O --help")?;
+    writeln!(out, "  O --version | O version")?;
+    writeln!(out, "  O version --json")?;
     writeln!(out)?;
     writeln!(out, "Runs a .O file or starts the interactive REPL.")?;
     writeln!(
@@ -308,6 +313,31 @@ fn print_usage(out: &mut impl Write) -> io::Result<()> {
         "With no arguments in an interactive terminal, O starts the REPL. Backend grants are optional compatibility hooks; shim backends have default host authority."
     )?;
     Ok(())
+}
+
+fn print_version_if_requested(args: &VecDeque<String>) -> Result<bool> {
+    let arguments = args.iter().map(String::as_str).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        ["--version"] | ["version"] => {
+            println!("O {}", env!("CARGO_PKG_VERSION"));
+            Ok(true)
+        }
+        ["version", "--json"] => {
+            println!(
+                "{}",
+                serde_json::to_string(&o_lang::version::OstadixVersionReportV1::current())
+                    .context("failed to serialize Ostadix version report")?
+            );
+            Ok(true)
+        }
+        ["--version", ..] => {
+            bail!("--version does not accept additional arguments")
+        }
+        ["version", ..] => {
+            bail!("usage: O version [--json]")
+        }
+        _ => Ok(false),
+    }
 }
 
 fn resolve_shim_dir(explicit: Option<PathBuf>) -> Result<(PathBuf, Option<ExtractedShims>)> {
