@@ -54,7 +54,8 @@ static bool has_current_byte(const OParser *p);
 static bool starts_with_at(const OParser *p, size_t pos, const char *pat);
 static bool starts_with(const OParser *p, const char *pat);
 static bool starts_with_exact_closer(const OParser *p, size_t pos,
-                                     const char *closer, size_t closer_len);
+                                     const Tag *tag, const char *closer,
+                                     size_t closer_len);
 static void skip_horizontal_whitespace(OParser *p);
 static void skip_whitespace(OParser *p);
 static void skip_to_end_of_line(OParser *p);
@@ -567,21 +568,30 @@ static bool starts_with(const OParser *p, const char *pat) {
     return starts_with_at(p, p->pos, pat);
 }
 
-/* A bare closer must not consume the prefix of a bracketed/attributed closer.
-   This makes the opener spelling part of the delimiter identity: `)_python`
-   cannot close `python[*]^(` and vice versa. */
+/* Match Rust's tag-shape boundary rule. A bare tag can still grow an
+   identifier, environment, or attribute; an environment tag can still grow
+   an attribute; an attributed tag is already complete. */
 static bool starts_with_exact_closer(const OParser *p, size_t pos,
-                                     const char *closer, size_t closer_len) {
+                                     const Tag *tag, const char *closer,
+                                     size_t closer_len) {
     size_t after;
+    unsigned char next;
 
-    if (!starts_with_at(p, pos, closer)) {
+    if (tag == NULL || !starts_with_at(p, pos, closer)) {
         return false;
     }
     after = pos + closer_len;
     if (after >= p->source_len) {
         return true;
     }
-    return p->source[after] != '[' && p->source[after] != '{';
+    next = (unsigned char)p->source[after];
+    if (tag->attr != NULL) {
+        return true;
+    }
+    if (tag->env_id != OLANG_ENV_EPHEMERAL) {
+        return next != '{';
+    }
+    return !is_ident_continue(next) && next != '[' && next != '{';
 }
 
 static void skip_horizontal_whitespace(OParser *p) {
@@ -1142,7 +1152,8 @@ static ONodeList *parse_until(OParser *p, const Tag *expected_closer) {
 
     while (p->pos < p->source_len) {
         if (expected_closer != NULL &&
-            starts_with_exact_closer(p, p->pos, closer, closer_len)) {
+            starts_with_exact_closer(p, p->pos, expected_closer, closer,
+                                     closer_len)) {
             if (!flush_text(nodes, p, text_start, p->pos)) {
                 onode_list_free(nodes);
                 free(closer);
@@ -1234,7 +1245,8 @@ static ONodeList *parse_until(OParser *p, const Tag *expected_closer) {
                 }
                 p->pos = temp_pos;
                 if (expected_closer != NULL &&
-                    starts_with_exact_closer(p, after_bs, closer, closer_len)) {
+                    starts_with_exact_closer(p, after_bs, expected_closer,
+                                             closer, closer_len)) {
                     p->pos = temp_pos;
                     if (!flush_text(nodes, p, text_start, p->pos) ||
                         !append_raw_text_literal(nodes, closer)) {

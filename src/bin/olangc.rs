@@ -1388,12 +1388,9 @@ fn dump_schedule_why(
 
     print!("{}", why.to_text());
     print_schedule_why_origins(input, source, &why, &origins)?;
-    let footprint = o_lang::placement::requirement_footprint_for_program_node(
-        &program,
-        &plan,
-        target,
-    )
-    .context("failed to derive Hosted Placement V6 requirement footprint")?;
+    let footprint =
+        o_lang::placement::requirement_footprint_for_program_node(&program, &plan, target)
+            .context("failed to derive Hosted Placement V6 requirement footprint")?;
     println!(
         "\n; Hosted Placement V6 requirement footprint (descriptive; not authority)\n{}",
         serde_json::to_string_pretty(&footprint)
@@ -1824,11 +1821,15 @@ fn executable_op_label(
         (ExecutableOp::Invoke { fn_name, mode }, _) => {
             format!("invoke:{fn_name} ({mode:?})")
         }
-        (ExecutableOp::EvalBackend { lang, env }, _) => match o_lang::environment::EnvironmentRefV2::from_encoded(*env) {
-            o_lang::environment::EnvironmentRefV2::Ephemeral => format!("eval:{lang}"),
-            o_lang::environment::EnvironmentRefV2::LinkerIsolated => format!("eval:{lang}[*]"),
-            o_lang::environment::EnvironmentRefV2::Persistent(id) => format!("eval:{lang}[{id}]"),
-        },
+        (ExecutableOp::EvalBackend { lang, env }, _) => {
+            match o_lang::environment::EnvironmentRefV2::from_encoded(*env) {
+                o_lang::environment::EnvironmentRefV2::Ephemeral => format!("eval:{lang}"),
+                o_lang::environment::EnvironmentRefV2::LinkerIsolated => format!("eval:{lang}[*]"),
+                o_lang::environment::EnvironmentRefV2::Persistent(id) => {
+                    format!("eval:{lang}[{id}]")
+                }
+            }
+        }
         (ExecutableOp::InlineBackend { lang }, _) => format!("inline:{lang}"),
         (ExecutableOp::ForceRequest { kind }, _) => format!("force-request:{kind}"),
         (ExecutableOp::Request { kind }, _) => format!("request:{kind}"),

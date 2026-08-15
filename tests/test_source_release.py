@@ -389,6 +389,7 @@ class SourceReleaseTests(unittest.TestCase):
             "LICENSE": FIXTURE_LICENSE,
             "README.md": fixture_readme(),
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "setup.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
             "docs/HOSTED_PLACEMENT_V6.md": "fixture hosted placement contract\n",
@@ -521,6 +522,9 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
             "src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
+            "src/bin/o-node.rs": "// fixture direct hosted-node CLI\n",
+            "src/bin/o-registry.rs": "// fixture signed local registry CLI\n",
+            "src/bin/octl.rs": "// fixture direct hosted-node client CLI\n",
             "src/bin/olink.rs": "// fixture project linker CLI\n",
             "src/bin/olangc.rs": "// fixture olangc project planner CLI\n",
             "src/bin/ocorec.rs": "// fixture O-core compiler CLI\n",
@@ -535,6 +539,8 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hgraph/graph.rs": "// fixture HGraph validation\n",
             "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
+            "src/hosted_remote/node.rs": "// fixture hosted node runtime\n",
+            "src/placement/records.rs": "// fixture placement validity records\n",
             "src/project/executor.rs": "// fixture project HGraph executor\n",
             "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
             "src/project/launch.rs": "// fixture World-bound project launch\n",
@@ -548,6 +554,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/project/world_execution.rs": (
                 "// fixture bounded World-project execution and receipt emission\n"
             ),
+            "src/registry/store.rs": "// fixture transactional signed registry store\n",
             "src/world/grounding.rs": "// fixture World grounding projection\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
@@ -576,6 +583,8 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
             "tests/test_world_alpha_evidence.py": "# fixture World evidence tests\n",
+            "tests/hosted_remote_cli.rs": "#[test] fn hosted_remote_cli_fixture() {}\n",
+            "tests/registry_v1.rs": "#[test] fn registry_v1_fixture() {}\n",
             "tests/project_hgraph.rs": "#[test] fn project_hgraph_fixture() {}\n",
             "tests/project_hgraph_exec.rs": "#[test] fn project_hgraph_exec_fixture() {}\n",
             "tests/project_deployment_plan.rs": "#[test] fn project_deployment_plan_fixture() {}\n",
@@ -606,6 +615,7 @@ class SourceReleaseTests(unittest.TestCase):
                 executable=path
                 in {
                     "boot-and-test.sh",
+                    "setup.sh",
                     "okernel-multikernel/boot-and-test.sh",
                     "ocore/kernel/build.sh",
                     "ocore/kernel/build-aarch64-g2.sh",
@@ -733,6 +743,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "LICENSE",
                 "README.md",
                 "boot-and-test.sh",
+                "setup.sh",
                 "docs/CLAIMS.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
                 "docs/HOSTED_PLACEMENT_V6.md",
@@ -841,6 +852,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/evidence/profile.rs",
                 "src/effects.rs",
                 "src/runtime_exec.rs",
+                "src/bin/o-node.rs",
+                "src/bin/o-registry.rs",
+                "src/bin/octl.rs",
                 "src/bin/olink.rs",
                 "src/bin/olangc.rs",
                 "src/bin/ocorec.rs",
@@ -855,6 +869,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/hgraph/graph.rs",
                 "src/hgraph/kinds.rs",
                 "src/hgraph/from_oir.rs",
+                "src/hosted_remote/node.rs",
+                "src/placement/records.rs",
                 "src/project/executor.rs",
                 "src/project/deployment.rs",
                 "src/project/launch.rs",
@@ -866,6 +882,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/project/runtime_graph.rs",
                 "src/project/trace.rs",
                 "src/project/world_execution.rs",
+                "src/registry/store.rs",
                 "src/world/grounding.rs",
                 "src/world/identity.rs",
                 "src/world/identity_wire.rs",
@@ -894,6 +911,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
                 "tests/test_world_alpha_evidence.py",
+                "tests/hosted_remote_cli.rs",
+                "tests/registry_v1.rs",
                 "tests/project_hgraph.rs",
                 "tests/project_hgraph_exec.rs",
                 "tests/project_deployment_plan.rs",
@@ -945,6 +964,7 @@ class SourceReleaseTests(unittest.TestCase):
             self.assertEqual(embedded["file_count"], len(included))
             modes = {entry["path"]: entry["mode"] for entry in embedded["files"]}
             self.assertEqual(modes["boot-and-test.sh"], "100755")
+            self.assertEqual(modes["setup.sh"], "100755")
             self.assertEqual(
                 modes["okernel-multikernel/boot-and-test.sh"], "100755"
             )
@@ -1281,6 +1301,30 @@ class SourceReleaseTests(unittest.TestCase):
             r"smoke_ostadix_mcp\.py.*test_mcp_smoke\.py",
         ):
             self._build("missing-mcp.zip")
+
+    def test_hosted_placement_v6_commands_and_contract_are_required(self) -> None:
+        required = (
+            "docs/HOSTED_PLACEMENT_V6.md",
+            "setup.sh",
+            "src/bin/o-node.rs",
+            "src/bin/o-registry.rs",
+            "src/bin/octl.rs",
+            "src/hosted_remote/node.rs",
+            "src/placement/records.rs",
+            "src/registry/store.rs",
+            "tests/hosted_remote_cli.rs",
+            "tests/registry_v1.rs",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove hosted placement V6 surface")
+
+        with self.assertRaises(release.ReleaseError) as raised:
+            self._build("missing-hosted-placement-v6.zip")
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for required_path in required:
+            self.assertIn(required_path, message)
 
     def test_mcp_config_and_crate_license_are_structurally_validated(self) -> None:
         self._commit({".mcp.json": '{"mcpServers":{}}\n'})

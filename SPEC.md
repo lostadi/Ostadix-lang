@@ -61,6 +61,10 @@ is not an environment identity and two `[*]` blocks do not denote the same
 actor. The two high `u32` wire values used for bare and `[*]` environments are
 reserved and MUST be rejected when spelled as numeric persistent IDs.
 
+The Rust runtime, Python reference, and C17 edition support `LANG[*]` parsing
+and its fresh-per-occurrence semantics under sequential evaluation. This
+portable environment form does not imply portable autonomous-call grammar.
+
 The parser requires the opener and closer to match textually. If you opened
 with `python^(` you must close with `)_python`; `python[0]^(` closes with
 `)_python[0]`, and `python[*]^(` closes with `)_python[*]`.
@@ -767,6 +771,13 @@ Two resolution modes are used internally:
 
 #### Scheduler guarantees
 
+The `autonomous(batch(...))` call-expression grammar and the guarantees in this
+subsection apply to the authoritative Rust edition. The C17 edition executes
+`LANG[*]` operations serially, and the Python reference does not implement the
+call-expression grammar needed to parse this wrapper. Consequently,
+`o-link --parallel` output currently requires the Rust edition even though
+ordinary sequential `LANG[*]` source is supported by all three hosted editions.
+
 Under `autonomous(batch(…))`:
 
 1. The inner requests are buffered (not executed) while evaluating the body.
@@ -918,6 +929,8 @@ output is one rendering of that tree.
 Same core tag set minus Rust-only orchestration extensions.
 `quote` and `O` are structural backends implemented via `eval_ast`.
 Let-bindings (`let NAME = LANG^(...)`) and `$var` substitution are supported.
+Sequential `LANG[*]` blocks use fresh evaluator state per occurrence. General
+call-expression grammar, including `autonomous(batch(...))`, is not implemented.
 
 Adding a new language: write a Backend subclass, add it to
 `o_lang/backends/__init__.py::default_registry`, and add the tag to
