@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::backend::state::{
-    BackendCheckpointV1, BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendWireCommandV2,
-    BackendWireResponseV2,
+    ensure_evaluator_snapshot_bound, sandbox_policy_sha256, BackendCheckpointV1,
+    BackendRestoreReceiptV1, BackendStateCapabilitiesV1, BackendStateTierV1, BackendWireCommandV2,
+    BackendWireResponseV2, EvaluatorActorCheckpointV1, EvaluatorStateSnapshotV1,
 };
 use crate::capability::BackendSandboxPolicy;
 use crate::value::OValue;
@@ -705,9 +706,15 @@ impl BackendProcess {
             bail!("backend session identity must be a 64-character SHA-256 digest");
         }
         #[cfg(test)]
-        let _ = executable_leases;
-        #[cfg(test)]
         let mut command = legacy_backend_command(shim_path, sandbox)?;
+        #[cfg(test)]
+        if let Some(executable_leases) = executable_leases {
+            executable_leases.verify_backend(lang)?;
+            command.env(
+                crate::runtime_exec::ADMITTED_EXECUTABLE_MANIFEST_ENV,
+                executable_leases.backend_manifest_json(lang)?,
+            );
+        }
 
         #[cfg(not(test))]
         let mut command = rust_backend_command(
@@ -1741,6 +1748,114 @@ impl ProcessRegistry {
             .expect("resolved backend process is missing")
             .checkpoint(max_bytes)
             .with_context(|| format!("failed to checkpoint backend `{lang}[{env_id}]`"))
+    }
+
+    /// Capture every settled persistent actor without removing, replacing, or
+    /// shutting down any registry entry. A refusal or protocol error aborts
+    /// the whole aggregate, while actors already queried remain live.
+    pub(crate) fn checkpoint_persistent_actors(
+        &mut self,
+        max_total_bytes: u64,
+    ) -> Result<EvaluatorStateSnapshotV1> {
+        if max_total_bytes == 0 {
+            bail!("evaluator snapshot byte limit must be non-zero");
+        }
+        let mut ordered = self
+            .registry
+            .keys()
+            .filter(|(_, env_id, _, _)| *env_id <= crate::environment::MAX_PERSISTENT_ENV_ID)
+            .cloned()
+            .map(|key| sandbox_policy_sha256(key.2.permissions()).map(|digest| (key, digest)))
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_by(|(left, left_sandbox), (right, right_sandbox)| {
+            (&left.0, left.1, left_sandbox, &left.3).cmp(&(
+                &right.0,
+                right.1,
+                right_sandbox,
+                &right.3,
+            ))
+        });
+
+        let mut actors = Vec::with_capacity(ordered.len());
+        let empty = EvaluatorStateSnapshotV1::new(Vec::new())?;
+        ensure_evaluator_snapshot_bound(&empty, max_total_bytes)?;
+        for ((lang, env_id, sandbox, launch_generation_sha256), _) in ordered {
+            let partial = EvaluatorStateSnapshotV1::new(actors.clone())?;
+            let used = u64::try_from(partial.encoded_len()?)
+                .context("partial evaluator snapshot length exceeds u64")?;
+            let remaining = max_total_bytes.checked_sub(used).ok_or_else(|| {
+                anyhow!("evaluator snapshot metadata exhausted its aggregate byte limit")
+            })?;
+            if remaining == 0 {
+                bail!("evaluator snapshot metadata exhausted its aggregate byte limit");
+            }
+
+            let capabilities = self.state_capabilities(&lang, env_id, &sandbox)?;
+            if capabilities.backend != lang {
+                bail!(
+                    "backend `{lang}[{env_id}]` reported state identity `{}`",
+                    capabilities.backend
+                );
+            }
+            if capabilities.tier == BackendStateTierV1::ExternalPinned
+                || !capabilities.restore_supported
+            {
+                return Err(anyhow::Error::new(BackendStatePinned {
+                    backend: lang,
+                    path: "$actor".to_string(),
+                    message:
+                        "backend state is pinned to external resources and has no portable restore"
+                            .to_string(),
+                }));
+            }
+            let checkpoint = self.checkpoint_env(&lang, env_id, &sandbox, remaining)?;
+            if checkpoint.tier != capabilities.tier || checkpoint.codec != capabilities.codec {
+                bail!(
+                    "backend `{lang}[{env_id}]` checkpoint disagrees with its advertised state capabilities"
+                );
+            }
+            actors.push(EvaluatorActorCheckpointV1::new(
+                lang,
+                env_id,
+                sandbox.permissions().to_vec(),
+                launch_generation_sha256,
+                checkpoint,
+            )?);
+            let partial = EvaluatorStateSnapshotV1::new(actors.clone())?;
+            ensure_evaluator_snapshot_bound(&partial, max_total_bytes)?;
+        }
+
+        let snapshot = EvaluatorStateSnapshotV1::new(actors)?;
+        ensure_evaluator_snapshot_bound(&snapshot, max_total_bytes)?;
+        Ok(snapshot)
+    }
+
+    /// Validate a staged restore set against the live registry without
+    /// mutating either side. This makes multi-actor staging all-or-nothing.
+    pub(crate) fn ensure_restore_targets_vacant(
+        &self,
+        actors: &[EvaluatorActorCheckpointV1],
+    ) -> Result<()> {
+        for actor in actors {
+            let sandbox = BackendSandboxPolicy::new(actor.sandbox_permissions.iter().copied());
+            if self
+                .registry
+                .keys()
+                .any(|(candidate_lang, candidate_env, candidate_sandbox, _)| {
+                    candidate_lang == &actor.canonical_backend
+                        && *candidate_env == actor.environment_id
+                        && candidate_sandbox == &sandbox
+                })
+            {
+                bail!(
+                    "state.restore-conflict: backend `{}[{}]` already owns an open session for sandbox {}",
+                    actor.canonical_backend,
+                    actor.environment_id,
+                    actor.sandbox_policy_sha256
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Restore a checkpoint into a new physical actor and publish it only

@@ -22,6 +22,9 @@ pub const BACKEND_CHECKPOINT_SCHEMA_V1: &str = "ostadix.backend-checkpoint/v1";
 pub const BACKEND_RESTORE_RECEIPT_SCHEMA_V1: &str = "ostadix.backend-restore-receipt/v1";
 pub const BACKEND_STATE_REASON_SCHEMA_V1: &str = "ostadix.backend-state-reason/v1";
 pub const BACKEND_STATE_ERROR_SCHEMA_V1: &str = "ostadix.backend-state-error/v1";
+pub const EVALUATOR_STATE_SNAPSHOT_SCHEMA_V1: &str = "ostadix.evaluator-state-snapshot/v1";
+pub const EVALUATOR_ACTOR_CHECKPOINT_SCHEMA_V1: &str = "ostadix.evaluator-actor-checkpoint/v1";
+pub const BACKEND_SANDBOX_POLICY_SCHEMA_V1: &str = "ostadix.backend-sandbox-policy/v1";
 pub const STATELESS_EMPTY_CODEC_V1: &str = "ostadix.backend-empty/v1";
 pub const SQL_CLI_CODEC_V1: &str = "ostadix.sqlite-cli-main/v1";
 
@@ -189,6 +192,173 @@ impl BackendCheckpointV1 {
 
     pub fn encoded_len(&self) -> Result<usize> {
         Ok(crate::wire::encode_message(self)?.len())
+    }
+}
+
+/// Canonical, authority-free metadata for one persistent evaluator actor.
+///
+/// This record is intentionally descriptive. It can prove that a future
+/// admitted dispatch is the exact target for a pending restore, but it cannot
+/// launch that target: live executable leases remain process-local authority.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorActorCheckpointV1 {
+    pub schema: String,
+    pub canonical_backend: String,
+    pub environment_id: u32,
+    pub sandbox_permissions: Vec<crate::value::BackendAuthority>,
+    pub sandbox_policy_sha256: String,
+    pub launch_generation_sha256: String,
+    pub runtime_binding_sha256: String,
+    pub checkpoint: BackendCheckpointV1,
+}
+
+impl EvaluatorActorCheckpointV1 {
+    pub fn new(
+        canonical_backend: impl Into<String>,
+        environment_id: u32,
+        sandbox_permissions: Vec<crate::value::BackendAuthority>,
+        launch_generation_sha256: impl Into<String>,
+        checkpoint: BackendCheckpointV1,
+    ) -> Result<Self> {
+        let runtime_binding_sha256 = checkpoint.runtime_binding_sha256.clone();
+        let actor = Self {
+            schema: EVALUATOR_ACTOR_CHECKPOINT_SCHEMA_V1.to_string(),
+            canonical_backend: canonical_backend.into(),
+            environment_id,
+            sandbox_policy_sha256: sandbox_policy_sha256(&sandbox_permissions)?,
+            sandbox_permissions,
+            launch_generation_sha256: launch_generation_sha256.into(),
+            runtime_binding_sha256,
+            checkpoint,
+        };
+        actor.validate()?;
+        Ok(actor)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != EVALUATOR_ACTOR_CHECKPOINT_SCHEMA_V1 {
+            bail!(
+                "unsupported evaluator actor-checkpoint schema `{}`",
+                self.schema
+            );
+        }
+        if self.canonical_backend.is_empty() {
+            bail!("evaluator actor checkpoint requires a canonical backend");
+        }
+        if self.environment_id > crate::environment::MAX_PERSISTENT_ENV_ID {
+            bail!(
+                "evaluator actor checkpoint environment {} is not persistent",
+                self.environment_id
+            );
+        }
+        if self
+            .sandbox_permissions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            bail!("evaluator actor checkpoint permissions are not canonical");
+        }
+        validate_canonical_sha256("sandbox policy", &self.sandbox_policy_sha256)?;
+        let actual_sandbox = sandbox_policy_sha256(&self.sandbox_permissions)?;
+        if actual_sandbox != self.sandbox_policy_sha256 {
+            bail!(
+                "evaluator actor checkpoint sandbox digest mismatch: expected {}, got {actual_sandbox}",
+                self.sandbox_policy_sha256
+            );
+        }
+        validate_canonical_sha256("actor launch generation", &self.launch_generation_sha256)?;
+        validate_canonical_sha256("actor runtime binding", &self.runtime_binding_sha256)?;
+        self.checkpoint.validate()?;
+        if self.checkpoint.backend != self.canonical_backend {
+            bail!(
+                "evaluator actor backend `{}` disagrees with checkpoint backend `{}`",
+                self.canonical_backend,
+                self.checkpoint.backend
+            );
+        }
+        if self.checkpoint.runtime_binding_sha256 != self.runtime_binding_sha256 {
+            bail!("evaluator actor runtime binding disagrees with its checkpoint");
+        }
+        if self.checkpoint.tier == BackendStateTierV1::ExternalPinned
+            || !self.checkpoint.external_resources.is_empty()
+        {
+            bail!(
+                "state.pin-required: external backend resources are not portable evaluator state"
+            );
+        }
+        Ok(())
+    }
+
+    fn canonical_sort_key(&self) -> (&str, u32, &str, &str) {
+        (
+            &self.canonical_backend,
+            self.environment_id,
+            &self.sandbox_policy_sha256,
+            &self.launch_generation_sha256,
+        )
+    }
+}
+
+/// Complete portable backend-owned state for an evaluator at settled actor
+/// boundaries. Actor order is canonical so semantically identical snapshots
+/// have identical wire bytes and digests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorStateSnapshotV1 {
+    pub schema: String,
+    pub actors: Vec<EvaluatorActorCheckpointV1>,
+}
+
+impl EvaluatorStateSnapshotV1 {
+    pub fn new(mut actors: Vec<EvaluatorActorCheckpointV1>) -> Result<Self> {
+        actors.sort_by(|left, right| left.canonical_sort_key().cmp(&right.canonical_sort_key()));
+        let snapshot = Self {
+            schema: EVALUATOR_STATE_SNAPSHOT_SCHEMA_V1.to_string(),
+            actors,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != EVALUATOR_STATE_SNAPSHOT_SCHEMA_V1 {
+            bail!(
+                "unsupported evaluator state-snapshot schema `{}`",
+                self.schema
+            );
+        }
+        for actor in &self.actors {
+            actor.validate()?;
+        }
+        if self
+            .actors
+            .windows(2)
+            .any(|pair| pair[0].canonical_sort_key() >= pair[1].canonical_sort_key())
+        {
+            bail!("evaluator actor checkpoints are not in unique canonical order");
+        }
+        if self.actors.windows(2).any(|pair| {
+            pair[0].canonical_backend == pair[1].canonical_backend
+                && pair[0].environment_id == pair[1].environment_id
+                && pair[0].sandbox_policy_sha256 == pair[1].sandbox_policy_sha256
+        }) {
+            bail!("evaluator state snapshot contains a duplicate logical actor");
+        }
+        Ok(())
+    }
+
+    pub fn encoded_len(&self) -> Result<usize> {
+        Ok(self.canonical_bytes()?.len())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        crate::wire::encode_message(self)
+    }
+
+    pub fn snapshot_sha256(&self) -> Result<String> {
+        Ok(hex::encode(Sha256::digest(self.canonical_bytes()?)))
     }
 }
 
@@ -398,6 +568,32 @@ pub fn ensure_checkpoint_bound(checkpoint: &BackendCheckpointV1, max_bytes: u64)
     Ok(())
 }
 
+pub fn ensure_evaluator_snapshot_bound(
+    snapshot: &EvaluatorStateSnapshotV1,
+    max_bytes: u64,
+) -> Result<()> {
+    if max_bytes == 0 {
+        bail!("evaluator snapshot byte limit must be non-zero");
+    }
+    snapshot.validate()?;
+    let encoded = snapshot.encoded_len()?;
+    let limit: usize = max_bytes
+        .try_into()
+        .context("evaluator snapshot byte limit exceeds host address space")?;
+    if encoded > limit {
+        bail!("evaluator snapshot length {encoded} exceeds requested maximum {limit}");
+    }
+    Ok(())
+}
+
+pub fn sandbox_policy_sha256(permissions: &[crate::value::BackendAuthority]) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(BACKEND_SANDBOX_POLICY_SCHEMA_V1.as_bytes());
+    digest.update([0]);
+    digest.update(crate::wire::encode_message(&permissions.to_vec())?);
+    Ok(hex::encode(digest.finalize()))
+}
+
 pub fn payload_sha256(payload: &Value) -> Result<String> {
     Ok(hex::encode(Sha256::digest(crate::wire::encode_message(
         payload,
@@ -411,10 +607,81 @@ fn validate_sha256(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_canonical_sha256(field: &str, value: &str) -> Result<()> {
+    validate_sha256(field, value)?;
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        bail!("{field} is not canonical lowercase SHA-256");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{OWireCommand, OWireResponse};
+    use crate::value::{BackendAuthority, OWireCommand, OWireResponse};
+
+    fn evaluator_actor(environment_id: u32, launch_byte: &str) -> EvaluatorActorCheckpointV1 {
+        EvaluatorActorCheckpointV1::new(
+            "bash",
+            environment_id,
+            vec![BackendAuthority::FileRead, BackendAuthority::Process],
+            launch_byte.repeat(32),
+            empty_checkpoint("bash", &"11".repeat(32)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluator_snapshot_bytes_are_canonical_bounded_and_round_trip() {
+        let snapshot =
+            EvaluatorStateSnapshotV1::new(vec![evaluator_actor(9, "22"), evaluator_actor(3, "33")])
+                .unwrap();
+        assert_eq!(snapshot.actors[0].environment_id, 3);
+        assert_eq!(snapshot.actors[1].environment_id, 9);
+
+        let bytes = snapshot.canonical_bytes().unwrap();
+        let decoded: EvaluatorStateSnapshotV1 = crate::wire::decode_message(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        ensure_evaluator_snapshot_bound(&snapshot, bytes.len() as u64).unwrap();
+        assert!(ensure_evaluator_snapshot_bound(&snapshot, bytes.len() as u64 - 1).is_err());
+        assert_eq!(snapshot.snapshot_sha256().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn evaluator_snapshot_rejects_duplicate_logical_actor() {
+        let first = evaluator_actor(7, "22");
+        let mut second = first.clone();
+        second.launch_generation_sha256 = "33".repeat(32);
+        let error = EvaluatorStateSnapshotV1::new(vec![first, second]).unwrap_err();
+        assert!(error.to_string().contains("duplicate logical actor"));
+    }
+
+    #[test]
+    fn evaluator_actor_checkpoint_rejects_external_resources_as_portable() {
+        let checkpoint = BackendCheckpointV1::new(
+            "ubuntu_vm",
+            BackendStateTierV1::ExternalPinned,
+            "ostadix.external-vm/v1",
+            "11".repeat(32),
+            serde_json::json!({ "kind": "external" }),
+            vec![BackendExternalResourceV1 {
+                kind: "virtual-machine".to_string(),
+                identity: "vm-7".to_string(),
+                recovery: "continue-pinned".to_string(),
+                metadata: BTreeMap::new(),
+            }],
+        )
+        .unwrap();
+        let error = EvaluatorActorCheckpointV1::new(
+            "ubuntu_vm",
+            7,
+            Vec::new(),
+            "22".repeat(32),
+            checkpoint,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not portable evaluator state"));
+    }
 
     #[test]
     fn legacy_command_shapes_are_byte_identical() {
