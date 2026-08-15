@@ -13,11 +13,15 @@ abstract: >-
   the runtime derives, validates, solves, and schedules a whole-program
   hypergraph (HGraph); the HGraph coordinator is the default executor and the
   ordered OIR path remains a differential oracle. The additive Hosted Placement
-  V6 preview contains target-descriptor, warrant, and signed namespace-registry
-  cores plus a separate bounded mutual-TLS prepared-operation channel; it does
-  not yet compose those pieces into scheduler-selected placement and remains
-  explicitly separate from an OSTADIX World. The repository contains the
-  authoritative
+  V6 preview composes target descriptors, requirements, warrants, capacity,
+  exact backend realization identity, and short-lived one-use authority with a
+  bounded mutual-TLS direct-node channel. Its durable V2 session path accepts
+  only one locally prepared shim fragment whose portable semantic bindings
+  reproduce the signed placement proof while process-local runtime authority is
+  rechecked at dispatch, then records mutations in a node-signed hash-chain
+  journal. Node selection remains explicit rather than
+  scheduler- or registry-driven, and this is neither an exactly-once claim nor
+  an OSTADIX World. The repository contains the authoritative
   Rust runtime, an actively supported C17 interpreter and AOT compiler, a
   readable Python semantic reference implementation, and the O-core
   freestanding native compiler path.
