@@ -4,35 +4,142 @@ on:
   workflow_dispatch:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
     branches: [master, main]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Rust authoritative runtime ─────────────────────────────────────────────
-  rust:
-    name: Rust authoritative runtime
+  contracts:
+    name: Contract surfaces
     runs-on: ubuntu-latest
-    env:
-      # Hosted-runtime integration gates must fail, rather than silently return,
-      # when a prerequisite promised by this release-evidence lane is absent.
-      OSTADIX_TEST_RUNTIME_POLICY: required
     steps:
-      - name: Start Rust lane duration clock
-        run: |
-          mkdir -p "$RUNNER_TEMP/ostadix-lifecycle"
-          date +%s > "$RUNNER_TEMP/ostadix-lifecycle/rust-lane-started-at"
-
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate authoritative contract projections
+        run: |
+          python3 scripts/contract_surfaces.py validate
+          python3 -m unittest -v tests.test_contract_surfaces
 
-      - name: Install Rust toolchain
+  rust-msrv:
+    name: Rust MSRV 1.93.1
+    needs: contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install supported-floor toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.93.1
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
+      - name: Check every target at the supported floor
+        run: cargo +1.93.1 check --locked --all-targets --all-features
+      - name: Check isolated MCP at the supported floor
+        run: cargo +1.93.1 check --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+
+  rust-quality:
+    name: Rust quality and source closure
+    needs: contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install release toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-quality-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all -- --check
+      - name: Clippy all targets and features
+        run: cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build Rust API documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.97.1 doc --locked --all-features --no-deps
+      - name: Verify every declared binary target
+        run: bash scripts/check_declared_bins.sh
+      - name: Check parser fuzz target
+        run: cargo +1.97.1 check --locked --manifest-path fuzz/Cargo.toml
 
-      - name: Verify required hosted evidence runtimes
+  rust-tests:
+    name: Rust semantic and reproducibility tests
+    needs: contracts
+    runs-on: ubuntu-latest
+    env:
+      OSTADIX_TEST_RUNTIME_POLICY: required
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install release toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - name: Install semantic-test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang sqlite3
+      - name: Verify declared runtime prerequisites
+        run: |
+          set -euo pipefail
+          while IFS= read -r runtime; do
+            executable="$(command -v "$runtime")" || {
+              echo "runtime-evidence status=missing-required policy=required runtime=$runtime" >&2
+              exit 1
+            }
+            echo "runtime-evidence status=located policy=required runtime=$runtime path=$executable"
+          done < <(python3 scripts/contract_surfaces.py required-executables --suite rust-tests)
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('Cargo.lock') }}
+      - name: Run broad Rust test suite
+        run: cargo +1.97.1 test --locked --all-targets --all-features --no-fail-fast
+      - name: Run deterministic parser properties
+        run: cargo +1.97.1 test --locked --test parser_proptest
+      - name: Verify byte-reproducible O-core objects
+        run: cargo +1.97.1 test --locked --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
+      - name: Run manifest-selected Rust example semantics
+        run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
+
+  rust-hosted:
+    name: Rust hosted lifecycle and placement
+    needs: contracts
+    runs-on: ubuntu-latest
+    env:
+      OSTADIX_TEST_RUNTIME_POLICY: required
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install release toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - name: Install hosted prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang openssl sqlite3
+      - name: Verify declared hosted runtimes
         run: |
           set -euo pipefail
           while IFS= read -r runtime; do
@@ -46,30 +153,24 @@ jobs:
             }
             first_line="${version%%$'\n'*}"
             echo "runtime-evidence status=invocable policy=required runtime=$runtime path=$executable version=$first_line"
-          done < <(python3 scripts/contract_surfaces.py required-executables --suite rust)
-
-      - name: Cache cargo registry and build
+          done < <(python3 scripts/contract_surfaces.py required-executables --suite rust-hosted)
+      - name: Cache Cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build
-        run: cargo build --all-targets --all-features --verbose
-
+          key: ${{ runner.os }}-cargo-hosted-${{ hashFiles('Cargo.lock') }}
+      - name: Build hosted targets
+        run: cargo +1.97.1 build --locked --all-targets --all-features
       - name: Run fast autonomous worker lifecycle gates
         timeout-minutes: 3
         env:
           O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/autonomous-workers.log
           RUST_BACKTRACE: "1"
         run: |
-          started_at="$(date +%s)"
-          status=0
+          mkdir -p "$RUNNER_TEMP/ostadix-lifecycle"
           for test_name in \
             ordinary_ephemeral_python_preserves_strict_fail_stop \
             explicit_one_worker_override_serializes_autonomous_blocks \
@@ -80,127 +181,31 @@ jobs:
             autonomous_worker_nested_hosted_callback_inherits_deadline \
             autonomous_nonresponsive_backend_fails_within_configured_bound
           do
-            cargo test \
-              --test autonomous_hosted_parallel \
-              "$test_name" \
-              -- \
-              --exact \
-              --nocapture \
-              --test-threads=1 || {
-                status=$?
-                break
-              }
+            cargo +1.97.1 test --locked --test autonomous_hosted_parallel "$test_name" -- --exact --nocapture --test-threads=1
           done
-          elapsed_seconds=$(( $(date +%s) - started_at ))
-          echo "fast_hosted_lifecycle_seconds=$elapsed_seconds"
-          printf -- '- Fast hosted lifecycle gates: `%s s`\n' \
-            "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
-
-      - name: Prove same-group active descendants become quiescent
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      - name: Prove descendant quiescence
         timeout-minutes: 2
         env:
           O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-descendant.log
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo test \
-            --test autonomous_hosted_parallel \
-            autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent \
-            -- \
-            --exact \
-            --nocapture \
-            --test-threads=1
-
-      - name: Run production Python backend-proxy lifecycle gate
+        run: cargo +1.97.1 test --locked --test autonomous_hosted_parallel autonomous_lingering_same_group_descendant_fails_and_group_becomes_quiescent -- --exact --nocapture --test-threads=1
+      - name: Run production backend-proxy lifecycle gate
         timeout-minutes: 2
         env:
           O_LIFECYCLE_TRACE: ${{ runner.temp }}/ostadix-lifecycle/backend-proxy.log
-          RUST_BACKTRACE: "1"
+        run: cargo +1.97.1 test --locked --test autonomous_hosted_parallel production_python_backend_proxy_shutdown_reaps_shim -- --exact --nocapture --test-threads=1
+      - name: Run hosted transport and session tests
         run: |
-          started_at="$(date +%s)"
-          status=0
-          cargo test \
-            --test autonomous_hosted_parallel \
-            production_python_backend_proxy_shutdown_reaps_shim \
-            -- \
-            --exact \
-            --nocapture \
-            --test-threads=1 || status=$?
-          elapsed_seconds=$(( $(date +%s) - started_at ))
-          echo "production_backend_proxy_lifecycle_seconds=$elapsed_seconds"
-          printf -- '- Production backend-proxy lifecycle gate: `%s s`\n' \
-            "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
-
-      - name: Run broad Rust test suite
-        run: cargo test --all-targets --all-features --verbose
-
-      - name: Build Rust API documentation with warnings denied
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --all-features --no-deps
-
-      - name: Verify every declared binary target
-        run: bash scripts/check_declared_bins.sh
-
-      - name: Run manifest-selected Rust example semantics
-        run: O_BIN="$PWD/target/debug/O" ./test_o_lang_examples.sh
-
-      - name: Run hosted HGraph benchmark semantic smoke
+          cargo +1.97.1 test --locked --test hosted_remote_cli
+          cargo +1.97.1 test --locked --test placement_v6
+          cargo +1.97.1 test --locked --test registry_v1
+      - name: Run hosted semantic smokes
         run: |
-          O_RELEASE_BIN="$PWD/target/debug/O" \
-            OLANGC_RELEASE_BIN="$PWD/target/debug/olangc" \
-            scripts/benchmark_hgraph_hosted.sh \
-            --warmups 0 \
-            --repetitions 1 \
-            --sleep 0 \
-            --workers 4 \
-            --missing-runtime fail
-
-      - name: Run hosted Live-World reference smoke
-        run: bash scripts/smoke-hosted-live-reference.sh
-
-      - name: Run hosted World ResourceKey conformance smoke
-        run: bash scripts/smoke-world-resource-keys.sh
-
-      - name: Run hosted project HGraph planning and compiled-adapter smoke
-        run: bash scripts/smoke-project-hgraph.sh
-
-      - name: Run hosted ordered project HGraph execution smoke
-        run: bash scripts/smoke-project-hgraph-exec.sh
-
-      - name: Run deterministic parser properties
-        run: cargo test --test parser_proptest
-
-      - name: Verify byte-reproducible O-core objects
-        run: cargo test --lib ocore::driver::tests::ocore_object_is_byte_reproducible_across_source_directories -- --exact
-
-      - name: Check parser fuzz target
-        run: cargo check --manifest-path fuzz/Cargo.toml
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Clippy lints
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Report Rust lane duration
-        if: always()
-        run: |
-          clock_file="$RUNNER_TEMP/ostadix-lifecycle/rust-lane-started-at"
-          if [[ -f "$clock_file" ]]; then
-            started_at="$(cat "$clock_file")"
-            elapsed_seconds=$(( $(date +%s) - started_at ))
-            echo "rust_lane_elapsed_seconds=$elapsed_seconds"
-            printf -- '- Rust lane elapsed time: `%s s`\n' \
-              "$elapsed_seconds" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "rust_lane_elapsed_seconds=unavailable"
-            printf -- '- Rust lane elapsed time: unavailable (clock did not start)\n' \
-              >> "$GITHUB_STEP_SUMMARY"
-          fi
-
+          O_RELEASE_BIN="$PWD/target/debug/O" OLANGC_RELEASE_BIN="$PWD/target/debug/olangc" \
+            scripts/benchmark_hgraph_hosted.sh --warmups 0 --repetitions 1 --sleep 0 --workers 4 --missing-runtime fail
+          bash scripts/smoke-hosted-live-reference.sh
+          bash scripts/smoke-world-resource-keys.sh
+          bash scripts/smoke-project-hgraph.sh
+          bash scripts/smoke-project-hgraph-exec.sh
       - name: Upload hosted lifecycle traces on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -210,185 +215,161 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ── Python reference runtime ───────────────────────────────────────────────
   python:
     name: Python reference runtime
+    needs: contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.x"
-
-      - name: Parser tests
-        run: python3 -m tests.test_parser
-
-      - name: Validate cross-edition example manifest
+      - name: Python contracts and reference runtime
         run: |
+          python3 -m tests.test_parser
           python3 tests/example_manifest.py validate
-          python3 -m unittest -v tests.test_example_manifest
+          python3 -m unittest -v tests.test_example_manifest tests.test_benchmark_hgraph_hosted
+          python3 -m unittest -v tests.test_ostadix_boot_media tests.test_ostadix_media_writer tests.test_ostadix_physical_evidence tests.test_setup
+          python3 -m tests.test_evaluator
+          python3 -B tests/test_bundled_shim_protocol.py -v
+          python3 -m compileall -q o_lang backends tests
 
-      - name: Validate hosted HGraph benchmark contracts
-        run: python3 -m unittest -v tests.test_benchmark_hgraph_hosted
-
-      - name: Validate deterministic OSTADIX media, writer, and observation safety
-        run: |
-          python3 -m unittest -v \
-            tests.test_ostadix_boot_media \
-            tests.test_ostadix_media_writer \
-            tests.test_ostadix_physical_evidence \
-            tests.test_setup
-
-      - name: Evaluator tests
-        run: python3 -m tests.test_evaluator
-
-      - name: Byte-compile all Python sources
-        run: python3 -m compileall -q o_lang backends tests
-
-  # ── C17 runtime and AOT compiler ───────────────────────────────────────────
   c17:
     name: C17 runtime and AOT compiler
+    needs: contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Make clean
-        run: make -C c_cpp clean
-
-      - name: Make build (interpreter + olangc)
-        run: make -C c_cpp
-
-      - name: Make manifest-selected interpreter smoke tests
-        run: make -C c_cpp test
-
-      - name: Make AOT compiler smoke tests
-        run: make -C c_cpp olangc-test
-
-      - name: Warning-clean C17 build and argv/path regression
-        run: make -C c_cpp warnings-as-errors
-
-      - name: CMake configure (clean out-of-source build)
+      - name: Build and test C17 editions
         run: |
-          rm -rf "${{ runner.temp }}/olang-cmake-build"
-          cmake -S c_cpp -B "${{ runner.temp }}/olang-cmake-build" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DOLANG_WARNINGS_AS_ERRORS=ON
+          make -C c_cpp clean
+          make -C c_cpp
+          make -C c_cpp test
+          make -C c_cpp olangc-test
+          make -C c_cpp warnings-as-errors
+          cmake -S c_cpp -B "${{ runner.temp }}/olang-cmake-build" -DCMAKE_BUILD_TYPE=Release -DOLANG_WARNINGS_AS_ERRORS=ON
+          cmake --build "${{ runner.temp }}/olang-cmake-build" --parallel
+          ctest --test-dir "${{ runner.temp }}/olang-cmake-build" --output-on-failure
 
-      - name: CMake build
-        run: cmake --build "${{ runner.temp }}/olang-cmake-build" --parallel
-
-      - name: CTest manifest, AOT, and path-safety smokes
-        run: ctest --test-dir "${{ runner.temp }}/olang-cmake-build" --output-on-failure
-
-  # ── Local MCP release surface (separate Cargo package) ─────────────────────
   mcp:
     name: Ostadix MCP release surface
+    needs: contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.97.1
+      - name: Build and validate MCP
+        run: |
+          cargo +1.97.1 build --release --locked --bin O --bin olangc
+          cargo +1.97.1 test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+          python3 -m unittest -v tests.test_mcp_smoke
+          cargo +1.97.1 clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
+          cargo +1.97.1 build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
+          python3 scripts/smoke_ostadix_mcp.py
 
-      - name: Build root runtime binaries used by MCP
-        run: cargo build --release --locked --bin O --bin olangc
-
-      - name: Test isolated MCP crate
-        run: cargo test --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
-
-      - name: Test MCP transport reader regressions
-        run: python3 -m unittest -v tests.test_mcp_smoke
-
-      - name: Clippy isolated MCP crate
-        run: cargo clippy --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml -- -D warnings
-
-      - name: Build isolated MCP release binary
-        run: cargo build --release --locked --manifest-path mcp/ostadix_lang_mcp_server/Cargo.toml
-
-      - name: Run direct stdio JSON-RPC MCP smoke
-        run: python3 scripts/smoke_ostadix_mcp.py
-
-  # ── Release-claim regression guard ─────────────────────────────────────────
   release-claims:
     name: Release-claim guard
+    needs: contracts
     runs-on: ubuntu-latest
     steps:
-      # Immutable evidence can bind content-addressed working-tree bytes that
-      # were committed by a later correction. The ledger validator searches
-      # reachable history for those exact bytes; a depth-1 checkout is
-      # intentionally insufficient.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-
-      - name: Check active docs for stale claims
-        run: bash scripts/check_release_claims.sh
-
-      - name: Test OSTADIX Alpha gate substitution rules
-        run: python3 -m unittest -v tests.test_world_alpha_evidence
-
-      - name: Test native release-evidence registry
-        run: python3 -m unittest -v tests.test_release_evidence
-
-      - name: Test deterministic source-release builder
-        run: python3 -m unittest -v tests.test_source_release
-
-      - name: Build and self-verify source release
+      - name: Validate release evidence and source archive
         run: |
-          python3 scripts/build_source_release.py \
-            --output "$RUNNER_TEMP/Ostadix-lang-source.zip"
-          python3 scripts/build_source_release.py \
-            --verify "$RUNNER_TEMP/Ostadix-lang-source.zip"
+          bash scripts/check_release_claims.sh
+          python3 -m unittest -v tests.test_world_alpha_evidence
+          python3 -m unittest -v tests.test_release_evidence
+          python3 -m unittest -v tests.test_source_release
+          python3 scripts/build_source_release.py --output "$RUNNER_TEMP/Ostadix-lang-source.zip"
+          python3 scripts/build_source_release.py --verify "$RUNNER_TEMP/Ostadix-lang-source.zip"
 
-  # ── O-core architectural and allocator proof ───────────────────────────────
   ocore-qemu:
     name: O-core QEMU proof
-    # Use the supported QEMU 9.2+ floor containing the real-mode NPT fix.
-    # Ubuntu 24.04 ships the affected QEMU 8.2.2 release.
+    needs: contracts
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.97.1
-
       - name: Install freestanding build, ELF inspection, and QEMU tools
         run: |
-          # The ubuntu-26.04 preview image currently carries optional Microsoft
-          # feeds that return HTTP 403. They are unrelated to this job and make
-          # apt reject otherwise healthy Ubuntu indexes.
           for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
             if [[ -f "$source" ]] && grep -qF packages.microsoft.com "$source"; then
               sudo mv "$source" "$source.disabled"
             fi
           done
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            clang lld llvm binutils \
-            qemu-system-x86 qemu-system-arm \
-            grub-efi-amd64-bin mtools ovmf
-          command -v llvm-objdump
-          command -v nm
-          command -v qemu-system-aarch64
+          sudo apt-get install --yes --no-install-recommends clang lld llvm binutils qemu-system-x86 qemu-system-arm grub-efi-amd64-bin mtools ovmf
           qemu-system-x86_64 --version
-
       - name: Verify isolated minimal Linux personality corpus
         run: ocore/kernel/check-linux-minimal-slice.sh
-
       - name: Prove deterministic x86_64 UEFI media boot through OVMF
         run: ocore/kernel/smoke-x86_64-uefi-media-qemu.sh
-
       # BEGIN GENERATED: REQUIRED_QEMU_EVIDENCE_CI
       - name: Validate central release-evidence manifest
         run: python3 scripts/release_evidence.py validate
-
       - name: Run all required portable QEMU evidence gates
         run: ./boot-and-test.sh smoke
       # END GENERATED: REQUIRED_QEMU_EVIDENCE_CI
+
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - contracts
+      - rust-msrv
+      - rust-quality
+      - rust-tests
+      - rust-hosted
+      - python
+      - c17
+      - mcp
+      - release-claims
+      - ocore-qemu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every independent evidence lane
+        env:
+          CONTRACTS: ${{ needs.contracts.result }}
+          RUST_MSRV: ${{ needs.rust-msrv.result }}
+          RUST_QUALITY: ${{ needs.rust-quality.result }}
+          RUST_TESTS: ${{ needs.rust-tests.result }}
+          RUST_HOSTED: ${{ needs.rust-hosted.result }}
+          PYTHON: ${{ needs.python.result }}
+          C17: ${{ needs.c17.result }}
+          MCP: ${{ needs.mcp.result }}
+          RELEASE_CLAIMS: ${{ needs.release-claims.result }}
+          OCORE_QEMU: ${{ needs.ocore-qemu.result }}
+        run: |
+          status=0
+          for name in CONTRACTS RUST_MSRV RUST_QUALITY RUST_TESTS RUST_HOSTED PYTHON C17 MCP RELEASE_CLAIMS OCORE_QEMU; do
+            result="${!name}"
+            printf '%s=%s\n' "$name" "$result"
+            [[ "$result" == success ]] || status=1
+          done
+          exit "$status"
+
+  release-package:
+    name: Release source package
+    needs: required-ci
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Build and verify release source
+        run: |
+          python3 scripts/build_source_release.py --output "$RUNNER_TEMP/Ostadix-lang-source.zip"
+          python3 scripts/build_source_release.py --verify "$RUNNER_TEMP/Ostadix-lang-source.zip"
+      - name: Upload verified source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Ostadix-lang-source-${{ github.sha }}
+          path: ${{ runner.temp }}/Ostadix-lang-source.zip
+          if-no-files-found: error
