@@ -48,9 +48,11 @@ the syntax that says "evaluate this in Python." The result is an OValue that
 HTML can embed directly, without either side knowing about the other's type
 system.
 
-**Start here:** [Quickstart](#quickstart) · [Architecture](#architecture) ·
-[Semantic custody](docs/SEMANTIC_CUSTODY.md) ·
-[Versioning](docs/VERSIONING.md) · [Evidence claims](docs/CLAIMS.md) ·
+**Start here:** [Quickstart](#quickstart) ·
+[Full setup](#getting-started-full-setup-guide) · [Docker](#docker) ·
+[Architecture](#architecture) · [Semantic custody](docs/SEMANTIC_CUSTODY.md) ·
+[Versioning](docs/VERSIONING.md) · [Testing](#running-the-tests) ·
+[Evidence claims](docs/CLAIMS.md) ·
 [Hosted Placement V6](docs/HOSTED_PLACEMENT_V6.md)
 
 Ostadix-lang now has two computation layers that share one project but do different
@@ -78,6 +80,41 @@ broad compiler/kernel target remains x86_64, while G2 adds a bounded,
 conservative `aarch64-unknown-none` scalar backend and single-vCPU QEMU/TCG
 execution. Those native target boundaries do not apply to hosted `.O`
 execution.
+
+## Quickstart
+
+For a fresh checkout, build the minimal hosted profile before invoking the
+installed tools. `setup.sh` also refreshes the local wrappers, so the commands
+below exercise the source revision you just checked out rather than an older
+binary already on `PATH`:
+
+```bash
+git clone https://github.com/lostadi/Ostadix-lang.git Ostadix-lang
+cd Ostadix-lang
+./setup.sh -y --minimal
+source "$HOME/.config/ostadix/env.sh"
+
+O examples/hello.O "$PWD/backends"
+# expected: [number] 2
+
+O version --json
+```
+
+`O version --json` reports compiled compatibility coordinates—package,
+toolchain, admission, catalog, Hosted, and World schema versions. It is
+descriptive: it does not prove that optional backend runtimes are installed,
+that a placement is authorized, or that a World is live.
+
+Choose the next path according to what you want to inspect:
+
+| Goal | Continue with |
+|------|---------------|
+| Learn typed-parenthesis syntax | [Gentle introduction](#gentle-introduction) |
+| Build all supported local tools | [Full setup guide](#getting-started-full-setup-guide) |
+| Inspect source -> OIR -> HGraph -> observed-result custody | [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) |
+| Run durable signed sessions | [Hosted V2 development quickstart](#hosted-v2-development-quickstart) |
+| Compile freestanding native code | [O-core native systems language](#o-core-native-systems-language) |
+| Run the repository gates | [Running the tests](#running-the-tests) |
 
 ## Hosted Placement V6
 
@@ -363,6 +400,18 @@ permanent. Absolute deadlines bound backend dispatch/wait and value acceptance;
 result encoding, checkpointing, journal fsync, and terminal response publication
 may finish later. They do not cancel or roll back effects already performed by
 a backend.
+
+For direct Rust embedders, `HostedV2Runtime::shutdown()` is the deterministic
+runtime lifecycle barrier. It stops admission, waits for in-flight API calls,
+queues actor close behind already accepted mailbox work, joins every actor
+thread owned by the runtime, and releases durable-store/root-lock ownership
+before returning. Operation terminality or a session-level Close alone does
+not prove runtime quiescence. Concurrent and repeated shutdown calls observe
+the same result; later direct calls receive `HostedV2RuntimeClosedV2`, while
+wire requests receive non-retryable `runtime-closed`. A worker panic produces
+`HostedV2RuntimeShutdownErrorV2` only after the root lock is released, allowing
+an immediate same-directory reopen. `Drop` remains bounded best-effort cleanup,
+not the deterministic shutdown contract.
 
 The current state tiers are deliberately narrow: `Stateless` requires a fresh
 fragment and a catalogued stateless backend; `CheckpointRestore` requires a
@@ -1511,13 +1560,20 @@ docker run --rm \
     o-lang:0.2.0 --project . --stdout > target/docker/project.O
 ```
 
-The repository-owned Docker smoke gate exercises the build, read-only hello
-run, inert project lift, and Python literal execution through an overridden
-entrypoint:
+The `Docker minimal runtime profile` lane is named in
+[`ci/required-jobs.toml`](ci/required-jobs.toml) and therefore feeds the
+aggregate `Required CI` job. It consumes the exact Docker probe declared in
+[`ci/test-suites.toml`](ci/test-suites.toml), then the repository-owned smoke
+script builds the image and exercises the read-only hello run, inert project
+lift, and Python literal execution through an overridden entrypoint:
 
 ```bash
 bash scripts/smoke-docker.sh
 ```
+
+The smoke requires a reachable Docker engine. `docker --version` proves only
+that the client is installed; a `docker info` or socket failure means the
+substrate gate did not run, not that the image passed or failed semantically.
 
 The O-core QEMU proof is intended to run directly on the host because it
 needs QEMU and the local Rust linker toolchain.
@@ -1594,6 +1650,9 @@ directories:
 # Interpreter smoke; expect [number] 2
 O examples/hello.O "$PWD/backends"
 
+# Compiled compatibility coordinates; descriptive, not a runtime inventory
+O version --json
+
 # Release CLI contract, including olangc and ocorec object emission
 bash tests/test_cli.sh
 
@@ -1607,6 +1666,11 @@ make -C c_cpp test
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
 ```
+
+Run `O version --json` only after `setup.sh` or a fresh build has refreshed the
+binary. Use the generated coordinates for compatibility inspection, and use
+the runtime probes in [Running the tests](#running-the-tests) when you need
+evidence that external tools are actually invocable.
 
 On the canonical macOS development host, run Rust builds and tests in the
 isolated `moral-gaur` Multipass guest rather than writing Cargo artifacts from
@@ -1627,19 +1691,29 @@ gates.
 
 ## Table of Contents
 
-1. [What is new here?](#what-is-new-here)
-2. [Related work and how Ostadix-lang differs](#related-work-and-how-ostadix-lang-differs)
-3. [Gentle introduction](#gentle-introduction)
-4. [Quickstart](#quickstart)
-5. [Hosted language tour](#hosted-language-tour)
-6. [OValue and the runtime boundary](#ovalue-and-the-runtime-boundary)
-7. [Hosted backends](#hosted-backends)
-8. [Compiler and composition tools](#compiler-and-composition-tools)
-9. [Architecture](#architecture)
-10. [O-core native systems language](#o-core-native-systems-language)
-11. [Running the tests](#running-the-tests)
-12. [Status](#status)
-13. [Citation and authorship](#citation-and-authorship)
+1. [Quickstart](#quickstart)
+2. [Hosted Placement V6](#hosted-placement-v6)
+3. [Using Ostadix-lang with AI agents](#using-ostadix-lang-with-ai-agents)
+4. [Getting Started: Full Setup Guide](#getting-started-full-setup-guide)
+5. [Docker](#docker)
+6. [Verifying the installation](#verifying-the-installation)
+7. [What is new here?](#what-is-new-here)
+8. [Related work and how Ostadix-lang differs](#related-work-and-how-ostadix-lang-differs)
+9. [Gentle introduction](#gentle-introduction)
+10. [Extended command examples](#extended-command-examples)
+11. [Hosted language tour](#hosted-language-tour)
+12. [OValue and the runtime boundary](#ovalue-and-the-runtime-boundary)
+13. [Hosted backends](#hosted-backends)
+14. [Compiler and composition tools](#compiler-and-composition-tools)
+15. [Architecture](#architecture)
+16. [O-core native systems language](#o-core-native-systems-language)
+17. [Running the tests](#running-the-tests)
+18. [Status](#status)
+19. [Citation and authorship](#citation-and-authorship)
+
+The independent compatibility coordinates and custody boundaries are defined
+in [VERSIONING.md](docs/VERSIONING.md) and
+[SEMANTIC_CUSTODY.md](docs/SEMANTIC_CUSTODY.md), respectively.
 
 ---
 
@@ -2046,7 +2120,7 @@ the resulting target code.
 
 ---
 
-## Quickstart
+## Extended command examples
 
 The bare Cargo examples in this general section assume CI or another isolated
 clone. On the canonical macOS development checkout, use `setup.sh` for the
@@ -2869,6 +2943,17 @@ between them. [Bounded semantic custody](docs/SEMANTIC_CUSTODY.md) identifies
 which transformations are digest-linked today and the authority each artifact
 does—or deliberately does not—carry.
 
+After a fresh build, materialize the inspectable hosted custody chain with:
+
+```bash
+bash scripts/semantic_custody_demo.sh
+```
+
+The ignored `target/semantic-custody/` directory contains the execution-intent
+JSON, schedule explanation, HGraph DOT, observed result, and a manifest hashing
+all four. The run performs fresh local V5 admission and records an observed
+value; it does not manufacture a signed Hosted V2 or World receipt.
+
 ```text
 Hosted orchestration
 ====================
@@ -3605,6 +3690,7 @@ edition supports every file.
 | `examples/ephemeral.O` | Fresh state for bare blocks. |
 | `examples/meta_eval.O` | `quote^`, OExpr, `O.quote`, and `O.eval`. |
 | `examples/script.O` | Executable O document with shebang. |
+| `examples/semantic_custody.O` | Exact-source and execution-intent gating for the bounded semantic-custody artifact. |
 | `examples/bash_hello.O` | Executing Bash backend. |
 | `examples/bash_binding.O` | Passing O bindings into Bash. |
 | `examples/bash_exit_code.O` | Bash success-path exit code. |
@@ -3637,15 +3723,30 @@ edition supports every file.
 
 On the canonical macOS development host, do not run Cargo in the live
 `~/Ostadix-lang` checkout. Confirm that the `moral-gaur` Multipass guest is
-available, then run the primary locked gate as one command. If the guest is
-stopped or unavailable, repair that runtime state before testing; do not treat
-a VM connection failure as a source failure.
+available, then run the primary locked gate as one command. If the Multipass
+socket or guest is unavailable, no Rust gate ran: repair that substrate or use
+Required CI or a separate throwaway clone. Do not treat a VM connection failure
+as a source failure, and do not fall back to Cargo in the live checkout.
 
 ```bash
 multipass list
 multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; git switch master; git pull --ff-only origin master; git rev-parse HEAD'
 multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export CARGO_TARGET_DIR=/home/ubuntu/ostadix-target-hosted-v2; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo check --locked --all-targets --all-features; rustup run 1.97.1 cargo test --locked --all-targets --all-features --no-fail-fast; rustup run 1.97.1 cargo clippy --locked --all-targets --all-features -- -D warnings'
 ```
+
+The runtime-probe manifest owns both each executable and its exact probe
+arguments—notably `openssl version`, rather than a universal `--version`.
+Validate the projections and inspect the probes directly with:
+
+```bash
+python3 scripts/contract_surfaces.py validate
+python3 scripts/contract_surfaces.py probe-runtimes --suite rust-hosted
+python3 scripts/contract_surfaces.py probe-runtimes --suite docker
+```
+
+The Rust test helpers and CI jobs consume those declarations. A successful
+probe establishes invocability for that command; it is not evidence that every
+backend, daemon, VM, or container required by a later test is healthy.
 
 The focused Hosted V2 suites cover signed admission and session semantics,
 durable restart/recovery and storage boundaries, and the public CLI lifecycle:
@@ -3669,6 +3770,26 @@ The release CLI suite checks interpreter errors, successful execution,
 ```bash
 multipass exec moral-gaur -- bash -lc 'set -euo pipefail; cd /home/ubuntu/Ostadix-lang; export OSTADIX_TEST_RUNTIME_POLICY=required; rustup run 1.97.1 cargo build --locked --release --target-dir "$PWD/target"; bash tests/test_cli.sh'
 ```
+
+Release claims and the self-contained source archive have separate gates. Run
+these from a clean checkout whose resolved commit is the revision to publish:
+
+```bash
+mkdir -p target/release-validation
+bash scripts/check_release_claims.sh
+python3 -m unittest -v tests.test_world_alpha_evidence
+python3 -m unittest -v tests.test_release_evidence
+python3 -m unittest -v tests.test_source_release
+python3 scripts/build_source_release.py \
+  --output target/release-validation/Ostadix-lang-source.zip
+python3 scripts/build_source_release.py \
+  --verify target/release-validation/Ostadix-lang-source.zip
+```
+
+Archive bytes always come from the resolved Git commit. `--allow-dirty` permits
+running with a dirty worktree but does not silently package uncommitted bytes;
+validate an uncommitted release candidate by creating a temporary commit in an
+isolated clone or worktree.
 
 In CI or another throwaway clone, run the quoted inner commands directly. All
 bare Cargo commands below likewise assume an isolated checkout; they are not
@@ -3712,8 +3833,8 @@ Additional implementation checks are:
 make -C c_cpp test
 python3 -m tests.test_parser
 python3 -m tests.test_evaluator
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+rustup run 1.97.1 cargo fmt --all -- --check
+rustup run 1.97.1 cargo clippy --locked --all-targets --all-features -- -D warnings
 bash scripts/check_declared_bins.sh
 bash scripts/smoke-hosted-live-reference.sh
 ./ocore/kernel/build-m4-artifacts.sh
@@ -3724,12 +3845,16 @@ python3 scripts/release_evidence.py validate
 ./boot-and-test.sh smoke
 # Hardware-only; requires an AMD host with nested SVM and writable /dev/kvm.
 ./ocore/kernel/smoke-kernel-world-execution-qemu.sh
-cargo test --test kernel_world_contract --no-default-features
+rustup run 1.97.1 cargo test --locked --test kernel_world_contract --no-default-features
 bash scripts/check_release_claims.sh
 python3 -m unittest -v tests.test_source_release
 
+# Machine-readable version and bounded semantic-custody artifacts
+rustup run 1.97.1 cargo test --locked --test version_cli
+rustup run 1.97.1 cargo test --locked --test semantic_custody_demo
+
 # Parser properties in the ordinary test suite
-cargo test --test parser_proptest
+rustup run 1.97.1 cargo test --locked --test parser_proptest
 
 # Continuous raw-byte parser fuzzing
 cargo install cargo-fuzz
