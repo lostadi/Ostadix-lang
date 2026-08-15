@@ -11,9 +11,10 @@
   discovery are compile-time projections of that one catalog; no runtime source
   parser or independently maintained MCP backend table is involved. The catalog
   records canonical tags, aliases, purity metadata, splice rendering, execution
-  mode, adapter ownership, backend authority requirements, and descriptive
-  executable alternatives. Executable presence is not health, authorization,
-  capacity, or operation admission.
+  mode, adapter ownership, backend authority requirements, typed integer/rich-
+  number preservation capabilities, and descriptive executable alternatives.
+  Executable presence and declared value capability are not health,
+  authorization, capacity, or operation admission.
 - `OValue` is the language-neutral value boundary (`src/value.rs`) used by the
   Rust hosted runtime, the C17 edition in `c_cpp/`, and the Python reference in
   `o_lang/`.
@@ -179,6 +180,37 @@
   capability, runtime-health result, retained admission, or authorization; `O`
   still constructs and rechecks a fresh process-local V5 admission, and direct
   `o_run` remains an explicitly ungated compatibility surface.
+- Admission V5 remains the supported legacy-local contract. Hosted Placement
+  V6 is an additive placement-aware contract; neither version is silently
+  upgraded or translated into the other. Existing MCP execution tools remain
+  local V5 surfaces. The direct V6 channel is exposed separately through
+  `o-node` and `octl node ...`; it does not upgrade a V5 handle.
+- The V6 placement core models a `RequirementFootprintV1` over operation
+  capability, value, effect, environment, and resource constraints and compares
+  it with a full `TargetDescriptorV1`. Eligibility never factors through an ISA
+  or language display name. Complete, conservatively unknown, and unsatisfiable
+  footprints remain distinct, and unknown requirements cannot join away.
+- `o why FILE.O P<N>` appends the compiler-derived V6 footprint for the exact
+  selected plan node. Hosted shim effects without explicit autonomous consent,
+  coordinator-local control, and unpackaged scope state remain
+  `ConservativeUnknown`; the report is descriptive and grants no placement
+  authority or lease.
+- Every positive V6 placement decision carries exact requirement-to-warrant
+  discharge. Compiler-static requirements and fresh runtime-discovered or
+  enforced target facts are the strict default. Provider declarations and
+  historical observations may authorize missing positive facts only under an
+  explicit trust policy, cannot override a fresh discovered negative, and are
+  bound into the transport-independent discharge record. The direct node
+  transport described below does not yet consume that placement proof.
+- Registry v1 is a transport-independent, canonical-CBOR, Ed25519-signed
+  append-only store for namespace-scoped `placement::NodeProfileV1` records.
+  It verifies pinned roots, strict-descendant namespace delegation, sequence
+  and previous-event chains, profile freshness and monotonic generation, and
+  rejects rollback, forks, equivocation, or untrusted imports before atomic
+  replacement. `o-registry` provides local `init`, `profile-local`,
+  `publish-profile`, `verify`, `list`, `export`, and `import` operations; it is
+  not a network daemon, discovery service, health oracle, lease issuer, or
+  execution authority, and the direct node path does not consume it.
 - HGraph represents ordinary results, successful completion, evaluator state,
   host-resource state, and persistent actor state as nodes. Executable
   operations are directed, multi-output hyperedges. Readiness follows only from
@@ -187,6 +219,12 @@
   `HostWorld` state chain. Persistent environments also use typed actor-state
   chains. The implementation does not claim exact effect inference from
   arbitrary Python, Bash, JavaScript, Rust, or other hosted source.
+- The current V5 scheduler's `ActorResourceId` is the canonical backend name
+  plus persistent numeric environment; the process registry additionally keys
+  sandbox and admitted launch generation. V6's stronger
+  `ActorGenerationIdV1` binds backend implementation, target, logical
+  environment, sandbox/launch context, and process generation, but is not yet
+  the V5 scheduler resource key.
 - Conservative `{lazy}` cache safety is enforced from backend metadata in
   `src/ir.rs` and validation in `src/eval.rs`: inline `html`, `markdown`,
   `latex`, and `text` are cache-safe; unrestricted shim backends including
@@ -201,9 +239,53 @@
   `batch`, `all`, `any`, and `race` are represented in `src/value.rs`, lowered
   through `src/ir.rs`, and resolved by evaluator/scheduler code; Eval requests
   remain serial.
+- Literal `o-link` wrappers use linker-isolated `[*]` environments rather than
+  synthesized persistent numeric indices. Authored numeric environments remain
+  persistent logical affinity. Ordered linking remains the default;
+  `o-link --parallel` is explicit autonomous consent, each admitted parallel
+  run returns input-ordered results, and sequential structural/inlined `.O`
+  boundaries split those runs. It does not by itself establish remote
+  eligibility or rollback already-started hidden effects.
+- The bounded direct-node transport uses synchronous TCP with TLS 1.3-only
+  mutual X.509 authentication, a pinned CA and server name, required client
+  certificate/key, and ALPN. It has no plaintext or 0-RTT path. Canonical-CBOR
+  frames are limited to 2 MiB; operation source to 1 MiB; result payload to
+  768 KiB; connect/handshake to 10 seconds; and I/O to 60 seconds by default.
+- `octl node run` sends one operator-selected node a
+  `RemotePreparedOperationV1` binding exact source SHA-256, task/attempt
+  identities, the full descriptive backend-catalog digest, deadline, and output
+  ceiling. The node creates a fresh evaluator for the operation; it exposes no
+  generic shell-command RPC, project-bundle dispatch, or persistent remote
+  actor. It returns a canonical-CBOR, SHA-256 self-digested
+  `HostedOperationReceiptV1`. The deadline suppresses a late result but cannot
+  cancel evaluator effects that were already running.
+- The current direct transport does not consume `RequirementFootprintV1`,
+  `TargetDescriptorV1`, warrant discharge, capacity admission, or a
+  `PlacementLeaseV1` or a verified registry profile. It has no automatic
+  discovery, target selection, durable attempt ledger, retry, status recovery,
+  or local fallback. Live TLS
+  authenticates the peer, but the self-digested receipt has no detached node
+  signature: it is tamper-evident after capture, not independently attributable
+  or offline-verifiable.
+- Hosted Placement V6 is not World membership, Governor admission/commit,
+  WorldFS, G1 or G10 evidence, a physical-machine or hardware-isolation proof,
+  a global exactly-once protocol, arbitrary project/HGraph-island placement,
+  persistent-actor migration, safepoint migration, or rematerialization. Its
+  exact boundary is documented in
+  [`HOSTED_PLACEMENT_V6.md`](HOSTED_PLACEMENT_V6.md).
 - Native value crossings are conservative: `Fidelity::NativeCapsule` in
   `src/value.rs` and `src/hgraph/solve.rs` prevents claiming general
   cross-runtime native value soundness.
+- Hosted crossing fidelity is derived from typed `BackendValueCapabilities`
+  embedded in the canonical backend specification, not from a language-name
+  allowlist. Aliases resolve through the same specification. Unknown integer or
+  rich-number capability yields `Unsupported`; an abstract `I64` crossing to a
+  53-bit float-only backend records structural numeric loss rather than an
+  optimistic `Lossless` result.
+- Structural fidelity loss is non-empty by construction. A legacy serialized
+  empty structural set normalizes to `Lossless`, so semantically identical
+  states cannot retain two evidence encodings. Composition is covered by
+  identity, idempotence, commutativity, and associativity checks.
 - O-core Milestones 0.1 through 0.3 are complete for their bounded, single-CPU
   QEMU bootstrap gates. They prove CPL3 `SYSCALL` and IRQ return, page-granular
   kernel and user protection, normalized faults, fault-aware bounded user copy,
@@ -539,6 +621,10 @@
   It fixes the replicated-Governor model, OValue/capability/capsule crossings,
   explicit aggregate-memory model, fifteen workstreams, and G0--G13
   convergence ladder. Defining that target is not evidence that a gate passed.
+- A byte-sealed historical comment in that constitution still names 24
+  component gates. The current unsealed `evidence/gates.toml` component
+  manifest and generated README projection define 26 required portable QEMU
+  gates. The old count is preserved as sealed history, not treated as current.
 - [`world_alpha_gates.toml`](../evidence/world_alpha_gates.toml) defines 14
   entries--the G0 constitutional baseline plus 13 integration gates through
   G13--with their dependencies, qualifying evidence classes, and prohibited
@@ -794,7 +880,7 @@
   intent digests with `O --require-source-sha256` and
   `--require-execution-intent-sha256` makes graph execution recompute and
   compare that projection before dispatch; a match still proceeds through a
-  fresh process-local V4 `AdmittedExecution`. The stable intent deliberately
+  fresh process-local V5 `AdmittedExecution`. The stable intent deliberately
   excludes runtime discovery, backend artifacts, environment and PID state,
   capacity, authority, and live admission, so it is sameness evidence rather
   than a capability or reusable admission token. The gate adds no work to an

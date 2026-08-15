@@ -183,22 +183,106 @@ pub enum AnnotationKind {
 /// Each backend injection/projection path should be able to say whether a
 /// crossing preserved the value exactly, preserved only portable structure,
 /// kept an opaque same-backend capsule, or could not represent the value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FidelityLossSet(BTreeSet<AnnotationKind>);
+
+impl FidelityLossSet {
+    fn new(lost: BTreeSet<AnnotationKind>) -> Option<Self> {
+        (!lost.is_empty()).then_some(Self(lost))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AnnotationKind> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, kind: &AnnotationKind) -> bool {
+        self.0.contains(kind)
+    }
+
+    pub fn as_set(&self) -> &BTreeSet<AnnotationKind> {
+        &self.0
+    }
+
+    fn into_set(self) -> BTreeSet<AnnotationKind> {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fidelity {
+    Lossless,
+    Structural { lost: FidelityLossSet },
+    NativeCapsule,
+    Unsupported,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FidelitySerialize<'a> {
+    Lossless,
+    Structural { lost: &'a BTreeSet<AnnotationKind> },
+    NativeCapsule,
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FidelityDeserialize {
     Lossless,
     Structural { lost: BTreeSet<AnnotationKind> },
     NativeCapsule,
     Unsupported,
 }
 
+impl Serialize for Fidelity {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Lossless => FidelitySerialize::Lossless,
+            Self::Structural { lost } => FidelitySerialize::Structural {
+                lost: lost.as_set(),
+            },
+            Self::NativeCapsule => FidelitySerialize::NativeCapsule,
+            Self::Unsupported => FidelitySerialize::Unsupported,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Fidelity {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = FidelityDeserialize::deserialize(deserializer)?;
+        Ok(match wire {
+            FidelityDeserialize::Lossless => Self::Lossless,
+            FidelityDeserialize::Structural { lost } => Self::structural(lost),
+            FidelityDeserialize::NativeCapsule => Self::NativeCapsule,
+            FidelityDeserialize::Unsupported => Self::Unsupported,
+        })
+    }
+}
+
 impl Fidelity {
     pub fn structural(lost: impl IntoIterator<Item = AnnotationKind>) -> Self {
         let lost = lost.into_iter().collect::<BTreeSet<_>>();
-        if lost.is_empty() {
-            Self::Lossless
-        } else {
-            Self::Structural { lost }
+        match FidelityLossSet::new(lost) {
+            Some(lost) => Self::Structural { lost },
+            None => Self::Lossless,
+        }
+    }
+
+    pub fn losses(&self) -> Option<&FidelityLossSet> {
+        match self {
+            Self::Structural { lost } => Some(lost),
+            _ => None,
         }
     }
 
@@ -220,9 +304,10 @@ impl Fidelity {
             (Unsupported, _) | (_, Unsupported) => Unsupported,
             (NativeCapsule, _) | (_, NativeCapsule) => NativeCapsule,
             (Lossless, other) | (other, Lossless) => other,
-            (Structural { mut lost }, Structural { lost: more }) => {
-                lost.extend(more);
-                Structural { lost }
+            (Structural { lost }, Structural { lost: more }) => {
+                let mut lost = lost.into_set();
+                lost.extend(more.into_set());
+                Fidelity::structural(lost)
             }
         }
     }
@@ -1108,7 +1193,9 @@ pub enum RequestKind {
     /// OValue::Thunk (the captured body + deps).
     ///
     /// `lang` selects which backend shim runs (python, nix, html, ...).
-    /// `env_id` selects the persistent env (`u32::MAX` = ephemeral for bare `lang^(...)` blocks; explicit `[N]` for named persistent).
+    /// `env_id` retains the V5 integer encoding: bare blocks are ephemeral,
+    /// `[*]` is linker-isolated/fresh, and numeric `[N]` is persistent. New
+    /// code should decode it through `EnvironmentRefV2`.
     /// `cacheable` distinguishes {lazy} (true, pure backends only, force-
     /// caches by fingerprint) from {defer} (false, any backend, re-runs on
     /// every force, errors on splice).
@@ -3401,13 +3488,11 @@ mod tests {
 
         assert_eq!(
             first.compose(second),
-            Fidelity::Structural {
-                lost: BTreeSet::from([
-                    AnnotationKind::TypeTag,
-                    AnnotationKind::NumericPrecision,
-                    AnnotationKind::Encoding,
-                ]),
-            }
+            Fidelity::structural([
+                AnnotationKind::TypeTag,
+                AnnotationKind::NumericPrecision,
+                AnnotationKind::Encoding,
+            ])
         );
         assert_eq!(
             Fidelity::Lossless.compose(Fidelity::NativeCapsule),
@@ -3438,10 +3523,55 @@ mod tests {
 
         assert_eq!(
             acc,
-            Fidelity::Structural {
-                lost: BTreeSet::from([AnnotationKind::NumericExactness, AnnotationKind::TypeTag]),
-            }
+            Fidelity::structural([AnnotationKind::NumericExactness, AnnotationKind::TypeTag])
         );
+    }
+
+    #[test]
+    fn fidelity_composition_obeys_semilattice_laws() {
+        let values = [
+            Fidelity::Lossless,
+            Fidelity::structural([AnnotationKind::TypeTag]),
+            Fidelity::structural([AnnotationKind::NumericExactness, AnnotationKind::Encoding]),
+            Fidelity::NativeCapsule,
+            Fidelity::Unsupported,
+        ];
+
+        for a in &values {
+            assert_eq!(a.clone().compose(Fidelity::Lossless), *a);
+            assert_eq!(Fidelity::Lossless.compose(a.clone()), *a);
+            assert_eq!(a.clone().compose(a.clone()), *a);
+            for b in &values {
+                assert_eq!(a.clone().compose(b.clone()), b.clone().compose(a.clone()));
+                for c in &values {
+                    assert_eq!(
+                        a.clone().compose(b.clone()).compose(c.clone()),
+                        a.clone().compose(b.clone().compose(c.clone()))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_structural_wire_value_normalizes_to_lossless() {
+        let legacy = r#"{"kind":"structural","lost":[]}"#;
+        let decoded: Fidelity = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded, Fidelity::Lossless);
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            r#"{"kind":"lossless"}"#
+        );
+    }
+
+    #[test]
+    fn nonempty_structural_fidelity_round_trips_canonically() {
+        let original =
+            Fidelity::structural([AnnotationKind::NumericPrecision, AnnotationKind::TypeTag]);
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Fidelity = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.losses().map(FidelityLossSet::len), Some(2));
     }
 
     #[test]

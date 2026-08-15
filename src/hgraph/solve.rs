@@ -8,6 +8,9 @@ use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::ir::{
+    BackendRegistry, BackendValueCapabilities, IntegerExactness, RichNumberPreservation,
+};
 use crate::value::{AnnotationKind, Fidelity, ONumber, OValue};
 
 use super::{
@@ -134,21 +137,44 @@ fn solve_types_with_limits(
 ) -> Result<(), SolveError> {
     validate_dataflow_constraints(graph)?;
     let mut trace = SolveTrace::default();
-    for _ in 0..applied_pass_limit {
-        let mut changed = false;
-        for eid in graph.edge_ids() {
-            trace.begin_edge(eid);
-            let updates_before = trace.slot_updates;
-            let edge_changed = propagate(graph, eid, &mut trace)?;
-            debug_assert_eq!(edge_changed, trace.slot_updates != updates_before);
-            changed |= edge_changed;
-        }
-        if !changed {
-            return Ok(());
+    let mut completed_passes = 0;
+    for phase in [SolvePhase::TypeAndValue, SolvePhase::Fidelity] {
+        loop {
+            if completed_passes == applied_pass_limit {
+                return Err(budget_exhausted(
+                    &trace,
+                    completed_passes,
+                    derived_pass_bound,
+                    applied_pass_limit,
+                ));
+            }
+            completed_passes += 1;
+
+            let mut changed = false;
+            for eid in graph.edge_ids() {
+                trace.begin_edge(eid);
+                let updates_before = trace.slot_updates;
+                let edge_changed = propagate(graph, eid, phase, &mut trace)?;
+                debug_assert_eq!(edge_changed, trace.slot_updates != updates_before);
+                changed |= edge_changed;
+            }
+            if !changed {
+                break;
+            }
         }
     }
+    Ok(())
+}
+
+fn budget_exhausted(
+    trace: &SolveTrace,
+    completed_passes: usize,
+    derived_pass_bound: usize,
+    applied_pass_limit: usize,
+) -> SolveError {
     let (last_changed_edge, last_changed_node, last_changed_slot, last_before, last_after) = trace
         .last_change
+        .clone()
         .map(|change| {
             (
                 Some(change.edge),
@@ -159,8 +185,8 @@ fn solve_types_with_limits(
             )
         })
         .unwrap_or((None, None, None, None, None));
-    Err(SolveError::BudgetExhausted(Box::new(BudgetDiagnostics {
-        completed_passes: applied_pass_limit,
+    SolveError::BudgetExhausted(Box::new(BudgetDiagnostics {
+        completed_passes,
         slot_updates: trace.slot_updates,
         derived_pass_bound,
         applied_pass_limit,
@@ -170,8 +196,8 @@ fn solve_types_with_limits(
         last_changed_slot,
         last_before,
         last_after,
-        recent_changed_edges: trace.recent_changed_edges.into_iter().collect(),
-    })))
+        recent_changed_edges: trace.recent_changed_edges.iter().copied().collect(),
+    }))
 }
 
 fn validate_dataflow_constraints(graph: &HGraph) -> Result<(), SolveError> {
@@ -265,8 +291,14 @@ fn derived_iteration_budget(graph: &HGraph) -> usize {
         .nodes
         .len()
         .saturating_mul(per_node_height)
-        .saturating_add(1) // one final no-change pass
+        .saturating_add(2) // one final no-change pass for each solver phase
         .max(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolvePhase {
+    TypeAndValue,
+    Fidelity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,7 +482,7 @@ impl SolverSlot for Option<Fidelity> {
             Some(Fidelity::Lossless) => FidelitySnapshot::Lossless,
             Some(Fidelity::Structural { lost }) => FidelitySnapshot::Structural {
                 loss_count: lost.len(),
-                loss_fingerprint: fidelity_loss_fingerprint(lost),
+                loss_fingerprint: fidelity_loss_fingerprint(lost.as_set()),
             },
             Some(Fidelity::NativeCapsule) => FidelitySnapshot::NativeCapsule,
             Some(Fidelity::Unsupported) => FidelitySnapshot::Unsupported,
@@ -511,10 +543,29 @@ fn fidelity_loss_fingerprint(lost: &BTreeSet<AnnotationKind>) -> u64 {
     )
 }
 
-fn propagate(graph: &mut HGraph, eid: EdgeId, trace: &mut SolveTrace) -> Result<bool, SolveError> {
+fn propagate(
+    graph: &mut HGraph,
+    eid: EdgeId,
+    phase: SolvePhase,
+    trace: &mut SolveTrace,
+) -> Result<bool, SolveError> {
     let Some(edge) = graph.edge(eid).cloned() else {
         return Ok(false);
     };
+
+    if phase == SolvePhase::Fidelity {
+        return match &edge.kind {
+            OpKind::BackendCrossing { from_lang, to_lang } => {
+                let fidelity = input_value_nodes(graph, &edge)
+                    .next()
+                    .map(|node| fidelity_for(node, from_lang, to_lang))
+                    .unwrap_or(Fidelity::Unsupported);
+                Ok(apply_fidelity_to_outputs(graph, &edge, fidelity, trace))
+            }
+            OpKind::DataFlow => Ok(propagate_dataflow_fidelity(graph, &edge, trace)),
+            _ => Ok(false),
+        };
+    }
 
     let changed = match &edge.kind {
         OpKind::Additive | OpKind::Multiplicative => {
@@ -564,14 +615,8 @@ fn propagate(graph: &mut HGraph, eid: EdgeId, trace: &mut SolveTrace) -> Result<
             apply_domain_to_inputs(graph, &edge, DomainFlags::STRUCT, trace)
         }
         OpKind::Dereferenceable => apply_domain_to_all(graph, &edge, DomainFlags::POINTER, trace),
-        OpKind::BackendCrossing { from_lang, to_lang } => {
-            let fidelity = input_value_nodes(graph, &edge)
-                .next()
-                .map(|node| fidelity_for(node, from_lang, to_lang))
-                .unwrap_or(Fidelity::Unsupported);
-            apply_fidelity_to_outputs(graph, &edge, fidelity, trace)
-        }
-        OpKind::DataFlow => propagate_dataflow(graph, &edge, trace)?,
+        OpKind::BackendCrossing { .. } => false,
+        OpKind::DataFlow => propagate_dataflow_type_value(graph, &edge, trace)?,
         OpKind::StructuralBarrier
         | OpKind::Sequence
         | OpKind::ActorSerial { .. }
@@ -598,7 +643,7 @@ pub fn min_rep_for_bigint(value: &BigInt) -> RepFlags {
     }
 }
 
-fn propagate_dataflow(
+fn propagate_dataflow_type_value(
     graph: &mut HGraph,
     edge: &HEdge,
     trace: &mut SolveTrace,
@@ -617,11 +662,32 @@ fn propagate_dataflow(
         if let Some(output) = value_node_mut(graph, nid) {
             changed |= update_slot(&mut output.domain, input.domain, trace, nid);
             changed |= update_slot(&mut output.rep, input.rep, trace, nid);
-            changed |= update_slot(&mut output.fidelity, input.fidelity.clone(), trace, nid);
             changed |= write_value_once(output, edge.id, nid, input.value.clone(), trace)?;
         }
     }
     Ok(changed)
+}
+
+fn propagate_dataflow_fidelity(graph: &mut HGraph, edge: &HEdge, trace: &mut SolveTrace) -> bool {
+    let Some(incoming) = input_value_nodes(graph, edge)
+        .next()
+        .and_then(|input| input.fidelity.clone())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for nid in edge
+        .ports
+        .iter()
+        .filter(|port| matches!(port.role, PortRole::Output | PortRole::InOut))
+        .map(|port| port.node)
+        .collect::<Vec<_>>()
+    {
+        if let Some(output) = value_node_mut(graph, nid) {
+            changed |= update_slot(&mut output.fidelity, Some(incoming.clone()), trace, nid);
+        }
+    }
+    changed
 }
 
 fn write_value_once(
@@ -680,47 +746,159 @@ pub fn fidelity_for(node: &HNode, from_lang: &str, to_lang: &str) -> Fidelity {
     if matches!(node.value, Some(OValue::Native { .. })) {
         return Fidelity::NativeCapsule;
     }
-    if from_lang == to_lang {
+
+    let registry = BackendRegistry::global();
+    let Some(to_spec) = registry.get(to_lang) else {
+        return Fidelity::Unsupported;
+    };
+    let same_backend = registry
+        .get(from_lang)
+        .is_some_and(|from_spec| from_spec.name == to_spec.name);
+    if same_backend {
         return Fidelity::Lossless;
     }
     if let Some(value) = &node.value {
-        return fidelity_for_value(value, to_lang);
+        return fidelity_for_value_with_capabilities(value, to_spec.value_capabilities);
     }
-    if node.rep.contains(RepFlags::BIG) && !backend_supports_bigint(to_lang) {
-        return Fidelity::structural([AnnotationKind::NumericPrecision]);
-    }
-    if node.domain.is_empty() || node.rep.is_empty() {
-        return Fidelity::Unsupported;
-    }
-    Fidelity::Lossless
+    fidelity_for_abstract(node, to_spec.value_capabilities)
 }
 
 pub fn fidelity_for_value(value: &OValue, to_lang: &str) -> Fidelity {
+    let Some(spec) = BackendRegistry::global().get(to_lang) else {
+        return Fidelity::Unsupported;
+    };
+    fidelity_for_value_with_capabilities(value, spec.value_capabilities)
+}
+
+fn fidelity_for_value_with_capabilities(
+    value: &OValue,
+    capabilities: BackendValueCapabilities,
+) -> Fidelity {
     match value {
         OValue::Native { .. } => Fidelity::NativeCapsule,
-        OValue::Number {
-            v: ONumber::Int { v },
-        } if min_rep_for_bigint(v) == RepFlags::BIG && !backend_supports_bigint(to_lang) => {
-            Fidelity::structural([AnnotationKind::NumericPrecision])
-        }
-        OValue::Number { .. } if !backend_supports_rich_numbers(to_lang) => {
-            Fidelity::structural([AnnotationKind::NumericExactness, AnnotationKind::TypeTag])
-        }
+        OValue::Number { v } => fidelity_for_number(v, capabilities),
         OValue::Graph { .. } => Fidelity::structural([AnnotationKind::Identity]),
         OValue::Capability { .. } => Fidelity::structural([AnnotationKind::Capability]),
         _ => Fidelity::Lossless,
     }
 }
 
-fn backend_supports_bigint(lang: &str) -> bool {
-    matches!(
-        lang,
-        "python" | "ruby" | "racket" | "haskell" | "lisp" | "common_lisp" | "mathematica"
-    )
+fn fidelity_for_number(number: &ONumber, capabilities: BackendValueCapabilities) -> Fidelity {
+    let mut lost = BTreeSet::new();
+
+    if let ONumber::Int { v } = number {
+        match integer_exceeds_capability(v, capabilities.integer_exactness) {
+            Some(true) => {
+                lost.insert(AnnotationKind::NumericPrecision);
+            }
+            Some(false) => {}
+            None => return Fidelity::Unsupported,
+        }
+    }
+
+    match capabilities.rich_numbers {
+        RichNumberPreservation::Preserved => {}
+        RichNumberPreservation::Collapsed => {
+            lost.insert(AnnotationKind::NumericExactness);
+            lost.insert(AnnotationKind::TypeTag);
+        }
+        RichNumberPreservation::Unknown => return Fidelity::Unsupported,
+    }
+
+    Fidelity::structural(lost)
 }
 
-fn backend_supports_rich_numbers(lang: &str) -> bool {
-    matches!(lang, "python" | "racket" | "haskell" | "mathematica")
+fn integer_exceeds_capability(value: &BigInt, exactness: IntegerExactness) -> Option<bool> {
+    match exactness {
+        IntegerExactness::Unknown => None,
+        IntegerExactness::Arbitrary => Some(false),
+        IntegerExactness::ExactMagnitudeBits(bits) => {
+            let limit = BigInt::from(1_u8) << usize::from(bits);
+            let minimum = -&limit;
+            Some(value < &minimum || value > &limit)
+        }
+    }
+}
+
+fn fidelity_for_abstract(node: &HNode, capabilities: BackendValueCapabilities) -> Fidelity {
+    if node.domain.is_empty() || node.rep.is_empty() {
+        return Fidelity::Unsupported;
+    }
+
+    let numeric_reps = RepFlags::I8
+        | RepFlags::I16
+        | RepFlags::I32
+        | RepFlags::I64
+        | RepFlags::I128
+        | RepFlags::BIG
+        | RepFlags::F32
+        | RepFlags::F64;
+    let numeric_domain = node.domain & DomainFlags::NUMERIC;
+    let numeric_rep = node.rep & numeric_reps;
+    if !numeric_domain.is_empty() || !numeric_rep.is_empty() {
+        if numeric_domain.is_empty()
+            || numeric_rep.is_empty()
+            || !node.domain.difference(DomainFlags::NUMERIC).is_empty()
+            || !node.rep.difference(numeric_reps).is_empty()
+        {
+            return Fidelity::Unsupported;
+        }
+
+        let mut lost = BTreeSet::new();
+        match abstract_integer_exceeds_capability(numeric_rep, capabilities.integer_exactness) {
+            Some(true) => {
+                lost.insert(AnnotationKind::NumericPrecision);
+            }
+            Some(false) => {}
+            None => return Fidelity::Unsupported,
+        }
+        match capabilities.rich_numbers {
+            RichNumberPreservation::Preserved => {}
+            RichNumberPreservation::Collapsed => {
+                lost.insert(AnnotationKind::NumericExactness);
+                lost.insert(AnnotationKind::TypeTag);
+            }
+            RichNumberPreservation::Unknown => return Fidelity::Unsupported,
+        }
+        return Fidelity::structural(lost);
+    }
+
+    let lossless_domains = DomainFlags::STRING | DomainFlags::BOOL;
+    let lossless_reps = RepFlags::STR | RepFlags::BOOL;
+    if node.domain.difference(lossless_domains).is_empty()
+        && node.rep.difference(lossless_reps).is_empty()
+    {
+        return Fidelity::Lossless;
+    }
+
+    Fidelity::Unsupported
+}
+
+fn abstract_integer_exceeds_capability(
+    reps: RepFlags,
+    exactness: IntegerExactness,
+) -> Option<bool> {
+    let integer_reps = reps
+        & (RepFlags::I8
+            | RepFlags::I16
+            | RepFlags::I32
+            | RepFlags::I64
+            | RepFlags::I128
+            | RepFlags::BIG);
+    if integer_reps.is_empty() {
+        return Some(false);
+    }
+    match exactness {
+        IntegerExactness::Unknown => None,
+        IntegerExactness::Arbitrary => Some(false),
+        IntegerExactness::ExactMagnitudeBits(bits) => Some(
+            integer_reps.intersects(RepFlags::BIG | RepFlags::I128)
+                || (integer_reps.contains(RepFlags::I64) && bits < 63)
+                || (integer_reps.contains(RepFlags::I32) && bits < 31)
+                || (integer_reps.contains(RepFlags::I16) && bits < 15)
+                || (integer_reps.contains(RepFlags::I8) && bits < 7),
+        ),
+    }
 }
 
 fn apply_domain_to_all(

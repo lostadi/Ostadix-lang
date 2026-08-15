@@ -6,8 +6,8 @@ Grammar (informally):
     document    := body_part*
     body_part   := text | expression
     expression  := OPENER body_part* CLOSER
-    OPENER      := IDENT ( '[' DIGITS ']' )? '^('
-    CLOSER      := ')_' IDENT ( '[' DIGITS ']' )?          (matching IDENT+env)
+    OPENER      := IDENT ( '[' (DIGITS | '*') ']' )? '^('
+    CLOSER      := ')_' IDENT ( '[' (DIGITS | '*') ']' )?  (matching IDENT+env)
     IDENT       := [A-Za-z_][A-Za-z0-9_]*   AND   IDENT in registered-languages
     text        := (any char, or \\X escape for literal X in {opener, closer})
 
@@ -27,10 +27,10 @@ Key design decisions:
    the inner language's syntax. This is what makes adding a new language
    a zero-parser-change operation.
 
-4. Environment IDs via [N]. The opener 'python[0]^(...)_python[0]' matches
-   strictly: the closer must include the [0] if the opener did. Omitting
-   [N] in the opener means "default env 0" BUT the closer must also omit
-   it. This makes parsing unambiguous without lookahead across languages.
+4. Numeric environment IDs via [N] are persistent. Bare blocks and explicit
+   [*] blocks are fresh per evaluation attempt, with distinct reserved AST
+   encodings so their source spelling round-trips. Openers and closers match
+   strictly, including the environment marker.
 """
 
 from __future__ import annotations
@@ -59,8 +59,14 @@ REGISTERED_LANGUAGES = {
     "nixos_test",
 }
 
-# IDENT[N]?^(  -- the opening delimiter
-OPEN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?\^\(")
+# Environment encodings shared with the Rust and C17 editions. Numeric source
+# IDs may not claim either reserved fresh-environment sentinel.
+EPHEMERAL_ENV_ID = (1 << 32) - 1
+LINKER_ISOLATED_ENV_ID = EPHEMERAL_ENV_ID - 1
+MAX_PERSISTENT_ENV_ID = EPHEMERAL_ENV_ID - 2
+
+# IDENT[N]?^( or IDENT[*]^( -- the opening delimiter
+OPEN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+|\*)\])?\^\(")
 
 # let NAME = LANG[N]?^(  -- top-level let binding
 LET_RE = re.compile(r"let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
@@ -100,20 +106,34 @@ class LetBinding:
 class ExpressionNode:
     """A typed expression: LANG[env]^( ... )_LANG[env]."""
     language: str
-    env_id: int                # 0 when not explicitly written
-    env_explicit: bool         # was [N] written in the source?
+    env_id: int                # reserved sentinel for bare and [*] blocks
+    env_explicit: bool         # was [N] or [*] written in the source?
     body: List[Union["TextPart", "ExpressionNode", "VarRef"]] = field(default_factory=list)
 
     @property
+    def environment_marker(self) -> str:
+        if not self.env_explicit:
+            return ""
+        if self.env_id == LINKER_ISOLATED_ENV_ID:
+            return "[*]"
+        return f"[{self.env_id}]"
+
+    @property
+    def opening_tag(self) -> str:
+        return f"{self.language}{self.environment_marker}^("
+
+    @property
     def closing_tag(self) -> str:
-        if self.env_explicit:
-            return f")_{self.language}[{self.env_id}]"
-        return f")_{self.language}"
+        return f")_{self.language}{self.environment_marker}"
+
+    @property
+    def is_fresh_environment(self) -> bool:
+        return self.env_id in (EPHEMERAL_ENV_ID, LINKER_ISOLATED_ENV_ID)
 
     @property
     def env_key(self) -> str:
         """Key used to look up persistent per-language environments."""
-        return f"{self.canonical_language}[{self.env_id}]"
+        return f"{self.canonical_language}{self.environment_marker or '[fresh]'}"
 
     @property
     def canonical_language(self) -> str:
@@ -142,6 +162,22 @@ _ALIASES = {
 
 def _canonicalize(lang: str) -> str:
     return _ALIASES.get(lang, lang)
+
+
+def _decode_environment(marker: Optional[str], pos: int, src: str) -> tuple[int, bool]:
+    if marker is None:
+        return EPHEMERAL_ENV_ID, False
+    if marker == "*":
+        return LINKER_ISOLATED_ENV_ID, True
+    env_id = int(marker)
+    if env_id > MAX_PERSISTENT_ENV_ID:
+        raise ParseError(
+            pos,
+            "persistent environment id is reserved or out of range "
+            f"(maximum {MAX_PERSISTENT_ENV_ID})",
+            src,
+        )
+    return env_id, True
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +233,7 @@ class _ParserState:
         while self.pos < len(self.src):
             # 1. Check for our closing tag (must come before opener check so that
             #    close-alike patterns don't get re-parsed).
-            if end_tag is not None and self.src.startswith(end_tag, self.pos):
+            if end_tag is not None and self._matches_end_tag(end_tag, self.pos):
                 flush_text()
                 self.pos += len(end_tag)
                 return out
@@ -208,7 +244,7 @@ class _ParserState:
             #    follows is an actual opener or our matching closer.
             if c == "\\":
                 # escaping the matching close tag?
-                if end_tag is not None and self.src.startswith(end_tag, self.pos + 1):
+                if end_tag is not None and self._matches_end_tag(end_tag, self.pos + 1):
                     text_buf.append(end_tag)
                     self.pos += 1 + len(end_tag)
                     continue
@@ -241,8 +277,9 @@ class _ParserState:
                         binding_name = let_m.group(1)
                         lang = open_m.group(1)
                         env_str = open_m.group(2)
-                        env_id = int(env_str) if env_str is not None else 0
-                        env_explicit = env_str is not None
+                        env_id, env_explicit = _decode_environment(
+                            env_str, rest_pos, self.src
+                        )
                         self.pos = open_m.end()
                         expr_node = ExpressionNode(
                             language=lang,
@@ -275,8 +312,9 @@ class _ParserState:
                 flush_text()
                 lang = m.group(1)
                 env_str = m.group(2)
-                env_id = int(env_str) if env_str is not None else 0
-                env_explicit = env_str is not None
+                env_id, env_explicit = _decode_environment(
+                    env_str, self.pos, self.src
+                )
                 self.pos = m.end()
 
                 node = ExpressionNode(
@@ -303,6 +341,14 @@ class _ParserState:
         flush_text()
         return out
 
+    def _matches_end_tag(self, end_tag: str, pos: int) -> bool:
+        if not self.src.startswith(end_tag, pos):
+            return False
+        after = pos + len(end_tag)
+        # Do not let a bare closer consume the prefix of `)_lang[N]` or
+        # `)_lang[*]`; the source marker is part of the delimiter identity.
+        return after >= len(self.src) or self.src[after] != "["
+
 
 # ---------------------------------------------------------------------------
 # Debug pretty-printer
@@ -322,7 +368,24 @@ def pretty(node, indent: int = 0) -> str:
     if isinstance(node, LetBinding):
         return f"{pad}LET {node.name} = {pretty(node.expr, indent)}"
     if isinstance(node, ExpressionNode):
-        header = f"{pad}EXPR {node.language}[{node.env_id}]"
+        marker = node.environment_marker or "[fresh]"
+        header = f"{pad}EXPR {node.language}{marker}"
         children = "\n".join(pretty(c, indent + 1) for c in node.body)
         return header + ("\n" + children if children else "")
     return f"{pad}?? {node!r}"
+
+
+def reconstruct_source(node) -> str:
+    """Reconstruct parsed O source while preserving each environment spelling."""
+    if isinstance(node, Document):
+        return "".join(reconstruct_source(child) for child in node.body)
+    if isinstance(node, TextPart):
+        return node.text
+    if isinstance(node, VarRef):
+        return f"${node.name}"
+    if isinstance(node, LetBinding):
+        return f"let {node.name} = {reconstruct_source(node.expr)}"
+    if isinstance(node, ExpressionNode):
+        body = "".join(reconstruct_source(child) for child in node.body)
+        return f"{node.opening_tag}{body}{node.closing_tag}"
+    raise TypeError(f"Unknown AST node: {node!r}")
