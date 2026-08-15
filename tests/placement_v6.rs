@@ -1034,6 +1034,7 @@ fn complete_candidate_requires_fresh_profile_capacity_and_exact_discharge() {
         trust_policy: &strict,
         reservation: &reservation,
         actor_generation: None,
+        prospective_logical_environment: None,
     };
     assert!(input.evaluate(now, &AcceptAll).is_eligible());
     assert!(!input
