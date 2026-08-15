@@ -10,8 +10,8 @@ Usage: scripts/demo_o_link_schedule_why.sh [OPTIONS]
 Literal-link a multi-file ordinary-O pipeline, inspect its admitted schedule,
 select the first hosted operation in predicted layer 3 for `o why`, and compare
 serial and graph returned-value semantics. A foreign-file link is checked as a
-negative control: o-link assigns persistent [N] environments, so those ordinary
-wrapped blocks remain coordinator-owned.
+conservative control: o-link assigns fresh-isolated [*] environments, and those
+ordinary non-autonomous blocks remain coordinator-owned.
 
 Options:
   --workers N         Graph worker capacity (default: 4)
@@ -244,12 +244,12 @@ compare_semantics complex \
     "$output_dir/complex-serial.json" "$output_dir/complex-graph.json" 111 \
     "$output_dir/complex-serial-semantic.json" "$output_dir/complex-graph-semantic.json"
 
-printf '\n== Foreign-file persistent-environment boundary ==\n'
+printf '\n== Foreign-file fresh-isolated, non-autonomous boundary ==\n'
 "$o_link_bin" "$foreign_fixture" --literal --verbose-skips -o "$foreign_program"
-require_pattern "$foreign_program" '^python\[0\]\^\($' \
-    "first foreign Python file did not receive environment [0]"
-require_pattern "$foreign_program" '^python\[1\]\^\($' \
-    "second foreign Python file did not receive environment [1]"
+require_count "$foreign_program" '^python\[\*\]\^\($' 2 \
+    "foreign Python files did not each receive a fresh-isolated [*] environment"
+reject_pattern "$foreign_program" '^python\[[0-9]+\]\^\($' \
+    "foreign Python files unexpectedly received persistent numeric environments"
 "$olangc_bin" "$foreign_program" \
     --target ir --explain-schedule --workers "$workers" --shim-dir "$backends_dir" \
     >"$foreign_explain"
@@ -266,13 +266,13 @@ foreign_target=$(awk '/^operation P[0-9]+ admitted=yes / { print $2; exit }' "$f
 [[ "$foreign_target" =~ ^P[0-9]+$ ]] || die "could not select the foreign control operation"
 O_LANG_OLANGC_BIN="$olangc_bin" "$o_cli" why \
     "$foreign_program" "$foreign_target" --shim-dir "$backends_dir" >"$foreign_why"
-require_pattern "$foreign_why" "^plan-node $foreign_target kind=exec python \[env 0\] " \
-    "foreign focused why did not preserve persistent environment identity"
+require_pattern "$foreign_why" "^plan-node $foreign_target kind=exec python \[env \*\] " \
+    "foreign focused why did not preserve fresh-isolated environment identity"
 require_pattern "$foreign_why" \
     '^  dispatch lane=coordinator adapter=coordinator/v1 semantics=strict-equivalent preparation=coordinator-owned$' \
     "foreign focused why did not report coordinator placement"
-require_pattern "$foreign_why" 'actor:python\[0\]' \
-    "foreign focused why omitted persistent actor-state effects"
+reject_pattern "$foreign_why" 'actor:python\[' \
+    "fresh-isolated foreign control unexpectedly acquired persistent actor state"
 
 "$o_bin" --executor serial --workers "$workers" --json \
     "$foreign_program" "$backends_dir" >"$output_dir/foreign-serial.json"

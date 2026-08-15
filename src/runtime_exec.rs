@@ -43,6 +43,80 @@ const LINUX_PROC_FD_PROXY_EXECUTION_V1: &str = "linux-procfd-open-object/v1";
 pub const CURRENT_O_LOGICAL_COMMAND: &str = "__ostadix_current_executable__";
 pub const SANDBOX_EXEC_LOGICAL_COMMAND: &str = "__sandbox_exec__";
 
+/// Resolve and validate a supported native executable image. This is a
+/// format-and-permission preflight, not an O backend-protocol or ABI probe.
+/// Shell dispatchers are not acceptable here: hashing a wrapper would leave
+/// the executable it selects outside the admitted artifact identity.
+pub fn validate_native_runtime_binary(path: &Path) -> Result<PathBuf> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("could not inspect `{}`", path.display()))?;
+    if !metadata.is_file() {
+        bail!("`{}` is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("`{}` is not executable", path.display());
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("could not canonicalize `{}`", path.display()))?;
+    let file = File::open(&canonical)
+        .with_context(|| format!("could not open `{}`", canonical.display()))?;
+    ensure_native_executable_image(&file, &canonical)?;
+    Ok(canonical)
+}
+
+fn has_native_executable_magic(prefix: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    return matches!(
+        prefix,
+        [0xfe, 0xed, 0xfa, 0xce]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbf, 0xba, 0xfe, 0xca]
+    );
+
+    #[cfg(windows)]
+    return prefix.starts_with(b"MZ");
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return prefix.starts_with(b"\x7fELF");
+
+    #[cfg(not(any(unix, windows)))]
+    false
+}
+
+fn ensure_native_executable_image(file: &File, path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut reader = file
+        .try_clone()
+        .with_context(|| format!("could not inspect `{}`", path.display()))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("could not inspect `{}`", path.display()))?;
+    let mut prefix = [0_u8; 4];
+    let read = reader
+        .read(&mut prefix)
+        .with_context(|| format!("could not inspect `{}`", path.display()))?;
+    if !has_native_executable_magic(&prefix[..read]) {
+        bail!(
+            "`{}` is a script or unsupported executable format",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutableGuaranteeV1 {
@@ -956,6 +1030,10 @@ fn capture_artifact(
     // only content hash. Later rows reuse that evidence after proving that the
     // canonical name and retained handle still designate the same object.
     if let Some(existing) = retained.get(&canonical_path) {
+        if role == "ostadix-proxy" {
+            ensure_native_executable_image(&existing.file, &canonical_path)
+                .context("O backend proxy is not a native executable image")?;
+        }
         let observed_path_identity =
             file_identity(&fs::metadata(&canonical_path).with_context(|| {
                 format!(
@@ -1012,6 +1090,10 @@ fn capture_artifact(
         );
     }
     ensure_executable_mode(&metadata, &canonical_path)?;
+    if role == "ostadix-proxy" {
+        ensure_native_executable_image(&file, &canonical_path)
+            .context("O backend proxy is not a native executable image")?;
+    }
     let identity = file_identity(&metadata)?;
     verify_invocation_target(
         &invocation_path,
@@ -1776,6 +1858,66 @@ mod tests {
     }
 
     #[test]
+    fn execution_manifest_rejects_script_as_o_proxy() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("O-wrapper");
+        fs::write(&wrapper, b"#!/bin/sh\nexec /some/other/O \"$@\"\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = format!(
+            "{:#}",
+            capture_execution_manifest_with_current_executable(&shell_plan(), &wrapper)
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("O backend proxy is not a native executable image"),
+            "{error}"
+        );
+        assert!(error.contains("script or unsupported executable format"));
+    }
+
+    #[test]
+    fn o_proxy_reuse_rejects_a_previously_retained_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("shared-launcher");
+        fs::write(&wrapper, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let selection = ArtifactSelection {
+            requirement_key: "shell",
+            selected_alternative: Some(0),
+            selection: ExecutableSelectionV1::CompleteCatalogAlternative,
+        };
+        let mut retained = BTreeMap::new();
+        capture_artifact(
+            "shell",
+            selection,
+            "sh",
+            "direct-launcher",
+            &wrapper,
+            &mut retained,
+        )
+        .unwrap();
+
+        let error = format!(
+            "{:#}",
+            capture_artifact(
+                "shell",
+                selection,
+                CURRENT_O_LOGICAL_COMMAND,
+                "ostadix-proxy",
+                &wrapper,
+                &mut retained,
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("O backend proxy is not a native executable image"),
+            "{error}"
+        );
+        assert!(error.contains("script or unsupported executable format"));
+    }
+
+    #[test]
     fn legacy_adapter_projection_includes_adapter_owned_tools() {
         let plan = OIrProgram {
             nodes: vec![OIr::Exec {
@@ -2007,10 +2149,7 @@ mod tests {
 
     #[test]
     fn child_manifest_rejects_inconsistent_backend_selection() {
-        let temp = tempfile::tempdir().unwrap();
-        let admitted = temp.path().join("tool");
-        fs::write(&admitted, b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&admitted, fs::Permissions::from_mode(0o755)).unwrap();
+        let admitted = std::env::current_exe().unwrap();
         let mut retained = BTreeMap::new();
         let direct = capture_artifact(
             "shell",

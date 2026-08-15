@@ -18,8 +18,8 @@ use crate::ir::{
     BACKEND_CATALOG_SCHEMA_V1,
 };
 use crate::runtime_exec::{
-    capture_execution_manifest, inspection_executable_manifest, ExecutableLeaseSet,
-    ExecutableManifestV1,
+    capture_execution_manifest, capture_execution_manifest_with_current_executable,
+    inspection_executable_manifest, ExecutableLeaseSet, ExecutableManifestV1,
 };
 use crate::value::GroupMode;
 
@@ -45,6 +45,32 @@ pub fn runtime_binding_from_directory(
         .flat_map(|backend| legacy_python_artifacts_from_directory(shim_dir, backend))
         .collect::<Vec<_>>();
     let (executable_manifest, executable_leases) = capture_execution_manifest(plan)?;
+    Ok(build_runtime_binding(
+        RuntimeSnapshotKindV1::Execution,
+        artifacts,
+        executable_manifest,
+        Some(executable_leases),
+        backend_catalog_projection_sha256(plan),
+        context,
+    ))
+}
+
+/// Capture an execution binding whose O backend proxy is an explicit native
+/// evaluator rather than the embedding process. This is required by hosts such
+/// as `o-node`: their own executable is not the `O --o-backend` entrypoint.
+pub fn runtime_binding_from_directory_with_current_executable(
+    plan: &ExecutionPlan,
+    shim_dir: &Path,
+    context: &[(&str, &str)],
+    current_executable: &Path,
+) -> Result<RuntimeBindingV1> {
+    let backends = legacy_python_shim_backends(plan);
+    let artifacts = backends
+        .into_iter()
+        .flat_map(|backend| legacy_python_artifacts_from_directory(shim_dir, backend))
+        .collect::<Vec<_>>();
+    let (executable_manifest, executable_leases) =
+        capture_execution_manifest_with_current_executable(plan, current_executable)?;
     Ok(build_runtime_binding(
         RuntimeSnapshotKindV1::Execution,
         artifacts,

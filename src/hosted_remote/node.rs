@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use crate::eval::Evaluator;
 use crate::ir::BackendRegistry;
 use crate::parser::Parser;
+use crate::runtime_exec::validate_native_runtime_binary;
 
 use super::protocol::{
     canonical_hosted_bytes, canonical_hosted_sha256, read_hosted_frame, sha256_hex, unix_time_ms,
@@ -31,6 +32,10 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 32;
 pub struct HostedNodeRuntime {
     pub node_id: String,
     pub shim_dir: PathBuf,
+    /// Native evaluator image used for admitted `--o-backend` proxy launches.
+    /// `o-node` is an embedding host and cannot serve as its own proxy. Image
+    /// validation is format-only; an admitted run exercises the protocol.
+    pub runtime_executable: PathBuf,
     pub max_concurrent_connections: usize,
 }
 
@@ -39,6 +44,8 @@ impl HostedNodeRuntime {
         if self.max_concurrent_connections == 0 || self.max_concurrent_connections > 1024 {
             bail!("node max-connections must be between 1 and 1024");
         }
+        validate_native_runtime_binary(&self.runtime_executable)
+            .context("node runtime executable is not a supported native image")?;
         // NodeProfile validates the identifier and catalog projection for us.
         self.profile().map(|_| ())
     }
@@ -51,6 +58,21 @@ impl HostedNodeRuntime {
         let profile = self.profile()?;
         let shim_exists = self.shim_dir.exists();
         let shim_is_directory = self.shim_dir.is_dir();
+        let runtime_check = match validate_native_runtime_binary(&self.runtime_executable) {
+            Ok(path) => NodeDoctorCheckV1 {
+                name: "native-runtime-image-valid".to_string(),
+                ok: true,
+                detail: format!(
+                    "{} (native-image preflight only; the first admitted hosted-backend launch exercises the O protocol)",
+                    path.display()
+                ),
+            },
+            Err(error) => NodeDoctorCheckV1 {
+                name: "native-runtime-image-valid".to_string(),
+                ok: false,
+                detail: format!("{error:#}"),
+            },
+        };
         let checks = vec![
             NodeDoctorCheckV1 {
                 name: "shim-directory-exists".to_string(),
@@ -62,6 +84,7 @@ impl HostedNodeRuntime {
                 ok: shim_is_directory,
                 detail: self.shim_dir.display().to_string(),
             },
+            runtime_check,
             NodeDoctorCheckV1 {
                 name: "backend-catalog-is-descriptive".to_string(),
                 ok: true,
@@ -120,6 +143,8 @@ impl HostedNodeRuntime {
         let started = unix_time_ms()?;
         let actual_source_sha256 = sha256_hex(operation.source_utf8.as_bytes());
         let actual_catalog_sha256 = BackendRegistry::global().catalog_sha256();
+        let runtime_executable = validate_native_runtime_binary(&self.runtime_executable)
+            .map_err(|error| format!("{error:#}"));
 
         let outcome = if actual_source_sha256 != operation.source_sha256 {
             HostedOperationOutcomeV1::failed(
@@ -138,6 +163,12 @@ impl HostedNodeRuntime {
                     "prepared catalog digest {} does not match node catalog {}",
                     operation.expected_backend_catalog_sha256, actual_catalog_sha256
                 ),
+            )
+        } else if let Err(error) = runtime_executable {
+            HostedOperationOutcomeV1::failed(
+                HostedFailureStageV1::Admission,
+                "runtime-executable-invalid",
+                error,
             )
         } else if started >= operation.deadline_unix_ms {
             HostedOperationOutcomeV1::failed(
@@ -197,8 +228,9 @@ impl HostedNodeRuntime {
             }
         };
 
-        let mut evaluator =
-            Evaluator::new(self.shim_dir.clone()).with_registered_backends(backends);
+        let mut evaluator = Evaluator::new(self.shim_dir.clone())
+            .with_registered_backends(backends)
+            .with_runtime_executable(self.runtime_executable.clone());
         match evaluator.eval_document(nodes) {
             Err(error) => HostedOperationOutcomeV1::failed(
                 HostedFailureStageV1::Evaluate,
@@ -340,6 +372,7 @@ mod tests {
         let runtime = HostedNodeRuntime {
             node_id: "node-a".to_string(),
             shim_dir: PathBuf::from("backends"),
+            runtime_executable: std::env::current_exe().unwrap(),
             max_concurrent_connections: 1,
         };
         let receipt = runtime.execute_prepared(operation).unwrap();
@@ -368,6 +401,7 @@ mod tests {
         let runtime = HostedNodeRuntime {
             node_id: "node-a".to_string(),
             shim_dir: PathBuf::from("backends"),
+            runtime_executable: std::env::current_exe().unwrap(),
             max_concurrent_connections: 1,
         };
         let receipt = runtime.execute_prepared(operation).unwrap();
@@ -377,6 +411,43 @@ mod tests {
                 stage: HostedFailureStageV1::Deadline,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn script_runtime_is_rejected_before_evaluation() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("O-wrapper");
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let operation = RemotePreparedOperationV1::new(
+            "task-1",
+            "attempt-1",
+            "text^(must-not-run)_text",
+            BackendRegistry::global().catalog_sha256(),
+            unix_time_ms().unwrap() + 60_000,
+            1024,
+        )
+        .unwrap();
+        let runtime = HostedNodeRuntime {
+            node_id: "node-a".to_string(),
+            shim_dir: PathBuf::from("backends"),
+            runtime_executable: wrapper,
+            max_concurrent_connections: 1,
+        };
+        let receipt = runtime.execute_prepared(operation).unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            HostedOperationOutcomeV1::Failed {
+                stage: HostedFailureStageV1::Admission,
+                ref code,
+                ..
+            } if code == "runtime-executable-invalid"
         ));
     }
 }

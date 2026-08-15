@@ -13,6 +13,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn backends_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("backends")
 }
@@ -48,12 +50,9 @@ fn run_bash_compatibility_case(temp: &Path, path_prefix: &[PathBuf], marker: &st
     paths.extend(std::env::split_paths(&inherited));
     let path = std::env::join_paths(paths).unwrap();
 
-    Command::new(private_o(temp))
-        .arg(program)
-        .arg(backends_dir())
-        .env("PATH", path)
-        .output()
-        .unwrap()
+    let mut command = Command::new(private_o(temp));
+    command.arg(program).arg(backends_dir()).env("PATH", path);
+    support::output_private_executable(&mut command).unwrap()
 }
 
 fn assert_bash_compatibility(output: &Output, marker: &str) {
@@ -113,16 +112,16 @@ printf '%s' unsafe-backend-ran
     paths.extend(std::env::split_paths(&inherited));
     let path = std::env::join_paths(paths).unwrap();
 
-    let mut child = Command::new(private_o(temp))
+    let mut command = Command::new(private_o(temp));
+    command
         .arg(&program)
         .arg(backends_dir())
         .env("PATH", path)
         .env("O_LIFECYCLE_TRACE", &trace)
         .env("O_BACKEND_OPERATION_TIMEOUT_MS", "10000")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = support::spawn_private_executable(&mut command).unwrap();
     wait_for_python_backend(&mut child, &trace);
     child
 }

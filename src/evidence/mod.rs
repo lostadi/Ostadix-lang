@@ -20,6 +20,7 @@ pub use admit::{
 pub use analyze::{
     analyze_execution, runtime_binding_from_adapter_bytes, runtime_binding_from_directory,
     runtime_binding_from_directory_reusing_executables,
+    runtime_binding_from_directory_with_current_executable,
 };
 pub use fact::{
     BackendArtifactStateV1, BackendArtifactV1, CapabilityDispositionV1, CostEstimateV1,

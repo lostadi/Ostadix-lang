@@ -48,8 +48,9 @@ WINDOWS_RERUN_REQUIRED=false
 ENV_FILE="${OSTADIX_ENV_FILE:-$HOME/.config/ostadix/env.sh}"
 GUESTS_DIR="${OSTADIX_GUESTS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ostadix/guests}"
 
+EVALUATOR_ALIAS=ostadix-evaluator
 RUST_BIN_TARGETS=(O olangc ocorec o-link o-unlink ogit o-live-host o-node octl o-registry)
-RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink ogit o-live-host o-node octl o-registry o-notebook)
+RUST_STALE_BINARIES=(O o olangc ocorec o-link olink o-unlink ogit o-live-host o-node octl o-registry o-notebook "$EVALUATOR_ALIAS")
 WRAPPER_TARGETS=(O o olangc o-c olangc-c o-notebook)
 CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
 
@@ -357,6 +358,7 @@ refresh_cargo_bin_binaries() {
     for bin in "${RUST_BIN_TARGETS[@]}"; do
       echo "[DRY] replace $CARGO_BIN_DIR/$bin from $PROJECT_ROOT/target/release/$bin"
     done
+    echo "[DRY] replace $CARGO_BIN_DIR/$EVALUATOR_ALIAS from $PROJECT_ROOT/target/release/O"
     echo "[DRY] install $CARGO_BIN_DIR/o through scripts/install-o-cli-wrapper.sh"
     return
   fi
@@ -375,6 +377,8 @@ refresh_cargo_bin_binaries() {
     cp "$src" "$dst"
     chmod +x "$dst"
   done
+  cp "$PROJECT_ROOT/target/release/O" "$CARGO_BIN_DIR/$EVALUATOR_ALIAS"
+  chmod +x "$CARGO_BIN_DIR/$EVALUATOR_ALIAS"
   "$PROJECT_ROOT/scripts/install-o-cli-wrapper.sh" "$CARGO_BIN_DIR/o"
   if directory_is_case_insensitive "$CARGO_BIN_DIR"; then
     echo "  $CARGO_BIN_DIR shares O/o; the wrapper dispatches by invocation spelling."
@@ -941,6 +945,7 @@ create_wrappers() {
         echo "[DRY] recreate wrapper $BIN_DIR/$wrapper"
       fi
     done
+    echo "[DRY] replace $BIN_DIR/$EVALUATOR_ALIAS from $PROJECT_ROOT/target/release/O"
     return
   fi
 
@@ -949,6 +954,12 @@ create_wrappers() {
   for wrapper in "${WRAPPER_TARGETS[@]}"; do
     remove_managed_file "$BIN_DIR/$wrapper"
   done
+  remove_managed_file "$BIN_DIR/$EVALUATOR_ALIAS"
+
+  # Stable native evaluator identity for placement fingerprinting. This name
+  # cannot collide with the O/o dispatcher on case-insensitive filesystems.
+  cp "$PROJECT_ROOT/target/release/O" "$BIN_DIR/$EVALUATOR_ALIAS"
+  chmod +x "$BIN_DIR/$EVALUATOR_ALIAS"
 
   # Rust evaluator (prefers release).
   cat > "$BIN_DIR/O" <<WRAP

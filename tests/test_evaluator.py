@@ -11,7 +11,11 @@ from o_lang import (
     OScope, OStorePath, OStr,
     evaluate_document, parse, run,
 )
-from o_lang.parser import REGISTERED_LANGUAGES
+from o_lang.parser import (
+    EPHEMERAL_ENV_ID,
+    LINKER_ISOLATED_ENV_ID,
+    REGISTERED_LANGUAGES,
+)
 from tests.example_manifest import (
     assert_python_expectation,
     examples_for,
@@ -130,6 +134,22 @@ def test_numeric_environment_persists_across_attempts_and_aliases():
     v = run("python[17]^(x + 2)_python[17]", ctx)
     assert isinstance(v, OInt)
     assert v.value == 42
+
+
+def test_fresh_environment_ids_never_enter_persistent_registry():
+    ctx = EvalContext()
+
+    bare_first = ctx.env_for("python", EPHEMERAL_ENV_ID)
+    bare_second = ctx.env_for("python", EPHEMERAL_ENV_ID)
+    star_first = ctx.env_for("python", LINKER_ISOLATED_ENV_ID)
+    star_second = ctx.env_for("python", LINKER_ISOLATED_ENV_ID)
+    persistent_first = ctx.env_for("python", 23)
+    persistent_second = ctx.env_for("python", 23)
+
+    assert bare_first is not bare_second
+    assert star_first is not star_second
+    assert persistent_first is persistent_second
+    assert set(ctx.envs) == {("python", 23)}
 
 
 def test_python_matplotlib_lifts_to_oblob():
