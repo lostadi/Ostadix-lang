@@ -6,7 +6,7 @@ use crate::effects::{
 };
 use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionPlan, OIr, PlanEdgeKind, PlanNodeId, PlanNodeKind};
-use crate::value::{Fidelity, OValue};
+use crate::value::{Fidelity, FidelityAssessmentV2, OValue};
 
 use super::kinds::{
     AdmissionFactKind, ConstraintOp, DomainFlags, ExecutableOp, HEdgeKind, OpKind,
@@ -63,6 +63,9 @@ pub struct HNode {
     pub rep: RepFlags,
     pub value: Option<OValue>,
     pub actor: Option<ActorId>,
+    /// Definite/possible fidelity bounds used by the stratified V2 solver.
+    /// `fidelity` remains the conservative V1 projection for frozen evidence.
+    pub fidelity_assessment: Option<FidelityAssessmentV2>,
     pub fidelity: Option<Fidelity>,
     pub incident: Vec<EdgeId>,
     /// Materialization state driven by the graph executor.
@@ -84,6 +87,7 @@ impl HNode {
             rep: RepFlags::ANY,
             value: None,
             actor: None,
+            fidelity_assessment: None,
             fidelity: None,
             incident: Vec::new(),
             state: ValueState::Unresolved,
@@ -931,6 +935,7 @@ impl HGraph {
                     || !node.domain.is_empty()
                     || !node.rep.is_empty()
                     || node.actor.is_some()
+                    || node.fidelity_assessment.is_some()
                     || node.fidelity.is_some()
                 {
                     return Err(format!(
