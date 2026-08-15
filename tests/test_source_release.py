@@ -380,14 +380,17 @@ class SourceReleaseTests(unittest.TestCase):
 
     def _commit(self, files: dict[str, str | bytes] | None = None) -> str:
         contents = {
+            ".dockerignore": "target\nOstadix-lang\n",
             ".github/dependabot.yml": "version: 2\nupdates: []\n",
             ".github/workflows/ci.yml": "name: fixture\n",
+            ".gitignore": "target/\nOstadix-lang/\n",
             ".mcp.json": (
                 '{"mcpServers":{"ostadix":{"command":"ostadix-mcp","args":[]}}}\n'
             ),
             "CITATION.cff": FIXTURE_CITATION,
             "Cargo.lock": "# fixture root lock\n",
             "Cargo.toml": FIXTURE_CARGO,
+            "Dockerfile": "FROM scratch\n",
             "LICENSE": FIXTURE_LICENSE,
             "README.md": fixture_readme(),
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
@@ -416,6 +419,8 @@ class SourceReleaseTests(unittest.TestCase):
             "docs/OSTADIX_WORLD.md": WORLD_NORMATIVE_BYTES[
                 "docs/OSTADIX_WORLD.md"
             ],
+            "docs/SEMANTIC_CUSTODY.md": "fixture semantic custody boundary\n",
+            "docs/VERSIONING.md": "fixture version axes\n",
             "evidence/gates.toml": fixture_evidence_manifest(),
             "evidence/world_alpha_gates.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/world_alpha_gates.toml"
@@ -429,7 +434,32 @@ class SourceReleaseTests(unittest.TestCase):
             "evidence/o_machine_contract_v1.toml": WORLD_NORMATIVE_BYTES[
                 "evidence/o_machine_contract_v1.toml"
             ],
-            "examples/manifest.json": '{"schema_version": 1, "examples": []}\n',
+            "examples/manifest.json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "examples": [
+                        {
+                            "path": "semantic_custody.O",
+                            "editions": ["rust"],
+                            "classification": "integration",
+                            "requirements": {
+                                "backends": ["python", "text"],
+                                "programs": ["python3"],
+                                "authorities": ["process"],
+                            },
+                            "expected": {
+                                "rust": {
+                                    "patterns": ["semantic-custody answer=42"]
+                                }
+                            },
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            "examples/docker_literal/main.py": "__oval_result__ = 42\n",
+            "examples/semantic_custody.O": "text^(fixture)_text\n",
             "llms.txt": "release index\n",
             "mcp/ostadix_lang_mcp_server/Cargo.lock": "# fixture lock\n",
             "mcp/ostadix_lang_mcp_server/Cargo.toml": (
@@ -513,6 +543,8 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/smoke-docker.sh": "#!/usr/bin/env bash\n",
+            "scripts/semantic_custody_demo.sh": "#!/usr/bin/env bash\n",
             "scripts/contract_surfaces.py": "#!/usr/bin/env python3\n",
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
@@ -527,6 +559,7 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/backend_catalog.inc.rs": "// fixture canonical backend catalog\n",
+            "src/api.rs": "// fixture curated public API\n",
             "src/backend.rs": "// fixture backend runtime\n",
             "src/backend_state.rs": "// fixture versioned backend state protocol\n",
             "src/evidence/admit.rs": "// fixture evidence admission compiler\n",
@@ -573,6 +606,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hosted_remote/v2/store.rs": "// fixture hosted V2 durable store\n",
             "src/ir.rs": "// fixture canonical backend catalog projection\n",
             "src/lib.rs": "pub mod placement;\n",
+            "src/main.rs": "fn main() {}\n",
             "src/placement/catalog_compat.rs": "// fixture catalog compatibility\n",
             "src/placement/mod.rs": "pub mod protocol;\n",
             "src/placement/projection.rs": "// fixture OIR requirement projection\n",
@@ -587,6 +621,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/placement/protocol/target.rs": "// fixture placement target descriptors\n",
             "src/placement/protocol/warrant.rs": "// fixture placement warrants\n",
             "src/process.rs": "// fixture persistent backend lifecycle\n",
+            "src/version.rs": "// fixture machine-readable version report\n",
             "src/project/executor.rs": "// fixture project HGraph executor\n",
             "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
             "src/project/launch.rs": "// fixture World-bound project launch\n",
@@ -766,6 +801,21 @@ class SourceReleaseTests(unittest.TestCase):
                                     "authorities": [],
                                 },
                                 "expected": {"rust": {"patterns": ["demo"]}},
+                            },
+                            {
+                                "path": "semantic_custody.O",
+                                "editions": ["rust"],
+                                "classification": "integration",
+                                "requirements": {
+                                    "backends": ["python", "text"],
+                                    "programs": ["python3"],
+                                    "authorities": ["process"],
+                                },
+                                "expected": {
+                                    "rust": {
+                                        "patterns": ["semantic-custody answer=42"]
+                                    }
+                                },
                             }
                         ],
                     },
@@ -791,11 +841,14 @@ class SourceReleaseTests(unittest.TestCase):
         with zipfile.ZipFile(result.output) as archive:
             names = set(archive.namelist())
             included = {
+                ".dockerignore",
                 ".github/dependabot.yml",
+                ".gitignore",
                 ".mcp.json",
                 "CITATION.cff",
                 "Cargo.lock",
                 "Cargo.toml",
+                "Dockerfile",
                 "LICENSE",
                 "README.md",
                 "boot-and-test.sh",
@@ -811,6 +864,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "docs/O_MACHINE_CONTRACT.md",
                 "docs/OSTADIX_BOOT.md",
                 "docs/OSTADIX_WORLD.md",
+                "docs/SEMANTIC_CUSTODY.md",
+                "docs/VERSIONING.md",
                 "evidence/gates.toml",
                 "evidence/o_machine_contract_v1.toml",
                 "evidence/world_alpha_gates.toml",
@@ -835,6 +890,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "evidence/world/transcripts/g2-aarch64-qemu.log",
                 "evidence/world/transcripts/g2-aarch64-qemu-2026-08-03.log",
                 "examples/manifest.json",
+                "examples/docker_literal/main.py",
+                "examples/semantic_custody.O",
                 "llms.txt",
                 "mcp/ostadix_lang_mcp_server/Cargo.lock",
                 "mcp/ostadix_lang_mcp_server/Cargo.toml",
@@ -890,6 +947,8 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/smoke-docker.sh",
+                "scripts/semantic_custody_demo.sh",
                 "scripts/contract_surfaces.py",
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
@@ -904,6 +963,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
                 "src/backend.rs",
+                "src/api.rs",
                 "src/backend_catalog.inc.rs",
                 "src/backend_state.rs",
                 "src/evidence/admit.rs",
@@ -950,6 +1010,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/hosted_remote/v2/store.rs",
                 "src/ir.rs",
                 "src/lib.rs",
+                "src/main.rs",
                 "src/placement/catalog_compat.rs",
                 "src/placement/mod.rs",
                 "src/placement/projection.rs",
@@ -964,6 +1025,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/placement/protocol/target.rs",
                 "src/placement/protocol/warrant.rs",
                 "src/process.rs",
+                "src/version.rs",
                 "src/project/executor.rs",
                 "src/project/deployment.rs",
                 "src/project/launch.rs",

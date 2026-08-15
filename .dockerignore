@@ -3,6 +3,8 @@ c_cpp/*.o
 c_cpp/O
 c_cpp/olangc
 .git/
+# Local archive/reference checkout; never recurse it into the build context.
+Ostadix-lang/
 docs/
 examples/
 setup/

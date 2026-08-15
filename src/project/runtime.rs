@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::executor::CancellationToken;
+#[cfg(target_os = "linux")]
+use crate::process::linux_process_observation_disappeared;
 
 use super::materialize::{materialize_isolated, Workspace};
 use super::model::{
@@ -1409,7 +1411,7 @@ impl OwnedRouteProcess {
         for entry in std::fs::read_dir("/proc")? {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if linux_process_observation_disappeared(&error) => continue,
                 Err(error) => return Err(error),
             };
             let Some(pid) = entry
@@ -1424,7 +1426,7 @@ impl OwnedRouteProcess {
             }
             let stat = match std::fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if linux_process_observation_disappeared(&error) => continue,
                 Err(error) => return Err(error),
             };
             let close = stat.rfind(')').ok_or_else(|| {
@@ -1627,6 +1629,72 @@ impl Drop for OwnedRouteProcess {
             // Drop must never reintroduce an unbounded wait on an exceptional
             // signal-delivery failure. Normal paths prove exit before reaping.
             let _ = self.child.try_wait();
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_process_observation_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn repeated_proc_scans_tolerate_short_lived_process_churn() {
+        const ITERATIONS: usize = 32;
+        const CHILDREN_PER_ITERATION: usize = 32;
+
+        for iteration in 0..ITERATIONS {
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "i=0; while [ \"$i\" -lt {CHILDREN_PER_ITERATION} ]; do (exit 0) & i=$((i + 1)); done; wait"
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.process_group(0);
+            let child = command
+                .spawn()
+                .expect("short-lived process churn must spawn");
+            let mut process = OwnedRouteProcess::new(child, ProcessTreePolicy::OwnedProcessGroup);
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            loop {
+                process
+                    .owned_group_has_no_active_descendants()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "iteration {iteration} treated a disappearing /proc entry as fatal: {error}"
+                        )
+                    });
+                if process
+                    .exited_without_reaping()
+                    .expect("short-lived process leader must remain observable")
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "short-lived process churn did not settle in iteration {iteration}"
+                );
+                std::thread::yield_now();
+            }
+
+            process
+                .owned_group_has_no_active_descendants()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "iteration {iteration} failed the final disappearing-entry scan: {error}"
+                    )
+                });
+            assert!(
+                process
+                    .wait()
+                    .expect("short-lived process must be reapable")
+                    .success(),
+                "short-lived process churn failed in iteration {iteration}"
+            );
         }
     }
 }

@@ -300,22 +300,24 @@ fn bounded_deadline(timeout: Duration, subject: &str) -> Result<Instant> {
         .ok_or_else(|| anyhow!("{subject} deadline overflowed"))
 }
 
+/// Return true when a non-authoritative `/proc` observation raced with normal
+/// process exit. Callers must continue to surface every other I/O error.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_process_observation_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Ostadix POSIX v1 containment governs descendants that remain in the
 /// backend's inherited process group. A descendant that deliberately creates
 /// a new session or process group (for example with `setsid`) escapes this v1
 /// boundary; complete containment requires a stronger OS facility such as a
 /// Linux cgroup or a Windows job object.
 #[cfg(target_os = "linux")]
-fn linux_proc_entry_vanished(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
-}
-
-#[cfg(target_os = "linux")]
 fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) if linux_proc_entry_vanished(&error) => continue,
+            Err(error) if linux_process_observation_disappeared(&error) => continue,
             Err(error) => return Err(error),
         };
         let Some(pid) = entry
@@ -330,7 +332,7 @@ fn owned_group_has_no_active_descendants(group: i32) -> io::Result<bool> {
         }
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if linux_proc_entry_vanished(&error) => continue,
+            Err(error) if linux_process_observation_disappeared(&error) => continue,
             Err(error) => return Err(error),
         };
         let close = stat.rfind(')').ok_or_else(|| {
@@ -2130,10 +2132,10 @@ mod tests {
         let permission_denied = io::Error::from_raw_os_error(libc::EACCES);
         let malformed = io::Error::new(io::ErrorKind::InvalidData, "malformed stat");
 
-        assert!(linux_proc_entry_vanished(&not_found));
-        assert!(linux_proc_entry_vanished(&esrch));
-        assert!(!linux_proc_entry_vanished(&permission_denied));
-        assert!(!linux_proc_entry_vanished(&malformed));
+        assert!(linux_process_observation_disappeared(&not_found));
+        assert!(linux_process_observation_disappeared(&esrch));
+        assert!(!linux_process_observation_disappeared(&permission_denied));
+        assert!(!linux_process_observation_disappeared(&malformed));
     }
 
     fn python_shim_path() -> std::path::PathBuf {

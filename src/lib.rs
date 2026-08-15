@@ -1,13 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Ostadix-lang runtime library
 //
-// All runtime modules are re-exported here so that both the `O` interpreter
-// binary and `olangc`-compiled binaries share the same public API surface.
-// Making these modules part of a library crate ensures every `pub` item is
-// considered reachable (it's public API), eliminating dead-code warnings
-// without suppression attributes.
+// The historical 0.2 module surface remains available for compatibility with
+// the interpreter, generated AOT crates, MCP, and existing embedders. New
+// consumers should begin with `o_lang::api`; implementation modules will move
+// behind that curated façade in later compatibility releases.
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub mod api;
 pub mod backend;
 mod capability;
 pub mod effects;
@@ -32,5 +32,6 @@ pub mod runtime_exec;
 pub mod scheduler;
 pub mod shims;
 pub mod value;
+pub mod version;
 pub mod wire;
 pub mod world;
