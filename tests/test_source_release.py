@@ -380,15 +380,27 @@ class SourceReleaseTests(unittest.TestCase):
 
     def _commit(self, files: dict[str, str | bytes] | None = None) -> str:
         contents = {
+            ".github/dependabot.yml": "version: 2\nupdates: []\n",
             ".github/workflows/ci.yml": "name: fixture\n",
             ".mcp.json": (
                 '{"mcpServers":{"ostadix":{"command":"ostadix-mcp","args":[]}}}\n'
             ),
             "CITATION.cff": FIXTURE_CITATION,
+            "Cargo.lock": "# fixture root lock\n",
             "Cargo.toml": FIXTURE_CARGO,
             "LICENSE": FIXTURE_LICENSE,
             "README.md": fixture_readme(),
             "boot-and-test.sh": "#!/bin/sh\nexit 0\n",
+            "ci/required-jobs.toml": (
+                'schema = "ostadix.ci-required-jobs/v1"\nrequired_jobs = ["contracts"]\n'
+            ),
+            "ci/test-suites.toml": (
+                'schema = "ostadix.ci-test-suites/v1"\n'
+                '[suites.contracts]\nrequired_executables = ["python3"]\n'
+            ),
+            "rust-toolchain.toml": (
+                '[toolchain]\nchannel = "1.97.1"\nprofile = "minimal"\n'
+            ),
             "setup.sh": "#!/bin/sh\nexit 0\n",
             "docs/CLAIMS.md": "fixture claims\n",
             "docs/HOSTED_LIVE_REFERENCE.md": "fixture hosted reference\n",
@@ -501,6 +513,7 @@ class SourceReleaseTests(unittest.TestCase):
             "ocore/world/value.oc": "module world::value;\n",
             "ocore/world/value_codec.oc": "module world::value_codec;\n",
             "scripts/smoke_ostadix_mcp.py": "#!/usr/bin/env python3\n",
+            "scripts/contract_surfaces.py": "#!/usr/bin/env python3\n",
             "scripts/install-o-cli-wrapper.sh": "#!/usr/bin/env bash\n",
             "scripts/o-cli.sh": "#!/usr/bin/env bash\nexec true\n",
             "scripts/o-kernel.sh": "#!/usr/bin/env bash\nexec true\n",
@@ -514,6 +527,8 @@ class SourceReleaseTests(unittest.TestCase):
             "scripts/release_evidence.py": "#!/usr/bin/env python3\n",
             "scripts/world_alpha_evidence.py": "#!/usr/bin/env python3\n",
             "src/backend_catalog.inc.rs": "// fixture canonical backend catalog\n",
+            "src/backend.rs": "// fixture backend runtime\n",
+            "src/backend_state.rs": "// fixture versioned backend state protocol\n",
             "src/evidence/admit.rs": "// fixture evidence admission compiler\n",
             "src/evidence/analyze.rs": "// fixture pre-execution evidence analyzer\n",
             "src/evidence/fact.rs": "// fixture evidence contract vocabulary\n",
@@ -521,6 +536,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/evidence/mod.rs": "pub mod admit;\n",
             "src/evidence/profile.rs": "// fixture non-authoritative cost profiles\n",
             "src/effects.rs": "// fixture governed effect vocabulary\n",
+            "src/eval.rs": "// fixture evaluator state bridge\n",
             "src/runtime_exec.rs": "// fixture direct-launch executable authority\n",
             "src/bin/o-node.rs": "// fixture direct hosted-node CLI\n",
             "src/bin/o-registry.rs": "// fixture signed local registry CLI\n",
@@ -540,11 +556,37 @@ class SourceReleaseTests(unittest.TestCase):
             "src/hgraph/kinds.rs": "// fixture HGraph operation vocabulary\n",
             "src/hgraph/from_oir.rs": "// fixture HGraph effect lowering\n",
             "src/hgraph/solve.rs": "// fixture HGraph fidelity transfer\n",
+            "src/hosted_remote/client.rs": "// fixture hosted client\n",
+            "src/hosted_remote/mod.rs": "pub mod protocol;\n",
             "src/hosted_remote/node.rs": "// fixture hosted node runtime\n",
+            "src/hosted_remote/paths.rs": "// fixture hosted paths\n",
+            "src/hosted_remote/protocol.rs": "// fixture hosted V1 protocol\n",
+            "src/hosted_remote/tls.rs": "// fixture hosted TLS\n",
+            "src/hosted_remote/v2/auth.rs": "// fixture hosted V2 authority adapter\n",
+            "src/hosted_remote/v2/client.rs": "// fixture hosted V2 client\n",
+            "src/hosted_remote/v2/crypto.rs": "// fixture hosted V2 signatures\n",
+            "src/hosted_remote/v2/dev.rs": "// fixture hosted V2 development authority\n",
+            "src/hosted_remote/v2/mod.rs": "pub mod protocol;\n",
+            "src/hosted_remote/v2/protocol.rs": "// fixture hosted V2 wire protocol\n",
+            "src/hosted_remote/v2/runtime.rs": "// fixture hosted V2 state machine\n",
+            "src/hosted_remote/v2/server.rs": "// fixture hosted V2 server\n",
+            "src/hosted_remote/v2/store.rs": "// fixture hosted V2 durable store\n",
             "src/ir.rs": "// fixture canonical backend catalog projection\n",
-            "src/placement/error.rs": "// fixture placement validation errors\n",
-            "src/placement/records.rs": "// fixture placement validity records\n",
-            "src/placement/target.rs": "// fixture placement target descriptors\n",
+            "src/lib.rs": "pub mod placement;\n",
+            "src/placement/catalog_compat.rs": "// fixture catalog compatibility\n",
+            "src/placement/mod.rs": "pub mod protocol;\n",
+            "src/placement/projection.rs": "// fixture OIR requirement projection\n",
+            "src/placement/protocol/candidate.rs": "// fixture candidate validation\n",
+            "src/placement/protocol/catalog.rs": "// fixture catalog authority trait\n",
+            "src/placement/protocol/digest.rs": "// fixture semantic digest\n",
+            "src/placement/protocol/error.rs": "// fixture placement validation errors\n",
+            "src/placement/protocol/mod.rs": "pub mod records;\n",
+            "src/placement/protocol/records.rs": "// fixture placement validity records\n",
+            "src/placement/protocol/requirement.rs": "// fixture placement requirements\n",
+            "src/placement/protocol/state.rs": "// fixture state and quota protocol\n",
+            "src/placement/protocol/target.rs": "// fixture placement target descriptors\n",
+            "src/placement/protocol/warrant.rs": "// fixture placement warrants\n",
+            "src/process.rs": "// fixture persistent backend lifecycle\n",
             "src/project/executor.rs": "// fixture project HGraph executor\n",
             "src/project/deployment.rs": "// fixture canonical project deployment plan\n",
             "src/project/launch.rs": "// fixture World-bound project launch\n",
@@ -559,6 +601,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "// fixture bounded World-project execution and receipt emission\n"
             ),
             "src/registry/store.rs": "// fixture transactional signed registry store\n",
+            "src/registry/bundle/mod.rs": "// fixture canonical backend bundle\n",
             "src/world/grounding.rs": "// fixture World grounding projection\n",
             "src/world/identity.rs": "// fixture World identities\n",
             "src/world/identity_wire.rs": "// fixture World identity wire oracle\n",
@@ -570,6 +613,7 @@ class SourceReleaseTests(unittest.TestCase):
             "src/world/value.rs": "// fixture portable World value vocabulary\n",
             "src/world/value_codec.rs": "// fixture portable World value codec\n",
             "tests/example_manifest.py": "# fixture example manifest consumer\n",
+            "tests/hosted_remote_v2.rs": "// fixture hosted V2 integration tests\n",
             "tests/fixtures/world_identity_v1.hex": "4f574944454e5431\n",
             "tests/fixtures/project_hgraph/input.txt": "fixture input\n",
             "tests/fixtures/project_hgraph/olang.project.toml": "[project]\nname = \"fixture\"\n",
@@ -580,10 +624,13 @@ class SourceReleaseTests(unittest.TestCase):
             "tests/fixtures/world_receipt_v1.hex": "4f57524543454950\n",
             "tests/fixtures/world_value_v1.hex": "4f5756414c554531\n",
             "tests/test_example_manifest.py": "# fixture example manifest tests\n",
+            "tests/test_contract_surfaces.py": "# fixture contract projection tests\n",
+            "tests/test_backend_state_protocol.py": "# fixture backend state protocol tests\n",
             "tests/test_mcp_smoke.py": "# fixture MCP smoke tests\n",
             "tests/test_ostadix_boot_media.py": "# fixture boot-media tests\n",
             "tests/test_ostadix_media_writer.py": "# fixture media-writer tests\n",
             "tests/test_ostadix_physical_evidence.py": "# fixture physical-evidence tests\n",
+            "tests/test_o_cli_dispatch.py": "# fixture lowercase CLI dispatch tests\n",
             "tests/test_release_evidence.py": "# fixture release evidence tests\n",
             "tests/test_setup.py": "# fixture setup tests\n",
             "tests/test_bundled_shim_protocol.py": "# fixture bundled shim protocol tests\n",
@@ -744,12 +791,17 @@ class SourceReleaseTests(unittest.TestCase):
         with zipfile.ZipFile(result.output) as archive:
             names = set(archive.namelist())
             included = {
+                ".github/dependabot.yml",
                 ".mcp.json",
                 "CITATION.cff",
+                "Cargo.lock",
                 "Cargo.toml",
                 "LICENSE",
                 "README.md",
                 "boot-and-test.sh",
+                "ci/required-jobs.toml",
+                "ci/test-suites.toml",
+                "rust-toolchain.toml",
                 "setup.sh",
                 "docs/CLAIMS.md",
                 "docs/HOSTED_LIVE_REFERENCE.md",
@@ -838,6 +890,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "ocore/world/value.oc",
                 "ocore/world/value_codec.oc",
                 "scripts/smoke_ostadix_mcp.py",
+                "scripts/contract_surfaces.py",
                 "scripts/install-o-cli-wrapper.sh",
                 "scripts/o-cli.sh",
                 "scripts/o-kernel.sh",
@@ -850,7 +903,9 @@ class SourceReleaseTests(unittest.TestCase):
                 "scripts/smoke-world-g0-conformance.sh",
                 "scripts/release_evidence.py",
                 "scripts/world_alpha_evidence.py",
+                "src/backend.rs",
                 "src/backend_catalog.inc.rs",
+                "src/backend_state.rs",
                 "src/evidence/admit.rs",
                 "src/evidence/analyze.rs",
                 "src/evidence/fact.rs",
@@ -858,6 +913,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/evidence/mod.rs",
                 "src/evidence/profile.rs",
                 "src/effects.rs",
+                "src/eval.rs",
                 "src/runtime_exec.rs",
                 "src/bin/o-node.rs",
                 "src/bin/o-registry.rs",
@@ -877,11 +933,37 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/hgraph/kinds.rs",
                 "src/hgraph/from_oir.rs",
                 "src/hgraph/solve.rs",
+                "src/hosted_remote/client.rs",
+                "src/hosted_remote/mod.rs",
                 "src/hosted_remote/node.rs",
+                "src/hosted_remote/paths.rs",
+                "src/hosted_remote/protocol.rs",
+                "src/hosted_remote/tls.rs",
+                "src/hosted_remote/v2/auth.rs",
+                "src/hosted_remote/v2/client.rs",
+                "src/hosted_remote/v2/crypto.rs",
+                "src/hosted_remote/v2/dev.rs",
+                "src/hosted_remote/v2/mod.rs",
+                "src/hosted_remote/v2/protocol.rs",
+                "src/hosted_remote/v2/runtime.rs",
+                "src/hosted_remote/v2/server.rs",
+                "src/hosted_remote/v2/store.rs",
                 "src/ir.rs",
-                "src/placement/error.rs",
-                "src/placement/records.rs",
-                "src/placement/target.rs",
+                "src/lib.rs",
+                "src/placement/catalog_compat.rs",
+                "src/placement/mod.rs",
+                "src/placement/projection.rs",
+                "src/placement/protocol/candidate.rs",
+                "src/placement/protocol/catalog.rs",
+                "src/placement/protocol/digest.rs",
+                "src/placement/protocol/error.rs",
+                "src/placement/protocol/mod.rs",
+                "src/placement/protocol/records.rs",
+                "src/placement/protocol/requirement.rs",
+                "src/placement/protocol/state.rs",
+                "src/placement/protocol/target.rs",
+                "src/placement/protocol/warrant.rs",
+                "src/process.rs",
                 "src/project/executor.rs",
                 "src/project/deployment.rs",
                 "src/project/launch.rs",
@@ -893,6 +975,7 @@ class SourceReleaseTests(unittest.TestCase):
                 "src/project/runtime_graph.rs",
                 "src/project/trace.rs",
                 "src/project/world_execution.rs",
+                "src/registry/bundle/mod.rs",
                 "src/registry/store.rs",
                 "src/world/grounding.rs",
                 "src/world/identity.rs",
@@ -915,15 +998,19 @@ class SourceReleaseTests(unittest.TestCase):
                 "tests/fixtures/world_receipt_v1.hex",
                 "tests/fixtures/world_value_v1.hex",
                 "tests/test_example_manifest.py",
+                "tests/test_contract_surfaces.py",
+                "tests/test_backend_state_protocol.py",
                 "tests/test_mcp_smoke.py",
                 "tests/test_ostadix_boot_media.py",
                 "tests/test_ostadix_media_writer.py",
                 "tests/test_ostadix_physical_evidence.py",
+                "tests/test_o_cli_dispatch.py",
                 "tests/test_release_evidence.py",
                 "tests/test_setup.py",
                 "tests/test_bundled_shim_protocol.py",
                 "tests/test_world_alpha_evidence.py",
                 "tests/hosted_remote_cli.rs",
+                "tests/hosted_remote_v2.rs",
                 "tests/placement_v6.rs",
                 "tests/registry_v1.rs",
                 "tests/project_hgraph.rs",
@@ -1316,25 +1403,79 @@ class SourceReleaseTests(unittest.TestCase):
         ):
             self._build("missing-mcp.zip")
 
+    def test_toolchain_and_ci_contract_projection_are_required(self) -> None:
+        required = (
+            ".github/dependabot.yml",
+            ".github/workflows/ci.yml",
+            "Cargo.lock",
+            "ci/required-jobs.toml",
+            "ci/test-suites.toml",
+            "rust-toolchain.toml",
+            "scripts/contract_surfaces.py",
+            "tests/test_contract_surfaces.py",
+        )
+        self._commit()
+        self._git("rm", *required)
+        self._git("commit", "-q", "-m", "remove toolchain and CI contracts")
+
+        with self.assertRaises(release.ReleaseError) as raised:
+            self._build("missing-ci-contracts.zip")
+        message = str(raised.exception)
+        self.assertIn("missing required path(s)", message)
+        for required_path in required:
+            self.assertIn(required_path, message)
+
     def test_hosted_placement_v6_commands_and_contract_are_required(self) -> None:
         required = (
             "backends/o_shim_common.py",
+            "src/backend.rs",
+            "src/backend_state.rs",
+            "src/eval.rs",
             "docs/HOSTED_PLACEMENT_V6.md",
             "setup.sh",
             "src/bin/o-node.rs",
             "src/bin/o-registry.rs",
             "src/bin/octl.rs",
+            "src/hosted_remote/client.rs",
+            "src/hosted_remote/mod.rs",
             "src/hosted_remote/node.rs",
+            "src/hosted_remote/paths.rs",
+            "src/hosted_remote/protocol.rs",
+            "src/hosted_remote/tls.rs",
+            "src/hosted_remote/v2/auth.rs",
+            "src/hosted_remote/v2/client.rs",
+            "src/hosted_remote/v2/crypto.rs",
+            "src/hosted_remote/v2/dev.rs",
+            "src/hosted_remote/v2/mod.rs",
+            "src/hosted_remote/v2/protocol.rs",
+            "src/hosted_remote/v2/runtime.rs",
+            "src/hosted_remote/v2/server.rs",
+            "src/hosted_remote/v2/store.rs",
             "src/hgraph/solve.rs",
             "src/ir.rs",
-            "src/placement/error.rs",
-            "src/placement/records.rs",
-            "src/placement/target.rs",
+            "src/placement/catalog_compat.rs",
+            "src/placement/mod.rs",
+            "src/placement/projection.rs",
+            "src/placement/protocol/candidate.rs",
+            "src/placement/protocol/catalog.rs",
+            "src/placement/protocol/digest.rs",
+            "src/placement/protocol/error.rs",
+            "src/placement/protocol/mod.rs",
+            "src/placement/protocol/records.rs",
+            "src/placement/protocol/requirement.rs",
+            "src/placement/protocol/state.rs",
+            "src/placement/protocol/target.rs",
+            "src/placement/protocol/warrant.rs",
+            "src/process.rs",
+            "src/registry/bundle/mod.rs",
             "src/registry/store.rs",
             "tests/hosted_remote_cli.rs",
+            "tests/hosted_remote_v2.rs",
             "tests/placement_v6.rs",
             "tests/registry_v1.rs",
             "tests/test_bundled_shim_protocol.py",
+            "tests/test_backend_state_protocol.py",
+            "tests/test_o_cli_dispatch.py",
         )
         self._commit()
         self._git("rm", *required)
@@ -1635,6 +1776,57 @@ class SourceReleaseTests(unittest.TestCase):
             r"src/runtime_exec\.rs",
         ):
             self._build("missing-evidence-bound-admission.zip")
+
+    def test_olangc_embedded_runtime_source_closure_is_derived_from_compiler(self) -> None:
+        self._commit(
+            {
+                "src/bin/olangc.rs": (
+                    'const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");\n'
+                ),
+                "src/value.rs": "// generated-runtime fixture value model\n",
+            }
+        )
+        self._git("rm", "src/value.rs")
+        self._git("commit", "-q", "-m", "remove generated runtime input")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"generated-runtime source closure path\(s\): src/value\.rs",
+        ):
+            self._build("missing-generated-runtime-input.zip")
+
+    def test_archive_verifier_revalidates_olangc_embedded_runtime_closure(self) -> None:
+        result = self._build(
+            "valid-before-runtime-closure-tamper.zip",
+            ref=self._commit(
+                {
+                    "src/bin/olangc.rs": (
+                        'const RUNTIME_VALUE_RS: &str = include_str!("../value.rs");\n'
+                    ),
+                    "src/value.rs": "// generated-runtime fixture value model\n",
+                }
+            ),
+        )
+
+        def redirect_runtime_include(entry):
+            if entry.path == "src/bin/olangc.rs":
+                return release.SourceEntry(
+                    entry.path,
+                    entry.mode,
+                    entry.data.replace(b"../value.rs", b"../missing-runtime.rs"),
+                )
+            return entry
+
+        tampered = self._rewrite_self_consistent(
+            result.output,
+            "self-consistent-missing-runtime-closure.zip",
+            redirect_runtime_include,
+        )
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            r"generated-runtime source closure path\(s\): src/missing-runtime\.rs",
+        ):
+            release.verify_archive(tampered)
 
     def test_prepared_task_pool_surface_is_required(self) -> None:
         self._commit()
