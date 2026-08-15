@@ -3,6 +3,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -12,14 +13,25 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use o_lang::hosted_remote::v2::{
+    default_hosted_v2_state_dir, read_node_signing_key_v2, read_placement_public_key_v2,
+    serve_node_dual, write_new_node_public_key_v2, write_new_node_signing_key_v2,
+    DurableSessionStoreV2, HostedDualNodeServerConfig, HostedNodeSignerV2, HostedV2Runtime,
+    HostedV2RuntimeConfig, PinnedEd25519PlacementAuthorizerV2, DEFAULT_MAX_ACTORS_PER_SESSION_V2,
+    DEFAULT_MAX_OPEN_SESSIONS_V2, DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2,
+    DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2, DEFAULT_MAX_STATE_BYTES_TOTAL_V2,
+};
 use o_lang::hosted_remote::{
     accept_mutual_tls, build_client_config, build_server_config, connect_mutual_tls,
     default_ca_path, default_node_cert_path, default_node_key_path, hosted_config_dir, serve_node,
     ClientTlsIdentity, HostedNodeRuntime, HostedNodeServerConfig, NodeDoctorCheckV1,
     ServerTlsIdentity, DEFAULT_MAX_CONNECTIONS, DEFAULT_NODE_BIND, DEFAULT_NODE_ID,
 };
+use o_lang::placement::{GenerationV1, StateQuotaLimitsV2};
 use o_lang::runtime_exec::validate_native_runtime_binary;
 use o_lang::shims::ExtractedShims;
+
+const V2_NODE_EPOCH_HELP: &str = "Stable node-state/deployment epoch bound into durable V2 session identity. Reuse it across normal process restarts. To bump it, use a new state root or archive the old root first; changing this value never evicts or migrates existing sessions.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +48,10 @@ struct Cli {
 enum Command {
     /// Provision a local development CA plus node/client identities.
     Pki(PkiArgs),
+    /// Initialize the durable V2 node receipt-signing identity.
+    Identity(IdentityArgs),
+    /// Explicit offline administration of durable V2 state.
+    Admin(AdminArgs),
     /// Print descriptive node/catalog metadata; this is not a health claim.
     Profile(ProfileArgs),
     /// Validate the local shim and TLS configuration without listening.
@@ -54,6 +70,55 @@ struct PkiArgs {
 enum PkiCommand {
     /// Generate a non-overwriting development PKI and verify it by mTLS handshake.
     Init(PkiInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct IdentityArgs {
+    #[command(subcommand)]
+    command: IdentityCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    /// Create a non-overwriting Ed25519 key for V2 journal receipts.
+    Init(IdentityInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminArgs {
+    #[command(subcommand)]
+    command: AdminCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    /// Permanently remove one durably closed session under the exclusive state lock.
+    GcClosed(AdminGcClosedArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminGcClosedArgs {
+    #[arg(long)]
+    session_id: String,
+    /// Durable V2 state root (default: XDG state ostadix/hosted-v2).
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// V2 Ed25519 receipt key (default: STATE_DIR/node-signing-key.v2).
+    #[arg(long)]
+    node_signing_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct IdentityInitArgs {
+    /// Durable V2 state root (default: XDG state ostadix/hosted-v2).
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Node signing key path (default: STATE_DIR/node-signing-key.v2).
+    #[arg(long)]
+    node_signing_key: Option<PathBuf>,
+    /// Public receipt-verification key (default: STATE_DIR/node-signing-public.v2).
+    #[arg(long)]
+    node_public_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -122,12 +187,42 @@ struct ServeArgs {
     tls: ServerTlsArgs,
     #[arg(long, default_value = DEFAULT_NODE_BIND)]
     bind: String,
+    /// Enable durable session protocol V2 using this capability-first state root.
+    #[arg(long)]
+    v2_state_dir: Option<PathBuf>,
+    /// V2 Ed25519 receipt key (default: V2_STATE_DIR/node-signing-key.v2).
+    #[arg(long)]
+    v2_node_signing_key: Option<PathBuf>,
+    /// Hex Ed25519 public key of the placement authority. Required with V2.
+    #[arg(long)]
+    v2_authority_public_key: Option<PathBuf>,
+    #[arg(long, default_value_t = 1, help = V2_NODE_EPOCH_HELP)]
+    v2_node_generation: u64,
+    /// Monotonic generation of the five canonical state quota limits.
+    #[arg(long, default_value_t = 1)]
+    v2_state_quota_generation: u64,
+    #[arg(long, default_value_t = DEFAULT_MAX_OPEN_SESSIONS_V2)]
+    v2_max_open_sessions: u32,
+    #[arg(long, default_value_t = DEFAULT_MAX_ACTORS_PER_SESSION_V2)]
+    v2_max_actors_per_session: u32,
+    #[arg(long, default_value_t = DEFAULT_MAX_SNAPSHOT_BYTES_PER_ACTOR_V2)]
+    v2_max_snapshot_bytes_per_actor: u64,
+    #[arg(long, default_value_t = DEFAULT_MAX_STATE_BYTES_PER_SESSION_V2)]
+    v2_max_state_bytes_per_session: u64,
+    #[arg(long, default_value_t = DEFAULT_MAX_STATE_BYTES_TOTAL_V2)]
+    v2_max_state_bytes_total: u64,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Pki(args) => match args.command {
             PkiCommand::Init(args) => init_development_pki(args),
+        },
+        Command::Identity(args) => match args.command {
+            IdentityCommand::Init(args) => init_v2_identity(args),
+        },
+        Command::Admin(args) => match args.command {
+            AdminCommand::GcClosed(args) => gc_closed_session(args),
         },
         Command::Profile(args) => {
             let profile =
@@ -138,6 +233,22 @@ fn main() -> Result<()> {
         Command::Doctor(args) => doctor(args),
         Command::Serve(args) => serve(args),
     }
+}
+
+fn gc_closed_session(args: AdminGcClosedArgs) -> Result<()> {
+    let state_dir = args.state_dir.unwrap_or_else(default_hosted_v2_state_dir);
+    let key_path = args
+        .node_signing_key
+        .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
+    let signer = read_node_signing_key_v2(&key_path)?;
+    let store = DurableSessionStoreV2::open(&state_dir, signer)?;
+    let receipt = store.gc_closed_session(&args.session_id)?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    eprintln!(
+        "o-node: permanently removed closed session {} (session files are not recoverable; signed authority-journal anchors remain)",
+        args.session_id
+    );
+    Ok(())
 }
 
 fn init_development_pki(args: PkiInitArgs) -> Result<()> {
@@ -333,6 +444,37 @@ fn init_development_pki(args: PkiInitArgs) -> Result<()> {
     Ok(())
 }
 
+fn init_v2_identity(args: IdentityInitArgs) -> Result<()> {
+    let state_dir = args.state_dir.unwrap_or_else(default_hosted_v2_state_dir);
+    let key_path = args
+        .node_signing_key
+        .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
+    let public_path = args
+        .node_public_key
+        .unwrap_or_else(|| state_dir.join("node-signing-public.v2"));
+    if key_path.exists() || public_path.exists() {
+        bail!(
+            "refusing to overwrite hosted V2 identity files: key={} public={}",
+            key_path.display(),
+            public_path.display()
+        );
+    }
+    let signer = HostedNodeSignerV2::generate()?;
+    // Opening the store establishes and verifies the 0700 capability root.
+    let _store = DurableSessionStoreV2::open(&state_dir, signer.clone())?;
+    write_new_node_signing_key_v2(&key_path, &signer)?;
+    if let Err(error) = write_new_node_public_key_v2(&public_path, &signer.public_key()) {
+        let _ = fs::remove_file(&key_path);
+        return Err(error).context("failed to install hosted V2 public identity");
+    }
+    println!("hosted V2 state initialized at {}", state_dir.display());
+    println!("node signing key: {}", key_path.display());
+    println!("node public-key file: {}", public_path.display());
+    println!("node public key: {}", signer.public_key_hex());
+    println!("node key id: {}", signer.key_id());
+    Ok(())
+}
+
 fn doctor(args: DoctorArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
     let runtime = runtime_from_args(args.runtime, shim_dir)?;
@@ -365,9 +507,77 @@ fn doctor(args: DoctorArgs) -> Result<()> {
 
 fn serve(args: ServeArgs) -> Result<()> {
     let (shim_dir, _shim_guard) = resolve_shim_dir(args.runtime.shim_dir.clone())?;
+    let v1_runtime = runtime_from_args(args.runtime, shim_dir)?;
+    if let Some(state_dir) = args.v2_state_dir {
+        let node_key_path = args
+            .v2_node_signing_key
+            .unwrap_or_else(|| state_dir.join("node-signing-key.v2"));
+        let authority_path = args
+            .v2_authority_public_key
+            .context("--v2-authority-public-key is required when --v2-state-dir enables V2")?;
+        let signer = read_node_signing_key_v2(&node_key_path)?;
+        let authority = read_placement_public_key_v2(&authority_path)?;
+        let node_state_epoch = GenerationV1::new(args.v2_node_generation)?;
+        let state_quota_generation = GenerationV1::new(args.v2_state_quota_generation)?;
+        let state_quotas = StateQuotaLimitsV2::new(
+            args.v2_max_open_sessions,
+            args.v2_max_actors_per_session,
+            args.v2_max_snapshot_bytes_per_actor,
+            args.v2_max_state_bytes_per_session,
+            args.v2_max_state_bytes_total,
+        )?;
+        let store = DurableSessionStoreV2::open(&state_dir, signer)?;
+        let v2_runtime = HostedV2Runtime::open(
+            HostedV2RuntimeConfig {
+                node_id: v1_runtime.node_id.clone(),
+                node_generation: node_state_epoch,
+                shim_dir: v1_runtime.shim_dir.clone(),
+                runtime_executable: v1_runtime.runtime_executable.clone(),
+                state_quota_generation,
+                state_quotas,
+            },
+            store,
+            Arc::new(PinnedEd25519PlacementAuthorizerV2::new(authority)),
+        )
+        .with_context(|| {
+            format!(
+                "failed to open durable V2 state at `{}` with stable node-state/deployment epoch {}; reuse the epoch across normal restarts, and use a new state root or archive the old root before bumping it; epoch changes never evict existing sessions",
+                state_dir.display(),
+                node_state_epoch.get()
+            )
+        })?;
+        eprintln!(
+            "o-node: durable V2 node-state/deployment epoch {} is stable across normal restarts; bump only with a new state root or after archiving `{}`; changing the epoch never evicts or migrates existing sessions",
+            node_state_epoch.get(),
+            state_dir.display()
+        );
+        let unreadable_sessions = v2_runtime.unreadable_sessions()?;
+        if !unreadable_sessions.is_empty() {
+            eprintln!(
+                "o-node: retained {} unreadable durable V2 session(s); no session was evicted. A node-state epoch change requires a new state root or an archived old root",
+                unreadable_sessions.len()
+            );
+            for diagnostic in unreadable_sessions {
+                eprintln!("o-node: retained unreadable V2 session: {diagnostic}");
+            }
+        }
+        eprintln!(
+            "o-node: serving {} on {} (TLS 1.3 mTLS; frozen V1 + durable V2; max {} connections)",
+            v1_runtime.node_id, args.bind, v1_runtime.max_concurrent_connections
+        );
+        return serve_node_dual(HostedDualNodeServerConfig {
+            bind_address: args.bind,
+            v1_runtime,
+            v2_runtime,
+            tls_identity: tls_identity(args.tls),
+        });
+    }
+    if args.v2_node_signing_key.is_some() || args.v2_authority_public_key.is_some() {
+        bail!("--v2-state-dir is required when any V2 key option is supplied");
+    }
     let config = HostedNodeServerConfig {
         bind_address: args.bind,
-        runtime: runtime_from_args(args.runtime, shim_dir)?,
+        runtime: v1_runtime,
         tls_identity: tls_identity(args.tls),
     };
     eprintln!(
@@ -609,6 +819,23 @@ impl Drop for TemporaryPkiDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use clap::CommandFactory;
+
+    #[test]
+    fn v2_node_generation_help_defines_a_stable_state_epoch() {
+        let mut command = Cli::command();
+        let serve = command.find_subcommand_mut("serve").unwrap();
+        let generation = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "v2_node_generation")
+            .unwrap();
+        let help = generation.get_help().unwrap().to_string();
+        assert_eq!(help, V2_NODE_EPOCH_HELP);
+        assert!(help.contains("Reuse it across normal process restarts"));
+        assert!(help.contains("new state root or archive the old root"));
+        assert!(help.contains("never evicts or migrates existing sessions"));
+    }
 
     #[test]
     fn development_pki_server_name_is_config_injection_safe() {
