@@ -77,6 +77,9 @@ impl InvokeMode {
 /// One executable OIR instruction. The tree shape preserves lexical and
 /// structural evaluation regions while `ExecutionPlan` makes dependencies
 /// and legal scheduling order explicit.
+// Keep this public AST's direct variant ownership stable. Boxing only the
+// largest variant would churn every constructor and pattern for a size hint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum OIr {
     /// Verbatim text destined for a backend splice buffer.
@@ -463,6 +466,9 @@ pub struct PlanEdge {
     pub kind: PlanEdgeKind,
 }
 
+// `PlanNodeKind` is a public execution-plan vocabulary; preserve its direct
+// variant ownership instead of changing that API solely to equalize sizes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanNodeKind {
     Text,

@@ -189,7 +189,7 @@ impl RequirementAtomV1 {
     }
 
     pub fn minimum_pointer_width(bits: u16) -> Result<Self, PlacementValidationError> {
-        if bits == 0 || bits > 128 || bits % 8 != 0 {
+        if bits == 0 || bits > 128 || !bits.is_multiple_of(8) {
             return Err(PlacementValidationError::InvalidToken {
                 field: "minimum pointer width",
                 value: bits.to_string(),
