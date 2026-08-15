@@ -2,20 +2,32 @@ use crate::environment::EnvironmentRefV2;
 use crate::ir::{ExecutionMode, ExecutionPlan, OIrProgram, PlanNodeId, PlanNodeKind};
 
 use super::{
-    EffectRequirementV1, EnvironmentRequirementV1, PlacementValidationError, RequirementAtomV1,
-    RequirementFootprintV1, ResourceKindV1, SemanticDigestV1,
+    CapabilityAtomV1, CapabilityKeyV1, EffectRequirementV1, EnvironmentRequirementV1,
+    PlacementValidationError, RequirementAtomV1, RequirementFootprintV1, ResourceKindV1,
+    SemanticDigestV1,
 };
+
+pub const SESSION_SERIALIZED_OPAQUE_EFFECTS_NAMESPACE_V1: &str = "execution";
+pub const SESSION_SERIALIZED_OPAQUE_EFFECTS_NAME_V1: &str = "session-serialized-opaque-effects";
+pub const SESSION_SERIALIZED_OPAQUE_EFFECTS_CAPABILITY_V1: &str =
+    "execution/session-serialized-opaque-effects@1";
 
 /// Semantic authority available while projecting one plan island.
 ///
 /// `AutonomousUnknownEffects` is never inferred from an ephemeral environment;
 /// callers may select it only for syntax already nested under an explicit
-/// `autonomous(...)` policy region.
+/// `autonomous(...)` policy region or for a sealed single-fragment authority
+/// whose consuming runtime forbids recursive evaluator callbacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlacementIntentV1 {
     #[default]
     Strict,
     AutonomousUnknownEffects,
+    /// The exact persistent actor/session serializes this one opaque shim
+    /// command.  This does not claim compiler-known effects, purity,
+    /// replayability, or isolation from other sessions; the selected target
+    /// must explicitly advertise the matching execution capability.
+    SessionSerializedOpaqueEffects,
 }
 
 /// Derive a placement footprint for one executable-plan node.
@@ -89,6 +101,17 @@ pub fn requirement_footprint_for_plan_node(
         atoms.push(RequirementAtomV1::Effect(
             EffectRequirementV1::AutonomousUnknownEffects,
         ));
+    } else if backend.execution == ExecutionMode::Shim
+        && environment.is_persistent()
+        && intent == PlacementIntentV1::SessionSerializedOpaqueEffects
+    {
+        atoms.push(RequirementAtomV1::Capability(CapabilityAtomV1::new(
+            CapabilityKeyV1::new(
+                SESSION_SERIALIZED_OPAQUE_EFFECTS_NAMESPACE_V1,
+                SESSION_SERIALIZED_OPAQUE_EFFECTS_NAME_V1,
+            )?,
+            1,
+        )?));
     } else if backend.execution == ExecutionMode::Shim {
         reasons.push("hosted shim effects are not compiler-closed".to_string());
     }
@@ -213,5 +236,46 @@ mod tests {
             .contains(&RequirementAtomV1::Environment(
                 EnvironmentRequirementV1::Stateless
             )));
+    }
+
+    #[test]
+    fn persistent_opaque_effects_require_explicit_session_serialization() {
+        let persistent = exec("python", EnvironmentRefV2::Persistent(7));
+        let strict =
+            requirement_footprint_for_plan_node(&persistent, PlacementIntentV1::Strict).unwrap();
+        assert!(strict.is_conservative_unknown());
+        let autonomous = requirement_footprint_for_plan_node(
+            &persistent,
+            PlacementIntentV1::AutonomousUnknownEffects,
+        )
+        .unwrap();
+        assert!(
+            autonomous.is_conservative_unknown(),
+            "fresh/autonomous authority must not authorize a persistent session"
+        );
+
+        let session = requirement_footprint_for_plan_node(
+            &persistent,
+            PlacementIntentV1::SessionSerializedOpaqueEffects,
+        )
+        .unwrap();
+        assert!(session.is_complete());
+        assert!(session
+            .known_atoms()
+            .contains(&RequirementAtomV1::Capability(
+                CapabilityAtomV1::new(
+                    CapabilityKeyV1::new(
+                        SESSION_SERIALIZED_OPAQUE_EFFECTS_NAMESPACE_V1,
+                        SESSION_SERIALIZED_OPAQUE_EFFECTS_NAME_V1,
+                    )
+                    .unwrap(),
+                    1,
+                )
+                .unwrap()
+            )));
+        assert!(session.known_atoms().iter().any(|atom| matches!(
+            atom,
+            RequirementAtomV1::Environment(EnvironmentRequirementV1::SameLogicalEnvironment { .. })
+        )));
     }
 }
